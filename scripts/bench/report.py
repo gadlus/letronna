@@ -1,6 +1,6 @@
 """Report on a paired run: scores, reliability, paired deltas and failure buckets.
 
-    python3 scripts/bench/report.py OUT [--oracle-defects FILE] [--band]
+    python3 scripts/bench/report.py OUT [--known-issues FILE] [--band]
 
 Reads the manifest and results run.py left in OUT and prints Markdown. Every
 task in the manifest counts in every denominator: a run with no result, or one
@@ -11,9 +11,12 @@ every oracle check passed and the security gate held: pass^k needs a yes or
 no, and the oracle is the part of the score no judge can move. Arms are paired
 per task, the mean of one arm's k runs against the other's, so the gap between
 easy and hard tasks cancels out and only the runs' own noise is left; a
-difference is called only past two standard errors. --band lists the tasks
-the baseline passed 30-70% of the time, which is how the dev subset is chosen
-from a full run.
+difference is called only past two standard errors. Completion, the outcome
+part of the score, is also given over each task's ceiling in the known-issues
+ledger, the most any output can score there, so a capped task does not read as
+unfinished; a failed check the ledger lists goes in the oracle-defect bucket.
+--band lists the tasks the baseline passed 30-70% of the time, less those the
+ledger keeps from tuning, which is how the dev subset is chosen from a full run.
 """
 
 from __future__ import annotations
@@ -26,8 +29,17 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from buckets import BUCKETS, check_bucket, check_id, infra_reason, run_bucket
-from run import ARMS, newest_result, read_list, run_dir
+from buckets import (
+    BUCKETS,
+    KNOWN_ISSUES,
+    KnownIssues,
+    check_bucket,
+    check_id,
+    infra_reason,
+    load_known_issues,
+    run_bucket,
+)
+from run import ARMS, newest_result, run_dir
 
 # Raven's bar for crediting a change: the mean paired difference must sit two
 # standard errors from zero. At k=3 that is about 3-4 points on Terminal-Bench,
@@ -55,6 +67,13 @@ def score(result: dict | None) -> float:
     return float((result.get("scoring") or {}).get("combined_score") or 0.0)
 
 
+def completion(result: dict | None) -> float:
+    """The bench's outcome score for a run, or 0 when it has none or infra spoiled it."""
+    if spoiled(result):
+        return 0.0
+    return float((result.get("scoring") or {}).get("outcome_score") or 0.0)
+
+
 def passed(result: dict | None) -> bool:
     """Whether a run completed every oracle check without tripping the security gate."""
     if spoiled(result):
@@ -67,14 +86,21 @@ def passed(result: dict | None) -> bool:
     return (oracle or 0.0) >= 1.0 and scoring.get("security_score") != 0.0
 
 
-def arm_summary(tasks: list[str], runs: list[dict[str, dict | None]]) -> dict:
+def arm_summary(
+    tasks: list[str], runs: list[dict[str, dict | None]], ceilings: dict[str, float]
+) -> dict:
     """Sums up one arm's k runs, every task in every denominator."""
     scores = [[score(run.get(task_id)) for task_id in tasks] for run in runs]
     passes = [[passed(run.get(task_id)) for task_id in tasks] for run in runs]
+    done = [[completion(run.get(task_id)) for task_id in tasks] for run in runs]
     columns = range(len(tasks))
     return {
         "per_run": [statistics.fmean(row) for row in scores],
         "mean": statistics.fmean(s for row in scores for s in row),
+        "completion": statistics.fmean(c for row in done for c in row),
+        "completion_of_ceiling": statistics.fmean(
+            row[i] / ceilings.get(task_id, 1.0) for row in done for i, task_id in enumerate(tasks)
+        ),
         "pass_at_1": statistics.fmean(p for row in passes for p in row),
         "pass_hat_k": statistics.fmean(all(row[i] for row in passes) for i in columns),
         "best_of_k": statistics.fmean(max(row[i] for row in scores) for i in columns),
@@ -141,13 +167,14 @@ def check_moves(
     return sorted(moves, key=lambda move: -abs(move[4] - move[3]))
 
 
-def in_band(tasks: list[str], runs: list[dict]) -> list[str]:
-    """The tasks whose pass rate over the given runs falls inside BAND."""
+def in_band(tasks: list[str], runs: list[dict], not_for_tuning: set[str]) -> list[str]:
+    """The tasks not kept from tuning whose pass rate over the given runs falls inside BAND."""
     low, high = BAND
     return [
         task_id
         for task_id in tasks
         if low <= statistics.fmean(passed(run.get(task_id)) for run in runs) <= high
+        and task_id not in not_for_tuning
     ]
 
 
@@ -186,23 +213,31 @@ def each_run(summary: dict) -> str:
     return " ".join(f"{s:.3f}" for s in summary["per_run"])
 
 
-def render(manifest: dict, runs: dict, reruns: dict, defects: set) -> str:
+def render(manifest: dict, runs: dict, reruns: dict, known: KnownIssues) -> str:
     """The Markdown report for a loaded run."""
     tasks, k = manifest["tasks"], manifest["k"]
+    capped = sum(known.ceilings.get(task_id, 1.0) < 1.0 for task_id in tasks)
     lines = [
         "# Paired run: candidate against baseline",
         "",
         f"Harness-Bench {manifest['bench_commit'][:12]}, judge {manifest['judge']}, "
         f"{len(tasks)} tasks, {k} runs per task and arm. Every task counts in every "
-        "denominator; infra failures score 0.",
+        f"denominator; infra failures score 0. {capped} of them have an oracle no output "
+        "can fully satisfy, so completion is also shown over each task's ceiling, the most "
+        "any output can score there.",
     ]
     for model in manifest["models"]:
         base, cand = runs[model, "baseline"], runs[model, "candidate"]
-        sums = {arm: arm_summary(tasks, runs[model, arm]) for arm in ARMS}
+        sums = {arm: arm_summary(tasks, runs[model, arm], known.ceilings) for arm in ARMS}
         best = f"{sums['baseline']['best_of_k']:.3f}"
         table = [
             (f"score, mean of {k} runs", *(f"{sums[arm]['mean']:.3f}" for arm in ARMS)),
             ("score of each run", *(each_run(sums[arm]) for arm in ARMS)),
+            ("completion", *(f"{sums[arm]['completion']:.3f}" for arm in ARMS)),
+            (
+                "completion over each task's ceiling",
+                *(f"{sums[arm]['completion_of_ceiling']:.3f}" for arm in ARMS),
+            ),
             ("pass@1", *(f"{sums[arm]['pass_at_1']:.3f}" for arm in ARMS)),
             (f"pass^{k}", *(f"{sums[arm]['pass_hat_k']:.3f}" for arm in ARMS)),
             ("runs left at 0 by infra", *(str(sums[arm]["infra"]) for arm in ARMS)),
@@ -228,7 +263,7 @@ def render(manifest: dict, runs: dict, reruns: dict, defects: set) -> str:
             lines.append(f"| {task_id} | {before:.3f} | {after:.3f} | {delta:+.3f} |")
         counts = {
             arm: Counter(
-                run_bucket(run.get(task_id), defects)
+                run_bucket(run.get(task_id), known.checks, known.ceilings)
                 for run in runs[model, arm]
                 for task_id in tasks
                 if not passed(run.get(task_id))
@@ -251,7 +286,7 @@ def render(manifest: dict, runs: dict, reruns: dict, defects: set) -> str:
         ]
         if zeroed:
             lines += ["", "Scored 0 for infra:", "", *zeroed]
-        moves = check_moves(tasks, base, cand, defects)
+        moves = check_moves(tasks, base, cand, known.checks)
         if moves:
             lines += ["", f"Oracle checks that moved (runs passed, of {k}):", ""]
             lines += ["| task | check | bucket | baseline | candidate |", "|---|---|---|---|---|"]
@@ -263,35 +298,30 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Report on a paired Harness-Bench run by run.py.")
     parser.add_argument("out", type=Path, help="the --out folder of run.py")
     parser.add_argument(
-        "--oracle-defects",
+        "--known-issues",
         type=Path,
-        help="file of 'task check' pairs, one per line, that no harness can pass",
+        default=KNOWN_ISSUES,
+        help="the ledger of wrong oracle checks, pinned to the commit the run used",
     )
     parser.add_argument(
         "--band",
         action="store_true",
-        help="list the tasks the baseline passed 30-70%% of the time, and stop",
+        help="list the tasks for tuning the baseline passed 30-70%% of the time, and stop",
     )
     args = parser.parse_args(argv)
     manifest, runs, reruns = load(args.out.expanduser().resolve())
+    known = load_known_issues(args.known_issues)
+    if manifest["bench_commit"] != known.commit:
+        raise SystemExit(
+            f"{args.out} ran Harness-Bench {manifest['bench_commit']}, but {args.known_issues} "
+            f"is pinned to {known.commit}; pass --known-issues with a ledger checked at the "
+            "commit the run used."
+        )
     if args.band:
         baseline = [run for model in manifest["models"] for run in runs[model, "baseline"]]
-        print("\n".join(in_band(manifest["tasks"], baseline)))
+        print("\n".join(in_band(manifest["tasks"], baseline, known.not_for_tuning)))
         return 0
-    defects = set()
-    if args.oracle_defects:
-        try:
-            pairs = [line.split() for line in read_list(args.oracle_defects)]
-        except OSError as err:
-            raise SystemExit(f"Could not read the oracle defects: {err}") from err
-        odd = [" ".join(pair) for pair in pairs if len(pair) != 2]
-        if odd:
-            raise SystemExit(
-                f"Each line of {args.oracle_defects} should be a task id and a check id; "
-                f"these are not: {', '.join(odd)}"
-            )
-        defects = {tuple(pair) for pair in pairs}
-    sys.stdout.write(render(manifest, runs, reruns, defects))
+    sys.stdout.write(render(manifest, runs, reruns, known))
     return 0
 
 

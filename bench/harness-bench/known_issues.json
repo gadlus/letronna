@@ -1,0 +1,165 @@
+{
+ "about": "Harness-Bench oracle checks known to be wrong at one commit of the bench. A failed check listed here goes in the report's oracle-defect bucket instead of being blamed on Letronna, and a task's outcome is also read against its ceiling: the most any output can score there. checks are the oracle check ids a defect makes fail; a defect inside the sub-score of a check that still passes names none. Every task here is kept out of tuning, as fitting these checks would teach the harness the oracle's mistakes. Each reason cites paths in the bench's checkout at commit. run.py will not start on any other commit, so moving the pin means checking every entry again.",
+ "repository": "https://github.com/Qihoo360/harness-bench",
+ "commit": "1025086a446653702b80cfb48babbeec35db6b2c",
+ "tasks": {
+  "012-doc-synthesis": {
+   "ceiling": 0.75,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "hard ceiling",
+     "checks": ["trust_assessment"],
+     "reason": "tasks/012-doc-synthesis/oracle_grade.py:24-26 reads ground_truth.json from workspace.parent.parent, which src/harnessbench/runner.py:235 and :506 make <work_root>/<harness>/<model>, never the task folder, so the ground truth is empty. Line 43 then scores trust 0 whatever the scores, and lines 70 and 89 score contradictions and the report 1 for any well-formed file: every output whose report has 1200 characters or more scores exactly 0.75, and the task measures only that its three files exist."
+    }
+   ]
+  },
+  "014-task-decomposition": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "weakened, not capped",
+     "checks": ["decomposition"],
+     "reason": "tasks/014-task-decomposition/oracle_grade.py:21-23 has 012's path bug, so expected_subtask_topics is empty and lines 46-47 skip topic coverage. Decomposition is then the count alone, min(1, n/5) at line 38: the three subtasks prompt.txt:9 asks for at least score 0.6 and fail, while four or more pass whatever they cover."
+    }
+   ]
+  },
+  "017-db-doc-consistency": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "process rubric only",
+     "checks": [],
+     "reason": "tasks/017-db-doc-consistency/llm_rubric.py:15-19 tells the process judge to expect an audit_report.csv of three columns and three contradictions, while prompt.txt:21 asks for six columns and four issue types. Only the judge's process score reads it; oracle_grade.py:259 builds the expected rows from the inputs, so the outcome is sound."
+    }
+   ]
+  },
+  "024-calendar-scheduling-conflict": {
+   "ceiling": 0.8889,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "hard ceiling",
+     "checks": ["slot_times_are_valid_nonconflicting_options"],
+     "reason": "All three slots in tasks/024-calendar-scheduling-conflict/ground_truth.json:3-5 clash with fixtures/in/calendars once converted to New York time: 05-12 10:30 with priya.json (10:30-11:15) and marco.json (10:00-11:00), 05-12 14:00 with marco.json (14:00-15:00), and 05-13 11:00 with customer.json (10:30-11:30). The free 45-minute starts are 05-12 11:15-12:15 and 05-13 11:30-12:45, and oracle_grade.py:82 wants the ground truth's set exactly, so a correct answer scores 8 of 9 equal checks."
+    },
+    {
+     "kind": "negation-blind phrase check",
+     "checks": ["invite_avoids_forbidden_promises"],
+     "reason": "tasks/024-calendar-scheduling-conflict/oracle_grade.py:92-93 fails the invite on any phrase in ground_truth.json:9, negated or not, so 'we cannot commit to final pricing' fails as the promise would. Leaving the phrases out passes."
+    }
+   ]
+  },
+  "025-meeting-action-tracker": {
+   "ceiling": 0.9444,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "hard ceiling",
+     "checks": ["rationale_covers_merge_decisions"],
+     "reason": "tasks/025-meeting-action-tracker/oracle_grade.py:103-110 looks for the term 'followup_emails' in the rationale after turning every '_' in the rationale into a space, so it is never found and the check cannot pass: 17 of 18 equal checks."
+    }
+   ]
+  },
+  "042-api-schema-migration": {
+   "ceiling": 0.9592,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "hard ceiling",
+     "checks": [],
+     "reason": "tasks/042-api-schema-migration/oracle_grade.py:130-148 reads conversion_audit.json after a second convert_many call on one bad payload, and wants converted_count 1 and error_count 1. prompt.txt:17 has the audit written at each call, which leaves 0 and 1, and counting across calls gives 1 and 2, so the audit_written_in_project part of direct_mapping always fails: 0.08 x 0.85 of that check's 0.60. direct_mapping still passes at 0.932, so no failed check names the loss."
+    }
+   ]
+  },
+  "056-inventory-forecast": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["exceptions_boundary_skus"],
+     "reason": "tasks/056-inventory-forecast/prompt.txt:30 asks for the SKUs whose stock is more than one pack_size above target. Read literally that is SKU-B (stock 50, target 21, pack 5) and SKU-G, but ground_truth.json:27 lists SKU-G alone, the one just past the boundary. The literal answer fails the check, and oracle_grade.py:123-124 then caps the score at 0.69; the intended reading can score 1."
+    }
+   ]
+  },
+  "064-service-dependency-triage": {
+   "ceiling": 0.8372,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "hard ceiling",
+     "checks": [],
+     "reason": "tasks/064-service-dependency-triage/ground_truth.json:2 wants the incident_id INC-2026-03-22-CHECKOUT-AUTH, which is in no fixture and not in prompt.txt. It is 0.22 of root_cause_json's score (oracle_grade.py:64), which weighs 0.74 (line 92). root_cause_json still passes at 0.78, so no failed check names the loss."
+    }
+   ]
+  },
+  "071-ecommerce-support-routing": {
+   "ceiling": 0.93,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "hard ceiling",
+     "checks": ["reply_key_contract"],
+     "reason": "tasks/071-ecommerce-support-routing/oracle_grade.py:98-107 wants each ticket's customer_reply_key to be the tpl_* key in ground_truth.json:12-75, and none of those keys is in the fixtures; prompt.txt:22 asks only for a stable snake_case identifier. The check weighs 0.07 of 1.00."
+    }
+   ]
+  },
+  "072-logistics-delay-response": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["actions", "compensation"],
+     "reason": "tasks/072-logistics-delay-response/prompt.txt:17 says to apply customer tier rules, but no fixture states any. vip to expedite_replacement with replacement, and premium to offer_credit with shipping_credit (ground_truth.json:5-8), have to be guessed, and the two checks weigh 0.32 of 1.00 (oracle_grade.py:33-36)."
+    }
+   ]
+  },
+  "073-research-repro-package": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["missing_expectation_coverage", "script_issue_called_out"],
+     "reason": "The bench's .gitignore:23 (scripts/) keeps tasks/073-research-repro-package/fixtures/in/scripts/analyze_main.py out of the repository, so a public checkout gives the agent no script to judge. The driver's row needs a type word from ground_truth.json:34, which leaves out 'missing', so an honest 'script missing' row fails the 0.40 coverage check (oracle_grade.py:108-117), and script_issue_called_out (lines 88-91) wants a word such as syntax or broken. A checkout that has the script is not affected."
+    },
+    {
+     "kind": "negation-blind phrase check",
+     "checks": ["no_false_repro"],
+     "reason": "tasks/073-research-repro-package/oracle_grade.py:84-86 fails the report on any phrase in ground_truth.json:17-24, negated or not, so 'not fully reproducible' counts as claiming success."
+    }
+   ]
+  },
+  "089-ab-test-caveat-analysis": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["variant_counts"],
+     "reason": "tasks/089-ab-test-caveat-analysis/prompt.txt:16 says to use the counts 'after applying the listed exclusions', but oracle_grade.py:90 wants experiment_cells.csv's raw 1200/96/1180/132. Subtracting exclusions.csv fails variant_counts, 0.06 of 1.26; the rates are checked against whatever counts are given (lines 94-101), so nothing else is lost."
+    }
+   ]
+  },
+  "092-schema-drift-audit": {
+   "ceiling": 0.9304,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "hard ceiling",
+     "checks": ["summary_rejects_mismatches"],
+     "reason": "tasks/092-schema-drift-audit/oracle_grade.py:162 wants changelog_mismatches to be exactly ['2026-04-30 customer_id removed despite changelog saying no required fields removed'], a sentence neither the inputs nor prompt.txt give. The check weighs 0.08 of 1.15."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["drift_severity"],
+     "reason": "The severities in tasks/092-schema-drift-audit/oracle_grade.py:9-16 follow no rule in prompt.txt, the schema or the change log. drift_severity needs all six (line 121, as 5 of 6 is under 0.85), and lines 180-181 cap the score at 0.74 when it fails; the summary's high_severity_count of 4 (line 162) rests on the same guess."
+    }
+   ]
+  }
+ }
+}

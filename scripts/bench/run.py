@@ -18,6 +18,8 @@ the other left. A run that infra trouble spoiled is run at most twice more, and
 whatever is still broken counts as 0 in the report. A run that already has a
 clean result is skipped, so an interrupted run carries on where it stopped --
 but only with the same settings and the same binaries, or the pairs would mix.
+It will not start on a bench at any commit but the one the known-issues ledger
+was checked against, as its ceilings and wrong checks may not hold there.
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 
-from buckets import infra_reason
+from buckets import KNOWN_ISSUES, infra_reason, load_known_issues
 
 ARMS = ("baseline", "candidate")
 
@@ -155,6 +157,12 @@ def main(argv: list[str] | None = None) -> int:
     add("--k", type=int, default=3, help="runs per task, arm and model (default 3)")
     add("--judge", default=JUDGE, help=f"the bench's judge model (default {JUDGE})")
     add("--out", type=Path, required=True, help="folder for the runs, outside any git checkout")
+    add(
+        "--known-issues",
+        type=Path,
+        default=KNOWN_ISSUES,
+        help="the ledger of wrong oracle checks; the bench must be at the commit it names",
+    )
     args = parser.parse_args(argv)
 
     bench = args.bench.expanduser().resolve()
@@ -194,6 +202,13 @@ def main(argv: list[str] | None = None) -> int:
         commit = subprocess.run(git, capture_output=True, text=True, check=False).stdout.strip()
     except OSError:
         commit = ""
+    known = load_known_issues(args.known_issues)
+    if commit != known.commit:
+        raise SystemExit(
+            f"{bench} is at {commit or 'no git commit'}, but {args.known_issues} was checked "
+            f"against Harness-Bench {known.commit}. Check that commit out there and apply the "
+            "adapter patch again, or check every entry against the new commit and move the pin."
+        )
     manifest = {
         "bench": str(bench),
         "bench_commit": commit or "unknown",
