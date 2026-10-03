@@ -341,6 +341,13 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
             tell(spec, Step::Asked(call.clone()));
         }
         if calls.is_empty() {
+            // Past the round cap the wrap-up is the last word, as in the
+            // terminal: mail or a Stop hook sending it back would undo the
+            // limit, and unread mail goes on to the owner. A run that starts
+            // wrapped up, as a quick look does, never reached a cap.
+            if turn.capped().is_some() && !spec.connection.wrap_up {
+                return Ok(Outcome::RoundLimit);
+            }
             // Mail that came while it worked may change the answer, so it
             // carries the run on rather than going unread.
             let mut mail = inbox::fold(&inbox::take(spec.id, true));
@@ -393,8 +400,12 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
         if capped || !turn.begin(calls) {
             return at_limit(spec, report);
         }
-        report.rounds += 1;
-        spec.status.rounds.store(report.rounds, Ordering::Relaxed);
+        // The round at the cap runs nothing: it only answers its calls as not
+        // run and asks for the wrap-up.
+        if turn.capped().is_none() {
+            report.rounds += 1;
+            spec.status.rounds.store(report.rounds, Ordering::Relaxed);
+        }
         work_through(spec, turn, report)?;
         // A hook's `continue: false`, whose results are kept.
         if crate::hooks::halted(spec.connection.conversation) {
@@ -816,8 +827,10 @@ fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Option<Message>, 
         // A fork's is its parent's, so its requests start as the parent's do.
         floor: spec.transcript.conversation.floor(),
     };
+    // The turn's, as the window and the terminal send, since at the round
+    // cap it alone asks for the wrap-up with no calls.
     let events = chat::start_with(
-        spec.connection.clone(),
+        turn.connection.clone(),
         spec.transcript.conversation.messages.clone(),
         extra,
     );
@@ -2668,6 +2681,79 @@ pub(crate) mod tests {
             (last["name"].as_str(), last["content"].as_str()),
             (Some("structured_output"), Some("Answer received."))
         );
+    }
+
+    /// A provider that makes the same call twice, then wraps up in prose.
+    fn capped_after_one_round() -> (String, Stub) {
+        provider(vec![
+            reply("", &[read_notes()]),
+            reply("", &[read_notes()]),
+            reply("The notes say hello; nothing is left to do.", &[]),
+        ])
+    }
+
+    #[test]
+    fn the_wrap_up_at_the_round_cap_is_requested_with_no_tools() {
+        let dir = scratch("wrap-up");
+        let (endpoint, provider) = capped_after_one_round();
+        let mut spec = spec(endpoint, &dir, AGENTS + 490);
+        spec.rounds = 1;
+        finished(spec);
+        let sent = provider.sent();
+
+        assert_eq!(sent[1].get("tool_choice"), None);
+        // Still offered, so the cached prefix holds, but none may be used.
+        assert_eq!(sent[2]["tool_choice"], "none");
+        assert_eq!(sent[2]["tools"], sent[1]["tools"]);
+        assert_eq!(
+            results(&sent[2]).last(),
+            Some(&"Not run: the tool-round limit (1) was reached.")
+        );
+        let asked = messages(&sent[2]).last().unwrap().to_string();
+        assert!(asked.contains("reached the tool-round limit"), "{asked}");
+    }
+
+    #[test]
+    fn a_prose_wrap_up_at_the_cap_ends_as_round_limit() {
+        let dir = scratch("capped");
+        let (endpoint, provider) = capped_after_one_round();
+        let mut spec = spec(endpoint, &dir, AGENTS + 500);
+        spec.rounds = 1;
+        let report = finished(spec);
+        provider.sent();
+
+        assert_eq!(report.status, Outcome::RoundLimit);
+        assert_eq!(report.text, "The notes say hello; nothing is left to do.");
+    }
+
+    #[test]
+    fn the_cap_round_is_not_counted_as_a_round_run() {
+        let dir = scratch("cap-round");
+        let (endpoint, provider) = capped_after_one_round();
+        let mut spec = spec(endpoint, &dir, AGENTS + 510);
+        spec.rounds = 1;
+        let status = spec.status.clone();
+        let report = finished(spec);
+        provider.sent();
+
+        assert_eq!(report.rounds, 1);
+        assert_eq!(status.rounds.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_run_that_starts_wrapped_up_still_ends_as_answered() {
+        let dir = scratch("wrapped-up");
+        let (endpoint, provider) = provider(vec![reply("It says hello.", &[])]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 520);
+        // As a quick look runs: one request, no tools, no rounds.
+        spec.connection.tools = false;
+        spec.connection.wrap_up = true;
+        spec.rounds = 0;
+        let report = finished(spec);
+        provider.sent();
+
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "It says hello.");
     }
 
     #[test]
