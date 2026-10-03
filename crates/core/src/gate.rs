@@ -881,11 +881,17 @@ fn never(why: &str) -> String {
 /// or refuses it when they cannot be asked.
 fn dangerous(why: &str, gate: &Gate) -> Outcome {
     // With nobody there it would wait forever, and a yes typed into a chat
-    // app is a message, not the user at this computer.
+    // app is a message, not the user at this computer. Told only to leave
+    // the step out, a run gives up on it; a narrower command, such as a
+    // delete of named files, is one the floor reads and may let run, while
+    // the same step put in a script would only hide it from the floor.
     if !gate.human {
         return Outcome::Refuse(format!(
             "Refused: this command {why}, and nobody is here to approve it. \
-             Leave it out and say in your answer that it is needed."
+             If the step is needed, do it with a narrower command that names \
+             each thing it changes, such as deleting files by name instead of \
+             their whole folder; do not hide the same step in a script. \
+             Otherwise say in your answer that it is needed."
         ));
     }
     if gate.ctx.remote.is_some() {
@@ -1413,6 +1419,37 @@ mod tests {
             broken: None,
         };
         assert_eq!(decide(&write(), &gate), Outcome::Ask);
+    }
+
+    #[test]
+    fn a_refused_recursive_delete_suggests_naming_the_files() {
+        let none = Grants::new();
+        let here = ToolContext::default();
+        // `-p --yes` with no terminal.
+        let gate = Gate {
+            ctx: &here,
+            mode: Mode::Bypass,
+            grants: &none,
+            human: false,
+            rules: &[],
+            broken: None,
+        };
+        let Outcome::Refuse(why) = decide(&command("rm -r out/tmp"), &gate) else {
+            panic!("a recursive delete ran with nobody to approve it");
+        };
+        assert!(
+            why.contains("deletes a folder and everything in it"),
+            "{why}"
+        );
+        assert!(why.contains("deleting files by name"), "{why}");
+        assert!(
+            why.contains("do not hide the same step in a script"),
+            "{why}"
+        );
+        assert!(!why.contains("Leave it out"), "{why}");
+        // The narrower command it suggests is one that runs.
+        let named = command("rm out/tmp/draft.json out/tmp/notes.txt");
+        assert_eq!(decide(&named, &gate), Outcome::Run);
     }
 
     #[test]
