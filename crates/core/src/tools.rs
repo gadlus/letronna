@@ -382,6 +382,8 @@ const ALIASES: &[(&str, &str, &[&str])] = &[
     ("cmd", "command", &["run_command"]),
     ("run_in_background", "background", &["run_command"]),
     ("is_background", "background", &["run_command"]),
+    ("cwd", "workdir", &["run_command"]),
+    ("directory", "workdir", &["run_command"]),
     ("job_id", "id", &["read_job", "stop_job"]),
     ("bash_id", "id", &["read_job"]),
     ("shell_id", "id", &["stop_job"]),
@@ -1180,18 +1182,19 @@ struct SaveTo {
     cap: usize,
 }
 
-/// Runs `command` in the sandbox for `cwd`, the project, as
+/// Runs `command` in `dir`, in the sandbox for `cwd`, the project, as
 /// `run_shell_saving` runs any other, and says in the result that it did.
 /// One still running at the limit is stopped rather than moved to the
 /// background, where nothing would keep it confined to what it was allowed.
 fn run_sandboxed(
     command: &str,
     cwd: &Path,
+    dir: &Path,
     cancel: &Cancel,
     save: Option<SaveTo>,
 ) -> Result<String, String> {
     let (policy, _scratch) = crate::sandbox::Policy::for_project(cwd)?;
-    let wrapped = crate::sandbox::here().wrap(&shell(command, Some(cwd)), &policy)?;
+    let wrapped = crate::sandbox::here().wrap(&shell(command, Some(dir)), &policy)?;
     match run_shell_saving(wrapped, command, cancel, save, COMMAND_TIMEOUT, None) {
         Ok(text) => Ok(crate::sandbox::noted(&text)),
         Err(e) => Err(crate::sandbox::noted(&e)),
@@ -1954,14 +1957,15 @@ impl Tool for RunCommand {
     }
     fn description(&self) -> &'static str {
         if cfg!(windows) {
-            "Run a Windows PowerShell 5.1 command in the project folder. `&&` and `||` are syntax errors in 5.1: separate commands with `;`, or write `first; if ($?) { second }` to run the second only when the first succeeded. Waits for it to finish and returns its output, with a 2 minute limit. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
+            "Run a Windows PowerShell 5.1 command in the project folder, or in the folder inside it that workdir names. `&&` and `||` are syntax errors in 5.1: separate commands with `;`, or write `first; if ($?) { second }` to run the second only when the first succeeded. Each call is a fresh PowerShell: cd and $env: changes do not carry over to the next call, so keep steps that depend on each other in one command and pass workdir instead of cd. Waits for it to finish and returns its output, with a 2 minute limit. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
         } else {
-            "Run a shell (sh) command in the project folder. Waits for it to finish and returns its output, with a 2 minute limit. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
+            "Run a shell (sh) command in the project folder, or in the folder inside it that workdir names. Each call is a fresh shell: cd, export and source do not carry over to the next call, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish and returns its output, with a 2 minute limit. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
         }
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
             "command": {"type": "string"},
+            "workdir": {"type": "string", "description": "The folder to run it in, inside the project: relative to the project folder, or absolute. Left out, it runs in the project folder."},
             "background": {"type": "boolean", "description": "Leave the command running and return a job number straight away. A notice comes when it exits; read its output meanwhile with read_job, and end it with stop_job."},
             "notify_on": {"type": "array", "items": {"type": "string"}, "description": "With background: a notice when an output line contains one of these, such as \"ready\" or \"error\". At most one notice every 15 s; exiting always sends one."},
             "unsandboxed": {"type": "boolean", "description": "Run it outside the sandbox. Only after a sandboxed run of it failed for want of the network or of writing outside the project; it needs the user's approval."}
@@ -1971,14 +1975,20 @@ impl Tool for RunCommand {
         true
     }
     fn preview(&self, args: &Value, _: &ToolContext) -> String {
-        args["command"].as_str().unwrap_or_default().to_owned()
+        let command = args["command"].as_str().unwrap_or_default();
+        // A yes to `rm -r build` is a yes for one folder's build, so the
+        // card names the folder when it is not the project's own.
+        match args["workdir"].as_str().filter(|raw| !raw.is_empty()) {
+            Some(raw) => format!("# in {raw}\n{command}"),
+            None => command.to_owned(),
+        }
     }
     fn judge_input(&self, args: &Value, ctx: &ToolContext) -> String {
         // Never cut: the end of a command can undo whatever its start shows.
         let line = args["command"].as_str().unwrap_or_default();
-        let folder = match &ctx.workspace {
-            Some(folder) => folder.display().to_string(),
-            None => "no folder".to_owned(),
+        let folder = match workdir(args, ctx) {
+            Ok(folder) => folder.display().to_string(),
+            Err(_) => "no folder".to_owned(),
         };
         let background = if args["background"].as_bool().unwrap_or(false) {
             ", left running in the background"
@@ -1998,6 +2008,7 @@ impl Tool for RunCommand {
             .workspace
             .as_deref()
             .ok_or("No project folder is attached. Ask the user to attach one first.")?;
+        let dir = workdir(args, ctx)?;
         let notify_on = notify_on(args)?;
         if !args["background"].as_bool().unwrap_or(false) {
             if !notify_on.is_empty() {
@@ -2024,14 +2035,14 @@ impl Tool for RunCommand {
                 cap: PIPE_SPILL_BYTES,
             });
             let out = if ctx.sandboxed {
-                run_sandboxed(command, cwd, &ctx.cancel, save)
+                run_sandboxed(command, cwd, &dir, &ctx.cancel, save)
             } else {
                 // A helper's command is stopped at the limit instead, since its
                 // report would come back before the command had finished, as is
                 // one run for no conversation, which no exit notice would reach.
                 let own = ctx.caller.agent.is_none() && ctx.conversation != 0;
                 let owner = own.then_some(ctx.conversation);
-                let cmd = shell(command, Some(cwd));
+                let cmd = shell(command, Some(&dir));
                 run_shell_saving(cmd, command, &ctx.cancel, save, COMMAND_TIMEOUT, owner)
             };
             let note = crate::filestate::note(ctx.conversation, before, cwd);
@@ -2046,7 +2057,7 @@ impl Tool for RunCommand {
         if ctx.sandboxed {
             return Err("A command left running in the background cannot run sandboxed.".into());
         }
-        let id = crate::jobs::start_watching(command, cwd, ctx.conversation, &notify_on)?;
+        let id = crate::jobs::start_watching(command, &dir, ctx.conversation, &notify_on)?;
         // Give it a moment to fail or announce a port, so the first reply says
         // something more useful than "started"; its first line mostly does,
         // so the moment ends there. A stop cuts the moment short, but the job
@@ -2077,6 +2088,48 @@ impl Tool for RunCommand {
             }
         ))
     }
+}
+
+/// The folder `run_command` runs `args`' command in: the project folder, or
+/// the folder inside it that `workdir`, or another agent's name for it, names.
+pub(crate) fn workdir(args: &Value, ctx: &ToolContext) -> Result<PathBuf, String> {
+    let workspace = ctx
+        .workspace
+        .as_deref()
+        .ok_or("No project folder is attached. Ask the user to attach one first.")?;
+    // The gate reads a call as it was sent, and must judge the command in
+    // the folder the tool, which reads `cwd` as `workdir`, runs it in.
+    let mut args = args.clone();
+    rename_aliases("run_command", &mut args);
+    let Some(raw) = args["workdir"].as_str().filter(|raw| !raw.is_empty()) else {
+        return Ok(workspace.to_path_buf());
+    };
+    // Before canonicalising, which opens the path: on Windows that alone
+    // signs in to another computer.
+    if let Some(why) = crate::paths::unsafe_raw(raw, Some(workspace)) {
+        return Err(format!("`{raw}` {why}; it stays out of reach."));
+    }
+    let root = std::fs::canonicalize(workspace).map_err(|_| "The project folder is missing.")?;
+    let real = std::fs::canonicalize(workspace.join(raw))
+        .map_err(|_| format!("The folder `{raw}` does not exist."))?;
+    let Ok(inside) = real.strip_prefix(&root) else {
+        return Err(format!(
+            "`{raw}` is outside the project folder. Give a folder inside it as workdir, or leave workdir out."
+        ));
+    };
+    if !real.is_dir() {
+        return Err(format!("`{raw}` is a file; workdir names a folder."));
+    }
+    if private(&real, &crate::chat::data_dir()) {
+        return Err(format!(
+            "`{raw}` is in Letronna's own folder, with its keys and settings; it stays out of reach."
+        ));
+    }
+    // Links and `..` followed, as the system follows them on the way in, so
+    // the command is judged where it really runs. Spelled from the project
+    // folder as the session has it: the checks on a command would read a
+    // canonical Windows path's `\\?\` as another drive.
+    Ok(workspace.join(inside))
 }
 
 /// The user's own earlier conversations, by name and size only.
@@ -5489,5 +5542,81 @@ mod tests {
         crate::permissions::switch(&file, &tools, true).unwrap();
         assert!(offered_names().contains(&tools[0]));
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    /// A project folder holding `a.txt` at its top and another in `sub`.
+    fn workspace_with_sub(label: &str) -> (PathBuf, ToolContext) {
+        let (dir, ctx) = workspace_with(label, "at the top\n");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/a.txt"), "in sub\n").unwrap();
+        (dir, ctx)
+    }
+
+    #[test]
+    fn a_command_runs_in_the_workdir_it_names() {
+        let (dir, ctx) = workspace_with_sub("workdir");
+        let cat = |workdir: Value| {
+            let args = json!({"command": "cat a.txt", "workdir": workdir}).to_string();
+            let out = run("run_command", &args, &ctx).unwrap();
+            out.trim_end().to_owned()
+        };
+        assert_eq!(cat(Value::Null), "at the top");
+        assert_eq!(cat(json!("sub")), "in sub");
+        // Given whole, as a prompt that names the project's full path has it.
+        assert_eq!(cat(json!(dir.join("sub"))), "in sub");
+        let job = r#"{"command":"cat a.txt","workdir":"sub","background":true}"#;
+        let started = run("run_command", job, &ctx).unwrap();
+        assert!(started.contains("in sub"), "{started}");
+        let judged = RunCommand.judge_input(&json!({"command": "ls", "workdir": "sub"}), &ctx);
+        let said = format!("Command, run in {}:", dir.join("sub").display());
+        assert!(judged.starts_with(&said), "{judged}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_workdir_outside_the_project_is_refused() {
+        let (dir, ctx) = workspace_with_sub("workdir-outside");
+        let refused = |workdir: &str| {
+            let args = json!({"command": "cat a.txt", "workdir": workdir}).to_string();
+            run("run_command", &args, &ctx).unwrap_err()
+        };
+        let parent = dir.parent().unwrap().display().to_string();
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut outside = vec!["..".to_owned(), "sub/../..".to_owned(), parent];
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.parent().unwrap(), dir.join("sub/up")).unwrap();
+            outside.push("sub/up".to_owned());
+        }
+        for raw in outside {
+            let why = refused(&raw);
+            assert!(why.contains("outside the project folder"), "{raw}: {why}");
+        }
+        let why = refused("nope");
+        assert!(why.contains("does not exist"), "{why}");
+        let why = refused("a.txt");
+        assert!(why.contains("is a file"), "{why}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cwd_is_read_as_workdir() {
+        let (dir, ctx) = workspace_with_sub("workdir-cwd");
+        for name in ["cwd", "directory"] {
+            let args = format!(r#"{{"command":"cat a.txt","{name}":"sub"}}"#);
+            let out = run("run_command", &args, &ctx).unwrap();
+            assert!(out.starts_with("in sub"), "{out}");
+            assert!(out.contains(&format!("`{name}` as `workdir`")), "{out}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_card_names_the_folder_a_command_runs_in() {
+        let ctx = ToolContext::default();
+        let card = |args: &str| preview("run_command", args, &ctx);
+        assert_eq!(card(r#"{"command":"rm -r build"}"#), "rm -r build");
+        let elsewhere = card(r#"{"command":"rm -r build","cwd":"web"}"#);
+        assert_eq!(elsewhere, "# in web\nrm -r build");
     }
 }

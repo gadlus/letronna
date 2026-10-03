@@ -858,14 +858,18 @@ fn marked(tool: &dyn Tool, args: &Value) -> Option<String> {
     (carried && !counted).then(|| crate::redact::carried(tool.name()))
 }
 
-/// What `run_command`'s line would do where the session works; `None` for
+/// What `run_command`'s line would do in the folder it runs in; `None` for
 /// every other tool.
 fn risk(name: &str, args: &Value, ctx: &ToolContext) -> Option<Risk> {
     if name != "run_command" {
         return None;
     }
     let line = args["command"].as_str().unwrap_or_default();
-    Some(command::assess(line, Dialect::here(), ctx.workspace.as_deref()).risk)
+    // A link in the folder `workdir` names can lead out of the project where
+    // the same name at its top leads nowhere. A folder the tool would refuse
+    // is judged as no folder at all, since nothing runs there.
+    let dir = tools::workdir(args, ctx).ok();
+    Some(command::assess(line, Dialect::here(), dir.as_deref()).risk)
 }
 
 /// The refusal for a command that never runs from here.
@@ -1077,6 +1081,15 @@ fn confinable(args: &Value, ctx: &ToolContext) -> bool {
         return false;
     };
     if !holdable(workspace) {
+        return false;
+    }
+    // The folder `workdir` names is in every path the command opens, as one
+    // a `cd` names is: Linux's sandbox reads a key such as `api/.ssh/id_rsa`
+    // and leaves it to this check to ask about a command that names it.
+    let Ok(dir) = tools::workdir(args, ctx) else {
+        return false;
+    };
+    if dir.strip_prefix(workspace).is_ok_and(protected) {
         return false;
     }
     let line = args["command"].as_str().unwrap_or_default();
@@ -1768,6 +1781,39 @@ mod tests {
         assert!(crate::search::SearchWeb.needs_approval());
     }
 
+    /// A read is judged in the folder `workdir` names, where a link can lead
+    /// out of the project though the same name at its top leads nowhere.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_through_a_link_in_the_workdir_asks() {
+        let dir = project_dir("workdir-link");
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join("sub")).unwrap();
+        std::fs::write(project.join("sub/a.txt"), "a").unwrap();
+        std::os::unix::fs::symlink(&dir, project.join("sub/up")).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(project),
+            ..Default::default()
+        };
+        let none = Grants::new();
+        let gate = Gate {
+            ctx: &ctx,
+            mode: Mode::Default,
+            grants: &none,
+            human: true,
+            rules: &[],
+            broken: None,
+        };
+        let read = |args| decide(&call("run_command", args), &gate);
+        let inside = serde_json::json!({ "command": "cat a.txt", "workdir": "sub" });
+        assert_eq!(read(inside), Outcome::Run);
+        for name in ["workdir", "cwd"] {
+            let out = serde_json::json!({ "command": "cat up/outside.txt", name: "sub" });
+            assert_eq!(read(out), Outcome::Ask, "{name}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn a_read_does_not_carry_a_hardline_or_dangerous_command_with_it() {
         let ctx = project(false);
@@ -2222,6 +2268,39 @@ mod tests {
             decide_with(&command("cargo test"), &gate, None, true),
             Outcome::Ask
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A command run in a protected folder that `workdir` names asks, as one
+    /// after `cd` into it does, rather than running sandboxed.
+    #[test]
+    fn a_command_in_a_protected_workdir_asks_rather_than_running_sandboxed() {
+        let dir = project_dir("sandboxed-workdir");
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join("api/.ssh")).unwrap();
+        std::fs::write(project.join("api/.ssh/id_rsa"), "key").unwrap();
+        let ctx = ToolContext {
+            workspace: Some(project),
+            ..Default::default()
+        };
+        let none = Grants::new();
+        let gate = Gate {
+            ctx: &ctx,
+            mode: Mode::AcceptEdits,
+            grants: &none,
+            rules: &[],
+            broken: None,
+            human: true,
+        };
+        let decided = |line: &str, workdir: &str| {
+            let args = serde_json::json!({ "command": line, "workdir": workdir });
+            decide_with(&call("run_command", args), &gate, None, true)
+        };
+        assert_eq!(decided("cargo test", "api"), Outcome::Sandboxed);
+        assert_eq!(decided("cat id_rsa", "api/.ssh"), Outcome::Ask);
+        assert_eq!(decided("cargo test", ".git"), Outcome::Ask);
+        let named = command("cd api/.ssh && cat id_rsa");
+        assert_eq!(decide_with(&named, &gate, None, true), Outcome::Ask);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
