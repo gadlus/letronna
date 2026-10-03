@@ -39,6 +39,13 @@ toml = { version = "1", default-features = false, features = ["std", "parse", "s
 # too big to send, and reading a mask's size; already in the lock file under
 # the window, which takes more of its formats.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# Reading Word, Excel and PowerPoint files, each a zip of XML parts. zip
+# with only its inflater, flate2's, already here under image; quick-xml
+# already in the lock file under the window. Not calamine: it holds a
+# sheet's cells in one block as wide and tall as the cells it finds, so
+# two cells at A1 and XFD1048576 ask for terabytes and end the process.
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
+quick-xml = "0.41"
 
 # Stopping a background job ends everything it started: a Job Object on
 # Windows, a process group elsewhere; a Ctrl-C is heard by a console handler

@@ -28,6 +28,7 @@ mod contract;
 #[cfg(feature = "workflows")]
 pub mod crew;
 pub mod diag;
+mod docs;
 mod downloads;
 pub mod driver;
 mod edit;
