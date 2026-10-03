@@ -53,6 +53,11 @@ With -p
   LETRONNA_DEADLINE=<s>    in the environment, the seconds a question may
                            take: at 80% it is told to write its outputs, and
                            at the end it stops
+      --json-schema <file>
+                           answer in JSON this schema checks, printed alone,
+                           or as \"value\" with --output json; the schema
+                           itself can stand in for the file; a new session
+                           only, so not with -c, -r or stream-json in
 ";
 
 /// What to open with.
@@ -123,6 +128,9 @@ pub struct Args {
     /// `--dump-config`: print what a `-p` run with these flags would get
     /// instead of running one.
     pub dump_config: bool,
+    /// The answer's JSON Schema from `--json-schema`: a file's path, or the
+    /// schema itself.
+    pub schema: Option<String>,
 }
 
 pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -154,6 +162,7 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         mcp: None,
         acp: false,
         dump_config: false,
+        schema: None,
     };
     // Only as the first word, so `-p mcp` still asks about it.
     if raw.next_if(|first| first == "mcp").is_some() {
@@ -243,6 +252,14 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
                     "--budget takes a number of tokens above 0, like --budget 200000.",
                 )?)
             }
+            "--json-schema" => {
+                let schema = raw
+                    .next()
+                    .filter(|schema| !schema.is_empty() && !schema.starts_with('-'));
+                args.schema = Some(schema.ok_or(
+                    "--json-schema takes a JSON Schema file, like --json-schema answer.json.",
+                )?);
+            }
             "--gateway" => args.gateway = raw.next(),
             "--effort" => args.effort = raw.next(),
             "setup" | "--install" => args.install = true,
@@ -307,6 +324,18 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
     if args.dump_config && args.start != Start::Fresh {
         return Err(
             "--dump-config describes a new session, so it takes no --continue or --resume.".into(),
+        );
+    }
+    if args.schema.is_some() && !args.once() {
+        return Err("--json-schema only works with -p.".into());
+    }
+    // The driver counts an answer's two corrections over the whole
+    // transcript, so on a session with earlier turns the answers turned down
+    // in those would use them up.
+    if args.schema.is_some() && (streamed || args.start != Start::Fresh) {
+        return Err(
+            "--json-schema needs a session of its own, so it does not work with -c, -r or --input-format stream-json."
+                .into(),
         );
     }
     Ok(args)
@@ -549,6 +578,45 @@ mod tests {
             "--dump-config describes a new session, so it takes no --continue or --resume.";
         assert_eq!(refused(&["--dump-config", "--continue"]), resumed);
         assert_eq!(refused(&["--dump-config", "--resume", "137"]), resumed);
+    }
+
+    #[test]
+    fn json_schema_takes_a_file_or_the_schema_and_only_works_with_p() {
+        let run = args(&["-p", "--json-schema", "answer.json", "count them"]);
+        assert_eq!(run.schema.as_deref(), Some("answer.json"));
+        assert_eq!(run.prompt.as_deref(), Some("count them"));
+        let inline = args(&["-p", "count them", "--json-schema", r#"{"type":"integer"}"#]);
+        assert_eq!(inline.schema.as_deref(), Some(r#"{"type":"integer"}"#));
+        assert!(args(&["-p", "hi"]).schema.is_none());
+
+        assert_eq!(
+            refused(&["-p", "x", "--json-schema", "--yes"]),
+            "--json-schema takes a JSON Schema file, like --json-schema answer.json."
+        );
+        assert!(refused(&["-p", "x", "--json-schema"]).starts_with("--json-schema takes"));
+        assert_eq!(
+            refused(&["--json-schema", "answer.json"]),
+            "--json-schema only works with -p."
+        );
+        let own = "--json-schema needs a session of its own, so it does not work with -c, -r or --input-format stream-json.";
+        assert_eq!(
+            refused(&["-p", "x", "-c", "--json-schema", "answer.json"]),
+            own
+        );
+        assert_eq!(
+            refused(&["-p", "x", "--resume", "7", "--json-schema", "answer.json"]),
+            own
+        );
+        let streamed = [
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output",
+            "stream-json",
+            "--json-schema",
+            "answer.json",
+        ];
+        assert_eq!(refused(&streamed), own);
     }
 
     #[test]

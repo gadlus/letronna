@@ -693,3 +693,41 @@ fn a_sigterm_stops_a_print_run_and_prints_its_result() {
     // What the run says for a Ctrl-C, once what it started is ended.
     assert_eq!(run.close(), 130);
 }
+
+#[test]
+fn a_print_run_with_a_schema_returns_its_value() {
+    let (data, work) = scratch("schema");
+    let schema = json!({"type": "object", "required": ["count"],
+        "properties": {"count": {"type": "integer"}}});
+    std::fs::write(work.join("answer.json"), schema.to_string()).unwrap();
+    let given = [("structured_output", json!({"count": 3}))];
+    let replies = vec![reply("Three.", &given), reply("Three.", &given)];
+    let (endpoint, bodies) = provider(replies);
+    let flags = [
+        "-p",
+        "count them",
+        "--output",
+        "json",
+        "--json-schema",
+        "answer.json",
+    ];
+    let run = Driven::start(&data, &work, &endpoint, &flags, &[]);
+    let result = run.next();
+    assert_eq!(
+        (&result["status"], &result["value"], &result["answer"]),
+        (&json!("done"), &json!({"count": 3}), &json!("Three."))
+    );
+    assert_eq!(run.close(), 0);
+    let tools = bodies.recv_timeout(WAIT).unwrap()["tools"].clone();
+    let offered = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["function"]["name"] == "structured_output");
+    assert_eq!(offered.unwrap()["function"]["parameters"], schema);
+    // As text, the value alone is printed, as one line of JSON.
+    let flags = ["-p", "count them", "--json-schema", "answer.json"];
+    let run = Driven::start(&data, &work, &endpoint, &flags, &[]);
+    assert_eq!(run.next(), json!({"count": 3}));
+    assert_eq!(run.close(), 0);
+}

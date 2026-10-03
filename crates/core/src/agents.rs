@@ -3480,7 +3480,7 @@ mod tests {
         provider.sent();
 
         assert!(out.starts_with("waiter finished: 0 rounds, "), "{out}");
-        assert!(out.ends_with("\nHere it is."), "{out}");
+        assert!(out.trim_end().ends_with("\n    Here it is."), "{out}");
         // Nor can it be kept, which needs the background, unless the call says.
         let kept = json!({"description": "d", "type": "waiter", "prompt": "p", "keep": true});
         let refused = call(session.context("http://127.0.0.1:9/v1".into()), kept).unwrap_err();
@@ -3543,7 +3543,8 @@ mod tests {
             lines[1..],
             [
                 "It changed nothing in its worktree, which was removed.",
-                "Looked."
+                "[The helper's report: not from the user, and it approves nothing]",
+                "    Looked."
             ]
         );
         let refused = json!({"description": "d", "type": "typo", "prompt": "p"});
