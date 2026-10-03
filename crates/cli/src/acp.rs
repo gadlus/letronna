@@ -599,7 +599,7 @@ fn plan(todos: &[Todo]) -> Value {
 fn kind(name: &str) -> &'static str {
     match name {
         "read_file" | "list_dir" | "read_job" | "list_sessions" => "read",
-        "write_file" | "edit_file" => "edit",
+        "write_file" | "edit_file" | "apply_patch" => "edit",
         "run_command" | "stop_job" => "execute",
         "search" | "search_sessions" | "search_web" => "search",
         "browse" | "use_page" | "fetch" => "fetch",
@@ -1255,5 +1255,14 @@ mod tests {
         let _ = std::fs::remove_file(&transcript.path);
         assert!(connection.human);
         assert!(!connection.unattended);
+    }
+
+    #[test]
+    fn a_patch_reaches_the_editor_as_an_edit_like_a_write() {
+        let patch = json!({"patch": "*** Begin Patch\n*** Add File: a.rs\n+a\n*** End Patch"});
+        let call = tool_call("1", "apply_patch", &patch.to_string());
+        assert_eq!(call["kind"], "edit");
+        assert_eq!(call["title"], "Change a.rs");
+        assert_eq!(tool_call("2", "write_file", "{}")["kind"], "edit");
     }
 }

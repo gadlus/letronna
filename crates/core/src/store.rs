@@ -2059,8 +2059,9 @@ pub fn artifacts() -> Vec<Artifact> {
     found
 }
 
-/// The paths the session file at `path` wrote or edited successfully, as
-/// the calls gave them, leaving out any a later rewind took back.
+/// The paths the session file at `path` wrote, edited or patched
+/// successfully, as the calls gave them, leaving out any a later rewind took
+/// back.
 fn written_in(path: &std::path::Path) -> Vec<String> {
     let Ok(bytes) = std::fs::read(path) else {
         return Vec::new();
@@ -2070,14 +2071,18 @@ fn written_in(path: &std::path::Path) -> Vec<String> {
     let (mut count, mut writes) = (0, Vec::new());
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let message = line.starts_with("{\"type\":\"message\"");
-        if message && !line.contains("\"write_file\"") && !line.contains("\"edit_file\"") {
+        if message
+            && !line.contains("\"write_file\"")
+            && !line.contains("\"edit_file\"")
+            && !line.contains("\"apply_patch\"")
+        {
             count += 1;
             continue;
         }
         match serde_json::from_str::<Record>(line) {
             Ok(Record::Message(m)) => {
                 count += 1;
-                if let Some(relative) = wrote(&m) {
+                for relative in wrote(&m) {
                     writes.push((count - 1, relative));
                 }
             }
@@ -2093,18 +2098,12 @@ fn written_in(path: &std::path::Path) -> Vec<String> {
     writes.into_iter().map(|(_, relative)| relative).collect()
 }
 
-/// The path a successful write or edit result wrote to.
-fn wrote(message: &Message) -> Option<String> {
+/// The paths a successful write, edit or patch result left a file at.
+fn wrote(message: &Message) -> Vec<String> {
     if message.role != "tool" || message.is_error {
-        return None;
+        return Vec::new();
     }
-    if !matches!(message.name.as_str(), "write_file" | "edit_file") {
-        return None;
-    }
-    let mut args = crate::tools::parse_args(&message.args).ok()?;
-    // Under the name the write ran with, `file_path` included.
-    crate::tools::rename_aliases(&message.name, &mut args);
-    args["path"].as_str().map(str::to_owned)
+    crate::tools::written(&message.name, &message.args)
 }
 
 /// The file's bytes from `TAIL_CHECK` before `len` up to `size`, and where
@@ -6269,6 +6268,43 @@ pub(crate) mod tests {
         assert_eq!(found[0].written, 200);
         assert_eq!(found[1].writes, 1);
         assert_eq!(found[1].path, std::path::PathBuf::from("/work/b.txt"));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_patched_file_is_an_output_and_one_the_patch_deleted_or_moved_away_is_not() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("patched-artifacts");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let patched = |patch: &str, is_error| Message {
+            role: "tool".into(),
+            name: "apply_patch".into(),
+            args: serde_json::json!({ "patch": patch }).to_string(),
+            is_error,
+            ..Default::default()
+        };
+        let applied = "*** Begin Patch\n*** Add File: new.txt\n+hi\n*** Delete File: gone.txt\n\
+                       *** Update File: old.rs\n*** Move to: moved.rs\n@@\n-a\n+b\n\
+                       *** Update File: kept.rs\n@@\n-a\n+b\n*** End Patch";
+        let refused = "*** Begin Patch\n*** Add File: never.txt\n+hi\n*** End Patch";
+        let mut store = Store {
+            conversations: vec![Conversation {
+                id: 1,
+                title: "patched".into(),
+                updated: 100,
+                workspace: Some("/work".into()),
+                messages: vec![patched(applied, false), patched(refused, true)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        store.save().unwrap();
+
+        let names: Vec<String> = super::artifacts()
+            .iter()
+            .map(|a| a.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["new.txt", "moved.rs", "kept.rs"]);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 

@@ -1096,6 +1096,31 @@ pub fn summary(name: &str, args: &str) -> String {
     one_line(&text)
 }
 
+/// The files a call of `name` with `args` leaves written, as it names them:
+/// write_file's or edit_file's path, what a patch adds or updates, a moved
+/// file under its new name, and none for any other call.
+pub fn written(name: &str, args: &str) -> Vec<String> {
+    let patch = name == crate::patch::APPLY_PATCH;
+    // Before any parsing, as most calls are no write.
+    if !patch && !matches!(name, "write_file" | "edit_file") {
+        return Vec::new();
+    }
+    let Ok(mut args) = parse_args(args) else {
+        return Vec::new();
+    };
+    // A file the patch deleted or moved away is not left written.
+    if patch {
+        return crate::patch::written(&args).unwrap_or_default();
+    }
+    // Under the name the write ran with, `file_path` included.
+    rename_aliases(name, &mut args);
+    args["path"]
+        .as_str()
+        .map(str::to_owned)
+        .into_iter()
+        .collect()
+}
+
 /// Collapse whitespace so a multi-line command cannot spill out of the
 /// single-line row it is shown in.
 pub fn one_line(text: &str) -> String {
