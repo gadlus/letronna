@@ -118,6 +118,12 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — `LETRONNA_ALLOW_HTTP=1` lets plain HTTP reach hosts on the local network; `LETRONNA_DISPOSABLE=1` lets an unwatched `--yes` run in a throwaway container delete a folder.
 - **All** — Letronna runs as a Harbor agent for Terminal-Bench and SWE-bench, and ClawBench and the A.I.G injection matrix can be run against it.
 - **All** — Releases carry a static terminal for x86_64 and aarch64 Linux.
+- **All** — A session can work in a git worktree of its own and apply its work back when done.
+- **All** — Scheduled runs can report by email, with the app password kept in the vault.
+- **All** — A side model in Settings makes summaries, commit suggestions and goal checks on something cheaper.
+- **All** — Memory changes can be listed and put back.
+- **All** — A folder's `.local` instructions file is read after its shared one.
+- **All** — Zed and JetBrains can reopen Letronna sessions and pick the model over ACP.
 ### Changed
 - **All** — A failed model request says what went wrong: the key, credit, a rate limit, a busy provider, a conversation too long, and so on.
 - **All** — OpenAI's reasoning models work, and a server that turns down a field is sent the request again without it.
@@ -172,6 +178,11 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Reading every page of an unchanged file counts as reading it whole; a picture too big to send is scaled down; a PDF `web_fetch` saves can be paged with `read_file`.
 - **All** — A goal's failing check command keeps the goal from being met, and `/review` covers new files and diffs from where the branch left.
 - **Terminal** — An unknown flag is an error, continuing stays in this folder's session, `--resume` under `-p` needs an id, and `-p` warns in Default mode that writes will be refused.
+- **All** — The agent is told when the session's mode changes, when you stopped its reply, which MCP servers are not ready, and, on long turns, the rules still in force (off unless chosen).
+- **All** — A tool that keeps failing is followed by a note to change approach; the goal check asks for evidence of each part.
+- **All** — Suggested commit messages follow the repository's own style.
+- **All** — Claude Code hooks Letronna does not run are left out with a notice; a window turn in a scheduled run is offered only what the run may call.
+- **Chat apps** — Slack shows bold, headings and links its own way.
 ### Fixed
 - **All** — A command that uploads a key file (curl, wget, scp, rsync) is refused in every mode, and .gnupg, .pgpass, .vault-token, .azure and gcloud settings count as secret.
 - **All** — An edit whose old text is missing says so instead of "already applied", plain text is no longer saved as a .docx, .xlsx, .pptx, .zip or .pdf, and a command that exits non-zero counts as failed.
