@@ -271,8 +271,9 @@ pub struct Connection {
     /// What the user typed in the session, oldest first, which Auto mode's
     /// judge reads as their wishes when it decides a helper's call.
     pub typed: Arc<[String]>,
-    /// The session's own model, set on its helpers' connections: Auto mode's
-    /// judge runs on it whichever model a helper was given.
+    /// The session's own model, set on its helpers' connections but a fork's
+    /// of the session, which runs on that model: Auto mode's judge runs on it
+    /// whichever model a helper was given.
     pub session_model: String,
 }
 
@@ -1069,7 +1070,9 @@ fn system_prompt(connection: &Connection, summary: Option<&str>) -> SystemPrompt
     } else if !connection.tools {
         system.push_str(" You have no tools or filesystem access on this gateway.");
     }
-    if connection.plan && !shared {
+    // Where plan mode keeps every tool its rules ride on the end instead
+    // (`PLANNING`), so switching it leaves this text as it was.
+    if connection.plan && !shared && !crate::tools::keeps_tools(connection) {
         system.push_str(" Plan mode is on: you can read, search and ask, and run commands that only read inside the project, such as ls, cat, rg or git status, but you cannot write files or run anything else, and the tools that would are unavailable.");
         // Where exit_plan is offered, a plan also written into the reply
         // would reach the user twice.
@@ -1459,6 +1462,25 @@ fn body_hashed(
         prefix.set(crate::cache_miss::Reason::Tools, tools);
     }
     body
+}
+
+/// Plan mode's rules where it keeps every tool (`tools::keeps_tools`),
+/// which end each request in plan mode in place of the system message's.
+// Marked as Letronna's, as the checklist is: it lands after the user's words
+// or a tool's output, and must not read as part of either.
+const PLANNING: &str = "(From Letronna, not part of the above: plan mode is on. Read, search, ask, and run only commands that just read inside the project, such as ls, cat, rg or git status. The tools that write or change things stay listed only to keep requests the same; they are refused until the user approves a plan. A request to make a change means planning it. When the plan is ready, put it to the user with exit_plan instead of writing it out in your reply; if they approve, plan mode turns off and you carry it out.)";
+
+/// What ends a request over `connection` on the wire only, empty for
+/// nothing: the open checklist first, as it always has, then `lsp`'s note,
+/// then plan mode's rules where it keeps every tool.
+fn ending(connection: &Connection, messages: &[Message], lsp: Option<&str>) -> String {
+    let planning = connection.plan && crate::tools::keeps_tools(connection);
+    let ending: Vec<String> = checklist(messages)
+        .into_iter()
+        .chain(lsp.map(str::to_owned))
+        .chain(planning.then(|| PLANNING.to_owned()))
+        .collect();
+    ending.join("\n\n")
 }
 
 /// The model's checklist as a note to end the request with, or none once
@@ -2935,12 +2957,7 @@ fn stream(
             let _ = sender.send_blocking(Event::SummaryUsage(usage));
         },
     );
-    // Both ride on the end, the checklist first as it always has.
-    let ending: Vec<String> = checklist(messages)
-        .into_iter()
-        .chain(lsp.map(str::to_owned))
-        .collect();
-    let ending = ending.join("\n\n");
+    let ending = ending(connection, messages, lsp);
     let mut prefix = crate::cache_miss::Prefix::default();
     let sent = body_hashed(
         connection,
@@ -4269,6 +4286,115 @@ mod tests {
         assert!(!offered);
         assert!(dm.contains("Plan mode is on"), "{dm}");
         assert!(!dm.contains("exit_plan"), "{dm}");
+    }
+
+    #[test]
+    fn tools_are_byte_identical_in_and_out_of_plan_mode_with_the_flag() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::store::tests::Scratch::new("chat-plan-keeps-tools");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let watched = Connection {
+            tools: true,
+            human: true,
+            workspace: Some("/w".into()),
+            ..connection()
+        };
+        let helper = Connection {
+            session_model: "session-model".into(),
+            ..watched.clone()
+        };
+        let sent = |connection: &Connection, plan: bool| {
+            let planning = Connection {
+                plan,
+                ..connection.clone()
+            };
+            let payload = body(&planning, &[said("user", "rename it")], None, None);
+            let system = payload["messages"][0]["content"].to_string();
+            (payload["tools"].to_string(), system)
+        };
+        let before = [sent(&watched, false), sent(&watched, true)];
+        let settings = json!({"endpoint": "", "model": "m", "plan_keeps_tools": true});
+        std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+        let kept = [sent(&watched, false), sent(&watched, true)];
+        let helpers = [sent(&helper, false), sent(&helper, true)];
+        // Taken out at once: turns started by tests beside this one read it.
+        std::fs::remove_file(dir.join("settings.json")).unwrap();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+
+        // Without the setting, switching plan mode changes both.
+        assert_ne!(before[0].0, before[1].0);
+        assert_ne!(before[0].1, before[1].1);
+        // With it, neither moves: plan mode offers what changes things, and
+        // exit_plan is offered out of plan mode too.
+        assert_eq!(kept[0], kept[1]);
+        assert_eq!(kept[0].1, before[0].1);
+        for name in ["write_file", "edit_file", crate::tools::EXIT_PLAN] {
+            let offered = format!("\"name\":\"{name}\"");
+            assert!(kept[1].0.contains(&offered), "{name}");
+        }
+        assert!(!kept[1].1.contains("Plan mode is on"), "{}", kept[1].1);
+        // A helper is still told what it may use by the array.
+        assert_ne!(helpers[0].0, helpers[1].0);
+        assert!(!helpers[1].0.contains("\"name\":\"write_file\""));
+    }
+
+    #[test]
+    fn the_plan_note_rides_the_wire_only() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::store::tests::Scratch::new("chat-plan-note");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let planning = Connection {
+            tools: true,
+            human: true,
+            plan: true,
+            ..connection()
+        };
+        let messages = vec![
+            said("user", "build it"),
+            planned(r#"{"text":"Read the code","status":"doing"}"#),
+            Message {
+                tool_call_id: "plan".into(),
+                ..said("tool", "Checklist updated: 0 of 1 done.")
+            },
+            said("user", "and now?"),
+        ];
+        let unflagged = ending(&planning, &messages, Some("LSP"));
+        let settings = json!({"endpoint": "", "model": "m", "plan_keeps_tools": true});
+        std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+        let ended = ending(&planning, &messages, Some("LSP"));
+        let off = Connection {
+            plan: false,
+            ..planning.clone()
+        };
+        let lifted = ending(&off, &messages, None);
+        let payload = body(&planning, &messages, None, Some(&ended));
+        std::fs::remove_file(dir.join("settings.json")).unwrap();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+
+        // After the checklist and the LSP's note, which end requests already.
+        assert!(!unflagged.contains(PLANNING), "{unflagged}");
+        assert_eq!(ended, format!("{unflagged}\n\n{PLANNING}"));
+        assert!(ended.starts_with("(From Letronna, not part of the above: your checklist"));
+        // Out of plan mode the checklist rides alone.
+        assert_eq!(Some(lifted), checklist(&messages));
+        // On the last message sent and nowhere else: not in the system
+        // message, nor in what the session keeps.
+        let context = payload["messages"].as_array().unwrap();
+        let last = context.last().unwrap()["content"].as_str().unwrap();
+        assert!(last.starts_with("and now?\n\n"), "{last}");
+        assert!(last.ends_with(PLANNING), "{last}");
+        let carrying = context
+            .iter()
+            .filter(|m| m["content"].to_string().contains("plan mode is on"))
+            .count();
+        assert_eq!(carrying, 1);
+        let system = context[0]["content"].as_str().unwrap();
+        assert!(!system.contains("Plan mode is on"), "{system}");
+        assert_eq!(messages.last().unwrap().content, "and now?");
     }
 
     /// The system message a request over `connection` with tools sends.

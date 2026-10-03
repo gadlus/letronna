@@ -433,6 +433,13 @@ pub struct Settings {
     /// time, as some benchmarks' graders require.
     #[serde(default = "yes")]
     pub parallel_tool_calls: bool,
+    /// Plan mode at the terminal or the window offers every tool, refusing
+    /// at the call those that change things, and gives its rules at the end
+    /// of each request instead of in the system message, so switching it
+    /// keeps the provider's cached prefix. Off until paired runs show models
+    /// keep to it; edited by hand with Letronna closed.
+    #[serde(default)]
+    pub plan_keeps_tools: bool,
     /// Models to carry a task on with, in order, when the chosen one is
     /// overloaded, out of credit or gone: `model` on the session's gateway,
     /// or `Gateway:model`; see `fallback`.
@@ -506,6 +513,7 @@ impl Default for Settings {
             voice: false,
             verify_edits: true,
             parallel_tool_calls: true,
+            plan_keeps_tools: false,
             session_filter: String::new(),
             group_by_project: false,
             quick_entry_hotkey: String::new(),
@@ -3116,6 +3124,12 @@ pub(crate) fn computer_use() -> bool {
 /// again each time as `disabled_tools` is.
 pub(crate) fn parallel_tool_calls() -> bool {
     settings().0.parallel_tool_calls
+}
+
+/// Whether the settings file has plan mode keep every tool, read again each
+/// time as `disabled_tools` is.
+pub(crate) fn plan_keeps_tools() -> bool {
+    settings().0.plan_keeps_tools
 }
 
 /// The settings file. A file that will not read at all is kept aside by
