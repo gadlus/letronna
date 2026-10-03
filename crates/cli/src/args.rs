@@ -235,7 +235,17 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
             other if !other.starts_with('-') && args.prompt.is_none() => {
                 args.prompt = Some(other.to_owned())
             }
-            _ => {}
+            // Once ignored: a mistyped flag ran with the defaults, and the
+            // word after it became the question.
+            other if other.starts_with('-') => {
+                return Err(format!("Unknown option {other}; see letronna --help."));
+            }
+            // Once ignored too, so `-p what is this` asked "what" alone.
+            other => {
+                return Err(format!(
+                    "`{other}` came after the question; a question of more than one word goes in quotes, like -p \"what is this\"."
+                ));
+            }
         }
     }
     args.mode = picked(mode, yes, plan);
@@ -507,5 +517,37 @@ mod tests {
             refused(&["-p", "hi", "--permission-prompt-tool", "mcp__ask"]),
             "--permission-prompt-tool takes stdio."
         );
+    }
+
+    #[test]
+    fn an_unknown_flag_is_an_error() {
+        // The word after it is not taken for the question.
+        assert_eq!(
+            refused(&["--foo", "bar"]),
+            "Unknown option --foo; see letronna --help."
+        );
+        // A typo does not run with the defaults instead.
+        assert_eq!(
+            refused(&["--max-round", "5", "-p", "q"]),
+            "Unknown option --max-round; see letronna --help."
+        );
+        assert_eq!(
+            refused(&["-p", "q", "-x"]),
+            "Unknown option -x; see letronna --help."
+        );
+        // A question that starts with a dash still goes after -p.
+        assert_eq!(
+            args(&["-p", "-5 or 5?"]).prompt.as_deref(),
+            Some("-5 or 5?")
+        );
+    }
+
+    #[test]
+    fn a_word_after_the_question_is_an_error() {
+        assert_eq!(
+            refused(&["-p", "what", "is", "this"]),
+            "`is` came after the question; a question of more than one word goes in quotes, like -p \"what is this\"."
+        );
+        assert!(refused(&["what", "--plan", "now"]).starts_with("`now` came after the question"));
     }
 }
