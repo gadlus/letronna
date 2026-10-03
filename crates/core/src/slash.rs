@@ -341,7 +341,9 @@ fn from_skill(skill: &Skill) -> Option<Command> {
         return None;
     }
     let (description, body) = match skill.source {
-        Source::User if !skill.learned => (skill.description.clone(), skill.body.clone()),
+        Source::User if !skill.learned && !skills::installed(skill) => {
+            (skill.description.clone(), skill.body.clone())
+        }
         // Anyone's, or a model's: fenced as the prompt fences them.
         source => (
             untrusted::visible(&skill.description),
@@ -349,7 +351,8 @@ fn from_skill(skill: &Skill) -> Option<Command> {
                 match source {
                     Source::Project => "this project's skill",
                     Source::Plugin => "a plugin's skill",
-                    Source::User => "a learned skill",
+                    Source::User if skill.learned => "a learned skill",
+                    Source::User => "an installed skill",
                 },
                 &skill.body,
             ),
@@ -759,6 +762,34 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_installed_skill_is_cleaned_and_the_user_s_own_is_not() {
+        let data = scratch("installed");
+        let folder = data.join("skills").join("tidy");
+        write(&folder.join(".installed-from"), "owner/repo\n");
+        let tidy = Skill {
+            description: "Tidies\u{202e} up".into(),
+            body: "Tidy\u{200b} up.".into(),
+            folder,
+            ..skill("tidy", Source::User)
+        };
+        let mine = Skill {
+            body: "Mine\u{200b}.".into(),
+            ..skill("mine", Source::User)
+        };
+        let listed = list_in(&data, None, &[tidy, mine], &[], &[]);
+        let tidy = find(&listed, "tidy").unwrap();
+        assert_eq!(tidy.description, "Tidies up");
+        assert!(
+            tidy.body
+                .starts_with("[Letronna's note: an installed skill holds 1 character"),
+            "{}",
+            tidy.body
+        );
+        assert!(tidy.body.ends_with("]\nTidy up."), "{}", tidy.body);
+        assert_eq!(find(&listed, "mine").unwrap().body, "Mine\u{200b}.");
     }
 
     #[cfg(unix)]
