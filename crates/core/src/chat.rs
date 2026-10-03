@@ -1898,6 +1898,11 @@ pub(crate) fn trim(text: &str, max: usize) -> String {
     )
 }
 
+/// Follows a reply the user stopped, on the wire only, so a message they
+/// type next reads as a new request rather than one steering the work the
+/// stop ended.
+const STOPPED_NOTE: &str = "(The user stopped this reply.)";
+
 fn wire_message(m: &Message, tool_chars: usize) -> Value {
     let mut content = if m.role == "tool" {
         trim(&m.content, tool_chars)
@@ -1913,6 +1918,13 @@ fn wire_message(m: &Message, tool_chars: usize) -> Value {
             "{gap}(Attached a picture, saved to {}.)",
             path.display()
         ));
+    }
+    // Send now cuts a reply short too, but leaves it unmarked: what it sends
+    // steers the work on. The note goes out with the reply on every request,
+    // so what a provider cached still matches.
+    if m.role == "assistant" && m.interrupted {
+        let gap = if content.is_empty() { "" } else { "\n\n" };
+        content.push_str(&format!("{gap}{STOPPED_NOTE}"));
     }
     let mut v = json!({"role": m.role, "content": content});
     if m.role == "tool" {
@@ -3845,6 +3857,44 @@ mod tests {
         };
         let wired = wire_message(&reply, MAX_TOOL_CHARS);
         assert_eq!(wired["tool_calls"][0]["function"]["arguments"], "{}");
+    }
+
+    #[test]
+    fn a_stopped_reply_carries_the_note_on_the_wire_only() {
+        let mut turn = crate::agent::Turn::new(connection());
+        turn.absorb(&Event::Delta("I will move every test into".into()));
+        let kept = turn.stop("test-model");
+        // Kept as it streamed: the note is the request's alone.
+        assert_eq!(kept[0].content, "I will move every test into");
+        let messages = [
+            said("user", "tidy the tests"),
+            kept[0].clone(),
+            said("user", "what does the parser do?"),
+        ];
+        let context = body(&connection(), &messages, None, None)["messages"].clone();
+        assert_eq!(
+            context[2]["content"],
+            "I will move every test into\n\n(The user stopped this reply.)"
+        );
+        assert_eq!(context[3]["content"], "what does the parser do?");
+    }
+
+    #[test]
+    fn a_send_now_cut_carries_no_note() {
+        // Send now keeps the reply it cuts into as `take_reply` gives it.
+        let mut turn = crate::agent::Turn::new(connection());
+        turn.absorb(&Event::Delta("I will move every test into".into()));
+        let cut = turn.take_reply("test-model");
+        let messages = [
+            said("user", "tidy the tests"),
+            cut,
+            Message {
+                folded: true,
+                ..said("user", "leave the parser's tests alone")
+            },
+        ];
+        let context = body(&connection(), &messages, None, None)["messages"].clone();
+        assert_eq!(context[2]["content"], "I will move every test into");
     }
 
     /// The calls a stream of `data:` payloads comes to.
