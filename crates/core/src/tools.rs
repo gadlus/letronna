@@ -3004,14 +3004,14 @@ impl Tool for ReadFile {
             ),
             _ => e,
         })?;
-        let (shown, whole) = if crate::notebook::is_notebook(&path) {
+        let (shown, lines) = if crate::notebook::is_notebook(&path) {
             page_notebook(text, offset, limit, cut)?
         } else {
             page(&mut text, offset, limit, cut)?
         };
         // A longer result loses its middle on the way to the model.
-        let whole = whole && shown.chars().count() <= crate::chat::MAX_TOOL_CHARS;
-        crate::filestate::read(ctx.conversation, &path, before, whole);
+        let lines = lines.filter(|_| shown.chars().count() <= crate::chat::MAX_TOOL_CHARS);
+        crate::filestate::read(ctx.conversation, &path, before, lines);
         Ok(shown)
     }
 }
@@ -3085,13 +3085,13 @@ pub(crate) fn open_text(path: &Path) -> Result<(Box<dyn BufRead>, bool), String>
 
 /// Lines from `offset` on, numbered, until `limit` of them or `PAGE_BYTES`,
 /// with a footer saying where the rest starts and a note on every page of a
-/// `cut` file; and whether that showed all of the file, as it is.
+/// `cut` file; and which lines that showed, if each showed as it is.
 pub(crate) fn page(
     reader: &mut impl BufRead,
     offset: usize,
     limit: usize,
     cut: bool,
-) -> Result<(String, bool), String> {
+) -> Result<(String, Option<crate::filestate::Lines>), String> {
     let mut out = String::new();
     let mut line = Vec::new();
     let (mut n, mut lossy, mut more, mut long) = (0, false, false, false);
@@ -3131,7 +3131,12 @@ pub(crate) fn page(
         out.push_str(&shown);
     }
     if n == 0 {
-        return Ok(("The file is empty.".into(), true));
+        let lines = crate::filestate::Lines {
+            first: 1,
+            last: 0,
+            end: true,
+        };
+        return Ok(("The file is empty.".into(), Some(lines)));
     }
     let mb = UTF16_BYTES / (1024 * 1024);
     if out.is_empty() {
@@ -3166,18 +3171,23 @@ pub(crate) fn page(
             n - 1
         ));
     }
-    let whole = offset == 1 && !more && !long && !lossy && !cut;
-    Ok((out, whole))
+    let lines = crate::filestate::Lines {
+        first: offset,
+        last: if more { n - 1 } else { n },
+        end: !more,
+    };
+    Ok((out, (!long && !lossy && !cut).then_some(lines)))
 }
 
 /// A page of a notebook's cells, or of its text after a note saying why it
-/// does not read as cells; and whether that showed all of the file, as it is.
+/// does not read as cells; and which lines of the file that showed, if each
+/// showed as it is.
 fn page_notebook(
     mut text: Box<dyn BufRead>,
     offset: usize,
     limit: usize,
     cut: bool,
-) -> Result<(String, bool), String> {
+) -> Result<(String, Option<crate::filestate::Lines>), String> {
     let mut bytes = Vec::new();
     // One byte past the cap tells a notebook cut there from one that fits it.
     text.by_ref()
@@ -3194,15 +3204,15 @@ fn page_notebook(
         // reason to let write_file replace the file.
         Ok(cells) => {
             let (shown, _) = page(&mut std::io::Cursor::new(cells), offset, limit, false)?;
-            return Ok((shown, false));
+            return Ok((shown, None));
         }
         Err(why) => why,
     };
     let mut raw = std::io::Cursor::new(bytes).chain(text);
-    let (shown, whole) = page(&mut raw, offset, limit, cut)?;
+    let (shown, lines) = page(&mut raw, offset, limit, cut)?;
     Ok((
         format!("[Not read as a notebook: {why}. Its text follows.]\n\n{shown}"),
-        whole,
+        lines,
     ))
 }
 
@@ -3766,7 +3776,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("letronna-read-ipynb-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        crate::filestate::asked(131, 1, 0);
+        crate::filestate::asked(131, 1, 0, 0);
         let ctx = ToolContext {
             workspace: Some(dir.clone()),
             conversation: 131,
@@ -3795,7 +3805,7 @@ mod tests {
         let past = read(json!({"path": "run.ipynb", "offset": 150})).unwrap_err();
         assert!(past.contains("149 lines"), "{past}");
         // Seeing every cell is not seeing the file, so it is not replaced whole.
-        crate::filestate::asked(131, 3, 0);
+        crate::filestate::asked(131, 3, 0, 0);
         let write = r#"{"path":"run.ipynb","content":"{}"}"#;
         let refused = run("write_file", write, &ctx).unwrap_err();
         assert!(refused.contains("edit_file instead"), "{refused}");
