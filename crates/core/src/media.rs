@@ -444,10 +444,15 @@ fn edit_refusal(status: u16, body: &Value, place: &str, model: Option<&str>) -> 
                 "{who} cannot edit images on {place} ({why}). Name a model that can, such as gpt-image-1."
             )
         }
+        // Said to the model as well as the user: a gateway without the route
+        // will not grow one on a retry, and a scripted change still gives
+        // the user a file where they asked for it.
         404 | 405 => format!(
             "There is no image edits route on {place}: /images/edits answered {status}. \
              Pictures can be edited on Letronna's hosted models, or on an OpenAI-compatible \
-             server that has that route."
+             server that has that route. Rather than trying again here, make the change \
+             with a script -- Python's PIL or ImageMagick through run_command -- save it \
+             where it was asked for, and say it was scripted, not redrawn by an image model."
         ),
         _ => why.unwrap_or_else(|| format!("The edit was turned down: {place} answered {status}.")),
     }
@@ -2016,6 +2021,21 @@ mod tests {
         assert!(why.contains("no image edits route"), "{why}");
         assert!(!project.join("media").exists());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_edits_route_points_to_a_script() {
+        let place = "the gateway at http://localhost/v1";
+        for (status, body) in [(404, json!(null)), (405, json!({"detail": "Not Found"}))] {
+            let why = edit_refusal(status, &body, place, Some("gpt-image-1"));
+            for named in ["with a script", "PIL", "ImageMagick", "run_command"] {
+                assert!(why.contains(named), "{named}: {why}");
+            }
+        }
+        // A model that cannot edit is put right by naming one that can.
+        let cannot = json!({"error": {"code": "model_not_found", "message": "No such thing."}});
+        let why = edit_refusal(404, &cannot, place, Some("flux.2-pro"));
+        assert!(!why.contains("run_command"), "{why}");
     }
 
     #[test]
