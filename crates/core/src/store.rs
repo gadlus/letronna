@@ -399,6 +399,10 @@ pub struct Settings {
     /// empty for the model of the agent that starts them.
     #[serde(default)]
     pub helper_model: String,
+    /// The model summaries, suggested commit messages and goal checks run
+    /// on, on the session's gateway; empty for the session's own. See `side`.
+    #[serde(default)]
+    pub side_model: String,
     /// How many helpers may run at once across Letronna; 0 for the usual 8.
     #[serde(default)]
     pub helpers_at_once: usize,
@@ -490,6 +494,7 @@ impl Default for Settings {
             context_window: 0,
             max_output: 0,
             helper_model: String::new(),
+            side_model: String::new(),
             helpers_at_once: 0,
             helper_depth: 0,
             helper_budget: 0,
@@ -1575,6 +1580,7 @@ fn usage_only(reply: Message) -> Message {
         cost: reply.cost,
         cost_estimated: reply.cost_estimated,
         summary_usage: reply.summary_usage,
+        summary_model: reply.summary_model,
         cache_miss: reply.cache_miss,
         at: reply.at,
         tool_calls: tool_calls.collect(),
@@ -2362,6 +2368,7 @@ pub(crate) fn keep_calls(aside: &std::path::Path, session: u64) -> std::io::Resu
             cost: reply.cost,
             cost_estimated: reply.cost_estimated,
             summary_usage: reply.summary_usage,
+            summary_model: reply.summary_model.clone(),
             at: reply.at,
             ..Default::default()
         };
@@ -2433,15 +2440,15 @@ fn spent_in(
                     reply.cached_tokens,
                 );
                 let copy = at > 0 && !seen.insert(key);
-                spent.extend(
-                    crate::usage::calls(&reply).map(|usage| crate::usage::Spent {
+                spent.extend(crate::usage::calls(&reply).map(|(model, usage)| {
+                    crate::usage::Spent {
                         session,
                         at: reply.at,
-                        model: reply.model.clone(),
+                        model: model.to_owned(),
                         usage,
                         copy,
-                    }),
-                )
+                    }
+                }))
             }
             // Only the file it was made in has the call: a copy's has not.
             Ok(Record::Summary {

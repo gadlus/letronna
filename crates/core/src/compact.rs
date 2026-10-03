@@ -82,6 +82,14 @@ const LISTED: usize = 10;
 /// kept to one short line: enough to tell them apart.
 const LINE_CHARS: usize = 200;
 
+/// What asking for one summary took, and the model that made it, which is
+/// the side model rather than the session's when Settings names one.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Paid {
+    pub model: String,
+    pub usage: Usage,
+}
+
 /// What became of one stretch of dropped messages.
 #[derive(Clone)]
 enum Entry {
@@ -111,7 +119,7 @@ struct Ahead {
     key: u64,
     /// `None` while it is being made; then the summary and what asking took,
     /// or `None` when the model could not make it.
-    made: Option<Option<(String, Usage)>>,
+    made: Option<Option<(String, Paid)>>,
     /// Set when what it covers was taken back, or the session closed, while
     /// it was being made: what comes of it is thrown away, and the session's
     /// place stays taken until then so a session never has two asks out.
@@ -142,7 +150,7 @@ pub fn summary(
     window: usize,
     compacting: impl FnOnce(),
     made: impl FnOnce(&str),
-    mut spent: impl FnMut(Usage),
+    mut spent: impl FnMut(Paid),
 ) -> Option<String> {
     let mut compacting = Some(compacting);
     let mut compact = || {
@@ -151,9 +159,9 @@ pub fn summary(
         }
     };
     match take_in(prepared(), connection.conversation, dropped, &mut compact) {
-        Some(Some((text, usage))) => {
+        Some(Some((text, paid))) => {
             remember_in(cache(), dropped, &text);
-            spent(usage);
+            spent(paid);
             made(&text);
             return with_skills(Some(text), dropped);
         }
@@ -176,8 +184,8 @@ pub fn summary(
         |earlier, transcript| {
             compact();
             // What asking took is told whatever came of it.
-            let reply = ask(connection, earlier, transcript).map(|(text, usage)| {
-                spent(usage);
+            let reply = ask(connection, earlier, transcript).map(|(text, paid)| {
+                spent(paid);
                 text
             });
             // What `summary_in` takes for a summary rather than a failure.
@@ -287,7 +295,7 @@ pub(crate) struct Making<'a> {
     covered: &'a [Message],
     /// `keys` of `covered`.
     keys: Vec<u64>,
-    made: Option<(String, Usage)>,
+    made: Option<(String, Paid)>,
 }
 
 impl Making<'_> {
@@ -304,7 +312,7 @@ impl Making<'_> {
         mut self,
         cache: &Cache,
         input: usize,
-        ask: impl FnOnce(Option<&str>, &str) -> Result<(String, Usage), String>,
+        ask: impl FnOnce(Option<&str>, &str) -> Result<(String, Paid), String>,
     ) {
         let (from, earlier) = earlier_in(cache, self.covered, &self.keys);
         self.made = ask(
@@ -312,7 +320,7 @@ impl Making<'_> {
             &transcript(&self.covered[from..], input),
         )
         .ok()
-        .map(|(text, usage)| (cut(text.trim(), SUMMARY_CHARS), usage))
+        .map(|(text, paid)| (cut(text.trim(), SUMMARY_CHARS), paid))
         .filter(|(text, _)| !text.is_empty());
     }
 }
@@ -341,7 +349,7 @@ fn take_in(
     session: u64,
     dropped: &[Message],
     waiting: impl FnOnce(),
-) -> Option<Option<(String, Usage)>> {
+) -> Option<Option<(String, Paid)>> {
     if dropped.is_empty() {
         return None;
     }
@@ -412,15 +420,15 @@ pub fn manual(
     connection: &Connection,
     covered: &[Message],
     window: usize,
-) -> Result<(String, Option<Usage>), String> {
+) -> Result<(String, Option<Paid>), String> {
     let mut spent = None;
     let text = manual_in(
         cache(),
         covered,
         INPUT_TOKENS.max(window),
         |earlier, transcript| {
-            let (text, usage) = ask(connection, earlier, transcript)?;
-            spent = Some(usage);
+            let (text, paid) = ask(connection, earlier, transcript)?;
+            spent = Some(paid);
             Ok(text)
         },
     )?;
@@ -876,18 +884,51 @@ fn line(text: &str) -> String {
     cut(text.trim().lines().next().unwrap_or_default(), LINE_CHARS)
 }
 
-/// One summary from the model the conversation is using, not streamed, and
-/// what it took.
+/// One summary from the side model Settings names, or else the model the
+/// conversation is using, not streamed, and what it took.
 fn ask(
     connection: &Connection,
     earlier: Option<&str>,
     transcript: &str,
-) -> Result<(String, Usage), String> {
+) -> Result<(String, Paid), String> {
+    crate::side::ask(connection, |on| ask_of(on, earlier, transcript))
+}
+
+/// `ask`, of the model `connection` names.
+fn ask_of(
+    connection: &Connection,
+    earlier: Option<&str>,
+    transcript: &str,
+) -> Result<(String, Paid), crate::side::Failed> {
     let endpoint = crate::chat::validate(connection)?;
     let input = match earlier {
         Some(earlier) => format!("Earlier summary:\n{earlier}\n\nNew messages:\n{transcript}"),
         None => format!("Messages:\n{transcript}"),
     };
+    let mut request = post(endpoint)?.json(&body(connection, &input));
+    if !connection.key.trim().is_empty() {
+        request = request.bearer_auth(connection.key.trim());
+    }
+    let value: Value = request
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.json())
+        .map_err(|e| crate::side::Failed::sending(&e, e.to_string()))?;
+    let reply = crate::chat::unwrap_response(&value)?;
+    let text = reply
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "No summary came back.".to_owned())?;
+    let usage = Usage::read(&reply["usage"]).priced(&connection.endpoint, &connection.model);
+    let model = connection.model.clone();
+    Ok((text, Paid { model, usage }))
+}
+
+/// The request for a summary of `input`, thinking at low effort lest the
+/// thinking take the whole reply, with the fields this model is known to
+/// want in place of others, as a turn's request has them.
+fn body(connection: &Connection, input: &str) -> Value {
     let mut body = json!({
         "model": connection.model.trim(),
         "messages": [
@@ -897,26 +938,17 @@ fn ask(
         "stream": false,
         "max_tokens": 1500,
     });
+    // Only to a model whose list gives levels: a server that does not know
+    // the field may turn the whole request down.
+    let levels = crate::models::facts(&connection.endpoint, connection.model.trim()).efforts;
+    if let Some(level) = crate::models::clamp(&levels.unwrap_or_default(), "low") {
+        body["reasoning_effort"] = level.id.clone().into();
+    }
     if crate::usage::asks_cost(&connection.endpoint) {
         body["usage"] = json!({"include": true});
     }
-    let mut request = post(endpoint)?.json(&body);
-    if !connection.key.trim().is_empty() {
-        request = request.bearer_auth(connection.key.trim());
-    }
-    let value: Value = request
-        .send()
-        .and_then(|r| r.error_for_status())
-        .and_then(|r| r.json())
-        .map_err(|e| e.to_string())?;
-    let reply = crate::chat::unwrap_response(&value)?;
-    let text = reply
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| "No summary came back.".to_owned())?;
-    let usage = Usage::read(&reply["usage"]).priced(&connection.endpoint, &connection.model);
-    Ok((text, usage))
+    crate::chat::fit_quirks(connection, &mut body);
+    body
 }
 
 /// A summary request to `endpoint`, on the chat's connection but with a
@@ -1441,7 +1473,7 @@ mod tests {
         session: u64,
         covered: &[Message],
         input: usize,
-        ask: impl FnOnce(Option<&str>, &str) -> Result<(String, Usage), String>,
+        ask: impl FnOnce(Option<&str>, &str) -> Result<(String, Paid), String>,
     ) {
         if let Some(making) = claim_in(cache, prepared, session, covered) {
             making.make_in(cache, input, ask);
@@ -1453,10 +1485,13 @@ mod tests {
         let (cache, prepared) = (Cache::default(), Prepared::default());
         let messages = turns(3);
         remember_in(&cache, &messages[..2], "summary of one turn");
-        let spent = Usage {
-            input: 800,
-            output: 40,
-            ..Default::default()
+        let spent = Paid {
+            model: "small-model".into(),
+            usage: Usage {
+                input: 800,
+                output: 40,
+                ..Default::default()
+            },
         };
         prepare_in(
             &cache,
@@ -1468,7 +1503,7 @@ mod tests {
                 // Folded into the step before's, like one made on the spot.
                 assert_eq!(earlier, Some("summary of one turn"));
                 assert!(!transcript.contains("question 0"), "{transcript}");
-                Ok(("  summary of two turns \n".into(), spent))
+                Ok(("  summary of two turns \n".into(), spent.clone()))
             },
         );
         let taken = take_in(&prepared, 7, &messages[..4], || panic!("it was made"));
@@ -1490,7 +1525,7 @@ mod tests {
             8,
             &messages[..4],
             INPUT_TOKENS,
-            |_, _| Ok(("summary of two turns".into(), Usage::default())),
+            |_, _| Ok(("summary of two turns".into(), Paid::default())),
         );
         // As many messages, one of them edited, or a different stretch.
         let mut edited = messages.clone();
@@ -1516,7 +1551,7 @@ mod tests {
                 prepare_in(c, p, 9, covered, INPUT_TOKENS, |_, _| {
                     started.send(()).unwrap();
                     released.recv().unwrap();
-                    Ok(("summary for a closed session".into(), Usage::default()))
+                    Ok(("summary for a closed session".into(), Paid::default()))
                 })
             });
             begun.recv().unwrap();
@@ -1589,7 +1624,7 @@ mod tests {
                 prepare_in(c, p, 11, covered, INPUT_TOKENS, |_, _| {
                     started.send(()).unwrap();
                     released.recv().unwrap();
-                    Ok(("summary of two turns".into(), Usage::default()))
+                    Ok(("summary of two turns".into(), Paid::default()))
                 })
             });
             begun.recv().unwrap();
@@ -1612,7 +1647,7 @@ mod tests {
                 INPUT_TOKENS,
                 |_, _| {
                     other = true;
-                    Ok(("another session's".into(), Usage::default()))
+                    Ok(("another session's".into(), Paid::default()))
                 },
             );
             assert!(other);
@@ -1763,5 +1798,100 @@ mod tests {
             Ok("forty turns".into())
         });
         assert_eq!(made.as_deref(), Ok("forty turns"));
+    }
+
+    /// The session asking for summaries in these tests, on a gateway at
+    /// `endpoint`; numbered apart from other tests', whose notes it would hear.
+    fn session_on(endpoint: String, conversation: u64) -> Connection {
+        Connection {
+            endpoint,
+            model: "big-model".into(),
+            conversation,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn compaction_uses_the_side_model_when_set() {
+        let reply = r#"{"choices":[{"message":{"content":"Summed up."}}],"usage":{"prompt_tokens":800,"completion_tokens":40}}"#;
+        let (endpoint, gateway) = crate::side::tests::gateway(vec![(200, reply)]);
+        let session = session_on(endpoint, 4_101);
+        let asked = crate::side::ask_on(&session, "small-model", |on| {
+            ask_of(on, None, "User: question 0")
+        });
+        let (text, paid) = asked.unwrap();
+        assert_eq!(text, "Summed up.");
+        // What it took is the side model's, priced and counted as its own.
+        assert_eq!(paid.model, "small-model");
+        assert_eq!((paid.usage.input, paid.usage.output), (800, 40));
+        let sent = gateway.join().unwrap();
+        assert_eq!(sent[0]["model"], "small-model");
+        assert!(sent[0].to_string().contains("question 0"));
+        assert_eq!(crate::side::notice(4_101), None);
+    }
+
+    #[test]
+    fn a_missing_side_model_retries_on_the_session_model_and_still_summarizes() {
+        let (endpoint, gateway) = crate::side::tests::gateway(vec![
+            (
+                404,
+                r#"{"error":{"message":"The model smal-model does not exist."}}"#,
+            ),
+            (200, r#"{"choices":[{"message":{"content":"Summed up."}}]}"#),
+        ]);
+        let session = session_on(endpoint, 4_102);
+        let mut made_by = String::new();
+        let made = manual_in(
+            &Cache::default(),
+            &turns(2),
+            INPUT_TOKENS,
+            |earlier, transcript| {
+                let asked = crate::side::ask_on(&session, "smal-model", |on| {
+                    ask_of(on, earlier, transcript)
+                });
+                asked.map(|(text, paid)| {
+                    made_by = paid.model;
+                    text
+                })
+            },
+        );
+        // A summary, not the error a typo would otherwise end every one in.
+        assert_eq!(made.as_deref(), Ok("Summed up."));
+        assert_eq!(made_by, "big-model");
+        let models: Vec<Value> = (gateway.join().unwrap().iter())
+            .map(|sent| sent["model"].clone())
+            .collect();
+        assert_eq!(models, ["smal-model", "big-model"]);
+        let note = crate::side::notice(4_102).unwrap_or_default();
+        assert!(note.contains("smal-model"), "{note}");
+    }
+
+    #[test]
+    fn a_summary_asks_a_model_that_thinks_in_levels_for_little_thinking() {
+        let endpoint = "https://summaries.test/v1";
+        let list = json!([
+            {"id": "plain-model", "reasoning_efforts": []},
+            {"id": "thinking-model", "reasoning_efforts": [
+                {"effort": "low", "label": "Low"}, {"effort": "high", "label": "High"}
+            ]}
+        ]);
+        crate::models::remember(endpoint, list.as_array().unwrap());
+        let sent = |endpoint: &str, model: &str| {
+            let on = Connection {
+                endpoint: endpoint.into(),
+                model: model.into(),
+                ..Default::default()
+            };
+            body(&on, "Messages:")
+        };
+        assert_eq!(sent(endpoint, "thinking-model")["reasoning_effort"], "low");
+        // One that offers none, or that the list does not name, is sent none.
+        for model in ["plain-model", "unlisted-model"] {
+            assert!(sent(endpoint, model).get("reasoning_effort").is_none());
+        }
+        // The cap goes under the name OpenAI's reasoning models take.
+        let gpt = sent("https://api.openai.com/v1", "gpt-5");
+        assert!(gpt.get("max_tokens").is_none(), "{gpt}");
+        assert!(gpt["max_completion_tokens"].is_u64(), "{gpt}");
     }
 }

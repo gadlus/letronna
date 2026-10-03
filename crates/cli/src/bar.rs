@@ -61,7 +61,7 @@ pub const COMMANDS: &[Command<'static>] = &[
     },
     Command {
         name: "/model",
-        blurb: "show or change the model; add image, speech or video for those",
+        blurb: "show or change the model; add image, speech or video for those, or side for summaries",
     },
     Command {
         name: "/fallback",

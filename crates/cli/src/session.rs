@@ -619,6 +619,10 @@ impl Runner {
                 render::blank();
                 render::said(&render::dim("●"), &render::dim(&switch.to_string()));
             }
+            if let Event::Note(note) = &event {
+                render::blank();
+                render::said(&render::dim("●"), &render::dim(note));
+            }
             turn.absorb(&event);
             if let Event::Finished(result) = event {
                 self.bar.wait_line(false);

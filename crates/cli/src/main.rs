@@ -1091,7 +1091,7 @@ impl Extras {
 /// whose cost is known, or None when no call's is.
 fn cost(messages: &[Message]) -> Option<f64> {
     let mut spent = usage::Totals::default();
-    for call in messages.iter().flat_map(usage::calls) {
+    for (_, call) in messages.iter().flat_map(usage::calls) {
         spent.add(&call);
     }
     (spent.unpriced < spent.calls).then_some(spent.cost)

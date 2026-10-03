@@ -83,6 +83,7 @@ pub mod sandbox;
 mod scan;
 pub mod schedule;
 pub mod search;
+mod side;
 pub mod skills;
 pub mod slash;
 pub mod speech;

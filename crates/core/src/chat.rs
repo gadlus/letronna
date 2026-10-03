@@ -50,6 +50,11 @@ pub struct Message {
     /// longer held took, a model call of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_usage: Option<crate::usage::Usage>,
+    /// For `role: "assistant"`: the model that made that summary, which may
+    /// be the side model; empty, as in a file from before it was kept, for
+    /// the reply's own.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary_model: String,
     /// For `role: "assistant"`: why the prompt cache served far less of its
     /// request than of the one before, when it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -360,9 +365,10 @@ pub enum Event {
         /// What OpenRouter billed, in dollars; see `usage::Usage::priced`.
         cost: Option<f64>,
     },
-    /// What summarizing the turns the request no longer holds took, sent
-    /// before the reply when a summary had to be asked for.
-    SummaryUsage(crate::usage::Usage),
+    /// What summarizing the turns the request no longer holds took, and the
+    /// model that made the summary, sent before the reply when a summary had
+    /// to be asked for.
+    SummaryUsage(crate::compact::Paid),
     /// Sent after `Usage` when the cache served far less of this request
     /// than of the session's last one, with the likely reason.
     CacheMiss(crate::cache_miss::Reason),
@@ -389,6 +395,10 @@ pub enum Event {
     Retrying(crate::retry::Retry),
     /// The request went to a fallback model rather than the session's.
     Switched(crate::fallback::Switch),
+    /// Something the user should hear of once, sent before the reply: the
+    /// side model the gateway turned away, which the session's model stood
+    /// in for.
+    Note(String),
     /// Sent before `Finished` when the reply stopped at the output limit;
     /// `in_call` when it stopped inside a tool call, which is then dropped
     /// rather than run half written.
@@ -3017,7 +3027,7 @@ pub fn compact(
         let summary = summary.filter(|_| start > 0).map_or(0, tokens);
         fixed + summary + sums[messages.len()] - sums[start]
     };
-    let (text, usage) = crate::compact::manual(connection, &messages[..end], budget.tokens)
+    let (text, paid) = crate::compact::manual(connection, &messages[..end], budget.tokens)
         .map_err(|e| format!("The summary failed, so every turn is kept as it was: {e}"))?;
     let (before, after) = (
         cost(start, summary),
@@ -3033,8 +3043,10 @@ pub fn compact(
         before,
         after,
         key: crate::compact::keys(&messages[..end])[end],
-        model: connection.model.clone(),
-        usage,
+        model: paid
+            .as_ref()
+            .map_or_else(|| connection.model.clone(), |paid| paid.model.clone()),
+        usage: paid.map(|paid| paid.usage),
         text,
     })
 }
@@ -3145,10 +3157,15 @@ fn stream(
                 text: text.to_owned(),
             });
         },
-        |usage| {
-            let _ = sender.send_blocking(Event::SummaryUsage(usage));
+        |paid| {
+            let _ = sender.send_blocking(Event::SummaryUsage(paid));
         },
     );
+    // After the summary, which may be what was turned away, and also for a
+    // summary made ahead or a commit message asked for since the last one.
+    if let Some(note) = crate::side::notice(connection.conversation) {
+        let _ = sender.send_blocking(Event::Note(note));
+    }
     let ending = ending(connection, messages, lsp, extra);
     let mut prefix = crate::cache_miss::Prefix::default();
     let sent = body_hashed(
@@ -6126,7 +6143,7 @@ mod tests {
         assert!(matches!(rx.recv_blocking().unwrap(), Event::Compacting));
         assert!(matches!(
             rx.recv_blocking().unwrap(),
-            Event::SummaryUsage(usage) if (usage.input, usage.output) == (800, 40)
+            Event::SummaryUsage(paid) if (paid.usage.input, paid.usage.output) == (800, 40)
         ));
         assert!(matches!(
             rx.recv_blocking().unwrap(),
