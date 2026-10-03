@@ -14,6 +14,15 @@
 //! one that needs a yes goes to it as `session/request_permission`, whose
 //! options are the terminal's answers: once, always in this session, or no.
 //! "Always" is a grant, which the floor's own questions still come before.
+//! The gate works in the mode the editor picks, through the protocol's mode
+//! option or `session/set_mode`.
+//! Every terminal mode is offered but Auto, since nothing here asks its
+//! judge, so what it would judge would only ask. In Plan the plan comes as
+//! the answer rather than for a yes, as the driver cannot lift the mode
+//! in the middle of a turn. A mode picked during a turn holds from the
+//! session's next call; helpers already running keep theirs, and none
+//! starts until the turn ends, as it would work in the mode the turn
+//! began in.
 //!
 //! A session is an ordinary Letronna session, in the same listing, so one
 //! begun in an editor can be carried on in the terminal or the window, and
@@ -62,8 +71,9 @@ const NEVER_RAN: &str = "It did not run: the turn ended first.";
 /// history shows at once, and few enough to send in one frame.
 const PAGE: usize = 50;
 
-/// The id of the one option of a session the editor can change.
+/// The ids of the options of a session the editor can change.
 const MODEL: &str = "model";
+const MODE: &str = "mode";
 
 /// What the agent asks of the Letronna it serves, which the tests stand in for.
 pub trait Home {
@@ -78,11 +88,35 @@ pub trait Home {
     fn models(&self) -> Box<dyn FnOnce() -> Vec<(String, String)> + Send>;
 }
 
+/// The modes an editor can pick, in the order its picker lists them: the
+/// terminal's, bar Auto.
+const MODES: [Mode; 5] = [
+    Mode::Default,
+    Mode::AcceptEdits,
+    Mode::Plan,
+    Mode::DontAsk,
+    Mode::Bypass,
+];
+
+/// What the model is told when it puts a plan up for a yes, which the driver
+/// cannot take: the plan comes as the answer, and the editor's mode lifts it.
+const PLAN_IN_REPLY: &str = "A plan cannot be approved from the editor, so plan mode stays on. \
+     Give the plan as your answer and stop there; the user picks another mode in the editor to \
+     carry it out.";
+
+/// What the model is told when it would set a helper working after the
+/// editor picked another mode mid-turn: helpers narrow from the turn's own
+/// connection, which keeps the mode the turn began in.
+const HELPER_AFTER_SWITCH: &str = "Refused: the user picked another mode during this turn, and \
+     a helper set working now would still work in the mode the turn began in. Do the work \
+     yourself, or leave the helper for after this turn ends.";
+
 /// Where frames go, a whole line at a time, from the reader and every turn alike.
 type Out = Arc<Mutex<Box<dyn Write + Send>>>;
 
 /// A session the editor opened.
 struct Session {
+    /// What the session's turns run on, in the mode the editor picked last.
     connection: Connection,
     /// The gateway the connection's model is on, which the model option names.
     gateway: String,
@@ -268,17 +302,23 @@ fn forward_approvals(agent: &Agent) {
     let (sessions, grants) = (agent.sessions.clone(), agent.grants.clone());
     std::thread::spawn(move || {
         for request in requests {
-            let ctx = lock(&sessions)
-                .get(&request.root)
-                .map(|open| ToolContext::of(&open.connection));
+            // In the most a helper of the session may run in, as helpers
+            // never bypass. A call of the session's own that asked in Bypass
+            // asks here too, save a command that could send data out after
+            // the session read someone else's words: here it may run in the
+            // OS sandbox instead, which lets nothing out.
+            let open = lock(&sessions).get(&request.root).map(|open| {
+                let mode = Mode::narrow(open.connection.mode, Mode::Bypass);
+                (ToolContext::of(&open.connection), mode)
+            });
             // A helper's call from some other session has nobody here to ask.
-            let Some(ctx) = ctx else {
+            let Some((ctx, mode)) = open else {
                 request.answer(Decision::Deny(String::new()));
                 continue;
             };
             // A helper's call comes without the session's gate, which the
             // session's own calls have been through already.
-            match decide(&request.call, &ctx, &grants) {
+            match decide(&request.call, &ctx, mode, &grants) {
                 gate::Outcome::Run => {
                     request.answer(Decision::Once);
                     continue;
@@ -330,6 +370,7 @@ impl Agent {
             "session/load" => self.load_session(params),
             "session/list" => list_sessions(params),
             "session/set_config_option" => self.set_option(params),
+            "session/set_mode" => self.set_mode(params),
             "session/prompt" => match self.prompt(id.clone(), params) {
                 // The turn replies when it ends.
                 Ok(()) => return,
@@ -362,8 +403,9 @@ impl Agent {
         let cwd = folder(params)?;
         let (connection, transcript) = self.home.start(&cwd).map_err(|e| (INTERNAL_ERROR, e))?;
         let id = transcript.conversation.id;
+        let modes = modes(connection.mode);
         let options = self.keep(connection, transcript);
-        Ok(json!({"sessionId": id.to_string(), "configOptions": options}))
+        Ok(json!({"sessionId": id.to_string(), "configOptions": options, "modes": modes}))
     }
 
     /// Reopens a saved session working in the folder the editor names,
@@ -394,8 +436,9 @@ impl Agent {
             send(&self.out, &update(session, update_of));
         }
         let path = store::sessions_dir().join(format!("{session}.jsonl"));
+        let modes = modes(connection.mode);
         let options = self.keep(connection, Transcript { path, conversation });
-        Ok(json!({"configOptions": options}))
+        Ok(json!({"configOptions": options, "modes": modes}))
     }
 
     /// Holds a session the editor opened or reopened, and gives its options.
@@ -413,17 +456,29 @@ impl Agent {
     }
 
     /// Puts the session the editor names on the model it picked, from its
-    /// next turn, and gives the options as they stand then.
+    /// next turn, or in the mode it picked, as `set_mode` does, and gives the
+    /// options as they stand then.
     fn set_option(&mut self, params: &Value) -> Result<Value, (i64, String)> {
         let session = session_id(params)?;
         let option = params["configId"].as_str().unwrap_or_default();
+        let picked = params["value"].as_str().unwrap_or_default();
+        if option == MODE {
+            let mode = mode_named(picked)?;
+            let models = lock(&self.models).clone();
+            let mut sessions = lock(&self.sessions);
+            let Some(open) = sessions.get_mut(&session) else {
+                return Err((INVALID_PARAMS, format!("There is no session {session}.")));
+            };
+            // Unlike the model, mid-turn too: the gate reads it at each call.
+            open.connection.switch_to(mode);
+            return Ok(json!({"configOptions": options(open, &models)}));
+        }
         if option != MODEL {
             return Err((
                 INVALID_PARAMS,
                 format!("There is no option `{option}` here."),
             ));
         }
-        let picked = params["value"].as_str().unwrap_or_default();
         let models = lock(&self.models).clone();
         let mut sessions = lock(&self.sessions);
         let Some(open) = sessions.get_mut(&session) else {
@@ -493,6 +548,19 @@ impl Agent {
         });
     }
 
+    /// Puts the session the editor names in the mode it picked: its calls
+    /// are gated in it from the next one on, and its next turn starts in it.
+    fn set_mode(&self, params: &Value) -> Result<Value, (i64, String)> {
+        let session = session_id(params)?;
+        let mode = mode_named(params["modeId"].as_str().unwrap_or_default())?;
+        let mut sessions = lock(&self.sessions);
+        let Some(open) = sessions.get_mut(&session) else {
+            return Err((INVALID_PARAMS, format!("There is no session {session}.")));
+        };
+        open.connection.switch_to(mode);
+        Ok(json!({}))
+    }
+
     /// Starts a turn on the prompt, which replies to `id` when it ends.
     fn prompt(&mut self, id: Value, params: &Value) -> Result<(), (i64, String)> {
         let session = session_id(params)?;
@@ -542,7 +610,12 @@ impl Agent {
             from: 0,
             schema: None,
             watch: Some(watcher(self.out.clone(), session, calls.clone())),
-            decide: Some(gate_of(self.grants.clone())),
+            decide: Some(gate_of(
+                self.grants.clone(),
+                self.sessions.clone(),
+                session,
+                open.connection.mode,
+            )),
         };
         drop(sessions);
         let (out, sessions) = (self.out.clone(), self.sessions.clone());
@@ -618,22 +691,87 @@ impl Agent {
     }
 }
 
-/// The session's whole gate, for its own turns.
-fn gate_of(grants: Arc<Mutex<Grants>>) -> Decide {
-    Arc::new(move |call, ctx| decide(call, ctx, &grants))
+/// The whole gate of session `session`, for its own turn begun in `began`.
+fn gate_of(
+    grants: Arc<Mutex<Grants>>,
+    sessions: Arc<Mutex<HashMap<u64, Session>>>,
+    session: u64,
+    began: Mode,
+) -> Decide {
+    Arc::new(move |call, ctx| {
+        // Looked up at each call, as the terminal's mode is, so a mode the
+        // editor picks while a turn runs holds from the session's next call.
+        let mode = lock(&sessions)
+            .get(&session)
+            .map_or(Mode::Default, |open| open.connection.mode);
+        // A helper narrows from the turn's own connection, still in `began`,
+        // and its calls reach the editor only when its own gate asks, so
+        // one set working after a switch would never meet the new mode.
+        if mode != began && sets_helper_working(call, session) {
+            return gate::Outcome::Refuse(HELPER_AFTER_SWITCH.into());
+        }
+        decide(call, ctx, mode, &grants)
+    })
 }
 
-/// What the session's gate makes of `call`, as the terminal decides its own
-/// calls: what is never allowed, then what must ask, then what the editor
-/// said to allow always.
-fn decide(call: &ToolCall, ctx: &ToolContext, grants: &Mutex<Grants>) -> gate::Outcome {
+/// Whether `call` in session `session` sets a helper working on the turn's
+/// connection: a new one, a workflow's, or one a message picks back up,
+/// which is any but one still running, whose message only waits in its
+/// mailbox.
+fn sets_helper_working(call: &ToolCall, session: u64) -> bool {
+    match call.name.as_str() {
+        "agent" | "workflow" => true,
+        "agents" => serde_json::from_str::<Value>(&call.arguments).is_ok_and(|args| {
+            let to = args["to"].as_str().unwrap_or_default();
+            let running = (letronna_core::agents::seen().iter()).any(|helper| {
+                helper.session == session && helper.name == to && helper.ended.is_none()
+            });
+            args["action"] == "send" && !running
+        }),
+        _ => false,
+    }
+}
+
+/// What the session's gate in `mode` makes of `call`, as the terminal
+/// decides its own calls: what is never allowed, then what must ask, then
+/// what the editor said to allow always.
+fn decide(call: &ToolCall, ctx: &ToolContext, mode: Mode, grants: &Mutex<Grants>) -> gate::Outcome {
     // Read afresh each time, since the window or the terminal may add one.
     let rules = permissions::load(&permissions::user_file());
     let grants = lock(grants).clone();
-    // An editor always has someone to answer, and offers no mode to pick,
-    // so its sessions ask as a new one does.
-    let gate = Gate::for_terminal(ctx, &grants, &rules, Mode::Default, true);
-    gate::decide(call, &gate)
+    // An editor always has someone to answer.
+    let gate = Gate::for_terminal(ctx, &grants, &rules, mode, true);
+    let outcome = gate::decide(call, &gate);
+    // A yes would have to lift plan mode in the middle of the turn, which
+    // the driver cannot, so the editor is never asked for one.
+    if call.name == tools::EXIT_PLAN && outcome == gate::Outcome::Ask {
+        return gate::Outcome::Refuse(PLAN_IN_REPLY.into());
+    }
+    outcome
+}
+
+/// The mode of those an editor can pick that goes by `name`.
+fn mode_named(name: &str) -> Result<Mode, (i64, String)> {
+    if let Some(mode) = MODES.into_iter().find(|mode| mode.name() == name) {
+        return Ok(mode);
+    }
+    let names: Vec<&str> = MODES.iter().map(|mode| mode.name()).collect();
+    Err((
+        INVALID_PARAMS,
+        format!(
+            "There is no `{name}` mode here; pick one of {}.",
+            names.join(", ")
+        ),
+    ))
+}
+
+/// The modes the editor can pick from, with `current` the session's.
+fn modes(current: Mode) -> Value {
+    let available: Vec<Value> = MODES
+        .iter()
+        .map(|mode| json!({"id": mode.name(), "name": mode.label(), "description": mode.about()}))
+        .collect();
+    json!({"currentModeId": current.name(), "availableModes": available})
 }
 
 /// What `initialize` answers: the version spoken and what this agent can do.
@@ -750,7 +888,8 @@ fn info(session: &Summary) -> Option<Value> {
     Some(info)
 }
 
-/// The options of `open` the editor can change: its model, among `models`.
+/// The options of `open` the editor can change: its model, among `models`,
+/// and its mode, which an editor that reads options reads here alone.
 fn options(open: &Session, models: &[(String, String)]) -> Value {
     let current = (open.gateway.clone(), open.connection.model.clone());
     let mut offered = models.to_vec();
@@ -765,14 +904,30 @@ fn options(open: &Session, models: &[(String, String)]) -> Value {
             json!({"value": choice(gateway, model), "name": format!("{model} · {gateway}")})
         })
         .collect();
-    json!([{
-        "id": MODEL,
-        "name": "Model",
-        "category": "model",
-        "type": "select",
-        "currentValue": choice(&current.0, &current.1),
-        "options": choices,
-    }])
+    let modes: Vec<Value> = MODES
+        .iter()
+        .map(
+            |mode| json!({"value": mode.name(), "name": mode.label(), "description": mode.about()}),
+        )
+        .collect();
+    json!([
+        {
+            "id": MODEL,
+            "name": "Model",
+            "category": "model",
+            "type": "select",
+            "currentValue": choice(&current.0, &current.1),
+            "options": choices,
+        },
+        {
+            "id": MODE,
+            "name": "Mode",
+            "category": "mode",
+            "type": "select",
+            "currentValue": open.connection.mode.name(),
+            "options": modes,
+        },
+    ])
 }
 
 /// A model as the option's value names it: its gateway, whose name has no
@@ -1260,6 +1415,8 @@ mod tests {
                 tools: true,
                 workspace: conversation.workspace.clone(),
                 conversation: conversation.id,
+                // As the runner's has it, so helpers have the editor to ask.
+                human: true,
                 ..Default::default()
             })
         }
@@ -1715,6 +1872,7 @@ mod tests {
         let model = &loaded["result"]["configOptions"][0];
         assert_eq!(model["category"], "model");
         assert_eq!(model["currentValue"], "Custom:old-model");
+        assert_eq!(loaded["result"]["modes"]["currentModeId"], "default");
 
         // The session carries on where it was, on its own model.
         let prompt = start(&mut editor, &id.to_string(), "Is it still fixed?");
@@ -1851,6 +2009,222 @@ mod tests {
         let connection = runner.connect(&mut reopened).unwrap();
         assert_eq!(connection.model, "test-model");
         assert!(connection.human);
+    }
+
+    /// Puts `session` in the mode named `mode` and gives the reply.
+    fn pick(editor: &mut Editor, session: &str, mode: &str) -> Value {
+        let set = editor.ask(
+            "session/set_mode",
+            json!({"sessionId": session, "modeId": mode}),
+        );
+        editor.reply(set).1
+    }
+
+    #[test]
+    fn a_new_session_lists_the_modes_it_offers() {
+        let dir = scratch("modes");
+        let mut editor = Editor::connect(provider(Vec::new()), SESSIONS + 80);
+        let new = editor.ask("session/new", json!({"cwd": dir, "mcpServers": []}));
+        let (_, opened) = editor.reply(new);
+        let modes = &opened["result"]["modes"];
+        assert_eq!(modes["currentModeId"], "default");
+        let offered: Vec<&str> = modes["availableModes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|mode| mode["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            offered,
+            ["default", "accept-edits", "plan", "dont-ask", "bypass"]
+        );
+        assert_eq!(modes["availableModes"][1]["name"], "Edits");
+    }
+
+    #[test]
+    fn an_editor_that_reads_options_picks_the_mode_there() {
+        let dir = scratch("mode-option");
+        let endpoint = provider(vec![
+            reply("", &[write("edited.txt")]),
+            reply("Wrote it.", &[]),
+            // The write is sent back once to be checked.
+            reply("Nothing here builds or tests.", &[]),
+        ]);
+        let mut editor = Editor::connect(endpoint, SESSIONS + 170);
+        let new = editor.ask("session/new", json!({"cwd": dir, "mcpServers": []}));
+        let (_, opened) = editor.reply(new);
+        let session = opened["result"]["sessionId"].as_str().unwrap().to_owned();
+        // Such an editor ignores `modes` once there are options.
+        let mode = &opened["result"]["configOptions"][1];
+        assert_eq!(mode["category"], "mode");
+        assert_eq!(mode["currentValue"], "default");
+        let values: Vec<&str> = mode["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| option["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            ["default", "accept-edits", "plan", "dont-ask", "bypass"]
+        );
+        let option =
+            |value: &str| json!({"sessionId": session, "configId": "mode", "value": value});
+        let auto = editor.ask("session/set_config_option", option("auto"));
+        let (_, refused) = editor.reply(auto);
+        assert_eq!(refused["error"]["code"], INVALID_PARAMS);
+        let set = editor.ask("session/set_config_option", option("accept-edits"));
+        let (_, set) = editor.reply(set);
+        let mode = &set["result"]["configOptions"][1];
+        assert_eq!(mode["currentValue"], "accept-edits", "{set}");
+
+        let prompt = start(&mut editor, &session, "Write a file.");
+        let (_, ended) = asked_or_ended(&editor, prompt);
+        assert!(!is_permission(&ended), "an edit in accept-edits asked");
+        assert_eq!(ended["result"]["stopReason"], "end_turn");
+        assert!(dir.join("edited.txt").exists());
+    }
+
+    #[test]
+    fn auto_is_not_offered_without_a_judge() {
+        let dir = scratch("no-auto");
+        let mut editor = Editor::connect(provider(Vec::new()), SESSIONS + 90);
+        let session = editor.open(&dir);
+        let refused = pick(&mut editor, &session, "auto");
+        assert_eq!(refused["error"]["code"], INVALID_PARAMS);
+        let why = refused["error"]["message"].as_str().unwrap();
+        assert!(why.contains("pick one of default,"), "{why}");
+    }
+
+    #[test]
+    fn set_mode_changes_how_the_next_edit_is_gated() {
+        let dir = scratch("set-mode");
+        let endpoint = provider(vec![
+            reply("", &[write("edited.txt")]),
+            reply("Wrote it.", &[]),
+            // The write is sent back once to be checked.
+            reply("Nothing here builds or tests.", &[]),
+        ]);
+        let mut editor = Editor::connect(endpoint, SESSIONS + 100);
+        let session = editor.open(&dir);
+        let set = pick(&mut editor, &session, "accept-edits");
+        assert_eq!(set["result"], json!({}), "{set}");
+        let prompt = start(&mut editor, &session, "Write a file.");
+
+        let (_, ended) = asked_or_ended(&editor, prompt);
+        assert!(!is_permission(&ended), "an edit in accept-edits asked");
+        assert_eq!(ended["result"]["stopReason"], "end_turn");
+        assert!(dir.join("edited.txt").exists());
+    }
+
+    #[test]
+    fn a_plan_comes_as_the_answer_since_the_editor_picks_the_mode() {
+        let dir = scratch("plan-mode");
+        let (endpoint, heard) = listening(vec![
+            reply("", &[("exit_plan", json!({"plan": "Write the file."}))]),
+            reply("The plan: write the file.", &[]),
+        ]);
+        let mut editor = Editor::connect(endpoint, SESSIONS + 110);
+        let session = editor.open(&dir);
+        let set = pick(&mut editor, &session, "plan");
+        assert_eq!(set["result"], json!({}), "{set}");
+        let prompt = start(&mut editor, &session, "Plan a file.");
+
+        let (frames, ended) = asked_or_ended(&editor, prompt);
+        assert!(!is_permission(&ended), "the plan was put to the editor");
+        assert_eq!(ended["result"]["stopReason"], "end_turn");
+        let refused = updates(&frames, "tool_call_update");
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0]["status"], "failed");
+        let why = refused[0]["content"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(why.contains(PLAN_IN_REPLY), "{why}");
+        // The turn ran in plan mode, as a terminal's does, not only gated so.
+        let first = heard.recv_timeout(WAIT).unwrap();
+        let offered: Vec<&str> = first["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            offered.contains(&"exit_plan") && !offered.contains(&"write_file"),
+            "{offered:?}"
+        );
+    }
+
+    #[test]
+    fn a_helper_in_a_bypass_session_still_asks_the_editor() {
+        let dir = scratch("helper-bypass");
+        let helper = json!({"description": "Make a picture", "prompt": "Make it.",
+            "background": false});
+        // A paid tool, which Auto's judge never decides, so the helper's own
+        // gate puts it to the editor without asking the provider first.
+        let picture = ("make_image", json!({"prompt": "A lighthouse."}));
+        let endpoint = provider(vec![
+            reply("", &[("agent", helper)]),
+            reply("", &[picture]),
+            reply("It was refused.", &[]),
+            reply("The helper could not make it.", &[]),
+        ]);
+        let mut editor = Editor::connect(endpoint, SESSIONS + 120);
+        let session = editor.open(&dir);
+        let set = pick(&mut editor, &session, "bypass");
+        assert_eq!(set["result"], json!({}), "{set}");
+        let prompt = start(&mut editor, &session, "Have a helper make a picture.");
+
+        let (_, asked) = asked_or_ended(&editor, prompt);
+        assert!(is_permission(&asked), "a helper's call ran in bypass");
+        let title = asked["params"]["toolCall"]["title"].as_str().unwrap();
+        assert!(title.starts_with("Helper "), "{title}");
+        choose(&editor, &asked, "reject-once");
+        let (_, ended) = editor.reply(prompt);
+        assert_eq!(ended["result"]["stopReason"], "end_turn");
+    }
+
+    #[test]
+    fn a_helper_is_not_started_in_the_old_mode_after_a_switch_mid_turn() {
+        let dir = scratch("switch-helper");
+        std::fs::create_dir_all(dir.join(".ssh")).unwrap();
+        std::fs::write(dir.join(".ssh/id_test"), "not a real key").unwrap();
+        let helper = json!({"description": "Write a file", "prompt": "Write it.",
+            "background": false});
+        let endpoint = provider(vec![
+            reply("", &[("read_file", json!({"path": ".ssh/id_test"}))]),
+            reply("", &[("agent", helper)]),
+            // The helper's write, or the session's once none starts, which
+            // plan mode refuses.
+            reply("", &[write("helped.txt")]),
+            reply("Done.", &[]),
+            reply("Done.", &[]),
+            reply("Done.", &[]),
+            reply("Done.", &[]),
+        ]);
+        let mut editor = Editor::connect(endpoint, SESSIONS + 160);
+        let session = editor.open(&dir);
+        let set = pick(&mut editor, &session, "accept-edits");
+        assert_eq!(set["result"], json!({}), "{set}");
+        let prompt = start(&mut editor, &session, "Read the key, then delegate.");
+
+        // The turn waits on the card while the user picks plan.
+        let (_, asked) = asked_or_ended(&editor, prompt);
+        assert!(is_permission(&asked), "the key file was read unasked");
+        let set = pick(&mut editor, &session, "plan");
+        assert_eq!(set["result"], json!({}), "{set}");
+        choose(&editor, &asked, "reject-once");
+
+        let (frames, ended) = asked_or_ended(&editor, prompt);
+        assert!(!is_permission(&ended), "{ended}");
+        assert_eq!(ended["result"]["stopReason"], "end_turn");
+        assert!(!dir.join("helped.txt").exists(), "a helper wrote unasked");
+        let closed = updates(&frames, "tool_call_update");
+        let said: Vec<&str> = closed
+            .iter()
+            .filter_map(|update| update["content"][0]["content"]["text"].as_str())
+            .collect();
+        let refused = said.iter().any(|text| text.contains(HELPER_AFTER_SWITCH));
+        assert!(refused, "{said:?}");
     }
 
     #[test]
