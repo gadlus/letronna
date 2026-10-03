@@ -411,7 +411,7 @@ impl Turn {
     /// Whether this turn can run a command to check its edits: not in plan
     /// mode, in a project folder, and never from a chat app, whose shared
     /// chats cannot reach this computer at all.
-    fn runs_commands(&self) -> bool {
+    pub(crate) fn runs_commands(&self) -> bool {
         let connection = &self.connection;
         connection.tools
             && !connection.plan
