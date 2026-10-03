@@ -5527,9 +5527,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         // Nothing written yet: memory still carries the guidance paragraph
-        // that goes out whenever tools do, and no skill is switched on.
+        // that goes out whenever tools do, and the built-in skill is listed.
         assert!(parts.memory > 0, "{parts:?}");
-        assert_eq!(parts.skills, 0, "{parts:?}");
+        assert!(parts.skills > 0, "{parts:?}");
         // No MCP server is set up in the test.
         assert_eq!(parts.mcp, 0, "{parts:?}");
         assert!(parts.system > 0, "{parts:?}");
