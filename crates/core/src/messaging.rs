@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub mod pairing;
+pub mod smtp;
 
 const API: &str = "https://api.telegram.org";
 const DISCORD_API: &str = "https://discord.com/api/v10";
@@ -67,6 +68,8 @@ pub struct Config {
     pub discord: Discord,
     #[serde(default)]
     pub slack: Slack,
+    #[serde(default)]
+    pub email: Email,
     /// Each chat's answer to whether its voice notes are transcribed, which
     /// costs credit, so it is asked once per chat; see `files::chat_key`.
     #[serde(default)]
@@ -163,6 +166,40 @@ impl Slack {
     /// Both tokens are in, so the app can listen and answer.
     pub fn ready(&self) -> bool {
         self.enabled && !self.app_token.trim().is_empty() && !self.bot_token.trim().is_empty()
+    }
+}
+
+/// Send-only, like the webhook: a scheduled run's report arrives as a
+/// plain-text mail titled with the job's name, sent through the user's own
+/// provider with an app password; see `smtp`.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Email {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The provider's submission server, such as smtp.gmail.com.
+    #[serde(default)]
+    pub smtp_host: String,
+    /// 465 for TLS from the first byte; 587, or any other, for STARTTLS.
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub username: String,
+    /// The app password, which the vault keeps.
+    #[serde(default)]
+    pub password: String,
+    /// The address the reports come from; the username when empty.
+    #[serde(default)]
+    pub from: String,
+    /// The one address they go to.
+    #[serde(default)]
+    pub to: String,
+}
+
+impl Email {
+    /// On, with a server and an address to send to; anything else missing
+    /// is said when a mail fails.
+    pub fn ready(&self) -> bool {
+        self.enabled && !self.smtp_host.trim().is_empty() && !self.to.trim().is_empty()
     }
 }
 
@@ -377,6 +414,7 @@ pub(crate) const SECRETS: &[(&str, &str)] = &[
     ("/discord/bot_token", "messaging.discord.bot_token"),
     ("/slack/app_token", "messaging.slack.app_token"),
     ("/slack/bot_token", "messaging.slack.bot_token"),
+    ("/email/password", "messaging.email.password"),
 ];
 
 fn on_disk() -> Option<serde_json::Value> {
@@ -417,10 +455,16 @@ pub mod files;
 /// is paired: that is the one the bot may talk to. Returns what failed to
 /// send.
 pub fn report(config: &Config, title: &str, body: &str) -> Vec<String> {
-    report_via(&api(), config, title, body)
+    report_via(&api(), smtp::tls(), config, title, body)
 }
 
-fn report_via(api: &str, config: &Config, title: &str, body: &str) -> Vec<String> {
+fn report_via(
+    api: &str,
+    tls: Option<&std::sync::Arc<rustls::ClientConfig>>,
+    config: &Config,
+    title: &str,
+    body: &str,
+) -> Vec<String> {
     let mut failed = Vec::new();
     if config.discord.ready() {
         let text = format!("**{title}**\n{body}");
@@ -445,6 +489,14 @@ fn report_via(api: &str, config: &Config, title: &str, body: &str) -> Vec<String
     if let (true, Some(chat)) = (config.telegram.ready(), config.telegram.chat) {
         let text = format!("**{title}**\n{body}");
         if let Err(error) = send_via(api, &config.telegram.token, chat, &text, None) {
+            failed.push(error);
+        }
+    }
+    if config.email.ready() {
+        let sent = tls
+            .ok_or_else(|| "Cannot initialize connection.".to_owned())
+            .and_then(|tls| smtp::send(tls, &config.email, title, body));
+        if let Err(error) = sent {
             failed.push(error);
         }
     }
@@ -911,7 +963,7 @@ mod tests {
     #[test]
     fn a_schedule_reports_to_the_paired_telegram_chat() {
         let (api, worker) = one_request("200 OK");
-        let failed = report_via(&api, &paired(), "Nightly", "all green");
+        let failed = report_via(&api, None, &paired(), "Nightly", "all green");
         assert!(failed.is_empty(), "{failed:?}");
         let (path, body) = worker.join().unwrap();
         assert_eq!(path, "/bot123:abc/sendMessage");
@@ -926,7 +978,7 @@ mod tests {
         let mut config = paired();
         config.telegram.chat = None;
         // An address that refuses connections: any attempt would fail loudly.
-        let failed = report_via("http://127.0.0.1:1", &config, "Nightly", "ok");
+        let failed = report_via("http://127.0.0.1:1", None, &config, "Nightly", "ok");
         assert!(failed.is_empty());
         // Nothing set up at all is equally quiet.
         assert!(report(&Config::default(), "Nightly", "ok").is_empty());
@@ -935,7 +987,7 @@ mod tests {
     #[test]
     fn a_rejected_report_says_so() {
         let (api, worker) = one_request("401 Unauthorized");
-        let failed = report_via(&api, &paired(), "Nightly", "ok");
+        let failed = report_via(&api, None, &paired(), "Nightly", "ok");
         worker.join().unwrap();
         assert_eq!(failed, ["Telegram rejected the message."]);
     }
@@ -952,7 +1004,7 @@ mod tests {
         let marker = crate::redact::MARKER;
 
         let (api, worker) = one_request("200 OK");
-        report_via(&api, &paired(), "Nightly", &format!("used {key}"));
+        report_via(&api, None, &paired(), "Nightly", &format!("used {key}"));
         let (_, body) = worker.join().unwrap();
         assert_eq!(body["text"], format!("<b>Nightly</b>\nused {marker}"));
         // A question's card is built from the call's own arguments.

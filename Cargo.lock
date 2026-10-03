@@ -3740,6 +3740,7 @@ name = "letronna-core"
 version = "0.1.0-alpha.2"
 dependencies = [
  "async-channel 2.5.0",
+ "base64",
  "chrono",
  "core-foundation 0.10.0",
  "core-graphics 0.24.0",
@@ -3752,12 +3753,14 @@ dependencies = [
  "reqwest",
  "ring",
  "rquickjs",
+ "rustls",
  "security-framework",
  "semver",
  "serde",
  "serde_json",
  "toml 1.1.6+spec-1.1.0",
  "tungstenite",
+ "webpki-roots 1.0.9",
  "windows-sys 0.59.0",
  "x11rb",
  "zbus",

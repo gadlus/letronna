@@ -23,6 +23,12 @@ regex = "1"
 # Discord's Gateway, for hearing server mentions as they happen. Blocking
 # like reqwest here, and on the same rustls.
 tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+# Scheduled runs' reports by mail: a small SMTP client on the rustls, web
+# roots and base64 reqwest already brings, through ring as reqwest does,
+# so the lock file gains nothing.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+webpki-roots = "1"
+base64 = "0.22"
 # Runs workflow scripts: QuickJS, in C built by cc, which ring already
 # needs. It can be stopped from outside and held to a heap and a stack.
 rquickjs = { version = "0.14", optional = true }
