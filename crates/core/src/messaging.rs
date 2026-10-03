@@ -73,7 +73,16 @@ pub struct Config {
     /// costs credit, so it is asked once per chat; see `files::chat_key`.
     #[serde(default)]
     pub voice: std::collections::BTreeMap<String, bool>,
+    /// Minutes a card may wait in the window with nobody at it before it
+    /// goes to the owner's private chat too, to be answered from either;
+    /// `None`, the default, keeps every card in the window.
+    #[serde(default)]
+    pub phone_cards: Option<u32>,
 }
+
+/// The wait the switch for sending cards to the phone starts at: a card
+/// answered at the desk within a few minutes never buzzes the phone.
+pub const PHONE_CARDS: u32 = 5;
 
 /// Two-way: Telegram hands out messages over long polling, so Letronna can
 /// both hear and answer without being reachable from the internet.
@@ -453,6 +462,159 @@ fn report_via(api: &str, config: &Config, title: &str, body: &str) -> Vec<String
     failed
 }
 
+/// The owner's own private chat with the app, the one place a card waiting
+/// in the window may go: never a group, a server channel or a webhook,
+/// which other people read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dm {
+    /// The paired Telegram chat, which is the owner's private one.
+    Telegram(i64),
+    /// The bot's DM with its owner, opened when something is sent.
+    Discord,
+    /// The app's DM with the paired member.
+    Slack,
+}
+
+impl Dm {
+    /// Whether `message` came from this chat. A DM's channel on Discord and
+    /// Slack is known only once it is opened, so there it is the app's one
+    /// chat that is not shared.
+    pub fn hears(self, message: &Incoming) -> bool {
+        match (self, &message.source) {
+            (Dm::Telegram(chat), Source::Telegram(from)) => chat == *from,
+            (Dm::Discord, Source::Discord(_)) | (Dm::Slack, Source::Slack { .. }) => {
+                !message.remote.shared
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether chat `source` may be this one, as far as its id says: on
+    /// Discord and Slack any of the app's chats may be the DM.
+    pub fn may_be(self, source: &Source) -> bool {
+        match (self, source) {
+            (Dm::Telegram(chat), Source::Telegram(other)) => chat == *other,
+            (Dm::Discord, Source::Discord(_)) | (Dm::Slack, Source::Slack { .. }) => true,
+            _ => false,
+        }
+    }
+}
+
+/// The owner's private chat a card waiting in the window may go to: the
+/// first app set up to answer there, or `None`. Telegram and Discord count
+/// only when `heard` says their answers come to this Letronna.
+pub fn owner_dm(config: &Config, heard: bool) -> Option<Dm> {
+    let telegram = &config.telegram;
+    // A private chat's ID is its one user's; a group's is negative, and its
+    // owner only the member who paired it.
+    let private = telegram
+        .chat
+        .filter(|&chat| chat > 0 && pairing::owner(telegram) == Some(chat));
+    if let (true, true, Some(chat)) = (heard, telegram.ready(), private) {
+        return Some(Dm::Telegram(chat));
+    }
+    if heard && config.discord.bot_ready() {
+        return Some(Dm::Discord);
+    }
+    if config.slack.ready() && !config.slack.owner.trim().is_empty() {
+        return Some(Dm::Slack);
+    }
+    None
+}
+
+/// A card sent to the owner's DM, by what taking its buttons off needs.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Sent {
+    Telegram { chat: i64, message: i64 },
+    Discord { channel: String, message: String },
+}
+
+/// Send `text` to the owner's DM `dm`, with Allow and Deny under it when
+/// `card` is the id of the call it asks about; the message the buttons
+/// are on, if any are.
+pub fn tell_dm(
+    config: &Config,
+    dm: Dm,
+    text: &str,
+    card: Option<&str>,
+) -> Result<Option<Sent>, String> {
+    tell_dm_via((&api(), DISCORD_API), config, dm, text, card)
+}
+
+fn tell_dm_via(
+    (telegram, discord): (&str, &str),
+    config: &Config,
+    dm: Dm,
+    text: &str,
+    card: Option<&str>,
+) -> Result<Option<Sent>, String> {
+    match dm {
+        Dm::Telegram(chat) => {
+            let message = send_via(telegram, &config.telegram.token, chat, text, card)?;
+            Ok(card
+                .and(message)
+                .map(|message| Sent::Telegram { chat, message }))
+        }
+        Dm::Discord => {
+            let token = &config.discord.bot_token;
+            let (channel, _) = discord_open_dm_via(discord, token, &config.discord.owner)?;
+            let message = discord_post_via(discord, token, &channel, text, card)?;
+            Ok(card
+                .and(message)
+                .map(|message| Sent::Discord { channel, message }))
+        }
+        // Slack's cards have no buttons: a typed answer is the only one.
+        Dm::Slack => {
+            slack_post(&config.slack.bot_token, &config.slack.owner, None, text).map(|()| None)
+        }
+    }
+}
+
+/// Take the buttons off card `sent`, answered in the window first, so the
+/// phone cannot answer it a second time.
+pub fn unbutton(config: &Config, sent: &Sent) -> Result<(), String> {
+    unbutton_via((&api(), DISCORD_API), config, sent)
+}
+
+fn unbutton_via(
+    (telegram, discord): (&str, &str),
+    config: &Config,
+    sent: &Sent,
+) -> Result<(), String> {
+    use serde_json::json;
+    let request = match sent {
+        Sent::Telegram { chat, message } => client()
+            .ok_or("Cannot initialize connection.")?
+            .post(format!(
+                "{telegram}/bot{}/editMessageReplyMarkup",
+                config.telegram.token.trim()
+            ))
+            .json(&json!({
+                "chat_id": chat,
+                "message_id": message,
+                "reply_markup": {"inline_keyboard": []}
+            })),
+        // As a tap's answer does, the two buttons become one that cannot be
+        // pressed, saying where the card was answered.
+        Sent::Discord { channel, message } => discord_bot_via(
+            discord,
+            reqwest::Method::PATCH,
+            &config.discord.bot_token,
+            &format!("/channels/{channel}/messages/{message}"),
+        )?
+        .json(&json!({"components": [{"type": 1, "components": [
+            {"type": 2, "style": 2, "label": "Answered in the window", "custom_id": "answered",
+             "disabled": true}
+        ]}]})),
+    };
+    request
+        .send()
+        .map_err(|_| "Cannot reach the chat app.".to_owned())?
+        .error_for_status()
+        .map_err(|_| "The chat app would not take the buttons off a card.".to_owned())?;
+    Ok(())
+}
+
 /// Pull the text messages out of a `getUpdates` response, with the offset to
 /// ask for next. Pure, so the shape of the payload is pinned by a test rather
 /// than discovered in production.
@@ -580,9 +742,12 @@ pub fn tell(
     card: Option<&str>,
 ) -> Result<(), String> {
     match source {
-        Source::Telegram(chat) => send_via(&api(), &config.telegram.token, *chat, text, card),
+        Source::Telegram(chat) => {
+            send_via(&api(), &config.telegram.token, *chat, text, card).map(|_| ())
+        }
         Source::Discord(channel) => {
             discord_post_via(DISCORD_API, &config.discord.bot_token, channel, text, card)
+                .map(|_| ())
         }
         // No buttons: a typed yes or no answers the card.
         Source::Slack { channel, thread } => {
@@ -592,18 +757,19 @@ pub fn tell(
 }
 
 /// Send to a Telegram chat: in parts, as HTML, and with a card's buttons
-/// under the last part.
+/// under the last part, whose message id comes back when Telegram gives it.
 fn send_via(
     api: &str,
     token: &str,
     chat: i64,
     text: &str,
     card: Option<&str>,
-) -> Result<(), String> {
+) -> Result<Option<i64>, String> {
     let client = client().ok_or("Cannot initialize connection.")?;
     let url = format!("{api}/bot{}/sendMessage", token.trim());
     let parts = format::split(&outgoing(text), TELEGRAM_PART);
     let last = parts.len().saturating_sub(1);
+    let mut sent = None;
     for (i, part) in parts.iter().enumerate() {
         let mut body = serde_json::json!({
             "chat_id": chat,
@@ -638,11 +804,15 @@ fn send_via(
             }
             false => response,
         };
-        response
+        let response = response
             .error_for_status()
             .map_err(|_| "Telegram rejected the message.".to_owned())?;
+        if i == last {
+            let body = response.json::<serde_json::Value>().ok();
+            sent = body.and_then(|body| body["result"]["message_id"].as_i64());
+        }
     }
-    Ok(())
+    Ok(sent)
 }
 
 /// Show the chat `source` names that a reply is being written. The service
@@ -824,14 +994,25 @@ pub fn poll(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        Config, Source, discord_post_via, discord_send, parse_updates, report, report_via,
-        send_via, settle_via, typing_via,
+        Config, Dm, Incoming, Sent, Source, discord_post_via, discord_send, parse_updates, report,
+        report_via, send_via, settle_via, tell_dm_via, typing_via, unbutton_via,
     };
     use serde_json::{Value, json};
+
+    /// A tap by Telegram user `user` on a button whose data is `data`, under
+    /// a card in chat `chat`.
+    pub(crate) fn tap(chat: i64, user: i64, data: &str) -> Incoming {
+        let update = json!({"update_id": 1, "callback_query": {
+            "id": "q1", "from": {"id": user}, "data": data,
+            "message": {"message_id": 7, "chat": {"id": chat}}}});
+        parse_updates(&json!({"ok": true, "result": [update]}))
+            .0
+            .remove(0)
+    }
 
     #[test]
     fn every_chat_app_call_shares_one_client() {
@@ -854,19 +1035,29 @@ mod tests {
     /// status, and hand back the paths and JSON bodies in order: a fake of
     /// the chat app's API, so nothing reaches a real one.
     fn requests(statuses: &[&str]) -> (String, std::thread::JoinHandle<Vec<(String, Value)>>) {
+        let empty: Vec<(&str, &str)> = statuses.iter().map(|status| (*status, "")).collect();
+        replies(&empty)
+    }
+
+    /// As `requests`, each answered with its status and the body beside it.
+    fn replies(
+        replies: &[(&str, &str)],
+    ) -> (String, std::thread::JoinHandle<Vec<(String, Value)>>) {
         let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", server.local_addr().unwrap());
-        let statuses: Vec<String> = statuses.iter().map(|s| s.to_string()).collect();
+        let replies: Vec<(String, String)> = (replies.iter())
+            .map(|(status, body)| (status.to_string(), body.to_string()))
+            .collect();
         let worker = std::thread::spawn(move || {
-            statuses
+            replies
                 .iter()
-                .map(|status| answer(&server, status))
+                .map(|(status, body)| answer(&server, status, body))
                 .collect()
         });
         (base, worker)
     }
 
-    fn answer(server: &std::net::TcpListener, status: &str) -> (String, Value) {
+    fn answer(server: &std::net::TcpListener, status: &str, reply: &str) -> (String, Value) {
         use std::io::{Read, Write};
         let (mut socket, _) = server.accept().unwrap();
         socket
@@ -895,7 +1086,8 @@ mod tests {
         };
         write!(
             socket,
-            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+            reply.len()
         )
         .unwrap();
         let path = head.split_whitespace().nth(1).unwrap().to_owned();
@@ -1190,6 +1382,92 @@ mod tests {
     }
 
     #[test]
+    fn a_card_for_the_owners_dm_goes_there_and_its_buttons_come_off_when_answered_elsewhere() {
+        let mut config = paired();
+        config.telegram.chat = Some(1001);
+        let nowhere = "http://127.0.0.1:1";
+        let (api, worker) = replies(&[("200 OK", r#"{"ok": true, "result": {"message_id": 7}}"#)]);
+        let sent = tell_dm_via(
+            (&api, nowhere),
+            &config,
+            Dm::Telegram(1001),
+            "run?",
+            Some("c1"),
+        );
+        let (path, body) = worker.join().unwrap().remove(0);
+        assert_eq!(path, "/bot123:abc/sendMessage");
+        assert_eq!(body["chat_id"], 1001);
+        let sent = sent.unwrap().expect("a card's message comes back");
+        assert_eq!(
+            sent,
+            Sent::Telegram {
+                chat: 1001,
+                message: 7
+            }
+        );
+        let (api, worker) = requests(&["200 OK"]);
+        unbutton_via((&api, nowhere), &config, &sent).unwrap();
+        let (path, body) = worker.join().unwrap().remove(0);
+        assert_eq!(path, "/bot123:abc/editMessageReplyMarkup");
+        assert_eq!(
+            body,
+            json!({"chat_id": 1001, "message_id": 7, "reply_markup": {"inline_keyboard": []}})
+        );
+
+        // Discord's DM is opened first, then the card posted into it.
+        config.discord.bot_token = "t".into();
+        config.discord.owner = "5".into();
+        let (base, worker) = replies(&[
+            ("200 OK", r#"{"id": "dm1"}"#),
+            ("200 OK", r#"{"id": "m9"}"#),
+        ]);
+        let sent = tell_dm_via((nowhere, &base), &config, Dm::Discord, "run?", Some("c1"));
+        let posted = worker.join().unwrap();
+        assert_eq!(posted[0].0, "/users/@me/channels");
+        assert_eq!(posted[0].1, json!({"recipient_id": "5"}));
+        assert_eq!(posted[1].0, "/channels/dm1/messages");
+        let sent = sent.unwrap().expect("a card's message comes back");
+        let (base, worker) = requests(&["200 OK"]);
+        unbutton_via((nowhere, &base), &config, &sent).unwrap();
+        let (path, body) = worker.join().unwrap().remove(0);
+        assert_eq!(path, "/channels/dm1/messages/m9");
+        let button = &body["components"][0]["components"][0];
+        assert_eq!(
+            (&button["label"], &button["disabled"]),
+            (&json!("Answered in the window"), &json!(true))
+        );
+
+        // A question has no buttons, so nothing is kept to take off.
+        let (api, worker) = replies(&[("200 OK", r#"{"ok": true, "result": {"message_id": 8}}"#)]);
+        let sent = tell_dm_via((&api, nowhere), &config, Dm::Telegram(1001), "which?", None);
+        worker.join().unwrap();
+        assert_eq!(sent, Ok(None));
+    }
+
+    #[test]
+    fn only_the_owners_dm_is_heard_as_one() {
+        let discord = super::Discord {
+            owner: "1".into(),
+            servers: vec!["g1".into()],
+            ..Default::default()
+        };
+        let interaction = |guild: Option<&str>| {
+            let mut tap = json!({"type": 3, "id": "i1", "token": "tok", "channel_id": "99",
+                "user": {"id": "1"}, "member": {"user": {"id": "1"}},
+                "data": {"custom_id": "allow:c1"}});
+            if let Some(guild) = guild {
+                tap["guild_id"] = guild.into();
+            }
+            super::gateway_press(&tap, &discord).unwrap()
+        };
+        assert!(Dm::Discord.hears(&interaction(None)));
+        assert!(!Dm::Discord.hears(&interaction(Some("g1"))));
+        assert!(Dm::Telegram(1001).hears(&tap(1001, 1001, "allow:c1")));
+        assert!(!Dm::Telegram(1001).hears(&tap(-100, 1001, "allow:c1")));
+        assert!(!Dm::Slack.hears(&tap(1001, 1001, "allow:c1")));
+    }
+
+    #[test]
     fn typing_shows_in_the_chat_the_turn_is_for() {
         let (api, worker) = one_request("200 OK");
         typing_via(
@@ -1297,12 +1575,21 @@ pub fn discord_bot_check(token: &str) -> Result<String, String> {
 /// message already in it, so a new poller starts after the history.
 /// Discord only lets a bot DM someone it shares a server with.
 pub fn discord_open_dm(token: &str, owner: &str) -> Result<(String, Option<String>), String> {
-    let body: serde_json::Value = discord_bot(reqwest::Method::POST, token, "/users/@me/channels")?
-        .json(&serde_json::json!({"recipient_id": owner.trim()}))
-        .send()
-        .map_err(|_| "Cannot reach Discord.".to_owned())?
-        .json()
-        .map_err(|_| "Discord sent an unreadable reply.".to_owned())?;
+    discord_open_dm_via(DISCORD_API, token, owner)
+}
+
+fn discord_open_dm_via(
+    api: &str,
+    token: &str,
+    owner: &str,
+) -> Result<(String, Option<String>), String> {
+    let body: serde_json::Value =
+        discord_bot_via(api, reqwest::Method::POST, token, "/users/@me/channels")?
+            .json(&serde_json::json!({"recipient_id": owner.trim()}))
+            .send()
+            .map_err(|_| "Cannot reach Discord.".to_owned())?
+            .json()
+            .map_err(|_| "Discord sent an unreadable reply.".to_owned())?;
     let channel = body["id"].as_str().ok_or_else(|| {
         "Discord would not open a DM with that user ID. The bot has to share a server \
          with you."
@@ -1316,19 +1603,21 @@ pub fn discord_open_dm(token: &str, owner: &str) -> Result<(String, Option<Strin
 
 /// Send into a channel: the DM, or the server channel a mention came from.
 pub fn discord_post(token: &str, channel: &str, text: &str) -> Result<(), String> {
-    discord_post_via(DISCORD_API, token, channel, text, None)
+    discord_post_via(DISCORD_API, token, channel, text, None).map(|_| ())
 }
 
-/// Post in parts, with a card's buttons under the last part.
+/// Post in parts, with a card's buttons under the last part, whose message
+/// id comes back when Discord gives it.
 fn discord_post_via(
     api: &str,
     token: &str,
     channel: &str,
     text: &str,
     card: Option<&str>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let parts = format::split(&outgoing(text), DISCORD_PART);
     let last = parts.len().saturating_sub(1);
+    let mut sent = None;
     for (i, part) in parts.into_iter().enumerate() {
         let mut body = serde_json::json!({"content": part});
         if let (true, Some(call)) = (i == last, card) {
@@ -1339,14 +1628,18 @@ fn discord_post_via(
             ]}]);
         }
         let path = format!("/channels/{channel}/messages");
-        discord_bot_via(api, reqwest::Method::POST, token, &path)?
+        let response = discord_bot_via(api, reqwest::Method::POST, token, &path)?
             .json(&body)
             .send()
             .map_err(|_| "Cannot reach Discord.".to_owned())?
             .error_for_status()
             .map_err(|_| "Discord rejected the message.".to_owned())?;
+        if i == last {
+            let body = response.json::<serde_json::Value>().ok();
+            sent = body.and_then(|body| body["id"].as_str().map(str::to_owned));
+        }
     }
-    Ok(())
+    Ok(sent)
 }
 
 /// Whether a Gateway message is for this agent, and what it says. Only the
@@ -1446,7 +1739,11 @@ fn gateway_press(interaction: &serde_json::Value, config: &Discord) -> Option<In
         author: user["id"].as_str().map(str::to_owned),
         text: String::new(),
         said: String::new(),
-        remote: backend::Remote::default(),
+        // A server's channel is read by others; a DM is the owner's own.
+        remote: backend::Remote {
+            shared: interaction["guild_id"].is_string(),
+            ..Default::default()
+        },
         press: Some(Press { allow, call, tap }),
         needs_session: false,
         spoken: false,

@@ -9,14 +9,23 @@
 //! next message answers it. What differs between the window and a Letronna
 //! with no window is the `Host`'s: who holds and writes the sessions, how a
 //! run starts and stops, and how a chat asking to be paired is shown.
+//!
+//! A card left waiting in the window while nobody is there can go to the
+//! owner's private chat as well, when they switch that on. It is the same
+//! card either way, so whichever answer comes first settles it: an answer
+//! at the desk takes the buttons off the phone's copy, and one from the
+//! phone answers the window's as a click would. The phone may allow a call
+//! once or deny it, never for the whole session, since whoever holds the
+//! chat account is not the person at the desk.
 
 use crate::approvals;
-use crate::chat::{self as backend, Message, Remote};
+use crate::chat::{self as backend, Message, Remote, ToolCall};
 use crate::driver::{self, Outcome};
 use crate::gate::Mode;
 use crate::inbox::{self, Notice, When};
 use crate::messaging::pairing::{self, Attempt};
-use crate::messaging::{self, CardAnswer, Config, Incoming, Press, Source, files};
+use crate::messaging::{self, CardAnswer, Config, Dm, Incoming, Press, Sent, Source, files};
+use crate::notify::Note;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
@@ -60,6 +69,46 @@ pub struct Dispatcher {
     voice: HashMap<Source, Incoming>,
     /// Sessions whose run answers a voice note, which is answered with one.
     spoken: HashSet<u64>,
+    /// The window's card that went to the owner's DM as well, settled by
+    /// whichever answer comes first. One at a time, so a typed answer there
+    /// has one card it can be for.
+    mirror: Option<Mirror>,
+    /// Sessions with a card that went to the owner's DM, which hears how
+    /// their run ends while nobody is at the window.
+    away: HashSet<u64>,
+    /// Plans the owner's DM was told wait in the window, by session, label
+    /// and call, so it is told of each once however often the window asks.
+    told: HashSet<(u64, String, String)>,
+}
+
+/// A card waiting in the window, sent to the owner's DM too.
+struct Mirror {
+    dm: Dm,
+    /// The session it waits in.
+    id: u64,
+    /// The helper whose card it is, empty for the session's own turn: call
+    /// ids repeat between helpers and turns, so they alone do not say which.
+    label: String,
+    call: ToolCall,
+    /// What its buttons carry, its own, so a tap on an older copy whose
+    /// buttons stayed never answers it.
+    key: String,
+    /// Its message in the DM, which the network gives back after the card
+    /// may already have been answered at the desk.
+    posted: Arc<Mutex<Posted>>,
+}
+
+/// Where a card sent to the owner's DM is.
+#[derive(Debug, PartialEq)]
+enum Posted {
+    /// On its way.
+    Going,
+    /// In the chat, with the message its buttons are on, if it has any.
+    Out(Option<Sent>),
+    /// Settled in the window, so its copy is taken off once it is out.
+    Settled,
+    /// Never reached the chat, so it may be sent again.
+    Failed,
 }
 
 impl Dispatcher {
@@ -123,6 +172,28 @@ pub trait Host {
     fn run(&mut self, id: u64, mode: Mode, prompt: Message, source: Source, remote: Remote);
     /// Stop session `id`'s run.
     fn stop(&mut self, id: u64);
+    /// Answer the card waiting in the window for call `call` of `label`, a
+    /// helper's or empty for the session's own turn, in session `id` as a
+    /// click there would, with what the owner's DM said to its copy: allow
+    /// once, deny, or a question's answer, which opens with `FROM_DM` and is
+    /// recorded as it comes. False when it waits there no longer. A
+    /// Letronna with no window has none to answer.
+    fn answer_card(&mut self, _id: u64, _label: &str, _call: &str, _answer: CardAnswer) -> bool {
+        false
+    }
+    /// Whether Telegram and Discord hand their messages to this Letronna,
+    /// rather than to another such as a `letronna serve`.
+    fn hearing(&self) -> bool {
+        hearing()
+    }
+}
+
+/// Whether this Letronna holds `HEARING` for the data folder in use, and
+/// so hears Telegram and Discord.
+fn hearing() -> bool {
+    let held = HEARING.lock().unwrap_or_else(PoisonError::into_inner);
+    held.as_ref()
+        .is_some_and(|(at, _)| *at == backend::data_dir())
 }
 
 /// Which Letronna hears the chat apps, as the record beside the lock says.
@@ -311,9 +382,12 @@ pub fn dispatch(host: &mut impl Host, mut message: Incoming) {
     let source = message.source.clone();
     // A tap answers only as the owner's own words would.
     let may_answer = pairing::may_answer(host.config(), &message);
+    // Where a card of the window's may be up.
+    let dm = host.dispatcher().mirror.as_ref().map(|mirror| mirror.dm);
+    let from_dm = may_answer && dm.is_some_and(|dm| dm.hears(&message));
     if let Some(tap) = message.press {
         if may_answer {
-            press(host, source, tap);
+            press(host, source, tap, from_dm);
         }
         return;
     }
@@ -363,6 +437,9 @@ pub fn dispatch(host: &mut impl Host, mut message: Incoming) {
     // In a group anyone may write, but only the owner's own words answer;
     // anyone else's go on as any message would while a run goes.
     if may_answer && answer(host, &source, &message.said) {
+        return;
+    }
+    if from_dm && answer_mirror(host, &message) {
         return;
     }
     // The chat's answer to whether its voice notes are transcribed is kept,
@@ -464,12 +541,26 @@ fn save(host: &mut impl Host) {
 
 /// A tap on a card's Allow or Deny. It answers the card only while that card
 /// is the one waiting, as a typed yes or no would; a tap on an older card,
-/// or a second tap, only loses its buttons.
-fn press(host: &mut impl Host, source: Source, tap: Press) {
+/// or a second tap, only loses its buttons. One in the owner's DM, `from_dm`,
+/// may be on the window's card, unless the desk answered it first.
+fn press(host: &mut impl Host, source: Source, tap: Press, from_dm: bool) {
     let dispatcher = host.dispatcher();
     let answers =
         (dispatcher.asks.get(&source)).is_some_and(|request| tap.answers(&request.call.id));
     let request = answers.then(|| dispatcher.asks.remove(&source)).flatten();
+    let mirror = (from_dm && request.is_none())
+        .then(|| dispatcher.mirror.take_if(|mirror| tap.answers(&mirror.key)))
+        .flatten();
+    let answers = match mirror {
+        Some(mirror) => {
+            let answer = match tap.allow {
+                true => CardAnswer::Allow,
+                false => CardAnswer::Deny(String::new()),
+            };
+            host.answer_card(mirror.id, &mirror.label, &mirror.call.id, answer)
+        }
+        None => answers,
+    };
     let allow = tap.allow;
     let config = host.config().clone();
     host.spawn(Box::new(move || {
@@ -553,6 +644,226 @@ fn answer(host: &mut impl Host, source: &Source, said: &str) -> bool {
     true
 }
 
+/// What came of putting a card waiting in the window to the owner's DM.
+#[derive(Debug, PartialEq)]
+pub enum Mirrored {
+    /// Sent, to be answered there or at the desk, whichever is first.
+    Sent,
+    /// The DM was only told the session waits: only the window answers it.
+    /// Asked again, the DM is not told again until it is settled.
+    Told,
+    /// Not yet: the DM has a card up, which one sent now would take the
+    /// place of and so decline. Try again once it is answered.
+    Later,
+    /// Never: the switch is off, the owner has no private chat paired that
+    /// this Letronna hears, or the session is a chat's own, whose cards go
+    /// to that chat.
+    No,
+}
+
+/// What a question's answer from the owner's DM opens with, as the window
+/// records it: like a chat's prompt, it was written by whoever holds that
+/// chat account, not at the desk.
+pub const FROM_DM: &str = "[Answered in the owner's chat app, not at the desk]";
+
+/// Said in the owner's DM under a card of the window's that waits there no
+/// longer, where nothing else shows it: Telegram leaves no trace of buttons
+/// taken off, and a question or a Slack card has none. Without it a later
+/// yes there would go on as a new message to the DM's own session.
+const GONE: &str = "That card is no longer waiting in the window.";
+
+/// The owner's DM a card of the window's goes to while the switch is on.
+/// Telegram and Discord hand their messages to whichever Letronna holds
+/// `HEARING`, and a `letronna serve` holding it has no card to answer and
+/// would take the owner's yes for a new chat, so they count only while
+/// this Letronna hears them; the window always hears its Slack.
+fn phone(host: &impl Host) -> Option<Dm> {
+    let config = host.config();
+    config.phone_cards?;
+    messaging::owner_dm(config, host.hearing())
+}
+
+/// Put session `id`'s card for `call` of `label`, a helper's or empty for
+/// the session's own turn, showing `preview`, to the owner's DM as well,
+/// once it has waited in the window, titled `title`, with nobody there. A
+/// tool can be allowed once or denied there and a question answered in
+/// words; a plan to approve only says the session waits.
+pub fn mirror(
+    host: &mut impl Host,
+    id: u64,
+    label: &str,
+    title: &str,
+    call: &ToolCall,
+    preview: &str,
+) -> Mirrored {
+    let Some(dm) = phone(host) else {
+        return Mirrored::No;
+    };
+    let dispatcher = host.dispatcher();
+    if dispatcher.holds(id) {
+        return Mirrored::No;
+    }
+    let card = (id, label.to_owned(), call.id.clone());
+    if dispatcher.told.contains(&card) {
+        return Mirrored::Told;
+    }
+    if (dispatcher.mirror.as_ref()).is_some_and(|up| *lock(&up.posted) == Posted::Failed) {
+        dispatcher.mirror = None;
+    }
+    if let Some(up) = &dispatcher.mirror {
+        return match up.id == id && up.label == label && up.call.id == call.id {
+            true => Mirrored::Sent,
+            false => Mirrored::Later,
+        };
+    }
+    let busy = (dispatcher.asks.keys())
+        .chain(dispatcher.voice.keys())
+        .any(|source| dm.may_be(source));
+    if busy {
+        return Mirrored::Later;
+    }
+    dispatcher.away.insert(id);
+    let config = host.config().clone();
+    let waiting = format!("\"{title}\" is waiting in the window.");
+    if call.name == crate::tools::EXIT_PLAN {
+        host.dispatcher().told.insert(card);
+        host.spawn(Box::new(move || {
+            let _ = messaging::tell_dm(&config, dm, &waiting, None);
+        }));
+        return Mirrored::Told;
+    }
+    let text = messaging::card_text(&call.name, &call.arguments, preview);
+    let text = format!("{waiting}\n\n{text}");
+    let key = fresh_key();
+    // A question is answered in words; a tool is allowed or not.
+    let buttons = (call.name != crate::tools::ASK_USER).then(|| key.clone());
+    let posted = Arc::new(Mutex::new(Posted::Going));
+    host.dispatcher().mirror = Some(Mirror {
+        dm,
+        id,
+        label: label.to_owned(),
+        call: call.clone(),
+        key,
+        posted: posted.clone(),
+    });
+    host.spawn(Box::new(move || {
+        let Ok(sent) = messaging::tell_dm(&config, dm, &text, buttons.as_deref()) else {
+            *lock(&posted) = Posted::Failed;
+            return;
+        };
+        if let Some(sent) = arrived(&posted, sent) {
+            take_off(&config, dm, sent.as_ref());
+        }
+    }));
+    Mirrored::Sent
+}
+
+/// A key for a card's buttons that no earlier card's carry, even one sent
+/// before Letronna last started: the time, to the nanosecond.
+fn fresh_key() -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    format!("w{}", now.unwrap_or_default().as_nanos())
+}
+
+/// Answer the window's card in the owner's DM with what `message` said
+/// there, if it is up there.
+fn answer_mirror(host: &mut impl Host, message: &Incoming) -> bool {
+    let source = &message.source;
+    // A voice note or file with no words says nothing to the card, and a
+    // voice question asked there meanwhile has the next words first.
+    let wordless = message.said.trim().is_empty() && (message.spoken || !message.files.is_empty());
+    if wordless || host.dispatcher().voice.contains_key(source) {
+        return false;
+    }
+    // Words written before the card reached the chat were not about it.
+    let out = |mirror: &mut Mirror| matches!(*lock(&mirror.posted), Posted::Out(_));
+    let Some(mirror) = host.dispatcher().mirror.take_if(out) else {
+        return false;
+    };
+    let call = &mirror.call;
+    let answer = match messaging::card_answer(&call.name, &call.arguments, &message.said) {
+        CardAnswer::Answer(text) => CardAnswer::Answer(format!("{FROM_DM}\n{text}")),
+        answer => answer,
+    };
+    if !host.answer_card(mirror.id, &mirror.label, &call.id, answer) {
+        host.tell(source, GONE);
+    }
+    true
+}
+
+/// The window's card for call `call` of `label` in session `id` went --
+/// answered at the desk, or dropped with its run -- so its copy in the
+/// owner's DM loses its buttons and says so, and an answer there does
+/// nothing. A plan the DM was only told of may be told of again.
+pub fn settled_in_window(host: &mut impl Host, id: u64, label: &str, call: &str) {
+    let dispatcher = host.dispatcher();
+    dispatcher
+        .told
+        .remove(&(id, label.to_owned(), call.to_owned()));
+    let mirrored =
+        |mirror: &mut Mirror| mirror.id == id && mirror.label == label && mirror.call.id == call;
+    if let Some(mirror) = dispatcher.mirror.take_if(mirrored) {
+        unbutton(host, &mirror);
+    }
+}
+
+/// Session `id`'s run in the window ended, as `note` says. While nobody is
+/// there, `away`, the owner's DM, sent a card of the session's, is told how,
+/// once; a card of its still up there loses its buttons.
+pub fn window_ended(host: &mut impl Host, id: u64, note: &Note, away: bool) {
+    let dispatcher = host.dispatcher();
+    dispatcher.told.retain(|(session, ..)| *session != id);
+    if let Some(mirror) = dispatcher.mirror.take_if(|mirror| mirror.id == id) {
+        unbutton(host, &mirror);
+    }
+    let sent = host.dispatcher().away.remove(&id);
+    let Some(dm) = phone(host).filter(|_| sent && away) else {
+        return;
+    };
+    let config = host.config().clone();
+    let line = format!("{}\n{}", note.title, note.body);
+    host.spawn(Box::new(move || {
+        let _ = messaging::tell_dm(&config, dm, &line, None);
+    }));
+}
+
+/// Take `mirror`'s copy in the DM off, now or as soon as it is out.
+fn unbutton(host: &mut impl Host, mirror: &Mirror) {
+    let was = std::mem::replace(&mut *lock(&mirror.posted), Posted::Settled);
+    if let Posted::Out(sent) = was {
+        let (config, dm) = (host.config().clone(), mirror.dm);
+        host.spawn(Box::new(move || take_off(&config, dm, sent.as_ref())));
+    }
+}
+
+/// Take the buttons off a card of the window's in `dm`, `sent` if it has
+/// any, and say there it waits no longer unless Discord's buttons do.
+fn take_off(config: &Config, dm: Dm, sent: Option<&Sent>) {
+    if let Some(sent) = sent {
+        let _ = messaging::unbutton(config, sent);
+    }
+    if !matches!(sent, Some(Sent::Discord { .. })) {
+        let _ = messaging::tell_dm(config, dm, GONE, None);
+    }
+}
+
+/// A card's message `sent` came back from the chat app: kept, or handed
+/// back to be taken off when the window settled the card meanwhile.
+fn arrived(posted: &Mutex<Posted>, sent: Option<Sent>) -> Option<Option<Sent>> {
+    let mut posted = lock(posted);
+    if *posted == Posted::Settled {
+        return Some(sent);
+    }
+    *posted = Posted::Out(sent);
+    None
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    // Nothing that can panic runs under these locks, so a poisoned one is
+    // still whole.
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Chat `source`'s run in session `id` ended, saying `text`, which the chat
 /// is told; read aloud too where it `answered` a voice note, rather than
 /// stopping or failing.
@@ -577,15 +888,18 @@ pub fn said(report: &driver::Report) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        By, Dispatcher, Holder, Host, NotHeard, RECORD, ask, dispatch, ended, holder, take_lock,
-        wait_for_lock,
+        By, Dispatcher, FROM_DM, GONE, Holder, Host, Mirrored, NotHeard, Posted, RECORD,
+        answer_mirror, arrived, ask, dispatch, ended, holder, mirror, settled_in_window, take_lock,
+        wait_for_lock, window_ended,
     };
     use crate::approvals::{self, tests::SERVING};
     use crate::chat::{Message, Remote, ToolCall};
     use crate::gate::Mode;
     use crate::inbox::{self, When};
     use crate::messaging::pairing::Attempt;
-    use crate::messaging::{Config, Incoming, Source};
+    use crate::messaging::tests::tap;
+    use crate::messaging::{self, CardAnswer, Config, Dm, Incoming, Sent, Source};
+    use crate::notify::Note;
     use crate::tools::ToolContext;
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -615,6 +929,15 @@ mod tests {
         troubles: Vec<String>,
         /// The id the next session opened gets.
         next: u64,
+        /// Whether the window's cards still wait there to be answered.
+        waiting: bool,
+        /// Each of the window's cards answered from a chat: its session,
+        /// label and call, and what was said.
+        answered: Vec<(u64, String, String, String)>,
+        /// Whether another Letronna hears Telegram and Discord.
+        elsewhere: bool,
+        /// How much work went off to the network.
+        spawned: usize,
     }
 
     impl Host for Fake {
@@ -650,7 +973,9 @@ mod tests {
             self.troubles.push(error);
         }
         /// Nothing here waits on the network.
-        fn spawn(&mut self, _: Box<dyn FnOnce() + Send>) {}
+        fn spawn(&mut self, _: Box<dyn FnOnce() + Send>) {
+            self.spawned += 1;
+        }
         fn after(&mut self, work: Box<dyn FnOnce() -> Incoming + Send>) {
             dispatch(self, work());
         }
@@ -677,6 +1002,18 @@ mod tests {
         }
         fn stop(&mut self, id: u64) {
             self.stopped.push(id);
+        }
+        fn answer_card(&mut self, id: u64, label: &str, call: &str, answer: CardAnswer) -> bool {
+            let said = match answer {
+                CardAnswer::Allow => "allow".to_owned(),
+                CardAnswer::Deny(why) => format!("deny {why}").trim().to_owned(),
+                CardAnswer::Answer(answer) => format!("answer {answer}"),
+            };
+            self.answered.push((id, label.into(), call.into(), said));
+            self.waiting
+        }
+        fn hearing(&self) -> bool {
+            !self.elsewhere
         }
     }
 
@@ -707,6 +1044,52 @@ mod tests {
             needs_session: false,
             spoken: false,
         }
+    }
+
+    /// A host whose paired Telegram chat is the owner's own, with cards
+    /// left waiting in its window sent there.
+    fn dm_host() -> Fake {
+        let mut fake = host(10);
+        fake.config.telegram.enabled = true;
+        fake.config.telegram.token = "123:abc".into();
+        fake.config.telegram.chat = Some(OWNER);
+        fake.config.phone_cards = Some(messaging::PHONE_CARDS);
+        fake.waiting = true;
+        fake
+    }
+
+    /// A call waiting on the user in the window.
+    fn window_call(id: &str, name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: arguments.into(),
+        }
+    }
+
+    /// The window's card sent to the DM came back from the chat app as
+    /// message 7, with buttons when it has any.
+    fn arrives(fake: &Fake) -> std::sync::Arc<std::sync::Mutex<Posted>> {
+        let posted = fake.remote.mirror.as_ref().unwrap().posted.clone();
+        let buttons = (fake.remote.mirror.as_ref())
+            .is_some_and(|mirror| mirror.call.name != crate::tools::ASK_USER);
+        let sent = buttons.then_some(Sent::Telegram {
+            chat: OWNER,
+            message: 7,
+        });
+        assert_eq!(arrived(&posted, sent), None);
+        posted
+    }
+
+    /// A tap on the Allow or Deny, `answer`, of the window's card up in the DM.
+    fn tap_mirror(fake: &Fake, answer: &str) -> Incoming {
+        let key = &fake.remote.mirror.as_ref().unwrap().key;
+        tap(OWNER, OWNER, &format!("{answer}:{key}"))
+    }
+
+    /// One of the window's cards answered from the DM, as the fake keeps it.
+    fn answered(id: u64, label: &str, call: &str, said: &str) -> (u64, String, String, String) {
+        (id, label.into(), call.into(), said.into())
     }
 
     fn last_told(fake: &Fake) -> &str {
@@ -1013,6 +1396,281 @@ mod tests {
         ended(&mut fake, &chat, 11, "Nothing.", true);
         let spoken: Vec<bool> = fake.answers.iter().map(|(_, spoken)| *spoken).collect();
         assert_eq!(spoken, [true, false, false]);
+    }
+
+    #[test]
+    fn a_group_chat_pairing_is_never_a_target() {
+        let mut fake = dm_host();
+        let call = window_call("w1", "run_command", r#"{"command": "cargo test"}"#);
+        assert_eq!(
+            messaging::owner_dm(&fake.config, true),
+            Some(Dm::Telegram(OWNER))
+        );
+        // A group's ID is negative, and many people read it.
+        fake.config.telegram.chat = Some(-100);
+        assert_eq!(messaging::owner_dm(&fake.config, true), None);
+        assert_eq!(mirror(&mut fake, 5, "", "Tests", &call, ""), Mirrored::No);
+        // A Discord webhook posts into a server channel; only the bot's DM
+        // with its owner will do.
+        fake.config.discord.enabled = true;
+        fake.config.discord.webhook = "https://discord.com/api/webhooks/1/t".into();
+        assert_eq!(messaging::owner_dm(&fake.config, true), None);
+        fake.config.discord.bot_token = "t".into();
+        fake.config.discord.owner = "5".into();
+        assert_eq!(messaging::owner_dm(&fake.config, true), Some(Dm::Discord));
+        // And nothing goes with the switch off.
+        fake.config.phone_cards = None;
+        assert_eq!(mirror(&mut fake, 5, "", "Tests", &call, ""), Mirrored::No);
+        assert_eq!(fake.spawned, 0);
+        assert!(fake.remote.mirror.is_none() && fake.remote.away.is_empty());
+    }
+
+    #[test]
+    fn a_dm_card_already_up_is_never_replaced() {
+        let _serving = SERVING.lock().unwrap_or_else(|e| e.into_inner());
+        let served = approvals::serve();
+        let wait = Duration::from_secs(10);
+        let mut fake = dm_host();
+        let dm = Source::Telegram(OWNER);
+        dispatch(&mut fake, from(OWNER, "run the tests"));
+        fake.running.insert(11);
+        let allowed = asking(11);
+        ask(&mut fake, dm.clone(), served.recv_timeout(wait).unwrap());
+
+        let call = window_call("w1", "run_command", r#"{"command": "cargo build"}"#);
+        assert_eq!(
+            mirror(&mut fake, 5, "", "Build", &call, ""),
+            Mirrored::Later
+        );
+        assert!(fake.remote.mirror.is_none());
+        dispatch(&mut fake, from(OWNER, "yes"));
+        assert!(allowed.recv_timeout(wait).unwrap().is_ok());
+        assert!(fake.answered.is_empty(), "the yes was the DM's own card's");
+
+        assert_eq!(mirror(&mut fake, 5, "", "Build", &call, ""), Mirrored::Sent);
+        let spawned = fake.spawned;
+        assert_eq!(mirror(&mut fake, 5, "", "Build", &call, ""), Mirrored::Sent);
+        assert_eq!(fake.spawned, spawned, "not sent twice");
+        let other = window_call("w2", "run_command", r#"{"command": "ls"}"#);
+        assert_eq!(
+            mirror(&mut fake, 6, "", "List", &other, ""),
+            Mirrored::Later
+        );
+        drop(served);
+    }
+
+    #[test]
+    fn a_second_answer_does_nothing() {
+        let mut fake = dm_host();
+        let call = window_call("w1", "run_command", r#"{"command": "cargo test"}"#);
+        assert_eq!(mirror(&mut fake, 5, "", "Tests", &call, ""), Mirrored::Sent);
+        arrives(&fake);
+        let (allow, deny) = (tap_mirror(&fake, "allow"), tap_mirror(&fake, "deny"));
+        dispatch(&mut fake, allow);
+        dispatch(&mut fake, deny);
+        dispatch(&mut fake, from(OWNER, "no"));
+        assert_eq!(fake.answered, [answered(5, "", "w1", "allow")]);
+    }
+
+    #[test]
+    fn a_window_question_is_answered_from_the_dm_once_it_is_there() {
+        let mut fake = dm_host();
+        let args = r#"{"question": "Which branch?", "options": ["main", "dev"]}"#;
+        let call = window_call("q1", crate::tools::ASK_USER, args);
+        assert_eq!(
+            mirror(&mut fake, 5, "", "Release", &call, ""),
+            Mirrored::Sent
+        );
+        // Written before the question reached the chat, it was not about it.
+        dispatch(&mut fake, from(OWNER, "2"));
+        assert!(fake.answered.is_empty());
+        arrives(&fake);
+        // Only the owner's own words answer, and a voice note's words are
+        // none of them.
+        let mut forward = from(OWNER, "1");
+        forward.author = None;
+        dispatch(&mut fake, forward);
+        let voice = Incoming {
+            spoken: true,
+            ..from(OWNER, "")
+        };
+        assert!(!answer_mirror(&mut fake, &voice));
+        dispatch(&mut fake, from(OWNER, "2"));
+        // The window records it as written in the chat app.
+        let said = format!("answer {FROM_DM}\ndev");
+        assert_eq!(fake.answered, [answered(5, "", "q1", &said)]);
+    }
+
+    #[test]
+    fn a_desk_answer_takes_the_phone_buttons_off() {
+        let mut fake = dm_host();
+        let call = window_call("w1", "run_command", r#"{"command": "cargo test"}"#);
+        assert_eq!(mirror(&mut fake, 5, "", "Tests", &call, ""), Mirrored::Sent);
+        let posted = arrives(&fake);
+        let allow = tap_mirror(&fake, "allow");
+        let spawned = fake.spawned;
+        settled_in_window(&mut fake, 5, "", "w1");
+        assert_eq!(fake.spawned, spawned + 1, "the buttons come off");
+        assert_eq!(*posted.lock().unwrap(), Posted::Settled);
+        dispatch(&mut fake, allow);
+        assert!(fake.answered.is_empty());
+
+        // Answered before the card reached the chat, it loses them as it does.
+        let call = window_call("w2", "run_command", r#"{"command": "ls"}"#);
+        assert_eq!(mirror(&mut fake, 5, "", "Tests", &call, ""), Mirrored::Sent);
+        let posted = fake.remote.mirror.as_ref().unwrap().posted.clone();
+        settled_in_window(&mut fake, 5, "", "w2");
+        let sent = Sent::Telegram {
+            chat: OWNER,
+            message: 8,
+        };
+        assert_eq!(arrived(&posted, Some(sent.clone())), Some(Some(sent)));
+
+        // A question has no buttons, but its copy is still taken off: the
+        // DM is told it waits no longer, so a later answer is not for it.
+        let args = r#"{"question": "Which branch?"}"#;
+        let question = window_call("q1", crate::tools::ASK_USER, args);
+        assert_eq!(
+            mirror(&mut fake, 5, "", "Tests", &question, ""),
+            Mirrored::Sent
+        );
+        arrives(&fake);
+        let spawned = fake.spawned;
+        settled_in_window(&mut fake, 5, "", "q1");
+        assert_eq!(fake.spawned, spawned + 1, "the DM is told");
+
+        // A phone answer to a card the window no longer has says so.
+        let call = window_call("w3", "run_command", r#"{"command": "pwd"}"#);
+        assert_eq!(mirror(&mut fake, 5, "", "Tests", &call, ""), Mirrored::Sent);
+        arrives(&fake);
+        fake.waiting = false;
+        dispatch(&mut fake, from(OWNER, "yes"));
+        assert_eq!(last_told(&fake), GONE);
+    }
+
+    #[test]
+    fn a_card_that_never_reached_the_dm_is_sent_again() {
+        let mut fake = dm_host();
+        let call = window_call("w1", "run_command", r#"{"command": "cargo test"}"#);
+        assert_eq!(mirror(&mut fake, 5, "", "Tests", &call, ""), Mirrored::Sent);
+        let posted = fake.remote.mirror.as_ref().unwrap().posted.clone();
+        *posted.lock().unwrap() = Posted::Failed;
+        dispatch(&mut fake, from(OWNER, "yes"));
+        assert!(fake.answered.is_empty(), "nothing in the chat to answer");
+        let spawned = fake.spawned;
+        assert_eq!(mirror(&mut fake, 5, "", "Tests", &call, ""), Mirrored::Sent);
+        assert_eq!(fake.spawned, spawned + 1);
+        assert_eq!(
+            *fake.remote.mirror.as_ref().unwrap().posted.lock().unwrap(),
+            Posted::Going
+        );
+    }
+
+    #[test]
+    fn a_plan_only_says_its_session_waits_and_the_dm_hears_its_end_once_while_away() {
+        let mut fake = dm_host();
+        let plan = window_call("p1", crate::tools::EXIT_PLAN, r#"{"plan": "Do it."}"#);
+        assert_eq!(
+            mirror(&mut fake, 5, "", "Refactor", &plan, ""),
+            Mirrored::Told
+        );
+        assert!(fake.remote.mirror.is_none(), "nothing there can answer it");
+        // Asked again on the window's next tick, the DM is not told again,
+        // until the plan is settled and a later one shares its call id.
+        let spawned = fake.spawned;
+        assert_eq!(
+            mirror(&mut fake, 5, "", "Refactor", &plan, ""),
+            Mirrored::Told
+        );
+        assert_eq!(fake.spawned, spawned);
+        settled_in_window(&mut fake, 5, "", "p1");
+        assert_eq!(
+            mirror(&mut fake, 5, "", "Refactor", &plan, ""),
+            Mirrored::Told
+        );
+        assert_eq!(fake.spawned, spawned + 1);
+        let note = Note {
+            session: 5,
+            title: "Refactor".into(),
+            body: "Finished: done.".into(),
+        };
+        let spawned = fake.spawned;
+        window_ended(&mut fake, 5, &note, true);
+        window_ended(&mut fake, 5, &note, true);
+        assert_eq!(fake.spawned, spawned + 1);
+        // Back at the desk, the DM is not told, nor later about that run.
+        mirror(&mut fake, 5, "", "Refactor", &plan, "");
+        let spawned = fake.spawned;
+        window_ended(&mut fake, 5, &note, false);
+        window_ended(&mut fake, 5, &note, true);
+        assert_eq!(fake.spawned, spawned);
+        // A session never sent a card is nothing to the DM.
+        window_ended(&mut fake, 6, &note, true);
+        assert_eq!(fake.spawned, spawned);
+    }
+
+    #[test]
+    fn cards_sharing_a_call_id_under_different_labels_are_told_apart() {
+        let mut fake = dm_host();
+        // Two helpers of one session, from a provider that names no calls.
+        let first = window_call("call_0", "run_command", r#"{"command": "cargo test"}"#);
+        let second = window_call("call_0", "run_command", r#"{"command": "rm -r target"}"#);
+        assert_eq!(
+            mirror(&mut fake, 5, "helper_a", "Tests", &first, ""),
+            Mirrored::Sent
+        );
+        assert_eq!(
+            mirror(&mut fake, 5, "helper_b", "Tests", &second, ""),
+            Mirrored::Later
+        );
+        arrives(&fake);
+        // The desk answers the second, which leaves the first's copy up.
+        let spawned = fake.spawned;
+        settled_in_window(&mut fake, 5, "helper_b", "call_0");
+        assert!(fake.remote.mirror.is_some());
+        assert_eq!(fake.spawned, spawned);
+        // An older card's buttons that stayed, keyed by the call id, answer
+        // nothing; the copy's own answer only the first.
+        dispatch(&mut fake, tap(OWNER, OWNER, "allow:call_0"));
+        assert!(fake.answered.is_empty());
+        let allow = tap_mirror(&fake, "allow");
+        dispatch(&mut fake, allow);
+        assert_eq!(fake.answered, [answered(5, "helper_a", "call_0", "allow")]);
+    }
+
+    #[test]
+    fn a_voice_question_asked_while_a_card_is_up_has_the_owners_next_words() {
+        let mut fake = dm_host();
+        let call = window_call("w1", "run_command", r#"{"command": "cargo test"}"#);
+        assert_eq!(mirror(&mut fake, 5, "", "Tests", &call, ""), Mirrored::Sent);
+        arrives(&fake);
+        // A voice note is held while the DM is asked whether it may be
+        // transcribed, which the owner's yes answers.
+        let held = Incoming {
+            spoken: true,
+            ..from(OWNER, "")
+        };
+        fake.remote.voice.insert(Source::Telegram(OWNER), held);
+        assert!(!answer_mirror(&mut fake, &from(OWNER, "yes")));
+        assert!(fake.answered.is_empty() && fake.remote.mirror.is_some());
+    }
+
+    #[test]
+    fn a_card_goes_only_to_a_dm_this_letronna_hears() {
+        let mut fake = dm_host();
+        // A `letronna serve` hears Telegram, and would take the owner's yes
+        // for a new chat.
+        fake.elsewhere = true;
+        let call = window_call("w1", "run_command", r#"{"command": "cargo test"}"#);
+        assert_eq!(mirror(&mut fake, 5, "", "Tests", &call, ""), Mirrored::No);
+        assert_eq!(fake.spawned, 0);
+        // The window always hears its own Slack.
+        fake.config.slack.enabled = true;
+        fake.config.slack.app_token = "xapp-1".into();
+        fake.config.slack.bot_token = "xoxb-1".into();
+        fake.config.slack.owner = "U1".into();
+        assert_eq!(mirror(&mut fake, 5, "", "Tests", &call, ""), Mirrored::Sent);
+        assert_eq!(fake.remote.mirror.as_ref().unwrap().dm, Dm::Slack);
     }
 
     #[test]
