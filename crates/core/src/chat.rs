@@ -398,6 +398,17 @@ impl FinishReason {
     }
 }
 
+/// Whether a request may go to `url` over plain HTTP: to this computer
+/// always, and anywhere on the local network when `opted_in`.
+fn plain_http(url: &reqwest::Url, opted_in: bool) -> bool {
+    // Plain HTTP sends the key in the clear. On this computer nobody else
+    // sees it; a local network can still be a cafe's, so reaching one --
+    // host.docker.internal, or a proxy named on a container's network --
+    // waits for the user to opt in.
+    matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+        || (opted_in && crate::web::local(url))
+}
+
 pub fn validate(connection: &Connection) -> Result<String, String> {
     let url = reqwest::Url::parse(connection.endpoint.trim())
         .map_err(|_| "Enter a valid endpoint, such as http://localhost:11434/v1".to_owned())?;
@@ -411,10 +422,13 @@ pub fn validate(connection: &Connection) -> Result<String, String> {
     {
         return Err("Use a base URL without credentials, query parameters, or fragments.".into());
     }
-    if url.scheme() == "http"
-        && !matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
-    {
-        return Err("Use HTTPS for remote providers, or HTTP on localhost.".into());
+    let opted_in = std::env::var_os("LETRONNA_ALLOW_HTTP").is_some_and(|value| value == "1");
+    if url.scheme() == "http" && !plain_http(&url, opted_in) {
+        return Err(if crate::web::local(&url) {
+            "Use HTTPS, or set LETRONNA_ALLOW_HTTP=1 for plain HTTP on the local network.".into()
+        } else {
+            "Use HTTPS for remote providers, or HTTP on localhost.".into()
+        });
     }
     if connection.model.trim().is_empty() {
         return Err("Enter the model ID served by your provider in Connection settings.".into());
@@ -3289,6 +3303,36 @@ mod tests {
         c.model = "test".into();
         c.endpoint = "http://example.com/v1".into();
         assert!(validate(&c).is_err());
+    }
+    #[test]
+    fn a_docker_host_over_http_is_allowed_when_opted_in() {
+        for endpoint in [
+            "http://host.docker.internal:4000/v1",
+            "http://proxy:8080/v1",
+            "http://172.17.0.1:8000/v1",
+            "http://192.168.1.5:11434/v1",
+            "http://10.0.0.7/v1",
+            "http://169.254.10.1/v1",
+            "http://[fd00::5]:8000/v1",
+        ] {
+            let url = reqwest::Url::parse(endpoint).unwrap();
+            assert!(plain_http(&url, true), "{endpoint}");
+            assert!(!plain_http(&url, false), "{endpoint}");
+        }
+        let localhost = reqwest::Url::parse("http://localhost:11434/v1").unwrap();
+        assert!(plain_http(&localhost, false));
+    }
+    #[test]
+    fn a_public_host_over_http_is_still_refused() {
+        for endpoint in [
+            "http://example.com/v1",
+            "http://api.openai.com/v1",
+            "http://8.8.8.8/v1",
+            "http://[2001:4860::8888]/v1",
+        ] {
+            let url = reqwest::Url::parse(endpoint).unwrap();
+            assert!(!plain_http(&url, true), "{endpoint}");
+        }
     }
     #[test]
     fn parses_text_and_provider_errors() {
