@@ -194,8 +194,75 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # The terminal alone, linked statically against musl: a file that needs no
+  # C library from the system, so it starts where the glibc 2.35 build above
+  # cannot -- an older distribution, Alpine, the slim images benchmark tasks
+  # run in. The window stays out: its graphics libraries come from the
+  # system. Each processor builds on its own runner, because Ubuntu's
+  # musl-gcc, which ring and QuickJS are compiled with, only makes code for
+  # the processor it runs on.
+  static:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: linux-x64-musl
+            triple: x86_64-unknown-linux-musl
+          - os: ubuntu-22.04-arm
+            target: linux-arm64-musl
+            triple: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: stable
+          targets: ${{ matrix.triple }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: musl C compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      # Named outright: for aarch64 the cc crate would look for
+      # aarch64-linux-musl-gcc, which Ubuntu does not ship.
+      - name: Build
+        env:
+          TARGET_CC: musl-gcc
+        run: cargo build --release --locked -p letronna-cli --target ${{ matrix.triple }}
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.triple }}/release/letronna dist/letronna-${{ matrix.target }}
+
+      # What makes it static, checked: it starts on a glibc older than the
+      # one the other Linux build needs, and on a system with no glibc.
+      - name: It says the tag's version on Debian 11 and on Alpine
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          for image in debian:bullseye-slim alpine:3.22; do
+            said=$(docker run --rm -v "$PWD/dist:/dist:ro" "$image" \
+              /dist/letronna-${{ matrix.target }} --version | awk '{print $NF}')
+            if [ "$said" != "$want" ]; then
+              echo "::error::letronna-${{ matrix.target }} says '$said' on $image, not $want"
+              exit 1
+            fi
+          done
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: letronna-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
   draft:
-    needs: build
+    needs: [build, static]
     runs-on: ubuntu-22.04
     permissions:
       contents: write

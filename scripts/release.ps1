@@ -36,7 +36,10 @@ $ProgressPreference = 'SilentlyContinue'
 $root = Split-Path $PSScriptRoot -Parent
 $repo = if ($env:LETRONNA_RELEASE_REPO) { $env:LETRONNA_RELEASE_REPO } else { 'gadlus/letronna' }
 $key = if ($env:LETRONNA_RELEASE_KEY) { $env:LETRONNA_RELEASE_KEY } else { Join-Path $HOME '.letronna-release\release.pem' }
-$targets = 'windows-x64', 'linux-x64', 'macos-arm64'
+# The musl builds are the terminal alone, listed so their SHA-256 is signed
+# too; the updater never asks for them, since it goes by `linux-x64` and
+# `linux-arm64`.
+$targets = 'windows-x64', 'linux-x64', 'macos-arm64', 'linux-x64-musl', 'linux-arm64-musl'
 
 function Fail([string] $message) {
     Write-Host "  $message" -ForegroundColor Red
