@@ -191,7 +191,9 @@ pub const PLAN_APPROVED: &str = "The user approved this plan. Plan mode is off; 
 /// The tool result the model gets when the user wants the plan changed.
 pub const KEEP_PLANNING: &str =
     "Keep planning: the user wants changes. Ask what to change, or refine the plan.";
-const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long `run_command` waits on a command before moving it to the
+/// background, or stopping it where it cannot be moved.
+pub const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// The most seconds a call can give a command to finish: half an hour fits
 /// a slow build or a full test suite, and what runs longer belongs in the
 /// background, where it does not hold the turn up.
@@ -234,7 +236,7 @@ const PIPE_GRACE: Duration = Duration::from_millis(300);
 /// whole instead of trimming its middle again, marker line and all. A quarter
 /// goes to the start and the rest to the end, because a build, a test run or
 /// an install ends with its errors, its summary and the exit code.
-const MAX_OUTPUT: usize = crate::chat::MAX_TOOL_CHARS;
+pub const MAX_OUTPUT: usize = crate::chat::MAX_TOOL_CHARS;
 /// Bytes kept free for the line that says what was left out, which with the
 /// largest counts a `usize` can hold is still shorter than this, apart from
 /// the name of the file the whole output was saved to.

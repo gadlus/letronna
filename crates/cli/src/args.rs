@@ -32,6 +32,8 @@ Options
       --gateway <name>     the gateway that model is on
       --effort <level>     how hard it thinks in this session, or auto
       --offline            with doctor: leave the network alone
+      --dump-config        print the settings and limits a -p run in a new
+                           session gets with the same flags, as JSON
   -h, --help               this
   -V, --version            which version this is
 
@@ -115,6 +117,9 @@ pub struct Args {
     pub mcp: Option<Vec<String>>,
     /// `letronna acp`: speak the Agent Client Protocol on stdin and stdout.
     pub acp: bool,
+    /// `--dump-config`: print what a `-p` run with these flags would get
+    /// instead of running one.
+    pub dump_config: bool,
 }
 
 pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -145,6 +150,7 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         budget: None,
         mcp: None,
         acp: false,
+        dump_config: false,
     };
     // Only as the first word, so `-p mcp` still asks about it.
     if raw.next_if(|first| first == "mcp").is_some() {
@@ -164,6 +170,7 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
             "update" => args.update = true,
             "doctor" => args.doctor = true,
             "--offline" => args.offline = true,
+            "--dump-config" => args.dump_config = true,
             // A flag straight after, short or long, is not the question, so
             // `-p --output json "what is this"` and `-p -c "what is this"`
             // take the bare word after it. A flag is one word, so a question
@@ -288,8 +295,16 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         || args.max_rounds.is_some()
         || args.tools.is_some()
         || args.budget.is_some();
-    if shaped && !args.once() {
+    // The dump says what they would come to, so it takes them without -p.
+    if shaped && !args.once() && !args.dump_config {
         return Err("--output, --max-rounds, --tools and --budget only work with -p.".into());
+    }
+    // It reads the model from the settings and the flags, not from a
+    // session that has one of its own.
+    if args.dump_config && args.start != Start::Fresh {
+        return Err(
+            "--dump-config describes a new session, so it takes no --continue or --resume.".into(),
+        );
     }
     Ok(args)
 }
@@ -509,6 +524,28 @@ mod tests {
         // A question of more than one word that starts with a dash is still one.
         let dashed = args(&["-p", "-5 or 5?"]);
         assert_eq!(dashed.prompt.as_deref(), Some("-5 or 5?"));
+    }
+
+    #[test]
+    fn dump_config_takes_the_run_flags_without_p_but_no_session_to_resume() {
+        let dump = args(&[
+            "--dump-config",
+            "--max-rounds",
+            "40",
+            "--tools",
+            "read_file",
+            "--budget",
+            "1000",
+        ]);
+        assert!(dump.dump_config && !dump.once());
+        assert_eq!(dump.max_rounds, Some(40));
+        // So a runner can add it to the line it runs with.
+        assert!(args(&["-p", "fix it", "--output", "json", "--dump-config"]).dump_config);
+        assert!(!args(&["-p", "fix it"]).dump_config);
+        let resumed =
+            "--dump-config describes a new session, so it takes no --continue or --resume.";
+        assert_eq!(refused(&["--dump-config", "--continue"]), resumed);
+        assert_eq!(refused(&["--dump-config", "--resume", "137"]), resumed);
     }
 
     #[test]

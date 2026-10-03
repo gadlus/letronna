@@ -587,13 +587,21 @@ impl Budget {
 /// and what the system prompt, the tools and subfolders' instructions take.
 fn budget(connection: &Connection, cap: u64) -> Budget {
     let facts = crate::models::facts(&connection.endpoint, connection.model.trim());
-    let cap = match cap {
-        0 => CAP_TOKENS,
-        cap => cap as usize,
-    };
     // The instructions ride on results the window counts without them.
     let fixed = fixed_tokens(connection) + crate::subfolders::reserve(connection);
-    sized(facts.context, facts.max_output, cap, fixed)
+    sized(facts.context, facts.max_output, cap_tokens(cap), fixed)
+}
+
+/// The most tokens a request carries besides the reply under a cap of `cap`
+/// (0 for the default) when the model's window holds that many.
+pub fn cap_tokens(cap: u64) -> usize {
+    // `sized` gives no window less than the floor, so a lower cap would say
+    // less than a request gets.
+    match cap {
+        0 => CAP_TOKENS,
+        cap => cap as usize,
+    }
+    .max(CONTEXT_TOKENS)
 }
 
 /// What the system prompt and the tools take of every request over
@@ -6703,6 +6711,20 @@ mod tests {
         assert!(default.tokens < CAP_TOKENS, "{default:?}");
         // Or under the user's own cap.
         assert_eq!(budget(&gpt, 20_000).step, 10_000);
+    }
+
+    #[test]
+    fn the_cap_is_the_default_for_nothing_and_never_under_the_floor() {
+        assert_eq!(cap_tokens(0), CAP_TOKENS);
+        assert_eq!(cap_tokens(20_000), 20_000);
+        assert_eq!(cap_tokens(1_000), CONTEXT_TOKENS);
+        // A request under a cap below the floor gets the floor's window.
+        let gpt = Connection {
+            endpoint: "https://sized.test/v1".into(),
+            model: "gpt-4o".into(),
+            ..connection()
+        };
+        assert_eq!(budget(&gpt, 1_000), budget(&gpt, CONTEXT_TOKENS as u64));
     }
 
     #[test]
