@@ -774,7 +774,7 @@ pub(crate) fn control(args: &Value, caller: &Caller) -> Option<Result<String, St
                 drop(runs);
                 let whole = std::fs::read_to_string(kept)
                     .map_err(|e| format!("{to}'s result could not be read: {e}"));
-                whole.and_then(|whole| agents::page(to, &whole, offset(args)))
+                whole.and_then(|whole| agents::page(to, &whole, offset(args), None))
             }
         },
         _ => Err(format!(
