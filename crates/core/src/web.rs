@@ -54,6 +54,11 @@ const MEMO_PAGES: usize = 64;
 /// are read, or hundreds of ordinary ones.
 const MEMO_BYTES: usize = 8 * 1024 * 1024;
 
+/// The most of an error answer's words that are shown, in characters: room
+/// for an API's reason and the state it hands back to carry on from, or an
+/// error page's message, without a whole page in every failed fetch.
+const MAX_ERROR_CHARS: usize = 2000;
+
 /// How long a fetch may take, redirects and all.
 const FETCH_TIME: Duration = Duration::from_secs(20);
 
@@ -211,9 +216,6 @@ fn fetch(raw: &str, secrets: &[String], fresh: bool) -> Result<Page, String> {
         url = next;
     };
     let status = response.status();
-    if !status.is_success() {
-        return Err(format!("The page answered HTTP {}.", status.as_u16()));
-    }
     let reached = response.url().clone();
     let address = reached.to_string();
     let kind = response
@@ -222,6 +224,9 @@ fn fetch(raw: &str, secrets: &[String], fresh: bool) -> Result<Page, String> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    if !status.is_success() {
+        return Err(error_answer(status.as_u16(), response, &kind, &reached));
+    }
     if kind.contains("pdf") {
         return pdf(response, address);
     }
@@ -255,6 +260,42 @@ fn fetch(raw: &str, secrets: &[String], fresh: bool) -> Result<Page, String> {
         memo.put([asked, memo_key(&reached)], text.clone(), Instant::now());
     }
     Ok(Page::Text(text))
+}
+
+/// The error `code` a page answered, over what it said with it when that is
+/// text: reduced as a page is, fenced, and cut to `MAX_ERROR_CHARS`.
+fn error_answer(
+    code: u16,
+    response: reqwest::blocking::Response,
+    kind: &str,
+    reached: &reqwest::Url,
+) -> String {
+    let lead = format!("The page answered HTTP {code}.");
+    let mut bytes = Vec::new();
+    // What arrived before the body stopped still says why, so a failed read
+    // only shortens it.
+    let _ = response.take(MAX_BYTES).read_to_end(&mut bytes);
+    let body = String::from_utf8_lossy(&bytes);
+    let said = if kind.contains("html") {
+        text_of(&body, reached)
+    } else if kind.is_empty()
+        || kind.starts_with("text/")
+        || kind.contains("json")
+        || kind.contains("xml")
+    {
+        body.into_owned()
+    } else {
+        // An image or a download says nothing the model can read.
+        return lead;
+    };
+    // Hidden before the cut below, which could split a key and leave part of
+    // it showing, and as cut already, since the read may have stopped in one.
+    let said = crate::redact::scrub_cut(&said, true);
+    let said = said.trim();
+    if said.is_empty() {
+        return lead;
+    }
+    crate::untrusted::quoted(&lead, &crate::page::cut(said, MAX_ERROR_CHARS))
 }
 
 /// The PDF `response` carries, unless it is larger than `MAX_PDF_BYTES`.
@@ -1069,6 +1110,79 @@ or <a data-href="/x" href=/top#part>the top</a>.</p>
         assert!(!asked.iter().any(|path| path.contains(&key)), "{asked:?}");
         // The address asked for, then the five redirects that are followed.
         assert_eq!(asked.iter().filter(|path| *path == "/loop").count(), 6);
+    }
+
+    /// The stand-in site's error answers, each with a body of its own.
+    fn errors(path: &str) -> String {
+        let (status, kind, body) = match path {
+            "/gone" => (
+                "410 Gone",
+                "application/json",
+                r#"{"error":"cursor_expired","checkpoint":"/v1/items?cursor=c42"}"#.to_owned(),
+            ),
+            "/missing" => (
+                "404 Not Found",
+                "text/html",
+                "<html><head><style>h1 { color: red; }</style></head><body><h1>Not here</h1>\
+                 <p>Try <a href=\"/home\">the home page</a>.</p></body></html>"
+                    .to_owned(),
+            ),
+            "/long" => (
+                "500 Internal Server Error",
+                "text/plain",
+                format!("{}the end", "x".repeat(MAX_ERROR_CHARS)),
+            ),
+            "/picture" => ("404 Not Found", "image/png", "PNG picture".to_owned()),
+            _ => ("503 Service Unavailable", "text/plain", String::new()),
+        };
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn an_error_answer_keeps_its_body_fenced() {
+        let (base, _) = serve(errors);
+        let why = fetch(&format!("{base}/gone"), &[], false).unwrap_err();
+        let (lead, rest) = why.split_once('\n').unwrap();
+        assert_eq!(lead, "The page answered HTTP 410.");
+        assert!(rest.starts_with("<untrusted-content-"), "{why}");
+        assert!(rest.trim_end().ends_with('>'), "{why}");
+        assert!(
+            rest.contains("\"checkpoint\":\"/v1/items?cursor=c42\""),
+            "{why}"
+        );
+        // An error page is read as a page is: its words and links, not its
+        // markup.
+        let why = fetch(&format!("{base}/missing"), &[], false).unwrap_err();
+        assert!(
+            why.starts_with("The page answered HTTP 404.\n<untrusted-content-"),
+            "{why}"
+        );
+        assert!(why.contains("# Not here"), "{why}");
+        assert!(
+            why.contains(&format!("[the home page]({base}/home)")),
+            "{why}"
+        );
+        assert!(!why.contains("color"), "{why}");
+    }
+
+    #[test]
+    fn an_error_answer_is_cut_short_and_one_with_nothing_to_read_is_its_code() {
+        let (base, _) = serve(errors);
+        let why = fetch(&format!("{base}/long"), &[], false).unwrap_err();
+        assert!(why.starts_with("The page answered HTTP 500.\n"), "{why}");
+        assert!(
+            why.contains(&format!("{}…", "x".repeat(MAX_ERROR_CHARS))),
+            "{why}"
+        );
+        assert!(!why.contains("the end"), "{why}");
+        let why = fetch(&format!("{base}/picture"), &[], false).unwrap_err();
+        assert_eq!(why, "The page answered HTTP 404.");
+        let why = fetch(&format!("{base}/busy"), &[], false).unwrap_err();
+        assert_eq!(why, "The page answered HTTP 503.");
     }
 
     /// A PDF of two pages, its page tree written out plainly.
