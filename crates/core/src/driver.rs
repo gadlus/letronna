@@ -3899,6 +3899,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_default_mode_schedule_gets_no_dont_ask_note() {
+        use gate::Mode;
+        for (at, mode, told) in [
+            (AGENTS + 1310, Mode::Default, None),
+            (AGENTS + 1320, Mode::AcceptEdits, Some("Don't ask")),
+            (AGENTS + 1330, Mode::Bypass, Some("Don't ask")),
+        ] {
+            let dir = scratch(&format!("schedule-note-{}", mode.name()));
+            let (endpoint, provider) = provider(vec![reply("Nothing needed tidying.", &[])]);
+            let report = finished(scheduled(endpoint, &dir, at, mode));
+            assert_eq!(report.status, Outcome::Done, "{mode:?}");
+            let sent = provider.sent();
+            let notes: Vec<&str> = messages(&sent[0])
+                .iter()
+                .filter_map(|message| message["content"].as_str()?.split_once("\n- Mode: "))
+                .filter_map(|(_, note)| note.split('.').next())
+                .collect();
+            assert_eq!(notes, told.as_slice(), "{mode:?}");
+        }
+    }
+
+    #[test]
     fn a_scheduled_run_in_auto_runs_what_the_judge_allows_on_the_jobs_prompt() {
         let _serving = crate::approvals::tests::SERVING
             .lock()
