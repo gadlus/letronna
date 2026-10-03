@@ -803,6 +803,11 @@ fn as_json(report: &Report) -> Value {
     if let Outcome::Failed(error) = &report.status {
         out["error"] = error.as_str().into();
     }
+    // Only when a file the request asked for is still wrong, so a result
+    // with nothing open reads as it always has.
+    if !report.contract.is_empty() {
+        out["contract"] = report.contract.clone().into();
+    }
     out
 }
 

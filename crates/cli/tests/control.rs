@@ -1,6 +1,6 @@
 //! `letronna -p --input-format stream-json`, driven over stdin as another
-//! program would drive it, against a local stub provider and a data folder of
-//! its own.
+//! program would drive it, and `-p --output json` as a script reads it,
+//! against a local stub provider and a data folder of its own.
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -469,4 +469,31 @@ fn an_interrupt_with_no_turn_running_leaves_the_next_message_alone() {
     run.say("go on");
     assert_eq!(run.next()["status"], "done");
     assert_eq!(run.close(), 0);
+}
+
+#[test]
+fn a_run_that_never_writes_its_required_file_says_so_in_the_json_result() {
+    let (data, work) = scratch("contract");
+    // The check sends it back once, and it ends again without the file.
+    let (endpoint, bodies) = provider(vec![reply("Done.", &[]), reply("Still done.", &[])]);
+    let ask = "Read notes.txt and write what it says to out/summary.json.";
+    let run = Driven::start(&data, &work, &endpoint, &["-p", ask, "--output", "json"]);
+    let result = run.next();
+    // Still done, so a script's idea of success is as it was.
+    assert_eq!(
+        (&result["status"], &result["answer"], &result["contract"]),
+        (
+            &json!("done"),
+            &json!("Still done."),
+            &json!(["`out/summary.json` does not exist."])
+        )
+    );
+    assert_eq!(run.close(), 0);
+    let _ = bodies.recv_timeout(WAIT).unwrap();
+    let (role, check) = said(&bodies.recv_timeout(WAIT).unwrap()).pop().unwrap();
+    assert_eq!(role, "user");
+    assert!(
+        check.contains("`out/summary.json` does not exist."),
+        "{check}"
+    );
 }
