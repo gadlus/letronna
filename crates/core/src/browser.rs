@@ -266,6 +266,30 @@ const FOCUSED: &str = "(() => {
   for (let hops = 0; at && at.contentDocument && hops < 16; hops++) at = at.contentDocument.activeElement;
   return at;
 })()";
+/// Whether a key pressed now goes to this element or into it -- through
+/// the shadow roots and frames above it whose page may read it -- or else
+/// to another field that takes text, as the next box of a code moved to:
+/// anywhere else, such as the page itself, it may be a site's shortcut.
+const TAKES_KEYS: &str = "function() {
+  let into = true;
+  for (let at = this; at && into; ) {
+    const root = at.getRootNode();
+    const active = root.activeElement;
+    into = !!active && (active === at || at.contains(active));
+    at = root.host || root.defaultView?.frameElement;
+  }
+  if (into) return true;
+  let doc = this.ownerDocument;
+  while (doc.defaultView?.frameElement) doc = doc.defaultView.frameElement.ownerDocument;
+  let at = doc.activeElement;
+  for (let hops = 0; hops < 16; hops++) {
+    const inner = at?.shadowRoot?.activeElement || at?.contentDocument?.activeElement;
+    if (!inner) break;
+    at = inner;
+  }
+  return !!at && (at.isContentEditable || at.localName === 'textarea'
+    || at.localName === 'input' && /^(text|search|email|tel|url|password|number)$/.test(at.type));
+}";
 /// The document an element is in, to look through for the options a
 /// dropdown of the site's own shows once opened.
 const DOCUMENT_OF: &str = "function() { return this.ownerDocument; }";
@@ -500,7 +524,7 @@ impl Tool for UsePage {
         "use_page"
     }
     fn description(&self) -> &'static str {
-        "Act on the page open in browse, the way a person would: `click` an element, `type` into a field (it replaces what is there; `submit` presses Enter after), `press` a key such as Enter, Tab, Escape or ArrowDown, `select` a dropdown's option by its text (a site's own dropdown too: it is opened and the option clicked), `upload` files from the project into a file field, `drag` an element onto another (`to`) or to a point, or `eval` a JavaScript expression and get its value back. Elements are named by the refs browse lists, such as e12; one listed under a frame's header marked cross-origin or opaque origin also needs `frame`, the origin that header names after \"frame\", and each such action is asked about on its own. `click` also takes a point instead of a ref, and names what was there: `x` and `y` in CSS pixels from the top left of the view, which is as big as the latest screenshot's result says -- not the picture's own pixels, which may have been shrunk on the way to you, and read off a screenshot of the view, not of the whole page. It is refused once the page has changed or scrolled since it was last seen, and inside a frame from another origin than the page's. `batch` runs `steps`, a list of these actions and browse's hover, wait and scroll, each written as its own call would be, in order in one call, stopping at the first that fails (a wait whose text does not come counts), and gives each step's short result; each step is asked about as it would be alone. Returns what changed on the page afterwards: the lines that are new (`>`) or gone (`<`), with the lines around them and where they are, measured against the page as you last saw it listed in this tab; the whole page instead after it loaded another page, when there is no earlier listing to measure against, or with `listing` set to `full`. It names any file an action downloaded, saved in the project's media/downloads folder (one the page starts a little later is named in the next result). A question the page asks, such as \"Are you sure?\", is answered Cancel unless `confirm` is true. Close a cookie banner or popup before acting on what it covers. Use a site's own search, filters and sort before paging through its results. After typing into a field that suggests as you type, click the suggestion that fits from what changed -- or wait for it with browse's wait if none shows yet -- rather than pressing Enter or using `submit`. Fill a form with one batch that ends with the click that sends it, unless a field suggests as you type or the form pays, buys, deletes or sends a message: then look at the filled form before sending. Read a long page with browse's look and `find` before asking for `full`. Before saying a task on the web is done, check that the page shows it done, and give the user only names, prices and addresses the pages showed, saying so when something asked for was not there."
+        "Act on the page open in browse, the way a person would: `click` an element, `type` into a field (it replaces what is there; `submit` presses Enter after), `press` a key such as Enter, Tab, Escape or ArrowDown, `select` a dropdown's option by its text (a site's own dropdown too: it is opened and the option clicked), `upload` files from the project into a file field, `drag` an element onto another (`to`) or to a point, or `eval` a JavaScript expression and get its value back. Elements are named by the refs browse lists, such as e12; one listed under a frame's header marked cross-origin or opaque origin also needs `frame`, the origin that header names after \"frame\", and each such action is asked about on its own. `click` also takes a point instead of a ref, and names what was there: `x` and `y` in CSS pixels from the top left of the view, which is as big as the latest screenshot's result says -- not the picture's own pixels, which may have been shrunk on the way to you, and read off a screenshot of the view, not of the whole page. It is refused once the page has changed or scrolled since it was last seen, and inside a frame from another origin than the page's. `batch` runs `steps`, a list of these actions and browse's hover, wait and scroll, each written as its own call would be, in order in one call, stopping at the first that fails (a wait whose text does not come counts), and gives each step's short result; each step is asked about as it would be alone. Returns what changed on the page afterwards: the lines that are new (`>`) or gone (`<`), with the lines around them and where they are, measured against the page as you last saw it listed in this tab; the whole page instead after it loaded another page, when there is no earlier listing to measure against, or with `listing` set to `full`. It names any file an action downloaded, saved in the project's media/downloads folder (one the page starts a little later is named in the next result). A question the page asks, such as \"Are you sure?\", is answered Cancel unless `confirm` is true. Close a cookie banner or popup before acting on what it covers. Use a site's own search, filters and sort before paging through its results. After typing into a field that suggests as you type, click the suggestion that fits from what changed -- or wait for it with browse's wait if none shows yet, or type it again with `keys` true if none comes at all -- rather than pressing Enter or using `submit`. Fill a form with one batch that ends with the click that sends it, unless a field suggests as you type or the form pays, buys, deletes or sends a message: then look at the filled form before sending. Read a long page with browse's look and `find` before asking for `full`. Before saying a task on the web is done, check that the page shows it done, and give the user only names, prices and addresses the pages showed, saying so when something asked for was not there."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -512,6 +536,7 @@ impl Tool for UsePage {
             "frame": {"type": "string", "description": "For an element in a frame from another origin than the page's, or keys typed or pressed while focus is in one: that origin, as the frame's header in the listing names it, such as https://pay.example, or opaque:https://pay.example for one whose origin is opaque, as a sandboxed frame's is. Left out otherwise."},
             "text": {"type": "string", "description": "For type: what to type. For select: the option's text, in a <select> or a site's own dropdown."},
             "submit": {"type": "boolean", "description": "For type: press Enter afterwards."},
+            "keys": {"type": "boolean", "description": "For type: press a key for each character, as a person types, instead of putting the text in at once. It is slower, so it is for short text, such as a city or an address, in a field that suggests only as keys are pressed."},
             "key": {"type": "string", "description": "For press: Enter, Tab, Escape, Backspace, Delete, an arrow such as ArrowDown, Home, End, PageUp, PageDown, Space, or one character. With a ref, the element is focused first."},
             "files": {"type": "array", "items": {"type": "string"}, "description": "For upload: the files to put in the field, by their paths in the project."},
             "script": {"type": "string", "description": "For eval: a JavaScript expression, run in the page."},
@@ -615,10 +640,11 @@ impl UsePage {
                     .as_str()
                     .ok_or("`text` is required for type.")?;
                 let submit = args["submit"].as_bool().unwrap_or(false);
+                let keys = args["keys"].as_bool().unwrap_or(false);
                 with_downloads(&saving, |session| {
                     let node = target(session)?;
                     session.act(agree, Some(&saving), after, |session| {
-                        session.type_into(node, text, submit, frame)
+                        session.type_into(node, text, submit, frame, keys)
                     })
                 })
             }
@@ -2291,6 +2317,16 @@ pub(crate) fn key(name: &str) -> Option<Key> {
         },
         text: c.to_string(),
     })
+}
+
+/// The key that types `c`; `None` for any other space than the space bar's,
+/// such as a line break or a tab, which `key` takes for the space bar.
+fn typed_key(c: char) -> Option<Key> {
+    match c {
+        ' ' => key(" "),
+        c if c.is_whitespace() => None,
+        c => key(&c.to_string()),
+    }
 }
 
 /// The events that press a key and let it go, with `modifiers` held as the
@@ -5000,15 +5036,18 @@ impl Session {
         }
     }
 
-    /// Replace what the field `node` holds with `text`, each round of keys
-    /// going only where `frame` says, as `keys_go_to` makes sure first: the
-    /// page may move focus as the field is focused, or at any key.
+    /// Replace what the field `node` holds with `text` -- put in at once, or
+    /// with `keys` a key for each character while focus stays where keys
+    /// type -- each round of keys going only where `frame` says, as
+    /// `keys_go_to` makes sure first: the page may move focus as the field
+    /// is focused, or at any key.
     fn type_into(
         &mut self,
         node: i64,
         text: &str,
         submit: bool,
         frame: Option<&str>,
+        keys: bool,
     ) -> Result<(), String> {
         // Not what is typed: it may be a password.
         self.point(node, "Typing into".into(), None);
@@ -5034,6 +5073,35 @@ impl Session {
         self.keys_go_to(frame)?;
         match text.is_empty() {
             true => self.press(&erase)?,
+            false if keys => {
+                let object = self.object(node)?;
+                let count = text.chars().count();
+                for (typed, c) in text.chars().enumerate() {
+                    // The first key's frame was looked at just above.
+                    if typed > 0 {
+                        self.keys_go_to(frame)?;
+                    }
+                    let asked = json!({"objectId": object, "functionDeclaration": TAKES_KEYS,
+                                       "returnByValue": true});
+                    let takes: Value = self.on_node("Runtime.callFunctionOn", asked)?;
+                    // Somewhere else, or a page that broke the function.
+                    if takes["result"]["value"] != true {
+                        return Err(format!(
+                            "Focus left the field with {typed} of {count} characters typed, so \
+                             no more keys were pressed: there, a key may be one of the page's \
+                             shortcuts. Look at the page before typing the rest."
+                        ));
+                    }
+                    match typed_key(c) {
+                        Some(key) => self.press(&key)?,
+                        // As without `keys`: pressed, a line break's Enter
+                        // would send the form, and a Tab leave the field.
+                        None => (self.tab)
+                            .call::<Ignored>("Input.insertText", json!({"text": c.to_string()}))
+                            .map(drop)?,
+                    }
+                }
+            }
             false => self
                 .tab
                 .call::<Ignored>("Input.insertText", json!({"text": text}))
@@ -6161,6 +6229,7 @@ mod tests {
             "cookie banner or popup before acting on what it covers",
             "own search, filters and sort before paging",
             "click the suggestion that fits",
+            "type it again with `keys` true if none comes",
             "one batch that ends with the click that sends it",
             "pays, buys, deletes or sends a message: then look at the filled form before sending",
             "`find` before asking for `full`",
@@ -7334,9 +7403,9 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// A page whose field answers the function that sets it with `set`;
-    /// what that function was given, each key and each text typed are kept
-    /// in `seen`.
+    /// A page whose field answers the function that sets it with `set`,
+    /// and keeps focus; what that function was given, each look at where
+    /// focus is, each key and each text typed are kept in `seen`.
     fn field_page(
         set: Value,
         seen: Arc<Mutex<Vec<String>>>,
@@ -7344,6 +7413,9 @@ mod tests {
         move |method, params| {
             let said = |at: &Value| at.as_str().unwrap_or_default().to_owned();
             let heard = match method {
+                "Runtime.callFunctionOn" if params["functionDeclaration"] == TAKES_KEYS => {
+                    Some("focus?".to_owned())
+                }
                 "Runtime.callFunctionOn" => {
                     Some(format!("set {}", said(&params["arguments"][0]["value"])))
                 }
@@ -7359,6 +7431,9 @@ mod tests {
                 "Page.getFrameTree" => json!({"frameTree": {"frame": {"id": "TOP"}}}),
                 "Page.createIsolatedWorld" => json!({"executionContextId": 1}),
                 "DOM.resolveNode" => json!({"object": {"objectId": "O"}}),
+                "Runtime.callFunctionOn" if params["functionDeclaration"] == TAKES_KEYS => {
+                    json!({"result": {"type": "boolean", "value": true}})
+                }
                 "Runtime.callFunctionOn" => {
                     assert_eq!(params["functionDeclaration"], SET_VALUE);
                     set.clone()
@@ -7374,11 +7449,15 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let set = json!({"result": {"type": "string", "value": ""}});
         let (mut session, server) = fake_session(field_page(set, seen.clone()));
-        session.type_into(3, "2026-10-02", false, None).unwrap();
+        session
+            .type_into(3, "2026-10-02", false, None, false)
+            .unwrap();
         assert_eq!(*seen.lock().unwrap(), ["set 2026-10-02"]);
         seen.lock().unwrap().clear();
         // Asked to, it still presses Enter once the field is set.
-        session.type_into(3, "2026-10-02", true, None).unwrap();
+        session
+            .type_into(3, "2026-10-02", true, None, false)
+            .unwrap();
         assert_eq!(
             *seen.lock().unwrap(),
             ["set 2026-10-02", "keyDown Enter", "keyUp Enter"]
@@ -7394,7 +7473,7 @@ mod tests {
         assert!(SET_VALUE.contains(shape));
         let refused = json!({"result": {"type": "string", "value": shape}});
         let (mut session, server) = fake_session(field_page(refused, seen.clone()));
-        let typed = session.type_into(3, "02/10/2026", true, None);
+        let typed = session.type_into(3, "02/10/2026", true, None, false);
         assert_eq!(typed, Err(shape.to_owned()));
         // Nothing is typed, and Enter does not send the form.
         assert_eq!(*seen.lock().unwrap(), ["set 02/10/2026"]);
@@ -7418,7 +7497,10 @@ mod tests {
             let seen = Arc::new(Mutex::new(Vec::new()));
             let refused = json!({"result": {"type": "object", "value": range}});
             let (mut session, server) = fake_session(field_page(refused, seen.clone()));
-            assert_eq!(session.type_into(3, "5", false, None), Err(said.to_owned()));
+            assert_eq!(
+                session.type_into(3, "5", false, None, false),
+                Err(said.to_owned())
+            );
             assert_eq!(*seen.lock().unwrap(), ["set 5"]);
             drop(session);
             server.join().unwrap();
@@ -7433,7 +7515,7 @@ mod tests {
         for set in [other, broken] {
             let seen = Arc::new(Mutex::new(Vec::new()));
             let (mut session, server) = fake_session(field_page(set, seen.clone()));
-            session.type_into(3, "Ada", true, None).unwrap();
+            session.type_into(3, "Ada", true, None, false).unwrap();
             assert_eq!(
                 *seen.lock().unwrap(),
                 [
@@ -7448,6 +7530,145 @@ mod tests {
             drop(session);
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn typing_with_keys_sends_a_key_event_per_character() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let other = json!({"result": {"type": "boolean", "value": false}});
+        let (mut session, server) = fake_session(field_page(other, seen.clone()));
+        session.type_into(3, "Ab 1\n", true, None, true).unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "set Ab 1\n",
+                "keyDown a",
+                "keyUp a",
+                "focus?",
+                "keyDown A",
+                "keyUp A",
+                "focus?",
+                "keyDown b",
+                "keyUp b",
+                "focus?",
+                "keyDown  ",
+                "keyUp  ",
+                "focus?",
+                "keyDown 1",
+                "keyUp 1",
+                // Put in as text, the line break sends no form.
+                "focus?",
+                "insert \n",
+                "keyDown Enter",
+                "keyUp Enter"
+            ]
+        );
+        // Each key types its character as it goes down.
+        let [down, _] = key_events(&typed_key('A').unwrap(), 0);
+        assert_eq!(
+            (&down["type"], &down["text"]),
+            (&json!("keyDown"), &json!("A"))
+        );
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn typing_with_keys_stops_once_focus_moves_into_another_origins_frame() {
+        let downs = Arc::new(Mutex::new(Vec::new()));
+        let heard = downs.clone();
+        let (mut session, server) = fake_session(move |method, params| {
+            if method == "Input.dispatchKeyEvent" && params["type"] == "keyDown" {
+                let key = params["key"].as_str().unwrap_or_default().to_owned();
+                heard.lock().unwrap().push(key);
+            }
+            // Select all, then the first key typed, and the page moves focus
+            // into the bank's frame.
+            let moved = heard.lock().unwrap().len() >= 2;
+            let context = params["contextId"].as_i64();
+            let answer = match method {
+                "Page.getFrameTree" => json!({"frameTree": {
+                    "frame": {"id": "TOP", "securityOrigin": "https://shop.test",
+                              "url": "https://shop.test/"},
+                    "childFrames": [{"frame": {"id": "F1", "securityOrigin": "https://bank.test",
+                                               "url": "https://bank.test/pay"}}]}}),
+                "Page.createIsolatedWorld" if params["frameId"] == "TOP" => {
+                    json!({"executionContextId": 1})
+                }
+                "Page.createIsolatedWorld" => json!({"executionContextId": 2}),
+                "Runtime.evaluate" if params["expression"] == "origin" => {
+                    let origin = match context {
+                        Some(1) => "https://shop.test",
+                        _ => "https://bank.test",
+                    };
+                    json!({"result": {"value": origin}})
+                }
+                "Runtime.evaluate" if context == Some(1) && moved => {
+                    json!({"result": {"type": "object", "objectId": "A"}})
+                }
+                "Runtime.evaluate" => json!({"result": {"type": "object", "subtype": "null"}}),
+                "DOM.describeNode" => json!({"node": {"nodeName": "IFRAME", "frameId": "F1"}}),
+                "DOM.resolveNode" => json!({"object": {"objectId": "O"}}),
+                "Runtime.callFunctionOn" if params["functionDeclaration"] == TAKES_KEYS => {
+                    json!({"result": {"type": "boolean", "value": true}})
+                }
+                _ => json!({}),
+            };
+            (Vec::new(), answer)
+        });
+        let refused = session.type_into(3, "Ada", false, None, true).unwrap_err();
+        assert!(refused.starts_with("Focus is inside a frame"), "{refused}");
+        assert_eq!(*downs.lock().unwrap(), ["a", "A"]);
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn typing_with_keys_stops_once_focus_leaves_the_field_for_the_page() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let other = json!({"result": {"type": "boolean", "value": false}});
+        let field = field_page(other, seen.clone());
+        let heard = seen.clone();
+        let (mut session, server) = fake_session(move |method, params| {
+            // Select all, then the first key typed, and the page moves focus
+            // to its body, where the next keys would be its shortcuts.
+            let ups = heard
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.starts_with("keyUp"))
+                .count();
+            let (told, answer) = field(method, params);
+            match params["functionDeclaration"] == TAKES_KEYS && ups >= 2 {
+                true => (told, json!({"result": {"type": "boolean", "value": false}})),
+                false => (told, answer),
+            }
+        });
+        let refused = session.type_into(3, "receipts", true, None, true);
+        assert_eq!(
+            refused,
+            Err(
+                "Focus left the field with 1 of 8 characters typed, so no more keys were \
+                 pressed: there, a key may be one of the page's shortcuts. Look at the page \
+                 before typing the rest."
+                    .to_owned()
+            )
+        );
+        // Nor is Enter pressed for submit.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "set receipts",
+                "keyDown a",
+                "keyUp a",
+                "focus?",
+                "keyDown r",
+                "keyUp r",
+                "focus?"
+            ]
+        );
+        drop(session);
+        server.join().unwrap();
     }
 
     #[test]
