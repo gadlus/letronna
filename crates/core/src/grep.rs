@@ -6,12 +6,14 @@
 //! What the model may never read is dropped in the walk's own filter, which
 //! no ignore rule or glob can overrule.
 
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::OverrideBuilder;
 use ignore::types::{Types, TypesBuilder};
 use ignore::{DirEntry, WalkBuilder};
 use regex::bytes::{Regex, RegexBuilder};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::collections::BTreeSet;
+use std::path::{MAIN_SEPARATOR_STR, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -30,6 +32,20 @@ const SKIP_DIRS: &[&str] = &[".git", ".hg", ".svn", "node_modules"];
 /// `.gitignore` leaves it out and a `build/` walked before `src/` could use
 /// up the file budget; a glob that names one searches it all the same.
 const BUILD_DIRS: &[&str] = &["target", "dist", "build", ".next"];
+/// Caches a repository's root `.gitignore` leaves out in every package of
+/// it, which the note on that `.gitignore` leaves unnamed as it does build
+/// output: they hold no source, and in a monorepo's package naming them
+/// would lengthen every search.
+const CACHE_DIRS: &[&str] = &[
+    "__pycache__",
+    ".venv",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".turbo",
+    "coverage",
+];
 /// The most a compiled pattern may take: twenty Unicode `\w` with case
 /// folding fit, and a bigger pattern is the kind that makes matching slow.
 const REGEX_BYTES: usize = 1 << 20;
@@ -60,6 +76,10 @@ const MAX_CONTEXT: usize = 5;
 /// whatever its size, which with five lines of multi-byte context either
 /// side comes to ~14k.
 const PAGE_BYTES: usize = crate::chat::MAX_TOOL_CHARS - 1_000;
+/// The most folders the note on a `.gitignore` above the project names: a
+/// `*` there, as a home folder kept in Git has, would otherwise list every
+/// folder in the project.
+const LEFT_OUT_NAMES: usize = 10;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Mode {
@@ -154,6 +174,11 @@ struct Walked {
     scanned: usize,
     stopped: bool,
     secrets: usize,
+    /// Folders a `.gitignore` above the workspace hid, in path order.
+    left_out: Vec<PathBuf>,
+    /// Whether those rules also hide files in a folder named, so naming it
+    /// as the path would not search all of it.
+    hidden_inside: bool,
 }
 
 /// Runs `query` until `deadline` or `files` files, and renders the page.
@@ -245,6 +270,27 @@ fn render(query: &Query, page: Page, note: Option<String>) -> String {
             "\n… Secret files and folders left out: {}. Ask the user to paste \
              what you need from them.",
             walked.secrets
+        ));
+    }
+    if !walked.left_out.is_empty() {
+        let left_out = &walked.left_out;
+        let (named, more) = left_out.split_at(left_out.len().min(LEFT_OUT_NAMES));
+        let mut names = named
+            .iter()
+            .map(|dir| shown(dir, query) + MAIN_SEPARATOR_STR)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !more.is_empty() {
+            names += &format!(" and {} more", more.len());
+        }
+        let though = if walked.hidden_inside {
+            ", though the same rules hide files inside too; list_dir shows all it holds"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "\n… Left out by a .gitignore above the project: {names}. Name a folder as \
+             the path to search it{though}."
         ));
     }
     out
@@ -414,7 +460,8 @@ fn walk(
     f: &mut dyn FnMut(&DirEntry) -> Next,
 ) -> Result<Walked, String> {
     let secrets = Arc::new(AtomicUsize::new(0));
-    let mut walked = Walked::default();
+    let above = ignores_above(query);
+    let (mut walked, mut dirs, mut full) = (Walked::default(), BTreeSet::new(), false);
     for entry in walker(query, secrets.clone())?.filter_map(Result::ok) {
         if walked.scanned >= files || Instant::now() >= deadline {
             walked.stopped = true;
@@ -423,12 +470,18 @@ fn walk(
         // A link is never followed: reading through it would reach whatever
         // it points at, a secret or Letronna's own folder included.
         if !entry.file_type().is_some_and(|t| t.is_file()) {
+            if !above.is_empty() && entry.file_type().is_some_and(|t| t.is_dir()) {
+                dirs.insert(entry.into_path());
+            }
             continue;
         }
         walked.scanned += 1;
         match f(&entry) {
             Next::More => {}
-            Next::Full => break,
+            Next::Full => {
+                full = true;
+                break;
+            }
             Next::Late => {
                 walked.stopped = true;
                 break;
@@ -436,7 +489,168 @@ fn walk(
         }
     }
     walked.secrets = secrets.load(Ordering::Relaxed);
+    // Only a walk that went through the whole tree knows what it passed over.
+    if !full && !walked.stopped {
+        (walked.left_out, walked.hidden_inside) = left_out(query, &above, &dirs, deadline);
+    }
     Ok(walked)
+}
+
+/// The `.gitignore` files above the workspace that the walk honours, nearest
+/// first, when the repository's root lies above the workspace, as a
+/// benchmark's sandbox or a monorepo's package does; none otherwise.
+fn ignores_above(query: &Query) -> Vec<Gitignore> {
+    let Some(workspace) = query.workspace else {
+        return Vec::new();
+    };
+    let top = query.root.ancestors().find(|dir| dir.join(".git").exists());
+    let Some(top) = top.filter(|top| *top != workspace && workspace.starts_with(top)) else {
+        return Vec::new();
+    };
+    workspace
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| dir.starts_with(top))
+        .map(|dir| Gitignore::new(dir.join(".gitignore")).0)
+        .filter(|ignore| !ignore.is_empty())
+        .collect()
+}
+
+/// The folders the walk passed over inside those it walked, `dirs`, that a
+/// `.gitignore` in `above` left out, and whether those rules hide files in
+/// the first named too; nothing once `deadline` passes.
+fn left_out(
+    query: &Query,
+    above: &[Gitignore],
+    dirs: &BTreeSet<PathBuf>,
+    deadline: Instant,
+) -> (Vec<PathBuf>, bool) {
+    // Folders are gathered only when a `.gitignore` lies above the workspace.
+    let Some(workspace) = query.workspace.filter(|_| !dirs.is_empty()) else {
+        return (Vec::new(), false);
+    };
+    // The project's own ignore files, starting with those between it and a
+    // searched folder inside it, which the walk read without walking theirs.
+    let mut inner: Vec<(PathBuf, Gitignore)> = query
+        .root
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| dir.starts_with(workspace))
+        .map(|dir| (dir.to_path_buf(), own_ignores(dir)))
+        .collect();
+    let (mut found, mut repos) = (Vec::new(), Vec::<&Path>::new());
+    // In path order, which puts a repository's root before what is in it,
+    // and a folder's ignore files before the folders they reach.
+    for dir in dirs {
+        if Instant::now() >= deadline {
+            return (Vec::new(), false);
+        }
+        if repos.iter().any(|repo| dir.starts_with(repo)) {
+            continue;
+        }
+        let Ok(children) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let children: Vec<_> = children.filter_map(Result::ok).collect();
+        // Git reads no `.gitignore` above a repository's own root, so in a
+        // repository inside the workspace those above it hide nothing.
+        if children.iter().any(|child| child.file_name() == ".git") {
+            repos.push(dir);
+            continue;
+        }
+        if children
+            .iter()
+            .any(|child| child.file_name() == ".gitignore" || child.file_name() == ".ignore")
+        {
+            inner.push((dir.clone(), own_ignores(dir)));
+        }
+        for child in children {
+            let (name, path) = (child.file_name(), child.path());
+            // A folder walked was let back in by an ignore file inside the
+            // project; skipped and secret folders stay out whatever any
+            // `.gitignore` says; and build output and caches are ignored as
+            // a matter of course, so naming them in a monorepo's package
+            // would only lengthen every search.
+            if !child.file_type().is_ok_and(|t| t.is_dir())
+                || dirs.contains(&path)
+                || SKIP_DIRS
+                    .iter()
+                    .chain(BUILD_DIRS)
+                    .chain(CACHE_DIRS)
+                    .any(|skip| name == *skip)
+                || crate::tools::secret(&path)
+            {
+                continue;
+            }
+            if hidden_above(&path, true, &inner, above) {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    // A `*` or `*.csv` above hides what is in a folder as well as the
+    // folder, and a search of it would then leave that out without a word.
+    let mut hidden_inside = false;
+    for dir in found.iter().take(LEFT_OUT_NAMES) {
+        if Instant::now() >= deadline {
+            return (Vec::new(), false);
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let entries: Vec<_> = entries.filter_map(Result::ok).collect();
+        // A repository's own root, searched, reads nothing above it.
+        if entries.iter().any(|entry| entry.file_name() == ".git") {
+            continue;
+        }
+        // Searched, the folder's own ignore files count for what is in it.
+        inner.push((dir.clone(), own_ignores(dir)));
+        hidden_inside = entries.iter().any(|entry| {
+            let (name, path) = (entry.file_name(), entry.path());
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            // What no search reads anyway is not worth the warning.
+            !SKIP_DIRS.iter().any(|skip| name == *skip)
+                && !crate::tools::secret(&path)
+                && hidden_above(&path, is_dir, &inner, above)
+        });
+        if hidden_inside {
+            break;
+        }
+    }
+    (found, hidden_inside)
+}
+
+/// Whether a rule in `above`, and none in the project's own ignore files in
+/// `inner`, leaves `path` out of the walk.
+fn hidden_above(
+    path: &Path,
+    is_dir: bool,
+    inner: &[(PathBuf, Gitignore)],
+    above: &[Gitignore],
+) -> bool {
+    // The nearest ignore file decides, and an `.ignore` outranks every
+    // `.gitignore`, so a match inside the project either way settles it there.
+    if inner
+        .iter()
+        .any(|(dir, ignore)| path.starts_with(dir) && !ignore.matched(path, is_dir).is_none())
+    {
+        return false;
+    }
+    above
+        .iter()
+        .map(|ignore| ignore.matched(path, is_dir))
+        .find(|rule| !rule.is_none())
+        .is_some_and(|rule| rule.is_ignore())
+}
+
+/// The rules in `dir`'s own `.gitignore` and `.ignore`, as one matcher.
+fn own_ignores(dir: &Path) -> Gitignore {
+    let mut builder = GitignoreBuilder::new(dir);
+    // A file that is missing or will not read adds nothing, as in the walk.
+    for name in [".gitignore", ".ignore"] {
+        let _ = builder.add(dir.join(name));
+    }
+    builder.build().unwrap_or_else(|_| Gitignore::empty())
 }
 
 /// Every file and folder a search of `root` would walk, relative to it with
@@ -1266,6 +1480,145 @@ mod tests {
         // Below a repository's root, its `.gitignore` still counts.
         let src = repo.join("src");
         assert_eq!(run(&src, json!({"pattern": "needle"})), "a.rs\n  1: needle");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_folder_hidden_by_a_parent_gitignore_is_named_in_the_footer() {
+        let dir = tree(
+            "above",
+            &[
+                (
+                    ".gitignore",
+                    "data/\nscripts/\nlogs/\nbuild/\ncache/\ntmp/\n__pycache__/\n",
+                ),
+                ("run/in/z.txt", "needle"),
+                ("run/in/data/d.txt", "needle"),
+                ("run/in/cache/q.txt", "needle"),
+                ("run/data/x.csv", "needle"),
+                ("run/scripts/y.py", "needle"),
+                ("run/.gitignore", "!logs/\ncache/\n"),
+                ("run/.ignore", "tmp/\n"),
+                ("run/logs/l.txt", "needle"),
+                ("run/cache/c.txt", "needle"),
+                ("run/tmp/t.txt", "needle"),
+                ("run/__pycache__/m.txt", "needle"),
+                ("run/build/b.txt", "needle"),
+                ("run/vendor/.gitignore", "data/\n"),
+                ("run/vendor/data/v.txt", "needle"),
+            ],
+        );
+        std::fs::create_dir(dir.join(".git")).unwrap();
+        std::fs::create_dir(dir.join("run/vendor/.git")).unwrap();
+        let run_dir = dir.join("run");
+        let named = |folders: &str| {
+            format!(
+                "… Left out by a .gitignore above the project: {}. Name a folder as the \
+                 path to search it.",
+                sep(folders)
+            )
+        };
+        // The project's own ignore files let logs/ back in and leave cache/
+        // and tmp/ out themselves, a repository inside it reads only its own,
+        // and build output and caches are not worth a name.
+        let hidden = "data/, in/data/, scripts/";
+        assert_eq!(
+            run(&run_dir, json!({"pattern": "needle"})),
+            sep("in/z.txt\n  1: needle\nlogs/l.txt\n  1: needle\n") + &named(hidden)
+        );
+        assert_eq!(
+            run(&run_dir, json!({"mode": "files", "glob": "*.txt"}))
+                .lines()
+                .last(),
+            Some(named(hidden).as_str())
+        );
+        // The project's `.gitignore` above a folder searched inside it counts
+        // all the same.
+        let args = json!({"pattern": "needle", "path": "in"});
+        let inside = run_dir.join("in");
+        let query = Query::from_args(&args, &inside, Some(&run_dir)).unwrap();
+        assert_eq!(
+            search(&query, Instant::now() + SEARCH_TIME, SEARCH_FILES).unwrap(),
+            sep("in/z.txt\n  1: needle\n") + &named("in/data/")
+        );
+        // Named as the path, the folder is searched.
+        let args = json!({"pattern": "needle", "path": "data"});
+        let data = run_dir.join("data");
+        let query = Query::from_args(&args, &data, Some(&run_dir)).unwrap();
+        assert_eq!(
+            search(&query, Instant::now() + SEARCH_TIME, SEARCH_FILES).unwrap(),
+            sep("data/x.csv\n  1: needle")
+        );
+        // At the repository's root the `.gitignore` is the project's own.
+        assert_eq!(
+            run(&dir, json!({"pattern": "needle", "mode": "count"})),
+            sep("run/in/z.txt: 1\nrun/logs/l.txt: 1\n… 2 matching lines in 2 files.")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_folder_whose_files_the_rules_above_hide_too_comes_with_a_warning() {
+        let dir = tree(
+            "inside",
+            &[(".gitignore", "*\n"), ("run/f00/a.txt", "needle")],
+        );
+        std::fs::create_dir(dir.join(".git")).unwrap();
+        assert_eq!(
+            run(&dir.join("run"), json!({"pattern": "needle"})),
+            sep(
+                "No matches.\n… Left out by a .gitignore above the project: f00/. Name a \
+                 folder as the path to search it, though the same rules hide files inside \
+                 too; list_dir shows all it holds."
+            )
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn nothing_is_named_once_the_time_is_up() {
+        let dir = tree(
+            "late",
+            &[(".gitignore", "data/\n"), ("run/data/x.csv", "needle")],
+        );
+        std::fs::create_dir(dir.join(".git")).unwrap();
+        let run_dir = dir.join("run");
+        let args = json!({"pattern": "needle"});
+        let query = Query::from_args(&args, &run_dir, Some(&run_dir)).unwrap();
+        let (above, dirs) = (ignores_above(&query), BTreeSet::from([run_dir.clone()]));
+        let later = Instant::now() + SEARCH_TIME;
+        assert_eq!(
+            left_out(&query, &above, &dirs, later),
+            (vec![run_dir.join("data")], false)
+        );
+        assert_eq!(
+            left_out(&query, &above, &dirs, Instant::now()),
+            (Vec::new(), false)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_the_first_few_hidden_folders_are_named() {
+        let mut files = vec![(".gitignore", "*/\n")];
+        let names: Vec<String> = (0..LEFT_OUT_NAMES + 2)
+            .map(|n| format!("run/f{n:02}/a.txt"))
+            .collect();
+        files.extend(names.iter().map(|name| (name.as_str(), "needle")));
+        let dir = tree("many", &files);
+        std::fs::create_dir(dir.join(".git")).unwrap();
+        let out = run(&dir.join("run"), json!({"pattern": "needle"}));
+        let shown: Vec<String> = (0..LEFT_OUT_NAMES)
+            .map(|n| sep(&format!("f{n:02}/")))
+            .collect();
+        assert_eq!(
+            out,
+            format!(
+                "No matches.\n… Left out by a .gitignore above the project: {} and 2 more. \
+                 Name a folder as the path to search it.",
+                shown.join(", ")
+            )
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
