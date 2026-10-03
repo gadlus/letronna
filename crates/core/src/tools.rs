@@ -3029,7 +3029,7 @@ impl Tool for ReadFile {
         true
     }
     fn description(&self) -> &'static str {
-        "Read a text file, or look at a PNG, JPEG, GIF or WebP picture. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from. A Jupyter notebook (.ipynb) reads as numbered cells with short outputs, and N counts the lines of that view."
+        "Read a text file, or look at a PNG, JPEG, GIF, WebP or BMP picture; one too big to send is scaled down. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from. A Jupyter notebook (.ipynb) reads as numbered cells with short outputs, and N counts the lines of that view."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -3073,30 +3073,57 @@ impl Tool for ReadFile {
 }
 
 /// A picture read_file was pointed at, copied as it is now into Letronna's
-/// own `media/`, from where the next request shows it to the model; None
-/// for a file that is not a picture every provider takes.
+/// own `media/`, from where the next request shows it to the model, scaled
+/// down as `media::fit` does when it cannot be sent as it is; None for a
+/// file that is not a picture.
 fn open_picture(path: &Path, raw: &str) -> Result<Option<String>, String> {
     let mut start = Vec::new();
     std::fs::File::open(path)
         .and_then(|file| file.take(12).read_to_end(&mut start))
         .map_err(|e| e.to_string())?;
-    let Some(kind) = crate::media::picture_kind(&start) else {
+    let kind = crate::media::picture_kind(&start);
+    // No provider takes a BMP, so one is sent converted. Its mark is two
+    // letters a text file can start with as well, but a text file has no
+    // NUL byte, and a BMP's header has several.
+    let bmp = start.starts_with(b"BM") && start.contains(&0);
+    if kind.is_none() && !bmp {
         return Ok(None);
-    };
+    }
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let size = crate::media::size(bytes.len());
-    if bytes.len() > crate::media::PICTURE_BYTES {
-        return Err(format!(
-            "`{raw}` is a picture of {size}, more than the {} a model is sent. A smaller copy of it can be read.",
-            crate::media::size(crate::media::PICTURE_BYTES)
-        ));
-    }
+    let (bytes, kind, scaled) = match kind {
+        Some(kind) if bytes.len() <= crate::media::PICTURE_BYTES => (bytes, kind, String::new()),
+        _ => {
+            let Some((fitted, fitted_kind)) = crate::media::fit(&bytes) else {
+                if kind.is_none() {
+                    return Ok(None);
+                }
+                return Err(format!(
+                    "`{raw}` is a picture of {size}, more than the {} a model is sent, and it could not be read to scale it down. A smaller copy of it can be read.",
+                    crate::media::size(crate::media::PICTURE_BYTES)
+                ));
+            };
+            // Both sizes, so a place found on the copy can be found on the
+            // picture itself.
+            let scaled = match (
+                crate::media::dimensions(&bytes),
+                crate::media::dimensions(&fitted),
+            ) {
+                (Some(was), Some(now)) if was != now => format!(
+                    ", scaled from {}x{} to {}x{} to be sent",
+                    was.0, was.1, now.0, now.1
+                ),
+                _ => String::new(),
+            };
+            (fitted, fitted_kind, scaled)
+        }
+    };
     let about = path.file_stem().unwrap_or_default().to_string_lossy();
     // Not into the project, as a media tool's are: looking at a picture
     // leaves the user's files as they were, in plan mode too.
     let copy = crate::media::save(&ToolContext::default(), &about, kind, &bytes)?;
     Ok(Some(format!(
-        "{}{}\nA copy of the picture `{raw}`, {size}. It follows the results when this model takes pictures.",
+        "{}{}\nA copy of the picture `{raw}`, {size}{scaled}. It follows the results when this model takes pictures.",
         crate::media::SAVED,
         copy.display()
     )))
@@ -4000,6 +4027,68 @@ mod tests {
         assert!(blob.starts_with("`blob.bin` is not a text file."), "{blob}");
         std::fs::remove_dir_all(dir).unwrap();
         std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn read_file_scales_down_a_picture_too_big_to_send_and_reads_a_bmp_as_one() {
+        use image::ImageEncoder;
+        use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+        let (_turn, data) = data_folder("picture-fit");
+        // Outside the data folder, whose files read_file refuses.
+        let dir = Scratch::new("picture-fit-project");
+        // Stored without compression, so the picture is too big a file to
+        // send as it is.
+        let mut photo = Vec::new();
+        PngEncoder::new_with_quality(
+            &mut photo,
+            CompressionType::Uncompressed,
+            FilterType::NoFilter,
+        )
+        .write_image(
+            &vec![0; 3_136 * 448 * 3],
+            3_136,
+            448,
+            image::ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+        assert!(photo.len() > crate::media::PICTURE_BYTES);
+        let size = crate::media::size(photo.len());
+        std::fs::write(dir.join("photo.png"), photo).unwrap();
+        let mut scan = Vec::new();
+        image::DynamicImage::new_rgb8(8, 8)
+            .write_to(
+                &mut std::io::Cursor::new(&mut scan),
+                image::ImageFormat::Bmp,
+            )
+            .unwrap();
+        std::fs::write(dir.join("scan.bmp"), scan).unwrap();
+        std::fs::write(dir.join("notes.txt"), "BMX and BMW").unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.to_path_buf()),
+            ..Default::default()
+        };
+        let read = run("read_file", r#"{"path":"photo.png"}"#, &ctx).unwrap();
+        assert!(
+            read.ends_with(&format!(
+                "`photo.png`, {size}, scaled from 3136x448 to 1568x224 to be sent. It follows the results when this model takes pictures."
+            )),
+            "{read}"
+        );
+        let copy = crate::media::saved_by("read_file", &read).unwrap();
+        assert!(copy.starts_with(data.join("media")), "{}", copy.display());
+        let sent = std::fs::read(&copy).unwrap();
+        assert_eq!(crate::media::dimensions(&sent), Some((1_568, 224)));
+        assert!(sent.len() <= crate::media::PICTURE_BYTES);
+        // A BMP goes as a PNG of the same size, and text that starts as a
+        // BMP does is still text.
+        let read = run("read_file", r#"{"path":"scan.bmp"}"#, &ctx).unwrap();
+        assert!(read.contains("`scan.bmp`, 1 KB. It follows"), "{read}");
+        let copy = crate::media::saved_by("read_file", &read).unwrap();
+        assert_eq!(copy.extension().unwrap(), "png");
+        let sent = std::fs::read(&copy).unwrap();
+        assert_eq!(crate::media::picture_kind(&sent), Some("png"));
+        let notes = run("read_file", r#"{"path":"notes.txt"}"#, &ctx).unwrap();
+        assert_eq!(notes, "1|BMX and BMW");
     }
 
     #[test]
