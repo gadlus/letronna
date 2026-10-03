@@ -104,8 +104,20 @@ fn replace(
         });
     let Some((old, new, (strategy, spans))) = found else {
         // A repeated call meets its own result: saying so keeps the model
-        // from hunting for text it has already replaced.
-        if !edit.new.is_empty() && find(text, edit.new).is_some_and(|(_, at)| at.len() == 1) {
+        // from hunting for text it has already replaced. It counts only
+        // when `new` is in the file as sent, bar the line endings it was
+        // written with: a `new` inside `old`, with or without its line
+        // numbers, was there before the edit too, and a loose match could be
+        // other code that looks alike, so either would report a change never
+        // made as done.
+        let made_already = |(how, at): (Strategy, Vec<Range<usize>>)| {
+            matches!(how, Strategy::Exact | Strategy::LineEndings) && at.len() == 1
+        };
+        let in_old = edit.old.contains(edit.new)
+            || stripped
+                .as_deref()
+                .is_some_and(|old| old.contains(edit.new));
+        if !in_old && find(text, edit.new).is_some_and(made_already) {
             return Ok(None);
         }
         return Err(
@@ -653,6 +665,70 @@ mod tests {
         assert_eq!(done.text, "let x = 2;\n");
         // `new` found twice could be anything, so it is still a miss.
         assert!(one("b b", "a", "b").is_err());
+    }
+
+    #[test]
+    fn a_mistyped_deletion_is_not_reported_as_already_applied() {
+        let file = "def f(x):\n    print(x)\n    return x\n";
+        // `new` is the tail of `old`, so the file holds it whether or not
+        // the line above was ever deleted.
+        let (old, new) = ("    print(y)\n    return x\n", "    return x\n");
+        let error = one(file, old, new).unwrap_err();
+        assert!(error.contains("was not found"), "{error}");
+        // Copied with read_file's numbers, `old` holds `new` only once they
+        // are gone, since they sit between its lines.
+        let numbered = one(
+            "def f(x):\n    print(x)\n    a = 1\n    return a\n",
+            "2|    print(y)\n3|    a = 1\n4|    return a",
+            "    a = 1\n    return a",
+        );
+        assert!(numbered.unwrap_err().contains("was not found"));
+        // Beside an edit that can be made, it fails the call rather than
+        // hiding behind the one that worked.
+        let edits = [
+            Edit {
+                old: "def f(x)",
+                new: "def g(x)",
+                all: false,
+            },
+            Edit {
+                old,
+                new,
+                all: false,
+            },
+        ];
+        let error = apply(file, &edits).err().unwrap();
+        assert!(error.starts_with("Edit 2 of 2:"), "{error}");
+    }
+
+    #[test]
+    fn an_edit_repeated_exactly_is_still_reported_as_already_applied() {
+        let edit = [Edit {
+            old: "    one();\n}",
+            new: "    two();\n    three();\n}",
+            all: false,
+        }];
+        let once = apply("fn a() {\r\n    one();\r\n}\r\n", &edit).unwrap();
+        assert_eq!(once.text, "fn a() {\r\n    two();\r\n    three();\r\n}\r\n");
+        // `new` went in with the file's CRLF, so only its line endings differ.
+        let twice = apply(&once.text, &edit).unwrap();
+        assert_eq!((twice.replaced, twice.already), (0, 1));
+        assert_eq!(twice.text, once.text);
+    }
+
+    #[test]
+    fn a_loose_match_of_new_is_not_taken_as_already_applied() {
+        let file = "say(“hi”);\n";
+        let new = "say(\"hi\");";
+        assert_eq!(find(file, new).map(|(how, _)| how), Some(Strategy::Quotes));
+        let error = one(file, "say(\"bye\");", new).unwrap_err();
+        assert!(error.contains("was not found"), "{error}");
+
+        let file = "fn f() {\n        a();\n        b();\n}\n";
+        let new = "a();\nb();";
+        assert_eq!(find(file, new).map(|(how, _)| how), Some(Strategy::Indent));
+        let error = one(file, "c();\nd();", new).unwrap_err();
+        assert!(error.contains("was not found"), "{error}");
     }
 
     #[test]
