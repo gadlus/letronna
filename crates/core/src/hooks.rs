@@ -18,7 +18,11 @@
 //! shown to the user and the call goes on, as in Claude Code. A hooks.json
 //! that cannot be used, or holds what hooks here cannot be, is never taken
 //! for none: until it is fixed the gate holds every call but a question for
-//! the user's yes, since a guard in it may be what the user counts on.
+//! the user's yes, since a guard in it may be what the user counts on. Hooks
+//! at Claude Code's events that run nothing here yet, and hooks other than
+//! commands away from PreToolUse, leave every call to the gate, which decides
+//! itself what a PermissionRequest hook would have, so a settings file pasted
+//! whole that holds them is used without them, and the user is told once.
 //!
 //! The file is read once and looked at again, by its modified time, at most
 //! once a turn, on the thread that starts it rather than the window's.
@@ -106,8 +110,8 @@ const ALIASES: &[(&str, &str)] = &[
     ("search_web", "WebSearch"),
 ];
 
-/// Hook failures, and what hooks asked to tell the user, that no frontend
-/// has shown yet, oldest first.
+/// Hook failures, and what hooks or hooks.json have to tell the user, that no
+/// frontend has shown yet, oldest first.
 static FAILURES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// hooks.json as last read.
@@ -136,6 +140,21 @@ pub enum Event {
     Notification,
 }
 
+/// Claude Code's events no hook runs at here yet, whose hooks are left out
+/// with a notice rather than breaking the file, since every call still meets
+/// the gate, which decides itself what a PermissionRequest hook would have.
+const KNOWN_ELSEWHERE: &[&str] = &[
+    "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
+    "PreCompact",
+    "PostCompact",
+    "SubagentStart",
+    "SubagentStop",
+    "PermissionRequest",
+    "PostToolUseFailure",
+];
+
 impl Event {
     const ALL: [Event; 4] = [
         Self::PreToolUse,
@@ -157,7 +176,11 @@ impl Event {
 
 /// The hooks in hooks.json, by event.
 #[derive(Default)]
-pub struct Hooks(BTreeMap<String, Vec<Group>>);
+pub struct Hooks {
+    events: BTreeMap<String, Vec<Group>>,
+    /// What the file holds that does not run here, as notices for the user.
+    skipped: Vec<String>,
+}
 
 /// Hooks that run together when their matcher fits.
 struct Group {
@@ -204,7 +227,7 @@ struct Hook {
 impl Hooks {
     /// Whether any hook is set for `event`, which costs no process.
     pub fn has(&self, event: Event) -> bool {
-        self.0
+        self.events
             .get(event.name())
             .is_some_and(|groups| groups.iter().any(|group| !group.hooks.is_empty()))
     }
@@ -280,7 +303,9 @@ pub fn load(file: &Path) -> Result<Hooks, String> {
 
 /// Reads hooks.json's shape, refusing what would leave a hook the user wrote
 /// quietly never running: events outside `"hooks"`, an event or a type of
-/// hook that does not run here, or a hook with no command.
+/// hook that does not run here, or a hook with no command, though hooks at
+/// `KNOWN_ELSEWHERE`, and those not commands away from PreToolUse, are left
+/// out with a notice.
 fn parse(text: &str) -> Result<Hooks, String> {
     // An editor that empties the file before writing it, or a `touch`,
     // leaves nothing to guard with rather than a broken guard.
@@ -298,22 +323,40 @@ fn parse(text: &str) -> Result<Hooks, String> {
         ));
     }
     let mut hooks = BTreeMap::new();
+    let mut elsewhere = Vec::new();
+    let mut dropped = Vec::new();
     for (name, groups) in wire.hooks.unwrap_or_default() {
+        // Only these names: a misspelt PreToolUse left out would be a guard
+        // quietly gone.
+        if KNOWN_ELSEWHERE.contains(&name.as_str()) {
+            elsewhere.push(name);
+            continue;
+        }
         if !Event::ALL.iter().any(|event| event.name() == name) {
             return Err(format!(
                 "hooks do not run at `{name}` here, only at PreToolUse, PostToolUse, \
                  Stop and Notification"
             ));
         }
+        let guard = name == Event::PreToolUse.name();
         let groups = groups
             .into_iter()
-            .map(|group| {
-                if let Some(hook) = group.hooks.iter().find(|hook| hook.kind != "command") {
-                    return Err(format!(
-                        "a {name} hook is of type `{}`; only command hooks run here",
-                        hook.kind
-                    ));
+            .map(|mut group| {
+                for hook in group.hooks.iter().filter(|hook| hook.kind != "command") {
+                    // A guard that cannot run has to hold calls, where any
+                    // other hook only goes unheard.
+                    if guard {
+                        return Err(format!(
+                            "a {name} hook is of type `{}`; only command hooks run here",
+                            hook.kind
+                        ));
+                    }
+                    let what = format!("{name} hooks of type `{}`", hook.kind);
+                    if !dropped.contains(&what) {
+                        dropped.push(what);
+                    }
                 }
+                group.hooks.retain(|hook| hook.kind == "command");
                 if group
                     .hooks
                     .iter()
@@ -329,7 +372,34 @@ fn parse(text: &str) -> Result<Hooks, String> {
             .collect::<Result<Vec<_>, String>>()?;
         hooks.insert(name, groups);
     }
-    Ok(Hooks(hooks))
+    let mut skipped = Vec::new();
+    if !elsewhere.is_empty() {
+        skipped.push(left_out(&format!("{} hooks", spoken(&elsewhere))));
+    }
+    if !dropped.is_empty() {
+        skipped.push(left_out(&spoken(&dropped)));
+    }
+    Ok(Hooks {
+        events: hooks,
+        skipped,
+    })
+}
+
+/// The notice that `what` in hooks.json was left out.
+fn left_out(what: &str) -> String {
+    format!(
+        "hooks.json: {what} do not run in {} yet; the rest of the file is in use.",
+        crate::BRAND
+    )
+}
+
+/// `items` as they are said: "a", "a and b", "a, b and c".
+fn spoken(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 /// Readies the hooks for a turn in `conversation`: an end a hook asked for
@@ -341,22 +411,44 @@ pub fn new_turn(conversation: u64) {
     reread();
 }
 
-/// Reads hooks.json again if it changed since it was last read.
+/// Reads hooks.json again if it changed since it was last read, telling the
+/// user what in it does not run here.
 fn reread() {
-    let file = file();
-    let stamp = std::fs::metadata(&file).ok().map(|meta| {
+    // Whole, not cut as a failure is, since a cut notice would lose events
+    // it names.
+    tell(&FAILURES, reread_at(&file(), &READ));
+}
+
+/// Reads `file` into `read` again if it changed since: the notices of what
+/// in it does not run here when it was read, so each change is told of once.
+fn reread_at(file: &Path, read: &Mutex<Option<Read>>) -> Vec<String> {
+    let stamp = std::fs::metadata(file).ok().map(|meta| {
         (
             meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             meta.len(),
         )
     });
-    if lock(&READ).as_ref().is_some_and(|read| read.stamp == stamp) {
-        return;
+    if lock(read).as_ref().is_some_and(|read| read.stamp == stamp) {
+        return Vec::new();
     }
     // Read with the lock let go, so the gate asking on a window's thread
     // never waits on the disk.
-    let hooks = Arc::new(load(&file));
-    *lock(&READ) = Some(Read { stamp, hooks });
+    let hooks = load(file);
+    let skipped = hooks
+        .as_ref()
+        .map(|hooks| hooks.skipped.clone())
+        .unwrap_or_default();
+    let mut last = lock(read);
+    // Another conversation's turn may have read this same change meanwhile,
+    // and told of it.
+    if last.as_ref().is_some_and(|read| read.stamp == stamp) {
+        return Vec::new();
+    }
+    *last = Some(Read {
+        stamp,
+        hooks: Arc::new(hooks),
+    });
+    skipped
 }
 
 /// The hooks as last read.
@@ -582,11 +674,20 @@ pub fn problems() -> Vec<String> {
 /// Keeps `problems` for a frontend to show, each cut to one line, dropping
 /// the oldest past `UNSHOWN`.
 fn report(problems: Vec<String>) {
-    if problems.is_empty() {
+    tell(
+        &FAILURES,
+        problems.iter().map(|problem| shown(problem)).collect(),
+    );
+}
+
+/// Keeps `notices` in `told` for a frontend to show, each on one line,
+/// dropping the oldest past `UNSHOWN`.
+fn tell(told: &Mutex<Vec<String>>, notices: Vec<String>) {
+    if notices.is_empty() {
         return;
     }
-    let mut kept = lock(&FAILURES);
-    kept.extend(problems.iter().map(|problem| shown(problem)));
+    let mut kept = lock(told);
+    kept.extend(notices.iter().map(|notice| crate::tools::one_line(notice)));
     let over = kept.len().saturating_sub(UNSHOWN);
     kept.drain(..over);
 }
@@ -677,7 +778,10 @@ struct Heard {
 fn hear(hooks: &Hooks, event: Event, subject: &str, input: &Value, ctx: &ToolContext) -> Heard {
     let mut heard = Heard::default();
     let input = input.to_string();
-    let groups = hooks.0.get(event.name()).map_or(&[][..], Vec::as_slice);
+    let groups = hooks
+        .events
+        .get(event.name())
+        .map_or(&[][..], Vec::as_slice);
     // Claude Code runs every Stop hook whatever its matcher says.
     let fitting = groups
         .iter()
@@ -1210,7 +1314,7 @@ mod tests {
         let unknown = error(json!({ "hooks": { "preToolUse": hook } }));
         assert!(unknown.contains("`preToolUse`"), "{unknown}");
         let prompt = json!([{ "hooks": [{ "type": "prompt", "command": "guard" }] }]);
-        let prompt = error(json!({ "hooks": { "Stop": prompt } }));
+        let prompt = error(json!({ "hooks": { "PreToolUse": prompt } }));
         assert!(prompt.contains("of type `prompt`"), "{prompt}");
         let empty = json!([{ "hooks": [{ "type": "command", "command": " " }] }]);
         let empty = error(json!({ "hooks": { "PreToolUse": empty } }));
@@ -1218,6 +1322,174 @@ mod tests {
         // The rest of a settings file pasted whole is let be.
         let pasted = json!({ "model": "x", "hooks": { "Stop": hook } });
         assert!(parse(&pasted.to_string()).is_ok_and(|hooks| hooks.has(Event::Stop)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pasted_settings_file_with_session_start_runs_its_pre_tool_use_hook() {
+        let dir = scratch("pasted");
+        let file = dir.join("hooks.json");
+        let pasted = json!({
+            "model": "x",
+            "hooks": {
+                "SessionStart": [{ "matcher": "startup", "hooks": [
+                    { "type": "command", "command": "cat notes.md" },
+                ] }],
+                "UserPromptSubmit": [{ "hooks": [
+                    { "type": "command", "command": "check-prompt" },
+                ] }],
+                "PreToolUse": [{ "matcher": "Bash", "hooks": [
+                    { "type": "command", "command": "sh -c 'echo no deleting >&2; exit 2'" },
+                ] }],
+            },
+        });
+        std::fs::write(&file, pasted.to_string()).unwrap();
+        let loaded = load(&file);
+        let args = json!({ "command": "rm -rf build" });
+        let why = before(&loaded, "run_command", &args, &ToolContext::default()).unwrap_err();
+        assert!(
+            why.contains("blocked this call") && why.contains("no deleting"),
+            "{why}"
+        );
+        // A call the guard does not match runs, where the broken file refused it.
+        let read = before(&loaded, "read_file", &json!({}), &ToolContext::default());
+        assert!(read.is_ok(), "{read:?}");
+    }
+
+    #[test]
+    fn a_skipped_event_is_named_once_per_file_change() {
+        let dir = scratch("skipped");
+        let file = dir.join("hooks.json");
+        let hook = json!([{ "hooks": [{ "type": "command", "command": "guard" }] }]);
+        let two = json!({ "hooks": { "UserPromptSubmit": hook, "SessionStart": hook } });
+        std::fs::write(&file, two.to_string()).unwrap();
+        let read = Mutex::new(None);
+        assert_eq!(
+            reread_at(&file, &read),
+            [
+                "hooks.json: SessionStart and UserPromptSubmit hooks do not run in Letronna \
+                 yet; the rest of the file is in use."
+            ]
+        );
+        assert!(reread_at(&file, &read).is_empty());
+        let three = json!({ "hooks": {
+            "PreCompact": hook, "SubagentStop": hook, "SessionEnd": hook, "Stop": hook,
+        } });
+        std::fs::write(&file, three.to_string()).unwrap();
+        let told = reread_at(&file, &read);
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(
+            told[0].starts_with("hooks.json: PreCompact, SessionEnd and SubagentStop hooks"),
+            "{told:?}"
+        );
+        assert!(reread_at(&file, &read).is_empty());
+        // A file with nothing left out is told of with nothing.
+        std::fs::write(&file, json!({ "hooks": { "Stop": hook } }).to_string()).unwrap();
+        assert!(reread_at(&file, &read).is_empty());
+    }
+
+    #[test]
+    fn a_notice_naming_every_left_out_hook_reaches_the_user_whole() {
+        let dir = scratch("whole");
+        let file = dir.join("hooks.json");
+        let hook = json!([{ "hooks": [{ "type": "command", "command": "guard" }] }]);
+        let mut events = serde_json::Map::new();
+        for name in KNOWN_ELSEWHERE {
+            events.insert(name.to_string(), hook.clone());
+        }
+        let stop = json!([{ "hooks": [
+            { "type": "prompt", "prompt": "Is the task done?" },
+            { "type": "agent", "prompt": "Check the tests pass." },
+        ] }]);
+        events.insert("Stop".into(), stop);
+        let post = json!([{ "hooks": [{ "type": "mcp_tool", "tool": "log" }] }]);
+        events.insert("PostToolUse".into(), post);
+        std::fs::write(&file, json!({ "hooks": events }).to_string()).unwrap();
+        let told = Mutex::new(Vec::new());
+        tell(&told, reread_at(&file, &Mutex::new(None)));
+        let told = told.into_inner().unwrap();
+        assert_eq!(told.len(), 2, "{told:?}");
+        for name in KNOWN_ELSEWHERE {
+            assert!(told[0].contains(name), "{name}: {}", told[0]);
+        }
+        for dropped in [
+            "PostToolUse hooks of type `mcp_tool`",
+            "Stop hooks of type `prompt`",
+            "Stop hooks of type `agent`",
+        ] {
+            assert!(told[1].contains(dropped), "{dropped}: {}", told[1]);
+        }
+        // Past the cap the oldest go, as with failures.
+        let told = Mutex::new(vec!["oldest".to_string(); UNSHOWN]);
+        tell(&told, vec!["newest".into()]);
+        let told = told.into_inner().unwrap();
+        assert_eq!(told.len(), UNSHOWN);
+        assert_eq!(told.last().map(String::as_str), Some("newest"));
+    }
+
+    #[test]
+    fn a_misspelled_pre_tool_use_still_holds_every_call() {
+        let hook = json!([{ "hooks": [{ "type": "command", "command": "guard" }] }]);
+        let known = json!({ "hooks": { "SessionStart": hook } });
+        assert!(parse(&known.to_string()).is_ok_and(|hooks| !hooks.has(Event::PreToolUse)));
+        // Only Claude Code's own spelling of an event is left out.
+        for name in ["preToolUse", "sessionStart", "PreToolUses", "Session_Start"] {
+            let file = json!({ "hooks": { "SessionStart": hook, name: hook } });
+            let loaded = parse(&file.to_string());
+            let error = loaded.as_ref().err().cloned().unwrap_or_default();
+            assert!(error.contains(&format!("`{name}`")), "{name}: {error}");
+            let why = before(&loaded, "read_file", &json!({}), &ToolContext::default());
+            assert!(
+                why.as_ref()
+                    .is_err_and(|why| why.contains("Until it is fixed")),
+                "{why:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_prompt_hook_under_pre_tool_use_still_holds_every_call() {
+        let prompt = json!([{ "hooks": [{ "type": "prompt", "prompt": "Is this safe?" }] }]);
+        let file = json!({ "hooks": { "PostToolUse": prompt, "PreToolUse": prompt } });
+        let loaded = parse(&file.to_string());
+        let error = loaded.as_ref().err().cloned().unwrap_or_default();
+        assert!(
+            error.contains("a PreToolUse hook is of type `prompt`"),
+            "{error}"
+        );
+        let why = before(&loaded, "read_file", &json!({}), &ToolContext::default());
+        assert!(
+            why.as_ref()
+                .is_err_and(|why| why.contains("Until it is fixed")),
+            "{why:?}"
+        );
+    }
+
+    #[test]
+    fn a_prompt_hook_under_stop_is_dropped_alone() {
+        let stop = json!([{ "hooks": [
+            { "type": "prompt", "prompt": "Is the task done?" },
+            { "type": "command", "command": "run-tests" },
+            { "type": "agent", "prompt": "Check the tests pass." },
+        ] }]);
+        let only = json!([{ "hooks": [{ "type": "prompt", "prompt": "Say done." }] }]);
+        let file = json!({ "hooks": { "Stop": stop, "Notification": only } });
+        let hooks = parse(&file.to_string()).unwrap();
+        let kept: Vec<&str> = hooks.events["Stop"][0]
+            .hooks
+            .iter()
+            .map(|hook| hook.command.as_str())
+            .collect();
+        assert_eq!(kept, ["run-tests"]);
+        assert!(hooks.has(Event::Stop) && !hooks.has(Event::Notification));
+        assert_eq!(
+            hooks.skipped,
+            [
+                "hooks.json: Notification hooks of type `prompt`, Stop hooks of type `prompt` \
+                 and Stop hooks of type `agent` do not run in Letronna yet; the rest of the \
+                 file is in use."
+            ]
+        );
     }
 
     #[test]
