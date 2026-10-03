@@ -21,6 +21,7 @@ use crossterm::event::{
 };
 use crossterm::terminal;
 use letronna_core::approvals::{self, Request};
+use letronna_core::chat::Message;
 use letronna_core::store::Todo;
 use std::collections::VecDeque;
 use std::sync::mpsc::Receiver;
@@ -319,6 +320,14 @@ const PAGE: isize = 10;
 /// Commands the menu will show at once, so a long list cannot eat the window.
 const MENU_LIMIT: usize = 8;
 
+/// Switches a list shows at once; the rest scroll, so dozens of skills do not
+/// push the box off a short window.
+const SWITCH_ROWS: usize = 10;
+
+/// Answers a question shows at once; a longer list, such as every model a
+/// gateway has, scrolls.
+const CHOICE_ROWS: usize = 10;
+
 /// The most columns a name takes in the menu and `/help`: over twice the
 /// longest of Letronna's own, and an added name longer than that is cut
 /// rather than pushing every description off the row.
@@ -519,6 +528,23 @@ pub fn unescaped(line: &str) -> &str {
     }
 }
 
+/// What was typed to send the prompt `content`, so sending it again sends
+/// the same: `/init` and a saved workflow's command as typed, `@` references
+/// without what they attached, and a slash that stood for one put back.
+fn as_typed(content: &str) -> String {
+    let content = letronna_core::references::typed(content);
+    if let Some(command) = letronna_core::init::typed(content) {
+        return command.to_owned();
+    }
+    if let Some(command) = letronna_core::workflow::saved::typed(content) {
+        return command;
+    }
+    if is_command(content) {
+        return format!("/{content}");
+    }
+    content.to_owned()
+}
+
 /// Where the menu's shown rows start. It only moves as far as it has to for
 /// the highlighted row to be one of them: the list held more commands than
 /// it drew, and the arrows walked all of them, so a highlight could sit on a
@@ -579,7 +605,24 @@ struct Choice {
     question: String,
     detail: Vec<String>,
     options: Vec<String>,
+    /// The highlighted answer, among those the filter leaves.
     picked: usize,
+    /// The first of those on show, when more are left than fit.
+    top: usize,
+    /// Letters typed to narrow a list the user opened. `None` where letters
+    /// must not answer anything, as in an approval that comes up under
+    /// someone typing.
+    filter: Option<String>,
+}
+
+impl Choice {
+    /// The places in `options` of the ones the filter leaves, in order.
+    fn shown(&self) -> Vec<usize> {
+        let filter = self.filter.as_deref().unwrap_or_default().to_lowercase();
+        (0..self.options.len())
+            .filter(|&i| self.options[i].to_lowercase().contains(&filter))
+            .collect()
+    }
 }
 
 /// What ended a wait at the prompt.
@@ -606,6 +649,38 @@ struct Slider {
     at: usize,
 }
 
+/// Things each on or off, switched in the box rather than by typing their
+/// names: the arrows move, space or enter switches the highlighted one at
+/// once, and letters narrow the list to the names holding them.
+struct Switches {
+    question: String,
+    rows: Vec<Switch>,
+    /// Letters typed to narrow the list.
+    filter: String,
+    /// The highlighted row, among those the filter leaves.
+    picked: usize,
+    /// The first of those on show, when more are left than fit.
+    top: usize,
+}
+
+impl Switches {
+    /// The places in `rows` of the ones the filter leaves, in order.
+    fn shown(&self) -> Vec<usize> {
+        let filter = self.filter.to_lowercase();
+        (0..self.rows.len())
+            .filter(|&i| self.rows[i].name.to_lowercase().contains(&filter))
+            .collect()
+    }
+}
+
+/// One row of a list of switches.
+pub struct Switch {
+    pub name: String,
+    /// Said after the name, dimmed and cut to the row.
+    pub about: String,
+    pub on: bool,
+}
+
 pub struct Bar {
     line: Line,
     picked: usize,
@@ -618,6 +693,10 @@ pub struct Bar {
     done: bool,
     choice: Option<Choice>,
     slider: Option<Slider>,
+    switches: Option<Switches>,
+    /// What a list of switches was asked to do: switch the row at a place in
+    /// it, or `None` to be done with it.
+    flip: Option<Option<usize>>,
     /// A line that must not be shown: typed as dots, and kept out of the
     /// conversation when it is sent. For keys.
     secret: bool,
@@ -626,6 +705,8 @@ pub struct Bar {
     /// What the slider settled on: a stop, or nothing when it was left.
     slid: Option<Option<usize>>,
     answer: Option<usize>,
+    /// Set when escape turned a question down without an answer.
+    declined: bool,
     /// True while a turn is in flight, which is what makes escape mean stop.
     working: bool,
     interrupt: bool,
@@ -695,10 +776,13 @@ impl Bar {
             done: false,
             choice: None,
             slider: None,
+            switches: None,
+            flip: None,
             secret: false,
             asking: None,
             slid: None,
             answer: None,
+            declined: false,
             working: false,
             interrupt: false,
             hurry: false,
@@ -814,6 +898,20 @@ impl Bar {
     pub fn set_goal(&mut self, line: Option<String>) {
         self.goal = line;
         self.settle();
+    }
+
+    /// Put what was typed into an opened session under up, so a restart or a
+    /// /resume does not leave up with nothing to bring back.
+    pub fn set_history(&mut self, messages: &[Message]) {
+        self.line.set_history(
+            messages
+                .iter()
+                // A notice, a chat app's message, and a follow-up folded into
+                // a turn -- which is also how a Stop hook's word goes in, so
+                // the two cannot be told apart -- were not typed here.
+                .filter(|m| m.role == "user" && !m.notice && !m.remote && !m.folded)
+                .map(|m| as_typed(&m.content)),
+        );
     }
 
     /// Let the inbox's doorbell end a wait at the prompt, only with the box
@@ -945,13 +1043,37 @@ impl Bar {
     }
 
     /// Ask a question with a fixed set of answers. Returns the one picked, or
-    /// `None` if the user left instead.
+    /// `None` if the user turned it down with escape or left instead.
     pub fn choose(
         &mut self,
         question: &str,
         detail: Vec<String>,
         options: &[&str],
     ) -> Option<usize> {
+        self.question(question, detail, options, false)
+    }
+
+    /// `choose`, for a list the user opened: letters typed narrow it to the
+    /// answers holding them, so a long one need not be scrolled through.
+    pub fn pick_from(
+        &mut self,
+        question: &str,
+        detail: Vec<String>,
+        options: &[&str],
+    ) -> Option<usize> {
+        self.question(question, detail, options, true)
+    }
+
+    fn question(
+        &mut self,
+        question: &str,
+        detail: Vec<String>,
+        options: &[&str],
+        narrowed: bool,
+    ) -> Option<usize> {
+        if options.is_empty() {
+            return None;
+        }
         if !self.live {
             render::line(&render::bold(question));
             for line in &detail {
@@ -965,11 +1087,14 @@ impl Bar {
             detail,
             options: options.iter().map(|o| (*o).to_owned()).collect(),
             picked: 0,
+            top: 0,
+            filter: narrowed.then(String::new),
         });
         self.answer = None;
+        self.declined = false;
         self.settle();
         loop {
-            if self.done {
+            if self.done || std::mem::take(&mut self.declined) {
                 self.choice = None;
                 self.settle();
                 return None;
@@ -1075,6 +1200,61 @@ impl Bar {
         }
     }
 
+    /// Switch things on and off from a list in the box, `flip` doing each one
+    /// at once as it is asked for. An error it gives shows in the footer and
+    /// leaves that row as it was. Returns the rows as they were left; off a
+    /// keyboard, as they came.
+    pub fn switches(
+        &mut self,
+        question: &str,
+        rows: Vec<Switch>,
+        flip: &mut dyn FnMut(&str, bool) -> Result<(), String>,
+    ) -> Vec<Switch> {
+        if !self.live || rows.is_empty() {
+            return rows;
+        }
+        self.switches = Some(Switches {
+            question: question.to_owned(),
+            rows,
+            filter: String::new(),
+            picked: 0,
+            top: 0,
+        });
+        self.flip = None;
+        self.settle();
+        loop {
+            if self.done {
+                break;
+            }
+            match self.flip.take() {
+                Some(None) => break,
+                Some(Some(index)) => {
+                    if let Some(row) = self.switches.as_mut().map(|list| &mut list.rows[index]) {
+                        match flip(&row.name, !row.on) {
+                            Ok(()) => row.on = !row.on,
+                            Err(why) => self.note = Some(why),
+                        }
+                    }
+                    self.settle();
+                }
+                None => self.pump(),
+            }
+        }
+        let rows = self
+            .switches
+            .take()
+            .map(|list| list.rows)
+            .unwrap_or_default();
+        self.settle();
+        rows
+    }
+
+    /// Whether lists and questions are steered in the box, rather than
+    /// answered on plain lines because there is no keyboard to steer with.
+    pub fn steered(&self) -> bool {
+        self.live
+    }
+
     /// Deal with whatever keys have arrived and hand the loop straight back.
     /// Called from inside a running turn, which is what lets you type while
     /// the model is still talking.
@@ -1107,7 +1287,7 @@ impl Bar {
                 Ok(Event::Paste(text)) => {
                     self.handled += 1;
                     self.focus.touch(std::time::Instant::now());
-                    if self.choice.is_none() {
+                    if self.choice.is_none() && self.switches.is_none() {
                         self.line.paste(&text);
                         self.picked = 0;
                     }
@@ -1144,7 +1324,7 @@ impl Bar {
         // several, is a line ending inside text that was pasted.
         if self.enters == 1 && self.enter_at == Some(self.handled) {
             self.send();
-        } else if self.handled > 8 && self.choice.is_none() {
+        } else if self.handled > 8 && self.choice.is_none() && self.switches.is_none() {
             self.line.fold_burst(mark);
         }
         // One repaint for the whole drain. Painting after every keystroke
@@ -1389,6 +1569,10 @@ impl Bar {
             self.pick(key);
             return;
         }
+        if self.switches.is_some() {
+            self.switch(key);
+            return;
+        }
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -1492,6 +1676,12 @@ impl Bar {
             KeyCode::Backspace if control => self.line.backspace_word(),
             KeyCode::Char('h') if control => self.line.backspace_word(),
             KeyCode::Char('w') if control => self.line.backspace_word(),
+            // A shell's line keys, which fingers reach for anyway; in a box of
+            // several lines they keep to the row the cursor is on.
+            KeyCode::Char('a') if control => self.line.row_start(),
+            KeyCode::Char('e') if control => self.line.row_end(),
+            KeyCode::Char('u') if control => self.line.backspace_to_row_start(),
+            KeyCode::Char('k') if control => self.line.delete_to_row_end(),
             KeyCode::Delete if control => self.line.delete_word(),
             KeyCode::Backspace => {
                 self.line.backspace();
@@ -1601,9 +1791,57 @@ impl Bar {
         }
     }
 
+    /// Steer a list of switches: the arrows move, space or enter switches the
+    /// highlighted one, letters narrow the list, and escape takes the narrowing
+    /// off, then leaves.
+    fn switch(&mut self, key: KeyEvent) {
+        let Some(list) = self.switches.as_mut() else {
+            return;
+        };
+        let shown = list.shown();
+        let last = shown.len().saturating_sub(1);
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Up => list.picked = list.picked.checked_sub(1).unwrap_or(last),
+            KeyCode::Down if list.picked >= last => list.picked = 0,
+            KeyCode::Down => list.picked += 1,
+            KeyCode::PageUp => list.picked = list.picked.saturating_sub(SWITCH_ROWS),
+            KeyCode::PageDown => list.picked = (list.picked + SWITCH_ROWS).min(last),
+            KeyCode::Home => list.picked = 0,
+            KeyCode::End => list.picked = last,
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if let Some(&index) = shown.get(list.picked) {
+                    self.flip = Some(Some(index));
+                }
+            }
+            KeyCode::Esc if !list.filter.is_empty() => {
+                list.filter.clear();
+                list.picked = 0;
+            }
+            KeyCode::Esc => self.flip = Some(None),
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => self.done = true,
+            KeyCode::Backspace => {
+                list.filter.pop();
+                list.picked = 0;
+            }
+            KeyCode::Char(letter) if plain => {
+                list.filter.push(letter);
+                list.picked = 0;
+            }
+            _ => {}
+        }
+        if let Some(list) = self.switches.as_mut() {
+            let count = list.shown().len();
+            list.top = menu_top(list.top, list.picked, count, SWITCH_ROWS);
+        }
+    }
+
     /// Steer a question. Enter takes what is highlighted, a digit takes that
-    /// one outright, and escape is the same as picking the last answer, which
-    /// is always the one that does nothing.
+    /// one outright, and escape turns the question down -- what the footer
+    /// says it does. In a list the user opened, letters and digits narrow it
+    /// instead, and escape takes the narrowing off first.
     fn pick(&mut self, key: KeyEvent) {
         // Letters are typing, not answering, and each one puts an answer off
         // again; an answer that comes too soon is dropped rather than put off,
@@ -1618,12 +1856,37 @@ impl Bar {
         let Some(choice) = self.choice.as_mut() else {
             return;
         };
-        let last = choice.options.len().saturating_sub(1);
+        let shown = choice.shown();
+        let last = shown.len().saturating_sub(1);
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         match key.code {
             KeyCode::Up => choice.picked = choice.picked.checked_sub(1).unwrap_or(last),
-            KeyCode::Down => choice.picked = (choice.picked + 1) % choice.options.len(),
-            KeyCode::Enter => self.answer = Some(choice.picked),
-            KeyCode::Esc => self.answer = Some(last),
+            KeyCode::Down if choice.picked >= last => choice.picked = 0,
+            KeyCode::Down => choice.picked += 1,
+            KeyCode::PageUp => choice.picked = choice.picked.saturating_sub(CHOICE_ROWS),
+            KeyCode::PageDown => choice.picked = (choice.picked + CHOICE_ROWS).min(last),
+            KeyCode::Home => choice.picked = 0,
+            KeyCode::End => choice.picked = last,
+            KeyCode::Enter => self.answer = shown.get(choice.picked).copied(),
+            KeyCode::Esc if choice.filter.as_ref().is_some_and(|f| !f.is_empty()) => {
+                choice.filter = Some(String::new());
+                choice.picked = 0;
+            }
+            KeyCode::Esc => self.declined = true,
+            KeyCode::Backspace if choice.filter.is_some() => {
+                if let Some(filter) = choice.filter.as_mut() {
+                    filter.pop();
+                }
+                choice.picked = 0;
+            }
+            KeyCode::Char(letter) if plain && choice.filter.is_some() => {
+                if let Some(filter) = choice.filter.as_mut() {
+                    filter.push(letter);
+                }
+                choice.picked = 0;
+            }
             KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
                 // A helper's question can come up while a call runs, and
                 // leaving there stops the turn, as Ctrl-C does anywhere else
@@ -1639,6 +1902,10 @@ impl Bar {
                 }
             }
             _ => {}
+        }
+        if let Some(choice) = self.choice.as_mut() {
+            let count = choice.shown().len();
+            choice.top = menu_top(choice.top, choice.picked, count, CHOICE_ROWS);
         }
     }
 
@@ -1754,10 +2021,11 @@ impl Bar {
             render::MARGIN,
             render::dim(&format!("╭{edge}╮"))
         ));
-        match (&self.slider, &self.choice) {
-            (Some(slider), _) => self.sliding(slider, room, &mut lines),
-            (None, Some(choice)) => self.asking(choice, room, &mut lines),
-            (None, None) => self.typing(room, &mut lines),
+        match (&self.slider, &self.choice, &self.switches) {
+            (Some(slider), _, _) => self.sliding(slider, room, &mut lines),
+            (None, Some(choice), _) => self.asking(choice, room, &mut lines),
+            (None, None, Some(list)) => self.switching(list, room, &mut lines),
+            (None, None, None) => self.typing(room, &mut lines),
         }
         lines.push(format!(
             "{}{}",
@@ -1765,7 +2033,7 @@ impl Bar {
             render::dim(&format!("╰{edge}╯"))
         ));
 
-        if self.choice.is_none() {
+        if self.choice.is_none() && self.switches.is_none() {
             let options = matches(self.line.text(), &self.added);
             let top = menu_top(self.menu_top, self.picked, options.len(), MENU_LIMIT);
             let end = (top + MENU_LIMIT).min(options.len());
@@ -1821,8 +2089,19 @@ impl Bar {
             said.clone()
         } else if self.slider.is_some() {
             "← → to slide  ·  enter to keep it  ·  esc to leave it as it was".to_owned()
-        } else if self.choice.is_some() {
-            "↑↓ to choose  ·  enter to take it  ·  esc to decline".to_owned()
+        } else if let Some(choice) = &self.choice {
+            match choice.filter.as_deref() {
+                Some("") => "↑↓ to choose  ·  enter to take it  ·  type to find  ·  esc to decline",
+                Some(_) => "↑↓ to choose  ·  enter to take it  ·  esc to show them all",
+                None => "↑↓ to choose  ·  enter to take it  ·  esc to decline",
+            }
+            .to_owned()
+        } else if let Some(list) = &self.switches {
+            if list.filter.is_empty() {
+                "↑↓ to move  ·  space to switch  ·  type to find  ·  esc when done".to_owned()
+            } else {
+                "↑↓ to move  ·  space to switch  ·  esc to show them all".to_owned()
+            }
         } else if back > 0 {
             format!("scrolled back {back} lines  ·  end to follow again")
         } else if self.working && self.sendable() > 0 {
@@ -1934,6 +2213,77 @@ impl Bar {
         lines.push(self.boxed("", 0, room));
     }
 
+    /// The box while it holds a list of switches: a mark on each row says
+    /// whether it is on, and the rows past what fits scroll.
+    fn switching(&self, list: &Switches, room: usize, lines: &mut Vec<String>) {
+        let question = render::bold(&list.question);
+        lines.push(self.boxed(&question, render::visible(&question), room));
+        let shown = list.shown();
+        let on = list.rows.iter().filter(|row| row.on).count();
+        let count = if list.filter.is_empty() {
+            format!("{on} of {} on", list.rows.len())
+        } else {
+            format!("{} with \"{}\" in the name", shown.len(), list.filter)
+        };
+        lines.push(self.boxed(&render::dim(&count), count.chars().count(), room));
+        lines.push(self.boxed("", 0, room));
+        // Room for as many rows as the whole list shows, and for the lines
+        // saying more are above and below when it scrolls, so narrowing it
+        // or moving through it does not make the box jump.
+        let rows = match list.rows.len() {
+            all if all > SWITCH_ROWS => SWITCH_ROWS + 2,
+            all => all,
+        };
+        let start = lines.len();
+        if shown.is_empty() {
+            let none = "Nothing by that name.";
+            lines.push(self.boxed(&render::dim(none), none.len(), room));
+        }
+        let end = (list.top + SWITCH_ROWS).min(shown.len());
+        let width = shown
+            .iter()
+            .map(|&i| list.rows[i].name.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(NAME_WIDTH);
+        let more = |count: usize, arrow: &str| {
+            let text = format!("    {arrow} {count} more");
+            self.boxed(&render::dim(&text), text.chars().count(), room)
+        };
+        if list.top > 0 {
+            lines.push(more(list.top, "↑"));
+        }
+        for (at, &index) in shown.iter().enumerate().take(end).skip(list.top) {
+            let row = &list.rows[index];
+            let picked = at == list.picked;
+            let mark = if row.on {
+                render::green("●")
+            } else {
+                render::dim("○")
+            };
+            let name = format!("{:<width$}", render::fit(&row.name, width));
+            let name = match (picked, row.on) {
+                (true, _) => render::blue(&name),
+                (false, true) => name,
+                (false, false) => render::dim(&name),
+            };
+            let pointer = if picked {
+                render::blue("›")
+            } else {
+                " ".to_owned()
+            };
+            let about = render::fit(&row.about, room.saturating_sub(width + 6));
+            let text = format!("{pointer} {mark} {name}  {}", render::dim(&about));
+            lines.push(self.boxed(&text, render::visible(&text), room));
+        }
+        if end < shown.len() {
+            lines.push(more(shown.len() - end, "↓"));
+        }
+        while lines.len() - start < rows {
+            lines.push(self.boxed("", 0, room));
+        }
+    }
+
     /// The box while it holds a question. The answers are listed inside it
     /// and steered with the arrow keys, so agreeing to something is one key
     /// and never the wrong letter.
@@ -1948,10 +2298,41 @@ impl Bar {
                 lines.push(self.boxed(&render::dim(&part), width, room));
             }
         }
+        let shown = choice.shown();
+        if let Some(filter) = choice.filter.as_deref().filter(|f| !f.is_empty()) {
+            let count = format!("{} with \"{filter}\"", shown.len());
+            lines.push(self.boxed(&render::dim(&count), count.chars().count(), room));
+        }
         lines.push(self.boxed("", 0, room));
-        for (i, option) in choice.options.iter().enumerate() {
-            let chosen = i == choice.picked;
-            let text = format!("{} {} {option}", if chosen { "›" } else { " " }, i + 1);
+        // A list the user narrows keeps its height as it is narrowed, so the
+        // box does not jump under the letters being typed.
+        let rows = match choice.options.len() {
+            all if all > CHOICE_ROWS => CHOICE_ROWS + 2,
+            all => all,
+        };
+        let start = lines.len();
+        if shown.is_empty() {
+            let none = "Nothing matches.";
+            lines.push(self.boxed(&render::dim(none), none.len(), room));
+        }
+        let more = |count: usize, arrow: &str| {
+            let text = format!("    {arrow} {count} more");
+            self.boxed(&render::dim(&text), text.chars().count(), room)
+        };
+        let end = (choice.top + CHOICE_ROWS).min(shown.len());
+        if choice.top > 0 {
+            lines.push(more(choice.top, "↑"));
+        }
+        for (at, &index) in shown.iter().enumerate().take(end).skip(choice.top) {
+            let chosen = at == choice.picked;
+            let mark = if chosen { "›" } else { " " };
+            // Digits take an answer outright only where letters are not
+            // being typed, and only the first nine.
+            let text = match (&choice.filter, index) {
+                (None, 0..=8) => format!("{mark} {} {}", index + 1, choice.options[index]),
+                _ => format!("{mark}   {}", choice.options[index]),
+            };
+            let text = render::clip(&text, room);
             let width = render::visible(&text);
             lines.push(self.boxed(
                 &if chosen {
@@ -1962,6 +2343,14 @@ impl Bar {
                 width,
                 room,
             ));
+        }
+        if end < shown.len() {
+            lines.push(more(shown.len() - end, "↓"));
+        }
+        if choice.filter.is_some() {
+            while lines.len() - start < rows {
+                lines.push(self.boxed("", 0, room));
+            }
         }
     }
 }
@@ -2126,12 +2515,14 @@ fn track(stops: &[String], at: usize, room: usize) -> (String, String, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Added, Bar, Choice, MENU_LIMIT, NAME_WIDTH, PLAN_ROWS, QUEUED_LIMIT, RELAY_LIMIT, Row,
-        STILL, Slider, Waited, at_work, checklist, closest, fitted, is_command, matches, menu_top,
-        name_width, offered, one_row, reach, relay_line, stops_at, track, unescaped,
+        Added, Bar, CHOICE_ROWS, Choice, MENU_LIMIT, NAME_WIDTH, PLAN_ROWS, QUEUED_LIMIT,
+        RELAY_LIMIT, Row, STILL, SWITCH_ROWS, Slider, Switch, Switches, Waited, at_work, checklist,
+        closest, fitted, is_command, matches, menu_top, name_width, offered, one_row, reach,
+        relay_line, stops_at, track, unescaped,
     };
     use crate::render::{MARGIN, plain, visible};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use letronna_core::chat::Message;
     use letronna_core::store::Todo;
     use std::time::Instant;
 
@@ -2613,6 +3004,8 @@ mod tests {
                 .map(String::from)
                 .into(),
             picked: 0,
+            top: 0,
+            filter: None,
         });
         let asking = rows(&bar, 24);
         assert!(asking.len() <= 24, "{asking:#?}");
@@ -2811,6 +3204,100 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_session_s_prompts_come_back_under_up() {
+        let said = |role: &str, content: &str| Message {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        };
+        let messages = [
+            said("user", "first prompt"),
+            said("assistant", "an answer"),
+            Message {
+                notice: true,
+                ..said("user", "a job finished")
+            },
+            Message {
+                folded: true,
+                ..said("user", "a stop hook's word")
+            },
+            Message {
+                remote: true,
+                ..said("user", "from the chat")
+            },
+            said(
+                "user",
+                &letronna_core::workflow::saved::prompt("tidy", "src"),
+            ),
+            said("user", "/tmp is full"),
+            said("user", "last prompt"),
+        ];
+        let mut bar = Bar::new(String::new());
+        bar.set_history(&messages);
+
+        // What has not gone in yet still comes back first.
+        bar.queued.push_back("queued".into());
+        hit(&mut bar, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(bar.line.text(), "queued");
+        bar.line.clear();
+
+        let mut recalled = Vec::new();
+        for _ in 0..5 {
+            hit(&mut bar, KeyCode::Up, KeyModifiers::NONE);
+            recalled.push(bar.line.text().to_owned());
+        }
+        // As typed, so each sends what it sent before; nothing anyone else
+        // wrote among them.
+        assert_eq!(
+            recalled,
+            [
+                "last prompt",
+                "//tmp is full",
+                "/tidy src",
+                "first prompt",
+                "first prompt"
+            ]
+        );
+    }
+
+    #[test]
+    fn ctrl_a_and_ctrl_e_go_to_the_ends_of_the_line() {
+        let mut bar = Bar::new(String::new());
+        bar.line.set("top row\nbottom row");
+        hit(&mut bar, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(bar.line.line_of_cursor(), (1, 0));
+        hit(&mut bar, KeyCode::Up, KeyModifiers::NONE);
+        hit(&mut bar, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(bar.line.line_of_cursor(), (0, 7));
+        // Nothing was typed by them.
+        assert_eq!(bar.line.text(), "top row\nbottom row");
+    }
+
+    #[test]
+    fn ctrl_u_clears_to_the_start_of_the_line() {
+        let mut bar = Bar::new(String::new());
+        bar.line.set("keep\ndrop this, keep that");
+        for _ in 0.."keep that".len() {
+            hit(&mut bar, KeyCode::Left, KeyModifiers::NONE);
+        }
+        hit(&mut bar, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(bar.line.text(), "keep\nkeep that");
+        assert_eq!(bar.line.line_of_cursor(), (1, 0));
+    }
+
+    #[test]
+    fn ctrl_k_clears_to_the_end_of_the_line() {
+        let mut bar = Bar::new(String::new());
+        bar.line.set("keep this, drop that\nkeep");
+        hit(&mut bar, KeyCode::Up, KeyModifiers::NONE);
+        hit(&mut bar, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(bar.line.text(), "keep\nkeep");
+        hit(&mut bar, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        hit(&mut bar, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(bar.line.text(), "\nkeep");
+    }
+
+    #[test]
     fn a_stopped_turn_puts_what_was_queued_back_in_the_box() {
         let mut bar = Bar::new(String::new());
         bar.queued = ["check the docs", "/where", "and the tests"]
@@ -2892,6 +3379,8 @@ mod tests {
             detail: Vec::new(),
             options: vec!["Yes".into(), "No".into()],
             picked: 0,
+            top: 0,
+            filter: None,
         });
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         // Just after the question came up, neither answers.
@@ -2908,6 +3397,168 @@ mod tests {
         bar.guard = Instant::now().checked_sub(STILL);
         bar.pick(key(KeyCode::Enter));
         assert_eq!(bar.answer, Some(0));
+    }
+
+    /// A question with `options`, narrowed by typing when `narrowed`.
+    fn question(options: &[&str], narrowed: bool) -> Choice {
+        Choice {
+            question: "Which one?".into(),
+            detail: Vec::new(),
+            options: options.iter().map(|o| (*o).to_owned()).collect(),
+            picked: 0,
+            top: 0,
+            filter: narrowed.then(String::new),
+        }
+    }
+
+    #[test]
+    fn escape_turns_a_question_down_rather_than_taking_its_last_answer() {
+        let mut bar = Bar::new(String::new());
+        bar.choice = Some(question(&["Personal", "Team one", "Team two"], false));
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(bar.answer, None);
+        assert!(bar.declined);
+    }
+
+    #[test]
+    fn letters_answer_nothing_in_a_question_nobody_opened() {
+        let mut bar = Bar::new(String::new());
+        bar.choice = Some(question(&["Yes", "No"], false));
+        hit(&mut bar, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert_eq!(bar.choice.as_ref().unwrap().shown(), vec![0, 1]);
+        hit(&mut bar, KeyCode::Char('2'), KeyModifiers::NONE);
+        assert_eq!(bar.answer, Some(1));
+    }
+
+    #[test]
+    fn a_list_opened_by_hand_narrows_as_its_names_are_typed() {
+        let mut bar = Bar::new(String::new());
+        let models = [
+            "gpt-5.5 · OpenAI",
+            "claude-x · Letronna",
+            "deepseek-v4 · Letronna",
+        ];
+        bar.choice = Some(question(&models, true));
+        // Digits are part of names here, not answers.
+        for letter in "v4".chars() {
+            hit(&mut bar, KeyCode::Char(letter), KeyModifiers::NONE);
+        }
+        assert_eq!(bar.answer, None);
+        assert_eq!(bar.choice.as_ref().unwrap().shown(), vec![2]);
+        hit(&mut bar, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(bar.answer, Some(2));
+        // Escape takes the narrowing off before it turns the list down.
+        bar.answer = None;
+        hit(&mut bar, KeyCode::Char('x'), KeyModifiers::NONE);
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(bar.choice.as_ref().unwrap().shown(), vec![0, 1, 2]);
+        assert!(!bar.declined);
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(bar.declined);
+    }
+
+    #[test]
+    fn a_long_list_of_answers_scrolls_to_the_one_highlighted() {
+        let names: Vec<String> = (0..30).map(|i| format!("model-{i:02}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut bar = Bar::new(String::new());
+        bar.choice = Some(question(&names, true));
+        hit(&mut bar, KeyCode::End, KeyModifiers::NONE);
+        assert_eq!(bar.choice.as_ref().unwrap().top, 30 - CHOICE_ROWS);
+        let drawn: Vec<String> = bar.lines(60).iter().map(|line| plain(line)).collect();
+        assert!(
+            drawn
+                .iter()
+                .any(|line| line.contains("› model-29") || line.contains("›   model-29"))
+        );
+        assert!(drawn.iter().any(|line| line.contains("↑ 20 more")));
+        hit(&mut bar, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(bar.answer, Some(29));
+    }
+
+    /// A list of switches named `names`, the first of each pair on.
+    fn switch_list(names: &[&str]) -> Switches {
+        Switches {
+            question: "Skills".into(),
+            rows: names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| Switch {
+                    name: (*name).into(),
+                    about: format!("about {name}"),
+                    on: i % 2 == 0,
+                })
+                .collect(),
+            filter: String::new(),
+            picked: 0,
+            top: 0,
+        }
+    }
+
+    #[test]
+    fn a_switch_is_flipped_by_the_arrows_and_space_without_typing_its_name() {
+        let mut bar = Bar::new(String::new());
+        bar.switches = Some(switch_list(&["alpha", "beta", "gamma"]));
+        hit(&mut bar, KeyCode::Down, KeyModifiers::NONE);
+        hit(&mut bar, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(bar.flip, Some(Some(1)));
+        bar.flip = None;
+        // Up from the top goes round to the bottom; enter switches too.
+        hit(&mut bar, KeyCode::Up, KeyModifiers::NONE);
+        hit(&mut bar, KeyCode::Up, KeyModifiers::NONE);
+        hit(&mut bar, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(bar.flip, Some(Some(2)));
+        bar.flip = None;
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(bar.flip, Some(None));
+    }
+
+    #[test]
+    fn letters_narrow_the_switches_and_escape_widens_them_before_leaving() {
+        let mut bar = Bar::new(String::new());
+        bar.switches = Some(switch_list(&["alpha", "beta", "gamma"]));
+        hit(&mut bar, KeyCode::Char('g'), KeyModifiers::NONE);
+        hit(&mut bar, KeyCode::Char('A'), KeyModifiers::SHIFT);
+        assert_eq!(bar.switches.as_ref().unwrap().shown(), vec![2]);
+        // The highlight is on what is left, so space switches gamma.
+        hit(&mut bar, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(bar.flip, Some(Some(2)));
+        bar.flip = None;
+        hit(&mut bar, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(bar.switches.as_ref().unwrap().shown(), vec![2]);
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(bar.switches.as_ref().unwrap().shown(), vec![0, 1, 2]);
+        assert_eq!(bar.flip, None);
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(bar.flip, Some(None));
+    }
+
+    #[test]
+    fn a_long_list_of_switches_scrolls_and_keeps_the_box_one_height() {
+        let names: Vec<String> = (0..25).map(|i| format!("skill-{i:02}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut bar = Bar::new(String::new());
+        bar.switches = Some(switch_list(&names));
+        let tall = bar.lines(60).len();
+        hit(&mut bar, KeyCode::End, KeyModifiers::NONE);
+        let list = bar.switches.as_ref().unwrap();
+        assert_eq!(list.top, 25 - SWITCH_ROWS);
+        let drawn: Vec<String> = bar.lines(60).iter().map(|line| plain(line)).collect();
+        assert!(drawn.iter().any(|line| line.contains("› ● skill-24")));
+        assert!(drawn.iter().any(|line| line.contains("↑ 15 more")));
+        assert!(drawn.iter().any(|line| line.contains("13 of 25 on")));
+        // Narrowed to one, the box keeps its height rather than jumping.
+        for letter in "skill-07".chars() {
+            hit(&mut bar, KeyCode::Char(letter), KeyModifiers::NONE);
+        }
+        assert_eq!(bar.switches.as_ref().unwrap().shown(), vec![7]);
+        assert_eq!(bar.lines(60).len(), tall);
+        assert!(
+            bar.lines(60)
+                .last()
+                .unwrap()
+                .contains("esc to show them all")
+        );
     }
 
     #[test]

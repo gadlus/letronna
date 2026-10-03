@@ -84,6 +84,12 @@ pub fn command(
         }
         "/mode" => {
             render::blank();
+            // Bare, on a keyboard, the modes are offered with the one in use
+            // marked; turned down, it is said as before.
+            let picked = (rest.is_empty() && runner.bar.steered())
+                .then(|| pick_mode(runner))
+                .flatten();
+            let rest = picked.unwrap_or(rest);
             if !rest.is_empty() {
                 match Mode::parse(rest) {
                     Ok(mode) => runner.mode = mode,
@@ -101,7 +107,7 @@ pub fn command(
                 mode.label(),
                 mode.about()
             )));
-            if rest.is_empty() {
+            if rest.is_empty() && !runner.bar.steered() {
                 let names = Mode::OFFERED.map(Mode::name).join(", ");
                 render::line(&render::dim(&format!(
                     "Change it with /mode and one of {names}."
@@ -250,7 +256,7 @@ pub fn command(
             Flow::Handled
         }
         "/jobs" => {
-            jobs(rest);
+            jobs(runner, rest);
             Flow::Handled
         }
         "/loop" | "/heartbeat" => {
@@ -258,7 +264,8 @@ pub fn command(
             Flow::Handled
         }
         "/agents" => {
-            agents(runner.store.conversations[*session].id, rest);
+            let id = runner.store.conversations[*session].id;
+            agents(runner, id, rest);
             Flow::Handled
         }
         "/workflows" => {
@@ -864,6 +871,8 @@ const KEYS: &[(&str, &str)] = &[
     ("enter", "send"),
     ("shift+enter", "a new line"),
     ("↑ ↓", "step through what you said before"),
+    ("ctrl+a/e", "go to the start or end of the line"),
+    ("ctrl+u/k", "delete to the start or end of the line"),
     ("esc", "stop an answer, or clear the line"),
     ("ctrl+c", "copy what is selected, clear the line, or leave"),
     ("page up/down", "scroll back through the conversation"),
@@ -1215,6 +1224,29 @@ fn effort(runner: &mut Runner, session: usize, rest: &str) {
 fn style(runner: &mut Runner, name: &str) {
     use letronna_core::styles;
     render::blank();
+    // Bare, on a keyboard, the styles are offered with the one in use marked.
+    if name.is_empty() && runner.bar.steered() {
+        let current = styles::current().map(|s| s.name);
+        let rows: Vec<(String, String)> = std::iter::once((
+            styles::DEFAULT.to_owned(),
+            "no style, as Letronna usually writes".to_owned(),
+        ))
+        .chain(styles::all().into_iter().map(|s| (s.name, s.about)))
+        .map(|(name, about)| {
+            let using = match current.as_deref() {
+                Some(current) if current == name => "  (in use)",
+                None if name == styles::DEFAULT => "  (in use)",
+                _ => "",
+            };
+            let label = format!("{name}  ·  {about}{using}");
+            (name, label)
+        })
+        .collect();
+        if let Some(picked) = pick_name(runner, "Reply style", &rows) {
+            style(runner, &picked);
+        }
+        return;
+    }
     if !name.is_empty() {
         let chosen = if name.eq_ignore_ascii_case(styles::DEFAULT) {
             String::new()
@@ -1287,7 +1319,7 @@ fn style(runner: &mut Runner, name: &str) {
 /// says nothing more unless asked. Without this the only way to find out was
 /// to ask the model to ask its tool, which is a long way round to a list the
 /// program already has.
-fn jobs(rest: &str) {
+fn jobs(runner: &mut Runner, rest: &str) {
     let running = letronna_core::jobs::list();
     render::blank();
     if running.is_empty() {
@@ -1297,6 +1329,21 @@ fn jobs(rest: &str) {
 
     // `/jobs stop 3`, or a bare `/jobs` to look.
     if let Some(id) = rest.strip_prefix("stop").map(str::trim) {
+        let rows: Vec<(String, String)> = running
+            .iter()
+            .filter(|job| job.running)
+            .map(|job| {
+                let command = letronna_core::tools::one_line(&job.command);
+                (job.id.to_string(), format!("{}  {command}", job.id))
+            })
+            .collect();
+        let id = match id.is_empty() && runner.bar.steered() && !rows.is_empty() {
+            true => match pick_name(runner, "Stop which job?", &rows) {
+                Some(id) => id,
+                None => return,
+            },
+            false => id.to_owned(),
+        };
         let Ok(id) = id.parse::<u64>() else {
             render::said(
                 &render::blue("●"),
@@ -1324,7 +1371,7 @@ fn jobs(rest: &str) {
             render::dim(state)
         ));
     }
-    render::line(&render::dim("/jobs stop <id> to stop one"));
+    render::line(&render::dim("/jobs stop to pick one to stop"));
 }
 
 /// Words that go with `/workflows`, shown after a list and for words it
@@ -1807,7 +1854,7 @@ fn crew(id: u64, rest: &str) {
 ///
 /// A helper in the background says nothing until it ends, and the model is
 /// told not to ask after it, so this is where the user looks in on one.
-fn agents(session: u64, rest: &str) {
+fn agents(runner: &mut Runner, session: u64, rest: &str) {
     let helpers: Vec<Seen> = (letronna_core::agents::seen().into_iter())
         .filter(|helper| helper.session == session)
         .collect();
@@ -1824,9 +1871,39 @@ fn agents(session: u64, rest: &str) {
     // or a bare `/agents` to look.
     let usage = "/agents stop <name>  ·  /agents send <name> <text>";
     let (action, rest) = rest.split_once(' ').unwrap_or((rest, ""));
+    // With no name, on a keyboard, the helpers still at work are offered.
+    let working: Vec<(String, String)> = helpers
+        .iter()
+        .filter(|helper| helper.ended.is_none())
+        .map(|helper| {
+            let task = letronna_core::tools::one_line(&helper.description);
+            (
+                helper.name.clone(),
+                format!("{}  ·  {}  ·  {task}", helper.name, helper.kind),
+            )
+        })
+        .collect();
+    let rest = rest.trim();
+    let picking = rest.is_empty() && runner.bar.steered() && !working.is_empty();
     match action {
-        "stop" => stop_helper(&helpers, rest.trim()),
-        "send" => send_to_helper(&helpers, rest.trim()),
+        "stop" if picking => {
+            if let Some(name) = pick_name(runner, "Stop which helper?", &working) {
+                stop_helper(&helpers, &name);
+            }
+        }
+        "send" if picking => {
+            let Some(name) = pick_name(runner, "Tell which helper?", &working) else {
+                return;
+            };
+            match runner.bar.ask(&format!("What should {name} hear?"), false) {
+                Some(text) if !text.trim().is_empty() => {
+                    send_to_helper(&helpers, &format!("{name} {}", text.trim()));
+                }
+                _ => render::line(&render::dim("Nothing sent.")),
+            }
+        }
+        "stop" => stop_helper(&helpers, rest),
+        "send" => send_to_helper(&helpers, rest),
         "" => {
             render::said(&render::blue("●"), &render::bold("Helpers"));
             let width = render::width().saturating_sub(render::PAD.len());
@@ -1964,6 +2041,29 @@ fn mcp_servers(runner: &mut Runner, rest: &str) {
     let (verb, name) = rest.split_once(' ').unwrap_or((rest, ""));
     let name = name.trim();
     render::blank();
+    if matches!(verb, "enable" | "disable") && name.is_empty() && switch_servers(runner) {
+        return;
+    }
+    // The other verbs that need a server, with none named, offer them.
+    let wants_one = matches!(verb, "reconnect" | "login" | "logout" | "log");
+    let servers: Vec<(String, String)> = match wants_one && name.is_empty() {
+        true => mcp::status()
+            .iter()
+            .map(|server| {
+                let health = render::plain(&crate::mcp::health(server));
+                (server.name.clone(), format!("{}  ·  {health}", server.name))
+            })
+            .collect(),
+        false => Vec::new(),
+    };
+    let picked = match runner.bar.steered() && !servers.is_empty() {
+        true => match pick_name(runner, &server_question(verb), &servers) {
+            Some(server) => server,
+            None => return,
+        },
+        false => name.to_owned(),
+    };
+    let name = picked.as_str();
     if !verb.is_empty() && verb != "reload" && name.is_empty() {
         let which = format!("Which server? /mcp {verb} <name>");
         render::said(&render::blue("●"), &render::bold(&which));
@@ -2028,8 +2128,51 @@ fn mcp_servers(runner: &mut Runner, rest: &str) {
         render::line(&render::dim("/mcp <prompt> to send one"));
     }
     render::line(&render::dim(
-        "/mcp reconnect|enable|disable|login|logout|log <name>, or /mcp reload after editing mcp.json",
+        "/mcp enable or /mcp disable to switch servers · /mcp reconnect|login|logout|log <name> · /mcp reload after editing mcp.json",
     ));
+}
+
+/// What picking a server for `/mcp <verb>` asks.
+fn server_question(verb: &str) -> String {
+    match verb {
+        "reconnect" => "Reconnect which server?".to_owned(),
+        "login" => "Sign in to which server?".to_owned(),
+        "logout" => "Sign out of which server?".to_owned(),
+        "log" => "Read which server's log?".to_owned(),
+        _ => format!("Which server for /mcp {verb}?"),
+    }
+}
+
+/// What picking a plugin for `/plugins <verb>` asks.
+fn plugin_question(verb: &str) -> &'static str {
+    match verb {
+        "allow" => "Allow which plugin to start its programs?",
+        _ => "Remove which plugin?",
+    }
+}
+
+/// The MCP servers as a list to switch on and off with the arrows. False off
+/// a keyboard, or with no servers to switch.
+fn switch_servers(runner: &mut Runner) -> bool {
+    use letronna_core::mcp::{self, State};
+    let rows: Vec<_> = mcp::status()
+        .iter()
+        .map(|server| crate::bar::Switch {
+            name: server.name.clone(),
+            about: format!(
+                "{} · {}",
+                server.transport,
+                render::plain(&crate::mcp::health(server))
+            ),
+            on: server.state != State::Disabled,
+        })
+        .collect();
+    if rows.is_empty() {
+        return false;
+    }
+    switch_list(runner, "MCP servers", rows, &mut |name, on| {
+        mcp::set_enabled(name, on)
+    })
 }
 
 /// The newest of what one server printed on stderr.
@@ -2083,6 +2226,12 @@ fn skills(runner: &mut Runner, rest: &str, workspace: Option<&std::path::Path>) 
             return;
         }
     };
+    // Switching with no name, or the bare command, opens them as a list to
+    // switch with the arrows; `/skills list` lists them as lines.
+    let switching = rest.is_empty() || (matches!(verb, "on" | "off") && target.is_empty());
+    if switching && !saved.is_empty() && switch_skills(runner, &saved) {
+        return;
+    }
     if matches!(verb, "on" | "off") {
         switch_skill(&saved, target, verb == "on");
         return;
@@ -2096,7 +2245,7 @@ fn skills(runner: &mut Runner, rest: &str, workspace: Option<&std::path::Path>) 
     }
 
     // Named, it goes to the model as the next thing said.
-    if !rest.is_empty() {
+    if !rest.is_empty() && rest != "list" {
         match pick_skill(&saved, rest) {
             Ok(skill) => {
                 render::said(&render::blue("●"), &render::bold(&skill.name));
@@ -2114,14 +2263,8 @@ fn skills(runner: &mut Runner, rest: &str, workspace: Option<&std::path::Path>) 
         } else {
             render::dim("off")
         };
-        let source = match skill.source {
-            Source::User if skill.learned => "learned",
-            Source::User => "yours",
-            Source::Project => "project",
-            Source::Plugin => "plugin",
-        };
         // A line each: descriptions are written for the model, and run long.
-        let about = format!("{source} · {}", skill.description);
+        let about = skill_about(skill);
         let room = render::width().saturating_sub(skill.name.chars().count() + 12);
         let about = if about.chars().count() > room {
             let cut: String = about.chars().take(room.saturating_sub(1)).collect();
@@ -2136,8 +2279,112 @@ fn skills(runner: &mut Runner, rest: &str, workspace: Option<&std::path::Path>) 
         ));
     }
     render::line(&render::dim(
-        "/skills <name> to use one · /skills on|off <name> · /skills add <owner/repo, link or path>",
+        "/skills <name> to use one · /skills to switch them · /skills add <owner/repo, link or path>",
     ));
+}
+
+/// What a skill is listed with: where it came from, then its description.
+fn skill_about(skill: &Skill) -> String {
+    let source = match skill.source {
+        Source::User if skill.learned => "learned",
+        Source::User => "yours",
+        Source::Project => "project",
+        Source::Plugin => "plugin",
+    };
+    format!("{source} · {}", skill.description)
+}
+
+/// The skills as a list to switch on and off with the arrows. False off a
+/// keyboard, where they are listed as lines instead.
+fn switch_skills(runner: &mut Runner, saved: &[Skill]) -> bool {
+    let rows = saved
+        .iter()
+        .map(|skill| crate::bar::Switch {
+            name: skill.name.clone(),
+            about: skill_about(skill),
+            on: skill.enabled,
+        })
+        .collect();
+    let switched = switch_list(runner, "Skills", rows, &mut |name, on| {
+        letronna_core::skills::set_enabled(name, on)
+    });
+    if switched {
+        render::line(&render::dim(
+            "Only the ones on are offered to the model · /skills <name> to use one",
+        ));
+    }
+    switched
+}
+
+/// A mode picked from those offered, each with what it does, the one in use
+/// marked. `None` when it was turned down.
+fn pick_mode(runner: &mut Runner) -> Option<&'static str> {
+    let labels: Vec<String> = Mode::OFFERED
+        .iter()
+        .map(|mode| {
+            let using = if *mode == runner.mode {
+                "  (in use)"
+            } else {
+                ""
+            };
+            format!("{}  ·  {}{using}", mode.label(), mode.about())
+        })
+        .collect();
+    let mut options: Vec<&str> = labels.iter().map(String::as_str).collect();
+    options.push("Keep the one I have");
+    let picked = runner.bar.pick_from("Mode", Vec::new(), &options)?;
+    Mode::OFFERED.get(picked).map(|mode| mode.name())
+}
+
+/// A name picked in the box for a command given none, from `rows` of a name
+/// and how it is listed, which typing narrows. `None` when it was turned
+/// down, saying so; the caller asks only on a keyboard and with rows to show.
+fn pick_name(runner: &mut Runner, question: &str, rows: &[(String, String)]) -> Option<String> {
+    let mut options: Vec<&str> = rows.iter().map(|(_, label)| label.as_str()).collect();
+    options.push("Never mind");
+    let picked = runner.bar.pick_from(question, Vec::new(), &options);
+    let name = picked
+        .and_then(|at| rows.get(at))
+        .map(|(name, _)| name.clone());
+    if name.is_none() {
+        render::line(&render::dim("Left as it was."));
+    }
+    name
+}
+
+/// Switch things on and off from a list in the box, and leave a line in the
+/// conversation saying what changed. False off a keyboard, with nothing done.
+fn switch_list(
+    runner: &mut Runner,
+    what: &str,
+    rows: Vec<crate::bar::Switch>,
+    flip: &mut dyn FnMut(&str, bool) -> Result<(), String>,
+) -> bool {
+    if !runner.bar.steered() {
+        return false;
+    }
+    let before: Vec<bool> = rows.iter().map(|row| row.on).collect();
+    let after = runner.bar.switches(what, rows, flip);
+    let on = after.iter().filter(|row| row.on).count();
+    render::said(
+        &render::blue("●"),
+        &render::bold(&format!("{what}: {on} of {} on", after.len())),
+    );
+    for (state, label) in [(true, "Switched on"), (false, "Switched off")] {
+        let names: Vec<&str> = after
+            .iter()
+            .zip(&before)
+            .filter(|(row, was)| row.on == state && row.on != **was)
+            .map(|(row, _)| row.name.as_str())
+            .collect();
+        if !names.is_empty() {
+            render::line(&render::dim(&format!("{label}: {}", names.join(", "))));
+        }
+    }
+    if after.iter().zip(&before).all(|(row, was)| row.on == *was) {
+        render::line(&render::dim("Nothing was switched."));
+    }
+    true
 }
 
 /// The skill called `wanted`, or else the one whose name contains it. When
@@ -2248,6 +2495,35 @@ fn add_skills(runner: &mut Runner, source: &str) {
 
 /// The plugins: list them and what each brings, or add, switch, allow,
 /// update or remove one, or look through the marketplaces.
+/// The plugins as a list to switch on and off with the arrows. False off a
+/// keyboard, or with no plugins to switch.
+fn switch_plugins(runner: &mut Runner) -> bool {
+    use letronna_core::plugins;
+    let rows: Vec<_> = match plugins::list() {
+        Ok(found) => found
+            .into_iter()
+            .map(|plugin| crate::bar::Switch {
+                about: match &plugin.broken {
+                    Some(why) => format!("will not load · {why}"),
+                    None => plugin.description.clone(),
+                },
+                name: plugin.name,
+                on: plugin.enabled,
+            })
+            .collect(),
+        Err(why) => {
+            render::line(&render::red(&why));
+            return true;
+        }
+    };
+    if rows.is_empty() {
+        return false;
+    }
+    switch_list(runner, "Plugins", rows, &mut |name, on| {
+        plugins::set_enabled(name, on)
+    })
+}
+
 fn plugins(runner: &mut Runner, rest: &str) {
     use letronna_core::plugins;
     render::blank();
@@ -2255,6 +2531,31 @@ fn plugins(runner: &mut Runner, rest: &str) {
         .split_once(' ')
         .map_or((rest, ""), |(verb, target)| (verb, target.trim()));
     let needs_name = matches!(verb, "on" | "off" | "allow" | "remove" | "add");
+    if matches!(verb, "on" | "off") && target.is_empty() && switch_plugins(runner) {
+        return;
+    }
+    // Allow and remove, with none named, offer the plugins they apply to.
+    let offered: Vec<(String, String)> =
+        match matches!(verb, "allow" | "remove") && target.is_empty() {
+            true => plugins::list()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|plugin| verb == "remove" || !plugin.allowed)
+                .map(|plugin| {
+                    let label = format!("{}  ·  {}", plugin.name, plugin.description);
+                    (plugin.name, label)
+                })
+                .collect(),
+            false => Vec::new(),
+        };
+    let picked = match runner.bar.steered() && !offered.is_empty() {
+        true => match pick_name(runner, plugin_question(verb), &offered) {
+            Some(plugin) => plugin,
+            None => return,
+        },
+        false => target.to_owned(),
+    };
+    let target = picked.as_str();
     if needs_name && target.is_empty() {
         let what = if verb == "add" {
             "<git url or owner/repo>"
@@ -2475,6 +2776,10 @@ fn plugin_market(runner: &mut Runner, rest: &str) {
 /// the window; this is the shortlist you would actually pick from.
 const SESSION_CHOICES: usize = 9;
 
+/// Sessions offered in the box, where typing narrows them by title, so the
+/// list reaches further back than the shortlist.
+const SESSION_LIST: usize = 50;
+
 /// How a session reads in the `/resume` list: its title, project folder and
 /// length.
 fn choice_label(conversation: &store::Conversation) -> String {
@@ -2519,7 +2824,11 @@ pub fn resume(
         })
         .collect();
     recent.sort_by_key(|i| std::cmp::Reverse(runner.store.conversations[*i].updated));
-    recent.truncate(SESSION_CHOICES);
+    recent.truncate(if runner.bar.steered() {
+        SESSION_LIST
+    } else {
+        SESSION_CHOICES
+    });
 
     if recent.is_empty() && !term.is_empty() {
         resume_said(runner, session, workspace, term);
@@ -2540,7 +2849,8 @@ pub fn resume(
     render::said(&render::blue("●"), &render::bold("Earlier sessions"));
     let mut options: Vec<&str> = labels.iter().map(String::as_str).collect();
     options.push("Stay where I am");
-    let Some(picked) = runner.bar.choose("Which one?", Vec::new(), &options) else {
+    let Some(picked) = runner.bar.pick_from("Which one?", Vec::new(), &options) else {
+        render::line(&render::dim("Stayed put."));
         return;
     };
     let Some(index) = recent.get(picked).copied() else {
@@ -3205,8 +3515,9 @@ fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
     )));
 }
 
-/// Models offered at once. Some gateways carry hundreds; a list longer than
-/// this is narrowed with a word rather than scrolled.
+/// Models listed at once where they cannot be steered through. Some gateways
+/// carry hundreds; there, a list longer than this is narrowed with a word. In
+/// the box they are all offered, and narrowed by typing.
 const MODEL_CHOICES: usize = 10;
 
 /// The media kind a `/model` word names, if it names one: `image` or `images`.
@@ -3243,13 +3554,18 @@ fn switch_media(runner: &mut Runner, kind: &'static str, label: &str) {
         return;
     }
     let chosen = letronna_core::media::choices().remove(kind);
-    let shown = &offers[..offers.len().min(MODEL_CHOICES)];
+    let room = if runner.bar.steered() {
+        offers.len()
+    } else {
+        MODEL_CHOICES
+    };
+    let shown = &offers[..offers.len().min(room)];
     let mut labels = vec!["Auto · the cheapest working".to_owned()];
     labels.extend(shown.iter().map(|o| format!("{} · {}", o.id, o.price())));
     let mut options: Vec<&str> = labels.iter().map(String::as_str).collect();
     options.push("Keep the one I have");
     let question = format!("In use: {}", chosen.as_deref().unwrap_or("Auto"));
-    let Some(picked) = runner.bar.choose(&question, Vec::new(), &options) else {
+    let Some(picked) = runner.bar.pick_from(&question, Vec::new(), &options) else {
         return;
     };
     let model = match picked {
@@ -3330,7 +3646,12 @@ pub fn switch_model(runner: &mut Runner, session: Option<usize>, filter: &str) {
         return;
     }
 
-    let shown: Vec<(String, String)> = matching.iter().take(MODEL_CHOICES).cloned().collect();
+    let room = if runner.bar.steered() {
+        matching.len()
+    } else {
+        MODEL_CHOICES
+    };
+    let shown: Vec<(String, String)> = matching.iter().take(room).cloned().collect();
     if matching.len() > shown.len() {
         render::line(&render::dim(&format!(
             "{} of {} shown — type /model <word> to narrow it.",
@@ -3343,7 +3664,8 @@ pub fn switch_model(runner: &mut Runner, session: Option<usize>, filter: &str) {
     options.push("Keep the one I have");
 
     let question = format!("In use: {current}");
-    let Some(picked) = runner.bar.choose(&question, Vec::new(), &options) else {
+    let Some(picked) = runner.bar.pick_from(&question, Vec::new(), &options) else {
+        render::line(&render::dim("Left as it was."));
         return;
     };
     match shown.get(picked) {

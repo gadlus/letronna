@@ -12,6 +12,11 @@ pub struct Paste {
     pub text: String,
 }
 
+/// Prompts an opened session puts back under up, the newest of them: more
+/// than anyone steps back through a key at a time, and few enough that a
+/// session of thousands of messages is not copied whole into the box.
+const HISTORY: usize = 100;
+
 #[derive(Default)]
 pub struct Line {
     text: String,
@@ -180,6 +185,28 @@ impl Line {
         self.cut(self.cursor, end);
     }
 
+    /// Move to the start of the row the cursor is on.
+    pub fn row_start(&mut self) {
+        self.cursor = self.row().0;
+    }
+
+    /// Move to the end of the row the cursor is on.
+    pub fn row_end(&mut self) {
+        self.cursor = self.row().1;
+    }
+
+    /// Delete back to the start of the row the cursor is on.
+    pub fn backspace_to_row_start(&mut self) {
+        let (start, _) = self.row();
+        self.cut(start, self.cursor);
+    }
+
+    /// Delete forward to the end of the row the cursor is on.
+    pub fn delete_to_row_end(&mut self) {
+        let (_, end) = self.row();
+        self.cut(self.cursor, end);
+    }
+
     pub fn word_left(&mut self) {
         self.cursor = self.word_start();
     }
@@ -210,6 +237,20 @@ impl Line {
             at -= 1;
         }
         at
+    }
+
+    /// Where the row the cursor is on starts and ends, between line endings.
+    fn row(&self) -> (usize, usize) {
+        let chars = self.chars();
+        let start = chars[..self.cursor]
+            .iter()
+            .rposition(|c| *c == '\n')
+            .map_or(0, |at| at + 1);
+        let end = chars[self.cursor..]
+            .iter()
+            .position(|c| *c == '\n')
+            .map_or(chars.len(), |at| self.cursor + at);
+        (start, end)
     }
 
     fn word_start(&self) -> usize {
@@ -337,11 +378,27 @@ impl Line {
         self.draft.clear();
         sent
     }
+
+    /// Start the lines sent earlier over from `sent`, oldest first, keeping
+    /// the newest `HISTORY` of them.
+    pub fn set_history(&mut self, sent: impl IntoIterator<Item = String>) {
+        self.history.clear();
+        for line in sent {
+            if !line.trim().is_empty() && self.history.last() != Some(&line) {
+                self.history.push(line);
+            }
+        }
+        let over = self.history.len().saturating_sub(HISTORY);
+        self.history.drain(..over);
+        // A place among the old lines means nothing among these.
+        self.recalled = None;
+        self.draft.clear();
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Line;
+    use super::{HISTORY, Line};
 
     fn typed(text: &str) -> Line {
         let mut line = Line::default();
@@ -493,6 +550,52 @@ three"
         line.up();
         // Nothing older to reach.
         assert_eq!(line.text(), "again");
+    }
+
+    #[test]
+    fn an_opened_session_brings_back_only_its_newest_prompts() {
+        let mut line = typed("draft");
+        let sent = (0..HISTORY + 5).map(|n| n.to_string());
+        line.set_history(sent.chain(["again".into(), "again".into()]));
+        line.up();
+        assert_eq!(line.text(), "again");
+        line.up();
+        // Said twice in a row, it comes back once.
+        assert_eq!(line.text(), (HISTORY + 4).to_string());
+        for _ in 0..HISTORY + 5 {
+            line.up();
+        }
+        // The oldest few are past the cap.
+        assert_eq!(line.text(), "6");
+
+        // Typed since, a line still joins the end.
+        line.clear();
+        line.insert_str("new");
+        line.take();
+        line.up();
+        assert_eq!(line.text(), "new");
+    }
+
+    #[test]
+    fn the_row_keys_keep_to_the_row_the_cursor_is_on() {
+        let mut line = typed("one two\nthree four\nfive");
+        line.up();
+        assert_eq!(line.line_of_cursor(), (1, 4));
+        line.row_start();
+        assert_eq!(line.line_of_cursor(), (1, 0));
+        line.row_end();
+        assert_eq!(line.line_of_cursor(), (1, 10));
+        for _ in 0.." four".len() {
+            line.left();
+        }
+        line.delete_to_row_end();
+        assert_eq!(line.text(), "one two\nthree\nfive");
+        line.backspace_to_row_start();
+        assert_eq!(line.text(), "one two\n\nfive");
+        // At either end of its row, there is nothing to take.
+        line.backspace_to_row_start();
+        line.delete_to_row_end();
+        assert_eq!(line.text(), "one two\n\nfive");
     }
 
     #[test]
