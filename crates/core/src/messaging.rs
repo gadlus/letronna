@@ -2425,6 +2425,7 @@ where
     let mut used = 0;
     let mut day = None;
     let mut joins_a_fence = false;
+    let mut noted = false;
     let kept = lines
         .iter()
         .rev()
@@ -2438,6 +2439,13 @@ where
             }
             if *theirs && !joins_a_fence {
                 used += crate::untrusted::FENCE_BYTES + 1;
+                noted = false;
+            }
+            // A run hiding characters gets a line after its fence saying
+            // so, counted at its longest.
+            if *theirs && !noted && crate::untrusted::cleaned(line).1 > 0 {
+                used += crate::untrusted::hidden_note(usize::MAX).len();
+                noted = true;
             }
             joins_a_fence = *theirs;
             used <= budget
@@ -2840,6 +2848,24 @@ mod discord_tests {
         let out = render_history(&page, (BOT, "7"), super::HISTORY_BUDGET, &chrono::Utc).unwrap();
         assert!(out.len() <= crate::chat::MAX_TOOL_CHARS, "{}", out.len());
         assert!(out.matches("<untrusted-content-").count() > 10, "{out}");
+    }
+
+    #[test]
+    fn a_history_hiding_characters_still_fits_one_result_with_its_notes() {
+        // As above, with a zero-width space in each line, so every fence is
+        // followed by a line saying it took one out.
+        let page: Vec<Value> = (0..500)
+            .map(|n| {
+                json!({"id": n.to_string(), "content": format!("word\u{200B} {}", "word ".repeat(39)),
+                       "timestamp": format!("2026-{:02}-{:02}T10:00:00+00:00", 1 + n / 28 % 12, 1 + n % 28),
+                       "author": {"id": if n % 2 == 0 { "7" } else { "8" }, "username": "someone"}})
+            })
+            .collect();
+        let out = render_history(&page, (BOT, "7"), super::HISTORY_BUDGET, &chrono::Utc).unwrap();
+        assert!(out.len() <= crate::chat::MAX_TOOL_CHARS, "{}", out.len());
+        let fences = out.matches("<untrusted-content-").count();
+        assert!(fences > 10, "{out}");
+        assert_eq!(out.matches("[Letronna's note: ").count(), fences, "{out}");
     }
 
     /// Reads a real channel. `LETRONNA_TEST_DISCORD_BOT=<token>
