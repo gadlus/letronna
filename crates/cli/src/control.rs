@@ -118,6 +118,9 @@ pub fn run(runner: &mut Runner, session: usize, args: &Args) -> i32 {
         }
     });
     let mode = runner.mode;
+    // Once, as `-p` alone says it: without asking over stdin, what needs a
+    // yes is refused, and only the model hears so.
+    crate::say_unanswered(mode, args.ask_stdio);
     let rules = permissions::load(&permissions::user_file());
     // One for the whole run, as a script counts on it to cap what it spends.
     let budget = args.budget.map(|limit| Arc::new(Budget::new(limit, None)));

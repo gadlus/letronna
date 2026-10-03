@@ -41,6 +41,7 @@ use letronna_core::budget::Budget;
 use letronna_core::cancel::Cancel;
 use letronna_core::chat::{self, Message};
 use letronna_core::driver::{self, Allow, Outcome, Report, Spec, Status};
+use letronna_core::gate::Mode;
 use letronna_core::store::Transcript;
 use letronna_core::{agent, crew, hooks, inbox, store, tools, update};
 use serde_json::{Value, json};
@@ -474,6 +475,9 @@ fn ask_once(
     let keyboard = args.output == Output::Text && render::interactive();
     // Its own gate asks only when someone can answer.
     spec.connection.human = keyboard;
+    // The gate's refusals reach only the model, so a script that left out
+    // --yes would otherwise see an answer that changed nothing and no why.
+    say_unanswered(spec.connection.mode, keyboard);
     answer_approvals(keyboard, context, spec.cancel.clone());
     let report = run_following(spec, args.output);
     finish(runner, session, id, before, report, args.output)
@@ -687,6 +691,17 @@ fn say_refused(name: &str, why: &str) {
         );
     } else {
         eprintln!("`{name}` was refused: {}", tools::one_line(why));
+    }
+}
+
+/// Says on stderr, when a run in Default `mode` has no `human` to answer for
+/// it, that what needs a yes will be refused.
+fn say_unanswered(mode: Mode, human: bool) {
+    if mode == Mode::Default && !human {
+        eprintln!(
+            "Nobody can approve calls in this run, so in Default mode each write or command \
+             that needs a yes will be refused; run with --yes, or --mode auto to have them judged."
+        );
     }
 }
 
