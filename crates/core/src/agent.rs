@@ -553,7 +553,7 @@ impl Turn {
             if declined || checks(result, self.connection.workspace.as_deref()) {
                 self.edited = false;
             }
-        } else if !result.is_error && EDITS.contains(&result.name.as_str()) && !only_notes(result) {
+        } else if changes_code(result) {
             self.edited = true;
         }
     }
@@ -706,6 +706,12 @@ fn checks(result: &Message, workspace: Option<&std::path::Path>) -> bool {
     let line = args["command"].as_str().unwrap_or_default();
     let dialect = crate::command::Dialect::here();
     crate::command::assess(line, dialect, workspace).risk != crate::command::Risk::ReadOnly
+}
+
+/// Whether a tool's result is an edit that went through to more than notes,
+/// the kind a build or test would check.
+pub(crate) fn changes_code(result: &Message) -> bool {
+    !result.is_error && EDITS.contains(&result.name.as_str()) && !only_notes(result)
 }
 
 /// Whether every file an edit names is a note, such as a report, rather
