@@ -53,10 +53,13 @@ const MAX_LIMIT: usize = 500;
 /// Lines of context either side of a match; more turns a page of matches
 /// into a page of files.
 const MAX_CONTEXT: usize = 5;
-/// A page holds at most this many bytes as shown, well under the tool's 24k
-/// output cap, so the paging note under it is never cut off. One match with
-/// five lines of context either side comes to ~14k at most.
-const PAGE_BYTES: usize = 18_000;
+/// A page holds at most this many bytes as shown: under the chat's cap on a
+/// tool result, with 1,000 bytes for the notes around it, some 450 with a
+/// pattern of usual length, so a full page reaches the model whole and
+/// paging on from its offset skips nothing. A page's first match is shown
+/// whatever its size, which with five lines of multi-byte context either
+/// side comes to ~14k.
+const PAGE_BYTES: usize = crate::chat::MAX_TOOL_CHARS - 1_000;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Mode {
@@ -1089,6 +1092,56 @@ mod tests {
         let (body, note) = page.rsplit_once('\n').unwrap();
         assert!(body.len() <= PAGE_BYTES, "{}", body.len());
         assert_eq!(note, format!("… {}", more(1)));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_full_search_page_is_never_cut_in_the_middle() {
+        // Long names and long lines fill every page, which carries every
+        // note it can: the pattern searched as plain text, the paging note
+        // and the secret left out.
+        let text = format!("x({}\n", "y".repeat(LINE_CHARS)).repeat(3);
+        let names: Vec<String> = (0..120)
+            .map(|n| format!("{n:03}-{}.txt", "long".repeat(20)))
+            .collect();
+        let mut files: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), &*text)).collect();
+        files.push((".env", "x("));
+        let dir = tree("never-cut", &files);
+        for (mode, total) in [("content", 360), ("files", 120), ("count", 120)] {
+            let entry = |line: &str| match mode {
+                "content" => line.contains(": x("),
+                "files" => line.ends_with(".txt"),
+                _ => line.ends_with(".txt: 3"),
+            };
+            let (mut offset, mut pages, mut shown) = (0, 0, 0);
+            loop {
+                let args = json!({"pattern": "x(", "mode": mode, "limit": 500, "offset": offset});
+                let page = run(&dir, args);
+                // A tool result this long goes to the model whole, where a
+                // longer one loses its middle while the offset skips past it.
+                assert!(
+                    page.len() <= crate::chat::MAX_TOOL_CHARS,
+                    "{mode}: {}",
+                    page.len()
+                );
+                assert!(page.starts_with("`x(` is not a regex"), "{page}");
+                assert!(
+                    page.ends_with("left out: 1. Ask the user to paste what you need from them.")
+                );
+                shown += page.lines().filter(|l| entry(l)).count();
+                pages += 1;
+                let next = page.split_once("pass offset ").map(|(_, rest)| {
+                    let digits = rest.split(' ').next().unwrap();
+                    digits.parse::<usize>().unwrap()
+                });
+                let Some(next) = next else {
+                    break;
+                };
+                offset = next;
+            }
+            assert!(pages > 1, "{mode} came in one page");
+            assert_eq!(shown, total, "{mode}");
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
