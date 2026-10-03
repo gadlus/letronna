@@ -317,6 +317,29 @@ const SET_VALUE: &str = "function(text) {
   field.dispatchEvent(new Event('change', {bubbles: true}));
   return '';
 }";
+/// What the field typed into holds once `text` is in, since a page may cut,
+/// reformat or refuse it -- `true` for `text`, `false` for a password field
+/// holding anything else, as its value is never said -- read from the
+/// element or the field inside it that has focus, and `null` for any other,
+/// such as an editor that draws its text its own way.
+const READ_BACK: &str = "function(text) {
+  const holds = e => e instanceof HTMLTextAreaElement || e instanceof HTMLInputElement
+    && ['text', 'search', 'email', 'url', 'tel', 'password', 'number'].includes(e.type);
+  let field = this;
+  if (!holds(field)) {
+    field = this.getRootNode().activeElement;
+    while (field && field.shadowRoot && field.shadowRoot.activeElement) field = field.shadowRoot.activeElement;
+    let at = field;
+    while (at && at !== this) at = at.parentNode || at.host;
+    if (!at || !holds(field)) return null;
+  }
+  if (field.value === text) return true;
+  return field.type === 'password' ? false : field.value;
+}";
+/// How much of what a field holds is said when it is not what was typed:
+/// twice what a listing line shows of a value, room for the start of a long
+/// text as well as a phone number's or a card's new shape.
+const READ_BACK_CHARS: usize = 200;
 /// The file field an upload fills: the element named, the one its label is
 /// for, the only one inside it, or the only one on the page -- sites hide
 /// the field behind a button of their own. Says what went wrong otherwise.
@@ -500,7 +523,7 @@ impl Tool for UsePage {
         "use_page"
     }
     fn description(&self) -> &'static str {
-        "Act on the page open in browse, the way a person would: `click` an element, `type` into a field (it replaces what is there; `submit` presses Enter after), `press` a key such as Enter, Tab, Escape or ArrowDown, `select` a dropdown's option by its text (a site's own dropdown too: it is opened and the option clicked), `upload` files from the project into a file field, `drag` an element onto another (`to`) or to a point, or `eval` a JavaScript expression and get its value back. Elements are named by the refs browse lists, such as e12; one listed under a frame's header marked cross-origin or opaque origin also needs `frame`, the origin that header names after \"frame\", and each such action is asked about on its own. `click` also takes a point instead of a ref, and names what was there: `x` and `y` in CSS pixels from the top left of the view, which is as big as the latest screenshot's result says -- not the picture's own pixels, which may have been shrunk on the way to you, and read off a screenshot of the view, not of the whole page. It is refused once the page has changed or scrolled since it was last seen, and inside a frame from another origin than the page's. `batch` runs `steps`, a list of these actions and browse's hover, wait and scroll, each written as its own call would be, in order in one call, stopping at the first that fails (a wait whose text does not come counts), and gives each step's short result; each step is asked about as it would be alone. Returns what changed on the page afterwards: the lines that are new (`>`) or gone (`<`), with the lines around them and where they are, measured against the page as you last saw it listed in this tab; the whole page instead after it loaded another page, when there is no earlier listing to measure against, or with `listing` set to `full`. It names any file an action downloaded, saved in the project's media/downloads folder (one the page starts a little later is named in the next result). A question the page asks, such as \"Are you sure?\", is answered Cancel unless `confirm` is true. Close a cookie banner or popup before acting on what it covers. Use a site's own search, filters and sort before paging through its results. After typing into a field that suggests as you type, click the suggestion that fits from what changed -- or wait for it with browse's wait if none shows yet -- rather than pressing Enter or using `submit`. Fill a form with one batch that ends with the click that sends it, unless a field suggests as you type or the form pays, buys, deletes or sends a message: then look at the filled form before sending. Read a long page with browse's look and `find` before asking for `full`. Before saying a task on the web is done, check that the page shows it done, and give the user only names, prices and addresses the pages showed, saying so when something asked for was not there."
+        "Act on the page open in browse, the way a person would: `click` an element, `type` into a field (it replaces what is there; `submit` presses Enter after), `press` a key such as Enter, Tab, Escape or ArrowDown, `select` a dropdown's option by its text (a site's own dropdown too: it is opened and the option clicked), `upload` files from the project into a file field, `drag` an element onto another (`to`) or to a point, or `eval` a JavaScript expression and get its value back. Elements are named by the refs browse lists, such as e12; one listed under a frame's header marked cross-origin or opaque origin also needs `frame`, the origin that header names after \"frame\", and each such action is asked about on its own. `click` also takes a point instead of a ref, and names what was there: `x` and `y` in CSS pixels from the top left of the view, which is as big as the latest screenshot's result says -- not the picture's own pixels, which may have been shrunk on the way to you, and read off a screenshot of the view, not of the whole page. It is refused once the page has changed or scrolled since it was last seen, and inside a frame from another origin than the page's. `batch` runs `steps`, a list of these actions and browse's hover, wait and scroll, each written as its own call would be, in order in one call, stopping at the first that fails (a wait whose text does not come counts, as does a field left holding other text than was typed), and gives each step's short result; each step is asked about as it would be alone. Returns what changed on the page afterwards: the lines that are new (`>`) or gone (`<`), with the lines around them and where they are, measured against the page as you last saw it listed in this tab; the whole page instead after it loaded another page, when there is no earlier listing to measure against, or with `listing` set to `full`. It names any file an action downloaded, saved in the project's media/downloads folder (one the page starts a little later is named in the next result). A question the page asks, such as \"Are you sure?\", is answered Cancel unless `confirm` is true. Close a cookie banner or popup before acting on what it covers. Use a site's own search, filters and sort before paging through its results. After typing into a field that suggests as you type, click the suggestion that fits from what changed -- or wait for it with browse's wait if none shows yet -- rather than pressing Enter or using `submit`. Fill a form with one batch that ends with the click that sends it, unless a field suggests as you type or the form pays, buys, deletes or sends a message: then look at the filled form before sending. Read a long page with browse's look and `find` before asking for `full`. Before saying a task on the web is done, check that the page shows it done, and give the user only names, prices and addresses the pages showed, saying so when something asked for was not there."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -511,7 +534,7 @@ impl Tool for UsePage {
             "to": {"type": "string", "description": "For drag: the element to drop onto, by its ref."},
             "frame": {"type": "string", "description": "For an element in a frame from another origin than the page's, or keys typed or pressed while focus is in one: that origin, as the frame's header in the listing names it, such as https://pay.example, or opaque:https://pay.example for one whose origin is opaque, as a sandboxed frame's is. Left out otherwise."},
             "text": {"type": "string", "description": "For type: what to type. For select: the option's text, in a <select> or a site's own dropdown."},
-            "submit": {"type": "boolean", "description": "For type: press Enter afterwards."},
+            "submit": {"type": "boolean", "description": "For type: press Enter afterwards, unless the field then holds other text than was typed."},
             "key": {"type": "string", "description": "For press: Enter, Tab, Escape, Backspace, Delete, an arrow such as ArrowDown, Home, End, PageUp, PageDown, Space, or one character. With a ref, the element is focused first."},
             "files": {"type": "array", "items": {"type": "string"}, "description": "For upload: the files to put in the field, by their paths in the project."},
             "script": {"type": "string", "description": "For eval: a JavaScript expression, run in the page."},
@@ -617,9 +640,12 @@ impl UsePage {
                 let submit = args["submit"].as_bool().unwrap_or(false);
                 with_downloads(&saving, |session| {
                     let node = target(session)?;
-                    session.act(agree, Some(&saving), after, |session| {
-                        session.type_into(node, text, submit, frame)
-                    })
+                    let mut read = None;
+                    let page = session.act(agree, Some(&saving), after, |session| {
+                        read = session.type_into(node, text, submit, frame)?;
+                        Ok(())
+                    })?;
+                    typed(read, page, after)
                 })
             }
             "press" => {
@@ -719,6 +745,21 @@ enum After {
     Whole,
     /// Nothing: a batch lists the page once, when its steps are done.
     Nothing,
+}
+
+/// What a `type` comes to: the page after it as `page` shows it, under what
+/// the field holds instead when that is not what was typed -- a failed step
+/// in a batch, whose steps after it, such as the click that sends the form,
+/// would go on from text that is not there.
+fn typed(read: Option<String>, page: String, after: After) -> Result<String, String> {
+    let Some(read) = read else {
+        return Ok(page);
+    };
+    let said = format!("{read}\n{page}").trim_end().to_owned();
+    match after {
+        After::Nothing => Err(said),
+        _ => Ok(said),
+    }
 }
 
 /// What a call asks to be shown of the page after it.
@@ -5001,15 +5042,16 @@ impl Session {
     }
 
     /// Replace what the field `node` holds with `text`, each round of keys
-    /// going only where `frame` says, as `keys_go_to` makes sure first: the
-    /// page may move focus as the field is focused, or at any key.
+    /// going only where `frame` says, as `keys_go_to` makes sure first -- the
+    /// page may move focus as the field is focused, or at any key -- and say
+    /// what it holds instead when that is not `text`, pressing no Enter then.
     fn type_into(
         &mut self,
         node: i64,
         text: &str,
         submit: bool,
         frame: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         // Not what is typed: it may be a password.
         self.point(node, "Typing into".into(), None);
         self.focus(node)?;
@@ -5019,7 +5061,7 @@ impl Session {
                 self.keys_go_to(frame)?;
                 self.press(&key("Enter").ok_or("There is no Enter key.")?)?;
             }
-            return Ok(());
+            return Ok(None);
         }
         self.keys_go_to(frame)?;
         for kind in ["keyDown", "keyUp"] {
@@ -5039,11 +5081,40 @@ impl Session {
                 .call::<Ignored>("Input.insertText", json!({"text": text}))
                 .map(drop)?,
         }
+        // Enter would send the form with text that is not there.
+        if let Some(other) = self.read_back(node, text) {
+            return Ok(Some(match submit {
+                true => format!("{other} Enter was not pressed."),
+                false => other,
+            }));
+        }
         if submit {
             self.keys_go_to(frame)?;
             self.press(&key("Enter").ok_or("There is no Enter key.")?)?;
         }
-        Ok(())
+        Ok(None)
+    }
+
+    /// What the field `node` holds once `text` is typed in, when that is not
+    /// `text`; `None` too when it cannot be read back.
+    fn read_back(&mut self, node: i64, text: &str) -> Option<String> {
+        let object = self.object(node).ok()?;
+        let answer: Value = self
+            .on_node(
+                "Runtime.callFunctionOn",
+                json!({"objectId": object, "functionDeclaration": READ_BACK,
+                       "arguments": [{"value": text}], "returnByValue": true}),
+            )
+            .ok()?;
+        match &answer["result"]["value"] {
+            // Written as a string literal, so its line breaks and ends show.
+            Value::String(now) => Some(format!(
+                "The field now reads {:?}, not what was typed.",
+                cut(now, READ_BACK_CHARS)
+            )),
+            Value::Bool(false) => Some("The field does not hold what was typed.".into()),
+            _ => None,
+        }
     }
 
     fn press(&mut self, key: &Key) -> Result<(), String> {
@@ -7334,18 +7405,21 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// A page whose field answers the function that sets it with `set`;
-    /// what that function was given, each key and each text typed are kept
-    /// in `seen`.
+    /// A page whose field answers the function that sets it with `set`, and
+    /// the one that reads it back with `read`; what each function was given,
+    /// each key and each text typed are kept in `seen`.
     fn field_page(
         set: Value,
+        read: Value,
         seen: Arc<Mutex<Vec<String>>>,
     ) -> impl Fn(&str, &Value) -> (Vec<Value>, Value) + Send + 'static {
         move |method, params| {
             let said = |at: &Value| at.as_str().unwrap_or_default().to_owned();
+            let reads = params["functionDeclaration"] == READ_BACK;
             let heard = match method {
                 "Runtime.callFunctionOn" => {
-                    Some(format!("set {}", said(&params["arguments"][0]["value"])))
+                    let what = if reads { "read" } else { "set" };
+                    Some(format!("{what} {}", said(&params["arguments"][0]["value"])))
                 }
                 "Input.dispatchKeyEvent" => {
                     let (kind, key) = (said(&params["type"]), said(&params["key"]));
@@ -7359,6 +7433,7 @@ mod tests {
                 "Page.getFrameTree" => json!({"frameTree": {"frame": {"id": "TOP"}}}),
                 "Page.createIsolatedWorld" => json!({"executionContextId": 1}),
                 "DOM.resolveNode" => json!({"object": {"objectId": "O"}}),
+                "Runtime.callFunctionOn" if reads => read.clone(),
                 "Runtime.callFunctionOn" => {
                     assert_eq!(params["functionDeclaration"], SET_VALUE);
                     set.clone()
@@ -7373,7 +7448,7 @@ mod tests {
     fn a_date_field_is_set_to_what_is_typed_not_typed_into() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let set = json!({"result": {"type": "string", "value": ""}});
-        let (mut session, server) = fake_session(field_page(set, seen.clone()));
+        let (mut session, server) = fake_session(field_page(set, json!(null), seen.clone()));
         session.type_into(3, "2026-10-02", false, None).unwrap();
         assert_eq!(*seen.lock().unwrap(), ["set 2026-10-02"]);
         seen.lock().unwrap().clear();
@@ -7393,7 +7468,7 @@ mod tests {
         let shape = "A date field takes its date as 2026-10-02.";
         assert!(SET_VALUE.contains(shape));
         let refused = json!({"result": {"type": "string", "value": shape}});
-        let (mut session, server) = fake_session(field_page(refused, seen.clone()));
+        let (mut session, server) = fake_session(field_page(refused, json!(null), seen.clone()));
         let typed = session.type_into(3, "02/10/2026", true, None);
         assert_eq!(typed, Err(shape.to_owned()));
         // Nothing is typed, and Enter does not send the form.
@@ -7417,7 +7492,8 @@ mod tests {
         for (range, said) in cases {
             let seen = Arc::new(Mutex::new(Vec::new()));
             let refused = json!({"result": {"type": "object", "value": range}});
-            let (mut session, server) = fake_session(field_page(refused, seen.clone()));
+            let (mut session, server) =
+                fake_session(field_page(refused, json!(null), seen.clone()));
             assert_eq!(session.type_into(3, "5", false, None), Err(said.to_owned()));
             assert_eq!(*seen.lock().unwrap(), ["set 5"]);
             drop(session);
@@ -7430,10 +7506,13 @@ mod tests {
         let broken = json!({"result": {"type": "object", "subtype": "error"},
                             "exceptionDetails": {"text": "Uncaught"}});
         let other = json!({"result": {"type": "boolean", "value": false}});
-        for set in [other, broken] {
+        let held = json!({"result": {"type": "boolean", "value": true}});
+        // A field that holds what was typed, and a page that broke the
+        // function reading it back, which cannot say: Enter goes either way.
+        for (set, read) in [(other, held), (broken.clone(), broken)] {
             let seen = Arc::new(Mutex::new(Vec::new()));
-            let (mut session, server) = fake_session(field_page(set, seen.clone()));
-            session.type_into(3, "Ada", true, None).unwrap();
+            let (mut session, server) = fake_session(field_page(set, read, seen.clone()));
+            assert_eq!(session.type_into(3, "Ada", true, None), Ok(None));
             assert_eq!(
                 *seen.lock().unwrap(),
                 [
@@ -7441,10 +7520,90 @@ mod tests {
                     "keyDown a",
                     "keyUp a",
                     "insert Ada",
+                    "read Ada",
                     "keyDown Enter",
                     "keyUp Enter"
                 ]
             );
+            drop(session);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_field_that_reformats_its_text_says_what_it_now_reads() {
+        let other = json!({"result": {"type": "boolean", "value": false}});
+        let password = other.clone();
+        let reads = |value: &str| json!({"result": {"type": "string", "value": value}});
+        let cases = [
+            (
+                reads("(555) 123-4567"),
+                "The field now reads \"(555) 123-4567\", not what was typed.",
+            ),
+            (
+                reads("555\n1234567"),
+                "The field now reads \"555\\n1234567\", not what was typed.",
+            ),
+            // A password field's value is never said.
+            (password, "The field does not hold what was typed."),
+        ];
+        for (read, said) in cases {
+            for (submit, enter) in [(false, ""), (true, " Enter was not pressed.")] {
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let page = field_page(other.clone(), read.clone(), seen.clone());
+                let (mut session, server) = fake_session(page);
+                let back = session.type_into(3, "5551234567", submit, None).unwrap();
+                assert_eq!(back, Some(format!("{said}{enter}")));
+                // Read back before Enter would go, which then it does not.
+                let last = seen.lock().unwrap().last().cloned();
+                assert_eq!(last.as_deref(), Some("read 5551234567"));
+                drop(session);
+                server.join().unwrap();
+            }
+        }
+        // As an action of its own, the page after it is shown under it.
+        let note = "The field now reads \"(555) 123-4567\", not what was typed.";
+        let page = "Nothing on the page changed.";
+        assert_eq!(
+            typed(Some(note.into()), page.into(), After::Changes),
+            Ok(format!("{note}\n{page}"))
+        );
+        assert_eq!(typed(None, page.into(), After::Nothing), Ok(page.into()));
+    }
+
+    #[test]
+    fn a_batch_stops_before_submit_when_typed_text_did_not_stick() {
+        let args = json!({"action": "batch", "steps": [
+            {"action": "type", "ref": "e3", "text": "5551234567"},
+            {"action": "click", "ref": "e4"}
+        ]});
+        let steps = steps(&args).unwrap();
+        let other = json!({"result": {"type": "boolean", "value": false}});
+        let cut = json!({"result": {"type": "string", "value": "555123"}});
+        let held = json!({"result": {"type": "boolean", "value": true}});
+        for (read, sends) in [(cut, false), (held, true)] {
+            let page = field_page(other.clone(), read, Arc::default());
+            let (mut session, server) = fake_session(page);
+            let mut sent = false;
+            // Each step as `batch` runs it, listing nothing after.
+            let said = run_steps(&steps, &Cancel::default(), |_, step| {
+                if step["action"] != "type" {
+                    sent = true;
+                    return Ok(String::new());
+                }
+                let text = step["text"].as_str().unwrap_or_default();
+                let read = session.type_into(3, text, false, None)?;
+                typed(read, String::new(), After::Nothing)
+            });
+            assert_eq!(sent, sends, "{said}");
+            let expected = match sends {
+                true => "All 2 steps ran:\n1. type into e3: done.\n2. click e4: done.",
+                false => {
+                    "Step 1 failed, so the one after it was not run:\n1. type into e3 failed: \
+                     The field now reads \"555123\", not what was typed."
+                }
+            };
+            assert_eq!(said, expected);
             drop(session);
             server.join().unwrap();
         }
@@ -9412,6 +9571,20 @@ mod tests {
                     && stopped.contains("Red, Green")
                     && stopped.contains("\"Hello Bo\""),
                 "{stopped}"
+            );
+            // A field that cuts what is typed stops it before the click.
+            let cut = "document.getElementById('name').maxLength = 2; 1";
+            use_page(json!({"action": "eval", "script": cut})).unwrap();
+            let steps = json!([
+                {"action": "type", "ref": name, "text": "1234"},
+                {"action": "click", "ref": ask, "confirm": true}
+            ]);
+            let cut = use_page(json!({"action": "batch", "steps": steps})).unwrap();
+            println!("{cut}\n");
+            assert!(
+                cut.contains("failed: The field now reads \"12\", not what was typed.")
+                    && !cut.contains("answered OK"),
+                "{cut}"
             );
             let steps = json!([
                 {"action": "select", "ref": colour, "text": "Red"},
