@@ -488,6 +488,18 @@ pub(crate) mod tests {
             panic!("{what}: {out:?} does not open with a fence");
         };
         let fenced = format!("<{TAG}-{id}>\n{inside}\n</{TAG}-{id}>{after}");
+        // A carrier of hidden characters is followed by the note that says
+        // how many were taken out, which these checks leave to their own.
+        let close = format!("</{TAG}-{id}>");
+        let out = match out.split_once(&format!(
+            "{close}\n[Letronna's note: the fenced text above held "
+        )) {
+            Some((before, rest)) => match rest.split_once("taken out here.]") {
+                Some((_, rest)) => format!("{before}{close}{rest}"),
+                None => out.to_owned(),
+            },
+            None => out.to_owned(),
+        };
         assert_eq!(out, fenced, "{what}");
     }
 
