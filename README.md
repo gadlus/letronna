@@ -83,6 +83,8 @@ The Letronna gateway's address follows `LETRONNA_API`, for working against a loc
 
 Model lists come from `GET {base}/models`. Streaming uses SSE chat completions.
 
+A reply that stays silent for five minutes is given up on. `LETRONNA_READ_TIMEOUT` sets that silence in seconds, from 30 to 3600, for a gateway or proxy that holds each reply back until it is whole.
+
 ## Web search
 
 The Web toggle is the gateway's own search, and only some gateways have one. A search service of your own works with any of them: set one up in Settings under Search, or with `/search services` in the terminal, and the agent gets a `search_web` tool that asks before each search.
