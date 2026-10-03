@@ -83,6 +83,8 @@ The Letronna gateway's address follows `LETRONNA_API`, for working against a loc
 
 A base URL over plain HTTP has to be on this computer. `LETRONNA_ALLOW_HTTP=1` lets it be anywhere on the local network too, such as `http://host.docker.internal:4000/v1` or a proxy named on a container's network, with the key sent unencrypted across that network.
 
+`letronna -p` can be pointed at a server with nothing set up, as in a container: `AGENT_BASE_URL` sends that run to it as Custom, with `AGENT_API_KEY` as its key and `AGENT_MODEL` (or `--model`) as the model. None of it is saved, and `--gateway` goes back to the gateways set up.
+
 Model lists come from `GET {base}/models`. Streaming uses SSE chat completions.
 
 A reply that stays silent for five minutes is given up on. `LETRONNA_READ_TIMEOUT` sets that silence in seconds, from 30 to 3600, for a gateway or proxy that holds each reply back until it is whole.

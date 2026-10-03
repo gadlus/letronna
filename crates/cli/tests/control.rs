@@ -131,6 +131,11 @@ impl Driven {
             .env("HOME", data)
             .env("USERPROFILE", data)
             .env_remove("LOCALAPPDATA")
+            // Exported for the live tests, these would send the run to the
+            // server they name rather than the stub.
+            .env_remove("AGENT_BASE_URL")
+            .env_remove("AGENT_API_KEY")
+            .env_remove("AGENT_MODEL")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
