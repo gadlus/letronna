@@ -416,18 +416,42 @@ fn log_file(logs: &Path, frontend: &str, n: usize) -> PathBuf {
     }
 }
 
+thread_local! {
+    /// Set while `contained` runs a parser of files from outside.
+    static CONTAINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f`, a parser of files from outside that may panic on one made to
+/// break it, with its panic caught, logged and kept out of the crash files
+/// and off the terminal: the file is at fault, its caller says so, and
+/// Letronna carries on.
+pub(crate) fn contained<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
+    let was = CONTAINED.replace(true);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    CONTAINED.set(was);
+    caught
+}
+
 /// Put a panic hook in front of the one there: it writes a crash file and
 /// the log's last lines, then lets the old hook report as it always did.
 fn catch_panics() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let location = info.location().map(|at| at.to_string()).unwrap_or_default();
+        // Caught where it happened: no crash, and the terminal stays as it is.
+        if CONTAINED.get() {
+            event(
+                "panic",
+                &[("at", location.into()), ("contained", true.into())],
+            );
+            return;
+        }
         let payload = info.payload();
         let message = payload
             .downcast_ref::<&str>()
             .map(|text| text.to_string())
             .or_else(|| payload.downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "(no message)".into());
-        let location = info.location().map(|at| at.to_string()).unwrap_or_default();
         let frontend = LOG.get().map_or("letronna", |log| log.frontend);
         let backtrace = std::backtrace::Backtrace::force_capture().to_string();
         // Read now rather than at start, so a key saved since is masked too.

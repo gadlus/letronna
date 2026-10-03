@@ -1,6 +1,7 @@
-//! Word, Excel and PowerPoint files as read_file shows them: a document's
-//! text, a workbook's sheets as rows of the values they last showed, and a
-//! deck's slides with their notes, in place of the zip of XML on disk.
+//! Word, Excel, PowerPoint and PDF files as read_file shows them: a
+//! document's text, a workbook's sheets as rows of the values they last
+//! showed, a deck's slides with their notes, and a PDF's pages, in place of
+//! the zip of XML or the PDF on disk.
 //!
 //! A Word heading becomes `#` marks and a table markdown rows. Each sheet
 //! opens with `## Sheet "Name" (R rows x C cols)`, its rows following one
@@ -13,7 +14,10 @@
 //! Documents mostly come from someone else, and one can be made to hurt its
 //! reader, so each is read within limits -- the files it holds, what its
 //! parts unpack to, the rows and columns of a sheet, the size of the view --
-//! on a thread of its own, which a deadline stops waiting for.
+//! on a thread of its own, which a deadline stops waiting for. The last few
+//! views are kept, so paging through a document reads it once.
+
+mod pdf;
 
 use quick_xml::XmlVersion;
 use quick_xml::events::{BytesRef, BytesStart, Event};
@@ -21,10 +25,11 @@ use quick_xml::reader::Reader;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Mutex;
 use std::sync::mpsc::RecvTimeoutError;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use zip::ZipArchive;
 use zip::result::ZipError;
 
@@ -56,6 +61,11 @@ const VIEW_BYTES: usize = 16 * 1024 * 1024;
 /// Past it the call gives up, and the reader stops at its next step through
 /// the XML rather than run on for a way past them nobody saw.
 const DEADLINE: Duration = Duration::from_secs(20);
+/// The stack a reader runs on: a PDF's parser goes down drawings within
+/// drawings by calling itself, so room for those a page may hold.
+const STACK_BYTES: usize = 64 * 1024 * 1024;
+/// How many views are kept, each with the file as it was when read.
+const KEPT_VIEWS: usize = 4;
 /// Elements whose text a reader does not see: deleted and moved-away text,
 /// the codes behind fields, and the copy of a drawing kept for programs
 /// that cannot show it, which would say a text box twice.
@@ -67,6 +77,7 @@ enum Kind {
     Word,
     Excel,
     PowerPoint,
+    Pdf,
 }
 
 /// The kind of document `path` is named as.
@@ -78,57 +89,104 @@ fn kind(path: &Path) -> Option<Kind> {
         "docx" | "docm" | "dotx" | "dotm" => Some(Kind::Word),
         "xlsx" | "xlsm" | "xltx" | "xltm" => Some(Kind::Excel),
         "pptx" | "pptm" | "potx" | "potm" | "ppsx" | "ppsm" => Some(Kind::PowerPoint),
+        "pdf" => Some(Kind::Pdf),
         _ => None,
     }
 }
 
-/// The plain kind, such as "docx", that a file named as a document
-/// converts to; None for one not named as a document.
+/// The plain kind, such as "docx", that a file named as an Office document
+/// converts to; None for one not named as one.
 pub(crate) fn plain(path: &Path) -> Option<&'static str> {
     Some(match kind(path)? {
         Kind::Word => "docx",
         Kind::Excel => "xlsx",
         Kind::PowerPoint => "pptx",
+        Kind::Pdf => return None,
     })
 }
 
 /// The view of the document at `path`; None for a file not named as one,
-/// or not a zip as one is, which is read as any other file.
+/// or not a zip or a PDF as one is, which is read as any other file.
 pub(crate) fn view(path: &Path) -> Result<Option<String>, String> {
     let Some(kind) = kind(path) else {
         return Ok(None);
     };
-    let mut start = [0; 4];
-    let zipped = File::open(path)
-        .and_then(|mut file| file.read_exact(&mut start))
-        .is_ok();
-    if !zipped || start != *b"PK\x03\x04" {
+    let mut start = [0; 1024];
+    let read_in = File::open(path).and_then(|mut file| file.read(&mut start));
+    let start = &start[..read_in.unwrap_or_default()];
+    let opens = match kind {
+        // A PDF may have a few bytes before its header.
+        Kind::Pdf => start.windows(5).any(|w| w == b"%PDF-"),
+        _ => start.starts_with(b"PK\x03\x04"),
+    };
+    if !opens {
         return Ok(None);
+    }
+    let stamp = std::fs::metadata(path)
+        .ok()
+        .map(|meta| (meta.len(), meta.modified().ok()));
+    if let Some(kept) = stamp.and_then(|stamp| kept(path, stamp)) {
+        return Ok(Some(kept));
     }
     let owned = path.to_path_buf();
     let until = Instant::now() + DEADLINE;
     let (send, wait) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("read-document".into())
+        .stack_size(STACK_BYTES)
         .spawn(move || {
-            let _ = send.send(read(&owned, kind, until));
+            // A parser's panic is the file's doing, so it is no crash.
+            let read = crate::diag::contained(|| read(&owned, kind, until))
+                .unwrap_or_else(|_| Err(FAILED.into()));
+            let _ = send.send(read);
         })
         .map_err(|e| e.to_string())?;
-    // A parser's panic ends only that thread, which closes the channel. Past
-    // the deadline the reader stops itself, as `walk` checks it.
+    // Past the deadline the reader stops itself at its next step: through
+    // the XML, or a PDF's next page or character.
     let outcome = match wait.recv_timeout(DEADLINE) {
         Ok(outcome) => outcome,
         Err(RecvTimeoutError::Timeout) => Err(late()),
-        Err(RecvTimeoutError::Disconnected) => Err("its reader failed on it".into()),
+        Err(RecvTimeoutError::Disconnected) => Err(FAILED.into()),
     };
     let extension = path.extension().unwrap_or_default().to_string_lossy();
-    outcome.map(Some).map_err(|why| {
+    let view = outcome.map_err(|why| {
         format!(
             "Could not read this .{}: {why}.",
             extension.to_ascii_lowercase()
         )
-    })
+    })?;
+    if let Some(stamp) = stamp {
+        keep(path, stamp, &view);
+    }
+    Ok(Some(view))
 }
+
+/// A file as it was when its view was read: its length and when it changed.
+type Stamp = (u64, Option<SystemTime>);
+
+/// The views read last, the newest first.
+static KEPT: Mutex<Vec<(PathBuf, Stamp, String)>> = Mutex::new(Vec::new());
+
+/// The view kept for `path` while it is as `stamp` says.
+fn kept(path: &Path, stamp: Stamp) -> Option<String> {
+    let kept = KEPT.lock().ok()?;
+    kept.iter()
+        .find(|(at, was, _)| at == path && *was == stamp)
+        .map(|(_, _, view)| view.clone())
+}
+
+/// Keeps `view` of `path`, as `stamp` says it is, among the last few.
+fn keep(path: &Path, stamp: Stamp, view: &str) {
+    let Ok(mut kept) = KEPT.lock() else {
+        return;
+    };
+    kept.retain(|(at, _, _)| at != path);
+    kept.insert(0, (path.to_path_buf(), stamp, view.to_owned()));
+    kept.truncate(KEPT_VIEWS);
+}
+
+/// Why a read whose parser panicked failed.
+const FAILED: &str = "its reader failed on it";
 
 /// Why a read that ran past `DEADLINE` failed.
 fn late() -> String {
@@ -137,13 +195,15 @@ fn late() -> String {
 
 /// The view of the document at `path`, read as a `kind` until `until`.
 fn read(path: &Path, kind: Kind, until: Instant) -> Result<String, String> {
+    let read_parts = match kind {
+        Kind::Word => document,
+        Kind::Excel => workbook,
+        Kind::PowerPoint => deck,
+        Kind::Pdf => return pdf::read(path, until),
+    };
     let mut package = Package::open(path, until)?;
     let mut view = View::default();
-    match kind {
-        Kind::Word => document(&mut package, &mut view)?,
-        Kind::Excel => workbook(&mut package, &mut view)?,
-        Kind::PowerPoint => deck(&mut package, &mut view)?,
-    }
+    read_parts(&mut package, &mut view)?;
     Ok(view.finish())
 }
 
@@ -1278,6 +1338,8 @@ fn deck(package: &mut Package, view: &mut View) -> Result<(), String> {
 pub(crate) mod tests {
     use super::*;
     use std::io::Write;
+
+    pub(crate) use super::pdf::tests::text_pdf;
 
     const W: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#;
     const P: &str = r#"xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;

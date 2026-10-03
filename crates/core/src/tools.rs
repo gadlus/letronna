@@ -3199,7 +3199,7 @@ impl Tool for ReadFile {
         true
     }
     fn description(&self) -> &'static str {
-        "Read a text file, a Word, Excel or PowerPoint file, or look at a PNG, JPEG, GIF, WebP or BMP picture; one too big to send is scaled down. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from. A Jupyter notebook (.ipynb) reads as numbered cells with short outputs, a document as its text with a heading for each sheet or slide, and N counts the lines of that view."
+        "Read a text file, a PDF, Word, Excel or PowerPoint file, or look at a PNG, JPEG, GIF, WebP or BMP picture; one too big to send is scaled down. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from. A Jupyter notebook (.ipynb) reads as numbered cells with short outputs, a document as its text with a heading for each page, sheet or slide, and N counts the lines of that view."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -4213,19 +4213,29 @@ mod tests {
     fn a_binary_file_names_itself_and_a_way_to_read_it() {
         let dir = std::env::temp_dir().join(format!("letronna-read-binary-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("report.pdf"), b"%PDF-1.7\n\0\x01").unwrap();
+        std::fs::write(dir.join("bundle.zip"), b"PK\x03\x04\0\x01").unwrap();
         let ctx = ToolContext {
             workspace: Some(dir.clone()),
             ..Default::default()
         };
         let read = ReadFile
-            .run(&json!({"path": "report.pdf"}), &ctx)
+            .run(&json!({"path": "bundle.zip"}), &ctx)
             .unwrap_err();
         assert_eq!(
             read,
-            "`report.pdf` is not a text file. Read it with a command made for its format, \
+            "`bundle.zip` is not a text file. Read it with a command made for its format, \
              such as `pdftotext` for a PDF or `unzip -l` for an archive, or convert a \
              picture to PNG and read that."
+        );
+        // A PDF is read, so one that is not whole says so.
+        std::fs::write(dir.join("report.pdf"), b"%PDF-1.7\n\0\x01").unwrap();
+        let cut = ReadFile
+            .run(&json!({"path": "report.pdf"}), &ctx)
+            .unwrap_err();
+        assert!(
+            cut.starts_with("Could not read this .pdf: it is damaged or cut short (")
+                && cut.ends_with("; `pdftotext` may still read it."),
+            "{cut}"
         );
         // A Word file from before 2007 is no zip, so it is named as one to convert.
         std::fs::write(dir.join("memo.doc"), b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1\0").unwrap();
