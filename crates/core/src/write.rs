@@ -269,6 +269,114 @@ fn with_comments(path: &Path) -> bool {
         || path.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new(".vscode"))
 }
 
+/// A note, each line starting with a line break, on what in CSV `after` a
+/// reader takes wrongly and `before` did not already have; empty for any
+/// other file, which is written as sent either way.
+pub(crate) fn csv_note(path: &Path, before: Option<&str>, after: &str) -> String {
+    let csv = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("csv"));
+    if !csv {
+        return String::new();
+    }
+    let shown = path.display();
+    let mut note = String::new();
+    // keep_format puts back a mark the file had, which these tools cannot
+    // then take off, so only a mark this write brought is worth saying.
+    let marked = |text: &str| text.starts_with('\u{FEFF}');
+    if marked(after) && !before.is_some_and(marked) {
+        note.push_str(&format!(
+            "\nNote: `{shown}` starts with a byte order mark, which a reader opening \
+             it as plain UTF-8 keeps in the first column's name; leave it out unless \
+             the task asks for one."
+        ));
+    }
+    // Rows that were uneven before are the file's own layout, not this
+    // write's mistake, as check_syntax lets a file broken before stay so.
+    if let Some(trouble) = uneven(after)
+        && !before.is_some_and(|old| uneven(old).is_some())
+    {
+        note.push_str(&format!("\nNote: `{shown}` {trouble}."));
+    }
+    note
+}
+
+/// How the rows of CSV `text` disagree, read as RFC 4180 and Python's csv
+/// module read them, skipping empty lines: a quoted field never closed, or
+/// the first row whose field count is not the header's.
+fn uneven(text: &str) -> Option<String> {
+    let mut header = None;
+    let (mut first, mut differ) = (None, 0);
+    let mut count = |line: usize, fields: usize| match header {
+        None => header = Some(fields),
+        Some(want) if fields != want => {
+            differ += 1;
+            first.get_or_insert((line, fields));
+        }
+        Some(_) => {}
+    };
+    let (mut line, mut starts, mut fields) = (1, 1, 1);
+    // Whether the row holds anything yet, and whether a field starts here.
+    let (mut blank, mut fresh) = (true, true);
+    // The line a quoted field that is still open began on.
+    let mut quote = None;
+    let mut bytes = text.bytes().peekable();
+    while let Some(byte) = bytes.next() {
+        if quote.is_some() {
+            match byte {
+                b'"' if bytes.peek() == Some(&b'"') => {
+                    bytes.next();
+                }
+                b'"' => quote = None,
+                b'\n' => line += 1,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'\n' => {
+                if !blank {
+                    count(starts, fields);
+                }
+                line += 1;
+                (starts, fields, blank, fresh) = (line, 1, true, true);
+            }
+            b'\r' if bytes.peek() == Some(&b'\n') => {}
+            b',' => (fields, blank, fresh) = (fields + 1, false, true),
+            // A quote opens a field only as its first character; anywhere
+            // else Python's reader keeps it as text, commas after it included.
+            b'"' if fresh => (quote, blank, fresh) = (Some(line), false, false),
+            _ => (blank, fresh) = (false, false),
+        }
+    }
+    if let Some(opened) = quote {
+        return Some(format!(
+            "line {opened} opens a quoted field that is never closed, so every row \
+             after it reads as part of that field; close it, and write a quote \
+             inside a quoted field as two (\"\")"
+        ));
+    }
+    if !blank {
+        count(starts, fields);
+    }
+    // A header of one field may be a file split by `;` or tabs, where a
+    // comma is only text, so its rows are not held to it.
+    let want = header.filter(|&want| want > 1)?;
+    let (at, fields) = first?;
+    let more = match differ - 1 {
+        0 => String::new(),
+        1 => ", and one more row differs too".into(),
+        n => format!(", and {n} more rows differ too"),
+    };
+    let fix = match fields > want {
+        true => "a field that holds a comma needs double quotes around it",
+        false => "every row needs a field for each column, empty or not",
+    };
+    Some(format!(
+        "line {at} has {fields} fields where the header has {want}{more}; {fix}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,5 +548,74 @@ mod tests {
         let err = check_syntax(cargo, Some(b"[package]"), "[package\nname = a").unwrap_err();
         assert!(err.contains("TOML"), "{err}");
         assert!(check_syntax(Path::new("notes.md"), None, "{").is_ok());
+    }
+
+    #[test]
+    fn a_csv_with_a_ragged_row_gets_a_note_naming_the_line() {
+        let path = Path::new("out/audit.csv");
+        let text = "id,field,issue\n1,amount,late\n2,amount, currency,mismatch\n\n3,date\n";
+        assert_eq!(
+            csv_note(path, None, text),
+            "\nNote: `out/audit.csv` line 3 has 4 fields where the header has 3, and one \
+             more row differs too; a field that holds a comma needs double quotes around it."
+        );
+        let short = csv_note(path, None, "a,b,c\r\n1,2\r\n");
+        assert!(
+            short.contains("line 2 has 2 fields where the header has 3;")
+                && short.contains("a field for each column"),
+            "{short}"
+        );
+    }
+
+    #[test]
+    fn a_csv_with_quoted_commas_gets_no_note() {
+        let path = Path::new("a.csv");
+        let text = "id,note\r\n1,\"late, by a day\"\r\n2,\"said \"\"no, thanks\"\"\nand left\"\r\n";
+        assert_eq!(csv_note(path, None, text), "");
+        // A row after a field that spans lines is named by the line it is on.
+        let after = csv_note(path, None, "a,b\n\"x\ny\",1\n1,2,3\n");
+        assert!(after.contains("line 4 has 3 fields"), "{after}");
+        // A quote inside a field is text, so a comma after it still splits.
+        let inside = csv_note(path, None, "a,b\n1,5\" screen, 2\n");
+        assert!(inside.contains("line 2 has 3 fields"), "{inside}");
+    }
+
+    #[test]
+    fn a_quoted_field_never_closed_gets_a_note_naming_its_line() {
+        let note = csv_note(Path::new("a.csv"), None, "a,b\n1,\"open\n2,3\n");
+        assert!(
+            note.contains("line 2 opens a quoted field that is never closed"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn a_csv_starting_with_a_bom_gets_a_note() {
+        let note = csv_note(Path::new("Out.CSV"), None, "\u{FEFF}a,b\n1,2\n");
+        assert!(
+            note.starts_with("\nNote: `Out.CSV` starts with a byte order mark"),
+            "{note}"
+        );
+        assert_eq!(note.matches("Note:").count(), 1, "{note}");
+    }
+
+    #[test]
+    fn a_csv_already_uneven_or_marked_before_the_write_gets_no_note() {
+        let path = Path::new("data.csv");
+        let ragged = "a,b\n1,2,3\n";
+        assert_eq!(csv_note(path, Some(ragged), "a,b\n1,2,3\n4,5,6\n"), "");
+        assert!(!csv_note(path, Some("a,b\n1,2\n"), ragged).is_empty());
+        let marked = keep_format("\u{FEFF}a,b\n".as_bytes(), "a,b\n1,2\n");
+        assert_eq!(csv_note(path, Some("\u{FEFF}a,b\n"), &marked), "");
+    }
+
+    #[test]
+    fn a_file_that_is_not_csv_gets_no_note() {
+        let ragged = "\u{FEFF}a,b\n1,2,3\n";
+        for name in ["notes.txt", "data.tsv", "csv", "Makefile"] {
+            assert_eq!(csv_note(Path::new(name), None, ragged), "", "{name}");
+        }
+        // A header of one field may be split by `;`, where a comma is text.
+        assert_eq!(csv_note(Path::new("eu.csv"), None, "a;b\n1,5;2\n"), "");
     }
 }

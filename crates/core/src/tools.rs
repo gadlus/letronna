@@ -1940,10 +1940,11 @@ impl Tool for WriteFile {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
+        let note = crate::write::csv_note(Path::new(path_arg(args)), change.before(), &text);
         let lsp = crate::lsp::before_write(ctx, &path, change.before());
         change.write(text.as_bytes(), &ctx.files)?;
         crate::lsp::wrote(lsp, &text);
-        Ok(format!("Wrote {} bytes.", text.len()))
+        Ok(format!("Wrote {} bytes.{note}", text.len()))
     }
 }
 
@@ -2064,17 +2065,19 @@ impl Tool for EditFile {
             return Err(crate::redact::refused("`new`"));
         }
         crate::write::check_syntax(&path, Some(text.as_bytes()), &done.text)?;
+        let note = crate::write::csv_note(Path::new(path_arg(args)), Some(text), &done.text);
         let lsp = crate::lsp::before_write(ctx, &path, Some(text));
         change.write(done.text.as_bytes(), &ctx.files)?;
         crate::lsp::wrote(lsp, &done.text);
-        Ok(match (done.replaced, done.already) {
+        let edited = match (done.replaced, done.already) {
             (1, 0) => "Edited.".into(),
             (n, 0) => format!("Edited {n} places."),
             (_, n) => format!(
                 "Edited. Already applied, so left alone: {n} of {} edits.",
                 edits.len()
             ),
-        })
+        };
+        Ok(edited + &note)
     }
 }
 
@@ -6050,5 +6053,36 @@ mod tests {
         let (_, below) = read.split_once('\n').unwrap();
         assert!(below.starts_with("[Letronna's note"), "{read}");
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn write_file_and_edit_file_note_a_csv_row_they_leave_uneven() {
+        let dir = std::env::temp_dir().join(format!("letronna-csv-note-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let ragged = "id,field\n1,amount, currency\n";
+        let write = json!({"path": "out/audit.csv", "content": ragged});
+        let wrote = WriteFile.run(&write, &ctx).unwrap();
+        let note = "Note: `out/audit.csv` line 2 has 3 fields where the header has 2;";
+        assert!(
+            wrote.starts_with(&format!("Wrote {} bytes.\n{note}", ragged.len())),
+            "{wrote}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("out/audit.csv")).unwrap(),
+            ragged
+        );
+
+        let (bare, quoted) = ("amount, currency", "\"amount, currency\"");
+        let quote = json!({"path": "out/audit.csv", "old": bare, "new": quoted});
+        assert_eq!(EditFile.run(&quote, &ctx).unwrap(), "Edited.");
+        let unquote = json!({"path": "out/audit.csv", "old": quoted, "new": bare});
+        let edited = EditFile.run(&unquote, &ctx).unwrap();
+        assert!(edited.starts_with(&format!("Edited.\n{note}")), "{edited}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
