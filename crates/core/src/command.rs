@@ -2484,7 +2484,7 @@ fn expand(path: &Path, deep: bool) -> Option<Vec<PathBuf>> {
 /// Whether `name` fits the wildcard `pattern`, loosely enough to take in
 /// every shell's matches: without case, with `*` and `?` taking a leading
 /// dot too, and all from the first `[` to the last `]` taken as `*`.
-fn fits(pattern: &str, name: &str) -> bool {
+pub(crate) fn fits(pattern: &str, name: &str) -> bool {
     let pattern = pattern.to_lowercase();
     let pattern = match (pattern.find('['), pattern.rfind(']')) {
         (Some(open), Some(close)) if open < close => {
