@@ -281,6 +281,12 @@ pub fn run(spec: Spec) -> Report {
 pub fn run_keeping(mut spec: Spec) -> (Report, Transcript) {
     let started = Instant::now();
     crate::hooks::new_turn(spec.connection.conversation);
+    // A helper's requests load the memory of the session it works for, which
+    // its own id would not find.
+    let serving = spec.connection.conversation != spec.root;
+    if serving {
+        crate::memory::serves(spec.connection.conversation, spec.root);
+    }
     // Once as the run starts, not with each request, so all of them and its
     // helpers' say the same, and the prefix a provider cached holds.
     if unwatched(&spec)
@@ -333,6 +339,9 @@ pub fn run_keeping(mut spec: Spec) -> (Report, Transcript) {
     let messages = &spec.transcript.conversation.messages;
     report.text = last_said(messages.get(spec.from..).unwrap_or_default());
     report.seconds = started.elapsed().as_secs();
+    if serving {
+        crate::memory::forget(spec.connection.conversation);
+    }
     (report, spec.transcript)
 }
 
@@ -664,8 +673,8 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
                 }
                 return save(&mut spec.transcript);
             }
-            Next::Run(call) => dispatch(spec, &call, false, report, false),
-            Next::Sandboxed(call) => dispatch(spec, &call, false, report, true),
+            Next::Run(call) => dispatch(spec, &call, false, report, false, None),
+            Next::Sandboxed(call) => dispatch(spec, &call, false, report, true, None),
             Next::Refuse(_, why) => Some(Err(why)),
             Next::AskUser(call) => {
                 // Only the judge's word says why, when it was unsure.
@@ -675,10 +684,18 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
                     // Only what was agreed to runs, never the model's own,
                     // and a yes to the model's call is none to a changed one.
                     Ok(allowed) => match allowed.arguments {
-                        None => dispatch(spec, &call, true, report, allowed.sandboxed),
+                        None => dispatch(
+                            spec,
+                            &call,
+                            true,
+                            report,
+                            allowed.sandboxed,
+                            allowed.keep_in,
+                        ),
                         Some(arguments) => {
                             let changed = ToolCall { arguments, ..call };
-                            dispatch(spec, &changed, false, report, allowed.sandboxed)
+                            let keep_in = allowed.keep_in;
+                            dispatch(spec, &changed, false, report, allowed.sandboxed, keep_in)
                         }
                     },
                     Err(_) if spec.cancel.is_set() => None,
@@ -776,7 +793,8 @@ fn gate_of<'a>(
 }
 
 /// Makes one call the way this agent may, `approved` when the user said yes
-/// to it on its card and inside the OS sandbox when `sandboxed`, or gives
+/// to it on its card, inside the OS sandbox when `sandboxed` and, for a
+/// memory save, kept where the card's answer put it in `keep_in`, or gives
 /// None when a stop came before it began.
 fn dispatch(
     spec: &mut Spec,
@@ -784,6 +802,7 @@ fn dispatch(
     approved: bool,
     report: &mut Report,
     sandboxed: bool,
+    keep_in: Option<crate::memory::Scope>,
 ) -> Option<Result<String, String>> {
     // Ahead of the allow list, which names only the tools that really run.
     if call.name == STRUCTURED_OUTPUT
@@ -807,6 +826,7 @@ fn dispatch(
     let ctx = ToolContext {
         approved,
         sandboxed,
+        keep_in,
         ..context(spec)
     };
     let outcome = off_thread(call, &ctx)?;

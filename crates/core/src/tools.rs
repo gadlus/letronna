@@ -40,6 +40,9 @@ pub struct ToolContext {
     /// The gate let this call run only inside the OS sandbox, which a
     /// command must then run in or not at all.
     pub sandboxed: bool,
+    /// Where the user chose on this memory save's card to keep it, which
+    /// wins over where the session keeps memory; None to keep it there.
+    pub keep_in: Option<crate::memory::Scope>,
     /// Who is calling, for tools that start other agents. Crate-private, so
     /// a plugin's tool never sees the connection's key.
     pub(crate) caller: Caller,
@@ -84,6 +87,7 @@ impl ToolContext {
             plan: connection.plan,
             approved: false,
             sandboxed: false,
+            keep_in: None,
             caller: Caller {
                 connection: Some(Arc::new(connection.clone())),
                 root: connection.conversation,

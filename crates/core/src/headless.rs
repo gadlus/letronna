@@ -382,8 +382,9 @@ fn open_session(id: u64) -> Result<Transcript, String> {
 fn spec(id: u64, run: &Run) -> Result<Spec, String> {
     let transcript = open_session(id)?;
     let conversation = &transcript.conversation;
-    // Saves memory as the session chose, wherever it chose it.
+    // Saves and keeps memory as the session chose, wherever it chose it.
     crate::memory::choose(id, conversation.memory_saving);
+    crate::memory::choose_scope(id, conversation.memory_scope);
     let settings = store::current_settings();
     // Each session keeps the model it was on, and the gateway with it, as
     // in the window.

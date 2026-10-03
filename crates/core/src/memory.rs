@@ -20,6 +20,14 @@
 //! a hash of the main checkout's path, which its linked worktrees and
 //! subfolders share.
 //!
+//! A session can keep its memory to the attached project, or to itself, as
+//! the user chooses: then only that memory loads, and every save goes there,
+//! whatever store the model named. A chat's own notes are kept in the data
+//! folder under its id, with a project's budget, and go when it is deleted.
+//! They load at the end of the prompt with the rest of memory, after what
+//! every session shares, so choosing differently costs no other session its
+//! cached prefix.
+//!
 //! USER.md and MEMORY.md go into every request, so each has a small budget --
 //! Hermes Agent's, which has run this way for a long time -- and a full one
 //! makes the model rewrite rather than pile up. Their entries are separated
@@ -80,13 +88,43 @@ const KEY_HELD: &str = "[an entry that held a key]";
 /// answers.
 pub(crate) const ALREADY_KEPT: &str = "Already kept.";
 
-/// How the model is told to use its memory, when it has the tool to: this,
-/// then the sentence on when to save that `Saving::told` gives, then
-/// `GUIDANCE_ENDS`, so a change of mode moves one sentence of the prompt.
+/// How the model is told to use its memory, when it has the tool to and
+/// keeps it everywhere: this, then the sentence on when to save that
+/// `Saving::told` gives, then `GUIDANCE_ENDS` and `FACTS`.
 const GUIDANCE: &str = " You have a memory that outlasts this session: what you know about the user (USER.md), your own notes (MEMORY.md) and, when a project folder is attached, your notes on that project (Project memory), shown below when there is anything in them, and kept with the memory tool.";
 
-/// The guidance's last sentences, the same whenever the model may save.
-const GUIDANCE_ENDS: &str = " Keep what is true of one project alone, such as how to build and test it, in its project memory. Write facts, not instructions to yourself.";
+/// What opens the guidance in place of `GUIDANCE` when memory is kept for
+/// the project alone.
+const GUIDANCE_PROJECT: &str = " You have a memory that outlasts this session: your notes on the project folder attached to it (Project memory) and your notes for this chat alone (Chat notes), shown below when there is anything in them, and kept with the memory tool.";
+
+/// What opens the guidance in place of `GUIDANCE` when memory is kept for
+/// the chat alone, which says nothing of what is kept elsewhere.
+const GUIDANCE_CHAT: &str = " You have notes for this chat alone (Chat notes), shown below when there is anything in them and kept with the memory tool; no other chat sees them, and a summary of the conversation does not lose them.";
+
+/// The guidance's sentence on project memory, when every store is used.
+const GUIDANCE_ENDS: &str = " Keep what is true of one project alone, such as how to build and test it, in its project memory.";
+
+/// The guidance's last sentence, whatever is kept where.
+const FACTS: &str = " Write facts, not instructions to yourself.";
+
+/// Runs of words that keep what the user asks to save to this chat alone,
+/// written as `words` writes them.
+const CHAT_WORDS: [&str; 5] = [
+    "this chat",
+    "this conversation",
+    "chat ini",
+    "percakapan ini",
+    "obrolan ini",
+];
+
+/// Runs of words that keep what the user asks to save to the project,
+/// written as `words` writes them.
+const PROJECT_WORDS: [&str; 4] = [
+    "this project",
+    "project memory",
+    "proyek ini",
+    "project ini",
+];
 
 /// What a memory call is told when the user saves memory only when they ask
 /// and the message that opened the turn did not.
@@ -194,20 +232,131 @@ impl Saving {
         ))
     }
 
-    /// The guidance's sentence on when to save.
-    fn told(self) -> &'static str {
+    /// The guidance's sentence on when to save what will matter `later`.
+    fn told(self, later: &str) -> String {
         match self {
-            Saving::WhenAsked => {
-                " Save to it only when the user asks you to remember or forget something; when they say something that will still matter in a later session, such as a preference or a correction, you may offer in one line: \"Want me to remember that?\""
-            }
-            Saving::Ask => {
-                " Save what will still matter in a later session -- the user's name and preferences, their setup, corrections they gave you -- and not the progress of the task at hand; the user says yes to each save."
-            }
-            Saving::Auto => {
-                " Save what will still matter in a later session -- the user's name and preferences, their setup, corrections they gave you -- and not the progress of the task at hand."
-            }
+            Saving::WhenAsked => format!(
+                " Save to it only when the user asks you to remember or forget something; when they say something that will still matter {later}, such as a preference or a correction, you may offer in one line: \"Want me to remember that?\""
+            ),
+            Saving::Ask => format!(
+                " Save what will still matter {later} -- the user's name and preferences, their setup, corrections they gave you -- and not the progress of the task at hand; the user says yes to each save."
+            ),
+            Saving::Auto => format!(
+                " Save what will still matter {later} -- the user's name and preferences, their setup, corrections they gave you -- and not the progress of the task at hand."
+            ),
         }
     }
+}
+
+/// Where memory is kept, and what of it a session loads, as the user chose
+/// for every chat or for one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Scope {
+    /// Where the model picks, USER.md, MEMORY.md or the project's memory,
+    /// and all of them load, with the chat's own notes: what new installs
+    /// and those from before the choice start in.
+    #[default]
+    Auto,
+    /// In the attached project's memory, which loads with the chat's own
+    /// notes and nothing else; with no project attached, as `Chat`.
+    Project,
+    /// In the chat's own notes, the only memory it loads, which no other
+    /// chat sees and which go when the chat is deleted.
+    Chat,
+}
+
+impl Scope {
+    /// The choices, in the order they are listed.
+    pub const OFFERED: [Scope; 3] = [Scope::Auto, Scope::Project, Scope::Chat];
+
+    /// The name the saved files use.
+    pub fn name(self) -> &'static str {
+        match self {
+            Scope::Auto => "auto",
+            Scope::Project => "project",
+            Scope::Chat => "chat",
+        }
+    }
+
+    /// The choice as a person reads it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Scope::Auto => "Everywhere",
+            Scope::Project => "This project only",
+            Scope::Chat => "This chat only",
+        }
+    }
+
+    /// The choice `text` names: its saved name or its label.
+    pub fn parse(text: &str) -> Result<Scope, String> {
+        let text = text.trim();
+        let named = |scope: &Scope| {
+            text.eq_ignore_ascii_case(scope.name()) || text.eq_ignore_ascii_case(scope.label())
+        };
+        if let Some(scope) = Scope::OFFERED.into_iter().find(named) {
+            return Ok(scope);
+        }
+        Err(format!(
+            "There is no `{text}` place to keep memory; pick auto, project or chat."
+        ))
+    }
+
+    /// The scope as it holds with a project attached or not: a project's,
+    /// with none, is the chat's.
+    fn with(self, project: bool) -> Scope {
+        match self {
+            Scope::Project if !project => Scope::Chat,
+            scope => scope,
+        }
+    }
+
+    /// The stores a session keeping memory here loads, in the order the
+    /// prompt shows them.
+    fn loads(self) -> &'static [Target] {
+        match self {
+            Scope::Auto => &[Target::User, Target::Memory, Target::Project, Target::Chat],
+            Scope::Project => &[Target::Project, Target::Chat],
+            Scope::Chat => &[Target::Chat],
+        }
+    }
+}
+
+impl Serialize for Scope {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for Scope {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // As for `Saving`: a newer name reads as the default.
+        let name = Option::<String>::deserialize(deserializer)?.unwrap_or_default();
+        Ok(Scope::OFFERED
+            .into_iter()
+            .find(|scope| scope.name() == name)
+            .unwrap_or_default())
+    }
+}
+
+/// How the model is told to use its memory in a session that saves as
+/// `saving` says and keeps memory in `scope`, as it holds there.
+fn guidance(saving: Saving, scope: Scope) -> String {
+    let (opens, later, lands, ends) = match scope {
+        Scope::Auto => (GUIDANCE, "in a later session", "", GUIDANCE_ENDS),
+        Scope::Project => (
+            GUIDANCE_PROJECT,
+            "in a later session",
+            " Whatever target you name, what you save goes to the project's memory.",
+            "",
+        ),
+        Scope::Chat => (
+            GUIDANCE_CHAT,
+            "later in this chat",
+            " Whatever target you name, what you save goes to this chat's notes.",
+            "",
+        ),
+    };
+    format!("{opens}{}{lands}{ends}{FACTS}", saving.told(later))
 }
 
 impl Serialize for Saving {
@@ -236,6 +385,13 @@ struct Session {
     /// The user asked in the turn to remember or forget something, or said
     /// yes to the offer to that came before it.
     asked: bool,
+    /// The session's own scope, which wins over the settings'.
+    scope: Option<Scope>,
+    /// Where the user's words in the turn said to keep what they asked to.
+    said: Option<Scope>,
+    /// The session a helper, a side question or a review works for, whose
+    /// memory its requests load; set on the helper's own id.
+    serves: Option<u64>,
 }
 
 /// Each session's, by its id. Kept in memory: a frontend says each turn
@@ -263,25 +419,61 @@ pub fn saving(session: u64) -> Saving {
     chosen.unwrap_or_else(|| crate::store::current_settings().memory_saving)
 }
 
+/// Has session `session` keep memory where `chosen` says, and load only
+/// that, from its next request on, or as the settings say for `None`. A
+/// frontend calls it as each turn starts and when the user picks, with the
+/// session's own choice.
+pub fn choose_scope(session: u64, chosen: Option<Scope>) {
+    sessions().entry(session).or_default().scope = chosen;
+}
+
+/// Where session `session` keeps memory: its own choice, or the settings'.
+pub fn scope(session: u64) -> Scope {
+    let chosen = sessions().get(&session).and_then(|kept| kept.scope);
+    chosen.unwrap_or_else(|| crate::store::current_settings().memory_scope)
+}
+
+/// Has the requests of agent `agent`, which works for session `session`,
+/// load that session's memory.
+pub(crate) fn serves(agent: u64, session: u64) {
+    sessions().entry(agent).or_default().serves = Some(session);
+}
+
+/// The session whose memory the requests of conversation `id` load.
+fn served(id: u64) -> u64 {
+    sessions()
+        .get(&id)
+        .and_then(|kept| kept.serves)
+        .unwrap_or(id)
+}
+
 /// Whether the turn session `session` is in asked to remember or forget
 /// something.
 pub(crate) fn asked(session: u64) -> bool {
     sessions().get(&session).is_some_and(|kept| kept.asked)
 }
 
+/// Where the user's words in the turn session `session` is in said to keep
+/// what they asked to, if they said.
+fn said(session: u64) -> Option<Scope> {
+    sessions().get(&session).and_then(|kept| kept.said)
+}
+
 /// Notes whether the turn whose request carries `messages` asked to remember
-/// or forget something, for the calls its reply makes in session `session`.
+/// or forget something, and where, for the calls its reply makes in session
+/// `session`.
 pub(crate) fn heard(session: u64, messages: &[Message]) {
-    let asked = asked_in(messages);
+    let (asked, said) = (asked_in(messages), said_in(messages));
     let mut sessions = sessions();
     // None is made for a session whose turn asked nothing, as a helper's.
     match sessions.get_mut(&session) {
-        Some(kept) => kept.asked = asked,
+        Some(kept) => (kept.asked, kept.said) = (asked, said),
         None if asked => {
             sessions.insert(
                 session,
                 Session {
                     asked,
+                    said,
                     ..Session::default()
                 },
             );
@@ -322,6 +514,27 @@ fn asked_in(messages: &[Message]) -> bool {
         .iter()
         .rfind(|message| message.role == "assistant" && !message.content.trim().is_empty());
     answered.is_some_and(|answer| offers(&answer.content)) && agrees(opening)
+}
+
+/// Where the messages the user sent in the last turn of `messages` and asked
+/// in to remember something said to keep it: this chat or this project.
+fn said_in(messages: &[Message]) -> Option<Scope> {
+    let at = messages.iter().rposition(crate::chat::opens_turn)?;
+    let asking = messages[at..]
+        .iter()
+        .filter_map(typed)
+        .filter(|text| asks(text));
+    asking.map(words).find_map(|words| {
+        let names = |phrase: &&str| words.contains(&format!(" {phrase} "));
+        // A chat's own is the narrower, so it wins where both are named.
+        if CHAT_WORDS.iter().any(names) {
+            Some(Scope::Chat)
+        } else if PROJECT_WORDS.iter().any(names) {
+            Some(Scope::Project)
+        } else {
+            None
+        }
+    })
 }
 
 /// What the user typed of `message`, without the files it attached, or None
@@ -387,35 +600,44 @@ pub fn soul() -> Option<String> {
     read_capped(&crate::chat::data_dir().join("SOUL.md"))
 }
 
-/// What follows the built-in lines of the prompt: memory, the project's own
-/// instructions, the helper types files define, and how to use them. Nothing
-/// where others read the replies.
+/// What follows the built-in lines of the prompt and loads in every
+/// session, being rules rather than memory: the project's own instructions
+/// and the helper types files define. Nothing where others read the replies.
 pub fn context(connection: &Connection) -> String {
     context_in(&crate::chat::data_dir(), connection)
 }
 
-fn context_in(dir: &Path, connection: &Connection) -> String {
+/// What the session remembers, for the end of the prompt: how to use its
+/// memory, then the stores its scope loads. After everything every session
+/// shares, so what one session leaves out or writes changes no other's
+/// cached prefix. Nothing where others read the replies.
+pub fn remembered(connection: &Connection) -> String {
+    remembered_in(&crate::chat::data_dir(), connection)
+}
+
+fn remembered_in(dir: &Path, connection: &Connection) -> String {
     if connection.remote.as_ref().is_some_and(|r| r.shared) {
         return String::new();
     }
+    // A helper's requests load the memory of the session it works for.
+    let session = served(connection.conversation);
+    let workspace = connection.workspace.as_deref();
+    let scope = scope(session).with(workspace.is_some());
     let mut out = String::new();
     if connection.tools {
-        out.push_str(GUIDANCE);
-        out.push_str(saving(connection.conversation).told());
-        out.push_str(GUIDANCE_ENDS);
+        out.push_str(&guidance(saving(session), scope));
     }
-    let project_notes = connection
-        .workspace
-        .as_deref()
-        .map(|workspace| project_dir(dir, &project_root(workspace)));
-    let stores = [(Target::User, dir), (Target::Memory, dir)]
-        .into_iter()
-        .chain(
-            project_notes
-                .as_deref()
-                .map(|folder| (Target::Project, folder)),
-        );
-    for (target, folder) in stores {
+    for &target in scope.loads() {
+        let folder = match target {
+            Target::User | Target::Memory => Some(dir.to_path_buf()),
+            Target::Project => {
+                workspace.map(|workspace| project_dir(dir, &project_root(workspace)))
+            }
+            Target::Chat => (session != 0).then(|| chat_dir(dir, session)),
+        };
+        let Some(folder) = folder else {
+            continue;
+        };
         let entries = entries(&folder.join(target.file()));
         if !entries.is_empty() {
             out.push_str(&format!(
@@ -428,6 +650,14 @@ fn context_in(dir: &Path, connection: &Connection) -> String {
             ));
         }
     }
+    out
+}
+
+fn context_in(dir: &Path, connection: &Connection) -> String {
+    if connection.remote.as_ref().is_some_and(|r| r.shared) {
+        return String::new();
+    }
+    let mut out = String::new();
     let project = connection
         .workspace
         .as_deref()
@@ -872,11 +1102,14 @@ fn decode(bytes: Vec<u8>) -> Option<String> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum Target {
     User,
     Memory,
     Project,
+    /// One chat's own notes, which only it loads. The model is not offered
+    /// the word, but a save is kept here when the user chose so.
+    Chat,
 }
 
 impl Target {
@@ -885,6 +1118,7 @@ impl Target {
             "user" => Ok(Self::User),
             "memory" => Ok(Self::Memory),
             "project" => Ok(Self::Project),
+            "chat" => Ok(Self::Chat),
             _ => Err("target is \"user\", \"memory\" or \"project\".".into()),
         }
     }
@@ -895,21 +1129,24 @@ impl Target {
             Self::User => "user",
             Self::Memory => "memory",
             Self::Project => "project",
+            Self::Chat => "chat",
         }
     }
 
     fn file(self) -> &'static str {
         match self {
             Self::User => "USER.md",
-            Self::Memory | Self::Project => "MEMORY.md",
+            Self::Memory | Self::Project | Self::Chat => "MEMORY.md",
         }
     }
 
     /// What the store is called to the model; a project's file has the same
-    /// name as Letronna's own notes, in a folder named by a hash.
+    /// name as Letronna's own notes, in a folder named by a hash, and a
+    /// chat's in one named by its id.
     fn name(self) -> &'static str {
         match self {
             Self::Project => "Project memory",
+            Self::Chat => "Chat notes",
             _ => self.file(),
         }
     }
@@ -918,7 +1155,8 @@ impl Target {
         match self {
             Self::User => USER_LIMIT,
             Self::Memory => MEMORY_LIMIT,
-            Self::Project => PROJECT_LIMIT,
+            // The same kind of notes as a project's, about one chat.
+            Self::Project | Self::Chat => PROJECT_LIMIT,
         }
     }
 
@@ -927,8 +1165,21 @@ impl Target {
             Self::User => "What you know about the user",
             Self::Memory => "Your notes",
             Self::Project => "Your notes on this project",
+            Self::Chat => "Your notes for this chat alone",
         }
     }
+}
+
+/// Where chat `session`'s own notes are kept: in the data folder, which no
+/// tool may read, rather than among the sessions, where every file is taken
+/// for one.
+fn chat_dir(data: &Path, session: u64) -> PathBuf {
+    data.join("chats").join(session.to_string())
+}
+
+/// The folder chat `session`'s own notes are kept in, which goes with it.
+pub(crate) fn chat_folder(session: u64) -> PathBuf {
+    chat_dir(&crate::chat::data_dir(), session)
 }
 
 /// Where the notes on the project at `root` are kept: a folder named by the
@@ -947,6 +1198,7 @@ fn store_dir(data: &Path, workspace: Option<&Path>, target: Target) -> Result<Pa
         Target::Project => workspace
             .map(|workspace| project_dir(data, &project_root(workspace)))
             .ok_or_else(|| "No project folder is attached, so there is no project memory.".into()),
+        Target::Chat => Err("A chat's notes are reached from the chat they belong to.".into()),
     }
 }
 
@@ -1633,18 +1885,62 @@ pub(crate) fn store_name(target: &str) -> Option<&'static str> {
     Target::parse(target).ok().map(Target::name)
 }
 
-/// The folder `target` is kept in for a session in `workspace`, and the
-/// project's root when it is a project's.
-fn place(target: Target, workspace: Option<&Path>) -> Result<(PathBuf, Option<PathBuf>), String> {
+/// The folder `target` is kept in for session `session` in `workspace`, and
+/// the project's root when it is a project's.
+fn place(
+    target: Target,
+    workspace: Option<&Path>,
+    session: u64,
+) -> Result<(PathBuf, Option<PathBuf>), String> {
     let data = crate::chat::data_dir();
-    let Target::Project = target else {
-        return Ok((data, None));
-    };
-    let Some(workspace) = workspace else {
-        return Err("No project folder is attached, so there is no project memory.".into());
-    };
-    let root = project_root(workspace);
-    Ok((project_dir(&data, &root), Some(root)))
+    match target {
+        Target::User | Target::Memory => Ok((data, None)),
+        Target::Chat if session == 0 => {
+            Err("This call is made in no chat, so there are no chat notes to keep it in.".into())
+        }
+        Target::Chat => Ok((chat_dir(&data, session), None)),
+        Target::Project => {
+            let Some(workspace) = workspace else {
+                return Err("No project folder is attached, so there is no project memory.".into());
+            };
+            let root = project_root(workspace);
+            Ok((project_dir(&data, &root), Some(root)))
+        }
+    }
+}
+
+/// Where a save naming `asked` goes in `ctx`'s session: where the user put
+/// it on its card, else where their words in the turn did, else where the
+/// session keeps memory.
+fn kept_in(asked: Target, ctx: &ToolContext) -> Target {
+    let session = session_of(ctx);
+    let chosen = ctx.keep_in.or_else(|| said(session));
+    let chosen = chosen.unwrap_or_else(|| scope(session));
+    match chosen.with(ctx.workspace.is_some()) {
+        Scope::Auto => asked,
+        Scope::Project => Target::Project,
+        Scope::Chat => Target::Chat,
+    }
+}
+
+/// The store a save naming the store `target` goes to in `ctx`'s session,
+/// by the word the memory tool takes for it.
+pub(crate) fn kept_target(target: &str, ctx: &ToolContext) -> Result<&'static str, String> {
+    Target::parse(target).map(|asked| kept_in(asked, ctx).word())
+}
+
+/// Where a card may offer to keep a memory save in `ctx`'s session: where it
+/// goes now first, then the others, a project's only while one is attached.
+pub fn places(ctx: &ToolContext) -> Vec<Scope> {
+    let session = session_of(ctx);
+    let project = ctx.workspace.is_some();
+    let now = said(session)
+        .unwrap_or_else(|| scope(session))
+        .with(project);
+    let others = Scope::OFFERED
+        .into_iter()
+        .filter(|&scope| scope != now && (project || scope != Scope::Project));
+    std::iter::once(now).chain(others).collect()
 }
 
 /// What adding an entry would come to, for a caller that may only add.
@@ -1667,10 +1963,10 @@ pub(crate) fn would_add(
     target: &str,
     content: &str,
     pending: &[&str],
-    workspace: Option<&Path>,
+    ctx: &ToolContext,
 ) -> Result<Fit, String> {
     let target = Target::parse(target)?;
-    let (dir, _) = place(target, workspace)?;
+    let (dir, _) = place(target, ctx.workspace.as_deref(), session_of(ctx))?;
     let add = |content| Op {
         action: "add",
         content,
@@ -1738,13 +2034,14 @@ impl Tool for Remember {
     fn asked_each_time(&self) -> bool {
         true
     }
-    /// The store and each change, the entry's words as they would be kept.
-    fn preview(&self, args: &Value, _: &ToolContext) -> String {
+    /// The store each change goes to, and each change, the entry's words as
+    /// they would be kept.
+    fn preview(&self, args: &Value, ctx: &ToolContext) -> String {
         let target = Target::parse(args["target"].as_str().unwrap_or_default());
         let (Ok(target), Ok(ops)) = (target, operations(args)) else {
             return args.to_string();
         };
-        let mut out = format!("Save to {}", target.name());
+        let mut out = format!("Save to {}", kept_in(target, ctx).name());
         for op in &ops {
             out.push_str(&match op.action {
                 "add" => format!("\nAdd: {}", op.content),
@@ -1756,14 +2053,29 @@ impl Tool for Remember {
         out
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
-        let target = Target::parse(args["target"].as_str().unwrap_or_default())?;
-        let (dir, root) = place(target, ctx.workspace.as_deref())?;
+        let asked = Target::parse(args["target"].as_str().unwrap_or_default())?;
+        let target = kept_in(asked, ctx);
+        // Said first, so neither the result nor an error reads as being
+        // about the store the call named.
+        let moved = if target == asked {
+            String::new()
+        } else {
+            format!(
+                "As the user chose, this goes to {} rather than {}. ",
+                target.name(),
+                asked.name()
+            )
+        };
+        let (dir, root) = place(target, ctx.workspace.as_deref(), session_of(ctx))
+            .map_err(|e| format!("{moved}{e}"))?;
         let origin = if ctx.caller.review {
             Origin::Review
         } else {
             Origin::Model
         };
-        let out = change(&dir, target, &operations(args)?, origin)?;
+        let out =
+            change(&dir, target, &operations(args)?, origin).map_err(|e| format!("{moved}{e}"))?;
+        let out = format!("{moved}{out}");
         // Says whose notes the folder holds to a person who opens it. Without
         // it the notes still work, so a failure is not the model's to handle.
         if let Some(root) = root {
@@ -1776,9 +2088,11 @@ impl Tool for Remember {
 /// A store as a person sees it: what it holds and how much of its budget
 /// that uses.
 pub struct Store {
-    /// "user", "memory", "project" or "soul", as `file` and `store` take it.
+    /// "user", "memory", "project" or "soul", as `file` and `store` take it,
+    /// or "chat" for a chat's own notes.
     pub target: &'static str,
-    /// What it is called: USER.md, MEMORY.md, Project memory or SOUL.md.
+    /// What it is called: USER.md, MEMORY.md, Project memory, Chat notes or
+    /// SOUL.md.
     pub name: &'static str,
     pub path: PathBuf,
     /// The entries, oldest first, or why the file could not be read.
@@ -1832,6 +2146,22 @@ fn stores_in(data: &Path, workspace: Option<&Path>) -> Vec<Store> {
             })
         })
         .collect()
+}
+
+/// Chat `session`'s own notes, as a person sees them.
+pub fn chat_notes(session: u64) -> Store {
+    let path = chat_folder(session).join(Target::Chat.file());
+    let entries = read_store(&path)
+        .map(|text| split(&text))
+        .map_err(|e| format!("{} could not be read: {e}", Target::Chat.name()));
+    Store {
+        target: Target::Chat.word(),
+        name: Target::Chat.name(),
+        used: entries.as_deref().map_or(0, size),
+        entries,
+        path,
+        limit: Target::Chat.limit(),
+    }
 }
 
 /// One store by its word, SOUL.md included as a store of one entry under the
@@ -2317,17 +2647,20 @@ mod tests {
         let connection = Connection {
             tools: true,
             workspace: Some(project),
+            conversation: 9_500_001,
             ..Default::default()
         };
-        let text = context_in(&dir, &connection);
-        assert!(text.contains("memory tool"));
+        let kept = remembered_with(&dir, &connection, Scope::Auto);
+        assert!(kept.contains("memory tool"));
         assert!(
-            text.contains(
+            kept.contains(
                 "Your notes (MEMORY.md, 27/2200 characters):\nWorks late.\n§\nLikes tables."
             ),
-            "{text}"
+            "{kept}"
         );
-        assert!(!text.contains("USER.md,"), "an empty store is left out");
+        assert!(!kept.contains("USER.md,"), "an empty store is left out");
+        let text = context_in(&dir, &connection);
+        assert!(!text.contains("Works late."), "{text}");
         assert!(text.contains("from AGENTS.md:\nRun cargo test before committing."));
         assert!(
             text.ends_with("agent tool's type: docs (Writes docs)."),
@@ -2342,6 +2675,7 @@ mod tests {
             ..connection
         };
         assert_eq!(context_in(&dir, &shared), "");
+        assert_eq!(remembered_with(&dir, &shared, Scope::Auto), "");
     }
 
     #[test]
@@ -2794,9 +3128,10 @@ mod tests {
             let connection = Connection {
                 tools: true,
                 workspace,
+                conversation: 9_500_002,
                 ..Default::default()
             };
-            context_in(&dir, &connection)
+            remembered_with(&dir, &connection, Scope::Auto)
         };
         let text = prompt(Some(main.join("src")));
         assert!(
@@ -2839,7 +3174,11 @@ mod tests {
         let dir = scratch("scan-marked");
         let raw = "Likes tables.\n§\nPre\u{200B}fers tabs.\u{E0069}\u{E0067}\n";
         std::fs::write(dir.join("MEMORY.md"), raw).unwrap();
-        let text = context_in(&dir, &Connection::default());
+        let connection = Connection {
+            conversation: 9_500_003,
+            ..Default::default()
+        };
+        let text = remembered_with(&dir, &connection, Scope::Auto);
         assert!(
             text.contains(
                 "Likes tables.\n§\n[Letronna's note: the entry below holds characters nobody \
@@ -3609,6 +3948,15 @@ mod tests {
         );
     }
 
+    /// What `connection`'s session remembers from `dir` while it keeps
+    /// memory in `scope`.
+    fn remembered_with(dir: &Path, connection: &Connection, scope: Scope) -> String {
+        choose_scope(connection.conversation, Some(scope));
+        let text = remembered_in(dir, connection);
+        forget(connection.conversation);
+        text
+    }
+
     /// Messages said in turn, the user's first, each a turn of its own.
     fn talk(said: &[&str]) -> Vec<Message> {
         let role = |at: usize| {
@@ -3721,7 +4069,7 @@ mod tests {
                 conversation: session,
                 ..Default::default()
             };
-            let text = context_in(&dir, &connection);
+            let text = remembered_with(&dir, &connection, Scope::Auto);
             forget(session);
             text
         };
@@ -3733,7 +4081,11 @@ mod tests {
         );
         for saving in [Saving::WhenAsked, Saving::Ask] {
             let text = said(9_100_002, saving);
-            assert_eq!(text.replace(saving.told(), Saving::Auto.told()), auto);
+            let later = "in a later session";
+            assert_eq!(
+                text.replace(&saving.told(later), &Saving::Auto.told(later)),
+                auto
+            );
         }
         assert!(said(9_100_003, Saving::WhenAsked).contains("\"Want me to remember that?\""));
     }
@@ -3766,5 +4118,174 @@ mod tests {
             "Save to USER.md\nReplace: tea\nWith: Drinks coffee, black.\nAdd: Lives in Bandung.\nRemove: Works late"
         );
         assert!(Remember.asked_each_time());
+    }
+
+    #[test]
+    fn each_scope_loads_its_own_stores_and_leaves_out_the_rest() {
+        let dir = scratch("scopes");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("AGENTS.md"), "Run make test.").unwrap();
+        std::fs::write(dir.join("USER.md"), "Called by a nickname.\n").unwrap();
+        std::fs::write(dir.join("MEMORY.md"), "Uses a Mac.\n").unwrap();
+        let notes = project_dir(&dir, &project_root(&project));
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(notes.join("MEMORY.md"), "Builds with make.\n").unwrap();
+        let session = 9_500_010;
+        std::fs::create_dir_all(chat_dir(&dir, session)).unwrap();
+        std::fs::write(
+            chat_dir(&dir, session).join("MEMORY.md"),
+            "Planning a trip.\n",
+        )
+        .unwrap();
+        let other = 9_500_011;
+        let connection = |conversation, workspace: Option<&Path>| Connection {
+            tools: true,
+            workspace: workspace.map(Path::to_path_buf),
+            conversation,
+            ..Default::default()
+        };
+        let all = [
+            "Called by a nickname.",
+            "Uses a Mac.",
+            "Builds with make.",
+            "Planning a trip.",
+        ];
+        let loaded = |text: &str| -> Vec<&str> {
+            all.iter()
+                .copied()
+                .filter(|entry| text.contains(entry))
+                .collect()
+        };
+        let here = connection(session, Some(&project));
+        assert_eq!(loaded(&remembered_with(&dir, &here, Scope::Auto)), all);
+        let kept = remembered_with(&dir, &here, Scope::Project);
+        assert_eq!(loaded(&kept), ["Builds with make.", "Planning a trip."]);
+        assert!(kept.contains("goes to the project's memory"), "{kept}");
+        let kept = remembered_with(&dir, &here, Scope::Chat);
+        assert_eq!(loaded(&kept), ["Planning a trip."]);
+        assert!(!kept.contains("USER.md"), "{kept}");
+        // A project's scope with no project is the chat's.
+        let projectless = connection(session, None);
+        assert_eq!(
+            remembered_with(&dir, &projectless, Scope::Project),
+            remembered_with(&dir, &projectless, Scope::Chat)
+        );
+        // No other chat sees this one's notes.
+        let elsewhere = remembered_with(&dir, &connection(other, Some(&project)), Scope::Auto);
+        assert!(!elsewhere.contains("Planning a trip."), "{elsewhere}");
+        // The project's rules load whatever the scope.
+        let rules = context_in(&dir, &here);
+        assert!(rules.contains("Run make test."), "{rules}");
+        assert!(loaded(&rules).is_empty(), "{rules}");
+    }
+
+    #[test]
+    fn a_scope_reads_by_its_name_or_label_and_a_newer_one_as_everywhere() {
+        assert_eq!(Scope::parse("project"), Ok(Scope::Project));
+        assert_eq!(Scope::parse("this chat only"), Ok(Scope::Chat));
+        assert_eq!(Scope::parse("Everywhere"), Ok(Scope::Auto));
+        assert!(Scope::parse("team").is_err());
+        assert_eq!(serde_json::to_string(&Scope::Chat).unwrap(), "\"chat\"");
+        let read = |text: &str| serde_json::from_str::<Scope>(text).unwrap();
+        assert_eq!(read("\"project\""), Scope::Project);
+        assert_eq!(read("\"team\""), Scope::Auto);
+    }
+
+    #[test]
+    fn the_users_words_name_where_one_save_goes() {
+        let said = |text: &str| said_in(&talk(&[text]));
+        assert_eq!(
+            said("Remember for this project: run make first."),
+            Some(Scope::Project)
+        );
+        assert_eq!(
+            said("remember for this chat only: the flight is at 9"),
+            Some(Scope::Chat)
+        );
+        assert_eq!(
+            said("Ingat untuk chat ini saja: saya di Jakarta."),
+            Some(Scope::Chat)
+        );
+        assert_eq!(said("Remember that I use pnpm."), None);
+        // Words that ask for nothing name no place.
+        assert_eq!(said("Fix this project's build."), None);
+    }
+
+    #[test]
+    fn a_save_goes_where_the_user_chose_and_says_so() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let data = scratch("kept-in");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*data) };
+        let project = data.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let session = 9_500_020;
+        let ctx = |workspace: Option<&Path>, keep_in| ToolContext {
+            keep_in,
+            ..ToolContext::of(&Connection {
+                workspace: workspace.map(Path::to_path_buf),
+                conversation: session,
+                ..Default::default()
+            })
+        };
+        let add = |content: &str| json!({"action": "add", "target": "user", "content": content});
+        let in_chat = data
+            .join("chats")
+            .join(session.to_string())
+            .join("MEMORY.md");
+        let project_notes = project_dir(&data, &project_root(&project)).join("MEMORY.md");
+
+        choose_scope(session, Some(Scope::Chat));
+        let out = Remember
+            .run(&add("Planning a trip."), &ctx(Some(&project), None))
+            .unwrap();
+        assert!(
+            out.starts_with("As the user chose, this goes to Chat notes rather than USER.md."),
+            "{out}"
+        );
+        assert_eq!(entries(&in_chat), ["Planning a trip."]);
+        // The card's answer wins over the session's scope.
+        let everywhere = ctx(Some(&project), Some(Scope::Auto));
+        Remember
+            .run(&add("Called by a nickname."), &everywhere)
+            .unwrap();
+        assert_eq!(entries(&data.join("USER.md")), ["Called by a nickname."]);
+
+        choose_scope(session, Some(Scope::Project));
+        Remember
+            .run(&add("Builds with make."), &ctx(Some(&project), None))
+            .unwrap();
+        assert_eq!(entries(&project_notes), ["Builds with make."]);
+        // With no project attached, a project's scope keeps to the chat.
+        Remember
+            .run(&add("Flies on Friday."), &ctx(None, None))
+            .unwrap();
+        assert_eq!(
+            entries(&in_chat),
+            ["Planning a trip.", "Flies on Friday."]
+        );
+        // The card offers where it goes now first.
+        assert_eq!(
+            places(&ctx(Some(&project), None)),
+            [Scope::Project, Scope::Auto, Scope::Chat]
+        );
+        assert_eq!(places(&ctx(None, None)), [Scope::Chat, Scope::Auto]);
+        let card = Remember.preview(&add("Flies on Friday."), &ctx(None, None));
+        assert!(card.starts_with("Save to Chat notes"), "{card}");
+
+        // The user's words in the turn win over the session's scope.
+        heard(
+            session,
+            &talk(&["Remember for this chat only: the hotel is booked."]),
+        );
+        Remember
+            .run(&add("The hotel is booked."), &ctx(Some(&project), None))
+            .unwrap();
+        assert_eq!(entries(&in_chat).len(), 3);
+        assert_eq!(chat_notes(session).used, size(&entries(&in_chat)));
+        forget(session);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }
