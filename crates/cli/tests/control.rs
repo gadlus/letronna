@@ -1,5 +1,5 @@
 //! `letronna -p --input-format stream-json`, driven over stdin as another
-//! program would drive it, and `-p --output json` as a script reads it,
+//! program would drive it, and the JSON `-p --output json` gives a script,
 //! against a local stub provider and a data folder of its own.
 
 use serde_json::{Value, json};
@@ -170,17 +170,21 @@ impl Driven {
         self.send(&json!({"type": "user", "message": {"role": "user", "content": text}}));
     }
 
-    /// The next line it wrote other than progress.
+    /// The next line it wrote other than the opening one and progress.
     fn next(&self) -> Value {
         loop {
-            let line = self
-                .lines
-                .recv_timeout(WAIT)
-                .expect("letronna wrote nothing more");
-            if line["type"] != "progress" {
+            let line = self.first();
+            if line["type"] != "progress" && line["type"] != "init" {
                 return line;
             }
         }
+    }
+
+    /// The next line it wrote, whatever it is.
+    fn first(&self) -> Value {
+        self.lines
+            .recv_timeout(WAIT)
+            .expect("letronna wrote nothing more")
     }
 
     /// Closes stdin and gives the exit code.
@@ -496,4 +500,98 @@ fn a_run_that_never_writes_its_required_file_says_so_in_the_json_result() {
         check.contains("`out/summary.json` does not exist."),
         "{check}"
     );
+}
+
+#[test]
+fn the_json_result_names_the_session_and_its_model() {
+    let (data, work) = scratch("named");
+    let (endpoint, bodies) = provider(vec![reply("Hello.", &[]), reply("Again.", &[])]);
+    let flags = ["-p", "hello", "--output", "json"];
+    let run = Driven::start(&data, &work, &endpoint, &flags);
+    let result = run.next();
+    assert_eq!(
+        (&result["model"], &result["gateway"], &result["refused"]),
+        (&json!("stub-model"), &json!("Custom"), &json!(0))
+    );
+    // A stub's model has no listed price, so what it cost is not known.
+    assert_eq!(result.get("cost_usd"), Some(&Value::Null));
+    assert_eq!(run.close(), 0);
+    let session = result["session"]
+        .as_u64()
+        .expect("no session in the result");
+    let file = data.join("sessions").join(format!("{session}.jsonl"));
+    assert!(file.exists(), "no session file at {}", file.display());
+    // That id carries the same conversation on.
+    let id = session.to_string();
+    let flags = ["-p", "again", "--resume", &id, "--output", "json"];
+    let run = Driven::start(&data, &work, &endpoint, &flags);
+    assert_eq!(run.next()["session"], session);
+    assert_eq!(run.close(), 0);
+    let _ = bodies.recv_timeout(WAIT).unwrap();
+    let later = said(&bodies.recv_timeout(WAIT).unwrap());
+    let tail: Vec<&str> = later[later.len() - 3..]
+        .iter()
+        .map(|(_, content)| content.as_str())
+        .collect();
+    assert_eq!(tail, ["hello", "Hello.", "again"]);
+}
+
+#[test]
+fn refused_calls_are_counted_in_the_json_result() {
+    let deny = json!([{"tool": "write_file", "effect": "deny"}]);
+    // Refused by a rule, and outside the tools the run was given.
+    let cases = [
+        ("count-rule", deny, &[][..]),
+        ("count-tools", json!([]), &["--tools", "read_file"][..]),
+    ];
+    for (name, rules, flags) in cases {
+        let (run, work) = writer(name, rules, flags);
+        let result = run.next();
+        assert_eq!(
+            (&result["answer"], &result["refused"]),
+            (&json!("Over."), &json!(1)),
+            "{name}"
+        );
+        assert_eq!(run.close(), 0);
+        assert!(!work.join("out.txt").exists(), "{name}: the call ran");
+    }
+    // Answered no, and answered yes.
+    for (name, behavior, refused) in [
+        ("count-no", json!({"behavior": "deny", "message": "no"}), 1),
+        ("count-yes", json!({"behavior": "allow"}), 0),
+    ] {
+        let (mut run, _) = writer(name, json!([]), &[]);
+        let asked = run.next();
+        assert_eq!(asked["request"]["subtype"], "can_use_tool", "{name}");
+        run.send(&answer(&asked, behavior));
+        assert_eq!(run.next()["refused"], refused, "{name}");
+        assert_eq!(run.close(), 0);
+    }
+}
+
+#[test]
+fn stream_json_starts_with_an_init_line_naming_the_session() {
+    let (data, work) = scratch("init");
+    let (endpoint, _bodies) = provider(vec![reply("Hi.", &[]), reply("Hi again.", &[])]);
+    let flags = ["-p", "hello", "--output", "stream-json"];
+    let run = Driven::start(&data, &work, &endpoint, &flags);
+    let init = run.first();
+    assert_eq!(
+        (&init["type"], &init["model"], &init["gateway"]),
+        (&json!("init"), &json!("stub-model"), &json!("Custom"))
+    );
+    assert!(init["session"].is_u64(), "{init}");
+    let result = run.next();
+    assert_eq!(
+        (&result["type"], &result["session"]),
+        (&json!("result"), &init["session"])
+    );
+    assert_eq!(run.close(), 0);
+    // Driven over stdin, it says so before any message is sent.
+    let mut run = Driven::streaming(&data, &work, &endpoint, &[]);
+    let init = run.first();
+    assert_eq!(init["type"], "init");
+    run.say("hello");
+    assert_eq!(run.next()["session"], init["session"]);
+    assert_eq!(run.close(), 0);
 }
