@@ -924,6 +924,16 @@ fn hidden(spec: &Spec) -> Vec<String> {
         .collect()
 }
 
+/// Whether a run held to `allow` may call an MCP server's tool: not when its
+/// list names none, nor when its calls are its caller's own to make.
+fn reaches_mcp(allow: &Allow) -> bool {
+    match allow {
+        Allow::All => true,
+        Allow::Only(names) => names.iter().any(|name| crate::mcp_find::is_mcp(name)),
+        Allow::Own(_) => false,
+    }
+}
+
 /// Why this agent may not make `call`, when it may not: its tool, or for a
 /// batch of browser steps the tool of any step, which runs as that tool's.
 fn call_refusal(spec: &Spec, call: &ToolCall) -> Option<String> {
@@ -1090,6 +1100,7 @@ fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Option<Message>, 
         guard: Some(Box::new(permit)),
         // A fork's is its parent's, so its requests start as the parent's do.
         floor: spec.transcript.conversation.floor(),
+        no_mcp: !reaches_mcp(&spec.allow),
     };
     // The turn's, as the window and the terminal send, since at the round
     // cap it alone asks for the wrap-up with no calls.
@@ -1920,6 +1931,16 @@ pub(crate) mod tests {
         assert!(pair.iter().all(|name| hides(&no_mcp, name)), "{no_mcp:?}");
         assert!(hides(&mcp, "write_file"), "{mcp:?}");
         assert!(!pair.iter().any(|name| hides(&mcp, name)), "{mcp:?}");
+    }
+
+    #[test]
+    fn only_a_run_that_may_call_an_mcp_tool_hears_which_servers_are_not_ready() {
+        let only = |names: &[&str]| Allow::Only(names.iter().map(|n| n.to_string()).collect());
+        assert!(reaches_mcp(&Allow::All));
+        assert!(reaches_mcp(&only(&["read_file", "mcp__docs__look_up"])));
+        assert!(!reaches_mcp(&only(&["read_file"])));
+        assert!(!reaches_mcp(&only(&[])));
+        assert!(!reaches_mcp(&Allow::Own(Arc::new(|_| Ok(String::new())))));
     }
 
     /// The system message the first request of `spec`'s run sends once

@@ -1474,6 +1474,26 @@ fn checklist(messages: &[Message]) -> Option<String> {
     ))
 }
 
+/// What rides on the end of a request and is never stored, if anything: the
+/// checklist first as it always has, then `lsp`, the language servers' news,
+/// then the MCP servers not ready, for a run that may call their tools.
+fn ending(
+    connection: &Connection,
+    messages: &[Message],
+    lsp: Option<&str>,
+    extra: &Extra,
+) -> String {
+    let mcp = (!extra.no_mcp)
+        .then(|| crate::mcp::note(connection))
+        .flatten();
+    let ending: Vec<String> = checklist(messages)
+        .into_iter()
+        .chain(lsp.map(str::to_owned))
+        .chain(mcp)
+        .collect();
+    ending.join("\n\n")
+}
+
 /// A picture a request shows the model.
 struct Picture {
     /// The message it goes in, the user's own; or the last result of the
@@ -2481,6 +2501,9 @@ pub struct Extra {
     pub guard: Option<Box<dyn Any + Send>>,
     /// The session's `Conversation::floor`, which the window never starts before.
     pub floor: usize,
+    /// The run may call no MCP server's tool, so it is not told which
+    /// servers are not ready.
+    pub no_mcp: bool,
 }
 
 /// A reply to `messages`, streamed, after which the summary the next turn's
@@ -2850,12 +2873,7 @@ fn stream(
             let _ = sender.send_blocking(Event::SummaryUsage(usage));
         },
     );
-    // Both ride on the end, the checklist first as it always has.
-    let ending: Vec<String> = checklist(messages)
-        .into_iter()
-        .chain(lsp.map(str::to_owned))
-        .collect();
-    let ending = ending.join("\n\n");
+    let ending = ending(connection, messages, lsp, extra);
     let mut prefix = crate::cache_miss::Prefix::default();
     let sent = body_hashed(
         connection,
@@ -3748,6 +3766,59 @@ mod tests {
             context.last().unwrap()["content"],
             "Checklist updated: 1 of 1 done."
         );
+    }
+    #[test]
+    fn a_starting_server_is_named_on_the_wire() {
+        crate::mcp::pretend("wire-starting", crate::mcp::State::Starting);
+        let c = Connection {
+            tools: true,
+            ..connection()
+        };
+        let messages = [said("user", "check my issues")];
+        let ending = ending(&c, &messages, None, &Extra::default());
+        let payload = body(&c, &messages, None, Some(ending.as_str()));
+        let context = payload["messages"].as_array().unwrap();
+        let last = context.last().unwrap()["content"].as_str().unwrap();
+        assert!(
+            last.starts_with("check my issues\n\n(From Letronna, not part of the above: some MCP"),
+            "{last}"
+        );
+        assert!(
+            last.ends_with(
+                "\nwire-starting: still starting; its tools appear by themselves once it answers."
+            ),
+            "{last}"
+        );
+        assert_eq!(messages[0].content, "check my issues");
+    }
+    #[test]
+    fn a_shared_chat_gets_no_server_line() {
+        crate::mcp::pretend("wire-shared", crate::mcp::State::Failed);
+        let messages = [said("user", "check my issues")];
+        let with_tools = Connection {
+            tools: true,
+            ..connection()
+        };
+        assert!(ending(&with_tools, &messages, None, &Extra::default()).contains("wire-shared"));
+        let shared = Connection {
+            remote: Some(Remote {
+                place: "#general in a Discord server".into(),
+                shared: true,
+                history: None,
+            }),
+            ..with_tools.clone()
+        };
+        assert_eq!(ending(&shared, &messages, None, &Extra::default()), "");
+        // Nor a session without tools, nor a run that may call no MCP tool.
+        assert_eq!(
+            ending(&connection(), &messages, None, &Extra::default()),
+            ""
+        );
+        let held = Extra {
+            no_mcp: true,
+            ..Default::default()
+        };
+        assert_eq!(ending(&with_tools, &messages, None, &held), "");
     }
     #[test]
     fn a_model_listing_no_levels_gets_no_effort_parameter() {
