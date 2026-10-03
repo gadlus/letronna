@@ -15,7 +15,9 @@
 //!
 //! Each skill can be switched off. What is kept is the names that are off, in
 //! `skills-off.json`, so a skill that is new, installed or brought by a
-//! project starts on. `install` adds skills from GitHub, a link or a folder.
+//! project starts on. One the model writes itself is the exception: it is
+//! switched off as it is saved, and waits for the user to switch it on.
+//! `install` adds skills from GitHub, a link or a folder.
 //!
 //! The model is shown the skills switched on, a line each, and loads one with
 //! the `skill` tool when a task matches it. That tool also serves the files

@@ -7,6 +7,11 @@
 //! refused, so a model that talked itself into a bad idea cannot rewrite
 //! instructions somebody else wrote or chose.
 //!
+//! A skill it makes starts switched off, listed as learned, and is offered
+//! to the model only once the user switches it on in Skills. Saying yes to
+//! the write, or running in Bypass with nobody asked, is not choosing to
+//! have a way of working that fit one task steer every session after it.
+//!
 //! Every change keeps the SKILL.md it replaced as `SKILL.md.prev`, and
 //! `undo` swaps the two back, so one bad patch costs nothing. Archiving
 //! moves the whole folder to the archive, as the Skills page's remove does.
@@ -14,8 +19,8 @@
 use super::install::{MARK, plain};
 use super::{
     Entry, SKILL_BYTES, SKILL_FILE, SKILLS_DIR, Source, clean, field, find, free_folder, gather,
-    migrate_in, read_root, read_skill, read_text, remove_in, render, same, save_off, slug, split,
-    summary_of, switched_off, temp_beside, write_skill,
+    migrate_in, read_root, read_skill, read_text, remove_in, render, same, set_enabled_in, slug,
+    split, summary_of, switched_off, temp_beside, write_skill,
 };
 use crate::chat as backend;
 use crate::tools::{Tool, ToolContext, one_line};
@@ -43,7 +48,7 @@ impl Tool for ManageSkill {
         "skill_manage"
     }
     fn description(&self) -> &'static str {
-        "Save a way of working you figured out as a skill, so later sessions can load it, or fix one you saved that turned out wrong. action create takes name, description and body (the instructions, in Markdown). action patch replaces the exact text old with new in a skill's body, or its description with field set to description; old must appear exactly once. action undo puts back a skill as it was before your last patch; undo again to redo it. action archive puts a skill away. Only skills you created can be changed; the user's own, installed and project skills are refused."
+        "Save a way of working you figured out as a skill, so later sessions can load it, or fix one you saved that turned out wrong. A skill you create starts switched off: it is not offered to you, and cannot be loaded, until the user switches it on in Skills. action create takes name, description and body (the instructions, in Markdown). action patch replaces the exact text old with new in a skill's body, or its description with field set to description; old must appear exactly once. action undo puts back a skill as it was before your last patch; undo again to redo it. action archive puts a skill away. Only skills you created can be changed; the user's own, installed and project skills are refused."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -134,7 +139,7 @@ fn manage(data: &Path, workspace: Option<&Path>, args: &Value) -> Result<String,
     }
 }
 
-/// Save a new learned skill, switched on.
+/// Save a new learned skill, switched off until the user switches it on.
 fn create(
     data: &Path,
     workspace: Option<&Path>,
@@ -169,6 +174,10 @@ fn create(
     let text = render(name, &description, &[], &body);
     scanned(&text)?;
     round_trips(&text, name)?;
+    // Switched off before it exists, so a crash between the two cannot
+    // leave it offered to the model before the user has chosen it.
+    let was_off = switched_off(data)?.iter().any(|n| same(n, name));
+    set_enabled_in(data, name, false)?;
     let folder = free_folder(&root, &slug(name));
     // The mark first, so a SKILL.md never exists without it and the skill
     // is never taken for the user's own.
@@ -178,17 +187,15 @@ fn create(
         .and_then(|()| write_skill(&folder, &text));
     if let Err(why) = made {
         let _ = std::fs::remove_dir_all(&folder);
+        // Or a skill the user makes later under this name would start off.
+        if !was_off {
+            let _ = set_enabled_in(data, name, true);
+        }
         return Err(why);
     }
-    // A name switched off before, by a skill since removed, should not
-    // leave this one off.
-    let mut off = switched_off(data)?;
-    if off.iter().any(|n| same(n, name)) {
-        off.retain(|n| !same(n, name));
-        save_off(data, &off)?;
-    }
     Ok(format!(
-        "Saved the skill \"{name}\" in {}. It is switched on and listed as learned.",
+        "Saved the skill \"{name}\" in {}. It is listed as learned and stays switched off, \
+         out of your reach, until the user switches it on in Skills; tell them it is waiting.",
         folder.display()
     ))
 }
@@ -488,20 +495,54 @@ mod tests {
     }
 
     #[test]
-    fn a_created_skill_is_marked_learned_and_starts_on() {
+    fn a_created_skill_is_marked_learned_and_starts_off() {
         let data = scratch("create");
-        // Off from an earlier skill of the same name, since removed.
-        set_enabled_in(&data, "Release checklist", false).unwrap();
         create(&data, "Release checklist", "Run the tests.\n\nThen tag.").unwrap();
         let skills = list_in(&data, None).unwrap();
         let skill = crate::skills::find(&skills, "release checklist").unwrap();
-        assert!(skill.learned && skill.enabled);
+        assert!(skill.learned && !skill.enabled);
         assert_eq!(skill.description, "When releasing.");
         assert_eq!(skill.body, "Run the tests.\n\nThen tag.");
         assert!(skill.folder.join(LEARNED).is_file());
         assert!(skill.folder.ends_with("release-checklist"));
         // A name is taken once.
         assert!(create(&data, "release checklist", "Again.").is_err());
+    }
+
+    #[test]
+    fn a_skill_the_model_writes_is_not_offered_until_switched_on() {
+        let data = scratch("pending");
+        let said = create(&data, "deploy", "Build.\n\nPush to staging.").unwrap();
+        assert!(said.contains("switches it on in Skills"), "{said}");
+        let connection = crate::chat::Connection {
+            tools: true,
+            ..Default::default()
+        };
+        let index = crate::skills::context_in(&data, &connection);
+        assert!(!index.contains("deploy"), "{index}");
+        let refused = crate::skills::load(&data, None, "deploy", None, 0).unwrap_err();
+        assert!(refused.contains("switched off"), "{refused}");
+        // While it waits, the model can still mend what it wrote.
+        let args =
+            json!({"action": "patch", "name": "deploy", "old": "staging", "new": "production"});
+        manage(&data, None, &args).unwrap();
+        set_enabled_in(&data, "deploy", true).unwrap();
+        let index = crate::skills::context_in(&data, &connection);
+        assert!(
+            index.contains("deploy (learned): When releasing."),
+            "{index}"
+        );
+        let loaded = crate::skills::load(&data, None, "deploy", None, 0).unwrap();
+        assert!(loaded.contains("Push to production."), "{loaded}");
+    }
+
+    #[test]
+    fn a_create_that_cannot_be_saved_leaves_no_name_switched_off() {
+        let data = scratch("unsaved");
+        // A file where the skills folder goes, so no skill folder can be made.
+        std::fs::write(data.join("skills"), "").unwrap();
+        assert!(create(&data, "notes", "Write it down.").is_err());
+        assert!(crate::skills::switched_off(&data).unwrap().is_empty());
     }
 
     #[test]
@@ -736,6 +777,7 @@ mod tests {
     fn a_learned_skill_reaches_the_model_without_its_hidden_characters() {
         let data = scratch("vetted");
         create(&data, "tidy", "Sort the files.").unwrap();
+        set_enabled_in(&data, "tidy", true).unwrap();
         let skills = list_in(&data, None).unwrap();
         let folder = crate::skills::find(&skills, "tidy").unwrap().folder.clone();
         // As one saved before writes were scanned, or edited by hand.
