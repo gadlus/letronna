@@ -876,7 +876,7 @@ fn refused(spec: &Spec, name: &str) -> Option<String> {
     // frontend's loop to come back to it later.
     match name {
         tools::ASK_USER => Some(NOBODY_TO_ASK.into()),
-        "wake_me" | "schedule" | "workflow" => {
+        _ if crate::schedule::NOT_AVAILABLE.contains(&name) => {
             Some(format!("`{name}` is not available in a scheduled run."))
         }
         _ => None,
