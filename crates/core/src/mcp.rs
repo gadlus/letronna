@@ -4413,6 +4413,47 @@ mod tests {
     }
 
     #[test]
+    fn injection_carriers_from_a_server_stay_inside_its_fence_and_lose_what_nobody_sees() {
+        use crate::untrusted::tests::{CARRIERS, assert_fenced};
+        // Settings of its own, so no other test's switched-off tools or keys
+        // are read while it calls by name.
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = Scratch::new("mcp-carriers");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (from_client, to_server) = std::io::pipe().unwrap();
+        let (from_server, to_client) = std::io::pipe().unwrap();
+        scripted_server(from_client, to_client);
+        let tools = connect("demo", 0, &ServerConfig::default(), from_server, to_server).unwrap();
+        super::serve(tools.into_iter().map(|t| t as Arc<dyn Tool>).collect());
+        let ctx = ToolContext::default();
+        for (carrier, sent, read) in CARRIERS {
+            let args = json!({ "text": sent }).to_string();
+            let out = crate::tools::run("mcp__demo__echo", &args, &ctx).unwrap();
+            let inside = format!("echo: {read}\n[image/png, 3 bytes]");
+            assert_fenced(carrier, &out, &inside, "");
+        }
+        // And as a resource's text, the carrier its uri numbers.
+        scripted("carriers", |method, params| match method {
+            "initialize" => greeting(json!({"resources": {}})),
+            "resources/read" => {
+                let at: usize = params["uri"].as_str()?.parse().ok()?;
+                let (_, sent, _) = CARRIERS[at];
+                Some(json!({"result": {"contents": [{"uri": at.to_string(), "text": sent}]}}))
+            }
+            _ => None,
+        })
+        .unwrap();
+        for (at, (carrier, _, read)) in CARRIERS.iter().enumerate() {
+            let args = json!({"server": "carriers", "uri": at.to_string()}).to_string();
+            let out = crate::tools::run(READ_RESOURCE, &args, &ctx).unwrap();
+            assert_fenced(carrier, &out, read, "");
+        }
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
     fn a_tool_its_server_marks_read_only_and_closed_to_the_world_runs_without_asking() {
         for (auto_approve, echo_asks) in [(vec![], true), (vec!["echo".into()], false)] {
             let (from_client, to_server) = std::io::pipe().unwrap();

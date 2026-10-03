@@ -1094,6 +1094,40 @@ or <a data-href="/x" href=/top#part>the top</a>.</p>
         }
     }
 
+    /// The stand-in page at `/n`: the `n`th injection carrier, as plain text.
+    fn carrier_page(path: &str) -> String {
+        let at: usize = path.trim_start_matches('/').parse().unwrap_or_default();
+        let (_, sent, _) = crate::untrusted::tests::CARRIERS[at];
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{sent}",
+            sent.len()
+        )
+    }
+
+    #[test]
+    fn injection_carriers_on_a_page_stay_inside_its_fence_and_letronnas_note_after_it() {
+        use crate::untrusted::tests::{CARRIERS, assert_fenced};
+        // Settings of its own, so no other test's switched-off tools or keys
+        // are read while it calls by name.
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::store::tests::Scratch::new("web-carriers");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (base, _) = serve(carrier_page);
+        let ctx = ToolContext::default();
+        // `fresh` as a string, which Letronna notes it read as a boolean.
+        let note = "\n\n[Read `fresh` as a boolean. Use the tool's own parameter names and types.]";
+        for (at, (carrier, _, read)) in CARRIERS.iter().enumerate() {
+            let address = format!("{base}/{at}");
+            let args = json!({"url": address, "fresh": "true"}).to_string();
+            let out = crate::tools::run("web_fetch", &args, &ctx).unwrap();
+            assert_fenced(carrier, &out, &format!("{address}\n\n{read}"), note);
+        }
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
     #[test]
     fn a_pdf_is_saved_as_a_file_and_one_too_large_is_refused() {
         let (base, _) = serve(papers);
