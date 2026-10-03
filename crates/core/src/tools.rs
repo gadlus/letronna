@@ -1062,7 +1062,7 @@ fn shell_over(
             .arg(with_utf8_output(command));
         c
     } else {
-        let mut c = Command::new("sh");
+        let mut c = Command::new(if bash() { "bash" } else { "sh" });
         c.args(["-c", command]);
         c
     };
@@ -1097,6 +1097,26 @@ fn shell_over(
         cmd.envs(crate::command::GUARDS.iter().copied());
     }
     cmd
+}
+
+/// Whether commands run in bash rather than sh: on Unix, wherever bash is on
+/// PATH.
+pub(crate) fn bash() -> bool {
+    static BASH: OnceLock<bool> = OnceLock::new();
+    // Models write commands for bash -- `source`, `[[ ]]`, `set -o pipefail`
+    // -- and the sh of Debian and Ubuntu is dash, which refuses them. This
+    // looks in Letronna's own PATH rather than the login shell's, since the
+    // tool's description asks before any command has run and capturing the
+    // login shell then would hold up the first reply; both hold the system's
+    // folders, where bash is. The program is still found on the PATH the
+    // command gets, so a newer bash a profile puts first is the one that
+    // runs. Asked once, the description and every command agree for the run.
+    *BASH.get_or_init(|| !cfg!(windows) && has_bash(std::env::var_os("PATH").as_deref()))
+}
+
+/// Whether one of the folders in `path` holds a program named bash.
+fn has_bash(path: Option<&std::ffi::OsStr>) -> bool {
+    path.is_some_and(|path| std::env::split_paths(path).any(|dir| dir.join("bash").is_file()))
 }
 
 /// Switches Windows PowerShell's output to UTF-8 where the session allows it.
@@ -1955,6 +1975,8 @@ impl Tool for RunCommand {
     fn description(&self) -> &'static str {
         if cfg!(windows) {
             "Run a Windows PowerShell 5.1 command in the project folder. `&&` and `||` are syntax errors in 5.1: separate commands with `;`, or write `first; if ($?) { second }` to run the second only when the first succeeded. Waits for it to finish and returns its output, with a 2 minute limit. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
+        } else if bash() {
+            "Run a bash command in the project folder. Waits for it to finish and returns its output, with a 2 minute limit. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
         } else {
             "Run a shell (sh) command in the project folder. Waits for it to finish and returns its output, with a 2 minute limit. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
         }
@@ -3897,6 +3919,38 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim(),
             "cat cat dumb yes"
         );
+    }
+
+    /// Process substitution fails in dash and in the sh of macOS alike, so
+    /// only bash prints the line. Skipped where bash is not installed.
+    #[cfg(unix)]
+    #[test]
+    fn bash_syntax_works_where_bash_is_on_path_and_the_tool_says_so() {
+        if !has_bash(std::env::var_os("PATH").as_deref()) {
+            return;
+        }
+        let line = "source /dev/null && [[ -n $BASH_VERSION ]] && cat <(echo in bash)";
+        let out = run_shell(line, None, &Cancel::default()).unwrap();
+        assert_eq!(out.trim_end(), "in bash");
+        let said = RunCommand.description();
+        assert!(said.starts_with("Run a bash command"), "{said}");
+    }
+
+    #[test]
+    fn only_a_program_named_bash_on_path_counts_as_bash() {
+        let dir = std::env::temp_dir().join(format!("letronna-bash-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("empty")).unwrap();
+        std::fs::create_dir_all(dir.join("folder/bash")).unwrap();
+        std::fs::create_dir_all(dir.join("program")).unwrap();
+        std::fs::write(dir.join("program/bash"), "").unwrap();
+        let path =
+            |names: &[&str]| std::env::join_paths(names.iter().map(|n| dir.join(n))).unwrap();
+
+        assert!(!has_bash(None));
+        assert!(!has_bash(Some(&path(&["empty", "folder"]))));
+        assert!(has_bash(Some(&path(&["empty", "folder", "program"]))));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

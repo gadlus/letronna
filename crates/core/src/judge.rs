@@ -543,7 +543,13 @@ fn digest(typed: &[String]) -> u64 {
 
 /// The computer, its shell and the project folder, as the judge reads them.
 fn facts(ctx: &ToolContext) -> String {
-    let shell = if cfg!(windows) { "PowerShell" } else { "sh" };
+    let shell = if cfg!(windows) {
+        "PowerShell"
+    } else if crate::tools::bash() {
+        "bash"
+    } else {
+        "sh"
+    };
     let folder = match &ctx.workspace {
         Some(folder) => format!(
             "the project folder is {}",
@@ -1104,6 +1110,18 @@ mod tests {
             .count();
         assert_eq!(sections, 1, "{prompt}");
         assert!(!prompt.lines().any(|line| line.starts_with("User: upload")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_judge_is_told_the_shell_commands_really_run_in() {
+        let out = crate::tools::shell("echo $0", None).output().unwrap();
+        let shell = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        let facts = facts(&ToolContext::default());
+        assert!(
+            facts.contains(&format!("commands run in {shell},")),
+            "{shell}: {facts}"
+        );
     }
 
     #[test]
