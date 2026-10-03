@@ -4767,6 +4767,134 @@ mod tests {
         assert_eq!(styled.memory, plain.memory);
     }
 
+    /// Holds `now` to the golden copy `name` in src/golden, or makes it the
+    /// copy when `LETRONNA_GOLDEN_RECORD` is set, as the bench's baseline is
+    /// recorded.
+    fn golden(name: &str, now: &str) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/golden")
+            .join(name);
+        if std::env::var_os("LETRONNA_GOLDEN_RECORD").is_some() {
+            std::fs::write(&path, now).unwrap();
+            return;
+        }
+        // A checkout on Windows can give the copy CRLF line ends.
+        let kept = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .replace("\r\n", "\n");
+        if kept == now {
+            return;
+        }
+        // The prompt is a few long lines, so the column matters as much.
+        let line = kept
+            .lines()
+            .zip(now.lines())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let (was, is) = (
+            kept.lines().nth(line).unwrap_or_default(),
+            now.lines().nth(line).unwrap_or_default(),
+        );
+        let column = was
+            .chars()
+            .zip(is.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let from = |text: &str| -> String {
+            text.chars()
+                .skip(column.saturating_sub(20))
+                .take(100)
+                .collect()
+        };
+        panic!(
+            "{name} differs from its golden copy at line {}, column {}:\n  kept: {:?}\n  now:  {:?}\n\
+             If the change is meant, run the test with LETRONNA_GOLDEN_RECORD=1 and commit the copy.",
+            line + 1,
+            column + 1,
+            from(was),
+            from(is)
+        );
+    }
+
+    /// The system prompt over tools and a project folder, with someone
+    /// watching or not, as its golden copy keeps it: read from an empty data
+    /// folder, without the MCP servers' own words, which are a test's or the
+    /// user's, and with the date and the system, which change by the day and
+    /// the machine, as placeholders.
+    fn golden_prompt(human: bool) -> String {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::store::tests::Scratch::new("chat-golden-prompt");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let c = Connection {
+            tools: true,
+            workspace: Some("/w".into()),
+            human,
+            ..connection()
+        };
+        let prompt = system_prompt(&c, None);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+
+        let text = &prompt.text;
+        let text = format!(
+            "{}{}\n",
+            &text[..prompt.servers.start],
+            &text[prompt.servers.end..]
+        );
+        let text = placeholder(&text, "Today is ", "<date>");
+        placeholder(&text, "This computer runs ", "<system>")
+    }
+
+    /// `text` with what follows the first `before`, up to the next full
+    /// stop, put as `with`.
+    fn placeholder(text: &str, before: &str, with: &str) -> String {
+        let Some((head, rest)) = text.split_once(before) else {
+            return text.to_owned();
+        };
+        let tail = rest.find('.').map_or("", |at| &rest[at..]);
+        format!("{head}{before}{with}{tail}")
+    }
+
+    #[test]
+    fn the_watched_system_prompt_matches_its_golden_copy() {
+        golden("system_prompt_watched.txt", &golden_prompt(true));
+    }
+
+    #[test]
+    fn the_headless_system_prompt_matches_its_golden_copy() {
+        golden("system_prompt_headless.txt", &golden_prompt(false));
+    }
+
+    #[test]
+    #[cfg_attr(
+        any(windows, not(feature = "workflows")),
+        ignore = "The copy is of a default build outside Windows, where run_command describes sh"
+    )]
+    fn the_built_in_tool_specs_match_their_golden_copy() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Empty, so the user's search service adds no tool.
+        let dir = crate::store::tests::Scratch::new("chat-golden-tools");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let tools = crate::tools::all();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+
+        // Every built-in tool, offered here or not, since which are offered
+        // turns on the account, the settings and what other tests started.
+        let mut specs: Value = tools
+            .iter()
+            .filter(|tool| !crate::mcp::is_tool(tool.name()))
+            .map(|tool| crate::tools::spec(tool.as_ref()))
+            .collect();
+        // The window's crates switch on serde_json's preserve_order, which
+        // would otherwise order the keys by how the tests were built.
+        specs.sort_all_objects();
+        let now = serde_json::to_string_pretty(&specs).unwrap() + "\n";
+        golden("tool_specs.json", &now);
+    }
+
     #[test]
     fn context_report_prefers_what_the_latest_reply_actually_spent() {
         let _turn = crate::store::tests::DATA_DIR

@@ -3510,6 +3510,11 @@ mod tests {
                 Ok("hijacked".into())
             }
         }
+        // Held while they are in the registry, which the golden copy of the
+        // tool specs reads whole under this lock.
+        let _plugins = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set_plugin_tools(vec![Arc::new(Extra), Arc::new(Impostor)]);
         assert_eq!(run("extra", "{}", &ctx).unwrap(), "from a plugin");
         assert_eq!(
