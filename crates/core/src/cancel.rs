@@ -150,9 +150,9 @@ impl Cancel {
     }
 }
 
-/// Set `cancel` at the first Ctrl-C instead of ending the process, so a run
-/// can end what it started before it goes; a second Ctrl-C ends the process
-/// at once, as the first did before.
+/// Set `cancel` at the first Ctrl-C, SIGTERM or hangup instead of ending the
+/// process, so a run can end what it started before it goes; a second Ctrl-C
+/// or SIGTERM ends the process at once, as the first did before.
 #[cfg(unix)]
 pub fn on_interrupt(cancel: Cancel) {
     use std::io::Read;
@@ -165,33 +165,48 @@ pub fn on_interrupt(cancel: Cancel) {
         // the pipe stays open for the life of the process.
         unsafe { libc::write(HEARD.load(Ordering::Relaxed), [1u8].as_ptr().cast(), 1) };
     }
-    // SAFETY: all zeroes is a valid sigaction, for the current one to be
-    // read into and for the new one, whose mask is emptied below.
-    let (mut before, mut action): (libc::sigaction, libc::sigaction) =
-        unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
-    // SAFETY: this only reads the current action.
-    unsafe { libc::sigaction(libc::SIGINT, std::ptr::null(), &mut before) };
-    // Ignored on purpose, as a shell does for what it runs in the background
-    // of a script, where the Ctrl-C is meant for the script alone.
-    if before.sa_sigaction == libc::SIG_IGN {
-        return;
-    }
     // Close-on-exec, so no command Letronna starts holds the pipe.
     let Ok((mut reader, writer)) = std::io::pipe() else {
         return;
     };
     HEARD.store(writer.into_raw_fd(), Ordering::Relaxed);
-    action.sa_sigaction = heard as *const () as libc::sighandler_t;
-    // Heard once, then back to the default, which ends the process; and a
-    // call another thread was in carries on rather than fail.
-    action.sa_flags = libc::SA_RESETHAND | libc::SA_RESTART;
-    // SAFETY: the mask is the action's own, and the action is whole when set.
-    unsafe {
-        libc::sigemptyset(&mut action.sa_mask);
-        libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+    // Whether a second of each ends the process: a second Ctrl-C or SIGTERM
+    // means now, but a closing terminal sends two hangups, one from its
+    // shell and one from the kernel as the shell exits, and the second
+    // would end the stop the first began.
+    for (signal, once) in [
+        (libc::SIGINT, true),
+        (libc::SIGTERM, true),
+        (libc::SIGHUP, false),
+    ] {
+        // SAFETY: all zeroes is a valid sigaction, for the current one to be
+        // read into and for the new one, whose mask is emptied below.
+        let (mut before, mut action): (libc::sigaction, libc::sigaction) =
+            unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
+        // SAFETY: this only reads the current action.
+        unsafe { libc::sigaction(signal, std::ptr::null(), &mut before) };
+        // Ignored on purpose, as a shell does with Ctrl-C for what it runs in
+        // the background of a script, where it is meant for the script alone,
+        // or nohup with a hangup.
+        if before.sa_sigaction == libc::SIG_IGN {
+            continue;
+        }
+        action.sa_sigaction = heard as *const () as libc::sighandler_t;
+        // With `once`, heard once and then back to the default, which ends
+        // the process; and a call another thread was in carries on rather
+        // than fail.
+        action.sa_flags = libc::SA_RESTART | if once { libc::SA_RESETHAND } else { 0 };
+        // SAFETY: the mask is the action's own, and the action is whole when
+        // set.
+        unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+        }
     }
     std::thread::spawn(move || {
-        if reader.read(&mut [0]).is_ok_and(|read| read == 1) {
+        // Read on after the first, so hangups that keep coming never fill
+        // the pipe and block the handler.
+        while reader.read(&mut [0]).is_ok_and(|read| read == 1) {
             cancel.set();
         }
     });
@@ -287,39 +302,54 @@ mod tests {
         assert_eq!(ran.load(Ordering::SeqCst), 2);
     }
 
-    /// What a Ctrl-C does to this process now.
+    /// What `signal` does to this process now.
     #[cfg(unix)]
-    fn on_ctrl_c() -> libc::sighandler_t {
+    fn action(signal: libc::c_int) -> libc::sighandler_t {
         // SAFETY: all zeroes is a valid sigaction to read the current one into.
         let mut now: libc::sigaction = unsafe { std::mem::zeroed() };
         // SAFETY: this only reads the current action.
-        unsafe { libc::sigaction(libc::SIGINT, std::ptr::null(), &mut now) };
+        unsafe { libc::sigaction(signal, std::ptr::null(), &mut now) };
         now.sa_sigaction
     }
 
-    // One test, since the action for a Ctrl-C is the whole process's.
+    // One test, since what a signal does is the whole process's.
     #[cfg(unix)]
     #[test]
-    fn a_ctrl_c_sets_the_token_once_unless_it_was_ignored() {
-        let ignored = Cancel::default();
-        // SAFETY: these only change what a Ctrl-C does to this test process.
-        unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
-        on_interrupt(ignored.clone());
-        assert_eq!(on_ctrl_c(), libc::SIG_IGN, "an ignored Ctrl-C was taken");
-        // SAFETY: as above.
-        unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+    fn a_ctrl_c_sigterm_or_hangup_sets_the_token_unless_it_was_ignored() {
+        let signals = [
+            ("Ctrl-C", libc::SIGINT, true),
+            ("SIGTERM", libc::SIGTERM, true),
+            ("hangup", libc::SIGHUP, false),
+        ];
+        for (name, signal, second_ends) in signals {
+            let ignored = Cancel::default();
+            // SAFETY: these only change what `signal` does to this test
+            // process.
+            unsafe { libc::signal(signal, libc::SIG_IGN) };
+            on_interrupt(ignored.clone());
+            assert_eq!(action(signal), libc::SIG_IGN, "an ignored {name} was taken");
+            // SAFETY: as above.
+            unsafe { libc::signal(signal, libc::SIG_DFL) };
 
-        let cancel = Cancel::default();
-        on_interrupt(cancel.clone());
-        assert_ne!(on_ctrl_c(), libc::SIG_DFL, "the Ctrl-C was not taken");
-        // SAFETY: SIGINT now goes to the handler just set.
-        unsafe { libc::raise(libc::SIGINT) };
-        assert!(
-            !cancel.sleep(Duration::from_secs(10)),
-            "the Ctrl-C was not heard"
-        );
-        assert!(!ignored.is_set());
-        // So a second one ends the process, as a Ctrl-C always did.
-        assert_eq!(on_ctrl_c(), libc::SIG_DFL);
+            let cancel = Cancel::default();
+            on_interrupt(cancel.clone());
+            assert_ne!(action(signal), libc::SIG_DFL, "the {name} was not taken");
+            // SAFETY: `signal` now goes to the handler just set.
+            unsafe { libc::raise(signal) };
+            assert!(
+                !cancel.sleep(Duration::from_secs(10)),
+                "the {name} was not heard"
+            );
+            assert!(!ignored.is_set());
+            // A second Ctrl-C or SIGTERM ends the process, as the first
+            // always did, while a second hangup is heard and passed by.
+            assert_eq!(action(signal) == libc::SIG_DFL, second_ends, "{name}");
+        }
+        // SAFETY: the hangup still goes to the handler, as just checked.
+        unsafe { libc::raise(libc::SIGHUP) };
+        for (_, signal, _) in signals {
+            // SAFETY: this leaves each at its default for the tests after.
+            unsafe { libc::signal(signal, libc::SIG_DFL) };
+        }
     }
 }

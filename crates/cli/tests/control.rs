@@ -673,3 +673,23 @@ fn a_print_run_near_its_deadline_is_told_to_commit_its_outputs() {
         "{told}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_sigterm_stops_a_print_run_and_prints_its_result() {
+    let (data, work) = scratch("sigterm");
+    let (endpoint, bodies) = provider(vec![None]);
+    let flags = ["-p", "take your time", "--output", "json"];
+    let run = Driven::start(&data, &work, &endpoint, &flags);
+    // The model has the request and is sitting on it.
+    bodies
+        .recv_timeout(WAIT)
+        .expect("the run never asked the model");
+    let pid = libc::pid_t::try_from(run.child.id()).unwrap();
+    // SAFETY: a signal to the letronna this test started, as a supervisor
+    // sends one at its time limit.
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    assert_eq!(run.next()["status"], "stopped");
+    // What the run says for a Ctrl-C, once what it started is ended.
+    assert_eq!(run.close(), 130);
+}

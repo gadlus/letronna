@@ -5768,7 +5768,7 @@ mod tests {
                 model: model.into(),
                 ..connection()
             };
-            let asked = budget(&c, 0);
+            let asked = budget(&c, Sizing::default());
             assert_eq!(asked.reply, reply, "{model}");
             let body = body_with(&c, &[], None, None, &asked, &[]);
             assert_eq!(body["max_completion_tokens"], reply, "{model}");
