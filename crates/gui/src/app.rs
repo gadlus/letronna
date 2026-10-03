@@ -2241,8 +2241,9 @@ impl Chat {
 
     /// Call the user back about a scheduled run that ended, in its session,
     /// which following the sessions folder brought into the sidebar as it
-    /// ran; a run left without one says why as an error. The schedules are
-    /// read again for the time it ran.
+    /// ran; a run left without one says why as an error, and one that found
+    /// nothing new says nothing. The schedules are read again for the time
+    /// it ran.
     fn scheduled_ended(&mut self, run: letronna_core::schedule::Ended, cx: &mut Context<Self>) {
         self.schedules = self.schedule_runner.list();
         // Listed as running no longer: its stop has nothing left to stop.
@@ -2252,6 +2253,7 @@ impl Chat {
         // The folder's watch waits for writes to settle, so this can come first.
         self.follow_sessions(cx);
         match run.session.filter(|&id| self.store.index_of(id).is_some()) {
+            _ if run.quiet => {}
             Some(id) => self.tell(id, notify::Why::Scheduled(&run.text)),
             None => self.error = Some(format!("Scheduled job {}: {}", run.name, run.text)),
         }

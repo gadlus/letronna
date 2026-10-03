@@ -74,6 +74,8 @@ impl Chat {
             last_run: 0,
             mode: Mode::Default,
             by_model: false,
+            quiet: false,
+            check: None,
         };
         schedule::armed_now(&mut fresh);
         let mut id = 0;
@@ -539,6 +541,8 @@ mod tests {
             last_run,
             mode: Default::default(),
             by_model: true,
+            quiet: false,
+            check: None,
         }
     }
 

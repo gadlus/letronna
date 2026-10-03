@@ -1195,6 +1195,10 @@ fn scheduled(event: letronna_core::schedule::Event) {
         // A run is said once, when it ends.
         letronna_core::schedule::Event::Started(_) => return,
     };
+    // A watch that found nothing new would say so every few minutes.
+    if run.quiet {
+        return;
+    }
     render::blank();
     let text = letronna_core::tools::one_line(&run.text);
     let mut preview: String = text.chars().take(PREVIEW).collect();

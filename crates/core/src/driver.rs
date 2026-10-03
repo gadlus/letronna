@@ -4055,6 +4055,8 @@ pub(crate) mod tests {
             last_run: 0,
             mode,
             by_model: false,
+            quiet: false,
+            check: None,
         }
     }
 
@@ -4077,7 +4079,7 @@ pub(crate) mod tests {
                 ..Default::default()
             },
         };
-        crate::schedule::run_of(&job, connection, transcript)
+        crate::schedule::run_of(&job, None, connection, transcript)
     }
 
     /// An edit in the project, a command that changes things and one that
