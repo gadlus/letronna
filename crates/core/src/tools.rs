@@ -1357,6 +1357,13 @@ fn run_shell_into(
     if let Some(code) = &code {
         text.push_str(code);
     }
+    // A blank result reads as a call that never answered, to the model and
+    // to whoever reads the transcript. Not for output cut short, which the
+    // cut's marker describes, nor for a command moving to the background,
+    // whose output so far leads its job's log.
+    if status.is_some() && gaps.is_empty() && text.trim().is_empty() {
+        text = "(no output)".into();
+    }
     if held_open {
         // First, so the cut `run` makes to a long result cannot drop it.
         let len = text.len();
@@ -3931,6 +3938,15 @@ mod tests {
         };
         let out = run_shell(print, None, &Cancel::default()).unwrap();
         assert_eq!(out.trim_end(), "red plain");
+    }
+
+    #[test]
+    fn a_command_that_prints_nothing_says_no_output() {
+        let out = run_shell("exit 0", None, &Cancel::default()).unwrap();
+        assert_eq!(out, "(no output)");
+        // A failure's exit code already says the command ran.
+        let out = run_shell("exit 3", None, &Cancel::default()).unwrap();
+        assert_eq!(out.trim_start(), "[exit code 3]");
     }
 
     #[test]
