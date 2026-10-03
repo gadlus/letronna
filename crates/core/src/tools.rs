@@ -120,6 +120,11 @@ pub trait Tool: Send + Sync {
     fn destructive(&self) -> bool {
         false
     }
+    /// Whether a call may reach machines other than this one, which only an
+    /// MCP server's own word says so far.
+    fn open_world(&self) -> bool {
+        false
+    }
     /// Whether the tool reads or changes this computer. Withheld where other
     /// people can read the replies; a tool has to opt out to be offered there,
     /// so a plugin's tool stays out unless it says otherwise.
@@ -725,9 +730,12 @@ pub(crate) fn run_found(
     // Hidden before the cut, which could split a key and leave half of it
     // showing, and before anything is wrapped around the result.
     let shapes = tool.hides_key_shapes();
-    let ran = tool
-        .run(&args, ctx)
-        .map_err(|e| crate::redact::scrub(&e, shapes) + &note + &heard)?;
+    let ran = tool.run(&args, ctx);
+    // Whether it worked or not: an error can quote a page or a server too.
+    if tool.untrusted() {
+        crate::taint::mark(ctx);
+    }
+    let ran = ran.map_err(|e| crate::redact::scrub(&e, shapes) + &note + &heard)?;
     let ran = crate::redact::scrub(&ran, shapes);
     // The note goes after the cut and outside any fence: it is Letronna's,
     // and never the part that gets lost. An untrusted tool's result is never
@@ -745,6 +753,9 @@ pub(crate) fn run_found(
     if NOTED.contains(&tool.name())
         && let Some(addressed) = addressed_note(&out)
     {
+        // Someone other than the user may have written it, as a page's
+        // author does, so the gate checks what the session does next.
+        crate::taint::mark(ctx);
         out = match out.split_once('\n') {
             Some((own, rest)) if crate::media::saved_by(tool.name(), own).is_some() => {
                 format!("{own}\n{addressed}{rest}")
@@ -1939,7 +1950,11 @@ impl Tool for WriteFile {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let lsp = crate::lsp::before_write(ctx, &path, change.before());
+        let new = change.before().is_none();
         change.write(text.as_bytes(), &ctx.files)?;
+        if new {
+            crate::taint::made(ctx, &path);
+        }
         crate::lsp::wrote(lsp, &text);
         Ok(format!("Wrote {} bytes.", text.len()))
     }

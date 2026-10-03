@@ -2288,6 +2288,9 @@ impl Server {
                     ask,
                     read_only: tool["annotations"]["readOnlyHint"].as_bool() == Some(true),
                     destructive: kind(&tool["annotations"]) == Kind::Destructive,
+                    // The protocol has a tool reach other machines unless it
+                    // says it does not.
+                    open_world: tool["annotations"]["openWorldHint"].as_bool() != Some(false),
                     wait: config.call_time(),
                 }));
             }
@@ -2596,6 +2599,7 @@ struct McpTool {
     ask: bool,
     read_only: bool,
     destructive: bool,
+    open_world: bool,
     /// How long a call may take.
     wait: Duration,
 }
@@ -2653,6 +2657,9 @@ impl Tool for McpTool {
     }
     fn destructive(&self) -> bool {
         self.destructive
+    }
+    fn open_world(&self) -> bool {
+        self.open_world
     }
     fn untrusted(&self) -> bool {
         true
