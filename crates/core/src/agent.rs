@@ -440,6 +440,8 @@ impl Turn {
                 role: "user".into(),
                 content: WRAP_UP.into(),
                 notice: true,
+                // It ends the turn it is in, as a nudge goes on with one.
+                folded: true,
                 ..Default::default()
             });
             self.connection.wrap_up = true;
@@ -675,6 +677,9 @@ fn nudge(notice: &str, why: &'static str) -> Nudge {
             role: "user".into(),
             content: notice.into(),
             notice: true,
+            // Part of the turn it sends back to work: opening one, it could
+            // start the window and leave that turn's request to a summary.
+            folded: true,
             ..Default::default()
         },
         why,
@@ -1595,6 +1600,86 @@ mod tests {
         let code = serde_json::json!({ "path": "src/main.rs", "content": "fn main() {}" });
         made(&mut turn, "write_file", code, Ok("Wrote src/main.rs"));
         assert!(sent_back_to_verify(&mut turn));
+    }
+
+    #[test]
+    fn a_nudge_does_not_open_a_turn() {
+        // One turn that checks its edits earns every nudge there is.
+        let mut turn = verifying_after(&["edit_file"]);
+        let mut nudges = Vec::new();
+        for in_call in [false, true] {
+            turn.absorb(&Event::CutOff { in_call });
+            let mut cut_off = turn.take_reply("some-model");
+            nudges.extend(turn.continuation(&mut cut_off).unwrap());
+        }
+        let mut blank = turn.take_reply("some-model");
+        nudges.extend(turn.continuation(&mut blank).unwrap());
+        let mut announced = answer(&mut turn, "Now let me run the tests:");
+        nudges.extend(turn.continuation(&mut announced).unwrap());
+        let mut done = answer(&mut turn, "Fixed the off-by-one.");
+        nudges.extend(turn.continuation(&mut done).unwrap());
+        let mut notices: Vec<Message> = nudges.into_iter().map(|nudge| nudge.notice).collect();
+        // And one at its round cap asks for the wrap-up.
+        let mut capped = Turn::with_limit(self::turn().connection, 1);
+        capped.begin(vec![call("read_file")]);
+        capped.finish_call(Ok("contents".into()));
+        capped.take_results();
+        assert!(capped.begin(vec![call("read_file")]));
+        notices.extend(capped.take_results().pop());
+        let sent: Vec<&str> = notices.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            sent,
+            [
+                CONTINUE,
+                CALL_AGAIN,
+                SPEAK_UP,
+                CONTINUE_NOW,
+                VERIFY,
+                WRAP_UP
+            ]
+        );
+
+        // The request, then far more work than the window holds, with the
+        // notices sent along the way.
+        let round = |i: usize| {
+            [
+                Message {
+                    role: "assistant".into(),
+                    tool_calls: vec![ToolCall {
+                        id: format!("call {i}"),
+                        ..call("read_file")
+                    }],
+                    ..Default::default()
+                },
+                Message {
+                    role: "tool".into(),
+                    tool_call_id: format!("call {i}"),
+                    content: "x".repeat(8_000),
+                    ..Default::default()
+                },
+            ]
+        };
+        let said = |role: &str, text: &str| Message {
+            role: role.into(),
+            content: text.into(),
+            ..Default::default()
+        };
+        let mut session = vec![
+            said("user", "an earlier question"),
+            said("assistant", "an earlier answer"),
+            said("user", "the turn's request"),
+        ];
+        for (i, notice) in notices.iter().enumerate() {
+            session.extend((2 * i..2 * i + 2).flat_map(round));
+            session.push(notice.clone());
+        }
+        assert_eq!(crate::chat::window_start_within(8_000, &session), 2);
+        // Each opening a turn of its own, they would move the window past it.
+        for message in &mut session {
+            message.folded = false;
+        }
+        let start = crate::chat::window_start_within(8_000, &session);
+        assert!(start > 2 && session[start].notice, "start {start}");
     }
 
     #[test]
