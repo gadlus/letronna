@@ -1944,7 +1944,16 @@ impl Tool for WriteFile {
         let lsp = crate::lsp::before_write(ctx, &path, change.before());
         change.write(text.as_bytes(), &ctx.files)?;
         crate::lsp::wrote(lsp, &text);
-        Ok(format!("Wrote {} bytes.{note}", text.len()))
+        // Named, so the result still says what changed where its call's
+        // arguments are not shown, as in a trace or a cleared history.
+        let (bytes, lines) = (text.len(), text.lines().count());
+        let s = |n: usize| if n == 1 { "" } else { "s" };
+        Ok(format!(
+            "Wrote `{}` ({bytes} byte{}, {lines} line{}).{note}",
+            path_arg(args),
+            s(bytes),
+            s(lines)
+        ))
     }
 }
 
@@ -2069,11 +2078,12 @@ impl Tool for EditFile {
         let lsp = crate::lsp::before_write(ctx, &path, Some(text));
         change.write(done.text.as_bytes(), &ctx.files)?;
         crate::lsp::wrote(lsp, &done.text);
+        let raw = path_arg(args);
         let edited = match (done.replaced, done.already) {
-            (1, 0) => "Edited.".into(),
-            (n, 0) => format!("Edited {n} places."),
+            (1, 0) => format!("Edited `{raw}`."),
+            (n, 0) => format!("Edited `{raw}` in {n} places."),
             (_, n) => format!(
-                "Edited. Already applied, so left alone: {n} of {} edits.",
+                "Edited `{raw}`. Already applied, so left alone: {n} of {} edits.",
                 edits.len()
             ),
         };
@@ -3966,7 +3976,7 @@ mod tests {
             preview.contains("- fn a()") && preview.contains("+ two();"),
             "{preview}"
         );
-        assert_eq!(edit(both).unwrap(), "Edited 2 places.");
+        assert_eq!(edit(both).unwrap(), "Edited `a.rs` in 2 places.");
         let written = "\u{FEFF}fn b() {\r\n    two();\r\n}\r\n";
         assert_eq!(std::fs::read_to_string(&file).unwrap(), written);
 
@@ -3980,12 +3990,46 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), written);
 
         let every = json!({"path": "a.rs", "old": "()", "new": "(x)", "replace_all": true});
-        assert_eq!(edit(every).unwrap(), "Edited 2 places.");
+        assert_eq!(edit(every).unwrap(), "Edited `a.rs` in 2 places.");
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "\u{FEFF}fn b(x) {\r\n    two(x);\r\n}\r\n"
         );
         assert!(edit(json!({"path": "a.rs"})).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_write_or_an_edit_names_the_file_it_changed() {
+        let dir = std::env::temp_dir().join(format!("letronna-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let write = |path: &str, content: &str| {
+            WriteFile.run(&json!({"path": path, "content": content}), &ctx)
+        };
+        assert_eq!(
+            write("out/a.json", "{\n  \"a\": 1\n}\n").unwrap(),
+            "Wrote `out/a.json` (13 bytes, 3 lines)."
+        );
+        assert_eq!(
+            write("b.txt", "x").unwrap(),
+            "Wrote `b.txt` (1 byte, 1 line)."
+        );
+        let edit = |args: Value| EditFile.run(&args, &ctx);
+        let one = json!({"path": "out/a.json", "old": "1", "new": "2"});
+        assert_eq!(edit(one).unwrap(), "Edited `out/a.json`.");
+        let half = json!({"path": "out/a.json", "edits": [
+            {"old": "\"a\": 1", "new": "\"a\": 2"},
+            {"old": "\"a\"", "new": "\"b\""}
+        ]});
+        // The first is in the file already, so only the second is made.
+        assert_eq!(
+            edit(half).unwrap(),
+            "Edited `out/a.json`. Already applied, so left alone: 1 of 2 edits."
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4066,7 +4110,10 @@ mod tests {
         };
         let content = "# Sales report\n\nTotal: 42\n";
         let args = json!({"path": "report.md", "content": content});
-        assert_eq!(WriteFile.run(&args, &ctx).unwrap(), "Wrote 26 bytes.");
+        assert_eq!(
+            WriteFile.run(&args, &ctx).unwrap(),
+            "Wrote `report.md` (26 bytes, 3 lines)."
+        );
         assert_eq!(
             std::fs::read_to_string(dir.join("report.md")).unwrap(),
             content
@@ -6069,7 +6116,9 @@ mod tests {
         let wrote = WriteFile.run(&write, &ctx).unwrap();
         let note = "Note: `out/audit.csv` line 2 has 3 fields where the header has 2;";
         assert!(
-            wrote.starts_with(&format!("Wrote {} bytes.\n{note}", ragged.len())),
+            wrote.starts_with(&format!(
+                "Wrote `out/audit.csv` (28 bytes, 2 lines).\n{note}"
+            )),
             "{wrote}"
         );
         assert_eq!(
@@ -6079,10 +6128,16 @@ mod tests {
 
         let (bare, quoted) = ("amount, currency", "\"amount, currency\"");
         let quote = json!({"path": "out/audit.csv", "old": bare, "new": quoted});
-        assert_eq!(EditFile.run(&quote, &ctx).unwrap(), "Edited.");
+        assert_eq!(
+            EditFile.run(&quote, &ctx).unwrap(),
+            "Edited `out/audit.csv`."
+        );
         let unquote = json!({"path": "out/audit.csv", "old": quoted, "new": bare});
         let edited = EditFile.run(&unquote, &ctx).unwrap();
-        assert!(edited.starts_with(&format!("Edited.\n{note}")), "{edited}");
+        assert!(
+            edited.starts_with(&format!("Edited `out/audit.csv`.\n{note}")),
+            "{edited}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
