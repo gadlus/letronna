@@ -24,6 +24,8 @@
 //! background jobs, the checklist -- stands in for it. It is made once per
 //! failure, so the requests in between still share their prefix. A digest
 //! is never written down: after a restart the model is asked again anyway.
+//! Either one is followed by the skills those turns loaded, named from the
+//! messages themselves, since a summarizer may leave them out.
 //!
 //! A summary takes a model call of its own, which the request that moves the
 //! window used to wait for whole before its reply began. So after a reply,
@@ -72,8 +74,8 @@ const RETRY_AFTER: [Duration; 3] = [
 /// How much of the user's latest requests a digest repeats, in characters:
 /// the few most recent ones, which say what the work is now.
 const REQUEST_CHARS: usize = 2_000;
-/// The most files, and the most jobs, a digest names: the latest are what
-/// the work is on, and a longer list is a history.
+/// The most files, jobs and skills named for the dropped turns: the latest
+/// are what the work is on, and a longer list is a history.
 const LISTED: usize = 10;
 /// How much of a command, a path or a checklist item a digest shows. The
 /// model wrote them, and a digest rides in the system prompt, so each is
@@ -153,11 +155,11 @@ pub fn summary(
             remember_in(cache(), dropped, &text);
             spent(usage);
             made(&text);
-            return Some(text);
+            return with_skills(Some(text), dropped);
         }
         // Asking again at once would make the reply wait out a second ask
         // after the one it just waited for.
-        Some(None) => return failed_in(cache(), dropped, Instant::now()),
+        Some(None) => return with_skills(failed_in(cache(), dropped, Instant::now()), dropped),
         None => {}
     }
     // A fresh summary, the first of a long session after a restart or of a
@@ -188,7 +190,27 @@ pub fn summary(
     if answered && let Some(text) = &text {
         made(text);
     }
-    text
+    with_skills(text, dropped)
+}
+
+/// `text`, what stands for `dropped`, followed by a line naming the skills
+/// loaded in those turns, read from the messages themselves: a summarizer
+/// may leave them out, and the model would go on following instructions it
+/// no longer has. Added after the session keeps a summary, so it is never
+/// said twice.
+fn with_skills(text: Option<String>, dropped: &[Message]) -> Option<String> {
+    let skills = skills_loaded(dropped);
+    if skills.is_empty() {
+        return text;
+    }
+    let line = format!(
+        "Skills loaded in those turns: {}; load them again before relying on them.",
+        skills.join(", ")
+    );
+    Some(match text {
+        Some(text) => format!("{text}\n\n{line}"),
+        None => line,
+    })
 }
 
 /// Take `text` as the summary of `covered`, as the session's file has it,
@@ -791,6 +813,28 @@ fn files(messages: &[Message]) -> Vec<String> {
     files
 }
 
+/// The skills whose instructions were loaded in `messages`, by the name
+/// each was last loaded with, the most recently loaded last, at most `LISTED`.
+fn skills_loaded(messages: &[Message]) -> Vec<String> {
+    let mut skills: Vec<String> = Vec::new();
+    for (name, _) in messages
+        .iter()
+        .rev()
+        .filter_map(crate::skills::instructions_in)
+    {
+        if skills.len() == LISTED {
+            break;
+        }
+        let name = line(&name);
+        let lower = name.to_lowercase();
+        if !skills.iter().any(|s| s.to_lowercase() == lower) {
+            skills.push(name);
+        }
+    }
+    skills.reverse();
+    skills
+}
+
 /// The background jobs started in `messages`, as their number and the first
 /// line of their command, the latest `LISTED`. The number is read from the
 /// start of the call's result, which says it first.
@@ -1184,6 +1228,103 @@ mod tests {
         assert!(!digest.contains("fn main"), "{digest}");
         // What the model wrote goes in one line at a time.
         assert!(!digest.contains("SYSTEM"), "{digest}");
+    }
+
+    /// A call to the skill tool with `arguments`, and its result.
+    fn loading(id: &str, arguments: &str, text: &str) -> [Message; 2] {
+        [
+            calling(id, "skill", arguments),
+            Message {
+                args: arguments.into(),
+                ..answering(id, "skill", text)
+            },
+        ]
+    }
+
+    /// A connection with no model set, so asking it for a summary fails
+    /// before anything is sent.
+    fn nowhere() -> Connection {
+        Connection {
+            endpoint: "http://127.0.0.1:9/v1".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_digest_names_the_skills_loaded_in_the_dropped_turns() {
+        let mut messages = vec![said("user", "fill in the form, then write the letter")];
+        messages.extend(loading("a", r#"{"name":"pdf"}"#, "Fill each field."));
+        messages.extend(loading("b", r#"{"name":"docx"}"#, "Write it as a letter."));
+        // A file beside the instructions, the listing and a failed load
+        // leave no instructions to follow.
+        messages.extend(loading(
+            "c",
+            r#"{"name":"pdf","file":"forms.md"}"#,
+            "a field",
+        ));
+        messages.extend(loading("d", r#"{"name":"?"}"#, "- pdf: forms"));
+        let mut failed = loading("e", r#"{"name":"xlsx"}"#, "There is no skill called xlsx.");
+        failed[1].is_error = true;
+        messages.extend(failed);
+        // Loaded again by another spelling: named once, as last loaded.
+        messages.extend(loading(
+            "f",
+            r#"{"name":"PDF","offset":2000}"#,
+            "Then flatten it.",
+        ));
+        let digest = summary(
+            &nowhere(),
+            &messages,
+            0,
+            || {},
+            |_| panic!("a digest was kept as a summary"),
+            |_| panic!("a summary that was never asked for was paid for"),
+        )
+        .unwrap();
+        assert!(digest.starts_with("(No summary could be made"), "{digest}");
+        assert!(
+            digest.ends_with(
+                "\n\nSkills loaded in those turns: docx, PDF; load them again before relying on \
+                 them."
+            ),
+            "{digest}"
+        );
+    }
+
+    #[test]
+    fn a_summary_is_followed_by_the_skills_its_turns_loaded() {
+        let mut messages = vec![said("user", "fill in the form for the clinic")];
+        messages.extend(loading("a", r#"{"name":"pdf"}"#, "Fill each field."));
+        remember(&messages, "They filled in the form.");
+        let text = summary(
+            &nowhere(),
+            &messages,
+            0,
+            || panic!("the model was asked for the summary again"),
+            |_| panic!("the kept summary was handed over as new"),
+            |_| panic!("asking for the summary again was paid for"),
+        );
+        assert_eq!(
+            text.as_deref(),
+            Some(
+                "They filled in the form.\n\nSkills loaded in those turns: pdf; load them again \
+                 before relying on them."
+            )
+        );
+        // What a later step folds into is the summary as the session kept it.
+        messages.push(said("user", "now send it"));
+        let mut earlier = None;
+        summary_in(
+            cache(),
+            &messages,
+            INPUT_TOKENS,
+            Instant::now(),
+            |summary, _| {
+                earlier = summary.map(str::to_owned);
+                Err("no".into())
+            },
+        );
+        assert_eq!(earlier.as_deref(), Some("They filled in the form."));
     }
 
     #[test]

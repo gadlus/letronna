@@ -1122,7 +1122,7 @@ fn body_hashed(
     // turn has had again. The session keeps them whole; only the request
     // is shortened.
     let old = old_before(window, budget);
-    let stubs = stubs(window, old);
+    let stubs = stubs(window, old, budget.squeezed);
     let hints = crate::subfolders::hints(window, connection);
     let turn = window.iter().rposition(opens_turn);
     // Once, so the calls in the history and the array agree on whether the
@@ -1849,14 +1849,16 @@ fn old_before(window: &[Message], budget: &Budget) -> usize {
 /// What goes on the wire instead of each tool result in `window`, where
 /// something shorter will do: before `old`, a line saying what the result
 /// was and how to get it again; from there on, a pointer back to the last
-/// result of the same call when it was identical.
+/// result of the same call when it was identical. The newest copy of each
+/// page of a skill's instructions stays whole however old, unless the
+/// budget is `squeezed`.
 ///
 /// It is the newer copy that points back, so everything before it goes out
 /// as it did last time; that also covers a file read again unchanged. The
 /// pointer names the call by its tool and arguments, not by its id: a
 /// provider that sends no ids gets `call_0` in every round, and many chat
 /// templates never show ids to the model at all.
-fn stubs(window: &[Message], old: usize) -> Vec<Option<String>> {
+fn stubs(window: &[Message], old: usize, squeezed: bool) -> Vec<Option<String>> {
     // Running something the user has to approve again is not for a line of
     // ours to suggest, so those only say what was cleared.
     let gated: Vec<String> = if old == 0 {
@@ -1868,6 +1870,23 @@ fn stubs(window: &[Message], old: usize) -> Vec<Option<String>> {
             .map(|t| t.name().to_owned())
             .collect()
     };
+    // The model was told to follow a skill it loaded, and with only a line
+    // saying it was cleared it follows what it remembers of it instead. A
+    // page costs at most a tool result's cap, and only the newest copy is
+    // kept, keyed as skill names are matched; the last one in wins.
+    let pages: Vec<Option<(String, usize)>> = if old == 0 {
+        Vec::new()
+    } else {
+        window.iter().map(crate::skills::instructions_in).collect()
+    };
+    let newest: HashMap<(String, usize), usize> = pages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, page)| {
+            let (name, offset) = page.as_ref()?;
+            Some(((name.to_lowercase(), *offset), i))
+        })
+        .collect();
     let mut last: HashMap<(&str, &str), &str> = HashMap::new();
     window
         .iter()
@@ -1889,6 +1908,17 @@ fn stubs(window: &[Message], old: usize) -> Vec<Option<String>> {
             // Asking again would put the question to the user again.
             if size < STUB_CHARS || m.name == crate::tools::ASK_USER {
                 return None;
+            }
+            // Whole while there is room; after an overflow the request has to
+            // shrink, skills and all.
+            if let Some(Some((name, offset))) = pages.get(i) {
+                if !squeezed && newest.get(&(name.to_lowercase(), *offset)) == Some(&i) {
+                    return None;
+                }
+                return Some(format!(
+                    "[skill \"{name}\" instructions of {size} chars cleared to save room; load it \
+                     again before relying on them]"
+                ));
             }
             let again = if gated.contains(&m.name) {
                 ""
@@ -7086,6 +7116,92 @@ mod tests {
         // As old as the seven reads after it, but sent whole.
         assert_eq!(sent[0], answer);
         assert_eq!(cleared(&sent[1..8]), 7);
+    }
+
+    /// A turn that loads the `pdf` skill, which says `instructions`, and then
+    /// reads sixteen files, so the load is among the old results.
+    fn skill_then_reads(instructions: &str) -> Vec<Message> {
+        let mut messages = vec![Message {
+            role: "user".into(),
+            content: "fill in the form".into(),
+            ..Default::default()
+        }];
+        let call = json!({"name": "pdf"}).to_string();
+        messages.extend(round("s", "skill", call, instructions.to_owned()));
+        messages.extend(reads(16, 2_000).into_iter().skip(1));
+        messages
+    }
+
+    #[test]
+    fn a_loaded_skill_stays_whole_while_older_results_are_cleared() {
+        let instructions = "Fill each field from the data, then flatten it. ".repeat(40);
+        let messages = skill_then_reads(&instructions);
+        let sent = results_sent(&messages, &Budget::SMALL);
+        // As old as the seven reads after it, but sent whole.
+        assert_eq!(sent[0], instructions);
+        assert_eq!(cleared(&sent[1..8]), 7);
+    }
+
+    #[test]
+    fn a_squeezed_window_clears_a_skill_with_a_reload_note() {
+        let instructions = "Fill each field from the data, then flatten it. ".repeat(40);
+        let messages = skill_then_reads(&instructions);
+        let squeezed = Budget {
+            squeezed: true,
+            ..Budget::SMALL
+        };
+        let sent = results_sent(&messages, &squeezed);
+        assert_eq!(
+            sent[0],
+            "[skill \"pdf\" instructions of 1920 chars cleared to save room; load it again before \
+             relying on them]"
+        );
+    }
+
+    #[test]
+    fn every_page_of_a_long_skill_is_kept() {
+        let first = "Page one of the form steps. ".repeat(80);
+        let second = "Page two of the form steps. ".repeat(80);
+        let mut messages = skill_then_reads(&first);
+        let next = json!({"name": "pdf", "offset": 2240}).to_string();
+        messages.splice(3..3, round("t", "skill", next, second.clone()));
+        let sent = results_sent(&messages, &Budget::SMALL);
+        assert_eq!(sent[..2], [first, second]);
+        assert_eq!(cleared(&sent[2..8]), 6);
+    }
+
+    #[test]
+    fn only_the_newest_load_of_a_skill_stays_whole() {
+        let old = "Fill each field by hand. ".repeat(40);
+        let new = "Fill each field from the data. ".repeat(40);
+        let mut messages = skill_then_reads(&old);
+        // Loaded again by another spelling, after the skill was changed.
+        let again = json!({"name": "PDF"}).to_string();
+        messages.splice(3..3, round("t", "skill", again, new.clone()));
+        // A file beside the instructions and the listing are cleared as any
+        // result is.
+        let file = json!({"name": "pdf", "file": "forms.md"}).to_string();
+        messages.splice(5..5, round("f", "skill", file, "a field ".repeat(40)));
+        let listing = json!({"name": "?"}).to_string();
+        messages.splice(
+            7..7,
+            round("l", "skill", listing, "- pdf: forms ".repeat(40)),
+        );
+        let sent = results_sent(&messages, &Budget::SMALL);
+        assert_eq!(
+            sent[0],
+            "[skill \"pdf\" instructions of 1000 chars cleared to save room; load it again before \
+             relying on them]"
+        );
+        assert_eq!(sent[1], new);
+        assert_eq!(
+            sent[2],
+            "[skill result of 320 chars cleared to save room; call it again if you need it]"
+        );
+        assert_eq!(
+            sent[3],
+            "[skill result of 520 chars cleared to save room; call it again if you need it]"
+        );
     }
 
     #[test]
