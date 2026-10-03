@@ -135,6 +135,8 @@ pub struct Live {
     pub cost: Option<f64>,
     /// What summarizing older turns for the request took.
     pub summary_usage: Option<crate::usage::Usage>,
+    /// The model that made that summary.
+    pub summary_model: String,
     /// Why the cache served far less of the request than of the last one.
     pub cache_miss: Option<crate::cache_miss::Reason>,
     pub calls: Vec<ToolCall>,
@@ -286,13 +288,18 @@ impl Turn {
                 self.live.reasoning_tokens = *reasoning;
                 self.live.cost = *cost;
             }
-            Event::SummaryUsage(usage) => self.live.summary_usage = Some(*usage),
+            Event::SummaryUsage(paid) => {
+                self.live.summary_usage = Some(paid.usage);
+                self.live.summary_model.clone_from(&paid.model);
+            }
             Event::CacheMiss(reason) => self.live.cache_miss = Some(*reason),
             Event::ToolCalls(calls) => self.live.calls = calls.clone(),
             Event::Drafting(drafts) => self.live.drafts = drafts.clone(),
             Event::Replay(replay) => self.live.replay = Some(replay.clone()),
             Event::Retrying(retry) => self.live.retrying = Some(*retry),
             Event::Switched(switch) => self.live.switched = Some(switch.clone()),
+            // The front end tells the user.
+            Event::Note(_) => {}
             Event::Compacting => self.live.compacting = true,
             // The front end keeps it with the session.
             Event::Summarized { .. } => {}
@@ -333,6 +340,7 @@ impl Turn {
             reasoning_tokens: live.reasoning_tokens,
             cost: live.cost,
             summary_usage: live.summary_usage,
+            summary_model: live.summary_model,
             cache_miss: live.cache_miss,
             at: crate::chat::now(),
             tool_calls: live.calls,
@@ -820,7 +828,10 @@ mod tests {
             output: 80,
             ..Default::default()
         };
-        turn.absorb(&Event::SummaryUsage(summary));
+        turn.absorb(&Event::SummaryUsage(crate::compact::Paid {
+            model: "small-model".into(),
+            usage: summary,
+        }));
         turn.absorb(&Event::Usage {
             completion: 12,
             per_second: 4.0,
@@ -839,6 +850,7 @@ mod tests {
         assert_eq!(reply.cached_tokens, 256);
         assert_eq!((reply.cache_write_tokens, reply.reasoning_tokens), (30, 5));
         assert_eq!(reply.summary_usage, Some(summary));
+        assert_eq!(reply.summary_model, "small-model");
         assert_eq!(reply.cache_miss, Some(crate::cache_miss::Reason::Memory));
         assert!(reply.at > 0);
         // No price is known for this model, so no cost is made up.
@@ -847,6 +859,7 @@ mod tests {
         assert!(turn.live.content.is_empty());
         let next = turn.take_reply("some-model");
         assert_eq!((next.tokens, next.summary_usage), (0, None));
+        assert!(next.summary_model.is_empty());
         assert_eq!(next.cache_miss, None);
     }
 

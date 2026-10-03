@@ -1669,11 +1669,12 @@ pub fn btw(
     }
 }
 
-/// Puts `question` alone to the helpers' model, or the session's when none
-/// is set, on a run that offers no tool and makes one request, until
-/// `cancel` stops it, and gives back what it said. For a quick look that
-/// needs none of the conversation, so it costs the same however long that
-/// is. Only what it cost is kept, where /usage counts it for the session.
+/// Puts `question` alone to the side model, or the helpers' model, or the
+/// session's when neither is set, on a run that offers no tool and makes
+/// one request, until `cancel` stops it, and gives back what it said. For a
+/// quick look that needs none of the conversation, so it costs the same
+/// however long that is. Only what it cost is kept, where /usage counts it
+/// for the session.
 pub fn quick(connection: &Connection, question: &str, cancel: Cancel) -> Result<String, String> {
     let session = connection.conversation;
     let id = fresh_id();
@@ -1684,10 +1685,11 @@ pub fn quick(connection: &Connection, question: &str, cancel: Cancel) -> Result<
         content: question.to_owned(),
         ..Default::default()
     }];
+    let settings = crate::store::current_settings();
     let mut asking = child(
         connection,
         &AgentDef::default(),
-        None,
+        look_model(&settings),
         &Limits::read(connection.conversation),
         id,
     );
@@ -1727,6 +1729,12 @@ pub fn quick(connection: &Connection, question: &str, cancel: Cancel) -> Result<
         _ if report.text.trim().is_empty() => Err("No answer came.".into()),
         _ => Ok(report.text),
     }
+}
+
+/// The model `quick` names for its look: the side model, when Settings name
+/// one, which comes before the helpers' model.
+fn look_model(settings: &crate::store::Settings) -> Option<&str> {
+    Some(settings.side_model.trim()).filter(|model| !model.is_empty())
 }
 
 /// An id no helper, run or other agent has, for one that needs its own.
@@ -3226,6 +3234,29 @@ mod tests {
             (nested.model.as_str(), nested.judge_model()),
             ("setting-model", "parent-model")
         );
+    }
+
+    #[test]
+    fn a_quick_look_asks_the_side_model_before_the_helpers_model() {
+        let session = Connection {
+            model: "session-model".into(),
+            ..Default::default()
+        };
+        let limits = Limits {
+            model: "helper-model".into(),
+            ..usual()
+        };
+        let looked_on = |side: &str| {
+            let settings = crate::store::Settings {
+                side_model: side.into(),
+                helper_model: "helper-model".into(),
+                ..Default::default()
+            };
+            let model = look_model(&settings);
+            child(&session, &AgentDef::default(), model, &limits, 1).model
+        };
+        assert_eq!(looked_on(" small-model "), "small-model");
+        assert_eq!(looked_on(""), "helper-model");
     }
 
     #[test]

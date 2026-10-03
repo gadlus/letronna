@@ -22,7 +22,7 @@
 //!
 //! The look runs on the headless driver with no tools and no history, the
 //! goal, the last reply and the check's output being all it reads, thinking
-//! at low effort, on the helpers' model when one is set: that setting is
+//! at low effort, on the side model or else the helpers' when set: those are
 //! where to name a cheap model, since a small one answers this as well as a
 //! large one. The price of each look stays flat as the session grows. A
 //! user who stops or types meanwhile ends it where it is, and nothing it

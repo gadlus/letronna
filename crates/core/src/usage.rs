@@ -263,11 +263,17 @@ pub struct Spent {
     pub copy: bool,
 }
 
-/// The calls behind `reply`: its own, and the summary made for its request
-/// when one was.
-pub fn calls(reply: &Message) -> impl Iterator<Item = Usage> {
-    let own = (reply.role == "assistant").then(|| Usage::of(reply));
-    own.into_iter().chain(reply.summary_usage)
+/// The calls behind `reply`, each with the model it was made on: its own,
+/// and the summary made for its request when one was, which the side model
+/// may have made.
+pub fn calls(reply: &Message) -> impl Iterator<Item = (&str, Usage)> {
+    let own = (reply.role == "assistant").then(|| (reply.model.as_str(), Usage::of(reply)));
+    let summarizer = match reply.summary_model.as_str() {
+        "" => reply.model.as_str(),
+        model => model,
+    };
+    let summary = reply.summary_usage.map(|usage| (summarizer, usage));
+    own.into_iter().chain(summary)
 }
 
 /// The totals for one session, the last `DAYS` days and the models of the
@@ -609,5 +615,32 @@ mod tests {
         assert_eq!(count(12_345), "12.3k");
         assert_eq!(count(999_960), "1.0M");
         assert_eq!(count(4_100_000), "4.1M");
+    }
+
+    #[test]
+    fn summary_usage_is_attributed_to_the_side_model() {
+        let line = r#"{"role":"assistant","content":"","model":"big-model","prompt_tokens":70,"tokens":7,"summary_usage":{"input":900,"output":60},"summary_model":"small-model"}"#;
+        let reply: Message = serde_json::from_str(line).unwrap();
+        let made: Vec<(&str, u64)> = calls(&reply)
+            .map(|(model, usage)| (model, usage.input))
+            .collect();
+        assert_eq!(made, [("big-model", 70), ("small-model", 900)]);
+        assert!(
+            serde_json::to_string(&reply)
+                .unwrap()
+                .contains(r#""summary_model":"small-model""#)
+        );
+        // One saved before summaries named their model was made on the reply's.
+        let older = Message {
+            summary_model: String::new(),
+            ..reply
+        };
+        let made: Vec<&str> = calls(&older).map(|(model, _)| model).collect();
+        assert_eq!(made, ["big-model", "big-model"]);
+        assert!(
+            !serde_json::to_string(&older)
+                .unwrap()
+                .contains("summary_model")
+        );
     }
 }

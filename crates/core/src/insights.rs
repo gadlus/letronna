@@ -121,15 +121,14 @@ impl<'a, Tz: chrono::TimeZone> Tally<'a, Tz> {
         };
         day.replies += 1;
         self.hours[time.hour() as usize % 24] += 1;
-        // Old replies can be saved without the name of their model.
-        let model = Some(reply.model.trim()).filter(|model| !model.is_empty());
-        let model = model.unwrap_or("unknown model");
-        let totals = self.models.entry(model.to_owned()).or_default();
-        for usage in calls(reply) {
+        for (model, usage) in calls(reply) {
             day.tokens = day
                 .tokens
                 .saturating_add(usage.input.saturating_add(usage.output));
-            totals.add(&usage);
+            // Old replies can be saved without the name of their model.
+            let model = Some(model.trim()).filter(|model| !model.is_empty());
+            let model = model.unwrap_or("unknown model");
+            self.models.entry(model.to_owned()).or_default().add(&usage);
             self.total.add(&usage);
         }
         for call in &reply.tool_calls {

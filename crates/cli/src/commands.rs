@@ -123,6 +123,11 @@ pub fn command(
             }
             Flow::Handled
         }
+        // What summaries and checks run on, not the chat model.
+        "/model" if rest.split_whitespace().next() == Some("side") => {
+            side_model(runner, rest.strip_prefix("side").unwrap_or_default());
+            Flow::Handled
+        }
         "/model" => {
             switch_model(runner, Some(*session), rest);
             Flow::Handled
@@ -452,6 +457,31 @@ fn retention(runner: &mut Runner, rest: &str) {
             if days == 1 { "" } else { "s" }
         ),
     }));
+}
+
+/// Show the side model, or set it from `rest`.
+fn side_model(runner: &mut Runner, rest: &str) {
+    render::blank();
+    if let Some(model) = side_setting(rest) {
+        runner.store.settings.side_model = model;
+        runner.persist();
+    }
+    render::line(&render::dim(&match runner.store.settings.side_model.as_str() {
+        "" => "Summaries, commit messages and goal checks use the session's model. /model side <model> names a cheaper one on the same gateway.".to_owned(),
+        model => format!(
+            "Summaries, commit messages and goal checks use {model}, on the session's gateway, or the session's model when the gateway turns it away. /model side off puts them back on the session's model."
+        ),
+    }));
+}
+
+/// The side model `/model side` was given: None to only show it, empty for
+/// the session's own.
+fn side_setting(rest: &str) -> Option<String> {
+    match rest.trim() {
+        "" => None,
+        "off" | "none" => Some(String::new()),
+        model => Some(model.to_owned()),
+    }
 }
 
 /// The days `/retention` was given: None to only show them, 0 to keep every
@@ -3881,8 +3911,8 @@ pub fn gateways(runner: &mut Runner) {
 mod tests {
     use super::{
         Asked, Flow, Run, Stage, agent_lines, agent_rows, asked, choice_label, command,
-        crew_switch, from_match, keep_days, last_prompt, name_label, run_rows, standing,
-        typed_path, with_files,
+        crew_switch, from_match, keep_days, last_prompt, name_label, run_rows, side_setting,
+        standing, typed_path, with_files,
     };
     use crate::session::Runner;
     use letronna_core::agents::Seen;
@@ -4086,6 +4116,13 @@ mod tests {
         assert_eq!(keep_days("0"), Ok(Some(0)));
         assert!(keep_days("a month").is_err());
         assert!(keep_days("-3").is_err());
+    }
+
+    #[test]
+    fn side_model_takes_a_model_or_off_and_shows_it_bare() {
+        assert_eq!(side_setting(""), None);
+        assert_eq!(side_setting(" small-model "), Some("small-model".into()));
+        assert_eq!(side_setting("off"), Some(String::new()));
     }
 
     #[test]

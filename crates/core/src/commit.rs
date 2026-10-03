@@ -404,14 +404,20 @@ was missing, what happens now, and any trade-off made. Keep it short; a small ch
 needs two or three sentences.";
 
 /// A commit message for what is staged in `folder`, from one round with the
-/// session's model and no tools, put in the house style however it came.
+/// side model Settings names, or else the session's, and no tools, put in
+/// the house style however it came.
 pub fn suggest(connection: &Connection, folder: &Path) -> Result<String, String> {
     let diff = staged_diff(folder)?;
     if diff.trim().is_empty() {
         return Err("Nothing is staged to write a message for.".into());
     }
+    crate::side::ask(connection, |on| suggest_of(on, &diff))
+}
+
+/// `suggest` for `diff`, of the model `connection` names.
+fn suggest_of(connection: &Connection, diff: &str) -> Result<String, crate::side::Failed> {
     let endpoint = crate::chat::validate(connection)?;
-    let body = suggest_body(connection, &diff);
+    let body = suggest_body(connection, diff);
     // The shared client would give up on a slow reply after its idle wait.
     let mut request = crate::chat::client()?
         .post(endpoint)
@@ -424,14 +430,15 @@ pub fn suggest(connection: &Connection, folder: &Path) -> Result<String, String>
         .send()
         .and_then(|r| r.error_for_status())
         .and_then(|r| r.json())
-        .map_err(|e| format!("No message came back: {e}"))?;
+        .map_err(|e| crate::side::Failed::sending(&e, format!("No message came back: {e}")))?;
     let text = crate::chat::unwrap_response(&value)?
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
         .unwrap_or_default();
     let message = house_style(text);
     if message.is_empty() {
-        return Err("The model gave no message; write one instead.".into());
+        let none = "The model gave no message; write one instead.";
+        return Err(none.to_owned().into());
     }
     Ok(message)
 }
@@ -1215,5 +1222,19 @@ mod tests {
         let diff = staged_diff(&folder).unwrap();
         assert!(diff.len() < SUGGEST_CAP + 100);
         assert!(diff.ends_with("the rest of the diff is left out.\n"));
+    }
+
+    #[test]
+    fn a_suggestion_asks_the_side_model_when_one_is_set() {
+        let reply = r#"{"choices":[{"message":{"content":"Stage one hunk at a time."}}]}"#;
+        let (endpoint, gateway) = crate::side::tests::gateway(vec![(200, reply)]);
+        let session = Connection {
+            endpoint,
+            model: "big-model".into(),
+            ..Default::default()
+        };
+        let message = crate::side::ask_on(&session, "small-model", |on| suggest_of(on, "diff"));
+        assert_eq!(message.as_deref(), Ok("Stage one hunk at a time"));
+        assert_eq!(gateway.join().unwrap()[0]["model"], "small-model");
     }
 }
