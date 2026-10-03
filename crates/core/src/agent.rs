@@ -87,6 +87,18 @@ const REPEATS_STOPPED: usize = 5;
 /// that nothing has happened yet.
 const POLLING: [&str; 4] = ["wait", "read_job", crate::messaging::READ_CHAT, "agents"];
 
+/// Rounds in a row one tool fails, whatever its arguments, before the model
+/// is told to change approach: one miss can be a slip, a second is a habit.
+const FAILURES_NOTED: usize = 2;
+
+/// Notes a turn gets about a tool that keeps failing: by a third the model
+/// has heard it, and more would only crowd its results.
+const FAILURE_NOTES: usize = 2;
+
+/// How the answer to a call that never ran opens: one left at the round
+/// cap, stopped before it started, or after a hook ended the turn.
+const NOT_RUN: &str = "Not run: ";
+
 /// Calls from one reply run at once. Enough for a model reading around a
 /// project in one go, few enough that a reply of dozens never starts dozens
 /// of threads and requests together.
@@ -184,6 +196,11 @@ pub struct Turn {
     /// Each change made this turn, by tool and arguments, so only a new one
     /// starts the counts again.
     changes: HashSet<(String, u64)>,
+    /// Each tool's failed rounds in a row this turn, with the round last
+    /// counted.
+    failures: HashMap<String, (usize, usize)>,
+    /// Notes sent this turn about a tool that keeps failing.
+    failure_notes: usize,
     /// Nobody is watching, so a call repeated without end stops the turn.
     unattended: bool,
     /// Why an unattended turn stopped going round in circles.
@@ -214,6 +231,8 @@ impl Turn {
             asked_to_verify: false,
             repeats: HashMap::new(),
             changes: HashSet::new(),
+            failures: HashMap::new(),
+            failure_notes: 0,
             looped: None,
             one_at_a_time: !crate::store::parallel_tool_calls(),
         }
@@ -517,10 +536,19 @@ impl Turn {
             Err(error) => (error, true),
         };
         let times = self.repeated(&call, &content, is_error);
+        let failures = self.failed(&call.name, &content, is_error);
         if times >= REPEATS_NOTED {
             content.push_str(&format!(
                 "\n\n[You have made this exact call {times} times this turn and got the same \
                  result each time. Change your approach instead of repeating it.]"
+            ));
+        } else if failures == FAILURES_NOTED && self.failure_notes < FAILURE_NOTES {
+            self.failure_notes += 1;
+            content.push_str(&format!(
+                "\n\n[`{}` has failed {failures} times in a row. Read the error and change \
+                 approach: re-read what it acts on, use another tool, or take a smaller step, \
+                 rather than retrying with small changes.]",
+                call.name
             ));
         }
         if times >= REPEATS_STOPPED && self.unattended && self.looped.is_none() {
@@ -584,6 +612,32 @@ impl Turn {
             self.repeats.clear();
         }
         let times = self.repeats.entry(key).or_default();
+        *times += 1;
+        *times
+    }
+
+    /// How many rounds in a row `name` has now failed this turn, or 0 when
+    /// this result adds none: a success starts the count again, and a
+    /// refusal, a stop, a polled tool's error or a schema answer's is not
+    /// counted.
+    fn failed(&mut self, name: &str, content: &str, is_error: bool) -> usize {
+        if !is_error {
+            self.failures.remove(name);
+            return 0;
+        }
+        // A run with a schema corrects a bad answer itself, twice at most and
+        // with only what was wrong.
+        let corrected = name == crate::driver::STRUCTURED_OUTPUT;
+        if POLLING.contains(&name) || corrected || refused_or_stopped(content) {
+            return 0;
+        }
+        let (times, round) = self.failures.entry(name.to_owned()).or_default();
+        // Calls made together were all made before any result was seen, so
+        // none of them is a retry of another.
+        if *round == self.rounds {
+            return 0;
+        }
+        *round = self.rounds;
         *times += 1;
         *times
     }
@@ -678,6 +732,16 @@ fn sorted(value: serde_json::Value) -> serde_json::Value {
         serde_json::Value::Array(items) => items.into_iter().map(sorted).collect(),
         other => other,
     }
+}
+
+/// Whether an error is a no from the user, the gate, a hook or Auto mode,
+/// or a stop, rather than the call itself failing.
+fn refused_or_stopped(error: &str) -> bool {
+    // Another way round a refusal would only get past it.
+    crate::gate::refused(error)
+        || tools::is_declined(error)
+        || error == STOPPED_WHILE_RUNNING
+        || error.starts_with(NOT_RUN)
 }
 
 /// A notice for the model, with the line that tells the user why.
@@ -1521,18 +1585,18 @@ mod tests {
     }
 
     /// Makes a call to `name` with `arguments` in a round of its own, coming
-    /// back `outcome`.
+    /// back `outcome`, and gives what the model was sent back.
     fn made(
         turn: &mut Turn,
         name: &str,
         arguments: serde_json::Value,
         outcome: Result<&str, &str>,
-    ) {
+    ) -> String {
         let mut call = call(name);
         call.arguments = arguments.to_string();
         turn.begin(vec![call]);
         turn.finish_call(outcome.map(str::to_owned).map_err(str::to_owned));
-        turn.take_results();
+        turn.take_results().remove(0).content
     }
 
     /// Whether an answer now is sent back to check the turn's edits.
@@ -1826,5 +1890,161 @@ mod tests {
             repeat(&mut self::turn(), &call("read_file"), "same", 1),
             ["same"]
         );
+    }
+
+    /// What `edit_file` says when its `old` is not in the file.
+    const MISSED: &str =
+        "`old` was not found in the file. Read it again and copy the text exactly.";
+
+    /// An edit of a.rs replacing `old`.
+    fn edit(old: &str) -> serde_json::Value {
+        serde_json::json!({ "path": "a.rs", "old": old, "new": "x" })
+    }
+
+    #[test]
+    fn two_edit_misses_with_different_old_get_the_note_on_the_second() {
+        let mut turn = turn();
+        assert_eq!(
+            made(&mut turn, "edit_file", edit("fn a()"), Err(MISSED)),
+            MISSED
+        );
+        assert_eq!(
+            made(&mut turn, "edit_file", edit("fn a( )"), Err(MISSED)),
+            format!(
+                "{MISSED}\n\n[`edit_file` has failed 2 times in a row. Read the error and \
+                 change approach: re-read what it acts on, use another tool, or take a \
+                 smaller step, rather than retrying with small changes.]"
+            )
+        );
+        // Once a streak: the third miss goes back as it came.
+        assert_eq!(
+            made(&mut turn, "edit_file", edit("fn a(  )"), Err(MISSED)),
+            MISSED
+        );
+    }
+
+    #[test]
+    fn a_success_between_misses_starts_the_count_again() {
+        let mut turn = turn();
+        made(&mut turn, "edit_file", edit("fn a()"), Err(MISSED));
+        made(&mut turn, "edit_file", edit("fn b()"), Ok("Edited a.rs."));
+        assert_eq!(
+            made(&mut turn, "edit_file", edit("fn c()"), Err(MISSED)),
+            MISSED
+        );
+    }
+
+    #[test]
+    fn a_command_exiting_one_twice_gets_no_note() {
+        let mut turn = turn();
+        let failed = "test result: FAILED\n[exit code 1]";
+        for line in ["cargo test", "cargo test -- --nocapture"] {
+            let test = serde_json::json!({ "command": line });
+            assert_eq!(made(&mut turn, "run_command", test, Ok(failed)), failed);
+        }
+    }
+
+    #[test]
+    fn declines_refusals_and_stops_get_no_note() {
+        let refusals = [
+            tools::DECLINED.to_owned(),
+            tools::declined("not that file"),
+            "This was not approved, so it did not run. Too broad.".to_owned(),
+            "Auto mode did not allow this: it deletes files. Do not retry it.".to_owned(),
+            "A PreToolUse hook blocked this call: edits wait for review.".to_owned(),
+            "`edit_file` is not available in plan mode: it changes things.".to_owned(),
+            "Step 2 of the batch (click Pay) would be refused on its own, so none of it \
+             ran: Refused: a permission rule denies `use_page`."
+                .to_owned(),
+            STOPPED_WHILE_RUNNING.to_owned(),
+            STOPPED_BEFORE_START.to_owned(),
+            "Not run: a hook ended the turn.".to_owned(),
+        ];
+        for refusal in refusals {
+            let mut turn = turn();
+            for old in ["fn a()", "fn b()", "fn c()"] {
+                let sent = made(&mut turn, "edit_file", edit(old), Err(&refusal));
+                assert_eq!(sent, refusal);
+            }
+        }
+    }
+
+    #[test]
+    fn two_refusals_from_the_gate_get_no_note() {
+        let ctx = tools::ToolContext::default();
+        let none = crate::gate::Grants::new();
+        // Nobody is here to give a command the yes it needs, as in `-p`.
+        let gate = crate::gate::Gate {
+            ctx: &ctx,
+            mode: crate::gate::Mode::Default,
+            grants: &none,
+            rules: &[],
+            broken: None,
+            human: false,
+        };
+        let mut turn = turn();
+        for line in ["cargo build", "cargo build --release"] {
+            let mut build = call("run_command");
+            build.arguments = serde_json::json!({ "command": line }).to_string();
+            turn.begin(vec![build]);
+            let Next::Refuse(_, why) = turn.next(|queued| crate::gate::decide(queued, &gate))
+            else {
+                panic!("`{line}` was not refused with nobody to approve it");
+            };
+            turn.finish_call(Err(why.clone()));
+            assert_eq!(turn.take_results()[0].content, why);
+        }
+    }
+
+    #[test]
+    fn misses_made_together_count_as_one() {
+        let mut turn = turn();
+        let reads = ["a.rs", "b.rs", "c.rs"].map(|path| ToolCall {
+            id: path.into(),
+            arguments: serde_json::json!({ "path": path }).to_string(),
+            ..call("read_file")
+        });
+        turn.begin(reads.into());
+        for _ in 0..3 {
+            turn.finish_call(Err("No such file.".into()));
+        }
+        let sent = turn.take_results();
+        assert!(sent.iter().all(|result| result.content == "No such file."));
+        // A miss after the model has seen them is the second in a row.
+        let read = serde_json::json!({ "path": "d.rs" });
+        let sent = made(&mut turn, "read_file", read, Err("No such file."));
+        assert!(
+            sent.contains("`read_file` has failed 2 times in a row"),
+            "{sent}"
+        );
+    }
+
+    #[test]
+    fn a_third_streak_in_one_turn_gets_no_note() {
+        let mut turn = turn();
+        let mut notes = 0;
+        for streak in 0..3 {
+            for old in ["fn a()", "fn b()"] {
+                let old = format!("{old} {streak}");
+                let sent = made(&mut turn, "edit_file", edit(&old), Err(MISSED));
+                notes += usize::from(sent != MISSED);
+            }
+            let fixed = edit(&format!("fn c() {streak}"));
+            made(&mut turn, "edit_file", fixed, Ok("Edited a.rs."));
+        }
+        assert_eq!(notes, 2);
+    }
+
+    #[test]
+    fn the_repeat_note_is_the_only_note_on_its_result() {
+        let mut turn = turn();
+        let (missing, gone) = (serde_json::json!({ "path": "a.rs" }), Err("No such file."));
+        made(&mut turn, "read_file", missing.clone(), gone);
+        let other = serde_json::json!({ "path": "b.rs" });
+        made(&mut turn, "read_file", other, Ok("fn b() {}"));
+        made(&mut turn, "read_file", missing.clone(), gone);
+        let sent = made(&mut turn, "read_file", missing, gone);
+        assert!(sent.contains("made this exact call 3 times"), "{sent}");
+        assert!(!sent.contains("in a row"), "{sent}");
     }
 }

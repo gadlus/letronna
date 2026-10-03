@@ -1217,6 +1217,42 @@ fn unasked(tool: &str) -> String {
     )
 }
 
+/// How the result of a call refused before it ran begins: refused by the
+/// gate, answered no, turned down by Auto mode's judge or by a hook.
+const REFUSED: [&str; 4] = [
+    "Refused: ",
+    "This was not approved",
+    "Auto mode did not allow this",
+    "A PreToolUse hook blocked this call",
+];
+
+/// How the result of a call the run may not make at all goes on after the
+/// tool's name: not among the tools it was given, switched off, or changing
+/// things in plan mode.
+const NOT_OFFERED: [&str; 4] = [
+    " is not available to this",
+    " is not available in plan mode",
+    " in plan mode only runs",
+    " is switched off",
+];
+
+/// Whether an error a call came back with is its refusal rather than the
+/// call running and failing.
+pub fn refused(error: &str) -> bool {
+    // A refusal is marked only in the words the model is told, which also
+    // tell it apart from a call that ran and failed. A batch refused for
+    // one of its steps says which step, then that step's refusal.
+    let text = error
+        .split_once(" would be refused on its own, so none of it ran: ")
+        .map_or(error, |(_, why)| why);
+    let after_name = text
+        .strip_prefix('`')
+        .and_then(|rest| rest.split_once('`'))
+        .map(|(_, rest)| rest);
+    REFUSED.iter().any(|start| text.starts_with(start))
+        || after_name.is_some_and(|rest| NOT_OFFERED.iter().any(|then| rest.starts_with(then)))
+}
+
 /// Paths in a project that an edit reaches only with a yes, as `SECRETS`
 /// are, matched without case as a run of names anywhere in the path, so
 /// that a folder covers everything in it; a trailing `*` takes any rest of
