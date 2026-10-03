@@ -19,7 +19,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — MCP servers over HTTP and OAuth, plugins from a git repository, and Zed or JetBrains running Letronna over ACP.
 - **App** — The browser opens beside the chat at half the room; long output rests as short previews; live work sits in one line over the box; Files, Changes and Jobs tabs, a Ctrl+K palette, and the whole window reachable from the keyboard.
 - **Chat apps** — Slack, pairing by code, files and voice notes both ways, and `letronna serve` to answer with no window open.
-- **All** — Runs nobody watches finish what they were asked: they keep going after cut-offs and empty replies, finish their checklist, check the files they were asked to make, and are told nobody can answer.
+- **All** — Runs nobody watches finish what they were asked: they keep going after cut-offs and empty replies, finish their checklist, read their inputs, check the files they were asked to make, and are told nobody can answer. `letronna -p` takes a deadline, a JSON Schema for its answer and its server from the environment.
 - **All** — Schedules in a mode of their own, memory you can review and edit, and a window that uses far less memory and processor while it works or sits idle.
 
 ### Added
@@ -106,6 +106,18 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **App** — Previews open by themselves unless turned off.
 - **Terminal** — Lists are steered with the arrows, and Escape declines.
 - **All** — Harness-Bench scripts to score `letronna -p` and compare two builds task by task.
+- **Terminal** — `letronna -p --json-schema` asks for the answer as JSON the schema checks; `--output json` names the session, model and cost and counts refused calls.
+- **Terminal** — `LETRONNA_DEADLINE` warns a `-p` run to write its outputs at 80% of its time, then stops it; `AGENT_BASE_URL`, `AGENT_API_KEY` and `AGENT_MODEL` point a run at a server with nothing set up.
+- **Terminal** — `letronna --dump-config` prints the settings and limits a `-p` run would get.
+- **All** — `context_window` and `max_output` in settings, or `LETRONNA_CONTEXT_WINDOW` and `LETRONNA_MAX_OUTPUT`, give an unknown model its real limits; vLLM and Groq model lists set them too.
+- **All** — `run_command` takes a `workdir`, and runs in bash where bash is on PATH; a headless run's long command carries on in the background.
+- **All** — A schedule can run once at a date and time, and the model knows the computer's time zone.
+- **All** — The browser can type a key for each character, and a typed field is read back so a batch stops when the text did not stick.
+- **All** — A fetched page shows its forms with their hidden fields, and leaves out the words its markup hides.
+- **All** — Setting `parallel_tool_calls` to false runs one tool call at a time; a helper type's effort, background and isolation take effect.
+- **All** — `LETRONNA_ALLOW_HTTP=1` lets plain HTTP reach hosts on the local network; `LETRONNA_DISPOSABLE=1` lets an unwatched `--yes` run in a throwaway container delete a folder.
+- **All** — Letronna runs as a Harbor agent for Terminal-Bench and SWE-bench, and ClawBench and the A.I.G injection matrix can be run against it.
+- **All** — Releases carry a static terminal for x86_64 and aarch64 Linux.
 ### Changed
 - **All** — A failed model request says what went wrong: the key, credit, a rate limit, a busy provider, a conversation too long, and so on.
 - **All** — OpenAI's reasoning models work, and a server that turns down a field is sent the request again without it.
@@ -151,6 +163,15 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Text from files and commands that addresses an AI gets a Letronna note, and the summary of dropped turns is marked as derived text.
 - **All** — Tool errors name the next step, and a command that prints nothing says so.
 - **All** — `LETRONNA_READ_TIMEOUT` sets how long a reply may stay silent.
+- **All** — A run is told before it ends which input files it never read, and a run nobody watches is told what is on PATH and in its folder.
+- **All** — Writes and edits name the file they changed; a CSV left with uneven rows gets a note; refused dangerous commands suggest a narrower one.
+- **All** — Files, command output, pages and MCP results lose characters nobody can see, with a note saying how many; `edit_file` finds text that differs only by them.
+- **All** — After untrusted content, risky calls are checked even under `--yes`; skills the model writes stay off until you switch them on, and installed skills reach the model cleaned and marked.
+- **All** — A helper's report comes quoted under a header; a skill being followed stays in view as old results are cleared, and a cleared result that was saved still names its file.
+- **All** — Reasoning models get the reply budget as `max_completion_tokens`; a full search page reaches the model whole; search names folders a `.gitignore` above the project hid.
+- **All** — Reading every page of an unchanged file counts as reading it whole; a picture too big to send is scaled down; a PDF `web_fetch` saves can be paged with `read_file`.
+- **All** — A goal's failing check command keeps the goal from being met, and `/review` covers new files and diffs from where the branch left.
+- **Terminal** — An unknown flag is an error, continuing stays in this folder's session, `--resume` under `-p` needs an id, and `-p` warns in Default mode that writes will be refused.
 ### Fixed
 - **All** — A command that uploads a key file (curl, wget, scp, rsync) is refused in every mode, and .gnupg, .pgpass, .vault-token, .azure and gcloud settings count as secret.
 - **All** — An edit whose old text is missing says so instead of "already applied", plain text is no longer saved as a .docx, .xlsx, .pptx, .zip or .pdf, and a command that exits non-zero counts as failed.
@@ -174,7 +195,10 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **App** — The window opens again on a session that has messages.
 - **Terminal** — A bad update is put back, and a good one is kept.
 - **Terminal** — A Ctrl-C of `letronna -p` ends the command it was running.
-
+- **Terminal** — A `-p` run never installs a staged update or puts an old one back, and a SIGTERM or a closed terminal stops it as Ctrl-C does.
+- **All** — A command stopped at a terminal prompt is ended and says why, and a page's error answer comes back with what the page said.
+- **All** — An image edit on a gateway without the route points to a script instead of failing.
+- **Terminal** — `letronna -p` over stream-json no longer hangs on Windows when it starts.
 ## [0.1.0-alpha.2] - 2026-09-27
 
 ### Added
