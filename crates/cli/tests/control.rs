@@ -270,7 +270,13 @@ fn an_interrupt_stops_the_turn_that_is_running() {
 fn asked_to_write(name: &str, behavior: Value) -> (Value, Vec<(String, String)>, PathBuf) {
     let (data, work) = scratch(name);
     let write = ("write_file", json!({"path": "out.txt", "content": "hi"}));
-    let (endpoint, bodies) = provider(vec![reply("", &[write]), reply("Over.", &[])]);
+    // A write that runs is sent back once to be checked, and the answer
+    // after the check is the same.
+    let (endpoint, bodies) = provider(vec![
+        reply("", &[write]),
+        reply("Over.", &[]),
+        reply("Over.", &[]),
+    ]);
     let mut run = Driven::streaming(
         &data,
         &work,
@@ -356,7 +362,13 @@ fn writer(name: &str, rules: Value, flags: &[&str]) -> (Driven, PathBuf) {
     let (data, work) = scratch(name);
     std::fs::write(data.join("permissions.json"), rules.to_string()).unwrap();
     let write = ("write_file", json!({"path": "out.txt", "content": "hi"}));
-    let (endpoint, _) = provider(vec![reply("", &[write]), reply("Over.", &[])]);
+    // A write that runs is sent back once to be checked, and the answer
+    // after the check is the same.
+    let (endpoint, _) = provider(vec![
+        reply("", &[write]),
+        reply("Over.", &[]),
+        reply("Over.", &[]),
+    ]);
     let mut all = vec!["--permission-prompt-tool", "stdio"];
     all.extend(flags);
     let mut run = Driven::streaming(&data, &work, &endpoint, &all);

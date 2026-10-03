@@ -622,12 +622,9 @@ fn take_back(runner: &mut Runner, session: usize, id: u64, before: usize) -> Opt
 
 /// The last thing the model said among `messages`, or nothing.
 fn said_last(messages: &[Message]) -> String {
-    messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "assistant" && !message.content.is_empty())
-        .map(|message| message.content.clone())
-        .unwrap_or_default()
+    // Read as the run's report reads it, so a reply continued after a
+    // cut-off is whole.
+    driver::last_said(messages)
 }
 
 /// A run that failed before it began, having spent nothing.

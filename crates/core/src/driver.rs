@@ -13,7 +13,9 @@
 //! to answer it; the checklist is kept on the agent's transcript; the
 //! browser is used unseen, with no panel to open; and messages sent
 //! meanwhile are read from the inbox after each batch of results and before
-//! the run counts as done.
+//! the run counts as done. A reply cut off at the output limit, empty, or
+//! stopping at its next step is sent back as the terminal sends it, and a
+//! session's own agent is asked once to check edits nothing has run since.
 //!
 //! A frontend that shows the run as it goes, as an editor does over ACP,
 //! gives it a `Watch`, which hears each step as it is made. A run that is a
@@ -238,7 +240,15 @@ pub fn run(spec: Spec) -> Report {
 pub fn run_keeping(mut spec: Spec) -> (Report, Transcript) {
     let started = Instant::now();
     crate::hooks::new_turn(spec.connection.conversation);
-    let mut turn = Turn::with_limit(spec.connection.clone(), spec.rounds).unattended();
+    // A session's own agent, as `-p` runs it, checks its edits as a turn in
+    // the terminal does, when it may run a command to; a helper's answer is
+    // its parent's to check.
+    let verify = spec.depth == 0
+        && crate::store::current_settings().verifies_edits()
+        && refused(&spec, "run_command").is_none();
+    let mut turn = Turn::with_limit(spec.connection.clone(), spec.rounds)
+        .unattended()
+        .verifying(verify);
     let mut report = Report {
         status: Outcome::Done,
         text: String::new(),
@@ -322,7 +332,7 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
         {
             return Ok(Outcome::OverBudget);
         }
-        let Some(reply) = ask_in_line(spec, turn)? else {
+        let Some(mut reply) = ask_in_line(spec, turn)? else {
             keep_cut_short(spec, turn);
             return Ok(Outcome::Stopped);
         };
@@ -335,10 +345,34 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
         if let Some(budget) = &spec.budget {
             budget.charge(&reply);
         }
+        // Taken before `continuation`, which drops calls made in the wrap-up
+        // at the round cap: they still end the run at its limit.
         let calls = reply.tool_calls.clone();
-        spec.transcript.conversation.messages.push(reply);
+        let next = turn.continuation(&mut reply);
+        // A reply with nothing in it -- empty, or cut off inside a tool call
+        // with no text before it -- leaves nothing to keep, and some routes
+        // turn down an empty assistant message.
+        if !reply.content.is_empty() || !reply.tool_calls.is_empty() {
+            spec.transcript.conversation.messages.push(reply);
+        }
         for call in &calls {
             tell(spec, Step::Asked(call.clone()));
+        }
+        match next {
+            Ok(Some(nudge)) => {
+                // Folded into the run, so the window keeps the task it is for.
+                spec.transcript.conversation.messages.push(Message {
+                    folded: true,
+                    ..nudge.notice
+                });
+                save(&mut spec.transcript)?;
+                continue;
+            }
+            Ok(None) => {}
+            Err(why) => {
+                save(&mut spec.transcript)?;
+                return Ok(Outcome::Failed(why));
+            }
         }
         if calls.is_empty() {
             // Past the round cap the wrap-up is the last word, as in the
@@ -1013,14 +1047,27 @@ fn forward_unread(spec: &Spec) {
     }
 }
 
-/// The last thing the agent said, which is its answer when it finished.
-pub(crate) fn last_said(messages: &[Message]) -> String {
-    messages
+/// The last thing the agent said, which is its answer when it finished, with
+/// every piece of a reply that went on after being cut off at the output limit.
+pub fn last_said(messages: &[Message]) -> String {
+    let said = |message: &Message| message.role == "assistant" && !message.content.is_empty();
+    let Some(last) = messages.iter().rposition(said) else {
+        return String::new();
+    };
+    // Each piece after the first follows the notice asking it to go on, and
+    // takes up where the one before stopped, so they join as they are.
+    let mut first = last;
+    while let [.., before, notice] = &messages[..first]
+        && notice.content == crate::agent::CONTINUE
+        && said(before)
+    {
+        first -= 2;
+    }
+    messages[first..=last]
         .iter()
-        .rev()
-        .find(|message| message.role == "assistant" && !message.content.is_empty())
-        .map(|message| message.content.clone())
-        .unwrap_or_default()
+        .step_by(2)
+        .map(|message| message.content.as_str())
+        .collect()
 }
 
 /// Tells the run's watcher about `step`, if it has one.
@@ -1222,8 +1269,62 @@ pub(crate) mod tests {
         out
     }
 
+    /// A streamed reply that says `text` and stops at the output limit, inside
+    /// `call` when there is one: a tool's name and its arguments as far as
+    /// they got.
+    fn cut(text: &str, call: Option<(&str, &str)>) -> String {
+        let mut events = Vec::new();
+        if !text.is_empty() {
+            events.push(json!({"choices": [{"delta": {"content": text}}]}));
+        }
+        if let Some((name, begun)) = call {
+            events.push(json!({"choices": [{"delta": {"tool_calls": [{"index": 0,
+                "id": "call-0", "function": {"name": name, "arguments": begun}}]}}]}));
+        }
+        events.push(json!({"choices": [{"delta": {}, "finish_reason": "length"}]}));
+        let mut out: String = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+        out.push_str("data: [DONE]\n\n");
+        out
+    }
+
     fn read_notes() -> (&'static str, Value) {
         ("read_file", json!({"path": "notes.txt"}))
+    }
+
+    fn write_made() -> (&'static str, Value) {
+        ("write_file", json!({"path": "made.txt", "content": "made"}))
+    }
+
+    /// A data folder of the test's own while it is held, so a run at depth 0
+    /// reads the settings at their defaults, verify_edits on, whatever the
+    /// user's own say.
+    struct Data {
+        _folder: Scratch,
+        _held: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Data {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        }
+    }
+
+    fn data(name: &str) -> Data {
+        let held = (crate::store::tests::DATA_DIR.lock()).unwrap_or_else(|e| e.into_inner());
+        let folder = Scratch::new(&format!("driver-data-{name}"));
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*folder) };
+        Data {
+            _folder: folder,
+            _held: held,
+        }
+    }
+
+    /// The session's own gate letting every call run, as a yes for each would.
+    fn runs_everything() -> Option<Decide> {
+        Some(Arc::new(|_, _| crate::gate::Outcome::Run))
     }
 
     /// Runs `spec` the way `spawn` does and waits for its report.
@@ -1789,6 +1890,7 @@ pub(crate) mod tests {
         let _serving = crate::approvals::tests::SERVING
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _data = data("scheduled");
         for (n, mode) in [Mode::Bypass, Mode::Default].into_iter().enumerate() {
             let dir = scratch(&format!("scheduled-{}", mode.name()));
             let session = AGENTS + 300 + n as u64;
@@ -1803,7 +1905,7 @@ pub(crate) mod tests {
                     request.answer(approvals::Decision::Deny(String::new()));
                 }
             });
-            let (endpoint, provider) = provider(vec![
+            let mut replies = vec![
                 reply(
                     "",
                     &[
@@ -1813,7 +1915,13 @@ pub(crate) mod tests {
                     ],
                 ),
                 reply("Done.", &[]),
-            ]);
+            ];
+            // A scheduled run is a session's own, so the write Bypass runs
+            // is sent back once to be checked.
+            if mode == Mode::Bypass {
+                replies.push(reply("Nothing here builds or tests.", &[]));
+            }
+            let (endpoint, provider) = provider(replies);
             let report = finished(scheduled(endpoint, &dir, session, mode));
             assert_eq!(report.status, Outcome::Done);
             let sent = provider.sent();
@@ -3292,5 +3400,217 @@ pub(crate) mod tests {
         let refused = results(sent.last().unwrap())[1];
         assert!(refused.contains("nobody is here to decide"), "{refused}");
         assert!(requests.try_recv().is_err(), "a card with nobody there");
+    }
+
+    #[test]
+    fn a_write_cut_off_at_the_output_limit_is_asked_for_again_and_written() {
+        let dir = scratch("cut-write");
+        let whole = "# Report\n\nThe notes say hello.\n";
+        let begun = r##"{"path": "report.md", "content": "# Rep"##;
+        let (endpoint, provider) = provider(vec![
+            cut("", Some(("write_file", begun))),
+            reply(
+                "",
+                &[("write_file", json!({"path": "report.md", "content": whole}))],
+            ),
+            reply("Wrote report.md.", &[]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 500);
+        spec.decide = runs_everything();
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        let asked = messages(&sent[1]).last().unwrap();
+        assert_eq!(asked["role"], "user");
+        let asked = asked["content"].as_str().unwrap();
+        assert!(asked.contains("in the middle of a tool call"), "{asked}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("report.md")).unwrap(),
+            whole
+        );
+        assert_eq!(report.text, "Wrote report.md.");
+        // The cut reply had nothing to keep, and the notice is folded into
+        // the run, so the window still holds the task.
+        let saved = written(&dir.join("helper.jsonl"));
+        let kept: Vec<(&str, bool)> = saved
+            .iter()
+            .filter(|record| record["type"] == "message")
+            .map(|record| (record["role"].as_str().unwrap(), record["folded"] == true))
+            .collect();
+        let roles = [
+            ("user", false),
+            ("user", true),
+            ("assistant", false),
+            ("tool", false),
+            ("assistant", false),
+        ];
+        assert_eq!(kept, roles);
+    }
+
+    #[test]
+    fn an_empty_reply_is_asked_for_once_before_the_run_ends() {
+        let dir = scratch("empty");
+        let (endpoint, provider) = provider(vec![reply("", &[]), reply("", &[])]);
+        let report = finished(spec(endpoint, &dir, AGENTS + 510));
+        let sent = provider.sent();
+
+        assert_eq!(
+            report.status,
+            Outcome::Failed("The model returned no text. Check model compatibility.".into())
+        );
+        let asked = messages(&sent[1]).last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(asked.contains("no visible output"), "{asked}");
+        // Neither empty reply is kept, since some routes turn one down.
+        assert!(messages(&sent[1]).iter().all(|m| m["role"] != "assistant"));
+    }
+
+    #[test]
+    fn a_reply_still_cut_off_after_three_continuations_fails_the_run() {
+        let dir = scratch("cut-four");
+        let parts = ["One", "Two", "Three", "Four"].map(|part| cut(&format!("{part}."), None));
+        let (endpoint, provider) = provider(parts.into());
+        let report = finished(spec(endpoint, &dir, AGENTS + 520));
+        let sent = provider.sent();
+
+        assert_eq!(
+            report.status,
+            Outcome::Failed(
+                "The reply was still cut off at the output limit after 3 continuations, so it \
+                 stops here."
+                    .into()
+            )
+        );
+        for request in &sent[1..] {
+            let asked = messages(request).last().unwrap()["content"]
+                .as_str()
+                .unwrap();
+            assert!(
+                asked.contains("continue exactly where it stopped"),
+                "{asked}"
+            );
+        }
+        // What it said is kept for the parent, every piece of it.
+        assert_eq!(report.text, "One.Two.Three.Four.");
+    }
+
+    #[test]
+    fn a_reply_cut_off_and_continued_is_answered_whole() {
+        let dir = scratch("cut-continued");
+        let (endpoint, provider) = provider(vec![cut("Part one.", None), reply(" Part two.", &[])]);
+        let report = finished(spec(endpoint, &dir, AGENTS + 525));
+        assert_eq!(report.status, Outcome::Done);
+        provider.sent();
+
+        assert_eq!(report.text, "Part one. Part two.");
+    }
+
+    #[test]
+    fn a_short_answer_announcing_its_next_step_is_pushed_on_at_depth_zero() {
+        let _data = data("pushed-on");
+        let dir = scratch("pushed-on");
+        let (endpoint, provider) = provider(vec![
+            reply("", &[read_notes()]),
+            reply("The notes say hello. Now let me check the tests.", &[]),
+            reply("The notes say hello, and there are no tests.", &[]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 530);
+        spec.depth = 0;
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        let asked = messages(&sent[2]).last().unwrap();
+        assert_eq!(asked["content"], "Continue now.");
+        assert_eq!(report.text, "The notes say hello, and there are no tests.");
+    }
+
+    #[test]
+    fn an_answer_after_unchecked_edits_is_sent_back_to_verify_once_at_depth_zero() {
+        let _data = data("verify");
+        let dir = scratch("verify");
+        let (endpoint, provider) = provider(vec![
+            reply("", &[write_made()]),
+            reply("Wrote made.txt.", &[]),
+            reply("There is nothing here to build or test.", &[]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 540);
+        spec.depth = 0;
+        spec.decide = runs_everything();
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        let asked = messages(&sent[2]).last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            asked.contains("You changed files and have not run anything since"),
+            "{asked}"
+        );
+        // Once: the answer after it ends the run.
+        assert_eq!(report.text, "There is nothing here to build or test.");
+    }
+
+    #[test]
+    fn a_helper_is_never_sent_back_to_verify() {
+        // The settings ask for the check, so only the depth keeps it away.
+        let _data = data("verify-helper");
+        let dir = scratch("verify-helper");
+        let (endpoint, provider) = provider(vec![
+            reply("", &[write_made()]),
+            reply("Wrote made.txt.", &[]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 550);
+        spec.decide = runs_everything();
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        provider.sent();
+
+        assert!(dir.join("made.txt").exists());
+        assert_eq!(report.text, "Wrote made.txt.");
+    }
+
+    #[test]
+    fn a_run_that_may_not_run_commands_is_never_sent_back_to_verify() {
+        // The settings ask for the check, so only the tools allowed keep it away.
+        let _data = data("verify-no-commands");
+        let dir = scratch("verify-no-commands");
+        let (endpoint, provider) = provider(vec![
+            reply("", &[write_made()]),
+            reply("Wrote made.txt.", &[]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 555);
+        spec.depth = 0;
+        spec.allow = Allow::Only(vec!["read_file".into(), "write_file".into()]);
+        spec.decide = runs_everything();
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        provider.sent();
+
+        assert!(dir.join("made.txt").exists());
+        assert_eq!(report.text, "Wrote made.txt.");
+    }
+
+    #[test]
+    fn calls_made_in_the_wrap_up_still_end_the_run_at_its_limit() {
+        let dir = scratch("wrap-up");
+        let (endpoint, provider) = provider(vec![
+            reply("", &[read_notes()]),
+            reply("", &[("list_dir", json!({"path": "."}))]),
+            reply("Reading more.", &[read_notes()]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 560);
+        spec.rounds = 1;
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::RoundLimit);
+        provider.sent();
+
+        // Kept without the calls that never ran, so a resume finds none hanging.
+        let last = written(&dir.join("helper.jsonl")).pop().unwrap();
+        assert_eq!(last["content"], "Reading more.");
+        assert!(last["tool_calls"].as_array().is_none_or(Vec::is_empty));
     }
 }

@@ -959,6 +959,9 @@ mod tests {
             reply("", &[write("allowed.txt")]),
             reply("", &[write("rejected.txt")]),
             reply("One written, one not.", &[]),
+            // An editor's turn is a session's own, so the write it allowed
+            // is sent back once to be checked.
+            reply("Nothing here builds or tests.", &[]),
         ]);
         let mut editor = Editor::connect(endpoint, SESSIONS + 10);
         let session = editor.open(&dir);
