@@ -1886,6 +1886,7 @@ impl Tool for WriteFile {
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let path = resolve_write(path_arg(args), ctx)?;
         let content = args["content"].as_str().ok_or("`content` is required.")?;
+        check_document(&path, content)?;
         let change = crate::filestate::overwrite(ctx.conversation, &path, path_arg(args))?;
         let before = change.before().map(str::as_bytes);
         let text = crate::write::keep_format(before.unwrap_or_default(), content);
@@ -1901,6 +1902,51 @@ impl Tool for WriteFile {
         crate::lsp::wrote(lsp, &text);
         Ok(format!("Wrote {} bytes.", text.len()))
     }
+}
+
+/// Refuses `content` for an office document, zip or PDF path unless it
+/// starts as such a file does, saying how to make the file instead.
+fn check_document(path: &Path, content: &str) -> Result<(), String> {
+    let extension = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase());
+    // A model asked for report.docx tends to write the report's text there,
+    // which no reader opens. Only the start is checked: a hand-written PDF is
+    // plain text and does open.
+    let zip = "PK\u{3}\u{4}";
+    let (magic, how) = match extension.as_deref() {
+        Some("docx") => (
+            zip,
+            "A .docx is a zip of XML files; build it with Python's zipfile module \
+             through run_command, or copy a .docx and rewrite its word/document.xml.",
+        ),
+        Some("xlsx") => (
+            zip,
+            "An .xlsx is a zip of XML files; build it with Python's zipfile module \
+             through run_command, or write a .csv if plain rows will do.",
+        ),
+        Some("pptx") => (
+            zip,
+            "A .pptx is a zip of XML files; build it with Python's zipfile module \
+             through run_command, or copy a .pptx and rewrite its \
+             ppt/slides/slide1.xml.",
+        ),
+        Some("zip") => (
+            zip,
+            "A .zip is an archive; write the files it should hold, then pack them \
+             with Python's zipfile module through run_command.",
+        ),
+        Some("pdf") => (
+            "%PDF-",
+            "A .pdf starts with %PDF-; make it through run_command with a converter \
+             this computer has, or write the text as .md or .html instead.",
+        ),
+        _ => return Ok(()),
+    };
+    if content.starts_with(magic) {
+        return Ok(());
+    }
+    Err(format!("{how} Nothing was written."))
 }
 
 struct EditFile;
@@ -3901,6 +3947,56 @@ mod tests {
             "[package]\nname = \"a\"\n"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn writing_plain_text_to_a_docx_is_refused_with_a_way_to_build_it() {
+        let dir = Scratch::new("tools-document");
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let write = |path: &str, content: &str| {
+            WriteFile.run(&json!({"path": path, "content": content}), &ctx)
+        };
+        let refused = write("out/report.docx", "# Sales report\n\nTotal: 42").unwrap_err();
+        assert!(refused.contains("zipfile"), "{refused}");
+        assert!(refused.contains("word/document.xml"), "{refused}");
+        assert!(refused.ends_with("Nothing was written."), "{refused}");
+        assert!(!dir.join("out").exists());
+        for path in ["REPORT.DOCX", "sheet.xlsx", "deck.pptx", "bundle.zip"] {
+            let refused = write(path, "PKI rollout notes").unwrap_err();
+            assert!(refused.contains("zipfile"), "{path}: {refused}");
+            assert!(!dir.join(path).exists(), "{path}");
+        }
+        let refused = write("policy.pdf", "Policy text").unwrap_err();
+        assert!(refused.contains("%PDF-"), "{refused}");
+        assert!(!dir.join("policy.pdf").exists());
+
+        // A PDF can be plain text, and a zip's own first bytes get through.
+        let pdf = "%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\n%%EOF\n";
+        write("policy.pdf", pdf).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("policy.pdf")).unwrap(),
+            pdf
+        );
+        write("bundle.zip", "PK\u{3}\u{4}").unwrap();
+    }
+
+    #[test]
+    fn writing_a_markdown_file_is_unchanged() {
+        let dir = Scratch::new("tools-markdown");
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let content = "# Sales report\n\nTotal: 42\n";
+        let args = json!({"path": "report.md", "content": content});
+        assert_eq!(WriteFile.run(&args, &ctx).unwrap(), "Wrote 26 bytes.");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("report.md")).unwrap(),
+            content
+        );
     }
 
     #[test]
