@@ -107,6 +107,7 @@ pub mod vault;
 pub mod wake;
 pub mod watch;
 pub mod web;
+mod wire_anthropic;
 #[cfg(feature = "workflows")]
 pub mod workflow;
 pub mod worktree;

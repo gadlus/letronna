@@ -601,15 +601,12 @@ fn ask(connection: &Connection, prompt: &str) -> Result<String, String> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| e.to_string())?;
-    let mut request = client.post(endpoint).json(&body);
-    if !connection.key.trim().is_empty() {
-        request = request.bearer_auth(connection.key.trim());
-    }
-    let value: Value = request
+    let value: Value = crate::chat::carrying(client.post(endpoint), connection, &body)
         .send()
         .and_then(|r| r.error_for_status())
         .and_then(|r| r.json())
         .map_err(|e| e.to_string())?;
+    let value = crate::chat::as_chat(connection, value);
     crate::chat::unwrap_response(&value)?
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)

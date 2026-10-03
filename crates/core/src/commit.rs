@@ -413,18 +413,15 @@ pub fn suggest(connection: &Connection, folder: &Path) -> Result<String, String>
     let endpoint = crate::chat::validate(connection)?;
     let body = suggest_body(connection, &diff);
     // The shared client would give up on a slow reply after its idle wait.
-    let mut request = crate::chat::client()?
+    let request = crate::chat::client()?
         .post(endpoint)
-        .timeout(Duration::from_secs(60))
-        .json(&body);
-    if !connection.key.trim().is_empty() {
-        request = request.bearer_auth(connection.key.trim());
-    }
-    let value: Value = request
+        .timeout(Duration::from_secs(60));
+    let value: Value = crate::chat::carrying(request, connection, &body)
         .send()
         .and_then(|r| r.error_for_status())
         .and_then(|r| r.json())
         .map_err(|e| format!("No message came back: {e}"))?;
+    let value = crate::chat::as_chat(connection, value);
     let text = crate::chat::unwrap_response(&value)?
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)

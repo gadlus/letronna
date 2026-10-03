@@ -15,7 +15,7 @@ Letronna is a chat-first desktop app built on [GPUI](https://github.com/zed-indu
 
 - Sessions sidebar with search, pinning and date groups
 - Markdown replies, streaming, multi-line composer
-- Gateways: Letronna (hosted models on your account), OpenAI, OpenRouter, Ollama, or a custom base URL
+- Gateways: Letronna (hosted models on your account), OpenAI, Anthropic, OpenRouter, Ollama, or a custom base URL
 - Searchable model picker fed by the gateway's model list
 - Single ~24 MB executable, no runtime, no Electron
 

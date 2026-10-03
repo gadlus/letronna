@@ -136,9 +136,10 @@ impl Tool for EditImage {
         true
     }
     // Off Letronna it is the chat's own gateway that is paid, which needs no
-    // account; on it, the credit does.
+    // account; on it, the credit does. Anthropic's API makes no pictures.
     fn offered(&self, connection: &Connection) -> bool {
-        crate::auth::signed_in() || !hosted(&connection.endpoint)
+        (crate::auth::signed_in() || !hosted(&connection.endpoint))
+            && !crate::wire_anthropic::speaks(&connection.endpoint)
     }
     fn mutates(&self) -> bool {
         true
@@ -1970,6 +1971,12 @@ mod tests {
             ..Default::default()
         };
         assert!(EditImage.offered(&custom) && !EditImage.offered(&letronna));
+        // Anthropic's API makes no pictures, signed in or not.
+        let anthropic = Connection {
+            endpoint: "https://api.anthropic.com/v1".into(),
+            ..Default::default()
+        };
+        assert!(!EditImage.offered(&anthropic));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
