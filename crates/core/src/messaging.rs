@@ -35,14 +35,12 @@ const TELEGRAM_PART: usize = 4096;
 const DISCORD_PART: usize = 2000;
 const SLACK_API: &str = "https://slack.com/api";
 /// Slack asks for message text under 4,000 characters, so a longer reply
-/// goes out in parts of at most that.
+/// goes out in parts of at most that. They are measured as written: the
+/// escapes added after can lengthen one, which Slack still shows whole.
 const SLACK_PART: usize = 4000;
 /// Slack cuts a message off past 40,000 characters, and nobody reads more
-/// in a chat: a reply is trimmed to that first, which is ten parts.
+/// in a chat: a reply's parts stop there, counted as sent.
 const SLACK_TOTAL: usize = 40_000;
-/// The trim above allows ten parts; line breaks can make them shorter, so
-/// more are dropped rather than posted a second apart.
-const SLACK_PARTS: usize = 10;
 /// How long a read waits for a frame. Slack does not document how often it
 /// pings, so the first quiet spell is answered with a ping of our own and
 /// only a second one in a row means the connection is gone; it is also how
@@ -439,7 +437,7 @@ fn report_via(api: &str, config: &Config, title: &str, body: &str) -> Vec<String
         }
     }
     if config.slack.ready() && !config.slack.owner.trim().is_empty() {
-        let text = format!("*{title}*\n{body}");
+        let text = format!("**{title}**\n{body}");
         if let Err(error) = slack_post(&config.slack.bot_token, &config.slack.owner, None, &text) {
             failed.push(error);
         }
@@ -1877,58 +1875,24 @@ fn slack_post_via(
     Ok(())
 }
 
-/// `text` as Slack messages: keys hidden, the three characters its markup
-/// reserves escaped, trimmed so the escaped text is what Slack keeps, and
-/// split into at most `SLACK_PARTS` it takes whole, at a line break where
-/// there is one.
+/// `text` as Slack messages: keys hidden, split as the other apps' replies
+/// are, so no part cuts a code block, then each part in Slack's own marks,
+/// stopping where those would pass `SLACK_TOTAL`.
 fn slack_parts(text: &str) -> Vec<String> {
-    let text = slack_trimmed(&outgoing(text));
-    let mut parts = Vec::new();
-    let mut rest = text.as_str();
-    while let Some((end, _)) = rest.char_indices().nth(SLACK_PART) {
-        let window = &rest[..end];
-        // Never inside an escape: half of `&lt;` shows as garbage.
-        let whole = match window.rfind('&') {
-            Some(amp) if !window[amp..].contains(';') => amp,
-            _ => end,
-        };
-        let cut = match window[..whole].rfind('\n') {
-            Some(line) if line >= whole / 2 => line + 1,
-            _ => whole,
-        };
-        parts.push(rest[..cut].to_owned());
-        rest = &rest[cut..];
-    }
-    parts.push(rest.to_owned());
-    if parts.len() > SLACK_PARTS {
-        parts.truncate(SLACK_PARTS);
-        parts[SLACK_PARTS - 1].push_str("\n\u{2026} (trimmed)");
+    let mut parts: Vec<String> = Vec::new();
+    let mut length = 0;
+    for part in format::split(&outgoing(text), SLACK_PART) {
+        let part = format::slack_mrkdwn(&part);
+        // Counted as sent, since an escape makes one character up to five;
+        // so the first part, at most five times `SLACK_PART`, always goes.
+        length += part.chars().count();
+        if let (true, Some(last)) = (length > SLACK_TOTAL, parts.last_mut()) {
+            last.push_str("\n\u{2026} (trimmed)");
+            break;
+        }
+        parts.push(part);
     }
     parts
-}
-
-/// `text` escaped, cut where its escaped form would pass `SLACK_TOTAL`, so
-/// an entity is never split and a reply full of `&` is not five times over.
-fn slack_trimmed(text: &str) -> String {
-    let mut length = 0;
-    for (at, c) in text.char_indices() {
-        length += match c {
-            '&' => 5,
-            '<' | '>' => 4,
-            _ => 1,
-        };
-        if length > SLACK_TOTAL {
-            return slack_escape(&format!("{}\n\u{2026} (trimmed)", &text[..at]));
-        }
-    }
-    slack_escape(text)
-}
-
-/// Slack reads `&`, `<` and `>` as markup, so they go as entities.
-fn slack_escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 /// Slack's markup made readable: a mention as @ and the ID, a channel as #
@@ -2904,10 +2868,10 @@ mod discord_tests {
 #[cfg(test)]
 mod slack_tests {
     use super::{
-        Ended, Envelope, Incoming, SLACK_PART, SLACK_PARTS, SLACK_QUIET, SLACK_RETRY,
-        SLACK_RETRY_MAX, SLACK_SEEN, SLACK_TOTAL, Slack, SlackListener, SlackSeen, SlackState,
-        Source, slack_backoff, slack_check, slack_envelope, slack_event, slack_parts,
-        slack_post_via, slack_session, slack_text,
+        Ended, Envelope, Incoming, SLACK_PART, SLACK_QUIET, SLACK_RETRY, SLACK_RETRY_MAX,
+        SLACK_SEEN, SLACK_TOTAL, Slack, SlackListener, SlackSeen, SlackState, Source,
+        slack_backoff, slack_check, slack_envelope, slack_event, slack_parts, slack_post_via,
+        slack_session, slack_text,
     };
     use serde_json::{Value, json};
 
@@ -3074,22 +3038,22 @@ mod slack_tests {
     #[test]
     fn replies_are_escaped_and_split_at_lines_never_inside_an_escape() {
         assert_eq!(slack_parts("a < b & c > d"), ["a &lt; b &amp; c &gt; d"]);
-        let line = format!("{}\n", "x".repeat(99));
-        let long = line.repeat(SLACK_PART / 100 + 5);
+        let line = "x".repeat(99);
+        let long = vec![line.as_str(); SLACK_PART / 100 + 5].join("\n");
         let parts = slack_parts(&long);
         assert_eq!(parts.len(), 2);
         assert!(parts.iter().all(|part| part.chars().count() <= SLACK_PART));
-        assert!(parts[0].ends_with('\n'));
-        assert_eq!(parts.concat(), long);
-        // No line break to cut at, and an escape straddling the limit.
+        assert_eq!(parts.join("\n"), long);
+        // No line break to cut at: escapes are made after the cut, so each
+        // arrives whole.
         let dense = format!("{}<{}", "y".repeat(SLACK_PART - 2), "z".repeat(10));
         let parts = slack_parts(&dense);
-        assert_eq!(parts[0], "y".repeat(SLACK_PART - 2));
-        assert!(parts[1].starts_with("&lt;z"));
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts.concat(), dense.replace('<', "&lt;"));
         let huge = "w".repeat(SLACK_TOTAL * 2);
         let parts = slack_parts(&huge);
-        assert_eq!(parts.len(), SLACK_PARTS);
-        assert!(parts.last().unwrap().ends_with("… (trimmed)"));
+        assert!(parts.iter().all(|part| part.chars().count() <= SLACK_PART));
+        assert!(parts.last().unwrap().contains("The rest of this reply"));
         // The escaped text is what is trimmed, and never mid-escape.
         let amps = slack_parts(&"&".repeat(SLACK_TOTAL)).concat();
         assert!(amps.chars().count() <= SLACK_TOTAL + 20);
@@ -3097,8 +3061,27 @@ mod slack_tests {
         // Lines cut at half a part would make twenty; ten are posted.
         let halves = format!("{}\n", "v".repeat(SLACK_PART / 2)).repeat(19);
         let parts = slack_parts(&halves);
-        assert_eq!(parts.len(), SLACK_PARTS);
-        assert!(parts.last().unwrap().ends_with("… (trimmed)"));
+        assert_eq!(parts.len(), 10);
+        assert!(parts.last().unwrap().contains("The rest of this reply"));
+    }
+
+    #[test]
+    fn replies_go_in_slack_marks_and_no_part_cuts_a_code_block() {
+        assert_eq!(
+            slack_parts("## Done\n**All** checks pass, see [the log](https://ci.x/1?a&b)."),
+            ["*Done*\n*All* checks pass, see <https://ci.x/1?a&amp;b|the log>."]
+        );
+        let code: Vec<String> = (0..600).map(|n| format!("let x{n} = a < b;")).collect();
+        let text = format!("Here:\n```rust\n{}\n```\nDone.", code.join("\n"));
+        let parts = slack_parts(&text);
+        assert!(parts.len() > 2);
+        for part in &parts {
+            let fences = part.lines().filter(|line| line.starts_with("```")).count();
+            assert_eq!(fences % 2, 0, "{part}");
+            assert!(!part.contains("```rust"), "{part}");
+            assert!(!part.contains(" < "), "{part}");
+        }
+        assert!(parts[1..].iter().all(|part| part.starts_with("```\n")));
     }
 
     #[test]
@@ -3495,6 +3478,9 @@ mod slack_tests {
         let name = slack_check(&env("LETRONNA_TEST_SLACK_APP"), &bot).unwrap();
         println!("connected as {name}");
         let to = env("LETRONNA_TEST_SLACK_TO");
-        super::slack_post(&bot, &to, None, "Letronna test: 1 < 2 & 3 > 2").unwrap();
+        let text = "Letronna test: **bold**, *italic*, ~~struck~~, `1 < 2 & 3 > 2`, \
+                    [a link](https://example.com/?a=1&b=2)\n## A heading\n- a bullet\n\
+                    > a quote\n```rust\nlet x = 1;\n```";
+        super::slack_post(&bot, &to, None, text).unwrap();
     }
 }

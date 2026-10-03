@@ -12,6 +12,10 @@
 //! write -- code, bold, italic, strikethrough, links, headings, bullets and
 //! quotes -- and escapes everything else, so a slip costs formatting and
 //! never the message: a part Telegram refuses is sent again as plain text.
+//!
+//! Slack shows the same marks as they are too, and has its own, mrkdwn, so
+//! its parts go through the same reading into those: one asterisk for bold,
+//! underscores for italic, a link in angle brackets.
 
 /// How many messages one reply may take. Past that the rest stays in the
 /// window rather than flooding the chat: ten Telegram parts are some 40,000
@@ -20,6 +24,19 @@ const MAX_PARTS: usize = 10;
 /// Room a part keeps beside its longest line for a code block's fences: an
 /// opening one with a language of up to 32 characters, and a closing one.
 const FENCE_ROOM: usize = 64;
+
+/// The app a part is written out for.
+#[derive(Clone, Copy, PartialEq)]
+enum Target {
+    Telegram,
+    Slack,
+}
+
+/// A style as Telegram's tag for it and Slack's mark.
+type Style = (&'static str, char);
+const BOLD: Style = ("b", '*');
+const ITALIC: Style = ("i", '_');
+const STRIKE: Style = ("s", '~');
 
 /// A code block's opening fence: its run of backticks and its language.
 #[derive(Clone, Debug, PartialEq)]
@@ -235,6 +252,16 @@ fn emit(parts: &mut Vec<String>, text: &str) {
 
 /// One part of a reply as the HTML Telegram formats.
 pub(super) fn telegram_html(markdown: &str) -> String {
+    render(markdown, Target::Telegram)
+}
+
+/// One part of a reply in Slack's mrkdwn.
+pub(super) fn slack_mrkdwn(markdown: &str) -> String {
+    render(markdown, Target::Slack)
+}
+
+/// One part of a reply in the marks app `to` formats.
+fn render(markdown: &str, to: Target) -> String {
     let mut out = Vec::new();
     let mut code: Option<(Fence, Vec<String>)> = None;
     let mut quote = Vec::new();
@@ -244,72 +271,101 @@ pub(super) fn telegram_html(markdown: &str) -> String {
                 body.push(escape(line));
                 continue;
             }
-            out.push(pre(fence, body));
+            out.push(pre(fence, body, to));
             code = None;
             continue;
         }
         let quoted = line.trim_start().strip_prefix('>');
         if quoted.is_none() && !quote.is_empty() {
-            out.push(format!("<blockquote>{}</blockquote>", quote.join("\n")));
+            out.push(blockquote(&quote, to));
             quote.clear();
         }
         if let Some(rest) = quoted {
-            quote.push(inline(rest.strip_prefix(' ').unwrap_or(rest), false));
+            quote.push(inline(rest.strip_prefix(' ').unwrap_or(rest), false, to));
         } else if let Some(fence) = opens(line) {
             code = Some((fence, Vec::new()));
         } else {
-            out.push(block(line));
+            out.push(block(line, to));
         }
     }
     if let Some((fence, body)) = &code {
-        out.push(pre(fence, body));
+        out.push(pre(fence, body, to));
     }
     if !quote.is_empty() {
-        out.push(format!("<blockquote>{}</blockquote>", quote.join("\n")));
+        out.push(blockquote(&quote, to));
     }
     out.join("\n")
 }
 
-fn pre(fence: &Fence, body: &[String]) -> String {
+fn pre(fence: &Fence, body: &[String], to: Target) -> String {
     let code = body.join("\n");
-    match fence.lang.is_empty() {
-        true => format!("<pre>{code}</pre>"),
-        false => format!(
+    match (to, fence.lang.is_empty()) {
+        // Slack would show the language as the block's first line.
+        (Target::Slack, _) => format!("```\n{code}\n```"),
+        (Target::Telegram, true) => format!("<pre>{code}</pre>"),
+        (Target::Telegram, false) => format!(
             "<pre><code class=\"language-{}\">{code}</code></pre>",
             fence.lang
         ),
     }
 }
 
+fn blockquote(lines: &[String], to: Target) -> String {
+    match to {
+        Target::Telegram => format!("<blockquote>{}</blockquote>", lines.join("\n")),
+        Target::Slack => lines
+            .iter()
+            .map(|line| format!("> {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+fn styled(inner: &str, (tag, mark): Style, to: Target) -> String {
+    match to {
+        Target::Telegram => format!("<{tag}>{inner}</{tag}>"),
+        Target::Slack => format!("{mark}{inner}{mark}"),
+    }
+}
+
 /// One line outside code: a heading goes bold, a bullet gets a dot.
-fn block(line: &str) -> String {
+fn block(line: &str, to: Target) -> String {
     let trimmed = line.trim_start();
     let indent = &line[..line.len() - trimmed.len()];
     let hashes = trimmed.len() - trimmed.trim_start_matches('#').len();
     if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
-        let heading = inline(trimmed[hashes..].trim(), true);
+        let text = trimmed[hashes..].trim();
+        // A heading written in bold is made bold once: Slack would show the
+        // second pair of marks as they are.
+        let text = text
+            .strip_prefix("**")
+            .and_then(|text| text.strip_suffix("**"))
+            .filter(|inner| !inner.contains("**"))
+            .unwrap_or(text);
+        let heading = inline(text, true, to);
         return match heading.is_empty() {
             true => heading,
-            false => format!("<b>{heading}</b>"),
+            false => styled(&heading, BOLD, to),
         };
     }
     for bullet in ["- ", "* ", "+ "] {
         if let Some(item) = trimmed.strip_prefix(bullet) {
-            return format!("{indent}\u{2022} {}", inline(item, false));
+            return format!("{indent}\u{2022} {}", inline(item, false, to));
         }
     }
-    inline(line, false)
+    inline(line, false, to)
 }
 
-/// A run of text with its inline marks as tags and everything else escaped.
-/// `nested` is true inside bold, italic or a link, which Telegram lets hold
-/// no code, so a code span there keeps only its text.
-fn inline(text: &str, nested: bool) -> String {
+/// A run of text with its inline marks as the app's and everything else
+/// escaped. `nested` is true inside bold, italic or a link, which Telegram
+/// lets hold no code, so a code span there keeps only its text, in Slack
+/// too so that both show a reply alike.
+fn inline(text: &str, nested: bool, to: Target) -> String {
     let mut out = String::new();
     let mut at = 0;
     while let Some(c) = text[at..].chars().next() {
         let before = text[..at].chars().next_back();
-        if let Some((html, used)) = span(&text[at..], before, nested) {
+        if let Some((html, used)) = span(&text[at..], before, nested, to) {
             out.push_str(&html);
             at += used;
             continue;
@@ -325,10 +381,10 @@ fn inline(text: &str, nested: bool) -> String {
     out
 }
 
-/// The mark `rest` opens with as HTML, and how many bytes it took, or
+/// The mark `rest` opens with as the app's, and how many bytes it took, or
 /// `None` when `rest` starts with plain text. `before` is the character
 /// ahead of it: an underscore inside a word, as in snake_case, is no mark.
-fn span(rest: &str, before: Option<char>, nested: bool) -> Option<(String, usize)> {
+fn span(rest: &str, before: Option<char>, nested: bool, to: Target) -> Option<(String, usize)> {
     if rest.starts_with('`') {
         let ticks = rest.len() - rest.trim_start_matches('`').len();
         let run = &rest[..ticks];
@@ -339,28 +395,36 @@ fn span(rest: &str, before: Option<char>, nested: bool) -> Option<(String, usize
             return Some((run.to_owned(), ticks));
         };
         let code = escape(rest[ticks..ticks + end].trim());
-        let html = match nested {
-            true => code,
-            false => format!("<code>{code}</code>"),
+        let html = match (nested, to) {
+            (true, _) => code,
+            (false, Target::Telegram) => format!("<code>{code}</code>"),
+            (false, Target::Slack) => format!("`{code}`"),
         };
         return Some((html, end + 2 * ticks));
     }
-    for (mark, tag) in [("**", "b"), ("~~", "s")] {
-        if let Some((inner, used)) = delimited(rest, mark) {
-            return Some((format!("<{tag}>{}</{tag}>", inline(inner, true)), used));
+    // Slack reads a mark only at the edge of a word, so one inside a word,
+    // as in 2*3*4, stays as written rather than becoming one it shows bare.
+    let outside_word = |&(_, used): &(&str, usize)| {
+        to == Target::Telegram
+            || !(before.is_some_and(char::is_alphanumeric)
+                || rest[used..].starts_with(char::is_alphanumeric))
+    };
+    for (mark, style) in [("**", BOLD), ("~~", STRIKE)] {
+        if let Some((inner, used)) = delimited(rest, mark).filter(outside_word) {
+            return Some((styled(&inline(inner, true, to), style, to), used));
         }
     }
     let starred = rest.starts_with('*');
     let underscored = rest.starts_with('_') && !before.is_some_and(char::is_alphanumeric);
     if starred || underscored {
-        let (inner, used) = delimited(rest, &rest[..1])?;
+        let (inner, used) = delimited(rest, &rest[..1]).filter(outside_word)?;
         if underscored && rest[used..].starts_with(char::is_alphanumeric) {
             return None;
         }
-        return Some((format!("<i>{}</i>", inline(inner, true)), used));
+        return Some((styled(&inline(inner, true, to), ITALIC, to), used));
     }
     if rest.starts_with('[') {
-        return link(rest);
+        return link(rest, to);
     }
     None
 }
@@ -390,7 +454,7 @@ fn delimited<'a>(rest: &'a str, mark: &str) -> Option<(&'a str, usize)> {
 /// `[text](address)` as a link, for web addresses only: a `tg://` one can
 /// ask Telegram to join a group or switch proxies, and nobody asked the
 /// model for that.
-fn link(rest: &str) -> Option<(String, usize)> {
+fn link(rest: &str, to: Target) -> Option<(String, usize)> {
     let close = rest.find("](")?;
     let text = &rest[1..close];
     let after = &rest[close + 2..];
@@ -406,11 +470,15 @@ fn link(rest: &str) -> Option<(String, usize)> {
     {
         return None;
     }
-    let html = format!(
-        "<a href=\"{}\">{}</a>",
-        escape(address).replace('"', "&quot;"),
-        inline(text, true)
-    );
+    let text = inline(text, true, to);
+    let html = match to {
+        Target::Telegram => format!(
+            "<a href=\"{}\">{text}</a>",
+            escape(address).replace('"', "&quot;")
+        ),
+        // A bar in the address would end it there and start the label.
+        Target::Slack => format!("<{}|{text}>", escape(address).replace('|', "%7C")),
+    };
     Some((html, close + 2 + end + 1))
 }
 
@@ -422,7 +490,7 @@ fn escape(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PARTS, fenced, split, telegram_html, units};
+    use super::{MAX_PARTS, fenced, slack_mrkdwn, split, telegram_html, units};
 
     /// Each line opening or closing a block, so a part with an even number
     /// has every block it opens closed.
@@ -594,6 +662,69 @@ mod tests {
             }
             assert!(open.is_empty(), "{html}");
         }
+    }
+
+    #[test]
+    fn slack_gets_the_common_marks_as_its_own_and_the_rest_escaped() {
+        assert_eq!(
+            slack_mrkdwn("**Done** and *checked*: `a<b>` & [the page](https://x.y/?a=1&b=2)"),
+            "*Done* and _checked_: `a&lt;b&gt;` &amp; <https://x.y/?a=1&amp;b=2|the page>"
+        );
+        assert_eq!(
+            slack_mrkdwn("~~gone~~ <br> _kept_"),
+            "~gone~ &lt;br&gt; _kept_"
+        );
+    }
+
+    #[test]
+    fn a_link_label_with_ampersand_is_escaped_inside_the_link() {
+        assert_eq!(
+            slack_mrkdwn("see [Q&A <here>](https://x.y/a|b)."),
+            "see <https://x.y/a%7Cb|Q&amp;A &lt;here&gt;>."
+        );
+    }
+
+    #[test]
+    fn a_fenced_block_drops_its_language_tag() {
+        assert_eq!(
+            slack_mrkdwn("```rust\nlet a = b < c && *d*;\n```\nafter"),
+            "```\nlet a = b &lt; c &amp;&amp; *d*;\n```\nafter"
+        );
+        // A block a cut left open is closed at the end of the part.
+        assert_eq!(slack_mrkdwn("```sh\nls"), "```\nls\n```");
+    }
+
+    #[test]
+    fn snake_case_and_two_times_three_stay_literal() {
+        for text in [
+            "call my_var_name now",
+            "2 * 3 * 4",
+            "2*3*4",
+            "ls *.rs *.toml",
+            "a ** b",
+            "x**2** and ~~y~~z",
+            "an ` alone",
+            "[a](javascript:alert(1))",
+            "[not a link] (https://x.y)",
+        ] {
+            assert_eq!(slack_mrkdwn(text), text, "{text}");
+        }
+    }
+
+    #[test]
+    fn slack_headings_bullets_and_quotes_read_as_they_would_on_screen() {
+        assert_eq!(
+            slack_mrkdwn("# Result\n- one\n  * two\n> quoted `x` & y\n> more\nend"),
+            "*Result*\n\u{2022} one\n  \u{2022} two\n> quoted `x` &amp; y\n> more\nend"
+        );
+        // Bold once, not with a second pair Slack would show as it is.
+        assert_eq!(slack_mrkdwn("## **Summary**"), "*Summary*");
+    }
+
+    #[test]
+    fn code_inside_bold_or_a_link_keeps_only_its_text_in_slack_too() {
+        assert_eq!(slack_mrkdwn("**use `x`**"), "*use x*");
+        assert_eq!(slack_mrkdwn("[`run`](https://x.y)"), "<https://x.y|run>");
     }
 
     #[test]
