@@ -1219,6 +1219,11 @@ fn body_hashed(
         if connection.wrap_up {
             body["tool_choice"] = "none".into();
         }
+        // Only beside the tools: OpenAI turns the field down in a request
+        // that offers none.
+        if !crate::store::parallel_tool_calls() {
+            body["parallel_tool_calls"] = false.into();
+        }
     }
     // Measured on a model that can be told how hard to think: sixty-four
     // reasoning tokens at low against seven hundred at high. A level saved on
@@ -1397,6 +1402,9 @@ enum Quirk {
     /// The wrap-up's `tool_choice`; without it a model may still call a
     /// tool, which is then not run.
     ToolChoice,
+    /// The ask for one call a reply; without it a model may make several,
+    /// which still run one at a time.
+    ParallelCalls,
     /// Everything `carry_back` adds, which a strict server may not take.
     Replay,
 }
@@ -1404,13 +1412,14 @@ enum Quirk {
 /// Each quirk by what a refusal says when its field is the one at fault: the
 /// field's name, or for the cap the name it asks for instead, since a server
 /// out of room names both caps and a new name would not give it more.
-const QUIRKS: [(Quirk, &str); 9] = [
+const QUIRKS: [(Quirk, &str); 10] = [
     (Quirk::CompletionTokens, "'max_completion_tokens' instead"),
     (Quirk::Effort, "reasoning_effort"),
     (Quirk::StreamOptions, "stream_options"),
     (Quirk::WebSearch, "web_search"),
     (Quirk::CacheControl, "cache_control"),
     (Quirk::ToolChoice, "tool_choice"),
+    (Quirk::ParallelCalls, "parallel_tool_calls"),
     (Quirk::Replay, "reasoning_details"),
     (Quirk::Replay, "extra_content"),
     (Quirk::Replay, "reasoning_content"),
@@ -1499,6 +1508,7 @@ fn apply_quirk(body: &mut Value, quirk: Quirk) -> bool {
         // Markers ride on message parts, not at the top.
         Quirk::CacheControl => remove_everywhere(body, "cache_control"),
         Quirk::ToolChoice => fields.remove("tool_choice").is_some(),
+        Quirk::ParallelCalls => fields.remove("parallel_tool_calls").is_some(),
         Quirk::Replay => fields.get_mut("messages").is_some_and(|messages| {
             ["reasoning_details", "extra_content", "reasoning_content"]
                 .iter()
@@ -5398,6 +5408,7 @@ mod tests {
             "stream_options": {"include_usage": true},
             "reasoning_effort": "high",
             "tool_choice": "none",
+            "parallel_tool_calls": false,
             "tools": [{"type": "function"}, {"type": "web_search"}]
         });
         let quirks: HashSet<Quirk> = QUIRKS.iter().map(|(quirk, _)| *quirk).collect();
@@ -5513,6 +5524,44 @@ mod tests {
                 .get("tool_choice")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn parallel_tool_calls_off_is_sent_in_the_request() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("one-call");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let c = Connection {
+            model: "refuses-parallel-calls".into(),
+            tools: true,
+            ..connection()
+        };
+        let together = body(&c, &hello(), None, None);
+        let settings = json!({"endpoint": "", "model": "m", "parallel_tool_calls": false});
+        std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+        let sent = body(&c, &hello(), None, None);
+        let toolless = Connection {
+            tools: false,
+            ..c.clone()
+        };
+        let toolless = body(&toolless, &hello(), None, None);
+        // Taken out at once: turns started by tests beside this one read it.
+        std::fs::remove_file(dir.join("settings.json")).unwrap();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(together.get("parallel_tool_calls").is_none());
+        assert_eq!(sent["parallel_tool_calls"], false);
+        assert!(toolless.get("parallel_tool_calls").is_none());
+        // A server that turns the field down gets the request without it.
+        let refusal = r#"{"error":{"message":"Unsupported parameter: 'parallel_tool_calls' is not supported with this model."}}"#;
+        assert!(learn(&c, &sent, refusal));
+        let mut again = sent.clone();
+        fit_quirks(&c, &mut again);
+        assert!(again.get("parallel_tool_calls").is_none());
+        assert_eq!(again["tools"], sent["tools"]);
     }
 
     #[test]

@@ -183,6 +183,9 @@ pub struct Turn {
     unattended: bool,
     /// Why an unattended turn stopped going round in circles.
     looped: Option<String>,
+    /// The settings turn parallel tool calls off, so no batch holds more
+    /// than one.
+    one_at_a_time: bool,
 }
 
 impl Turn {
@@ -207,6 +210,7 @@ impl Turn {
             repeats: HashMap::new(),
             changes: HashSet::new(),
             looped: None,
+            one_at_a_time: !crate::store::parallel_tool_calls(),
         }
     }
 
@@ -479,9 +483,13 @@ impl Turn {
     }
 
     /// The calls at the front of the queue that may run at once, at most
-    /// `max`, up to the first one `held` says the gate does not run as it
-    /// stands; left queued until `finish_id` records each.
+    /// `max` or one when the settings turn parallel calls off, up to the
+    /// first one `held` says the gate does not run as it stands; left queued
+    /// until `finish_id` records each.
     pub fn next_batch(&self, held: impl Fn(&ToolCall) -> bool, max: usize) -> Vec<ToolCall> {
+        // The request asked for one call a reply, but a model may make
+        // several anyway; each still runs only once the one before is back.
+        let max = if self.one_at_a_time { 1 } else { max };
         self.queue
             .iter()
             .take_while(|call| tools::concurrent(&call.name) && !held(call))
@@ -1180,6 +1188,30 @@ mod tests {
         // A reply of a dozen reads runs eight at a time.
         turn.begin(vec![call("read_file"); 12]);
         assert_eq!(turn.next_batch(never, MAX_BATCH).len(), 8);
+    }
+
+    #[test]
+    fn with_parallel_calls_switched_off_reads_run_one_at_a_time_in_order() {
+        // Set here rather than saved, since turns started by tests beside
+        // this one read the same settings file.
+        let mut turn = Turn {
+            one_at_a_time: true,
+            ..turn()
+        };
+        let never = |_: &ToolCall| false;
+        let reads = ["read_file", "list_dir", "search"].map(call);
+        turn.begin(reads.to_vec());
+        for read in &reads {
+            assert_eq!(
+                turn.next_batch(never, MAX_BATCH),
+                std::slice::from_ref(read)
+            );
+            turn.finish_id(&read.id, Ok(read.name.clone()));
+        }
+        assert!(turn.next_batch(never, MAX_BATCH).is_empty());
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Ask);
+        let order: Vec<String> = turn.take_results().into_iter().map(|r| r.content).collect();
+        assert_eq!(order, ["read_file", "list_dir", "search"]);
     }
 
     #[test]
