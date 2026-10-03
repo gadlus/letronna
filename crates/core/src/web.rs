@@ -462,7 +462,7 @@ fn follow(
 }
 
 /// Whether `url` names this machine or the local network by its host.
-fn local(url: &reqwest::Url) -> bool {
+pub(crate) fn local(url: &reqwest::Url) -> bool {
     let host = url.host_str().unwrap_or_default();
     let ip = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>();
     match ip.map(|ip| ip.to_canonical()) {

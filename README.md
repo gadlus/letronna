@@ -81,6 +81,8 @@ First launch uses the Letronna gateway: sign in (`/login` in the terminal, or **
 
 The Letronna gateway's address follows `LETRONNA_API`, for working against a local API.
 
+A base URL over plain HTTP has to be on this computer. `LETRONNA_ALLOW_HTTP=1` lets it be anywhere on the local network too, such as `http://host.docker.internal:4000/v1` or a proxy named on a container's network, with the key sent unencrypted across that network.
+
 Model lists come from `GET {base}/models`. Streaming uses SSE chat completions.
 
 ## Web search
