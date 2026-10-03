@@ -428,6 +428,11 @@ pub struct Settings {
     /// it is about to finish with no command run since.
     #[serde(default = "yes")]
     pub verify_edits: bool,
+    /// Lets the model make several tool calls in one reply and run them
+    /// together; false asks every request for one and runs them one at a
+    /// time, as some benchmarks' graders require.
+    #[serde(default = "yes")]
+    pub parallel_tool_calls: bool,
     /// Models to carry a task on with, in order, when the chosen one is
     /// overloaded, out of credit or gone: `model` on the session's gateway,
     /// or `Gateway:model`; see `fallback`.
@@ -500,6 +505,7 @@ impl Default for Settings {
             notifications: true,
             voice: false,
             verify_edits: true,
+            parallel_tool_calls: true,
             session_filter: String::new(),
             group_by_project: false,
             quick_entry_hotkey: String::new(),
@@ -3106,6 +3112,12 @@ pub(crate) fn computer_use() -> bool {
     settings().0.computer_use
 }
 
+/// Whether the settings file lets one reply's tool calls run together, read
+/// again each time as `disabled_tools` is.
+pub(crate) fn parallel_tool_calls() -> bool {
+    settings().0.parallel_tool_calls
+}
+
 /// The settings file. A file that will not read at all is kept aside by
 /// `state::read` as before.
 fn read_settings_file() -> Settings {
@@ -5343,6 +5355,18 @@ pub(crate) mod tests {
         assert!(read("").verifies_edits());
         assert!(!read(r#", "verify_edits": false"#).verifies_edits());
         assert!(!read(r#", "disabled_tools": ["run_command"]"#).verifies_edits());
+    }
+
+    #[test]
+    fn tool_calls_run_together_unless_the_file_says_otherwise() {
+        let read = |extra: &str| {
+            let text = format!(r#"{{"endpoint": "", "model": "m"{extra}}}"#);
+            super::read_settings(text.as_bytes()).unwrap()
+        };
+        // A file from before the setting runs them together, as a first run does.
+        assert!(read("").parallel_tool_calls);
+        assert!(super::Settings::default().parallel_tool_calls);
+        assert!(!read(r#", "parallel_tool_calls": false"#).parallel_tool_calls);
     }
 
     #[test]
