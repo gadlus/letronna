@@ -402,7 +402,7 @@ impl Tool for Agent {
             "type": {"type": "string", "description": "general (default), explore (read-only, cheaper), plan, or review. Other types this project defines are named in your instructions."},
             "name": {"type": "string", "description": "A handle for the agents tool. Defaults to the type."},
             "model": {"type": "string", "description": "A model id on this gateway. Default: the type's, then Settings, then yours."},
-            "background": {"type": "boolean", "description": "Default true in the window and terminal: return now and get a notice when it finishes. false waits for the report."},
+            "background": {"type": "boolean", "description": "Default true in the window and terminal, unless the type says otherwise: return now and get a notice when it finishes. false waits for the report."},
             "fork": {"type": "boolean", "description": "Start it from a copy of this conversation rather than from nothing: it has seen everything so far, so the prompt only says what to do. It keeps your model and tools, whatever type and model say."},
             "keep": {"type": "boolean", "description": "Keep it for more work after it reports, in the background only. Default false."},
             "isolation": {"type": "string", "enum": ["worktree"], "description": "worktree: it works in a new git worktree of this repository, on a branch of its own made from HEAD, so your uncommitted edits are not in it. Its file tools stay inside it; its commands are not confined. The worktree is removed if it changed nothing, else its path and branch are in the report."}
@@ -484,11 +484,16 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
     };
     let wanted = text(args, "name").unwrap_or(if forking { "fork" } else { kind });
     check_name(wanted)?;
-    let isolated = worktree::asked(&args["isolation"])?;
+    let def = agent_defs::find(kind, parent.workspace.as_deref())?;
+    // The type's, when the call does not say.
+    let isolated = match (&args["isolation"], &def.isolation) {
+        (Value::Null, Some(its)) => worktree::asked(&json!(its))
+            .map_err(|error| format!("Helper type \"{}\" cannot start: its {error}", def.name))?,
+        (asked, _) => worktree::asked(asked)?,
+    };
     if isolated && parent.workspace.is_none() {
         return Err("A worktree needs a project folder, and none is attached.".into());
     }
-    let def = agent_defs::find(kind, parent.workspace.as_deref())?;
     // Read before a place is taken, so a fork with nothing to start from takes none.
     let mut history = if forking {
         Some(parent_conversation(caller)?)
@@ -496,7 +501,13 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
         None
     };
     let owner = caller.agent.unwrap_or(caller.root);
-    let background = in_background(args, inbox::listened(), caller.depth, parent);
+    let background = in_background(
+        args,
+        def.background,
+        inbox::listened(),
+        caller.depth,
+        parent,
+    );
     let keep = args["keep"].as_bool() == Some(true);
     if keep {
         may_keep(background, caller.root)?;
@@ -507,8 +518,13 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
     let slot = reserve(caller.root, waiting, wanted, limits.at_once, cancel.clone())?;
     let (mut connection, first, allow) = match history.as_mut() {
         Some(from) => (
-            // Narrowed as any helper's is, but on its parent's model.
-            child(parent, &def, Some(&parent.model), limits, slot.id),
+            // Narrowed as any helper's is, but on its parent's model and
+            // effort, since a change of either can lose the cache of the
+            // prefix the two share.
+            Connection {
+                effort: parent.effort.clone(),
+                ..child(parent, &def, Some(&parent.model), limits, slot.id)
+            },
             forked(
                 std::mem::take(&mut from.messages),
                 Some(args),
@@ -668,7 +684,7 @@ fn may_keep(background: bool, root: u64) -> Result<(), String> {
     if !background {
         return Err(
             "`keep` needs a helper in the background: one the session's own agent starts in \
-             the window or the terminal, without background false."
+             the window or the terminal, without background false from the call or its type."
                 .into(),
         );
     }
@@ -695,11 +711,18 @@ fn allow(def: &AgentDef, tools: Vec<String>) -> Allow {
     }
 }
 
-/// Whether a helper runs in the background: unless the call says not to, for
-/// a session's own agent where a front end listens for notices, outside a
-/// chat app.
-fn in_background(args: &Value, listened: bool, depth: u8, parent: &Connection) -> bool {
-    listened && depth == 0 && parent.remote.is_none() && args["background"].as_bool() != Some(false)
+/// Whether a helper runs in the background: unless the call says not to, or
+/// says nothing and its type does, for a session's own agent where a front end
+/// listens for notices, outside a chat app.
+fn in_background(
+    args: &Value,
+    type_says: Option<bool>,
+    listened: bool,
+    depth: u8,
+    parent: &Connection,
+) -> bool {
+    let asked = args["background"].as_bool().or(type_says);
+    listened && depth == 0 && parent.remote.is_none() && asked != Some(false)
 }
 
 /// What stops a helper started or picked back up by a call on `ctx`: that
@@ -1308,7 +1331,7 @@ pub fn steer(id: AgentId, message: &str) -> bool {
 
 /// The connection a helper works on: its parent's, under the helper's own id,
 /// with the model the call, its type, Settings or its parent names, in that
-/// order.
+/// order, and the effort its type or else its parent names.
 fn child(
     parent: &Connection,
     def: &AgentDef,
@@ -1325,6 +1348,7 @@ fn child(
     let mode = helper_mode(parent, def.plan);
     Connection {
         model,
+        effort: def.effort.clone().unwrap_or_else(|| parent.effort.clone()),
         mode,
         plan: helper_plan(parent, def.plan, mode),
         conversation: id,
@@ -2146,7 +2170,8 @@ fn resume(
     };
     let (mut what, def, transcript) = reread(caller.root, sender, name, n, sidecar, &notices)?;
     let owner = caller.agent.unwrap_or(caller.root);
-    let background = in_background(args, inbox::listened(), caller.depth, sender);
+    // Its type says how it starts, not how a message picks it up.
+    let background = in_background(args, None, inbox::listened(), caller.depth, sender);
     let waiting = if background { 0 } else { owner };
     let cancel = cancel_for(background, ctx);
     let run = Run::new(owner, background);
@@ -2256,6 +2281,9 @@ fn rerun(
     let mode = helper_mode(sender, what.plan);
     let connection = Connection {
         model: what.model,
+        // As when it started: its type's, but for a fork, which keeps to its
+        // parent's.
+        effort: (def.effort.clone().filter(|_| !fork)).unwrap_or_else(|| sender.effort.clone()),
         mode,
         plan: helper_plan(sender, what.plan, mode),
         workspace: (what.worktree.as_ref())
@@ -3416,15 +3444,115 @@ mod tests {
         let (plain, asked) = (json!({}), json!({"background": true}));
         let declined = json!({"background": false});
         // Where a front end listens, a session's own helper goes unless told not to.
-        assert!(in_background(&plain, true, 0, &here));
-        assert!(in_background(&asked, true, 0, &here));
-        assert!(!in_background(&declined, true, 0, &here));
+        assert!(in_background(&plain, None, true, 0, &here));
+        assert!(in_background(&asked, None, true, 0, &here));
+        assert!(!in_background(&declined, None, true, 0, &here));
         // Nowhere else, even when asked, since nothing there would hear its notice.
         for args in [&plain, &asked] {
-            assert!(!in_background(args, false, 0, &here), "nobody listens");
-            assert!(!in_background(args, true, 1, &here), "a helper's helper");
-            assert!(!in_background(args, true, 0, &chat_app), "a chat app");
+            assert!(
+                !in_background(args, None, false, 0, &here),
+                "nobody listens"
+            );
+            assert!(
+                !in_background(args, None, true, 1, &here),
+                "a helper's helper"
+            );
+            assert!(!in_background(args, None, true, 0, &chat_app), "a chat app");
         }
+        // Its type says when the call does not, and the call wins when it does.
+        assert!(!in_background(&plain, Some(false), true, 0, &here));
+        assert!(in_background(&asked, Some(false), true, 0, &here));
+        assert!(!in_background(&declined, Some(true), true, 0, &here));
+        assert!(!in_background(&plain, Some(true), false, 0, &here));
+    }
+
+    #[test]
+    fn a_helper_type_marked_foreground_is_waited_for_unless_the_call_says() {
+        let session = Session::new("type-waits");
+        inbox::listen();
+        let types = session.work.join(".letronna").join("agents");
+        std::fs::create_dir_all(&types).unwrap();
+        let waiter = "---\nname: waiter\nbackground: false\n---\nReport back.\n";
+        std::fs::write(types.join("waiter.md"), waiter).unwrap();
+        let (endpoint, provider) = Stub::start(vec![reply("Here it is.", None)]);
+        let args = json!({"description": "Wait for it", "type": "waiter", "prompt": "Report."});
+        let out = call(session.context(endpoint), args).unwrap();
+        provider.sent();
+
+        assert!(out.starts_with("waiter finished: 0 rounds, "), "{out}");
+        assert!(out.ends_with("\nHere it is."), "{out}");
+        // Nor can it be kept, which needs the background, unless the call says.
+        let kept = json!({"description": "d", "type": "waiter", "prompt": "p", "keep": true});
+        let refused = call(session.context("http://127.0.0.1:9/v1".into()), kept).unwrap_err();
+        assert!(refused.contains("from the call or its type"), "{refused}");
+    }
+
+    #[test]
+    fn a_helper_types_effort_reaches_its_requests() {
+        let session = Session::new("type-effort");
+        let types = session.work.join(".letronna").join("agents");
+        std::fs::create_dir_all(&types).unwrap();
+        // The project's own general type, which a fork starts as too.
+        let deep = "---\nname: general\neffort: high\n---\nThink it through.\n";
+        std::fs::write(types.join("general.md"), deep).unwrap();
+        let (endpoint, provider) = Stub::start(vec![
+            reply("Thought it through.", None),
+            reply("And again.", None),
+            reply("Forked and done.", None),
+        ]);
+        let mut parent = (session.context(endpoint).caller.connection.as_deref())
+            .unwrap()
+            .clone();
+        parent.effort = "low".into();
+        let args = json!({"description": "Think", "name": "thinker", "background": false,
+            "prompt": "Think."});
+        call(ToolContext::of(&parent), args).unwrap();
+        let message = json!({"action": "send", "to": "thinker", "background": false,
+            "message": "Again."});
+        talk(ToolContext::of(&parent), message).unwrap();
+        let fork = fork_args();
+        saved_session(&forking(&fork));
+        call(ToolContext::of(&parent), fork).unwrap();
+        let sent = provider.sent();
+
+        assert_eq!(sent[0]["reasoning_effort"], "high", "{}", sent[0]);
+        // Picked back up, it still thinks at its type's level.
+        assert_eq!(sent[1]["reasoning_effort"], "high", "{}", sent[1]);
+        // A fork keeps its parent's, which the prefix they share was sent with.
+        assert_eq!(sent[2]["reasoning_effort"], "low", "{}", sent[2]);
+    }
+
+    #[test]
+    fn a_helper_types_worktree_isolates_it_unless_the_type_names_no_such_thing() {
+        let session = Session::new("type-tree");
+        crate::worktree::tests::repo(&session.work);
+        let types = session.work.join(".letronna").join("agents");
+        std::fs::create_dir_all(&types).unwrap();
+        let apart = "---\nname: apart\nisolation: worktree\n---\nWork apart.\n";
+        std::fs::write(types.join("apart.md"), apart).unwrap();
+        let typo = "---\nname: typo\nisolation: copy\n---\nWork apart.\n";
+        std::fs::write(types.join("typo.md"), typo).unwrap();
+        let (endpoint, provider) = Stub::start(vec![reply("Looked.", None)]);
+        let args = json!({"description": "Look", "type": "apart", "background": false,
+            "prompt": "Look."});
+        let out = call(session.context(endpoint), args).unwrap();
+        provider.sent();
+
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines[1..],
+            [
+                "It changed nothing in its worktree, which was removed.",
+                "Looked."
+            ]
+        );
+        let refused = json!({"description": "d", "type": "typo", "prompt": "p"});
+        let said = call(session.context("http://127.0.0.1:9/v1".into()), refused).unwrap_err();
+        assert_eq!(
+            said,
+            "Helper type \"typo\" cannot start: its isolation \"copy\" is not one there is: the \
+             only one is \"worktree\"."
+        );
     }
 
     #[test]
