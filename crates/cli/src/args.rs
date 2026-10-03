@@ -24,6 +24,8 @@ Options
   -p, --print <prompt>     ask one question, print the answer, exit
   -c, --continue           resume this folder's most recent session
   -r, --resume [id]        choose a session, or open the one with this id
+      --worktree           work in a git worktree of its own, on a branch
+                           made from HEAD, leaving your checkout alone
       --mode <mode>        how much runs without asking: default, accept-edits,
                            plan, auto, dont-ask or bypass
       --yes                --mode bypass: run tools without asking, bar risky ones
@@ -137,6 +139,8 @@ pub struct Args {
     /// The answer's JSON Schema from `--json-schema`: a file's path, or the
     /// schema itself.
     pub schema: Option<String>,
+    /// `--worktree`: the new session works in a git worktree of its own.
+    pub worktree: bool,
 }
 
 pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -169,6 +173,7 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         acp: false,
         dump_config: false,
         schema: None,
+        worktree: false,
     };
     // Only as the first word, so `-p mcp` still asks about it.
     if raw.next_if(|first| first == "mcp").is_some() {
@@ -201,6 +206,7 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
                 }
             }
             "-c" | "--continue" => args.start = Start::Last,
+            "--worktree" => args.worktree = true,
             // `--resume` on its own offers the recent sessions; with an id it
             // opens that one, which is what the id in `/where` is for. Any
             // other word is refused rather than dropped, which left `-p` to
@@ -290,6 +296,13 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         }
     }
     args.mode = picked(mode, yes, plan);
+    // A session carried on keeps the folder it had, worktree or not.
+    if args.worktree && args.start != Start::Fresh {
+        return Err(
+            "--worktree starts a new session, so it does not go with --continue or --resume."
+                .into(),
+        );
+    }
     let streamed = args.input == Input::StreamJson;
     if streamed && !print {
         return Err("--input-format stream-json only works with -p.".into());
@@ -455,6 +468,16 @@ mod tests {
         assert_eq!(args(&["-p", "mcp"]).prompt.as_deref(), Some("mcp"));
         assert!(args(&["acp"]).acp && args(&["acp"]).prompt.is_none());
         assert_eq!(args(&["-p", "acp"]).prompt.as_deref(), Some("acp"));
+        assert!(args(&["--worktree"]).worktree && !bare.worktree);
+        assert!(args(&["--worktree", "-p", "fix it"]).worktree);
+    }
+
+    #[test]
+    fn a_worktree_is_only_for_a_new_session() {
+        let said = "--worktree starts a new session, so it does not go with --continue or \
+                    --resume.";
+        assert_eq!(refused(&["--worktree", "-c"]), said);
+        assert_eq!(refused(&["--resume", "4", "--worktree"]), said);
     }
 
     #[test]

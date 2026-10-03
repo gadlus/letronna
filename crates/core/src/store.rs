@@ -45,6 +45,10 @@ pub struct Conversation {
     /// Project folder attached to this session, if any.
     #[serde(default)]
     pub workspace: Option<PathBuf>,
+    /// The git worktree made for the session from the folder it was given,
+    /// which `workspace` is then in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<crate::worktree::Worktree>,
     /// The model's own checklist for the work in progress.
     #[serde(default)]
     pub todos: Vec<Todo>,
@@ -172,6 +176,8 @@ pub struct Meta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<crate::goal::Goal>,
     pub imported_from: Option<crate::import::Source>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<crate::worktree::Worktree>,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1068,6 +1074,7 @@ impl Conversation {
             effort: self.effort.clone(),
             goal: self.goal.clone(),
             imported_from: self.imported_from.clone(),
+            worktree: self.worktree.clone(),
         }
     }
 
@@ -1303,6 +1310,7 @@ impl Conversation {
                 self.effort = meta.effort;
                 self.goal = meta.goal;
                 self.imported_from = meta.imported_from;
+                self.worktree = meta.worktree;
             }
             Record::Message(message) => self.messages.push(message),
             Record::Rewind { to } => {
@@ -1761,6 +1769,8 @@ pub struct Summary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<crate::goal::Goal>,
     pub imported_from: Option<crate::import::Source>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<crate::worktree::Worktree>,
 }
 
 /// The sessions on disk, newest first, without loading what is in them.
@@ -1972,6 +1982,7 @@ fn tally(summary: &mut Summary, bytes: &[u8]) {
                 summary.effort = meta.effort;
                 summary.goal = meta.goal;
                 summary.imported_from = meta.imported_from;
+                summary.worktree = meta.worktree;
             }
             Ok(Record::Message(_)) => summary.messages += 1,
             Ok(Record::Rewind { to }) => summary.messages = summary.messages.min(to),
@@ -3018,6 +3029,7 @@ fn listed(s: Summary) -> Conversation {
         effort: s.effort,
         goal: s.goal,
         imported_from: s.imported_from,
+        worktree: s.worktree,
         counted: s.messages,
         ..Default::default()
     };
@@ -6909,6 +6921,33 @@ pub(crate) mod tests {
         conversation.goal = None;
         conversation.flush_to(&path).unwrap();
         assert_eq!(replay(&path).unwrap().goal, None);
+    }
+
+    #[test]
+    fn a_sessions_worktree_is_kept_in_its_file_and_its_listing() {
+        let dir = scratch("worktree");
+        let path = dir.join("1.jsonl");
+        let mut conversation = tagged(1, "tree");
+        conversation.flush_to(&path).unwrap();
+        // A session without one writes no more than before sessions had them.
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("worktree\"")
+        );
+        let tree = crate::worktree::Worktree {
+            path: "/work/.letronna/worktrees/session-1".into(),
+            branch: "letronna/session-1".into(),
+            base: "0123abcd".into(),
+            prefix: String::new(),
+            checkout: Some("/work".into()),
+        };
+        conversation.worktree = Some(tree.clone());
+        conversation.flush_to(&path).unwrap();
+
+        assert_eq!(replay(&path).unwrap().worktree.as_ref(), Some(&tree));
+        let (_, summary) = super::scan(&path, 1, None).unwrap();
+        assert_eq!(super::listed(summary).worktree, Some(tree));
     }
 
     /// A fixed-seed source of made-up sessions, so every run of the bench

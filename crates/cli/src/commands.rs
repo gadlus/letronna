@@ -2989,6 +2989,10 @@ fn pick_up(
     if runner.store.conversations[index].workspace.is_none() {
         runner.store.conversations[index].workspace = workspace.map(|p| p.to_path_buf());
     }
+    // Made again if it went, so the session works where it did.
+    if let Err(error) = letronna_core::worktree::resume(&mut runner.store.conversations[index]) {
+        render::line(&render::red(&error));
+    }
     runner.persist();
 
     // No title line here: the first thing replayed is the message the title

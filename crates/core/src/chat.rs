@@ -1102,7 +1102,12 @@ fn system_prompt(connection: &Connection, summary: Option<&str>) -> SystemPrompt
             " After changing code, verify it (build, test, or run) before reporting done.",
         );
         match &connection.workspace {
-            Some(w) => system.push_str(&format!(" The project folder is `{}`.", w.display())),
+            Some(w) => {
+                system.push_str(&format!(" The project folder is `{}`.", w.display()));
+                if let Some(note) = crate::worktree::note(w) {
+                    system.push_str(&format!(" {note}"));
+                }
+            }
             None => system.push_str(" No project folder is attached: you can only read under the home folder. Ask the user to attach one before writing or running anything."),
         }
     } else if !connection.tools {
@@ -4689,6 +4694,25 @@ mod tests {
         assert_eq!(shown.chars().count(), NAME_CHARS, "{shown}");
         assert!(shown.starts_with("export-xxx"), "{shown}");
         assert!(shown.ends_with("x…x-2026-09-30.csv"), "{shown}");
+    }
+
+    #[test]
+    fn a_session_in_a_worktree_is_told_what_is_not_in_it() {
+        let tree = std::path::PathBuf::from("/work/.letronna/worktrees/session-3");
+        let isolated = system_with_tools(Connection {
+            workspace: Some(tree.clone()),
+            ..connection()
+        });
+        let plain = system_with_tools(Connection {
+            workspace: Some("/work".into()),
+            ..connection()
+        });
+
+        let note = crate::worktree::note(&tree).unwrap();
+        let told = format!("The project folder is `{}`. {note}", tree.display());
+        assert!(isolated.contains(&told), "{isolated}");
+        assert!(note.contains("ignored files such as .env"), "{note}");
+        assert!(!plain.contains("git worktree"), "{plain}");
     }
 
     #[test]

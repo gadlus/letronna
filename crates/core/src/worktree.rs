@@ -1,5 +1,5 @@
-//! Git worktrees that helpers work in, so helpers writing side by side do not
-//! trip over each other or over the user's own edits.
+//! Git worktrees that helpers and sessions work in, so agents writing side by
+//! side do not trip over each other or over the user's own edits.
 //!
 //! Everything goes through the git CLI: it is the git the user has, it knows
 //! every repository layout, and a helper costs a handful of calls. A worktree
@@ -19,12 +19,24 @@
 //! it, since a wrong guess that way loses a helper's work. A record read back
 //! from disk is used only when it names a place `create` could have made, so
 //! a sidecar cannot point git anywhere else.
+//!
+//! A session's work goes back to the checkout it was made from as one patch,
+//! never as a merge: its commits, edits and new files since its base, staged
+//! in an index of its own so its real one is left alone. A file the user has
+//! not edited there is merged three ways, as `git apply --3way` does, which
+//! copes with commits the user made meanwhile; one they have edited is laid
+//! onto their copy, keeping their edits. Every file is tried first on a copy
+//! of the index or with `--check`, and nothing is written while any file
+//! conflicts; nothing is committed there either way.
 
+use crate::store::Conversation;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -55,8 +67,8 @@ const BUILT: [&str; 7] = [
     "__pycache__",
     ".next",
 ];
-/// How many ignored files a kept line names: enough to know them by, few
-/// enough for one line of a report.
+/// How many files or commits a kept line or an error names: enough to know
+/// them by, few enough for one line of a report.
 const NAMED: usize = 5;
 /// Config every git call here runs with, so no program the repository names
 /// runs: no hooks (nothing is ever below the null device, and `<` is no name
@@ -76,7 +88,8 @@ const GUARDS: [(&str, &str); 6] = [
 /// exclude file: git holds a lock for those, and a second one at once fails.
 static CHANGING: Mutex<()> = Mutex::new(());
 
-/// A worktree a helper works in, as its sidecar keeps it.
+/// A worktree a helper or a session works in, as its sidecar or its session
+/// file keeps it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Worktree {
     pub path: PathBuf,
@@ -87,14 +100,42 @@ pub struct Worktree {
     /// top, else ending in a slash.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prefix: String,
+    /// The folder it was made from, which its work is applied back to; none
+    /// in a record from before records kept it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<PathBuf>,
 }
 
 /// What `status` found in a worktree.
 struct Status {
-    /// Anything uncommitted: a change, a new file or a submodule's.
-    changed: bool,
+    /// Whatever is uncommitted -- a change, a new file or a submodule's -- as
+    /// git names it.
+    changed: Vec<String>,
     /// Ignored files and folders outside build output, as git names them.
     ignored: Vec<String>,
+}
+
+/// What bringing a worktree's work back to its checkout finds, by the files'
+/// paths in the repository.
+#[derive(Debug, Default, PartialEq)]
+pub struct Preflight {
+    /// The top folder of the checkout it goes into.
+    pub into: PathBuf,
+    /// Files whose changes go in as the checkout is now.
+    pub clean: Vec<String>,
+    /// Files whose changes clash with the checkout's own copy.
+    pub conflicts: Vec<String>,
+}
+
+/// How a file's changes go into the checkout.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Way {
+    /// Merged three ways from the copy the change was made to, which takes
+    /// commits made there since but needs the copy unedited.
+    Merged,
+    /// Laid onto the copy there, edits and all, where the lines around each
+    /// change still read as they did.
+    Laid,
 }
 
 /// Whether an `isolation` option asks for a worktree, refusing one that
@@ -148,12 +189,62 @@ pub fn create(workspace: &Path, name: &str) -> Result<Worktree, String> {
             branch,
             base,
             prefix,
+            checkout: Some(native(workspace)),
         });
     }
     Err(format!(
         "{TRIES} worktrees named {slug} are left in {}; remove some first.",
         top.join(FOLDER).display()
     ))
+}
+
+/// Moves `session` into a worktree of its own named for `name`, made from its
+/// folder's HEAD, so it works beside the user's checkout instead of in it.
+pub fn isolate(session: &mut Conversation, name: &str) -> Result<(), String> {
+    let Some(folder) = session.workspace.as_deref() else {
+        return Err("A worktree needs a project folder, and none is attached.".into());
+    };
+    let made = create(folder, name)?;
+    session.workspace = Some(made.workspace());
+    session.worktree = Some(made);
+    Ok(())
+}
+
+/// Points `session` back at its worktree, made again when its folder was
+/// removed, unless it was moved to another folder since.
+pub fn resume(session: &mut Conversation) -> Result<(), String> {
+    let Some(tree) = session.worktree.clone() else {
+        return Ok(());
+    };
+    let inside = (session.workspace.as_ref()).is_some_and(|folder| folder.starts_with(&tree.path));
+    if !inside {
+        return Ok(());
+    }
+    let checkout = tree.checkout.clone();
+    let again = tree.reopen(checkout.as_deref())?;
+    session.workspace = Some(again.workspace());
+    session.worktree = Some(again);
+    Ok(())
+}
+
+/// What a model working in `workspace` is told when that is in a worktree
+/// Letronna made: read from the path alone, so it holds still all session.
+pub fn note(workspace: &Path) -> Option<String> {
+    let tree = (workspace.ancestors()).find(|folder| {
+        folder
+            .parent()
+            .is_some_and(|parent| parent.ends_with(FOLDER))
+    })?;
+    let name = tree.file_name()?.to_str()?;
+    (slug(name) == name).then(|| {
+        format!(
+            "You work in git worktree `{}` on branch `letronna/{name}`, made from HEAD; the \
+             user's uncommitted edits and ignored files such as .env, node_modules and target \
+             are not in it, and your changes stay here until the user applies them to their \
+             checkout.",
+            tree.display()
+        )
+    })
 }
 
 /// The top folder of the main worktree of the repository `workspace` is in,
@@ -308,7 +399,8 @@ impl Worktree {
         .and_then(|count| count.parse::<u64>().ok());
         let status = status(&self.path);
         let stashed = stashed(&self.path, &self.branch);
-        let clean = matches!(&status, Some(found) if !found.changed && found.ignored.is_empty());
+        let clean =
+            matches!(&status, Some(found) if found.changed.is_empty() && found.ignored.is_empty());
         if commits != Some(0) || !clean || stashed != Some(0) {
             return Some(self.kept(commits, status.as_ref(), stashed));
         }
@@ -351,8 +443,12 @@ impl Worktree {
             self.check_out_again(&top, &format!("{FOLDER}/{name}"))?;
             return Ok(self);
         }
-        let prefix = self.prefix;
-        create(&top, &name).map(|made| Self { prefix, ..made })
+        let (prefix, checkout) = (self.prefix, self.checkout);
+        create(&top, &name).map(|made| Self {
+            prefix,
+            checkout,
+            ..made
+        })
     }
 
     /// Checks its branch out at `folder` of `top` again, commits and all.
@@ -402,6 +498,243 @@ impl Worktree {
         })
     }
 
+    /// What applying its work to the checkout it was made from would do,
+    /// writing nothing.
+    pub fn preflight(&self) -> Result<Preflight, String> {
+        self.bring_back(false)
+    }
+
+    /// Applies its work to the checkout it was made from, staging what it
+    /// merges there as `git apply --3way` does and committing nothing, unless
+    /// a file conflicts, when nothing is written at all.
+    pub fn apply(&self) -> Result<Preflight, String> {
+        self.bring_back(true)
+    }
+
+    /// Removes it and its branch: at once when nothing was done in it or all
+    /// of it is in its checkout already, else only when the user is `sure`,
+    /// having seen the error naming what would go.
+    pub fn discard(&self, sure: bool) -> Result<(), String> {
+        let Some((top, name)) = self.place() else {
+            return Err(format!(
+                "Its worktree record names no worktree Letronna makes, so {} was left alone.",
+                self.path.display()
+            ));
+        };
+        let mut force = sure;
+        if !sure {
+            let range = format!("{}..refs/heads/{}", self.base, self.branch);
+            let asked = ["log", "--no-show-signature", "--format=%s", range.as_str()];
+            let commits: Option<Vec<String>> = (git(&top, &asked).ok()).map(|log| {
+                log.lines()
+                    .map(|subject| format!("\"{subject}\""))
+                    .collect()
+            });
+            // A folder already gone holds nothing more.
+            let status = match self.path.exists() {
+                true => status(&self.path),
+                false => Some(Status {
+                    changed: Vec::new(),
+                    ignored: Vec::new(),
+                }),
+            };
+            // Ignored files are in no patch, so applying never took them;
+            // stash entries outlive it either way.
+            let risked = match (&commits, &status) {
+                (Some(commits), Some(found)) => {
+                    let done = commits.is_empty() && found.changed.is_empty();
+                    !found.ignored.is_empty() || !(done || self.applied())
+                }
+                _ => true,
+            };
+            if risked {
+                return Err(self.unsaved(commits.as_deref(), status.as_ref()));
+            }
+            // Edits its checkout has now are all git would keep it for.
+            force = status.is_some_and(|found| !found.changed.is_empty());
+        }
+        self.remove(&top, &name, force)
+    }
+
+    /// What bringing its work back finds and, with `write`, the work brought
+    /// back.
+    fn bring_back(&self, write: bool) -> Result<Preflight, String> {
+        let into = self.into()?;
+        let (diff, index, trial) = (
+            Scratch::new("patch"),
+            Scratch::new("index"),
+            Scratch::new("trial"),
+        );
+        let files = self.diff(&diff.0, &index.0)?;
+        let patch = named(&diff.0)?;
+        if write {
+            // A copy only touched since reads as edited to `apply --3way`
+            // until its index entry is refreshed; the exit says some were.
+            let _ = git(&into, &["update-index", "-q", "--refresh"]);
+        }
+        let edited = unstaged(&into)?;
+        let mut found = Preflight {
+            into: into.clone(),
+            ..Default::default()
+        };
+        let mut ways = Vec::new();
+        for way in [Way::Merged, Way::Laid] {
+            let (group, others): (Vec<&String>, Vec<&String>) =
+                (files.iter()).partition(|file| edited.contains(*file) == (way == Way::Laid));
+            if group.is_empty() {
+                continue;
+            }
+            // Named by the edited files, which are few, whichever way; the
+            // whole patch's names could pass what a command line holds.
+            let filter: Vec<String> = match way {
+                _ if others.is_empty() => Vec::new(),
+                Way::Laid => group.iter().map(|file| only("--include", file)).collect(),
+                Way::Merged => others.iter().map(|file| only("--exclude", file)).collect(),
+            };
+            if fits(&into, patch, way, &filter, &trial)? {
+                found.clean.extend(group.into_iter().cloned());
+            } else {
+                for file in group {
+                    let alone = [only("--include", file)];
+                    match fits(&into, patch, way, &alone, &trial)? {
+                        true => found.clean.push(file.clone()),
+                        false => found.conflicts.push(file.clone()),
+                    }
+                }
+            }
+            ways.push((way, filter));
+        }
+        found.clean.sort();
+        found.conflicts.sort();
+        if !write {
+            return Ok(found);
+        }
+        if !found.conflicts.is_empty() {
+            return Err(format!(
+                "Nothing was applied, since these files conflict with {}: {}. Ask the session to \
+                 bring its branch up to date with the checkout's, or apply it with git.",
+                into.display(),
+                few(&found.conflicts)
+            ));
+        }
+        for (way, filter) in ways {
+            let mut args = match way {
+                Way::Merged => vec!["apply", "--3way"],
+                Way::Laid => vec!["apply"],
+            };
+            args.extend(filter.iter().map(String::as_str));
+            args.push(patch);
+            git(&into, &args)?;
+        }
+        Ok(found)
+    }
+
+    /// Writes everything done in it since its base -- commits, edits and new
+    /// files, nothing ignored -- to `patch` as one diff, staged in the
+    /// scratch index `index`, giving the files it touches.
+    fn diff(&self, patch: &Path, index: &Path) -> Result<Vec<String>, String> {
+        std::fs::copy(index_of(&self.path)?, index)
+            .map_err(|e| format!("Could not copy the worktree's index: {e}"))?;
+        let staged = |args: &[&str]| git_on(&self.path, args, Some(index));
+        staged(&["add", "--all"])?;
+        let output = format!("--output={}", named(patch)?);
+        // The plumbing diff, which no diff config, colour or external tool
+        // the user set can turn into something `apply` cannot read.
+        let base = self.base.as_str();
+        staged(&[
+            "diff-index",
+            "--cached",
+            "--patch",
+            "--binary",
+            &output,
+            base,
+        ])?;
+        let names = staged(&["diff-index", "--cached", "--name-only", "-z", base])?;
+        Ok((names.split('\0').filter(|name| !name.is_empty()))
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// The top folder of the checkout it was made from, while that is still
+    /// a checkout of the repository it was made in.
+    fn into(&self) -> Result<PathBuf, String> {
+        let gone = || {
+            "The folder its worktree was made from is gone or in another repository now, so its \
+             work has nowhere to go."
+                .to_owned()
+        };
+        let (Some((top, _)), Some(checkout)) = (self.place(), self.checkout.as_deref()) else {
+            return Err(gone());
+        };
+        if main_top(checkout).ok().is_none_or(|(main, _)| main != top) {
+            return Err(gone());
+        }
+        let into = git(checkout, &["rev-parse", "--show-toplevel"]).map_err(|_| gone())?;
+        Ok(native(Path::new(&into)))
+    }
+
+    /// Whether all its work is in its checkout already, as `apply` leaves it:
+    /// taking it back out of there would fit.
+    fn applied(&self) -> bool {
+        let (diff, index) = (Scratch::new("patch"), Scratch::new("index"));
+        let (Ok(into), Ok(files), Ok(patch)) =
+            (self.into(), self.diff(&diff.0, &index.0), named(&diff.0))
+        else {
+            return false;
+        };
+        !files.is_empty() && git(&into, &["apply", "--check", "--reverse", patch]).is_ok()
+    }
+
+    /// The error naming what removing it would lose: its `commits`, as their
+    /// subjects, and what `status` found uncommitted or ignored, None where
+    /// git could not tell.
+    fn unsaved(&self, commits: Option<&[String]>, status: Option<&Status>) -> String {
+        let mut lost = Vec::new();
+        match commits {
+            None => lost.push("commits that could not be counted".to_owned()),
+            Some([]) => {}
+            Some(one @ [_]) => lost.push(format!("1 commit ({})", few(one))),
+            Some(all) => lost.push(format!("{} commits ({})", all.len(), few(all))),
+        }
+        match status {
+            None => lost.push("changes that could not be looked at".to_owned()),
+            Some(found) => {
+                if !found.changed.is_empty() {
+                    lost.push(format!("uncommitted changes to {}", few(&found.changed)));
+                }
+                if !found.ignored.is_empty() {
+                    lost.push(format!("ignored files {}", few(&found.ignored)));
+                }
+            }
+        }
+        format!(
+            "Its worktree at {} on branch {} has {}. Discarding it deletes them.",
+            self.path.display(),
+            self.branch,
+            lost.join("; ")
+        )
+    }
+
+    /// Removes it and its branch, and with `force` the uncommitted work in
+    /// it, which git otherwise keeps it for.
+    fn remove(&self, top: &Path, name: &str, force: bool) -> Result<(), String> {
+        let _changing = changing();
+        if self.path.exists() {
+            let folder = format!("{FOLDER}/{name}");
+            let mut args = vec!["worktree", "remove", folder.as_str()];
+            if force {
+                args.insert(2, "--force");
+            }
+            git(top, &args)?;
+        }
+        // One whose folder was deleted by hand is on git's list until pruned.
+        let _ = git(top, &["worktree", "prune"]);
+        if has_branch(top, &self.branch) {
+            git(top, &["branch", "-D", &self.branch])?;
+        }
+        Ok(())
+    }
+
     /// The repository's top folder and the slug, when this names a place
     /// `create` could have made.
     fn place(&self) -> Option<(PathBuf, String)> {
@@ -434,7 +767,7 @@ impl Worktree {
             None => "commits unknown".to_owned(),
         };
         let mut dirty = match status {
-            Some(found) if found.changed => "uncommitted changes".to_owned(),
+            Some(found) if !found.changed.is_empty() => "uncommitted changes".to_owned(),
             Some(_) => "nothing uncommitted".to_owned(),
             None => "uncommitted changes unknown".to_owned(),
         };
@@ -512,7 +845,7 @@ fn status(path: &Path) -> Option<Status> {
     ];
     let answer = git(path, &asked).ok()?;
     let mut found = Status {
-        changed: false,
+        changed: Vec::new(),
         ignored: Vec::new(),
     };
     let mut entries = answer.split('\0');
@@ -520,8 +853,8 @@ fn status(path: &Path) -> Option<Status> {
         match (entry.get(..2), entry.get(3..)) {
             (Some("!!"), Some(name)) if !built(name) => found.ignored.push(name.to_owned()),
             (Some("!!"), _) | (None, _) => {}
-            (Some(code), _) => {
-                found.changed = true;
+            (Some(code), name) => {
+                found.changed.push(name.unwrap_or(entry).to_owned());
                 // A rename or copy is followed by the name it had.
                 if code.starts_with(['R', 'C']) {
                     entries.next();
@@ -549,6 +882,104 @@ fn built(path: &str) -> bool {
     parts.iter().any(|part| BUILT.contains(part))
 }
 
+/// Whether the changes to the files `filter` picks from `patch` go into the
+/// checkout at `into` the `way` given, tried so nothing is written: merged
+/// into a copy of its index at `trial`, or laid on with `--check`.
+fn fits(
+    into: &Path,
+    patch: &str,
+    way: Way,
+    filter: &[String],
+    trial: &Scratch,
+) -> Result<bool, String> {
+    let mut args = vec!["apply"];
+    args.extend(filter.iter().map(String::as_str));
+    if way == Way::Laid {
+        args.extend(["--check", patch]);
+        return Ok(git(into, &args).is_ok());
+    }
+    // Afresh each time, as a try leaves what it merged in the copy.
+    std::fs::copy(index_of(into)?, &trial.0)
+        .map_err(|e| format!("Could not copy the checkout's index: {e}"))?;
+    args.extend(["--3way", "--cached", patch]);
+    Ok(git_on(into, &args, Some(&trial.0)).is_ok())
+}
+
+/// The files in the checkout at `top` whose copy is not as its index has
+/// it -- edited, deleted or new -- by their paths in the repository.
+fn unstaged(top: &Path) -> Result<HashSet<String>, String> {
+    let asked = [
+        "status",
+        "--porcelain",
+        "-z",
+        "--untracked-files=all",
+        "--no-renames",
+    ];
+    let answer = git(top, &asked)?;
+    // The second letter is the copy against the index.
+    Ok((answer.split('\0'))
+        .filter(|entry| entry.get(1..2).is_some_and(|copy| copy != " "))
+        .filter_map(|entry| entry.get(3..))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// The index file of the worktree at `dir`.
+fn index_of(dir: &Path) -> Result<PathBuf, String> {
+    // Relative to where git ran, unless git gave it whole.
+    git(dir, &["rev-parse", "--git-path", "index"]).map(|named| dir.join(named))
+}
+
+/// `path` as git is given it, which takes only Unicode.
+fn named(path: &Path) -> Result<&str, String> {
+    (path.to_str()).ok_or_else(|| format!("git cannot be given the path {}.", path.display()))
+}
+
+/// The `flag` option of `git apply` picking `file` alone: its pattern with
+/// the characters a pattern reads escaped.
+fn only(flag: &str, file: &str) -> String {
+    let mut option = format!("{flag}=");
+    for c in file.chars() {
+        if matches!(c, '*' | '?' | '[' | '\\') {
+            option.push('\\');
+        }
+        option.push(c);
+    }
+    option
+}
+
+/// The first of `names`, enough to know them by, and how many more there are.
+fn few(names: &[String]) -> String {
+    let mut said = names[..names.len().min(NAMED)].join(", ");
+    if names.len() > NAMED {
+        said.push_str(&format!(" and {} more", names.len() - NAMED));
+    }
+    said
+}
+
+/// A file of its own in the temporary folder, gone with this.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    /// A new one, its name ending in `kind`.
+    fn new(kind: &str) -> Self {
+        static MADE: AtomicU64 = AtomicU64::new(0);
+        let n = MADE.fetch_add(1, Ordering::Relaxed);
+        let name = format!("letronna-worktree-{}-{n}.{kind}", std::process::id());
+        Self(std::env::temp_dir().join(name))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        // Left by a git that was ended while it had the file open.
+        let mut lock = self.0.clone().into_os_string();
+        lock.push(".lock");
+        let _ = std::fs::remove_file(lock);
+    }
+}
+
 /// The hold on changing worktrees, which a panic while holding it leaves usable.
 fn changing() -> MutexGuard<'static, ()> {
     CHANGING.lock().unwrap_or_else(PoisonError::into_inner)
@@ -557,6 +988,12 @@ fn changing() -> MutexGuard<'static, ()> {
 /// Runs git in `dir` and gives what it printed, trimmed, or what went wrong.
 /// It can never wait on the user: it gets no input and may not prompt.
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    git_on(dir, args, None)
+}
+
+/// `git`, on the index file `index` in place of the repository's own when
+/// given one.
+fn git_on(dir: &Path, args: &[&str], index: Option<&Path>) -> Result<String, String> {
     let what = args.first().copied().unwrap_or_default();
     let mut command = Command::new("git");
     command
@@ -569,11 +1006,14 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
         // the repository in place of `-C`.
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_COMMON_DIR")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    match index {
+        Some(index) => command.env("GIT_INDEX_FILE", index),
+        None => command.env_remove("GIT_INDEX_FILE"),
+    };
     // Letronna owns no console, and Windows would open one for every call.
     #[cfg(windows)]
     {
@@ -820,6 +1260,7 @@ pub(crate) mod tests {
             branch: "letronna/repo".into(),
             base,
             prefix: String::new(),
+            checkout: Some(repo.clone()),
         };
         let mut climbing = create(&repo, "general").unwrap();
         climbing.prefix = "../../..".into();
@@ -1135,5 +1576,168 @@ pub(crate) mod tests {
             std::thread::sleep(TICK);
         }
         assert!(!alive(), "sleep {} outlived its group", started.trim());
+    }
+
+    /// Lines 1 to 30, one number a line, so a test can change one far from
+    /// another.
+    fn lines() -> String {
+        (1..=30).map(|n| format!("{n}\n")).collect()
+    }
+
+    /// Writes `text` over line `n`, from 1, of `file`.
+    fn reword(file: &Path, n: usize, text: &str) {
+        let old = std::fs::read_to_string(file).unwrap();
+        let new: String = (old.lines().enumerate())
+            .map(|(at, line)| format!("{}\n", if at + 1 == n { text } else { line }))
+            .collect();
+        std::fs::write(file, new).unwrap();
+    }
+
+    /// A repository whose `list.txt` holds `lines`, and a session's
+    /// worktree made from it.
+    fn listed(name: &str) -> (PathBuf, Worktree) {
+        let repo = fresh(name);
+        std::fs::write(repo.join("list.txt"), lines()).unwrap();
+        commit(&repo, "List");
+        let made = create(&repo, "session").unwrap();
+        (repo, made)
+    }
+
+    #[test]
+    fn applying_onto_a_dirty_checkout_keeps_the_users_edits() {
+        let (repo, made) = listed("apply-dirty");
+        reword(&made.path.join("list.txt"), 2, "two");
+        commit(&made.path, "Two");
+        reword(&made.path.join("list.txt"), 28, "twenty-eight");
+        std::fs::write(made.path.join("new.txt"), "new").unwrap();
+        // The user carries on in their checkout meanwhile, in the same file.
+        reword(&repo.join("list.txt"), 15, "fifteen");
+        std::fs::write(repo.join("readme.txt"), "the user's").unwrap();
+        let head = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+
+        let found = made.preflight().unwrap();
+        assert_eq!(found.into, repo);
+        assert_eq!(found.clean, ["list.txt", "new.txt"]);
+        assert!(found.conflicts.is_empty(), "{found:?}");
+        assert_eq!(made.apply(), Ok(found));
+        let list = std::fs::read_to_string(repo.join("list.txt")).unwrap();
+        let words: Vec<&str> = (list.lines())
+            .filter(|line| line.parse::<u32>().is_err())
+            .collect();
+        assert_eq!(words, ["two", "fifteen", "twenty-eight"]);
+        let readme = std::fs::read_to_string(repo.join("readme.txt")).unwrap();
+        assert_eq!(readme, "the user's");
+        assert!(repo.join("new.txt").is_file());
+        assert_eq!(git(&repo, &["rev-parse", "HEAD"]), Ok(head));
+    }
+
+    #[test]
+    fn a_conflicting_hunk_is_reported_and_nothing_written() {
+        let (repo, made) = listed("apply-conflict");
+        reword(&made.path.join("list.txt"), 2, "two");
+        std::fs::write(made.path.join("new.txt"), "new").unwrap();
+        // The user changed the same line and committed it.
+        reword(&repo.join("list.txt"), 2, "TWO");
+        commit(&repo, "Two");
+
+        let found = made.preflight().unwrap();
+        assert_eq!(found.clean, ["new.txt"]);
+        assert_eq!(found.conflicts, ["list.txt"]);
+        let refused = made.apply().unwrap_err();
+        assert!(
+            refused.starts_with("Nothing was applied, since these files conflict with"),
+            "{refused}"
+        );
+        assert!(refused.contains(": list.txt."), "{refused}");
+        assert!(!repo.join("new.txt").exists());
+        assert_eq!(git(&repo, &["status", "--porcelain"]), Ok(String::new()));
+    }
+
+    #[test]
+    fn a_change_near_one_the_user_committed_since_is_merged_in() {
+        let (repo, made) = listed("apply-merged");
+        reword(&made.path.join("list.txt"), 10, "ten");
+        // Among the lines around the session's change, which laying it on
+        // would need as they were.
+        reword(&repo.join("list.txt"), 12, "twelve");
+        commit(&repo, "Twelve");
+
+        assert_eq!(made.apply().unwrap().clean, ["list.txt"]);
+        let list = std::fs::read_to_string(repo.join("list.txt")).unwrap();
+        assert!(list.contains("9\nten\n11\ntwelve\n13\n"), "{list}");
+    }
+
+    #[test]
+    fn discarding_a_worktree_with_commits_needs_confirmation() {
+        let repo = fresh("discard");
+        let made = create(&repo, "session").unwrap();
+        std::fs::write(made.path.join("done.txt"), "done").unwrap();
+        commit(&made.path, "Done");
+        std::fs::write(made.path.join("half.txt"), "half").unwrap();
+
+        let asked = made.discard(false).unwrap_err();
+        let named = format!(
+            "Its worktree at {} on branch letronna/session has 1 commit (\"Done\"); uncommitted \
+             changes to half.txt. Discarding it deletes them.",
+            made.path.display()
+        );
+        assert_eq!(asked, named);
+        assert!(made.path.join("done.txt").is_file());
+        assert!(has_branch(&repo, "letronna/session"));
+        assert_eq!(made.discard(true), Ok(()));
+        assert!(!made.path.exists());
+        assert!(!has_branch(&repo, "letronna/session"));
+    }
+
+    #[test]
+    fn a_worktree_whose_work_was_applied_goes_without_asking() {
+        let repo = fresh("discard-applied");
+        let made = create(&repo, "session").unwrap();
+        std::fs::write(made.path.join("done.txt"), "done").unwrap();
+        commit(&made.path, "Done");
+        made.apply().unwrap();
+
+        assert_eq!(made.discard(false), Ok(()));
+        assert!(!made.path.exists());
+        assert!(repo.join("done.txt").is_file());
+    }
+
+    #[test]
+    fn a_worktree_session_comes_back_after_its_folder_was_removed() {
+        let repo = fresh("session-back");
+        let mut session = Conversation {
+            workspace: Some(repo.clone()),
+            ..Default::default()
+        };
+        isolate(&mut session, "session-7").unwrap();
+        let tree = session.worktree.clone().unwrap();
+        assert_eq!(tree.path, repo.join(".letronna/worktrees/session-7"));
+        assert_eq!(session.workspace.as_ref(), Some(&tree.path));
+        assert_eq!(tree.checkout.as_ref(), Some(&repo));
+        std::fs::remove_dir_all(&tree.path).unwrap();
+
+        resume(&mut session).unwrap();
+        assert_eq!(session.worktree.as_ref(), Some(&tree));
+        assert_eq!(session.workspace.as_ref(), Some(&tree.path));
+        assert!(tree.path.join("readme.txt").is_file());
+        // Moved to another folder since, it has left its worktree.
+        std::fs::remove_dir_all(&tree.path).unwrap();
+        session.workspace = Some(repo.clone());
+        resume(&mut session).unwrap();
+        assert_eq!(session.workspace, Some(repo));
+        assert!(!tree.path.exists());
+    }
+
+    #[test]
+    fn a_model_in_a_worktree_is_told_so_from_its_path_alone() {
+        let top = Path::new("/work/.letronna/worktrees/session-3");
+        let said = note(&top.join("apps").join("web")).unwrap();
+        let start = format!(
+            "You work in git worktree `{}` on branch `letronna/session-3`, made from HEAD;",
+            top.display()
+        );
+        assert!(said.starts_with(&start), "{said}");
+        assert_eq!(note(Path::new("/work/apps/web")), None);
+        assert_eq!(note(Path::new("/work/.letronna/worktrees/Not Made")), None);
     }
 }
