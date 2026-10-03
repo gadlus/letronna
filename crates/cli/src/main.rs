@@ -117,8 +117,13 @@ fn main() {
     // An update downloaded last time goes in now, before anything is running,
     // and so does the old version when a new one keeps failing to start.
     // After `--version`, which the updater runs a new binary with before it
-    // is trusted, and which must not count as a start.
-    if let Some(program) = update::on_start() {
+    // is trusted, and which must not count as a start. Not for a `-p` run
+    // either: a script asking one question after another would have the
+    // program change under it part way, and its failed answers, often the
+    // model's fault, would put a working version back.
+    if !args.once()
+        && let Some(program) = update::on_start()
+    {
         std::process::exit(start_instead(&program));
     }
     let keep = Keep::new(confirm_update);
