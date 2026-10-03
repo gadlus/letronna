@@ -639,6 +639,7 @@ fn failed(error: String) -> Report {
         seconds: 0,
         files: Vec::new(),
         jobs: Vec::new(),
+        contract: Vec::new(),
         value: None,
     }
 }
@@ -1067,6 +1068,7 @@ mod tests {
             seconds: 4,
             files: vec!["notes.txt".into()],
             jobs: Vec::new(),
+            contract: Vec::new(),
             value: None,
         }
     }

@@ -30,7 +30,7 @@
 //! mistake rather than an invisible trick.
 
 /// The fence's tag, before its id.
-const TAG: &str = "untrusted-content";
+pub(crate) const TAG: &str = "untrusted-content";
 /// What `TAG` becomes wherever fenced text spells it.
 const DEFANGED: &str = "untrusted_content";
 /// What a fence means, said once in the system prompt rather than with every

@@ -2526,6 +2526,7 @@ mod tests {
             seconds: 38,
             files: vec!["crates/core/src/chat.rs".into()],
             jobs: Vec::new(),
+            contract: Vec::new(),
         }
     }
 
