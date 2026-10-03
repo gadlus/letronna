@@ -192,8 +192,10 @@ fn main() {
     // With nothing set up there is nothing to talk to, so the first run is
     // the setup -- the same one the installers hand over to. Asking a
     // question from a pipe cannot wait for answers, so that one stops here,
-    // and so does serving, which nobody sits at.
-    let first_run = runner.store.settings.model.is_empty();
+    // and so does serving, which nobody sits at. A question the environment
+    // routes has its server and model from there, and needs none of it.
+    let routed = args.once() && given_route(&args, |name| std::env::var(name).ok()).is_some();
+    let first_run = runner.store.settings.model.is_empty() && !routed;
     if first_run && (args.once() || args.serve) {
         let error = "Nothing is set up yet. Run `letronna setup` first.";
         show(args.output, &failed(error.into()));
@@ -231,7 +233,7 @@ fn main() {
         },
         _ => runner.open(false, workspace.clone()),
     };
-    choose_by_flags(&mut runner, session, gateway, &args);
+    choose_by_flags(&mut runner, session, gateway, &args, routed);
     letronna_core::diag::mark("session");
 
     // One question, one answer, no banner: this form gets piped.
@@ -490,6 +492,11 @@ fn begin(
     budget: Option<Arc<Budget>>,
 ) -> Result<(Spec, tools::ToolContext, usize), String> {
     let mut connection = runner.connection(session);
+    // Read on each run and put nowhere else: not in the settings, not with
+    // the keys, so the key lives in this process alone.
+    if let Some(route) = given_route(args, |name| std::env::var(name).ok()) {
+        (connection.endpoint, connection.key, connection.model) = route?;
+    }
     if let Some(model) = &args.model {
         connection.model = model.clone();
     }
@@ -815,11 +822,49 @@ fn gateway_named(name: &str) -> Result<&'static str, String> {
     ))
 }
 
+/// The Custom route, as (endpoint, key, model), that `AGENT_BASE_URL`,
+/// `AGENT_API_KEY` and `--model` or `AGENT_MODEL` give a `-p` run when `var`
+/// reads them and `--gateway` names no gateway of its own.
+fn given_route(
+    args: &Args,
+    var: impl Fn(&str) -> Option<String>,
+) -> Option<Result<(String, String, String), String>> {
+    // A gateway named for this run is the nearer choice, as --model is.
+    if args.gateway.is_some() {
+        return None;
+    }
+    let given = |name: &str| {
+        var(name)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    let endpoint = given("AGENT_BASE_URL")?;
+    // The model set up belongs to another gateway, so it is not guessed at.
+    let Some(model) = args.model.clone().or_else(|| given("AGENT_MODEL")) else {
+        return Some(Err(
+            "AGENT_BASE_URL is set, but no model is: set AGENT_MODEL or pass --model.".into(),
+        ));
+    };
+    Some(Ok((
+        endpoint,
+        given("AGENT_API_KEY").unwrap_or_default(),
+        model,
+    )))
+}
+
 /// Put the session on the model, gateway and effort the flags name. Only the
 /// session takes them: the settings, and with them new sessions, stay as
 /// they were.
-fn choose_by_flags(runner: &mut Runner, session: usize, gateway: Option<&str>, args: &args::Args) {
-    if gateway.is_some() || args.model.is_some() {
+fn choose_by_flags(
+    runner: &mut Runner,
+    session: usize,
+    gateway: Option<&str>,
+    args: &args::Args,
+    routed: bool,
+) {
+    // A model named for a run the environment routes is that server's, which
+    // nothing keeps: pinned, it would be asked of the gateway set up later.
+    if (gateway.is_some() || args.model.is_some()) && !routed {
         let (on, model) = runner.store.model(session);
         let gateway = gateway.unwrap_or(on).to_owned();
         let model = args.model.clone().unwrap_or_else(|| model.to_owned());
@@ -1241,6 +1286,70 @@ mod tests {
             KEPT.load(Ordering::SeqCst),
             1,
             "kept again by the turn after it"
+        );
+    }
+
+    /// What `letronna` makes of `words`.
+    fn parsed(words: &[&str]) -> Args {
+        parse(words.iter().map(|word| word.to_string())).unwrap()
+    }
+
+    /// An environment with a server, its key and its model in it.
+    fn routed(name: &str) -> Option<String> {
+        match name {
+            "AGENT_BASE_URL" => Some(" https://proxy.test/v1 ".into()),
+            "AGENT_API_KEY" => Some("env-key".into()),
+            "AGENT_MODEL" => Some("env-model".into()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_environment_routes_a_print_run_with_the_flag_model_first() {
+        let route = |words: &[&str]| given_route(&parsed(words), routed);
+        let given = |model: &str| {
+            Some(Ok((
+                "https://proxy.test/v1".into(),
+                "env-key".into(),
+                model.into(),
+            )))
+        };
+        assert_eq!(route(&["-p", "q"]), given("env-model"));
+        assert_eq!(
+            route(&["-p", "q", "--model", "flag-model"]),
+            given("flag-model")
+        );
+        assert_eq!(route(&["-p", "q", "--gateway", "Ollama"]), None);
+    }
+
+    #[test]
+    fn no_server_routes_nothing_and_a_server_with_no_model_says_so() {
+        let without =
+            |gone: &'static str| move |name: &str| (name != gone).then(|| routed(name)).flatten();
+        let route = given_route(&parsed(&["-p", "q"]), without("AGENT_BASE_URL"));
+        assert_eq!(route, None);
+        let blank = |name: &str| {
+            (name == "AGENT_BASE_URL")
+                .then(|| " ".into())
+                .or_else(|| routed(name))
+        };
+        assert_eq!(given_route(&parsed(&["-p", "q"]), blank), None);
+        let Some(Err(why)) = given_route(&parsed(&["-p", "q"]), without("AGENT_MODEL")) else {
+            panic!("a server with no model was taken");
+        };
+        assert!(
+            why.contains("AGENT_MODEL") && why.contains("--model"),
+            "{why}"
+        );
+        // A server may take no key, as Custom's need not.
+        let keyless = given_route(&parsed(&["-p", "q"]), without("AGENT_API_KEY"));
+        assert_eq!(
+            keyless,
+            Some(Ok((
+                "https://proxy.test/v1".into(),
+                String::new(),
+                "env-model".into()
+            )))
         );
     }
 }

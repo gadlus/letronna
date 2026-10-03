@@ -81,6 +81,8 @@ First launch uses the Letronna gateway: sign in (`/login` in the terminal, or **
 
 The Letronna gateway's address follows `LETRONNA_API`, for working against a local API.
 
+`letronna -p` can be pointed at a server with nothing set up, as in a container: `AGENT_BASE_URL` sends that run to it as Custom, with `AGENT_API_KEY` as its key and `AGENT_MODEL` (or `--model`) as the model. None of it is saved, and `--gateway` goes back to the gateways set up.
+
 Model lists come from `GET {base}/models`. Streaming uses SSE chat completions.
 
 ## Web search

@@ -109,6 +109,9 @@ pub(crate) enum Shapes {
 pub(crate) fn secrets() -> Vec<String> {
     let mut all: Vec<String> = crate::store::load_keys().into_values().collect();
     all.extend(crate::auth::account().map(|account| account.token));
+    // The key `letronna -p` can be given in its environment, which is in
+    // none of the files or vault entries the keys are read from.
+    all.extend(std::env::var("AGENT_API_KEY").ok());
     let chats = crate::messaging::load();
     all.extend([
         chats.telegram.token,

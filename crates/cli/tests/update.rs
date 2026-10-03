@@ -36,6 +36,11 @@ fn command(program: &Path, dir: &Path, args: &[&str]) -> Command {
         .env("LOCALAPPDATA", dir)
         .env("HOME", dir)
         .env("USERPROFILE", dir)
+        // Exported for the live tests, these would send a -p run to the
+        // server they name rather than the stub.
+        .env_remove("AGENT_BASE_URL")
+        .env_remove("AGENT_API_KEY")
+        .env_remove("AGENT_MODEL")
         // A debug build leaves updating alone unless told otherwise.
         .env("LETRONNA_UPDATES", "1")
         .stdin(Stdio::null());
