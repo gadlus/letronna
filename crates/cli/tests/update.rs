@@ -221,8 +221,8 @@ fn a_downloaded_update_is_put_in_place_and_started_instead() {
             "staged": {"version": VERSION, "files": [{"dest": dest, "sha256": sha256(&new)}]},
         }),
     );
-    // Nothing is set up, so the question is refused once it gets that far.
-    let out = run(&dest, &dir, &["-p", "hello"]);
+    // Nothing is set up, so serving is refused once it gets that far.
+    let out = run(&dest, &dir, &["serve"]);
     assert_eq!(out.status.code(), Some(1));
     let said = String::from_utf8_lossy(&out.stdout);
     assert!(said.contains("Nothing is set up yet"), "{said}");
@@ -255,11 +255,11 @@ fn a_version_that_never_settled_is_put_back_and_started_instead() {
         std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     write_state(&dir, pending(&dest, 2));
-    let out = run(&dest, &dir, &["-p", "hello"]);
+    let out = run(&dest, &dir, &["serve"]);
     let said = String::from_utf8_lossy(&out.stdout);
     if cfg!(unix) {
         assert!(out.status.success(), "{said}");
-        assert_eq!(said.trim(), "the old version, asked -p hello");
+        assert_eq!(said.trim(), "the old version, asked serve");
     } else {
         assert_eq!(out.status.code(), Some(1));
         assert!(said.contains("Nothing is set up yet"), "{said}");
@@ -284,7 +284,7 @@ fn a_version_given_up_on_that_was_not_put_back_carries_on() {
     let Some(out) = run_within(
         Path::new(LETRONNA),
         &dir,
-        &["-p", "hello"],
+        &["serve"],
         Duration::from_secs(30),
     ) else {
         panic!("it kept starting itself again");
@@ -333,5 +333,48 @@ fn a_question_that_fails_does_not_keep_the_update() {
     assert_eq!(out.status.code(), Some(1));
     let pending = &read_state(&dir)["pending"];
     assert_eq!(pending["to"], VERSION);
-    assert_eq!(pending["starts"], 1);
+    // Nor is it counted against the update, as a start would be.
+    assert_eq!(pending["starts"], 0);
+}
+
+#[test]
+fn a_print_run_leaves_a_staged_update_for_later() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("print-staged");
+    let dest = installed(&dir);
+    let new = beside(&dest, "new");
+    std::fs::copy(LETRONNA, &new).unwrap();
+    write_state(
+        &dir,
+        json!({
+            "staged": {"version": VERSION, "files": [{"dest": dest, "sha256": sha256(&new)}]},
+        }),
+    );
+    let before = std::fs::read(state_path(&dir)).unwrap();
+    let out = run(&dest, &dir, &["-p", "hello"]);
+    assert_eq!(out.status.code(), Some(1));
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.contains("Nothing is set up yet"), "{said}");
+    assert!(new.is_file());
+    assert!(!beside(&dest, "old").exists());
+    assert_eq!(std::fs::read(state_path(&dir)).unwrap(), before);
+}
+
+#[test]
+fn a_print_run_never_puts_the_old_version_back() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("print-pending");
+    let dest = installed(&dir);
+    let old = beside(&dest, "old");
+    std::fs::write(&old, "the version an update replaced").unwrap();
+    // Counted, this start would be the third and put the old version back.
+    write_state(&dir, pending(&dest, 2));
+    let before = std::fs::read(state_path(&dir)).unwrap();
+    let out = run(&dest, &dir, &["-p", "hello"]);
+    assert_eq!(out.status.code(), Some(1));
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.contains("Nothing is set up yet"), "{said}");
+    assert!(old.is_file());
+    assert!(!beside(&dest, "failed").exists());
+    assert_eq!(std::fs::read(state_path(&dir)).unwrap(), before);
 }
