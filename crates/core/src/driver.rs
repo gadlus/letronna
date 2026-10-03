@@ -102,7 +102,7 @@ const NOT_APPROVED: &str = "This was not approved, so it did not run. Do not try
 const RETRIES: usize = 3;
 
 /// The tool a run with a schema gives its answer through.
-const STRUCTURED_OUTPUT: &str = "structured_output";
+pub(crate) const STRUCTURED_OUTPUT: &str = "structured_output";
 
 /// Answers turned down after the first before the run gives up: more
 /// corrections than two make a model drop fields it had right.

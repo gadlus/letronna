@@ -77,23 +77,6 @@ const WARN_AT: f64 = 0.8;
 /// "continue" and a task left to run on its own, such as a fix across a
 /// repository, often reads and runs more than 25 times.
 const PRINT_ROUNDS: usize = 100;
-/// How the result of a call refused before it ran begins: refused by the
-/// gate, answered no, turned down by Auto mode's judge or by a hook.
-const REFUSED: [&str; 4] = [
-    "Refused: ",
-    "This was not approved",
-    "Auto mode did not allow this",
-    "A PreToolUse hook blocked this call",
-];
-/// How the result of a call the run may not make at all goes on after the
-/// tool's name: not among the tools it was given, switched off, or changing
-/// things in plan mode.
-const NOT_OFFERED: [&str; 4] = [
-    " is not available to this",
-    " is not available in plan mode",
-    " in plan mode only runs",
-    " is switched off",
-];
 
 fn main() {
     // The first mark, from which the others are timed.
@@ -1075,22 +1058,7 @@ fn cost(messages: &[Message]) -> Option<f64> {
 
 /// Whether `result` answers a call that was refused rather than run.
 fn refused(result: &Message) -> bool {
-    if result.role != "tool" || !result.is_error {
-        return false;
-    }
-    // Core marks a refusal only in the words the model is told, which
-    // also tell it apart from a call that ran and failed. A batch refused
-    // for one of its steps says which step, then that step's refusal.
-    let content = result.content.as_str();
-    let text = content
-        .split_once(" would be refused on its own, so none of it ran: ")
-        .map_or(content, |(_, why)| why);
-    let after_name = text
-        .strip_prefix('`')
-        .and_then(|rest| rest.split_once('`'))
-        .map(|(_, rest)| rest);
-    REFUSED.iter().any(|start| text.starts_with(start))
-        || after_name.is_some_and(|rest| NOT_OFFERED.iter().any(|then| rest.starts_with(then)))
+    result.role == "tool" && result.is_error && letronna_core::gate::refused(&result.content)
 }
 
 /// The gateway `name` means, in any case.
