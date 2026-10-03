@@ -405,6 +405,7 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
     let mut steps = Vec::new();
     let mut claimed = Vec::new();
     let mut said = Vec::new();
+    let mut notes = String::new();
     for action in actions {
         match action {
             Action::Add { path: raw, text } => {
@@ -416,6 +417,7 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
                     ));
                 }
                 crate::write::check_syntax(&path, None, text)?;
+                notes.push_str(&crate::write::csv_note(Path::new(raw), None, text));
                 steps.push(Step::Write {
                     path,
                     raw: raw.clone(),
@@ -448,6 +450,11 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
                 let after = patched(&before, hunks, raw)?;
                 let Some(to) = to else {
                     crate::write::check_syntax(&path, Some(before.as_bytes()), &after)?;
+                    notes.push_str(&crate::write::csv_note(
+                        Path::new(raw),
+                        Some(&before),
+                        &after,
+                    ));
                     steps.push(Step::Write {
                         path,
                         raw: raw.clone(),
@@ -466,6 +473,11 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
                     ));
                 }
                 crate::write::check_syntax(&moved, Some(before.as_bytes()), &after)?;
+                notes.push_str(&crate::write::csv_note(
+                    Path::new(to),
+                    Some(&before),
+                    &after,
+                ));
                 steps.push(Step::Write {
                     path: moved,
                     raw: to.clone(),
@@ -504,7 +516,7 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
         }
         done.push(step);
     }
-    Ok(format!("Applied the patch: {}.", said.join(", ")))
+    Ok(format!("Applied the patch: {}.{notes}", said.join(", ")))
 }
 
 /// Where `raw` may be written, as write_file resolves it, refused when the
@@ -778,6 +790,29 @@ mod tests {
         assert!(!dir.join("gone.txt").exists());
         assert!(!dir.join("old.txt").exists());
         assert_eq!(read(&dir, "moved/new.txt"), "keep\nchanged\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_csv_the_patch_leaves_uneven_gets_a_note() {
+        let (dir, ctx) = project("csv");
+        std::fs::write(dir.join("b.csv"), "id,field\n1,\"amount, currency\"\n").unwrap();
+        let text = "*** Begin Patch
+*** Add File: a.csv
++id,field
++1,\"amount, currency\"
+*** Update File: b.csv
+@@
+ id,field
+-1,\"amount, currency\"
++1,amount, currency
+*** End Patch";
+        assert_eq!(
+            patch(&ctx, text).unwrap(),
+            "Applied the patch: added a.csv, updated b.csv.\nNote: `b.csv` line 2 has 3 \
+             fields where the header has 2; a field that holds a comma needs double quotes \
+             around it."
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
