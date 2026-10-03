@@ -335,8 +335,10 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
     tools.extend(crate::mcp_find::tools());
     #[cfg(feature = "workflows")]
     tools.push(Arc::new(crate::workflow::tool::Workflow));
-    // The user's own search service, once one is set up.
-    if crate::search::ready() {
+    // A search service, DuckDuckGo while the user picks none, unless the one
+    // picked is not set up; with DuckDuckGo switched off too, so a call says
+    // how to search.
+    if crate::search::offered() {
         tools.push(Arc::new(crate::search::SearchWeb));
     }
     if let Ok(extra) = plugin_tools().lock() {
@@ -6164,8 +6166,11 @@ mod tests {
             .iter()
             .filter(|t| t.untrusted())
             .map(|t| t.name())
-            // MCP's come and go with the servers other tests start.
-            .filter(|name| !name.starts_with("mcp__") && !name.contains("_mcp_"))
+            // MCP's come and go with the servers other tests start, and
+            // search_web with the search settings in the data folder.
+            .filter(|name| {
+                !name.starts_with("mcp__") && !name.contains("_mcp_") && *name != "search_web"
+            })
             .collect();
         // read_chat fences other people's lines itself, and not the user's.
         assert_eq!(fenced, ["web_fetch", "browse", "use_page", "computer"]);

@@ -101,7 +101,7 @@ pub const COMMANDS: &[Command<'static>] = &[
     },
     Command {
         name: "/search",
-        blurb: "let the model search the web; /search services for your own",
+        blurb: "let the model search the web; /search services for your own, /search keyless for DuckDuckGo",
     },
     Command {
         name: "/notify",

@@ -5678,7 +5678,8 @@ mod tests {
         let _turn = crate::store::tests::DATA_DIR
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // Empty, so the user's search service adds no tool.
+        // Empty, as a fresh install's is, so search_web comes through
+        // DuckDuckGo.
         let dir = crate::store::tests::Scratch::new("chat-golden-tools");
         unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
         let tools = crate::tools::all();

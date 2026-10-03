@@ -1006,6 +1006,13 @@ fn unavailable(
              every call of it. Carry on without it."
         ));
     }
+    // Offered with DuckDuckGo switched off, so the model learns how to search;
+    // nothing would leave, so there is nothing to ask about.
+    if name == "search_web"
+        && let Some(why) = crate::search::switched_off()
+    {
+        return Some(why.into());
+    }
     // Only fitting tools are offered, but the model can name any of them;
     // refuse here too rather than trust the offer.
     if ctx.shared() && tool.machine() {
@@ -2201,6 +2208,44 @@ mod tests {
         );
         // Searching the web sends the query out, so it still asks.
         assert!(crate::search::SearchWeb.needs_approval());
+    }
+
+    #[test]
+    fn a_search_with_duckduckgo_switched_off_says_how_to_search_unasked() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // No search service chosen, as on a fresh install.
+        let dir = crate::store::tests::Scratch::new("gate-keyless-search");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        let settings = dir.join("settings.json");
+        let ctx = ToolContext::default();
+        let none = Grants::new();
+        let gate = Gate {
+            ctx: &ctx,
+            mode: Mode::Default,
+            grants: &none,
+            human: true,
+            rules: &[],
+            broken: None,
+        };
+        let search = call("search_web", serde_json::json!({ "query": "rust" }));
+        let on = decide(&search, &gate);
+        std::fs::write(
+            &settings,
+            r#"{"endpoint": "", "model": "", "keyless_search": false}"#,
+        )
+        .unwrap();
+        let off = decide(&search, &gate);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert_eq!(on, Outcome::Ask);
+        let Outcome::Refuse(why) = off else {
+            panic!("{off:?}");
+        };
+        assert!(
+            why.contains("/search keyless") && why.contains("/search services"),
+            "{why}"
+        );
     }
 
     /// A read is judged in the folder `workdir` names, where a link can lead

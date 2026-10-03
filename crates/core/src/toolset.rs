@@ -104,6 +104,9 @@ impl Family {
     pub fn readiness(self) -> Option<Readiness> {
         let (ready, note, fix) = match self {
             Family::Files | Family::Commands => return None,
+            // It searches, but by an unofficial way that may be limited, so
+            // the note says which search runs and leads to a steadier one.
+            Family::Web if crate::search::keyless() => (false, "keyless search", Some(Fix::Search)),
             Family::Web => (crate::search::ready(), "no search key", Some(Fix::Search)),
             Family::Browser => (
                 crate::browser::remote_address().is_some() || crate::cdp::installed().is_some(),
@@ -200,6 +203,44 @@ mod tests {
         assert_eq!(switched_off(&media), ["speak"]);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_web_family_says_keyless_search_runs_until_it_is_switched_off() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::store::tests::Scratch::new("toolset-search");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        let fix = Some(Fix::Search);
+        let keyless = Family::Web.readiness();
+        let on = (crate::search::offered(), crate::search::switched_off());
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"endpoint": "", "model": "", "keyless_search": false}"#,
+        )
+        .unwrap();
+        let off = Family::Web.readiness();
+        // Still offered, so a search can say how to switch it back on.
+        let offered = crate::search::offered();
+        let why = crate::search::switched_off();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert_eq!(on, (true, None));
+        assert!(offered && why.is_some_and(|why| why.contains("/search keyless")));
+        assert_eq!(
+            keyless,
+            Some(Readiness {
+                note: "keyless search",
+                fix
+            })
+        );
+        assert_eq!(
+            off,
+            Some(Readiness {
+                note: "no search key",
+                fix
+            })
+        );
     }
 
     #[test]

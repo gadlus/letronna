@@ -201,6 +201,11 @@ pub fn command(
             search_services(runner);
             Flow::Handled
         }
+        "/search" if rest == "keyless" => {
+            let on = !runner.store.settings.keyless_search;
+            keyless_search(runner, on);
+            Flow::Handled
+        }
         "/search" => {
             runner.store.settings.search = !runner.store.settings.search;
             runner.persist();
@@ -3728,8 +3733,22 @@ fn set_model(runner: &mut Runner, session: Option<usize>, gateway: String, model
     ));
 }
 
+/// Switch searching with DuckDuckGo while no search service is chosen on or
+/// off, and say what that means.
+fn keyless_search(runner: &mut Runner, on: bool) {
+    runner.store.settings.keyless_search = on;
+    runner.persist();
+    render::blank();
+    render::line(&render::dim(if on {
+        "Search with DuckDuckGo when no search key is set: on. It needs no key, each search is asked first, and a service with a key (/search services) gives steadier results."
+    } else {
+        "Search with DuckDuckGo when no search key is set: off. Without a search service of your own (/search services), the model cannot search."
+    }));
+}
+
 /// Every search service and where it stands, then set one up to search with,
-/// or remove one. The one set up last is used.
+/// remove one, or switch DuckDuckGo on or off. The one set up last is used,
+/// and DuckDuckGo while none is.
 pub fn search_services(runner: &mut Runner) {
     use letronna_core::search::{self, SERVICES};
     let keys = store::load_keys();
@@ -3738,11 +3757,28 @@ pub fn search_services(runner: &mut Runner) {
     let mut choices: Vec<(String, &'static str, &'static str)> = Vec::new();
     for s in SERVICES {
         let (status, good, set_up) = search::status(s.name, &choice, &keys);
+        // The keyless one has nothing to set up, so its row says what it is.
+        let blurb = match s.keyless {
+            true => format!(" · {}", s.blurb),
+            false => String::new(),
+        };
         rows.push(format!(
-            "{} {:<8} {status}",
+            "{} {:<10} {status}{blurb}",
             if good { "●" } else { "○" },
             s.name
         ));
+        if s.keyless {
+            // Used while no other is chosen, so going back to it is choosing
+            // none; otherwise its setting is switched.
+            let other = !choice.service.is_empty() && choice.service != s.name;
+            let what = match (other, good) {
+                (true, _) => ("Use", "use"),
+                (false, true) => ("Switch off", "off"),
+                (false, false) => ("Switch on", "on"),
+            };
+            choices.push((format!("{} {}", what.0, s.name), s.name, what.1));
+            continue;
+        }
         let verb = if set_up { "Change" } else { "Set up" };
         choices.push((format!("{verb} {}", s.name), s.name, "set"));
         if set_up {
@@ -3757,6 +3793,21 @@ pub fn search_services(runner: &mut Runner) {
     let Some((_, name, what)) = choices.get(picked).cloned() else {
         return;
     };
+    if what == "on" || what == "off" {
+        keyless_search(runner, what == "on");
+        return;
+    }
+    if what == "use" {
+        // The other services' keys and addresses are kept.
+        choice.service.clear();
+        if let Err(error) = search::choose(&choice) {
+            render::blank();
+            render::line(&render::red(&error));
+            return;
+        }
+        keyless_search(runner, true);
+        return;
+    }
     let Some(service) = search::service(name) else {
         return;
     };
