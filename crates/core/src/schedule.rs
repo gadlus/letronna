@@ -1063,7 +1063,7 @@ impl Tool for Scheduler {
         "schedule"
     }
     fn description(&self) -> &'static str {
-        "Run a prompt later on this computer, each time in a fresh session with nobody there to answer: every N minutes, daily at a time, or once in N minutes. Also lists the schedules and removes one you added. Adding or removing waits for the user's yes."
+        "Run a prompt later on this computer, each time in a fresh session with nobody there to answer: every N minutes, daily at a time, or once at a date and time or in N minutes. Also lists the schedules and removes one you added. Adding or removing waits for the user's yes."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -1073,6 +1073,7 @@ impl Tool for Scheduler {
             "every_minutes": {"type": "integer", "description": "For add: run every N minutes."},
             "daily_at": {"type": "string", "description": "For add: HH:MM each day, in this computer's time zone."},
             "weekdays_only": {"type": "boolean", "description": "With daily_at: Monday to Friday only."},
+            "at": {"type": "string", "description": "For add: run once at this local date and time, YYYY-MM-DD HH:MM."},
             "in_minutes": {"type": "integer", "description": "For add: run once, N minutes from now."},
             "mode": {"type": "string", "enum": ["default", "accept-edits", "plan", "auto", "bypass"], "description": "For add: what each run may do unasked; with nobody there, what would ask is refused. Defaults to default; pick more only when the user asked for it."},
             "id": {"type": "integer", "description": "For remove: the schedule's number from list."}
@@ -1157,7 +1158,7 @@ fn drafted(args: &Value, ctx: &ToolContext, now: DateTime<Local>) -> Result<Sche
 }
 
 /// When an add's `args` say to run, as of `now`: exactly one of
-/// `every_minutes`, `daily_at` and `in_minutes`.
+/// `every_minutes`, `daily_at`, `at` and `in_minutes`.
 fn trigger(args: &Value, now: DateTime<Local>) -> Result<Trigger, String> {
     let minutes = |key: &str| match &args[key] {
         Value::Null => Ok(None),
@@ -1169,9 +1170,15 @@ fn trigger(args: &Value, now: DateTime<Local>) -> Result<Trigger, String> {
             .ok_or(format!("`{key}` is a whole number of minutes, 1 or more.")),
     };
     let daily = args["daily_at"].as_str();
-    match (minutes("every_minutes")?, daily, minutes("in_minutes")?) {
-        (Some(minutes), None, None) => Ok(Trigger::Every { minutes }),
-        (None, Some(time), None) => {
+    let once = args["at"].as_str();
+    match (
+        minutes("every_minutes")?,
+        daily,
+        once,
+        minutes("in_minutes")?,
+    ) {
+        (Some(minutes), None, None, None) => Ok(Trigger::Every { minutes }),
+        (None, Some(time), None, None) => {
             let time = chrono::NaiveTime::parse_from_str(time.trim(), "%H:%M")
                 .map_err(|_| format!("`daily_at` is HH:MM, such as 09:30, not `{time}`."))?;
             Ok(Trigger::DailyAt {
@@ -1180,11 +1187,55 @@ fn trigger(args: &Value, now: DateTime<Local>) -> Result<Trigger, String> {
                 weekdays_only: args["weekdays_only"].as_bool().unwrap_or(false),
             })
         }
-        (None, None, Some(minutes)) => Ok(Trigger::Once {
+        (None, None, Some(text), None) => Ok(Trigger::Once {
+            at: moment(text, &now)?,
+        }),
+        (None, None, None, Some(minutes)) => Ok(Trigger::Once {
             at: now.timestamp().max(0) as u64 + u64::from(minutes) * 60,
         }),
-        _ => Err("Give exactly one of `every_minutes`, `daily_at` and `in_minutes`.".into()),
+        _ => Err("Give exactly one of `every_minutes`, `daily_at`, `at` and `in_minutes`.".into()),
     }
+}
+
+/// The epoch second an `at` of `text` names in `now`'s time zone, refused
+/// when it has passed or the clocks skip it.
+// Any zone, not only Local, so a test has one with a gap on a computer
+// whose own zone has none.
+fn moment<Tz: TimeZone>(text: &str, now: &DateTime<Tz>) -> Result<u64, String>
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let text = text.trim();
+    // Models write ISO's `T` and the seconds about as often as the form asked.
+    let forms = [
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+    ];
+    let Some(local) = forms
+        .iter()
+        .find_map(|form| chrono::NaiveDateTime::parse_from_str(text, form).ok())
+    else {
+        return Err(format!(
+            "`at` is YYYY-MM-DD HH:MM, such as 2026-10-03 15:00, not `{text}`."
+        ));
+    };
+    // A time the clocks skip is refused rather than moved: an hour out is
+    // the wrong reminder, said nowhere until it comes.
+    let Some(at) = local.and_local_timezone(now.timezone()).earliest() else {
+        return Err(format!(
+            "`at` {text} does not exist here: the clocks change then."
+        ));
+    };
+    // One already gone would never run, as a new job's clock starts now.
+    if at <= *now {
+        return Err(format!(
+            "`at` {text} has passed: it is {} here.",
+            now.format("%H:%M on %Y-%m-%d")
+        ));
+    }
+    Ok(at.timestamp().max(0) as u64)
 }
 
 /// Add `job` to `list` under the next number, its clock started now: what
@@ -1258,10 +1309,13 @@ fn listed(list: &[Schedule]) -> String {
 /// or removed, when it runs, and above all what it may do with nobody there.
 fn card(runner: Option<Runner>, args: &Value, ctx: &ToolContext) -> String {
     match args["action"].as_str() {
-        Some("add") => match drafted(args, ctx, Local::now()) {
-            Ok(job) => adding(&job, args["in_minutes"].as_u64()),
-            Err(why) => format!("Add a schedule, which will be refused: {why}"),
-        },
+        Some("add") => {
+            let now = Local::now();
+            match drafted(args, ctx, now) {
+                Ok(job) => adding(&job, args["in_minutes"].as_u64(), now),
+                Err(why) => format!("Add a schedule, which will be refused: {why}"),
+            }
+        }
         Some("remove") => {
             let id = args["id"].as_u64().unwrap_or_default();
             let found =
@@ -1280,13 +1334,19 @@ fn card(runner: Option<Runner>, args: &Value, ctx: &ToolContext) -> String {
     }
 }
 
-/// What the card says of `job` about to be added, where `in_minutes` is a
-/// `Once`'s wait, counted from the yes.
-fn adding(job: &Schedule, in_minutes: Option<u64>) -> String {
+/// What the card says of `job` about to be added at `now`, where
+/// `in_minutes` is a `Once`'s wait, counted from the yes.
+fn adding(job: &Schedule, in_minutes: Option<u64>, now: DateTime<Local>) -> String {
     let when = match (&job.trigger, in_minutes) {
-        (Trigger::Once { .. }, Some(1)) => "Once, a minute after your yes".into(),
-        (Trigger::Once { .. }, Some(minutes)) => format!("Once, {minutes} minutes after your yes"),
-        (Trigger::DailyAt { .. }, _) => format!("{}, this computer's time", job.trigger.label()),
+        (Trigger::Once { at }, Some(1)) => {
+            format!("Once, a minute after your yes{}", about(*at, now))
+        }
+        (Trigger::Once { at }, Some(minutes)) => {
+            format!("Once, {minutes} minutes after your yes{}", about(*at, now))
+        }
+        (Trigger::DailyAt { .. } | Trigger::Once { .. }, _) => {
+            format!("{}, this computer's time", job.trigger.label())
+        }
         _ => job.trigger.label(),
     };
     let unasked = match job.mode {
@@ -1307,17 +1367,33 @@ fn adding(job: &Schedule, in_minutes: Option<u64>) -> String {
     )
 }
 
+/// The clock time a wait from `now` ends at, epoch second `at`, as the card
+/// puts it after the wait: with the day when that is not today.
+// Whoever says yes checks a time far more easily than a count of minutes.
+fn about(at: u64, now: DateTime<Local>) -> String {
+    let Some(then) = Local.timestamp_opt(at as i64, 0).single() else {
+        return String::new();
+    };
+    let form = if then.date_naive() == now.date_naive() {
+        "%H:%M"
+    } else {
+        "%H:%M on %a %-d %b"
+    };
+    format!(" (about {})", then.format(form))
+}
+
 #[cfg(test)]
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute here.
     use super::{
-        AT_ONCE, Ended, Event, LIMIT, Listed, Runner, Schedule, Started, Trigger, act, armed_now,
-        is_due, load, lock, next_due, path, runs_dir, save, step,
+        AT_ONCE, Ended, Event, LIMIT, Listed, Runner, Schedule, Started, Trigger, act, adding,
+        armed_now, drafted, is_due, load, lock, moment, next_due, path, runs_dir, save, step,
+        trigger,
     };
     use crate::cancel::Cancel;
     use crate::tools::ToolContext;
-    use chrono::{DateTime, Local, TimeZone};
+    use chrono::{DateTime, FixedOffset, Local, MappedLocalTime, NaiveDate, NaiveTime, TimeZone};
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{self, Receiver, Sender};
@@ -2111,11 +2187,20 @@ mod tests {
             json!({"action": "add", "name": "Deploy", "prompt": "Ship it.",
             "in_minutes": 30, "mode": "bypass"}),
         );
+        // The clock time it ends at depends on when this runs; the test
+        // after this one gives the card a fixed now.
+        let (when, rest) = bypass.split_once(" (about ").unwrap();
         assert_eq!(
-            bypass,
-            "Add schedule \"Deploy\"\nWhen: Once, 30 minutes after your yes\nMode: bypass -- \
-             runs without asking, bar risky calls and your rules. It acts without asking \
-             anyone.\nFolder: /work\nEach run starts a fresh session and is told:\nShip it."
+            when,
+            "Add schedule \"Deploy\"\nWhen: Once, 30 minutes after your yes"
+        );
+        assert_eq!(
+            rest.split_once(")\n").map(|(_, rest)| rest),
+            Some(
+                "Mode: bypass -- runs without asking, bar risky calls and your rules. It \
+                 acts without asking anyone.\nFolder: /work\nEach run starts a fresh session \
+                 and is told:\nShip it."
+            )
         );
         let daily = card(json!({"action": "add", "prompt": "Tidy up.", "daily_at": "9:05"}));
         assert!(
@@ -2128,6 +2213,156 @@ mod tests {
         assert_eq!(
             card(json!({"action": "remove", "id": 3})),
             "Remove schedule #3."
+        );
+    }
+
+    #[test]
+    fn the_card_gives_the_clock_time_a_wait_ends_at_and_the_zone_of_an_at() {
+        let now = at("2026-10-03 15:42:00");
+        let ctx = ToolContext::default();
+        let card = |args: serde_json::Value| {
+            let job = drafted(&args, &ctx, now).unwrap();
+            adding(&job, args["in_minutes"].as_u64(), now)
+        };
+        let soon = card(json!({"prompt": "x", "in_minutes": 120}));
+        assert!(
+            soon.contains("When: Once, 120 minutes after your yes (about 17:42)\n"),
+            "{soon}"
+        );
+        let one = card(json!({"prompt": "x", "in_minutes": 1}));
+        assert!(
+            one.contains("When: Once, a minute after your yes (about 15:43)\n"),
+            "{one}"
+        );
+        // Past midnight the hour alone would read as today's.
+        let late = card(json!({"prompt": "x", "in_minutes": 1080}));
+        assert!(
+            late.contains("When: Once, 1080 minutes after your yes (about 09:42 on Sun 4 Oct)\n"),
+            "{late}"
+        );
+        let set = card(json!({"prompt": "x", "at": "2026-10-04 08:00"}));
+        assert!(
+            set.contains("When: Once at 08:00 on Sun 4 Oct 2026, this computer's time\n"),
+            "{set}"
+        );
+    }
+
+    #[test]
+    fn an_at_sets_once_at_that_local_moment() {
+        let now = at("2026-10-03 15:42:00");
+        let five = at("2026-10-03 17:00:00").timestamp() as u64;
+        for text in [
+            "2026-10-03 17:00",
+            "2026-10-03T17:00",
+            "2026-10-03 17:00:00",
+            " 2026-10-03T17:00:00 ",
+        ] {
+            let set = trigger(&json!({"at": text}), now).unwrap();
+            assert!(matches!(set, Trigger::Once { at } if at == five), "{text}");
+        }
+        assert_eq!(
+            trigger(&json!({"at": "5pm"}), now).err().unwrap(),
+            "`at` is YYYY-MM-DD HH:MM, such as 2026-10-03 15:00, not `5pm`."
+        );
+    }
+
+    #[test]
+    fn a_past_at_is_refused_and_names_the_time_now() {
+        let now = at("2026-10-03 15:42:00");
+        assert_eq!(
+            trigger(&json!({"at": "2026-10-03 15:00"}), now)
+                .err()
+                .unwrap(),
+            "`at` 2026-10-03 15:00 has passed: it is 15:42 on 2026-10-03 here."
+        );
+        // An add said yes to after its time is refused just the same.
+        let dir = scratch("tool-past-at");
+        let probe = probe(&dir);
+        let add = json!({"action": "add", "prompt": "x", "at": "2020-01-01 09:00"});
+        let refused = act(Some(probe.runner.clone()), &add, &ToolContext::default());
+        assert!(refused.unwrap_err().contains("has passed: it is "));
+        assert!(load(&dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn at_together_with_in_minutes_is_refused() {
+        let now = at("2026-10-03 15:42:00");
+        for both in [
+            json!({"at": "2026-10-03 17:00", "in_minutes": 5}),
+            json!({"at": "2026-10-03 17:00", "daily_at": "17:00"}),
+        ] {
+            assert_eq!(
+                trigger(&both, now).err().unwrap(),
+                "Give exactly one of `every_minutes`, `daily_at`, `at` and `in_minutes`."
+            );
+        }
+    }
+
+    /// A zone at UTC whose clocks go from 01:00 to 02:00 on 2026-03-29, as
+    /// London's do, so a gap is there to test on a computer anywhere.
+    #[derive(Clone)]
+    struct Spring;
+
+    impl Spring {
+        /// The local time the clocks jump from, and the UTC instant they do.
+        fn change() -> chrono::NaiveDateTime {
+            "2026-03-29T01:00:00".parse().unwrap()
+        }
+    }
+
+    impl TimeZone for Spring {
+        type Offset = FixedOffset;
+        fn from_offset(_: &FixedOffset) -> Self {
+            Spring
+        }
+        fn offset_from_local_date(&self, local: &NaiveDate) -> MappedLocalTime<FixedOffset> {
+            self.offset_from_local_datetime(&local.and_time(NaiveTime::MIN))
+        }
+        fn offset_from_local_datetime(
+            &self,
+            local: &chrono::NaiveDateTime,
+        ) -> MappedLocalTime<FixedOffset> {
+            let change = Spring::change();
+            if *local < change {
+                MappedLocalTime::Single(FixedOffset::east_opt(0).unwrap())
+            } else if *local < change + chrono::TimeDelta::hours(1) {
+                MappedLocalTime::None
+            } else {
+                MappedLocalTime::Single(FixedOffset::east_opt(3600).unwrap())
+            }
+        }
+        fn offset_from_utc_date(&self, utc: &NaiveDate) -> FixedOffset {
+            self.offset_from_utc_datetime(&utc.and_time(NaiveTime::MIN))
+        }
+        fn offset_from_utc_datetime(&self, utc: &chrono::NaiveDateTime) -> FixedOffset {
+            let east = if *utc < Spring::change() { 0 } else { 3600 };
+            FixedOffset::east_opt(east).unwrap()
+        }
+    }
+
+    #[test]
+    fn a_time_in_a_dst_gap_is_refused() {
+        let now = Spring
+            .from_local_datetime(&"2026-03-28T12:00:00".parse().unwrap())
+            .unwrap();
+        assert_eq!(
+            moment("2026-03-29 01:30", &now).unwrap_err(),
+            "`at` 2026-03-29 01:30 does not exist here: the clocks change then."
+        );
+        // Either side of the gap is a minute apart in UTC.
+        let utc = |text: &str| {
+            text.parse::<chrono::NaiveDateTime>()
+                .unwrap()
+                .and_utc()
+                .timestamp() as u64
+        };
+        assert_eq!(
+            moment("2026-03-29 00:59", &now),
+            Ok(utc("2026-03-29T00:59:00"))
+        );
+        assert_eq!(
+            moment("2026-03-29 02:00", &now),
+            Ok(utc("2026-03-29T01:00:00"))
         );
     }
 }

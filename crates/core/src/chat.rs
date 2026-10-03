@@ -1117,7 +1117,20 @@ fn system_prompt(connection: &Connection, summary: Option<&str>) -> SystemPrompt
             "linux" => "Linux",
             other => other,
         };
-        system.push_str(&format!(" This computer runs {os}."));
+        // The zone, so "at 3pm" or "9am in London" is worked out from here;
+        // it changes only when the computer moves or the clocks do. Windows
+        // says the offset alone: its zone's name would build WinRT bindings
+        // that nothing else here needs.
+        let offset = chrono::Local::now().format("UTC%:z");
+        #[cfg(unix)]
+        let name = iana_time_zone::get_timezone().ok();
+        #[cfg(not(unix))]
+        let name: Option<String> = None;
+        let zone = match name {
+            Some(name) => format!("{name} time ({offset})"),
+            None => offset.to_string(),
+        };
+        system.push_str(&format!(" This computer runs {os}, set to {zone}."));
         // What the last run nobody watches to start in this folder found,
         // not a fresh look, so a run's every request says the same; after
         // the date, as it changes from one run to the next.
@@ -4157,6 +4170,38 @@ mod tests {
         assert!(shared.contains("Today is "));
         assert!(shared.contains("The model behind you is test-model."));
         assert!(!shared.contains("This computer runs"), "{shared}");
+    }
+
+    #[test]
+    fn the_computer_line_names_its_time_zone_and_a_shared_chat_gets_none() {
+        let system = |connection: &Connection| -> String {
+            body(connection, &[], None, None)["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let offset = chrono::Local::now().format("UTC%:z").to_string();
+        let here = system(&connection());
+        #[cfg(unix)]
+        if let Ok(name) = iana_time_zone::get_timezone() {
+            assert!(
+                here.contains(&format!(", set to {name} time ({offset}).")),
+                "{here}"
+            );
+        }
+        assert!(here.contains(&offset), "{here}");
+        assert!(here.contains(", set to "), "{here}");
+
+        let shared = system(&Connection {
+            remote: Some(Remote {
+                place: "#general in a Discord server".into(),
+                shared: true,
+                history: None,
+            }),
+            ..connection()
+        });
+        assert!(!shared.contains(&offset), "{shared}");
+        assert!(!shared.contains(", set to "), "{shared}");
     }
 
     #[test]
