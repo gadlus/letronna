@@ -19,6 +19,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — MCP servers over HTTP and OAuth, plugins from a git repository, and Zed or JetBrains running Letronna over ACP.
 - **App** — The browser opens beside the chat at half the room; long output rests as short previews; live work sits in one line over the box; Files, Changes and Jobs tabs, a Ctrl+K palette, and the whole window reachable from the keyboard.
 - **Chat apps** — Slack, pairing by code, files and voice notes both ways, and `letronna serve` to answer with no window open.
+- **All** — Runs nobody watches finish what they were asked: they keep going after cut-offs and empty replies, finish their checklist, check the files they were asked to make, and are told nobody can answer.
 - **All** — Schedules in a mode of their own, memory you can review and edit, and a window that uses far less memory and processor while it works or sits idle.
 
 ### Added
@@ -100,6 +101,11 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — When a site's check stops the agent, it waits while you get past it and carries on by itself.
 - **All** — The browser works on a site's own dropdowns, scrolls a panel by its ref, types into date, time, colour and range fields, names what a click hit, and waits for what a click set off before reading the page.
 - **Terminal** — Skills and MCP prompts no longer crowd the `/` menu: they come up as you type, and under `/skills` and `/mcp`.
+- **All** — A run nobody watches (`-p`, schedules, `/bg`, editors, chat apps) keeps going after a reply cut off or an empty one, is sent back once with checklist items still open, and checks the files its request asked for before it ends; `-p --output json` lists what is still wrong.
+- **All** — `run_command` takes a timeout of up to half an hour for slow builds and tests.
+- **App** — Previews open by themselves unless turned off.
+- **Terminal** — Lists are steered with the arrows, and Escape declines.
+- **All** — Harness-Bench scripts to score `letronna -p` and compare two builds task by task.
 ### Changed
 - **All** — A failed model request says what went wrong: the key, credit, a rate limit, a busy provider, a conversation too long, and so on.
 - **All** — OpenAI's reasoning models work, and a server that turns down a field is sent the request again without it.
@@ -140,7 +146,14 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **App** — Night is calmer: a midnight frame around a dark ink page.
 - **All** — A command that exits non-zero counts as a failed step, and a web search row shows what was searched for.
 - **All** — A workflow's tokens count up while its agents' replies stream.
+- **All** — A `-p` run gets 100 tool rounds, retries like a scheduled run, and is told nobody is watching, with the tools it may not use left out.
+- **All** — The reminder to check edits covers patches, and only a clean, non-read-only command settles it; edits to .md or .txt files alone do not ask for it.
+- **All** — Text from files and commands that addresses an AI gets a Letronna note, and the summary of dropped turns is marked as derived text.
+- **All** — Tool errors name the next step, and a command that prints nothing says so.
+- **All** — `LETRONNA_READ_TIMEOUT` sets how long a reply may stay silent.
 ### Fixed
+- **All** — A command that uploads a key file (curl, wget, scp, rsync) is refused in every mode, and .gnupg, .pgpass, .vault-token, .azure and gcloud settings count as secret.
+- **All** — An edit whose old text is missing says so instead of "already applied", plain text is no longer saved as a .docx, .xlsx, .pptx, .zip or .pdf, and a command that exits non-zero counts as failed.
 - **App** — Deleting the last session no longer crashes the window, a new session no longer inherits a deleted one's pictures, and a finished empty reply no longer shows Thinking forever.
 - **App** — New session goes to the top, even when it reuses an empty one.
 - **App** — Closing settings or the browser panel gives their pictures back to the GPU.
