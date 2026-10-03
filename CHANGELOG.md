@@ -159,7 +159,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — A command that exits non-zero counts as a failed step, and a web search row shows what was searched for.
 - **All** — A workflow's tokens count up while its agents' replies stream.
 - **All** — A `-p` run gets 100 tool rounds, retries like a scheduled run, and is told nobody is watching, with the tools it may not use left out.
-- **All** — The reminder to check edits covers patches, and only a clean, non-read-only command settles it; edits to .md or .txt files alone do not ask for it.
+- **All** — The reminder to check edits covers patches, and only a clean, non-read-only command settles it; edits to .md or .txt files alone do not ask for it. A run nobody watches is told which files it changed after its last passing build or test.
 - **All** — Text from files and commands that addresses an AI gets a Letronna note, and the summary of dropped turns is marked as derived text.
 - **All** — Tool errors name the next step, and a command that prints nothing says so.
 - **All** — `LETRONNA_READ_TIMEOUT` sets how long a reply may stay silent.
