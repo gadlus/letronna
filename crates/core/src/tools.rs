@@ -67,6 +67,10 @@ pub(crate) struct Caller {
     pub fork: bool,
     /// What the calling agent may call, which a fork of it is held to.
     pub allow: Allow,
+    /// Whether a script makes the call, whose result reaches the model only
+    /// as the script passes it on: a read there is not one the model saw,
+    /// and the script's output is fenced and noted as a whole, not each result.
+    pub script: bool,
 }
 
 impl ToolContext {
@@ -331,6 +335,8 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
     tools.extend(crate::mcp_find::tools());
     #[cfg(feature = "workflows")]
     tools.push(Arc::new(crate::workflow::tool::Workflow));
+    #[cfg(feature = "workflows")]
+    tools.push(Arc::new(crate::script::Script));
     // The user's own search service, once one is set up.
     if crate::search::ready() {
         tools.push(Arc::new(crate::search::SearchWeb));
@@ -752,27 +758,32 @@ pub(crate) fn run_found(
     let ran = crate::redact::scrub(&ran, shapes);
     // The note goes after the cut and outside any fence: it is Letronna's,
     // and never the part that gets lost. An untrusted tool's result is never
-    // saved aside to page through: read back, it would come unfenced.
-    let mut out = if tool.untrusted() {
-        fenced(tool.name(), &args, &ran)?
-    } else {
-        fit(ran, ctx)
+    // saved aside to page through: read back, it would come unfenced. In a
+    // script any result is cut without a copy, whose path only the script
+    // would hear of, and the script's whole output is fenced or saved aside
+    // instead, as what the script makes of a page is the page's too.
+    let mut out = match (tool.untrusted(), ctx.caller.script) {
+        (_, true) => keep_ends(ran, MAX_OUTPUT, ""),
+        (true, false) => fenced(tool.name(), &args, &ran)?,
+        (false, false) => fit(ran, ctx),
     };
     // Above the output, where no cut drops it and a command's exit code
     // stays its last line; under a picture's line naming its copy, which
     // stays first for the window and the next request. Of these tools only
     // read_file writes that line: a command's output or a file name found
-    // can start with the same words.
+    // can start with the same words. A script's output is noted as a whole,
+    // so a call in one gets no note of its own.
     let addressed = NOTED
         .contains(&tool.name())
         .then(|| addressed_note(&out))
         .flatten();
     // Someone other than the user may have written it, as a page's author
-    // does, so the gate checks what the session does next.
+    // does, so the gate checks what the session does next, a script's
+    // reading of it included.
     if addressed.is_some() {
         crate::taint::mark(ctx);
     }
-    let noted: String = if NOTED.contains(&tool.name()) {
+    let noted: String = if NOTED.contains(&tool.name()) && !ctx.caller.script {
         [hidden_note(hid), addressed]
             .into_iter()
             .flatten()
@@ -841,7 +852,7 @@ fn hidden_note(hid: usize) -> Option<String> {
 /// Letronna's note heading `text`, a file's or a command's output, on its
 /// own line, when the text says to an AI what no file or command has reason
 /// to.
-fn addressed_note(text: &str) -> Option<String> {
+pub(crate) fn addressed_note(text: &str) -> Option<String> {
     if !crate::scan::said_to_an_ai(text) {
         return None;
     }
@@ -1034,6 +1045,12 @@ pub fn summary(name: &str, args: &str) -> String {
             .and_then(|plan| plan.lines().find(|line| !line.trim().is_empty()))
             .unwrap_or_default()
             .trim_start_matches(['#', ' '])
+            .to_owned(),
+        // So is a script; its first line is as near as it has to a name.
+        "script" => v["code"]
+            .as_str()
+            .and_then(|code| code.lines().find(|line| !line.trim().is_empty()))
+            .unwrap_or_default()
             .to_owned(),
         "make_image" | "edit_image" => v["prompt"].as_str().unwrap_or_default().to_owned(),
         "make_video" => v["prompt"]
@@ -3231,7 +3248,10 @@ impl Tool for ReadFile {
             shown.chars().count() <= crate::chat::MAX_TOOL_CHARS
                 && crate::untrusted::visible(&shown) == shown
         });
-        crate::filestate::read(ctx.conversation, &path, before, lines);
+        // The model sees a script's read only as the script passes it on.
+        if !ctx.caller.script {
+            crate::filestate::read(ctx.conversation, &path, before, lines);
+        }
         Ok(shown)
     }
 }

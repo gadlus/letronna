@@ -414,6 +414,12 @@ pub struct Settings {
     /// switch for it.
     #[serde(default)]
     pub computer_use: bool,
+    /// Offers the `script` tool, an experiment that runs JavaScript calling
+    /// the read-only tools in one step; read as each session starts, so a
+    /// session's tools stay the same throughout. Edited by hand until the
+    /// window has a switch for it.
+    #[serde(default)]
+    pub script_tool: bool,
     /// Read replies aloud as they stream and answer a chat app's voice note
     /// with one, off by default because the speech is paid from credit.
     #[serde(default)]
@@ -484,6 +490,7 @@ impl Default for Settings {
             disabled_tools: Vec::new(),
             keep_days: 0,
             computer_use: false,
+            script_tool: false,
             keys_in: String::new(),
             fallbacks: Vec::new(),
             memory_review: false,
@@ -960,6 +967,8 @@ fn erase(id: u64, lock: Option<Lock>) {
     crate::history::forget(id);
     crate::lsp::forget(id);
     crate::tasklist::forget(id);
+    #[cfg(feature = "workflows")]
+    crate::script::forget(id);
 }
 
 /// The file marking when old sessions were last looked for.
@@ -3110,6 +3119,12 @@ pub(crate) fn disabled_tools() -> Vec<String> {
 /// `disabled_tools` is.
 pub(crate) fn computer_use() -> bool {
     settings().0.computer_use
+}
+
+/// Whether the settings file offers the `script` tool, which a session reads
+/// once, as it starts.
+pub(crate) fn script_tool() -> bool {
+    settings().0.script_tool
 }
 
 /// Whether the settings file lets one reply's tool calls run together, read
