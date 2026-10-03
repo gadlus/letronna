@@ -1,0 +1,630 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index 7ba7fee..bcb1d65 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -4,7 +4,7 @@ This file is for coding agents (Claude Code, Cursor, Copilot, etc.) to understan
+ 
+ ## What This Is
+ 
+-ClawBench is a benchmarking framework for evaluating AI web agents on real-world online tasks. V1 lives in `test-cases/v1/` with 152 tasks spanning 143 live websites and 15 life categories; V2 lives in `test-cases/v2/` with 129 tasks; Lite lives in `test-cases/v1-lite/` with 20 link-backed V1 tasks. Each task runs in an isolated Docker container with  a browser, a recording Chrome extension, and an AI agent harness (`openclaw`, `opencode`, `claude-code`, `claude-code-chrome-extension`, `codex`, `browser-use`, `claw-code`, `hermes`, or `pi`, or `webbrain`, selectable via `--harness`). The framework captures five layers of data: session replay (MP4), action screenshots, HTTP traffic, browser actions, and agent messages.
++ClawBench is a benchmarking framework for evaluating AI web agents on real-world online tasks. V1 lives in `test-cases/v1/` with 152 tasks spanning 143 live websites and 15 life categories; V2 lives in `test-cases/v2/` with 129 tasks; Lite lives in `test-cases/v1-lite/` with 20 link-backed V1 tasks. Each task runs in an isolated Docker container with  a browser, a recording Chrome extension, and an AI agent harness (`openclaw`, `opencode`, `claude-code`, `claude-code-chrome-extension`, `codex`, `browser-use`, `claw-code`, `hermes`, or `pi`, or `webbrain`, or `letronna`, selectable via `--harness`). The framework captures five layers of data: session replay (MP4), action screenshots, HTTP traffic, browser actions, and agent messages.
+ 
+ ## Project Structure
+ 
+@@ -130,7 +130,11 @@ test-output/<model>/<harness>-<case>-<model>-<timestamp>/
+                             #   `message_start`/`message_end`,
+                             #   `tool_execution_*`, tool-call content, and
+                             #   thinking blocks; streaming `message_update`
+-                            #   fragments are omitted)
++                            #   fragments are omitted;
++                            #   letronna → its session file: `head`/`meta`
++                            #   records, then a `message` record per message
++                            #   with `role`, `content`, `tool_calls`, and each
++                            #   reply's tokens and cost)
+     screenshots/            # Timestamped PNGs
+     recording.mp4           # Full session video
+     interception.json       # Interception result
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e321b51..0787b01 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
+ - `run-meta.json` now carries a `provenance` block: the ClawBench version, commit, branch, and dirty state; the corpus suite and the revision of the commit that last touched it; and the agent and plugin versions pinned by the harness Dockerfile, with a `pins_source` saying whether those pins describe the image that actually ran. Every field is best-effort and null outside a git checkout, so a run never fails on a missing one. See [`docs/trace-cookbook.md`](docs/trace-cookbook.md#provenance).
+ - Added `scripts/export_openeval.py`, an additive script exporting a batch's `rescore-summary.json` as an [EvalPort](https://github.com/adhabnr-ux/evalport) `ResultSet` Thanks to [@adhabnr-ux](https://github.com/adhabnr-ux).
+ - Added a `--browser-runtime kernel` mode to the Harbor adapter that runs each task against one Kernel cloud browser, exposing only a credential-free CDP bridge to the agent, and finalizes the replay and deletes the browser during verification.
++- Added the `letronna` harness: Letronna's terminal agent (`letronna -p`) drives the ClawBench browser over CDP in the browser's own context, so the recorder sees every action, with its session file as the transcript and a usage emitter that reads each call's tokens from it.
+ 
+ ### Changed
+ - Container-engine detection is now lazy: `run_support.config.engine()` probes PATH on first use instead of at import time, so importing the runner modules no longer requires Docker or Podman. `config.ENGINE` still resolves but is deprecated.
+diff --git a/src/clawbench/runtime/harnesses/harnesses.yaml b/src/clawbench/runtime/harnesses/harnesses.yaml
+index 3867b39..7d744e8 100644
+--- a/src/clawbench/runtime/harnesses/harnesses.yaml
++++ b/src/clawbench/runtime/harnesses/harnesses.yaml
+@@ -123,6 +123,17 @@ harnesses:
+     agent_message_sources:
+       - type: file
+         path: /data/agent-messages.jsonl
++  - name: letronna
++    image: clawbench-letronna
++    dockerfile: letronna/Dockerfile.letronna
++    setup_script: letronna/setup-letronna.sh
++    run_script: letronna/run-letronna.sh
++    usage_emitter: letronna/usage-emitter.py
++    agent_message_sources:
++      - type: file
++        path: /data/agent-messages.jsonl
++      - type: latest_glob
++        pattern: /root/.letronna/sessions/*.jsonl
+   # Null baseline — takes no action; establishes the benchmark floor (~0 score,
+   # and the interceptor must not fire without genuine agent activity).
+   - name: "null"
+diff --git a/src/clawbench/runtime/harnesses/letronna/Dockerfile.letronna b/src/clawbench/runtime/harnesses/letronna/Dockerfile.letronna
+new file mode 100644
+index 0000000..75d68f6
+--- /dev/null
++++ b/src/clawbench/runtime/harnesses/letronna/Dockerfile.letronna
+@@ -0,0 +1,52 @@
++# Letronna's terminal agent, `letronna -p`, on ClawBench's browser image.
++# Source: scripts/clawbench in the Letronna repo, which fork.patch copies here.
++#
++# The Letronna repo is private, so the clone needs a GitHub token that can
++# read it, given as a build secret. ClawBench's own build passes none, so
++# build this image once by hand; ClawBench's rebuilds then reuse the cached
++# layer:
++#   docker build --secret id=letronna_token,env=GITHUB_TOKEN \
++#     -f src/clawbench/runtime/harnesses/letronna/Dockerfile.letronna \
++#     -t clawbench-letronna src/clawbench/runtime
++#
++# The commit built: bump it to measure a newer Letronna.
++ARG LETRONNA_REF=103a3b95918ad7ef3d02a139f0ef25e5adb9fd6a
++
++# Bookworm's older glibc, so the binary also runs on the base image's newer
++# one. 1.98 is the toolchain Letronna is developed on; an older one may lack
++# what it uses.
++FROM rust:1.98-slim-bookworm AS letronna-builder
++ARG LETRONNA_REF
++RUN apt-get update && apt-get install -y --no-install-recommends \
++    git ca-certificates \
++    && rm -rf /var/lib/apt/lists/*
++WORKDIR /build/letronna
++# The token goes in a header rather than the URL, which git would keep in
++# FETCH_HEAD, and .git goes before the layer is saved. With no token the
++# fetch goes without one, for a fork that is public.
++RUN --mount=type=secret,id=letronna_token \
++    set --; \
++    if [ -s /run/secrets/letronna_token ]; then \
++      set -- -c "http.extraHeader=Authorization: Basic $(printf 'x-access-token:%s' "$(cat /run/secrets/letronna_token)" | base64 -w0)"; \
++    fi; \
++    git init -q . \
++    && { git "$@" fetch -q --depth 1 https://github.com/gadlus/letronna.git "$LETRONNA_REF" \
++         || { echo "Could not fetch Letronna $LETRONNA_REF: build with --secret id=letronna_token,env=GITHUB_TOKEN, a token that can read gadlus/letronna." >&2; exit 1; }; } \
++    && git checkout -q FETCH_HEAD \
++    && rm -rf .git
++RUN cargo build --release --locked -p letronna-cli \
++    && install -D -m 0755 target/release/letronna /out/letronna \
++    && rm -rf target
++
++FROM clawbench-base
++
++# LiteLLM serves Anthropic and Gemini models as the OpenAI-compatible chat
++# API, the only one Letronna's gateways speak.
++RUN pip install --no-cache-dir 'litellm[proxy]==1.83.9'
++
++COPY --from=letronna-builder /out/letronna /usr/local/bin/letronna
++
++COPY harnesses/letronna/setup-letronna.sh /setup-letronna.sh
++COPY harnesses/letronna/run-letronna.sh   /run-harness.sh
++COPY harnesses/letronna/usage-emitter.py  /usage-emitter.py
++RUN chmod +x /setup-letronna.sh /run-harness.sh /usage-emitter.py
+diff --git a/src/clawbench/runtime/harnesses/letronna/run-letronna.sh b/src/clawbench/runtime/harnesses/letronna/run-letronna.sh
+new file mode 100755
+index 0000000..f71987d
+--- /dev/null
++++ b/src/clawbench/runtime/harnesses/letronna/run-letronna.sh
+@@ -0,0 +1,209 @@
++#!/bin/bash
++set -e
++
++# Run-time harness script for Letronna's terminal agent, `letronna -p`.
++#
++# Letronna drives ClawBench's Chrome itself, over CDP: LETRONNA_BROWSER_URL
++# points it there, and setup's browser_shared keeps its pages in the
++# browser's own context, so the recorder sees every action. It gets the
++# browser and reading tools only, as the other CLI harnesses do. Its session
++# file is its transcript, copied to /data/agent-messages.jsonl at the end,
++# and usage-emitter.py reads each call's tokens from it.
++
++# Stands in for / in the tests; empty in the image.
++ROOT="${LETRONNA_CLAWBENCH_ROOT:-}"
++DATA="$ROOT/data"
++WORKSPACE="$ROOT/root/workspace"
++export AGENT_DATA_DIR="$ROOT/root/.letronna"
++
++# Tool rounds a message gets. Letronna's own default of 25 ends a checkout
++# flow before its last request, the one ClawBench scores; Hermes runs here
++# with 90 turns, and 150 leaves the time limit, not the rounds, to end a
++# slow run.
++MAX_ROUNDS=150
++# Seconds Letronna has after the interrupt to end the run and let go of the
++# browser before it is terminated: it gives its commands two seconds, and a
++# reply being streamed stops at once.
++STOP_GRACE_S=10
++
++"$ROOT/setup-letronna.sh"
++
++# Anthropic and Gemini models go through LiteLLM, which setup configured.
++PROXY_PID=""
++if [ -f "$AGENT_DATA_DIR/litellm-config.yaml" ]; then
++  echo "Starting API translation proxy (litellm)..."
++  litellm --config "$AGENT_DATA_DIR/litellm-config.yaml" --port 4000 \
++    > "$DATA/proxy.log" 2>&1 &
++  PROXY_PID=$!
++  for i in $(seq 1 30); do
++    if curl -sf http://localhost:4000/health/liveliness > /dev/null 2>&1; then
++      echo "API proxy ready"
++      break
++    fi
++    if [ "$i" -eq 30 ]; then
++      echo "API proxy not ready after 30s; check $DATA/proxy.log"
++      echo "proxy_failed" > "$DATA/.stop-reason"
++      exit 1
++    fi
++    sleep 1
++  done
++fi
++
++# Copy /my-info/ into the workspace so the agent can access it via ./my-info/
++mkdir -p "$WORKSPACE"
++if [ -d "$ROOT/my-info" ]; then
++  cp -r "$ROOT/my-info" "$WORKSPACE/my-info"
++  echo "Copied /my-info to $WORKSPACE/my-info"
++fi
++
++echo "Waiting for Chrome CDP..."
++for i in $(seq 1 30); do
++  if [[ "$CLAWBENCH_BROWSER_CDP_URL" == ws://* || "$CLAWBENCH_BROWSER_CDP_URL" == wss://* ]]; then
++    echo "Chrome CDP ready"
++    break
++  fi
++  if curl -sf "${CLAWBENCH_BROWSER_CDP_URL%/}/json/version" > /dev/null 2>&1; then
++    echo "Chrome CDP ready"
++    break
++  fi
++  if [ "$i" -eq 30 ]; then
++    echo "Chrome CDP not ready after 30s, aborting"
++    echo "chrome_cdp_timeout" > "$DATA/.stop-reason"
++    exit 1
++  fi
++  sleep 1
++done
++
++# Restrict PATH to safe read-only commands
++SAFE_BIN="$ROOT/tmp/safe-bin"
++mkdir -p "$SAFE_BIN"
++for cmd in ls cat find file head tail wc grep sort sh bash; do
++  [ -x "$(command -v "$cmd" 2>/dev/null)" ] && ln -sf "$(command -v "$cmd")" "$SAFE_BIN/$cmd"
++done
++ln -sf "$(command -v letronna)" "$SAFE_BIN/letronna"
++
++LETRONNA_ARGS=(-p "$INSTRUCTION" --output json --yes
++  --tools browse,use_page,read_file,list_dir --max-rounds "$MAX_ROUNDS")
++case "${THINKING_LEVEL:-}" in
++  "")       ;;
++  off)      LETRONNA_ARGS+=(--effort none) ;;
++  adaptive) LETRONNA_ARGS+=(--effort auto) ;;
++  *)        LETRONNA_ARGS+=(--effort "$THINKING_LEVEL") ;;
++esac
++
++cd "$WORKSPACE"
++echo "Starting Letronna (model=${MODEL_NAME})..."
++: > "$DATA/usage.jsonl"
++# A script runs what it puts in the background with Ctrl-C ignored, and
++# Letronna then leaves it ignored, so the interrupt that stops it below would
++# do nothing. Job control gives it the default back, and a process group of
++# its own to signal.
++set -m
++PATH="$SAFE_BIN" LETRONNA_BROWSER_URL="$CLAWBENCH_BROWSER_CDP_URL" LETRONNA_NO_LOGIN_ENV=1 \
++  "$SAFE_BIN/letronna" "${LETRONNA_ARGS[@]}" \
++  < /dev/null > "$DATA/letronna-result.json" 2> "$DATA/agent.log" &
++AGENT_PID=$!
++set +m
++
++# Watchdog: detect agent no action for 300s
++IDLE_THRESHOLD=300
++MAX_WAIT=${TIME_LIMIT_S:-1800}
++ELAPSED=0
++LAST_SIZE=0
++IDLE=0
++STOP_REASON=""
++
++while kill -0 $AGENT_PID 2>/dev/null && [ "$ELAPSED" -lt "$MAX_WAIT" ]; do
++  sleep 5
++  ELAPSED=$((ELAPSED + 5))
++
++  # Check if server requested stop (eval interceptor matched)
++  if [ -f "$DATA/.stop-requested" ]; then
++    echo "Stop requested by server (eval matched), stopping agent."
++    STOP_REASON="eval_matched"
++    break
++  fi
++
++  CURRENT_SIZE=$(wc -c < "$DATA/actions.jsonl" 2>/dev/null || echo 0)
++
++  if [ "$CURRENT_SIZE" -gt 0 ] && [ "$CURRENT_SIZE" -eq "$LAST_SIZE" ]; then
++    IDLE=$((IDLE + 5))
++    if [ "$IDLE" -ge "$IDLE_THRESHOLD" ]; then
++      echo "Agent idle for ${IDLE_THRESHOLD}s, assuming done."
++      STOP_REASON="agent_idle"
++      break
++    fi
++  else
++    IDLE=0
++  fi
++  LAST_SIZE=$CURRENT_SIZE
++done
++
++# Determine stop reason if not set (loop exited without breaking). Letronna
++# exits non-zero only when the run failed, such as on a model call that kept
++# failing; said apart from a run it ended itself, though ClawBench still
++# counts it as the model's.
++if [ -z "$STOP_REASON" ]; then
++  if kill -0 $AGENT_PID 2>/dev/null; then
++    echo "Time limit (${MAX_WAIT}s) exceeded, stopping agent."
++    STOP_REASON="time_limit_exceeded"
++  else
++    AGENT_STATUS=0
++    wait $AGENT_PID || AGENT_STATUS=$?
++    if [ "$AGENT_STATUS" -eq 0 ]; then
++      STOP_REASON="agent_exited"
++    else
++      echo "Letronna exited with status ${AGENT_STATUS}; see $DATA/letronna-result.json."
++      STOP_REASON="letronna_failed"
++    fi
++  fi
++fi
++
++echo "$STOP_REASON" > "$DATA/.stop-reason"
++
++# Stop Letronna as Ctrl-C would, which ends the run and lets go of the
++# browser and anything it started; then terminate and kill its group if it
++# has not gone by the end of the grace.
++if kill -INT -- -$AGENT_PID 2>/dev/null; then
++  for _ in $(seq 1 "$STOP_GRACE_S"); do
++    kill -0 $AGENT_PID 2>/dev/null || break
++    sleep 1
++  done
++  if kill -TERM -- -$AGENT_PID 2>/dev/null; then
++    sleep 2
++    kill -KILL -- -$AGENT_PID 2>/dev/null || true
++  fi
++fi
++if [ -n "$PROXY_PID" ]; then
++  kill $PROXY_PID 2>/dev/null || true
++  pkill -f "litellm" 2>/dev/null || true
++fi
++sleep 2
++
++# Promote Letronna's session file to /data/agent-messages.jsonl. A fresh
++# data folder holds the one session -p made, written as the run went, so it
++# is there even when the run was killed.
++LATEST_SESSION=$(ls -t "$AGENT_DATA_DIR"/sessions/*.jsonl 2>/dev/null | head -n 1)
++if [ -n "$LATEST_SESSION" ]; then
++  cp "$LATEST_SESSION" "$DATA/agent-messages.jsonl"
++  python3 "$ROOT/usage-emitter.py" --input "$DATA/agent-messages.jsonl" --output "$DATA/usage.jsonl" || true
++else
++  echo "WARN: Letronna wrote no session file"
++  : > "$DATA/agent-messages.jsonl"
++fi
++
++curl -sf -X POST http://localhost:7878/api/stop || true
++
++# Clean up internal marker (created by /api/stop)
++rm -f "$DATA/.stop-requested"
++
++# Grace period: keep recording for 15s after agent is killed to capture end result
++echo "Agent finished, recording grace period (15s)..."
++sleep 15
++
++# Stop recording
++echo "Stopping recording..."
++curl -sf -X POST http://localhost:7878/api/stop-recording || true
++sleep 2
++rm -f "$DATA"/*.log
++echo "Done."
+diff --git a/src/clawbench/runtime/harnesses/letronna/setup-letronna.sh b/src/clawbench/runtime/harnesses/letronna/setup-letronna.sh
+new file mode 100755
+index 0000000..1651c91
+--- /dev/null
++++ b/src/clawbench/runtime/harnesses/letronna/setup-letronna.sh
+@@ -0,0 +1,121 @@
++#!/bin/bash
++set -e
++
++# Writes Letronna's settings and key into its data folder, AGENT_DATA_DIR,
++# from the model the test driver hands over (models.yaml): MODEL_NAME,
++# BASE_URL, API_TYPE, and API_KEYS or API_KEY. `letronna -p` with no model
++# set up stops at once, and the terminal has no flag or variable for the
++# endpoint, so the settings file is the only way in.
++if [ -z "$BASE_URL" ] || [ -z "$MODEL_NAME" ] || [ -z "$API_TYPE" ] || [ -z "$AGENT_DATA_DIR" ]; then
++  echo "ERROR: BASE_URL, MODEL_NAME, API_TYPE and AGENT_DATA_DIR must be set"
++  exit 1
++fi
++
++if [ -n "$TEMPERATURE" ]; then
++  echo "WARN: Letronna has no temperature flag; TEMPERATURE='$TEMPERATURE' will be ignored."
++fi
++if [ -n "$MAX_TOKENS" ]; then
++  echo "WARN: Letronna has no max-tokens flag; MAX_TOKENS='$MAX_TOKENS' will be ignored."
++fi
++
++python3 - <<'PYEOF'
++import json
++import os
++import urllib.request
++from pathlib import Path
++
++base_url = os.environ["BASE_URL"].rstrip("/")
++model_name = os.environ["MODEL_NAME"]
++api_type = os.environ["API_TYPE"]
++data = Path(os.environ["AGENT_DATA_DIR"])
++
++# One key, the first of API_KEYS, else API_KEY.
++key = ""
++try:
++    keys = json.loads(os.environ.get("API_KEYS") or "[]")
++except json.JSONDecodeError:
++    keys = []
++if isinstance(keys, list) and keys:
++    key = str(keys[0])
++    if len(keys) > 1:
++        print(f"WARN: Letronna does not rotate keys; using the first of {len(keys)}")
++key = key or os.environ.get("API_KEY", "")
++if not key:
++    raise SystemExit("ERROR: no API key provided (API_KEYS or API_KEY)")
++
++# OpenRouter wants the full id, such as qwen/qwen3.5-397b-a17b, where
++# models.yaml may name the model without its maker.
++model = model_name
++is_openrouter = "openrouter.ai" in base_url
++if is_openrouter:
++    try:
++        request = urllib.request.Request(
++            f"{base_url}/models", headers={"Authorization": f"Bearer {key}"}
++        )
++        listed = json.loads(urllib.request.urlopen(request, timeout=10).read())
++        for row in listed.get("data", []):
++            if row["id"] == model_name or row["id"].endswith(f"/{model_name}"):
++                model = row["id"]
++                break
++    except Exception as e:
++        print(f"WARN: could not resolve the OpenRouter model id: {e}")
++
++data.mkdir(parents=True, exist_ok=True)
++# Letronna speaks the OpenAI chat API to any server through its Custom
++# gateway, so an OpenAI-compatible one is reached directly. LiteLLM, which
++# the run script starts on this port, translates for the others.
++litellm_port = 4000
++if is_openrouter or api_type in ("openai-completions", "openai-responses"):
++    endpoint = base_url
++    letronna_key = key
++elif api_type in ("anthropic-messages", "google-generative-ai"):
++    prefix = "anthropic" if api_type == "anthropic-messages" else "gemini"
++    native = (
++        "https://api.anthropic.com"
++        if prefix == "anthropic"
++        else "https://generativelanguage.googleapis.com"
++    )
++    params = {"model": f"{prefix}/{model_name}", "api_key": key}
++    if not base_url.startswith(native):
++        params["api_base"] = base_url
++    proxy = {
++        "model_list": [{"model_name": model_name, "litellm_params": params}],
++        # Parameters one API has and the other lacks are left out rather
++        # than refused.
++        "litellm_settings": {"drop_params": True},
++    }
++    # JSON is YAML too. In the data folder, which Letronna's tools refuse to
++    # read, since it holds the key.
++    config = data / "litellm-config.yaml"
++    config.write_text(json.dumps(proxy, indent=2))
++    config.chmod(0o600)
++    endpoint = f"http://127.0.0.1:{litellm_port}"
++    # LiteLLM here takes no key of its own.
++    letronna_key = ""
++else:
++    raise SystemExit(f"ERROR: unsupported api_type for the letronna harness: {api_type}")
++
++if letronna_key:
++    keys_file = data / "keys.json"
++    keys_file.write_text(json.dumps({"Custom": letronna_key}))
++    keys_file.chmod(0o600)
++
++settings = {
++    "endpoint": endpoint,
++    "custom_endpoint": endpoint,
++    "gateway": "Custom",
++    "model": model,
++    # Never a keyring, which the container does not have.
++    "keys_in": "files",
++    # Every conversation in the browser's own context, where ClawBench's
++    # recorder extension and stealth profile are, rather than in a private
++    # one of Letronna's, which has neither.
++    "browser_shared": True,
++    # Each review is a model call the task did not ask for.
++    "memory_review": False,
++    "manual_updates": True,
++    "notifications": False,
++}
++(data / "settings.json").write_text(json.dumps(settings, indent=2))
++print(f"Letronna config: model={model}, endpoint={endpoint}")
++PYEOF
+diff --git a/src/clawbench/runtime/harnesses/letronna/usage-emitter.py b/src/clawbench/runtime/harnesses/letronna/usage-emitter.py
+new file mode 100755
+index 0000000..09e5d30
+--- /dev/null
++++ b/src/clawbench/runtime/harnesses/letronna/usage-emitter.py
+@@ -0,0 +1,141 @@
++#!/usr/bin/env python3
++"""Usage rows for ClawBench from Letronna's session file.
++
++Letronna keeps a session as JSON lines, one record per message, and each
++assistant message carries the tokens and cost of the model call that made
++it, with a summary's call beside it when the context was compacted.
++ClawBench reads one row per call from /data/usage.jsonl, in the shape its
++other harnesses' emitters write, and adds them up for the run. The shared
++emitter looks for a `usage` object, which Letronna's records do not have,
++so this one reads them as they are.
++
++Letronna counts the thinking inside the output and the cache inside the
++input, where ClawBench adds each part to the total, so each is taken out of
++the one it sits in and every token is counted once.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++from pathlib import Path
++from typing import Any
++
++HARNESS = "letronna"
++
++
++def number(value: Any) -> int:
++    """A token count as a whole number, 0 for anything that is not one."""
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        return 0
++    return max(int(value), 0)
++
++
++def reply_usage(record: dict[str, Any]) -> dict[str, Any]:
++    """What the call that made an assistant message took, in the summary's terms."""
++    prompt = number(record.get("prompt_tokens"))
++    cached = number(record.get("cached_tokens"))
++    written = number(record.get("cache_write_tokens"))
++    # OpenAI counts cache hits and writes inside prompt_tokens, and some
++    # gateways beside it, as Message::input_tokens in chat.rs allows for.
++    total_input = prompt + cached + written if cached + written > prompt else prompt
++    return {
++        "input": total_input,
++        "cached": cached,
++        "cache_write": written,
++        "output": number(record.get("tokens")),
++        "reasoning": number(record.get("reasoning_tokens")),
++        "cost": record.get("cost"),
++    }
++
++
++def row(
++    call_id: str, usage: dict[str, Any], model: str, at: Any
++) -> dict[str, Any] | None:
++    """The usage row ClawBench reads for one call, or None when it took no tokens."""
++    cached = number(usage.get("cached"))
++    written = number(usage.get("cache_write"))
++    fresh = max(number(usage.get("input")) - cached - written, 0)
++    output = number(usage.get("output"))
++    reasoning = min(number(usage.get("reasoning")), output)
++    total = fresh + cached + written + output
++    if total == 0:
++        return None
++    cost = usage.get("cost")
++    cost = (
++        float(cost)
++        if isinstance(cost, (int, float)) and not isinstance(cost, bool)
++        else None
++    )
++    return {
++        "type": "usage",
++        "source_harness": HARNESS,
++        "call_id": call_id,
++        "timestamp": at or None,
++        "model": model,
++        "input_tokens": fresh,
++        "output_tokens": output - reasoning,
++        "cache_read_tokens": cached,
++        "cache_write_tokens": written,
++        "reasoning_tokens": reasoning,
++        "total_tokens": total,
++        # Letronna's own figure: billed by OpenRouter, else from the model's
++        # listed price.
++        "estimated_cost_usd": round(cost, 6) if cost is not None else None,
++        "cost_status": "estimated" if cost is not None else "price_unavailable",
++        "pricing_source_url": None,
++        "matched_model_id": None,
++    }
++
++
++def rows(lines: list[str], default_model: str) -> list[dict[str, Any]]:
++    """One row for each model call the session's lines record, in order."""
++    out: list[dict[str, Any]] = []
++    for line_number, line in enumerate(lines, start=1):
++        try:
++            record = json.loads(line)
++        except json.JSONDecodeError:
++            continue
++        if not isinstance(record, dict) or record.get("role") != "assistant":
++            continue
++        # A "paid" record is a reply a rewind took out of the session, still
++        # a call that was made.
++        if record.get("type") not in ("message", "paid"):
++            continue
++        model = str(record.get("model") or default_model)
++        at = record.get("at")
++        made = row(f"{HARNESS}:{line_number}", reply_usage(record), model, at)
++        if made:
++            out.append(made)
++        summary = record.get("summary_usage")
++        if isinstance(summary, dict):
++            made = row(f"{HARNESS}:{line_number}:summary", summary, model, at)
++            if made:
++                out.append(made)
++    return out
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    parser.add_argument(
++        "--input", type=Path, required=True, help="Letronna's session file"
++    )
++    parser.add_argument("--output", type=Path, default=Path("/data/usage.jsonl"))
++    parser.add_argument("--model", default=os.environ.get("MODEL_NAME", ""))
++    args = parser.parse_args()
++    try:
++        lines = args.input.read_text(encoding="utf-8", errors="replace").splitlines()
++    except OSError:
++        lines = []
++    args.output.parent.mkdir(parents=True, exist_ok=True)
++    # Written whole each time, so running it again counts no call twice.
++    with args.output.open("w", encoding="utf-8") as out:
++        for made in rows(lines, args.model):
++            out.write(
++                json.dumps(made, ensure_ascii=False, separators=(",", ":")) + "\n"
++            )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/test_harness_registry.py b/tests/test_harness_registry.py
+index c697eb8..376536e 100644
+--- a/tests/test_harness_registry.py
++++ b/tests/test_harness_registry.py
+@@ -28,6 +28,7 @@ EXPECTED_HARNESSES = (
+     "hermes",
+     "pi",
+     "webbrain",
++    "letronna",
+     "null",
+     "random-click",
+ )
+@@ -87,6 +88,10 @@ EXPECTED_AGENT_MESSAGE_SOURCES = {
+         ("file", "/data/agent-messages.raw.jsonl"),
+     ),
+     "webbrain": (("file", "/data/agent-messages.jsonl"),),
++    "letronna": (
++        ("file", "/data/agent-messages.jsonl"),
++        ("latest_glob", "/root/.letronna/sessions/*.jsonl"),
++    ),
+     "harbor": (("file", "/data/agent-messages.jsonl"),),
+     "null": (("file", "/data/agent-messages.jsonl"),),
+     "random-click": (("file", "/data/agent-messages.jsonl"),),

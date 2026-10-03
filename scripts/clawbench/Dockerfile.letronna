@@ -1,0 +1,52 @@
+# Letronna's terminal agent, `letronna -p`, on ClawBench's browser image.
+# Source: scripts/clawbench in the Letronna repo, which fork.patch copies here.
+#
+# The Letronna repo is private, so the clone needs a GitHub token that can
+# read it, given as a build secret. ClawBench's own build passes none, so
+# build this image once by hand; ClawBench's rebuilds then reuse the cached
+# layer:
+#   docker build --secret id=letronna_token,env=GITHUB_TOKEN \
+#     -f src/clawbench/runtime/harnesses/letronna/Dockerfile.letronna \
+#     -t clawbench-letronna src/clawbench/runtime
+#
+# The commit built: bump it to measure a newer Letronna.
+ARG LETRONNA_REF=103a3b95918ad7ef3d02a139f0ef25e5adb9fd6a
+
+# Bookworm's older glibc, so the binary also runs on the base image's newer
+# one. 1.98 is the toolchain Letronna is developed on; an older one may lack
+# what it uses.
+FROM rust:1.98-slim-bookworm AS letronna-builder
+ARG LETRONNA_REF
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build/letronna
+# The token goes in a header rather than the URL, which git would keep in
+# FETCH_HEAD, and .git goes before the layer is saved. With no token the
+# fetch goes without one, for a fork that is public.
+RUN --mount=type=secret,id=letronna_token \
+    set --; \
+    if [ -s /run/secrets/letronna_token ]; then \
+      set -- -c "http.extraHeader=Authorization: Basic $(printf 'x-access-token:%s' "$(cat /run/secrets/letronna_token)" | base64 -w0)"; \
+    fi; \
+    git init -q . \
+    && { git "$@" fetch -q --depth 1 https://github.com/gadlus/letronna.git "$LETRONNA_REF" \
+         || { echo "Could not fetch Letronna $LETRONNA_REF: build with --secret id=letronna_token,env=GITHUB_TOKEN, a token that can read gadlus/letronna." >&2; exit 1; }; } \
+    && git checkout -q FETCH_HEAD \
+    && rm -rf .git
+RUN cargo build --release --locked -p letronna-cli \
+    && install -D -m 0755 target/release/letronna /out/letronna \
+    && rm -rf target
+
+FROM clawbench-base
+
+# LiteLLM serves Anthropic and Gemini models as the OpenAI-compatible chat
+# API, the only one Letronna's gateways speak.
+RUN pip install --no-cache-dir 'litellm[proxy]==1.83.9'
+
+COPY --from=letronna-builder /out/letronna /usr/local/bin/letronna
+
+COPY harnesses/letronna/setup-letronna.sh /setup-letronna.sh
+COPY harnesses/letronna/run-letronna.sh   /run-harness.sh
+COPY harnesses/letronna/usage-emitter.py  /usage-emitter.py
+RUN chmod +x /setup-letronna.sh /run-harness.sh /usage-emitter.py
