@@ -9,3 +9,6 @@ CLAUDE.md
 
 # Files the agent wrote while being tested in this folder
 /hello.asm
+
+# Bytecode from the scripts under scripts/aig
+__pycache__/
