@@ -149,7 +149,7 @@ The window shows the browser beside the chat, live, while the agent uses it or o
 - `media/` images, speech and video made with no project attached, and browser screenshots
 - `browser/` the browser's own profile: delete it to sign out of everything there
 
-With a project folder attached, its `AGENTS.md` (or `CLAUDE.md`) is read as the project's instructions, and so is the one in each folder above it up to the repository's root.
+With a project folder attached, its `AGENTS.md` (or `CLAUDE.md`) is read as the project's instructions, and so is the one in each folder above it up to the repository's root. An `AGENTS.local.md` (or `CLAUDE.local.md`) beside one, for rules of your own that you keep out of git, is read after it.
 
 Chat text is sent to the gateway you selected and nowhere else.
 
@@ -230,7 +230,7 @@ The window shows the browser beside the chat, live, while the agent uses it or o
 - `media/` images, speech and video made with no project attached, and browser screenshots
 - `browser/` the browser's own profile: delete it to sign out of everything there
 
-With a project folder attached, its `AGENTS.md` (or `CLAUDE.md`) is read as the project's instructions, and so is the one in each folder above it up to the repository's root.
+With a project folder attached, its `AGENTS.md` (or `CLAUDE.md`) is read as the project's instructions, and so is the one in each folder above it up to the repository's root. An `AGENTS.local.md` (or `CLAUDE.local.md`) beside one, for rules of your own that you keep out of git, is read after it.
 
 Chat text is sent to the gateway you selected and nowhere else.
 

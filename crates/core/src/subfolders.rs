@@ -7,7 +7,9 @@
 //! package's folder. The first tool result in the context window that reads,
 //! lists, searches or writes inside such a folder carries its file after it,
 //! on the wire only: the saved and shown result never does, and the system
-//! prompt stays the same, so what a provider cached still matches.
+//! prompt stays the same, so what a provider cached still matches. A
+//! folder's AGENTS.local.md (or CLAUDE.local.md), the user's own, follows
+//! its shared file there, as the project folder's does in the prompt.
 //!
 //! Nothing is remembered between requests. Which result carries which file
 //! follows from the window alone, as the screenshot's place does, so once
@@ -51,6 +53,8 @@ const TOTAL_TOKENS: usize = 4_000;
 const FLOOR_TOKENS: usize = 500;
 /// A folder's instruction file, the first found, as for the project's own.
 const NAMES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+/// The user's own file beside it, the first found, which goes after it.
+const LOCAL_NAMES: [&str; 2] = ["AGENTS.local.md", "CLAUDE.local.md"];
 /// Folders of version control, installed packages and build output, whose
 /// files are someone else's or made from the project's own.
 const SKIP: &[&str] = &[
@@ -203,7 +207,11 @@ impl<'a> Request<'a> {
     /// folder's hint, so the text does not go out again right after it.
     fn read(&mut self, m: &Message, raw: &str) {
         let name = raw.rsplit(['/', '\\']).next().unwrap_or_default();
-        if m.name != "read_file" || !NAMES.iter().any(|n| same(name, n, FOLD)) {
+        let named = NAMES
+            .iter()
+            .chain(&LOCAL_NAMES)
+            .any(|n| same(name, n, FOLD));
+        if m.name != "read_file" || !named {
             return;
         }
         if let Ok(path) = std::fs::canonicalize(self.workspace.join(raw)) {
@@ -219,10 +227,7 @@ impl<'a> Request<'a> {
     }
 
     /// The lines that bring in the folder `rel`'s instructions the first
-    /// time a result touches it: its file, cut to the tokens left; only its
-    /// name where a `read_file` of it would be asked about or too few are
-    /// left; and nothing where one would be denied, or its file went out
-    /// already, through a link or read by the model.
+    /// time a result touches it: its shared file, then the user's own.
     fn hint(&mut self, rel: &str) -> String {
         if !self.folders.insert(key(rel)) {
             return String::new();
@@ -232,7 +237,19 @@ impl<'a> Request<'a> {
             return String::new();
         }
         let shown = clean(rel);
-        for name in NAMES {
+        // The user's own file is the more specific, so it takes the tokens
+        // left first, as in the prompt.
+        let own = self.file_hint(rel, &shown, LOCAL_NAMES);
+        self.file_hint(rel, &shown, NAMES) + &own
+    }
+
+    /// The lines that bring in the first of `names` in the folder `rel`,
+    /// shown as `shown`: its text, cut to the tokens left; only its name
+    /// where a `read_file` of it would be asked about or too few are left;
+    /// and nothing where one would be denied, or it went out already,
+    /// through a link or read by the model.
+    fn file_hint(&mut self, rel: &str, shown: &str, names: [&str; 2]) -> String {
+        for name in names {
             let Some(path) = self.file(rel, name) else {
                 continue;
             };
@@ -797,6 +814,32 @@ mod tests {
             result("read_file", "web/a.ts"),
         ];
         assert_eq!(hints(&window, &connection(&dir)), [None, None]);
+    }
+
+    #[test]
+    fn a_folders_overlay_follows_its_shared_file() {
+        let dir = scratch("overlay");
+        write(dir.join("web/AGENTS.md"), "Shared rules.");
+        write(dir.join("web/CLAUDE.local.md"), "My rules.");
+        write(dir.join("api/AGENTS.md"), "Api rules.");
+        write(dir.join("api/AGENTS.local.md"), "My api rules.");
+        let window = [
+            result("read_file", "web/a.ts"),
+            result("read_file", "api/AGENTS.local.md"),
+        ];
+        let hints = hints(&window, &connection(&dir));
+        assert_eq!(
+            hints[0].as_deref(),
+            Some(
+                "\n\n[Instructions for web/, from web/AGENTS.md:]\nShared rules.\
+                 \n\n[Instructions for web/, from web/CLAUDE.local.md:]\nMy rules."
+            )
+        );
+        // Reading the user's own file stands in for it alone.
+        assert_eq!(
+            hints[1].as_deref(),
+            Some("\n\n[Instructions for api/, from api/AGENTS.md:]\nApi rules.")
+        );
     }
 
     #[test]
