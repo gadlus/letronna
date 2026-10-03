@@ -46,6 +46,9 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Securit
 [target.'cfg(unix)'.dependencies]
 # Also stops a git that ran past its time together with what it started.
 libc = "0.2"
+# The time zone's name in the system prompt; chrono already reads it with
+# this crate here, so it is in the lock file and built.
+iana-time-zone = "0.1"
 
 # The login Keychain keeps the keys and tokens on macOS; already in the lock
 # file under rustls-native-certs. Computer use on macOS: the window list,

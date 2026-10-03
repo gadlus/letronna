@@ -3742,6 +3742,7 @@ dependencies = [
  "chrono",
  "core-foundation 0.10.0",
  "core-graphics 0.24.0",
+ "iana-time-zone",
  "ignore",
  "image",
  "landlock",
