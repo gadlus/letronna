@@ -98,6 +98,7 @@ impl Runner {
             typed: Default::default(),
             // Its own: the judge runs on `model`.
             session_model: String::new(),
+            system: None,
         }
     }
 
