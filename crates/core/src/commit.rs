@@ -38,6 +38,22 @@ const SUGGEST_CAP: usize = 48 * 1024;
 /// Where a commit message's lines are wrapped, as `git log` reads well.
 const WRAP: usize = 72;
 
+/// How many of the newest commits a suggestion reads the subjects of: more
+/// than it keeps, so a run of bots' commits still leaves enough.
+const RECENT_READ: usize = 20;
+
+/// The most subjects a suggestion shows the model, about 200 tokens.
+const RECENT_KEPT: usize = 15;
+
+/// The fewest subjects that show a style; a young repository's first few
+/// ("init", "wip") show none, and its suggestions keep the house style.
+const RECENT_FEWEST: usize = 5;
+
+/// Where a listed subject is cut: git makes a message's whole first
+/// paragraph its subject when no blank line follows the first line, and
+/// the start of it shows the style as well as all of it does.
+const SUBJECT_CAP: usize = 100;
+
 /// What happened to a file, as git's status letters say it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -394,24 +410,35 @@ pub fn staged_diff(folder: &Path) -> Result<String, String> {
     Ok(text)
 }
 
-/// What the model is told a commit message is, in this project's style.
-const HOUSE_STYLE: &str = "You write one git commit message for the staged diff you are given. \
-Reply with the message alone: no code fence, no preamble.\n\
-The first line is the subject: the outcome for someone using the program, in about 60 \
-characters, with no type prefix such as feat: or fix:, no scope, and no trailing period.\n\
+/// What the model is told it writes, before the style it writes in.
+const TASK: &str = "You write one git commit message for the staged diff you are given. \
+Reply with the message alone: no code fence, no preamble.\n";
+
+/// What the model is told when it is shown the repository's own subjects,
+/// which then win over the house style.
+const FOLLOW_REPO: &str = "When recent subjects are given, follow the conventions they share \
+(type prefixes and scopes, capitalisation, tense, issue or PR references) but not their \
+vagueness; where they share none, use this style:\n";
+
+/// What a commit message is in this project's style.
+const HOUSE_STYLE: &str = "The first line is the subject: the outcome for someone using the \
+program, in about 60 characters, with no type prefix such as feat: or fix:, no scope, and no \
+trailing period.\n\
 Then a blank line, then a body in plain prose paragraphs, no bullets or headings: what \
 was missing, what happens now, and any trade-off made. Keep it short; a small change \
 needs two or three sentences.";
 
 /// A commit message for what is staged in `folder`, from one round with the
-/// session's model and no tools, put in the house style however it came.
+/// session's model and no tools, in the style of the repository's recent
+/// subjects or else the house style.
 pub fn suggest(connection: &Connection, folder: &Path) -> Result<String, String> {
     let diff = staged_diff(folder)?;
     if diff.trim().is_empty() {
         return Err("Nothing is staged to write a message for.".into());
     }
     let endpoint = crate::chat::validate(connection)?;
-    let body = suggest_body(connection, &diff);
+    let subjects = recent_subjects(folder);
+    let body = suggest_body(connection, &diff, &subjects);
     // The shared client would give up on a slow reply after its idle wait.
     let mut request = crate::chat::client()?
         .post(endpoint)
@@ -429,22 +456,71 @@ pub fn suggest(connection: &Connection, folder: &Path) -> Result<String, String>
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let message = house_style(text);
+    let message = house_style(text, prefixed(&subjects));
     if message.is_empty() {
         return Err("The model gave no message; write one instead.".into());
     }
     Ok(message)
 }
 
+/// Up to [`RECENT_KEPT`] of the newest subjects on the current branch,
+/// leaving out merges and bots' commits; none when too few are left to
+/// show a style, or there are no commits yet.
+fn recent_subjects(folder: &Path) -> Vec<String> {
+    let count = format!("--max-count={RECENT_READ}");
+    let args = ["log", count.as_str(), "--no-merges", "--format=%an%x1f%s"];
+    let Ok(out) = look(folder, &args) else {
+        return Vec::new();
+    };
+    let subjects: Vec<String> = out
+        .lines()
+        .filter_map(|line| line.split_once('\u{1f}'))
+        .filter(|(author, _)| !author.trim_end().ends_with("[bot]"))
+        .map(|(_, subject)| subject.trim().chars().take(SUBJECT_CAP).collect::<String>())
+        .filter(|subject| !subject.is_empty())
+        .take(RECENT_KEPT)
+        .collect();
+    if subjects.len() < RECENT_FEWEST {
+        return Vec::new();
+    }
+    subjects
+}
+
+/// Whether at least half of `subjects` open with a type prefix such as
+/// `fix(ui):`, so a suggestion keeps the one it was written with.
+fn prefixed(subjects: &[String]) -> bool {
+    let with = subjects
+        .iter()
+        .filter(|subject| unprefixed(subject) != subject.as_str())
+        .count();
+    !subjects.is_empty() && with * 2 >= subjects.len()
+}
+
 /// The request for a suggestion. It sends no effort, which a model that
 /// offers none may be refused for, and takes the fields this model is known
-/// to want in place of others, as a turn's request does.
-fn suggest_body(connection: &Connection, diff: &str) -> Value {
+/// to want in place of others, as a turn's request does. Without `subjects`
+/// it asks for the house style alone.
+fn suggest_body(connection: &Connection, diff: &str, subjects: &[String]) -> Value {
+    let (system, asked) = if subjects.is_empty() {
+        (
+            format!("{TASK}{HOUSE_STYLE}"),
+            format!("Staged diff:\n{diff}"),
+        )
+    } else {
+        let listed: String = subjects.iter().map(|s| format!("- {s}\n")).collect();
+        (
+            format!("{TASK}{FOLLOW_REPO}{HOUSE_STYLE}"),
+            format!(
+                "Recent commit subjects in this repository, newest first:\n{listed}\n\
+                 Staged diff:\n{diff}"
+            ),
+        )
+    };
     let mut body = json!({
         "model": connection.model.trim(),
         "messages": [
-            {"role": "system", "content": HOUSE_STYLE},
-            {"role": "user", "content": format!("Staged diff:\n{diff}")},
+            {"role": "system", "content": system},
+            {"role": "user", "content": asked},
         ],
         "stream": false,
         "max_tokens": 1500,
@@ -454,8 +530,9 @@ fn suggest_body(connection: &Connection, diff: &str) -> Value {
 }
 
 /// `text` as a commit message in the house style: the subject without a
-/// type prefix or a closing period, the body's paragraphs wrapped at 72.
-pub fn house_style(text: &str) -> String {
+/// closing period, and without a type prefix unless `keep_prefix`, the
+/// body's prose paragraphs wrapped at 72 and its lists left as written.
+pub fn house_style(text: &str, keep_prefix: bool) -> String {
     let lines: Vec<&str> = text
         .lines()
         .filter(|line| !line.trim_start().starts_with("```"))
@@ -465,18 +542,28 @@ pub fn house_style(text: &str) -> String {
         return String::new();
     };
     let subject = subject.trim().trim_matches(['"', '`', '*']).trim();
-    let subject = unprefixed(subject).trim_end_matches('.').trim_end();
+    let subject = if keep_prefix {
+        subject
+    } else {
+        unprefixed(subject)
+    };
+    let subject = subject.trim_end_matches('.').trim_end();
     let mut message = subject.to_owned();
     let mut paragraph: Vec<&str> = Vec::new();
     let mut paragraphs: Vec<String> = Vec::new();
     for line in lines.chain([""]) {
         if line.trim().is_empty() {
             if !paragraph.is_empty() {
-                paragraphs.push(wrap(&paragraph.join(" "), WRAP));
+                // Joined up, a list's items would run into one line.
+                paragraphs.push(if paragraph.iter().any(|line| listed(line)) {
+                    paragraph.join("\n")
+                } else {
+                    wrap(&paragraph.join(" "), WRAP)
+                });
                 paragraph.clear();
             }
         } else {
-            paragraph.push(line.trim());
+            paragraph.push(line.trim_end());
         }
     }
     if !paragraphs.is_empty() {
@@ -499,6 +586,15 @@ fn unprefixed(subject: &str) -> &str {
     };
     let prefix = !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase());
     if prefix { rest.trim_start() } else { subject }
+}
+
+/// Whether `line` is an item of a list, opening with `- `, `* ` or `1. `.
+fn listed(line: &str) -> bool {
+    let line = line.trim_start();
+    let numbered = line
+        .split_once(". ")
+        .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+    line.starts_with("- ") || line.starts_with("* ") || numbered
 }
 
 /// `text` broken between words into lines of at most `width` characters;
@@ -1181,14 +1277,150 @@ mod tests {
     fn a_suggested_message_is_put_in_the_house_style() {
         let long = "word ".repeat(40);
         let text = format!("```\nfeat(ui): Stage one hunk at a time.\n\n{long}\n\nSecond.\n```");
-        let message = house_style(&text);
+        let message = house_style(&text, false);
         let mut lines = message.lines();
         assert_eq!(lines.next(), Some("Stage one hunk at a time"));
         assert_eq!(lines.next(), Some(""));
         assert!(message.lines().all(|line| line.chars().count() <= WRAP));
         assert!(message.ends_with("\n\nSecond."), "{message}");
         // A colon in a real subject is not a prefix.
-        assert_eq!(house_style("Say why: it failed"), "Say why: it failed");
+        assert_eq!(
+            house_style("Say why: it failed", false),
+            "Say why: it failed"
+        );
+    }
+
+    /// Commit nothing once for each of `subjects`, oldest first.
+    fn commits(folder: &Path, subjects: &[&str]) {
+        for subject in subjects {
+            setup(folder, &["commit", "-q", "--allow-empty", "-m", subject]);
+        }
+    }
+
+    /// A connection that wants nothing in place of `max_tokens`.
+    fn plain() -> Connection {
+        Connection {
+            endpoint: "https://api.openai.com/v1".into(),
+            model: "gpt-4o".into(),
+            ..Default::default()
+        }
+    }
+
+    /// The text of the request's message number `at`.
+    fn said(body: &Value, at: usize) -> &str {
+        body["messages"][at]["content"].as_str().unwrap()
+    }
+
+    #[test]
+    fn a_repo_of_prefixed_subjects_keeps_the_prefix() {
+        let folder = repo("prefixed");
+        commits(
+            &folder,
+            &[
+                "fix(ui): Keep the tab open",
+                "feat: Add a log",
+                "fix(core): Read the index once",
+                "chore: Bump the version",
+                "Say why a push failed",
+            ],
+        );
+        let subjects = recent_subjects(&folder);
+        assert_eq!(subjects.len(), 6, "{subjects:?}");
+        assert!(prefixed(&subjects));
+        let body = suggest_body(&plain(), "d", &subjects);
+        let asked = said(&body, 1);
+        assert!(
+            asked.starts_with(
+                "Recent commit subjects in this repository, newest first:\n\
+                 - Say why a push failed\n- chore: Bump the version\n"
+            ),
+            "{asked}"
+        );
+        assert!(asked.ends_with("- first\n\nStaged diff:\nd"), "{asked}");
+        assert_eq!(said(&body, 0), format!("{TASK}{FOLLOW_REPO}{HOUSE_STYLE}"));
+        let message = house_style("fix(ui): Stage one hunk at a time.", prefixed(&subjects));
+        assert_eq!(message, "fix(ui): Stage one hunk at a time");
+    }
+
+    #[test]
+    fn a_house_style_repo_still_strips_it() {
+        let folder = repo("house");
+        commits(
+            &folder,
+            &[
+                "Keep the tab open",
+                "fix: Read the index once",
+                "Say why a push failed",
+                "Stage one hunk at a time",
+                "Show the branch",
+            ],
+        );
+        let subjects = recent_subjects(&folder);
+        assert_eq!(subjects.len(), 6, "{subjects:?}");
+        assert!(!prefixed(&subjects));
+        let message = house_style("feat(ui): Stage one hunk at a time.", prefixed(&subjects));
+        assert_eq!(message, "Stage one hunk at a time");
+    }
+
+    #[test]
+    fn fewer_than_five_commits_send_todays_request() {
+        let folder = repo("few");
+        commits(&folder, &["fix: One", "fix: Two", "fix: Three"]);
+        let subjects = recent_subjects(&folder);
+        assert!(subjects.is_empty(), "{subjects:?}");
+        // A repository with no commits has no log to read.
+        let unborn = scratch("unborn");
+        setup(&unborn, &["init", "-q", "-b", "main"]);
+        assert!(recent_subjects(&unborn).is_empty());
+        let body = suggest_body(&plain(), "d", &subjects);
+        assert_eq!(said(&body, 0), format!("{TASK}{HOUSE_STYLE}"));
+        assert_eq!(said(&body, 1), "Staged diff:\nd");
+        assert_eq!(body["messages"].as_array().map(Vec::len), Some(2));
+        let message = house_style("fix(ui): Stage one hunk at a time.", prefixed(&subjects));
+        assert_eq!(message, "Stage one hunk at a time");
+    }
+
+    #[test]
+    fn merge_and_bot_commits_are_ignored() {
+        let folder = repo("merges");
+        commits(&folder, &["fix: One", "fix: Two", "fix: Three"]);
+        setup(&folder, &["checkout", "-q", "-b", "side"]);
+        commits(&folder, &["fix: Four"]);
+        setup(&folder, &["checkout", "-q", "main"]);
+        let merge = ["merge", "-q", "--no-ff", "-m", "Merge #1: side", "side"];
+        setup(&folder, &merge);
+        for n in 1..=4 {
+            let bump = format!("Bump a library to {n}");
+            let by_bot = [
+                "-c",
+                "user.name=deps[bot]",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                bump.as_str(),
+            ];
+            setup(&folder, &by_bot);
+        }
+        let subjects = recent_subjects(&folder);
+        let mut sorted = subjects.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            ["first", "fix: Four", "fix: One", "fix: Three", "fix: Two"],
+            "{subjects:?}"
+        );
+    }
+
+    #[test]
+    fn a_bullet_body_survives() {
+        let text = "Add two checks\n\n- One for the index\n- One for the\n  remote\n\n\
+                    Steps:\n1. Stage\n2. Commit\n\nProse that runs on\nacross lines.";
+        assert_eq!(
+            house_style(text, false),
+            "Add two checks\n\n- One for the index\n- One for the\n  remote\n\n\
+             Steps:\n1. Stage\n2. Commit\n\nProse that runs on across lines."
+        );
     }
 
     #[test]
@@ -1198,10 +1430,10 @@ mod tests {
             model: model.into(),
             ..Default::default()
         };
-        let plain = suggest_body(&on("https://api.openai.com/v1", "gpt-4o"), "d");
+        let plain = suggest_body(&on("https://api.openai.com/v1", "gpt-4o"), "d", &[]);
         assert!(plain.get("reasoning_effort").is_none(), "{plain}");
         assert_eq!(plain["max_tokens"], 1500);
-        let reasoning = suggest_body(&on("https://api.openai.com/v1", "gpt-5"), "d");
+        let reasoning = suggest_body(&on("https://api.openai.com/v1", "gpt-5"), "d", &[]);
         assert!(reasoning.get("max_tokens").is_none(), "{reasoning}");
         assert!(reasoning["max_completion_tokens"].is_u64(), "{reasoning}");
     }
