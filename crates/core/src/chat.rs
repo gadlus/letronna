@@ -1487,10 +1487,11 @@ const QUIRKS: [(Quirk, &str); 9] = [
     (Quirk::Replay, "reasoning_content"),
 ];
 
-/// The cap sent as `max_completion_tokens`, which counts a model's thinking
-/// as well as its answer: the 8192 an answer gets elsewhere and as much again
-/// to think in, the most every model `reasons_on_openai` matches will take
-/// (GPT-5's chat models stop at 16384).
+/// The least sent as `max_completion_tokens`, which counts a model's thinking
+/// as well as its answer: the 8192 an answer gets when the model's limit is
+/// not known and as much again to think in, the most every model
+/// `reasons_on_openai` matches will take (GPT-5's chat models stop at 16384).
+/// A longer reply asked for, from a known limit, goes as it is.
 const COMPLETION_TOKENS: u64 = 16384;
 
 /// Quirks learned from refusals, by endpoint and model, for the rest of this
@@ -1551,10 +1552,13 @@ fn apply_quirk(body: &mut Value, quirk: Quirk) -> bool {
     };
     match quirk {
         Quirk::CompletionTokens => {
-            if fields.remove("max_tokens").is_none() {
+            let Some(reply) = fields.remove("max_tokens") else {
                 return false;
-            }
-            fields.insert("max_completion_tokens".into(), COMPLETION_TOKENS.into());
+            };
+            // Thinking comes out of the same cap, and at high effort it alone
+            // can spend all of a fixed 16384, which leaves no reply at all.
+            let cap = reply.as_u64().unwrap_or(0).max(COMPLETION_TOKENS);
+            fields.insert("max_completion_tokens".into(), cap.into());
             true
         }
         Quirk::Effort => fields.remove("reasoning_effort").is_some(),
@@ -5619,6 +5623,47 @@ mod tests {
             let body = sent(endpoint, model);
             assert_eq!(body["max_tokens"], 8192, "{model} at {endpoint}");
             assert!(body.get("max_completion_tokens").is_none(), "{model}");
+        }
+    }
+
+    #[test]
+    fn a_reasoning_model_is_asked_for_its_reply_budget() {
+        // Sized from the family table: the longest reply any model is asked
+        // for, or a chat model's own lower limit, with no fixed 16384 between.
+        for (model, reply) in [
+            ("gpt-5", MAX_REPLY_TOKENS),
+            ("o1-mini", MAX_REPLY_TOKENS),
+            ("gpt-5-chat-latest", 16_384),
+        ] {
+            let c = Connection {
+                endpoint: "https://api.openai.com/v1".into(),
+                model: model.into(),
+                ..connection()
+            };
+            let asked = budget(&c, 0);
+            assert_eq!(asked.reply, reply, "{model}");
+            let body = body_with(&c, &[], None, None, &asked, &[]);
+            assert_eq!(body["max_completion_tokens"], reply, "{model}");
+            assert!(body.get("max_tokens").is_none(), "{model}");
+        }
+    }
+
+    #[test]
+    fn a_small_reply_budget_still_gets_the_old_floor() {
+        let c = Connection {
+            endpoint: "https://api.openai.com/v1".into(),
+            model: "o3-mini".into(),
+            ..connection()
+        };
+        // The reply a model of unknown limits gets, and a suggestion's short
+        // one, still leave as much again to think in.
+        for reply in [REPLY_TOKENS, 1_500] {
+            let asked = Budget {
+                reply,
+                ..Budget::SMALL
+            };
+            let body = body_with(&c, &[], None, None, &asked, &[]);
+            assert_eq!(body["max_completion_tokens"], COMPLETION_TOKENS, "{reply}");
         }
     }
 
