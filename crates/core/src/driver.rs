@@ -32,6 +32,11 @@
 //! prose is reminded once. Past either, the run fails with no answer and says
 //! why.
 //!
+//! A session's own run that would end without touching a file its request
+//! names under `in/` is told so once, as a notice, to read it or say why not.
+//! A run someone answers as it ends, an editor's turn over ACP or a chat
+//! app's, is not, as the window's own turns are not.
+//!
 //! Nothing here polls. Each wait -- for the model, for a tool, for an
 //! approval -- is a blocking receive that a stop closes, so a stop is heard at
 //! once, and the stop and the budget are checked again before every model
@@ -45,6 +50,7 @@ use crate::cancel::Cancel;
 use crate::chat::{self, Connection, Event, Extra, Message, ToolCall};
 use crate::gate::{self, Gate, Grants, Layer};
 use crate::inbox::{self, Notice, When};
+use crate::inputs;
 use crate::judge;
 use crate::limits::{self, Permit};
 use crate::permissions::{self, Rule};
@@ -311,6 +317,9 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
         ));
     }
     let mut reminded = false;
+    // Found as the run starts, so a file it makes under `in/` is no input.
+    let inputs = asked_to_read(spec);
+    let mut pointed = false;
     loop {
         if spec.cancel.is_set() {
             return Ok(Outcome::Stopped);
@@ -358,6 +367,33 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
                     when: When::Next,
                     text: REMINDER.into(),
                 }]);
+            }
+            // An input never opened is likely part of the task dropped, so the
+            // run goes on once more to read it or say why not; past once, what
+            // is left was left on purpose. With no round or budget left, going
+            // on could only end an answered run at its limit.
+            if mail.is_none()
+                && !pointed
+                && report.rounds < spec.rounds
+                && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
+            {
+                let own =
+                    (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
+                let unread = inputs::unread(&inputs, own);
+                if !unread.is_empty() {
+                    pointed = true;
+                    let text = inputs::notice(&unread);
+                    let notice = inbox::fold(&[Notice {
+                        from: "Letronna".into(),
+                        when: When::Next,
+                        text,
+                    }]);
+                    // Folded, so it opens no turn of its own, as a Stop hook's word does not.
+                    mail = notice.map(|notice| Message {
+                        folded: true,
+                        ..notice
+                    });
+                }
             }
             let answered = mail.is_none();
             spec.transcript.conversation.messages.extend(mail);
@@ -743,6 +779,35 @@ fn context(spec: &Spec) -> ToolContext {
 /// it began, as `off_thread` does.
 fn made(own: &Call, call: &ToolCall, cancel: &Cancel) -> Option<Result<String, String>> {
     (!cancel.is_set()).then(|| own(call))
+}
+
+/// The input files a session's own run is asked to read, as the request it
+/// was started with names them; none for a run whose end someone answers.
+fn asked_to_read(spec: &Spec) -> Vec<String> {
+    // A helper's work is its parent's to judge, and a person reads an
+    // editor's turn over ACP or a chat app's as it ends, as in the window.
+    let (0, None, None, Some(workspace)) = (
+        spec.depth,
+        &spec.watch,
+        &spec.connection.remote,
+        &spec.connection.workspace,
+    ) else {
+        return Vec::new();
+    };
+    if !spec.connection.tools {
+        return Vec::new();
+    }
+    let messages = &spec.transcript.conversation.messages;
+    let own = messages.get(spec.from..).unwrap_or_default();
+    let Some(request) = own.iter().rfind(|m| chat::opens_turn(m)) else {
+        return Vec::new();
+    };
+    // Mail, such as a job's output, is no request.
+    if request.notice {
+        return Vec::new();
+    }
+    let typed = crate::references::typed(&request.content);
+    inputs::named(typed, workspace)
 }
 
 /// Runs a tool on a thread of its own, so a stop ends the wait even for a
@@ -3206,5 +3271,98 @@ pub(crate) mod tests {
         let refused = results(sent.last().unwrap())[1];
         assert!(refused.contains("nobody is here to decide"), "{refused}");
         assert!(requests.try_recv().is_err(), "a card with nobody there");
+    }
+
+    /// A session's own run in `dir`, asked to read `in/brief.md` and
+    /// `in/data.json`, which it holds.
+    fn asked_to_read_two(endpoint: String, dir: &Path, id: AgentId) -> Spec {
+        std::fs::create_dir_all(dir.join("in")).unwrap();
+        std::fs::write(dir.join("in/brief.md"), "The brief says hello.").unwrap();
+        std::fs::write(dir.join("in/data.json"), "{}").unwrap();
+        let mut spec = spec(endpoint, dir, id);
+        spec.depth = 0;
+        spec.transcript.conversation.messages[0].content =
+            "Read in/brief.md and in/data.json, then say what they hold.".into();
+        spec
+    }
+
+    /// The notice the last request of `sent` ends with, checked to be one.
+    fn last_notice(sent: &[Value]) -> &str {
+        let last = messages(sent.last().unwrap()).last().unwrap();
+        assert_eq!(last["role"], "user");
+        let notice = last["content"].as_str().unwrap();
+        assert!(notice.starts_with("[Letronna notice"), "{notice}");
+        notice
+    }
+
+    #[test]
+    fn an_input_never_read_is_named_before_the_run_ends() {
+        let dir = scratch("unread-input");
+        let brief = ("read_file", json!({"path": "in/brief.md"}));
+        let (endpoint, provider) = provider(vec![
+            reply("", &[brief]),
+            reply("The brief says hello.", &[]),
+            reply("The data is empty, so the brief says it all: hello.", &[]),
+        ]);
+        let report = finished(asked_to_read_two(endpoint, &dir, AGENTS + 600));
+        // A fourth request, a second notice, would find no provider.
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(
+            report.text,
+            "The data is empty, so the brief says it all: hello."
+        );
+        let sent = provider.sent();
+
+        assert_eq!(messages(&sent[1]).last().unwrap()["role"], "tool");
+        let notice = last_notice(&sent);
+        assert!(notice.contains("input files you have not read"), "{notice}");
+        assert!(notice.ends_with("- `in/data.json`"), "{notice}");
+        assert!(!notice.contains("brief"), "{notice}");
+        // Folded into the run as a notice, so neither the window nor the
+        // judge takes it for the user's words or a turn of their own.
+        let saved = written(&dir.join("helper.jsonl"));
+        let kept = saved
+            .iter()
+            .find(|record| record["content"].as_str() == Some(notice))
+            .unwrap();
+        assert_eq!(
+            (&kept["notice"], &kept["folded"]),
+            (&json!(true), &json!(true))
+        );
+    }
+
+    #[test]
+    fn an_input_read_by_a_command_counts_as_read() {
+        let dir = scratch("inputs-by-command");
+        let (endpoint, provider) = provider(vec![
+            reply("", &[command("cat in/*.json")]),
+            reply("The data is empty.", &[]),
+            reply("The data is empty and the brief says hello.", &[]),
+        ]);
+        let report = finished(asked_to_read_two(endpoint, &dir, AGENTS + 610));
+        assert_eq!(report.status, Outcome::Done);
+        let notice = last_notice(&provider.sent()).to_owned();
+        assert!(notice.ends_with("- `in/brief.md`"), "{notice}");
+        assert!(!notice.contains("data.json"), "{notice}");
+    }
+
+    /// Checks that the run `asked_to_read_two` gives, as `change` leaves
+    /// it, ends at its first answer with no notice.
+    fn ends_untold(id: AgentId, change: impl FnOnce(&mut Spec)) {
+        let dir = scratch(&format!("inputs-untold-{id}"));
+        let (endpoint, provider) = provider(vec![reply("The brief says hello.", &[])]);
+        let mut spec = asked_to_read_two(endpoint, &dir, id);
+        change(&mut spec);
+        assert_eq!(finished(spec).status, Outcome::Done, "{id}");
+        assert_eq!(provider.sent().len(), 1, "{id}");
+    }
+
+    #[test]
+    fn a_helper_an_editors_turn_or_a_chat_apps_run_is_not_told_of_unread_inputs() {
+        ends_untold(AGENTS + 620, |spec| spec.depth = 1);
+        ends_untold(AGENTS + 630, |spec| spec.watch = Some(Arc::new(|_| ())));
+        ends_untold(AGENTS + 640, |spec| {
+            spec.connection.remote = Some(Default::default());
+        });
     }
 }

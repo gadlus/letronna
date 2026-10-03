@@ -45,6 +45,7 @@ pub mod hooks;
 pub mod import;
 pub mod inbox;
 pub mod init;
+mod inputs;
 pub mod insights;
 pub mod interrupt;
 pub mod jobs;
