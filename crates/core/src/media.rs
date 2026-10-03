@@ -44,6 +44,11 @@ pub const UPLOAD_BYTES: u64 = 25 * 1024 * 1024;
 /// The largest picture a model is sent: Anthropic refuses one over 5 MB of
 /// base64, which is four thirds of the file.
 pub const PICTURE_BYTES: usize = 5 * 1024 * 1024 / 4 * 3;
+/// The long side a picture is scaled down to when it is attached, or read
+/// and too big to send as it is: the most Anthropic looks at before it
+/// scales one down itself, and more than OpenAI keeps of it (768 on the
+/// short side).
+const LONG_SIDE: u32 = 1_568;
 
 pub struct MakeImage;
 impl Tool for MakeImage {
@@ -409,7 +414,7 @@ fn upload_ready(
 }
 
 /// A picture's width and height, read from its header alone.
-fn dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+pub(crate) fn dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?
@@ -1045,20 +1050,53 @@ fn card(what: String, args: &Value, kind: &str) -> String {
     format!("{what}\n\nMade by {model}, paid from your Letronna credit.")
 }
 
-/// Save a picture the user attached, in Letronna's own `media/` as browse's
-/// screenshots are: it belongs to the session, not the project. `name` is
-/// what it was called.
+/// Save a picture the user attached, scaled down as `fit` does, in
+/// Letronna's own `media/` as browse's screenshots are: it belongs to the
+/// session, not the project. `name` is what it was called.
 pub fn attach(name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
-    let kind =
-        picture_kind(bytes).ok_or("Only a PNG, JPEG, GIF or WebP picture can be attached.")?;
-    if bytes.len() > PICTURE_BYTES {
-        return Err(format!(
-            "The picture is {}; the most a model is sent is {}.",
-            size(bytes.len()),
-            size(PICTURE_BYTES)
-        ));
+    let (bytes, kind) =
+        fit(bytes).ok_or("Only a PNG, JPEG, GIF, WebP or BMP picture can be attached.")?;
+    save(&ToolContext::default(), name, kind, &bytes)
+}
+
+/// `bytes` as a picture goes to a model, and its file type: as they are
+/// when they are a kind every provider takes, small enough and no longer
+/// than `LONG_SIDE` a side; otherwise scaled to `LONG_SIDE`, as a PNG,
+/// which keeps a screenshot's text sharp, unless that is still too big or
+/// the picture was a photo to begin with, then as a JPEG; None when they
+/// are not a picture this can read.
+pub(crate) fn fit(bytes: &[u8]) -> Option<(Vec<u8>, &'static str)> {
+    let kind = picture_kind(bytes);
+    // From the header alone, so one the window has fitted already is not
+    // decoded a second time on its way here.
+    let long = dimensions(bytes).map(|(width, height)| width.max(height));
+    if let Some(kind) = kind
+        && bytes.len() <= PICTURE_BYTES
+        && long.is_some_and(|long| long <= LONG_SIDE)
+    {
+        return Some((bytes.to_vec(), kind));
     }
-    save(&ToolContext::default(), name, kind, bytes)
+    let picture = image::load_from_memory(bytes).ok()?;
+    let picture = if picture.width().max(picture.height()) > LONG_SIDE {
+        picture.thumbnail(LONG_SIDE, LONG_SIDE)
+    } else {
+        picture
+    };
+    if matches!(kind, Some("png") | None) {
+        let png = encode(&picture, image::ImageFormat::Png)?;
+        if png.len() <= PICTURE_BYTES {
+            return Some((png, "png"));
+        }
+    }
+    let rgb = image::DynamicImage::ImageRgb8(picture.to_rgb8());
+    Some((encode(&rgb, image::ImageFormat::Jpeg)?, "jpg"))
+}
+
+/// `picture` written out as `format`.
+fn encode(picture: &image::DynamicImage, format: image::ImageFormat) -> Option<Vec<u8>> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    picture.write_to(&mut out, format).ok()?;
+    Some(out.into_inner())
 }
 
 /// Save what was made under `media/`, named after what it shows and when.
@@ -1779,6 +1817,73 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut bytes), format)
             .unwrap();
         bytes
+    }
+
+    /// A blank PNG `width` by `height` stored without compression, so a
+    /// large picture is a large file too.
+    fn stored_png(width: u32, height: u32) -> Vec<u8> {
+        use image::ImageEncoder;
+        use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+        let mut bytes = Vec::new();
+        let pixels = vec![0; width as usize * height as usize * 3];
+        PngEncoder::new_with_quality(
+            &mut bytes,
+            CompressionType::Uncompressed,
+            FilterType::NoFilter,
+        )
+        .write_image(&pixels, width, height, image::ExtendedColorType::Rgb8)
+        .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn a_picture_too_big_to_send_is_scaled_down() {
+        let sides = |bytes: &[u8]| dimensions(bytes).unwrap();
+        let (wide, kind) = fit(&picture(4_000, 1_000, image::ImageFormat::Png)).unwrap();
+        assert_eq!((sides(&wide), kind), ((LONG_SIDE, 392), "png"));
+        let (tall, _) = fit(&picture(600, 3_136, image::ImageFormat::Png)).unwrap();
+        assert_eq!(sides(&tall), (300, LONG_SIDE));
+        // Too heavy to send, it is scaled down as well, and a photo stays a
+        // JPEG.
+        let heavy = stored_png(3_136, 448);
+        assert!(heavy.len() > PICTURE_BYTES);
+        let (light, kind) = fit(&heavy).unwrap();
+        assert_eq!((sides(&light), kind), ((LONG_SIDE, 224), "png"));
+        assert!(light.len() <= PICTURE_BYTES);
+        let mut photo = Vec::new();
+        image::DynamicImage::new_rgb8(2_000, 1_000)
+            .write_to(
+                &mut std::io::Cursor::new(&mut photo),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        let (photo, kind) = fit(&photo).unwrap();
+        assert_eq!((sides(&photo), kind), ((LONG_SIDE, 784), "jpg"));
+        // One that can be sent goes as it is, a kind not every provider
+        // takes as one that is, and other bytes not at all.
+        let small = picture(800, 600, image::ImageFormat::Png);
+        assert_eq!(fit(&small).unwrap(), (small.clone(), "png"));
+        let (bmp, kind) = fit(&picture(8, 8, image::ImageFormat::Bmp)).unwrap();
+        assert_eq!((picture_kind(&bmp), kind), (Some("png"), "png"));
+        assert!(fit(b"not a picture").is_none());
+    }
+
+    #[test]
+    fn an_attached_picture_too_big_to_send_or_a_bmp_is_saved_fitted() {
+        let (_turn, dir) = scratch("attach");
+        let media = dir.join("data").join("media");
+        let heavy = attach("heavy", &stored_png(3_136, 448)).unwrap();
+        assert!(heavy.starts_with(&media), "{}", heavy.display());
+        let saved = std::fs::read(&heavy).unwrap();
+        assert_eq!(dimensions(&saved), Some((LONG_SIDE, 224)));
+        let bmp = attach("scan", &picture(8, 8, image::ImageFormat::Bmp)).unwrap();
+        assert_eq!(picture_kind(&std::fs::read(&bmp).unwrap()), Some("png"));
+        assert_eq!(bmp.extension().unwrap(), "png");
+        assert_eq!(
+            attach("notes", b"BM, then words").unwrap_err(),
+            "Only a PNG, JPEG, GIF, WebP or BMP picture can be attached."
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
