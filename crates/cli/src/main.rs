@@ -42,7 +42,7 @@ use letronna_core::cancel::Cancel;
 use letronna_core::chat::{self, Message};
 use letronna_core::driver::{self, Allow, Outcome, Report, Spec, Status};
 use letronna_core::store::Transcript;
-use letronna_core::{agent, crew, hooks, inbox, store, tools, update};
+use letronna_core::{agent, crew, hooks, inbox, store, structured, tools, update};
 use serde_json::{Value, json};
 use session::Runner;
 use std::io::IsTerminal;
@@ -504,6 +504,9 @@ fn begin(
     {
         return Err(format!("There is no tool called `{name}`."));
     }
+    // Before the prompt goes on the session, so a schema that cannot be read
+    // or checked leaves nothing behind.
+    let schema = args.schema.as_deref().map(answer_schema).transpose()?;
     let conversation = &mut runner.store.conversations[session];
     // One turn and out: nobody is there to watch a loop or stop it.
     if conversation.goal.is_some() {
@@ -547,7 +550,7 @@ fn begin(
         depth: 0,
         fork: false,
         from: 0,
-        schema: None,
+        schema,
         watch: None,
         decide: None,
         allow: args.tools.clone().map_or(Allow::All, Allow::Only),
@@ -557,6 +560,30 @@ fn begin(
         status: Arc::default(),
     };
     Ok((spec, context, before))
+}
+
+/// The JSON Schema `--json-schema` gave, read from the file it names unless
+/// it is the schema itself, when the driver can check answers against it.
+fn answer_schema(given: &str) -> Result<Value, String> {
+    // Other agents' command lines take the schema itself after this flag, so
+    // a program written for one of them can pass it as it is.
+    let text = if given.trim_start().starts_with('{') {
+        given.to_owned()
+    } else {
+        std::fs::read_to_string(given)
+            .map_err(|e| format!("Could not read the schema in {given}: {e}"))?
+    };
+    let schema =
+        serde_json::from_str(&text).map_err(|e| format!("The answer's schema is not JSON: {e}"))?;
+    // The driver makes this same check, but only once the prompt is on the
+    // session and saved.
+    structured::check_schema(&schema).map_err(|problems| {
+        format!(
+            "The answer's schema cannot be checked: {}",
+            problems.join("; ")
+        )
+    })?;
+    Ok(schema)
 }
 
 /// Runs `spec` to its end on this thread, with progress lines while it runs
@@ -754,10 +781,14 @@ fn progress(status: &Status) -> Value {
     })
 }
 
-/// Prints the answer as the conversation would, and a line after it when the
-/// run did not finish.
+/// Prints the answer as the conversation would, or its checked value as JSON,
+/// and a line after it when the run did not finish.
 fn print_answer(report: &Report) {
-    if !report.text.is_empty() {
+    // With a schema the checked value is what was asked for, and one line of
+    // JSON is what a script reads; the words around it are left out.
+    if let Some(value) = &report.value {
+        emit(value);
+    } else if !report.text.is_empty() {
         let mut out = render::Stream::opening_with(render::bullet());
         out.push(&report.text);
         out.end();
@@ -795,6 +826,9 @@ fn as_json(report: &Report) -> Value {
     });
     if let Outcome::Failed(error) = &report.status {
         out["error"] = error.as_str().into();
+    }
+    if let Some(value) = &report.value {
+        out["value"] = value.clone();
     }
     out
 }
@@ -1096,6 +1130,44 @@ mod tests {
             (&json!("failed"), &json!("The key was refused."))
         );
         assert!(out.get("error").is_none());
+    }
+
+    #[test]
+    fn json_output_carries_the_checked_value_only_when_there_is_one() {
+        let mut answered = report(Outcome::Done);
+        answered.value = Some(json!({"count": 3}));
+        assert_eq!(as_json(&answered)["value"], json!({"count": 3}));
+        assert!(as_json(&report(Outcome::Done)).get("value").is_none());
+    }
+
+    #[test]
+    fn a_schema_is_read_from_its_file_unless_it_is_given_itself() {
+        let file =
+            std::env::temp_dir().join(format!("letronna-schema-{}.json", std::process::id()));
+        let path = file.to_str().unwrap();
+        std::fs::write(&file, r#"{"type": "array"}"#).unwrap();
+        assert_eq!(answer_schema(path), Ok(json!({"type": "array"})));
+        std::fs::remove_file(&file).unwrap();
+        assert!(
+            answer_schema(path)
+                .unwrap_err()
+                .starts_with("Could not read the schema in")
+        );
+        let given = r#" {"type": "integer"}"#;
+        assert_eq!(answer_schema(given), Ok(json!({"type": "integer"})));
+        let broken = answer_schema("{type: integer}").unwrap_err();
+        assert!(
+            broken.starts_with("The answer's schema is not JSON"),
+            "{broken}"
+        );
+    }
+
+    #[test]
+    fn a_schema_the_driver_cannot_check_is_turned_down_before_the_run() {
+        assert_eq!(
+            answer_schema(r#"{"type": "integer", "minimum": 0}"#),
+            Err("The answer's schema cannot be checked: unsupported keyword \"minimum\"".into())
+        );
     }
 
     #[test]
