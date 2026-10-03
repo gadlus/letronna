@@ -242,6 +242,13 @@ pub fn run(spec: Spec) -> Report {
 pub fn run_keeping(mut spec: Spec) -> (Report, Transcript) {
     let started = Instant::now();
     crate::hooks::new_turn(spec.connection.conversation);
+    // Once as the run starts, not with each request, so all of them and its
+    // helpers' say the same, and the prefix a provider cached holds.
+    if unwatched(&spec)
+        && let Some(workspace) = &spec.connection.workspace
+    {
+        crate::chat::look_around(workspace);
+    }
     let mut turn = Turn::with_limit(spec.connection.clone(), spec.rounds).unattended();
     let mut report = Report {
         status: Outcome::Done,
@@ -1604,6 +1611,42 @@ pub(crate) mod tests {
         assert!(pair.iter().all(|name| hides(&no_mcp, name)), "{no_mcp:?}");
         assert!(hides(&mcp, "write_file"), "{mcp:?}");
         assert!(!pair.iter().any(|name| hides(&mcp, name)), "{mcp:?}");
+    }
+
+    /// The system message the first request of `spec`'s run sends once
+    /// `change` has been made to it, the run answered at once.
+    fn first_system(dir: &Path, id: AgentId, change: impl FnOnce(&mut Spec)) -> String {
+        let (endpoint, provider) = provider(vec![reply("Nothing to do.", &[])]);
+        let mut spec = spec(endpoint, dir, id);
+        change(&mut spec);
+        assert_eq!(finished(spec).status, Outcome::Done);
+        let sent = provider.sent();
+        sent[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn a_run_nobody_watches_is_told_what_its_folder_held_as_it_started() {
+        let dir = scratch("surroundings");
+        let first = first_system(&dir, AGENTS + 800, |spec| spec.depth = 0);
+        std::fs::write(dir.join("later.txt"), "written by the run").unwrap();
+        let fork = first_system(&dir, AGENTS + 805, |spec| spec.fork = true);
+        let watched = first_system(&dir, AGENTS + 810, |spec| {
+            spec.depth = 0;
+            spec.connection.human = true;
+        });
+        let next = first_system(&dir, AGENTS + 820, |spec| spec.depth = 0);
+
+        assert!(first.contains("on PATH"), "{first}");
+        assert!(first.contains("folder held: notes.txt."), "{first}");
+        // A helper looks at nothing again, so a fork says what its parent's
+        // run does, and the two still share a cached prefix.
+        assert!(fork.contains("folder held: notes.txt."), "{fork}");
+        assert!(!watched.contains("on PATH"), "{watched}");
+        assert!(!watched.contains("folder held"), "{watched}");
+        assert!(next.contains("later.txt"), "{next}");
     }
 
     #[test]
