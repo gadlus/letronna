@@ -321,8 +321,9 @@ pub(crate) fn remember(endpoint: &str, list: &[Value]) {
     }
 }
 
-/// The facts in one entry of a `/models` list, in OpenRouter's shape or the
-/// hosted gateway's, which keeps them at the top; OpenAI's entries hold none.
+/// The facts in one entry of a `/models` list, in OpenRouter's shape or one
+/// that keeps them at the top, as the hosted gateway, vLLM and Groq do;
+/// OpenAI's entries hold none.
 fn read(entry: &Value) -> Facts {
     let tokens = |value: &Value| value.as_u64().filter(|&n| n > 0);
     let names = |value: &Value| {
@@ -334,10 +335,20 @@ fn read(entry: &Value) -> Facts {
         })
     };
     Facts {
+        // vLLM and SGLang call the window they serve `max_model_len`, and Groq
+        // calls it `context_window`: the window that route holds a request
+        // to, not the one the model was trained for.
         context: tokens(&entry["context_length"])
-            .or_else(|| tokens(&entry["top_provider"]["context_length"])),
+            .or_else(|| tokens(&entry["top_provider"]["context_length"]))
+            .or_else(|| tokens(&entry["max_model_len"]))
+            .or_else(|| tokens(&entry["context_window"])),
+        // A `max_tokens` that is really the window does no harm: the reply
+        // asked for is a quarter of a known window at most, and no more than
+        // usual when the window is not known.
         max_output: tokens(&entry["top_provider"]["max_completion_tokens"])
-            .or_else(|| tokens(&entry["max_output_tokens"])),
+            .or_else(|| tokens(&entry["max_output_tokens"]))
+            .or_else(|| tokens(&entry["max_completion_tokens"]))
+            .or_else(|| tokens(&entry["max_tokens"])),
         inputs: names(&entry["architecture"]["input_modalities"])
             .or_else(|| names(&entry["input_modalities"])),
         parameters: names(&entry["supported_parameters"]),
@@ -550,6 +561,46 @@ mod tests {
         assert_eq!(limits("gpt-4-1106-preview"), (None, None));
         assert_eq!(limits("gpt-4.1"), (Some(1_047_576), Some(32_768)));
         assert_eq!(limits("openai/gpt-4o:free"), (Some(128_000), Some(16_384)));
+    }
+
+    #[test]
+    fn a_vllm_entry_gives_its_max_model_len_as_the_window() {
+        let list = json!({"object": "list", "data": [{
+            "id": "Qwen/Qwen3-32B", "object": "model", "created": 1_760_000_000,
+            "owned_by": "vllm", "root": "Qwen/Qwen3-32B", "parent": null,
+            "max_model_len": 40_960,
+            "permission": [{"id": "modelperm-1", "object": "model_permission"}]
+        }]});
+        let endpoint = "http://vllm.test:8000/v1";
+        remember(endpoint, list["data"].as_array().unwrap());
+
+        let served = facts(endpoint, "Qwen/Qwen3-32B");
+        assert_eq!((served.context, served.max_output), (Some(40_960), None));
+    }
+
+    #[test]
+    fn a_groq_entry_gives_its_context_window_and_max_completion_tokens() {
+        let list = json!({"object": "list", "data": [{
+            "id": "llama-3.3-70b-versatile", "object": "model", "created": 1_733_447_754,
+            "owned_by": "Meta", "active": true, "context_window": 131_072,
+            "public_apps": null, "max_completion_tokens": 32_768
+        }]});
+        let endpoint = "https://groq.test/openai/v1";
+        remember(endpoint, list["data"].as_array().unwrap());
+
+        let served = facts(endpoint, "llama-3.3-70b-versatile");
+        assert_eq!(
+            (served.context, served.max_output),
+            (Some(131_072), Some(32_768))
+        );
+    }
+
+    #[test]
+    fn a_top_level_max_tokens_is_read_as_the_output_limit() {
+        let list = json!([{"id": "some-model", "context_length": 200_000, "max_tokens": 64_000}]);
+        let endpoint = "https://max-tokens.test/v1";
+        remember(endpoint, list.as_array().unwrap());
+        assert_eq!(facts(endpoint, "some-model").max_output, Some(64_000));
     }
 
     #[test]
