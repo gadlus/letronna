@@ -66,6 +66,13 @@ const PREVIEW_LINES: usize = 12;
 /// How long a new version runs before it counts as working and is kept, as
 /// in the window.
 const SETTLED: std::time::Duration = std::time::Duration::from_secs(10);
+/// Holds the whole seconds a `-p` run may take from the start. A harness
+/// that kills a task at a time limit sets it a little under that limit, so
+/// the run is warned in time and ends with its result line before the kill.
+const DEADLINE: &str = "LETRONNA_DEADLINE";
+/// The share of a deadline gone when the run is told to write what it owes,
+/// which leaves it a fifth, two minutes of ten, to write it and check it.
+const WARN_AT: f64 = 0.8;
 /// Four times a conversation's 25 tool rounds, since nobody is there to say
 /// "continue" and a task left to run on its own, such as a fix across a
 /// repository, often reads and runs more than 25 times.
@@ -91,6 +98,8 @@ const NOT_OFFERED: [&str; 4] = [
 fn main() {
     // The first mark, from which the others are timed.
     letronna_core::diag::mark("start");
+    // What a deadline counts from, as whoever started this counts it.
+    let started = std::time::Instant::now();
     rescue_terminal();
     let args = match parse(std::env::args().skip(1)) {
         Ok(args) => args,
@@ -285,7 +294,7 @@ fn main() {
                 // started is ended below before the process goes. Not during
                 // the wait above, which would not hear it.
                 letronna_core::cancel::on_interrupt(interrupted.clone());
-                let finished = ask_once(&mut runner, session, prompt, &args, &interrupted);
+                let finished = ask_once(&mut runner, session, prompt, &args, &interrupted, started);
                 if finished {
                     keep.now();
                 }
@@ -487,17 +496,26 @@ fn main() {
     letronna_core::diag::stop();
 }
 
-/// Runs one prompt on the driver, stopped when `interrupted` is set, and
-/// prints what came of it in the form asked for, saying whether it ended
-/// without failing.
+/// Runs one prompt on the driver, stopped when `interrupted` is set or at
+/// the deadline counted from `started`, and prints what came of it in the
+/// form asked for, saying whether it ended without failing.
 fn ask_once(
     runner: &mut Runner,
     session: usize,
     prompt: &str,
     args: &Args,
     interrupted: &Cancel,
+    started: std::time::Instant,
 ) -> bool {
     let budget = args.budget.map(|limit| Arc::new(Budget::new(limit, None)));
+    // Before the prompt goes on the session, which a mistake leaves alone.
+    let deadline = match deadline_of(std::env::var(DEADLINE).ok().as_deref(), started) {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            show(args.output, &failed(error), None);
+            return false;
+        }
+    };
     // Named while the session is in the store, which the run takes it out of.
     let opening = init(runner, session);
     let (mut spec, context, before) = match begin(runner, session, prompt, args, budget) {
@@ -511,6 +529,11 @@ fn ask_once(
     // as a Ctrl-C.
     spec.cancel = interrupted.child();
     let id = spec.id;
+    // Stopped through the run's own token, not `interrupted`, so a run out
+    // of time exits 0 with what it has rather than as a Ctrl-C does.
+    if let Some(deadline) = deadline {
+        hold_to_deadline(started, deadline, id, spec.cancel.clone());
+    }
     // Served before the run starts, since a request with nobody serving is
     // declined at once.
     let keyboard = args.output == Output::Text && render::interactive();
@@ -525,6 +548,60 @@ fn ask_once(
     }
     let report = run_following(spec, args.output);
     finish(runner, session, id, before, report, args.output)
+}
+
+/// The deadline `value` sets for a run started at `started`, or None when it
+/// is unset or too far off for the clock to hold.
+fn deadline_of(
+    value: Option<&str>,
+    started: std::time::Instant,
+) -> Result<Option<std::time::Instant>, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    match value.parse::<u64>() {
+        Ok(seconds) if seconds > 0 => {
+            Ok(started.checked_add(std::time::Duration::from_secs(seconds)))
+        }
+        _ => Err(format!(
+            "{DEADLINE} takes the whole seconds a run may take, above 0, like {DEADLINE}=570."
+        )),
+    }
+}
+
+/// Tells run `id` how long it has left once most of the time from `started`
+/// to `deadline` has gone, then stops it through `cancel` at the deadline,
+/// unless `cancel` is set first.
+fn hold_to_deadline(
+    started: std::time::Instant,
+    deadline: std::time::Instant,
+    id: u64,
+    cancel: Cancel,
+) -> std::thread::JoinHandle<()> {
+    let warn = started + deadline.saturating_duration_since(started).mul_f64(WARN_AT);
+    std::thread::spawn(move || {
+        if !cancel.sleep(warn.saturating_duration_since(std::time::Instant::now())) {
+            return;
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        // A notice, as a finished job's is, so nothing takes it for the
+        // user's words; the run reads it at its next step.
+        inbox::push(
+            id,
+            inbox::Notice {
+                from: "deadline".into(),
+                when: inbox::When::Next,
+                text: format!(
+                    "About {} s are left before this run is stopped: write every output the \
+                     task asks for now, complete and valid, and improve it in place only after that.",
+                    left.as_secs_f64().round()
+                ),
+            },
+        );
+        if cancel.sleep(left) {
+            cancel.set();
+        }
+    })
 }
 
 /// Puts `prompt` on the session and hands the session to a run spending
@@ -1619,5 +1696,70 @@ mod tests {
             1,
             "kept again by the turn after it"
         );
+    }
+
+    #[test]
+    fn a_deadline_is_whole_seconds_from_the_start() {
+        let started = std::time::Instant::now();
+        assert_eq!(deadline_of(None, started), Ok(None));
+        assert_eq!(deadline_of(Some(" "), started), Ok(None));
+        assert_eq!(
+            deadline_of(Some(" 570 "), started),
+            Ok(Some(started + std::time::Duration::from_secs(570)))
+        );
+        for wrong in ["0", "-5", "1.5", "ten"] {
+            let Err(error) = deadline_of(Some(wrong), started) else {
+                panic!("{DEADLINE}={wrong} was taken");
+            };
+            assert!(error.contains("whole seconds"), "{error}");
+        }
+    }
+
+    /// Waits up to ten seconds for what run `id` has been sent.
+    fn told(id: u64) -> Vec<inbox::Notice> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let notices = inbox::take(id, false);
+            if !notices.is_empty() || std::time::Instant::now() > deadline {
+                return notices;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_run_near_its_deadline_is_told_to_commit_its_outputs() {
+        // 85 of its 100 s gone: past the warning, short of the deadline.
+        let started = std::time::Instant::now() - std::time::Duration::from_secs(85);
+        let (id, cancel) = (9_250_001, Cancel::default());
+        let timer = hold_to_deadline(
+            started,
+            started + std::time::Duration::from_secs(100),
+            id,
+            cancel.clone(),
+        );
+        let notices = told(id);
+        let texts: Vec<&str> = notices.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(texts[0].starts_with("About 15 s are left"), "{texts:?}");
+        assert!(texts[0].contains("write every output"), "{texts:?}");
+        assert!(!cancel.is_set(), "stopped before its deadline");
+        // A run stopped meanwhile is told nothing more, and the timer goes.
+        cancel.set();
+        timer.join().unwrap();
+        assert!(inbox::take(id, true).is_empty());
+    }
+
+    #[test]
+    fn a_run_past_its_deadline_stops() {
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(300);
+        let cancel = Cancel::default();
+        hold_to_deadline(started, deadline, 9_250_002, cancel.clone())
+            .join()
+            .unwrap();
+        assert!(cancel.is_set());
+        assert!(std::time::Instant::now() >= deadline, "stopped early");
+        assert_eq!(inbox::take(9_250_002, true).len(), 1);
     }
 }

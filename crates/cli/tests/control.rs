@@ -1,6 +1,7 @@
 //! `letronna -p --input-format stream-json`, driven over stdin as another
-//! program would drive it, and the JSON `-p --output json` gives a script,
-//! against a local stub provider and a data folder of its own.
+//! program would drive it, the JSON `-p --output json` gives a script, and
+//! `letronna -p` given a deadline, against a local stub provider and a data
+//! folder of its own.
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -105,9 +106,15 @@ struct Driven {
 }
 
 impl Driven {
-    /// Starts `letronna` with `flags` in `work`, set up in `data` to use the
-    /// provider at `endpoint`.
-    fn start(data: &Path, work: &Path, endpoint: &str, flags: &[&str]) -> Driven {
+    /// Starts `letronna` with `flags` and `env` in `work`, set up in `data` to
+    /// use the provider at `endpoint`.
+    fn start(
+        data: &Path,
+        work: &Path,
+        endpoint: &str,
+        flags: &[&str],
+        env: &[(&str, &str)],
+    ) -> Driven {
         let settings = json!({
             "endpoint": endpoint,
             "model": "stub-model",
@@ -117,6 +124,7 @@ impl Driven {
         std::fs::write(data.join("settings.json"), settings.to_string()).unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_letronna"))
             .args(flags)
+            .envs(env.iter().copied())
             .current_dir(work)
             // Nothing here may reach the real data folder or home.
             .env("AGENT_DATA_DIR", data)
@@ -157,7 +165,7 @@ impl Driven {
             "stream-json",
         ];
         flags.extend(more);
-        Driven::start(data, work, endpoint, &flags)
+        Driven::start(data, work, endpoint, &flags, &[])
     }
 
     fn send(&mut self, line: &Value) {
@@ -339,7 +347,7 @@ fn a_line_that_cannot_be_read_exits_2() {
     assert_eq!(run.close(), 2);
     // Asking for stream-json in with text out is bad usage.
     let flags = ["-p", "--input-format", "stream-json"];
-    let run = Driven::start(&data, &work, &endpoint, &flags);
+    let run = Driven::start(&data, &work, &endpoint, &flags, &[]);
     assert_eq!(run.close(), 2);
     assert!(bodies.try_recv().is_err(), "the model was asked");
 }
@@ -481,7 +489,13 @@ fn a_run_that_never_writes_its_required_file_says_so_in_the_json_result() {
     // The check sends it back once, and it ends again without the file.
     let (endpoint, bodies) = provider(vec![reply("Done.", &[]), reply("Still done.", &[])]);
     let ask = "Read notes.txt and write what it says to out/summary.json.";
-    let run = Driven::start(&data, &work, &endpoint, &["-p", ask, "--output", "json"]);
+    let run = Driven::start(
+        &data,
+        &work,
+        &endpoint,
+        &["-p", ask, "--output", "json"],
+        &[],
+    );
     let result = run.next();
     // Still done, so a script's idea of success is as it was.
     assert_eq!(
@@ -507,7 +521,7 @@ fn the_json_result_names_the_session_and_its_model() {
     let (data, work) = scratch("named");
     let (endpoint, bodies) = provider(vec![reply("Hello.", &[]), reply("Again.", &[])]);
     let flags = ["-p", "hello", "--output", "json"];
-    let run = Driven::start(&data, &work, &endpoint, &flags);
+    let run = Driven::start(&data, &work, &endpoint, &flags, &[]);
     let result = run.next();
     assert_eq!(
         (&result["model"], &result["gateway"], &result["refused"]),
@@ -524,7 +538,7 @@ fn the_json_result_names_the_session_and_its_model() {
     // That id carries the same conversation on.
     let id = session.to_string();
     let flags = ["-p", "again", "--resume", &id, "--output", "json"];
-    let run = Driven::start(&data, &work, &endpoint, &flags);
+    let run = Driven::start(&data, &work, &endpoint, &flags, &[]);
     assert_eq!(run.next()["session"], session);
     assert_eq!(run.close(), 0);
     let _ = bodies.recv_timeout(WAIT).unwrap();
@@ -574,7 +588,7 @@ fn stream_json_starts_with_an_init_line_naming_the_session() {
     let (data, work) = scratch("init");
     let (endpoint, _bodies) = provider(vec![reply("Hi.", &[]), reply("Hi again.", &[])]);
     let flags = ["-p", "hello", "--output", "stream-json"];
-    let run = Driven::start(&data, &work, &endpoint, &flags);
+    let run = Driven::start(&data, &work, &endpoint, &flags, &[]);
     let init = run.first();
     assert_eq!(
         (&init["type"], &init["model"], &init["gateway"]),
@@ -594,4 +608,68 @@ fn stream_json_starts_with_an_init_line_naming_the_session() {
     run.say("hello");
     assert_eq!(run.next()["session"], init["session"]);
     assert_eq!(run.close(), 0);
+}
+
+#[test]
+fn a_print_run_past_its_deadline_stops_with_its_result() {
+    let (data, work) = scratch("deadline-past");
+    // The model sits on the request, so only the deadline ends the run.
+    let (endpoint, _bodies) = provider(vec![None]);
+    let flags = ["-p", "take your time", "--output", "json"];
+    let run = Driven::start(
+        &data,
+        &work,
+        &endpoint,
+        &flags,
+        &[("LETRONNA_DEADLINE", "2")],
+    );
+    assert_eq!(run.next()["status"], "stopped");
+    // Out of time is not a Ctrl-C, so a harness counts the run as having ended.
+    assert_eq!(run.close(), 0);
+}
+
+#[test]
+fn a_print_run_near_its_deadline_is_told_to_commit_its_outputs() {
+    let (data, work) = scratch("deadline-near");
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+    let (sent, bodies) = mpsc::channel();
+    // The run has 8 s from its start, which is before its first request: the
+    // first answer comes past the warning at 6.4 s, and the second request
+    // goes out well before 8 s.
+    let replies = [
+        (Duration::from_millis(6_800), "Done."),
+        (Duration::ZERO, "Every output is written."),
+    ];
+    std::thread::spawn(move || {
+        for (held, text) in replies {
+            let (mut socket, _) = server.accept().unwrap();
+            let _ = sent.send(request(&mut socket));
+            std::thread::sleep(held);
+            let reply = reply(text, &[]).unwrap();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+        }
+    });
+    let flags = ["-p", "write the report", "--output", "json"];
+    let run = Driven::start(
+        &data,
+        &work,
+        &endpoint,
+        &flags,
+        &[("LETRONNA_DEADLINE", "8")],
+    );
+    let result = run.next();
+    assert_eq!(
+        (&result["status"], &result["answer"]),
+        (&json!("done"), &json!("Every output is written."))
+    );
+    assert_eq!(run.close(), 0);
+    let _ = bodies.recv_timeout(WAIT).unwrap();
+    let later = said(&bodies.recv_timeout(WAIT).unwrap());
+    let (role, told) = later.last().unwrap();
+    assert_eq!(role, "user");
+    assert!(
+        told.contains("s are left before this run is stopped"),
+        "{told}"
+    );
 }
