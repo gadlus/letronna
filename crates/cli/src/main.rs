@@ -42,7 +42,7 @@ use letronna_core::cancel::Cancel;
 use letronna_core::chat::{self, Message};
 use letronna_core::driver::{self, Allow, Outcome, Report, Spec, Status};
 use letronna_core::store::Transcript;
-use letronna_core::{agent, crew, hooks, inbox, store, tools, update};
+use letronna_core::{agent, crew, hooks, inbox, store, tools, update, usage};
 use serde_json::{Value, json};
 use session::Runner;
 use std::io::IsTerminal;
@@ -65,6 +65,23 @@ const PREVIEW_LINES: usize = 12;
 /// How long a new version runs before it counts as working and is kept, as
 /// in the window.
 const SETTLED: std::time::Duration = std::time::Duration::from_secs(10);
+/// How the result of a call refused before it ran begins: refused by the
+/// gate, answered no, turned down by Auto mode's judge or by a hook.
+const REFUSED: [&str; 4] = [
+    "Refused: ",
+    "This was not approved",
+    "Auto mode did not allow this",
+    "A PreToolUse hook blocked this call",
+];
+/// How the result of a call the run may not make at all goes on after the
+/// tool's name: not among the tools it was given, switched off, or changing
+/// things in plan mode.
+const NOT_OFFERED: [&str; 4] = [
+    " is not available to this",
+    " is not available in plan mode",
+    " in plan mode only runs",
+    " is switched off",
+];
 
 fn main() {
     // The first mark, from which the others are timed.
@@ -196,7 +213,7 @@ fn main() {
     let first_run = runner.store.settings.model.is_empty();
     if first_run && (args.once() || args.serve) {
         let error = "Nothing is set up yet. Run `letronna setup` first.";
-        show(args.output, &failed(error.into()));
+        show(args.output, &failed(error.into()), None);
         std::process::exit(1);
     }
     if args.serve {
@@ -225,6 +242,7 @@ fn main() {
                 show(
                     args.output,
                     &failed(format!("No session with the id {id}.")),
+                    None,
                 );
                 std::process::exit(1);
             }
@@ -458,10 +476,12 @@ fn ask_once(
     interrupted: &Cancel,
 ) -> bool {
     let budget = args.budget.map(|limit| Arc::new(Budget::new(limit, None)));
+    // Named while the session is in the store, which the run takes it out of.
+    let opening = init(runner, session);
     let (mut spec, context, before) = match begin(runner, session, prompt, args, budget) {
         Ok(begun) => begun,
         Err(error) => {
-            show(args.output, &failed(error));
+            show(args.output, &failed(error), None);
             return false;
         }
     };
@@ -475,6 +495,9 @@ fn ask_once(
     // Its own gate asks only when someone can answer.
     spec.connection.human = keyboard;
     answer_approvals(keyboard, context, spec.cancel.clone());
+    if args.output == Output::StreamJson {
+        emit(&opening);
+    }
     let report = run_following(spec, args.output);
     finish(runner, session, id, before, report, args.output)
 }
@@ -589,10 +612,12 @@ fn finish(
     }
     // The report's text is the last thing said in the whole session, which
     // after -c is an earlier answer when this run said nothing.
+    let mut extras = None;
     if let Some(said) = take_back(runner, session, id, before) {
         report.text = said;
+        extras = Some(Extras::of(runner, session, before));
     }
-    show(output, &report);
+    show(output, &report, extras.as_ref());
     !matches!(report.status, Outcome::Failed(_))
 }
 
@@ -637,16 +662,16 @@ fn failed(error: String) -> Report {
     }
 }
 
-/// Prints how a run ended in the form asked for, so a script reading JSON
-/// gets JSON for a run that never began too.
-fn show(output: Output, report: &Report) {
+/// Prints how a run ended in the form asked for, with `extras` in the JSON
+/// forms, so a script reading JSON gets JSON for a run that never began too.
+fn show(output: Output, report: &Report, extras: Option<&Extras>) {
     match output {
         Output::Text => print_answer(report),
         Output::Json => {
-            emit(&as_json(report));
+            emit(&as_json(report, extras));
         }
         Output::StreamJson => {
-            let mut result = as_json(report);
+            let mut result = as_json(report, extras);
             result["type"] = "result".into();
             emit(&result);
         }
@@ -743,6 +768,18 @@ fn show_progress(status: Arc<Status>, ended: mpsc::Receiver<()>) -> std::thread:
     })
 }
 
+/// The stream-json line a run opens with: the session at `session`, by the
+/// id `--resume` takes, and the model and gateway it runs on.
+fn init(runner: &Runner, session: usize) -> Value {
+    let (gateway, model) = runner.store.model(session);
+    json!({
+        "type": "init",
+        "session": runner.store.conversations[session].id,
+        "model": model,
+        "gateway": gateway,
+    })
+}
+
 /// A run's progress so far, as a stream-json line.
 fn progress(status: &Status) -> Value {
     json!({
@@ -774,8 +811,9 @@ fn print_answer(report: &Report) {
     render::line(&note);
 }
 
-/// What a run came to, as `--output json` prints it.
-fn as_json(report: &Report) -> Value {
+/// What a run came to, as `--output json` prints it, with `extras` once it
+/// has begun.
+fn as_json(report: &Report, extras: Option<&Extras>) -> Value {
     let status = match &report.status {
         Outcome::Done => "done",
         Outcome::RoundLimit => "round_limit",
@@ -796,7 +834,75 @@ fn as_json(report: &Report) -> Value {
     if let Outcome::Failed(error) = &report.status {
         out["error"] = error.as_str().into();
     }
+    if let Some(extras) = extras {
+        out["session"] = extras.session.into();
+        out["model"] = extras.model.as_str().into();
+        out["gateway"] = extras.gateway.as_str().into();
+        out["cost_usd"] = extras.cost.into();
+        out["refused"] = extras.refused.into();
+    }
     out
+}
+
+/// What the JSON says about a run beyond its report, read from the session
+/// it ran in.
+struct Extras {
+    /// The session's id, which `--resume` takes.
+    session: u64,
+    model: String,
+    gateway: String,
+    /// What the run's own model calls cost in US dollars, over those whose
+    /// cost is known; None when no call's is.
+    cost: Option<f64>,
+    /// The run's own calls that were refused rather than run.
+    refused: usize,
+}
+
+impl Extras {
+    /// The extras of the run whose messages follow the first `before` in the
+    /// session at `session`.
+    fn of(runner: &Runner, session: usize, before: usize) -> Extras {
+        let conversation = &runner.store.conversations[session];
+        let own = conversation.messages.get(before..).unwrap_or_default();
+        let (gateway, model) = runner.store.model(session);
+        Extras {
+            session: conversation.id,
+            model: model.to_owned(),
+            gateway: gateway.to_owned(),
+            cost: cost(own),
+            refused: own.iter().filter(|message| refused(message)).count(),
+        }
+    }
+}
+
+/// What the model calls behind `messages` cost in US dollars, over those
+/// whose cost is known, or None when no call's is.
+fn cost(messages: &[Message]) -> Option<f64> {
+    let mut spent = usage::Totals::default();
+    for call in messages.iter().flat_map(usage::calls) {
+        spent.add(&call);
+    }
+    (spent.unpriced < spent.calls).then_some(spent.cost)
+}
+
+/// Whether `result` answers a call that was refused rather than run.
+fn refused(result: &Message) -> bool {
+    if result.role != "tool" || !result.is_error {
+        return false;
+    }
+    // Core marks a refusal only in the words the model is told, which
+    // also tell it apart from a call that ran and failed. A batch refused
+    // for one of its steps says which step, then that step's refusal.
+    let content = result.content.as_str();
+    let text = content
+        .split_once(" would be refused on its own, so none of it ran: ")
+        .map_or(content, |(_, why)| why);
+    let after_name = text
+        .strip_prefix('`')
+        .and_then(|rest| rest.split_once('`'))
+        .map(|(_, rest)| rest);
+    REFUSED.iter().any(|start| text.starts_with(start))
+        || after_name.is_some_and(|rest| NOT_OFFERED.iter().any(|then| rest.starts_with(then)))
 }
 
 /// The gateway `name` means, in any case.
@@ -1067,7 +1173,7 @@ mod tests {
 
     #[test]
     fn json_output_carries_the_answer_rounds_and_tokens() {
-        let out = as_json(&report(Outcome::Done));
+        let out = as_json(&report(Outcome::Done), None);
         assert_eq!(
             out,
             json!({
@@ -1083,19 +1189,136 @@ mod tests {
         );
         // A run that ended short says how, and a failed one says why.
         assert_eq!(
-            as_json(&report(Outcome::RoundLimit))["status"],
+            as_json(&report(Outcome::RoundLimit), None)["status"],
             "round_limit"
         );
         assert_eq!(
-            as_json(&report(Outcome::OverBudget))["status"],
+            as_json(&report(Outcome::OverBudget), None)["status"],
             "over_budget"
         );
-        let failed = as_json(&report(Outcome::Failed("The key was refused.".into())));
+        let failed = as_json(
+            &report(Outcome::Failed("The key was refused.".into())),
+            None,
+        );
         assert_eq!(
             (&failed["status"], &failed["error"]),
             (&json!("failed"), &json!("The key was refused."))
         );
         assert!(out.get("error").is_none());
+    }
+
+    #[test]
+    fn json_output_names_the_session_its_model_and_what_it_cost() {
+        let mut extras = Extras {
+            session: 137,
+            model: "stub-model".into(),
+            gateway: "Custom".into(),
+            cost: Some(0.25),
+            refused: 2,
+        };
+        let out = as_json(&report(Outcome::Done), Some(&extras));
+        assert_eq!(
+            (
+                &out["session"],
+                &out["model"],
+                &out["gateway"],
+                &out["cost_usd"],
+                &out["refused"]
+            ),
+            (
+                &json!(137),
+                &json!("stub-model"),
+                &json!("Custom"),
+                &json!(0.25),
+                &json!(2)
+            )
+        );
+        assert_eq!(out["answer"], "The notes say hello.");
+        // A cost nobody knows is said to be unknown, not nothing.
+        extras.cost = None;
+        let out = as_json(&report(Outcome::Done), Some(&extras));
+        assert_eq!(out.get("cost_usd"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn the_cost_adds_up_the_calls_whose_cost_is_known() {
+        let reply = |cost: Option<f64>| Message {
+            role: "assistant".into(),
+            cost,
+            ..Default::default()
+        };
+        let summarized = Message {
+            summary_usage: Some(usage::Usage {
+                cost: Some(0.5),
+                ..Default::default()
+            }),
+            ..reply(Some(0.25))
+        };
+        let run = [reply(Some(0.125)), reply(None), summarized];
+        assert_eq!(cost(&run), Some(0.875));
+        assert_eq!(cost(&[reply(None)]), None);
+        assert_eq!(cost(&[]), None);
+    }
+
+    #[test]
+    fn a_call_refused_before_it_ran_is_told_from_one_that_ran_and_failed() {
+        let result = |content: &str, is_error| Message {
+            role: "tool".into(),
+            name: "write_file".into(),
+            content: content.into(),
+            is_error,
+            ..Default::default()
+        };
+        // The gate's own words, in each mode and by each rule that refuses.
+        let ctx = tools::ToolContext::default();
+        let none = Ok(Vec::new());
+        let denied = Ok(vec![Rule {
+            tool: "write_file".into(),
+            pattern: String::new(),
+            effect: permissions::Effect::Deny,
+            project: None,
+        }]);
+        let gated = [
+            (write(), &none, Mode::Default),
+            (write(), &none, Mode::DontAsk),
+            (write(), &none, Mode::Plan),
+            (command("touch notes.txt"), &none, Mode::Plan),
+            (write(), &denied, Mode::Bypass),
+            (
+                command("Remove-Item -Recurse -Force ~"),
+                &none,
+                Mode::Bypass,
+            ),
+        ];
+        for (call, rules, mode) in gated {
+            let Some(Decision::Deny(why)) = answered(&call, &ctx, rules, mode, false) else {
+                panic!("{} was not refused in {mode:?}", call.name);
+            };
+            assert!(refused(&result(&why, true)), "{why}");
+        }
+        for why in [
+            "`write_file` is not available to this helper.",
+            "This was not approved, so it did not run. The user said why: not now",
+            "Auto mode did not allow this: it deletes files.",
+            "A PreToolUse hook blocked this call: no writes here",
+            "Step 2 of the batch (click Pay) would be refused on its own, so none of it \
+             ran: `use_page` is not available in plan mode: it changes things.",
+        ] {
+            assert!(refused(&result(why, true)), "{why}");
+        }
+        // A call that ran and failed, or whose output only reads like a refusal.
+        let ran = [
+            result("Could not read `notes.txt`: it is not there.", true),
+            result("Refused: the server said no.", false),
+            result("`gh` is not available on this computer.", true),
+            Message {
+                role: "assistant".into(),
+                ..result("Refused: nothing.", true)
+            },
+        ];
+        for message in ran {
+            assert!(!refused(&message), "{}", message.content);
+        }
     }
 
     #[test]

@@ -10,8 +10,9 @@
 //! stdio` a call the user's own rules and mode leave open goes out as a
 //! `can_use_tool` request and waits for the `control_response` that answers
 //! it. What those rules and that mode settle is settled before the program is
-//! asked, so its yes never undoes them. Every message ends with its own
-//! `result` line on stdout, as `-p` alone does.
+//! asked, so its yes never undoes them. Stdout opens with an `init` line
+//! naming the session, and every message ends with its own `result` line,
+//! as with `-p` alone.
 //!
 //! Closing stdin lets the turns already sent run to their end and then exits,
 //! the way a pipe of questions would expect. A line that is not UTF-8 JSON
@@ -103,6 +104,8 @@ enum Got {
 /// stdin closes, and gives the exit code: 0, 1 when a turn failed or stdout
 /// closed, or 2 for a line that could not be read.
 pub fn run(runner: &mut Runner, session: usize, args: &Args) -> i32 {
+    // Before any turn, which takes the session out of the store as it runs.
+    crate::emit(&crate::init(runner, session));
     let (events, heard) = mpsc::channel();
     let current = Arc::new(AtomicU64::new(0));
     read_stdin(events.clone(), current.clone());
@@ -145,7 +148,7 @@ pub fn run(runner: &mut Runner, session: usize, args: &Args) -> i32 {
                         running = Some(turn);
                     }
                     Err(error) => {
-                        crate::show(args.output, &crate::failed(error));
+                        crate::show(args.output, &crate::failed(error), None);
                         failed = true;
                     }
                 }
