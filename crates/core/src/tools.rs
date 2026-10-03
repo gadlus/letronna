@@ -120,6 +120,11 @@ pub trait Tool: Send + Sync {
     fn destructive(&self) -> bool {
         false
     }
+    /// Whether a call may reach machines other than this one, which only an
+    /// MCP server's own word says so far.
+    fn open_world(&self) -> bool {
+        false
+    }
     /// Whether the tool reads or changes this computer. Withheld where other
     /// people can read the replies; a tool has to opt out to be offered there,
     /// so a plugin's tool stays out unless it says otherwise.
@@ -731,9 +736,12 @@ pub(crate) fn run_found(
     // Hidden before the cut, which could split a key and leave half of it
     // showing, and before anything is wrapped around the result.
     let shapes = tool.hides_key_shapes();
-    let ran = tool
-        .run(&args, ctx)
-        .map_err(|e| crate::redact::scrub(&e, shapes) + &note + &heard)?;
+    let ran = tool.run(&args, ctx);
+    // Whether it worked or not: an error can quote a page or a server too.
+    if tool.untrusted() {
+        crate::taint::mark(ctx);
+    }
+    let ran = ran.map_err(|e| crate::redact::scrub(&e, shapes) + &note + &heard)?;
     // Before the scrub: a key with a hidden character inside reads as a key
     // only once the character is gone.
     let (ran, hid) = if NOTED.contains(&tool.name()) {
@@ -755,8 +763,17 @@ pub(crate) fn run_found(
     // stays first for the window and the next request. Of these tools only
     // read_file writes that line: a command's output or a file name found
     // can start with the same words.
+    let addressed = NOTED
+        .contains(&tool.name())
+        .then(|| addressed_note(&out))
+        .flatten();
+    // Someone other than the user may have written it, as a page's author
+    // does, so the gate checks what the session does next.
+    if addressed.is_some() {
+        crate::taint::mark(ctx);
+    }
     let noted: String = if NOTED.contains(&tool.name()) {
-        [hidden_note(hid), addressed_note(&out)]
+        [hidden_note(hid), addressed]
             .into_iter()
             .flatten()
             .collect()
@@ -2072,7 +2089,11 @@ impl Tool for WriteFile {
         }
         let note = crate::write::csv_note(Path::new(path_arg(args)), change.before(), &text);
         let lsp = crate::lsp::before_write(ctx, &path, change.before());
+        let new = change.before().is_none();
         change.write(text.as_bytes(), &ctx.files)?;
+        if new {
+            crate::taint::made(ctx, &path);
+        }
         crate::lsp::wrote(lsp, &text);
         // Named, so the result still says what changed where its call's
         // arguments are not shown, as in a trace or a cleared history.

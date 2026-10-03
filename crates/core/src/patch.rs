@@ -153,6 +153,24 @@ pub(crate) fn paths(args: &Value) -> Option<Vec<String>> {
     Some(paths)
 }
 
+/// The paths the patch in `args` deletes or moves away, as it names them;
+/// none when it does not parse, and then nothing is written.
+pub(crate) fn removes(args: &Value) -> Vec<String> {
+    let Some(Ok(actions)) = patch_arg(args).map(parse) else {
+        return Vec::new();
+    };
+    actions
+        .into_iter()
+        .filter_map(|action| match action {
+            Action::Delete { path }
+            | Action::Update {
+                path, to: Some(_), ..
+            } => Some(path),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The patch's files and hunks, or an error naming the line at fault.
 fn parse(patch: &str) -> Result<Vec<Action>, String> {
     let lines: Vec<(usize, &str)> = patch
@@ -406,6 +424,8 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
     let mut claimed = Vec::new();
     let mut said = Vec::new();
     let mut notes = String::new();
+    // Only these are the session's own: a file moved is still the user's.
+    let mut added = Vec::new();
     for action in actions {
         match action {
             Action::Add { path: raw, text } => {
@@ -418,6 +438,7 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
                 }
                 crate::write::check_syntax(&path, None, text)?;
                 notes.push_str(&crate::write::csv_note(Path::new(raw), None, text));
+                added.push(path.clone());
                 steps.push(Step::Write {
                     path,
                     raw: raw.clone(),
@@ -515,6 +536,9 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
             return Err(format!("{e}{}", undo(&done, &mut batch)));
         }
         done.push(step);
+    }
+    for path in &added {
+        crate::taint::made(ctx, path);
     }
     Ok(format!("Applied the patch: {}.{notes}", said.join(", ")))
 }

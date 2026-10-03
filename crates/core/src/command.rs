@@ -277,6 +277,20 @@ const CURL_SENDS: &[&str] = &[
 /// else to each program.
 const WGET_FILES: &[&str] = &["--post-file", "--body-file"];
 
+/// curl's long options, besides `CURL_SENDS`, that send what they are given
+/// as it is, or name the request's method.
+const CURL_POSTS: &[&str] = &["--data-raw", "--form-string", "--request"];
+
+/// wget's options, besides `WGET_FILES`, that send what they are given as
+/// it is, or name the request's method.
+const WGET_POSTS: &[&str] = &["--post-data", "--body-data", "--method"];
+
+/// Programs that carry data to another machine whatever they are given: a
+/// remote shell, a file transfer, a raw connection.
+const SENDERS: &[&str] = &[
+    "ssh", "sftp", "ftp", "nc", "ncat", "netcat", "socat", "telnet",
+];
+
 /// scp's options that take a value -- the key to sign in with, the ssh
 /// config, an option for ssh -- so that what follows them is not a file
 /// being copied anywhere.
@@ -444,6 +458,9 @@ pub struct Command {
     /// The files its output is written to after `>` and `>>`, leaving out
     /// those that go nowhere, such as `/dev/null`.
     pub writes: Vec<String>,
+    /// The folder it runs in, where its relative paths lead, or None once
+    /// the line has changed folder.
+    pub dir: Option<PathBuf>,
 }
 
 /// A line judged: each command in it, and the worst of them.
@@ -1291,6 +1308,7 @@ fn judge(simple: &Simple, dialect: Dialect, places: &Places, depth: u8) -> Comma
             .filter(|w| !nowhere(w, dialect))
             .map(|w| w.text.clone())
             .collect(),
+        dir: places.dir.clone(),
     }
 }
 
@@ -1788,9 +1806,9 @@ fn remote(path: &str, dialect: Dialect) -> bool {
     })
 }
 
-/// The git commands that throw work away or rewrite what others have.
-fn git(args: &[String]) -> Risk {
-    // Options before the subcommand, two of them with a value: `git -C dir push`.
+/// Where git's subcommand sits in `args`, past the options before it, two
+/// of them with a value: `git -C dir push`.
+fn git_at(args: &[String]) -> usize {
     let mut at = 0;
     while let Some(arg) = args.get(at) {
         if !arg.starts_with('-') {
@@ -1798,6 +1816,12 @@ fn git(args: &[String]) -> Risk {
         }
         at += if arg == "-C" || arg == "-c" { 2 } else { 1 };
     }
+    at
+}
+
+/// The git commands that throw work away or rewrite what others have.
+fn git(args: &[String]) -> Risk {
+    let at = git_at(args);
     let Some(sub) = args.get(at) else {
         return Risk::Plain;
     };
@@ -1820,6 +1844,84 @@ fn git(args: &[String]) -> Risk {
         }
         _ => Risk::Plain,
     }
+}
+
+/// Whether `command`, or a line it hands to another shell, sends data to
+/// another machine as `dialect` reads it: a remote shell or raw connection,
+/// a copy to another machine, a fetch that sends something, a git push, or
+/// output written to bash's `/dev/tcp` or `/dev/udp`.
+pub(crate) fn sends_out(command: &Command, dialect: Dialect) -> bool {
+    let sends = command.argv.get(command.at).is_some_and(|word| {
+        let args = &command.argv[command.at + 1..];
+        match name_of(word).as_str() {
+            "scp" => copies_out(args, SCP_VALUES, dialect),
+            "rsync" => copies_out(args, RSYNC_VALUES, dialect),
+            // PowerShell 5.1 calls its own web cmdlet `curl` and `wget` too.
+            name @ ("curl" | "wget") => posts(name, args) || cmdlet_posts(args),
+            "invoke-webrequest" | "iwr" | "invoke-restmethod" | "irm" => cmdlet_posts(args),
+            // Any remote counts, since the session could have just added it.
+            "git" => args.get(git_at(args)).is_some_and(|sub| sub == "push"),
+            name => SENDERS.contains(&name),
+        }
+    });
+    let socket = |raw: &String| raw.starts_with("/dev/tcp/") || raw.starts_with("/dev/udp/");
+    sends
+        || command.writes.iter().any(socket)
+        || (command.nested.iter()).any(|nested| sends_out(nested, dialect))
+}
+
+/// Whether scp or rsync, given `args` with `takes` its options that take a
+/// value, copies to another machine, which it names last.
+fn copies_out(args: &[String], takes: &[&str], dialect: Dialect) -> bool {
+    let (_, paths) = given(args, takes);
+    paths.last().is_some_and(|to| remote(to, dialect))
+}
+
+/// Whether curl or wget, as `name` says, sends something given `args`: a
+/// body, a form, a file, or a method other than GET or HEAD. Options are
+/// read as `given` reads them, so `-sXGET` is a GET and not a `-T`.
+fn posts(name: &str, args: &[String]) -> bool {
+    let takes = if name == "wget" {
+        [WGET_FILES, WGET_POSTS].concat()
+    } else {
+        [CURL_LETTERS, CURL_SENDS, CURL_POSTS].concat()
+    };
+    let (values, _) = given(args, &takes);
+    values.iter().any(|(option, value)| match option.as_str() {
+        "-X" | "--request" | "--method" => !matches!(value.to_lowercase().as_str(), "get" | "head"),
+        // A header's or a query's own words are like a URL's; only a file
+        // they name is sent as a body is.
+        "-H" | "--header" | "--url-query" => curl_file(option, value).is_some(),
+        // curl's other letters set how it fetches, not what it sends.
+        option => !CURL_LETTERS.contains(&option) || ["-d", "-F", "-T"].contains(&option),
+    })
+}
+
+/// Whether PowerShell's web cmdlets send something given `args`: a body, a
+/// file, a form, or a method other than GET or HEAD. Their parameters take
+/// no case and may hold their value after a `:`.
+fn cmdlet_posts(args: &[String]) -> bool {
+    let mut words = args.iter();
+    while let Some(word) = words.next() {
+        let lower = word.to_lowercase();
+        let (flag, glued) = lower.split_once(':').unwrap_or((&lower, ""));
+        if ["-body", "-infile", "-form"]
+            .iter()
+            .any(|start| flag.starts_with(start))
+        {
+            return true;
+        }
+        if ["-method", "-custommethod"].contains(&flag) {
+            let method = match glued {
+                "" => words.next().map(|next| next.to_lowercase()),
+                method => Some(method.to_owned()),
+            };
+            if !method.is_some_and(|method| matches!(method.as_str(), "get" | "head")) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Whether a write to `word` goes nowhere, as one to `/dev/null` does.
@@ -3964,5 +4066,74 @@ mod tests {
             &["find . -name '*.txt'"],
         );
         let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_command_that_sends_data_out_is_told_from_one_that_only_fetches() {
+        let fetches = [
+            "curl https://example.com/a.tar.gz -o a.tar.gz",
+            "curl -fsSL https://example.com/install.sh",
+            "curl -X GET https://example.com",
+            "curl -sXGET https://example.com",
+            "curl -H 'Accept: text/html' https://example.com",
+            "curl -I https://example.com",
+            "curl -x proxy.example.com:8080 https://example.com",
+            "curl https://example.com -OutFile a.html",
+            "wget -T 30 https://example.com/a",
+            "wget --method=HEAD https://example.com/a",
+            "Invoke-WebRequest -Method Get https://example.com",
+            "rsync -a src/ dst/",
+            "rsync -e ssh example.com:backup/ here/",
+            "scp a.txt b.txt",
+            "scp user@example.com:notes.txt .",
+            "git pull",
+            "git -c core.editor=vi commit -m push",
+            "cargo test",
+        ];
+        let sends = [
+            "curl -d key=value https://example.com",
+            "curl -sSd key=value https://example.com",
+            "curl --data-binary key=value https://example.com",
+            "curl --data-raw key=value https://example.com",
+            "curl -H '@headers.txt' https://example.com",
+            "curl -F name=value https://example.com",
+            "curl -T notes.txt https://example.com",
+            "curl -XPOST https://example.com",
+            "curl --request=PUT https://example.com",
+            "sudo curl -X DELETE https://example.com/a",
+            "wget --post-file=notes.txt https://example.com",
+            "wget --post-data=key=value https://example.com",
+            "Invoke-RestMethod -Method Post https://example.com",
+            "Invoke-WebRequest -Method:Put https://example.com",
+            "iwr https://example.com -InFile notes.txt",
+            "scp notes.txt user@example.com:/tmp/",
+            "rsync -a src/ example.com:backup/",
+            "ssh example.com uptime",
+            "sh -c 'nc example.com 80'",
+            "git push https://example.com/repo.git HEAD",
+            "git -C repo push origin main",
+            "cat notes.txt > /dev/tcp/example.com/80",
+        ];
+        for dialect in [Dialect::Sh, Dialect::PowerShell] {
+            let out = |line: &str| {
+                let commands = assess(line, dialect, None).commands;
+                commands.iter().any(|command| sends_out(command, dialect))
+            };
+            for line in fetches {
+                assert!(!out(line), "{dialect:?} read `{line}` as sending");
+            }
+            for line in sends {
+                assert!(out(line), "{dialect:?} missed what `{line}` sends");
+            }
+        }
+    }
+
+    #[test]
+    fn each_command_knows_the_folder_it_runs_in_until_one_moves() {
+        let line = "echo a > x.txt; cd sub; echo b > y.txt";
+        let commands = assess(line, Dialect::Sh, Some(Path::new("/work"))).commands;
+        let dirs: Vec<Option<&Path>> = commands.iter().map(|c| c.dir.as_deref()).collect();
+        let work = Some(Path::new("/work"));
+        assert_eq!(dirs, [work, work, None]);
     }
 }
