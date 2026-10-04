@@ -5,6 +5,7 @@
 use crate::prelude::*;
 use crate::ui::actions::{NextTurn, PreviousTurn, Stop};
 use letronna_core::approvals::Decision;
+use letronna_core::memory::{self, Scope};
 use letronna_core::{gate, tools};
 
 /// Eight of a code block's 18px lines: a longer preview scrolls, so the
@@ -29,6 +30,9 @@ pub(crate) struct CardFor {
     /// Where the card stands among its reply's calls that wait on the
     /// user, when that is known.
     place: Option<Place>,
+    /// Where a memory save may be kept, where it goes now first; empty for
+    /// any other call.
+    places: Vec<Scope>,
 }
 
 impl CardFor {
@@ -41,6 +45,10 @@ impl CardFor {
                 && !tools::asked_each_time(&call.name),
             args,
             place: None,
+            places: match call.name.as_str() {
+                "memory" => memory::places(ctx),
+                _ => Vec::new(),
+            },
         }
     }
 
@@ -160,11 +168,24 @@ impl Chat {
         self.resolve_call(Verdict::Deny(reason), cx);
     }
 
-    /// Allows the call on the card this once.
+    /// Allows the call on the card this once, a memory save kept where
+    /// its first button says.
     fn allow_call(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.take_reason(window, cx);
         self.keys_back(false, window, cx);
-        self.resolve_call(Verdict::Allow { remember: false }, cx);
+        // Pinned to the button Enter is shown on, though the chat's scope
+        // may have changed since the card came up.
+        let place = self
+            .turn
+            .as_ref()
+            .and_then(|turn| front_call(turn, self.asking.as_deref()))
+            .and_then(|(call, _)| self.card_for.as_ref().filter(|shown| shown.is_for(&call)))
+            .and_then(|shown| shown.places.first().copied());
+        let verdict = match place {
+            Some(place) => Verdict::Keep(place),
+            None => Verdict::Allow { remember: false },
+        };
+        self.resolve_call(verdict, cx);
     }
 
     /// Gives the keys back to the composer when they are on the card about
@@ -531,6 +552,7 @@ impl Chat {
             "run_command" => "Letronna wants to run a command".to_owned(),
             "browse" | "use_page" => format!("Letronna wants to {summary}"),
             "search_web" => "Letronna wants to search the web".to_owned(),
+            "memory" => "Letronna wants to change what it remembers".to_owned(),
             other => format!("Letronna wants to use {other}"),
         };
         let folder = self.card_folder();
@@ -546,7 +568,47 @@ impl Chat {
                 .text_xs()
             })
         };
-        let answers = if asks_for_folder(&call.name, folder.is_some()) {
+        let answers = if !shown.places.is_empty() {
+            // Where it goes now first, as Enter keeps it; each other place
+            // keeps it there instead. The reason goes under them, where the
+            // places leave it room.
+            let keep = shown.places.iter().enumerate().fold(
+                h_flex().gap_2().items_center().flex_wrap(),
+                |row, (at, &place)| {
+                    let button = Button::new(("keep", at))
+                        .small()
+                        .label(crate::ui::remember::keep_words(place));
+                    let button = if at == 0 {
+                        button.primary().children(hint("enter"))
+                    } else {
+                        button.framed(cx)
+                    };
+                    row.child(button.on_click(cx.listener(move |this, _, window, cx| {
+                        this.take_reason(window, cx);
+                        this.keys_back(false, window, cx);
+                        this.resolve_call(Verdict::Keep(place), cx)
+                    })))
+                },
+            );
+            let refuse = h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Input::new(&self.deny_reason).small().w_full()),
+                )
+                .child(
+                    Button::new("deny")
+                        .plain(cx)
+                        .small()
+                        .label("Don't save")
+                        .children(hint("escape"))
+                        .on_click(cx.listener(|this, _, window, cx| this.deny_call(window, cx))),
+                );
+            v_flex().gap_2().child(keep).child(refuse)
+        } else if asks_for_folder(&call.name, folder.is_some()) {
             h_flex()
                 .gap_2()
                 .items_center()
@@ -727,6 +789,21 @@ impl Chat {
                 this.answer_agent(root, &label, &id, decision.clone(), cx)
             })
         };
+        // A memory save is answered with where to keep it, its first place
+        // where it goes now.
+        let keep: Vec<_> = (request.places.iter().enumerate())
+            .map(|(at, &place)| {
+                let button = Button::new(("helper-keep", at))
+                    .small()
+                    .label(crate::ui::remember::keep_words(place));
+                let button = if at == 0 {
+                    button.primary()
+                } else {
+                    button.framed(cx)
+                };
+                button.on_click(answer(Decision::Keep(place)))
+            })
+            .collect();
         let (once, for_run, deny) = (
             answer(Decision::Once),
             answer(Decision::ForRun),
@@ -749,6 +826,20 @@ impl Chat {
                     .child(request.why.clone()),
             )
         });
+        if !keep.is_empty() {
+            return Some(
+                card.child(
+                    h_flex().gap_2().children(keep).child(
+                        Button::new("helper-deny")
+                            .plain(cx)
+                            .small()
+                            .label("Don't save")
+                            .on_click(deny),
+                    ),
+                )
+                .into_any_element(),
+            );
+        }
         Some(
             card.child(
                 h_flex()
@@ -884,6 +975,7 @@ fn wants(who: &str, name: &str, summary: &str) -> String {
         "run_command" => format!("{who} wants to run a command"),
         "browse" | "use_page" => format!("{who} wants to {summary}"),
         "search_web" => format!("{who} wants to search the web"),
+        "memory" => format!("{who} wants to change what it remembers"),
         other => format!("{who} wants to use {other}"),
     }
 }

@@ -19,6 +19,8 @@ pub(crate) struct MemoryPage {
     /// The project folder of the session settings were opened over, whose
     /// notes are shown.
     workspace: Option<PathBuf>,
+    /// The session settings were opened over, whose own notes are shown.
+    session: u64,
     stores: Vec<memory::Store>,
     /// Each store's entries as they are drawn, worked out when read.
     shown: Vec<Vec<Shown>>,
@@ -71,6 +73,7 @@ impl MemoryPage {
         .detach();
         Self {
             workspace: None,
+            session: 0,
             stores: Vec::new(),
             shown: Vec::new(),
             soul: None,
@@ -83,11 +86,13 @@ impl MemoryPage {
         }
     }
 
-    /// Read the stores afresh, with `workspace`'s notes. An entry being
-    /// edited and SOUL.md's unsaved text are kept.
+    /// Read the stores afresh, with `workspace`'s notes and session
+    /// `session`'s own. An entry being edited and SOUL.md's unsaved text are
+    /// kept.
     pub(crate) fn refresh(
         &mut self,
         workspace: Option<PathBuf>,
+        session: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -101,6 +106,7 @@ impl MemoryPage {
             self.editing = None;
         }
         self.workspace = workspace;
+        self.session = session;
         self.notice = None;
         self.reload(window, cx);
     }
@@ -108,6 +114,9 @@ impl MemoryPage {
     /// Read the stores again, leaving what is typed alone.
     fn reload_stores(&mut self) {
         self.stores = memory::stores(self.workspace.as_deref());
+        if self.session != 0 {
+            self.stores.push(memory::chat_notes(self.session));
+        }
         self.soul = memory::store(None, "soul");
         self.shown = self
             .stores
@@ -338,7 +347,16 @@ impl MemoryPage {
     /// Open a store's file with the system, or the folder it will be in
     /// before anything is kept.
     fn open_file(&mut self, target: &'static str, cx: &mut Context<Self>) {
-        match memory::file(self.workspace.as_deref(), target) {
+        // Core's lookup takes no chat; its notes as read say where they are.
+        let notes = self.stores.iter().find(|store| store.target == "chat");
+        let file = match notes.filter(|_| target == "chat") {
+            Some(notes) if !notes.path.is_file() => {
+                Err("Nothing is kept for this chat yet.".into())
+            }
+            Some(notes) => Ok(notes.path.clone()),
+            None => memory::file(self.workspace.as_deref(), target),
+        };
+        match file {
             Ok(path) if path.is_file() => cx.open_with_system(&path),
             Ok(path) => {
                 if let Some(folder) = path.parent() {
@@ -416,11 +434,6 @@ impl Render for MemoryPage {
                 }
             }))
             .gap_5()
-            .child(super::settings::heading(
-                "Memory",
-                "What Letronna keeps from one session to the next, as plain files you can open. All of it goes into every request, so the model keeps it short with its memory tool.",
-                cx,
-            ))
             .children(notice)
             .children(stores)
             .when(self.workspace.is_none(), |this| {
@@ -505,6 +518,9 @@ impl MemoryPage {
         let blurb = match store.target {
             "user" => "What Letronna knows about you.",
             "memory" => "Its own notes.",
+            "chat" => {
+                "Its notes for this chat alone, which only it loads and which go when it is deleted. To change one, ask in the chat."
+            }
             _ => {
                 "Its notes on this session's project, kept in the data folder, never in the repository."
             }
@@ -614,15 +630,19 @@ impl MemoryPage {
             ))
         });
         let (edit_was, delete_was) = (entry.to_owned(), entry.to_owned());
-        row.child(
+        let row = row.child(
             v_flex()
                 .flex_1()
                 .min_w_0()
                 .gap_0p5()
                 .child(div().text_sm().child(shown.text.clone()))
                 .children(flag),
-        )
-        .child(
+        );
+        // Core edits a chat's notes only from the chat itself.
+        if target == "chat" {
+            return row;
+        }
+        row.child(
             h_flex()
                 .flex_shrink_0()
                 .gap_1()

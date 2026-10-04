@@ -26,6 +26,7 @@ pub(crate) mod pictures;
 pub(crate) mod plugin_page;
 pub(crate) mod profiles;
 pub(crate) mod quick;
+pub(crate) mod remember;
 pub(crate) mod schedules;
 pub(crate) mod search;
 pub(crate) mod sessions;

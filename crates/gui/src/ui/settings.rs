@@ -323,13 +323,11 @@ impl Chat {
             self.load_usage(cx);
         }
         // Memory may have been written since, by the model or by hand.
-        let workspace = self
-            .store
-            .conversations
-            .get(self.store.active)
-            .and_then(|conversation| conversation.workspace.clone());
+        let on_screen = self.store.conversations.get(self.store.active);
+        let workspace = on_screen.and_then(|conversation| conversation.workspace.clone());
+        let session = on_screen.map_or(0, |conversation| conversation.id);
         self.memory
-            .update(cx, |page, cx| page.refresh(workspace, window, cx));
+            .update(cx, |page, cx| page.refresh(workspace, session, window, cx));
         cx.notify();
     }
 
@@ -554,7 +552,16 @@ impl Chat {
             "Thinking" => thinking_page(&chat, &self.store, window, cx).into_any_element(),
             "Shortcuts" => shortcuts_page(&hotkey, &chat, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
-            "Memory" => self.memory.clone().into_any_element(),
+            "Memory" => v_flex()
+                .gap_5()
+                .child(heading(
+                    "Memory",
+                    "What Letronna keeps from one chat to the next, as plain files you can open. What a chat loads goes into each of its requests, so the model keeps it short with its memory tool.",
+                    cx,
+                ))
+                .child(super::remember::defaults(&chat, &self.store.settings, cx))
+                .child(self.memory.clone())
+                .into_any_element(),
             "About" => about_page(&chat, self, cx).into_any_element(),
             "Search" => search_page(self.search_rows(), &pick, &endpoint, &key, &chat, cx)
                 .into_any_element(),
@@ -1535,16 +1542,6 @@ fn thinking_page(chat: &Entity<Chat>, store: &Store, window: &mut Window, cx: &m
         cx,
         std::rc::Rc::new(move |this: &mut Chat| this.store.settings.verify_edits = !verifying),
     );
-    let reviewing = settings.memory_review;
-    let review = toggle_row(
-        "memory-review",
-        "Review memory",
-        "Every 10 of your messages, look back over the session and add what is worth remembering. Each look is a model call on your account.",
-        reviewing,
-        chat,
-        cx,
-        std::rc::Rc::new(move |this: &mut Chat| this.store.settings.memory_review = !reviewing),
-    );
 
     v_flex()
         .gap_4()
@@ -1559,11 +1556,10 @@ fn thinking_page(chat: &Entity<Chat>, store: &Store, window: &mut Window, cx: &m
         .child(search)
         .child(voice)
         .child(verify)
-        .child(review)
 }
 
 /// A switch with a name and a line about what it does.
-fn toggle_row(
+pub(crate) fn toggle_row(
     id: &'static str,
     title: &'static str,
     blurb: &'static str,

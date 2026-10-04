@@ -6,6 +6,9 @@ const GUIDE: &str = "https://letronna.ai/docs";
 /// The window width from which the palette's button says what it does:
 /// below it, its words would take the session name's room.
 const COMMAND_WORDS: Pixels = px(960.);
+/// The chat pane's width from which the memory chip says what it is set
+/// to: below it, the words would push the status bar past its edge.
+const MEMORY_WORDS: Pixels = px(760.);
 
 impl Chat {
     pub(crate) fn title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -384,7 +387,8 @@ impl Chat {
         )
     }
 
-    pub(crate) fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The bar under the chat, as wide as `pane`.
+    pub(crate) fn status_bar(&self, pane: Pixels, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .h(px(20.))
             .px_3()
@@ -394,6 +398,7 @@ impl Chat {
             .text_color(cx.theme().muted_foreground)
             .child(self.gateway_chip(cx))
             .child(self.workspace_chip(cx))
+            .child(self.memory_chip(pane >= MEMORY_WORDS, cx))
             .children(self.running_pill(cx))
             .children(self.loop_chip(cx))
             .children(

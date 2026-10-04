@@ -66,6 +66,8 @@ pub(crate) enum Verdict {
     Deny(String),
     /// The reply to an `ask_user` question.
     Answer(String),
+    /// Allow a memory save, kept where its card's answer put it.
+    Keep(letronna_core::memory::Scope),
 }
 
 /// A side question asked with /btw, answered on a fork of its session and
@@ -512,6 +514,9 @@ pub(crate) struct Chat {
     pub(crate) hit_at: Option<(Pixels, bool)>,
     /// The list of modes, while the mode chip has it open.
     pub(crate) mode_menu: Option<Entity<gpui_component::menu::PopupMenu>>,
+    /// When the chat on screen saves to memory and where, while the memory
+    /// chip has its menu open.
+    pub(crate) memory_menu: Option<Entity<gpui_component::menu::PopupMenu>>,
     /// Whether a frame has been drawn, before which the window has no focus
     /// path to ask about.
     pub(crate) drawn: bool,
@@ -1045,6 +1050,7 @@ impl Chat {
             revealed: None,
             hit_at: None,
             mode_menu: None,
+            memory_menu: None,
             drawn: false,
             mic: None,
             card_key: None,
@@ -1924,6 +1930,12 @@ impl Chat {
         let (endpoint, key) = resolve(gateway, &self.store.settings.custom_endpoint, &saved);
         let session = self.store.conversations[ix].id;
         let mode = self.mode(session);
+        // When the session saves to memory and where, as it chose, hold
+        // from this connection's first request on: the terminal may have
+        // chosen since its last turn here.
+        let conversation = &self.store.conversations[ix];
+        letronna_core::memory::choose(session, conversation.memory_saving);
+        letronna_core::memory::choose_scope(session, conversation.memory_scope);
         let connection = Connection {
             endpoint,
             model: model.to_owned(),
@@ -2504,7 +2516,7 @@ impl Chat {
                 if auto {
                     self.tag_unjudged(&call);
                 }
-                self.execute_call(call, false, false, cx);
+                self.execute_call(call, false, false, None, cx);
             }
             cx.notify();
             return;
@@ -2592,8 +2604,8 @@ impl Chat {
             agent::Next::Run(call) if call.name == letronna_core::tools::TODO => {
                 self.apply_todo(&call.arguments.clone(), cx)
             }
-            agent::Next::Run(call) => self.execute_call(call, false, false, cx),
-            agent::Next::Sandboxed(call) => self.execute_call(call, false, true, cx),
+            agent::Next::Run(call) => self.execute_call(call, false, false, None, cx),
+            agent::Next::Sandboxed(call) => self.execute_call(call, false, true, None, cx),
             agent::Next::Refuse(_, why) => self.record_result(Err(why), cx),
             agent::Next::Ask => {
                 let results = self
@@ -2697,11 +2709,13 @@ impl Chat {
         call: backend::ToolCall,
         approved: bool,
         sandboxed: bool,
+        keep_in: Option<letronna_core::memory::Scope>,
         cx: &mut Context<Self>,
     ) {
         let mut ctx = self.call_context();
         ctx.approved = approved;
         ctx.sandboxed = sandboxed;
+        ctx.keep_in = keep_in;
         ctx.cancel = self.turn_stop.clone();
         self.call_running = true;
         let (id, name) = (call.id.clone(), call.name.clone());
@@ -3096,8 +3110,9 @@ impl Chat {
                     // Its helpers are let through by the rule of the call.
                     approvals::allow_for_session(id, &call, &self.call_context());
                 }
-                self.execute_call(call, true, false, cx);
+                self.execute_call(call, true, false, None, cx);
             }
+            Verdict::Keep(place) => self.execute_call(call, true, false, Some(place), cx),
             Verdict::AllowHere => {
                 // Into the user's own rules, held to this project: the
                 // project's file may not allow anything.
@@ -3106,7 +3121,7 @@ impl Chat {
                 if let Some(Err(error)) = kept {
                     self.error = Some(error);
                 }
-                self.execute_call(call, true, false, cx);
+                self.execute_call(call, true, false, None, cx);
             }
         }
     }
@@ -4323,7 +4338,7 @@ impl Render for Chat {
                         .child(self.composer(pane < px(600.), cx)),
                 )
             })
-            .child(self.status_bar(cx))
+            .child(self.status_bar(pane, cx))
             // The chat draws its own over the conversation; a page has
             // nowhere else to show that F6 put the keys on it.
             .when(self.page != Page::Chat, |this| {
@@ -4342,6 +4357,13 @@ impl Render for Chat {
             .on_action(cx.listener(|this, _: &NewSession, window, cx| this.new_chat(window, cx)))
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleCrew, _, cx| this.toggle_crew(cx)))
+            .on_action(
+                cx.listener(|this, _: &crate::ui::remember::MemoryMenu, window, cx| {
+                    if !window.has_active_dialog(cx) && !this.settings_open {
+                        this.open_memory_menu(window, cx)
+                    }
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &DismissCrew, window, cx| this.dismiss_crew(window, cx)),
             )
