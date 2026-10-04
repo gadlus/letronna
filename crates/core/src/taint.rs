@@ -171,6 +171,22 @@ mod tests {
     }
 
     #[test]
+    fn a_session_is_marked_once_it_reads_a_document() {
+        let dir = std::env::temp_dir().join(format!("letronna-taint-docx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let docx = crate::docs::tests::docx("<w:p><w:r><w:t>Quarterly figures</w:t></w:r></w:p>");
+        std::fs::write(dir.join("report.docx"), docx).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..in_session(731_041)
+        };
+        tools::run("read_file", r#"{"path":"report.docx"}"#, &ctx).unwrap();
+        assert!(marked(&ctx));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_helper_counts_as_the_session_it_works_for() {
         let helper = |session: u64| ToolContext {
             conversation: (1 << 40) + session,

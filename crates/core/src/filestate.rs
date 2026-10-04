@@ -1137,6 +1137,21 @@ mod tests {
     }
 
     #[test]
+    fn a_document_read_counts_as_seeing_none_of_the_file() {
+        let (dir, ctx) = project("document", 116);
+        let docx = crate::docs::tests::docx("<w:p><w:r><w:t>Short</w:t></w:r></w:p>");
+        std::fs::write(dir.join("short.docx"), docx).unwrap();
+        let shown = page(&ctx, "short.docx", 1);
+        assert!(shown.contains("\n1|Short\n"), "{shown}");
+        // All of the view was seen, none of the zip it was read from.
+        let state = state();
+        let seen = &state.seen[&(ctx.conversation, key(&dir.join("short.docx")))];
+        assert!(!seen.whole && seen.pages.is_empty());
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn the_oldest_entry_goes_when_the_map_is_full() {
         let mut state = State::default();
         let seen = Seen {

@@ -253,7 +253,7 @@ const MAX_COMMAND_SECS: u64 = 1800;
 const PAGE_BYTES: usize = crate::chat::MAX_TOOL_CHARS - 1_000;
 /// A line of a file longer than this, in characters, is cut, so a minified
 /// file on one line still leaves room in a page for the lines around it.
-const LINE_CHARS: usize = 1_000;
+pub(crate) const LINE_CHARS: usize = 1_000;
 /// The footer counts the lines after a page only this far: at disk speed that
 /// is well under a second, where counting a log of many gigabytes would hold
 /// the session up.
@@ -3681,7 +3681,7 @@ impl Tool for ReadFile {
         true
     }
     fn description(&self) -> &'static str {
-        "Read a text file, or look at a PNG, JPEG, GIF, WebP or BMP picture; one too big to send is scaled down. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from. A Jupyter notebook (.ipynb) reads as numbered cells with short outputs, and N counts the lines of that view."
+        "Read a text file, a Word, Excel or PowerPoint file, or look at a PNG, JPEG, GIF, WebP or BMP picture; one too big to send is scaled down. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from. A Jupyter notebook (.ipynb) reads as numbered cells with short outputs, a document as its text with a heading for each sheet or slide, and N counts the lines of that view."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -3704,12 +3704,18 @@ impl Tool for ReadFile {
             return Ok(copy);
         }
         let before = crate::filestate::stat(&path);
+        if let Some(view) = crate::docs::view(&path)? {
+            let (shown, _) = page(&mut view.as_bytes(), offset, limit, false)?;
+            // The view is not the bytes on disk, so seeing all of it is no
+            // reason to let write_file replace the file.
+            crate::filestate::read(ctx.conversation, &path, before, None);
+            // Fenced as someone else's words, so the gate checks what the
+            // session does next, as after a page.
+            crate::taint::mark(ctx);
+            return fence_document(&shown);
+        }
         let (mut text, cut) = open_text(&path).map_err(|e| match e.as_str() {
-            NOT_TEXT => format!(
-                "`{raw}` is not a text file. Read it with a command made for its format, \
-                 such as `pdftotext` for a PDF or `unzip -l` for an archive, or convert a \
-                 picture to PNG and read that."
-            ),
+            NOT_TEXT => not_text(&path, raw),
             _ => e,
         })?;
         let (shown, lines) = if crate::notebook::is_notebook(&path) {
@@ -3788,6 +3794,54 @@ fn open_picture(path: &Path, raw: &str) -> Result<Option<String>, String> {
         crate::media::SAVED,
         copy.display()
     )))
+}
+
+/// A page of a document's view, fenced, since documents mostly come from
+/// someone else, as attachments and downloads. The footer saying where the
+/// next page starts is Letronna's, so it stays outside; no line of the view
+/// can look like it, each starting with its number.
+fn fence_document(shown: &str) -> Result<String, String> {
+    let (lines, footer) = match shown.rsplit_once("\n\nLines ") {
+        Some((lines, footer)) => (lines, format!("\n\nLines {footer}")),
+        None => (shown, String::new()),
+    };
+    Ok(crate::untrusted::fence(lines, MAX_OUTPUT)? + &footer)
+}
+
+/// What read_file says of `raw`, which is not text: how to read it.
+fn not_text(path: &Path, raw: &str) -> String {
+    // Named as a document read_file reads, yet not the zip one is.
+    if let Some(newer) = crate::docs::plain(path) {
+        return format!(
+            "`{raw}` is not a zip, as a Word, Excel or PowerPoint file is: it has a \
+             password, or is an older Office file renamed. Save it again without the \
+             password, or convert it with LibreOffice's `soffice --headless \
+             --convert-to {newer}`, and read that."
+        );
+    }
+    let extension = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase());
+    let (newer, mac) = match extension.as_deref() {
+        Some("doc") => (
+            "docx",
+            " On macOS, `textutil -convert txt` makes a .txt of it.",
+        ),
+        Some("xls") => ("xlsx", ""),
+        Some("ppt") => ("pptx", ""),
+        _ => {
+            return format!(
+                "`{raw}` is not a text file. Read it with a command made for its format, \
+                 such as `pdftotext` for a PDF or `unzip -l` for an archive, or convert a \
+                 picture to PNG and read that."
+            );
+        }
+    };
+    format!(
+        "`{raw}` is an Office file from before 2007, which read_file cannot read. Convert \
+         it to .{newer} first, as LibreOffice's `soffice --headless --convert-to {newer}` \
+         does, and read that.{mac}"
+    )
 }
 
 /// What `open_text` refuses a binary file with, which read_file swaps for
@@ -4658,6 +4712,76 @@ mod tests {
              such as `pdftotext` for a PDF or `unzip -l` for an archive, or convert a \
              picture to PNG and read that."
         );
+        // A Word file from before 2007 is no zip, so it is named as one to convert.
+        std::fs::write(dir.join("memo.doc"), b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1\0").unwrap();
+        let old = ReadFile
+            .run(&json!({"path": "memo.doc"}), &ctx)
+            .unwrap_err();
+        assert!(
+            old.starts_with("`memo.doc` is an Office file from before 2007")
+                && old.contains("`soffice --headless --convert-to docx`")
+                && old.contains("`textutil -convert txt`"),
+            "{old}"
+        );
+        // So is a password-protected workbook, though named as a new one.
+        std::fs::write(dir.join("pay.xlsx"), b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1\0").unwrap();
+        let locked = ReadFile
+            .run(&json!({"path": "pay.xlsx"}), &ctx)
+            .unwrap_err();
+        assert!(
+            locked.starts_with("`pay.xlsx` is not a zip, as a Word, Excel or PowerPoint file")
+                && locked.contains("`soffice --headless --convert-to xlsx`"),
+            "{locked}"
+        );
+        // A show converts to the deck it plays.
+        std::fs::write(dir.join("talk.ppsx"), b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1\0").unwrap();
+        let show = ReadFile
+            .run(&json!({"path": "talk.ppsx"}), &ctx)
+            .unwrap_err();
+        assert!(
+            show.contains("`soffice --headless --convert-to pptx`"),
+            "{show}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_document_view_pages_across_a_page_boundary() {
+        let dir = std::env::temp_dir().join(format!("letronna-read-docx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let body: String = (1..=400)
+            .map(|n| format!("<w:p><w:r><w:t>Paragraph {n} of the report, long enough to fill pages.</w:t></w:r></w:p>"))
+            .collect();
+        std::fs::write(dir.join("report.docx"), crate::docs::tests::docx(&body)).unwrap();
+        let read = |args: &str| run("read_file", args, &ctx).unwrap();
+        // Fenced as words from outside, with Letronna's footer after the fence.
+        let first = read(r#"{"path":"report.docx"}"#);
+        let (fenced, footer) = first.rsplit_once("\n\n").unwrap();
+        assert!(fenced.starts_with("<untrusted-content-"), "{fenced}");
+        assert!(fenced.ends_with('>'), "{fenced}");
+        assert!(fenced.contains("\n1|Paragraph 1 of the report"), "{fenced}");
+        let next: usize = footer
+            .trim_start_matches(|c| c != '=')
+            .trim_matches(['=', '.'])
+            .parse()
+            .unwrap();
+        assert_eq!(
+            footer,
+            format!("Lines 1-{} of 400. Continue with offset={next}.", next - 1)
+        );
+        let last = format!("\n{}|Paragraph {} of", next - 1, next - 1);
+        assert!(fenced.contains(&last), "{fenced}");
+        let second = read(&format!(r#"{{"path":"report.docx","offset":{next}}}"#));
+        let start = format!(">\n{next}|Paragraph {next} of");
+        assert!(second.contains(&start), "{second}");
+        // The terminal and the window name where the words came from.
+        let from = crate::untrusted::shown("read_file", &second).1;
+        assert_eq!(from, Some("from the document"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

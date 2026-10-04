@@ -1945,6 +1945,8 @@ mod tests {
 
     /// Run git in `folder` as a test sets a repository up, without the
     /// user's own config.
+    // Its tests run sh commands, so they are unix-only.
+    #[cfg(unix)]
     fn git(folder: &Path, args: &[&str]) {
         let ok = std::process::Command::new("git")
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
@@ -1963,6 +1965,8 @@ mod tests {
 
     /// A project that is a repository with `files` committed, and a
     /// history folder of its own.
+    // Its tests run sh commands, so they are unix-only.
+    #[cfg(unix)]
     fn repository(name: &str, files: &[(&str, &str)]) -> (PathBuf, PathBuf) {
         let (project, kept) = scratch(name);
         git(&project, &["init", "-q"]);
@@ -1976,6 +1980,8 @@ mod tests {
 
     /// Run `command` as a turn runs it in the foreground, and give back its
     /// result message, whether it worked or not.
+    // Its tests run sh commands, so they are unix-only.
+    #[cfg(unix)]
     fn ran(ctx: &ToolContext, command: &str) -> Message {
         let args = serde_json::json!({ "command": command }).to_string();
         let _ = run("run_command", &args, ctx);
@@ -1989,6 +1995,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn text(project: &Path, name: &str) -> String {
         std::fs::read_to_string(project.join(name)).unwrap()
     }

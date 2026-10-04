@@ -396,6 +396,8 @@ pub fn shown(tool: &str, text: &str) -> (String, Option<&'static str>) {
         "web_fetch" | "search_web" => "from the web",
         "browse" | "use_page" => "from the page",
         "read_chat" => "from the chat",
+        // Of the files read_file reads, it fences only documents.
+        "read_file" => "from the document",
         tool if tool.starts_with("mcp__") => "from the server",
         _ => "from outside",
     };
