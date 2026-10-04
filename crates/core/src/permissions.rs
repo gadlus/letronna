@@ -227,7 +227,7 @@ fn in_project(rule: &Rule, workspace: Option<&Path>) -> bool {
 pub fn suggest(call: &ToolCall, ctx: &ToolContext) -> Option<Rule> {
     let project = ctx.workspace.clone()?;
     let tool = tools::find(&call.name)?;
-    let args = tools::parse_args(&call.arguments).ok()?;
+    let args = tools::parse_args_for(&call.name, &call.arguments).ok()?;
     let pattern = if tool.name() == "run_command" {
         let line = args["command"].as_str()?;
         let line = command::assess(line, Dialect::here(), Some(&project));
@@ -305,7 +305,7 @@ pub fn scope(call: &ToolCall, ctx: &ToolContext) -> Option<(String, String)> {
     // A yes to fetching the docs must not let the run send what it read to
     // any address, so a page is kept by its host. Other tools, such as MCP
     // servers' and media, have no argument a yes could be kept by.
-    let args = tools::parse_args(&call.arguments).ok()?;
+    let args = tools::parse_args_for(&call.name, &call.arguments).ok()?;
     let address = match call.name.as_str() {
         "web_fetch" => args["url"].as_str().map(str::to_owned),
         crate::browser::BROWSE | "use_page" => crate::browser::acts_on(&args, ctx),
@@ -1143,6 +1143,28 @@ mod tests {
             assert_eq!(offered(path), None, "{path}");
         }
         assert_eq!(offered("src/lib.rs").as_deref(), Some("src/**"));
+        std::fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn always_allow_reads_a_call_under_another_agents_names_as_the_tool_does() {
+        let project = scratch("aliased");
+        let ctx = ToolContext {
+            workspace: Some(project.clone()),
+            ..Default::default()
+        };
+        let offered = |name: &str, args: serde_json::Value| {
+            let call = ToolCall {
+                id: format!("{name}-1"),
+                name: name.into(),
+                arguments: args.to_string(),
+            };
+            suggest(&call, &ctx).map(|rule| rule.pattern)
+        };
+        let test = serde_json::json!({ "cmd": "cargo test" });
+        assert_eq!(offered("run_command", test).as_deref(), Some("cargo test"));
+        let write = serde_json::json!({ "file_path": "src/lib.rs", "content": "x" });
+        assert_eq!(offered("write_file", write).as_deref(), Some("src/**"));
         std::fs::remove_dir_all(project).unwrap();
     }
 

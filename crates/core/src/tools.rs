@@ -444,7 +444,7 @@ const NOTED: [&str; 5] = ["read_file", "search", "run_command", "read_job", "wai
 
 /// Parameter names other agents use, as (theirs, ours, the tools it applies
 /// to), since a model used to one of them reaches for its names first.
-const ALIASES: &[(&str, &str, &[&str])] = &[
+pub(crate) const ALIASES: &[(&str, &str, &[&str])] = &[
     ("file_path", "path", FILE_TOOLS),
     ("filepath", "path", FILE_TOOLS),
     ("absolute_path", "path", FILE_TOOLS),
@@ -2420,16 +2420,12 @@ impl Tool for RunCommand {
 }
 
 /// The folder `run_command` runs `args`' command in: the project folder, or
-/// the folder inside it that `workdir`, or another agent's name for it, names.
+/// the folder inside it that `workdir` names.
 pub(crate) fn workdir(args: &Value, ctx: &ToolContext) -> Result<PathBuf, String> {
     let workspace = ctx
         .workspace
         .as_deref()
         .ok_or("No project folder is attached. Ask the user to attach one first.")?;
-    // The gate reads a call as it was sent, and must judge the command in
-    // the folder the tool, which reads `cwd` as `workdir`, runs it in.
-    let mut args = args.clone();
-    rename_aliases("run_command", &mut args);
     let Some(raw) = args["workdir"].as_str().filter(|raw| !raw.is_empty()) else {
         return Ok(workspace.to_path_buf());
     };

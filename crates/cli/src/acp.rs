@@ -919,7 +919,8 @@ fn tool_call(id: &str, name: &str, arguments: &str) -> Value {
         "title": title,
         "kind": kind(name),
         "status": "pending",
-        "rawInput": tools::parse_args(arguments).unwrap_or(Value::Null),
+        // As the gate and the tool read it, so the editor's card shows what runs.
+        "rawInput": tools::parse_args_for(name, arguments).unwrap_or(Value::Null),
     })
 }
 
@@ -1564,6 +1565,29 @@ mod tests {
         let closed = updates(&after, "tool_call_update");
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0]["status"], "failed");
+    }
+
+    #[test]
+    fn the_editor_is_shown_a_command_sent_under_another_agents_name_as_it_would_run() {
+        let dir = scratch("aliased");
+        let endpoint = provider(vec![
+            reply("", &[("run_command", json!({"cmd": "touch one.txt"}))]),
+            reply("Left it.", &[]),
+        ]);
+        let mut editor = Editor::connect(endpoint, SESSIONS + 160);
+        let session = editor.open(&dir);
+        let prompt = start(&mut editor, &session, "Make a file.");
+
+        let (_, asked) = asked_or_ended(&editor, prompt);
+        assert!(is_permission(&asked), "the command ran unasked");
+        assert_eq!(
+            asked["params"]["toolCall"]["rawInput"]["command"],
+            "touch one.txt"
+        );
+        choose(&editor, &asked, "reject-once");
+        let (_, ended) = editor.reply(prompt);
+        assert_eq!(ended["result"]["stopReason"], "end_turn");
+        assert!(!dir.join("one.txt").exists());
     }
 
     #[test]

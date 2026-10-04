@@ -222,7 +222,8 @@ pub fn judge(
     let Some(tool) = tools::find(&call.name) else {
         return Verdict::Unsure(format!("there is no tool `{}`", call.name));
     };
-    let Ok(mut args) = tools::parse_args(&call.arguments) else {
+    // As the gate and the tool read them, so the judge sees what would run.
+    let Ok(mut args) = tools::parse_args_for(&call.name, &call.arguments) else {
         return Verdict::Unsure("the call's arguments could not be read".into());
     };
     let Some(nonce) = nonce() else {
@@ -271,7 +272,8 @@ fn memory() -> &'static Memory {
 
 /// `stop`, with what the judge keeps handed in.
 fn stop_in(memory: &Memory, call: &ToolCall, typed: &[String], conversation: u64) {
-    let Ok(mut args) = tools::parse_args(&call.arguments) else {
+    // Read as `judge` reads it, so the stop meets the call however it was sent.
+    let Ok(mut args) = tools::parse_args_for(&call.name, &call.arguments) else {
         return;
     };
     args.sort_all_objects();
@@ -1017,6 +1019,29 @@ mod tests {
             Ok(format!("{NONCE} ALLOW"))
         });
         assert_eq!(other, Verdict::Allow);
+    }
+
+    #[test]
+    fn a_stop_holds_for_the_same_call_sent_under_another_agents_names() {
+        let typed = typed(&["clean the build"]);
+        let own = command_call("rm -rf build");
+        let aliased = ToolCall {
+            arguments: json!({ "cmd": "rm -rf build" }).to_string(),
+            ..command_call("")
+        };
+        let why = "no rule or allowance covers it";
+        let ctx = ToolContext::default();
+        for (session, stopped, judged) in [(731_151, &aliased, &own), (731_152, &own, &aliased)] {
+            let connection = Connection {
+                conversation: session,
+                ..Default::default()
+            };
+            stop(stopped, &typed, session);
+            // Settled before any model would be asked.
+            let verdict = judge(judged, why, &typed, &connection, &ctx, Mode::Auto);
+            let sent = &judged.arguments;
+            assert_eq!(verdict, Verdict::Unsure(STOPPED.into()), "{sent}");
+        }
     }
 
     #[test]
