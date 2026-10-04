@@ -20,6 +20,34 @@ README, the build and package manifests, the CI workflows, the folder layout \
 and a few representative source files -- and find out:
 
 - how to build, run, lint, format and test it, including how to run a single test;
+- the conventions the code follows that no single file shows: naming, error handling, style, how commits are written;
+- the gotchas, one line each: required setup, traps, and what must never be done, written as \"Never ...\".
+
+Write only what you saw in the project. Never invent a command, script or path; \
+leave out what you could not find rather than guess. Keep it short -- what a \
+capable newcomer would get wrong without being told, not a map of the folders \
+or advice that fits any project. Leave out secrets, keys and anything personal: \
+the file is usually committed.
+
+If AGENTS.md already exists at the project root, keep all of it as it is and \
+only add what is missing; if something in it looks out of date, say so in your \
+reply instead of changing it. If there is a CLAUDE.md, .cursorrules, \
+.cursor/rules or .github/copilot-instructions.md, carry over what in it still \
+holds.
+
+Write the file as AGENTS.md at the root of the project folder and change no \
+other file. Then say in a few lines what you wrote or added.";
+
+/// What `/init` sent before [`PROMPT`] last changed, so the command still
+/// shows for it in a session saved then.
+const EARLIER: &[&str] = &[
+    "\
+Study this project and write its AGENTS.md: the instructions every future \
+session in this folder reads before it starts. Look before you write -- the \
+README, the build and package manifests, the CI workflows, the folder layout \
+and a few representative source files -- and find out:
+
+- how to build, run, lint, format and test it, including how to run a single test;
 - how the code is laid out: the main parts, what each is for, and where to start reading;
 - the conventions the code follows that no single file shows: naming, error handling, style, how commits are written;
 - the gotchas: required setup, traps, and what must never be done.
@@ -37,7 +65,8 @@ reply instead of changing it. If there is a CLAUDE.md, .cursorrules, \
 holds.
 
 Write the file as AGENTS.md at the root of the project folder and change no \
-other file. Then say in a few lines what you wrote or added.";
+other file. Then say in a few lines what you wrote or added.",
+];
 
 /// The prompt `/init` sends in a session with `workspace` attached, or why it
 /// sends nothing.
@@ -59,9 +88,10 @@ pub fn command(line: &str, workspace: Option<&Path>) -> Option<Result<&'static s
 }
 
 /// What the user typed for `prompt`: `/init` for the prompt that command
-/// sends, so a front end can show that while the model keeps the prompt.
+/// sends or once sent, so a front end can show that while the model keeps
+/// the prompt.
 pub fn typed(prompt: &str) -> Option<&'static str> {
-    (prompt == PROMPT).then_some(COMMAND)
+    (prompt == PROMPT || EARLIER.contains(&prompt)).then_some(COMMAND)
 }
 
 #[cfg(test)]
@@ -93,5 +123,14 @@ mod tests {
         assert_eq!(typed("/init"), None);
         assert_eq!(typed(&format!("{PROMPT} ")), None);
         assert_eq!(typed("write AGENTS.md"), None);
+    }
+
+    #[test]
+    fn an_earlier_init_prompt_still_shows_as_the_command() {
+        for earlier in EARLIER {
+            assert_ne!(*earlier, PROMPT);
+            assert_eq!(typed(earlier), Some("/init"));
+            assert_eq!(typed(&format!("{earlier} ")), None);
+        }
     }
 }
