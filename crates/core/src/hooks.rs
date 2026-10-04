@@ -621,8 +621,12 @@ pub fn stop(ctx: &ToolContext, last: &str, again: bool) -> Option<String> {
         return None;
     }
     let why = heard.blocks.into_iter().next()?;
-    Some(format!("Stop hook feedback:\n{why}"))
+    Some(format!("{FEEDBACK}\n{why}"))
 }
+
+/// What starts a Stop hook's word sent back as the next message of a turn,
+/// which the user's kept words leave out as the hook's, not theirs.
+pub(crate) const FEEDBACK: &str = "Stop hook feedback:";
 
 /// Runs the Notification hooks for the card a call of `tool` puts up, on a
 /// thread of their own, since nothing waits on them; their failures are

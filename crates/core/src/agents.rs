@@ -1589,6 +1589,19 @@ fn forked(mut messages: Vec<Message>, own: Option<&Value>, directive: Message) -
     messages
 }
 
+/// How many of a fork's first `from` messages in `messages` are its
+/// parent's own, as the parent's file numbers them: all but what `forked`
+/// added, the results standing in for calls still running and the
+/// directive.
+pub(crate) fn copied(messages: &[Message], from: usize) -> usize {
+    let Some((_, before)) = messages[..from.min(messages.len())].split_last() else {
+        return 0;
+    };
+    let added =
+        |m: &&Message| m.role == "tool" && [FORKED_HERE, IN_PARENT].contains(&m.content.as_str());
+    before.len() - before.iter().rev().take_while(added).count()
+}
+
 /// What a fork is told after its parent's messages: that it is a copy, then
 /// its task.
 fn directive(prompt: &str) -> Message {
@@ -4203,6 +4216,9 @@ mod tests {
             .collect();
         assert_eq!(added, [("b", FORKED_HERE), ("c", IN_PARENT)]);
         assert_eq!(out.len(), 6);
+        // Its parent's file holds the first three as they are; what the fork
+        // added after them is its own.
+        assert_eq!(copied(&out, out.len()), 3);
     }
 
     #[test]
@@ -4415,6 +4431,20 @@ mod tests {
             said("user", "What does notes.txt say? Check it two ways."),
         ];
         crate::compact::remember(&messages[..2], summary);
+        // Saved before it asks, as a session is, so its requests and the
+        // fork's both say where what it summed up is kept.
+        std::fs::create_dir_all(crate::store::sessions_dir()).unwrap();
+        let mut saved = Transcript {
+            path: crate::store::sessions_dir().join("4242.jsonl"),
+            conversation: crate::store::Conversation {
+                id: 4242,
+                messages: messages.clone(),
+                asked: vec![(2, summary.into())],
+                summary: Some((2, summary.into())),
+                ..Default::default()
+            },
+        };
+        saved.save().unwrap();
         let extra = crate::chat::Extra {
             floor: 2,
             ..Default::default()
@@ -4427,19 +4457,8 @@ mod tests {
         }
         let args = fork_args();
         messages.extend(forking(&args));
-        std::fs::create_dir_all(crate::store::sessions_dir()).unwrap();
-        Transcript {
-            path: crate::store::sessions_dir().join("4242.jsonl"),
-            conversation: crate::store::Conversation {
-                id: 4242,
-                messages,
-                asked: vec![(2, summary.into())],
-                summary: Some((2, summary.into())),
-                ..Default::default()
-            },
-        }
-        .save()
-        .unwrap();
+        saved.conversation.messages = messages;
+        saved.save().unwrap();
         let answer = call(ctx, args).unwrap();
         assert!(answer.contains("Forked and done."), "{answer}");
         let sent = stub.sent();
@@ -4450,10 +4469,16 @@ mod tests {
             serde_json::to_string(&after[..before.len()]).unwrap(),
             serde_json::to_string(before).unwrap()
         );
-        let fork = fork.to_string();
+        // What the user summed up stays out of its window, but for their own
+        // words beside the summary.
+        let system = after[0]["content"].as_str().unwrap();
+        let window = serde_json::to_string(&after[1..]).unwrap();
+        assert!(system.contains(summary), "{system}");
+        assert!(system.contains("#0: SUMMED-UP PASTE"), "{system}");
+        assert!(!window.contains("SUMMED-UP PASTE"), "{window}");
         assert!(
-            fork.contains(summary) && !fork.contains("SUMMED-UP PASTE"),
-            "{fork}"
+            system.contains("#0 to #1, are kept in session 4242"),
+            "{system}"
         );
         // Picked back up from its own file, it still starts there.
         let kept = Transcript::open(4242, 1).unwrap().conversation;
