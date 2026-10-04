@@ -124,6 +124,18 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Memory changes can be listed and put back.
 - **All** — A folder's `.local` instructions file is read after its shared one.
 - **All** — Zed and JetBrains can reopen Letronna sessions and pick the model over ACP.
+- **All** — An Anthropic key connects directly to Anthropic's API, with prompt caching and thinking; OpenAI reasoning models keep their reasoning between tool rounds through the Responses API.
+- **All** — Memory: choose when a chat saves (only when asked, after a yes, or by itself) and where it keeps it (a project, the chat, or everywhere), from `--memory`, `--memory-scope`, `--private`, `/remember`, the window and chat apps.
+- **All** — `read_file` reads Word, Excel, PowerPoint and PDF files as text, and search can look inside documents.
+- **All** — A fresh install can search the web with DuckDuckGo, without a key.
+- **All** — A background job can be answered at its prompts with `send_job`.
+- **All** — Rewinding also undoes what a command changed in the project.
+- **All** — A wake-up outlives a restart and can be a day away; a schedule can stay quiet unless something changed.
+- **All** — A chat with no project works in Letronna's own folder.
+- **All** — An experimental script tool can run many read-only calls in one step.
+- **All** — Letronna has a built-in skill that explains its own commands and settings.
+- **All** — Core can send a card waiting in the window to the owner's DM in a chat app.
+- **All** — Editors over ACP can pick the agent's mode.
 ### Changed
 - **All** — A failed model request says what went wrong: the key, credit, a rate limit, a busy provider, a conversation too long, and so on.
 - **All** — OpenAI's reasoning models work, and a server that turns down a field is sent the request again without it.
@@ -183,6 +195,14 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Suggested commit messages follow the repository's own style.
 - **All** — Claude Code hooks Letronna does not run are left out with a notice; a window turn in a scheduled run is offered only what the run may call.
 - **Chat apps** — Slack shows bold, headings and links its own way.
+- **All** — Memory is saved only when you ask, unless you choose otherwise.
+- **All** — An edit that misses shows the closest text and what differs; a write that breaks a file's syntax says so.
+- **All** — A long page can be read past its first screen, and web answers come from the page that settles them, with its address.
+- **All** — Files a patch wrote show in Outputs and reach editors as edits; files the request says not to modify are named if a run changed them.
+- **All** — A blocked goal gets one more try, then pauses instead of being dropped.
+- **All** — Plan mode can keep every tool, so switching it keeps the cache (off unless chosen).
+- **All** — The gate reads a call's arguments under the names the tool accepts; `run_command` says how to read its result and that it has no keyboard.
+- **All** — The checklist tool says when to use it and what done means; a summary keeps your rules word for word and marks what is done.
 ### Fixed
 - **All** — A command that uploads a key file (curl, wget, scp, rsync) is refused in every mode, and .gnupg, .pgpass, .vault-token, .azure and gcloud settings count as secret.
 - **All** — An edit whose old text is missing says so instead of "already applied", plain text is no longer saved as a .docx, .xlsx, .pptx, .zip or .pdf, and a command that exits non-zero counts as failed.
