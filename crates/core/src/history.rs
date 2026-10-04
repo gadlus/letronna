@@ -835,9 +835,14 @@ fn current(path: &Path) -> Option<String> {
     std::fs::read(path).ok().map(|bytes| hash(&bytes))
 }
 
-/// The real path of the project folder, or `None` when there is none.
+/// The real path of the folder the tools wrote in, the project folder or else
+/// the fallback folder.
 fn real(workspace: Option<&Path>) -> Option<PathBuf> {
-    workspace.and_then(|root| std::fs::canonicalize(root).ok())
+    // None when it is not there.
+    let root = workspace
+        .map(Path::to_path_buf)
+        .or_else(crate::chat::fallback_folder)?;
+    std::fs::canonicalize(root).ok()
 }
 
 /// Whether a rewind may write or remove `path`: where the file tools could,

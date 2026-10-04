@@ -2548,7 +2548,9 @@ fn types(ctx: &ToolContext) -> Result<String, String> {
     if ctx.remote.as_ref().is_some_and(|remote| remote.shared) {
         return Err("Helper types are not available here: other people can read this chat.".into());
     }
-    let lines: Vec<String> = agent_defs::all(ctx.workspace.as_deref())
+    // Types are started through the session's own folder, which the
+    // fallback folder is not.
+    let lines: Vec<String> = agent_defs::all(ctx.project())
         .iter()
         .map(|def| match tools::one_line(&def.description).as_str() {
             "" => def.name.clone(),
@@ -5211,6 +5213,27 @@ mod tests {
             reopened.starts_with("#1 open, added by main, rev 4"),
             "{reopened}"
         );
+    }
+
+    #[test]
+    fn the_fallback_folder_lists_no_project_helper_types() {
+        let session = Session::new("fallback-types");
+        let defs = session.work.join(".letronna").join("agents");
+        std::fs::create_dir_all(&defs).unwrap();
+        let def = "---\ndescription: Mends the notes.\n---\nMend them.";
+        std::fs::write(defs.join("mender.md"), def).unwrap();
+        let attached = ToolContext {
+            workspace: Some(session.work.clone()),
+            ..ToolContext::default()
+        };
+        assert!(types(&attached).unwrap().contains("mender"));
+        // A helper starts in the session's own folder, which is none, so a
+        // type listed from here could not be started.
+        let fallback = ToolContext {
+            fallback: true,
+            ..attached
+        };
+        assert!(!types(&fallback).unwrap().contains("mender"));
     }
 
     /// Whether `done` comes true within a few seconds.

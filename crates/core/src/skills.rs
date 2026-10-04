@@ -458,13 +458,7 @@ impl Tool for UseSkill {
             .as_u64()
             .and_then(|o| usize::try_from(o).ok())
             .unwrap_or(0);
-        load(
-            &backend::data_dir(),
-            ctx.workspace.as_deref(),
-            name,
-            file,
-            offset,
-        )
+        load(&backend::data_dir(), ctx.project(), name, file, offset)
     }
 }
 
@@ -2568,5 +2562,37 @@ mod tests {
                 "{refused}"
             );
         }
+    }
+
+    #[test]
+    fn the_fallback_folder_lends_no_project_skills() {
+        use crate::tools::{Tool, ToolContext};
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let data = scratch("fallback-data");
+        let folder = scratch("fallback").join("Letronna");
+        write(
+            &folder.join(".agents/skills/planted/SKILL.md"),
+            "---\nname: planted\n---\nBody",
+        );
+        let attached = ToolContext {
+            workspace: Some(folder),
+            ..ToolContext::default()
+        };
+        // The prompt lists no project skills there, and the model may have
+        // written this one itself.
+        let fallback = ToolContext {
+            fallback: true,
+            ..attached.clone()
+        };
+        let args = serde_json::json!({"name": "planted"});
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &data) };
+        let found = super::UseSkill.run(&args, &attached);
+        let refused = super::UseSkill.run(&args, &fallback);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert!(found.is_ok(), "{found:?}");
+        let refused = refused.unwrap_err();
+        assert!(refused.contains("no skill called"), "{refused}");
     }
 }

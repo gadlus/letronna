@@ -8,9 +8,11 @@
 //! gateway, since OpenAI and the servers copying it have the same route, and
 //! is offered signed out whenever that gateway is not Letronna.
 //!
-//! What is made is saved as a file: in `media/` in the project folder, or in
-//! Letronna's own data folder when no project is attached. The result starts
-//! with `Saved to <path>`, which is how the window finds the file to show.
+//! What is made is saved as a file: in `media/` in the folder the session
+//! works in, its project or the fallback folder, or in Letronna's own data
+//! folder in a chat other people read and where there is no fallback folder,
+//! as without a home folder. The result starts with `Saved to <path>`, which
+//! is how the window finds the file to show.
 //! A video renders for minutes, so make_video hands the wait to a background
 //! job and the line comes in that job's notice instead.
 //! A picture read_file opened or an MCP server sent, and one the user

@@ -713,9 +713,11 @@ fn shown(problem: &str) -> String {
 /// The JSON a hook reads on stdin: the fields Claude Code sends every hook,
 /// then `own`, the event's.
 fn input(event: Event, ctx: &ToolContext, own: Value) -> Value {
+    // Where `spawn` starts the hook.
     let cwd = ctx
         .workspace
         .clone()
+        .filter(|dir| dir.is_dir())
         .or_else(|| std::env::current_dir().ok())
         .map(|dir| dir.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -920,7 +922,10 @@ struct Ran {
 /// its whole process tree when it outlives its timeout or the call is
 /// stopped; `Err` says why it did not finish.
 fn spawn(hook: &Hook, input: &str, ctx: &ToolContext) -> Result<Ran, String> {
-    let cwd = ctx.workspace.as_deref();
+    // The fallback folder is made by the first write or command, after the
+    // hooks before it run: one started in a folder not there yet would not
+    // start at all, and a guard would be passed over.
+    let cwd = ctx.workspace.as_deref().filter(|dir| dir.is_dir());
     let windows = cfg!(windows);
     let path = std::env::var_os("PATH");
     let words = argv(&hook.command, windows).filter(|words| {
@@ -943,8 +948,9 @@ fn spawn(hook: &Hook, input: &str, ctx: &ToolContext) -> Result<Ran, String> {
         }
         None => crate::tools::shell(&shell_line(&hook.command, windows), cwd),
     };
-    // Scripts written for Claude Code find the project through this.
-    if let Some(dir) = cwd {
+    // Scripts written for Claude Code find the project through this, and
+    // the fallback folder is none.
+    if let Some(dir) = ctx.project() {
         command.env("CLAUDE_PROJECT_DIR", dir);
     }
     #[cfg(unix)]
@@ -1761,5 +1767,56 @@ mod tests {
             "guard.cmd | Out-Null\nif ($LASTEXITCODE) { exit $LASTEXITCODE }"
         );
         assert_eq!(shell_line("jq . | guard", false), "jq . | guard");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_guard_still_blocks_a_command_in_a_fallback_folder_not_made_yet() {
+        let dir = scratch("fallback");
+        let deny = script(&dir, "deny.sh", "echo 'not here' >&2\nexit 2");
+        let hooks = Ok(one("PreToolUse", &deny, None));
+        let folder = dir.join("Letronna");
+        let ctx = ToolContext {
+            workspace: Some(folder.clone()),
+            fallback: true,
+            ..Default::default()
+        };
+        let tool = crate::tools::find("run_command").unwrap();
+        let args = json!({ "command": "touch made" }).to_string();
+        let why = crate::tools::run_found(tool.as_ref(), &args, &ctx, &hooks).unwrap_err();
+        assert!(why.contains("not here"), "{why}");
+        // The command never ran, so nothing made the folder.
+        assert!(!folder.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_in_the_fallback_folder_is_given_no_project() {
+        let dir = scratch("fallback-project");
+        let tell = script(
+            &dir,
+            "tell.sh",
+            "echo \"in [$CLAUDE_PROJECT_DIR]\" >&2\nexit 2",
+        );
+        let hooks = Ok(one("PreToolUse", &tell, None));
+        let folder = dir.join("Letronna");
+        std::fs::create_dir_all(&folder).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(folder.clone()),
+            fallback: true,
+            ..Default::default()
+        };
+        let tool = crate::tools::find("run_command").unwrap();
+        let args = json!({ "command": "true" }).to_string();
+        let named = format!("in [{}]", folder.display());
+        let why = crate::tools::run_found(tool.as_ref(), &args, &ctx, &hooks).unwrap_err();
+        assert!(!why.contains(&named), "{why}");
+        // A folder the user attached is named.
+        let attached = ToolContext {
+            fallback: false,
+            ..ctx
+        };
+        let why = crate::tools::run_found(tool.as_ref(), &args, &attached, &hooks).unwrap_err();
+        assert!(why.contains(&named), "{why}");
     }
 }

@@ -1916,7 +1916,7 @@ fn kept_in(asked: Target, ctx: &ToolContext) -> Target {
     let session = session_of(ctx);
     let chosen = ctx.keep_in.or_else(|| said(session));
     let chosen = chosen.unwrap_or_else(|| scope(session));
-    match chosen.with(ctx.workspace.is_some()) {
+    match chosen.with(ctx.project().is_some()) {
         Scope::Auto => asked,
         Scope::Project => Target::Project,
         Scope::Chat => Target::Chat,
@@ -1933,7 +1933,7 @@ pub(crate) fn kept_target(target: &str, ctx: &ToolContext) -> Result<&'static st
 /// goes now first, then the others, a project's only while one is attached.
 pub fn places(ctx: &ToolContext) -> Vec<Scope> {
     let session = session_of(ctx);
-    let project = ctx.workspace.is_some();
+    let project = ctx.project().is_some();
     let now = said(session)
         .unwrap_or_else(|| scope(session))
         .with(project);
@@ -1966,7 +1966,7 @@ pub(crate) fn would_add(
     ctx: &ToolContext,
 ) -> Result<Fit, String> {
     let target = Target::parse(target)?;
-    let (dir, _) = place(target, ctx.workspace.as_deref(), session_of(ctx))?;
+    let (dir, _) = place(target, ctx.project(), session_of(ctx))?;
     let add = |content| Op {
         action: "add",
         content,
@@ -2066,8 +2066,8 @@ impl Tool for Remember {
                 asked.name()
             )
         };
-        let (dir, root) = place(target, ctx.workspace.as_deref(), session_of(ctx))
-            .map_err(|e| format!("{moved}{e}"))?;
+        let (dir, root) =
+            place(target, ctx.project(), session_of(ctx)).map_err(|e| format!("{moved}{e}"))?;
         let origin = if ctx.caller.review {
             Origin::Review
         } else {
@@ -3150,6 +3150,27 @@ mod tests {
         let context = ToolContext::of(&Connection::default());
         let refused = Remember.run(&args, &context).unwrap_err();
         assert!(refused.contains("No project folder"), "{refused}");
+    }
+
+    #[test]
+    fn the_fallback_folder_keeps_no_project_memory() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let data = scratch("fallback-data");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*data) };
+        let folder = scratch("fallback");
+        let args = json!({"action": "add", "target": "project", "content": "Build with make."});
+        let context = ToolContext {
+            workspace: Some(folder.to_path_buf()),
+            fallback: true,
+            ..Default::default()
+        };
+        let refused = Remember.run(&args, &context);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        let refused = refused.unwrap_err();
+        assert!(refused.contains("No project folder"), "{refused}");
+        assert!(!data.join("projects").exists());
     }
 
     #[test]

@@ -1138,7 +1138,12 @@ fn system_prompt(connection: &Connection, summary: Option<&str>) -> SystemPrompt
                     system.push_str(&format!(" {note}"));
                 }
             }
-            None => system.push_str(" No project folder is attached: you can only read under the home folder. Ask the user to attach one before writing or running anything."),
+            // The folder is the same for every request on this computer,
+            // so the cached prefix holds.
+            None => match fallback_folder() {
+                Some(folder) => system.push_str(&format!(" No project folder is attached, so you work in your own folder `{}`: files you make go there, commands run there, and when you report, say where a file is. You can read anywhere under the home folder; to change files elsewhere, ask the user to attach that folder.", folder.display())),
+                None => system.push_str(" No project folder is attached: you can only read under the home folder. Ask the user to attach one before writing or running anything."),
+            },
         }
     } else if !connection.tools {
         system.push_str(" You have no tools or filesystem access on this gateway.");
@@ -2960,6 +2965,34 @@ pub fn data_dir() -> std::path::PathBuf {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     dir.unwrap_or_else(base_dir)
+}
+
+/// The folder a session with no project folder works in, `Letronna` in the
+/// home folder, which its first write or command makes.
+#[cfg(not(test))]
+pub fn fallback_folder() -> Option<PathBuf> {
+    // None without a home folder, or where `fallback_in` refuses it.
+    fallback_in(&crate::tools::home()?, &base_dir())
+}
+
+/// In tests, the fallback folder in a scratch home folder of the run's own.
+#[cfg(test)]
+pub fn fallback_folder() -> Option<PathBuf> {
+    // So no test writes in the folder of whoever runs them, and every
+    // computer sees one, whatever its home folder holds.
+    let home = std::env::temp_dir().join(format!("letronna-home-{}", std::process::id()));
+    fallback_in(&home, &base_dir())
+}
+
+/// The fallback folder in `home` with the data folder at `data`, if it can be.
+fn fallback_in(home: &std::path::Path, data: &std::path::Path) -> Option<PathBuf> {
+    // Not where the two would hold one another, as `AGENT_DATA_DIR` can make
+    // them, since the keys there stay out of reach; nor where a git checkout
+    // is there already, which is someone's project, as a clone of Letronna's
+    // own source at `~/letronna` is on a disk that ignores case.
+    let folder = home.join("Letronna");
+    let apart = !folder.starts_with(data) && !data.starts_with(&folder);
+    (apart && !folder.join(".git").exists()).then_some(folder)
 }
 
 /// Point `data_dir` at `dir` from now on, or back at `base_dir` for `None`.
@@ -10776,5 +10809,53 @@ mod tests {
         let next = sent_for(&session, &window);
         assert_eq!(next[..sent.len()], sent[..]);
         assert_eq!(next[5]["role"], "assistant");
+    }
+
+    #[test]
+    fn a_session_with_no_project_is_told_where_it_works() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("fallback");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let c = Connection {
+            tools: true,
+            ..connection()
+        };
+        let alone = system_prompt(&c, None).text;
+        let shared = Connection {
+            remote: Some(Remote {
+                place: "a group chat".into(),
+                shared: true,
+                history: None,
+            }),
+            ..c
+        };
+        let shared = system_prompt(&shared, None).text;
+        let folder = fallback_folder().unwrap();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let told = format!("you work in your own folder `{}`", folder.display());
+        assert!(alone.contains(&told), "{alone}");
+        assert!(!alone.contains("Ask the user to attach one"), "{alone}");
+        assert!(!shared.contains("your own folder"), "{shared}");
+    }
+
+    #[test]
+    fn the_fallback_folder_is_never_a_checkout_or_the_data_folder() {
+        let home = empty_data_dir("fallback-home");
+        let data = home.join("Library/Application Support/Letronna");
+        assert_eq!(fallback_in(&home, &data), Some(home.join("Letronna")));
+        for data in [
+            home.join("Letronna"),
+            home.join("Letronna/data"),
+            home.clone(),
+        ] {
+            assert_eq!(fallback_in(&home, &data), None, "{}", data.display());
+        }
+        std::fs::create_dir_all(home.join("Letronna/.git")).unwrap();
+        assert_eq!(fallback_in(&home, &data), None);
+        std::fs::remove_dir_all(&home).unwrap();
     }
 }

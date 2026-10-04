@@ -520,8 +520,8 @@ struct Inner {
 
 /// The time downloads are let in: an action and the grace after it.
 struct Window {
-    /// The project, or Letronna's own folder without one; `None` in plan
-    /// mode, which refuses every download.
+    /// The folder the session works in, or Letronna's own where it has
+    /// none; `None` in plan mode, which refuses every download.
     root: Option<PathBuf>,
     conversation: u64,
     /// The call's stop, which ends the window too.

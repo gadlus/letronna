@@ -20,8 +20,12 @@ use std::time::{Duration, Instant};
 /// Where a session is allowed to look.
 #[derive(Clone, Default)]
 pub struct ToolContext {
-    /// The folder attached to the session. Relative paths resolve here.
+    /// The folder attached to the session, or the fallback folder when none
+    /// is. Relative paths resolve here.
     pub workspace: Option<PathBuf>,
+    /// `workspace` is `chat::fallback_folder`, not a project the user
+    /// attached: it keeps no project memory and no schedule takes it along.
+    pub fallback: bool,
     /// Set when a chat app is driving the session: where `read_chat` reads,
     /// and whether other people can see the replies.
     pub remote: Option<Remote>,
@@ -81,9 +85,18 @@ pub(crate) struct Caller {
 }
 
 impl ToolContext {
+    /// What a call over `connection` runs with.
     pub fn of(connection: &Connection) -> Self {
+        // With no project folder it works in the fallback folder, which the
+        // prompt names, except in a chat other people read, where nothing on
+        // this computer is in reach.
+        let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
+        let fallback = (connection.workspace.is_none() && !shared)
+            .then(crate::chat::fallback_folder)
+            .flatten();
         Self {
-            workspace: connection.workspace.clone(),
+            fallback: fallback.is_some(),
+            workspace: connection.workspace.clone().or(fallback),
             remote: connection.remote.clone(),
             conversation: connection.conversation,
             files: crate::history::Log::default(),
@@ -104,6 +117,25 @@ impl ToolContext {
     /// reach: what a tool finds would be posted to all of them.
     pub(crate) fn shared(&self) -> bool {
         self.remote.as_ref().is_some_and(|r| r.shared)
+    }
+
+    /// The project folder the user attached, which the fallback folder is not.
+    pub fn project(&self) -> Option<&Path> {
+        self.workspace.as_deref().filter(|_| !self.fallback)
+    }
+
+    /// The folder a write or a command works in, made first when it is the
+    /// fallback folder and nothing has been put there yet.
+    pub(crate) fn working_folder(&self) -> Result<&Path, String> {
+        let folder = self
+            .workspace
+            .as_deref()
+            .ok_or("No project folder is attached. Ask the user to attach one first.")?;
+        if self.fallback {
+            std::fs::create_dir_all(folder)
+                .map_err(|e| format!("Cannot make {}: {e}", folder.display()))?;
+        }
+        Ok(folder)
     }
 }
 
@@ -1238,10 +1270,7 @@ fn resolve_write_in(
     data: &Path,
     me: Option<&Path>,
 ) -> Result<PathBuf, String> {
-    let workspace = ctx
-        .workspace
-        .as_ref()
-        .ok_or("No project folder is attached. Ask the user to attach one first.")?;
+    let workspace = ctx.working_folder()?;
     let root = std::fs::canonicalize(workspace).map_err(|_| "The project folder is missing.")?;
     // Before the probe below touches it: on Windows the touch is the harm.
     if let Some(why) = crate::paths::unsafe_raw(raw, Some(workspace)) {
@@ -2450,10 +2479,7 @@ impl Tool for RunCommand {
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let command = args["command"].as_str().ok_or("`command` is required.")?;
-        let cwd = ctx
-            .workspace
-            .as_deref()
-            .ok_or("No project folder is attached. Ask the user to attach one first.")?;
+        let cwd = ctx.working_folder()?;
         let dir = workdir(args, ctx)?;
         let notify_on = notify_on(args)?;
         if !backgrounded(args) {
@@ -7429,5 +7455,68 @@ mod tests {
             "{judged}"
         );
         crate::jobs::stop(id).unwrap();
+    }
+
+    #[test]
+    fn a_session_with_no_project_writes_and_runs_in_the_fallback_folder() {
+        let connection = Connection {
+            tools: true,
+            ..Default::default()
+        };
+        let given = ToolContext::of(&connection);
+        assert!(given.workspace.is_some() && given.fallback);
+        assert_eq!(given.workspace, crate::chat::fallback_folder());
+        assert_eq!(given.project(), None);
+        // Nothing on this computer is in reach of a chat others read.
+        let shared = Connection {
+            remote: Some(Remote {
+                shared: true,
+                ..Default::default()
+            }),
+            ..connection
+        };
+        assert_eq!(ToolContext::of(&shared).workspace, None);
+
+        // The same, in a folder of the test's own, which no other test makes.
+        let dir = Scratch::new("tools-fallback");
+        let folder = dir.join("Letronna");
+        let ctx = ToolContext {
+            workspace: Some(folder.clone()),
+            fallback: true,
+            ..given
+        };
+        let write = json!({"path": "list.csv", "content": "a,b\n"}).to_string();
+        run("write_file", &write, &ctx).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(folder.join("list.csv")).unwrap(),
+            "a,b\n"
+        );
+        std::fs::remove_dir_all(&folder).unwrap();
+        let ran = run("run_command", r#"{"command":"pwd"}"#, &ctx).unwrap();
+        assert!(ran.contains("Letronna"), "{ran}");
+        assert!(folder.is_dir());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_confined_command_can_write_in_the_fallback_folder() {
+        // As in the sandbox's own test: a sandboxed runner cannot start one.
+        if !crate::sandbox::available() {
+            return;
+        }
+        let dir = Scratch::new("tools-fallback-sandboxed");
+        let folder = dir.join("Letronna");
+        let ctx = ToolContext {
+            workspace: Some(folder.clone()),
+            fallback: true,
+            sandboxed: true,
+            ..Default::default()
+        };
+        let out = run("run_command", r#"{"command":"echo hi > made.txt"}"#, &ctx).unwrap();
+        assert!(out.starts_with(crate::sandbox::NOTE), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(folder.join("made.txt")).unwrap(),
+            "hi\n"
+        );
     }
 }
