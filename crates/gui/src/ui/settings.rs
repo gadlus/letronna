@@ -563,8 +563,16 @@ impl Chat {
                 .child(self.memory.clone())
                 .into_any_element(),
             "About" => about_page(&chat, self, cx).into_any_element(),
-            "Search" => search_page(self.search_rows(), &pick, &endpoint, &key, &chat, cx)
-                .into_any_element(),
+            "Search" => search_page(
+                self.search_rows(),
+                self.store.settings.keyless_search,
+                &pick,
+                &endpoint,
+                &key,
+                &chat,
+                cx,
+            )
+            .into_any_element(),
             _ => gateway_page(
                 self.gateway_rows(),
                 &pick,
@@ -1672,6 +1680,9 @@ pub(crate) struct SearchRow {
     good: bool,
     set_up: bool,
     self_hosted: bool,
+    /// Needs nothing set up, so it has no key or address to edit; its
+    /// switch is below the list.
+    keyless: bool,
 }
 
 impl Chat {
@@ -1690,6 +1701,7 @@ impl Chat {
                     good,
                     set_up,
                     self_hosted: s.self_hosted(),
+                    keyless: s.keyless,
                 }
             })
             .collect()
@@ -1698,6 +1710,7 @@ impl Chat {
 
 fn search_page(
     rows: Vec<SearchRow>,
+    keyless_search: bool,
     pick: &Entity<String>,
     endpoint: &Entity<InputState>,
     key: &Entity<InputState>,
@@ -1774,7 +1787,13 @@ fn search_page(
                             .child(row.status),
                     ),
             )
-            .child(div().w(px(96.)).flex().justify_end().child(button));
+            .child(
+                div()
+                    .w(px(96.))
+                    .flex()
+                    .justify_end()
+                    .when(!row.keyless, |d| d.child(button)),
+            );
         let mut item = v_flex()
             .when(i > 0, |d| d.border_t_1().border_color(cx.theme().border))
             .child(head);
@@ -1856,6 +1875,18 @@ fn search_page(
             cx,
         ))
         .child(list)
+        .child(toggle_row(
+            "keyless-search",
+            "Search with DuckDuckGo when no search key is set",
+            "DuckDuckGo has no official search API. Turned off, the agent searches only with \
+             a service set up above.",
+            keyless_search,
+            chat,
+            cx,
+            std::rc::Rc::new(move |this: &mut Chat| {
+                this.store.settings.keyless_search = !keyless_search
+            }),
+        ))
 }
 
 fn shortcuts_page(hotkey: &Entity<InputState>, chat: &Entity<Chat>, cx: &App) -> Div {
