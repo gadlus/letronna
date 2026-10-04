@@ -978,7 +978,12 @@ impl Chat {
             })
             .read(cx)
             .clone();
-        let summary = letronna_core::tools::summary(&message.name, &message.args);
+        let summary = letronna_core::tools::summary_after(
+            &message.name,
+            &message.args,
+            &message.content,
+            !message.is_error,
+        );
         // A call that used the browser can bring its page back up, at the
         // address it opened if the browser has since let it go.
         let page = matches!(message.name.as_str(), "browse" | "use_page");

@@ -1194,15 +1194,9 @@ pub fn summary(name: &str, args: &str) -> String {
         // read the way the tool runs it so operations sent as a string show.
         "memory" => {
             let v = parse_args_for(name, args).unwrap_or_default();
-            let listed = v["operations"].as_array().into_iter().flatten();
-            let actions: Vec<&str> = std::iter::once(&v)
-                .chain(listed)
-                .filter_map(|op| op["action"].as_str())
-                .filter(|action| !action.is_empty())
-                .collect();
             format!(
                 "{} {}",
-                actions.join(", "),
+                memory_actions(&v).join(", "),
                 v["target"].as_str().unwrap_or_default()
             )
         }
@@ -1222,6 +1216,31 @@ pub fn summary(name: &str, args: &str) -> String {
         _ => v["path"].as_str().unwrap_or_default().to_owned(),
     };
     one_line(&text)
+}
+
+/// `summary` for a call that ran and gave back `result`, `done` when it
+/// succeeded: a memory save says where its entry went, which the user's
+/// choice can make another store than the one the call named.
+pub fn summary_after(name: &str, args: &str, result: &str, done: bool) -> String {
+    if name == "memory" {
+        let v = parse_args_for(name, args).unwrap_or_default();
+        let target = v["target"].as_str().unwrap_or_default();
+        if let Some(row) = crate::memory::row(target, &memory_actions(&v), result, done) {
+            return row;
+        }
+    }
+    summary(name, args)
+}
+
+/// The changes a memory call with `args` makes, in order: its action, or
+/// each of its operations', read the way the tool runs them.
+fn memory_actions(args: &Value) -> Vec<&str> {
+    let listed = args["operations"].as_array().into_iter().flatten();
+    std::iter::once(args)
+        .chain(listed)
+        .filter_map(|op| op["action"].as_str())
+        .filter(|action| !action.is_empty())
+        .collect()
 }
 
 /// The files a call of `name` with `args` leaves written, as it names them:

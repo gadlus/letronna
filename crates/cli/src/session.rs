@@ -811,7 +811,7 @@ impl Runner {
         }
         let outcome =
             ran.unwrap_or_else(|| Err(letronna_core::agent::STOPPED_WHILE_RUNNING.into()));
-        print_call(&call.name, &summary, &outcome, tag.as_deref());
+        print_call(&call.name, &call.arguments, &outcome, tag.as_deref());
         show_hook_problems();
         turn.finish_call(outcome);
         !stopped
@@ -888,7 +888,7 @@ impl Runner {
             for (call, outcome) in ready {
                 print_call(
                     &call.name,
-                    &tools::summary(&call.name, &call.arguments),
+                    &call.arguments,
                     &outcome,
                     tags.get(&call.id).map(String::as_str),
                 );
@@ -1572,7 +1572,9 @@ impl Batch {
 /// Print a call that has run: what it was and on what, then how it went,
 /// with `tag` naming what let it run, and the first lines of what it gave
 /// back.
-fn print_call(name: &str, summary: &str, outcome: &Result<String, String>, tag: Option<&str>) {
+fn print_call(name: &str, args: &str, outcome: &Result<String, String>, tag: Option<&str>) {
+    let (Ok(result) | Err(result)) = outcome;
+    let summary = &tools::summary_after(name, args, result, outcome.is_ok());
     // Every turn of the conversation opens with a blank line, whoever is
     // speaking; a tool result that butts up against the question it came
     // from reads as part of it.
