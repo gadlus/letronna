@@ -40,6 +40,9 @@ enum To {
     Watched,
     /// A run nobody watches.
     Unwatched,
+    /// Where someone at this computer watches the turn as it goes: the
+    /// window's, the terminal's or an editor's session, not a chat app's.
+    OnScreen,
     /// Where the reads and searches of one reply run at once.
     Parallel,
 }
@@ -51,6 +54,7 @@ impl To {
             To::Every => true,
             To::Watched => watched(connection),
             To::Unwatched => !watched(connection),
+            To::OnScreen => connection.human && connection.remote.is_none(),
             To::Parallel => crate::store::parallel_tool_calls(),
         }
     }
@@ -58,7 +62,7 @@ impl To {
     /// Whether a run nobody watches can carry the rule, and so be measured
     /// without it.
     fn droppable(self) -> bool {
-        self != To::Watched
+        !matches!(self, To::Watched | To::OnScreen)
     }
 }
 
@@ -72,7 +76,7 @@ fn watched(connection: &Connection) -> bool {
 /// how calls are approved or, in a run nobody watches, what it is told in
 /// place of approvals and `ask_user`, neither of which it has; then checking
 /// the work, making calls, ending a turn and the steps to ask about first.
-pub(crate) const TOOLS: [Rule; 18] = [
+pub(crate) const TOOLS: [Rule; 20] = [
     // Undoing what the user changed is the git rule's. New files and tests
     // are not forbidden, as checks and required outputs need them.
     Rule {
@@ -80,15 +84,30 @@ pub(crate) const TOOLS: [Rule; 18] = [
         to: To::Every,
         text: "Do not refactor, rename or reformat code the task does not need changed, or add dependencies it does not need, and do not paste code into your reply in place of editing the file.",
     },
+    // True in every mode, so switching one leaves the prompt's bytes as
+    // they were; the mode itself comes as a note in the conversation.
     Rule {
         id: "approval",
         to: To::Watched,
-        text: "Writes and commands are shown to the user for approval; a denial is final for that action.",
+        text: "Depending on the session's mode and the user's rules, a write or command runs at once, waits for the user's approval, or is refused; a denial or refusal is final for that action: do not reach the same result another way.",
     },
     Rule {
         id: "ask",
         to: To::Watched,
-        text: "Ask with ask_user when a decision is the user's to make, such as a project name.",
+        text: "Ask with ask_user only for a choice that is the user's and that the request and project do not settle, such as a name; otherwise take the sensible default and mention it.",
+    },
+    // Files by name, not path:line, as nothing links them and lines move.
+    Rule {
+        id: "report",
+        to: To::OnScreen,
+        text: "When you finish a task, end with a short report for someone who did not watch: the outcome first, then the files you changed, what you ran to check them and what it showed, and anything left undone. The user may not have opened tool output, so relay what matters and do not replay your steps. A simple question gets a short answer.",
+    },
+    // The answer rides with the next call, since a reply with only text
+    // would end the turn with the task half done.
+    Rule {
+        id: "steering",
+        to: To::OnScreen,
+        text: "A message the user types while you work steers the task in hand: take it in and keep going, answering any question in a line alongside your next tool call; stop only if it says to stop, wait or do something else instead.",
     },
     Rule {
         id: "assume",
@@ -372,7 +391,13 @@ mod tests {
         assert!(!headless.contains("for approval"), "{headless}");
         let window = told_without(&window(), &TOOLS, &[]);
         assert!(
-            window.contains(" in place of editing the file. Writes and commands are shown to the user for approval; a denial is final for that action. Ask with ask_user when a decision is the user's to make, such as a project name. After changing code, run the narrowest check"),
+            window.contains(" in place of editing the file. Depending on the session's mode and the user's rules, a write or command runs at once, waits for the user's approval, or is refused;"),
+            "{window}"
+        );
+        assert!(
+            window.contains(
+                " or do something else instead. After changing code, run the narrowest check"
+            ),
             "{window}"
         );
     }
