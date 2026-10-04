@@ -3857,7 +3857,9 @@ impl Chat {
         }
         self.save();
         match step {
-            goal::Step::Continue { notice, message } => {
+            goal::Step::Continue {
+                notice, message, ..
+            } => {
                 self.note = Some(notice);
                 self.start_in(id, goal::continuation(message), cx);
             }
