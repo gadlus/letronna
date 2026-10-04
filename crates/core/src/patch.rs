@@ -171,6 +171,19 @@ pub(crate) fn removes(args: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The paths the patch in `args` leaves a file at, as it names them: what
+/// it adds or updates, a moved file under its new name; `None` when it does
+/// not parse.
+pub(crate) fn written(args: &Value) -> Option<Vec<String>> {
+    let actions = parse(patch_arg(args)?).ok()?;
+    let left = actions.into_iter().filter_map(|action| match action {
+        Action::Add { path, .. } => Some(path),
+        Action::Update { path, to, .. } => Some(to.unwrap_or(path)),
+        Action::Delete { .. } => None,
+    });
+    Some(left.collect())
+}
+
 /// The patch's files and hunks, or an error naming the line at fault.
 fn parse(patch: &str) -> Result<Vec<Action>, String> {
     let lines: Vec<(usize, &str)> = patch
