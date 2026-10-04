@@ -14,6 +14,8 @@
 //! one that needs a yes goes to it as `session/request_permission`, whose
 //! options are the terminal's answers: once, always in this session, or no.
 //! "Always" is a grant, which the floor's own questions still come before.
+//! A memory save's options are the places it may be kept, or not at all,
+//! and it saves as the session chose, as a terminal session does.
 //!
 //! A session is an ordinary Letronna session, in the same listing, so one
 //! begun in an editor can be carried on in the terminal or the window, and
@@ -32,9 +34,10 @@ use letronna_core::cancel::Cancel;
 use letronna_core::chat::{self, Connection, Message, ToolCall};
 use letronna_core::driver::{self, Allow, Decide, Outcome, Spec, Step, Watch};
 use letronna_core::gate::{self, Gate, Grants, Mode};
+use letronna_core::memory::{self, Scope};
 use letronna_core::store::{self, Conversation, Summary, Todo, Transcript};
 use letronna_core::tools::ToolContext;
-use letronna_core::{agent, gateway, hooks, permissions, tools, untrusted};
+use letronna_core::{agent, gateway, hooks, permissions, references, tools, untrusted};
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, Write};
@@ -511,6 +514,9 @@ impl Agent {
             ));
         };
         let conversation = &mut transcript.conversation;
+        // Saving and keeping memory as the session chose, wherever it chose.
+        memory::choose(session, conversation.memory_saving);
+        memory::choose_scope(session, conversation.memory_scope);
         if conversation.messages.is_empty() && conversation.title.is_empty() {
             conversation.title = text.chars().take(40).collect();
         }
@@ -598,12 +604,16 @@ impl Agent {
             return;
         };
         let outcome = &message["result"]["outcome"];
-        let decision = match (outcome["outcome"].as_str(), outcome["optionId"].as_str()) {
-            (Some("selected"), Some("allow-once")) => Decision::Once,
+        let option = outcome["optionId"].as_str();
+        // A memory save's place, of those its request offered.
+        let place = option.and_then(|option| kept(&request, option));
+        let decision = match (outcome["outcome"].as_str(), option, place) {
+            (Some("selected"), _, Some(place)) => Decision::Keep(place),
+            (Some("selected"), Some("allow-once"), _) => Decision::Once,
             // Kept as the terminal keeps "stop asking": a grant the gate
             // reads after the floor's own questions, which a yes for the
             // whole run would skip.
-            (Some("selected"), Some("allow-always")) => {
+            (Some("selected"), Some("allow-always"), _) => {
                 let tool = request.call.name.clone();
                 lock(&self.grants)
                     .entry(request.root)
@@ -833,28 +843,42 @@ fn typed(content: &str) -> String {
 }
 
 /// A prompt's content blocks as the text of one message: words as they
-/// are, a linked file by its link, and an embedded one with its text.
+/// are and a linked file by its link, then each embedded one with its text,
+/// attached after them as the window attaches what `@` names.
 fn prompt_text(blocks: &Value) -> String {
-    let parts: Vec<String> = blocks
+    let parts: Vec<(bool, String)> = blocks
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|block| match block["type"].as_str()? {
-            "text" => Some(block["text"].as_str()?.to_owned()),
-            "resource_link" => Some(format!(
-                "[{}]({})",
-                block["name"].as_str().unwrap_or_default(),
-                block["uri"].as_str()?
+            "text" => Some((false, block["text"].as_str()?.to_owned())),
+            "resource_link" => Some((
+                false,
+                format!(
+                    "[{}]({})",
+                    block["name"].as_str().unwrap_or_default(),
+                    block["uri"].as_str()?
+                ),
             )),
             "resource" => {
                 let resource = &block["resource"];
                 let uri = resource["uri"].as_str().unwrap_or_default();
-                Some(embedded(uri, resource["text"].as_str()?))
+                Some((true, embedded(uri, resource["text"].as_str()?)))
             }
             _ => None,
         })
         .collect();
-    parts.join("\n\n")
+    let joined = |parts: Vec<(bool, String)>| {
+        let texts: Vec<String> = parts.into_iter().map(|(_, text)| text).collect();
+        texts.join("\n\n")
+    };
+    // So what the user typed reads apart from what came with it: a file's or
+    // a page's words never count as theirs, as in asking to remember.
+    let (attached, said): (Vec<_>, Vec<_>) = parts.into_iter().partition(|(attached, _)| *attached);
+    match attached.is_empty() {
+        true => joined(said),
+        false => references::with_attached(&joined(said), &joined(attached)),
+    }
 }
 
 /// An embedded resource under its uri: one of the user's files in a code
@@ -974,6 +998,22 @@ fn permission_request(id: u64, request: &Request) -> Value {
     // The preview is what a card in the terminal or the window shows.
     asked["content"] = json!([{"type": "content",
         "content": {"type": "text", "text": request.preview}}]);
+    // A memory save is asked about each time, with where to keep it.
+    let options = match request.places.as_slice() {
+        [] => json!([
+            {"optionId": "allow-once", "name": "Allow", "kind": "allow_once"},
+            {"optionId": "allow-always", "name": "Allow for this session", "kind": "allow_always"},
+            {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"},
+        ]),
+        places => {
+            let keep = places.iter().map(|place| {
+                json!({"optionId": keep_option(*place), "name": place.save_label(), "kind": "allow_once"})
+            });
+            let refuse =
+                json!({"optionId": "reject-once", "name": "Don't save", "kind": "reject_once"});
+            Value::Array(keep.chain([refuse]).collect())
+        }
+    };
     json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -981,13 +1021,22 @@ fn permission_request(id: u64, request: &Request) -> Value {
         "params": {
             "sessionId": request.root.to_string(),
             "toolCall": asked,
-            "options": [
-                {"optionId": "allow-once", "name": "Allow", "kind": "allow_once"},
-                {"optionId": "allow-always", "name": "Allow for this session", "kind": "allow_always"},
-                {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"},
-            ],
+            "options": options,
         },
     })
+}
+
+/// The option that keeps a memory save in `place`.
+fn keep_option(place: Scope) -> String {
+    format!("keep-{}", place.name())
+}
+
+/// The place of those `request` offered that the option `option` keeps a
+/// memory save in, if it is one of them.
+fn kept(request: &Request, option: &str) -> Option<Scope> {
+    (request.places.iter())
+        .find(|&&place| keep_option(place) == option)
+        .copied()
 }
 
 /// A `session/update` notification for `session` carrying `update`.
@@ -1615,6 +1664,8 @@ mod tests {
             text.contains("https://example.com/\n<untrusted-content-"),
             "{text}"
         );
+        // What came with the words is no part of what the user typed.
+        assert_eq!(references::typed(&text), "Look at these.");
     }
 
     /// Saves session `id`, on the model "old-model" and working in `dir`,
@@ -1642,6 +1693,66 @@ mod tests {
             content: content.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_memory_save_asks_the_editor_where_to_keep_it_as_the_session_chose() {
+        let dir = scratch("memory");
+        let save = json!({"action": "add", "target": "user", "content": "Uses pnpm."});
+        let endpoint = provider(vec![reply("", &[("memory", save)]), reply("Saved.", &[])]);
+        let mut editor = Editor::connect(endpoint, SESSIONS + 200);
+        let id = SESSIONS + 200;
+        // This session asks before each save, whatever the settings say.
+        let path = store::sessions_dir().join(format!("{id}.jsonl"));
+        std::fs::create_dir_all(store::sessions_dir()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let conversation = Conversation {
+            id,
+            title: "Remembering".into(),
+            updated: 100,
+            workspace: Some(dir.clone()),
+            gateway: Some("Custom".into()),
+            model: Some("test-model".into()),
+            memory_saving: Some(memory::Saving::Ask),
+            messages: vec![said("user", "Hello."), said("assistant", "Hi.")],
+            ..Default::default()
+        };
+        Transcript { path, conversation }.save().unwrap();
+        let load = editor.ask(
+            "session/load",
+            json!({"sessionId": id.to_string(), "cwd": dir, "mcpServers": []}),
+        );
+        editor.reply(load);
+
+        let prompt = start(&mut editor, &id.to_string(), "Remember that I use pnpm.");
+        let (_, asked) = editor.until(is_permission);
+        let params = &asked["params"];
+        let shown = &params["toolCall"]["content"][0]["content"]["text"];
+        assert!(
+            shown.as_str().unwrap().contains("Add: Uses pnpm."),
+            "{shown}"
+        );
+        let options: Vec<(&str, &str)> = (params["options"].as_array().unwrap().iter())
+            .map(|option| {
+                let id = option["optionId"].as_str().unwrap();
+                (id, option["name"].as_str().unwrap())
+            })
+            .collect();
+        assert_eq!(
+            options,
+            [
+                ("keep-auto", "Save everywhere"),
+                ("keep-project", "Save for this project only"),
+                ("keep-chat", "Save for this chat only"),
+                ("reject-once", "Don't save"),
+            ]
+        );
+        choose(&editor, &asked, "keep-chat");
+        let (_, ended) = editor.reply(prompt);
+        assert_eq!(ended["result"]["stopReason"], "end_turn");
+        let notes = memory::chat_notes(id);
+        assert_eq!(notes.entries.unwrap(), ["Uses pnpm."]);
+        let _ = std::fs::remove_dir_all(notes.path.parent().unwrap());
     }
 
     #[test]

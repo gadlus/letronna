@@ -205,7 +205,9 @@ pub struct Spec {
     /// The shape its answer must have, given through `structured_output`
     /// instead of in prose; None for an answer in prose.
     pub schema: Option<Value>,
-    /// Hears the run step by step; None when only the report is wanted.
+    /// Hears the run step by step; None when only the report is wanted. A
+    /// session's own run someone watches so, as an editor's turn, keeps
+    /// memory as its session chose.
     pub watch: Option<Watch>,
     /// The session's own gate, for a run that is a session's turn rather
     /// than a helper's; None asks about every call that needs a yes.
@@ -900,13 +902,19 @@ pub(crate) fn refusal(allow: &Allow, name: &str) -> Option<String> {
 
 /// Why this agent may not call `name`, when it may not: a scheduled run's
 /// own agent as such, another nobody watches as such when it asks the user,
-/// any other as `refusal` says.
+/// a chat app's run or an editor's turn not for memory, any other as
+/// `refusal` says.
 fn refused(spec: &Spec, name: &str) -> Option<String> {
     if spec.depth > 0 || crate::schedule::running(spec.root).is_none() {
         // Not a helper, so not told to end on the open question: with
         // nobody to read it, that ends the run with the task undone.
         if name == tools::ASK_USER && unwatched(spec) {
             return Some(NOBODY_HERE.into());
+        }
+        // The gate holds each save to when and where the session saves,
+        // and refuses it where other people read the chat.
+        if name == "memory" && remembers(spec) {
+            return None;
         }
         return refusal(&spec.allow, name);
     }
@@ -919,6 +927,14 @@ fn refused(spec: &Spec, name: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Whether this is a session's own turn with its person a card away, a chat
+/// app's run or an editor's over ACP, which keeps memory as the window's do.
+fn remembers(spec: &Spec) -> bool {
+    spec.depth == 0
+        && matches!(spec.allow, Allow::All)
+        && (spec.connection.remote.is_some() || spec.watch.is_some())
 }
 
 /// Whether this is a session's own run with nobody there to answer it, as
@@ -2160,6 +2176,111 @@ pub(crate) mod tests {
             results(&sent[1])
         );
         assert!(requests.try_recv().is_err(), "a card with nobody there");
+    }
+
+    /// The tools `body` offered, by name.
+    fn offered(body: &Value) -> Vec<&str> {
+        let tools = body["tools"].as_array().unwrap();
+        tools
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect()
+    }
+
+    /// A Telegram chat, shared with others when `shared`.
+    fn telegram(shared: bool) -> Option<chat::Remote> {
+        Some(chat::Remote {
+            place: "a Telegram chat".into(),
+            shared,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_chat_apps_run_and_an_editors_turn_keep_memory_and_no_other_run_does() {
+        use crate::memory::Saving;
+        let data = data("memory-runs");
+        let dir = scratch("memory-runs");
+        // Session `id`'s own turn saving `entry`, made as `change` makes it
+        // and saving automatically: whether memory was offered, and what
+        // the save came to.
+        let run = |id: AgentId, entry: &str, change: &dyn Fn(&mut Spec)| {
+            let save = json!({"action": "add", "target": "user", "content": entry});
+            let (endpoint, provider) =
+                provider(vec![reply("", &[("memory", save)]), reply("Done.", &[])]);
+            let mut spec = spec(endpoint, &dir, id);
+            (spec.depth, spec.owner, spec.root, spec.run) = (0, id, id, id);
+            spec.connection.human = true;
+            change(&mut spec);
+            crate::memory::choose(id, Some(Saving::Auto));
+            assert_eq!(finished(spec).status, Outcome::Done);
+            crate::memory::forget(id);
+            let sent = provider.sent();
+            let offers = offered(&sent[0]).contains(&"memory");
+            (offers, results(&sent[1])[0].to_owned())
+        };
+        let kept = || std::fs::read_to_string(data.folder.join("USER.md")).unwrap_or_default();
+
+        let (offers, saved) = run(AGENTS + 1400, "Chats from Telegram.", &|spec| {
+            spec.connection.remote = telegram(false);
+        });
+        assert!(offers);
+        assert!(kept().contains("Chats from Telegram."), "{saved}");
+        let (offers, saved) = run(AGENTS + 1410, "Codes in an editor.", &|spec| {
+            spec.watch = Some(Arc::new(|_| ()));
+        });
+        assert!(offers);
+        assert!(kept().contains("Codes in an editor."), "{saved}");
+
+        // Other people read a shared chat, so memory is neither offered nor
+        // kept there, whatever the session chose.
+        let (offers, saved) = run(AGENTS + 1420, "Shares a group.", &|spec| {
+            spec.connection.remote = telegram(true);
+        });
+        assert!(!offers);
+        assert!(saved.contains("other people can read this chat"), "{saved}");
+        // A -p run, with a terminal or without, the MCP turn tool's and a
+        // chat's helper keep none.
+        let (_, saved) = run(AGENTS + 1430, "Runs -p.", &|_| ());
+        assert_eq!(saved, "`memory` is not available to this helper.");
+        let (_, saved) = run(AGENTS + 1435, "Runs -p alone.", &|spec| {
+            spec.connection.human = false;
+        });
+        assert_eq!(saved, "`memory` is not available to this helper.");
+        let (_, saved) = run(AGENTS + 1440, "Helps a chat.", &|spec| {
+            spec.connection.remote = telegram(false);
+            (spec.depth, spec.root) = (1, 7);
+        });
+        assert_eq!(saved, "`memory` is not available to this helper.");
+        let kept = kept();
+        for left in ["Shares a group.", "Runs -p", "Helps a chat."] {
+            assert!(!kept.contains(left), "{kept}");
+        }
+    }
+
+    #[test]
+    fn a_chat_apps_save_that_nobody_can_say_yes_to_is_refused_not_waited_on() {
+        use crate::memory::Saving;
+        let _serving = crate::approvals::tests::SERVING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A frontend that went away: nobody takes the card.
+        drop(approvals::serve());
+        let data = data("memory-nobody");
+        let dir = scratch("memory-nobody");
+        let save = json!({"action": "add", "target": "user", "content": "Never asked."});
+        let (endpoint, provider) =
+            provider(vec![reply("", &[("memory", save)]), reply("Left it.", &[])]);
+        let id = AGENTS + 1450;
+        let mut spec = spec(endpoint, &dir, id);
+        (spec.depth, spec.owner, spec.root, spec.run) = (0, id, id, id);
+        spec.connection.remote = telegram(false);
+        spec.connection.human = true;
+        crate::memory::choose(id, Some(Saving::Ask));
+        assert_eq!(finished(spec).status, Outcome::Done);
+        crate::memory::forget(id);
+        assert_eq!(results(&provider.sent()[1]), [NOT_APPROVED]);
+        assert!(!data.folder.join("USER.md").exists());
     }
 
     #[test]

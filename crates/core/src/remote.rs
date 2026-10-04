@@ -476,10 +476,20 @@ fn press(host: &mut impl Host, source: Source, tap: Press) {
         let _ = messaging::settle(&config, &tap, answers);
     }));
     if let Some(request) = request {
-        request.answer(match allow {
-            true => approvals::Decision::Once,
+        let decision = match allow {
+            true => yes(&request),
             false => approvals::Decision::Deny(String::new()),
-        });
+        };
+        request.answer(decision);
+    }
+}
+
+/// A yes to `request`: a memory save kept in the first place its card
+/// offered, where it goes now, any other call run once.
+fn yes(request: &approvals::Request) -> approvals::Decision {
+    match request.places.first() {
+        Some(&place) => approvals::Decision::Keep(place),
+        None => approvals::Decision::Once,
     }
 }
 
@@ -526,10 +536,15 @@ fn leave_for_run(id: u64, place: &str, text: &str) {
 }
 
 /// A call of chat `source`'s run that needs a yes: its card goes to the
-/// chat, whose next message or a tap on the card answers it.
+/// chat, whose next message or a tap on the card answers it, a memory
+/// save's with where to keep it.
 pub fn ask(host: &mut impl Host, source: Source, request: approvals::Request) {
     let (call, preview) = (&request.call, &request.preview);
-    let text = messaging::card_text(&call.name, &call.arguments, preview);
+    // A memory save shows the entry and where it may be kept.
+    let text = match request.places.is_empty() {
+        true => messaging::card_text(&call.name, &call.arguments, preview),
+        false => messaging::keep_card_text(preview, &request.places),
+    };
     // A question is answered in words; a tool is allowed or not.
     let card = (call.name != crate::tools::ASK_USER).then(|| call.id.clone());
     host.tell_card(&source, &text, card);
@@ -543,8 +558,13 @@ fn answer(host: &mut impl Host, source: &Source, said: &str) -> bool {
         return false;
     };
     let call = &request.call;
+    // A memory save's place, picked by its number.
+    if let Some(place) = messaging::picked_place(said, &request.places) {
+        request.answer(approvals::Decision::Keep(place));
+        return true;
+    }
     let decision = match messaging::card_answer(&call.name, &call.arguments, said) {
-        CardAnswer::Allow => approvals::Decision::Once,
+        CardAnswer::Allow => yes(&request),
         CardAnswer::Deny(reason) => approvals::Decision::Deny(reason),
         // A run beside the chat asks no questions, so words are a no.
         CardAnswer::Answer(_) => approvals::Decision::Deny(String::new()),
@@ -953,6 +973,64 @@ mod tests {
         ended(&mut fake, &chat, 11, "Stopped.", false);
         assert!(dropped.recv_timeout(wait).unwrap().is_err());
         assert_eq!(last_told(&fake), "Stopped.");
+        drop(served);
+    }
+
+    #[test]
+    fn a_memory_save_goes_to_its_chat_with_its_entry_and_is_kept_where_answered() {
+        use crate::memory::{self, Scope};
+        let _serving = SERVING.lock().unwrap_or_else(|e| e.into_inner());
+        let served = approvals::serve();
+        let wait = Duration::from_secs(10);
+        // An id no other test's session has, as a scope is kept per process.
+        let session = 9_700_001;
+        memory::choose_scope(session, Some(Scope::Auto));
+        let saving = move || {
+            let call = ToolCall {
+                id: "1".into(),
+                name: "memory".into(),
+                arguments: r#"{"action": "add", "target": "user", "content": "Uses pnpm."}"#.into(),
+            };
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let ctx = ToolContext {
+                    conversation: session,
+                    ..Default::default()
+                };
+                let asked = approvals::ask(session, session, "chat", &call, &ctx, "", false);
+                let _ = tx.send(asked.map(|allowed| allowed.keep_in));
+            });
+            rx
+        };
+        let mut fake = host(10);
+        dispatch(&mut fake, from(PAIRED, "remember I use pnpm"));
+        fake.running.insert(11);
+        let chat = Source::Telegram(PAIRED);
+
+        let picked = saving();
+        ask(&mut fake, chat.clone(), served.recv_timeout(wait).unwrap());
+        let card = last_told(&fake);
+        assert!(card.contains("Add: Uses pnpm."), "{card}");
+        assert!(
+            card.contains("1. Save everywhere\n2. Save for this chat only"),
+            "{card}"
+        );
+        dispatch(&mut fake, from(PAIRED, "2"));
+        assert_eq!(picked.recv_timeout(wait).unwrap(), Ok(Some(Scope::Chat)));
+
+        // A yes keeps it where it goes now, the first place.
+        let first = saving();
+        ask(&mut fake, chat.clone(), served.recv_timeout(wait).unwrap());
+        dispatch(&mut fake, from(PAIRED, "yes"));
+        assert_eq!(first.recv_timeout(wait).unwrap(), Ok(Some(Scope::Auto)));
+
+        let refused = saving();
+        ask(&mut fake, chat.clone(), served.recv_timeout(wait).unwrap());
+        dispatch(&mut fake, from(PAIRED, "no, not that"));
+        assert!(refused.recv_timeout(wait).unwrap().is_err());
+        // None of the answers is a prompt.
+        assert_eq!(fake.runs.len(), 1);
+        memory::forget(session);
         drop(served);
     }
 

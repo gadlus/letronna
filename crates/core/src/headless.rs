@@ -777,6 +777,53 @@ mod tests {
     }
 
     #[test]
+    fn a_chats_memory_save_asks_it_where_to_keep_it_as_its_session_chose() {
+        use crate::driver::tests::{provider, reply};
+        use crate::memory::{self, Saving};
+        let _serving = SERVING.lock().unwrap_or_else(|e| e.into_inner());
+        let _data = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = Scratch::new("headless-memory");
+        let (data, work) = (dir.join("data"), dir.join("work"));
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &data) };
+        let save = serde_json::json!({"action": "add", "target": "user", "content": "Uses pnpm."});
+        let (endpoint, stub) = provider(vec![
+            reply("Hi.", &[]),
+            reply("", &[("memory", save)]),
+            reply("Saved.", &[]),
+        ]);
+        // Every other chat saves on its own; this one asks each time.
+        let settings = serde_json::json!({"endpoint": endpoint, "model": "stub",
+            "gateway": "Custom", "custom_endpoint": endpoint, "memory_saving": "auto"});
+        std::fs::write(data.join("settings.json"), settings.to_string()).unwrap();
+        let serving = Serving::start(Some(work));
+        answer_cards(serving.inputs.clone());
+        serving.hear("hello");
+        assert_eq!(serving.next_told(), "Hi.");
+        let mut sessions = store::load();
+        sessions.choose_memory_saving(0, Some(Saving::Ask));
+        sessions.save().unwrap();
+        let id = sessions.conversations[0].id;
+        // So the run hears the choice from the session's file alone.
+        memory::forget(id);
+
+        serving.hear("remember I use pnpm");
+        let card = serving.next_told();
+        assert!(card.contains("Add: Uses pnpm."), "{card}");
+        assert!(card.contains("3. Save for this chat only"), "{card}");
+        serving.hear("3");
+        assert_eq!(serving.next_told(), "Saved.");
+        serving.quit();
+        let _ = stub.sent();
+        let notes = memory::chat_notes(id).entries.unwrap();
+        assert_eq!(notes, ["Uses pnpm."]);
+        assert!(!data.join("USER.md").exists());
+        memory::forget(id);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
     fn a_status_line_carries_no_escape_sequence_and_stays_short() {
         let sneaky = "hi \u{1b}]52;c;aGk=\u{7}there\u{1b}[2J\nsecond line";
         assert_eq!(preview(sneaky), "hi ]52;c;aGk=there[2J second line");
