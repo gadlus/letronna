@@ -3187,6 +3187,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_check_runs_in_the_job_folder_and_the_floor_still_refuses() {
+        // Only this unix test uses it, so a module-level import would be unused on Windows.
+        use super::check;
         let dir = scratch("check-real");
         std::fs::write(dir.join("price.txt"), "4.99").unwrap();
         let job = watch(&dir, false, None);
