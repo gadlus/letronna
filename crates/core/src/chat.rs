@@ -224,6 +224,10 @@ pub struct Replay {
     /// id: where Google's OpenAI-shaped API puts a thought signature.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_content: BTreeMap<String, Value>,
+    /// The Responses API's reasoning items, encrypted, whole and in the
+    /// order they came.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_items: Vec<Value>,
 }
 
 /// How long ago, in the words a person would use. For listing sessions,
@@ -1883,6 +1887,12 @@ enum Quirk {
     /// Anthropic's adaptive thinking, which a model that thinks only on a
     /// budget turns down; the chat body has no field for it.
     Thinking,
+    /// The Responses API, which the route turned down: the model is sent
+    /// chat/completions instead.
+    Responses,
+    /// The Responses API's summaries of the reasoning, which OpenAI gives
+    /// only an organization it has verified.
+    Summary,
 }
 
 /// Each quirk by what a refusal says when its field is the one at fault: the
@@ -1938,16 +1948,12 @@ fn has_quirk(connection: &Connection, quirk: Quirk) -> bool {
         .is_ok_and(|quirks| quirks.contains(&(endpoint, model, quirk)))
 }
 
-/// OpenAI's o-series and GPT-5 models on OpenAI's own API, which refuse
+/// OpenAI's o-series, GPT-5 and codex models on OpenAI's own API, which refuse
 /// `max_tokens`. Another route to them that does too says so, and is learned.
 fn reasons_on_openai(connection: &Connection) -> bool {
     let on_openai = reqwest::Url::parse(connection.endpoint.trim())
         .is_ok_and(|url| url.host_str() == Some("api.openai.com"));
-    let model = connection.model.trim().to_lowercase();
-    on_openai
-        && ["o1", "o3", "o4", "gpt-5"]
-            .iter()
-            .any(|family| model.starts_with(family))
+    on_openai && crate::wire_responses::reasons(&connection.model)
 }
 
 /// Change `body` as every quirk known for this model asks.
@@ -1990,12 +1996,19 @@ fn apply_quirk(body: &mut Value, quirk: Quirk) -> bool {
         Quirk::ToolChoice => fields.remove("tool_choice").is_some(),
         Quirk::ParallelCalls => fields.remove("parallel_tool_calls").is_some(),
         Quirk::Replay => fields.get_mut("messages").is_some_and(|messages| {
-            ["reasoning_details", "extra_content", "reasoning_content"]
-                .iter()
-                .fold(false, |found, key| remove_everywhere(messages, key) | found)
+            [
+                "reasoning_details",
+                "extra_content",
+                "reasoning_content",
+                "reasoning_items",
+            ]
+            .iter()
+            .fold(false, |found, key| remove_everywhere(messages, key) | found)
         }),
         // Left out of the Messages request instead; see `as_messages`.
         Quirk::Thinking => false,
+        // Not fields of the chat body: `to_responses` reads them.
+        Quirk::Responses | Quirk::Summary => false,
     }
 }
 
@@ -2170,6 +2183,95 @@ pub(crate) fn as_chat(connection: &Connection, reply: Value) -> Value {
     } else {
         reply
     }
+}
+
+/// Whether requests over `connection` go to the Responses API: OpenAI's
+/// reasoning models on its own API, unless their route turned it down this
+/// run and they have chat/completions to go to instead.
+fn speaks_responses(connection: &Connection) -> bool {
+    let model = connection.model.trim();
+    crate::wire_responses::serves(&connection.endpoint, model)
+        && (crate::wire_responses::only(model) || !has_quirk(connection, Quirk::Responses))
+}
+
+/// The Responses API's URL and form of `body`, built chat-shaped as every
+/// request is, for a request over `connection` that goes there rather than
+/// to `endpoint`, the URL `validate` gave; `None` for one that does not.
+pub(crate) fn to_responses(
+    connection: &Connection,
+    endpoint: &str,
+    body: &Value,
+) -> Option<(String, Value)> {
+    if !speaks_responses(connection) {
+        return None;
+    }
+    // The summary and the judge build bodies of their own, whose cap is
+    // meant for the answer alone: here it counts the thinking too.
+    let mut body = body.clone();
+    fit_quirks(connection, &mut body);
+    // Only a streamed reply shows them, and the callers that wait for a
+    // whole one never learn that they were refused.
+    let summaries = body["stream"] == true && !has_quirk(connection, Quirk::Summary);
+    Some((
+        crate::wire_responses::url(endpoint),
+        crate::wire_responses::request(&body, summaries),
+    ))
+}
+
+/// Learn from a refusal of a request that went to the Responses API, built
+/// as `sent` and posted as `posted`, what the next one does instead, saying
+/// whether sending it again would now go differently.
+fn learn_responses(
+    connection: &Connection,
+    sent: &Value,
+    posted: &Value,
+    failure: &Failure,
+    error: &str,
+) -> bool {
+    let error = error.to_lowercase();
+    let (endpoint, model) = route(connection);
+    // Decided by what this request carried, as `learn` does: one that went
+    // out alongside it may have learned it first, and this one still goes
+    // again without it. The next leaves it out, so each costs one retry.
+    let goes_without = |quirk| {
+        learned().lock().is_ok_and(|mut quirks| {
+            quirks.insert((endpoint.clone(), model.clone(), quirk));
+            true
+        })
+    };
+    // OpenAI turns away an organization it has not verified for asking for
+    // summaries of the reasoning.
+    let summaries = error.contains("reasoning.summary") || error.contains("reasoning summar");
+    if summaries && posted["reasoning"].get("summary").is_some() {
+        return goes_without(Quirk::Summary);
+    }
+    // Some of these models take fewer efforts than the rest, as GPT-5 pro
+    // takes high alone, and name the field as this API spells it.
+    if error.contains("reasoning.effort") && sent.get("reasoning_effort").is_some() {
+        return goes_without(Quirk::Effort);
+    }
+    // Reasoning encrypted for another key, as after the key was changed,
+    // cannot be read back.
+    let replayed = sent["messages"]
+        .as_array()
+        .is_some_and(|messages| messages.iter().any(|m| m.get("reasoning_items").is_some()));
+    if replayed && error.contains("encrypted") {
+        return goes_without(Quirk::Replay);
+    }
+    // Any other refusal of the request as written sends the rest of the run
+    // to chat/completions, as before, unless the model has no route there.
+    // So does a key allowed chat/completions but not this API, as OpenAI's
+    // restricted keys can be. Another refusal of the key or the account, or
+    // an overflow a smaller window mends, would be no different there.
+    let as_written = match failure.kind {
+        FailureKind::BadRequest | FailureKind::NotFound | FailureKind::Settings => true,
+        FailureKind::Auth => error.contains("api.responses"),
+        _ => false,
+    };
+    as_written
+        && failure.overflow.is_none()
+        && !crate::wire_responses::only(&model)
+        && goes_without(Quirk::Responses)
 }
 
 /// The host a URL names, if it is one.
@@ -2366,6 +2468,11 @@ fn carry_back(wired: &mut Value, m: &Message, connection: &Connection, this_turn
             if let Some(extra) = replay.extra_content.get(&call.id) {
                 wired["tool_calls"][at]["extra_content"] = extra.clone();
             }
+        }
+        // Only the Responses API reads these, and chat/completions refuses a
+        // field it does not know, so a route gone back to it gets none.
+        if !replay.reasoning_items.is_empty() && speaks_responses(connection) {
+            wired["reasoning_items"] = replay.reasoning_items.clone().into();
         }
     }
     let lower = model.to_lowercase();
@@ -2603,6 +2710,8 @@ struct Chunk {
     /// stream assembles them.
     tool_calls: Vec<(Option<usize>, String, String, String, Value)>,
     reasoning_details: Vec<Value>,
+    /// The Responses API's reasoning items, each whole.
+    reasoning_items: Vec<Value>,
     cache_write_tokens: Option<u64>,
     reasoning_tokens: Option<u64>,
     cost: Option<f64>,
@@ -2791,6 +2900,10 @@ fn parse_chunk(value: &Value) -> Result<Chunk, Failure> {
         .and_then(|d| d["reasoning_details"].as_array())
         .cloned()
         .unwrap_or_default();
+    let reasoning_items = delta
+        .and_then(|d| d["reasoning_items"].as_array())
+        .cloned()
+        .unwrap_or_default();
     // vLLM also sends a `stop_reason`, but there it is the stop string that
     // matched rather than why, so only `finish_reason` is read.
     let finish = inner
@@ -2809,6 +2922,7 @@ fn parse_chunk(value: &Value) -> Result<Chunk, Failure> {
         cost,
         tool_calls,
         reasoning_details,
+        reasoning_items,
         finish,
     })
 }
@@ -3363,15 +3477,20 @@ fn stream(
     );
     let ticket = crate::cache_miss::sent(connection.conversation, prefix);
     // What goes out in its place on Anthropic's own API, kept to learn from
-    // a refusal of it.
+    // a refusal of it; an OpenAI reasoning model's goes to the Responses API.
     let posted =
         crate::wire_anthropic::speaks(&connection.endpoint).then(|| as_messages(connection, &sent));
+    let wired = to_responses(connection, &endpoint, &sent);
+    let url = wired
+        .as_ref()
+        .map_or(endpoint.as_str(), |(url, _)| url.as_str());
     let request = client()
         .map_err(|e| Failure::new(FailureKind::Unknown, e))?
-        .post(endpoint);
-    let request = match &posted {
-        Some(posted) => crate::wire_anthropic::sign(request, &connection.key, posted),
-        None => carrying(request, connection, &sent),
+        .post(url);
+    let request = match (&posted, &wired) {
+        (Some(posted), _) => crate::wire_anthropic::sign(request, &connection.key, posted),
+        (None, Some((_, body))) => carrying(request, connection, body),
+        (None, None) => carrying(request, connection, &sent),
     };
     // A rate limit or a dropped connection part way through an agent loop
     // would otherwise lose the whole task, though it passes on its own.
@@ -3442,7 +3561,18 @@ fn stream(
                     return stream(connection, messages, start, budget, extra, lsp, sender);
                 }
                 let body = serde_json::from_str::<Value>(&error).unwrap_or_default();
-                classify(Some(status.as_u16()), &headers, &body)
+                let failure = classify(Some(status.as_u16()), &headers, &body);
+                // What only the Responses API is sent, and that API itself,
+                // are learned as a field is: each costs at most one retry.
+                if let Some((_, responded)) = &wired
+                    && status.is_client_error()
+                    && !matches!(status.as_u16(), 408 | 429)
+                    && learn_responses(connection, &sent, responded, &failure, &error)
+                    && !sender.is_closed()
+                {
+                    return stream(connection, messages, start, budget, extra, lsp, sender);
+                }
+                failure
             }
         };
         if slow {
@@ -3500,6 +3630,9 @@ fn read(
     stands: &mut bool,
     slow: &mut bool,
 ) -> Result<(), Failure> {
+    // The Responses API's events, and its reply when one comes whole, are
+    // read as the chat chunks they stand for.
+    let responses = response.url().path().ends_with("/responses");
     if response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -3510,6 +3643,11 @@ fn read(
             .json()
             .map_err(|_| Failure::new(FailureKind::BadReply, "Invalid model response."))?;
         let value = as_chat(connection, value);
+        let value = if responses {
+            crate::wire_responses::reply(value)
+        } else {
+            value
+        };
         let began = std::time::Instant::now();
         let mut reply = Reply::default();
         reply.absorb(parse_chunk(&value)?, stands, sender)?;
@@ -3557,6 +3695,7 @@ fn read(
             break;
         }
         let chunk = match &mut messages {
+            None if responses => parse_chunk(&crate::wire_responses::chunk(&read_event(data)?))?,
             None => parse_event(data)?,
             Some(messages) => match messages.event(&read_event(data)?) {
                 crate::wire_anthropic::Said::Chunk(chunk) => parse_chunk(&chunk)?,
@@ -3659,6 +3798,9 @@ struct Reply {
     cost: Option<f64>,
     assembler: Assembler,
     reasoning_details: Vec<Value>,
+    reasoning_items: Vec<Value>,
+    /// Whether any reasoning has been passed on yet.
+    thought: bool,
     finish: Option<FinishReason>,
     think: crate::think::Scrubber,
     /// Each call begun as last told, by its place in `assembler.calls`,
@@ -3703,7 +3845,14 @@ impl Reply {
         *stands |= !chunk.tool_calls.is_empty();
         self.assembler.add(&chunk);
         join_details(&mut self.reasoning_details, chunk.reasoning_details);
-        if let Some(text) = chunk.reasoning {
+        self.reasoning_items.extend(chunk.reasoning_items);
+        // A break between paragraphs, as the Responses API's summaries are
+        // parted, would only open the thinking with blank lines.
+        if let Some(text) = chunk
+            .reasoning
+            .filter(|t| self.thought || !t.trim().is_empty())
+        {
+            self.thought = true;
             *stands = true;
             sender
                 .send_blocking(Event::Reasoning(text))
@@ -3861,6 +4010,7 @@ impl Reply {
                 .filter(|(_, extra)| !extra.is_null())
                 .map(|(call, extra)| (call.id.clone(), extra))
                 .collect(),
+            reasoning_items: self.reasoning_items,
         };
         let mut received = self.received;
         if !calls.is_empty() {
@@ -3884,7 +4034,9 @@ impl Reply {
             };
             return Err(Failure::new(FailureKind::BadReply, why));
         }
-        let carries = !replay.reasoning_details.is_empty() || !replay.extra_content.is_empty();
+        let carries = !replay.reasoning_details.is_empty()
+            || !replay.extra_content.is_empty()
+            || !replay.reasoning_items.is_empty();
         // Reasoning that led to dropped calls is not sent back without them.
         if carries && !in_call {
             sender
@@ -6890,7 +7042,16 @@ mod tests {
             };
             body(&c, &[], None, None)
         };
-        for model in ["o1", "o3-mini", "o4-mini", "gpt-5", "gpt-5-mini", "gpt-5.1"] {
+        for model in [
+            "o1",
+            "o3-mini",
+            "o4-mini",
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5.1",
+            "codex-mini-latest",
+            "o5-mini",
+        ] {
             let body = sent("https://api.openai.com/v1", model);
             assert_eq!(body["max_completion_tokens"], COMPLETION_TOKENS, "{model}");
             assert!(body.get("max_tokens").is_none(), "{model}");
@@ -9665,6 +9826,7 @@ mod tests {
             model: "moonshotai/kimi-k2-instruct".into(),
             reasoning_details: vec![json!({"type": "reasoning.text", "text": "t", "index": 0})],
             extra_content: BTreeMap::from([("a".into(), json!({"google": {}}))]),
+            reasoning_items: Vec::new(),
         }));
         let window = answered(reply);
         let sent = body(&c, &window, None, None);
@@ -9833,6 +9995,469 @@ mod tests {
         assert_eq!(subject("todo", r#"{"items": [], "#), "");
     }
 
+    /// A reply from gpt-5 over the Responses API that thinks in two
+    /// summary parts, says a few words and reads a file, as OpenAI streams
+    /// it.
+    const RESPONSES_STREAM: &str = concat!(
+        "event: response.created\n",
+        r#"data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_0a1b","object":"response","created_at":1759480000,"status":"in_progress","model":"gpt-5-2025-08-07","output":[],"usage":null}}"#,
+        "\n\nevent: response.in_progress\n",
+        r#"data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_0a1b","object":"response","status":"in_progress","output":[]}}"#,
+        "\n\nevent: response.output_item.added\n",
+        r#"data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"id":"rs_0a1b","type":"reasoning","summary":[]}}"#,
+        "\n\nevent: response.reasoning_summary_part.added\n",
+        r#"data: {"type":"response.reasoning_summary_part.added","sequence_number":3,"item_id":"rs_0a1b","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}"#,
+        "\n\nevent: response.reasoning_summary_text.delta\n",
+        r#"data: {"type":"response.reasoning_summary_text.delta","sequence_number":4,"item_id":"rs_0a1b","output_index":0,"summary_index":0,"delta":"**Finding the entry point**","obfuscation":"k2"}"#,
+        "\n\nevent: response.reasoning_summary_text.done\n",
+        r#"data: {"type":"response.reasoning_summary_text.done","sequence_number":5,"item_id":"rs_0a1b","output_index":0,"summary_index":0,"text":"**Finding the entry point**"}"#,
+        "\n\nevent: response.reasoning_summary_part.done\n",
+        r#"data: {"type":"response.reasoning_summary_part.done","sequence_number":6,"item_id":"rs_0a1b","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":"**Finding the entry point**"}}"#,
+        "\n\nevent: response.reasoning_summary_part.added\n",
+        r#"data: {"type":"response.reasoning_summary_part.added","sequence_number":7,"item_id":"rs_0a1b","output_index":0,"summary_index":1,"part":{"type":"summary_text","text":""}}"#,
+        "\n\nevent: response.reasoning_summary_text.delta\n",
+        r#"data: {"type":"response.reasoning_summary_text.delta","sequence_number":8,"item_id":"rs_0a1b","output_index":0,"summary_index":1,"delta":"main.rs should hold it.","obfuscation":"Qm"}"#,
+        "\n\nevent: response.output_item.done\n",
+        r#"data: {"type":"response.output_item.done","sequence_number":9,"output_index":0,"item":{"id":"rs_0a1b","type":"reasoning","encrypted_content":"gAAAAABo3xEnc","summary":[{"type":"summary_text","text":"**Finding the entry point**"},{"type":"summary_text","text":"main.rs should hold it."}]}}"#,
+        "\n\nevent: response.output_item.added\n",
+        r#"data: {"type":"response.output_item.added","sequence_number":10,"output_index":1,"item":{"id":"msg_0a1b","type":"message","status":"in_progress","content":[],"role":"assistant"}}"#,
+        "\n\nevent: response.content_part.added\n",
+        r#"data: {"type":"response.content_part.added","sequence_number":11,"item_id":"msg_0a1b","output_index":1,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""}}"#,
+        "\n\nevent: response.output_text.delta\n",
+        r#"data: {"type":"response.output_text.delta","sequence_number":12,"item_id":"msg_0a1b","output_index":1,"content_index":0,"delta":"Let me","logprobs":[],"obfuscation":"x9Tz"}"#,
+        "\n\nevent: response.output_text.delta\n",
+        r#"data: {"type":"response.output_text.delta","sequence_number":13,"item_id":"msg_0a1b","output_index":1,"content_index":0,"delta":" look.","logprobs":[],"obfuscation":"P"}"#,
+        "\n\nevent: response.output_text.done\n",
+        r#"data: {"type":"response.output_text.done","sequence_number":14,"item_id":"msg_0a1b","output_index":1,"content_index":0,"text":"Let me look.","logprobs":[]}"#,
+        "\n\nevent: response.output_item.done\n",
+        r#"data: {"type":"response.output_item.done","sequence_number":15,"output_index":1,"item":{"id":"msg_0a1b","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"Let me look."}],"role":"assistant"}}"#,
+        "\n\nevent: response.output_item.added\n",
+        r#"data: {"type":"response.output_item.added","sequence_number":16,"output_index":2,"item":{"id":"fc_0a1b","type":"function_call","status":"in_progress","arguments":"","call_id":"call_Q7","name":"read_file"}}"#,
+        "\n\nevent: response.function_call_arguments.delta\n",
+        r#"data: {"type":"response.function_call_arguments.delta","sequence_number":17,"item_id":"fc_0a1b","output_index":2,"delta":"{\"path\":","obfuscation":"w"}"#,
+        "\n\nevent: response.function_call_arguments.delta\n",
+        r#"data: {"type":"response.function_call_arguments.delta","sequence_number":18,"item_id":"fc_0a1b","output_index":2,"delta":"\"src/main.rs\"}","obfuscation":""}"#,
+        "\n\nevent: response.function_call_arguments.done\n",
+        r#"data: {"type":"response.function_call_arguments.done","sequence_number":19,"item_id":"fc_0a1b","output_index":2,"arguments":"{\"path\":\"src/main.rs\"}"}"#,
+        "\n\nevent: response.output_item.done\n",
+        r#"data: {"type":"response.output_item.done","sequence_number":20,"output_index":2,"item":{"id":"fc_0a1b","type":"function_call","status":"completed","arguments":"{\"path\":\"src/main.rs\"}","call_id":"call_Q7","name":"read_file"}}"#,
+        "\n\nevent: response.completed\n",
+        r#"data: {"type":"response.completed","sequence_number":21,"response":{"id":"resp_0a1b","object":"response","status":"completed","model":"gpt-5-2025-08-07","output":[{"id":"fc_0a1b","type":"function_call","status":"completed","arguments":"{\"path\":\"src/main.rs\"}","call_id":"call_Q7","name":"read_file"}],"usage":{"input_tokens":2468,"input_tokens_details":{"cached_tokens":2304},"output_tokens":187,"output_tokens_details":{"reasoning_tokens":128},"total_tokens":2655}}}"#,
+        "\n\n"
+    );
+
+    /// The same reply as chat/completions streams it.
+    const CHAT_STREAM: &str = concat!(
+        r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","reasoning":"**Finding the entry point**"}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"index":0,"delta":{"reasoning":"\n\n"}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"index":0,"delta":{"reasoning":"main.rs should hold it."}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"index":0,"delta":{"content":"Let me"}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"index":0,"delta":{"content":" look."}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_Q7","type":"function","function":{"name":"read_file","arguments":""}}]}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"src/main.rs\"}"}}]}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "\n\n",
+        r#"data: {"choices":[],"usage":{"prompt_tokens":2468,"completion_tokens":187,"total_tokens":2655,"prompt_tokens_details":{"cached_tokens":2304},"completion_tokens_details":{"reasoning_tokens":128}}}"#,
+        "\n\ndata: [DONE]\n\n"
+    );
+
+    /// What `read` makes of `stream` when it comes from `path`, event by
+    /// event in words.
+    fn heard(path: &str, stream: &'static str) -> Vec<String> {
+        let (endpoint, worker) = serve(vec![("200 OK", "text/event-stream", stream)]);
+        let response = client()
+            .unwrap()
+            .post(format!("{endpoint}{path}"))
+            .body("{}")
+            .send()
+            .unwrap();
+        let (sender, events) = async_channel::unbounded();
+        let (mut stands, mut slow) = (false, false);
+        let extra = Extra::default();
+        read(
+            response,
+            &connection(),
+            &extra,
+            0,
+            &sender,
+            &mut stands,
+            &mut slow,
+        )
+        .unwrap();
+        worker.join().unwrap();
+        std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                Event::Delta(text) => Some(format!("text {text:?}")),
+                Event::Reasoning(text) => Some(format!("thinking {text:?}")),
+                Event::Usage {
+                    completion,
+                    prompt,
+                    cached,
+                    cache_write,
+                    reasoning,
+                    cost,
+                    ..
+                } => Some(format!(
+                    "usage {prompt} in, {cached} cached, {cache_write} written, \
+                     {completion} out, {reasoning} thinking, {cost:?}"
+                )),
+                Event::ToolCalls(calls) => Some(format!("calls {calls:?}")),
+                Event::Replay(replay) => Some(format!("replay {}", json!(replay.reasoning_items))),
+                Event::CutOff { in_call } => Some(format!("cut off {in_call}")),
+                // The drafts of a call follow only where its arguments
+                // happened to be cut.
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn recorded_responses_sse_gives_the_same_chunks_and_usage() {
+        let chat = heard("/chat/completions", CHAT_STREAM);
+        assert!(
+            chat.contains(
+                &"usage 2468 in, 2304 cached, 0 written, 187 out, 128 thinking, None".into()
+            ),
+            "{chat:?}"
+        );
+        let mut responses = heard("/responses", RESPONSES_STREAM);
+        // Only the Responses API hands its reasoning over to be sent back.
+        let replay = responses.pop();
+        assert_eq!(responses, chat);
+        let item = json!({"id": "rs_0a1b", "type": "reasoning", "encrypted_content": "gAAAAABo3xEnc",
+            "summary": [{"type": "summary_text", "text": "**Finding the entry point**"},
+                        {"type": "summary_text", "text": "main.rs should hold it."}]});
+        assert_eq!(replay, Some(format!("replay {}", json!([item]))));
+    }
+
+    #[test]
+    fn thinking_summarized_first_by_a_later_item_opens_without_blank_lines() {
+        let (sender, events) = async_channel::unbounded();
+        let mut reply = Reply::default();
+        let mut stands = false;
+        // The first item summarized comes after a search, at index 1.
+        let part = |summary_index: u64| {
+            json!({"type": "response.reasoning_summary_part.added",
+                   "output_index": 1, "summary_index": summary_index})
+        };
+        let words = |delta: &str| {
+            json!({"type": "response.reasoning_summary_text.delta",
+                   "output_index": 1, "delta": delta})
+        };
+        for event in [part(0), words("Searching."), part(1), words("Found it.")] {
+            let chunk = parse_chunk(&crate::wire_responses::chunk(&event)).unwrap();
+            reply.absorb(chunk, &mut stands, &sender).unwrap();
+        }
+        let mut thought = String::new();
+        while let Ok(event) = events.try_recv() {
+            if let Event::Reasoning(text) = event {
+                thought.push_str(&text);
+            }
+        }
+        assert_eq!(thought, "Searching.\n\nFound it.");
+    }
+
+    /// An assistant `reply` from `model` on OpenAI that read a file, with the
+    /// reasoning `item` the Responses API gave with it, then the file.
+    fn reasoned(model: &str, item: &Value) -> Vec<Message> {
+        let mut reply = thought_then_called("a", model);
+        reply.replay = Some(Box::new(Replay {
+            endpoint: "https://api.openai.com/v1".into(),
+            model: model.into(),
+            reasoning_details: Vec::new(),
+            extra_content: BTreeMap::new(),
+            reasoning_items: vec![item.clone()],
+        }));
+        answered(reply)
+    }
+
+    /// A connection to `model` on OpenAI's own API.
+    fn on_openai(model: &str) -> Connection {
+        Connection {
+            endpoint: "https://api.openai.com/v1".into(),
+            model: model.into(),
+            ..connection()
+        }
+    }
+
+    /// `body` read the way `classify` reads a refusal with `status`.
+    fn refused(status: u16, body: &str) -> Failure {
+        let body = serde_json::from_str(body).unwrap();
+        classify(Some(status), &reqwest::header::HeaderMap::new(), &body)
+    }
+
+    #[test]
+    fn reasoning_items_replay_before_their_calls() {
+        let item = json!({"id": "rs_1", "type": "reasoning", "summary": [], "encrypted_content": "gAAAAB1"});
+        let window = reasoned("gpt-5", &item);
+        let c = on_openai("gpt-5");
+        let endpoint = validate(&c).unwrap();
+        let (url, sent) = to_responses(&c, &endpoint, &body(&c, &window, None, None)).unwrap();
+        assert_eq!(url, "https://api.openai.com/v1/responses");
+        let input = sent["input"].as_array().unwrap();
+        let kinds: Vec<&str> = input
+            .iter()
+            .filter_map(|i| i["type"].as_str().or(i["role"].as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            ["user", "reasoning", "function_call", "function_call_output"]
+        );
+        // Whole but for its id: nothing is stored at OpenAI for it to name.
+        let mut unnamed = item.clone();
+        unnamed.as_object_mut().unwrap().remove("id");
+        assert_eq!(input[1], unnamed);
+        assert_eq!(
+            (&input[2]["call_id"], &input[3]["call_id"]),
+            (&json!("a"), &json!("a"))
+        );
+        // Another model's reasoning is not this one's to read.
+        let other = on_openai("gpt-5-mini");
+        let elsewhere = body(&other, &window, None, None);
+        let (_, sent) = to_responses(&other, &endpoint, &elsewhere).unwrap();
+        assert!(!sent.to_string().contains("gAAAAB1"));
+    }
+
+    #[test]
+    fn a_refused_responses_route_falls_back_to_chat_for_the_run() {
+        let model = "gpt-5-search-api";
+        let item = json!({"id": "rs_2", "type": "reasoning", "summary": [], "encrypted_content": "gAAAAB2"});
+        let window = reasoned(model, &item);
+        let c = on_openai(model);
+        let endpoint = validate(&c).unwrap();
+        let sent = body(&c, &window, None, None);
+        let (_, posted) = to_responses(&c, &endpoint, &sent).unwrap();
+        let refusal = r#"{"error":{"message":"The model gpt-5-search-api is not supported with the Responses API.","type":"invalid_request_error","param":"model","code":null}}"#;
+        let failure = refused(400, refusal);
+        assert!(learn_responses(&c, &sent, &posted, &failure, refusal));
+        // chat/completions from now on, without what only the other API reads.
+        assert!(to_responses(&c, &endpoint, &sent).is_none());
+        let again = body(&c, &window, None, None);
+        assert!(!again.to_string().contains("gAAAAB2"));
+        // One that went out alongside the first goes again there as well.
+        assert!(learn_responses(&c, &sent, &posted, &failure, refusal));
+        // An overflow is mended by a smaller window, not another API.
+        let overflow = r#"{"error":{"message":"Your input exceeds the context window of this model. Please adjust your input and try again.","type":"invalid_request_error","param":"input","code":"context_length_exceeded"}}"#;
+        let roomy = on_openai("gpt-5-overflows");
+        assert!(!learn_responses(
+            &roomy,
+            &sent,
+            &posted,
+            &refused(400, overflow),
+            overflow
+        ));
+        assert!(to_responses(&roomy, &endpoint, &sent).is_some());
+    }
+
+    #[test]
+    fn a_codex_model_never_falls_back() {
+        let c = on_openai("gpt-5-codex");
+        let endpoint = validate(&c).unwrap();
+        let sent = body(&c, &hi(), None, None);
+        let (_, posted) = to_responses(&c, &endpoint, &sent).unwrap();
+        let refusal = r#"{"error":{"message":"Unsupported parameter: 'truncation'.","type":"invalid_request_error","param":"truncation","code":"unsupported_parameter"}}"#;
+        assert!(!learn_responses(
+            &c,
+            &sent,
+            &posted,
+            &refused(400, refusal),
+            refusal
+        ));
+        let (url, _) = to_responses(&c, &endpoint, &sent).unwrap();
+        assert_eq!(url, "https://api.openai.com/v1/responses");
+    }
+
+    #[test]
+    fn a_key_kept_from_the_responses_api_falls_back_where_chat_serves_the_model() {
+        let refusal = r#"{"error":{"message":"You have insufficient permissions for this operation. Missing scopes: api.responses.write. Check that you have the correct role in your organization (Reader, Writer, Owner) and project (Member, Owner), and if you're using a restricted API key, that it has the necessary scopes.","type":"invalid_request_error","param":null,"code":null}}"#;
+        let failure = refused(401, refusal);
+        assert_eq!(failure.kind, FailureKind::Auth);
+        for (model, falls_back) in [
+            ("gpt-5-restricted", true),
+            ("gpt-5-codex-restricted", false),
+        ] {
+            let c = on_openai(model);
+            let endpoint = validate(&c).unwrap();
+            let sent = body(&c, &hi(), None, None);
+            let (_, posted) = to_responses(&c, &endpoint, &sent).unwrap();
+            let fell_back = learn_responses(&c, &sent, &posted, &failure, refusal);
+            assert_eq!(fell_back, falls_back, "{model}");
+            let on_chat = to_responses(&c, &endpoint, &sent).is_none();
+            assert_eq!(on_chat, falls_back, "{model}");
+        }
+        // A key that is simply wrong would be turned down there as well.
+        let wrong = r#"{"error":{"message":"Incorrect API key provided: sk-proj-****abcd. You can find your API key at https://platform.openai.com/account/api-keys.","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}"#;
+        let c = on_openai("gpt-5-wrong-key");
+        let endpoint = validate(&c).unwrap();
+        let sent = body(&c, &hi(), None, None);
+        let (_, posted) = to_responses(&c, &endpoint, &sent).unwrap();
+        assert!(!learn_responses(
+            &c,
+            &sent,
+            &posted,
+            &refused(401, wrong),
+            wrong
+        ));
+        assert!(to_responses(&c, &endpoint, &sent).is_some());
+    }
+
+    /// OpenAI's refusal of summaries to an organization it has not verified.
+    const SUMMARIES_REFUSED: &str = r#"{"error":{"message":"Your organization must be verified to generate reasoning summaries. Please go to: https://platform.openai.com/settings/organization/general and click on Verify Organization. If you just verified, it can take up to 15 minutes for access to propagate.","type":"invalid_request_error","param":"reasoning.summary","code":"unsupported_value"}}"#;
+
+    #[test]
+    fn an_organization_refused_summaries_is_asked_for_none() {
+        let c = on_openai("gpt-5.1-codex");
+        let endpoint = validate(&c).unwrap();
+        let sent = body(&c, &hi(), None, None);
+        let (_, asked) = to_responses(&c, &endpoint, &sent).unwrap();
+        assert_eq!(asked["reasoning"]["summary"], "auto");
+        let failure = refused(400, SUMMARIES_REFUSED);
+        assert!(learn_responses(
+            &c,
+            &sent,
+            &asked,
+            &failure,
+            SUMMARIES_REFUSED
+        ));
+        let (url, again) = to_responses(&c, &endpoint, &sent).unwrap();
+        assert_eq!(url, "https://api.openai.com/v1/responses");
+        assert!(again["reasoning"].get("summary").is_none());
+        // Asked for none, a refusal that still names them is shown as it is.
+        assert!(!learn_responses(
+            &c,
+            &sent,
+            &again,
+            &failure,
+            SUMMARIES_REFUSED
+        ));
+    }
+
+    #[test]
+    fn requests_out_together_each_go_again_without_summaries() {
+        let failure = refused(400, SUMMARIES_REFUSED);
+        // Neither a model with a chat route nor one without leaves this API.
+        for model in ["gpt-5-alongside", "gpt-5-codex-alongside"] {
+            let c = on_openai(model);
+            let endpoint = validate(&c).unwrap();
+            let sent = body(&c, &hi(), None, None);
+            let (_, first) = to_responses(&c, &endpoint, &sent).unwrap();
+            let (_, second) = to_responses(&c, &endpoint, &sent).unwrap();
+            for posted in [first, second] {
+                let again = learn_responses(&c, &sent, &posted, &failure, SUMMARIES_REFUSED);
+                assert!(again, "{model}");
+            }
+            let (_, next) = to_responses(&c, &endpoint, &sent).expect(model);
+            assert!(next["reasoning"].get("summary").is_none(), "{model}");
+        }
+    }
+
+    #[test]
+    fn a_reply_waited_for_whole_asks_for_no_summaries() {
+        let c = on_openai("gpt-5");
+        let endpoint = validate(&c).unwrap();
+        let mut sent = body(&c, &hi(), None, None);
+        sent["stream"] = false.into();
+        let (_, posted) = to_responses(&c, &endpoint, &sent).unwrap();
+        assert_eq!(posted["stream"], false);
+        assert!(posted["reasoning"].get("summary").is_none(), "{posted}");
+    }
+
+    #[test]
+    fn a_summary_asked_for_on_its_own_leaves_room_to_think() {
+        let c = on_openai("gpt-5");
+        let endpoint = validate(&c).unwrap();
+        // As compact.rs asks for one: its cap is for the summary alone.
+        let asked = json!({
+            "model": "gpt-5",
+            "messages": [
+                {"role": "system", "content": "Summarize."},
+                {"role": "user", "content": "Messages: ..."},
+            ],
+            "stream": false,
+            "max_tokens": 1500,
+        });
+        let (_, posted) = to_responses(&c, &endpoint, &asked).unwrap();
+        assert_eq!(posted["max_output_tokens"], COMPLETION_TOKENS);
+    }
+
+    #[test]
+    fn one_call_a_reply_is_asked_for_over_the_responses_api_too() {
+        let c = Connection {
+            tools: true,
+            ..on_openai("gpt-5-one-call")
+        };
+        let endpoint = validate(&c).unwrap();
+        // As `body` builds it with the setting off, set here rather than in a
+        // settings file the tests beside this one would read.
+        let mut sent = body(&c, &hi(), None, None);
+        sent["parallel_tool_calls"] = false.into();
+        let (url, posted) = to_responses(&c, &endpoint, &sent).unwrap();
+        assert_eq!(url, "https://api.openai.com/v1/responses");
+        assert_eq!(posted["parallel_tool_calls"], false, "{posted}");
+        // Turned down there, it is learned from the request as built.
+        let refusal = r#"{"error":{"message":"Unsupported parameter: 'parallel_tool_calls' is not supported with this model.","type":"invalid_request_error","param":"parallel_tool_calls","code":"unsupported_parameter"}}"#;
+        assert!(learn(&c, &sent, refusal));
+        let (url, again) = to_responses(&c, &endpoint, &sent).unwrap();
+        assert_eq!(url, "https://api.openai.com/v1/responses");
+        assert!(again.get("parallel_tool_calls").is_none(), "{again}");
+    }
+
+    #[test]
+    fn an_effort_the_model_turns_down_is_left_out_on_the_same_api() {
+        let c = Connection {
+            effort: "low".into(),
+            ..on_openai("gpt-5-pro")
+        };
+        let endpoint = validate(&c).unwrap();
+        let sent = body(&c, &hi(), None, None);
+        let (_, posted) = to_responses(&c, &endpoint, &sent).unwrap();
+        assert_eq!(posted["reasoning"]["effort"], "low");
+        let refusal = r#"{"error":{"message":"Unsupported value: 'low' is not supported with the 'gpt-5-pro' model. Supported values are: 'high'.","type":"invalid_request_error","param":"reasoning.effort","code":"unsupported_value"}}"#;
+        assert!(learn_responses(
+            &c,
+            &sent,
+            &posted,
+            &refused(400, refusal),
+            refusal
+        ));
+        let again = body(&c, &hi(), None, None);
+        let (url, posted) = to_responses(&c, &endpoint, &again).unwrap();
+        assert_eq!(url, "https://api.openai.com/v1/responses");
+        assert!(posted["reasoning"].get("effort").is_none(), "{posted}");
+    }
+
+    #[test]
+    fn reasoning_encrypted_for_another_key_is_not_sent_back_again() {
+        let model = "gpt-5.2-codex";
+        let item = json!({"id": "rs_3", "type": "reasoning", "summary": [], "encrypted_content": "gAAAAB3"});
+        let window = reasoned(model, &item);
+        let c = on_openai(model);
+        let endpoint = validate(&c).unwrap();
+        let sent = body(&c, &window, None, None);
+        let (_, posted) = to_responses(&c, &endpoint, &sent).unwrap();
+        let refusal = r#"{"error":{"message":"The encrypted content for item rs_3 could not be verified.","type":"invalid_request_error","param":null,"code":"invalid_encrypted_content"}}"#;
+        assert!(learn_responses(
+            &c,
+            &sent,
+            &posted,
+            &refused(400, refusal),
+            refusal
+        ));
+        let again = body(&c, &window, None, None);
+        let (url, posted) = to_responses(&c, &endpoint, &again).unwrap();
+        assert_eq!(url, "https://api.openai.com/v1/responses");
+        assert!(!posted.to_string().contains("gAAAAB3"));
+    }
+
     /// An environment holding only `LETRONNA_READ_TIMEOUT`, set to `value`.
     fn read_timeout(value: &str) -> impl Fn(&str) -> Option<String> {
         move |name| (name == "LETRONNA_READ_TIMEOUT").then(|| value.to_owned())
@@ -9937,6 +10562,7 @@ mod tests {
                     model,
                     reasoning_details: vec![thinking],
                     extra_content: BTreeMap::new(),
+                    reasoning_items: Vec::new(),
                 })),
                 ..said("assistant", "")
             },

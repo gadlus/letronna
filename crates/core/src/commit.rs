@@ -449,6 +449,8 @@ fn suggest_of(
 ) -> Result<String, crate::side::Failed> {
     let endpoint = crate::chat::validate(connection)?;
     let body = suggest_body(connection, diff, subjects);
+    let (endpoint, body) =
+        crate::chat::to_responses(connection, &endpoint, &body).unwrap_or((endpoint, body));
     // The shared client would give up on a slow reply after its idle wait.
     let request = crate::chat::client()?
         .post(endpoint)
@@ -458,7 +460,7 @@ fn suggest_of(
         .and_then(|r| r.error_for_status())
         .and_then(|r| r.json())
         .map_err(|e| crate::side::Failed::sending(&e, format!("No message came back: {e}")))?;
-    let value = crate::chat::as_chat(connection, value);
+    let value = crate::wire_responses::reply(crate::chat::as_chat(connection, value));
     let text = crate::chat::unwrap_response(&value)?
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)

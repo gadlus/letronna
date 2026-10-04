@@ -900,6 +900,7 @@ mod tests {
             reasoning_details: vec![json!({"type": "thinking", "thinking": "A plan first.",
                 "signature": "c2lnbmVk", "index": 0})],
             extra_content: Default::default(),
+            reasoning_items: Default::default(),
         };
         let todo = r#"{"items": [{"text": "Read a.rs", "status": "doing"}]}"#;
         let mut messages = vec![
