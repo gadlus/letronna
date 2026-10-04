@@ -1458,7 +1458,7 @@ fn body_hashed(
         prefix.set(Reason::Model, route);
     }
     let mut context = vec![json!({"role": "system", "content": system.text})];
-    let sees = sees_images(&connection.model) && listed_as_seeing(connection);
+    let sees = takes_images(connection);
     let shown: Vec<(Picture, Value)> = pictures(window)
         .into_iter()
         .filter(|_| sees)
@@ -1532,6 +1532,22 @@ fn body_hashed(
         }
         if on_demand {
             crate::mcp_find::wrap(&mut wired, connection);
+        }
+        // A model that cannot view what the user attached is told so, and
+        // how else to look, rather than only that it is there.
+        if m.role == "user"
+            && !sees
+            && let Some(text) = wired["content"].as_str()
+        {
+            let unseen: String = (m.images.iter())
+                .filter(|path| crate::media::is_picture(path))
+                .filter_map(|path| {
+                    let bytes = std::fs::read(path).ok()?;
+                    let note = crate::media::unseen(&bytes);
+                    Some(format!("\n\n{} is {note}", path.display()))
+                })
+                .collect();
+            wired["content"] = format!("{text}{unseen}").into();
         }
         let here = shown.iter().filter(|(picture, _)| picture.after == i);
         if m.role == "user" {
@@ -1855,6 +1871,12 @@ fn listed_as_seeing(connection: &Connection) -> bool {
 fn sightless() -> &'static Mutex<HashSet<String>> {
     static SIGHTLESS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     SIGHTLESS.get_or_init(Default::default)
+}
+
+/// Whether `connection`'s model is sent pictures: not when its gateway's
+/// list says it takes text alone, nor once it has turned one down.
+pub(crate) fn takes_images(connection: &Connection) -> bool {
+    sees_images(&connection.model) && listed_as_seeing(connection)
 }
 
 fn sees_images(model: &str) -> bool {
@@ -5910,12 +5932,21 @@ mod tests {
         let told = body(&blind, &messages, None, None)["messages"].clone();
         let told = told.as_array().unwrap();
         assert!(told.iter().all(|m| urls(m).is_empty()) && told.len() == 5);
+        let attached = told[4]["content"].as_str().unwrap();
+        assert!(attached.starts_with("(Attached a picture"), "{attached}");
+        // And that it cannot view it, with what it is and how else to look.
+        let four = dir.join("4.jpg").display().to_string();
         assert!(
-            told[4]["content"]
-                .as_str()
-                .unwrap()
-                .starts_with("(Attached a picture")
+            attached.contains(&format!(
+                "\n\n{four} is a JPEG picture, 1 KB. This model cannot view images"
+            )),
+            "{attached}"
         );
+        let first = told[1]["content"].as_str().unwrap();
+        assert_eq!(first.matches("This model cannot view images").count(), 3);
+        // A model that sees is not told.
+        let seen = body(&connection(), &messages, None, None).to_string();
+        assert!(!seen.contains("cannot view images"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

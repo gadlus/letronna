@@ -3706,7 +3706,10 @@ impl Tool for ReadFile {
         if path.is_dir() {
             return Err(format!("`{raw}` is a folder; list it with list_dir."));
         }
-        if let Some(copy) = open_picture(&path, raw)? {
+        // A call with no model behind it, as a plugin's own, shows the
+        // picture as a request to an unknown model would.
+        let sees = (ctx.caller.connection.as_deref()).is_none_or(crate::chat::takes_images);
+        if let Some(copy) = open_picture(&path, raw, sees)? {
             return Ok(copy);
         }
         let before = crate::filestate::stat(&path);
@@ -3747,9 +3750,10 @@ impl Tool for ReadFile {
 
 /// A picture read_file was pointed at, copied as it is now into Letronna's
 /// own `media/`, from where the next request shows it to the model, scaled
-/// down as `media::fit` does when it cannot be sent as it is; None for a
-/// file that is not a picture.
-fn open_picture(path: &Path, raw: &str) -> Result<Option<String>, String> {
+/// down as `media::fit` does when it cannot be sent as it is, or only
+/// described when the model `sees` none; None for a file that is not a
+/// picture.
+fn open_picture(path: &Path, raw: &str, sees: bool) -> Result<Option<String>, String> {
     let mut start = Vec::new();
     std::fs::File::open(path)
         .and_then(|file| file.take(12).read_to_end(&mut start))
@@ -3763,6 +3767,15 @@ fn open_picture(path: &Path, raw: &str) -> Result<Option<String>, String> {
         return Ok(None);
     }
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    // No copy is kept, so nothing the model cannot use is sent, whatever
+    // model the session moves to later.
+    if !sees {
+        // As below, a file that only starts as a BMP does is not one.
+        if kind.is_none() && crate::media::dimensions(&bytes).is_none() {
+            return Ok(None);
+        }
+        return Ok(Some(format!("`{raw}` is {}", crate::media::unseen(&bytes))));
+    }
     let size = crate::media::size(bytes.len());
     let (bytes, kind, scaled) = match kind {
         Some(kind) if bytes.len() <= crate::media::PICTURE_BYTES => (bytes, kind, String::new()),
@@ -4952,6 +4965,55 @@ mod tests {
         assert_eq!(crate::media::picture_kind(&sent), Some("png"));
         let notes = run("read_file", r#"{"path":"notes.txt"}"#, &ctx).unwrap();
         assert_eq!(notes, "1|BMX and BMW");
+    }
+
+    #[test]
+    fn read_file_tells_a_model_that_cannot_see_about_a_picture_and_sends_none() {
+        let (_turn, data) = data_folder("picture-unseen");
+        // Outside the data folder, whose files read_file refuses.
+        let dir = Scratch::new("picture-unseen-project");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(40, 30)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(dir.join("cat.png"), &png).unwrap();
+        let connection = Connection {
+            endpoint: "http://reads-text.invalid/v1".into(),
+            model: "text-alone".into(),
+            workspace: Some(dir.to_path_buf()),
+            ..Default::default()
+        };
+        crate::models::remember(
+            &connection.endpoint,
+            &[
+                json!({"id": "text-alone", "input_modalities": ["text"]}),
+                json!({"id": "sees-too", "input_modalities": ["text", "image"]}),
+            ],
+        );
+        let ctx = ToolContext::of(&connection);
+        let read = run("read_file", r#"{"path":"cat.png"}"#, &ctx).unwrap();
+        assert!(
+            read.starts_with("`cat.png` is a PNG picture of 40x30 pixels, 1 KB. This model cannot view images, so it was not sent"),
+            "{read}"
+        );
+        assert_eq!(crate::media::saved_by("read_file", &read), None);
+        assert!(!data.join("media").exists(), "a copy was kept to send");
+        // A model that sees is shown the picture as before.
+        let sees = Connection {
+            model: "sees-too".into(),
+            ..connection
+        };
+        let read = run(
+            "read_file",
+            r#"{"path":"cat.png"}"#,
+            &ToolContext::of(&sees),
+        )
+        .unwrap();
+        assert!(
+            crate::media::saved_by("read_file", &read).is_some(),
+            "{read}"
+        );
+        std::fs::remove_dir_all(data).unwrap();
     }
 
     #[test]

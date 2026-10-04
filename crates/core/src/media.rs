@@ -1280,6 +1280,65 @@ pub fn picture_kind(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// What a model that cannot view pictures is told of one in place of it.
+const UNSEEN: &str = "This model cannot view images, so it was not sent, and dumping its pixel values will not show what it is.";
+
+/// A script the Mac's own Vision framework looks at a picture with: the
+/// labels it gives the whole picture, then any text it reads in it.
+const VISION_SCRIPT: &str = r#"import Foundation
+import Vision
+let url = URL(fileURLWithPath: CommandLine.arguments[1])
+let labels = VNClassifyImageRequest()
+let text = VNRecognizeTextRequest()
+try VNImageRequestHandler(url: url, options: [:]).perform([labels, text])
+for case let label as VNClassificationObservation in labels.results ?? [] where label.confidence > 0.1 {
+    print(label.identifier, label.confidence)
+}
+for case let line as VNRecognizedTextObservation in text.results ?? [] {
+    print(line.topCandidates(1).first?.string ?? "")
+}
+"#;
+
+/// What a model that cannot view pictures is told of the picture in
+/// `bytes`, after its name: its format and size, and how to look into it
+/// with what this computer has.
+pub(crate) fn unseen(bytes: &[u8]) -> String {
+    let mac = cfg!(target_os = "macos");
+    unseen_on(
+        bytes,
+        mac,
+        !mac && crate::files::on_path("tesseract").is_some(),
+    )
+}
+
+/// `unseen` on a Mac, or elsewhere with or without tesseract on PATH.
+fn unseen_on(bytes: &[u8], mac: bool, tesseract: bool) -> String {
+    let format = match picture_kind(bytes) {
+        Some("png") => "a PNG",
+        Some("jpg") => "a JPEG",
+        Some("gif") => "a GIF",
+        Some("webp") => "a WebP",
+        _ if bytes.starts_with(b"BM") => "a BMP",
+        _ => "a",
+    };
+    let pixels = dimensions(bytes)
+        .map(|(width, height)| format!(" of {width}x{height} pixels"))
+        .unwrap_or_default();
+    let size = size(bytes.len());
+    // The Mac's classifier names what a picture shows; elsewhere nothing
+    // that comes with the system does, and tesseract only reads its text.
+    let how = if mac {
+        format!(
+            "To see what it shows, save this as look.swift and run `swift look.swift <path>` (swift comes with Xcode's command line tools); it prints the labels VNClassifyImageRequest gives it, then any text VNRecognizeTextRequest reads in it:\n```swift\n{VISION_SCRIPT}```"
+        )
+    } else if tesseract {
+        "To read any text in it, run `tesseract <path> -`. Nothing found here says what else it shows, so for that ask the user, or to switch to a model that takes images.".to_owned()
+    } else {
+        "No tool found here reads pictures, so ask the user what it shows, or to switch to a model that takes images.".to_owned()
+    };
+    format!("{format} picture{pixels}, {size}. {UNSEEN} {how}")
+}
+
 /// Whether `path` is named as a picture a model can be shown.
 pub fn is_picture(path: &Path) -> bool {
     path.extension().is_some_and(|extension| {
@@ -1372,6 +1431,60 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A PNG of `width` by `height` black pixels.
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::DynamicImage::new_rgb8(width, height)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn a_model_that_cannot_see_is_told_the_picture_and_the_macs_own_way_to_look() {
+        let note = unseen_on(&png(3, 2), true, false);
+        assert!(
+            note.starts_with("a PNG picture of 3x2 pixels, 1 KB. This model cannot view images"),
+            "{note}"
+        );
+        for named in [
+            "VNClassifyImageRequest",
+            "VNRecognizeTextRequest",
+            "swift look.swift <path>",
+        ] {
+            assert!(note.contains(named), "{named}: {note}");
+        }
+        assert!(note.ends_with("```"), "{note}");
+        assert!(!note.contains("tesseract"), "{note}");
+    }
+
+    #[test]
+    fn elsewhere_it_is_offered_tesseract_only_when_it_is_there() {
+        let read = unseen_on(&png(3, 2), false, true);
+        assert!(read.contains("`tesseract <path> -`"), "{read}");
+        assert!(
+            !read.contains("Vision") && !read.contains("swift"),
+            "{read}"
+        );
+        let none = unseen_on(&png(3, 2), false, false);
+        assert!(none.ends_with("No tool found here reads pictures, so ask the user what it shows, or to switch to a model that takes images."), "{none}");
+        assert!(!none.contains("tesseract"), "{none}");
+    }
+
+    #[test]
+    fn a_picture_that_cannot_be_measured_is_still_named_by_its_format() {
+        let note = unseen_on(&[0xFF, 0xD8, 0xFF, 1], false, false);
+        assert!(note.starts_with("a JPEG picture, 1 KB. "), "{note}");
+        let mut bmp = Vec::new();
+        image::DynamicImage::new_rgb8(4, 4)
+            .write_to(&mut std::io::Cursor::new(&mut bmp), image::ImageFormat::Bmp)
+            .unwrap();
+        assert!(unseen_on(&bmp, false, false).starts_with("a BMP picture of 4x4 pixels"));
+    }
 
     #[test]
     fn every_media_call_shares_one_client() {
