@@ -1,7 +1,7 @@
 [
   {
     "function": {
-      "description": "Read a text file, or look at a PNG, JPEG, GIF, WebP or BMP picture; one too big to send is scaled down. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from. A Jupyter notebook (.ipynb) reads as numbered cells with short outputs, and N counts the lines of that view.",
+      "description": "Read a text file, a PDF, Word, Excel or PowerPoint file, or look at a PNG, JPEG, GIF, WebP or BMP picture; one too big to send is scaled down. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from. A Jupyter notebook (.ipynb) reads as numbered cells with short outputs, a document as its text with a heading for each page, sheet or slide, and N counts the lines of that view.",
       "name": "read_file",
       "parameters": {
         "properties": {
@@ -185,7 +185,7 @@
   },
   {
     "function": {
-      "description": "Run a bash command in the project folder, or in the folder inside it that workdir names. Each call is a fresh shell: cd, export and source do not carry over to the next call, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish and returns its output, for up to 2 minutes or the `timeout` given. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead.",
+      "description": "Run a bash command in the project folder, or in the folder inside it that workdir names. Each call is a fresh shell: cd, export and source do not carry over to the next call, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish, for up to 2 minutes or the `timeout` given, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0. Past its timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, with a file for read_file named in the cut, so a build or test run need not be piped through tail, which would also hide its exit code. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead.",
       "name": "run_command",
       "parameters": {
         "properties": {
@@ -194,6 +194,7 @@
             "type": "boolean"
           },
           "command": {
+            "description": "The command line; it runs as one script.",
             "type": "string"
           },
           "notify_on": {
@@ -206,6 +207,10 @@
           "timeout": {
             "description": "Seconds to wait for it to finish, 1 to 1800; 120 if left out. Give a slow build, install or test suite longer.",
             "type": "number"
+          },
+          "tty": {
+            "description": "Run it in the background on a pseudo-terminal, so you can answer it with send_job. Only for a program that must be answered at a keyboard and has no flag to skip the question.",
+            "type": "boolean"
           },
           "unsandboxed": {
             "description": "Run it outside the sandbox. Only after a sandboxed run of it failed for want of the network or of writing outside the project; it needs the user's approval.",
@@ -273,6 +278,48 @@
         },
         "required": [
           "id"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Type into a tty job and return what it prints next. keys: enter, tab, esc, up, down, ctrl-c, ctrl-d. Never for passwords.",
+      "name": "send_job",
+      "parameters": {
+        "properties": {
+          "job": {
+            "type": "integer"
+          },
+          "keys": {
+            "description": "Pressed after text, in order.",
+            "items": {
+              "enum": [
+                "enter",
+                "tab",
+                "esc",
+                "up",
+                "down",
+                "ctrl-c",
+                "ctrl-d"
+              ],
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "text": {
+            "description": "Typed first, as it is.",
+            "type": "string"
+          },
+          "until": {
+            "description": "Return once the job prints this, rather than once it goes quiet.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job"
         ],
         "type": "object"
       }
@@ -349,6 +396,10 @@
             "description": "For add: run once at this local date and time, YYYY-MM-DD HH:MM.",
             "type": "string"
           },
+          "check": {
+            "description": "For add: a command run first each time; when its output matches last time's, the run is skipped. Print only what matters (e.g. `curl -s URL | jq .price`), never a clock.",
+            "type": "string"
+          },
           "daily_at": {
             "description": "For add: HH:MM each day, in this computer's time zone.",
             "type": "string"
@@ -383,6 +434,10 @@
           "prompt": {
             "description": "For add: what each run is told. It starts with no memory of this chat, so say everything it needs.",
             "type": "string"
+          },
+          "quiet": {
+            "description": "For add: post a run only when it has news. Use for watches and alerts, not digests or reminders.",
+            "type": "boolean"
           },
           "weekdays_only": {
             "description": "With daily_at: Monday to Friday only.",
@@ -537,7 +592,7 @@
   },
   {
     "function": {
-      "description": "Keep something for later sessions, or correct what is kept. target \"user\" is what you know about the user (USER.md); target \"memory\" is your own notes (MEMORY.md); target \"project\" is your notes on the project folder attached to this session, for what is true of it alone. They are shown to you at the start of every session (a project's only while it is attached) and have small budgets. action \"add\" keeps content as a new entry; \"replace\" swaps the entry containing old_text for content; \"remove\" deletes the entry containing old_text. To make several changes to one target, pass operations instead, in one call: they are made in order, all or none, and the budget is checked on the result, so a call can make room and add. When one is full, replace or remove before adding.",
+      "description": "Keep something for later sessions, or correct what is kept. target \"user\" is what you know about the user (USER.md); target \"memory\" is your own notes (MEMORY.md); target \"project\" is your notes on the project folder attached to this session, for what is true of it alone, such as how to build and test it. They are shown to you at the start of every session (a project's only while it is attached) and have small budgets. action \"add\" keeps content as a new entry; \"replace\" swaps the entry containing old_text for content; \"remove\" deletes the entry containing old_text. To make several changes to one target, pass operations instead, in one call: they are made in order, all or none, and the budget is checked on the result, so a call can make room and add. When one is full, replace or remove before adding.",
       "name": "memory",
       "parameters": {
         "properties": {
@@ -1368,6 +1423,53 @@
         },
         "required": [
           "code"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Search the web. Returns a numbered list of results, each with its title, address and a snippet. Snippets are cut short and may be stale: before you state a fact from a search, read the page that settles it in full with web_fetch, preferring the primary source (the official site or the project's own docs) over a page summarizing it, and give that page's address beside the fact. allowed_domains keeps only results from those sites and blocked_domains drops them, subdomains included; a site in both is blocked. Some services apply site filters after answering, so fewer results may come back. freshness keeps to pages from the last day, week, month or year. The same search again within 10 minutes gives the earlier answer.",
+      "name": "search_web",
+      "parameters": {
+        "properties": {
+          "allowed_domains": {
+            "description": "Only results from these sites and their subdomains, such as [\"docs.rs\"].",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "blocked_domains": {
+            "description": "No results from these sites or their subdomains.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "count": {
+            "description": "How many results, 1 to 10. Left out, 5.",
+            "type": "integer"
+          },
+          "freshness": {
+            "description": "Only pages from this last stretch of time.",
+            "enum": [
+              "day",
+              "week",
+              "month",
+              "year"
+            ],
+            "type": "string"
+          },
+          "query": {
+            "description": "What to search for, as you would type it into a search engine.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
         ],
         "type": "object"
       }

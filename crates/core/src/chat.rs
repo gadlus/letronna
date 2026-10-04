@@ -6047,6 +6047,7 @@ mod tests {
         unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
         let c = Connection {
             tools: true,
+            human: true,
             ..connection()
         };
         let messages = [said("user", "hello"), said("assistant", "hi there")];
@@ -6055,7 +6056,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         // Nothing written yet: memory still carries the guidance paragraph
-        // that goes out whenever tools do, and the built-in skill is listed.
+        // that goes out whenever tools do and someone watches, and the
+        // built-in skill is listed.
         assert!(parts.memory > 0, "{parts:?}");
         assert!(parts.skills > 0, "{parts:?}");
         // No MCP server is set up in the test.
