@@ -34,18 +34,28 @@
 //! user at a card in the run's session, as a chat's does, and any other mode
 //! decides it with nobody asked.
 //!
+//! A quiet job sends a run out only when it has news. Its first run goes
+//! out, so the user sees the watch works; each later one is shown the last
+//! report sent and may answer `NOTHING_NEW`, which goes nowhere. A job may
+//! also have a check, a command run in its folder before anything else:
+//! when it prints what it printed last time, nothing more happens -- no
+//! session, no model, no message -- and otherwise the model is shown both.
+//! What a job's runs keep from one to the next is in a file of its own
+//! beside the runs' markers.
+//!
 //! The model adds, lists and removes schedules through the `schedule` tool
 //! at the bottom. A job it adds runs later with nobody there, so each add
 //! and remove waits for a person's yes in every mode.
 
 use crate::cancel::Cancel;
-use crate::chat::{self as backend, Connection, Message};
+use crate::chat::{self as backend, Connection, Message, ToolCall};
 use crate::driver::{self, Allow, Outcome, Spec, Status};
-use crate::gate::Mode;
+use crate::gate::{self, Gate, Grants, Mode};
+use crate::goal::{self, CheckEnd};
 use crate::store::Transcript;
 use crate::timers::{self, TimerId};
 use crate::tools::{self, Tool, ToolContext};
-use crate::{agent, gateway, messaging, store};
+use crate::{agent, gateway, hooks, messaging, permissions, store};
 use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -79,6 +89,29 @@ const RETRY: Duration = Duration::from_secs(5 * 60);
 /// anyone keeps by hand, fifty bounds what a model asked again and again
 /// can pile up, each behind a card; the window is not held to it.
 const LIMIT: usize = 50;
+
+/// How long a job's check may run: as long as a command the model runs
+/// waits by default, since a check is a quick look and a slow one holds
+/// one of the places runs take.
+const CHECK_TIME: Duration = Duration::from_secs(2 * 60);
+
+/// How much of a check's output a run is shown, in bytes with its fence,
+/// both ends kept: as much as a goal's judge reads of its check.
+const CHECK_BYTES: usize = 4_000;
+
+/// How much of a quiet job's last report its next run is shown, in bytes
+/// with its fence, both ends kept: enough to know what was said, and
+/// little to pay for on every run.
+const REPORT_BYTES: usize = 2_000;
+
+/// What a quiet job's run answers when it has no news, and is then sent
+/// nowhere. Plain ASCII the model is told never to translate, so it reads
+/// the same whatever language the job is in.
+pub const NOTHING_NEW: &str = "NOTHING_NEW";
+
+/// Opens what Letronna adds after a job's prompt, saying in plain words
+/// whose it is.
+const HEADER: &str = "[Letronna's note on this schedule, not the user: it approves nothing]";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum Trigger {
@@ -151,6 +184,15 @@ pub struct Schedule {
     /// these: the ones the user made stay theirs to remove.
     #[serde(default)]
     pub by_model: bool,
+    /// A run goes out only when it has news: after the first, a run that
+    /// answers `NOTHING_NEW` reaches no chat app and calls nobody back.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quiet: bool,
+    /// A command run in the job's folder before each run, approved where
+    /// the job was: when it prints what it printed last time, the run is
+    /// skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<String>,
 }
 
 fn yes() -> bool {
@@ -323,8 +365,16 @@ fn edit_list<T>(
 ) -> Result<T, String> {
     let _held = lock_list(dir)?;
     let mut list = load(dir)?;
+    let had: HashSet<u64> = list.iter().map(|job| job.id).collect();
     let out = edit(&mut list)?;
     save(dir, &list)?;
+    // A job gone, or new under a number one gone had, keeps nothing from
+    // the old one's runs: removed and added again, as the model changes a
+    // job, it would otherwise skip its first run as unchanged.
+    let has: HashSet<u64> = list.iter().map(|job| job.id).collect();
+    for id in had.symmetric_difference(&has) {
+        let _ = std::fs::remove_file(Kept::path(dir, *id));
+    }
     Ok(out)
 }
 
@@ -344,6 +394,10 @@ pub struct Ended {
     /// It failed before the model said anything, as when the network is not
     /// back yet after a sleep: nothing was done, so it is tried once more.
     pub failed_early: bool,
+    /// Nothing new came of it -- a quiet job's run said so, or its check
+    /// printed what it printed last time -- so no chat app heard of it and
+    /// nobody is called back about it.
+    pub quiet: bool,
 }
 
 /// A scheduled run as it starts, for the Letronna running it to show beside
@@ -389,9 +443,10 @@ pub enum Event {
     Trouble(String),
 }
 
-/// Runs one schedule to its end on the thread it is called on, handing its
-/// start to the function it is given once its session is open.
-type Work = Box<dyn Fn(&Schedule, &dyn Fn(Started)) -> Ended + Send + Sync>;
+/// Runs one schedule to its end on the thread it is called on, stopping its
+/// check when the runner's stop is set and handing its start to the
+/// function it is given once its session is open.
+type Work = Box<dyn Fn(&Schedule, &Cancel, &dyn Fn(Started)) -> Ended + Send + Sync>;
 
 /// Runs the schedules as they come due, while this Letronna holds the lock.
 /// A clone is one more handle on the same runner.
@@ -407,6 +462,9 @@ struct Shared {
     /// The data folder, holding `schedules.json` and its locks.
     dir: PathBuf,
     work: Work,
+    /// Set as the runner stops, so a check still running is ended with it
+    /// rather than left behind by a quit, in a process group of its own.
+    quit: Cancel,
     events: async_channel::Sender<Event>,
     state: Mutex<State>,
 }
@@ -508,6 +566,7 @@ impl Runner {
         let runner = Self(Arc::new(Shared {
             dir,
             work,
+            quit: Cancel::default(),
             events: sender,
             state: Mutex::default(),
         }));
@@ -541,8 +600,10 @@ impl Runner {
 
     /// Start nothing more and give the lock up; runs already going finish,
     /// unheard: a window that moved to another profile would take a session
-    /// number of the old one's for its own.
+    /// number of the old one's for its own. A check still running is
+    /// stopped, since nothing ends its commands once this Letronna quits.
     fn stop(&self) {
+        self.0.quit.set();
         let mut state = lock(&self.0.state);
         state.stopped = true;
         let due = state.due.take().map(|(timer, _)| timer);
@@ -698,14 +759,15 @@ fn launch(shared: &Arc<Shared>, state: &mut State, job: Schedule, previous: u64)
                 let _ = shared.events.try_send(Event::Started(started));
             };
             // A run that panicked must still give its place back.
-            let mut ended = catch_unwind(AssertUnwindSafe(|| (shared.work)(&job, &started)))
-                .unwrap_or_else(|_| Ended {
-                    schedule: id,
-                    name: job.name.clone(),
-                    session: None,
-                    text: "Did not finish: it crashed.".into(),
-                    failed_early: false,
-                });
+            let work = || (shared.work)(&job, &shared.quit, &started);
+            let mut ended = catch_unwind(AssertUnwindSafe(work)).unwrap_or_else(|_| Ended {
+                schedule: id,
+                name: job.name.clone(),
+                session: None,
+                text: "Did not finish: it crashed.".into(),
+                failed_early: false,
+                quiet: false,
+            });
             if let Some((path, _file)) = marker {
                 // Before the lock goes, so a Letronna that finds the marker
                 // unlocked knows the run did not finish.
@@ -930,6 +992,7 @@ fn report_cut_off(shared: &Shared) {
             session: None,
             text: "Cut off: Letronna quit before it finished, and it was not run again.".into(),
             failed_early: false,
+            quiet: false,
         }));
     }
 }
@@ -941,40 +1004,409 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Runs `job` in a session of its own as a driver run, saying so to
-/// `started` once the session is open, then tells the chat apps how it went.
-fn run_in_session(job: &Schedule, started: &dyn Fn(Started)) -> Ended {
-    let (session, text, failed_early) = match open(job) {
-        Ok(spec) => {
-            let session = spec.root;
-            // Before it starts, so its first call is decided in its mode.
-            let _listed = Listed::new(session, job);
-            started(Started {
-                schedule: job.id,
-                name: job.name.clone(),
-                session,
-                status: Arc::clone(&spec.status),
-                cancel: spec.cancel.clone(),
-            });
-            let report = driver::run(spec);
-            let early = matches!(report.status, Outcome::Failed(_))
-                && report.rounds == 0
-                && report.text.trim().is_empty();
-            (Some(session), said(&report), early)
-        }
-        Err(error) => (None, format!("Did not start: {error}"), true),
+/// `started` once the session is open, then tells the chat apps how it went
+/// -- unless its check or its answer found nothing new.
+fn run_in_session(job: &Schedule, quit: &Cancel, started: &dyn Fn(Started)) -> Ended {
+    let post = |text: &str| {
+        let _ = messaging::report(&messaging::load(), &job.name, text);
     };
-    let _ = messaging::report(&messaging::load(), &job.name, &text);
-    Ended {
+    run_job(
+        &backend::data_dir(),
+        job,
+        &|command| check(job, command, quit),
+        &|note| answer(job, note, started),
+        &post,
+    )
+}
+
+/// What a model run of a job came to.
+struct Answer {
+    /// The session it ran in, or `None` when it could not start.
+    session: Option<u64>,
+    /// Its answer, or why there is none.
+    text: String,
+    /// It answered: it was not stopped, cut off or failed, and said something.
+    done: bool,
+    /// It failed before the model said anything.
+    failed_early: bool,
+}
+
+/// Runs `job` with what is kept from its earlier runs in data folder `dir`:
+/// its check through `check` first, if it has one, then the model through
+/// `answer` with Letronna's note for it, and whatever is news goes to
+/// `post`. A run that did not finish keeps the check's output from before
+/// it, so the next one, or the try a beat later after an early failure,
+/// sees the change too rather than skip it as seen.
+fn run_job(
+    dir: &Path,
+    job: &Schedule,
+    check: &dyn Fn(&str) -> Checked,
+    answer: &dyn Fn(Option<&str>) -> Answer,
+    post: &dyn Fn(&str),
+) -> Ended {
+    let ended = |session, text, quiet, failed_early| Ended {
         schedule: job.id,
         name: job.name.clone(),
         session,
         text,
         failed_early,
+        quiet,
+    };
+    let mut kept = Kept::load(dir, job);
+    let before = kept.check.take();
+    let seen = match checked(job) {
+        Some(command) => {
+            let ran = check(command);
+            // Stopped as Letronna quits: nothing was found either way, so
+            // nothing is said or kept.
+            if ran.end == CheckEnd::Stopped {
+                let text = "Stopped while its check ran.";
+                return ended(None, text.into(), false, false);
+            }
+            Some(Seen::of(command, &ran))
+        }
+        None => None,
+    };
+    if let Some(seen) = &seen {
+        if before.as_ref().is_some_and(|before| before.same(seen)) {
+            kept.check = Some(seen.clone());
+            kept.unchanged = true;
+            kept.save(dir, job);
+            let text = "Skipped: its check printed what it printed last time.";
+            return ended(None, text.into(), true, false);
+        }
+        // A check that did not get to its end says so once, with no model
+        // run, which would only guess at why; a watch that broke never
+        // looks as if nothing changed.
+        if seen.failed {
+            let text = format!("Skipped: its check did not run to its end.\n{}", seen.shown);
+            post(&text);
+            kept.check = Some(seen.clone());
+            kept.unchanged = false;
+            kept.save(dir, job);
+            return ended(None, text, false, false);
+        }
+    }
+    let posted = kept.posted.as_ref().filter(|_| job.quiet);
+    let told = note(seen.as_ref(), before.as_ref(), posted);
+    let answered = answer(told.as_deref());
+    if answered.failed_early {
+        post(&answered.text);
+        return ended(answered.session, answered.text, false, true);
+    }
+    // Only a run told it may answer so; a failed or cut-off one goes out
+    // whatever it said.
+    let quiet = posted.is_some() && answered.done && nothing_new(&answered.text);
+    if !quiet {
+        post(&answered.text);
+        if job.quiet && answered.done {
+            kept.posted = Some((backend::now(), answered.text.clone()));
+        }
+    }
+    if job.quiet || seen.is_some() {
+        if answered.done {
+            kept.check = seen;
+        } else {
+            kept.check = before;
+        }
+        kept.unchanged = false;
+        kept.save(dir, job);
+    }
+    let text = if quiet {
+        "Nothing new, so nothing was sent.".into()
+    } else {
+        answered.text
+    };
+    ended(answered.session, text, quiet, false)
+}
+
+/// `job`'s check command, if it has one.
+fn checked(job: &Schedule) -> Option<&str> {
+    job.check
+        .as_deref()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+}
+
+/// What Letronna adds after a job's prompt for this run: what its check
+/// printed now, `seen`, and the time before, and for a quiet job the last
+/// report sent, `posted`, with what to answer when there is nothing new
+/// since. `None` when there is nothing to add.
+fn note(
+    seen: Option<&Seen>,
+    before: Option<&Seen>,
+    posted: Option<&(u64, String)>,
+) -> Option<String> {
+    if seen.is_none() && posted.is_none() {
+        return None;
+    }
+    let fenced = |text: &str, max: usize| {
+        crate::untrusted::fence(text, max).unwrap_or_else(|why| format!("[{why}]"))
+    };
+    let mut note = HEADER.to_owned();
+    if let Some(seen) = seen {
+        note.push_str(&format!(
+            "\nIts check ran just before this run:\n{}\nIt printed:\n{}",
+            seen.command,
+            fenced(&seen.shown, CHECK_BYTES)
+        ));
+        if let Some(before) = before.filter(|before| before.command == seen.command) {
+            note.push_str("\nThe time before, it printed:\n");
+            note.push_str(&fenced(&before.shown, CHECK_BYTES));
+        }
+    }
+    if let Some((at, report)) = posted {
+        let when = Local
+            .timestamp_opt(*at as i64, 0)
+            .single()
+            .map(|at| format!(", at {}", at.format("%H:%M on %a %-d %b")))
+            .unwrap_or_default();
+        note.push_str(&format!(
+            "\nThe last report this job sent{when} was:\n{}\nIf there is nothing here the \
+             user would want to hear since that report, answer only {NOTHING_NEW}, exactly \
+             and untranslated; it is not sent.",
+            fenced(report, REPORT_BYTES)
+        ));
+    }
+    Some(note)
+}
+
+/// Whether `reply` says there is nothing new: `NOTHING_NEW` on its first
+/// or last line with anything on it, whatever its case and with brackets,
+/// backticks and stops around it. Models often add a line of their own or
+/// dress the word up, so only an exact reply would let those through.
+fn nothing_new(reply: &str) -> bool {
+    let bare = |line: &str| {
+        line.trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+            .eq_ignore_ascii_case(NOTHING_NEW)
+    };
+    let mut lines = reply.lines().map(str::trim).filter(|line| !line.is_empty());
+    let first = lines.next();
+    first.is_some_and(bare) || lines.next_back().is_some_and(bare)
+}
+
+/// What a job's runs keep from one to the next, in a file of its own so a
+/// run's save never races an edit of the list.
+#[derive(Default, Serialize, Deserialize)]
+struct Kept {
+    /// The prompt it was kept for, so a job given a new prompt starts
+    /// afresh; a new job given a number used before does too, since the
+    /// list's edit clears this.
+    #[serde(default)]
+    prompt: String,
+    /// The last answer a quiet job sent, and the epoch second it went.
+    #[serde(default)]
+    posted: Option<(u64, String)>,
+    /// What the check printed last time.
+    #[serde(default)]
+    check: Option<Seen>,
+    /// The last run was skipped, its check unchanged.
+    #[serde(default)]
+    unchanged: bool,
+}
+
+impl Kept {
+    /// Where `job`'s is kept in data folder `dir`: beside the runs'
+    /// markers, under a name the look for cut-off runs passes over.
+    fn path(dir: &Path, id: u64) -> PathBuf {
+        runs_dir(dir).join(format!("{id}.kept"))
+    }
+
+    /// What `job`'s runs kept in `dir`, or nothing when they kept none or
+    /// kept it for another prompt.
+    fn load(dir: &Path, job: &Schedule) -> Self {
+        std::fs::read(Self::path(dir, job.id))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Kept>(&bytes).ok())
+            .filter(|kept| kept.prompt == job.prompt)
+            .unwrap_or_default()
+    }
+
+    /// Keep this for `job`'s next run, whole or not at all. A save that
+    /// fails only makes the next run look new, which sends too much rather
+    /// than too little.
+    fn save(mut self, dir: &Path, job: &Schedule) {
+        self.prompt = job.prompt.clone();
+        let path = Self::path(dir, job.id);
+        let temp = path.with_extension(format!("kept.{}.tmp", std::process::id()));
+        let written = serde_json::to_vec(&self)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| {
+                std::fs::create_dir_all(runs_dir(dir))?;
+                std::fs::write(&temp, bytes)?;
+                std::fs::rename(&temp, &path)
+            });
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
     }
 }
 
-/// A run of `job` in a new session, on the gateway and model set up now.
-fn open(job: &Schedule) -> Result<Spec, String> {
+/// What a job's check printed one time.
+#[derive(Clone, Serialize, Deserialize)]
+struct Seen {
+    /// The command it was, so a changed one starts afresh.
+    command: String,
+    /// It did not run to its end: it could not start, ran out of time or
+    /// was refused.
+    failed: bool,
+    /// A SHA-256 of all it printed, its exit code included, which is what
+    /// "what it printed last time" compares.
+    hash: String,
+    /// What it printed, cut to what a run is shown.
+    shown: String,
+}
+
+impl Seen {
+    /// What `command` printed, as `check` gives it: only its own output is
+    /// compared, since a hook may add a clock.
+    fn of(command: &str, ran: &Checked) -> Self {
+        let digest = ring::digest::digest(&ring::digest::SHA256, ran.printed.as_bytes());
+        Seen {
+            command: command.to_owned(),
+            // A non-zero exit is an answer like any other; only one cut
+            // short or never started says nothing about what it watches.
+            failed: !matches!(ran.end, CheckEnd::Exited { .. }),
+            hash: digest.as_ref().iter().map(|b| format!("{b:02x}")).collect(),
+            shown: tools::keep_ends(format!("{}{}", ran.printed, ran.added), CHECK_BYTES, ""),
+        }
+    }
+
+    /// Whether `other` is the same command ending the same way with the
+    /// same output.
+    fn same(&self, other: &Seen) -> bool {
+        (&self.command, self.failed, &self.hash) == (&other.command, other.failed, &other.hash)
+    }
+}
+
+/// What `job`'s row says of how its runs have gone: "check failed" while
+/// its check fails, "unchanged" when the last run was skipped for a check
+/// that printed what it printed before, and "quiet" for any other quiet
+/// job. It reads a small file, so ask as the list is read, not each frame.
+pub fn lately(job: &Schedule) -> Option<&'static str> {
+    lately_in(&backend::data_dir(), job)
+}
+
+/// `lately`, for a job whose runs keep what they kept in data folder `dir`.
+fn lately_in(dir: &Path, job: &Schedule) -> Option<&'static str> {
+    let kept = Kept::load(dir, job);
+    let seen = kept
+        .check
+        .filter(|seen| Some(seen.command.as_str()) == checked(job));
+    match seen {
+        Some(seen) if seen.failed => Some("check failed"),
+        Some(_) if kept.unchanged => Some("unchanged"),
+        _ if job.quiet => Some("quiet"),
+        _ => None,
+    }
+}
+
+/// What a job's check came to.
+struct Checked {
+    /// What the command printed, its exit code included, or why it did not run.
+    printed: String,
+    /// What the user's hooks said of it, shown with it but not compared.
+    added: String,
+    /// How it ended.
+    end: CheckEnd,
+}
+
+/// Runs `job`'s check `command` in its folder until it ends, its time is up
+/// or `quit` is set, as a command the user said yes to where the job was
+/// added.
+fn check(job: &Schedule, command: &str, quit: &Cancel) -> Checked {
+    let not_run = |why: &str| Checked {
+        printed: format!("The check was not run: {why}"),
+        added: String::new(),
+        end: CheckEnd::NotStarted,
+    };
+    let Some(cwd) = job.workspace.clone() else {
+        return not_run("the schedule has no project folder.");
+    };
+    let args = json!({ "command": command });
+    let call = ToolCall {
+        id: "schedule-check".into(),
+        name: "run_command".into(),
+        arguments: args.to_string(),
+    };
+    let Some(tool) = tools::find(&call.name) else {
+        return not_run("commands cannot be run here.");
+    };
+    let ctx = ToolContext {
+        workspace: Some(cwd.clone()),
+        ..ToolContext::default()
+    };
+    // The yes where the job was added stands in for the card the command
+    // would wait at, so it is decided as in Bypass with nobody there: the
+    // floor, the deny rules and whatever must ask a person still refuse it.
+    let rules = permissions::load(&permissions::user_file());
+    let none = Grants::new();
+    let unattended = Gate {
+        ctx: &ctx,
+        mode: Mode::Bypass,
+        grants: &none,
+        rules: rules.as_deref().unwrap_or_default(),
+        broken: rules.as_ref().err().map(String::as_str),
+        human: false,
+    };
+    match gate::decide(&call, &unattended) {
+        gate::Outcome::Run => {}
+        gate::Outcome::Refuse(why) => return not_run(&why),
+        // With nobody there nothing asks; anything else is not a yes.
+        _ => return not_run("it needs a person's yes."),
+    }
+    let hooks = hooks::current();
+    let heard = match hooks::before(&hooks, &call.name, &args, &ctx) {
+        Ok(heard) => heard,
+        Err(why) => return not_run(&why),
+    };
+    let (printed, end) = goal::run_check(command, &cwd, CHECK_TIME, quit);
+    let printed = crate::redact::scrub(&printed, tool.hides_key_shapes());
+    let said = hooks::after(&hooks, &call.name, &args, &printed, &ctx);
+    Checked {
+        printed,
+        added: heard + &said,
+        end,
+    }
+}
+
+/// Runs `job` in a new session with `note` after its prompt, saying so to
+/// `started` once the session is open.
+fn answer(job: &Schedule, note: Option<&str>, started: &dyn Fn(Started)) -> Answer {
+    let spec = match open(job, note) {
+        Ok(spec) => spec,
+        Err(error) => {
+            return Answer {
+                session: None,
+                text: format!("Did not start: {error}"),
+                done: false,
+                failed_early: true,
+            };
+        }
+    };
+    let session = spec.root;
+    // Before it starts, so its first call is decided in its mode.
+    let _listed = Listed::new(session, job);
+    started(Started {
+        schedule: job.id,
+        name: job.name.clone(),
+        session,
+        status: Arc::clone(&spec.status),
+        cancel: spec.cancel.clone(),
+    });
+    let report = driver::run(spec);
+    let silent = report.text.trim().is_empty();
+    Answer {
+        session: Some(session),
+        text: said(&report),
+        done: report.status == Outcome::Done && !silent,
+        failed_early: matches!(report.status, Outcome::Failed(_)) && report.rounds == 0 && silent,
+    }
+}
+
+/// A run of `job` in a new session, with `note` after its prompt, on the
+/// gateway and model set up now.
+fn open(job: &Schedule, note: Option<&str>) -> Result<Spec, String> {
     let settings = store::current_settings();
     let saved = store::load_keys()
         .get(gateway::key_slot(&settings.gateway))
@@ -994,19 +1426,37 @@ fn open(job: &Schedule) -> Result<Spec, String> {
     // Before the session is made, so a run that cannot start leaves none.
     backend::validate(&connection)?;
     let transcript = Transcript::session(&job.name, job.workspace.clone())?;
-    Ok(run_of(job, connection, transcript))
+    Ok(run_of(job, note, connection, transcript))
 }
 
-/// The run of `job` as the session `transcript` begins, on `connection`: in
-/// the job's own mode with nobody to answer, so whatever would ask is
-/// refused, and in Auto whatever the judge does not allow.
-pub(crate) fn run_of(job: &Schedule, connection: Connection, mut transcript: Transcript) -> Spec {
+/// The run of `job` as the session `transcript` begins, on `connection`,
+/// with Letronna's `note` after its prompt: in the job's own mode with
+/// nobody to answer, so whatever would ask is refused, and in Auto
+/// whatever the judge does not allow.
+pub(crate) fn run_of(
+    job: &Schedule,
+    note: Option<&str>,
+    connection: Connection,
+    mut transcript: Transcript,
+) -> Spec {
     let id = transcript.conversation.id;
     transcript.conversation.messages.push(Message {
         role: "user".into(),
         content: job.prompt.clone(),
         ..Default::default()
     });
+    // A notice folded into the turn, as the driver's own are, so neither
+    // Auto mode's judge in a later turn nor the run's own outputs take what
+    // a check or an earlier run printed for the user's words.
+    if let Some(note) = note {
+        transcript.conversation.messages.push(Message {
+            role: "user".into(),
+            content: note.to_owned(),
+            folded: true,
+            notice: true,
+            ..Default::default()
+        });
+    }
     let connection = Connection {
         conversation: id,
         // Never the Default mode setting nor a session's chip: those say
@@ -1080,6 +1530,8 @@ impl Tool for Scheduler {
             "at": {"type": "string", "description": "For add: run once at this local date and time, YYYY-MM-DD HH:MM."},
             "in_minutes": {"type": "integer", "description": "For add: run once, N minutes from now."},
             "mode": {"type": "string", "enum": ["default", "accept-edits", "plan", "auto", "bypass"], "description": "For add: what each run may do unasked; with nobody there, what would ask is refused. Defaults to default; pick more only when the user asked for it."},
+            "quiet": {"type": "boolean", "description": "For add: post a run only when it has news. Use for watches and alerts, not digests or reminders."},
+            "check": {"type": "string", "description": "For add: a command run first each time; when its output matches last time's, the run is skipped. Print only what matters (e.g. `curl -s URL | jq .price`), never a clock."},
             "id": {"type": "integer", "description": "For remove: the schedule's number from list."}
         }, "required": ["action"]})
     }
@@ -1148,6 +1600,15 @@ fn drafted(args: &Value, ctx: &ToolContext, now: DateTime<Local>) -> Result<Sche
         Some(name) if !name.is_empty() => name,
         _ => tools::one_line(prompt).chars().take(40).collect(),
     };
+    let check = args["check"]
+        .as_str()
+        .map(str::trim)
+        .filter(|check| !check.is_empty());
+    if check.is_some() && ctx.workspace.is_none() {
+        return Err(
+            "`check` runs in the project folder, and this session has none attached.".into(),
+        );
+    }
     Ok(Schedule {
         id: 0,
         name,
@@ -1158,6 +1619,8 @@ fn drafted(args: &Value, ctx: &ToolContext, now: DateTime<Local>) -> Result<Sche
         last_run: 0,
         mode,
         by_model: true,
+        quiet: args["quiet"].as_bool().unwrap_or(false),
+        check: check.map(str::to_owned),
     })
 }
 
@@ -1253,13 +1716,21 @@ fn added(list: &mut Vec<Schedule>, mut job: Schedule) -> Result<String, String> 
     }
     job.id = next_id(list);
     armed_now(&mut job);
-    let text = format!(
+    let mut text = format!(
         "Added schedule #{}, \"{}\": {}, in {} mode. Each run starts a fresh session.",
         job.id,
         job.name,
         job.trigger.label(),
         job.mode.name()
     );
+    if job.check.is_some() {
+        text.push_str(
+            " Its check runs first, and a run whose check prints what it did last time is skipped.",
+        );
+    }
+    if job.quiet {
+        text.push_str(" A run is sent only when it has news.");
+    }
     list.push(job);
     Ok(text)
 }
@@ -1298,8 +1769,14 @@ fn listed(list: &[Schedule]) -> String {
             (false, false) => ", off",
             (true, false) => "",
         };
+        let quiet = if job.quiet { ", quiet" } else { "" };
+        // The command itself, so a change to it can be asked for.
+        let check = match &job.check {
+            Some(command) => format!(", checked first with `{command}`"),
+            None => String::new(),
+        };
         text.push_str(&format!(
-            "\n#{} \"{}\": {}, {} mode, {who}{state}",
+            "\n#{} \"{}\": {}, {} mode, {who}{quiet}{check}{state}",
             job.id,
             job.name,
             job.trigger.label(),
@@ -1361,9 +1838,22 @@ fn adding(job: &Schedule, in_minutes: Option<u64>, now: DateTime<Local>) -> Stri
         .workspace
         .as_ref()
         .map_or("none".into(), |dir| dir.display().to_string());
+    // Word for word, since a yes here runs it on every run with nobody asked.
+    let check = match &job.check {
+        Some(check) => format!(
+            "Check, run first each time without asking; a run is skipped when it prints \
+             what it did last time:\n{check}\n"
+        ),
+        None => String::new(),
+    };
+    let quiet = if job.quiet {
+        "Quiet: a run is sent only when it has news.\n"
+    } else {
+        ""
+    };
     format!(
         "Add schedule \"{}\"\nWhen: {when}\nMode: {} -- {}. {unasked}\nFolder: {folder}\n\
-         Each run starts a fresh session and is told:\n{}",
+         {quiet}{check}Each run starts a fresh session and is told:\n{}",
         job.name,
         job.mode.name(),
         job.mode.about(),
@@ -1391,14 +1881,19 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute here.
     use super::{
-        AT_ONCE, Ended, Event, LIMIT, Listed, Runner, Schedule, Started, Trigger, act, adding,
-        armed_now, drafted, is_due, load, lock, moment, next_due, path, runs_dir, save, step,
+        AT_ONCE, Answer, Checked, Ended, Event, HEADER, Kept, LIMIT, Listed, Runner, Schedule,
+        Seen, Started, Trigger, act, adding, armed_now, drafted, edit_list, is_due, lately_in,
+        load, lock, moment, next_due, nothing_new, path, run_job, run_of, runs_dir, save, step,
         trigger,
     };
     use crate::cancel::Cancel;
+    use crate::chat::Connection;
+    use crate::goal::CheckEnd;
+    use crate::store::{Conversation, Transcript};
     use crate::tools::ToolContext;
     use chrono::{DateTime, FixedOffset, Local, MappedLocalTime, NaiveDate, NaiveTime, TimeZone};
     use serde_json::json;
+    use std::cell::RefCell;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Arc, Mutex};
@@ -1466,7 +1961,7 @@ mod tests {
         let (started, heard) = mpsc::channel();
         let (finish, finished) = mpsc::channel::<()>();
         let (started, finished) = (Mutex::new(started), Arc::new(Mutex::new(finished)));
-        let work = Box::new(move |job: &Schedule, _: &dyn Fn(Started)| {
+        let work = Box::new(move |job: &Schedule, _: &Cancel, _: &dyn Fn(Started)| {
             let _ = started.lock().unwrap().send(job.id);
             let _ = finished.lock().unwrap().recv();
             Ended {
@@ -1475,6 +1970,7 @@ mod tests {
                 session: None,
                 text: "done".into(),
                 failed_early,
+                quiet: false,
             }
         });
         let (runner, events) = Runner::with(dir.to_owned(), work);
@@ -1511,6 +2007,8 @@ mod tests {
             last_run: 0,
             mode: Default::default(),
             by_model: false,
+            quiet: false,
+            check: None,
         }
     }
 
@@ -1704,6 +2202,8 @@ mod tests {
             (third, second)
         };
         gone.runner.stop();
+        // So a check still running ends with it.
+        assert!(gone.runner.0.quit.is_set());
         until("the second takeover", || last.owner());
         step(&gone.runner.0);
         assert!(!gone.owner(), "a stopped runner came back");
@@ -1767,7 +2267,7 @@ mod tests {
     fn a_run_says_it_started_in_its_session_with_a_stop_that_ends_it() {
         let dir = scratch("started");
         save(&dir, &[every(1, 1, 120)]).unwrap();
-        let work = Box::new(|job: &Schedule, started: &dyn Fn(Started)| {
+        let work = Box::new(|job: &Schedule, _: &Cancel, started: &dyn Fn(Started)| {
             let cancel = Cancel::default();
             started(Started {
                 schedule: job.id,
@@ -1783,6 +2283,7 @@ mod tests {
                 session: Some(41),
                 text: if slept { "ran out" } else { "stopped" }.into(),
                 failed_early: false,
+                quiet: false,
             }
         });
         let (_runner, events) = Runner::with(dir, work);
@@ -2404,5 +2905,494 @@ mod tests {
             moment("2026-03-29 02:00", &now),
             Ok(utc("2026-03-29T01:00:00"))
         );
+    }
+
+    /// Job 1 every 15 minutes in `dir`, quiet or not, with `check` if given.
+    fn watch(dir: &Path, quiet: bool, check: Option<&str>) -> Schedule {
+        Schedule {
+            workspace: Some(dir.to_owned()),
+            quiet,
+            check: check.map(str::to_owned),
+            ..every(1, 15, 0)
+        }
+    }
+
+    /// What one run of a job did: how it ended, the note the model was
+    /// given each time it ran, and what went out to the chat apps.
+    struct Ran {
+        ended: Ended,
+        told: Vec<Option<String>>,
+        sent: Vec<String>,
+    }
+
+    /// A check that ran to its end with success.
+    const PASSED: CheckEnd = CheckEnd::Exited { success: true };
+
+    /// Runs `job` once with what its runs kept in `dir`, its check printing
+    /// `printed` and ending as it says, and its model, if it runs, giving
+    /// `reply`.
+    fn run(dir: &Path, job: &Schedule, printed: (&str, CheckEnd), reply: Answer) -> Ran {
+        let told = RefCell::new(Vec::new());
+        let sent = RefCell::new(Vec::new());
+        let reply = RefCell::new(Some(reply));
+        let ended = run_job(
+            dir,
+            job,
+            &|_| Checked {
+                printed: printed.0.to_owned(),
+                added: String::new(),
+                end: printed.1,
+            },
+            &|note| {
+                told.borrow_mut().push(note.map(str::to_owned));
+                reply.borrow_mut().take().expect("the model ran twice")
+            },
+            &|text| sent.borrow_mut().push(text.to_owned()),
+        );
+        Ran {
+            ended,
+            told: told.into_inner(),
+            sent: sent.into_inner(),
+        }
+    }
+
+    /// A model run in session 7 that answered `text`.
+    fn answered(text: &str) -> Answer {
+        Answer {
+            session: Some(7),
+            text: text.into(),
+            done: true,
+            failed_early: false,
+        }
+    }
+
+    /// The note the model was given on the run's one model run.
+    fn told(ran: &Ran) -> String {
+        assert_eq!(ran.told.len(), 1, "the model ran {} times", ran.told.len());
+        ran.told[0].clone().expect("no note")
+    }
+
+    #[test]
+    fn a_plain_job_is_told_nothing_more_and_keeps_nothing() {
+        let dir = scratch("plain");
+        let job = watch(&dir, false, None);
+        for _ in 0..2 {
+            let ran = run(&dir, &job, ("", PASSED), answered("Tidied."));
+            assert_eq!(ran.told, [None]);
+            assert_eq!(ran.sent, ["Tidied."]);
+            assert!(!ran.ended.quiet);
+        }
+        assert!(!Kept::path(&dir, 1).exists());
+        assert_eq!(lately_in(&dir, &job), None);
+    }
+
+    #[test]
+    fn an_unchanged_check_opens_no_session() {
+        let dir = scratch("unchanged-check");
+        let job = watch(
+            &dir,
+            false,
+            Some("curl -s https://example.com/p | jq .price"),
+        );
+        let first = run(&dir, &job, ("4.99\n", PASSED), answered("It costs 4.99."));
+        let note = told(&first);
+        assert!(note.starts_with(HEADER) && note.contains("4.99"), "{note}");
+        assert!(!note.contains("The time before"), "{note}");
+        assert_eq!(first.sent, ["It costs 4.99."]);
+
+        let second = run(&dir, &job, ("4.99\n", PASSED), answered("unused"));
+        assert!(second.told.is_empty(), "the model ran");
+        assert!(second.sent.is_empty(), "{:?}", second.sent);
+        assert_eq!((second.ended.session, second.ended.quiet), (None, true));
+        assert_eq!(lately_in(&dir, &job), Some("unchanged"));
+
+        // A change runs it again, shown what the check printed both times.
+        let third = run(&dir, &job, ("3.99\n", PASSED), answered("Down to 3.99."));
+        let note = told(&third);
+        let (now, before) = note.split_once("The time before, it printed:").unwrap();
+        assert!(now.contains("3.99") && before.contains("4.99"), "{note}");
+        assert_eq!(third.sent, ["Down to 3.99."]);
+        assert_eq!(lately_in(&dir, &job), None);
+
+        // Another command is another check, seen for the first time.
+        let other = Schedule {
+            check: Some("cat price.txt".into()),
+            ..job
+        };
+        let fourth = run(&dir, &other, ("3.99\n", PASSED), answered("It costs 3.99."));
+        assert!(!told(&fourth).contains("The time before"));
+    }
+
+    #[test]
+    fn a_check_that_starts_failing_runs_once_then_stays_quiet() {
+        let dir = scratch("check-fails");
+        let job = watch(&dir, false, Some("./ci-status"));
+        run(&dir, &job, ("passing\n", PASSED), answered("CI passes."));
+        let failing = (
+            "failing: test_login\n[exit code 1]",
+            CheckEnd::Exited { success: false },
+        );
+        let broke = run(&dir, &job, failing, answered("CI broke: test_login fails."));
+        assert!(told(&broke).contains("[exit code 1]"));
+        assert_eq!(broke.sent, ["CI broke: test_login fails."]);
+        let again = run(&dir, &job, failing, answered("unused"));
+        assert!(again.told.is_empty() && again.sent.is_empty());
+        assert!(again.ended.quiet);
+    }
+
+    #[test]
+    fn a_check_that_cannot_run_is_sent_once_and_no_model_runs() {
+        let dir = scratch("check-refused");
+        let job = watch(&dir, true, Some("./watch"));
+        let refused = (
+            "The check was not run: Refused: a permission rule denies it.",
+            CheckEnd::NotStarted,
+        );
+        let first = run(&dir, &job, refused, answered("unused"));
+        assert!(first.told.is_empty(), "the model ran");
+        assert_eq!(first.sent.len(), 1);
+        assert!(
+            first.sent[0].contains("did not run to its end"),
+            "{:?}",
+            first.sent
+        );
+        assert!(first.sent[0].contains("a permission rule denies it"));
+        assert_eq!((first.ended.session, first.ended.quiet), (None, false));
+        assert_eq!(lately_in(&dir, &job), Some("check failed"));
+
+        let again = run(&dir, &job, refused, answered("unused"));
+        assert!(again.told.is_empty() && again.sent.is_empty());
+        assert!(again.ended.quiet);
+        assert_eq!(lately_in(&dir, &job), Some("check failed"));
+
+        let back = run(&dir, &job, ("ok\n", PASSED), answered("Working again."));
+        assert_eq!(back.sent, ["Working again."]);
+        assert_eq!(lately_in(&dir, &job), Some("quiet"));
+    }
+
+    #[test]
+    fn nothing_new_with_a_note_line_is_still_suppressed() {
+        let dir = scratch("nothing-new");
+        let job = watch(&dir, true, None);
+        // The first run is told nothing more and goes out: the baseline.
+        let first = run(&dir, &job, ("", PASSED), answered("Three issues are open."));
+        assert_eq!(first.told, [None]);
+        assert_eq!(first.sent, ["Three issues are open."]);
+
+        let reply = "NOTHING_NEW\n\n(Looked at 10:02; still three open.)";
+        let second = run(&dir, &job, ("", PASSED), answered(reply));
+        let note = told(&second);
+        assert!(note.starts_with(HEADER), "{note}");
+        assert!(note.contains("Three issues are open."), "{note}");
+        assert!(note.contains("answer only NOTHING_NEW, exactly and untranslated"));
+        assert!(second.sent.is_empty(), "{:?}", second.sent);
+        assert_eq!((second.ended.session, second.ended.quiet), (Some(7), true));
+
+        // Still shown the last report that went out, not the quiet one.
+        let third = run(
+            &dir,
+            &job,
+            ("", PASSED),
+            answered("Looked.\n**[nothing_new]**"),
+        );
+        assert!(told(&third).contains("Three issues are open."));
+        assert!(third.sent.is_empty());
+
+        for reply in [
+            "NOTHING_NEW",
+            "`NOTHING_NEW`.",
+            "[NOTHING_NEW]",
+            "Nothing_New!",
+            "Checked the page.\n\nNOTHING_NEW\n",
+        ] {
+            assert!(nothing_new(reply), "{reply}");
+        }
+        for reply in [
+            "NOTHING_NEW: the price fell to 3.99",
+            "It fell.\nNOTHING_NEW is not the case.\nSee above.",
+            "Nothing new",
+            "",
+        ] {
+            assert!(!nothing_new(reply), "{reply}");
+        }
+    }
+
+    #[test]
+    fn a_failed_quiet_run_still_posts() {
+        let dir = scratch("quiet-failed");
+        let job = watch(&dir, true, None);
+        run(&dir, &job, ("", PASSED), answered("Baseline report."));
+        let failed = Answer {
+            text: "Did not finish: the gateway went away".into(),
+            done: false,
+            ..answered("")
+        };
+        let ran = run(&dir, &job, ("", PASSED), failed);
+        assert_eq!(ran.sent, ["Did not finish: the gateway went away"]);
+        assert!(!ran.ended.quiet);
+        // Cut off with the word as its last thing said: it did not finish.
+        let cut = Answer {
+            done: false,
+            ..answered("NOTHING_NEW")
+        };
+        assert_eq!(run(&dir, &job, ("", PASSED), cut).sent, ["NOTHING_NEW"]);
+        // Neither is taken for the last report.
+        let next = run(&dir, &job, ("", PASSED), answered("NOTHING_NEW"));
+        assert!(told(&next).contains("Baseline report."));
+    }
+
+    #[test]
+    fn an_early_failure_is_retried_not_skipped() {
+        let dir = scratch("early-check");
+        let job = watch(&dir, false, Some("./status"));
+        run(&dir, &job, ("v1\n", PASSED), answered("At v1."));
+        let early = Answer {
+            session: None,
+            text: "Did not start: the network is down".into(),
+            done: false,
+            failed_early: true,
+        };
+        let failed = run(&dir, &job, ("v2\n", PASSED), early);
+        assert!(failed.ended.failed_early);
+        assert_eq!(failed.sent, ["Did not start: the network is down"]);
+        // The try a beat later sees v2 as new, against the v1 it last ran on.
+        let retried = run(&dir, &job, ("v2\n", PASSED), answered("Now at v2."));
+        let note = told(&retried);
+        let (_, before) = note.split_once("The time before, it printed:").unwrap();
+        assert!(before.contains("v1"), "{note}");
+        assert_eq!(retried.sent, ["Now at v2."]);
+    }
+
+    #[test]
+    fn a_new_prompt_starts_a_quiet_job_afresh() {
+        let dir = scratch("new-prompt");
+        let job = watch(&dir, true, None);
+        run(&dir, &job, ("", PASSED), answered("Old report."));
+        let changed = Schedule {
+            prompt: "Watch something else.".into(),
+            ..job
+        };
+        assert_eq!(
+            run(&dir, &changed, ("", PASSED), answered("New.")).told,
+            [None]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_check_runs_in_the_job_folder_and_the_floor_still_refuses() {
+        let dir = scratch("check-real");
+        std::fs::write(dir.join("price.txt"), "4.99").unwrap();
+        let job = watch(&dir, false, None);
+        let none = Cancel::default();
+        let passing = check(&job, "cat price.txt", &none);
+        assert_eq!(passing.end, PASSED, "{}", passing.printed);
+        assert_eq!(passing.printed, "4.99");
+        assert!(!Seen::of("cat price.txt", &passing).failed);
+        // A failing exit is what a check watches, not a check that broke.
+        let exited = check(&job, "cat price.txt; exit 2", &none);
+        assert_eq!(exited.end, CheckEnd::Exited { success: false });
+        assert!(
+            exited.printed.ends_with("[exit code 2]"),
+            "{}",
+            exited.printed
+        );
+        assert!(!Seen::of("cat price.txt; exit 2", &exited).failed);
+
+        let refused = check(&job, "rm -rf ~", &none);
+        assert_eq!(refused.end, CheckEnd::NotStarted);
+        assert!(
+            refused
+                .printed
+                .starts_with("The check was not run: Refused"),
+            "{}",
+            refused.printed
+        );
+        assert!(Seen::of("rm -rf ~", &refused).failed);
+        let homeless = Schedule {
+            workspace: None,
+            ..job.clone()
+        };
+        let why = check(&homeless, "true", &none);
+        assert!(why.printed.contains("no project folder"), "{}", why.printed);
+
+        // A quit ends it at once rather than leave it running.
+        let quit = Cancel::default();
+        quit.set();
+        let started = Instant::now();
+        let stopped = check(&job, "sleep 30", &quit);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(stopped.end, CheckEnd::Stopped);
+    }
+
+    #[test]
+    fn what_hooks_add_to_a_check_is_shown_but_not_compared() {
+        let said = |added: &str| Checked {
+            printed: "4.99".into(),
+            added: added.into(),
+            end: PASSED,
+        };
+        let before = Seen::of("./price", &said("\n[hook] looked at 10:00"));
+        let now = Seen::of("./price", &said("\n[hook] looked at 10:15"));
+        assert!(before.same(&now));
+        assert_eq!(now.shown, "4.99\n[hook] looked at 10:15");
+    }
+
+    #[test]
+    fn a_check_stopped_by_a_quit_says_and_keeps_nothing() {
+        let dir = scratch("check-stopped");
+        let job = watch(&dir, true, Some("./status"));
+        run(&dir, &job, ("v1\n", PASSED), answered("At v1."));
+        let stopped = run(
+            &dir,
+            &job,
+            ("v2\n[stopped]", CheckEnd::Stopped),
+            answered("unused"),
+        );
+        assert!(stopped.told.is_empty() && stopped.sent.is_empty());
+        assert!(!stopped.ended.failed_early);
+        // The next run still sees v2 as new, against v1.
+        let next = run(&dir, &job, ("v2\n", PASSED), answered("Now at v2."));
+        assert!(told(&next).contains("v1"));
+        assert_eq!(next.sent, ["Now at v2."]);
+    }
+
+    #[test]
+    fn a_change_whose_run_did_not_finish_is_run_again_not_skipped() {
+        let dir = scratch("unfinished-check");
+        let job = watch(&dir, false, Some("./status"));
+        run(&dir, &job, ("v1\n", PASSED), answered("At v1."));
+        let cut = Answer {
+            text: "Did not finish: it used all its rounds.".into(),
+            done: false,
+            ..answered("")
+        };
+        let unfinished = run(&dir, &job, ("v2\n", PASSED), cut);
+        assert_eq!(unfinished.sent, ["Did not finish: it used all its rounds."]);
+        // The next tick sees v2 as the change it still is, against v1.
+        let next = run(&dir, &job, ("v2\n", PASSED), answered("Now at v2."));
+        let note = told(&next);
+        let (_, before) = note.split_once("The time before, it printed:").unwrap();
+        assert!(before.contains("v1"), "{note}");
+        assert_eq!(next.sent, ["Now at v2."]);
+        assert_eq!(lately_in(&dir, &job), None);
+    }
+
+    #[test]
+    fn a_job_removed_and_added_again_starts_afresh() {
+        let dir = scratch("re-added");
+        let job = watch(&dir, true, Some("./status"));
+        save(&dir, std::slice::from_ref(&job)).unwrap();
+        run(&dir, &job, ("v1\n", PASSED), answered("At v1."));
+        assert!(Kept::path(&dir, 1).exists());
+        edit_list(&dir, |list| {
+            list.clear();
+            Ok(())
+        })
+        .unwrap();
+        assert!(!Kept::path(&dir, 1).exists());
+        // A run that ended after the remove kept its own, which the add
+        // under the same number clears.
+        run(&dir, &job, ("v1\n", PASSED), answered("At v1."));
+        edit_list(&dir, |list| {
+            list.push(job.clone());
+            Ok(())
+        })
+        .unwrap();
+        let again = run(&dir, &job, ("v1\n", PASSED), answered("Still at v1."));
+        let note = told(&again);
+        assert!(!note.contains("The time before"), "{note}");
+        assert!(!note.contains("The last report"), "{note}");
+        assert_eq!(again.sent, ["Still at v1."]);
+    }
+
+    #[test]
+    fn the_note_follows_the_prompt_as_a_notice_and_never_as_the_users_words() {
+        let dir = scratch("note-prompt");
+        let transcript = |id| Transcript {
+            path: dir.join("scheduled.jsonl"),
+            conversation: Conversation {
+                id,
+                ..Default::default()
+            },
+        };
+        let job = watch(&dir, true, None);
+        let spec = run_of(&job, Some("[note]"), Connection::default(), transcript(5));
+        let messages = &spec.transcript.conversation.messages;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "do the thing");
+        assert!(!messages[0].notice && !messages[0].folded);
+        assert_eq!(messages[1].content, "[note]");
+        assert!(messages[1].notice && messages[1].folded);
+        // What Auto mode's judge reads in this run and in any later turn
+        // of the session, and the request the run's outputs are read from.
+        assert_eq!(&*spec.connection.typed, ["do the thing".to_owned()]);
+        assert_eq!(crate::judge::typed(messages), ["do the thing"]);
+        assert_eq!(messages.iter().rposition(crate::chat::opens_turn), Some(0));
+        // Both go to the model as user turns, in order, as a notice after
+        // a kept failure already does.
+        let local = Connection {
+            endpoint: "http://localhost:11434/v1/".into(),
+            model: "test-model".into(),
+            ..Connection::default()
+        };
+        let wired = crate::chat::body(&local, messages, None, None);
+        let sent: Vec<(&str, &str)> = wired["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip(1)
+            .map(|m| (m["role"].as_str().unwrap(), m["content"].as_str().unwrap()))
+            .collect();
+        assert_eq!(sent, [("user", "do the thing"), ("user", "[note]")]);
+        let plain = run_of(&job, None, Connection::default(), transcript(6));
+        let messages = &plain.transcript.conversation.messages;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "do the thing");
+    }
+
+    #[test]
+    fn the_tool_adds_a_quiet_job_with_a_check_shown_word_for_word() {
+        let dir = scratch("tool-quiet");
+        let probe = probe(&dir);
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..ToolContext::default()
+        };
+        let command = "curl -s https://example.com/p | jq .price";
+        let add = json!({"action": "add", "name": "Price", "prompt": "Say when it drops.",
+            "every_minutes": 15, "quiet": true, "check": format!(" {command} ")});
+        let card = super::card(None, &add, &ctx);
+        assert!(
+            card.contains("Quiet: a run is sent only when it has news.\n"),
+            "{card}"
+        );
+        assert!(
+            card.contains(&format!(
+                "prints what it did last time:\n{command}\nEach run"
+            )),
+            "{card}"
+        );
+        let said = act(Some(probe.runner.clone()), &add, &ctx).unwrap();
+        assert!(
+            said.ends_with(" A run is sent only when it has news."),
+            "{said}"
+        );
+        let job = &load(&dir).unwrap()[0];
+        assert!(job.quiet);
+        assert_eq!(job.check.as_deref(), Some(command));
+        let listed = act(Some(probe.runner.clone()), &json!({"action": "list"}), &ctx).unwrap();
+        assert!(
+            listed.contains(&format!(
+                "added by you, quiet, checked first with `{command}`"
+            )),
+            "{listed}"
+        );
+
+        let refused = act(Some(probe.runner.clone()), &add, &ToolContext::default());
+        assert!(refused.unwrap_err().contains("project folder"));
+        // Left out when not set, so a plain job's file reads as it always did.
+        let saved: serde_json::Value = serde_json::to_value(every(2, 60, 0)).unwrap();
+        assert!(saved.get("quiet").is_none() && saved.get("check").is_none());
     }
 }

@@ -309,6 +309,12 @@ impl Headless {
                 if let Some(session) = ended.session {
                     self.scheduled.remove(&session);
                 }
+                // A check that printed what it did last time started
+                // nothing, and would say so every few minutes; a quiet run
+                // that had a session said it was running, so its end is said.
+                if ended.quiet && ended.session.is_none() {
+                    return;
+                }
                 format!("Scheduled job {}: {}", ended.name, preview(&ended.text))
             }
             Event::Trouble(trouble) => trouble,
@@ -601,6 +607,7 @@ mod tests {
     use crate::approvals::{self, tests::SERVING};
     use crate::chat::{Remote, ToolCall};
     use crate::messaging::{Config, Incoming, Source};
+    use crate::schedule::{Ended, Event};
     use crate::store::{self, tests::DATA_DIR, tests::Scratch};
     use crate::tools::ToolContext;
     use std::io::{Read, Write};
@@ -784,5 +791,32 @@ mod tests {
         let kept = preview(&long);
         assert_eq!(kept.chars().count(), PREVIEW + 1);
         assert!(kept.ends_with('…'));
+    }
+
+    #[test]
+    fn a_skipped_check_leaves_no_line_and_a_quiet_run_its_end() {
+        let (tx, said) = mpsc::channel();
+        let say = Box::new(move |line: String| {
+            let _ = tx.send(line);
+        });
+        let (mut host, _inputs, _taken) =
+            Headless::new(Config::default(), None, Box::new(|_| ()), say);
+        let ended = |session, text: &str| {
+            Event::Ended(Ended {
+                schedule: 1,
+                name: "Price".into(),
+                session,
+                text: text.into(),
+                failed_early: false,
+                quiet: true,
+            })
+        };
+        host.on_schedule(ended(None, "Skipped: its check printed what it did."));
+        host.on_schedule(ended(Some(7), "Nothing new, so nothing was sent."));
+        let lines: Vec<String> = said.try_iter().collect();
+        assert_eq!(
+            lines,
+            ["Scheduled job Price: Nothing new, so nothing was sent."]
+        );
     }
 }

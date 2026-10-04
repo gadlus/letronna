@@ -3143,6 +3143,8 @@ mod tests {
             last_run: 0,
             mode: Mode::DontAsk,
             by_model: false,
+            quiet: false,
+            check: None,
         };
         let mut saved = serde_json::to_value(&schedule).unwrap();
         assert_eq!(saved["mode"], "dont-ask");

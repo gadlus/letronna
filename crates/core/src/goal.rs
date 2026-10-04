@@ -624,10 +624,10 @@ fn check(connection: &Connection, command: &str, cancel: &Cancel) -> (String, bo
         Ok(heard) => heard,
         Err(why) => return (format!("The check command was not run: {why}"), false),
     };
-    let (ran, failed) = run_check(command, &cwd, CHECK_TIME, cancel);
+    let (ran, end) = run_check(command, &cwd, CHECK_TIME, cancel);
     let out = crate::redact::scrub(&ran, tool.hides_key_shapes());
     let said = crate::hooks::after(&hooks, &call.name, &args, &out, &ctx);
-    (out + &heard + &said, failed)
+    (out + &heard + &said, end.failed())
 }
 
 /// The run a check's approval is asked under: one per session and command,
@@ -641,12 +641,39 @@ fn check_run(session: u64, command: &str) -> u64 {
     hasher.finish() | 1 << 63
 }
 
+/// How a check command came to its end. Its own callers ask different
+/// things of it -- a goal whether it passed, a schedule whether it ran to
+/// its end -- so it is said in full rather than as one yes or no.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CheckEnd {
+    /// It ended by itself, with success or not.
+    Exited { success: bool },
+    /// Its time limit passed first.
+    TimedOut,
+    /// It was stopped, or could no longer be waited on.
+    Stopped,
+    /// It could not start.
+    NotStarted,
+}
+
+impl CheckEnd {
+    /// Whether it started and ended other than with success.
+    pub(crate) fn failed(self) -> bool {
+        !matches!(self, Self::Exited { success: true } | Self::NotStarted)
+    }
+}
+
 /// Runs `command` in `cwd` as a process tree of its own until it ends,
 /// `limit` passes or `cancel` is set, and gives back what it printed and
-/// how it ended, and whether it failed: started, and ended other than with
-/// success. The whole tree is ended after, so nothing a test run started
-/// is left running to hold the build lock the next check needs.
-fn run_check(command: &str, cwd: &Path, limit: Duration, cancel: &Cancel) -> (String, bool) {
+/// how it ended, in words and as a `CheckEnd`. The whole tree is ended
+/// after, so nothing a test run started is left running to hold the build
+/// lock the next check needs.
+pub(crate) fn run_check(
+    command: &str,
+    cwd: &Path,
+    limit: Duration,
+    cancel: &Cancel,
+) -> (String, CheckEnd) {
     let mut shell = tools::shell(command, Some(cwd));
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut shell, 0);
@@ -656,7 +683,10 @@ fn run_check(command: &str, cwd: &Path, limit: Duration, cancel: &Cancel) -> (St
         .spawn();
     let mut child = match spawned {
         Ok(child) => child,
-        Err(e) => return (format!("The check command could not start: {e}"), false),
+        Err(e) => {
+            let why = format!("The check command could not start: {e}");
+            return (why, CheckEnd::NotStarted);
+        }
     };
     // At once, so the shell has had as little time as possible to start
     // anything that would escape the tree.
@@ -667,7 +697,7 @@ fn run_check(command: &str, cwd: &Path, limit: Duration, cancel: &Cancel) -> (St
         let _ = child.wait();
         return (
             "The check command could not start: its output could not be read.".into(),
-            false,
+            CheckEnd::NotStarted,
         );
     };
     let (sender, open) = std::sync::mpsc::channel();
@@ -676,23 +706,32 @@ fn run_check(command: &str, cwd: &Path, limit: Duration, cancel: &Cancel) -> (St
         tools::forward(stderr, sender),
     ];
     let started = Instant::now();
-    let ending = loop {
+    let (ending, end) = loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => break None,
+            Ok(Some(status)) if status.success() => {
+                break (None, CheckEnd::Exited { success: true });
+            }
             Ok(Some(status)) => {
-                break Some(format!("[exit code {}]", status.code().unwrap_or(-1)));
+                let code = format!("[exit code {}]", status.code().unwrap_or(-1));
+                break (Some(code), CheckEnd::Exited { success: false });
             }
             Ok(None) => {}
-            Err(e) => break Some(format!("[could not be waited on: {e}]")),
+            Err(e) => {
+                break (
+                    Some(format!("[could not be waited on: {e}]")),
+                    CheckEnd::Stopped,
+                );
+            }
         }
         if started.elapsed() >= limit {
-            break Some(format!(
+            let said = format!(
                 "[stopped after {} s, the check's time limit; above is what it printed until then]",
                 limit.as_secs()
-            ));
+            );
+            break (Some(said), CheckEnd::TimedOut);
         }
         if !cancel.sleep(CHECK_POLL) {
-            break Some("[stopped]".to_owned());
+            break (Some("[stopped]".to_owned()), CheckEnd::Stopped);
         }
     };
     tree.kill();
@@ -706,12 +745,11 @@ fn run_check(command: &str, cwd: &Path, limit: Duration, cancel: &Cancel) -> (St
         text.push_str("\n[stderr]\n");
         text.push_str(&err);
     }
-    let failed = ending.is_some();
     if let Some(ending) = ending {
         text.push('\n');
         text.push_str(&ending);
     }
-    (text, failed)
+    (text, end)
 }
 
 #[cfg(test)]
@@ -1172,7 +1210,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_check_that_prints_and_fails_says_so() {
-        let (out, failed) = run_check(
+        let (out, end) = run_check(
             "echo one; echo two >&2; exit 3",
             &std::env::temp_dir(),
             Duration::from_secs(20),
@@ -1181,7 +1219,8 @@ mod tests {
         assert!(out.starts_with("one\n"), "{out}");
         assert!(out.contains("[stderr]\ntwo"), "{out}");
         assert!(out.ends_with("[exit code 3]"), "{out}");
-        assert!(failed);
+        assert_eq!(end, CheckEnd::Exited { success: false });
+        assert!(end.failed());
     }
 
     #[cfg(unix)]
@@ -1192,7 +1231,7 @@ mod tests {
         // A child that outlives the shell's own command, as a test run's do.
         let command = "echo before; sleep 30 & echo $! > child.pid; sleep 30";
         let started = Instant::now();
-        let (out, failed) = run_check(command, &dir, Duration::from_secs(1), &Cancel::default());
+        let (out, end) = run_check(command, &dir, Duration::from_secs(1), &Cancel::default());
         assert!(started.elapsed() < Duration::from_secs(10), "{out}");
         assert!(out.starts_with("before"), "{out}");
         assert!(
@@ -1200,7 +1239,8 @@ mod tests {
             "{out}"
         );
         // Not passing in its time is not passing.
-        assert!(failed);
+        assert_eq!(end, CheckEnd::TimedOut);
+        assert!(end.failed());
         let pid: libc::pid_t = std::fs::read_to_string(dir.join("child.pid"))
             .unwrap()
             .trim()
@@ -1225,9 +1265,10 @@ mod tests {
         let cancel = Cancel::default();
         cancel.set();
         let started = Instant::now();
-        let (out, _) = run_check("sleep 30", &std::env::temp_dir(), CHECK_TIME, &cancel);
+        let (out, end) = run_check("sleep 30", &std::env::temp_dir(), CHECK_TIME, &cancel);
         assert!(started.elapsed() < Duration::from_secs(10), "{out}");
         assert!(out.ends_with("[stopped]"), "{out}");
+        assert_eq!(end, CheckEnd::Stopped);
     }
 
     #[test]
@@ -1339,13 +1380,15 @@ mod tests {
 
     #[test]
     fn a_passing_check_lets_the_judge_say_met() {
-        let (out, failed) = run_check(
+        let (out, end) = run_check(
             "echo ok",
             &std::env::temp_dir(),
             Duration::from_secs(20),
             &Cancel::default(),
         );
         assert!(out.starts_with("ok"), "{out}");
+        assert_eq!(end, CheckEnd::Exited { success: true });
+        let failed = end.failed();
         assert!(!failed);
         let model = Scripted::new(&[r#"{"status":"met","reason":"green"}"#]);
         let step = review_with(
