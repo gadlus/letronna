@@ -1215,6 +1215,15 @@ fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Option<Message>, 
         match &event {
             Event::Delta(text) => tell(spec, Step::Said(text.clone())),
             Event::Reasoning(text) => tell(spec, Step::Thought(text.clone())),
+            // The words of a reply the stream cut off were told, so the
+            // watcher hears they are dropped, and the count starts again
+            // with the try that takes their place.
+            Event::Retrying(retry) if retry.dropped => {
+                spec.status.streamed.store(0, Ordering::Relaxed);
+                // An editor cannot take back what it was sent.
+                let dropped = crate::retry::DROPPED;
+                tell(spec, Step::Said(format!("\n\n({dropped})\n\n")));
+            }
             _ => {}
         }
         turn.absorb(&event);
@@ -1858,6 +1867,54 @@ pub(crate) mod tests {
         // The provider's count holds it from here.
         assert_eq!(status.streamed.load(Ordering::Relaxed), 0);
         assert_eq!(status.output.load(Ordering::Relaxed), 50);
+    }
+
+    #[test]
+    fn a_reply_the_stream_cut_off_is_asked_for_again_and_never_run_or_kept() {
+        let dir = scratch("cut-stream");
+        let half = json!({"index": 0, "id": "call-0", "function": {"name": "write_file",
+            "arguments": "{\"path\": \"made.txt\", \"content\": \"ha"}});
+        // The provider hangs up part way through a call, with no reason to
+        // stop and no [DONE], then answers the same request whole.
+        let cut: String = [
+            json!({"choices": [{"delta": {"content": "Half an ans"}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [half]}}]}),
+        ]
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect();
+        let (endpoint, provider) = provider(vec![
+            cut,
+            reply("", &[read_notes()]),
+            reply("The notes say hello.", &[]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 1460);
+        let said = Arc::new(std::sync::Mutex::new(String::new()));
+        let heard = said.clone();
+        spec.watch = Some(Arc::new(move |step| {
+            if let Step::Said(text) = step {
+                heard.lock().unwrap().push_str(&text);
+            }
+        }));
+        let report = finished(spec);
+        let sent = provider.sent();
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "The notes say hello.");
+        assert_eq!(report.rounds, 1);
+        assert!(!dir.join("made.txt").exists(), "the half-written call ran");
+        // The first two requests are the same: nothing of the cut reply went back.
+        assert_eq!(sent[0], sent[1]);
+        let kept = written(&dir.join("helper.jsonl"));
+        assert!(
+            kept.iter()
+                .all(|record| !record.to_string().contains("Half an ans")),
+            "the cut reply was kept"
+        );
+        let said = said.lock().unwrap();
+        assert!(
+            said.starts_with(&format!("Half an ans\n\n({})", crate::retry::DROPPED)),
+            "{said}"
+        );
     }
 
     #[test]

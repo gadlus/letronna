@@ -315,7 +315,16 @@ impl Turn {
             Event::ToolCalls(calls) => self.live.calls = calls.clone(),
             Event::Drafting(drafts) => self.live.drafts = drafts.clone(),
             Event::Replay(replay) => self.live.replay = Some(replay.clone()),
-            Event::Retrying(retry) => self.live.retrying = Some(*retry),
+            Event::Retrying(retry) => {
+                // What a cut reply said is not kept: the next try's comes in
+                // its place, and the calls it had begun were never whole.
+                if retry.dropped {
+                    self.live.content.clear();
+                    self.live.reasoning.clear();
+                    self.live.drafts.clear();
+                }
+                self.live.retrying = Some(*retry);
+            }
             Event::Switched(switch) => self.live.switched = Some(switch.clone()),
             // The front end tells the user.
             Event::Note(_) => {}
@@ -968,11 +977,32 @@ mod tests {
             attempt: 2,
             of: 6,
             wait: std::time::Duration::from_secs(1),
+            dropped: false,
         };
         turn.absorb(&Event::Retrying(retry));
         assert_eq!(turn.live.retrying, Some(retry));
         turn.absorb(&Event::Reasoning("thinking".into()));
         assert_eq!(turn.live.retrying, None);
+    }
+
+    #[test]
+    fn what_a_cut_reply_said_is_dropped_and_the_next_try_is_kept() {
+        let mut turn = turn();
+        turn.absorb(&Event::Reasoning("Let me".into()));
+        turn.absorb(&Event::Delta("Half an ans".into()));
+        turn.absorb(&Event::Drafting(vec![Default::default()]));
+        turn.absorb(&Event::Retrying(crate::retry::Retry {
+            kind: crate::failure::FailureKind::Network,
+            attempt: 2,
+            of: 6,
+            wait: std::time::Duration::from_secs(1),
+            dropped: true,
+        }));
+        assert!(turn.live.drafts.is_empty());
+        turn.absorb(&Event::Delta("The whole answer.".into()));
+        let reply = turn.take_reply("test");
+        assert_eq!(reply.content, "The whole answer.");
+        assert!(reply.reasoning.is_empty());
     }
 
     #[test]

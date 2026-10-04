@@ -3553,8 +3553,9 @@ fn stream(
             .ok_or_else(|| Failure::new(FailureKind::Unknown, "Could not prepare the request."))?
             .send();
         let mut stands = false;
+        let mut begun = false;
         let mut slow = false;
-        let failure = match send {
+        let mut failure = match send {
             Err(e) => {
                 slow = ran_out(&e);
                 Failure::new(
@@ -3563,14 +3564,18 @@ fn stream(
                 )
             }
             Ok(response) if response.status().is_success() => {
+                // An event stream can end early for a reason that passes, as
+                // when a gateway keeps it open with comments and then gives
+                // up on the model. Any other reply, a web page say, would
+                // come back the same every time.
+                let kind = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|h| h.to_str().ok())
+                    .unwrap_or_default();
+                stands = !kind.contains("text/event-stream") && !kind.contains("application/json");
                 match read(
-                    response,
-                    connection,
-                    extra,
-                    ticket,
-                    sender,
-                    &mut stands,
-                    &mut slow,
+                    response, connection, extra, ticket, sender, &mut begun, &mut slow,
                 ) {
                     Ok(()) => return Ok(()),
                     Err(failure) => failure,
@@ -3623,24 +3628,27 @@ fn stream(
         if slow {
             timeouts += 1;
         }
-        // Once part of the reply is on screen, another go would be shown
-        // after it rather than in its place; read says when else a failure
-        // stands. A reply that ran out of time may well run out again, each
-        // try perhaps billed, so it gets one more go and no more.
+        // A reply that is no event stream would come back the same, and one
+        // cut off part way is on screen, so it stands as it is unless it is
+        // asked for again. A reply that ran out of time may well run out
+        // again, each try perhaps billed, so it gets one more go and no more.
+        failure.stands = stands || begun;
         if stands || timeouts > 1 {
-            let mut failure = failure;
-            failure.stands = stands;
             return Err(failure);
         }
-        let Some(retry) = crate::retry::after(&failure, tried, connection.unattended) else {
+        let Some(mut retry) = crate::retry::after(&failure, tried, connection.unattended) else {
             // An overflow never passes by itself, so it is never waited out:
             // it gets here on the try it came back on. The one request sent
             // again after it has tries of its own for what does pass.
-            if let Some(budget) = refit(connection, &failure, budget) {
+            if !begun && let Some(budget) = refit(connection, &failure, budget) {
                 return send_window(connection, messages, &budget, extra, lsp, sender);
             }
             return Err(failure);
         };
+        // The frontends drop what the cut reply said, and the calls it had
+        // begun were never handed over, so the next try's reply is the one
+        // kept and run.
+        retry.dropped = begun;
         sender
             .send_blocking(Event::Retrying(retry))
             .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
@@ -3663,16 +3671,16 @@ fn ran_out_reading(e: &std::io::Error) -> bool {
         .is_some_and(ran_out)
 }
 
-/// Pass a successful reply on as it arrives, setting `stands` once the model
-/// has begun it or when it is no event stream, and `slow` if it runs out of
-/// time. `ticket` is the one `cache_miss::sent` gave for the request.
+/// Pass a successful reply on as it arrives, setting `begun` once the model
+/// has begun it, and `slow` if it runs out of time. `ticket` is the one
+/// `cache_miss::sent` gave for the request.
 fn read(
     response: reqwest::blocking::Response,
     connection: &Connection,
     extra: &Extra,
     ticket: u64,
     sender: &async_channel::Sender<Event>,
-    stands: &mut bool,
+    begun: &mut bool,
     slow: &mut bool,
 ) -> Result<(), Failure> {
     // The Responses API's events, and its reply when one comes whole, are
@@ -3695,17 +3703,9 @@ fn read(
         };
         let began = std::time::Instant::now();
         let mut reply = Reply::default();
-        reply.absorb(parse_chunk(&value)?, stands, sender)?;
+        reply.absorb(parse_chunk(&value)?, begun, sender)?;
         return reply.end(true, began, connection, &extra.tools, ticket, sender);
     }
-    // An event stream can end early for a reason that passes, as when a
-    // gateway keeps it open with comments and then gives up on the model.
-    // Any other reply, a web page say, would come back the same every time.
-    *stands = !response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|h| h.to_str().ok())
-        .is_some_and(|h| h.contains("text/event-stream"));
     let began = std::time::Instant::now();
     let mut reply = Reply::default();
     let mut done = false;
@@ -3751,7 +3751,7 @@ fn read(
                 }
             },
         };
-        reply.absorb(chunk, stands, sender)?;
+        reply.absorb(chunk, begun, sender)?;
         reply.draft(&extra.tools, sender)?;
     }
     reply.end(done, began, connection, &extra.tools, ticket, sender)
@@ -3860,7 +3860,7 @@ impl Reply {
     fn absorb(
         &mut self,
         chunk: Chunk,
-        stands: &mut bool,
+        begun: &mut bool,
         sender: &async_channel::Sender<Event>,
     ) -> Result<(), Failure> {
         if let Some(n) = chunk.completion_tokens {
@@ -3885,9 +3885,8 @@ impl Reply {
             self.finish = chunk.finish;
         }
         // A tool call is handed over only once the stream ends, but one begun
-        // is an answer under way like any text: another go is billed again,
-        // and a server that never sends [DONE] would cut it off again.
-        *stands |= !chunk.tool_calls.is_empty();
+        // is an answer under way like any text, which another go replaces.
+        *begun |= !chunk.tool_calls.is_empty();
         self.assembler.add(&chunk);
         join_details(&mut self.reasoning_details, chunk.reasoning_details);
         self.reasoning_items.extend(chunk.reasoning_items);
@@ -3898,13 +3897,13 @@ impl Reply {
             .filter(|t| self.thought || !t.trim().is_empty())
         {
             self.thought = true;
-            *stands = true;
+            *begun = true;
             sender
                 .send_blocking(Event::Reasoning(text))
                 .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
         }
         if let Some(text) = chunk.content {
-            *stands = true;
+            *begun = true;
             let pieces = self.think.feed(&text);
             self.pass_on(pieces, sender)?;
         }
@@ -7951,35 +7950,81 @@ mod tests {
     }
 
     #[test]
-    fn a_stream_cut_off_after_it_began_is_not_tried_again() {
-        let (endpoint, worker) = serve(vec![(
-            "200 OK",
-            "text/event-stream",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
-        )]);
+    fn a_stream_cut_off_after_it_began_is_asked_for_again_in_its_place() {
+        let (endpoint, worker) = serve(vec![
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"reasoning\":\"Hmm.\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
         let rx = ask(endpoint);
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Reasoning(s) if s == "Hmm."));
         assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "Hel"));
-        let Event::Finished(Err(failure)) = rx.recv_blocking().unwrap() else {
-            panic!("a reply already on screen was tried again");
+        let Event::Retrying(retry) = rx.recv_blocking().unwrap() else {
+            panic!("a reply the stream cut off was not asked for again");
         };
-        assert_eq!(failure.kind, FailureKind::Network);
-        worker.join().unwrap();
+        assert_eq!(retry.kind, FailureKind::Network);
+        assert!(retry.dropped);
+        assert!(
+            retry
+                .to_string()
+                .starts_with("The provider closed the stream early"),
+            "{retry}"
+        );
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "Hello"));
+        assert!(matches!(
+            rx.recv_blocking().unwrap(),
+            Event::Finished(Ok(()))
+        ));
+        let bodies = worker.join().unwrap();
+        assert_eq!(bodies[0], bodies[1], "the second try asked something else");
     }
 
     #[test]
-    fn a_stream_cut_off_in_a_tool_call_is_not_tried_again() {
-        let (endpoint, worker) = serve(vec![(
-            "200 OK",
-            "text/event-stream",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]}}]}\n\n",
-        )]);
+    fn a_tool_call_the_stream_cut_off_is_never_handed_over_and_the_next_try_is() {
+        let (endpoint, worker) = serve(vec![
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"notes.md\\\",\\\"content\\\":\\\"Half\"}}]}}]}\n\n",
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c2\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"notes.md\\\",\\\"content\\\":\\\"Whole\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
         let rx = ask(endpoint);
-        // Shown as being written, which a second try could not take back.
-        assert!(matches!(rx.recv_blocking().unwrap(), Event::Drafting(_)));
-        let Event::Finished(Err(failure)) = rx.recv_blocking().unwrap() else {
-            panic!("a tool call already begun was tried again");
+        let events: Vec<Event> = std::iter::from_fn(|| rx.recv_blocking().ok()).collect();
+        let retried = events
+            .iter()
+            .position(|event| matches!(event, Event::Retrying(retry) if retry.dropped))
+            .expect("a call the stream cut off was not asked for again");
+        let handed: Vec<(usize, &ToolCall)> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(at, event)| match event {
+                Event::ToolCalls(calls) => Some(calls.iter().map(move |call| (at, call))),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let [(at, call)] = handed[..] else {
+            panic!("calls handed over: {handed:?}");
         };
-        assert_eq!(failure.kind, FailureKind::Network);
+        assert!(at > retried, "the half-written call was handed over");
+        assert_eq!(call.id, "c2");
+        assert_eq!(
+            serde_json::from_str::<Value>(&call.arguments).unwrap(),
+            json!({"path": "notes.md", "content": "Whole"})
+        );
+        assert!(matches!(events.last(), Some(Event::Finished(Ok(())))));
         worker.join().unwrap();
     }
 

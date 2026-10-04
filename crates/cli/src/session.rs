@@ -571,6 +571,28 @@ impl Runner {
                     return Err("The model connection closed unexpectedly.".to_owned());
                 }
             };
+            // The words of a reply the stream cut off are on screen for good,
+            // so they are marked as dropped and the next try's start afresh.
+            if let Event::Retrying(retry) = &event
+                && retry.dropped
+                && (opened || thought)
+            {
+                if opened {
+                    out.end();
+                } else {
+                    render::out("", true);
+                }
+                if let Some(voice) = &mut self.voice {
+                    voice.hush();
+                }
+                render::blank();
+                render::said(
+                    &render::dim("●"),
+                    &render::dim(letronna_core::retry::DROPPED),
+                );
+                out = Stream::opening_with(render::bullet());
+                (opened, thought) = (false, false);
+            }
             // The waiting line says why while a failed try waits to be made
             // again, earlier turns are summarized or a call is being written,
             // and goes back to waiting once the reply answers, which may be
