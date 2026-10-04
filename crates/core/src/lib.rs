@@ -88,6 +88,7 @@ pub mod search;
 mod side;
 pub mod skills;
 pub mod slash;
+mod snapshot;
 pub mod speech;
 mod state;
 pub mod store;

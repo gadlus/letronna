@@ -186,9 +186,11 @@ fn tell_with(messages: &[Message], flags: impl Fn(&str) -> Option<(bool, bool)>)
 }
 
 /// A call's kind, and what it was about: the file, the command, the page.
-/// A call that changes things is an edit when it names or wrote a file, and
-/// a command when it carried one; one that only looks reads a file or a page
-/// or searches. One that stays off this computer is a step like any other.
+/// A call that changes things is an edit when it names a file, a command
+/// when it carried one -- whatever files the command changed -- and an
+/// edit again when it wrote a file; one that only looks reads a file or a
+/// page or searches. One that stays off this computer is a step like any
+/// other.
 fn kind_of(message: &Message, args: &Value, flags: Option<(bool, bool)>) -> (Kind, String) {
     let text = |key: &str| args[key].as_str().map(str::to_owned);
     let path = text("path");
@@ -196,14 +198,14 @@ fn kind_of(message: &Message, args: &Value, flags: Option<(bool, bool)>) -> (Kin
         return (Kind::Other, message.name.clone());
     };
     if mutates {
-        if let Some(file) = path.or_else(|| {
-            let wrote = message.files.first()?;
-            Some(wrote.path.to_string_lossy().into_owned())
-        }) {
+        if let Some(file) = path {
             return (Kind::Edited, file);
         }
-        return match text("command") {
-            Some(command) => (Kind::Ran, command),
+        if let Some(command) = text("command") {
+            return (Kind::Ran, command);
+        }
+        return match message.files.first() {
+            Some(wrote) => (Kind::Edited, wrote.path.to_string_lossy().into_owned()),
             None => (Kind::Other, message.name.clone()),
         };
     }
@@ -330,7 +332,9 @@ mod tests {
     fn flags(name: &str) -> Option<(bool, bool)> {
         match name {
             "read_file" | "list_dir" | "search" | "web_fetch" => Some((false, true)),
-            "edit_file" | "write_file" | "run_command" | "stop_job" => Some((true, true)),
+            "edit_file" | "write_file" | "apply_patch" | "run_command" | "stop_job" => {
+                Some((true, true))
+            }
             "todo" => Some((false, false)),
             _ => None,
         }
@@ -356,6 +360,22 @@ mod tests {
             "Read 3 files · Edited composer.rs · Ran 2 commands"
         );
         assert!(told.failed.is_empty());
+    }
+
+    #[test]
+    fn a_command_that_changed_files_still_reads_as_a_command() {
+        let wrote = |name: &str, args: Value| Message {
+            files: vec![crate::history::FileChange {
+                path: "/p/src/b.rs".into(),
+                ..Default::default()
+            }],
+            ..call(name, args)
+        };
+        let run = [
+            wrote("run_command", serde_json::json!({"command": "cargo fmt"})),
+            wrote("apply_patch", serde_json::json!({"patch": "..."})),
+        ];
+        assert_eq!(tell_with(&run, flags).did, "Edited b.rs · Ran 1 command");
     }
 
     #[test]

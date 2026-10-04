@@ -10,11 +10,14 @@
 //! A file apply_patch deletes goes through `write::remove`, which keeps its
 //! bytes the same way and notes an empty hash after, so it comes back too.
 //!
+//! What a foreground command changes in the project is noted the same way,
+//! on its own result, by `snapshot`, which also says on the result what it
+//! could not keep; its copies are charged to an allowance of their own.
+//!
 //! Going back to a turn looks at the messages it drops: each file they wrote
 //! goes back to the oldest `before` among them, or away if a tool created it.
 //! A file whose hash is no longer the last `after` was changed since -- by
-//! the user or a command -- and is left alone rather than overwritten. Only
-//! the file tools are covered: what a command changes is never seen here.
+//! the user or a command -- and is left alone rather than overwritten.
 //!
 //! Files are noted by their real path, so one file under two spellings is one
 //! file. A rewind touches only what the tools themselves could write -- no
@@ -23,8 +26,9 @@
 
 use crate::chat::Message;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// The largest file whose old bytes are kept. Source files are well under a
 /// megabyte; ten covers a big generated one, a lock file or a bundle, without
@@ -35,6 +39,13 @@ pub const FILE_CAP: u64 = 10 * 1024 * 1024;
 /// dozens of turns rewriting large files; past it the session carries on,
 /// and a rewind names the files it has no copy of.
 pub const SESSION_CAP: u64 = 100 * 1024 * 1024;
+
+/// What the copies kept for commands may add up to in one session, beside
+/// [`SESSION_CAP`], so a command that rewrites a whole tree never leaves
+/// an edit with no copy. A hundred megabytes holds the first look at a
+/// folder outside git, at most fifty, with as much again for what commands
+/// change after it.
+pub const COMMAND_CAP: u64 = 100 * 1024 * 1024;
 
 /// One file a tool call wrote, by its content hash before and after.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -47,6 +58,13 @@ pub struct FileChange {
     /// is empty, and a build that predates removals takes the empty hash
     /// for a file changed since and leaves it alone.
     pub after: String,
+    /// The mode it had, where a command changed that or removed the file,
+    /// for a rewind to set again: its permission bits, or for a file that
+    /// matched the commit, git's mode for it, 0o100644 or 0o100755, which
+    /// a rewind applies as a checkout does, under the umask. Left out, the
+    /// file keeps the mode it has, as for what the file tools write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
 }
 
 /// Where a turn keeps old bytes, and what its calls have written since their
@@ -55,6 +73,8 @@ pub struct FileChange {
 pub struct Log {
     dir: Option<PathBuf>,
     changes: Arc<Mutex<Vec<FileChange>>>,
+    /// What of the last command's changes was not kept, until taken.
+    unkept: Arc<Mutex<Option<String>>>,
 }
 
 impl Log {
@@ -76,6 +96,46 @@ impl Log {
             .unwrap_or_default()
     }
 
+    /// What of the last command's changes a rewind cannot put back, for the
+    /// result of the call that ran it, as `Message::unkept` says.
+    pub fn unkept(&self) -> Option<String> {
+        self.unkept
+            .lock()
+            .map(|mut unkept| unkept.take())
+            .unwrap_or_default()
+    }
+
+    /// Where this log keeps copies, or `None` when it keeps nothing.
+    pub(crate) fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
+    }
+
+    /// Keep `bytes` a command may change, from the commands' allowance, and
+    /// give their hash, which is noted whether or not there was room.
+    pub(crate) fn keep_bytes(&self, bytes: &[u8]) -> String {
+        let hash = hash(bytes);
+        if let Some(dir) = &self.dir {
+            // As for a file tool: a copy that cannot be made costs only
+            // this file's rewind, which then says there is no copy.
+            let _ = store(dir, &hash, bytes, Pot::Commands);
+        }
+        hash
+    }
+
+    /// Note what a command changed, and what of its changes a rewind cannot
+    /// put back: "" for nothing.
+    pub(crate) fn command(&self, changes: Vec<FileChange>, unkept: String) {
+        if let Ok(mut noted) = self.changes.lock() {
+            noted.extend(changes);
+        }
+        if let Ok(mut noted) = self.unkept.lock() {
+            *noted = Some(unkept);
+        }
+        if let Some(dir) = &self.dir {
+            settle(dir);
+        }
+    }
+
     /// Keep what `path` holds before a write replaces it, and say what that
     /// was: `Some(None)` for no file, `None` when nothing is to be noted --
     /// this log keeps nothing, or the old file cannot be read.
@@ -88,7 +148,7 @@ impl Log {
         let hash = hash(&bytes);
         // A copy that cannot be made costs only this file's rewind, which
         // then says there is no copy; the write itself goes ahead.
-        let _ = store(dir, &hash, &bytes);
+        let _ = store(dir, &hash, &bytes, Pot::Tools);
         Some(Some(hash))
     }
 
@@ -104,6 +164,7 @@ impl Log {
                 path,
                 before,
                 after: hash(bytes),
+                mode: None,
             });
         }
     }
@@ -119,6 +180,7 @@ impl Log {
                 path: real.to_owned(),
                 before,
                 after: String::new(),
+                mode: None,
             });
         }
     }
@@ -133,7 +195,10 @@ pub fn folder(session: u64) -> PathBuf {
 
 /// Remove session `session`'s copies, as the session itself goes.
 pub fn forget(session: u64) {
-    let _ = std::fs::remove_dir_all(folder(session));
+    let dir = folder(session);
+    let _ = std::fs::remove_dir_all(&dir);
+    lock_used().remove(&dir);
+    crate::snapshot::forget(&dir);
 }
 
 /// A copy is written in well under a second, so a part-written one an hour
@@ -185,24 +250,118 @@ fn remove_parts(dir: &Path) {
     }
 }
 
-/// Keep `bytes` in `dir` under `hash`, unless a copy is there already or it
-/// would go over a cap.
-fn store(dir: &Path, hash: &str, bytes: &[u8]) -> std::io::Result<()> {
+/// Which allowance a copy is charged to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Pot {
+    /// What the file tools replace, and what a rewind replaces in turn.
+    Tools,
+    /// What a command may change, and what a rewind of that replaces.
+    Commands,
+}
+
+/// What one session folder's copies add up to, by allowance.
+#[derive(Clone, Copy, Default)]
+struct Used {
+    tools: u64,
+    commands: u64,
+}
+
+/// Each session folder's [`Used`], counted from the folder the first time
+/// a copy goes in and kept up from then on: listing a folder of thousands
+/// of copies before each one would make a command's first look quadratic.
+static USED: Mutex<BTreeMap<PathBuf, Used>> = Mutex::new(BTreeMap::new());
+
+/// The file in a session folder that says how much of it was kept for
+/// commands, which a listing of the folder cannot tell after a restart.
+const LEDGER: &str = "commands.used";
+
+fn lock_used() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, Used>> {
+    // Nothing under this lock panics, so a poisoned one is still whole.
+    USED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What the copies in `dir` add up to, by allowance.
+fn counted(dir: &Path) -> Used {
+    let all: u64 = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|meta| meta.len())
+        .sum();
+    let commands = std::fs::read_to_string(dir.join(LEDGER))
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(all);
+    Used {
+        tools: all - commands,
+        commands,
+    }
+}
+
+/// Count `size` more bytes against `dir`'s `pot`, or say there is no room.
+fn charge(dir: &Path, pot: Pot, size: u64) -> bool {
+    let mut used = lock_used();
+    let used = used.entry(dir.to_owned()).or_insert_with(|| counted(dir));
+    let (now, cap) = match pot {
+        Pot::Tools => (&mut used.tools, SESSION_CAP),
+        Pot::Commands => (&mut used.commands, COMMAND_CAP),
+    };
+    if *now + size > cap {
+        return false;
+    }
+    *now += size;
+    true
+}
+
+/// Give back what a copy that could not be written was charged.
+fn refund(dir: &Path, pot: Pot, size: u64) {
+    if let Some(used) = lock_used().get_mut(dir) {
+        let now = match pot {
+            Pot::Tools => &mut used.tools,
+            Pot::Commands => &mut used.commands,
+        };
+        *now = now.saturating_sub(size);
+    }
+}
+
+/// Write down what `dir` has kept for commands, for the next start to count.
+fn settle(dir: &Path) {
+    let Some(commands) = lock_used().get(dir).map(|used| used.commands) else {
+        return;
+    };
+    if commands == 0 && !dir.join(LEDGER).exists() {
+        return;
+    }
+    let temp = dir.join(format!("{LEDGER}.{}.part", std::process::id()));
+    if crate::store::write_private(&temp, commands.to_string().as_bytes()).is_ok() {
+        let _ = std::fs::rename(&temp, dir.join(LEDGER));
+    }
+}
+
+/// Keep `bytes` in `dir` under `hash`, charged to `pot`, unless a copy is
+/// there already or it would go over a cap.
+fn store(dir: &Path, hash: &str, bytes: &[u8], pot: Pot) -> std::io::Result<()> {
     let blob = dir.join(hash);
     let size = bytes.len() as u64;
     if blob.exists() || size > FILE_CAP {
         return Ok(());
     }
     make_folder(dir)?;
-    if used(dir) + size > SESSION_CAP {
+    if !charge(dir, pot, size) {
         return Ok(());
     }
     // Written aside and renamed, so a copy is never seen half written: its
     // name is the promise of what is in it. Owner-only, as the file it is a
     // copy of may hold a secret.
     let temp = dir.join(format!("{hash}.{}.part", std::process::id()));
-    crate::store::write_private(&temp, bytes)?;
-    std::fs::rename(&temp, &blob)
+    let written =
+        crate::store::write_private(&temp, bytes).and_then(|()| std::fs::rename(&temp, &blob));
+    if written.is_err() {
+        refund(dir, pot, size);
+    }
+    written
 }
 
 /// Make `dir`, and whatever above it is missing, owner-only where the
@@ -215,19 +374,8 @@ fn make_folder(dir: &Path) -> std::io::Result<()> {
     builder.create(dir)
 }
 
-/// What the copies in `dir` add up to.
-fn used(dir: &Path) -> u64 {
-    std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| entry.metadata().ok())
-        .map(|meta| meta.len())
-        .sum()
-}
-
 /// The SHA-256 of `bytes`, as lowercase hex.
-fn hash(bytes: &[u8]) -> String {
+pub(crate) fn hash(bytes: &[u8]) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
     digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -267,14 +415,52 @@ impl Fate {
     }
 }
 
-/// Said beside the files when the turns a rewind drops ran commands.
-pub const COMMANDS_NOTE: &str = "Commands it ran are not undone: what they changed stays.";
+/// Said beside the files when the turns a rewind drops ran a command whose
+/// changes were not all kept.
+pub const COMMANDS_NOTE: &str = "Some commands it ran are not undone: what they changed stays.";
 
-/// Whether any of `dropped` ran a command, whose changes are never kept.
+/// Said after the files when some of them were changed by a command, whose
+/// changes are only looked for in the project's own files.
+pub const COMMAND_FILES_NOTE: &str = "What commands did to git's own records, to submodules, \
+     to files the project ignores or to anything outside it stays.";
+
+/// Whether any of `dropped` ran a command whose changes were not all kept:
+/// one left in the background, one that moved git HEAD or changed too
+/// much, or one run before commands were watched.
 pub fn ran_commands(dropped: &[Message]) -> bool {
     dropped
         .iter()
-        .any(|m| m.role == "tool" && m.name == "run_command")
+        .any(|m| m.role == "tool" && m.name == "run_command" && m.unkept.as_deref() != Some(""))
+}
+
+/// Characters of a command a line about it shows, enough to tell it from
+/// the others a turn ran.
+const COMMAND_CHARS: usize = 60;
+
+/// A line for each command of `dropped` whose changes a rewind cannot all
+/// put back, naming it and saying why.
+pub fn unkept(dropped: &[Message]) -> Vec<String> {
+    dropped
+        .iter()
+        .filter(|m| m.role == "tool" && m.name == "run_command")
+        .filter_map(|m| {
+            let args: serde_json::Value = serde_json::from_str(&m.args).unwrap_or_default();
+            let why = match m.unkept.as_deref() {
+                Some("") => return None,
+                Some(why) => why,
+                None if args["background"].as_bool() == Some(true) => {
+                    "left running in the background, so not undone"
+                }
+                None => return None,
+            };
+            let line = args["command"].as_str()?.lines().next().unwrap_or_default();
+            let mut shown: String = line.chars().take(COMMAND_CHARS).collect();
+            if shown.len() < line.len() {
+                shown.push('…');
+            }
+            Some(format!("`{shown}`: {why}."))
+        })
+        .collect()
 }
 
 /// The files the tools wrote in `messages` that are inside `workspace`, each
@@ -471,15 +657,16 @@ pub fn revert_plan(
 }
 
 /// The tool results of `messages` cut down to their writes to `name`, all
-/// a plan looks at.
+/// a plan looks at: what wrote it, and what it wrote.
 fn writes_to(messages: &[Message], workspace: &Path, name: &Path) -> Vec<Message> {
     messages
         .iter()
         .filter(|m| m.role == "tool")
-        .flat_map(|m| &m.files)
-        .filter(|change| Path::new(&label(&change.path, Some(workspace))) == name)
-        .map(|change| Message {
+        .flat_map(|m| m.files.iter().map(move |change| (m, change)))
+        .filter(|(_, change)| Path::new(&label(&change.path, Some(workspace))) == name)
+        .map(|(m, change)| Message {
             role: "tool".into(),
+            name: m.name.clone(),
             files: vec![change.clone()],
             ..Default::default()
         })
@@ -491,8 +678,12 @@ fn writes_to(messages: &[Message], workspace: &Path, name: &Path) -> Vec<Message
 pub struct Restore {
     pub path: PathBuf,
     pub fate: Fate,
+    /// A command changed it, so it may be news to the user that it goes back.
+    pub by_command: bool,
     /// The hash it goes back to, or `None` to remove it.
     to: Option<String>,
+    /// The mode it goes back to, as [`FileChange::mode`] says it.
+    mode: Option<u32>,
     /// The hash Letronna last left it with, empty when it removed it.
     last: String,
 }
@@ -507,11 +698,11 @@ pub fn plan(session: u64, dropped: &[Message], workspace: Option<&Path>) -> Vec<
 fn plan_in(dir: &Path, dropped: &[Message], workspace: Option<&Path>) -> Vec<Restore> {
     let root = real(workspace);
     let mut files: Vec<Restore> = Vec::new();
-    let changes = dropped
-        .iter()
-        .filter(|m| m.role == "tool")
-        .flat_map(|m| &m.files);
-    for change in changes {
+    let changes = dropped.iter().filter(|m| m.role == "tool").flat_map(|m| {
+        let command = m.name == "run_command";
+        m.files.iter().map(move |change| (change, command))
+    });
+    for (change, command) in changes {
         match files.iter_mut().find(|file| file.path == change.path) {
             Some(file) => {
                 // A write that did not start from what the one before left
@@ -521,11 +712,14 @@ fn plan_in(dir: &Path, dropped: &[Message], workspace: Option<&Path>) -> Vec<Res
                     file.fate = Fate::Changed;
                 }
                 file.last.clone_from(&change.after);
+                file.by_command |= command;
             }
             None => files.push(Restore {
                 path: change.path.clone(),
                 fate: Fate::Back,
+                by_command: command,
                 to: change.before.clone(),
+                mode: change.mode,
                 last: change.after.clone(),
             }),
         }
@@ -553,15 +747,25 @@ fn plan_in(dir: &Path, dropped: &[Message], workspace: Option<&Path>) -> Vec<Res
 const LISTED: usize = 10;
 
 /// The lines a rewind's question shows: each file and what will become of
-/// it, relative to `workspace`.
+/// it, relative to `workspace`, and what of the commands' changes stays.
 pub fn listing(plan: &[Restore], workspace: Option<&Path>) -> Vec<String> {
     let mut lines: Vec<String> = plan
         .iter()
         .take(LISTED)
-        .map(|file| format!("{} {}", label(&file.path, workspace), file.fate.says()))
+        .map(|file| {
+            let by = if file.by_command {
+                " (changed by a command)"
+            } else {
+                ""
+            };
+            format!("{} {}{by}", label(&file.path, workspace), file.fate.says())
+        })
         .collect();
     if plan.len() > LISTED {
         lines.push(format!("and {} more", plan.len() - LISTED));
+    }
+    if plan.iter().any(|file| file.by_command) {
+        lines.push(COMMAND_FILES_NOTE.to_owned());
     }
     lines
 }
@@ -783,6 +987,7 @@ fn restore_in(dir: &Path, plan: &[Restore], workspace: Option<&Path>) -> Restore
             Err(why) => done.left.push(format!("{name}: {why}.")),
         }
     }
+    settle(dir);
     done
 }
 
@@ -801,7 +1006,12 @@ fn put_back(dir: &Path, file: &Restore, root: Option<&Path>) -> Result<(), Strin
     // Letronna's version goes into the same folder before it is replaced,
     // so the rewind can itself be undone by hand; a removed file has none.
     if let Some(now) = &now {
-        let _ = store(dir, &file.last, now);
+        let pot = if file.by_command {
+            Pot::Commands
+        } else {
+            Pot::Tools
+        };
+        let _ = store(dir, &file.last, now, pot);
         if !dir.join(&file.last).is_file() {
             return Err("its current version could not be kept, so it was left alone".into());
         }
@@ -809,9 +1019,46 @@ fn put_back(dir: &Path, file: &Restore, root: Option<&Path>) -> Result<(), Strin
     let Some(old) = old else {
         return std::fs::remove_file(&file.path).map_err(|e| format!("could not remove it: {e}"));
     };
+    // A folder a command removed with it is made again, inside the project
+    // as `reachable` found.
+    if let Some(folder) = file.path.parent() {
+        std::fs::create_dir_all(folder)
+            .map_err(|e| format!("could not make its folder again: {e}"))?;
+    }
     // Written the way the tools write, but noted nowhere: a rewind is not a
     // turn, and there is nothing after it to go back past.
-    crate::write::atomic(&file.path, &old, &Log::default())
+    crate::write::atomic(&file.path, &old, &Log::default())?;
+    let Some(mode) = file.mode else {
+        return Ok(());
+    };
+    set_mode(&file.path, mode).map_err(|e| format!("its bytes went back but not its mode: {e}"))
+}
+
+/// Give the file at `path` the mode `mode`, as [`FileChange::mode`] says
+/// it: a git mode lets it run wherever it may be read, as a checkout does
+/// under the umask, or not at all. Never a set-id or sticky bit, which no
+/// session line is trusted to give.
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    // Changed through the file it opens, not by name, so a link put in its
+    // place since cannot carry the change outside the project.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let now = file.metadata()?.permissions().mode() & 0o777;
+    let bits = match mode & !0o777 {
+        0 => mode,
+        _ if mode & 0o100 != 0 => now | (now & 0o444) >> 2,
+        _ => now & !0o111,
+    };
+    file.set_permissions(std::fs::Permissions::from_mode(bits & 0o777))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_: &Path, _: u32) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// The bytes kept in `dir` as `name`, once they are sure to be what the name
@@ -847,7 +1094,11 @@ fn real(workspace: Option<&Path>) -> Option<PathBuf> {
 
 /// Whether a rewind may write or remove `path`: where the file tools could,
 /// so not a link and in a folder that is really inside `root`, the real
-/// project folder. A session line naming anywhere else is not followed.
+/// project folder. A folder that is gone, as a command removed it, counts
+/// as the nearest one above it still there, which `put_back` makes it in.
+/// A session line naming anywhere else is not followed, nor is a folder on
+/// the way that became a link since: paths are noted by their real path,
+/// and the file would land wherever the link leads.
 fn reachable(path: &Path, root: Option<&Path>) -> bool {
     let Some(root) = root else {
         return false;
@@ -855,9 +1106,17 @@ fn reachable(path: &Path, root: Option<&Path>) -> bool {
     if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
         return false;
     }
-    path.parent()
-        .and_then(|parent| std::fs::canonicalize(parent).ok())
-        .is_some_and(|parent| parent.starts_with(root))
+    // Folders that are gone are made by name, and a `..` among them would
+    // climb out of the one found.
+    if path.components().any(|part| part == Component::ParentDir) {
+        return false;
+    }
+    path.ancestors()
+        .skip(1)
+        .find(|up| std::fs::symlink_metadata(up).is_ok())
+        .filter(|up| up.is_dir())
+        .and_then(|up| Some((up, std::fs::canonicalize(up).ok()?)))
+        .is_some_and(|(up, real)| real == up && real.starts_with(root))
 }
 
 /// `path` as a rewind lists it: inside the project folder, relative to it.
@@ -888,6 +1147,8 @@ fn share_between(from: &Path, to: &Path) {
     if make_folder(to).is_err() {
         return;
     }
+    // What the folder holds is counted afresh, with what it was given.
+    lock_used().remove(to);
     for entry in entries.flatten() {
         let target = to.join(entry.file_name());
         if std::fs::hard_link(entry.path(), &target).is_err() {
@@ -911,13 +1172,15 @@ mod tests {
         (project, kept)
     }
 
-    /// Run a file tool as a turn does, and give back its result message.
+    /// Run a tool as a turn does, and give back its result message.
     fn call(ctx: &ToolContext, name: &str, args: serde_json::Value) -> Message {
         run(name, &args.to_string(), ctx).unwrap();
         Message {
             role: "tool".into(),
             name: name.into(),
+            args: args.to_string(),
             files: ctx.files.take(),
+            unkept: ctx.files.unkept(),
             ..Default::default()
         }
     }
@@ -1151,7 +1414,7 @@ mod tests {
         std::fs::create_dir_all(&kept).unwrap();
         let filler = std::fs::File::create(kept.join("filler")).unwrap();
         filler.set_len(SESSION_CAP).unwrap();
-        store(&kept, &hash(b"more"), b"more").unwrap();
+        store(&kept, &hash(b"more"), b"more", Pot::Tools).unwrap();
         assert!(!kept.join(hash(b"more")).exists());
     }
 
@@ -1191,7 +1454,9 @@ mod tests {
             .map(|i| Restore {
                 path: PathBuf::from(format!("f{i}.txt")),
                 fate: Fate::Back,
+                by_command: false,
                 to: None,
+                mode: None,
                 last: String::new(),
             })
             .collect();
@@ -1317,6 +1582,7 @@ mod tests {
                 path: victim.clone(),
                 before: None,
                 after: hash(b"precious\n"),
+                mode: None,
             }],
             ..Default::default()
         };
@@ -1326,7 +1592,9 @@ mod tests {
         let made_up = [Restore {
             path: victim.clone(),
             fate: Fate::Remove,
+            by_command: false,
             to: None,
+            mode: None,
             last: hash(b"precious\n"),
         }];
         assert_eq!(restore_in(&kept, &made_up, Some(&project)).back, 0);
@@ -1673,5 +1941,922 @@ mod tests {
                 Row::Folded(8),
             ]
         );
+    }
+
+    /// Run git in `folder` as a test sets a repository up, without the
+    /// user's own config.
+    fn git(folder: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(folder)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// A project that is a repository with `files` committed, and a
+    /// history folder of its own.
+    fn repository(name: &str, files: &[(&str, &str)]) -> (PathBuf, PathBuf) {
+        let (project, kept) = scratch(name);
+        git(&project, &["init", "-q"]);
+        for (file, text) in files {
+            std::fs::write(project.join(file), text).unwrap();
+        }
+        git(&project, &["add", "."]);
+        git(&project, &["commit", "-q", "-m", "first"]);
+        (project, kept)
+    }
+
+    /// Run `command` as a turn runs it in the foreground, and give back its
+    /// result message, whether it worked or not.
+    fn ran(ctx: &ToolContext, command: &str) -> Message {
+        let args = serde_json::json!({ "command": command }).to_string();
+        let _ = run("run_command", &args, ctx);
+        Message {
+            role: "tool".into(),
+            name: "run_command".into(),
+            args,
+            files: ctx.files.take(),
+            unkept: ctx.files.unkept(),
+            ..Default::default()
+        }
+    }
+
+    fn text(project: &Path, name: &str) -> String {
+        std::fs::read_to_string(project.join(name)).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sed_in_place_rm_checkout_and_reset_hard_restore() {
+        let files = [("a.txt", "one\n"), ("b.txt", "bee\n"), ("c.txt", "sea\n")];
+        let (project, kept) = repository("command-git", &files);
+        // Work not yet committed, which checkout and reset throw away.
+        std::fs::write(project.join("c.txt"), "mine\n").unwrap();
+        let ctx = context(&project, &kept);
+        let cases = [
+            (
+                "sed -i.bak 's/one/two/' a.txt && rm a.txt.bak",
+                "a.txt",
+                "one\n",
+            ),
+            ("rm b.txt", "b.txt", "bee\n"),
+            ("git checkout -- c.txt", "c.txt", "mine\n"),
+            ("git reset -q --hard", "c.txt", "mine\n"),
+        ];
+        for (command, name, was) in cases {
+            let turn = ran(&ctx, command);
+            assert_eq!(turn.unkept.as_deref(), Some(""), "{command}");
+            assert!(!ran_commands(std::slice::from_ref(&turn)), "{command}");
+            let plan = plan_in(&kept, std::slice::from_ref(&turn), Some(&project));
+            assert_eq!(fates(&plan, &project), [(name.to_owned(), Fate::Back)]);
+            assert_eq!(
+                listing(&plan, Some(&project)),
+                [
+                    format!("{name} goes back to how it was (changed by a command)"),
+                    COMMAND_FILES_NOTE.to_owned()
+                ]
+            );
+            let done = restore_in(&kept, &plan, Some(&project));
+            assert_eq!(done.back, 1, "{command}: {:?}", done.left);
+            assert_eq!(text(&project, name), was, "{command}");
+        }
+        // What was kept for commands is written down for the next start.
+        assert!(counted(&kept).commands > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_formatters_changes_restore() {
+        // Outside git, where the whole folder is looked at.
+        let (project, kept) = scratch("command-format");
+        for folder in ["src", "out"] {
+            std::fs::create_dir_all(project.join(folder)).unwrap();
+        }
+        std::fs::write(project.join(".gitignore"), "out/\n").unwrap();
+        for name in ["src/a.rs", "src/b.rs", "out/gen.rs"] {
+            std::fs::write(project.join(name), "fn  main( ) {}\n").unwrap();
+        }
+        std::fs::write(project.join("src/same.rs"), "fn main() {}\n").unwrap();
+        let ctx = context(&project, &kept);
+        // Written beside each file and moved over it, as formatters do.
+        let turn = ran(
+            &ctx,
+            "for f in src/*.rs out/*.rs; do sed 's/  */ /g; s/( )/()/' \"$f\" > \"$f.new\" \
+             && mv \"$f.new\" \"$f\"; done",
+        );
+        assert_eq!(text(&project, "src/a.rs"), "fn main() {}\n");
+        let plan = plan_in(&kept, std::slice::from_ref(&turn), Some(&project));
+        // Nor what the project ignores, nor a file written back the same.
+        assert_eq!(
+            fates(&plan, &project),
+            [
+                ("src/a.rs".to_owned(), Fate::Back),
+                ("src/b.rs".to_owned(), Fate::Back)
+            ]
+        );
+        // Reverting one of them from the Changes tab says so too.
+        let one = writes_to(std::slice::from_ref(&turn), &project, Path::new("src/a.rs"));
+        assert!(plan_in(&kept, &one, Some(&project))[0].by_command);
+        assert_eq!(restore_in(&kept, &plan, Some(&project)).back, 2);
+        assert_eq!(text(&project, "src/a.rs"), "fn  main( ) {}\n");
+        assert_eq!(text(&project, "src/b.rs"), "fn  main( ) {}\n");
+        assert_eq!(text(&project, "out/gen.rs"), "fn main() {}\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_untracked_file_is_removed() {
+        let (project, kept) = repository("command-new", &[("a.txt", "one\n")]);
+        let ctx = context(&project, &kept);
+        let turn = ran(
+            &ctx,
+            "mkdir gen && echo hi > gen/out.txt && echo hi > new.txt",
+        );
+        let plan = plan_in(&kept, &[turn], Some(&project));
+        assert_eq!(
+            fates(&plan, &project),
+            [
+                ("gen/out.txt".to_owned(), Fate::Remove),
+                ("new.txt".to_owned(), Fate::Remove)
+            ]
+        );
+        assert_eq!(restore_in(&kept, &plan, Some(&project)).back, 2);
+        assert!(!project.join("gen/out.txt").exists());
+        assert!(!project.join("new.txt").exists());
+        assert_eq!(text(&project, "a.txt"), "one\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_the_command_stops_ignoring_is_left_alone() {
+        let files = [(".gitignore", "secret.txt\n"), ("a.txt", "one\n")];
+        let (project, kept) = repository("command-unignore", &files);
+        std::fs::write(project.join("secret.txt"), "key\n").unwrap();
+        // Older than the command by more than a clock's tick.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let ctx = context(&project, &kept);
+        let turn = ran(&ctx, "printf '' > .gitignore && echo hi > new.txt");
+        // It may have been the command's, so the user is told it stays.
+        assert_eq!(
+            turn.unkept.as_deref(),
+            Some("left secret.txt: it looks older than the command")
+        );
+        let plan = plan_in(&kept, &[turn], Some(&project));
+        assert_eq!(
+            fates(&plan, &project),
+            [
+                (".gitignore".to_owned(), Fate::Back),
+                ("new.txt".to_owned(), Fate::Remove)
+            ]
+        );
+        restore_in(&kept, &plan, Some(&project));
+        assert_eq!(text(&project, "secret.txt"), "key\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_changes_too_many_files_records_none_and_says_so() {
+        let (project, kept) = repository("command-many", &[("a.txt", "one\n")]);
+        let ctx = context(&project, &kept);
+        let turn = ran(&ctx, "for i in $(seq 1 501); do echo $i > f$i.txt; done");
+        assert!(project.join("f501.txt").exists());
+        assert!(turn.files.is_empty());
+        assert_eq!(
+            turn.unkept.as_deref(),
+            Some("not undoable: it changed over 500 files")
+        );
+        assert!(ran_commands(&[turn]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_moved_to_the_background_keeps_what_it_changed_so_far() {
+        let _turn = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (project, kept) = scratch("command-moved");
+        std::fs::write(project.join("a.txt"), "one\n").unwrap();
+        // A conversation of its own, which a command can become a job for.
+        let ctx = ToolContext {
+            conversation: 7_704,
+            ..context(&project, &kept)
+        };
+        let command = "echo two > a.txt; sleep 2; echo three > a.txt";
+        let args = serde_json::json!({"command": command, "timeout": 1});
+        let turn = call(&ctx, "run_command", args);
+        assert_eq!(turn.unkept.as_deref(), Some("later changes not undoable"));
+        let plan = plan_in(&kept, std::slice::from_ref(&turn), Some(&project));
+        assert_eq!(fates(&plan, &project), [("a.txt".to_owned(), Fate::Back)]);
+        // What the job does after is not the command's to undo.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while text(&project, "a.txt") != "three\n" {
+            assert!(std::time::Instant::now() < deadline, "the job never wrote");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let plan = plan_in(&kept, &[turn], Some(&project));
+        assert_eq!(
+            fates(&plan, &project),
+            [("a.txt".to_owned(), Fate::Changed)]
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while crate::inbox::take(7_704, true).is_empty() {
+            assert!(std::time::Instant::now() < deadline, "no exit notice");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_branch_checkout_records_nothing() {
+        let (project, kept) = repository("command-branch", &[("a.txt", "one\n")]);
+        git(&project, &["checkout", "-q", "-b", "other"]);
+        std::fs::write(project.join("a.txt"), "other\n").unwrap();
+        git(&project, &["commit", "-q", "-am", "other"]);
+        git(&project, &["checkout", "-q", "-"]);
+        let ctx = context(&project, &kept);
+        let turn = ran(&ctx, "git checkout -q other");
+        assert_eq!(text(&project, "a.txt"), "other\n");
+        // Putting a.txt back without the branch would be a half state.
+        assert!(turn.files.is_empty(), "{:?}", turn.files);
+        let turns = [turn];
+        assert!(ran_commands(&turns));
+        assert_eq!(
+            unkept(&turns),
+            ["`git checkout -q other`: moved git HEAD; go back with git."]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_commands_are_skipped() {
+        let _turn = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (project, kept) = scratch("command-background");
+        let ctx = context(&project, &kept);
+        let args = serde_json::json!({"command": "echo hi > bg.txt", "background": true});
+        call(&ctx, "run_command", args);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !project.join("bg.txt").exists() {
+            assert!(std::time::Instant::now() < deadline, "the job never wrote");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let args = serde_json::json!({"command": "echo hi > bg.txt", "background": true});
+        let job = Message {
+            role: "tool".into(),
+            name: "run_command".into(),
+            args: args.to_string(),
+            files: ctx.files.take(),
+            unkept: ctx.files.unkept(),
+            ..Default::default()
+        };
+        assert!(job.files.is_empty() && job.unkept.is_none());
+        let turns = [job];
+        assert!(ran_commands(&turns));
+        assert_eq!(
+            unkept(&turns),
+            ["`echo hi > bg.txt`: left running in the background, so not undone."]
+        );
+        // One that only reads has nothing to keep and nothing missed.
+        let read = ran(&ctx, "cat bg.txt");
+        assert!(read.files.is_empty());
+        assert_eq!(read.unkept.as_deref(), Some(""));
+        assert!(!ran_commands(&[read]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_tool_edit_after_a_large_snapshot_keeps_its_copy() {
+        let (project, kept) = scratch("command-pots");
+        std::fs::write(project.join("a.txt"), "one\n").unwrap();
+        // Commands have used up their allowance, as a first look at a big
+        // folder might. The filler is sparse: it counts its full length
+        // but takes no disk.
+        std::fs::create_dir_all(&kept).unwrap();
+        let filler = std::fs::File::create(kept.join("filler")).unwrap();
+        filler.set_len(COMMAND_CAP).unwrap();
+        std::fs::write(kept.join(LEDGER), COMMAND_CAP.to_string()).unwrap();
+        let ctx = context(&project, &kept);
+        let turn = ran(&ctx, "echo two > a.txt");
+        // The change is noted, but its old bytes did not fit.
+        let plan = plan_in(&kept, std::slice::from_ref(&turn), Some(&project));
+        assert_eq!(fates(&plan, &project), [("a.txt".to_owned(), Fate::NoCopy)]);
+        // The file tools have their own allowance, untouched.
+        let edit = call(
+            &ctx,
+            "write_file",
+            serde_json::json!({"path": "a.txt", "content": "three\n"}),
+        );
+        assert!(kept.join(hash(b"two\n")).is_file());
+        let plan = plan_in(&kept, &[edit], Some(&project));
+        assert_eq!(restore_in(&kept, &plan, Some(&project)).back, 1);
+        assert_eq!(text(&project, "a.txt"), "two\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_a_filter_writes_is_said_not_kept_rather_than_put_back_wrong() {
+        let (project, kept) = scratch("command-filter");
+        git(&project, &["init", "-q"]);
+        // The repository's own filter, which a look at it turns off.
+        for part in ["clean", "smudge"] {
+            let key = format!("filter.rot.{part}");
+            git(&project, &["config", key.as_str(), "tr a-z n-za-m"]);
+        }
+        std::fs::write(project.join(".gitattributes"), "*.sec filter=rot\n").unwrap();
+        let secrets = ["s1.sec", "s2.sec", "s3.sec", "s4.sec"];
+        // Older than the index git writes, so git trusts its times rather
+        // than reading them again with the filter off.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3_600);
+        for name in secrets.iter().chain(&["a.txt"]) {
+            std::fs::write(project.join(name), "hello\n").unwrap();
+            let file = std::fs::File::options()
+                .write(true)
+                .open(project.join(name));
+            file.unwrap().set_modified(old).unwrap();
+        }
+        git(&project, &["add", "."]);
+        git(&project, &["commit", "-q", "-m", "first"]);
+        let ctx = context(&project, &kept);
+        let turn = ran(&ctx, "for f in *.sec a.txt; do echo bye > $f; done");
+        assert_eq!(
+            turn.unkept.as_deref(),
+            Some("s1.sec, s2.sec, s3.sec and 1 more could not be kept")
+        );
+        assert!(ran_commands(std::slice::from_ref(&turn)));
+        let plan = plan_in(&kept, &[turn], Some(&project));
+        assert_eq!(fates(&plan, &project), [("a.txt".to_owned(), Fate::Back)]);
+        assert_eq!(restore_in(&kept, &plan, Some(&project)).back, 1);
+        assert_eq!(text(&project, "a.txt"), "hello\n");
+        // Never the filtered bytes of the commit.
+        assert_eq!(text(&project, "s1.sec"), "bye\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_removed_folder_comes_back_whole() {
+        let files = [("src/a.txt", "one\n"), ("src/b.txt", "bee\n")];
+        let (project, kept) = scratch("command-rmdir");
+        git(&project, &["init", "-q"]);
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        for (file, text) in files {
+            std::fs::write(project.join(file), text).unwrap();
+        }
+        git(&project, &["add", "."]);
+        git(&project, &["commit", "-q", "-m", "first"]);
+        // Uncommitted work, tracked and not.
+        std::fs::write(project.join("src/b.txt"), "mine\n").unwrap();
+        std::fs::create_dir_all(project.join("wip")).unwrap();
+        std::fs::write(project.join("wip/new.txt"), "draft\n").unwrap();
+        let ctx = context(&project, &kept);
+        let turn = ran(&ctx, "rm -rf src wip");
+        let plan = plan_in(&kept, &[turn], Some(&project));
+        let back =
+            ["src/a.txt", "src/b.txt", "wip/new.txt"].map(|name| (name.to_owned(), Fate::Back));
+        assert_eq!(fates(&plan, &project), back);
+        assert_eq!(restore_in(&kept, &plan, Some(&project)).back, 3);
+        assert_eq!(text(&project, "src/a.txt"), "one\n");
+        assert_eq!(text(&project, "src/b.txt"), "mine\n");
+        assert_eq!(text(&project, "wip/new.txt"), "draft\n");
+
+        // Outside git, a file written again where the folder was is still
+        // the one the command removed, under the same real path.
+        let (project, kept) = scratch("command-rmdir-walk");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(project.join("src/a.txt"), "one\n").unwrap();
+        let ctx = context(&project, &kept);
+        let turns = [
+            ran(&ctx, "rm -rf src"),
+            call(
+                &ctx,
+                "write_file",
+                serde_json::json!({"path": "src/a.txt", "content": "two\n"}),
+            ),
+        ];
+        let plan = plan_in(&kept, &turns, Some(&project));
+        assert_eq!(
+            fates(&plan, &project),
+            [("src/a.txt".to_owned(), Fate::Back)]
+        );
+        assert_eq!(restore_in(&kept, &plan, Some(&project)).back, 1);
+        assert_eq!(text(&project, "src/a.txt"), "one\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_moved_file_goes_back_and_a_new_one_that_looks_old_is_named() {
+        for in_git in [true, false] {
+            let files = [("a.txt", "one\n"), ("b.txt", "bee\n")];
+            let (project, kept) = if in_git {
+                repository("command-mv", &files)
+            } else {
+                let (project, kept) = scratch("command-mv-walk");
+                for (file, text) in files {
+                    std::fs::write(project.join(file), text).unwrap();
+                }
+                (project, kept)
+            };
+            // Older than the command by more than a clock's tick, as a
+            // file it moves, links or copies with its times kept stays.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let ctx = context(&project, &kept);
+            let turn = ran(&ctx, "mv a.txt moved.txt && ln b.txt linked.txt");
+            assert_eq!(
+                turn.unkept.as_deref(),
+                Some("left linked.txt: it looks older than the command"),
+                "in git: {in_git}"
+            );
+            let plan = plan_in(&kept, &[turn], Some(&project));
+            assert_eq!(
+                fates(&plan, &project),
+                [
+                    ("a.txt".to_owned(), Fate::Back),
+                    ("moved.txt".to_owned(), Fate::Remove)
+                ],
+                "in git: {in_git}"
+            );
+            assert_eq!(restore_in(&kept, &plan, Some(&project)).back, 2);
+            assert_eq!(text(&project, "a.txt"), "one\n");
+            assert!(!project.join("moved.txt").exists());
+            assert_eq!(text(&project, "linked.txt"), "bee\n");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_a_command_adds_to_the_index_are_noted_as_made() {
+        let (project, kept) = repository("command-add", &[("a.txt", "one\n")]);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let ctx = context(&project, &kept);
+        let turn = ran(
+            &ctx,
+            "git mv a.txt b.txt && echo n > n.txt && git add n.txt",
+        );
+        assert_eq!(turn.unkept.as_deref(), Some(""));
+        let plan = plan_in(&kept, &[turn], Some(&project));
+        assert_eq!(
+            fates(&plan, &project),
+            [
+                ("a.txt".to_owned(), Fate::Back),
+                ("n.txt".to_owned(), Fate::Remove),
+                ("b.txt".to_owned(), Fate::Remove)
+            ]
+        );
+        assert_eq!(restore_in(&kept, &plan, Some(&project)).back, 3);
+        assert_eq!(text(&project, "a.txt"), "one\n");
+        assert!(!project.join("b.txt").exists() && !project.join("n.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_project_its_repository_ignores_is_walked() {
+        let (project, kept) = scratch("command-ignored");
+        let home = project.parent().unwrap();
+        // A home folder kept in git, ignoring all but what it adds.
+        git(home, &["init", "-q"]);
+        std::fs::write(home.join(".gitignore"), "*\n").unwrap();
+        std::fs::write(project.join("a.txt"), "one\n").unwrap();
+        let ctx = context(&project, &kept);
+        let turn = ran(&ctx, "echo two > a.txt && echo x > b.txt");
+        assert_eq!(turn.unkept.as_deref(), Some(""));
+        let plan = plan_in(&kept, &[turn], Some(&project));
+        assert_eq!(
+            fates(&plan, &project),
+            [
+                ("a.txt".to_owned(), Fate::Back),
+                ("b.txt".to_owned(), Fate::Remove)
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_failing_in_a_repository_is_said_rather_than_walked_past() {
+        let (project, kept) = scratch("command-broken-git");
+        // A repository git cannot read, as one it refuses for who owns it.
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::write(project.join("a.txt"), "one\n").unwrap();
+        let ctx = context(&project, &kept);
+        let turn = ran(&ctx, "echo two > a.txt");
+        assert!(turn.files.is_empty());
+        assert_eq!(
+            turn.unkept.as_deref(),
+            Some("not undoable: git could not list the changes")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_given_a_used_folder_keeps_its_own_copies() {
+        let (project, kept) = scratch("command-reused");
+        std::fs::write(project.join("a.txt"), "one\n").unwrap();
+        let ctx = context(&project, &kept);
+        ran(&ctx, "echo x > other.txt");
+        // The session goes, and a new one is given its folder.
+        std::fs::remove_dir_all(&kept).unwrap();
+        lock_used().remove(&kept);
+        let turn = ran(&ctx, "echo two > a.txt");
+        let plan = plan_in(&kept, &[turn], Some(&project));
+        assert_eq!(fates(&plan, &project), [("a.txt".to_owned(), Fate::Back)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_look_after_a_command_stops_at_what_it_may_read() {
+        let (project, kept) = repository("command-read-cap", &[("a.txt", "one\n")]);
+        let ctx = context(&project, &kept);
+        // Sparse, so they take no disk: ten of them are all that is read.
+        let turn = ran(
+            &ctx,
+            "for i in 1 2 3 4 5 6 7 8 9 10 11; do \
+             dd if=/dev/zero of=big$i.bin bs=1 count=0 seek=10485760 2>/dev/null; done",
+        );
+        assert_eq!(turn.files.len(), 10);
+        assert_eq!(turn.unkept.as_deref(), Some("big9.bin could not be kept"));
+    }
+
+    /// The permission bits of `name` in `project`.
+    #[cfg(unix)]
+    fn mode(project: &Path, name: &str) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(project.join(name)).unwrap();
+        meta.permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn set_mode(project: &Path, name: &str, bits: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let bits = std::fs::Permissions::from_mode(bits);
+        std::fs::set_permissions(project.join(name), bits).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_a_command_removes_is_named_and_never_written_back_as_a_file() {
+        let link = |to: &str, project: &Path, at: &str| {
+            std::os::unix::fs::symlink(to, project.join(at)).unwrap();
+        };
+        let (project, kept) = scratch("command-links");
+        git(&project, &["init", "-q"]);
+        std::fs::create_dir_all(project.join("d")).unwrap();
+        std::fs::write(project.join("AGENTS.md"), "rules\n").unwrap();
+        std::fs::write(project.join("d/a.txt"), "one\n").unwrap();
+        link("AGENTS.md", &project, "CLAUDE.md");
+        link("../AGENTS.md", &project, "d/link.md");
+        git(&project, &["add", "."]);
+        git(&project, &["commit", "-q", "-m", "first"]);
+        // And one not committed.
+        link("AGENTS.md", &project, "mine.md");
+        let ctx = context(&project, &kept);
+        let turn = ran(&ctx, "rm CLAUDE.md mine.md && rm -rf d");
+        assert_eq!(
+            turn.unkept.as_deref(),
+            Some("links stay as the command left them: CLAUDE.md, d/link.md, mine.md")
+        );
+        assert!(ran_commands(std::slice::from_ref(&turn)));
+        let plan = plan_in(&kept, &[turn], Some(&project));
+        assert_eq!(fates(&plan, &project), [("d/a.txt".to_owned(), Fate::Back)]);
+        assert_eq!(restore_in(&kept, &plan, Some(&project)).back, 1);
+        assert_eq!(text(&project, "d/a.txt"), "one\n");
+        // Never a file holding where the link pointed.
+        for name in ["CLAUDE.md", "d/link.md", "mine.md"] {
+            assert!(
+                std::fs::symlink_metadata(project.join(name)).is_err(),
+                "{name}"
+            );
+        }
+
+        // A link written over with a file, as GNU sed -i does, and one made.
+        git(&project, &["checkout", "-q", "--", "."]);
+        let turn = ran(
+            &ctx,
+            "rm CLAUDE.md && echo flat > CLAUDE.md && ln -s AGENTS.md new.md",
+        );
+        assert_eq!(
+            turn.unkept.as_deref(),
+            Some("links stay as the command left them: CLAUDE.md, new.md")
+        );
+        assert!(turn.files.is_empty(), "{:?}", turn.files);
+
+        // Outside git, the same.
+        let (project, kept) = scratch("command-links-walk");
+        std::fs::write(project.join("a.txt"), "one\n").unwrap();
+        link("a.txt", &project, "link.txt");
+        let ctx = context(&project, &kept);
+        let turn = ran(&ctx, "rm link.txt && ln -s a.txt other.txt");
+        assert_eq!(
+            turn.unkept.as_deref(),
+            Some("links stay as the command left them: link.txt, other.txt")
+        );
+        assert!(turn.files.is_empty(), "{:?}", turn.files);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_put_back_has_its_mode_back() {
+        let (project, kept) = scratch("command-modes");
+        git(&project, &["init", "-q"]);
+        std::fs::create_dir_all(project.join("d")).unwrap();
+        for name in ["run.sh", "d/tool.sh", "go.sh"] {
+            std::fs::write(project.join(name), "#!/bin/sh\n").unwrap();
+            set_mode(&project, name, 0o755);
+        }
+        git(&project, &["add", "."]);
+        git(&project, &["commit", "-q", "-m", "first"]);
+        // Not committed: a key kept private, and a script of the user's.
+        std::fs::write(project.join(".env"), "KEY=1\n").unwrap();
+        set_mode(&project, ".env", 0o600);
+        std::fs::write(project.join("mine.sh"), "#!/bin/sh\n").unwrap();
+        set_mode(&project, "mine.sh", 0o750);
+        let ctx = context(&project, &kept);
+        let turn = ran(
+            &ctx,
+            "rm -rf d run.sh .env mine.sh && chmod -x go.sh && echo more >> go.sh",
+        );
+        assert_eq!(turn.unkept.as_deref(), Some(""));
+        let plan = plan_in(&kept, &[turn], Some(&project));
+        assert_eq!(restore_in(&kept, &plan, Some(&project)).back, 5);
+        assert_eq!(mode(&project, ".env"), 0o600);
+        assert_eq!(mode(&project, "mine.sh"), 0o750);
+        // What git would check out: runnable wherever it may be read.
+        for name in ["run.sh", "d/tool.sh", "go.sh"] {
+            let bits = mode(&project, name);
+            assert!(bits & 0o100 != 0, "{name}: {bits:o}");
+            assert_eq!(bits & 0o111, (bits & 0o444) >> 2, "{name}: {bits:o}");
+        }
+        assert_eq!(text(&project, "go.sh"), "#!/bin/sh\n");
+
+        // A file moved goes back with its mode.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let turn = ran(&ctx, "mkdir bin && mv mine.sh bin/mine.sh");
+        let plan = plan_in(&kept, &[turn], Some(&project));
+        assert_eq!(
+            fates(&plan, &project),
+            [
+                ("mine.sh".to_owned(), Fate::Back),
+                ("bin/mine.sh".to_owned(), Fate::Remove)
+            ]
+        );
+        assert_eq!(restore_in(&kept, &plan, Some(&project)).back, 2);
+        assert_eq!(mode(&project, "mine.sh"), 0o750);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_mode_alone_changed_is_named() {
+        let (project, kept) = repository("command-chmod", &[("a.txt", "one\n")]);
+        let ctx = context(&project, &kept);
+        let turn = ran(&ctx, "chmod +x a.txt");
+        assert!(turn.files.is_empty());
+        assert_eq!(
+            turn.unkept.as_deref(),
+            Some("modes stay as the command left them: a.txt")
+        );
+
+        let (project, kept) = scratch("command-chmod-walk");
+        std::fs::write(project.join("b.txt"), "bee\n").unwrap();
+        set_mode(&project, "b.txt", 0o644);
+        let ctx = context(&project, &kept);
+        let turn = ran(&ctx, "chmod 600 b.txt");
+        assert!(turn.files.is_empty());
+        assert_eq!(
+            turn.unkept.as_deref(),
+            Some("modes stay as the command left them: b.txt")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_made_a_folder_or_a_link_is_named() {
+        for in_git in [true, false] {
+            let files = [("a.txt", "one\n"), ("x.txt", "ex\n"), ("y.txt", "why\n")];
+            let (project, kept) = if in_git {
+                repository("command-retyped", &files)
+            } else {
+                let (project, kept) = scratch("command-retyped-walk");
+                for (file, text) in files {
+                    std::fs::write(project.join(file), text).unwrap();
+                }
+                (project, kept)
+            };
+            let ctx = context(&project, &kept);
+            let turn = ran(
+                &ctx,
+                "rm x.txt && mkdir x.txt && echo f > x.txt/f && rm y.txt && ln -s a.txt y.txt",
+            );
+            assert_eq!(
+                turn.unkept.as_deref(),
+                Some(
+                    "links stay as the command left them: y.txt; \
+                     folders and submodules stay as the command left them: x.txt"
+                ),
+                "in git: {in_git}"
+            );
+            let plan = plan_in(&kept, &[turn], Some(&project));
+            assert_eq!(
+                fates(&plan, &project),
+                [("x.txt/f".to_owned(), Fate::Remove)],
+                "in git: {in_git}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binary_files_and_line_endings_come_back_byte_for_byte() {
+        let (project, kept) = scratch("command-bytes");
+        git(&project, &["init", "-q"]);
+        // Checked out with CR LF, though the commit holds LF.
+        std::fs::write(project.join(".gitattributes"), "*.txt text eol=crlf\n").unwrap();
+        let binary: Vec<u8> = (0..4096u32).map(|i| (i * 7 % 256) as u8).collect();
+        std::fs::write(project.join("data.bin"), &binary).unwrap();
+        std::fs::write(project.join("lines.txt"), "one\r\ntwo\r\n").unwrap();
+        git(&project, &["add", "."]);
+        git(&project, &["commit", "-q", "-m", "first"]);
+        let fresh: Vec<u8> = binary.iter().rev().copied().collect();
+        std::fs::write(project.join("new.bin"), &fresh).unwrap();
+        let ctx = context(&project, &kept);
+        let turn = ran(&ctx, "rm data.bin lines.txt new.bin");
+        assert_eq!(turn.unkept.as_deref(), Some(""));
+        let plan = plan_in(&kept, &[turn], Some(&project));
+        assert_eq!(restore_in(&kept, &plan, Some(&project)).back, 3);
+        assert_eq!(std::fs::read(project.join("data.bin")).unwrap(), binary);
+        assert_eq!(std::fs::read(project.join("new.bin")).unwrap(), fresh);
+        assert_eq!(text(&project, "lines.txt"), "one\r\ntwo\r\n");
+
+        // Asked for by the repository's config rather than an attribute.
+        let (project, kept) = scratch("command-bytes-config");
+        git(&project, &["init", "-q"]);
+        git(&project, &["config", "core.autocrlf", "true"]);
+        std::fs::write(project.join("notes.md"), "one\r\ntwo\r\n").unwrap();
+        git(&project, &["add", "."]);
+        git(&project, &["commit", "-q", "-m", "first"]);
+        let ctx = context(&project, &kept);
+        let turn = ran(&ctx, "rm notes.md");
+        let plan = plan_in(&kept, &[turn], Some(&project));
+        assert_eq!(restore_in(&kept, &plan, Some(&project)).back, 1);
+        assert_eq!(text(&project, "notes.md"), "one\r\ntwo\r\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nothing_outside_the_project_is_noted_or_touched() {
+        let (repo, kept) = scratch("command-outside");
+        git(&repo, &["init", "-q"]);
+        let project = repo.join("app");
+        std::fs::create_dir_all(project.join("d")).unwrap();
+        std::fs::write(repo.join("other.txt"), "repo's\n").unwrap();
+        std::fs::write(project.join("d/x.txt"), "mine\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "first"]);
+        let elsewhere = repo.parent().unwrap().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("x.txt"), "theirs\n").unwrap();
+        std::fs::write(repo.parent().unwrap().join("gone.txt"), "precious\n").unwrap();
+        let ctx = context(&project, &kept);
+        // Its repository's other files, a folder above it, and a folder of
+        // its own made a link to one outside.
+        let turn = ran(
+            &ctx,
+            "echo x > ../other.txt && rm ../../gone.txt && rm -rf d && ln -s ../../elsewhere d",
+        );
+        assert_eq!(
+            turn.unkept.as_deref(),
+            Some("links stay as the command left them: d")
+        );
+        let plan = plan_in(&kept, &[turn], Some(&project));
+        assert_eq!(
+            fates(&plan, &project),
+            [("d/x.txt".to_owned(), Fate::Outside)]
+        );
+        let done = restore_in(&kept, &plan, Some(&project));
+        assert_eq!(done.back, 0);
+        assert_eq!(text(&elsewhere, "x.txt"), "theirs\n");
+        assert_eq!(text(&repo, "other.txt"), "x\n");
+        assert!(!repo.parent().unwrap().join("gone.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_submodule_a_command_removes_is_named() {
+        let (project, kept) = repository("command-submodule", &[("a.txt", "one\n")]);
+        let inner = project.parent().unwrap().join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        git(&inner, &["init", "-q"]);
+        std::fs::write(inner.join("s.txt"), "sub\n").unwrap();
+        git(&inner, &["add", "."]);
+        git(&inner, &["commit", "-q", "-m", "inner"]);
+        let url = inner.to_str().unwrap();
+        let add = [
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            url,
+            "sub",
+        ];
+        git(&project, &add);
+        git(&project, &["commit", "-q", "-m", "sub"]);
+        let ctx = context(&project, &kept);
+        let turn = ran(&ctx, "rm -rf sub && echo two > a.txt");
+        assert_eq!(
+            turn.unkept.as_deref(),
+            Some("folders and submodules stay as the command left them: sub")
+        );
+        let plan = plan_in(&kept, &[turn], Some(&project));
+        assert_eq!(fates(&plan, &project), [("a.txt".to_owned(), Fate::Back)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn many_long_paths_are_asked_about_in_parts() {
+        let (project, kept) = scratch("command-long-paths");
+        git(&project, &["init", "-q"]);
+        // Each near 250 bytes, three hundred of them: over one call's worth.
+        let folder = "f".repeat(120);
+        std::fs::create_dir_all(project.join(&folder)).unwrap();
+        let names: Vec<String> = (0..300)
+            .map(|i| format!("{folder}/{i:03}{}", "n".repeat(120)))
+            .collect();
+        for name in &names {
+            std::fs::write(project.join(name), name.as_bytes()).unwrap();
+        }
+        git(&project, &["add", "."]);
+        git(&project, &["commit", "-q", "-m", "first"]);
+        let ctx = context(&project, &kept);
+        let turn = ran(&ctx, &format!("rm -rf {folder}"));
+        assert_eq!(turn.unkept.as_deref(), Some(""));
+        assert_eq!(turn.files.len(), 300);
+        let plan = plan_in(&kept, &[turn], Some(&project));
+        assert_eq!(restore_in(&kept, &plan, Some(&project)).back, 300);
+        for name in &names {
+            assert_eq!(&text(&project, name), name);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_saved_while_a_command_runs_is_listed_as_the_commands() {
+        let (project, kept) = repository("command-midway", &[("a.txt", "one\n")]);
+        let ctx = context(&project, &kept);
+        let path = project.join("a.txt");
+        let saver = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            std::fs::write(path, "saved\n").unwrap();
+        });
+        let turn = ran(&ctx, "sleep 3 && echo x > own.txt");
+        saver.join().unwrap();
+        // It cannot be told from the command's own change.
+        let plan = plan_in(&kept, &[turn], Some(&project));
+        assert_eq!(
+            listing(&plan, Some(&project))[0],
+            "a.txt goes back to how it was (changed by a command)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_nobody_watches_walks_no_folder_outside_git() {
+        let nobody = crate::chat::Connection {
+            unattended: true,
+            ..Default::default()
+        };
+        let unwatched = |project: &Path, kept: &Path| ToolContext {
+            files: Log {
+                dir: Some(kept.to_owned()),
+                ..Log::default()
+            },
+            workspace: Some(project.to_owned()),
+            ..ToolContext::of(&nobody)
+        };
+        let (project, kept) = scratch("command-unwatched");
+        std::fs::write(project.join("a.txt"), "one\n").unwrap();
+        let turn = ran(&unwatched(&project, &kept), "echo two > a.txt");
+        assert!(turn.files.is_empty());
+        assert_eq!(
+            turn.unkept.as_deref(),
+            Some("not undoable: outside git, a run nobody watches keeps no copies")
+        );
+        assert!(
+            std::fs::read_dir(&kept)
+                .into_iter()
+                .flatten()
+                .next()
+                .is_none()
+        );
+        // In git it still keeps what git names, which copies next to nothing.
+        let (project, kept) = repository("command-unwatched-git", &[("a.txt", "one\n")]);
+        let turn = ran(&unwatched(&project, &kept), "echo two > a.txt");
+        assert_eq!(turn.unkept.as_deref(), Some(""));
+        let plan = plan_in(&kept, &[turn], Some(&project));
+        assert_eq!(fates(&plan, &project), [("a.txt".to_owned(), Fate::Back)]);
     }
 }

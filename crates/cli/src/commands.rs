@@ -3365,15 +3365,20 @@ fn undo(runner: &mut Runner, session: usize, workspace: Option<&std::path::Path>
         Some((at, _)) => {
             let dropped = &conversation.messages[at..];
             let plan = history::plan(id, dropped, folder.as_deref());
-            (plan, history::ran_commands(dropped))
+            // What stays, and why, said after the files.
+            let commands: Vec<String> = match history::ran_commands(dropped) {
+                true => std::iter::once(history::COMMANDS_NOTE.to_owned())
+                    .chain(history::unkept(dropped))
+                    .collect(),
+                false => Vec::new(),
+            };
+            (plan, commands)
         }
-        None => (Vec::new(), false),
+        None => (Vec::new(), Vec::new()),
     };
     if files && !plan.is_empty() {
         let mut detail = history::listing(&plan, folder.as_deref());
-        if commands {
-            detail.push(history::COMMANDS_NOTE.to_owned());
-        }
+        detail.extend(commands.iter().cloned());
         let options = [
             "Take it back and put the files back",
             "Leave everything as it is",
@@ -3398,6 +3403,11 @@ fn undo(runner: &mut Runner, session: usize, workspace: Option<&std::path::Path>
         "Took back the last exchange. Your message is back in the box.",
     ));
     if plan.is_empty() {
+        if files {
+            for line in &commands {
+                render::line(&render::dim(line));
+            }
+        }
         return;
     }
     if !files {
@@ -3416,8 +3426,8 @@ fn undo(runner: &mut Runner, session: usize, workspace: Option<&std::path::Path>
     for line in history::restore(id, &plan, folder.as_deref()).lines() {
         render::line(&render::dim(&line));
     }
-    if commands {
-        render::line(&render::dim(history::COMMANDS_NOTE));
+    for line in &commands {
+        render::line(&render::dim(line));
     }
 }
 
