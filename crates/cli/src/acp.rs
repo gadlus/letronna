@@ -174,6 +174,7 @@ pub fn run() -> i32 {
         ended: None,
         voice: None,
         review: Default::default(),
+        plain_terminal: false,
     };
     let stdin = std::io::stdin();
     serve(
@@ -2134,6 +2135,7 @@ mod tests {
             ended: None,
             voice: None,
             review: Default::default(),
+            plain_terminal: false,
         };
         runner.store.settings.gateway = "Ollama".into();
         runner.store.settings.model = "test-model".into();
@@ -2385,6 +2387,7 @@ mod tests {
             ended: None,
             voice: None,
             review: Default::default(),
+            plain_terminal: false,
         };
         runner.store.settings.gateway = "Ollama".into();
         runner.store.settings.model = "test-model".into();

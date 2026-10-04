@@ -221,6 +221,8 @@ fn main() {
         images: Vec::new(),
         voice: None,
         review: Default::default(),
+        // Only at the prompt: a `-p` answer may be piped where Markdown shows.
+        plain_terminal: !args.once(),
     };
     letronna_core::diag::mark("listed");
     runner.match_voice();

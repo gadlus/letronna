@@ -50,6 +50,9 @@ enum To {
     Plan,
     /// A model other than Claude.
     NotClaude,
+    /// Where replies print in the interactive terminal, which someone at
+    /// this computer watches.
+    Terminal,
 }
 
 impl To {
@@ -62,6 +65,7 @@ impl To {
             To::OnScreen => connection.human && connection.remote.is_none(),
             To::Parallel => crate::store::parallel_tool_calls(),
             To::NotClaude => not_claude(connection),
+            To::Terminal => connection.plain_terminal,
             To::Plan => crate::tools::offers_plan(connection),
         }
     }
@@ -80,7 +84,7 @@ impl To {
     /// Whether a run nobody watches can carry the rule, and so be measured
     /// without it.
     fn droppable(self) -> bool {
-        !matches!(self, To::Watched | To::OnScreen | To::Plan)
+        !matches!(self, To::Watched | To::OnScreen | To::Plan | To::Terminal)
     }
 }
 
@@ -276,6 +280,17 @@ pub(crate) const PLAN: [Rule; 2] = [
     },
 ];
 
+/// The rule after where Letronna runs, for the terminal's own prompt, whose
+/// replies show **bold** and `code` and print the rest of Markdown as it is.
+// Replies only, so a README the agent writes keeps its headings; to the
+// user, so it holds for a helper, which shares the session's system message;
+// and what to use instead, so a long answer keeps its shape.
+pub(crate) const TERMINAL: [Rule; 1] = [Rule {
+    id: "terminal",
+    to: To::Terminal,
+    text: "Replies to the user print in a terminal that shows only **bold** and `code`: instead of # headings, tables and [text](url) links, use a **bold** line, - lists and bare URLs.",
+}];
+
 /// The rules after where a chat app's reply is posted, the second only with
 /// tools: Telegram, Discord and Slack show no table, and their cards show a
 /// call but never its result, so "as shown above" points at nothing.
@@ -322,8 +337,9 @@ pub(crate) const INSTRUCTIONS: [Rule; 1] = [Rule {
 }];
 
 /// Every table of rules, for finding a row by its id.
-const TABLES: [&[Rule]; 7] = [
+const TABLES: [&[Rule]; 8] = [
     &PROSE,
+    &TERMINAL,
     &TOOLS,
     &PROJECT,
     &PLAN,
@@ -585,6 +601,13 @@ mod tests {
         let added = parse("+compute").unwrap_err();
         assert!(added.contains("only leaves rules out"), "{added}");
         assert!(parse("compute").is_err());
+    }
+
+    #[test]
+    fn the_terminal_row_cannot_be_named_as_only_the_terminal_prompt_is_told_it() {
+        let rule = all().find(|rule| rule.id == "terminal").unwrap();
+        assert!(!rule.to.droppable());
+        assert!(parse("-terminal").is_err());
     }
 
     #[test]
