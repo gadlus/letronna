@@ -70,6 +70,10 @@ pub struct Conversation {
     /// settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_saving: Option<crate::memory::Saving>,
+    /// Where this session keeps memory and what of it loads; `None` follows
+    /// the settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_scope: Option<crate::memory::Scope>,
     /// Messages already on disk. Everything past this is appended on save.
     /// Only `flush` and `rewind` should touch it; it is visible because
     /// callers build a Conversation with `..Default::default()`.
@@ -184,6 +188,8 @@ pub struct Meta {
     pub worktree: Option<crate::worktree::Worktree>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_saving: Option<crate::memory::Saving>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_scope: Option<crate::memory::Scope>,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -492,6 +498,10 @@ pub struct Settings {
     /// update stops the saves nobody asked for.
     #[serde(default)]
     pub memory_saving: crate::memory::Saving,
+    /// Where memory is kept, and what of it loads, in a session that has not
+    /// chosen for itself: everywhere, as before the choice, unless chosen.
+    #[serde(default)]
+    pub memory_scope: crate::memory::Scope,
 }
 
 // Written out rather than derived so the film grain, notifications and
@@ -517,6 +527,7 @@ impl Default for Settings {
             fallbacks: Vec::new(),
             memory_review: false,
             memory_saving: crate::memory::Saving::WhenAsked,
+            memory_scope: crate::memory::Scope::Auto,
             gateway: String::new(),
             custom_endpoint: String::new(),
             presence: String::new(),
@@ -859,6 +870,32 @@ impl Store {
         crate::memory::choose(conversation.id, chosen);
     }
 
+    /// Where the session at `index` keeps memory, and what of it loads: its
+    /// own choice, or the settings' when it has none.
+    pub fn memory_scope(&self, index: usize) -> crate::memory::Scope {
+        self.conversations
+            .get(index)
+            .and_then(|c| c.memory_scope)
+            .unwrap_or(self.settings.memory_scope)
+    }
+
+    /// Have the session at `index` keep memory where `chosen` says, and load
+    /// only that, from its next request on, or as the settings say for `None`.
+    pub fn choose_memory_scope(&mut self, index: usize, chosen: Option<crate::memory::Scope>) {
+        let Some(conversation) = self.conversations.get_mut(index) else {
+            return;
+        };
+        conversation.memory_scope = chosen;
+        crate::memory::choose_scope(conversation.id, chosen);
+    }
+
+    /// Make the session at `index` a private chat: it loads and keeps only
+    /// its own notes, and saves to them only when the user asks.
+    pub fn make_private(&mut self, index: usize) {
+        self.choose_memory_scope(index, Some(crate::memory::Scope::Chat));
+        self.choose_memory_saving(index, Some(crate::memory::Saving::WhenAsked));
+    }
+
     /// Put the session at `index` on `model` at `gateway`, and start new
     /// sessions there too. Sessions with a model of their own keep it.
     pub fn choose_model(&mut self, index: usize, gateway: &str, model: &str) {
@@ -1004,6 +1041,7 @@ fn erase(id: u64, lock: Option<Lock>) {
     }
     let _ = std::fs::remove_dir_all(helpers_dir(id));
     let _ = std::fs::remove_dir_all(crate::tools::results_dir(id));
+    let _ = std::fs::remove_dir_all(crate::memory::chat_folder(id));
     // A new session can be given the same id.
     crate::filestate::forget(id);
     crate::compact::forget(id, 0);
@@ -1121,6 +1159,7 @@ impl Conversation {
             imported_from: self.imported_from.clone(),
             worktree: self.worktree.clone(),
             memory_saving: self.memory_saving,
+            memory_scope: self.memory_scope,
         }
     }
 
@@ -1358,6 +1397,7 @@ impl Conversation {
                 self.imported_from = meta.imported_from;
                 self.worktree = meta.worktree;
                 self.memory_saving = meta.memory_saving;
+                self.memory_scope = meta.memory_scope;
             }
             Record::Message(message) => self.messages.push(message),
             Record::Rewind { to } => {
@@ -1821,6 +1861,8 @@ pub struct Summary {
     pub worktree: Option<crate::worktree::Worktree>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_saving: Option<crate::memory::Saving>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_scope: Option<crate::memory::Scope>,
 }
 
 /// The sessions on disk, newest first, without loading what is in them.
@@ -2034,6 +2076,7 @@ fn tally(summary: &mut Summary, bytes: &[u8]) {
                 summary.imported_from = meta.imported_from;
                 summary.worktree = meta.worktree;
                 summary.memory_saving = meta.memory_saving;
+                summary.memory_scope = meta.memory_scope;
             }
             Ok(Record::Message(_)) => summary.messages += 1,
             Ok(Record::Rewind { to }) => summary.messages = summary.messages.min(to),
@@ -3083,6 +3126,7 @@ fn listed(s: Summary) -> Conversation {
         imported_from: s.imported_from,
         worktree: s.worktree,
         memory_saving: s.memory_saving,
+        memory_scope: s.memory_scope,
         counted: s.messages,
         ..Default::default()
     };
@@ -5577,6 +5621,35 @@ pub(crate) mod tests {
         store.choose_memory_saving(0, None);
         assert_eq!(store.memory_saving(0), Saving::Auto);
         store.remove(0);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_private_chat_keeps_to_its_own_notes_which_go_with_it() {
+        use crate::memory::{Saving, Scope};
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("private-chat");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let id = 9_300_011;
+        let mut store = Store::default();
+        store.settings.memory_saving = Saving::Auto;
+        store.conversations.push(Conversation { id, ..numbered(1) });
+        assert_eq!(store.memory_scope(0), Scope::Auto);
+        store.make_private(0);
+        assert_eq!(store.memory_scope(0), Scope::Chat);
+        assert_eq!(store.memory_saving(0), Saving::WhenAsked);
+        assert_eq!(crate::memory::scope(id), Scope::Chat);
+        store.save().unwrap();
+        let back = load();
+        let at = back.index_of(id).unwrap();
+        assert_eq!(back.memory_scope(at), Scope::Chat);
+        assert_eq!(back.memory_saving(at), Saving::WhenAsked);
+
+        let notes = crate::memory::chat_folder(id);
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(notes.join("MEMORY.md"), "Planning a trip.\n").unwrap();
+        store.remove(0);
+        assert!(!notes.exists());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 

@@ -704,7 +704,9 @@ fn context_parts(connection: &Connection, messages: &[Message], floor: usize) ->
     let prompt = system_prompt(connection, None);
     let text = prompt.text.as_str();
     let part = |range: &Range<usize>| tokens(&text[range.clone()]) as u64;
-    let system = tokens(&text[..prompt.identity]) + tokens(&text[prompt.skills.end..]);
+    let system = tokens(&text[..prompt.identity])
+        + tokens(&text[prompt.skills.end..prompt.remembered.start])
+        + tokens(&text[prompt.remembered.end..]);
     let (tools, mcp) = if connection.tools {
         let every = crate::tools::all();
         let on_demand = crate::mcp_find::on_demand(&every);
@@ -738,7 +740,7 @@ fn context_parts(connection: &Connection, messages: &[Message], floor: usize) ->
         system: system as u64,
         tools,
         mcp: part(&prompt.servers) + mcp,
-        memory: part(&prompt.memory),
+        memory: part(&prompt.memory) + part(&prompt.remembered),
         skills: part(&prompt.skills),
         conversation,
     }
@@ -1022,12 +1024,17 @@ struct SystemPrompt {
     text: String,
     /// Where who Letronna is, its reply style and its rules end.
     identity: usize,
+    /// The project's instructions and the helper types, which every
+    /// session loads.
     memory: Range<usize>,
     /// The MCP servers' own instructions, between memory and skills.
     servers: Range<usize>,
     skills: Range<usize>,
     /// Where the model line starts, after the date and the computer.
     model: usize,
+    /// What the session remembers, after the model line: the part of memory
+    /// that differs from one session to the next.
+    remembered: Range<usize>,
 }
 
 /// What a run nobody watches is told in place of approvals and `ask_user`,
@@ -1090,6 +1097,7 @@ fn system_prompt(connection: &Connection, summary: Option<&str>) -> SystemPrompt
             servers: end..end,
             skills: end..end,
             model: end,
+            remembered: end..end,
         };
     }
     let mut system = identity(crate::styles::chosen());
@@ -1147,9 +1155,9 @@ fn system_prompt(connection: &Connection, summary: Option<&str>) -> SystemPrompt
     // Said once here, not with every fenced result: a result pays only for
     // its tags, and this part of the prompt stays cached.
     system.push_str(&format!(" {}", crate::untrusted::RULE));
-    // Memory and skills first: they change rarely, so the prompt's start
-    // stays cacheable; the summary of dropped turns changes as the
-    // conversation grows.
+    // The project's rules and skills first: they change rarely, so the
+    // prompt's start stays cacheable; the summary of dropped turns changes
+    // as the conversation grows.
     let identity = system.len();
     system.push_str(&crate::memory::context(connection));
     let memory = identity..system.len();
@@ -1202,6 +1210,16 @@ fn system_prompt(connection: &Connection, summary: Option<&str>) -> SystemPrompt
     }
     let model = system.len();
     system.push_str(&format!(" The model behind you is {}.", connection.model));
+    // Memory goes after all that sessions share, as what one session loads
+    // and writes is its own: another's choice, or a save, then changes no
+    // byte of the prefix they share.
+    let kept = crate::memory::remembered(connection);
+    let start = system.len();
+    if !kept.is_empty() {
+        system.push_str("\n\n");
+        system.push_str(kept.trim_start());
+    }
+    let remembered = start..system.len();
     // Fenced, as what it paraphrases may be a page's or a file's words, which
     // would otherwise speak with the system prompt's authority; what the
     // user asked keeps its weight through the line before it.
@@ -1221,6 +1239,7 @@ fn system_prompt(connection: &Connection, summary: Option<&str>) -> SystemPrompt
         servers,
         skills,
         model,
+        remembered,
     }
 }
 
@@ -1399,7 +1418,8 @@ fn body_hashed(
         let text = system.text.as_str();
         let rest = &text[system.skills.end..system.model];
         prefix.set(Reason::System, (&text[..system.identity], rest));
-        prefix.set(Reason::Memory, &text[system.memory.clone()]);
+        let remembered = &text[system.remembered.clone()];
+        prefix.set(Reason::Memory, (&text[system.memory.clone()], remembered));
         prefix.set(Reason::Skills, &text[system.skills.clone()]);
         prefix.set(Reason::Summary, summary);
         // Another gateway holds no cache of this one's, whatever the model.
@@ -5572,6 +5592,41 @@ mod tests {
         assert_eq!(&prompt.text[prompt.memory.clone()], memory);
         assert!(styled.system > plain.system, "{plain:?} {styled:?}");
         assert_eq!(styled.memory, plain.memory);
+    }
+
+    #[test]
+    fn sessions_that_load_different_memory_share_every_byte_before_it() {
+        use crate::memory::Scope;
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("scoped");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        std::fs::write(dir.join("SOUL.md"), "You are a careful helper.").unwrap();
+        std::fs::write(dir.join("USER.md"), "Called by a nickname.\n").unwrap();
+        let session = |conversation, scope| {
+            crate::memory::choose_scope(conversation, Some(scope));
+            let c = Connection {
+                tools: true,
+                conversation,
+                ..connection()
+            };
+            let prompt = system_prompt(&c, None);
+            crate::memory::forget(conversation);
+            prompt
+        };
+        let everywhere = session(9_600_001, Scope::Auto);
+        let private = session(9_600_002, Scope::Chat);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let shared = |prompt: &SystemPrompt| prompt.text[..prompt.remembered.start].to_owned();
+        assert_eq!(shared(&everywhere), shared(&private));
+        // Who Letronna is loads whatever is remembered.
+        assert!(shared(&private).contains("You are a careful helper."));
+        let kept = &everywhere.text[everywhere.remembered.clone()];
+        assert!(kept.contains("Called by a nickname."), "{kept}");
+        assert!(!private.text.contains("Called by a nickname."));
     }
 
     /// Holds `now` to the golden copy `name` in src/golden, or makes it the

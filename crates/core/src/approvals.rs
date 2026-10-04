@@ -52,6 +52,9 @@ pub enum Decision {
     /// Do not run it, for the reason the program driving the run gave, empty
     /// when it gave none.
     Declined(String),
+    /// Run this memory save, keeping it where the user chose of the card's
+    /// `places`.
+    Keep(crate::memory::Scope),
 }
 
 /// A call waiting for a yes, as the frontend that serves receives it.
@@ -68,6 +71,9 @@ pub struct Request {
     /// Why the helper's gate put the call to the user, such as Auto mode's
     /// judge being unsure, for the card; empty when it asks as it always does.
     pub why: String,
+    /// Where the card may offer to keep a memory save, where it goes now
+    /// first, each answered with `Decision::Keep`; empty for any other call.
+    pub places: Vec<crate::memory::Scope>,
     /// The run and rule a `ForRun` answer covers, if any does.
     key: Option<Key>,
     reply: Sender<Decision>,
@@ -165,6 +171,8 @@ pub(crate) struct Allowed {
     pub arguments: Option<String>,
     /// Whether it may run only inside the OS sandbox.
     pub sandboxed: bool,
+    /// Where the user chose to keep it, for a memory save.
+    pub keep_in: Option<crate::memory::Scope>,
 }
 
 /// What a `ForRun` answer to `call` in run `run` covers, or `None` when it
@@ -269,6 +277,10 @@ pub(crate) fn ask(
         call: call.clone(),
         preview: tools::preview(&call.name, &call.arguments, ctx),
         why: why.to_owned(),
+        places: match call.name.as_str() {
+            "memory" => crate::memory::places(ctx),
+            _ => Vec::new(),
+        },
         key: key.clone(),
         reply,
     };
@@ -283,6 +295,10 @@ pub(crate) fn ask(
         }),
         Ok(Decision::Changed(arguments)) => Ok(Allowed {
             arguments: Some(arguments),
+            ..Allowed::default()
+        }),
+        Ok(Decision::Keep(scope)) => Ok(Allowed {
+            keep_in: Some(scope),
             ..Allowed::default()
         }),
         Ok(Decision::ForRun) => {
@@ -505,8 +521,8 @@ pub(crate) mod tests {
         let request = requests.recv_timeout(WAIT).unwrap();
         request.answer(Decision::Sandboxed);
         let confined = Allowed {
-            arguments: None,
             sandboxed: true,
+            ..Allowed::default()
         };
         assert_eq!(rx.recv_timeout(WAIT), Ok(Ok(confined)));
     }
@@ -790,7 +806,7 @@ pub(crate) mod tests {
                 Decision::Changed("{}".into()),
                 Ok(Allowed {
                     arguments: Some("{}".to_owned()),
-                    sandboxed: false,
+                    ..Allowed::default()
                 }),
             ),
             (
@@ -817,5 +833,34 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_memory_save_card_offers_its_places_and_keeps_the_one_picked() {
+        use crate::memory::Scope;
+        let _turn = lock(&SERVING);
+        let requests = serve();
+        let save = ToolCall {
+            id: "m".into(),
+            name: "memory".into(),
+            arguments: serde_json::json!({"action": "add", "target": "user", "content": "x"})
+                .to_string(),
+        };
+        let ctx = ToolContext {
+            conversation: 9_700_001,
+            ..Default::default()
+        };
+        crate::memory::choose_scope(9_700_001, Some(Scope::Auto));
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(ask(9_700_001, 1905, "helper", &save, &ctx, "", false));
+        });
+        let request = requests.recv_timeout(WAIT).unwrap();
+        // With no project attached, there is none to offer.
+        assert_eq!(request.places, [Scope::Auto, Scope::Chat]);
+        request.answer(Decision::Keep(Scope::Chat));
+        let allowed = rx.recv_timeout(WAIT).unwrap().unwrap();
+        assert_eq!(allowed.keep_in, Some(Scope::Chat));
+        crate::memory::forget(9_700_001);
     }
 }
