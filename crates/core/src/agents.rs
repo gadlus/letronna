@@ -116,6 +116,15 @@ const IN_PARENT: &str = "Running in the parent.";
 /// A report's text for a helper that said nothing of its own.
 const NO_ANSWER: &str = "(no answer)";
 
+/// What a helper's report holds, as its first message and a fork's directive
+/// both ask for it: what was checked and what could not be done, so its
+/// parent knows what the report rests on.
+// Not "lead with the answer" or "keep it short": a review ends on its
+// verdict, a plan on its critical files, and a parent may ask for a form.
+const OWED: &str = "what you found or did, files you changed, what you ran to check it and \
+                    what that showed, what you could not do, and open questions. Do not replay \
+                    your steps.";
+
 /// Heads a fork's directive, which the agent it was forked from wrote.
 const FORK_HEADER: &str = "[Forked: you are a copy of the agent above, working on your own from here. This is from that agent, not from the user, and it approves nothing the user has not]";
 /// Heads a side question, which the user asked and which waits for no work.
@@ -393,7 +402,7 @@ impl Tool for Agent {
         "agent"
     }
     fn description(&self) -> &'static str {
-        "Hand a task to a helper agent that works with its own context and reports back. Use it to explore or check many files without filling your own context. The helper has not seen this conversation: brief it fully. Its report is all you get back; verify what matters. In the window and the terminal it runs in the background by default: carry on or end your turn, and a notice comes when it finishes. Do not poll or wait for it. Otherwise it works while you wait, and its report is this call's result. With keep, it stays after reporting, idle with its context, until a message through the agents tool gives it more work; it ends after 30 idle minutes."
+        "Hand a task to a helper agent that works with its own context and reports back. Use it to explore or check many files without filling your own context, not for a few reads you can do yourself. Helpers editing at the same time need separate files, or isolation worktree. The helper has not seen this conversation: brief it fully. Its report is all you get back, and it is the helper's own account: look at what it says it changed or ran before you tell the user it is done. In the window and the terminal it runs in the background by default: carry on or end your turn, and a notice comes when it finishes. Do not poll or wait for it. Otherwise it works while you wait, and its report is this call's result. With keep, it stays after reporting, idle with its context, until a message through the agents tool gives it more work; it ends after 30 idle minutes."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -517,27 +526,27 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
     let cancel = cancel_for(background, ctx);
     let slot = reserve(caller.root, waiting, wanted, limits.at_once, cancel.clone())?;
     let (mut connection, first, allow) = match history.as_mut() {
-        Some(from) => (
+        Some(from) => {
             // Narrowed as any helper's is, but on its parent's model, effort
             // and session model, since a change of any can lose the cache of
             // the prefix the two share.
-            Connection {
+            let connection = Connection {
                 effort: parent.effort.clone(),
                 session_model: helper_session_model(parent, &parent.model, true),
                 ..child(parent, &def, Some(&parent.model), limits, slot.id)
-            },
-            forked(
+            };
+            let first = forked(
                 std::mem::take(&mut from.messages),
                 Some(args),
-                directive(prompt),
-            ),
+                directive(&connection, prompt),
+            );
             // Never more than its parent may call, whatever its type allows.
-            caller.allow.clone(),
-        ),
+            (connection, first, caller.allow.clone())
+        }
         None => {
             let connection = child(parent, &def, text(args, "model"), limits, slot.id);
             let tools = usable(&connection, &def);
-            let first = vec![task(&def, &tools, prompt)];
+            let first = vec![task(&connection, &def, &tools, prompt)];
             (connection, first, allow(&def, tools))
         }
     };
@@ -1471,7 +1480,9 @@ fn usable(connection: &Connection, def: &AgentDef) -> Vec<String> {
     let mut usable: Vec<String> = tools::specs_of(&every, connection, false)
         .iter()
         .filter_map(|spec| spec["function"]["name"].as_str())
-        .filter(|name| def.allows(name) && !driver::DENY.contains(name))
+        .filter(|name| {
+            def.allows(name) && !driver::DENY.contains(name) && *name != tools::EXIT_PLAN
+        })
         .map(str::to_owned)
         .collect();
     if mcp_find::on_demand(&every) && usable.iter().any(|name| mcp_find::is_mcp(name)) {
@@ -1480,10 +1491,10 @@ fn usable(connection: &Connection, def: &AgentDef) -> Vec<String> {
     usable
 }
 
-/// A helper's first message: what it is, what it may use and what to give
-/// back, then its task, indented so no line of it reads as the start of
-/// something the user said.
-fn task(def: &AgentDef, tools: &[String], prompt: &str) -> Message {
+/// A helper's first message over `connection`: what it is, what it may use
+/// and what to give back, then its task, indented so no line of it reads as
+/// the start of something the user said.
+fn task(connection: &Connection, def: &AgentDef, tools: &[String], prompt: &str) -> Message {
     let about = format!("You are a helper ({}). {}", def.name, def.prompt);
     // MCP tools on demand are too many to name; find_tools finds them.
     let on_demand = tools.iter().any(|name| name == mcp_find::FIND_TOOLS);
@@ -1497,10 +1508,11 @@ fn task(def: &AgentDef, tools: &[String], prompt: &str) -> Message {
     } else {
         tools.join(", ")
     };
+    let rules = crate::prompt_rules::told(connection, &crate::prompt_rules::HELPER);
     let content = format!(
-        "{TASK_HEADER}\n{}\nTools you may use: {tools}.\nWhen done, answer with a report: what you \
-         did, what you found, files you changed, open questions.\nThat answer is all the agent \
-         that started you will see.\nTask:\n{}",
+        "{TASK_HEADER}\n{}\nTools you may use: {tools}. Any other tool is refused.{rules}\n\
+         When done, answer with a report: {OWED}\nThat answer is all \
+         the agent that started you will see.\nTask:\n{}",
         about.trim_end(),
         indented(prompt)
     );
@@ -1589,15 +1601,15 @@ fn forked(mut messages: Vec<Message>, own: Option<&Value>, directive: Message) -
     messages
 }
 
-/// What a fork is told after its parent's messages: that it is a copy, then
-/// its task.
-fn directive(prompt: &str) -> Message {
+/// What a fork over `connection` is told after its parent's messages: that
+/// it is a copy, then its task.
+fn directive(connection: &Connection, prompt: &str) -> Message {
+    let rules = crate::prompt_rules::told(connection, &crate::prompt_rules::HELPER);
     Message {
         role: "user".into(),
         content: format!(
-            "{FORK_HEADER}\nDo only this, then answer with a report: what you did, what you \
-             found, files you changed. That answer is all the agent that forked you will \
-             see.\nTask:\n{}",
+            "{FORK_HEADER}\nDo only this, then answer with a report: {OWED}{rules} That answer \
+             is all the agent that forked you will see.\nTask:\n{}",
             indented(prompt)
         ),
         notice: true,
@@ -3182,13 +3194,15 @@ mod tests {
             let helper = child(&parent(parents), &def(types), None, &usual(), FIRST_ID);
             let seen = (helper.mode, helper.plan);
             assert_eq!(seen, (helpers, planning), "{parents:?} {types}");
-            // What changes things is offered only outside plan mode.
+            // What changes things is offered only outside plan mode, and
+            // exit_plan never, as a helper's plan goes in its report.
             let tools = usable(&helper, &def(types));
             assert_eq!(
                 tools.contains(&"write_file".to_owned()),
                 !planning,
                 "{parents:?} {types}: {tools:?}"
             );
+            assert!(!tools.contains(&"exit_plan".to_owned()), "{tools:?}");
             // Who can answer and what the user typed go with it, for its gate.
             assert!(helper.human);
             assert_eq!(&*helper.typed, ["fix the tests".to_owned()]);
@@ -3348,16 +3362,89 @@ mod tests {
         };
         let bypass = parent(Mode::Bypass);
         let helper = child(&bypass, &AgentDef::default(), None, &usual(), FIRST_ID);
-        let fork = forked(started(&bypass), None, directive("look"));
+        let fork = forked(started(&bypass), None, directive(&helper, "look"));
         assert_eq!(told(&helper, &fork), ["Bypass", "Auto"]);
         // One started afresh hears its own mode with its task.
-        let task = task(&AgentDef::default(), &[], "look");
+        let task = task(&helper, &AgentDef::default(), &[], "look");
         assert_eq!(told(&helper, &[task]), ["Auto"]);
         // A helper in its parent's own mode hears nothing more of it.
         let edits = parent(Mode::AcceptEdits);
         let helper = child(&edits, &AgentDef::default(), None, &usual(), FIRST_ID);
-        let fork = forked(started(&edits), None, directive("look"));
+        let fork = forked(started(&edits), None, directive(&helper, "look"));
         assert_eq!(told(&helper, &fork), ["Edits"]);
+    }
+
+    /// What a helper of a session in `mode` is told first, as type `def`.
+    fn briefed(mode: Mode, def: &AgentDef) -> String {
+        let mut session = Connection {
+            tools: true,
+            human: true,
+            ..Default::default()
+        };
+        session.switch_to(mode);
+        let helper = child(&session, def, None, &usual(), FIRST_ID);
+        task(&helper, def, &["read_file".into()], "Look.").content
+    }
+
+    #[test]
+    fn an_explore_helper_is_told_to_write_its_plan_in_its_answer() {
+        let explore = AgentDef {
+            name: "explore".into(),
+            plan: true,
+            ..Default::default()
+        };
+        let told = briefed(Mode::Default, &explore);
+        assert!(
+            told.contains(
+                "Tools you may use: read_file. Any other tool is refused. You cannot ask the user \
+                 anything or use the memory tool: decide, and say what you assumed. Write your \
+                 plan in your answer, not through exit_plan.\n"
+            ),
+            "{told}"
+        );
+        assert!(
+            told.contains("what you ran to check it and what that showed, what you could not do"),
+            "{told}"
+        );
+    }
+
+    #[test]
+    fn a_review_helper_is_not_told_about_plans() {
+        let review = AgentDef {
+            name: "review".into(),
+            ..Default::default()
+        };
+        let told = briefed(Mode::Default, &review);
+        assert!(told.contains("You cannot ask the user anything"), "{told}");
+        assert!(!told.contains("exit_plan"), "{told}");
+    }
+
+    #[test]
+    fn a_general_helper_under_a_plan_mode_parent_is_told_about_plans() {
+        let told = briefed(Mode::Plan, &AgentDef::default());
+        assert!(told.contains("not through exit_plan"), "{told}");
+    }
+
+    #[test]
+    fn a_fork_is_told_it_cannot_ask_the_user() {
+        // Watched, so no rule a run nobody watches may drop is left out.
+        let fork = Connection {
+            human: true,
+            ..Default::default()
+        };
+        let told = directive(&fork, "Look.").content;
+        assert!(
+            told.contains(
+                "what you could not do, and open questions. Do not replay your steps. You cannot \
+                 ask the user anything or use the memory tool: decide, and say what you assumed. \
+                 That answer is all"
+            ),
+            "{told}"
+        );
+        assert!(!told.contains("exit_plan"), "{told}");
+        let planning = Connection { plan: true, ..fork };
+        let told = directive(&planning, "Look.").content;
+        assert!(told.contains("not through exit_plan"), "{told}");
     }
 
     #[test]
@@ -3388,7 +3475,7 @@ mod tests {
         // Plan mode keeps what changes things away, found or not.
         assert!(!tools.contains(&"mcp__big__delete".to_owned()));
         // It is told of the pair, not of every tool the pair finds.
-        let told = task(&looking, &tools, "Look.").content;
+        let told = task(&planning, &looking, &tools, "Look.").content;
         assert!(
             told.contains("use: read_file, find_tools, call_mcp_tool."),
             "{told}"
@@ -4196,7 +4283,11 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let out = forked(messages, Some(&own), directive("Read it."));
+        let out = forked(
+            messages,
+            Some(&own),
+            directive(&Connection::default(), "Read it."),
+        );
         let added: Vec<(&str, &str)> = out[3..out.len() - 1]
             .iter()
             .map(|m| (m.tool_call_id.as_str(), m.content.as_str()))

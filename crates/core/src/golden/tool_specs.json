@@ -1193,7 +1193,7 @@
   },
   {
     "function": {
-      "description": "Hand a task to a helper agent that works with its own context and reports back. Use it to explore or check many files without filling your own context. The helper has not seen this conversation: brief it fully. Its report is all you get back; verify what matters. In the window and the terminal it runs in the background by default: carry on or end your turn, and a notice comes when it finishes. Do not poll or wait for it. Otherwise it works while you wait, and its report is this call's result. With keep, it stays after reporting, idle with its context, until a message through the agents tool gives it more work; it ends after 30 idle minutes.",
+      "description": "Hand a task to a helper agent that works with its own context and reports back. Use it to explore or check many files without filling your own context, not for a few reads you can do yourself. Helpers editing at the same time need separate files, or isolation worktree. The helper has not seen this conversation: brief it fully. Its report is all you get back, and it is the helper's own account: look at what it says it changed or ran before you tell the user it is done. In the window and the terminal it runs in the background by default: carry on or end your turn, and a notice comes when it finishes. Do not poll or wait for it. Otherwise it works while you wait, and its report is this call's result. With keep, it stays after reporting, idle with its context, until a message through the agents tool gives it more work; it ends after 30 idle minutes.",
       "name": "agent",
       "parameters": {
         "properties": {
