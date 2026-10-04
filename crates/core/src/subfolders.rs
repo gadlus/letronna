@@ -91,9 +91,15 @@ pub(crate) fn reserve(connection: &Connection) -> usize {
 /// `text`, a tool result's own, with `MARKER` rewritten wherever it is
 /// spelled, in any case, so no result can forge the lines added after it.
 pub(crate) fn defang(text: &str) -> Cow<'_, str> {
+    defanged(text, MARKER, DEFANGED)
+}
+
+/// `text` with `marker`, which opens with `[`, rewritten as `instead` wherever
+/// it is spelled, in any case.
+pub(crate) fn defanged<'a>(text: &'a str, marker: &str, instead: &str) -> Cow<'a, str> {
     let spelled = |at: &usize| {
-        text.get(*at..*at + MARKER.len())
-            .is_some_and(|found| found.eq_ignore_ascii_case(MARKER))
+        text.get(*at..*at + marker.len())
+            .is_some_and(|found| found.eq_ignore_ascii_case(marker))
     };
     let mut found = text.match_indices('[').map(|(at, _)| at).filter(spelled);
     let Some(first) = found.next() else {
@@ -103,8 +109,8 @@ pub(crate) fn defang(text: &str) -> Cow<'_, str> {
     let mut from = 0;
     for at in std::iter::once(first).chain(found) {
         out.push_str(&text[from..at]);
-        out.push_str(DEFANGED);
-        from = at + MARKER.len();
+        out.push_str(instead);
+        from = at + marker.len();
     }
     out.push_str(&text[from..]);
     Cow::Owned(out)
