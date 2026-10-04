@@ -43,7 +43,7 @@
   },
   {
     "function": {
-      "description": "Search file contents under a folder with a regex (Rust syntax), matched line by line, leaving out what .gitignore ignores and, outside a Git repository, target, dist and build folders unless the glob names them. Mode content (the default) shows each file's matching lines as `12: text` and context lines as `13- text`; files lists the matching files, newest first; count gives matching lines per file. Mode files with no pattern lists the files a glob or type picks. Ignores case unless case_sensitive is set. Paths come back ready for read_file.",
+      "description": "Search file contents under a folder with a regex (Rust syntax), matched line by line, leaving out what .gitignore ignores and, outside a Git repository, target, dist and build folders unless the glob names them. Mode content (the default) shows each file's matching lines as `12: text` and context lines as `13- text`; files lists the matching files, newest first; count gives matching lines per file. Mode files with no pattern lists the files a glob or type picks. Ignores case unless case_sensitive is set. Paths come back ready for read_file. PDF, Word, Excel and PowerPoint files are searched as read_file reads them only when type, glob or path names them.",
       "name": "search",
       "parameters": {
         "properties": {

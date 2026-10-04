@@ -4156,7 +4156,9 @@ impl Tool for Search {
          each file's matching lines as `12: text` and context lines as `13- text`; files \
          lists the matching files, newest first; count gives matching lines per file. Mode \
          files with no pattern lists the files a glob or type picks. Ignores case unless \
-         case_sensitive is set. Paths come back ready for read_file."
+         case_sensitive is set. Paths come back ready for read_file. PDF, Word, Excel and \
+         PowerPoint files are searched as read_file reads them only when type, glob or path \
+         names them."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -4197,7 +4199,14 @@ impl Tool for Search {
             ));
         }
         let query = crate::grep::Query::from_args(args, &root, workspace.map(PathBuf::as_path))?;
-        crate::grep::search(&query, Instant::now() + SEARCH_TIME, SEARCH_FILES)
+        let (found, documents) =
+            crate::grep::search(&query, Instant::now() + SEARCH_TIME, SEARCH_FILES)?;
+        // A document's lines are someone else's words, as a page of one read
+        // with read_file is, so the gate checks what the session does next.
+        if documents {
+            crate::taint::mark(ctx);
+        }
+        Ok(found)
     }
 }
 
@@ -4757,6 +4766,49 @@ mod tests {
         assert!(
             show.contains("`soffice --headless --convert-to pptx`"),
             "{show}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_hits_offset_opens_the_same_line_in_read_file() {
+        let dir = std::env::temp_dir().join(format!("letronna-search-pdf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lines: Vec<String> = (1..=30).map(|n| format!("Line {n} of the page")).collect();
+        let page: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let pages = [&page[..], &page[..], &["The figure we want"][..]];
+        std::fs::write(dir.join("long.pdf"), crate::docs::tests::text_pdf(&pages)).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..ToolContext::of(&crate::chat::Connection {
+                conversation: 731_207,
+                ..Default::default()
+            })
+        };
+        let found = run(
+            "search",
+            r#"{"pattern":"figure we want","type":"pdf"}"#,
+            &ctx,
+        )
+        .unwrap();
+        let line = found
+            .lines()
+            .find_map(|line| line.trim_start().split_once(": The figure"))
+            .map(|(n, _)| n.to_owned())
+            .unwrap();
+        assert!(found.contains("  65- ## Page 3 of 3\n"), "{found}");
+        // Someone else's words, as a page read with read_file is.
+        assert!(crate::taint::marked(&ctx));
+        let read = run(
+            "read_file",
+            &format!(r#"{{"path":"long.pdf","offset":{line},"limit":1}}"#),
+            &ctx,
+        )
+        .unwrap();
+        assert!(
+            read.contains(&format!("\n{line}|The figure we want\n")),
+            "{read}"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
