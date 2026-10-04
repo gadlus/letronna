@@ -48,13 +48,13 @@ impl Tool for ManageSkill {
         "skill_manage"
     }
     fn description(&self) -> &'static str {
-        "Save a way of working you figured out as a skill, so later sessions can load it, or fix one you saved that turned out wrong. A skill you create starts switched off: it is not offered to you, and cannot be loaded, until the user switches it on in Skills. action create takes name, description and body (the instructions, in Markdown). action patch replaces the exact text old with new in a skill's body, or its description with field set to description; old must appear exactly once. action undo puts back a skill as it was before your last patch; undo again to redo it. action archive puts a skill away. Only skills you created can be changed; the user's own, installed and project skills are refused."
+        "Save a way of working as a skill, so later sessions can load it, or fix one you saved that turned out wrong. Save only work likely to recur, and only steps you saw work or the user gave: short, ordered, each saying how to tell it worked. Leave out task results, one-off details, failed attempts, and claims that a tool does not work; save the fix that did. A skill you create starts switched off: it is not offered to you, and cannot be loaded, until the user switches it on in Skills. action create takes name, description and body (the instructions, in Markdown, at most 20,000 bytes). action patch replaces the exact text old with new in a skill's body, or its description with field set to description; old must appear exactly once. action undo puts back a skill as it was before your last patch; undo again to redo it. action archive puts a skill away. Only skills you created can be changed; the user's own, installed and project skills are refused."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
             "action": {"type": "string", "enum": ["create", "patch", "undo", "archive"]},
             "name": {"type": "string", "description": "The skill's name: a few words, such as release-checklist."},
-            "description": {"type": "string", "description": "For create: one line saying when to use the skill."},
+            "description": {"type": "string", "description": "For create: one line that starts with when to use the skill."},
             "body": {"type": "string", "description": "For create: the instructions, in Markdown."},
             "field": {"type": "string", "enum": ["body", "description"], "description": "For patch: where old is. The body unless said."},
             "old": {"type": "string", "description": "For patch: the exact text to replace."},
@@ -481,8 +481,9 @@ fn keep_previous(folder: &Path, text: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BODY_BYTES, LEARNED, PREV_FILE, earlier, manage};
+    use super::{BODY_BYTES, LEARNED, ManageSkill, PREV_FILE, earlier, manage};
     use crate::skills::{create_in, install::install_in, list_in, set_enabled_in};
+    use crate::tools::Tool;
     use serde_json::json;
     use std::path::{Path, PathBuf};
 
@@ -861,5 +862,14 @@ mod tests {
         .unwrap();
         let refused = manage(&data, None, &undo).unwrap_err();
         assert!(refused.starts_with("Nothing was changed"), "{refused}");
+    }
+
+    #[test]
+    fn the_skill_manage_description_rules_out_saving_tool_failures_and_names_the_size_limit() {
+        let description = ManageSkill.description();
+        assert!(description.contains("claims that a tool does not work"));
+        assert!(description.contains("only steps you saw work or the user gave"));
+        assert!(description.contains("at most 20,000 bytes"));
+        assert_eq!(BODY_BYTES, 20_000);
     }
 }
