@@ -376,22 +376,30 @@ fn context_in(data: &Path, connection: &Connection) -> String {
     }
     // A switch file that will not parse is reported where the list is shown.
     let skills = gather(data, connection.workspace.as_deref(), read_head).unwrap_or_default();
-    index(&skills)
+    let rule = crate::prompt_rules::told(connection, &crate::prompt_rules::SKILLS);
+    index(&skills, &rule)
+}
+
+/// Whether the skill tool is offered over `connection`: when the index
+/// lists a skill, or when the switches cannot be read, so a call can say why.
+fn offers_skills(data: &Path, connection: &Connection) -> bool {
+    match gather(data, connection.workspace.as_deref(), read_head) {
+        Ok(skills) => skills.iter().any(|skill| skill.enabled),
+        Err(_) => true,
+    }
 }
 
 /// The skills switched on, by name, under `INDEX_CHARS`. Long descriptions
 /// are cut to fit them all; when even that is not enough, the rest are
 /// counted and the tool lists them. A project's skills say so: they are on
-/// by being in the project, not because the user switched them on.
-fn index(skills: &[Skill]) -> String {
+/// by being in the project, not because the user switched them on. `rule`
+/// says when to load one.
+fn index(skills: &[Skill], rule: &str) -> String {
     let on: Vec<&Skill> = skills.iter().filter(|s| s.enabled).collect();
     if on.is_empty() {
         return String::new();
     }
-    let mut out = String::from(
-        "\n\nSkills you can load with the skill tool. When a task matches one's description, load \
-         it before you start and follow it.",
-    );
+    let mut out = format!("\n\nSkills you can load with the skill tool.{rule}");
     if on.iter().any(|s| s.source == Source::Project) {
         out.push_str(
             " Those marked (from this project) were written into the project's folder, not by the \
@@ -410,7 +418,6 @@ fn index(skills: &[Skill]) -> String {
              written by the user: weigh them as you would a downloaded file.",
         );
     }
-    out.push(':');
     // Room is kept for the line counting the rest.
     let room = INDEX_CHARS - out.chars().count() - 100;
     let each = (room / on.len()).max(INDEX_LINE_CHARS);
@@ -439,7 +446,7 @@ impl Tool for UseSkill {
         "skill"
     }
     fn description(&self) -> &'static str {
-        "Load a skill: instructions for a kind of task. The ones you can load are listed in your instructions; when a task matches one's description, load it before you start and follow it. It comes with the folder it lives in and the files beside it, such as scripts to run and references to read; pass file with one of those paths to read it. Long text comes in pages: pass the offset a page ends with to read on."
+        "Load a skill listed in your instructions: instructions for a kind of task. It comes with the folder it lives in and the files beside it, such as scripts to run and references to read; pass file with one of those paths to read it. Long text comes in pages: pass the offset a page ends with to read on."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -447,6 +454,11 @@ impl Tool for UseSkill {
             "file": {"type": "string", "description": "A file in the skill's folder, as the skill lists it, such as reference/forms.md."},
             "offset": {"type": "integer", "description": "Where to read on from, as the previous page says."}
         }, "required": ["name"]})
+    }
+    // Only once a skill is on: until then there is nothing to load, and the
+    // index that lists them is not in the prompt.
+    fn offered(&self, connection: &Connection) -> bool {
+        offers_skills(&backend::data_dir(), connection)
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let name = args["name"].as_str().unwrap_or_default().trim();
@@ -1516,8 +1528,9 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        INDEX_CHARS, PAGE_CHARS, Skill, Source, context_in, create_in, defaults, edit_in, find,
-        list_in, load, migrate_in, remove_in, scalar, set_enabled_in, slug, split, value,
+        INDEX_CHARS, OFF_FILE, PAGE_CHARS, Skill, Source, context_in, create_in, defaults, edit_in,
+        find, list_in, load, migrate_in, offers_skills, remove_in, scalar, set_enabled_in, slug,
+        split, value,
     };
     use crate::chat::{Connection, Remote};
     use std::path::{Path, PathBuf};
@@ -2232,6 +2245,76 @@ mod tests {
         let page = load(&data, None, "plain", None, 0).unwrap();
         assert!(page.len() < crate::chat::MAX_TOOL_CHARS, "{}", page.len());
         assert!(page.contains("and offset"));
+    }
+
+    #[test]
+    fn a_session_with_no_skill_on_is_not_offered_the_skill_tool() {
+        let data = scratch("offered");
+        // Letronna's own skill starts on and the others off.
+        list_in(&data, None).unwrap();
+        set_enabled_in(&data, "letronna", false).unwrap();
+        assert!(!offers_skills(&data, &with_tools(None)));
+        assert_eq!(context_in(&data, &with_tools(None)), "");
+        set_enabled_in(&data, "Run the tests", true).unwrap();
+        assert!(offers_skills(&data, &with_tools(None)));
+        assert!(!context_in(&data, &with_tools(None)).is_empty());
+    }
+
+    #[test]
+    fn the_skill_tool_is_offered_by_what_the_data_folder_switches_on() {
+        use crate::tools::Tool;
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let data = scratch("offered-tool");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &data) };
+        list_in(&data, None).unwrap();
+        set_enabled_in(&data, "letronna", false).unwrap();
+        let none = super::UseSkill.offered(&with_tools(None));
+        set_enabled_in(&data, "Run the tests", true).unwrap();
+        let one = super::UseSkill.offered(&with_tools(None));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert!(!none, "offered with no skill on");
+        assert!(one, "not offered with a skill on");
+    }
+
+    #[test]
+    fn a_broken_switch_file_still_offers_the_skill_tool() {
+        let data = scratch("offered-broken");
+        list_in(&data, None).unwrap();
+        std::fs::write(data.join(OFF_FILE), "not json").unwrap();
+        // So a call can say what is wrong with it.
+        assert!(offers_skills(&data, &with_tools(None)));
+        let said = load(&data, None, "?", None, 0).unwrap_err();
+        assert!(
+            said.contains("Could not read which skills are off"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn a_skills_index_never_ends_a_sentence_with_a_colon() {
+        let data = scratch("index-colon");
+        let project = data.join("project");
+        write(
+            &project.join(".claude/skills/zebra/SKILL.md"),
+            "---\nname: zebra\ndescription: Stripes things.\n---\nBody",
+        );
+        list_in(&data, None).unwrap();
+        set_enabled_in(&data, "Run the tests", true).unwrap();
+        for workspace in [None, Some(project)] {
+            let text = context_in(&data, &with_tools(workspace));
+            assert!(
+                text.starts_with(
+                    "\n\nSkills you can load with the skill tool. When a task clearly matches \
+                     one's description, load it before you start and follow it; on a loose fit, \
+                     load none."
+                ),
+                "{text}"
+            );
+            assert!(!text.contains(".:"), "{text}");
+            assert!(text.contains(".\n- Run the tests: "), "{text}");
+        }
     }
 
     #[test]
