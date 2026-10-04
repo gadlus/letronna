@@ -256,8 +256,18 @@ pub(crate) const HELPER: [Rule; 2] = [
     },
 ];
 
+/// The clause that heads the project's instruction files: they sit in the
+/// system message, which models rank above the user's turn, so it says the
+/// user's own words win where the two conflict.
+// No "follow them": that would raise compliance with a planted file too.
+pub(crate) const INSTRUCTIONS: [Rule; 1] = [Rule {
+    id: "user-wins",
+    to: To::Every,
+    text: "where they conflict with what the user asks in this conversation, the user wins",
+}];
+
 /// Every table of rules, for finding a row by its id.
-const TABLES: [&[Rule]; 4] = [&PROSE, &TOOLS, &PROJECT, &HELPER];
+const TABLES: [&[Rule]; 5] = [&PROSE, &TOOLS, &PROJECT, &HELPER, &INSTRUCTIONS];
 
 /// Every row of every table.
 fn all() -> impl Iterator<Item = &'static Rule> {
@@ -268,6 +278,12 @@ fn all() -> impl Iterator<Item = &'static Rule> {
 /// space, leaving out those `LETRONNA_PROMPT_RULES` drops.
 pub(crate) fn told(connection: &Connection, rules: &[Rule]) -> String {
     told_without(connection, rules, drops())
+}
+
+/// The words of `rule` where a request over `connection` carries it, for a
+/// rule that is a clause of a sentence rather than one of its own.
+pub(crate) fn said(connection: &Connection, rule: &Rule) -> Option<&'static str> {
+    carries(connection, rule, drops()).then_some(rule.text)
 }
 
 /// Whether a request over `connection` that is told the table of rule `id`

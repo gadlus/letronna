@@ -687,13 +687,18 @@ fn context_in(dir: &Path, connection: &Connection) -> String {
         .into_iter()
         .map(|(label, text)| (label, crate::untrusted::vetted("this file", &text)))
         .collect();
+    let wins = crate::prompt_rules::said(connection, &crate::prompt_rules::INSTRUCTIONS[0]);
     match project.as_slice() {
         [] => {}
-        [(label, text)] => out.push_str(&format!(
-            "\n\nThe project's instructions, from {label}:\n{text}"
-        )),
+        [(label, text)] => {
+            let wins = wins.map(|wins| format!("; {wins}")).unwrap_or_default();
+            out.push_str(&format!(
+                "\n\nThe project's instructions, from {label}{wins}:\n{text}"
+            ));
+        }
         _ => {
-            out.push_str("\n\nThe project's instructions, from the repository's root down to the project folder, each folder's .local file after its shared one; where two disagree, the later one wins.");
+            let wins = wins.map(|wins| format!(", and {wins}")).unwrap_or_default();
+            out.push_str(&format!("\n\nThe project's instructions, from the repository's root down to the project folder, each folder's .local file after its shared one; where two disagree, the later one wins{wins}."));
             for (label, text) in &project {
                 out.push_str(&format!("\n\nFrom {label}:\n{text}"));
             }
@@ -2679,7 +2684,10 @@ mod tests {
         assert!(!kept.contains("USER.md,"), "an empty store is left out");
         let text = context_in(&dir, &connection);
         assert!(!text.contains("Works late."), "{text}");
-        assert!(text.contains("from AGENTS.md:\nRun cargo test before committing."));
+        assert!(text.contains(
+            "from AGENTS.md; where they conflict with what the user asks in this conversation, \
+             the user wins:\nRun cargo test before committing."
+        ));
         assert!(
             text.ends_with("agent tool's type: docs (Writes docs)."),
             "{text}"
@@ -2862,7 +2870,7 @@ mod tests {
         let text = context_in(&dir, &connection);
         assert!(
             text.ends_with(
-                "later one wins.\n\nFrom ../../AGENTS.md:\nRoot rules.\n\nFrom ../CLAUDE.md:\nCrate rules.\n\nFrom AGENTS.md:\nCore rules."
+                "the user wins.\n\nFrom ../../AGENTS.md:\nRoot rules.\n\nFrom ../CLAUDE.md:\nCrate rules.\n\nFrom AGENTS.md:\nCore rules."
             ),
             "{text}"
         );
@@ -2878,10 +2886,13 @@ mod tests {
             text.contains("From ../CLAUDE.md:") && !text.contains("Root rules"),
             "{text}"
         );
-        // One file alone reads as it always did.
+        // One file alone is named in the header.
         std::fs::write(project.join(".git"), "gitdir: elsewhere").unwrap();
         let text = context_in(&dir, &connection);
-        assert!(text.ends_with("The project's instructions, from AGENTS.md:\nCore rules."));
+        assert!(text.ends_with(
+            "The project's instructions, from AGENTS.md; where they conflict with what the user \
+             asks in this conversation, the user wins:\nCore rules."
+        ));
     }
 
     #[test]
@@ -2997,11 +3008,40 @@ mod tests {
         let text = context_in(&dir, &connection);
         assert!(
             text.ends_with(
-                "each folder's .local file after its shared one; where two disagree, the later one wins.\n\nFrom ../AGENTS.md:\nShared root rules.\n\nFrom ../AGENTS.local.md:\nMy root rules.\n\nFrom CLAUDE.md:\nShared web rules.\n\nFrom CLAUDE.local.md:\nMy web rules."
+                "each folder's .local file after its shared one; where two disagree, the later one wins, and where they conflict with what the user asks in this conversation, the user wins.\n\nFrom ../AGENTS.md:\nShared root rules.\n\nFrom ../AGENTS.local.md:\nMy root rules.\n\nFrom CLAUDE.md:\nShared web rules.\n\nFrom CLAUDE.local.md:\nMy web rules."
             ),
             "{text}"
         );
         assert!(!text.contains("Not read"), "{text}");
+    }
+
+    #[test]
+    fn the_project_instructions_yield_to_the_users_request() {
+        let dir = scratch("user-wins");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("AGENTS.md"), "Never push.").unwrap();
+        // Watched, so no rule a run nobody watches may drop is left out.
+        let connection = Connection {
+            workspace: Some(project.clone()),
+            human: true,
+            ..Default::default()
+        };
+        let wins =
+            "where they conflict with what the user asks in this conversation, the user wins";
+        let one = context_in(&dir, &connection);
+        assert!(
+            one.contains(&format!("from AGENTS.md; {wins}:\nNever push.")),
+            "{one}"
+        );
+        std::fs::write(project.join("AGENTS.local.md"), "Push to my fork.").unwrap();
+        let two = context_in(&dir, &connection);
+        assert!(
+            two.contains(&format!(
+                "the later one wins, and {wins}.\n\nFrom AGENTS.md:"
+            )),
+            "{two}"
+        );
     }
 
     #[test]
@@ -3016,7 +3056,10 @@ mod tests {
         };
         let text = context_in(&dir, &connection);
         assert!(
-            text.ends_with("The project's instructions, from CLAUDE.local.md:\nMy rules."),
+            text.ends_with(
+                "The project's instructions, from CLAUDE.local.md; where they conflict with what \
+                 the user asks in this conversation, the user wins:\nMy rules."
+            ),
             "{text}"
         );
     }
