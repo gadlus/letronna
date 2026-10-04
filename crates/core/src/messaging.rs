@@ -359,6 +359,48 @@ pub fn card_text(name: &str, arguments: &str, preview: &str) -> String {
     )
 }
 
+/// A memory save's card written out for a chat: the change word for word,
+/// then `places` numbered, where it goes now first.
+pub(crate) fn keep_card_text(preview: &str, places: &[crate::memory::Scope]) -> String {
+    let mut text = format!(
+        "Letronna wants to change what it remembers:\n{}\n",
+        format::fenced(&trim_to(preview, 800))
+    );
+    for (at, place) in places.iter().enumerate() {
+        text.push_str(&format!("\n{}. {}", at + 1, place.save_label()));
+    }
+    text.push_str(
+        "\n\nReply with a number to save it there, or tap Allow or reply yes for 1. \
+         Tap Deny or reply no, and why not, to leave it unsaved. Anything else declines.",
+    );
+    text
+}
+
+/// The place of `places` a reply to a memory save's card picks by its
+/// number, if it is one of theirs.
+pub(crate) fn picked_place(
+    reply: &str,
+    places: &[crate::memory::Scope],
+) -> Option<crate::memory::Scope> {
+    let at = reply.trim().trim_end_matches('.').parse::<usize>().ok()?;
+    places.get(at.checked_sub(1)?).copied()
+}
+
+/// The words the sender of a chat message wrote, of `text` as
+/// `message_text` makes it: what comes before the message it replies to
+/// or forwards, quoted in after them.
+pub(crate) fn own_words(text: &str) -> &str {
+    // A forward alone has no words of the sender's before it.
+    if text.starts_with("Forwarded message:") {
+        return "";
+    }
+    let quoted = ["\n\nForwarded message:", "\n\nIn reply to "]
+        .iter()
+        .filter_map(|lead| text.find(lead))
+        .min();
+    &text[..quoted.unwrap_or(text.len())]
+}
+
 pub enum CardAnswer {
     Answer(String),
     Allow,
@@ -2923,6 +2965,28 @@ mod card_tests {
         assert_eq!(reason("not yet"), "not yet");
         assert_eq!(reason("nothing to add"), "nothing to add");
     }
+
+    #[test]
+    fn a_memory_save_shows_its_entry_and_a_number_picks_its_place() {
+        use crate::memory::Scope;
+        let places = [Scope::Chat, Scope::Auto];
+        let text = super::keep_card_text("Save to Chat notes\nAdd: Flies on Friday.", &places);
+        assert!(
+            text.starts_with(
+                "Letronna wants to change what it remembers:\n```\nSave to Chat notes\nAdd: Flies on Friday.\n```"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n1. Save for this chat only\n2. Save everywhere\n"),
+            "{text}"
+        );
+        assert_eq!(super::picked_place(" 2 ", &places), Some(Scope::Auto));
+        assert_eq!(super::picked_place("1.", &places), Some(Scope::Chat));
+        for reply in ["3", "0", "yes", "two"] {
+            assert_eq!(super::picked_place(reply, &places), None, "{reply}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3076,6 +3140,33 @@ mod discord_tests {
             heard(own).as_deref(),
             Some("and this?\n\nIn reply to me:\n> my plan")
         );
+    }
+
+    #[test]
+    fn the_senders_own_words_leave_out_what_they_quote() {
+        let offer = json!({
+            "channel_id": "dm1", "content": "no thanks", "author": {"id": "7"},
+            "referenced_message": {"content": "Done.\n\nWant me to remember that?", "author": {"id": "99"}}
+        });
+        let text = heard(offer).unwrap();
+        assert!(text.contains("remember"), "{text}");
+        assert_eq!(super::own_words(&text), "no thanks");
+        let forward = json!({
+            "channel_id": "dm1", "content": "", "author": {"id": "7"},
+            "message_reference": {"type": 1, "channel_id": "5", "message_id": "4"},
+            "message_snapshots": [{"message": {"content": "remember the milk"}}]
+        });
+        assert_eq!(super::own_words(&heard(forward).unwrap()), "");
+        let both = json!({
+            "channel_id": "dm1", "content": "keep in mind I'm away", "author": {"id": "7"},
+            "message_reference": {"type": 1, "channel_id": "5", "message_id": "4"},
+            "message_snapshots": [{"message": {"content": "out of office"}}]
+        });
+        assert_eq!(
+            super::own_words(&heard(both).unwrap()),
+            "keep in mind I'm away"
+        );
+        assert_eq!(super::own_words("plain words"), "plain words");
     }
 
     #[test]

@@ -287,6 +287,15 @@ impl Scope {
         }
     }
 
+    /// The answer on a memory save's card that keeps it here.
+    pub fn save_label(self) -> &'static str {
+        match self {
+            Scope::Auto => "Save everywhere",
+            Scope::Project => "Save for this project only",
+            Scope::Chat => "Save for this chat only",
+        }
+    }
+
     /// The choice `text` names: its saved name or its label.
     pub fn parse(text: &str) -> Result<Scope, String> {
         let text = text.trim();
@@ -542,7 +551,16 @@ fn said_in(messages: &[Message]) -> Option<Scope> {
 fn typed(message: &Message) -> Option<&str> {
     // A job's output or a helper's report is posted as the user's too, and
     // asks nothing.
-    (message.role == "user" && !message.notice).then(|| crate::references::typed(&message.content))
+    if message.role != "user" || message.notice {
+        return None;
+    }
+    let typed = crate::references::typed(&message.content);
+    // A chat app's message quotes what it replies to or forwards after the
+    // sender's words, and a "no" under a quoted offer asks nothing.
+    Some(match message.remote {
+        true => crate::messaging::own_words(typed),
+        false => typed,
+    })
 }
 
 /// Whether `text` asks to remember, save or forget something.
@@ -4062,6 +4080,31 @@ mod tests {
             ..Default::default()
         });
         assert!(asked_in(&messages));
+    }
+
+    #[test]
+    fn a_chat_apps_message_asks_by_its_senders_words_not_by_what_it_quotes() {
+        let offered = "Noted.\n\nWant me to remember that?";
+        let from_chat = |content: &str| Message {
+            role: "user".into(),
+            content: content.into(),
+            remote: true,
+            ..Default::default()
+        };
+        let mut messages = talk(&["I'm vegetarian.", offered]);
+        messages.push(from_chat(
+            "no thanks\n\nIn reply to your earlier message:\n> Want me to remember that?",
+        ));
+        assert!(!asked_in(&messages));
+        messages.pop();
+        messages.push(from_chat(
+            "yes\n\nIn reply to your earlier message:\n> Want me to remember that?",
+        ));
+        assert!(asked_in(&messages));
+        let forwarded = from_chat("Forwarded message:\n> remember to call the bank");
+        assert!(!asked_in(&[forwarded]));
+        let asked = from_chat("Remember I fly on Fridays.\n\nForwarded message:\n> the itinerary");
+        assert!(asked_in(&[asked]));
     }
 
     #[test]

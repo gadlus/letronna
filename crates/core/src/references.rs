@@ -86,6 +86,12 @@ pub fn expand(text: &str, workspace: Option<&Path>) -> String {
     format!("{text}{ATTACHED}{}", out.trim_start_matches('\n'))
 }
 
+/// `typed` with `attached` after it, as `expand` attaches what a message's
+/// references name, so `typed` gives back the words alone.
+pub fn with_attached(typed: &str, attached: &str) -> String {
+    format!("{typed}{ATTACHED}{attached}")
+}
+
 /// What the user typed of a message `expand` made, without what it attached.
 pub fn typed(content: &str) -> &str {
     content.split(ATTACHED).next().unwrap_or(content)
