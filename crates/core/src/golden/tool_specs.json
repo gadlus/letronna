@@ -318,7 +318,7 @@
             "type": "string"
           },
           "seconds": {
-            "description": "60 to 3600.",
+            "description": "60 to 86400.",
             "type": "integer"
           }
         },

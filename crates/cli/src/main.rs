@@ -370,6 +370,8 @@ fn main() {
     // Only a conversation that goes on hears about work that ends after its
     // turn; `-p` has left by now, with its answer.
     runner.bar.listen();
+    // The open session's wake-ups fire here, one missed meanwhile at once.
+    letronna_core::wake::serve([runner.store.conversations[session].id]);
     runner.ended = Some(letronna_core::notify::listen());
     // Likewise only a terminal that stays open runs the schedules, unless the
     // window already does. A run lands in the sessions, where /resume finds
@@ -432,6 +434,9 @@ fn main() {
             // footer's count once a command has opened another.
             let open = runner.store.conversations[session].id;
             runner.bar.show_helpers_of(open);
+            // Only the open session's wake-ups: another's would leave a
+            // notice that starts nothing here.
+            letronna_core::wake::serve([open]);
             runner
                 .bar
                 .set_folder(runner.store.conversations[session].workspace.clone());

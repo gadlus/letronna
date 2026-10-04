@@ -2,12 +2,24 @@
 //!
 //! Coming back in twenty minutes used to mean holding the turn open in
 //! `wait`, which keeps a round in flight and gives up after two minutes. A
-//! wake-up is instead one deadline on the shared timer thread that leaves a
-//! `Later` notice in the session's mailbox, so nothing runs while the session
-//! sleeps and the front end that listens starts its next turn with the
-//! notice. A session has one at a time, or a model that arms one every turn
-//! would be woken once for each. It lives in memory only: a pending wake-up
-//! is lost when Letronna exits, and outliving a restart is a schedule's job.
+//! wake-up instead ends the turn and, once it comes due, leaves a `Later`
+//! notice in the session's mailbox, so nothing runs while the session sleeps
+//! and the front end that listens starts its next turn with the notice. A
+//! session has one at a time, or a model that arms one every turn would be
+//! woken once for each.
+//!
+//! "Look at CI again tomorrow morning" outlasts most Letronnas, so a pending
+//! wake-up waits in `wakes.json` in the data folder, under the short lock
+//! the schedules' list takes. Only a front end that starts turns in the
+//! session fires it -- the window for every session it lists, the terminal
+//! for the one it has open -- since a notice is heard only in the process it
+//! is left in. That front end takes the wake-up out of the file under the
+//! lock before it leaves the notice, so two Letronnas never both fire it.
+//! While it serves any session it looks by the wall clock every minute, as
+//! another Letronna may leave one meanwhile and the timer thread's clock
+//! stops while the machine sleeps. One missed while nothing served it fires
+//! once, saying how late it is; one more than a day late leaves a note for
+//! the next turn rather than starting one, and ends a loop waiting on it.
 //!
 //! `/loop` and `/heartbeat` keep a session going on the same footing. A loop
 //! leaves its prompt in the mailbox as a tick, the first at once and each
@@ -15,14 +27,18 @@
 //! when the model's own wake-up comes due. Only the end of the turn that took
 //! a tick can say whether it answered LOOP_COMPLETE or asked to be woken, so
 //! the front ends report every turn's end and the loop picks out its own. A
-//! session has one loop, held in memory like its wake-up.
+//! session has one loop, held in memory only, so a restart ends it.
 
-use crate::chat::Connection;
+use crate::chat::{self as backend, Connection};
 use crate::inbox::{self, Notice, When};
+use crate::schedule;
 use crate::timers::{self, TimerId};
 use crate::tools::{Tool, ToolContext, one_line};
+use chrono::{Local, TimeZone};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -31,15 +47,51 @@ use std::time::{Duration, Instant};
 /// without ending it.
 const SOONEST: f64 = 60.;
 
-/// An hour: a longer sleep belongs to a schedule, which outlives a restart
-/// where a wake-up does not.
-const LATEST: f64 = 3_600.;
+/// A day, as far as "tomorrow morning": anything further off, or anything
+/// that repeats, is a schedule's, which runs on a prompt of its own.
+const LATEST: f64 = 86_400.;
 
 /// What a woken session is told to do when the model named nothing else.
 const CARRY_ON: &str = "Carry on where you left off.";
 
-/// The wake-up each session has pending, so a newer one can take it back.
-static PENDING: Mutex<BTreeMap<u64, TimerId>> = Mutex::new(BTreeMap::new());
+/// How often a front end looks at the wake-ups of the sessions it serves. A
+/// minute is also the most a sleeping machine can make one late once it is
+/// awake again, and how late one has to be to have been missed.
+const BEAT: Duration = Duration::from_secs(60);
+
+/// A day: a wake-up missed by longer, as over a weekend away, was about a
+/// moment long gone, so it leaves a note instead of starting a turn.
+const STALE: u64 = 24 * 60 * 60;
+
+/// Where a wake-up comes from in the mailbox.
+const WAKE_UP: &str = "wake-up";
+
+/// A wake-up waiting in `wakes.json`, where it outlives the Letronna that
+/// armed it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Wake {
+    session: u64,
+    /// When it comes due, in epoch seconds by the wall clock, which goes on
+    /// while the machine sleeps.
+    due: u64,
+    reason: String,
+    prompt: String,
+    /// When it was armed, in epoch seconds.
+    armed: u64,
+}
+
+/// The sessions whose wake-ups this Letronna fires, and its next look.
+struct Served {
+    sessions: BTreeSet<u64>,
+    /// Set while it serves any.
+    timer: Option<TimerId>,
+}
+
+/// What this Letronna serves, none until wake_me or `serve` names one.
+static SERVED: Mutex<Served> = Mutex::new(Served {
+    sessions: BTreeSet::new(),
+    timer: None,
+});
 
 /// Where a loop's ticks come from in the mailbox, which is also how the turn
 /// that took one is told from a turn that ran while it waited.
@@ -87,7 +139,7 @@ impl Tool for WakeMe {
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
-            "seconds": {"type": "integer", "description": "60 to 3600."},
+            "seconds": {"type": "integer", "description": "60 to 86400."},
             "reason": {"type": "string", "description": "Shown to the user."},
             "prompt": {"type": "string", "description": "What to do on waking; defaults to carrying on."}
         }, "required": ["seconds", "reason"]})
@@ -98,7 +150,7 @@ impl Tool for WakeMe {
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let seconds = args["seconds"]
             .as_f64()
-            .ok_or("`seconds` is required: how long to sleep, 60 to 3600.")?;
+            .ok_or("`seconds` is required: how long to sleep, 60 to 86400.")?;
         let reason = one_line(args["reason"].as_str().unwrap_or_default());
         if reason.is_empty() {
             return Err(
@@ -111,30 +163,39 @@ impl Tool for WakeMe {
         };
         let delay = delay(seconds);
         let session = ctx.conversation;
-        let text = format!("wake-up: {reason}\n{prompt}");
-        arm(
-            session,
-            delay,
-            Box::new(move || {
-                if wake_loop(session, &text) {
-                    return;
-                }
-                inbox::push(
-                    session,
-                    Notice {
-                        from: "wake-up".into(),
-                        when: When::Later,
-                        text,
-                    },
-                );
-            }),
-        );
-        asked_to_wake(session);
-        let at = (chrono::Local::now() + delay).format("%H:%M");
+        let now = backend::now();
+        let dir = backend::data_dir();
+        put(
+            &dir,
+            Wake {
+                session,
+                due: now + delay.as_secs(),
+                reason: reason.clone(),
+                prompt: prompt.into(),
+                armed: now,
+            },
+        )?;
+        // Its turn runs here, so this front end serves it.
+        served().sessions.insert(session);
+        look_in(dir, delay.min(BEAT));
+        asked_to_wake(session, delay);
+        let at = Local::now() + delay;
+        let tomorrow = if at.date_naive() == Local::now().date_naive() {
+            ""
+        } else {
+            " tomorrow"
+        };
         let minutes = (delay.as_secs() + 30) / 60;
-        let s = if minutes == 1 { "" } else { "s" };
+        // Past two hours, minutes are harder to read than the hours they make.
+        let (count, unit) = if minutes < 120 {
+            (minutes, "minute")
+        } else {
+            ((minutes + 30) / 60, "hour")
+        };
+        let s = if count == 1 { "" } else { "s" };
         Ok(format!(
-            "This session wakes at {at}, in {minutes} minute{s} (\"{reason}\"). End your turn now. A newer wake_me replaces this one."
+            "This session wakes at {}{tomorrow}, in {count} {unit}{s} (\"{reason}\"). End your turn now. A newer wake_me replaces this one.",
+            at.format("%H:%M")
         ))
     }
 }
@@ -145,22 +206,258 @@ fn woken(listened: bool, connection: &Connection) -> bool {
     listened && connection.remote.is_none()
 }
 
-/// The sleep asked for, held to between a minute and an hour.
+/// The sleep asked for, held to between a minute and a day.
 fn delay(seconds: f64) -> Duration {
     Duration::from_secs_f64(seconds.clamp(SOONEST, LATEST))
 }
 
-/// Run `fire` for a session once `delay` has passed, taking back the wake-up
-/// it had pending.
-fn arm(session: u64, delay: Duration, fire: Box<dyn FnOnce() + Send>) {
-    // Held across both steps, so two calls at once still leave one pending.
-    let mut pending = PENDING.lock().unwrap_or_else(PoisonError::into_inner);
-    let timer = timers::at(Instant::now() + delay, fire);
-    // One that already fired stays listed until the next takes it back,
-    // which does nothing.
-    if let Some(older) = pending.insert(session, timer) {
+/// Fire the wake-ups of `sessions` and no other session's from now on, any
+/// missed while nothing served them at once.
+pub fn serve(sessions: impl IntoIterator<Item = u64>) {
+    // A Letronna that starts no turn between prompts would take a wake-up
+    // out of the file into a mailbox nobody reads.
+    if !inbox::listened() {
+        return;
+    }
+    served().sessions = sessions.into_iter().collect();
+    look_in(backend::data_dir(), Duration::ZERO);
+}
+
+/// Take back the session's pending wake-up, if it has one.
+pub fn cancel(session: u64) -> Result<(), String> {
+    let dir = backend::data_dir();
+    // With no file there is nothing to take back, and no lock to make.
+    if !path(&dir).exists() {
+        return Ok(());
+    }
+    edit(&dir, |wakes| wakes.retain(|wake| wake.session != session))
+}
+
+/// Where the wake-ups wait in data folder `dir`.
+fn path(dir: &Path) -> PathBuf {
+    dir.join("wakes.json")
+}
+
+/// The wake-ups on disk: none when there is no file, and why not when there
+/// is one this build cannot read, which is then never saved over.
+fn load(dir: &Path) -> Result<Vec<Wake>, String> {
+    let bytes = match std::fs::read(path(dir)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("Could not read the wake-ups: {e}")),
+    };
+    serde_json::from_slice(&bytes).map_err(|e| {
+        format!(
+            "The wake-ups in {} cannot be read ({e}), so nothing is saved over them until the file is fixed.",
+            path(dir).display()
+        )
+    })
+}
+
+/// Write the wake-ups whole through a file of this process's own, so a
+/// Letronna reading meanwhile finds the old list or the new one.
+fn save(dir: &Path, wakes: &[Wake]) -> Result<(), String> {
+    let failed = |e: std::io::Error| format!("Could not save the wake-ups: {e}");
+    // With none left the file goes, so a look finds nothing without taking
+    // the lock.
+    if wakes.is_empty() {
+        return match std::fs::remove_file(path(dir)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(failed(e)),
+            _ => Ok(()),
+        };
+    }
+    let bytes = serde_json::to_vec_pretty(wakes)
+        .map_err(|e| format!("Could not save the wake-ups: {e}"))?;
+    let temp = path(dir).with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temp, bytes)
+        .and_then(|()| std::fs::rename(&temp, path(dir)))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&temp);
+            failed(e)
+        })
+}
+
+/// Read the wake-ups, let `change` change them and save what it leaves, all
+/// under the schedules' short lock, so no other Letronna's change lands in
+/// between and is lost.
+fn edit<T>(dir: &Path, change: impl FnOnce(&mut Vec<Wake>) -> T) -> Result<T, String> {
+    let _held = lock(dir)?;
+    let mut wakes = load(dir)?;
+    let out = change(&mut wakes);
+    save(dir, &wakes)?;
+    Ok(out)
+}
+
+/// Hold the schedules' short lock, which the wake-ups' file is kept under
+/// too, until the file goes.
+fn lock(dir: &Path) -> Result<std::fs::File, String> {
+    schedule::hold_list_lock(dir).map_err(|e| format!("Could not lock the wake-ups: {e}"))
+}
+
+/// Keep `wake` in place of any its session had.
+fn put(dir: &Path, wake: Wake) -> Result<(), String> {
+    edit(dir, |wakes| {
+        wakes.retain(|other| other.session != wake.session);
+        wakes.push(wake);
+    })
+}
+
+/// Take the wake-ups of `served` sessions due by `now` out of the file under
+/// its lock, so no other Letronna fires them too, with when the next of
+/// theirs still waiting comes due.
+fn claim(dir: &Path, served: &BTreeSet<u64>, now: u64) -> Result<(Vec<Wake>, Option<u64>), String> {
+    if !path(dir).exists() {
+        return Ok((Vec::new(), None));
+    }
+    let _held = lock(dir)?;
+    let (due, waiting): (Vec<Wake>, Vec<Wake>) = load(dir)?
+        .into_iter()
+        .partition(|wake| served.contains(&wake.session) && wake.due <= now);
+    if !due.is_empty() {
+        save(dir, &waiting)?;
+    }
+    let next = waiting
+        .iter()
+        .filter(|wake| served.contains(&wake.session))
+        .map(|wake| wake.due)
+        .min();
+    Ok((due, next))
+}
+
+/// Leave a claimed wake-up in its session's mailbox, saying when it was due
+/// if it was missed, or only a line for the next turn once a day late.
+fn deliver(wake: &Wake, now: u64) {
+    let late = now.saturating_sub(wake.due);
+    let due = clock(wake.due, now);
+    if late > STALE {
+        // A loop the model paces waits for this as its next tick, and with
+        // no tick coming it would wait for good.
+        let mut loops = loops();
+        let paced = (loops.get(&wake.session)).is_some_and(|looping| looping.pace == Pace::Model);
+        let ended = if paced {
+            loops.remove(&wake.session)
+        } else {
+            None
+        };
+        drop(loops);
+        let stopped = match ended {
+            Some(looping) => {
+                looping.end(wake.session);
+                " and stopped the /loop waiting on it"
+            }
+            None => "",
+        };
+        inbox::push(
+            wake.session,
+            Notice {
+                from: WAKE_UP.into(),
+                when: When::Quiet,
+                text: format!(
+                    "wake-up \"{}\", due {due}, came more than a day late, so it started no turn{stopped}.",
+                    wake.reason
+                ),
+            },
+        );
+        return;
+    }
+    let mut text = format!("wake-up: {}", wake.reason);
+    if late > BEAT.as_secs() {
+        text.push_str(&format!(" (due {due}, {})", late_by(late)));
+    }
+    text.push('\n');
+    text.push_str(&wake.prompt);
+    if wake_loop(wake.session, &text) {
+        return;
+    }
+    inbox::push(
+        wake.session,
+        Notice {
+            from: WAKE_UP.into(),
+            when: When::Later,
+            text,
+        },
+    );
+}
+
+/// An epoch second as the time of day, with the weekday when it was not
+/// today as of `now`.
+fn clock(at: u64, now: u64) -> String {
+    let local = |second: u64| Local.timestamp_opt(second as i64, 0).single();
+    match (local(at), local(now)) {
+        (Some(at), Some(now)) if at.date_naive() == now.date_naive() => {
+            at.format("%H:%M").to_string()
+        }
+        (Some(at), _) => at.format("%a %H:%M").to_string(),
+        (None, _) => "earlier".into(),
+    }
+}
+
+/// How late a wake-up is, in words: "42 min late", or "5 h late" once
+/// minutes are more than can be read at a glance.
+fn late_by(seconds: u64) -> String {
+    let minutes = (seconds + 30) / 60;
+    if minutes < 120 {
+        format!("{minutes} min late")
+    } else {
+        format!("{} h late", (minutes + 30) / 60)
+    }
+}
+
+/// Fire what is due among the wake-ups this Letronna serves in data folder
+/// `dir`, and look again while it serves any.
+fn look(dir: PathBuf) {
+    let served = served().sessions.clone();
+    if served.is_empty() {
+        return;
+    }
+    let now = backend::now();
+    let wait = match claim(&dir, &served, now) {
+        Ok((due, next)) => {
+            for wake in &due {
+                deliver(wake, now);
+            }
+            // With none waiting it still looks a beat on, as another
+            // Letronna may leave one for a session served here.
+            next.map_or(BEAT, |at| {
+                Duration::from_secs(at.saturating_sub(now)).min(BEAT)
+            })
+        }
+        // A lock or a save that failed may work a beat on.
+        Err(_) => BEAT,
+    };
+    look_in(dir, wait);
+}
+
+/// Look after `wait`, in place of the look set before.
+fn look_in(dir: PathBuf, wait: Duration) {
+    // Held until the timer is listed, or a look it starts at once could list
+    // its next one first and have it taken back here.
+    let mut served = served();
+    // A look reads and writes a file, which a timer's callback is too quick
+    // for, so it gets a thread of its own, or runs right there when there is
+    // none to be had.
+    let timer = timers::at(
+        Instant::now() + wait,
+        Box::new(move || {
+            let there = dir.clone();
+            if std::thread::Builder::new()
+                .name("wake-ups".into())
+                .spawn(move || look(there))
+                .is_err()
+            {
+                look(dir);
+            }
+        }),
+    );
+    if let Some(older) = served.timer.replace(timer) {
         timers::cancel(older);
     }
+}
+
+/// What this Letronna serves, which is whole even after a panic because
+/// nothing is left half done under the lock.
+fn served() -> MutexGuard<'static, Served> {
+    SERVED.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// How a loop comes round again.
@@ -307,13 +604,9 @@ impl Loop {
             timers::cancel(timer);
         }
         inbox::withdraw(session, TICK);
-        if self.pace == Pace::Model
-            && let Some(timer) = PENDING
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&session)
-        {
-            timers::cancel(timer);
+        // One a failed take-back leaves fires once as a plain wake-up.
+        if self.pace == Pace::Model {
+            let _ = cancel(session);
         }
     }
 }
@@ -515,19 +808,27 @@ fn wake_loop(session: u64, woken: &str) -> bool {
     true
 }
 
-/// Note that the model asked to be woken, which in a loop it paces makes the
-/// fallback needless and forgives a tick that asked for nothing.
-fn asked_to_wake(session: u64) {
+/// Note that the model asked to be woken in `delay`, which in a loop it paces
+/// puts the fallback off until after the wake-up and forgives a tick that
+/// asked for nothing.
+fn asked_to_wake(session: u64, delay: Duration) {
     let mut loops = loops();
     let Some(looping) = loops.get_mut(&session) else {
         return;
     };
     looping.woke = true;
     looping.missed = false;
-    if looping.pace == Pace::Model
-        && let Some(timer) = looping.timer.take()
-    {
-        timers::cancel(timer);
+    if looping.pace == Pace::Model {
+        // The wake-up is the next tick, unless another Letronna serving the
+        // session fires it, which would leave this loop waiting for good.
+        let id = looping.id;
+        let fallback = timers::at(
+            Instant::now() + delay + FALLBACK,
+            Box::new(move || fire(session, id)),
+        );
+        if let Some(older) = looping.timer.replace(fallback) {
+            timers::cancel(older);
+        }
     }
 }
 
@@ -564,48 +865,54 @@ fn loops() -> MutexGuard<'static, BTreeMap<u64, Loop>> {
 mod tests {
     use super::*;
     use crate::chat::Remote;
+    use crate::store::tests::{DATA_DIR, Scratch};
     use crate::tools::{run, specs};
-    use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
+    use std::sync::{Arc, Barrier};
 
-    /// A callback that sends `label` down `sent`, and drops `sent` unsent if
-    /// it is taken back.
-    fn say(sent: mpsc::Sender<&'static str>, label: &'static str) -> Box<dyn FnOnce() + Send> {
-        Box::new(move || {
-            let _ = sent.send(label);
-        })
+    /// A wake-up for `session` due at epoch second `due`.
+    fn wake(session: u64, due: u64, reason: &str) -> Wake {
+        Wake {
+            session,
+            due,
+            reason: reason.into(),
+            prompt: CARRY_ON.into(),
+            armed: due.saturating_sub(3_600),
+        }
+    }
+
+    /// A data folder of the test's own, set as `AGENT_DATA_DIR` while the
+    /// guards are held, for code that finds the wake-ups through it.
+    fn data_folder(name: &str) -> (MutexGuard<'static, ()>, MutexGuard<'static, ()>, Scratch) {
+        let data = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let bell = inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = Scratch::new(name);
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        (data, bell, dir)
     }
 
     #[test]
     fn a_newer_wake_replaces_the_pending_one() {
-        let (older, older_fired) = mpsc::channel();
-        let (other, other_fired) = mpsc::channel();
-        let (newer, newer_fired) = mpsc::channel();
-        // An hour off, so the older one can only end by being taken back.
-        arm(901, Duration::from_secs(3_600), say(older, "older"));
-        arm(902, Duration::from_secs(3_600), say(other, "other"));
-        arm(901, Duration::from_millis(50), say(newer, "newer"));
-        assert_eq!(
-            older_fired.recv_timeout(Duration::from_secs(10)),
-            Err(RecvTimeoutError::Disconnected)
-        );
-        assert_eq!(
-            newer_fired.recv_timeout(Duration::from_secs(10)),
-            Ok("newer")
-        );
+        let dir = Scratch::new("wakes-newer");
+        put(&dir, wake(901, 100, "older")).unwrap();
+        put(&dir, wake(902, 100, "other")).unwrap();
+        put(&dir, wake(901, 200, "newer")).unwrap();
         // Another session's wake-up is its own, and still pending.
-        assert_eq!(other_fired.try_recv(), Err(TryRecvError::Empty));
-        timers::cancel(PENDING.lock().unwrap()[&902]);
+        let reasons: Vec<String> = load(&dir).unwrap().into_iter().map(|w| w.reason).collect();
+        assert_eq!(reasons, ["other", "newer"]);
     }
 
     #[test]
-    fn delays_are_clamped_to_a_minute_and_an_hour() {
+    fn delays_are_clamped_to_a_minute_and_a_day() {
         for (asked, slept) in [
             (-5., 60),
             (0., 60),
             (5., 60),
             (90., 90),
             (1_200., 1_200),
-            (86_400., 3_600),
+            (86_400., 86_400),
+            (200_000., 86_400),
         ] {
             assert_eq!(delay(asked), Duration::from_secs(slept), "{asked}");
         }
@@ -641,7 +948,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(refused.contains("not available"), "{refused}");
-        assert!(!PENDING.lock().unwrap().contains_key(&904));
+        assert!(!served().sessions.contains(&904));
     }
 
     /// Stand in for the timer of a session's loop coming due, taking back
@@ -786,9 +1093,7 @@ mod tests {
 
     #[test]
     fn a_tick_without_wake_me_gets_one_fallback() {
-        let _bell = inbox::tests::DOORBELL
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let (_data, _bell, dir) = data_folder("wakes-fallback");
         inbox::listen();
         let session = 912;
         command(session, "/loop", "watch the deploy")
@@ -796,8 +1101,8 @@ mod tests {
             .unwrap();
         assert!(take_tick(session).contains("call wake_me"));
 
-        // A tick that asked to be woken has no fallback: its wake-up is the
-        // next tick.
+        // A tick that asked to be woken keeps a fallback only for a wake-up
+        // another Letronna fires: its own wake-up is the next tick.
         let ctx = ToolContext {
             conversation: session,
             ..Default::default()
@@ -809,13 +1114,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(turn_ended(session, Some("Back in 20 minutes.")), None);
+        assert!(loops()[&session].timer.is_some());
+        let due = load(&dir).unwrap()[0].due;
+        let (woken, _) = claim(&dir, &BTreeSet::from([session]), due).unwrap();
+        deliver(&woken[0], due);
         assert!(loops()[&session].timer.is_none());
-        let wake_up = PENDING.lock().unwrap().remove(&session).unwrap();
-        timers::cancel(wake_up);
-        assert!(wake_loop(
-            session,
-            &format!("wake-up: rollout at 40%\n{CARRY_ON}")
-        ));
         let tick = take_tick(session);
         assert!(tick.starts_with("/loop tick 2,"), "{tick}");
         assert!(tick.contains("\nwake-up: rollout at 40%\n"), "{tick}");
@@ -828,6 +1131,18 @@ mod tests {
         let ended = turn_ended(session, Some("Still rolling out.")).unwrap();
         assert!(ended.contains("wake_me"), "{ended}");
         assert!(looping(session).is_none());
+
+        // Stopping a loop the model paces takes back the wake-up that would
+        // have been its next tick.
+        command(session, "/loop", "watch the deploy")
+            .unwrap()
+            .unwrap();
+        take_tick(session);
+        run("wake_me", r#"{"seconds": 1200, "reason": "rollout"}"#, &ctx).unwrap();
+        assert_eq!(load(&dir).unwrap().len(), 1);
+        command(session, "/loop", "stop").unwrap().unwrap();
+        assert!(load(&dir).unwrap().is_empty());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
     #[test]
@@ -855,5 +1170,211 @@ mod tests {
         take_tick(session);
         assert!(turn_ended(session, None).is_some());
         assert!(looping(session).is_none());
+    }
+
+    #[test]
+    fn a_wake_armed_before_a_restart_fires_once_after_it() {
+        let _bell = inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = Scratch::new("wakes-restart");
+        let session = 921;
+        // All that is left of it once the Letronna that armed it quit.
+        let mut armed = wake(session, 1_000_000, "check CI");
+        armed.prompt = "Look at the last run.".into();
+        put(&dir, armed).unwrap();
+        let served = BTreeSet::from([session]);
+        // A Letronna that does not serve the session leaves it be.
+        let missed = 1_000_000 + 42 * 60;
+        let other = BTreeSet::from([922]);
+        assert_eq!(claim(&dir, &other, missed).unwrap(), (Vec::new(), None));
+        // One that does names when it is due, until it is.
+        assert_eq!(
+            claim(&dir, &served, 999_000).unwrap(),
+            (Vec::new(), Some(1_000_000))
+        );
+        let (due, next) = claim(&dir, &served, missed).unwrap();
+        assert_eq!(next, None);
+        deliver(&due[0], missed);
+        let taken = inbox::take(session, true);
+        assert_eq!(taken.len(), 1, "{taken:?}");
+        assert_eq!(taken[0].when, When::Later);
+        let (first, prompt) = taken[0].text.split_once('\n').unwrap();
+        assert!(first.starts_with("wake-up: check CI (due "), "{first}");
+        assert!(first.ends_with(", 42 min late)"), "{first}");
+        assert_eq!(prompt, "Look at the last run.");
+        // It went out of the file as it fired, so it never fires again.
+        assert!(!path(&dir).exists());
+        assert_eq!(
+            claim(&dir, &served, missed + 3_600).unwrap(),
+            (Vec::new(), None)
+        );
+        assert_eq!(late_by(5 * 60 * 60 + 100), "5 h late");
+    }
+
+    #[test]
+    fn two_letronnas_never_fire_the_same_wake() {
+        let dir = Scratch::new("wakes-two");
+        put(&dir, wake(931, 100, "check CI")).unwrap();
+        put(&dir, wake(932, 100, "the deploy")).unwrap();
+        // Each claim opens the lock afresh, as another process does.
+        let start = Arc::new(Barrier::new(8));
+        let claims: Vec<_> = (0..8)
+            .map(|_| {
+                let (dir, start) = (dir.to_path_buf(), Arc::clone(&start));
+                std::thread::spawn(move || {
+                    start.wait();
+                    claim(&dir, &BTreeSet::from([931, 932]), 200).unwrap().0
+                })
+            })
+            .collect();
+        let mut fired: Vec<u64> = claims
+            .into_iter()
+            .flat_map(|claim| claim.join().unwrap())
+            .map(|wake| wake.session)
+            .collect();
+        fired.sort_unstable();
+        assert_eq!(fired, [931, 932]);
+    }
+
+    #[test]
+    fn a_wake_more_than_a_day_late_leaves_a_note() {
+        let _bell = inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = 941;
+        deliver(
+            &wake(session, 1_000_000, "check CI"),
+            1_000_000 + STALE + 60,
+        );
+        // No turn starts for it...
+        assert!(!inbox::pending().contains(&session));
+        assert!(inbox::take(session, false).is_empty());
+        // ...but the next one that starts anyway reads it, in a line.
+        let taken = inbox::take(session, true);
+        assert_eq!(taken.len(), 1, "{taken:?}");
+        assert!(!taken[0].text.contains('\n'), "{}", taken[0].text);
+        assert!(
+            taken[0].text.starts_with("wake-up \"check CI\", due "),
+            "{}",
+            taken[0].text
+        );
+        assert!(taken[0].text.contains("more than a day late"));
+        // A day late to the second still starts one.
+        deliver(&wake(session, 1_000_000, "check CI"), 1_000_000 + STALE);
+        assert!(inbox::pending().contains(&session));
+        assert!(inbox::take(session, true)[0].text.contains(" h late)\n"));
+    }
+
+    #[test]
+    fn a_user_message_does_not_cancel_a_wake() {
+        let (_data, _bell, dir) = data_folder("wakes-user");
+        inbox::listen();
+        let session = 951;
+        let ctx = ToolContext {
+            conversation: session,
+            ..Default::default()
+        };
+        let said = run(
+            "wake_me",
+            r#"{"seconds": 86400, "reason": "check CI", "prompt": "Look at last night's run."}"#,
+            &ctx,
+        )
+        .unwrap();
+        assert!(said.contains(", in 24 hours (\"check CI\")"), "{said}");
+        let kept = load(&dir).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].due - kept[0].armed, 86_400);
+        assert_eq!(kept[0].prompt, "Look at last night's run.");
+        assert!(served().sessions.contains(&session));
+        // The user's own turn in the session meanwhile leaves it waiting.
+        assert_eq!(turn_ended(session, Some("Done.")), None);
+        assert_eq!(load(&dir).unwrap(), kept);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn serving_a_session_fires_its_missed_wake_and_keeps_looking() {
+        let (_data, _bell, dir) = data_folder("wakes-serve");
+        inbox::listen();
+        let (first, second) = (961, 962);
+        // Both came due while nothing served them, as over a restart.
+        let missed = backend::now() - 5 * 60;
+        put(&dir, wake(first, missed, "check CI")).unwrap();
+        put(&dir, wake(second, missed, "the deploy")).unwrap();
+        serve([first]);
+        let armed = served().timer;
+        // The look runs on a thread of its own a moment later.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !inbox::pending().contains(&first) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let taken = inbox::take(first, true);
+        assert_eq!(taken.len(), 1, "{taken:?}");
+        let (line, _) = taken[0].text.split_once('\n').unwrap();
+        assert!(line.starts_with("wake-up: check CI (due "), "{line}");
+        assert!(line.ends_with(", 5 min late)"), "{line}");
+        // The session it does not serve keeps its wake-up in the file.
+        let left: Vec<u64> = load(&dir).unwrap().iter().map(|w| w.session).collect();
+        assert_eq!(left, [second]);
+        // With none of its own waiting it still looks again, for one that
+        // another Letronna leaves meanwhile.
+        while served().timer == armed && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_ne!(served().timer, armed);
+        serve([]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_wake_a_day_late_stops_the_loop_waiting_on_it() {
+        let (_data, _bell, dir) = data_folder("wakes-stale-loop");
+        inbox::listen();
+        let session = 942;
+        command(session, "/loop", "watch the deploy")
+            .unwrap()
+            .unwrap();
+        take_tick(session);
+        let ctx = ToolContext {
+            conversation: session,
+            ..Default::default()
+        };
+        run(
+            "wake_me",
+            r#"{"seconds": 86400, "reason": "rollout"}"#,
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(turn_ended(session, Some("Back tomorrow.")), None);
+        // A laptop shut for two days finds it a day late once it opens.
+        let opened = load(&dir).unwrap()[0].due + STALE + 60;
+        let (woken, _) = claim(&dir, &BTreeSet::from([session]), opened).unwrap();
+        deliver(&woken[0], opened);
+        assert!(looping(session).is_none());
+        let taken = inbox::take(session, true);
+        assert_eq!(taken.len(), 1, "{taken:?}");
+        assert_eq!(taken[0].when, When::Quiet);
+        assert!(
+            taken[0]
+                .text
+                .ends_with("started no turn and stopped the /loop waiting on it."),
+            "{}",
+            taken[0].text
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_wake_that_cannot_be_locked_says_so() {
+        let dir = Scratch::new("wakes-unlocked");
+        // A file where the data folder should be leaves no room for the lock.
+        let file = dir.join("data");
+        std::fs::write(&file, "").unwrap();
+        let refused = put(&file, wake(971, 100, "check CI")).unwrap_err();
+        assert!(
+            refused.starts_with("Could not lock the wake-ups: "),
+            "{refused}"
+        );
     }
 }

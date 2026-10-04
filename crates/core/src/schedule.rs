@@ -896,9 +896,14 @@ fn wait_for_lock(shared: &Arc<Shared>, file: File) -> bool {
 /// Hold the list's own lock until the file goes, waiting while another
 /// Letronna reads or changes the list, which takes a moment.
 fn lock_list(dir: &Path) -> Result<File, String> {
-    let refused = |e: std::io::Error| format!("Could not lock the scheduled jobs: {e}");
-    let file = open_lock(&dir.join("schedules.json.lock")).map_err(refused)?;
-    file.lock().map_err(refused)?;
+    hold_list_lock(dir).map_err(|e| format!("Could not lock the scheduled jobs: {e}"))
+}
+
+/// The list's own lock, which keeps the wake-ups' file too, held until the
+/// file goes.
+pub(crate) fn hold_list_lock(dir: &Path) -> std::io::Result<File> {
+    let file = open_lock(&dir.join("schedules.json.lock"))?;
+    file.lock()?;
     Ok(file)
 }
 
