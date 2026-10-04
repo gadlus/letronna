@@ -1,7 +1,7 @@
-//! Word, Excel, PowerPoint and PDF files as read_file shows them: a
-//! document's text, a workbook's sheets as rows of the values they last
-//! showed, a deck's slides with their notes, and a PDF's pages, in place of
-//! the zip of XML or the PDF on disk.
+//! Word, Excel, PowerPoint and PDF files, and EPUB books, as read_file
+//! shows them: a document's text, a workbook's sheets as rows of the values
+//! they last showed, a deck's slides with their notes, a PDF's pages, and a
+//! book's chapters, in place of the zip of XML or the PDF on disk.
 //!
 //! A Word heading becomes `#` marks and a table markdown rows. Each sheet
 //! opens with `## Sheet "Name" (R rows x C cols)`, its rows following one
@@ -17,6 +17,7 @@
 //! on a thread of its own, which a deadline stops waiting for. The last few
 //! views are kept, so paging through a document reads it once.
 
+mod epub;
 mod pdf;
 
 use quick_xml::XmlVersion;
@@ -78,6 +79,7 @@ enum Kind {
     Excel,
     PowerPoint,
     Pdf,
+    Epub,
 }
 
 /// The kind of document `path` is named as.
@@ -94,6 +96,7 @@ fn kind_of(extension: &str) -> Option<Kind> {
         "xlsx" | "xlsm" | "xltx" | "xltm" => Some(Kind::Excel),
         "pptx" | "pptm" | "potx" | "potm" | "ppsx" | "ppsm" => Some(Kind::PowerPoint),
         "pdf" => Some(Kind::Pdf),
+        "epub" => Some(Kind::Epub),
         _ => None,
     }
 }
@@ -110,12 +113,13 @@ pub(crate) fn is_extension(extension: &str) -> bool {
 
 /// The lines of `lines`, the view of the document at `path`, that say where
 /// in it the lines after them are: a PDF's pages, a workbook's sheets, a
-/// deck's slides, or a Word document's headings.
+/// deck's slides, a book's chapters, or a Word document's headings.
 pub(crate) fn places(path: &Path, lines: &[&[u8]]) -> Vec<usize> {
     let starts: &[&[u8]] = match kind(path) {
         Some(Kind::Pdf) => &[b"## Page "],
         Some(Kind::Excel) => &[b"## Sheet \""],
         Some(Kind::PowerPoint) => &[b"## Slide "],
+        Some(Kind::Epub) => &[b"## Chapter "],
         Some(Kind::Word) => &[b"# ", b"## ", b"### ", b"#### ", b"##### ", b"###### "],
         None => &[],
     };
@@ -131,7 +135,7 @@ pub(crate) fn plain(path: &Path) -> Option<&'static str> {
         Kind::Word => "docx",
         Kind::Excel => "xlsx",
         Kind::PowerPoint => "pptx",
-        Kind::Pdf => return None,
+        Kind::Pdf | Kind::Epub => return None,
     })
 }
 
@@ -241,6 +245,7 @@ fn read(path: &Path, kind: Kind, until: Instant) -> Result<String, String> {
         Kind::Word => document,
         Kind::Excel => workbook,
         Kind::PowerPoint => deck,
+        Kind::Epub => epub::book,
         Kind::Pdf => return pdf::read(path, until),
     };
     let mut package = Package::open(path, until)?;
@@ -423,7 +428,8 @@ fn reference(name: &BytesRef) -> Option<String> {
         return Some(c.to_string());
     }
     let name = name.decode().ok()?;
-    quick_xml::escape::resolve_xml_entity(&name).map(str::to_owned)
+    // HTML's too, such as `&nbsp;`, which a book's chapters declare.
+    quick_xml::escape::resolve_predefined_entity(&name).map(str::to_owned)
 }
 
 /// The name of `tag` without its prefix.
@@ -1381,6 +1387,7 @@ pub(crate) mod tests {
     use super::*;
     use std::io::Write;
 
+    pub(crate) use super::epub::tests::{epub, xhtml};
     pub(crate) use super::pdf::tests::text_pdf;
 
     const W: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#;
@@ -1483,7 +1490,7 @@ pub(crate) mod tests {
     }
 
     /// The view of `bytes` saved as `name` in a folder of its own.
-    fn view_of(name: &str, bytes: &[u8]) -> Result<Option<String>, String> {
+    pub(crate) fn view_of(name: &str, bytes: &[u8]) -> Result<Option<String>, String> {
         let dir = std::env::temp_dir().join(format!("letronna-docs-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
@@ -1495,7 +1502,7 @@ pub(crate) mod tests {
 
     /// Rewrites what `zip` says its part `name` unpacks to, in its local
     /// header and in the central directory both.
-    fn say_unpacked(zip: &mut [u8], name: &str, size: u32) {
+    pub(crate) fn say_unpacked(zip: &mut [u8], name: &str, size: u32) {
         for at in 0..zip.len().saturating_sub(46) {
             let (name_at, size_at, length_at) = match &zip[at..at + 4] {
                 b"PK\x03\x04" => (30, 22, 26),

@@ -6,12 +6,12 @@
 //! What the model may never read is dropped in the walk's own filter, which
 //! no ignore rule or glob can overrule.
 //!
-//! PDF, Word, Excel and PowerPoint files are searched as read_file shows
-//! them, and only when the type, the glob or the path names them: reading
-//! one takes far longer than a text file, so a plain search passes them by
-//! and says how many it passed. A match in one shows the heading of the
-//! page, sheet or slide it is on, and the lines are fenced, being someone
-//! else's words as a page of one read is.
+//! PDF, Word, Excel, PowerPoint and EPUB files are searched as read_file
+//! shows them, and only when the type, the glob or the path names them:
+//! reading one takes far longer than a text file, so a plain search passes
+//! them by and says how many it passed. A match in one shows the heading of
+//! the page, sheet, slide or chapter it is on, and the lines are fenced,
+//! being someone else's words as a page of one read is.
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::OverrideBuilder;
@@ -1242,6 +1242,30 @@ mod tests {
                 .lines()
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn a_search_reads_a_book_named_by_type_under_its_chapters() {
+        let dir = tree("book", &[("notes.txt", "The whale")]);
+        let (epub, xhtml) = (crate::docs::tests::epub, crate::docs::tests::xhtml);
+        let book = epub(
+            &[
+                ("one.xhtml", &xhtml("<p>Call me Ishmael.</p>")),
+                ("two.xhtml", &xhtml("<p>The whale rose.</p>")),
+            ],
+            &[("two.xhtml", "The Chase")],
+        );
+        std::fs::write(dir.join("moby.epub"), book).unwrap();
+        assert_eq!(
+            run(&dir, json!({"pattern": "whale"})),
+            "notes.txt\n  1: The whale\n\
+             … 1 PDF/Office file was not searched; name them with type or glob."
+        );
+        let found = run(&dir, json!({"pattern": "whale", "type": "epub"}));
+        assert!(
+            found.contains("moby.epub\n  4- ## Chapter 2: The Chase\n  5: The whale rose.\n"),
+            "{found}"
         );
     }
 

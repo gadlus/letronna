@@ -45,7 +45,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # sheet's cells in one block as wide and tall as the cells it finds, so
 # two cells at A1 and XFD1048576 ask for terabytes and end the process.
 zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
-quick-xml = "0.41"
+quick-xml = { version = "0.41", features = ["escape-html"] }
 # Saying when a write leaves code that no longer parses: tree-sitter and the
 # grammars the window already links for highlighting, at its versions, so a
 # build of both compiles them once. Not bash, whose grammar rejects 8% of
