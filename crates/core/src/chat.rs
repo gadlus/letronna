@@ -1153,11 +1153,23 @@ fn system_prompt(connection: &Connection, summary: Option<&str>) -> SystemPrompt
     }
     // Where plan mode keeps every tool its rules ride on the end instead
     // (`PLANNING`), so switching it leaves this text as it was.
-    if connection.plan && !shared && !crate::tools::keeps_tools(connection) {
-        system.push_str(" Plan mode is on: you can read, search and ask, and run commands that only read inside the project, such as ls, cat, rg or git status, but you cannot write files or run anything else, and the tools that would are unavailable.");
+    // Without tools there is nothing it could read or run.
+    if connection.plan && connection.tools && !shared && !crate::tools::keeps_tools(connection) {
+        // The project, not every file: memory notes go to Letronna's own
+        // folder and stay offered. A run nobody watches has nobody to ask.
+        let ask = if crate::prompt_rules::watched(connection) {
+            ", ask"
+        } else {
+            ""
+        };
+        system.push_str(&format!(" Plan mode is on: you can read, search{ask} and run commands that only read inside the project, such as ls, cat, rg or git status, but you cannot change the project or run anything else, and the tools that would are unavailable."));
+        system.push_str(&crate::prompt_rules::told(
+            connection,
+            &crate::prompt_rules::PLAN,
+        ));
         // Where exit_plan is offered, a plan also written into the reply
         // would reach the user twice.
-        if connection.tools && crate::tools::offers_plan(connection) {
+        if crate::tools::offers_plan(connection) {
             system.push_str(" Work out what you would do, and when the plan is ready, put it to the user with exit_plan instead of writing it out in your reply; if they approve, plan mode turns off and you carry it out.");
         } else {
             system.push_str(" Work out what you would do and lay out the plan, then let the user turn plan mode off to carry it out.");
@@ -5156,6 +5168,7 @@ mod tests {
                 &Connection {
                     tools: true,
                     plan: true,
+                    human: true,
                     remote,
                     ..connection()
                 },
@@ -5185,6 +5198,75 @@ mod tests {
         assert!(!offered);
         assert!(dm.contains("Plan mode is on"), "{dm}");
         assert!(!dm.contains("exit_plan"), "{dm}");
+    }
+
+    #[test]
+    fn the_plan_prompt_says_a_request_means_plan_it_and_leaves_memory_alone() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("plan-text");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let planning = |human: bool, remote: Option<Remote>| {
+            system_with_tools(Connection {
+                plan: true,
+                human,
+                remote,
+                ..connection()
+            })
+        };
+        let window = planning(true, None);
+        let dm = planning(
+            true,
+            Some(Remote {
+                place: "a Telegram chat".into(),
+                ..Default::default()
+            }),
+        );
+        let alone = planning(false, None);
+        let toolless = system_prompt(
+            &Connection {
+                plan: true,
+                human: true,
+                ..connection()
+            },
+            None,
+        )
+        .text;
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        let request = " A request to change something means plan the change.";
+        for system in [&window, &dm] {
+            assert!(
+                system.contains(" Plan mode is on: you can read, search, ask and run commands"),
+                "{system}"
+            );
+            assert!(
+                system.contains(&format!(
+                    "the tools that would are unavailable.{request} Find out what the project \
+                     can tell you before asking."
+                )),
+                "{system}"
+            );
+        }
+        // The project, not every file: memory notes are Letronna's own.
+        assert!(
+            window.contains("but you cannot change the project or run anything else"),
+            "{window}"
+        );
+        assert!(!window.contains("cannot write files"), "{window}");
+        assert!(window.contains("with exit_plan"), "{window}");
+        assert!(!dm.contains("exit_plan"), "{dm}");
+        // Nobody can answer a question or approve a plan in a run nobody
+        // watches.
+        assert!(
+            alone.contains(" Plan mode is on: you can read, search and run commands"),
+            "{alone}"
+        );
+        assert!(alone.contains(request), "{alone}");
+        assert!(!alone.contains("before asking"), "{alone}");
+        assert!(!alone.contains("exit_plan"), "{alone}");
+        // Without tools it can read and run nothing at all.
+        assert!(!toolless.contains("Plan mode is on"), "{toolless}");
     }
 
     #[test]

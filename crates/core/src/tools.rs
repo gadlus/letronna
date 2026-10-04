@@ -676,10 +676,11 @@ pub fn plan_of(args: &str) -> Result<String, String> {
 }
 
 /// Whether `exit_plan` is offered: in plan mode, or always where plan mode
-/// keeps every tool, and only at the terminal or the window, since a chat
-/// app's plan mode is its owner's to lift.
+/// keeps every tool, with someone there to approve the plan, and only at the
+/// terminal or the window, since a chat app's plan mode is its owner's to
+/// lift.
 pub fn offers_plan(connection: &Connection) -> bool {
-    connection.remote.is_none() && (connection.plan || keeps_tools(connection))
+    connection.human && connection.remote.is_none() && (connection.plan || keeps_tools(connection))
 }
 
 /// Whether plan mode leaves the `tools` array as it is outside it, so that
@@ -3499,7 +3500,7 @@ impl Tool for ExitPlan {
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
-            "plan": {"type": "string", "description": "The plan in markdown: what will change, where, and how it will be checked."}
+            "plan": {"type": "string", "description": "The plan in markdown, short enough to review: the goal, the changes in order, how they will be checked, and any assumptions you made. Settle the choices the work needs, so approving the plan approves them."}
         }, "required": ["plan"]})
     }
     fn needs_approval(&self) -> bool {
@@ -6353,21 +6354,24 @@ mod tests {
 
     #[test]
     fn a_plan_is_offered_only_in_plan_mode_and_refused_when_nobody_can_answer() {
-        let offered = |plan: bool, remote: Option<Remote>| {
+        let offered = |plan: bool, human: bool, remote: Option<Remote>| {
             specs(&Connection {
                 tools: true,
                 plan,
+                human,
                 remote,
                 ..Default::default()
             })
             .iter()
             .any(|t| t["function"]["name"] == EXIT_PLAN)
         };
-        assert!(offered(true, None));
-        assert!(!offered(false, None));
+        assert!(offered(true, true, None));
+        assert!(!offered(false, true, None));
+        // A run nobody watches has nobody to approve one.
+        assert!(!offered(true, false, None));
         // A chat app's DMs stay in plan mode by default, and nobody there can
         // approve a plan.
-        assert!(!offered(true, Some(Remote::default())));
+        assert!(!offered(true, true, Some(Remote::default())));
         assert!(needs_approval(EXIT_PLAN));
 
         // Reaching `run` means nobody was asked: it refuses, and says what to do.

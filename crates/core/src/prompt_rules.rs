@@ -46,7 +46,7 @@ enum To {
     /// Where the reads and searches of one reply run at once.
     Parallel,
     /// Where the system message speaks of `exit_plan`: plan mode outside a
-    /// chat app.
+    /// chat app, with someone there to approve a plan.
     Plan,
 }
 
@@ -67,19 +67,23 @@ impl To {
     /// helpers' included: its explore and plan helpers are in plan mode
     /// whatever the run is.
     fn reaches_run(self, connection: &Connection) -> bool {
-        self == To::Plan || self.reaches(connection)
+        let planning = || Connection {
+            plan: true,
+            ..connection.clone()
+        };
+        (self == To::Plan && self.reaches(&planning())) || self.reaches(connection)
     }
 
     /// Whether a run nobody watches can carry the rule, and so be measured
     /// without it.
     fn droppable(self) -> bool {
-        !matches!(self, To::Watched | To::OnScreen)
+        !matches!(self, To::Watched | To::OnScreen | To::Plan)
     }
 }
 
 /// Someone can see this session's cards or messages, so it is told every
 /// rule.
-fn watched(connection: &Connection) -> bool {
+pub(crate) fn watched(connection: &Connection) -> bool {
     connection.human || connection.remote.is_some()
 }
 
@@ -237,6 +241,23 @@ pub(crate) const PROJECT: [Rule; 1] = [Rule {
     text: "Changes in the project you did not make are the user's: work with them. Unless asked, never revert or discard them (git checkout --, git restore, git reset --hard), commit, or rewrite git history; never commit secrets.",
 }];
 
+/// The rules after what plan mode allows, where it takes tools away: what a
+/// request means there and when to ask, so "add a test" is planned rather
+/// than tried and refused.
+// What is left to ask about is the ask row's.
+pub(crate) const PLAN: [Rule; 2] = [
+    Rule {
+        id: "plan-request",
+        to: To::Every,
+        text: "A request to change something means plan the change.",
+    },
+    Rule {
+        id: "plan-ask",
+        to: To::Watched,
+        text: "Find out what the project can tell you before asking.",
+    },
+];
+
 /// The rules a helper's first message gives after the tools it may use, and
 /// a fork's after the report it owes: it shares its parent's system message,
 /// which speaks of asking the user, of memory and, in plan mode, of
@@ -267,7 +288,7 @@ pub(crate) const INSTRUCTIONS: [Rule; 1] = [Rule {
 }];
 
 /// Every table of rules, for finding a row by its id.
-const TABLES: [&[Rule]; 5] = [&PROSE, &TOOLS, &PROJECT, &HELPER, &INSTRUCTIONS];
+const TABLES: [&[Rule]; 6] = [&PROSE, &TOOLS, &PROJECT, &PLAN, &HELPER, &INSTRUCTIONS];
 
 /// Every row of every table.
 fn all() -> impl Iterator<Item = &'static Rule> {
@@ -546,17 +567,21 @@ mod tests {
     }
 
     #[test]
-    fn a_run_not_in_plan_mode_reports_the_plan_row_its_helpers_leave_out() {
-        // Its explore and plan helpers are in plan mode all the same.
-        let planning = Connection {
+    fn the_plan_row_reaches_only_where_someone_can_approve_a_plan() {
+        let planning = |connection: Connection| Connection {
             plan: true,
-            ..headless()
+            ..connection
         };
-        assert!(tells(&planning, "helper-plan"));
-        assert!(!tells(&headless(), "helper-plan"));
-        let report = seen_without(&headless(), &["helper-plan"]);
-        assert_eq!(report["dropped"], json!(["helper-plan"]));
-        assert_ne!(report, seen_without(&headless(), &[]));
+        assert!(tells(&planning(window()), "helper-plan"));
+        assert!(!tells(&window(), "helper-plan"));
+        // Nobody can approve one in a run nobody watches, so there is no
+        // exit_plan to keep its helpers from, and no row to drop.
+        assert!(!tells(&planning(headless()), "helper-plan"));
+        assert!(parse("-helper-plan").is_err());
+        // A watched run's explore and plan helpers are in plan mode all the
+        // same, so its hash counts the row.
+        assert!(To::Plan.reaches_run(&window()));
+        assert!(!To::Plan.reaches_run(&headless()));
     }
 
     #[test]
