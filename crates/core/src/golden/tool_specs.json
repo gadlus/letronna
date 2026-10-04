@@ -424,7 +424,7 @@
   },
   {
     "function": {
-      "description": "Put your finished plan to the user for approval, written in markdown. If they approve, plan mode turns off and you carry the plan out straight away; if not, keep planning. Use it once the plan is ready, instead of asking whether to go ahead.",
+      "description": "Use only in plan mode. Put your finished plan to the user for approval, written in markdown. If they approve, plan mode turns off and you carry the plan out straight away; if not, keep planning. Use it once the plan is ready, instead of asking whether to go ahead.",
       "name": "exit_plan",
       "parameters": {
         "properties": {

@@ -624,15 +624,33 @@ pub fn plan_of(args: &str) -> Result<String, String> {
     }
 }
 
-/// Whether `exit_plan` is offered: in plan mode, and only at the terminal or
-/// the window, since a chat app's plan mode is its owner's to lift.
+/// Whether `exit_plan` is offered: in plan mode, or always where plan mode
+/// keeps every tool, and only at the terminal or the window, since a chat
+/// app's plan mode is its owner's to lift.
 pub fn offers_plan(connection: &Connection) -> bool {
-    connection.plan && connection.remote.is_none()
+    connection.remote.is_none() && (connection.plan || keeps_tools(connection))
+}
+
+/// Whether plan mode leaves the `tools` array as it is outside it, so that
+/// switching it keeps the provider's cached prefix: only where the user
+/// turned `plan_keeps_tools` on, and only for a session's own requests at
+/// the terminal or the window, which someone there switches, and its forks'.
+pub(crate) fn keeps_tools(connection: &Connection) -> bool {
+    // A helper's connection names its session's model, but a fork of the
+    // session's own, which sends the session's bytes; any other is held to
+    // plan mode by its type as well, and is told what it may use by the array.
+    let own = connection.session_model.is_empty();
+    connection.tools
+        && connection.human
+        && connection.remote.is_none()
+        && own
+        && crate::store::plan_keeps_tools()
 }
 
 /// The `tools` array for a chat completion request. In plan mode the tools
 /// that change things are left out entirely, so the model cannot try them,
-/// but for `run_command`, which the gate lets run a command that only reads;
+/// but for `run_command`, which the gate lets run a command that only reads,
+/// unless `keeps_tools`, when the gate refuses them at the call instead;
 /// where other people read the replies, so is everything that touches this
 /// computer; `read_chat` exists only where there is a chat to read, and
 /// `exit_plan` only where there is a plan to hand over and someone to take it.
@@ -664,13 +682,15 @@ pub(crate) fn specs_of(
     let scheduled = !connection.human
         && connection.remote.is_none()
         && crate::schedule::running(connection.conversation).is_some();
+    let planning = connection.plan && !keeps_tools(connection);
+    let plan = offers_plan(connection);
     tools
         .iter()
         .filter(|t| !switched_off(t.name(), &disabled))
         .filter(|t| !scheduled || !crate::schedule::NOT_AVAILABLE.contains(&t.name()))
         .filter(|t| crate::mcp_find::in_array(t.name(), on_demand))
-        .filter(|t| !connection.plan || !t.mutates() || t.name() == "run_command")
-        .filter(|t| t.name() != EXIT_PLAN || offers_plan(connection))
+        .filter(|t| !planning || !t.mutates() || t.name() == "run_command")
+        .filter(|t| t.name() != EXIT_PLAN || plan)
         .filter(|t| !shared || !t.machine())
         .filter(|t| history || !t.needs_history())
         .filter(|t| t.offered(connection))
@@ -3069,7 +3089,7 @@ impl Tool for ExitPlan {
         EXIT_PLAN
     }
     fn description(&self) -> &'static str {
-        "Put your finished plan to the user for approval, written in markdown. If they approve, plan mode turns off and you carry the plan out straight away; if not, keep planning. Use it once the plan is ready, instead of asking whether to go ahead."
+        "Use only in plan mode. Put your finished plan to the user for approval, written in markdown. If they approve, plan mode turns off and you carry the plan out straight away; if not, keep planning. Use it once the plan is ready, instead of asking whether to go ahead."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {

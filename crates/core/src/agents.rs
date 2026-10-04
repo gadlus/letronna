@@ -518,11 +518,12 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
     let slot = reserve(caller.root, waiting, wanted, limits.at_once, cancel.clone())?;
     let (mut connection, first, allow) = match history.as_mut() {
         Some(from) => (
-            // Narrowed as any helper's is, but on its parent's model and
-            // effort, since a change of either can lose the cache of the
-            // prefix the two share.
+            // Narrowed as any helper's is, but on its parent's model, effort
+            // and session model, since a change of any can lose the cache of
+            // the prefix the two share.
             Connection {
                 effort: parent.effort.clone(),
+                session_model: helper_session_model(parent, &parent.model, true),
                 ..child(parent, &def, Some(&parent.model), limits, slot.id)
             },
             forked(
@@ -1447,6 +1448,19 @@ pub(crate) fn helper_plan(parent: &Connection, plan: bool, mode: Mode) -> bool {
     plan || parent.plan || mode == Mode::Plan
 }
 
+/// The session model a helper on `model` of `parent` names: the one that
+/// judges `parent`'s calls, or for a fork on `parent`'s model `parent`'s own
+/// field, which names the same judge.
+fn helper_session_model(parent: &Connection, model: &str, fork: bool) -> String {
+    // So a fork of the session's own names none, as the session does, and is
+    // offered the tools the session is (`tools::keeps_tools`).
+    if fork && model == parent.model {
+        parent.session_model.clone()
+    } else {
+        parent.judge_model().to_owned()
+    }
+}
+
 /// The tools a helper may use, in the order it is offered them: those its
 /// connection offers and its type allows, less those no helper may use.
 /// MCP tools count as offered when they go out on demand, so a type allows
@@ -2293,6 +2307,7 @@ fn rerun(
     let allowed = what.allow.clone();
     // Only ever narrowed, as when it started.
     let mode = helper_mode(sender, what.plan);
+    let session_model = helper_session_model(sender, &what.model, fork);
     let connection = Connection {
         model: what.model,
         // As when it started: its type's, but for a fork, which keeps to its
@@ -2304,7 +2319,7 @@ fn rerun(
             .map(Worktree::workspace)
             .or_else(|| sender.workspace.clone()),
         conversation: claimed.slot.id,
-        session_model: sender.judge_model().to_owned(),
+        session_model,
         ..sender.clone()
     };
     let tools = usable(&connection, def);
@@ -4319,6 +4334,70 @@ mod tests {
         let directive = directive["content"].as_str().unwrap();
         assert!(directive.starts_with(FORK_HEADER), "{directive}");
         assert!(directive.ends_with("    Read notes.txt and say what it says."));
+    }
+
+    #[test]
+    fn a_fork_sends_its_parents_tools_and_system_message_where_plan_mode_keeps_every_tool() {
+        for plan in [false, true] {
+            let session = Session::new(&format!("fork-keeps-tools-{plan}"));
+            let (endpoint, stub) = Stub::start(vec![
+                reply("", None),
+                reply("Forked and done.", None),
+                reply("Done again.", None),
+            ]);
+            let ctx = session.context(endpoint);
+            let parent = Connection {
+                human: true,
+                plan,
+                mode: if plan { Mode::Plan } else { Mode::Default },
+                ..ctx.caller.connection.as_deref().unwrap().clone()
+            };
+            let settings = session.data.join("settings.json");
+            let flagged = json!({"endpoint": "", "model": "m", "plan_keeps_tools": true});
+            std::fs::write(&settings, flagged.to_string()).unwrap();
+            let mut messages = vec![said("user", "What does notes.txt say? Check it two ways.")];
+            let events = crate::chat::start(parent.clone(), messages.clone());
+            while let Ok(event) = events.recv_blocking() {
+                if matches!(event, crate::chat::Event::Finished(_)) {
+                    break;
+                }
+            }
+            messages.push(Message {
+                role: "assistant".into(),
+                tool_calls: vec![tool_call("call-fork", "agent", &fork_args())],
+                ..Default::default()
+            });
+            saved_session(&messages);
+            let answer = call(ToolContext::of(&parent), fork_args()).unwrap();
+            assert!(answer.contains("Forked and done."), "{answer}");
+            // Picked back up, it is offered the same again.
+            let message = json!({"action": "send", "to": sidecar(&session, 1)["name"],
+                "message": "Once more.", "background": false});
+            let again = talk(ToolContext::of(&parent), message).unwrap();
+            assert!(again.contains("Done again."), "{again}");
+            // Taken out at once: turns started by tests beside this one read it.
+            std::fs::remove_file(&settings).unwrap();
+
+            let sent = stub.sent();
+            let parent = &sent[0];
+            for helper in &sent[1..] {
+                assert_eq!(helper["tools"], parent["tools"], "plan mode {plan}");
+                assert_eq!(
+                    helper["messages"][0], parent["messages"][0],
+                    "plan mode {plan}"
+                );
+                // Told plan mode's rules where it is on, at the end.
+                let last = helper["messages"].as_array().unwrap().last().unwrap();
+                let told = last["content"].to_string().contains("plan mode is on");
+                assert_eq!(told, plan, "{last}");
+            }
+            // The setting took: plan mode offers what changes things, and
+            // exit_plan is offered out of it too.
+            let offered = parent["tools"].to_string();
+            for name in ["write_file", tools::EXIT_PLAN] {
+                assert!(offered.contains(&format!("\"name\":\"{name}\"")), "{name}");
+            }
+        }
     }
 
     #[test]

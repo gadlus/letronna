@@ -1036,6 +1036,11 @@ fn unavailable(
              nothing on this computer is in reach."
         ));
     }
+    // Offered outside plan mode too where plan mode keeps every tool, and
+    // remembered from it anywhere; there is no plan mode to lift.
+    if name == tools::EXIT_PLAN && !plan {
+        return Some("`exit_plan` is for plan mode, which is off: carry on with the task.".into());
+    }
     if plan && tool.mutates() {
         // A command that only reads looks rather than acts.
         if name == "run_command" {
@@ -1905,6 +1910,42 @@ mod tests {
             turn.next(|queued| decide(queued, &gate)),
             Next::Run(looked) if looked.name == "read_file"
         ));
+    }
+
+    #[test]
+    fn exit_plan_outside_plan_mode_is_refused() {
+        let none = Grants::new();
+        let plan = call(tools::EXIT_PLAN, serde_json::json!({"plan": "Rename it"}));
+        let decided = |planning: bool, mode: Mode| {
+            let ctx = ToolContext {
+                plan: planning,
+                ..Default::default()
+            };
+            let gate = Gate {
+                ctx: &ctx,
+                mode,
+                grants: &none,
+                human: true,
+                rules: &[],
+                broken: None,
+            };
+            decide(&plan, &gate)
+        };
+        assert_eq!(decided(true, Mode::Default), Outcome::Ask);
+        // The session's chip says Plan even where the connection does not.
+        assert_eq!(decided(false, Mode::Plan), Outcome::Ask);
+        for mode in [Mode::Default, Mode::DontAsk, Mode::Bypass] {
+            let Outcome::Refuse(why) = decided(false, mode) else {
+                panic!("{mode:?} put a plan to the user outside plan mode");
+            };
+            assert_eq!(
+                why,
+                "`exit_plan` is for plan mode, which is off: carry on with the task."
+            );
+        }
+        // A call that reaches the tool without the gate is refused the same.
+        let refused = tools::run(tools::EXIT_PLAN, &plan.arguments, &ToolContext::default());
+        assert!(refused.unwrap_err().contains("which is off"));
     }
 
     #[test]

@@ -1096,7 +1096,10 @@ mod tests {
     fn approving_a_plan_ends_plan_mode_and_declining_keeps_it() {
         use crate::gate::{Gate, Grants, Mode, decide};
         use std::collections::HashSet;
-        let ctx = tools::ToolContext::default();
+        let ctx = tools::ToolContext {
+            plan: true,
+            ..Default::default()
+        };
         let granted = Grants::from([(0, HashSet::from([tools::EXIT_PLAN.to_owned()]))]);
         let decided = |skip_approvals, human| {
             let gate = Gate {
