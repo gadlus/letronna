@@ -96,6 +96,8 @@ pub mod store;
 pub mod structured;
 pub mod styles;
 mod subfolders;
+#[cfg(feature = "syntax")]
+mod syntax;
 mod taint;
 pub mod tasklist;
 pub mod tasks;

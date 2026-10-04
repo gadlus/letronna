@@ -451,6 +451,7 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
                 }
                 crate::write::check_syntax(&path, None, text)?;
                 notes.push_str(&crate::write::csv_note(Path::new(raw), None, text));
+                notes.push_str(&crate::write::syntax_note(Path::new(raw), None, text));
                 added.push(path.clone());
                 steps.push(Step::Write {
                     path,
@@ -489,6 +490,11 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
                         Some(&before),
                         &after,
                     ));
+                    notes.push_str(&crate::write::syntax_note(
+                        Path::new(raw),
+                        Some(&before),
+                        &after,
+                    ));
                     steps.push(Step::Write {
                         path,
                         raw: raw.clone(),
@@ -508,6 +514,11 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
                 }
                 crate::write::check_syntax(&moved, Some(before.as_bytes()), &after)?;
                 notes.push_str(&crate::write::csv_note(
+                    Path::new(to),
+                    Some(&before),
+                    &after,
+                ));
+                notes.push_str(&crate::write::syntax_note(
                     Path::new(to),
                     Some(&before),
                     &after,
@@ -1050,6 +1061,35 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("Line 3"), "{err}");
         assert!(!dir.join("a.txt").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "syntax")]
+    #[test]
+    fn a_patch_that_breaks_code_says_so_and_still_writes_it() {
+        let (dir, ctx) = project("broken-code");
+        std::fs::write(dir.join("lib.rs"), "fn one() {\n    let a = 1;\n}\n").unwrap();
+        let text = "*** Begin Patch
+*** Add File: src/app.py
++def f(x):
++    return x +
+*** Update File: lib.rs
+@@ fn one() {
+-    let a = 1;
++    let a = (1;
+*** End Patch";
+        let said = patch(&ctx, text).unwrap();
+        assert!(
+            said.starts_with(
+                "Applied the patch: added src/app.py, updated lib.rs.\nNote: `src/app.py` line \
+                 2 does not parse as Python: `    return x +`."
+            ),
+            "{said}"
+        );
+        let rust =
+            "\nNote: `lib.rs` line 2 no longer parses as Rust, missing `)`: `    let a = (1;`.";
+        assert!(said.contains(rust), "{said}");
+        assert_eq!(read(&dir, "lib.rs"), "fn one() {\n    let a = (1;\n}\n");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
