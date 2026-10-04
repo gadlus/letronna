@@ -443,7 +443,7 @@
   },
   {
     "function": {
-      "description": "Record or update your plan as a checklist the user can see. Send the whole list every time, with each item's status. Use it for work with several steps, and mark items done as you go.",
+      "description": "Keep your plan as a checklist, for work of three or more steps or several requests at once; skip it for a quick task. Send the whole list every time. Keep one item doing, and mark one done only once it is done and checked where it can be, never on intent. A blocked item goes back to pending, with one added naming the blocker; drop one no longer needed and say why. When a task covers each file or all N of something, give each its own item, grouping them past about 20. Do not paste the whole list into your reply. Returns how many items are done.",
       "name": "todo",
       "parameters": {
         "properties": {
@@ -459,6 +459,7 @@
                   "type": "string"
                 },
                 "text": {
+                  "description": "One concrete step that can be checked.",
                   "type": "string"
                 }
               },

@@ -3533,12 +3533,12 @@ impl Tool for Todo {
         TODO
     }
     fn description(&self) -> &'static str {
-        "Record or update your plan as a checklist the user can see. Send the whole list every time, with each item's status. Use it for work with several steps, and mark items done as you go."
+        "Keep your plan as a checklist, for work of three or more steps or several requests at once; skip it for a quick task. Send the whole list every time. Keep one item doing, and mark one done only once it is done and checked where it can be, never on intent. A blocked item goes back to pending, with one added naming the blocker; drop one no longer needed and say why. When a task covers each file or all N of something, give each its own item, grouping them past about 20. Do not paste the whole list into your reply. Returns how many items are done."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
             "items": {"type": "array", "items": {"type": "object", "properties": {
-                "text": {"type": "string"},
+                "text": {"type": "string", "description": "One concrete step that can be checked."},
                 "status": {"type": "string", "enum": ["pending", "doing", "done"]}
             }, "required": ["text", "status"]}}
         }, "required": ["items"]})
@@ -3547,8 +3547,8 @@ impl Tool for Todo {
         false
     }
     fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
-        let items = args["items"].as_array().ok_or("`items` is required.")?;
-        Ok(format!("Noted {} items.", items.len()))
+        // As the window, the terminal and the driver answer it.
+        crate::store::apply_todo(&mut Vec::new(), &args.to_string())
     }
 }
 
@@ -5369,6 +5369,17 @@ mod tests {
         // A failure's exit code already says the command ran.
         let out = run_shell("exit 3", None, &Cancel::default()).unwrap();
         assert_eq!(out.trim_start(), "[exit code 3]");
+    }
+
+    #[test]
+    fn the_checklist_tool_answers_as_the_window_and_the_terminal_do() {
+        let items = json!({"items": [
+            {"text": "Read the config", "status": "done"},
+            {"text": "Add the flag", "status": "doing"},
+            {"text": "Run the tests", "status": "pending"}
+        ]});
+        let said = Todo.run(&items, &ToolContext::default()).unwrap();
+        assert_eq!(said, "Checklist updated: 1 of 3 done.");
     }
 
     #[test]
