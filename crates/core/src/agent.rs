@@ -543,6 +543,11 @@ impl Turn {
             Ok(out) => (out, false),
             Err(error) => (error, true),
         };
+        // Whichever front end asked, the mark on an offered answer was for
+        // the user's eyes.
+        if call.name == tools::ASK_USER && !is_error {
+            content = tools::answered(&content).to_owned();
+        }
         let times = self.repeated(&call, &content, is_error);
         let failures = self.failed(&call.name, &content, is_error);
         if times >= REPEATS_NOTED {
@@ -1424,6 +1429,19 @@ mod tests {
             turn.finish_id("read_file-1", Ok("contents".into()));
             assert!(turn.next_batch(never, MAX_BATCH).is_empty(), "{alone}");
             assert_eq!(turn.next(|_| Outcome::Run), Next::Run(call(alone)));
+        }
+    }
+
+    #[test]
+    fn an_answer_picked_as_recommended_reaches_the_model_without_the_mark() {
+        for (answer, kept) in [
+            ("Postgres (Recommended)", "Postgres"),
+            ("SQLite, as it is one file", "SQLite, as it is one file"),
+        ] {
+            let mut turn = turn();
+            turn.begin(vec![call(tools::ASK_USER)]);
+            turn.finish_call(Ok(answer.into()));
+            assert_eq!(turn.take_results()[0].content, kept);
         }
     }
 
