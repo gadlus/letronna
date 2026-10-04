@@ -276,6 +276,22 @@ pub(crate) const PLAN: [Rule; 2] = [
     },
 ];
 
+/// The rules after where a chat app's reply is posted, the second only with
+/// tools: Telegram, Discord and Slack show no table, and their cards show a
+/// call but never its result, so "as shown above" points at nothing.
+pub(crate) const CHAT_APP: [Rule; 2] = [
+    Rule {
+        id: "tables",
+        to: To::Watched,
+        text: "Tables do not display there; use plain lists.",
+    },
+    Rule {
+        id: "unseen",
+        to: To::Watched,
+        text: "Nobody there sees what your tools return, so state the result, with the numbers, names or lines that matter, instead of pointing at output.",
+    },
+];
+
 /// The rules a helper's first message gives after the tools it may use, and
 /// a fork's after the report it owes: it shares its parent's system message,
 /// which speaks of asking the user, of memory and, in plan mode, of
@@ -306,7 +322,15 @@ pub(crate) const INSTRUCTIONS: [Rule; 1] = [Rule {
 }];
 
 /// Every table of rules, for finding a row by its id.
-const TABLES: [&[Rule]; 6] = [&PROSE, &TOOLS, &PROJECT, &PLAN, &HELPER, &INSTRUCTIONS];
+const TABLES: [&[Rule]; 7] = [
+    &PROSE,
+    &TOOLS,
+    &PROJECT,
+    &PLAN,
+    &CHAT_APP,
+    &HELPER,
+    &INSTRUCTIONS,
+];
 
 /// Every row of every table.
 fn all() -> impl Iterator<Item = &'static Rule> {
@@ -561,6 +585,15 @@ mod tests {
         let added = parse("+compute").unwrap_err();
         assert!(added.contains("only leaves rules out"), "{added}");
         assert!(parse("compute").is_err());
+    }
+
+    #[test]
+    fn a_chat_app_row_cannot_be_named_as_no_run_nobody_watches_is_told_it() {
+        for id in ["tables", "unseen"] {
+            let rule = all().find(|rule| rule.id == id).unwrap();
+            assert!(!rule.to.droppable(), "{id}");
+            assert!(parse(&format!("-{id}")).is_err(), "{id}");
+        }
     }
 
     #[test]
