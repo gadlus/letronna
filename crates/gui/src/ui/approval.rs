@@ -33,11 +33,15 @@ pub(crate) struct CardFor {
     /// Where a memory save may be kept, where it goes now first; empty for
     /// any other call.
     places: Vec<Scope>,
+    /// For a send_job call, the job and what is typed into it.
+    typing: Option<tools::Typing>,
 }
 
 impl CardFor {
     pub(crate) fn of(call: &backend::ToolCall, ctx: &tools::ToolContext) -> Self {
         let args = tools::parse_args_for(&call.name, &call.arguments).unwrap_or_default();
+        // Read once: it looks up the job and what it printed last.
+        let typing = (call.name == "send_job").then(|| tools::typing_of(&args, ctx));
         Self {
             call: call.clone(),
             preview: tools::preview(&call.name, &call.arguments, ctx),
@@ -49,6 +53,7 @@ impl CardFor {
                 "memory" => memory::places(ctx),
                 _ => Vec::new(),
             },
+            typing,
         }
     }
 
@@ -553,6 +558,7 @@ impl Chat {
             "browse" | "use_page" => format!("Letronna wants to {summary}"),
             "search_web" => "Letronna wants to search the web".to_owned(),
             "memory" => "Letronna wants to change what it remembers".to_owned(),
+            "send_job" => "Letronna wants to type into a running job".to_owned(),
             other => format!("Letronna wants to use {other}"),
         };
         let folder = self.card_folder();
@@ -737,6 +743,24 @@ impl Chat {
                             )
                         },
                     )
+                    // Which job, and what it shows now, which what is typed
+                    // does not say; wrapped, so a long command is all there.
+                    .when_some(shown.typing.as_ref(), |this, typing| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(typing.job.clone()),
+                        )
+                        .when(!typing.last.trim().is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("It shows: {}", typing.last.trim())),
+                            )
+                        })
+                    })
                     // Why Auto mode's judge left it to the user.
                     .when_some(self.why.clone(), |this, why| {
                         this.child(
@@ -747,10 +771,11 @@ impl Chat {
                         )
                     }),
             )
-            .child(
+            .child(match shown.typing.as_ref() {
+                Some(typing) => typed(typing, window, cx).into_any_element(),
                 // Scrolls only once the preview is long, so a one-line command
                 // does not sit in a tall empty panel.
-                div()
+                None => div()
                     .p_2()
                     .min_w_0()
                     .rounded(cx.theme().radius)
@@ -761,8 +786,9 @@ impl Chat {
                         PREVIEW_MAX,
                         window,
                         cx,
-                    )),
-            )
+                    ))
+                    .into_any_element(),
+            })
             .child(answers)
             .into_any_element(),
         )
@@ -955,6 +981,69 @@ fn pressed(
     }
 }
 
+/// What a send_job card says it will type: what an earlier call left on the
+/// line, the text exactly, control characters written out, then each key it
+/// presses as a key.
+fn typed(typing: &tools::Typing, window: &mut Window, cx: &mut App) -> Div {
+    let theme = cx.theme();
+    let (muted, radius, ground) = (theme.muted_foreground, theme.radius, theme.background);
+    let keys: Vec<AnyElement> = (typing.keys.iter())
+        .map(|name| match stroke_of(name) {
+            Some(stroke) => Kbd::new(stroke).text_xs().into_any_element(),
+            None => div()
+                .font_family(MONO_FONT)
+                .child(name.clone())
+                .into_any_element(),
+        })
+        .collect();
+    let then = if typing.text.is_empty() {
+        "Presses"
+    } else {
+        "Then presses"
+    };
+    v_flex()
+        .gap_2()
+        // Enter sends it with the text, so it is shown before it.
+        .when(!typing.earlier.is_empty(), |this| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(format!("Already on the line: {}", typing.earlier)),
+            )
+        })
+        .when(!typing.text.is_empty(), |this| {
+            this.child(div().p_2().min_w_0().rounded(radius).bg(ground).child(
+                crate::ui::code_block(
+                    "preview",
+                    tools::clamp_lines(&typing.text, 400),
+                    PREVIEW_MAX,
+                    window,
+                    cx,
+                ),
+            ))
+        })
+        .when(!keys.is_empty(), |this| {
+            this.child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .flex_wrap()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(then)
+                    .children(keys),
+            )
+        })
+}
+
+/// The key send_job's key `name` stands for, to show it as one.
+fn stroke_of(name: &str) -> Option<Keystroke> {
+    // gpui names Escape in full; send_job's other names are gpui's own.
+    let name = if name == "esc" { "escape" } else { name };
+    Keystroke::parse(name).ok()
+}
+
 /// The box an approval card sits in.
 fn frame(cx: &App) -> Div {
     v_flex()
@@ -976,6 +1065,7 @@ fn wants(who: &str, name: &str, summary: &str) -> String {
         "browse" | "use_page" => format!("{who} wants to {summary}"),
         "search_web" => format!("{who} wants to search the web"),
         "memory" => format!("{who} wants to change what it remembers"),
+        "send_job" => format!("{who} wants to type into a running job"),
         other => format!("{who} wants to use {other}"),
     }
 }
@@ -1019,7 +1109,9 @@ fn permission(
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{CardKey, Press, asks_for_folder, option_letter, options_in, place, pressed};
+    use super::{
+        CardKey, Press, asks_for_folder, option_letter, options_in, place, pressed, stroke_of,
+    };
 
     #[test]
     fn a_question_offers_its_answers_in_order_each_under_a_letter() {
@@ -1071,5 +1163,20 @@ mod tests {
         assert!(asks_for_folder("edit_file", false));
         assert!(!asks_for_folder("run_command", true));
         assert!(!asks_for_folder("search_web", false));
+    }
+
+    #[test]
+    fn each_key_send_job_presses_is_shown_as_that_key() {
+        let stroke = |name: &str| stroke_of(name).unwrap();
+        assert_eq!(stroke("enter").key, "enter");
+        assert_eq!(stroke("tab").key, "tab");
+        assert_eq!(stroke("up").key, "up");
+        assert_eq!(stroke("down").key, "down");
+        // Esc is gpui's escape, and a control key is the letter held with Ctrl.
+        assert_eq!(stroke("esc").key, "escape");
+        let ctrl_c = stroke("ctrl-c");
+        assert!(ctrl_c.modifiers.control && !ctrl_c.modifiers.shift);
+        assert_eq!(ctrl_c.key, "c");
+        assert_eq!(stroke("ctrl-d").key, "d");
     }
 }
