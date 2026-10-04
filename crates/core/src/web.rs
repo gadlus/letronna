@@ -388,7 +388,7 @@ fn save_pdf(ctx: &ToolContext, address: &str, bytes: &[u8]) -> Result<String, St
         None => String::new(),
     };
     Ok(format!(
-        "{}{}\nA PDF of {pages}{}, from {address}. Its text is not read here.",
+        "{}{}\nA PDF of {pages}{}, from {address}. read_file reads its text.",
         crate::media::SAVED,
         path.display(),
         crate::media::size(bytes.len())
@@ -1859,9 +1859,20 @@ or <a data-href="/x" href=/top#part>the top</a>.</p>
         4 0 obj << /Type/Page /Parent 2 0 R >> endobj\n\
         5 0 obj << /Type /Outlines /Count 7 >> endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n";
 
-    /// The stand-in site's PDFs: one to save, and one said to be too large.
+    /// The stand-in site's PDFs: one to save, one with text to read, and one
+    /// said to be too large.
     fn papers(path: &str) -> String {
         match path {
+            "/papers/minutes.pdf" => {
+                let pdf =
+                    crate::docs::tests::text_pdf(&[&["Minutes of the board"], &["Adjourned"]]);
+                let pdf = String::from_utf8(pdf).unwrap();
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{pdf}",
+                    pdf.len()
+                )
+            }
             "/papers/2401.12345v2.pdf" => format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Length: {}\r\n\
                  Connection: close\r\n\r\n{PDF}",
@@ -1941,7 +1952,7 @@ or <a data-href="/x" href=/top#part>the top</a>.</p>
     }
 
     #[test]
-    fn a_fetched_pdf_is_saved_where_read_file_may_open_it() {
+    fn a_fetched_pdf_reads_as_text() {
         let _turn = crate::store::tests::DATA_DIR
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1954,14 +1965,20 @@ or <a data-href="/x" href=/top#part>the top</a>.</p>
             ..Default::default()
         };
         let (base, _) = serve(papers);
-        let url = json!({"url": format!("{base}/papers/2401.12345v2.pdf")});
+        let url = json!({"url": format!("{base}/papers/minutes.pdf")});
         let said = WebFetch.run(&url, &in_conversation(7)).unwrap();
+        assert!(said.ends_with(". read_file reads its text."), "{said}");
         let path = crate::media::saved(&said).unwrap();
         assert!(path.starts_with(crate::tools::results_dir(7)), "{path:?}");
 
         let read = json!({"path": path}).to_string();
         let page = crate::tools::run("read_file", &read, &in_conversation(7)).unwrap();
-        assert!(page.contains("/Type /Pages /Kids [3 0 R 4 0 R]"), "{page}");
+        assert!(
+            page.contains(
+                "\n1|## Page 1 of 2\n2|Minutes of the board\n3|\n4|## Page 2 of 2\n5|Adjourned\n"
+            ),
+            "{page}"
+        );
         // It stays this conversation's, and the project is left as it was.
         assert!(crate::tools::run("read_file", &read, &in_conversation(8)).is_err());
         assert!(!dir.join("project").join("media").exists());

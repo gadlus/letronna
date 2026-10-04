@@ -56,6 +56,17 @@ tree-sitter-rust = { version = "0.24", optional = true }
 tree-sitter-javascript = { version = "0.23", optional = true }
 tree-sitter-typescript = { version = "0.23", optional = true }
 tree-sitter-yaml = { version = "0.7", optional = true }
+# Reading a PDF's text page by page, in pure Rust on lopdf without its
+# default features. Chosen over lopdf alone, pdf_oxide and unpdf by reading
+# 51 real PDFs with each: it alone kept every two-column paper in reading
+# order and read text drawn inside forms, it never ended the process where
+# pdf_oxide and unpdf overflowed the stack, and it adds about 1.5 MB to a
+# release build, where pdf_oxide adds 6. flate2 and weezl, already in the
+# lock file under it and image, measure what a stream unpacks to before the
+# parser unpacks it.
+pdf-extract = "0.12.1"
+flate2 = "1"
+weezl = "0.1"
 
 # Stopping a background job ends everything it started: a Job Object on
 # Windows, a process group elsewhere; a Ctrl-C is heard by a console handler
