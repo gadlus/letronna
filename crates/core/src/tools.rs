@@ -2438,16 +2438,16 @@ impl Tool for RunCommand {
     }
     fn description(&self) -> &'static str {
         if cfg!(windows) {
-            "Run a Windows PowerShell 5.1 command in the project folder, or in the folder inside it that workdir names. `&&` and `||` are syntax errors in 5.1: separate commands with `;`, or write `first; if ($?) { second }` to run the second only when the first succeeded. Each call is a fresh PowerShell: cd and $env: changes do not carry over to the next call, so keep steps that depend on each other in one command and pass workdir instead of cd. Waits for it to finish and returns its output, for up to 2 minutes or the `timeout` given. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
+            "Run a Windows PowerShell 5.1 command in the project folder, or in the folder inside it that workdir names. `&&` and `||` are syntax errors in 5.1: separate commands with `;`, or write `first; if ($?) { second }` to run the second only when the first succeeded. Each call is a fresh PowerShell: cd and $env: changes do not carry over to the next call, so keep steps that depend on each other in one command and pass workdir instead of cd. Waits for it to finish, for up to 2 minutes or the `timeout` given, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0. Past its timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, with a file for read_file named in the cut, so a build or test run need not be piped through Select-Object -Last. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
         } else if bash() {
-            "Run a bash command in the project folder, or in the folder inside it that workdir names. Each call is a fresh shell: cd, export and source do not carry over to the next call, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish and returns its output, for up to 2 minutes or the `timeout` given. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
+            "Run a bash command in the project folder, or in the folder inside it that workdir names. Each call is a fresh shell: cd, export and source do not carry over to the next call, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish, for up to 2 minutes or the `timeout` given, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0. Past its timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, with a file for read_file named in the cut, so a build or test run need not be piped through tail, which would also hide its exit code. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
         } else {
-            "Run a shell (sh) command in the project folder, or in the folder inside it that workdir names. Each call is a fresh shell: cd, export and source do not carry over to the next call, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish and returns its output, for up to 2 minutes or the `timeout` given. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
+            "Run a shell (sh) command in the project folder, or in the folder inside it that workdir names. Each call is a fresh shell: cd, export and source do not carry over to the next call, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish, for up to 2 minutes or the `timeout` given, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0. Past its timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, with a file for read_file named in the cut, so a build or test run need not be piped through tail, which would also hide its exit code. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
         }
     }
     fn parameters(&self) -> Value {
         let mut parameters = json!({"type": "object", "properties": {
-            "command": {"type": "string"},
+            "command": {"type": "string", "description": "The command line; it runs as one script."},
             "workdir": {"type": "string", "description": "The folder to run it in, inside the project: relative to the project folder, or absolute. Left out, it runs in the project folder."},
             "background": {"type": "boolean", "description": "Leave the command running and return a job number straight away. A notice comes when it exits; read its output meanwhile with read_job, and end it with stop_job."},
             "notify_on": {"type": "array", "items": {"type": "string"}, "description": "With background: a notice when an output line contains one of these, such as \"ready\" or \"error\". At most one notice every 15 s; exiting always sends one."},
@@ -5369,6 +5369,21 @@ mod tests {
         // A failure's exit code already says the command ran.
         let out = run_shell("exit 3", None, &Cancel::default()).unwrap();
         assert_eq!(out.trim_start(), "[exit code 3]");
+    }
+
+    #[test]
+    fn the_run_command_description_names_the_markers_its_results_carry() {
+        let line = if cfg!(windows) {
+            "Write-Output out; [Console]::Error.WriteLine('err'); exit 3"
+        } else {
+            "echo out; echo err >&2; exit 3"
+        };
+        let out = run_shell(line, None, &Cancel::default()).unwrap();
+        let said = RunCommand.description();
+        for marker in ["[stderr]", "[exit code "] {
+            assert!(out.contains(marker), "{out}");
+            assert!(said.contains(marker), "{said}");
+        }
     }
 
     #[test]
