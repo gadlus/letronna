@@ -1177,6 +1177,17 @@ impl Chat {
                         .child(tag),
                 )
             })
+            // What a rewind past the command would leave as it left it,
+            // wrapped, as the names in it are what it is for.
+            .when_some(rewind_leaves(message), |this, note| {
+                this.child(
+                    div()
+                        .pl(px(26.))
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(note),
+                )
+            })
             .when_some(made, |this, path| {
                 let playing = self.video.as_ref().is_some_and(|v| v.path == path);
                 let frame = self.video_frame.clone().filter(|_| playing);
@@ -2081,6 +2092,22 @@ fn exit_code(tool: &str, output: &str) -> Option<i64> {
     (code != 0).then_some(code)
 }
 
+/// What a rewind past the command `message` ran would leave as the command
+/// left it, as core noted it; `None` for any other row, or one it undoes all of.
+fn rewind_leaves(message: &Message) -> Option<String> {
+    if message.role != "tool" || message.name != "run_command" {
+        return None;
+    }
+    let why = message.unkept.as_deref().map(str::trim).unwrap_or_default();
+    let mut chars = why.chars();
+    let first = chars.next()?;
+    Some(format!(
+        "A rewind won't undo all of this. {}{}.",
+        first.to_uppercase(),
+        chars.as_str()
+    ))
+}
+
 /// Whether `message` is a command's output that ends in a failing exit
 /// code: a failure, though the call itself went through.
 pub(crate) fn exited_badly(message: &Message) -> bool {
@@ -2399,8 +2426,8 @@ mod tests {
     // Deliberately not `use super::*`: the prelude re-exports gpui, whose own
     // `test` macro would shadow the built-in attribute here.
     use super::{
-        countdown, edited_by, ends_thinking, exit_code, prompt_rest, retry_due, took_for,
-        usage_line, without_exit,
+        countdown, edited_by, ends_thinking, exit_code, prompt_rest, retry_due, rewind_leaves,
+        took_for, usage_line, without_exit,
     };
     use letronna_core::chat::{Draft, Event, Message};
 
@@ -2537,5 +2564,31 @@ mod tests {
         assert!(prompt_rest(&"x".repeat(900), 102).is_some());
         // Short, however narrow: a question, not a paste.
         assert_eq!(prompt_rest("why does this fail?", 10), None);
+    }
+
+    #[test]
+    fn a_command_row_says_what_a_rewind_would_leave() {
+        let ran = |unkept: Option<&str>| Message {
+            role: "tool".into(),
+            name: "run_command".into(),
+            unkept: unkept.map(str::to_owned),
+            ..Default::default()
+        };
+        let why = "links stay as the command left them: docs/README.md";
+        assert_eq!(
+            rewind_leaves(&ran(Some(why))).as_deref(),
+            Some(
+                "A rewind won't undo all of this. \
+                 Links stay as the command left them: docs/README.md."
+            )
+        );
+        // All of it undone, or nothing looked for, says nothing.
+        assert_eq!(rewind_leaves(&ran(Some(""))), None);
+        assert_eq!(rewind_leaves(&ran(None)), None);
+        let wrote = Message {
+            name: "write_file".into(),
+            ..ran(Some(why))
+        };
+        assert_eq!(rewind_leaves(&wrote), None);
     }
 }

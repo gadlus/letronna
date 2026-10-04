@@ -337,8 +337,18 @@ impl Chat {
         let planned = cx.background_executor().spawn(async move {
             let files = history::plan(session, &dropped, folder.as_deref());
             let mut rows = history::listing(&files, folder.as_deref());
+            // That what commands changed goes back too may be news, so it
+            // is said with the files, before the note on what of theirs stays.
+            if let Some(line) = history::undone_commands(&dropped, &files) {
+                let at = (rows.iter())
+                    .position(|row| row == history::COMMAND_FILES_NOTE)
+                    .unwrap_or(rows.len());
+                rows.insert(at, line);
+            }
+            // And what each command leaves, as the terminal's /undo says it.
             if !files.is_empty() && history::ran_commands(&dropped) {
                 rows.push(history::COMMANDS_NOTE.to_owned());
+                rows.extend(history::unkept(&dropped));
             }
             (files, rows)
         });
@@ -386,7 +396,7 @@ impl Chat {
         // putting files back replaces what is on disk, so it is asked for.
         let put_back = Rc::new(Cell::new(false));
         let chat = cx.entity();
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let (chat, back) = (chat.clone(), back.clone());
             let (files, put_back) = (files.clone(), put_back.clone());
             let ticked = put_back.get();
@@ -427,7 +437,7 @@ impl Chat {
                                     .pl_6()
                                     .text_sm()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(row.clone())
+                                    .child(with_code(row, window, cx))
                             })),
                     )
                 })
@@ -1482,6 +1492,45 @@ pub(crate) fn turns(messages: &[Message], streaming: bool) -> Vec<Span> {
     turns
 }
 
+/// A line of the rewind question with each command in it, which core
+/// writes between backticks, in the code font, as the chat shows commands.
+fn with_code(row: &str, window: &Window, cx: &App) -> StyledText {
+    let font = window.text_style().font();
+    let color = cx.theme().muted_foreground;
+    let parts = code_spans(row);
+    let text: String = parts.iter().map(|(part, _)| part.as_str()).collect();
+    let runs = (parts.iter())
+        .map(|(part, code)| TextRun {
+            len: part.len(),
+            font: match code {
+                true => Font {
+                    family: MONO_FONT.into(),
+                    ..font.clone()
+                },
+                false => font.clone(),
+            },
+            color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        })
+        .collect();
+    StyledText::new(text).with_runs(runs)
+}
+
+/// `row` cut at its backticks into parts, each saying whether it was
+/// between a pair, with the backticks gone; a row with one left unpaired
+/// is kept whole, so no backtick a command holds is lost.
+fn code_spans(row: &str) -> Vec<(String, bool)> {
+    if row.matches('`').count() % 2 == 1 {
+        return vec![(row.to_owned(), false)];
+    }
+    (row.split('`').enumerate())
+        .filter(|(_, part)| !part.is_empty())
+        .map(|(at, part)| (part.to_owned(), at % 2 == 1))
+        .collect()
+}
+
 /// "1 message" or "N messages".
 fn message_count(n: usize) -> String {
     if n == 1 {
@@ -1496,7 +1545,8 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        Span, Stop, line_totals, message_count, scrolls, shows_bar, step_stop, stops, turns,
+        Span, Stop, code_spans, line_totals, message_count, scrolls, shows_bar, step_stop, stops,
+        turns,
     };
     use letronna_core::chat::Message;
     use letronna_core::history::Lines;
@@ -1660,5 +1710,31 @@ mod tests {
             ]
         );
         assert_eq!(turns(&woken[..3], true)[3], span(3, 3, false));
+    }
+
+    #[test]
+    fn a_rewind_line_shows_its_commands_without_their_backticks() {
+        let part = |text: &str, code| (text.to_owned(), code);
+        assert_eq!(
+            code_spans("`rm b.txt`: links stay as the command left them: a.md."),
+            [
+                part("rm b.txt", true),
+                part(": links stay as the command left them: a.md.", false)
+            ]
+        );
+        assert_eq!(
+            code_spans("This also undoes what these commands changed: `a`, `b`."),
+            [
+                part("This also undoes what these commands changed: ", false),
+                part("a", true),
+                part(", ", false),
+                part("b", true),
+                part(".", false)
+            ]
+        );
+        // An unpaired backtick is a command's own, so the line stays whole.
+        let odd = "`echo `date`: left running in the background, so not undone.";
+        assert_eq!(code_spans(odd), [part(odd, false)]);
+        assert_eq!(code_spans("No commands."), [part("No commands.", false)]);
     }
 }
