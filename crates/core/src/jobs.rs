@@ -27,6 +27,9 @@
 //! The window hears of a job starting, printing and ending through a
 //! doorbell rather than by reading the list on a timer, so while no job
 //! prints it has nothing to do.
+//!
+//! A job can run on a pseudo-terminal, for a program that must be answered
+//! at a keyboard; see `tty`.
 
 use crate::cancel::Cancel;
 use crate::inbox::{Notice, When};
@@ -40,6 +43,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender};
+
+mod tty;
 
 /// Output kept per job. Enough to see what a server is doing without letting a
 /// chatty process grow without bound.
@@ -88,6 +93,23 @@ const KEEP_FINISHED: Duration = Duration::from_secs(30 * 60);
 /// 64 KB each hold 4 MB.
 const MAX_JOBS: usize = 64;
 
+/// The most bytes typed into a tty job at once: a terminal holds a line of
+/// at most 1,024 until the program reads it on macOS, and a longer one
+/// belongs in a file the program reads.
+const MAX_TYPED: usize = 1_000;
+
+/// How long typing waits for a program to take what is typed before it
+/// gives up: a terminal whose program never reads holds it for good.
+const TYPE_WAIT: Duration = Duration::from_secs(5);
+
+/// Ctrl-C, which a password prompt still takes: it ends the prompt rather
+/// than answering it.
+const CTRL_C: &[u8] = b"\x03";
+
+/// Why a tty job is not typed into at a password prompt.
+const SECRET: &str = "It is asking for a password, which Letronna never types; ask the user \
+                      to run it in their own terminal.";
+
 pub struct Job {
     pub id: u64,
     pub command: String,
@@ -109,6 +131,41 @@ pub struct Job {
     started: Instant,
     /// When the process exited, which starts the time until it is cleared.
     ended: Arc<OnceLock<Instant>>,
+    /// The terminal a tty job runs on; None for any other job.
+    tty: Option<Terminal>,
+}
+
+/// The terminal a tty job runs on, as send_job types into it.
+type Terminal = Arc<Mutex<Keyboard>>;
+
+/// Letronna's side of a tty job's terminal, and what was typed there since
+/// a line last ended.
+#[derive(Default)]
+struct Keyboard {
+    /// Let go of once the shell exits: a system has only a few hundred
+    /// terminals to give out.
+    main: Option<std::fs::File>,
+    /// Typed since enter was last pressed, which the next enter sends along
+    /// with what is typed then, for the gate to read as one line.
+    line: Vec<u8>,
+}
+
+/// The most of a line typed in parts that is kept for the gate to read; a
+/// longer one counts as unreadable, as the gate cannot see all of it.
+pub(crate) const LINE_CAP: usize = 16 * 1024;
+
+impl Keyboard {
+    /// Note `input` as typed: a line ends at enter, and Ctrl-C or Ctrl-U
+    /// throws away what was typed on it.
+    fn typed(&mut self, input: &[u8]) {
+        for &byte in input {
+            match byte {
+                b'\r' | b'\n' | b'\x03' | b'\x15' => self.line.clear(),
+                _ if self.line.len() < LINE_CAP => self.line.push(byte),
+                _ => {}
+            }
+        }
+    }
 }
 
 /// What a job has printed: its newest bytes, and how many it printed in all.
@@ -217,11 +274,12 @@ fn next_id() -> u64 {
 }
 
 /// Drain a pipe into the shared log until the process closes it, showing
-/// each line to the job's watch, if it has one.
+/// each line to the job's watch, if it has one, and each read to `heard`.
 fn pump(
     mut source: impl Read + Send + 'static,
     log: Arc<Mutex<Log>>,
     watch: Option<Arc<Mutex<Watch>>>,
+    mut heard: impl FnMut(&[u8]) + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut block = [0u8; 4096];
@@ -230,6 +288,7 @@ fn pump(
             match source.read(&mut block) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    heard(&block[..n]);
                     // Under the log's lock, so a line the watch passes over
                     // before `first_output` is in the text that returns.
                     {
@@ -504,6 +563,22 @@ fn decode(bytes: &[u8]) -> String {
     text
 }
 
+/// A tty job's output as its terminal shows it: without escapes, such as
+/// the queries answered for it, with CR LF as a line break, and with only
+/// what was written over a line a lone carriage return took back to its
+/// start, as a progress bar redraws itself.
+fn on_screen(text: &str) -> String {
+    let text = crate::tools::strip_escapes(text);
+    let lines: Vec<&str> = text
+        .split('\n')
+        .map(|line| {
+            let line = line.trim_end_matches('\r');
+            line.rsplit('\r').next().unwrap_or(line)
+        })
+        .collect();
+    lines.join("\n")
+}
+
 /// A job's shell, or an MCP server, and everything it starts, held as one
 /// Job Object so that stopping reaches a server the shell launched and not
 /// just the shell.
@@ -621,6 +696,12 @@ impl Tree {
         unsafe { libc::kill(-self.0, libc::SIGKILL) };
     }
 
+    /// End every process in the session a tty job's shell leads, as `kill`
+    /// does its group.
+    fn kill_session(&self) {
+        tty::end_session(self.0);
+    }
+
     /// Let go of the tree, leaving what is in it running; a process group
     /// needs no closing.
     fn leave(self) {}
@@ -641,7 +722,7 @@ pub fn start_for(command: &str, cwd: &Path, owner: u64) -> Result<u64, String> {
 /// has let it through. Its exit is told to nobody, since no agent is waiting
 /// on it.
 pub fn start_yours(command: &str, cwd: &Path) -> Result<u64, String> {
-    launch(command, cwd, 0, &[], true)
+    launch(command, cwd, 0, &[], true, false)
 }
 
 /// Start a job as `start_for` does, telling `owner` too of the output lines
@@ -652,7 +733,18 @@ pub fn start_watching(
     owner: u64,
     needles: &[String],
 ) -> Result<u64, String> {
-    launch(command, cwd, owner, needles, false)
+    launch(command, cwd, owner, needles, false, false)
+}
+
+/// Start a job as `start_watching` does, on a pseudo-terminal that
+/// `type_into` types into.
+pub fn start_on_terminal(
+    command: &str,
+    cwd: &Path,
+    owner: u64,
+    needles: &[String],
+) -> Result<u64, String> {
+    launch(command, cwd, owner, needles, false, true)
 }
 
 fn launch(
@@ -661,16 +753,39 @@ fn launch(
     owner: u64,
     needles: &[String],
     yours: bool,
+    on_terminal: bool,
 ) -> Result<u64, String> {
     let mut shell = crate::tools::shell(command, Some(cwd));
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut shell, 0);
-    let mut child = shell
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Cannot start the shell: {e}"))?;
+    let tty = match on_terminal {
+        true => {
+            let master = tty::attach(&mut shell)?;
+            let copy = || {
+                master
+                    .try_clone()
+                    .map_err(|e| format!("Cannot read the terminal: {e}"))
+            };
+            // One to read the job's output and one to answer its queries,
+            // both kept until it is all read.
+            let (reader, answerer) = (copy()?, copy()?);
+            Some((master, reader, answerer))
+        }
+        false => {
+            // In a group of its own, as a tty job's shell is by leading a
+            // session.
+            #[cfg(unix)]
+            std::os::unix::process::CommandExt::process_group(&mut shell, 0);
+            shell
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            None
+        }
+    };
+    let spawned = shell.spawn();
+    // The terminal's other side, which the shell now holds, must close here
+    // too, or reading it would never end once the job has.
+    drop(shell);
+    let mut child = spawned.map_err(|e| format!("Cannot start the shell: {e}"))?;
     // At once, so the shell has had as little time as possible to start
     // anything that would escape the tree.
     let tree = match Tree::of(&child) {
@@ -685,8 +800,29 @@ fn launch(
     let watch =
         (!needles.is_empty()).then(|| Arc::new(Mutex::new(Watch::new(id, command, needles))));
     let log = Arc::new(Mutex::new(Log::default()));
-    let out = pump(child.stdout.take().unwrap(), log.clone(), watch.clone());
-    let err = pump(child.stderr.take().unwrap(), log.clone(), watch.clone());
+    let (pumps, tty) = match tty {
+        Some((master, reader, answerer)) => {
+            let mut answers = tty::Answers::on(answerer);
+            let heard = move |bytes: &[u8]| answers.heard(bytes);
+            (
+                vec![pump(reader, log.clone(), watch.clone(), heard)],
+                Some(Arc::new(Mutex::new(Keyboard {
+                    main: Some(master),
+                    line: Vec::new(),
+                }))),
+            )
+        }
+        None => {
+            let mut pumps = Vec::new();
+            if let Some(out) = child.stdout.take() {
+                pumps.push(pump(out, log.clone(), watch.clone(), |_| {}));
+            }
+            if let Some(err) = child.stderr.take() {
+                pumps.push(pump(err, log.clone(), watch.clone(), |_| {}));
+            }
+            (pumps, None)
+        }
+    };
     let job = Job {
         id,
         command: command.to_owned(),
@@ -700,10 +836,11 @@ fn launch(
         watch,
         started: Instant::now(),
         ended: Arc::default(),
+        tty,
     };
     keep(job, child, owner, move || {
         let waited = Instant::now();
-        while !(out.is_finished() && err.is_finished()) && waited.elapsed() < DRAIN_WAIT {
+        while !pumps.iter().all(|pump| pump.is_finished()) && waited.elapsed() < DRAIN_WAIT {
             std::thread::sleep(Duration::from_millis(50));
         }
     })
@@ -744,6 +881,7 @@ pub(crate) fn adopt(
         watch: None,
         started,
         ended: Arc::default(),
+        tty: None,
     };
     keep(job, child, owner, move || {
         let _ = open.recv_timeout(DRAIN_WAIT);
@@ -766,11 +904,16 @@ fn keep(
     {
         let (finished, exit_code) = (job.finished.clone(), job.exit_code.clone());
         let (log, command, ended) = (job.log.clone(), job.command.clone(), job.ended.clone());
-        let watch = job.watch.clone();
+        let (watch, tty) = (job.watch.clone(), job.tty.clone());
         std::thread::spawn(move || {
             let Ok(status) = child.wait() else { return };
             if let Ok(mut code) = exit_code.lock() {
                 *code = status.code();
+            }
+            if let Some(tty) = &tty
+                && let Ok(mut keyboard) = tty.lock()
+            {
+                keyboard.main = None;
             }
             let _ = ended.set(Instant::now());
             finished.store(true, Ordering::Relaxed);
@@ -781,7 +924,7 @@ fn keep(
             if let Some(watch) = &watch {
                 close(watch);
             }
-            report_exit(id, &command, status.code(), &log);
+            report_exit(id, &command, status.code(), &log, tty.is_some());
         });
     }
 
@@ -828,11 +971,15 @@ fn stale(jobs: Vec<(u64, Option<Instant>)>, now: Instant) -> Vec<u64> {
         .collect()
 }
 
-/// Record how a job ended and tell its owner, with the last lines it printed.
-fn report_exit(id: u64, command: &str, code: Option<i32>, log: &Mutex<Log>) {
+/// Record how a job ended and tell its owner, with the last lines it
+/// printed, as its terminal showed them for a `tty` job.
+fn report_exit(id: u64, command: &str, code: Option<i32>, log: &Mutex<Log>, tty: bool) {
     let log = log
         .lock()
-        .map(|mut l| text(&mut l.tail))
+        .map(|mut l| match text(&mut l.tail) {
+            text if tty => on_screen(&text),
+            text => text,
+        })
         .unwrap_or_default();
     let how = match code {
         Some(code) => format!("exited with code {code}"),
@@ -922,6 +1069,7 @@ pub fn start_work(
                 watch: None,
                 started: Instant::now(),
                 ended: ended.clone(),
+                tty: None,
             },
         );
     ring();
@@ -983,7 +1131,10 @@ pub fn log_since(id: u64, mark: u64) -> Result<String, String> {
     let log = with_job(id, |job| {
         job.log
             .lock()
-            .map(|mut l| crate::tools::strip_escapes(&since(&mut l, mark)))
+            .map(|mut l| match since(&mut l, mark) {
+                text if job.tty.is_some() => on_screen(&text),
+                text => crate::tools::strip_escapes(&text),
+            })
             .unwrap_or_default()
     })?;
     // Its start is where the oldest bytes were dropped or the mark fell, and
@@ -1015,8 +1166,78 @@ pub fn first_output(id: u64) -> Result<String, String> {
         {
             watch.shown = true;
         }
-        text(&mut log.tail)
+        match text(&mut log.tail) {
+            text if job.tty.is_some() => on_screen(&text),
+            text => text,
+        }
     })
+}
+
+/// The command the job runs, or the label of its work.
+pub fn command(id: u64) -> Result<String, String> {
+    with_job(id, |job| job.command.clone())
+}
+
+/// What was typed into tty job `id` since enter was last pressed, which
+/// the next enter sends with whatever is typed then; empty for any other
+/// job.
+pub fn typed_line(id: u64) -> Result<Vec<u8>, String> {
+    with_job(id, |job| {
+        (job.tty.as_ref())
+            .and_then(|tty| tty.lock().ok().map(|keyboard| keyboard.line.clone()))
+            .unwrap_or_default()
+    })
+}
+
+/// Type `input` into tty job `id`, as keys pressed at its terminal.
+pub fn type_into(id: u64, input: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    if input.len() > MAX_TYPED {
+        return Err(format!(
+            "At most {MAX_TYPED} bytes are typed at once. Put longer input in a file \
+             and have the program read it."
+        ));
+    }
+    let master = with_job(id, |job| {
+        let Some(tty) = &job.tty else {
+            return Err(format!(
+                "Job #{id} was not started with tty: true, so it reads no keyboard. \
+                 Start it again with tty: true."
+            ));
+        };
+        let mut keyboard = tty.lock().map_err(|_| "The terminal is poisoned.")?;
+        // Let go of once the shell has exited.
+        let Some(master) = keyboard.main.as_ref() else {
+            return Err(format!(
+                "Job #{id} has ended, so nothing reads what is typed."
+            ));
+        };
+        if input != CTRL_C && tty::hides_typing(master) {
+            return Err(SECRET.into());
+        }
+        let master = master
+            .try_clone()
+            .map_err(|e| format!("Cannot type into job #{id}: {e}"))?;
+        // Before it is written, so a program slow to read it still has it
+        // counted on the line.
+        keyboard.typed(input);
+        Ok(master)
+    })??;
+    // On a thread of its own, so a program that never reads holds that
+    // thread rather than the call.
+    let (done, wait) = std::sync::mpsc::channel();
+    let input = input.to_vec();
+    std::thread::spawn(move || {
+        let _ = done.send((&master).write_all(&input));
+    });
+    match wait.recv_timeout(TYPE_WAIT) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("Cannot type into job #{id}: {e}")),
+        Err(_) => Err(format!(
+            "Job #{id} did not take what was typed within {}s: it is not reading its input.",
+            TYPE_WAIT.as_secs()
+        )),
+    }
 }
 
 pub fn running(id: u64) -> Result<bool, String> {
@@ -1068,6 +1289,13 @@ fn end(job: &Job) {
         Ends::Tree(tree) => {
             if cfg!(windows) || !job.finished.load(Ordering::Relaxed) {
                 tree.kill();
+                // A shell at a terminal gives each command typed into it a
+                // group of its own, which killing its group misses. After
+                // the shell, which then starts no more.
+                #[cfg(unix)]
+                if job.tty.is_some() {
+                    tree.kill_session();
+                }
             }
         }
         Ends::Token(token) => token.set(),
@@ -1842,6 +2070,80 @@ mod tests {
                 "job #7 printed 4 matching lines (`npm run dev`):\n{}",
                 seen[1..].join("\n")
             ))
+        );
+    }
+
+    #[test]
+    fn a_terminal_shows_a_redrawn_line_once_and_its_line_ends_plainly() {
+        let printed = "\x1b[32mbuilding\x1b[0m\r\n10%\r55%\r100%\r\nname? ";
+        assert_eq!(on_screen(printed), "building\n100%\nname? ");
+        // A line taken back to its start and not yet written over still shows.
+        assert_eq!(on_screen("50%\r"), "50%");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_asking_where_the_cursor_is_gets_an_answer() {
+        // It reads the six bytes of the answer key by key, and without one
+        // it would wait until it was stopped.
+        let ask = "stty -icanon; printf '\\033[6n'; dd bs=1 count=6 >/dev/null 2>&1; echo answered";
+        let id = start_on_terminal(ask, &std::env::temp_dir(), 0, &[]).unwrap();
+        assert!(
+            until(|| log(id).unwrap().contains("answered")),
+            "never answered: {:?}",
+            log(id)
+        );
+        assert!(until(|| !running(id).unwrap()), "job never finished");
+    }
+
+    /// The process running `sleep <secs>`, as ps lists it, once there is one.
+    #[cfg(unix)]
+    fn sleeping(secs: u32) -> Option<u32> {
+        let listed = std::process::Command::new("ps")
+            .args(["-A", "-o", "pid=,args="])
+            .output()
+            .ok()?;
+        let wanted = format!("sleep {secs}");
+        String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .find_map(|line| {
+                let (pid, args) = line.trim().split_once(' ')?;
+                (args.trim() == wanted).then(|| pid.parse().ok())?
+            })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_a_tty_job_ends_what_its_shell_left_in_the_background() {
+        let shell = "bash --norc --noprofile -i";
+        let id = start_on_terminal(shell, &std::env::temp_dir(), 0, &[]).unwrap();
+        assert!(until(|| !log(id).unwrap().is_empty()), "no prompt");
+        // Lengths no other test sleeps for, so ps tells these apart.
+        let left = 4_000_000 + std::process::id() % 1_000_000;
+        let held = left + 1;
+        type_into(id, format!("sleep {left} &\r").as_bytes()).unwrap();
+        assert!(until(|| sleeping(left).is_some()), "{:?}", log(id));
+        type_into(id, format!("sleep {held}\r").as_bytes()).unwrap();
+        assert!(until(|| sleeping(held).is_some()), "{:?}", log(id));
+        let pids = [sleeping(left).unwrap(), sleeping(held).unwrap()];
+        stop(id).unwrap();
+        for pid in pids {
+            assert!(until(|| !alive(pid)), "process {pid} outlived its job");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tty_jobs_exit_tells_the_last_lines_as_its_terminal_showed_them() {
+        let _turn = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let count = "printf '1/2\\r2/2\\n'; echo done";
+        let id = start_on_terminal(count, &std::env::temp_dir(), 7_106, &[]).unwrap();
+        let notices = heard(7_106, id);
+        assert_eq!(
+            notices[0].text,
+            format!("job #{id} exited with code 0 (`{count}`):\n2/2\ndone")
         );
     }
 }

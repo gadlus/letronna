@@ -259,6 +259,10 @@ impl Matcher {
         if patch && (self.fits("write_file") || self.fits("edit_file")) {
             return true;
         }
+        // A line typed into a terminal's shell runs as a command does.
+        if name == "send_job" && self.fits("run_command") {
+            return true;
+        }
         let fits = |name: &str| match self {
             Self::All => true,
             Self::Names(names) => names.iter().any(|n| n == name),
@@ -747,6 +751,13 @@ fn tool_input(tool: &str, args: &Value, ctx: &ToolContext) -> Value {
             None => PathBuf::from(path),
         };
         object.insert("file_path".into(), path.to_string_lossy().into());
+    }
+    // What is typed into a terminal is where a guard written for Bash
+    // reads a command: the whole line, with what earlier calls typed on it.
+    if tool == "send_job"
+        && let Some(line) = crate::tools::typed(args, ctx).lines.pop()
+    {
+        object.insert("command".into(), line.into());
     }
     // One replacement in a list is Claude Code's Edit all the same.
     if let Some([edit]) = args["edits"].as_array().map(Vec::as_slice)
@@ -1514,6 +1525,8 @@ mod tests {
         assert!(!fits("Edit|Write", "read_file"));
         assert!(fits("Edit", "apply_patch") && fits("write_file", "apply_patch"));
         assert!(!fits("Bash", "apply_patch"));
+        assert!(fits("Bash", "send_job") && fits("run_command", "send_job"));
+        assert!(!fits("Edit|Write", "send_job"));
         assert!(fits("^web_", "web_fetch") && fits("Web.*", "web_fetch"));
         assert!(!fits("mcp__.*", "run_command"));
         assert!(Matcher::of("(").is_err());
@@ -1606,6 +1619,8 @@ mod tests {
         let input = tool_input("run_command", &command, &ctx);
         assert_eq!(input["run_in_background"], true);
         assert!(input.get("file_path").is_none());
+        let typed = json!({ "job": 3, "text": "git push", "keys": ["enter"] });
+        assert_eq!(tool_input("send_job", &typed, &ctx)["command"], "git push");
     }
 
     #[test]

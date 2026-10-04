@@ -87,7 +87,7 @@ impl Family {
     pub fn tools(self) -> Vec<String> {
         let names: &[&str] = match self {
             Family::Files => &["read_file", "list_dir", "search", "write_file", "edit_file"],
-            Family::Commands => &["run_command", "read_job", "stop_job"],
+            Family::Commands => &["run_command", "read_job", "stop_job", "send_job"],
             Family::Web => &["web_fetch", "search_web"],
             Family::Browser => &[crate::browser::BROWSE, "use_page"],
             Family::Media => &["make_image", "speak", "transcribe", "make_video"],
