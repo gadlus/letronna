@@ -121,7 +121,11 @@ pub const COMMANDS: &[Command<'static>] = &[
     },
     Command {
         name: "/memory-review",
-        blurb: "look back now and then for what to remember, or stop",
+        blurb: "look back now and then for what to remember, or stop; only while saving automatically",
+    },
+    Command {
+        name: "/remember",
+        blurb: "when this chat saves memory and where; /remember <text> keeps that",
     },
     Command {
         name: "/jobs",
@@ -2716,7 +2720,10 @@ mod tests {
             ..Added::default()
         };
         let names: Vec<&str> = matches("/re", &added).iter().map(|c| c.name).collect();
-        assert_eq!(names, ["/retention", "/resume", "/retry", "/review"]);
+        assert_eq!(
+            names,
+            ["/retention", "/remember", "/resume", "/retry", "/review"]
+        );
         let long = [("/a-long-command-name".to_owned(), String::new())];
         assert_eq!(name_width(&long), "/a-long-command-name".len());
         // A name past the cap is cut, not every row pushed along by it.

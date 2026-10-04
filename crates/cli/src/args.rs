@@ -1,6 +1,7 @@
 //! What `letronna` was asked for on the command line.
 
 use letronna_core::gate::Mode;
+use letronna_core::memory::{Saving, Scope};
 
 pub const HELP: &str = "\
 Letronna — a small agent in your terminal
@@ -33,6 +34,13 @@ Options
       --model <id>         this session's model, leaving the default as it is
       --gateway <name>     the gateway that model is on
       --effort <level>     how hard it thinks in this session, or auto
+      --memory <when>      when this session saves to memory: when-asked,
+                           ask (a yes for each save) or auto
+      --memory-scope <where>
+                           where it keeps memory and what of it it loads:
+                           auto (everywhere), project or chat
+      --private            a new private chat: only its own notes load, and
+                           it saves to them only when asked
       --offline            with doctor: leave the network alone
       --dump-config        print the settings and limits a -p run in a new
                            session gets with the same flags, as JSON
@@ -141,6 +149,12 @@ pub struct Args {
     pub schema: Option<String>,
     /// `--worktree`: the new session works in a git worktree of its own.
     pub worktree: bool,
+    /// When the session saves to memory, from `--memory`.
+    pub memory: Option<Saving>,
+    /// Where it keeps memory and what of it loads, from `--memory-scope`.
+    pub memory_scope: Option<Scope>,
+    /// `--private`: the new session is a private chat.
+    pub private: bool,
 }
 
 pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -174,6 +188,9 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         dump_config: false,
         schema: None,
         worktree: false,
+        memory: None,
+        memory_scope: None,
+        private: false,
     };
     // Only as the first word, so `-p mcp` still asks about it.
     if raw.next_if(|first| first == "mcp").is_some() {
@@ -272,6 +289,13 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
                     "--json-schema takes a JSON Schema file, like --json-schema answer.json.",
                 )?);
             }
+            "--memory" => {
+                args.memory = Some(Saving::parse(&raw.next().unwrap_or_default())?);
+            }
+            "--memory-scope" => {
+                args.memory_scope = Some(Scope::parse(&raw.next().unwrap_or_default())?);
+            }
+            "--private" => args.private = true,
             "--gateway" => args.gateway = raw.next(),
             "--effort" => args.effort = raw.next(),
             "setup" | "--install" => args.install = true,
@@ -296,6 +320,12 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         }
     }
     args.mode = picked(mode, yes, plan);
+    // A chat carried on keeps what it chose; `/remember` changes that.
+    if args.private && args.start != Start::Fresh {
+        return Err(
+            "--private starts a new chat, so it does not go with --continue or --resume.".into(),
+        );
+    }
     // A session carried on keeps the folder it had, worktree or not.
     if args.worktree && args.start != Start::Fresh {
         return Err(
@@ -420,6 +450,7 @@ fn picked(mode: Option<Result<Mode, String>>, yes: bool, plan: bool) -> Result<M
 mod tests {
     use super::{Input, Output, parse};
     use letronna_core::gate::Mode;
+    use letronna_core::memory::{Saving, Scope};
 
     fn args(words: &[&str]) -> super::Args {
         parse(words.iter().map(|w| w.to_string())).unwrap()
@@ -724,5 +755,24 @@ mod tests {
             "`is` came after the question; a question of more than one word goes in quotes, like -p \"what is this\"."
         );
         assert!(refused(&["what", "--plan", "now"]).starts_with("`now` came after the question"));
+    }
+
+    #[test]
+    fn the_memory_flags_read_their_choices_and_private_starts_a_new_chat() {
+        let flagged = args(&[
+            "--memory",
+            "when-asked",
+            "--memory-scope",
+            "chat",
+            "-p",
+            "q",
+        ]);
+        assert_eq!(flagged.memory, Some(Saving::WhenAsked));
+        assert_eq!(flagged.memory_scope, Some(Scope::Chat));
+        assert_eq!(args(&["--memory", "ask"]).memory, Some(Saving::Ask));
+        assert!(args(&["--private", "-p", "q"]).private);
+        assert!(refused(&["--memory", "often"]).contains("when-asked, ask or auto"));
+        assert!(refused(&["--memory-scope", "team"]).contains("auto, project or chat"));
+        assert!(refused(&["--private", "--continue"]).starts_with("--private starts a new chat"));
     }
 }

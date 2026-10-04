@@ -682,6 +682,7 @@ fn begin(
         ..Default::default()
     });
     runner.persist();
+    runner.hold_memory(session);
     // The run writes on into the session's own file, so the session is
     // listed and can be continued as before. It leaves the store here and
     // comes back only when the run is over, so that file has one writer.
@@ -1177,6 +1178,17 @@ fn choose_by_flags(
             effort
         };
         runner.store.conversations[session].effort = Some(effort);
+    }
+    // The session's own, as --model and --effort are, and before the flags
+    // that change one part of the preset.
+    if args.private {
+        runner.store.make_private(session);
+    }
+    if let Some(saving) = args.memory {
+        runner.store.choose_memory_saving(session, Some(saving));
+    }
+    if let Some(scope) = args.memory_scope {
+        runner.store.choose_memory_scope(session, Some(scope));
     }
 }
 
