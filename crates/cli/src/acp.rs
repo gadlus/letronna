@@ -23,7 +23,8 @@
 //! session's next call; helpers already running keep theirs, and none
 //! starts until the turn ends, as it would work in the mode the turn
 //! began in.
-/!/n//! A memory save's options are the places it may be kept, or not at all,
+//!
+//! A memory save's options are the places it may be kept, or not at all,
 //! and it saves as the session chose, as a terminal session does.
 //!
 //! A session is an ordinary Letronna session, in the same listing, so one

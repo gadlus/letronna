@@ -150,7 +150,7 @@ impl Tool for WebFetch {
         "web_fetch"
     }
     fn description(&self) -> &'static str {
-        "Fetch a web page (http or https) and return its text: HTML is reduced to readable markdown with its links as full addresses and its forms' fields (hidden ones too), plain text and JSON come back as they are, and a PDF is saved as a file. A page read in the last 15 minutes is given again from memory unless `fresh` is true. Use it to read a page the user mentions, or one a search turned up."
+        "Fetch a web page (http or https) and return its text: HTML is reduced to readable markdown with its links as full addresses and its forms' fields (hidden ones too), plain text and JSON come back as they are, and a PDF is saved as a file. A page read in the last 15 minutes is given again from memory unless `fresh` is true. Use it to read a page the user mentions, or one a search turned up. For a fact that may have changed since your training, such as a price, a latest release, a schedule or news, look it up rather than answer from training; if you cannot, say your answer may be out of date."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
