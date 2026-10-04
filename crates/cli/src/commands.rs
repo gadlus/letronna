@@ -2491,12 +2491,23 @@ fn pick_remembering(runner: &mut Runner, session: usize) {
         Row::Save(saving) => store.choose_memory_saving(session, *saving),
         Row::Keep(scope) => store.choose_memory_scope(session, *scope),
         Row::MakeDefault => {
-            store.settings.memory_saving = store.memory_saving(session);
-            store.settings.memory_scope = store.memory_scope(session);
-            render::line(&render::dim("New chats start with these."));
+            make_memory_default(store, session);
+            render::line(&render::dim(
+                "New chats start with these, and this chat now follows the default.",
+            ));
         }
     }
     runner.persist();
+}
+
+/// Make the session's memory choices the default for new chats, then drop
+/// its own so it follows the default, as the window's does; left set, they
+/// would keep the chat apart from the default the user just changed.
+fn make_memory_default(store: &mut store::Store, session: usize) {
+    store.settings.memory_saving = store.memory_saving(session);
+    store.settings.memory_scope = store.memory_scope(session);
+    store.choose_memory_saving(session, None);
+    store.choose_memory_scope(session, None);
 }
 
 /// A name picked in the box for a command given none, from `rows` of a name
@@ -4111,6 +4122,8 @@ mod tests {
     use letronna_core::chat::Message;
     use letronna_core::driver::Status;
     use letronna_core::gate::Mode;
+    use letronna_core::memory::{Saving, Scope};
+    use letronna_core::store;
     use letronna_core::workflow::{AgentState, AgentView, PhaseView, RunState, RunView};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -4496,5 +4509,23 @@ mod tests {
         assert_eq!(sent(&mut runner, "/remember --chat"), None);
         assert_eq!(sent(&mut runner, "/remember"), None);
         assert_eq!(runner.store.conversations[0].memory_saving, None);
+    }
+
+    #[test]
+    fn making_memory_the_default_sets_it_and_leaves_the_chat_following_it() {
+        let mut store = store::Store::default();
+        store.conversations.push(Default::default());
+        store.choose_memory_saving(0, Some(Saving::Auto));
+        store.choose_memory_scope(0, Some(Scope::Chat));
+
+        super::make_memory_default(&mut store, 0);
+
+        assert_eq!(store.settings.memory_saving, Saving::Auto);
+        assert_eq!(store.settings.memory_scope, Scope::Chat);
+        // No choice of its own left, so a later change of the default moves it.
+        assert_eq!(store.conversations[0].memory_saving, None);
+        assert_eq!(store.conversations[0].memory_scope, None);
+        store.settings.memory_saving = Saving::Ask;
+        assert_eq!(store.memory_saving(0), Saving::Ask);
     }
 }
