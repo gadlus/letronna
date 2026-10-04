@@ -82,16 +82,46 @@ enum Kind {
 
 /// The kind of document `path` is named as.
 fn kind(path: &Path) -> Option<Kind> {
-    let extension = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    kind_of(&path.extension()?.to_string_lossy())
+}
+
+/// The kind of document a file ending in `extension`, such as "pdf", is.
+fn kind_of(extension: &str) -> Option<Kind> {
     // Each with its macro-enabled kind and its templates, and a deck with
     // the shows that open playing: the same zips, the same parts.
-    match extension.as_str() {
+    match extension.to_ascii_lowercase().as_str() {
         "docx" | "docm" | "dotx" | "dotm" => Some(Kind::Word),
         "xlsx" | "xlsm" | "xltx" | "xltm" => Some(Kind::Excel),
         "pptx" | "pptm" | "potx" | "potm" | "ppsx" | "ppsm" => Some(Kind::PowerPoint),
         "pdf" => Some(Kind::Pdf),
         _ => None,
     }
+}
+
+/// Whether `path` is named as a document read_file shows as a view.
+pub(crate) fn named(path: &Path) -> bool {
+    kind(path).is_some()
+}
+
+/// Whether a file ending in `extension`, such as "pdf", is such a document.
+pub(crate) fn is_extension(extension: &str) -> bool {
+    kind_of(extension).is_some()
+}
+
+/// The lines of `lines`, the view of the document at `path`, that say where
+/// in it the lines after them are: a PDF's pages, a workbook's sheets, a
+/// deck's slides, or a Word document's headings.
+pub(crate) fn places(path: &Path, lines: &[&[u8]]) -> Vec<usize> {
+    let starts: &[&[u8]] = match kind(path) {
+        Some(Kind::Pdf) => &[b"## Page "],
+        Some(Kind::Excel) => &[b"## Sheet \""],
+        Some(Kind::PowerPoint) => &[b"## Slide "],
+        Some(Kind::Word) => &[b"# ", b"## ", b"### ", b"#### ", b"##### ", b"###### "],
+        None => &[],
+    };
+    (0..lines.len())
+        .filter(|&n| starts.iter().any(|start| lines[n].starts_with(start)))
+        .collect()
 }
 
 /// The plain kind, such as "docx", that a file named as an Office document
@@ -108,6 +138,12 @@ pub(crate) fn plain(path: &Path) -> Option<&'static str> {
 /// The view of the document at `path`; None for a file not named as one,
 /// or not a zip or a PDF as one is, which is read as any other file.
 pub(crate) fn view(path: &Path) -> Result<Option<String>, String> {
+    view_by(path, Instant::now() + DEADLINE)
+}
+
+/// The view as `view` gives it, given up on at `until` when that comes
+/// before `DEADLINE` would: a search has a budget of its own.
+pub(crate) fn view_by(path: &Path, until: Instant) -> Result<Option<String>, String> {
     let Some(kind) = kind(path) else {
         return Ok(None);
     };
@@ -129,7 +165,7 @@ pub(crate) fn view(path: &Path) -> Result<Option<String>, String> {
         return Ok(Some(kept));
     }
     let owned = path.to_path_buf();
-    let until = Instant::now() + DEADLINE;
+    let until = until.min(Instant::now() + DEADLINE);
     let (send, wait) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("read-document".into())
@@ -143,7 +179,7 @@ pub(crate) fn view(path: &Path) -> Result<Option<String>, String> {
         .map_err(|e| e.to_string())?;
     // Past the deadline the reader stops itself at its next step: through
     // the XML, or a PDF's next page or character.
-    let outcome = match wait.recv_timeout(DEADLINE) {
+    let outcome = match wait.recv_timeout(until.saturating_duration_since(Instant::now())) {
         Ok(outcome) => outcome,
         Err(RecvTimeoutError::Timeout) => Err(late()),
         Err(RecvTimeoutError::Disconnected) => Err(FAILED.into()),
@@ -191,6 +227,12 @@ const FAILED: &str = "its reader failed on it";
 /// Why a read that ran past `DEADLINE` failed.
 fn late() -> String {
     format!("it took over {} seconds", DEADLINE.as_secs())
+}
+
+/// Whether `error`, from `view_by`, says the read ran out of time rather
+/// than that the file could not be read.
+pub(crate) fn ran_late(error: &str) -> bool {
+    error.ends_with(&format!(": {}.", late()))
 }
 
 /// The view of the document at `path`, read as a `kind` until `until`.

@@ -5,6 +5,13 @@
 //!
 //! What the model may never read is dropped in the walk's own filter, which
 //! no ignore rule or glob can overrule.
+//!
+//! PDF, Word, Excel and PowerPoint files are searched as read_file shows
+//! them, and only when the type, the glob or the path names them: reading
+//! one takes far longer than a text file, so a plain search passes them by
+//! and says how many it passed. A match in one shows the heading of the
+//! page, sheet or slide it is on, and the lines are fenced, being someone
+//! else's words as a page of one read is.
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::OverrideBuilder;
@@ -110,6 +117,9 @@ pub(crate) struct Query<'a> {
     pub case_sensitive: bool,
     pub limit: usize,
     pub offset: usize,
+    /// Whether PDF and Office files are searched: the type, the glob or the
+    /// path names them.
+    pub documents: bool,
 }
 
 impl<'a> Query<'a> {
@@ -138,6 +148,16 @@ impl<'a> Query<'a> {
         if pattern.is_none() && mode != Mode::Files {
             return Err("Pattern is empty.".into());
         }
+        // A glob that leaves them out names them only to say so.
+        let names_documents = |text: &str| {
+            !text.starts_with('!')
+                && text
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(crate::docs::is_extension)
+        };
+        let documents = text("type").is_some_and(names_documents)
+            || text("glob").is_some_and(names_documents)
+            || (root.is_file() && crate::docs::named(root));
         Ok(Self {
             root,
             given: args["path"].as_str().unwrap_or("."),
@@ -152,6 +172,7 @@ impl<'a> Query<'a> {
             case_sensitive: args["case_sensitive"].as_bool().unwrap_or(false),
             limit: number("limit").unwrap_or(LIMIT).clamp(1, MAX_LIMIT),
             offset: number("offset").unwrap_or(0),
+            documents,
         })
     }
 }
@@ -165,6 +186,8 @@ struct Page {
     tail: Option<String>,
     /// Whether anything matched at all, on this page or another.
     matched: bool,
+    /// Whether the body holds lines of a document.
+    from_documents: bool,
     walked: Walked,
 }
 
@@ -179,10 +202,19 @@ struct Walked {
     /// Whether those rules also hide files in a folder named, so naming it
     /// as the path would not search all of it.
     hidden_inside: bool,
+    /// PDF and Office files passed by, as nothing named them.
+    documents: usize,
+    /// PDF and Office files that could not be read.
+    unread: usize,
 }
 
-/// Runs `query` until `deadline` or `files` files, and renders the page.
-pub(crate) fn search(query: &Query, deadline: Instant, files: usize) -> Result<String, String> {
+/// Runs `query` until `deadline` or `files` files, and renders the page;
+/// with whether it shows lines of a document.
+pub(crate) fn search(
+    query: &Query,
+    deadline: Instant,
+    files: usize,
+) -> Result<(String, bool), String> {
     let mut note = None;
     let regex = match query.pattern {
         None => None,
@@ -215,7 +247,8 @@ pub(crate) fn search(query: &Query, deadline: Instant, files: usize) -> Result<S
             page = again;
         }
     }
-    Ok(render(query, page, note))
+    let from_documents = page.from_documents;
+    Ok((render(query, page, note)?, from_documents))
 }
 
 fn build(pattern: &str, case_sensitive: bool) -> Result<Regex, regex::Error> {
@@ -247,9 +280,14 @@ fn literal(pattern: &str, case_sensitive: bool) -> Result<Regex, String> {
 
 /// The notes around a page: how the pattern was read, and whatever the walk
 /// could not finish or would not show.
-fn render(query: &Query, page: Page, note: Option<String>) -> String {
+fn render(query: &Query, page: Page, note: Option<String>) -> Result<String, String> {
     let mut out = note.map(|n| n + "\n").unwrap_or_default();
     match (page.body.is_empty(), query.offset) {
+        // Fenced whole, the notes after it Letronna's own.
+        (false, _) if page.from_documents => out.push_str(&crate::untrusted::fence(
+            page.body.trim_end(),
+            crate::chat::MAX_TOOL_CHARS,
+        )?),
         (false, _) => out.push_str(page.body.trim_end()),
         (true, 0) => out.push_str("No matches."),
         (true, offset) => out.push_str(&format!("Nothing past offset {offset}.")),
@@ -293,7 +331,22 @@ fn render(query: &Query, page: Page, note: Option<String>) -> String {
              the path to search it{though}."
         ));
     }
-    out
+    if walked.documents > 0 {
+        let files = match walked.documents {
+            1 => "1 PDF/Office file was".to_owned(),
+            n => format!("{n} PDF/Office files were"),
+        };
+        out.push_str(&format!(
+            "\n… {files} not searched; name them with type or glob."
+        ));
+    }
+    if walked.unread > 0 {
+        out.push_str(&format!(
+            "\n… PDF/Office files that could not be read: {}; read_file says why.",
+            walked.unread
+        ));
+    }
+    Ok(out)
 }
 
 /// One pass over the tree with `regex`, rendered the way `query.mode` asks.
@@ -304,12 +357,16 @@ fn find(
     files: usize,
 ) -> Result<Page, String> {
     let mut page = Page::default();
+    let mut passed = Passed::default();
     match (query.mode, regex) {
         (Mode::Content, Some(regex)) => {
             let (mut seen, end) = (0, query.offset.saturating_add(query.limit));
             page.walked = walk(query, deadline, files, &mut |entry| {
-                let Some(bytes) = searchable(entry) else {
-                    return Next::More;
+                let (bytes, document) = match content(entry, query, deadline, &mut passed) {
+                    Content::Text(bytes) => (bytes, false),
+                    Content::Document(bytes) => (bytes, true),
+                    Content::Passed => return Next::More,
+                    Content::Late => return Next::Late,
                 };
                 let Some(hits) = hits(&bytes, regex, deadline) else {
                     return Next::Late;
@@ -331,7 +388,16 @@ fn find(
                     let mut file = shown(entry.path(), query) + "\n";
                     let room = PAGE_BYTES.saturating_sub(page.body.len());
                     let (lines, context) = (lines(&bytes), query.context);
-                    let done = block(&mut file, room, &lines, &hits, &kept, context, regex);
+                    let places = match document {
+                        true => crate::docs::places(entry.path(), &lines),
+                        false => Vec::new(),
+                    };
+                    let found = Lines {
+                        lines: &lines,
+                        hits: &hits,
+                        places: &places,
+                    };
+                    let done = block(&mut file, room, &found, &kept, context, regex);
                     // Measured as it will be shown: with multi-byte text one
                     // match and its context can run to many kilobytes.
                     if file.len() > room && !page.body.is_empty() {
@@ -339,6 +405,7 @@ fn find(
                         return Next::Full;
                     }
                     page.body += &file;
+                    page.from_documents |= document;
                     if done < kept.len() {
                         page.tail = Some(more(first + done));
                     }
@@ -354,8 +421,10 @@ fn find(
             let mut found = Vec::new();
             page.walked = walk(query, deadline, files, &mut |entry| {
                 if let Some(regex) = regex {
-                    let Some(bytes) = searchable(entry) else {
-                        return Next::More;
+                    let bytes = match content(entry, query, deadline, &mut passed) {
+                        Content::Text(bytes) | Content::Document(bytes) => bytes,
+                        Content::Passed => return Next::More,
+                        Content::Late => return Next::Late,
                     };
                     let Some(hits) = hits(&bytes, regex, deadline) else {
                         return Next::Late;
@@ -386,8 +455,10 @@ fn find(
         (Mode::Count, Some(regex)) => {
             let mut found = Vec::new();
             page.walked = walk(query, deadline, files, &mut |entry| {
-                let Some(bytes) = searchable(entry) else {
-                    return Next::More;
+                let bytes = match content(entry, query, deadline, &mut passed) {
+                    Content::Text(bytes) | Content::Document(bytes) => bytes,
+                    Content::Passed => return Next::More,
+                    Content::Late => return Next::Late,
                 };
                 let Some(hits) = hits(&bytes, regex, deadline) else {
                     return Next::Late;
@@ -417,7 +488,55 @@ fn find(
         }
         (_, None) => return Err("Pattern is empty.".into()),
     }
+    (page.walked.documents, page.walked.unread) = (passed.documents, passed.unread);
     Ok(page)
+}
+
+/// The PDF and Office files a pass went by: those nothing named, and those
+/// it could not read.
+#[derive(Default)]
+struct Passed {
+    documents: usize,
+    unread: usize,
+}
+
+/// What of a file a search reads.
+enum Content {
+    Text(Vec<u8>),
+    /// A document's view, as read_file shows it.
+    Document(Vec<u8>),
+    /// Nothing: a binary, a file too large, or a document nothing named.
+    Passed,
+    /// Nothing, as the time ran out reading it.
+    Late,
+}
+
+/// What a search reads of `entry`: a document's view where the query names
+/// documents, else the file's text, counting in `passed` what it goes by.
+fn content(entry: &DirEntry, query: &Query, deadline: Instant, passed: &mut Passed) -> Content {
+    let path = entry.path();
+    if crate::docs::named(path) {
+        if !query.documents {
+            passed.documents += 1;
+            return Content::Passed;
+        }
+        match crate::docs::view_by(path, deadline) {
+            Ok(Some(view)) => return Content::Document(view.into_bytes()),
+            // Not one after all, as its first bytes say: read as any file.
+            Ok(None) => {}
+            Err(why) if crate::docs::ran_late(&why) || Instant::now() >= deadline => {
+                return Content::Late;
+            }
+            Err(_) => {
+                passed.unread += 1;
+                return Content::Passed;
+            }
+        }
+    }
+    match searchable(entry) {
+        Some(bytes) => Content::Text(bytes),
+        None => Content::Passed,
+    }
 }
 
 /// Whether `line` goes on the page: it keeps the page within `PAGE_BYTES`,
@@ -670,6 +789,8 @@ pub(crate) fn entries(root: &Path, deadline: Instant, most: usize) -> Result<Vec
         case_sensitive: false,
         limit: 0,
         offset: 0,
+        // Only names are walked; nothing is read.
+        documents: false,
     };
     let mut found = Vec::new();
     for entry in walker(&query, Arc::default())?.filter_map(Result::ok) {
@@ -926,15 +1047,24 @@ fn shown(path: &Path, query: &Query) -> String {
     .to_string()
 }
 
+/// A file's lines as a search shows them: which match, and for a document
+/// the lines that say where in it the others are.
+struct Lines<'a> {
+    lines: &'a [&'a [u8]],
+    hits: &'a [usize],
+    places: &'a [usize],
+}
+
 /// One file's `kept` matches with `context` lines around them, the way
 /// ripgrep shows them: `12:` on a matching line, `13-` on context, and `--`
-/// between runs that do not touch. Adds matches while `out` stays within
-/// `room` bytes, the first whatever its size, and says how many it added.
+/// between runs that do not touch. In a document each match follows the
+/// heading of its page, sheet or slide, shown as context unless it is shown
+/// already. Adds matches while `out` stays within `room` bytes, the first
+/// whatever its size, and says how many it added.
 fn block(
     out: &mut String,
     room: usize,
-    lines: &[&[u8]],
-    hits: &[usize],
+    file: &Lines,
     kept: &[usize],
     context: usize,
     regex: &Regex,
@@ -944,13 +1074,27 @@ fn block(
         let from = n
             .saturating_sub(context)
             .max(last.map_or(0, |last| last + 1));
-        let to = (n + context).min(lines.len() - 1);
+        let to = (n + context).min(file.lines.len() - 1);
+        let place = file.places[..file.places.partition_point(|&at| at <= n)]
+            .last()
+            .copied()
+            .filter(|&at| at < from && last.is_none_or(|last| at > last));
+        let apart = |at: usize| context > 0 && last.is_some_and(|last| at > last + 1);
         let mut run = String::new();
-        if context > 0 && last.is_some_and(|last| from > last + 1) {
+        if let Some(at) = place {
+            if apart(at) {
+                run.push_str("  --\n");
+            }
+            run.push_str(format!("  {}- {}", at + 1, clip(file.lines[at], None)).trim_end());
+            run.push('\n');
+            if context > 0 && from > at + 1 {
+                run.push_str("  --\n");
+            }
+        } else if apart(from) {
             run.push_str("  --\n");
         }
-        for (at, line) in lines.iter().enumerate().take(to + 1).skip(from) {
-            let hit = hits.binary_search(&at).is_ok();
+        for (at, line) in file.lines.iter().enumerate().take(to + 1).skip(from) {
+            let hit = file.hits.binary_search(&at).is_ok();
             let mark = if hit { ':' } else { '-' };
             let text = clip(line, hit.then_some(regex));
             // A blank line of context keeps no trailing space.
@@ -1011,11 +1155,94 @@ mod tests {
     /// Searches `dir` as the workspace with the full budget.
     fn run(dir: &Path, args: Value) -> String {
         let query = Query::from_args(&args, dir, Some(dir)).unwrap();
-        search(&query, Instant::now() + SEARCH_TIME, SEARCH_FILES).unwrap()
+        search(&query, Instant::now() + SEARCH_TIME, SEARCH_FILES)
+            .unwrap()
+            .0
     }
 
     fn sep(text: &str) -> String {
         text.replace('/', std::path::MAIN_SEPARATOR_STR)
+    }
+
+    #[test]
+    fn a_search_hits_text_on_a_pdf_page_with_its_heading() {
+        let dir = tree("documents", &[("notes.txt", "The board met.")]);
+        let pdf = crate::docs::tests::text_pdf(&[&["Minutes of the board"], &["Adjourned"]]);
+        std::fs::write(dir.join("minutes.pdf"), pdf).unwrap();
+        // Named by type, by glob, or as the path, it is read as read_file
+        // reads it, each match under the heading of its page, and fenced.
+        let named = |args: Value| {
+            let file = dir.join("minutes.pdf");
+            let query = Query::from_args(&args, &file, Some(&dir)).unwrap();
+            search(&query, Instant::now() + SEARCH_TIME, SEARCH_FILES)
+                .unwrap()
+                .0
+        };
+        for args in [
+            json!({"pattern": "adjourned|board", "type": "pdf"}),
+            json!({"pattern": "adjourned|board", "glob": "*.{pdf,docx}"}),
+            json!({"pattern": "adjourned|board", "path": "minutes.pdf"}),
+        ] {
+            let found = match args["path"].is_string() {
+                true => named(args.clone()),
+                false => run(&dir, args.clone()),
+            };
+            let (fenced, rest) = found.split_once('\n').unwrap();
+            assert!(fenced.starts_with("<untrusted-content-"), "{args}: {found}");
+            assert!(
+                rest.starts_with(
+                    "minutes.pdf\n  1- ## Page 1 of 2\n  2: Minutes of the board\n  \
+                     4- ## Page 2 of 2\n  5: Adjourned\n</untrusted-content-"
+                ),
+                "{args}: {found}"
+            );
+        }
+        // Context shows the lines between, the heading among them.
+        let found = run(
+            &dir,
+            json!({"pattern": "adjourned", "type": "pdf", "context": 2}),
+        );
+        assert!(
+            found.contains("minutes.pdf\n  3-\n  4- ## Page 2 of 2\n  5: Adjourned\n"),
+            "{found}"
+        );
+        // One that does not read is counted, not shown.
+        std::fs::write(dir.join("broken.pdf"), b"%PDF-1.7 and nothing more").unwrap();
+        let found = run(
+            &dir,
+            json!({"pattern": "board", "mode": "count", "type": "pdf"}),
+        );
+        assert_eq!(
+            found,
+            "minutes.pdf: 1\n… 1 matching lines in 1 files.\n\
+             … PDF/Office files that could not be read: 1; read_file says why."
+        );
+    }
+
+    #[test]
+    fn a_plain_search_names_the_documents_it_skipped() {
+        let dir = tree("skipped", &[("notes.txt", "budget for May")]);
+        let pdf = crate::docs::tests::text_pdf(&[&["The budget"]]);
+        std::fs::write(dir.join("budget.pdf"), &pdf).unwrap();
+        std::fs::write(dir.join("old.pdf"), &pdf).unwrap();
+        // Unread, and unfenced, as only the user's own text is shown.
+        assert_eq!(
+            run(&dir, json!({"pattern": "budget"})),
+            "notes.txt\n  1: budget for May\n\
+             … 2 PDF/Office files were not searched; name them with type or glob."
+        );
+        // A glob that leaves them out does not name them.
+        assert_eq!(
+            run(&dir, json!({"pattern": "budget", "glob": "!*.pdf"})),
+            "notes.txt\n  1: budget for May"
+        );
+        // Listing files reads none of them.
+        assert_eq!(
+            run(&dir, json!({"mode": "files", "glob": "*.pdf"}))
+                .lines()
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -1041,7 +1268,7 @@ mod tests {
         let query = Query::from_args(&args, &dir, None).unwrap();
         let far = Instant::now() + SEARCH_TIME;
         assert_eq!(
-            search(&query, far, SEARCH_FILES).unwrap(),
+            search(&query, far, SEARCH_FILES).unwrap().0,
             format!(
                 "{}\n  1: a needle here",
                 Path::new("../elsewhere").join("ok.txt").display()
@@ -1049,8 +1276,8 @@ mod tests {
         );
         // Out of budget: stops at once and says why, rather than wandering on.
         for out in [
-            search(&query, far, 0).unwrap(),
-            search(&query, Instant::now(), SEARCH_FILES).unwrap(),
+            search(&query, far, 0).unwrap().0,
+            search(&query, Instant::now(), SEARCH_FILES).unwrap().0,
         ] {
             assert!(out.starts_with("No matches."), "{out}");
             assert!(out.contains("Stopped early after 0 files"), "{out}");
@@ -1422,7 +1649,9 @@ mod tests {
         );
         let outside = |args: Value| {
             let query = Query::from_args(&args, &dir, None).unwrap();
-            search(&query, Instant::now() + SEARCH_TIME, SEARCH_FILES).unwrap()
+            search(&query, Instant::now() + SEARCH_TIME, SEARCH_FILES)
+                .unwrap()
+                .0
         };
         let given = Path::new(".").join("notes.txt").display().to_string();
         // Neither a type that lists dotfiles nor an ignore file's `!` brings
@@ -1538,7 +1767,9 @@ mod tests {
         let inside = run_dir.join("in");
         let query = Query::from_args(&args, &inside, Some(&run_dir)).unwrap();
         assert_eq!(
-            search(&query, Instant::now() + SEARCH_TIME, SEARCH_FILES).unwrap(),
+            search(&query, Instant::now() + SEARCH_TIME, SEARCH_FILES)
+                .unwrap()
+                .0,
             sep("in/z.txt\n  1: needle\n") + &named("in/data/")
         );
         // Named as the path, the folder is searched.
@@ -1546,7 +1777,9 @@ mod tests {
         let data = run_dir.join("data");
         let query = Query::from_args(&args, &data, Some(&run_dir)).unwrap();
         assert_eq!(
-            search(&query, Instant::now() + SEARCH_TIME, SEARCH_FILES).unwrap(),
+            search(&query, Instant::now() + SEARCH_TIME, SEARCH_FILES)
+                .unwrap()
+                .0,
             sep("data/x.csv\n  1: needle")
         );
         // At the repository's root the `.gitignore` is the project's own.
@@ -1657,7 +1890,9 @@ mod tests {
         let mut query = Query::from_args(&args, &dir, Some(&dir)).unwrap();
         query.data = Some(dir.join("data"));
         assert_eq!(
-            search(&query, Instant::now() + SEARCH_TIME, SEARCH_FILES).unwrap(),
+            search(&query, Instant::now() + SEARCH_TIME, SEARCH_FILES)
+                .unwrap()
+                .0,
             "a.txt\n  1: needle"
         );
         std::fs::remove_dir_all(dir).unwrap();
