@@ -547,7 +547,7 @@ impl Tool for Transcribe {
         "transcribe"
     }
     fn description(&self) -> &'static str {
-        "Turn the speech in an audio or video file into text, on Letronna's hosted models. Files up to 25 MB. It is paid from the user's Letronna credit by the minute of audio."
+        "Turn the speech in an audio or video file into text, on Letronna's hosted models. Files up to 25 MB. It is paid from the user's Letronna credit by the minute of audio, so use it only when the task needs what a recording says, such as a transcript or a summary. It returns the words as plain text, without timings."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {

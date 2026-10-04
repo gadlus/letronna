@@ -27,12 +27,12 @@
   },
   {
     "function": {
-      "description": "List the entries of a folder. Folders end with a slash.",
+      "description": "List one folder's entries, one a line, not what its subfolders hold. Folders end with a slash. To find files by name across the tree, use search with mode files and a glob.",
       "name": "list_dir",
       "parameters": {
         "properties": {
           "path": {
-            "description": "Defaults to the workspace root.",
+            "description": "The folder, relative to the workspace; the workspace root if left out.",
             "type": "string"
           }
         },
@@ -268,11 +268,12 @@
   },
   {
     "function": {
-      "description": "Stop a background job.",
+      "description": "Stop a background job, killing the processes it started if it still runs. No exit notice follows; read_job still shows its log for a while.",
       "name": "stop_job",
       "parameters": {
         "properties": {
           "id": {
+            "description": "The job's number, from list_jobs or the call that started it.",
             "type": "integer"
           }
         },
@@ -337,7 +338,7 @@
             "type": "integer"
           },
           "seconds": {
-            "description": "How long to wait. Also the limit when waiting for output.",
+            "description": "How long to wait, 10 unless given and 120 at most. Also the limit when waiting for output.",
             "type": "number"
           },
           "until": {
@@ -899,7 +900,7 @@
   },
   {
     "function": {
-      "description": "Turn the speech in an audio or video file into text, on Letronna's hosted models. Files up to 25 MB. It is paid from the user's Letronna credit by the minute of audio.",
+      "description": "Turn the speech in an audio or video file into text, on Letronna's hosted models. Files up to 25 MB. It is paid from the user's Letronna credit by the minute of audio, so use it only when the task needs what a recording says, such as a transcript or a summary. It returns the words as plain text, without timings.",
       "name": "transcribe",
       "parameters": {
         "properties": {
