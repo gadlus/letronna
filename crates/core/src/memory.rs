@@ -1200,6 +1200,43 @@ pub(crate) fn chat_folder(session: u64) -> PathBuf {
     chat_dir(&crate::chat::data_dir(), session)
 }
 
+/// Give chat `to`, a fork of chat `from`, a copy of `from`'s own notes and
+/// their history, as it has a copy of its messages: in a private chat they
+/// are all it remembers.
+pub fn copy_chat_notes(from: u64, to: u64) -> Result<(), String> {
+    copy_notes_in(&crate::chat::data_dir(), from, to)
+}
+
+fn copy_notes_in(data: &Path, from: u64, to: u64) -> Result<(), String> {
+    let failed = |e: std::io::Error| {
+        format!(
+            "The fork started without the notes of the chat it came from, as they could not be copied ({e}). They are still in that chat."
+        )
+    };
+    let entries = match std::fs::read_dir(chat_dir(data, from)) {
+        Ok(entries) => entries,
+        // A chat that never kept a note has no folder.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(failed(e)),
+    };
+    let copy = chat_dir(data, to);
+    std::fs::create_dir_all(&copy).map_err(failed)?;
+    for entry in entries {
+        let entry = entry.map_err(failed)?;
+        let name = entry.file_name();
+        // The lock is held on the original's file, and a temporary one is a
+        // write still under way, which lands in the original alone.
+        let own = name
+            .to_str()
+            .is_none_or(|name| name.ends_with(".lock") || name.ends_with(".tmp"));
+        if own || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        std::fs::copy(entry.path(), copy.join(&name)).map_err(failed)?;
+    }
+    Ok(())
+}
+
 /// Where the notes on the project at `root` are kept: a folder named by the
 /// SHA-256 of its path, which can be too long or too odd to name one itself.
 fn project_dir(data: &Path, root: &Path) -> PathBuf {
@@ -4242,6 +4279,36 @@ mod tests {
         let rules = context_in(&dir, &here);
         assert!(rules.contains("Run make test."), "{rules}");
         assert!(loaded(&rules).is_empty(), "{rules}");
+    }
+
+    #[test]
+    fn a_fork_keeps_the_chats_own_notes() {
+        let dir = scratch("fork-notes");
+        let (chat, fork) = (9_500_040, 9_500_041);
+        let notes = chat_dir(&dir, chat);
+        apply(&notes, Target::Chat, "add", "Planning a trip.", "").unwrap();
+        // A lock and a write cut short stay the original's.
+        std::fs::write(notes.join("MEMORY.lock"), "").unwrap();
+        std::fs::write(notes.join("MEMORY.42.tmp"), "half").unwrap();
+        copy_notes_in(&dir, chat, fork).unwrap();
+        let connection = |conversation| Connection {
+            tools: true,
+            conversation,
+            ..Default::default()
+        };
+        let kept = remembered_with(&dir, &connection(fork), Scope::Chat);
+        assert!(kept.contains("Planning a trip."), "{kept}");
+        let copy = chat_dir(&dir, fork);
+        assert_eq!(changes(&copy, "MEMORY.md").len(), 1);
+        assert!(!copy.join("MEMORY.lock").exists());
+        assert!(!copy.join("MEMORY.42.tmp").exists());
+        // From then on each keeps its own.
+        apply(&copy, Target::Chat, "add", "Flies on Friday.", "").unwrap();
+        let original = remembered_with(&dir, &connection(chat), Scope::Chat);
+        assert!(!original.contains("Flies on Friday."), "{original}");
+        // A chat with no notes forks into one with none.
+        copy_notes_in(&dir, 9_500_042, 9_500_043).unwrap();
+        assert!(!chat_dir(&dir, 9_500_043).exists());
     }
 
     #[test]
