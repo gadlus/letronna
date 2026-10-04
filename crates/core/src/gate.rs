@@ -475,7 +475,9 @@ fn ladder(
     let Some(tool) = tools::find(&call.name) else {
         return Outcome::Refuse(tools::unknown(&call.name));
     };
-    let args = match tools::parse_args(&call.arguments) {
+    // Read as the tool will run them, under its own names and types, so no
+    // layer judges an empty line while the tool runs `cmd`.
+    let args = match tools::parse_args_for(&call.name, &call.arguments) {
         Ok(args) => args,
         Err(error) => return Outcome::Refuse(error),
     };
@@ -774,7 +776,7 @@ pub fn grant(call: &ToolCall) -> String {
     if call.name == crate::computer::COMPUTER {
         return crate::computer::grant_key(call);
     }
-    let args = tools::parse_args(&call.arguments).unwrap_or_default();
+    let args = tools::parse_args_for(&call.name, &call.arguments).unwrap_or_default();
     // Uploads only cover other uploads: a yes to using pages is not one to
     // send this computer's files to them.
     if uploads(&call.name, &args) {
@@ -889,9 +891,6 @@ fn reach(tool: &dyn Tool, args: &Value, ctx: &ToolContext) -> Option<Reach> {
     if !crate::taint::marked(ctx) {
         return None;
     }
-    // The tool takes other agents' names for its parameters, as `cmd`.
-    let mut args = args.clone();
-    tools::rename_aliases(tool.name(), &mut args);
     let dir = ctx.workspace.as_deref();
     match tool.name() {
         "run_command" => {
@@ -900,7 +899,7 @@ fn reach(tool: &dyn Tool, args: &Value, ctx: &ToolContext) -> Option<Reach> {
         }
         // A shell runs what is typed into it as it runs a command line.
         "send_job" => {
-            let typed = tools::typed(&args, ctx);
+            let typed = tools::typed(args, ctx);
             let commands: Vec<command::Command> = (typed.lines.iter())
                 .flat_map(|line| command::assess(line, Dialect::here(), dir).commands)
                 .collect();
@@ -911,11 +910,11 @@ fn reach(tool: &dyn Tool, args: &Value, ctx: &ToolContext) -> Option<Reach> {
             let raw = args["path"].as_str()?;
             (dir.is_some() && replaces(raw, dir, ctx)).then_some(Reach::Destroys)
         }
-        crate::patch::APPLY_PATCH => (crate::patch::removes(&args).iter())
+        crate::patch::APPLY_PATCH => (crate::patch::removes(args).iter())
             .any(|raw| !own(raw, dir, ctx))
             .then_some(Reach::Destroys),
         crate::messaging::files::SEND_FILE => Some(Reach::Posts),
-        name if uploads(name, &args) => Some(Reach::SendsOut),
+        name if uploads(name, args) => Some(Reach::SendsOut),
         // A server's word that its tool stays on this machine does not make
         // a delete through it any safer.
         _ => (tool.mutates() && (tool.open_world() || tool.destructive())).then_some(Reach::Writes),
@@ -4371,5 +4370,124 @@ mod tests {
         crate::memory::heard(9_200_001, &[said("Fix the build.")]);
         assert_eq!(decided(Mode::Default, false, &none), Outcome::Run);
         crate::memory::forget(9_200_001);
+    }
+
+    /// The names other agents give `tool`'s parameter `ours`, which the tool
+    /// reads as it.
+    fn other_names(tool: &str, ours: &str) -> Vec<&'static str> {
+        (tools::ALIASES.iter())
+            .filter(|(_, to, tools)| *to == ours && tools.contains(&tool))
+            .map(|(theirs, ..)| *theirs)
+            .collect()
+    }
+
+    #[test]
+    fn a_command_under_another_agents_name_meets_the_floor_and_rules_in_every_mode() {
+        let dir = project_dir("aliased-command");
+        let ctx = ToolContext {
+            workspace: Some(dir.join("project")),
+            ..Default::default()
+        };
+        let rules = [Rule {
+            tool: "run_command".into(),
+            pattern: "git push".into(),
+            effect: permissions::Effect::Deny,
+            project: None,
+        }];
+        let none = Grants::new();
+        let granted = commands_granted();
+        // Each of these is settled before the judge, in Auto mode too.
+        let unasked = |_: &ToolCall, _: &str| -> Verdict { panic!("the judge was asked") };
+        let theirs = other_names("run_command", "command");
+        assert!(theirs.contains(&"cmd"), "{theirs:?}");
+        for mode in Mode::OFFERED {
+            for human in [true, false] {
+                for grants in [&none, &granted] {
+                    for sandbox in [false, true] {
+                        let gate = Gate {
+                            ctx: &ctx,
+                            mode,
+                            grants,
+                            rules: &rules,
+                            broken: None,
+                            human,
+                        };
+                        for line in [HARDLINE, DANGEROUS, "git push origin main"] {
+                            let decided = |name: &str| {
+                                let sent = call("run_command", serde_json::json!({ name: line }));
+                                decide_with(&sent, &gate, Some(&unasked), sandbox)
+                            };
+                            let what = format!("{line} in {mode:?}, human {human}");
+                            let own = decided("command");
+                            assert!(
+                                matches!(own, Outcome::Ask | Outcome::Refuse(_)),
+                                "{what}: {own:?}"
+                            );
+                            for name in &theirs {
+                                assert_eq!(decided(name), own, "`{name}`: {what}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_secret_or_denied_path_under_another_agents_name_asks_or_is_refused_in_every_mode() {
+        let dir = project_dir("aliased-path");
+        let project = dir.join("project");
+        std::fs::write(project.join(".env"), "TOKEN=x").unwrap();
+        std::fs::create_dir_all(project.join("private")).unwrap();
+        std::fs::write(project.join("private/notes.txt"), "x").unwrap();
+        let ctx = ToolContext {
+            workspace: Some(project),
+            ..Default::default()
+        };
+        let none = Grants::new();
+        let unasked = |_: &ToolCall, _: &str| -> Verdict { panic!("the judge was asked") };
+        for tool in ["read_file", "list_dir", "search"] {
+            let rules = [Rule {
+                tool: tool.into(),
+                pattern: "private/**".into(),
+                effect: permissions::Effect::Deny,
+                project: None,
+            }];
+            let theirs = other_names(tool, "path");
+            assert!(!theirs.is_empty(), "{tool}");
+            for mode in Mode::OFFERED {
+                for human in [true, false] {
+                    let gate = Gate {
+                        ctx: &ctx,
+                        mode,
+                        grants: &none,
+                        rules: &rules,
+                        broken: None,
+                        human,
+                    };
+                    for path in [".env", "private/notes.txt"] {
+                        let decided = |name: &str| {
+                            let sent = call(tool, serde_json::json!({ name: path }));
+                            decide_with(&sent, &gate, Some(&unasked), false)
+                        };
+                        let what = format!("{tool} {path} in {mode:?}, human {human}");
+                        let own = decided("path");
+                        assert!(
+                            matches!(own, Outcome::Ask | Outcome::Refuse(_)),
+                            "{what}: {own:?}"
+                        );
+                        for name in &theirs {
+                            assert_eq!(decided(name), own, "`{name}`: {what}");
+                        }
+                    }
+                }
+            }
+        }
+        // The tool reads the other name too, and without the yes refuses.
+        let read = serde_json::json!({ "file_path": ".env" }).to_string();
+        let refused = tools::run("read_file", &read, &ctx).unwrap_err();
+        assert!(refused.contains("holds keys"), "{refused}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
