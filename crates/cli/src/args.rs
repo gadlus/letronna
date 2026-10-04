@@ -775,4 +775,52 @@ mod tests {
         assert!(refused(&["--memory-scope", "team"]).contains("auto, project or chat"));
         assert!(refused(&["--private", "--continue"]).starts_with("--private starts a new chat"));
     }
+
+    /// The skill that tells the model how Letronna works keeps up with what
+    /// `--help` and `/help` list, so a verb added since is not left to a
+    /// guess.
+    #[test]
+    fn the_help_skill_names_every_cli_verb_and_slash_command() {
+        let skill = include_str!("../../core/skills-builtin/letronna/SKILL.md");
+        // Named whole: `/mode` inside `/model` is not `/mode`.
+        let names = |word: &str| {
+            skill.match_indices(word).any(|(at, _)| {
+                !skill[at + word.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '-')
+            })
+        };
+        let mut missing = Vec::new();
+        for line in super::HELP.lines().map(str::trim) {
+            // A use, `letronna mcp serve   offer ...`: the words before
+            // the gap and any placeholder.
+            if let Some(usage) = line.strip_prefix("letronna ") {
+                let words: Vec<&str> = usage
+                    .split("  ")
+                    .next()
+                    .unwrap_or_default()
+                    .split(' ')
+                    .filter(|word| !word.is_empty())
+                    .take_while(|word| !word.starts_with(['<', '[', '"']))
+                    .collect();
+                let verb = format!("letronna {}", words.join(" "));
+                if !words.is_empty() && !names(&verb) {
+                    missing.push(verb);
+                }
+            }
+            // An option, `-p, --print <prompt>   ask ...`: its long name.
+            if line.starts_with('-') {
+                let flags = line.split("  ").next().unwrap_or_default();
+                for flag in flags.split([' ', ',']).filter(|f| f.starts_with("--")) {
+                    if !names(flag) {
+                        missing.push(flag.to_owned());
+                    }
+                }
+            }
+        }
+        for command in crate::bar::COMMANDS {
+            if !names(command.name) {
+                missing.push(command.name.to_owned());
+            }
+        }
+        assert!(missing.is_empty(), "The help skill leaves out {missing:?}");
+    }
 }

@@ -353,6 +353,7 @@ fn from_skill(skill: &Skill) -> Option<Command> {
                     Source::Plugin => "a plugin's skill",
                     Source::User if skill.learned => "a learned skill",
                     Source::User => "an installed skill",
+                    Source::BuiltIn => "a built-in skill",
                 },
                 &skill.body,
             ),

@@ -2335,6 +2335,7 @@ fn skill_about(skill: &Skill) -> String {
         Source::User => "yours",
         Source::Project => "project",
         Source::Plugin => "plugin",
+        Source::BuiltIn => "built in",
     };
     format!("{source} · {}", skill.description)
 }

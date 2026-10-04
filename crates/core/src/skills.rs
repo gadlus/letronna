@@ -13,6 +13,13 @@
 //! project folder, so a repository cannot quietly swap out a skill the user
 //! relies on.
 //!
+//! Letronna brings a few of its own, such as `letronna`, which knows its
+//! commands and settings. They are read from the binary rather than written
+//! into the user's folder, where an update would leave a stale copy, and
+//! come last, so any other skill of the same name takes their place. One is
+//! unpacked into `<data>/skills-builtin/<version>` only when it is loaded,
+//! so its files can be read and run like any skill's.
+//!
 //! Each skill can be switched off. What is kept is the names that are off, in
 //! `skills-off.json`, so a skill that is new, installed or brought by a
 //! project starts on. One the model writes itself is the exception: it is
@@ -86,6 +93,27 @@ const HEAD_BYTES: u64 = 16_384;
 /// tool's reply over the chat's cap, counted in bytes, loses its middle, and
 /// a page of wide characters would lose part of itself.
 const PAGE_BYTES: usize = crate::chat::MAX_TOOL_CHARS - 500;
+/// Where the built-in skills are unpacked when loaded, in the data folder.
+const BUILT_IN_DIR: &str = "skills-builtin";
+/// The skills that come with Letronna: each one's folder name, then its
+/// files by their path in the folder.
+const BUILT_IN: &[(&str, &[(&str, &str)])] = &[(
+    "letronna",
+    &[
+        (
+            SKILL_FILE,
+            include_str!("../skills-builtin/letronna/SKILL.md"),
+        ),
+        (
+            "chat-apps.md",
+            include_str!("../skills-builtin/letronna/chat-apps.md"),
+        ),
+        (
+            "settings-and-data.md",
+            include_str!("../skills-builtin/letronna/settings-and-data.md"),
+        ),
+    ],
+)];
 
 /// Where a skill comes from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -97,6 +125,8 @@ pub enum Source {
     Project,
     /// A plugin's skills folder.
     Plugin,
+    /// Letronna's own, from the binary.
+    BuiltIn,
 }
 
 /// A skill as the list shows it.
@@ -136,9 +166,10 @@ pub(crate) fn list_in(data: &Path, workspace: Option<&Path>) -> Result<Vec<Skill
     gather(data, workspace, read_skill)
 }
 
-/// The skills on disk, each read by `read`, without moving skills.json
-/// across: the model's index and tool gather on every request, which should
-/// never write. At most `REQUEST_SKILLS` are read, the user's first.
+/// The skills on disk, each read by `read`, then the built-in ones, without
+/// moving skills.json across: the model's index and tool gather on every
+/// request, which should never write. At most `REQUEST_SKILLS` are read,
+/// the user's first.
 fn gather(
     data: &Path,
     workspace: Option<&Path>,
@@ -146,7 +177,13 @@ fn gather(
 ) -> Result<Vec<Skill>, String> {
     let off = switched_off(data)?;
     let mut skills: Vec<Skill> = Vec::new();
-    for (root, source) in roots(data, workspace) {
+    let mut found = roots(data, workspace);
+    // Last, so any other skill of the same name takes their place.
+    found.push((
+        data.join(BUILT_IN_DIR).join(crate::update::VERSION),
+        Source::BuiltIn,
+    ));
+    for (root, source) in found {
         if skills.len() >= REQUEST_SKILLS {
             break;
         }
@@ -313,7 +350,8 @@ fn remove_in(data: &Path, name: &str) -> Result<PathBuf, String> {
 fn not_yours(name: &str) -> String {
     format!(
         "None of your skills is called \"{name}\". A skill that comes with a project is changed \
-         in the project's folder."
+         in the project's folder, and one that comes with Letronna is switched off or replaced by \
+         a skill of yours of the same name."
     )
 }
 
@@ -485,8 +523,19 @@ fn load(
             format!("{why} Switched on: {}.", names.join(", "))
         });
     };
+    // Only now is a built-in one put on disk, where its files are read from.
+    // Its instructions are in the binary, so a data folder that cannot be
+    // written costs only the files beside them.
+    let unpacked = match skill.source {
+        Source::BuiltIn => unpack(&skill.folder),
+        _ => Ok(()),
+    };
     let text = match file {
-        Some(file) => told(skill, "this file", &support_file(&skill.folder, file)?),
+        Some(file) => {
+            unpacked?;
+            told(skill, "this file", &support_file(&skill.folder, file)?)
+        }
+        None if skill.source == Source::BuiltIn => overview(skill),
         // Only now is the whole of it read.
         None => {
             let whole = read_skill(&skill.folder, skill.source).ok_or_else(|| {
@@ -507,7 +556,7 @@ fn from(skill: &Skill) -> &'static str {
     match skill.source {
         Source::User if skill.learned => " (learned)",
         Source::User if installed(skill) => " (installed)",
-        Source::User => "",
+        Source::User | Source::BuiltIn => "",
         Source::Project => " (from this project)",
         Source::Plugin => " (from a plugin)",
     }
@@ -523,10 +572,11 @@ pub(crate) fn installed(skill: &Skill) -> bool {
 /// model reads it: cleaned and marked as the project's instruction file is,
 /// since a cloned repository's or a downloaded skill is anyone's, and a
 /// learned one was written by a model that may have been reading one. `what`
-/// names it in the note. The user's own are as written.
+/// names it in the note. The user's own and Letronna's are as written.
 fn told(skill: &Skill, what: &str, text: &str) -> String {
     match skill.source {
         Source::User if !skill.learned && !installed(skill) => text.to_owned(),
+        Source::BuiltIn => text.to_owned(),
         Source::User | Source::Project | Source::Plugin => crate::untrusted::vetted(what, text),
     }
 }
@@ -763,12 +813,16 @@ pub(crate) fn read_root(root: &Path, source: Source) -> Vec<Skill> {
     read_root_with(root, source, read_skill)
 }
 
-/// `read_root`, with each skill read by `read`.
+/// `read_root`, with each skill read by `read`; the built-in ones come from
+/// the binary.
 fn read_root_with(
     root: &Path,
     source: Source,
     read: fn(&Path, Source) -> Option<Skill>,
 ) -> Vec<Skill> {
+    if source == Source::BuiltIn {
+        return built_in(root);
+    }
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
@@ -788,6 +842,72 @@ fn read_root_with(
         .take(ROOT_SKILLS)
         .filter_map(|folder| read(folder, source))
         .collect()
+}
+
+/// The built-in skills, read from the binary, so listing them never writes;
+/// each one's folder is the one under `root` it is unpacked into.
+fn built_in(root: &Path) -> Vec<Skill> {
+    BUILT_IN
+        .iter()
+        .filter_map(|(name, files)| {
+            let (_, text) = files.iter().find(|(path, _)| *path == SKILL_FILE)?;
+            parse_skill(&root.join(name), Source::BuiltIn, text)
+        })
+        .collect()
+}
+
+/// Write a built-in skill's files into its folder, each only when what is
+/// there differs: a second load writes nothing, and a copy changed by hand
+/// is put back.
+fn unpack(folder: &Path) -> Result<(), String> {
+    let files = BUILT_IN
+        .iter()
+        .find(|(name, _)| folder.file_name().is_some_and(|f| f == *name))
+        .map_or(&[][..], |(_, files)| *files);
+    let mut wrote = false;
+    for (path, text) in files {
+        let file = folder.join(path);
+        if read_text(&file, SKILL_BYTES).as_deref() == Some(*text) {
+            continue;
+        }
+        let temp = temp_beside(&file);
+        file.parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&temp, text))
+            .and_then(|()| std::fs::rename(&temp, &file))
+            .map_err(|e| format!("Could not unpack the skill into {}: {e}", folder.display()))?;
+        wrote = true;
+    }
+    // Most likely a version's first load, after which the copies older ones
+    // unpacked would only pile up, an update at a time.
+    if wrote {
+        prune(folder);
+    }
+    Ok(())
+}
+
+/// Remove the folders other versions unpacked their built-in skills into,
+/// beside the one `folder` is in. Best effort: one left behind costs only
+/// its space, and a binary of that version still running unpacks it again
+/// when it next loads one.
+fn prune(folder: &Path) {
+    let Some(version) = folder.parent() else {
+        return;
+    };
+    let Some(root) = version
+        .parent()
+        .filter(|root| root.file_name().is_some_and(|n| n == BUILT_IN_DIR))
+    else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.path() != version && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// The skill in `folder`, if it holds a SKILL.md that can be read. A missing
@@ -1402,8 +1522,8 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        INDEX_CHARS, PAGE_CHARS, Skill, Source, context_in, create_in, defaults, edit_in, list_in,
-        load, migrate_in, remove_in, scalar, set_enabled_in, slug, split, value,
+        INDEX_CHARS, PAGE_CHARS, Skill, Source, context_in, create_in, defaults, edit_in, find,
+        list_in, load, migrate_in, remove_in, scalar, set_enabled_in, slug, split, value,
     };
     use crate::chat::{Connection, Remote};
     use std::path::{Path, PathBuf};
@@ -1425,8 +1545,21 @@ mod tests {
             .collect()
     }
 
+    /// The skills listed but the built-in ones, which every list has.
+    fn on_disk(skills: Vec<Skill>) -> Vec<Skill> {
+        skills
+            .into_iter()
+            .filter(|s| s.source != Source::BuiltIn)
+            .collect()
+    }
+
+    /// Their names, but the built-in ones'.
     fn names(skills: &[Skill]) -> Vec<&str> {
-        skills.iter().map(|s| s.name.as_str()).collect()
+        skills
+            .iter()
+            .filter(|s| s.source != Source::BuiltIn)
+            .map(|s| s.name.as_str())
+            .collect()
     }
 
     fn write(path: &Path, text: &str) {
@@ -1437,7 +1570,7 @@ mod tests {
     #[test]
     fn a_first_run_writes_the_built_in_skills_as_folders() {
         let data = scratch("first-run");
-        let skills = list_in(&data, None).unwrap();
+        let skills = on_disk(list_in(&data, None).unwrap());
         assert_eq!(skills.len(), defaults().len());
         for skill in &skills {
             assert_eq!(skill.source, Source::User);
@@ -1446,13 +1579,13 @@ mod tests {
             assert!(skill.folder.join("SKILL.md").is_file());
             assert!(!skill.description.is_empty());
         }
-        assert_eq!(list_in(&data, None).unwrap().len(), skills.len());
+        assert_eq!(on_disk(list_in(&data, None).unwrap()).len(), skills.len());
 
         // Removing them all leaves an empty folder, not the defaults again.
         for skill in &skills {
             remove_in(&data, &skill.name).unwrap();
         }
-        assert!(list_in(&data, None).unwrap().is_empty());
+        assert!(on_disk(list_in(&data, None).unwrap()).is_empty());
     }
 
     #[test]
@@ -1463,7 +1596,7 @@ mod tests {
                        {"id": 3, "name": "Blank", "prompt": "  "}]"#;
         std::fs::write(data.join("skills.json"), old).unwrap();
 
-        let skills = list_in(&data, None).unwrap();
+        let skills = on_disk(list_in(&data, None).unwrap());
         assert_eq!(names(&skills), ["Mine", "Nameless prompt"]);
         assert_eq!(skills[0].body, "Keep me\nwhole");
         assert_eq!(skills[0].description, "Keep me whole");
@@ -1710,7 +1843,7 @@ mod tests {
         let data = scratch("switches");
         list_in(&data, None).unwrap();
         set_enabled_in(&data, "run the tests", true).unwrap();
-        let skills = list_in(&data, None).unwrap();
+        let skills = on_disk(list_in(&data, None).unwrap());
         let on: Vec<&str> = skills
             .iter()
             .filter(|s| s.enabled)
@@ -1861,7 +1994,7 @@ mod tests {
             &data.join("skills/x/SKILL.md"),
             "---\nname: \"two\\nlines\"\ndescription: \"red \u{1b}[31mtext\"\n---\nBody",
         );
-        let skills = list_in(&data, None).unwrap();
+        let skills = on_disk(list_in(&data, None).unwrap());
         assert_eq!(skills[0].name, "two lines");
         assert_eq!(skills[0].description, "red [31mtext");
     }
@@ -1935,11 +2068,13 @@ mod tests {
         let text = context_in(&data, &with_tools(Some(project.clone())));
         assert!(text.starts_with("\n\nSkills you can load with the skill tool."));
         let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("- ")).collect();
-        assert_eq!(lines.len(), 3, "{text}");
-        assert!(lines[0].starts_with("- Review these changes: Look at the uncommitted"));
-        assert!(lines[1].starts_with("- Run the tests: "));
+        assert_eq!(lines.len(), 4, "{text}");
+        // The built-in one is on, and as the user's own are, unmarked.
+        assert!(lines[0].starts_with("- letronna: Letronna itself: "));
+        assert!(lines[1].starts_with("- Review these changes: Look at the uncommitted"));
+        assert!(lines[2].starts_with("- Run the tests: "));
         // A project's skill says where it came from.
-        assert_eq!(lines[2], "- zebra (from this project): Stripes things.");
+        assert_eq!(lines[3], "- zebra (from this project): Stripes things.");
         assert!(text.contains("not by the user"), "{text}");
         let loaded = load(&data, Some(&project), "zebra", None, 0).unwrap();
         assert!(loaded.contains("not from the user"), "{loaded}");
@@ -2070,7 +2205,7 @@ mod tests {
             "Middle line.\n".repeat(5_000)
         );
         create_in(&data, "long", "Goes on a while.", &body).unwrap();
-        let heads = super::gather(&data, None, super::read_head).unwrap();
+        let heads = on_disk(super::gather(&data, None, super::read_head).unwrap());
         assert_eq!(heads[0].description, "Goes on a while.");
         assert_eq!(heads[0].body, "");
         let text = context_in(&data, &with_tools(None));
@@ -2159,7 +2294,8 @@ mod tests {
         );
         // Asked for, the list comes whole, in pages.
         let all = load(&data, None, "?", None, 0).unwrap();
-        assert!(all.starts_with("- skill 00: Does a great many things."));
+        assert!(all.starts_with("- letronna: "), "{all}");
+        assert!(all.contains("\n- skill 00: Does a great many things."));
         assert!(
             all.contains("Call skill with name \"?\" and offset"),
             "{all}"
@@ -2273,7 +2409,7 @@ mod tests {
         let off = load(&data, None, "run the tests", None, 0).unwrap_err();
         assert!(off.contains("switched off"), "{off}");
         assert!(
-            off.contains("Switched on: Explain this project, Review these changes."),
+            off.contains("Switched on: Explain this project, letronna, Review these changes."),
             "{off}"
         );
         let unknown = load(&data, None, "deploy", None, 0).unwrap_err();
@@ -2307,5 +2443,130 @@ mod tests {
                 .unwrap()
                 .contains("nothing past")
         );
+    }
+
+    #[test]
+    fn the_built_in_skill_is_on_and_in_the_index_without_being_written() {
+        let data = scratch("built-in");
+        let skills = list_in(&data, None).unwrap();
+        let help = find(&skills, "letronna").unwrap();
+        assert_eq!(help.source, Source::BuiltIn);
+        assert!(help.enabled && !help.learned);
+        assert!(help.body.contains("letronna doctor"), "{}", help.body);
+        let text = context_in(&data, &with_tools(None));
+        assert!(
+            text.contains(
+                "\n- letronna: Letronna itself: its commands, settings, chat apps, MCP servers, \
+                 profiles and doctor. Load before answering how to use or set up Letronna."
+            ),
+            "{text}"
+        );
+        // Read from the binary: listing it writes nothing.
+        assert!(!data.join("skills-builtin").exists());
+    }
+
+    #[test]
+    fn the_built_in_skill_is_unpacked_when_loaded_and_comes_whole() {
+        let data = scratch("unpack");
+        let page = load(&data, None, "letronna", None, 0).unwrap();
+        let folder = data
+            .join("skills-builtin")
+            .join(crate::update::VERSION)
+            .join("letronna");
+        assert!(page.contains(&folder.display().to_string()), "{page}");
+        assert!(
+            page.contains("- chat-apps.md\n- settings-and-data.md\n"),
+            "{page}"
+        );
+        // One page each, with no note on reading on.
+        assert!(!page.contains("… [characters"), "{page}");
+        assert!(page.ends_with("never invent a menu, setting or command."));
+        let apps = load(&data, None, "letronna", Some("chat-apps.md"), 0).unwrap();
+        assert!(apps.contains("Pair a chat") && !apps.contains("… [characters"));
+        let paths = load(&data, None, "letronna", Some("settings-and-data.md"), 0).unwrap();
+        assert!(paths.contains("AGENT_DATA_DIR") && !paths.contains("… [characters"));
+
+        // A copy changed by hand is put back by the next load.
+        std::fs::write(folder.join("chat-apps.md"), "Wrong.").unwrap();
+        assert_eq!(
+            load(&data, None, "letronna", Some("chat-apps.md"), 0).unwrap(),
+            apps
+        );
+    }
+
+    #[test]
+    fn a_new_version_s_first_load_removes_what_older_ones_unpacked() {
+        let data = scratch("prune");
+        let old = data.join("skills-builtin/0.0.1/letronna");
+        write(&old.join("SKILL.md"), "An older page.");
+        load(&data, None, "letronna", None, 0).unwrap();
+        assert!(!data.join("skills-builtin/0.0.1").exists());
+        assert!(
+            data.join("skills-builtin")
+                .join(crate::update::VERSION)
+                .join("letronna/SKILL.md")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn a_data_folder_that_cannot_be_written_still_serves_the_built_in_page() {
+        let data = scratch("unwritable");
+        // A file where the folder goes, so nothing can be unpacked.
+        std::fs::write(data.join("skills-builtin"), "").unwrap();
+        let page = load(&data, None, "letronna", None, 0).unwrap();
+        assert!(page.ends_with("never invent a menu, setting or command."));
+        let file = load(&data, None, "letronna", Some("chat-apps.md"), 0).unwrap_err();
+        assert!(file.starts_with("Could not unpack the skill"), "{file}");
+    }
+
+    #[test]
+    fn a_user_skill_named_letronna_wins_over_the_built_in() {
+        let data = scratch("user-wins");
+        let project = data.join("project");
+        write(
+            &project.join(".agents/skills/help/SKILL.md"),
+            "---\nname: letronna\ndescription: The project's.\n---\nTheirs.",
+        );
+        // A project's comes before it too.
+        let listed = list_in(&data, Some(&project)).unwrap();
+        assert_eq!(find(&listed, "letronna").unwrap().source, Source::Project);
+
+        create_in(&data, "Letronna", "Mine.", "My own notes.").unwrap();
+        let listed = list_in(&data, Some(&project)).unwrap();
+        let named: Vec<&Skill> = listed
+            .iter()
+            .filter(|s| s.name.eq_ignore_ascii_case("letronna"))
+            .collect();
+        assert_eq!(named.len(), 1, "{listed:?}");
+        assert_eq!(named[0].source, Source::User);
+        let loaded = load(&data, Some(&project), "letronna", None, 0).unwrap();
+        assert!(loaded.ends_with("My own notes."), "{loaded}");
+        assert!(!data.join("skills-builtin").exists());
+    }
+
+    #[test]
+    fn the_built_in_skill_can_be_switched_off() {
+        let data = scratch("built-in-off");
+        set_enabled_in(&data, "Letronna", false).unwrap();
+        let listed = list_in(&data, None).unwrap();
+        assert!(!find(&listed, "letronna").unwrap().enabled);
+        // The others start off too, so nothing is left to index.
+        assert_eq!(context_in(&data, &with_tools(None)), "");
+        let off = load(&data, None, "letronna", None, 0).unwrap_err();
+        assert!(off.contains("switched off"), "{off}");
+
+        set_enabled_in(&data, "letronna", true).unwrap();
+        assert!(context_in(&data, &with_tools(None)).contains("\n- letronna: "));
+        // Nor is it the user's to edit or remove, which says how instead.
+        for refused in [
+            edit_in(&data, "letronna", "letronna", None, "Mine now.").unwrap_err(),
+            remove_in(&data, "letronna").unwrap_err(),
+        ] {
+            assert!(
+                refused.contains("comes with Letronna is switched off"),
+                "{refused}"
+            );
+        }
     }
 }

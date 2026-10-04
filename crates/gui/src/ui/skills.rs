@@ -258,6 +258,7 @@ impl Chat {
         let badge = match (skill.source, skill.learned) {
             (Source::Project, _) => Some("Project"),
             (Source::Plugin, _) => Some("Plugin"),
+            (Source::BuiltIn, _) => Some("Built in"),
             (Source::User, true) => Some("Learned"),
             (Source::User, false) => None,
         };

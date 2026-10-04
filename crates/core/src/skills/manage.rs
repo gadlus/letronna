@@ -165,9 +165,12 @@ fn create(
         ));
     }
     if let Some(theirs) = find(&gather(data, workspace, read_skill)?, name) {
+        let whose = match theirs.source {
+            Source::BuiltIn => "Letronna already has",
+            _ => "The project already has",
+        };
         return Err(format!(
-            "The project already has a skill called \"{}\". Pick another name, so it is not \
-             hidden behind yours.",
+            "{whose} a skill called \"{}\". Pick another name, so it is not hidden behind yours.",
             theirs.name
         ));
     }
@@ -316,6 +319,13 @@ fn learned(data: &Path, workspace: Option<&Path>, name: &str) -> Result<PathBuf,
         return Err(format!(
             "\"{}\" comes with this project, so it is not yours to change. Say what you would \
              change and leave it to the user.",
+            skill.name
+        ));
+    }
+    if skill.source == Source::BuiltIn {
+        return Err(format!(
+            "\"{}\" comes with Letronna, so it is not yours to change. Say what is wrong with it \
+             and leave it to the user.",
             skill.name
         ));
     }
@@ -674,6 +684,16 @@ mod tests {
         // Nor can a learned one take its name and hide it.
         let args = json!({"action": "create", "name": "lint", "description": "x", "body": "y"});
         assert!(manage(&data, Some(&project), &args).is_err());
+    }
+
+    #[test]
+    fn a_built_in_skill_is_refused_and_keeps_its_name() {
+        let data = scratch("built-in");
+        let args = json!({"action": "patch", "name": "letronna", "old": "Letronna", "new": "It"});
+        let refused = manage(&data, None, &args).unwrap_err();
+        assert!(refused.contains("comes with Letronna"), "{refused}");
+        let refused = create(&data, "Letronna", "Mine now.").unwrap_err();
+        assert!(refused.starts_with("Letronna already has"), "{refused}");
     }
 
     #[test]
