@@ -2831,6 +2831,10 @@ fn begin(
     let window = window_from(&messages, &budget, extra.floor);
     let cleared = window + old_before(&messages[window..], &budget);
     crate::filestate::asked(connection.conversation, messages.len(), window, cleared);
+    // Only a reply that may call tools can save to memory.
+    if connection.tools {
+        crate::memory::heard(connection.conversation, &messages);
+    }
     let (sender, receiver) = async_channel::bounded(64);
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
