@@ -2214,12 +2214,12 @@ impl Tool for WriteFile {
         "write_file"
     }
     fn description(&self) -> &'static str {
-        "Create or overwrite a text file in the project folder. Parent folders are created. A file that exists keeps its line endings and byte order mark. Overwriting needs the whole file read first, in an earlier step; to change part of a file, use edit_file."
+        "Create or overwrite a text file in the project folder. Parent folders are created. A file that exists keeps its line endings and byte order mark. Overwriting needs the whole file read first with read_file in an earlier reply, or written with write_file, and not changed since; to change part of a file, use edit_file."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
             "path": {"type": "string"},
-            "content": {"type": "string"}
+            "content": {"type": "string", "description": "The whole new text of the file; none of the old text is kept."}
         }, "required": ["path", "content"]})
     }
     fn needs_approval(&self) -> bool {
@@ -2326,7 +2326,7 @@ impl Tool for EditFile {
         "edit_file"
     }
     fn description(&self) -> &'static str {
-        "Replace `old` with `new` in a file you have read. `old` must match exactly once, unless replace_all is set to change every match. Line endings, trailing spaces, indentation, curly quotes and invisible characters need not match; the file keeps its own. For several changes to one file, pass `edits` instead: they are made in order, and if one fails none is made."
+        "Replace `old` with `new` in a file you read with read_file in an earlier reply, or wrote with write_file, if it has not changed since; search hits and command output do not count as reads. `old` must match exactly once, unless replace_all is set to change every match. Line endings, trailing spaces, indentation, curly quotes and invisible characters need not match; the file keeps its own. For several changes to one file, pass `edits` instead: they are made in order, and if one fails none is made. A failed edit changes nothing and says why; a successful one need not be read back."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -7826,5 +7826,13 @@ mod tests {
             .run(&json!({"seconds": -5}), &ToolContext::default())
             .unwrap();
         assert_eq!(out, "Waited 0s.");
+    }
+
+    #[test]
+    fn the_edit_description_says_search_hits_do_not_count_as_reads() {
+        let edit = EditFile.description();
+        assert!(edit.contains("search hits and command output do not count"));
+        assert!(edit.contains("need not be read back"));
+        assert!(WriteFile.description().contains("in an earlier reply"));
     }
 }
