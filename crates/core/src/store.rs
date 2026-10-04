@@ -515,11 +515,16 @@ pub struct Settings {
     /// chosen for itself: everywhere, as before the choice, unless chosen.
     #[serde(default)]
     pub memory_scope: crate::memory::Scope,
+    /// Search with DuckDuckGo, which needs no key, while no search service
+    /// is chosen; switched off, search_web says how to turn it back on or
+    /// add a key.
+    #[serde(default = "yes")]
+    pub keyless_search: bool,
 }
 
-// Written out rather than derived so the film grain, notifications and
-// previews opening by themselves start on for a first run too, as they do
-// for a settings file from before them.
+// Written out rather than derived so the film grain, notifications,
+// previews opening by themselves and keyless search start on for a first
+// run too, as they do for a settings file from before them.
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -542,6 +547,7 @@ impl Default for Settings {
             memory_review: false,
             memory_saving: crate::memory::Saving::WhenAsked,
             memory_scope: crate::memory::Scope::Auto,
+            keyless_search: true,
             gateway: String::new(),
             custom_endpoint: String::new(),
             presence: String::new(),
@@ -3261,6 +3267,12 @@ pub(crate) fn plan_keeps_tools() -> bool {
     settings().0.plan_keeps_tools
 }
 
+/// Whether the settings file lets searches go to DuckDuckGo with no key,
+/// read again each time as `disabled_tools` is.
+pub(crate) fn keyless_search() -> bool {
+    settings().0.keyless_search
+}
+
 /// The settings file. A file that will not read at all is kept aside by
 /// `state::read` as before.
 fn read_settings_file() -> Settings {
@@ -5498,6 +5510,17 @@ pub(crate) mod tests {
         assert!(read("").verifies_edits());
         assert!(!read(r#", "verify_edits": false"#).verifies_edits());
         assert!(!read(r#", "disabled_tools": ["run_command"]"#).verifies_edits());
+    }
+
+    #[test]
+    fn keyless_search_is_on_unless_switched_off() {
+        let read = |extra: &str| {
+            let text = format!(r#"{{"endpoint": "", "model": "m"{extra}}}"#);
+            super::read_settings(text.as_bytes()).unwrap()
+        };
+        // A file from before the setting starts it on, as a first run does.
+        assert!(read("").keyless_search && super::Settings::default().keyless_search);
+        assert!(!read(r#", "keyless_search": false"#).keyless_search);
     }
 
     #[test]

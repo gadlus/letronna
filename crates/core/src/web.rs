@@ -1332,7 +1332,7 @@ impl<'a> Markdown<'a> {
 }
 
 /// The value of the attribute `name` in the tag `raw`, entities decoded.
-fn attribute(raw: &str, name: &str) -> Option<String> {
+pub(crate) fn attribute(raw: &str, name: &str) -> Option<String> {
     let lower = raw.to_ascii_lowercase();
     let mut at = 0;
     while let Some(found) = lower[at..].find(name).map(|i| at + i) {
@@ -1375,7 +1375,7 @@ fn backticks(text: &str) -> usize {
 
 /// Entities written out as the characters they stand for; anything that is
 /// not a known one is left as it was written.
-fn decode(text: &str) -> String {
+pub(crate) fn decode(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(amp) = rest.find('&') {

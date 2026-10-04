@@ -93,7 +93,7 @@ A reply that stays silent for five minutes is given up on. `LETRONNA_READ_TIMEOU
 
 ## Web search
 
-The Web toggle is the gateway's own search, and only some gateways have one. A search service of your own works with any of them: set one up in Settings under Search, or with `/search services` in the terminal, and the agent gets a `search_web` tool that asks before each search.
+The Web toggle is the gateway's own search, and only some gateways have one. A search service of your own works with any of them: set one up in Settings under Search, or with `/search services` in the terminal, and the agent gets a `search_web` tool that asks before each search. Until a service is chosen, searches go to DuckDuckGo without a key, each one asked first. DuckDuckGo has no public search API, so this is a setting, on unless switched off: `/search keyless` in the terminal, or `"keyless_search": false` in `settings.json`. Switched off with no service chosen, `search_web` says how to switch it back on or add a key instead of searching.
 
 | Service  | Official address                                  | Needs               |
 |----------|---------------------------------------------------|---------------------|
@@ -101,6 +101,7 @@ The Web toggle is the gateway's own search, and only some gateways have one. A s
 | Tavily   | `https://api.tavily.com/search`                   | an API key          |
 | Exa      | `https://api.exa.ai/search`                       | an API key          |
 | SearXNG  | your own server, such as `http://mac-mini:8888`   | its json format on  |
+| DuckDuckGo | `https://html.duckduckgo.com/html`              | nothing; unofficial, may be rate-limited |
 
 The one set up last is used. Each is reached at its official address unless you give another, such as a proxy; Reset, or `official` in the terminal, goes back to it. A SearXNG answers searches from Letronna only with `json` among the `formats` in its `settings.yml`. Keys are kept with the gateways' (see Local data).
 

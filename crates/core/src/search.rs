@@ -13,9 +13,21 @@
 //! only at the address it is given. Emptied, an address goes back to the
 //! official one.
 //!
-//! The tool is only offered once a service is set up, and asks before each
-//! search: the query leaves for somebody else's server, and a page read a
-//! moment ago may be what is asking for it.
+//! While no service is chosen, searches go to DuckDuckGo's page for browsers
+//! without JavaScript, which needs no key, so a fresh install can search from
+//! its first turn. DuckDuckGo has no public search API, so `keyless_search`
+//! in the settings, on unless the user switches it off, says whether it is
+//! used. It is never a stand-in: a chosen service that is not set up gives
+//! its own error, and switched off with no other service chosen, the tool
+//! says how to switch it back on or add a key rather than searching. It is
+//! asked once per search with Letronna's own user agent; when it limits
+//! searches, the model is told so rather than given an empty list, and it is
+//! left alone for a while.
+//!
+//! The tool is only offered while a service is usable, or DuckDuckGo is
+//! switched off with nothing else chosen, and asks before each search: the
+//! query leaves for somebody else's server, and a page read a moment ago may
+//! be what is asking for it.
 
 use crate::tools::{Tool, ToolContext};
 use serde::{Deserialize, Serialize};
@@ -39,6 +51,15 @@ const SNIPPET: usize = 300;
 const WIDER: u64 = 20;
 /// How long a search's answer is given again for the very same search.
 const MEMO_TIME: Duration = Duration::from_secs(10 * 60);
+/// How long DuckDuckGo is not asked again once it limits a search: asking at
+/// once only keeps the block in place, and a few minutes usually lift it.
+const HOLD_OFF: Duration = Duration::from_secs(5 * 60);
+/// What the model is told while DuckDuckGo limits searches. Not an empty
+/// list, which it would take for a subject nobody has written about.
+const LIMITED: &str = "DuckDuckGo is limiting searches from this connection for now. Read a page you know with web_fetch, or ask the user to add a search service in Settings › Search (/search services).";
+/// What a search is answered while DuckDuckGo is switched off and no other
+/// service is chosen: nothing is sent, and the user is told how to search.
+const SWITCHED_OFF: &str = "Searching with DuckDuckGo, which needs no key, is switched off and no other search service is chosen, so nothing was searched. The user can switch it back on with /search keyless in the terminal or \"keyless_search\": true in Letronna's settings.json, or add a search service's key in Settings › Search (/search services).";
 
 /// A search service Letronna can use.
 pub struct Service {
@@ -47,6 +68,9 @@ pub struct Service {
     /// Where it answers unless the user says otherwise. Empty for SearXNG,
     /// which is the user's own and needs no key.
     pub official: &'static str,
+    /// Needs neither a key nor an address of the user's: it is used while no
+    /// other is chosen, unless the settings switch it off.
+    pub keyless: bool,
 }
 
 impl Service {
@@ -61,21 +85,33 @@ pub const SERVICES: &[Service] = &[
         name: "Brave",
         blurb: "Brave's own index of the web. A free plan, then paid by the search.",
         official: "https://api.search.brave.com/res/v1/web/search",
+        keyless: false,
     },
     Service {
         name: "Tavily",
         blurb: "Search made for agents, each result with the text that matters.",
         official: "https://api.tavily.com/search",
+        keyless: false,
     },
     Service {
         name: "Exa",
         blurb: "Search by meaning, with the passages of each page that match.",
         official: "https://api.exa.ai/search",
+        keyless: false,
     },
     Service {
         name: "SearXNG",
         blurb: "Your own metasearch server, at its address. No key, nothing paid.",
         official: "",
+        keyless: false,
+    },
+    Service {
+        name: "DuckDuckGo",
+        blurb: "No key; unofficial, may be rate-limited; a key gives steadier results.",
+        // Its page without JavaScript, the one meant for any client; with no
+        // slash on the end, as `web_address` leaves an address.
+        official: "https://html.duckduckgo.com/html",
+        keyless: true,
     },
 ];
 
@@ -125,7 +161,8 @@ pub fn choice() -> Choice {
         .unwrap_or_default()
 }
 
-/// Save which service is used; an empty one turns searching off.
+/// Save which service is used; with none, DuckDuckGo is, unless the
+/// settings switch it off.
 pub fn choose(choice: &Choice) -> Result<(), String> {
     let _ = std::fs::create_dir_all(crate::chat::data_dir());
     let bytes = serde_json::to_vec_pretty(choice).map_err(|e| e.to_string())?;
@@ -136,20 +173,62 @@ fn choice_path() -> std::path::PathBuf {
     crate::chat::data_dir().join("search.json")
 }
 
-/// Whether a search service is set up, so the tool is offered.
+/// Whether the search in use is the keyless one, which a service with a key
+/// would make steadier.
+pub fn keyless() -> bool {
+    let now = standing();
+    now.ready && now.keyless
+}
+
+/// Whether a search service is usable, so searches go out.
 pub fn ready() -> bool {
+    standing().ready
+}
+
+/// Whether the tool is offered: while a service is usable, and while
+/// DuckDuckGo is switched off with no other chosen, so that a call can say
+/// how to search.
+pub fn offered() -> bool {
+    let now = standing();
+    now.ready || now.keyless
+}
+
+/// Why a search cannot go out though the tool is offered: DuckDuckGo is
+/// switched off and no other service is chosen.
+pub(crate) fn switched_off() -> Option<&'static str> {
+    let now = standing();
+    (now.keyless && !now.ready).then_some(SWITCHED_OFF)
+}
+
+/// Where searching stands, as the files say now.
+#[derive(Clone, Copy)]
+struct Standing {
+    /// A service is usable.
+    ready: bool,
+    /// The service searches go to, or would but for the settings, is the
+    /// keyless one.
+    keyless: bool,
+}
+
+fn standing() -> Standing {
     // Asked on every tool lookup -- several for each call, and one each
     // frame the window's approval card is up -- so the files are only read
     // again once one has changed: the terminal and the window each save
     // them, and each has to see the other's change.
-    static SEEN: Mutex<Option<([Stamp; 3], bool)>> = Mutex::new(None);
-    let (choice_file, keys, vault) = (
+    static SEEN: Mutex<Option<([Stamp; 4], Standing)>> = Mutex::new(None);
+    let (choice_file, keys, vault, settings) = (
         choice_path(),
         crate::store::keys_path(),
         crate::vault::index_path(),
+        crate::store::settings_path(),
     );
-    remembered(&SEEN, [&choice_file, &keys, &vault], || {
-        usable(&choice(), &crate::store::load_keys()).is_ok()
+    remembered(&SEEN, [&choice_file, &keys, &vault, &settings], || {
+        let choice = choice();
+        let keys = crate::store::load_keys();
+        Standing {
+            ready: usable(&choice, &keys, crate::store::keyless_search()).is_ok(),
+            keyless: picked(&choice).is_some_and(|s| s.keyless),
+        }
     })
 }
 
@@ -165,11 +244,11 @@ fn stamp(path: &Path) -> Stamp {
 
 /// The answer kept in `seen` while the files are as they were when it was
 /// read, or a fresh one from `read` once one has changed.
-fn remembered<const N: usize>(
-    seen: &Mutex<Option<([Stamp; N], bool)>>,
+fn remembered<T: Copy, const N: usize>(
+    seen: &Mutex<Option<([Stamp; N], T)>>,
     files: [&Path; N],
-    read: impl FnOnce() -> bool,
-) -> bool {
+    read: impl FnOnce() -> T,
+) -> T {
     // Stamped before reading, so a save that lands during the read leaves
     // a stamp that no longer matches, and the next call reads again.
     let stamps = files.map(stamp);
@@ -193,13 +272,33 @@ pub fn status(
     choice: &Choice,
     keys: &HashMap<String, String>,
 ) -> (&'static str, bool, bool) {
-    let set_up = match service(name) {
+    // Only the keyless one's stands on the settings, so only it reads them.
+    let keyless = service(name).is_some_and(|s| s.keyless) && crate::store::keyless_search();
+    status_with(name, choice, keys, keyless)
+}
+
+/// `status`, with `keyless` saying whether the settings let DuckDuckGo
+/// search.
+fn status_with(
+    name: &str,
+    choice: &Choice,
+    keys: &HashMap<String, String>,
+    keyless: bool,
+) -> (&'static str, bool, bool) {
+    let found = service(name);
+    let set_up = match found {
+        Some(s) if s.keyless => true,
         Some(s) if s.self_hosted() => !choice.address(s).is_empty(),
         Some(_) => keys.get(name).is_some_and(|key| !key.trim().is_empty()),
         None => false,
     };
-    match (set_up, choice.service == name) {
+    let in_use = picked(choice).is_some_and(|s| s.name == name);
+    match (set_up, in_use) {
+        // Nothing of it was saved: it needs nothing, and only the settings
+        // say whether it is used.
+        _ if found.is_some_and(|s| s.keyless) && !keyless => ("Switched off", false, true),
         (true, true) => ("In use", true, true),
+        (true, false) if found.is_some_and(|s| s.keyless) => ("Not in use", false, true),
         (true, false) => ("Saved, not in use", false, true),
         (false, _) => ("Not set up", false, false),
     }
@@ -207,6 +306,15 @@ pub fn status(
 
 pub fn service(name: &str) -> Option<&'static Service> {
     SERVICES.iter().find(|s| s.name == name)
+}
+
+/// The service searches go to: the one chosen, or with none chosen the
+/// keyless one, which the settings may switch off.
+fn picked(choice: &Choice) -> Option<&'static Service> {
+    match choice.service.as_str() {
+        "" => SERVICES.iter().find(|s| s.keyless),
+        name => service(name),
+    }
 }
 
 /// What searching needs: the service, its key (none for SearXNG) and the
@@ -217,19 +325,23 @@ struct Reach {
     address: String,
 }
 
-/// The service to search with, and how to reach it.
-fn usable(choice: &Choice, keys: &HashMap<String, String>) -> Result<Reach, String> {
-    let Some(service) = service(&choice.service) else {
+/// The service to search with, and how to reach it; `keyless` says whether
+/// the settings let DuckDuckGo search.
+fn usable(choice: &Choice, keys: &HashMap<String, String>, keyless: bool) -> Result<Reach, String> {
+    let Some(service) = picked(choice) else {
         return Err(
             "No search service is set up: add one in Settings, Search, or with /search services."
                 .into(),
         );
     };
+    if service.keyless && !keyless {
+        return Err(SWITCHED_OFF.into());
+    }
     let key = keys
         .get(service.name)
         .map(|key| key.trim().to_owned())
         .unwrap_or_default();
-    if !service.self_hosted() && key.is_empty() {
+    if !service.self_hosted() && !service.keyless && key.is_empty() {
         return Err(format!("{} has no key saved.", service.name));
     }
     let address = web_address(&choice.address(service), service.self_hosted());
@@ -269,7 +381,7 @@ impl Tool for SearchWeb {
         "search_web"
     }
     fn description(&self) -> &'static str {
-        "Search the web with the user's search service. Returns a numbered list of results, each with its title, address and a snippet; read a page in full with web_fetch. allowed_domains keeps only results from those sites and blocked_domains drops them, subdomains included; a site in both is blocked. Tavily and Exa narrow the search itself, while Brave and SearXNG are filtered here after they answer, so fewer results may come back. freshness keeps to pages from the last day, week, month or year. The same search again within 10 minutes gives the earlier answer."
+        "Search the web. Returns a numbered list of results, each with its title, address and a snippet; read a page in full with web_fetch. allowed_domains keeps only results from those sites and blocked_domains drops them, subdomains included; a site in both is blocked. Some services apply site filters after answering, so fewer results may come back. freshness keeps to pages from the last day, week, month or year. The same search again within 10 minutes gives the earlier answer."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -290,7 +402,8 @@ impl Tool for SearchWeb {
             .unwrap_or(RESULTS)
             .clamp(1, MOST_RESULTS);
         let options = options(args)?;
-        let reach = usable(&choice(), &crate::store::load_keys())?;
+        let keyless = crate::store::keyless_search();
+        let reach = usable(&choice(), &crate::store::load_keys(), keyless)?;
         let asked = Asked {
             service: reach.service.name,
             address: reach.address.clone(),
@@ -314,13 +427,15 @@ impl Tool for SearchWeb {
     }
     fn preview(&self, args: &Value, _: &ToolContext) -> String {
         let query = args["query"].as_str().unwrap_or_default();
-        // Tavily and Exa are sent the sites too, so the card and the judge
+        // Tavily and Exa are sent the sites too, and DuckDuckGo a single
+        // allowed one as site: in the query, so the card and the judge
         // see every word that leaves, not just the query. Filters that do
         // not parse stop the call before anything is sent.
         let filters = options(args)
             .map(|options| filters(&options))
             .unwrap_or_default();
-        let search = match usable(&choice(), &crate::store::load_keys()) {
+        let keyless = crate::store::keyless_search();
+        let search = match usable(&choice(), &crate::store::load_keys(), keyless) {
             Ok(reach) if reach.address == reach.service.official => {
                 format!("Search {} for \"{query}\"", reach.service.name)
             }
@@ -385,6 +500,16 @@ impl Freshness {
             Freshness::Week => "pw",
             Freshness::Month => "pm",
             Freshness::Year => "py",
+        }
+    }
+
+    /// DuckDuckGo's code for it.
+    fn duckduckgo(self) -> &'static str {
+        match self {
+            Freshness::Day => "d",
+            Freshness::Week => "w",
+            Freshness::Month => "m",
+            Freshness::Year => "y",
         }
     }
 
@@ -522,7 +647,8 @@ fn narrows_by_site(service: &str) -> bool {
     matches!(service, "Tavily" | "Exa")
 }
 
-/// What the services asked with a GET are sent: Brave and SearXNG.
+/// What the services asked with a GET are sent: Brave, SearXNG and
+/// DuckDuckGo.
 fn parameters(
     service: &str,
     query: &str,
@@ -530,7 +656,17 @@ fn parameters(
     options: &Options,
 ) -> Vec<(&'static str, String)> {
     let mut sent = vec![("q", query.to_owned())];
-    if service == "Brave" {
+    if service == "DuckDuckGo" {
+        // It takes no list of sites, but one site is narrowed to as a person
+        // would type it; the rest are filtered here. It answers a page of
+        // results whatever the count.
+        if let [site] = options.allowed.as_slice() {
+            sent[0].1 = format!("{query} site:{site}");
+        }
+        if let Some(freshness) = options.freshness {
+            sent.push(("df", freshness.duckduckgo().to_owned()));
+        }
+    } else if service == "Brave" {
         let count = match options.by_site() {
             true => WIDER,
             false => count,
@@ -648,18 +784,59 @@ fn searched_once(
     Ok(listing)
 }
 
-/// Ask the service for `query`, and list what it found that the filters keep.
+/// Ask the service for `query`, and list what it found that the filters keep;
+/// DuckDuckGo one search at a time, and not while it is held off.
 fn search(reach: &Reach, query: &str, count: u64, options: &Options) -> Result<String, String> {
+    if !reach.service.keyless {
+        return ask(reach, query, count, options);
+    }
+    static LIMITED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+    unless_held_off(&LIMITED_AT, Instant::now(), || {
+        ask(reach, query, count, options)
+    })
+}
+
+/// The answer from `ask`, unless DuckDuckGo limited a search less than
+/// `HOLD_OFF` before `now`, when nothing is sent. A limit in the answer
+/// starts the wait.
+fn unless_held_off(
+    limited_at: &Mutex<Option<Instant>>,
+    now: Instant,
+    ask: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    // Held across the request, so searches the model sends side by side
+    // reach it one at a time, and none goes out once one was limited.
+    let mut at = limited_at
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if at.is_some_and(|at| now.saturating_duration_since(at) < HOLD_OFF) {
+        return Err(LIMITED.into());
+    }
+    let answer = ask();
+    if answer.as_ref().is_err_and(|error| error == LIMITED) {
+        *at = Some(now);
+    }
+    answer
+}
+
+/// Send the one request a search takes, and list what came back that the
+/// filters keep.
+fn ask(reach: &Reach, query: &str, count: u64, options: &Options) -> Result<String, String> {
     let Reach {
         service,
         key,
         address,
     } = reach;
-    let client = reqwest::blocking::Client::builder()
+    let mut client = reqwest::blocking::Client::builder()
         .timeout(SEARCH_TIME)
-        .user_agent(concat!("Letronna/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| e.to_string())?;
+        .user_agent(concat!("Letronna/", env!("CARGO_PKG_VERSION")));
+    if service.keyless {
+        // A bang or a leading \ in the query makes it answer with a redirect
+        // to some other site, perhaps one on this machine or its network:
+        // followed, the query would go where the approval card never said.
+        client = client.redirect(reqwest::redirect::Policy::none());
+    }
+    let client = client.build().map_err(|e| e.to_string())?;
     let today = chrono::Utc::now().date_naive();
     let request = match service.name {
         "Brave" => client
@@ -681,6 +858,12 @@ fn search(reach: &Reach, query: &str, count: u64, options: &Options) -> Result<S
             options,
             today,
         )),
+        "DuckDuckGo" => client.get(format!("{address}/")).query(&parameters(
+            service.name,
+            query,
+            count,
+            options,
+        )),
         _ => client.get(format!("{address}/search")).query(&parameters(
             service.name,
             query,
@@ -697,7 +880,56 @@ fn search(reach: &Reach, query: &str, count: u64, options: &Options) -> Result<S
         false => format!("Could not reach {} at {address}: {e}", service.name),
     })?;
     let status = reply.status();
+    // The site a redirect points to, which only DuckDuckGo's are left unfollowed.
+    let elsewhere = reply
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|to| to.to_str().ok())
+        .and_then(|to| reply.url().join(to).ok())
+        .and_then(|to| to.host_str().map(str::to_owned));
     let text = reply.text().unwrap_or_default();
+    // Every answer goes through the filters, a service that narrowed by
+    // site too: it may not count subdomains the same way, and only Tavily
+    // takes both lists at once.
+    let wider = match options.by_site() && !narrows_by_site(service.name) {
+        true => usize::MAX,
+        false => count as usize,
+    };
+    if service.keyless {
+        // Its challenge to prove a person is searching comes back as HTTP
+        // 202, and a block as 403 or 429; with no key to refuse, a 401 is a
+        // block too.
+        // Sent on rather than answered is the query's doing, not a limit, so
+        // it neither reads as one nor holds the next search off.
+        if status.is_redirection() {
+            let to = elsewhere
+                .map(|host| format!(" to {host}"))
+                .unwrap_or_default();
+            // It may redirect for reasons of its own too, where dropping a
+            // bang the query does not have would be no help.
+            let next = if sends_on(query) {
+                ", as it does for a word starting with ! or a query starting with \\. It was \
+                 not followed: search again without them."
+            } else {
+                ". It was not followed: read a page you know with web_fetch, or search again \
+                 later."
+            };
+            return Err(format!(
+                "DuckDuckGo answered by sending this search on{to} rather than listing results{next}"
+            ));
+        }
+        let found = match status.as_u16() {
+            202 | 401 | 403 | 429 => None,
+            _ if !status.is_success() => {
+                return Err(refusal(service, status.as_u16(), &text));
+            }
+            _ => duckduckgo_hits(&text, wider),
+        };
+        let Some(found) = found else {
+            return Err(LIMITED.into());
+        };
+        return Ok(kept(service.name, query, found, count, options));
+    }
     if !status.is_success() {
         return Err(refusal(service, status.as_u16(), &text));
     }
@@ -707,13 +939,6 @@ fn search(reach: &Reach, query: &str, count: u64, options: &Options) -> Result<S
             service.name
         )
     })?;
-    // Every answer goes through the filters, a service that narrowed by
-    // site too: it may not count subdomains the same way, and only Tavily
-    // takes both lists at once.
-    let wider = match options.by_site() && !narrows_by_site(service.name) {
-        true => usize::MAX,
-        false => count as usize,
-    };
     Ok(kept(
         service.name,
         query,
@@ -811,6 +1036,113 @@ fn text(value: &Value) -> String {
         .replace("&gt;", ">")
         .replace("&nbsp;", " ")
         .replace("&amp;", "&");
+    plain.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether `query` has what makes DuckDuckGo send a search on to another
+/// site: a word starting with ! or a \ before it all.
+fn sends_on(query: &str) -> bool {
+    query.trim_start().starts_with('\\') || query.split_whitespace().any(|w| w.starts_with('!'))
+}
+
+/// The results on a DuckDuckGo page, up to `count`, its ads left out; `None`
+/// when the page is no list of results -- its challenge to prove a person is
+/// searching, or a page with neither results nor its note that there are
+/// none -- which is DuckDuckGo limiting searches from here.
+fn duckduckgo_hits(page: &str, count: usize) -> Option<Vec<Hit>> {
+    // Read by the class of each tag, never by text the page holds: the
+    // query is written back into it, and could hold any marker.
+    let mut hits = Vec::new();
+    // The result whose snippet comes next; none after an ad, so the ad's
+    // snippet goes with it.
+    let mut open: Option<Hit> = None;
+    let (mut listed, mut none_found) = (false, false);
+    let mut at = 0;
+    while let Some(start) = page[at..].find('<').map(|i| at + i) {
+        let Some(end) = page[start..].find('>').map(|i| start + i) else {
+            break;
+        };
+        let tag = &page[start + 1..end];
+        at = end + 1;
+        // Its form fields hold the query in their values, where a name is
+        // read without minding quotes and could be any marker.
+        let name = tag
+            .split(|c: char| c.is_ascii_whitespace() || c == '/')
+            .next()
+            .unwrap_or_default();
+        if name.eq_ignore_ascii_case("input") {
+            continue;
+        }
+        let class = crate::web::attribute(tag, "class").unwrap_or_default();
+        let classes: Vec<&str> = class.split_whitespace().collect();
+        if classes.iter().any(|c| c.starts_with("anomaly-modal"))
+            || crate::web::attribute(tag, "id").as_deref() == Some("challenge-form")
+        {
+            return None;
+        }
+        none_found |= classes
+            .iter()
+            .any(|c| matches!(*c, "no-results" | "result--no-result"));
+        let title = classes.contains(&"result__a");
+        if !title && !classes.contains(&"result__snippet") {
+            continue;
+        }
+        let close = page[at..].find("</a>").map_or(page.len(), |i| at + i);
+        let words = words(&page[at..close]);
+        at = close;
+        if title {
+            listed = true;
+            hits.extend(open.take());
+            open = crate::web::attribute(tag, "href")
+                .as_deref()
+                .and_then(landing)
+                .map(|url| Hit {
+                    title: words,
+                    url,
+                    snippet: String::new(),
+                });
+        } else if let Some(hit) = open.as_mut() {
+            hit.snippet = words;
+        }
+    }
+    hits.extend(open);
+    if !listed && !none_found {
+        return None;
+    }
+    hits.truncate(count);
+    Some(hits)
+}
+
+/// Where a DuckDuckGo result leads: it links each through an address of its
+/// own with the real one in `uddg`. `None` for its ads, which lead through
+/// duckduckgo.com/y.js, and for anything that is not a web page.
+fn landing(href: &str) -> Option<String> {
+    let link = reqwest::Url::parse("https://duckduckgo.com/")
+        .ok()?
+        .join(href)
+        .ok()?;
+    let real = link
+        .query_pairs()
+        .find(|(name, _)| name == "uddg")
+        .map_or_else(|| link.to_string(), |(_, real)| real.into_owned());
+    let url = reqwest::Url::parse(&real).ok()?;
+    let ad = url.host_str() == Some("duckduckgo.com") && url.path() == "/y.js";
+    (matches!(url.scheme(), "http" | "https") && !ad).then_some(real)
+}
+
+/// A piece of a page as the words a reader sees: its tags gone, entities
+/// written out and spacing made plain.
+fn words(html: &str) -> String {
+    let mut plain = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(open) = rest.find('<') {
+        plain.push_str(&rest[..open]);
+        rest = rest[open..]
+            .find('>')
+            .map_or("", |close| &rest[open + close + 1..]);
+    }
+    plain.push_str(rest);
+    let plain = crate::web::decode(&plain);
     plain.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -956,7 +1288,7 @@ mod tests {
             service: "Brave".into(),
             ..Choice::default()
         };
-        let reach = usable(&brave, &keys).unwrap();
+        let reach = usable(&brave, &keys, true).unwrap();
         assert_eq!((reach.service.name, reach.key.as_str()), ("Brave", "key"));
         assert_eq!(reach.address, service("Brave").unwrap().official);
         assert_eq!(status("Brave", &brave, &keys), ("In use", true, true));
@@ -969,7 +1301,7 @@ mod tests {
             service: "Tavily".into(),
             ..Choice::default()
         };
-        assert!(usable(&tavily, &keys).is_err(), "chosen, but no key");
+        assert!(usable(&tavily, &keys, true).is_err(), "chosen, but no key");
         assert_eq!(
             status("Brave", &tavily, &keys),
             ("Saved, not in use", false, true)
@@ -979,9 +1311,12 @@ mod tests {
             service: "SearXNG".into(),
             ..Choice::default()
         };
-        assert!(usable(&searxng, &keys).is_err(), "no address yet");
+        assert!(usable(&searxng, &keys, true).is_err(), "no address yet");
         searxng.set_address(service("SearXNG").unwrap(), "mini:8888");
-        assert_eq!(usable(&searxng, &keys).unwrap().address, "http://mini:8888");
+        assert_eq!(
+            usable(&searxng, &keys, true).unwrap().address,
+            "http://mini:8888"
+        );
         // Its address is kept while another service is used.
         let back_to_brave = Choice {
             service: "Brave".into(),
@@ -991,7 +1326,10 @@ mod tests {
             status("SearXNG", &back_to_brave, &keys),
             ("Saved, not in use", false, true)
         );
-        assert!(usable(&Choice::default(), &keys).is_err(), "nothing chosen");
+        assert!(
+            usable(&Choice::default(), &keys, false).is_err(),
+            "nothing chosen, DuckDuckGo switched off"
+        );
     }
 
     #[test]
@@ -1131,6 +1469,22 @@ mod tests {
         assert_eq!(
             payload("Tavily", "rust", 5, &Options::default(), today),
             json!({"query": "rust", "max_results": 5})
+        );
+        // DuckDuckGo takes one site in the query, and more only here.
+        assert_eq!(
+            parameters("DuckDuckGo", "rust", 5, &options),
+            vec![
+                ("q", "rust site:docs.rs".to_owned()),
+                ("df", "w".to_owned())
+            ]
+        );
+        let two_sites = Options {
+            allowed: vec!["docs.rs".into(), "rust-lang.org".into()],
+            ..Options::default()
+        };
+        assert_eq!(
+            parameters("DuckDuckGo", "rust", 5, &two_sites),
+            vec![("q", "rust".to_owned())]
         );
     }
 
@@ -1304,6 +1658,384 @@ mod tests {
             searched_once(&memo, failed, later, search).unwrap(),
             "listing 4"
         );
+    }
+
+    /// A DuckDuckGo results page cut down from a real one: an instant
+    /// answer, an ad, two results with marked words and entities, and its
+    /// Next form, whose copy of the query names the markers.
+    const RESULTS_PAGE: &str = r#"<html><head><title>rust at DuckDuckGo</title></head><body>
+<input name="q" class="search__input" type="text" value="rust" />
+<div class="zci"><h1 class="zci__heading"><a rel="nofollow" href="https://en.wikipedia.org/wiki/Rust">Rust</a></h1></div>
+<div class="result results_links results_links_deep result--ad ">
+  <h2 class="result__title"><a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fduckduckgo.com%2Fy.js%3Fad_domain%3Dcourses.example&amp;rut=1">Learn Rust Fast</a></h2>
+  <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fduckduckgo.com%2Fy.js%3Fad_domain%3Dcourses.example&amp;rut=1">An <b>ad</b>.</a>
+</div>
+<div class="result results_links results_links_deep web-result ">
+  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+  <h2 class="result__title"><a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Frust%2Dlang.org%2F&amp;rut=98">Rust Programming Language</a></h2>
+  <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Frust%2Dlang.org%2F&amp;rut=98">rust-lang.org</a>
+  <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Frust%2Dlang.org%2F&amp;rut=98">A <b>language</b> empowering
+     everyone.</a>
+  </div>
+</div>
+<div class="result results_links results_links_deep web-result ">
+  <h2 class="result__title"><a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust%2Dlang.org%2Fbook%2F&amp;rut=dd">The Rust Book &amp; more</a></h2>
+  <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust%2Dlang.org%2Fbook%2F&amp;rut=dd">It assumes you&#x27;re using <b>Rust</b> with edition = &quot;2024&quot;.</a>
+</div>
+<div class="nav-link"><form action="/html/" method="post">
+  <input type="submit" class='btn btn--alt' value="Next" />
+  <input type="hidden" name="q" value="x class=anomaly-modal id=challenge-form class=result__a href=https://evil.example/ y" />
+</form></div>
+</body></html>"#;
+
+    /// Its page when nothing is found, for a query that names its markers.
+    const NO_RESULTS_PAGE: &str = r#"<html><head><title>"result__a" anomaly-modal at DuckDuckGo</title></head><body>
+<input name="q" class="search__input" type="text" value="&quot;result__a&quot; anomaly-modal" />
+<div class="result results_links results_links_deep web-result result--no-result">
+  <div class="no-results__container result__title"><span class='no-results'>
+    <div class="no-results__message"><h1>No results found for <strong>&quot;result__a&quot; anomaly-modal</strong></h1></div>
+  </span></div>
+</div>
+</body></html>"#;
+
+    /// Its challenge to prove a person is searching.
+    const CHALLENGE_PAGE: &str = r#"<html><body>
+<div class="anomaly-modal__mask"><div class="anomaly-modal__modal" data-testid="anomaly-modal">
+<div class="anomaly-modal__title">Unfortunately, bots use DuckDuckGo too.</div>
+<form id="challenge-form" action="//duckduckgo.com/anomaly.js?sv=html&amp;q=rust" method="POST"></form>
+</div></div>
+</body></html>"#;
+
+    /// A stand-in server that answers one request with `status`, any headers
+    /// after it, and `body`, and gives back the request.
+    fn answer_once(status: &str, body: &'static str) -> (u16, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let status = status.to_owned();
+        let asked = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let reply = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(reply.as_bytes()).unwrap();
+            String::from_utf8_lossy(&request[..read]).into_owned()
+        });
+        (port, asked)
+    }
+
+    fn duckduckgo_at(port: u16) -> Reach {
+        Reach {
+            service: service("DuckDuckGo").unwrap(),
+            key: String::new(),
+            address: format!("http://127.0.0.1:{port}/html"),
+        }
+    }
+
+    #[test]
+    fn fixture_parses_results_ads_entities_and_no_results() {
+        // The query in the Next form, though it names the markers, neither
+        // adds a result nor reads as a challenge.
+        assert_eq!(
+            duckduckgo_hits(RESULTS_PAGE, 10),
+            Some(vec![
+                Hit {
+                    title: "Rust Programming Language".into(),
+                    url: "https://rust-lang.org/".into(),
+                    snippet: "A language empowering everyone.".into(),
+                },
+                Hit {
+                    title: "The Rust Book & more".into(),
+                    url: "https://doc.rust-lang.org/book/".into(),
+                    snippet: "It assumes you're using Rust with edition = \"2024\".".into(),
+                },
+            ])
+        );
+        assert_eq!(
+            duckduckgo_hits(RESULTS_PAGE, 1).map(|hits| hits.len()),
+            Some(1)
+        );
+        // Nothing found is an empty list, though the query names the markers.
+        assert_eq!(duckduckgo_hits(NO_RESULTS_PAGE, 10), Some(Vec::new()));
+        assert_eq!(
+            landing("https://example.com/direct"),
+            Some("https://example.com/direct".into())
+        );
+        assert_eq!(
+            landing("//duckduckgo.com/l/?uddg=javascript%3Aalert(1)"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_anomaly_page_reads_as_limited_not_empty() {
+        assert_eq!(duckduckgo_hits(CHALLENGE_PAGE, 10), None);
+        // A page of some other kind, with neither results nor the note that
+        // there are none, is not taken for nothing found either.
+        assert_eq!(
+            duckduckgo_hits("<html><body><p>Something new</p></body></html>", 10),
+            None
+        );
+        assert_eq!(duckduckgo_hits("", 10), None);
+        // Its challenge comes back as HTTP 202.
+        let (port, asked) = answer_once("202 Accepted", CHALLENGE_PAGE);
+        let error = ask(&duckduckgo_at(port), "rust", 5, &Options::default()).unwrap_err();
+        assert_eq!(error, LIMITED);
+        asked.join().unwrap();
+        let (port, asked) = answer_once("200 OK", "<html><body></body></html>");
+        let error = ask(&duckduckgo_at(port), "rust", 5, &Options::default()).unwrap_err();
+        assert_eq!(error, LIMITED);
+        asked.join().unwrap();
+        // It has no key, so a 401 is a block, never a key refused.
+        let (port, asked) = answer_once("401 Unauthorized", "");
+        let error = ask(&duckduckgo_at(port), "rust", 5, &Options::default()).unwrap_err();
+        assert_eq!(error, LIMITED);
+        asked.join().unwrap();
+    }
+
+    #[test]
+    fn a_duckduckgo_search_is_one_get_that_says_who_is_asking() {
+        let (port, asked) = answer_once("200 OK", RESULTS_PAGE);
+        let options = Options {
+            allowed: vec!["rust-lang.org".into()],
+            freshness: Some(Freshness::Week),
+            ..Options::default()
+        };
+        let found = ask(&duckduckgo_at(port), "rust", 5, &options).unwrap();
+        assert!(
+            found.starts_with("DuckDuckGo results for \"rust\":\n"),
+            "{found}"
+        );
+        assert!(
+            found.contains("\n1. Rust Programming Language\n   https://rust-lang.org/\n   A language empowering everyone.\n"),
+            "{found}"
+        );
+        assert!(found.contains("\n2. The Rust Book & more\n"), "{found}");
+        let request = asked.join().unwrap().to_lowercase();
+        assert!(
+            request.starts_with("get /html/?q=rust+site%3arust-lang.org&df=w "),
+            "{request}"
+        );
+        let agent = format!("user-agent: letronna/{}\r\n", env!("CARGO_PKG_VERSION"));
+        assert!(request.contains(&agent.to_lowercase()), "{request}");
+    }
+
+    #[test]
+    fn a_duckduckgo_redirect_is_neither_followed_nor_taken_for_a_limit() {
+        // A bang answers with a redirect to the site it names, here one on
+        // this machine that would hear the query if it were followed.
+        let elsewhere = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        elsewhere.set_nonblocking(true).unwrap();
+        let to = elsewhere.local_addr().unwrap().port();
+        let (port, asked) = answer_once(
+            &format!("303 See Other\r\nLocation: http://127.0.0.1:{to}/wiki?search=rust"),
+            "",
+        );
+        let limited_at = Mutex::new(None);
+        let error = unless_held_off(&limited_at, Instant::now(), || {
+            ask(&duckduckgo_at(port), "!w rust", 5, &Options::default())
+        })
+        .unwrap_err();
+        asked.join().unwrap();
+        assert!(
+            error.starts_with("DuckDuckGo answered by sending this search on to 127.0.0.1 "),
+            "{error}"
+        );
+        assert!(error.ends_with("search again without them."), "{error}");
+        assert!(
+            elsewhere
+                .accept()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock),
+            "the redirect was followed"
+        );
+        assert_eq!(*limited_at.lock().unwrap(), None, "held off");
+
+        // One it makes for reasons of its own, to a page of its own or
+        // nowhere it says, is not put down to a bang the query lacks.
+        for (status, said) in [
+            (
+                "302 Found\r\nLocation: /html/",
+                "search on to 127.0.0.1 rather",
+            ),
+            ("301 Moved Permanently", "search on rather"),
+        ] {
+            let (port, asked) = answer_once(status, "");
+            let error = unless_held_off(&limited_at, Instant::now(), || {
+                ask(&duckduckgo_at(port), "rust", 5, &Options::default())
+            })
+            .unwrap_err();
+            asked.join().unwrap();
+            assert!(error.contains(said), "{error}");
+            assert!(error.ends_with("search again later."), "{error}");
+            assert_eq!(*limited_at.lock().unwrap(), None, "held off");
+        }
+        assert!(sends_on("\\rust book") && sends_on("rust !w") && !sends_on("rust! book"));
+    }
+
+    #[test]
+    fn a_chosen_brave_without_a_key_errors_rather_than_using_duckduckgo() {
+        let none = HashMap::new();
+        let brave = Choice {
+            service: "Brave".into(),
+            ..Choice::default()
+        };
+        assert_eq!(
+            usable(&brave, &none, true).err().as_deref(),
+            Some("Brave has no key saved.")
+        );
+        let searxng = Choice {
+            service: "SearXNG".into(),
+            ..Choice::default()
+        };
+        assert_eq!(
+            usable(&searxng, &none, true).err().as_deref(),
+            Some("SearXNG has no address saved.")
+        );
+        assert_eq!(
+            status_with("DuckDuckGo", &brave, &none, true),
+            ("Not in use", false, true)
+        );
+    }
+
+    #[test]
+    fn duckduckgo_searches_while_nothing_is_chosen_unless_switched_off() {
+        let none = HashMap::new();
+        let nothing = Choice::default();
+        // On, as it is unless switched off: DuckDuckGo, which needs no key.
+        let reach = usable(&nothing, &none, true).unwrap();
+        assert_eq!(
+            (reach.service.name, reach.address.as_str()),
+            ("DuckDuckGo", "https://html.duckduckgo.com/html")
+        );
+        assert_eq!(
+            status_with("DuckDuckGo", &nothing, &none, true),
+            ("In use", true, true)
+        );
+        // Switched off, nothing is searched, and the answer says how to
+        // switch it back on or add a key.
+        let off = usable(&nothing, &none, false).err().unwrap_or_default();
+        assert_eq!(off, SWITCHED_OFF);
+        for how in [
+            "/search keyless",
+            r#""keyless_search": true"#,
+            "/search services",
+        ] {
+            assert!(off.contains(how), "{how}: {off}");
+        }
+        assert_eq!(
+            status_with("DuckDuckGo", &nothing, &none, false),
+            ("Switched off", false, true)
+        );
+        // So is it when chosen by name.
+        let named = Choice {
+            service: "DuckDuckGo".into(),
+            ..Choice::default()
+        };
+        assert_eq!(
+            usable(&named, &none, false).err().as_deref(),
+            Some(SWITCHED_OFF)
+        );
+        // A service with a key searches either way.
+        let keys = HashMap::from([("Brave".to_owned(), "key".to_owned())]);
+        let brave = Choice {
+            service: "Brave".into(),
+            ..Choice::default()
+        };
+        assert_eq!(usable(&brave, &keys, false).unwrap().service.name, "Brave");
+    }
+
+    #[test]
+    fn a_block_fails_fast_for_five_minutes() {
+        let limited_at = Mutex::new(None);
+        let asked = std::cell::Cell::new(0);
+        let limited = || {
+            asked.set(asked.get() + 1);
+            Err(LIMITED.to_owned())
+        };
+        let answered = || {
+            asked.set(asked.get() + 1);
+            Ok("listing".to_owned())
+        };
+        let start = Instant::now();
+        assert_eq!(
+            unless_held_off(&limited_at, start, limited),
+            Err(LIMITED.to_owned())
+        );
+        // Nothing is sent for five minutes.
+        let soon = start + Duration::from_secs(4 * 60 + 59);
+        assert_eq!(
+            unless_held_off(&limited_at, soon, answered),
+            Err(LIMITED.to_owned())
+        );
+        assert_eq!(asked.get(), 1);
+        let later = start + Duration::from_secs(5 * 60);
+        assert_eq!(
+            unless_held_off(&limited_at, later, answered),
+            Ok("listing".to_owned())
+        );
+        assert_eq!(asked.get(), 2);
+        // Any other failure, such as no connection, is not held against it.
+        let down = || Err("Could not reach DuckDuckGo".to_owned());
+        assert!(unless_held_off(&limited_at, later, down).is_err());
+        assert_eq!(
+            unless_held_off(&limited_at, later, answered),
+            Ok("listing".to_owned())
+        );
+        assert_eq!(asked.get(), 3);
+    }
+
+    #[test]
+    fn searches_side_by_side_go_one_at_a_time_and_none_after_a_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let limited_at = Mutex::new(None);
+        let (asking, most, asked) = (
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        );
+        // Each request takes a moment, so two not kept apart would overlap.
+        let ask = |answer: Result<String, String>| {
+            asked.fetch_add(1, SeqCst);
+            most.fetch_max(asking.fetch_add(1, SeqCst) + 1, SeqCst);
+            std::thread::sleep(Duration::from_millis(100));
+            asking.fetch_sub(1, SeqCst);
+            answer
+        };
+        let side_by_side = |answer: Result<String, String>| -> Vec<Result<String, String>> {
+            std::thread::scope(|scope| {
+                let searches: Vec<_> = (0..2)
+                    .map(|_| {
+                        let answer = answer.clone();
+                        scope.spawn(|| unless_held_off(&limited_at, Instant::now(), || ask(answer)))
+                    })
+                    .collect();
+                searches.into_iter().map(|s| s.join().unwrap()).collect()
+            })
+        };
+        let listed = Ok("listing".to_owned());
+        assert_eq!(side_by_side(listed.clone()), vec![listed; 2]);
+        assert_eq!((asked.load(SeqCst), most.load(SeqCst)), (2, 1));
+        // The one that waited is not sent once the first was limited.
+        let limited = Err(LIMITED.to_owned());
+        assert_eq!(side_by_side(limited.clone()), vec![limited; 2]);
+        assert_eq!(asked.load(SeqCst), 3);
+    }
+
+    /// Sends one search to DuckDuckGo from this connection.
+    #[test]
+    #[ignore = "searches the real DuckDuckGo, which may limit this connection"]
+    fn searches_the_real_duckduckgo() {
+        let service = service("DuckDuckGo").unwrap();
+        let reach = Reach {
+            service,
+            key: String::new(),
+            address: service.official.to_owned(),
+        };
+        let found = ask(&reach, "rust programming language", 3, &Options::default()).unwrap();
+        assert!(found.contains("1. "), "{found}");
     }
 
     /// Needs a SearXNG with the json format on, at the address in
