@@ -4262,10 +4262,7 @@ mod tests {
         Remember
             .run(&add("Flies on Friday."), &ctx(None, None))
             .unwrap();
-        assert_eq!(
-            entries(&in_chat),
-            ["Planning a trip.", "Flies on Friday."]
-        );
+        assert_eq!(entries(&in_chat), ["Planning a trip.", "Flies on Friday."]);
         // The card offers where it goes now first.
         assert_eq!(
             places(&ctx(Some(&project), None)),

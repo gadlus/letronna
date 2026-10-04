@@ -215,7 +215,9 @@ impl Draft {
 pub struct Replay {
     pub endpoint: String,
     pub model: String,
-    /// OpenRouter's `reasoning_details`, whole and in the order they came.
+    /// OpenRouter's `reasoning_details`, or Anthropic's thinking blocks with
+    /// the place each goes back to among the reply's, whole and in the order
+    /// they came.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_details: Vec<Value>,
     /// The `extra_content` of each tool call that had one, by the call's
@@ -475,7 +477,12 @@ pub fn validate(connection: &Connection) -> Result<String, String> {
             "Sign in with /login to use Letronna's hosted models, or pick another provider.".into(),
         );
     }
-    Ok(if base.ends_with("/chat/completions") {
+    let chat = base.strip_suffix("/chat/completions");
+    if crate::wire_anthropic::speaks(base) {
+        let root = chat.or_else(|| base.strip_suffix("/messages"));
+        return Ok(format!("{}/messages", root.unwrap_or(base)));
+    }
+    Ok(if chat.is_some() {
         base.into()
     } else {
         format!("{base}/chat/completions")
@@ -1544,7 +1551,8 @@ fn body_hashed(
     if let Some(mode) = notes[window.len()] {
         context.push(mode_notice(mode));
     }
-    if marks_cache(connection) {
+    let marks = marks_cache(connection);
+    if marks {
         mark_cache(&mut context);
     }
     // The context window can drop the call that made the plan, and a long
@@ -1579,6 +1587,18 @@ fn body_hashed(
         // tool is offered them all, and refused at the call as before.
         if !tools.iter().all(hidden) {
             tools.retain(|tool| !hidden(tool));
+        }
+        // Anthropic reads the tools ahead of the system prompt, so on its own
+        // API the fourth marker it allows goes on the last of the
+        // connection's own: they stay cached when the date or the summary in
+        // the system prompt moves.
+        if marks
+            && crate::wire_anthropic::speaks(&connection.endpoint)
+            && let Some(last) = tools
+                .iter_mut()
+                .rfind(|tool| tool.get("function").is_some())
+        {
+            last["cache_control"] = json!({"type": "ephemeral"});
         }
         // Last, so the tools before them go out byte for byte as they would
         // without them, and a provider's cached prefix holds up to here.
@@ -1845,8 +1865,12 @@ enum Quirk {
     /// The ask for one call a reply; without it a model may make several,
     /// which still run one at a time.
     ParallelCalls,
-    /// Everything `carry_back` adds, which a strict server may not take.
+    /// Everything `carry_back` adds, which a strict server may not take; on
+    /// Anthropic's API, the binding beta too, which is only for what it adds.
     Replay,
+    /// Anthropic's adaptive thinking, which a model that thinks only on a
+    /// budget turns down; the chat body has no field for it.
+    Thinking,
 }
 
 /// Each quirk by what a refusal says when its field is the one at fault: the
@@ -1958,6 +1982,8 @@ fn apply_quirk(body: &mut Value, quirk: Quirk) -> bool {
                 .iter()
                 .fold(false, |found, key| remove_everywhere(messages, key) | found)
         }),
+        // Left out of the Messages request instead; see `as_messages`.
+        Quirk::Thinking => false,
     }
 }
 
@@ -2024,6 +2050,116 @@ fn learn(connection: &Connection, sent: &Value, error: &str) -> bool {
     learned_any
 }
 
+/// What a refusal from Anthropic's API names when the field at fault is one
+/// the chat body has under another name, or not at all.
+// A bad signature is a replayed block the route cannot check, as one made
+// for another account; "thinking block" is a model that thinks only on a
+// budget wanting the last call's thinking back, which it then never gets.
+const MESSAGES_QUIRKS: [(Quirk, &str); 6] = [
+    (Quirk::Effort, "effort"),
+    (Quirk::Replay, "anthropic-beta"),
+    (Quirk::Replay, "block_binding"),
+    (Quirk::Replay, "signature"),
+    (Quirk::Thinking, "adaptive"),
+    (Quirk::Thinking, "thinking block"),
+];
+
+/// `learn`, from a refusal of `posted`, the Messages request a chat body
+/// went out as, of what only a Messages request carries.
+fn learn_messages(connection: &Connection, posted: &Value, error: &str) -> bool {
+    let error = error.to_lowercase().replace('_', "");
+    let (endpoint, model) = route(connection);
+    let mut learned_any = false;
+    for (quirk, field) in MESSAGES_QUIRKS {
+        let carried = match quirk {
+            Quirk::Effort => posted.pointer("/output_config/effort").is_some(),
+            Quirk::Thinking => posted.get("thinking").is_some(),
+            _ => {
+                posted.pointer("/thinking/block_binding").is_some()
+                    || crate::wire_anthropic::replays(posted)
+            }
+        };
+        if error.contains(&field.replace('_', ""))
+            && carried
+            && learned().lock().is_ok_and(|mut quirks| {
+                quirks.insert((endpoint.clone(), model.clone(), quirk));
+                true
+            })
+        {
+            learned_any = true;
+        }
+    }
+    learned_any
+}
+
+/// `body`, a chat completion request, as the Messages request Anthropic's
+/// API takes in its place, leaving out what the route is known to refuse.
+fn as_messages(connection: &Connection, body: &Value) -> Value {
+    let mut body = body.clone();
+    // A summary, a commit message and the judge's verdict are asked for
+    // unstreamed, under a short cap and a minute at most. A model that thinks
+    // unasked would think at its own default, high, out of that cap and
+    // could leave nothing for the answer; told the least level its list
+    // offers, it thinks little. None of them asks for thinking either, which
+    // a model that thinks only on a budget turns down: a helper learns
+    // nothing from a refusal.
+    let helper = body["stream"] == false;
+    let listed = crate::models::facts(&connection.endpoint, &connection.model).efforts;
+    if helper
+        && body.get("reasoning_effort").is_none()
+        && let Some(least) = listed.and_then(|levels| levels.into_iter().next())
+    {
+        body["reasoning_effort"] = least.id.into();
+    }
+    fit_quirks(connection, &mut body);
+    // A caller's own level, as the judge's, goes to the nearest the model
+    // offers, or none: Anthropic turns down a level it does not know, where
+    // most chat routes pass over it.
+    if let Some(level) = body["reasoning_effort"].as_str().map(str::to_owned) {
+        let levels = crate::models::efforts(&connection.endpoint, &connection.model);
+        match crate::models::clamp(&levels, &level) {
+            Some(offered) => body["reasoning_effort"] = offered.id.clone().into(),
+            None => {
+                apply_quirk(&mut body, Quirk::Effort);
+            }
+        }
+    }
+    let thinking = crate::wire_anthropic::Thinking {
+        allowed: !helper && !has_quirk(connection, Quirk::Thinking),
+        bound: !has_quirk(connection, Quirk::Replay),
+    };
+    crate::wire_anthropic::request(&body, thinking)
+}
+
+/// `request` carrying `body`, a chat completion request, and the key, as
+/// the wire the connection's endpoint speaks takes them.
+pub(crate) fn carrying(
+    request: reqwest::blocking::RequestBuilder,
+    connection: &Connection,
+    body: &Value,
+) -> reqwest::blocking::RequestBuilder {
+    let key = connection.key.trim();
+    if crate::wire_anthropic::speaks(&connection.endpoint) {
+        return crate::wire_anthropic::sign(request, key, &as_messages(connection, body));
+    }
+    let request = request.json(body);
+    if key.is_empty() {
+        request
+    } else {
+        request.bearer_auth(key)
+    }
+}
+
+/// A reply that was not streamed, as a chat completion, whichever wire it
+/// came over.
+pub(crate) fn as_chat(connection: &Connection, reply: Value) -> Value {
+    if crate::wire_anthropic::speaks(&connection.endpoint) {
+        crate::wire_anthropic::reply(&reply)
+    } else {
+        reply
+    }
+}
+
 /// The host a URL names, if it is one.
 pub(crate) fn host(url: &str) -> Option<String> {
     reqwest::Url::parse(url.trim())
@@ -2042,7 +2178,8 @@ fn unmarked() -> &'static Mutex<HashSet<String>> {
 /// Whether requests on this route mark where the prompt cache ends: Claude
 /// models, whose cache holds only what a request marks, reached through
 /// OpenRouter or the hosted gateway, which pass `cache_control` on to
-/// Anthropic. OpenAI and the servers people run cache without being asked.
+/// Anthropic, or on Anthropic's own API. OpenAI and the servers people run
+/// cache without being asked.
 fn marks_cache(connection: &Connection) -> bool {
     let model = connection.model.trim();
     let claude = model
@@ -2051,7 +2188,7 @@ fn marks_cache(connection: &Connection) -> bool {
         .is_some_and(|id| id.to_lowercase().starts_with("claude"));
     let passes_markers = host(&connection.endpoint).is_some_and(|h| {
         h == "openrouter.ai" || host(&crate::auth::hosted_base()).is_some_and(|hosted| h == hosted)
-    });
+    }) || crate::wire_anthropic::speaks(&connection.endpoint);
     claude
         && passes_markers
         && unmarked()
@@ -2417,9 +2554,9 @@ fn written(arguments: &str, wrote: bool) -> Option<String> {
 
 /// Gateway and edge failures that say nothing about the request itself.
 /// 520-527 are Cloudflare's own (525 is a failed TLS handshake between the
-/// edge and the origin).
+/// edge and the origin), and 529 is Anthropic's for being overloaded.
 pub(crate) fn transient(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 502 | 503 | 504 | 520..=527)
+    matches!(status.as_u16(), 502 | 503 | 504 | 520..=527 | 529)
 }
 
 /// A provider's complaint, cut to a length worth reading.
@@ -2573,13 +2710,17 @@ fn name_as_offered(calls: &mut [ToolCall], extra: &[Value]) {
 }
 
 fn parse_event(data: &str) -> Result<Chunk, Failure> {
-    let value: Value = serde_json::from_str(data).map_err(|_| {
+    parse_chunk(&read_event(data)?)
+}
+
+/// One stream event's data, as JSON.
+fn read_event(data: &str) -> Result<Value, Failure> {
+    serde_json::from_str(data).map_err(|_| {
         Failure::new(
             FailureKind::BadReply,
             "Provider returned an invalid stream event.",
         )
-    })?;
-    parse_chunk(&value)
+    })
 }
 
 /// Read one stream event, or the whole reply of a server that does not
@@ -2760,10 +2901,17 @@ pub(crate) fn client() -> Result<&'static reqwest::blocking::Client, String> {
 
 pub fn list_models(base: &str, key: &str) -> Result<Vec<String>, String> {
     let base = base.trim().trim_end_matches('/');
-    let mut request = client()?
-        .get(format!("{base}/models"))
-        .timeout(Duration::from_secs(20));
-    if !key.trim().is_empty() {
+    let anthropic = crate::wire_anthropic::speaks(base);
+    // Anthropic's list comes twenty models at a time unless asked for up to
+    // 1000, the most it gives at once.
+    let url = match anthropic {
+        true => format!("{base}/models?limit=1000"),
+        false => format!("{base}/models"),
+    };
+    let mut request = client()?.get(url).timeout(Duration::from_secs(20));
+    if anthropic {
+        request = crate::wire_anthropic::keyed(request, key);
+    } else if !key.trim().is_empty() {
         request = request.bearer_auth(key.trim());
     }
     let response = request
@@ -3202,13 +3350,17 @@ fn stream(
         Some(&mut prefix),
     );
     let ticket = crate::cache_miss::sent(connection.conversation, prefix);
-    let mut request = client()
+    // What goes out in its place on Anthropic's own API, kept to learn from
+    // a refusal of it.
+    let posted =
+        crate::wire_anthropic::speaks(&connection.endpoint).then(|| as_messages(connection, &sent));
+    let request = client()
         .map_err(|e| Failure::new(FailureKind::Unknown, e))?
-        .post(endpoint)
-        .json(&sent);
-    if !connection.key.trim().is_empty() {
-        request = request.bearer_auth(connection.key.trim());
-    }
+        .post(endpoint);
+    let request = match &posted {
+        Some(posted) => crate::wire_anthropic::sign(request, &connection.key, posted),
+        None => carrying(request, connection, &sent),
+    };
     // A rate limit or a dropped connection part way through an agent loop
     // would otherwise lose the whole task, though it passes on its own.
     let mut tried = 0;
@@ -3269,7 +3421,10 @@ fn stream(
                 }
                 if status.is_client_error()
                     && !matches!(status.as_u16(), 408 | 429)
-                    && learn(connection, &sent, &error)
+                    && (learn(connection, &sent, &error)
+                        | posted
+                            .as_ref()
+                            .is_some_and(|posted| learn_messages(connection, posted, &error)))
                     && !sender.is_closed()
                 {
                     return stream(connection, messages, start, budget, extra, lsp, sender);
@@ -3342,6 +3497,7 @@ fn read(
         let value: Value = response
             .json()
             .map_err(|_| Failure::new(FailureKind::BadReply, "Invalid model response."))?;
+        let value = as_chat(connection, value);
         let began = std::time::Instant::now();
         let mut reply = Reply::default();
         reply.absorb(parse_chunk(&value)?, stands, sender)?;
@@ -3358,6 +3514,10 @@ fn read(
     let began = std::time::Instant::now();
     let mut reply = Reply::default();
     let mut done = false;
+    // A Messages stream says in many events what a chat completion says in
+    // one chunk, so it is read through what it has said so far.
+    let mut messages = crate::wire_anthropic::speaks(&connection.endpoint)
+        .then(crate::wire_anthropic::Stream::default);
     for line in BufReader::new(response).lines() {
         let line = match line {
             Ok(line) => line,
@@ -3384,7 +3544,18 @@ fn read(
             done = true;
             break;
         }
-        reply.absorb(parse_event(data)?, stands, sender)?;
+        let chunk = match &mut messages {
+            None => parse_event(data)?,
+            Some(messages) => match messages.event(&read_event(data)?) {
+                crate::wire_anthropic::Said::Chunk(chunk) => parse_chunk(&chunk)?,
+                crate::wire_anthropic::Said::Nothing => continue,
+                crate::wire_anthropic::Said::Over => {
+                    done = true;
+                    break;
+                }
+            },
+        };
+        reply.absorb(chunk, stands, sender)?;
         reply.draft(&extra.tools, sender)?;
     }
     reply.end(done, began, connection, &extra.tools, ticket, sender)
@@ -5051,7 +5222,7 @@ mod tests {
     #[test]
     fn transient_statuses_are_retried_not_blamed_on_the_user() {
         use reqwest::StatusCode;
-        for code in [502, 503, 504, 520, 525, 527] {
+        for code in [502, 503, 504, 520, 525, 527, 529] {
             assert!(transient(StatusCode::from_u16(code).unwrap()), "{code}");
         }
         for code in [400, 401, 403, 404, 429, 500] {
@@ -8555,6 +8726,9 @@ mod tests {
 
     #[test]
     fn stored_messages_are_never_changed() {
+        // Both requests read the settings and memory, which a test moving the
+        // data folder meanwhile would change between them.
+        let _held = (crate::store::tests::DATA_DIR.lock()).unwrap_or_else(|e| e.into_inner());
         let mut messages = reads(20, 800);
         let newest = messages[messages.len() - 1].content.clone();
         let call = messages[messages.len() - 2].tool_calls[0].arguments.clone();
@@ -9554,6 +9728,176 @@ mod tests {
         assert_eq!(idle(&read_timeout("0")), Duration::from_secs(30));
         assert_eq!(idle(&read_timeout("5")), Duration::from_secs(30));
         assert_eq!(idle(&read_timeout("86400")), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn an_anthropic_endpoint_posts_to_messages() {
+        let c = Connection {
+            endpoint: "https://api.anthropic.com/v1/".into(),
+            model: "claude-opus-5".into(),
+            ..connection()
+        };
+        let messages = "https://api.anthropic.com/v1/messages";
+        assert_eq!(validate(&c).unwrap(), messages);
+        // Pasted as Custom with the chat route of Anthropic's copy of OpenAI's API.
+        let pasted = Connection {
+            endpoint: "https://api.anthropic.com/v1/chat/completions".into(),
+            ..c.clone()
+        };
+        assert_eq!(validate(&pasted).unwrap(), messages);
+        // Or with the Messages route itself.
+        let pasted = Connection {
+            endpoint: "https://api.anthropic.com/v1/messages/".into(),
+            ..c
+        };
+        assert_eq!(validate(&pasted).unwrap(), messages);
+    }
+
+    #[test]
+    fn a_helper_on_anthropic_asks_for_the_least_effort_its_model_offers() {
+        let endpoint = "https://helpers.anthropic.test/v1";
+        let offers = json!({"supported": true, "low": {"supported": true},
+            "medium": {"supported": true}, "high": {"supported": true}});
+        crate::models::remember(
+            endpoint,
+            &[
+                json!({"id": "claude-thinks-unasked", "capabilities": {"effort": offers}}),
+                json!({"id": "claude-without-effort",
+                    "capabilities": {"effort": {"supported": false}}}),
+            ],
+        );
+        let on = |model: &str| Connection {
+            endpoint: endpoint.into(),
+            model: model.into(),
+            ..connection()
+        };
+        let summary = |model: &str| {
+            json!({"model": model, "stream": false, "max_tokens": 1500,
+                "messages": [{"role": "user", "content": "Sum this up."}]})
+        };
+        let posted = as_messages(
+            &on("claude-thinks-unasked"),
+            &summary("claude-thinks-unasked"),
+        );
+        assert_eq!(posted["output_config"], json!({"effort": "low"}));
+        // No thinking asked for, which a model that thinks on a budget refuses.
+        assert!(posted.get("thinking").is_none());
+        // A turn keeps the level the user chose, or none.
+        let mut turn = summary("claude-thinks-unasked");
+        turn["stream"] = true.into();
+        assert!(
+            as_messages(&on("claude-thinks-unasked"), &turn)
+                .get("output_config")
+                .is_none()
+        );
+        // A model that offers no level, or is not listed, is sent none.
+        for model in ["claude-without-effort", "claude-not-listed"] {
+            let posted = as_messages(&on(model), &summary(model));
+            assert!(posted.get("output_config").is_none(), "{model}");
+        }
+    }
+
+    /// A turn on `connection` whose reply thought before it called read_file.
+    fn thought_before_reading(connection: &Connection) -> Vec<Message> {
+        let (endpoint, model) = route(connection);
+        let thinking = json!({"type": "thinking", "thinking": "First the file.",
+            "signature": "c2lnbmVk", "index": 0});
+        vec![
+            said("user", "Read a.rs."),
+            Message {
+                model: model.clone(),
+                tool_calls: vec![ToolCall {
+                    id: "toolu_01".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"a.rs"}"#.into(),
+                }],
+                replay: Some(Box::new(Replay {
+                    endpoint,
+                    model,
+                    reasoning_details: vec![thinking],
+                    extra_content: BTreeMap::new(),
+                })),
+                ..said("assistant", "")
+            },
+            Message {
+                tool_call_id: "toolu_01".into(),
+                name: "read_file".into(),
+                ..said("tool", "fn main() {}")
+            },
+        ]
+    }
+
+    #[test]
+    fn a_refused_binding_beta_sends_thinking_back_no_more() {
+        let c = Connection {
+            endpoint: "https://api.anthropic.com/v1".into(),
+            model: "claude-refuses-the-binding".into(),
+            ..connection()
+        };
+        let window = thought_before_reading(&c);
+        let posted = as_messages(&c, &body(&c, &window, None, None));
+        assert!(crate::wire_anthropic::replays(&posted));
+        assert!(posted.pointer("/thinking/block_binding").is_some());
+        // What a route without the controls says to the header.
+        let refusal = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Unexpected value(s) `thinking-binding-controls-2026-08-01` for the `anthropic-beta` header. Please consult our documentation at docs.anthropic.com or try again without the header."}}"#;
+        assert!(learn_messages(&c, &posted, refusal));
+        let again = as_messages(&c, &body(&c, &window, None, None));
+        assert!(!crate::wire_anthropic::replays(&again));
+        assert!(again.get("thinking").is_none());
+        // Refused again, it carried nothing to leave out, so it is not sent again.
+        assert!(!learn_messages(&c, &again, refusal));
+    }
+
+    #[test]
+    fn a_model_that_turns_adaptive_thinking_down_is_asked_without_it() {
+        let c = Connection {
+            endpoint: "https://api.anthropic.com/v1".into(),
+            model: "claude-thinks-on-a-budget".into(),
+            effort: "high".into(),
+            ..connection()
+        };
+        let posted = as_messages(&c, &body(&c, &hello(), None, None));
+        assert_eq!(posted["output_config"], json!({"effort": "high"}));
+        assert_eq!(posted["thinking"]["type"], "adaptive");
+        let refusal = r#"{"type":"error","error":{"type":"invalid_request_error","message":"thinking.type: Input tag 'adaptive' found using 'type' does not match any of the expected tags: 'disabled', 'enabled'"}}"#;
+        assert!(learn_messages(&c, &posted, refusal));
+        let again = as_messages(&c, &body(&c, &hello(), None, None));
+        assert!(again.get("thinking").is_none());
+        // The effort was not at fault, and still goes.
+        assert_eq!(again["output_config"], json!({"effort": "high"}));
+    }
+
+    #[test]
+    fn the_fourth_marker_goes_on_the_last_own_tool_on_anthropic_alone() {
+        let answer = json!({"type": "function", "function": {
+            "name": "structured_output", "parameters": {"type": "object"}
+        }});
+        let sent = |endpoint: &str, model: &str| {
+            let c = Connection {
+                endpoint: endpoint.into(),
+                model: model.into(),
+                tools: true,
+                ..connection()
+            };
+            let extra = std::slice::from_ref(&answer);
+            let sent = body_with(&c, &hello(), None, None, &Budget::SMALL, extra);
+            (c, sent)
+        };
+        let (c, chat) = sent("https://api.anthropic.com/v1", "claude-opus-5");
+        let tools = chat["tools"].as_array().unwrap();
+        let marked: Vec<usize> = (0..tools.len())
+            .filter(|&at| tools[at].get("cache_control").is_some())
+            .collect();
+        // Not the caller's own, which comes after it and changes from call to call.
+        assert_eq!(marked, [tools.len() - 2]);
+        let posted = as_messages(&c, &chat);
+        let marker = json!({"type": "ephemeral"});
+        assert_eq!(posted["tools"][tools.len() - 2]["cache_control"], marker);
+        // With the system prompt's and the one message's.
+        assert_eq!(posted.to_string().matches("cache_control").count(), 3);
+        // Through OpenRouter, Claude's tools go out as they always have.
+        let (_, routed) = sent("https://openrouter.ai/api/v1", "anthropic/claude-opus-5");
+        assert!(!routed["tools"].to_string().contains("cache_control"));
     }
 
     #[test]

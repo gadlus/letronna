@@ -905,15 +905,13 @@ fn ask_of(
         Some(earlier) => format!("Earlier summary:\n{earlier}\n\nNew messages:\n{transcript}"),
         None => format!("Messages:\n{transcript}"),
     };
-    let mut request = post(endpoint)?.json(&body(connection, &input));
-    if !connection.key.trim().is_empty() {
-        request = request.bearer_auth(connection.key.trim());
-    }
-    let value: Value = request
-        .send()
-        .and_then(|r| r.error_for_status())
-        .and_then(|r| r.json())
-        .map_err(|e| crate::side::Failed::sending(&e, e.to_string()))?;
+    let value: Value =
+        crate::chat::carrying(post(endpoint)?, connection, &body(connection, &input))
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.json())
+            .map_err(|e| crate::side::Failed::sending(&e, e.to_string()))?;
+    let value = crate::chat::as_chat(connection, value);
     let reply = crate::chat::unwrap_response(&value)?;
     let text = reply
         .pointer("/choices/0/message/content")

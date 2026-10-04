@@ -25,6 +25,12 @@ pub const GATEWAYS: &[Gateway] = &[
         blurb: "OpenAI directly. Needs an OpenAI API key.",
     },
     Gateway {
+        name: "Anthropic",
+        base: "https://api.anthropic.com/v1",
+        needs_key: true,
+        blurb: "Claude directly. Needs an Anthropic API key.",
+    },
+    Gateway {
         name: "OpenRouter",
         base: "https://openrouter.ai/api/v1",
         needs_key: true,
@@ -181,6 +187,23 @@ mod tests {
         let names: Vec<_> = ready(&keys, "").into_iter().map(|r| r.0).collect();
         assert!(names.contains(&"OpenAI") && names.contains(&"Ollama"));
         assert!(!names.contains(&"OpenRouter") && !names.contains(&"Custom"));
+    }
+
+    #[test]
+    fn an_anthropic_key_goes_to_anthropic_itself() {
+        let (base, key) = resolve("Anthropic", "", "sk-ant");
+        assert_eq!(
+            (base.as_str(), key.as_str()),
+            ("https://api.anthropic.com/v1", "sk-ant")
+        );
+        let keys = HashMap::from([("Anthropic".to_string(), "sk-ant".to_string())]);
+        let names: Vec<_> = ready(&keys, "").into_iter().map(|r| r.0).collect();
+        assert!(names.contains(&"Anthropic"));
+        let none = HashMap::new();
+        assert_eq!(
+            status("Anthropic", &none, "", 0),
+            ("Not set up".into(), false, false)
+        );
     }
 
     #[test]

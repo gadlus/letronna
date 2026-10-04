@@ -125,6 +125,16 @@ const EFFORT_ORDER: &[&str] = &[
 /// always offered, so such a model is sent what it was sent before.
 const USUAL_EFFORTS: [(&str, &str); 3] = [("low", "Low"), ("medium", "Medium"), ("high", "High")];
 
+/// Anthropic's effort levels, least first, with what they are called: its
+/// list says which of them a model offers, but not what to call them.
+const ANTHROPIC_EFFORTS: [(&str, &str); 5] = [
+    ("low", "Low"),
+    ("medium", "Medium"),
+    ("high", "High"),
+    ("xhigh", "Extra high"),
+    ("max", "Max"),
+];
+
 /// How long a host whose list did not come, or came empty, is left before it
 /// is asked again: ten minutes keeps a gateway without a list from being asked
 /// on every round of a turn, and one that was only down for a moment is not
@@ -268,8 +278,11 @@ pub fn ask_for_list(endpoint: &str, key: &str) -> Option<mpsc::Receiver<()>> {
     if key.trim().is_empty() || !due(&host(endpoint)) {
         return None;
     }
-    let base = endpoint
-        .strip_suffix("/chat/completions")
+    // A request to Anthropic's own API goes to its Messages route instead.
+    let base = (endpoint.strip_suffix("/chat/completions"))
+        .or_else(|| {
+            (endpoint.strip_suffix("/messages")).filter(|_| crate::wire_anthropic::speaks(endpoint))
+        })
         .unwrap_or(endpoint)
         .to_owned();
     let key = key.to_owned();
@@ -321,9 +334,9 @@ pub(crate) fn remember(endpoint: &str, list: &[Value]) {
     }
 }
 
-/// The facts in one entry of a `/models` list, in OpenRouter's shape or one
-/// that keeps them at the top, as the hosted gateway, vLLM and Groq do;
-/// OpenAI's entries hold none.
+/// The facts in one entry of a `/models` list, in OpenRouter's shape, one
+/// that keeps them at the top, as the hosted gateway, vLLM and Groq do, or
+/// Anthropic's; OpenAI's entries hold none.
 fn read(entry: &Value) -> Facts {
     let tokens = |value: &Value| value.as_u64().filter(|&n| n > 0);
     let names = |value: &Value| {
@@ -334,14 +347,17 @@ fn read(entry: &Value) -> Facts {
                 .collect()
         })
     };
+    let capabilities = &entry["capabilities"];
     Facts {
         // vLLM and SGLang call the window they serve `max_model_len`, and Groq
         // calls it `context_window`: the window that route holds a request
-        // to, not the one the model was trained for.
+        // to, not the one the model was trained for. Anthropic's calls it
+        // `max_input_tokens`.
         context: tokens(&entry["context_length"])
             .or_else(|| tokens(&entry["top_provider"]["context_length"]))
             .or_else(|| tokens(&entry["max_model_len"]))
-            .or_else(|| tokens(&entry["context_window"])),
+            .or_else(|| tokens(&entry["context_window"]))
+            .or_else(|| tokens(&entry["max_input_tokens"])),
         // A `max_tokens` that is really the window does no harm: the reply
         // asked for is a quarter of a known window at most, and no more than
         // usual when the window is not known.
@@ -350,7 +366,8 @@ fn read(entry: &Value) -> Facts {
             .or_else(|| tokens(&entry["max_completion_tokens"]))
             .or_else(|| tokens(&entry["max_tokens"])),
         inputs: names(&entry["architecture"]["input_modalities"])
-            .or_else(|| names(&entry["input_modalities"])),
+            .or_else(|| names(&entry["input_modalities"]))
+            .or_else(|| sights(capabilities)),
         parameters: names(&entry["supported_parameters"]),
         // The hosted gateway leaves the levels out for a model that cannot
         // reason rather than listing none, and says so in its capabilities.
@@ -368,11 +385,38 @@ fn read(entry: &Value) -> Facts {
                     .collect()
             })
             .or_else(|| {
-                let reasons = entry["capabilities"]["reasoning"].as_bool();
+                let reasons = capabilities["reasoning"].as_bool();
                 (reasons == Some(false)).then(Vec::new)
-            }),
+            })
+            .or_else(|| levels(&capabilities["effort"])),
         price: price(&entry["pricing"]),
     }
+}
+
+/// What Anthropic's `capabilities` say a model takes in: text, and pictures
+/// when it can see them.
+fn sights(capabilities: &Value) -> Option<Vec<String>> {
+    let sees = capabilities["image_input"]["supported"].as_bool()?;
+    let inputs = if sees {
+        &["text", "image"][..]
+    } else {
+        &["text"]
+    };
+    Some(inputs.iter().map(|input| (*input).to_owned()).collect())
+}
+
+/// The effort levels Anthropic's `capabilities` say a model offers, least
+/// first; none when it offers no effort.
+fn levels(effort: &Value) -> Option<Vec<Effort>> {
+    effort["supported"].as_bool()?;
+    let offered = ANTHROPIC_EFFORTS
+        .iter()
+        .filter(|(id, _)| effort[*id]["supported"] == true)
+        .map(|&(id, label)| Effort {
+            id: id.to_owned(),
+            label: label.to_owned(),
+        });
+    Some(offered.collect())
 }
 
 /// The price in a list entry's `pricing`, in OpenRouter's shape: dollars a
@@ -490,6 +534,55 @@ mod tests {
         assert_eq!(new.context, Some(32_768));
         assert_eq!(new.max_output, None);
         assert_eq!(new.parameters, Some(vec![]));
+    }
+
+    #[test]
+    fn an_anthropic_list_gives_the_window_the_output_cap_pictures_and_efforts() {
+        let list = json!({"data": [
+            {
+                "type": "model",
+                "id": "claude-opus-5-5",
+                "display_name": "Claude Opus 5.5",
+                "max_input_tokens": 1_000_000,
+                "max_tokens": 128_000,
+                "capabilities": {
+                    "image_input": {"supported": true},
+                    "thinking": {"supported": true, "types": {"adaptive": {"supported": true}}},
+                    "effort": {"supported": true, "low": {"supported": true},
+                        "medium": {"supported": true}, "high": {"supported": true},
+                        "xhigh": {"supported": true}, "max": {"supported": true}}
+                }
+            },
+            {
+                "type": "model",
+                "id": "claude-haiku-4-5",
+                "max_input_tokens": 200_000,
+                "max_tokens": 32_000,
+                "capabilities": {
+                    "image_input": {"supported": false},
+                    "effort": {"supported": false, "low": {"supported": false}}
+                }
+            }
+        ]});
+        let endpoint = "https://anthropic.test/v1";
+        remember(endpoint, list["data"].as_array().unwrap());
+
+        let opus = facts(endpoint, "claude-opus-5-5");
+        assert_eq!(
+            (opus.context, opus.max_output),
+            (Some(1_000_000), Some(128_000))
+        );
+        assert_eq!(opus.inputs, Some(vec!["text".to_owned(), "image".into()]));
+        let levels: Vec<String> = (efforts(endpoint, "claude-opus-5-5").into_iter())
+            .map(|level| level.id)
+            .collect();
+        assert_eq!(levels, ["low", "medium", "high", "xhigh", "max"]);
+
+        let haiku = facts(endpoint, "claude-haiku-4-5");
+        // Lower than the family's 64,000, so this can only come from the list.
+        assert_eq!(haiku.max_output, Some(32_000));
+        assert_eq!(haiku.inputs, Some(vec!["text".to_owned()]));
+        assert!(efforts(endpoint, "claude-haiku-4-5").is_empty());
     }
 
     #[test]
