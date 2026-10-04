@@ -43,7 +43,9 @@ use letronna_core::chat::{self, Message};
 use letronna_core::driver::{self, Allow, Outcome, Report, Spec, Status};
 use letronna_core::gate::Mode;
 use letronna_core::store::Transcript;
-use letronna_core::{crew, hooks, inbox, store, structured, tools, update, usage, worktree};
+use letronna_core::{
+    crew, hooks, inbox, prompt_rules, store, structured, tools, update, usage, worktree,
+};
 use serde_json::{Value, json};
 use session::Runner;
 use std::io::IsTerminal;
@@ -166,6 +168,14 @@ fn main() {
     }
     if args.doctor {
         std::process::exit(doctor::run(args.offline));
+    }
+    // A rule named wrongly would be told all the same, and the run would
+    // read as one without it.
+    if args.once()
+        && let Err(error) = prompt_rules::check()
+    {
+        eprintln!("{}", render::red(&error));
+        std::process::exit(1);
     }
     // Before anything is opened, so a mistyped name leaves nothing behind.
     let gateway = match args.gateway.as_deref().map(gateway_named).transpose() {
@@ -577,8 +587,9 @@ fn ask_once(
     if args.output == Output::StreamJson {
         emit(&opening);
     }
+    let prompt = prompt_rules::seen(&spec.connection).unwrap_or_default();
     let report = run_following(spec, args.output);
-    finish(runner, session, id, before, report, args.output)
+    finish(runner, session, (id, before), report, args.output, prompt)
 }
 
 /// The deadline `value` sets for a run started at `started`, or None when it
@@ -752,6 +763,14 @@ fn dump_config(args: &Args, settings: &store::Settings) -> Result<Value, String>
         "verify_edits": settings.verifies_edits(),
         "command_timeout_seconds": tools::COMMAND_TIMEOUT.as_secs(),
         "tool_output_bytes": tools::MAX_OUTPUT,
+        // As a run whose answer is piped is told them.
+        "prompt": prompt_rules::seen(&chat::Connection {
+            tools: true,
+            model: model.to_owned(),
+            mode,
+            plan: mode == Mode::Plan,
+            ..Default::default()
+        })?,
     }))
 }
 
@@ -793,15 +812,16 @@ fn run_following(spec: Spec, output: Output) -> Report {
     report
 }
 
-/// Takes the session back from run `id` and prints how the run ended,
-/// saying whether it ended without failing.
+/// Takes the session back from run `id`, whose messages follow the first
+/// `before`, and prints how the run ended with what it was told of the
+/// prompt's rules, saying whether it ended without failing.
 fn finish(
     runner: &mut Runner,
     session: usize,
-    id: u64,
-    before: usize,
+    (id, before): (u64, usize),
     mut report: Report,
     output: Output,
+    prompt: Value,
 ) -> bool {
     // On stderr, apart from the answer: what a hook said or could not do.
     for problem in hooks::problems() {
@@ -812,7 +832,7 @@ fn finish(
     let mut extras = None;
     if let Some(said) = take_back(runner, session, id, before) {
         report.text = said;
-        extras = Some(Extras::of(runner, session, before));
+        extras = Some(Extras::of(runner, session, before, prompt));
     }
     show(output, &report, extras.as_ref());
     !matches!(report.status, Outcome::Failed(_))
@@ -1055,6 +1075,7 @@ fn as_json(report: &Report, extras: Option<&Extras>) -> Value {
         out["gateway"] = extras.gateway.as_str().into();
         out["cost_usd"] = extras.cost.into();
         out["refused"] = extras.refused.into();
+        out["prompt"] = extras.prompt.clone();
     }
     if let Some(value) = &report.value {
         out["value"] = value.clone();
@@ -1074,12 +1095,14 @@ struct Extras {
     cost: Option<f64>,
     /// The run's own calls that were refused rather than run.
     refused: usize,
+    /// The prompt rules left out of the run and a hash of those told.
+    prompt: Value,
 }
 
 impl Extras {
     /// The extras of the run whose messages follow the first `before` in the
-    /// session at `session`.
-    fn of(runner: &Runner, session: usize, before: usize) -> Extras {
+    /// session at `session`, told `prompt` of the rules.
+    fn of(runner: &Runner, session: usize, before: usize, prompt: Value) -> Extras {
         let conversation = &runner.store.conversations[session];
         let own = conversation.messages.get(before..).unwrap_or_default();
         let (gateway, model) = runner.store.model(session);
@@ -1089,6 +1112,7 @@ impl Extras {
             gateway: gateway.to_owned(),
             cost: cost(own),
             refused: own.iter().filter(|message| refused(message)).count(),
+            prompt,
         }
     }
 }
@@ -1472,6 +1496,7 @@ mod tests {
             gateway: "Custom".into(),
             cost: Some(0.25),
             refused: 2,
+            prompt: json!({"dropped": ["compute"], "rules_sha": "0123456789ab"}),
         };
         let out = as_json(&report(Outcome::Done), Some(&extras));
         assert_eq!(
@@ -1491,6 +1516,7 @@ mod tests {
             )
         );
         assert_eq!(out["answer"], "The notes say hello.");
+        assert_eq!(out["prompt"]["dropped"], json!(["compute"]));
         // A cost nobody knows is said to be unknown, not nothing.
         extras.cost = None;
         let out = as_json(&report(Outcome::Done), Some(&extras));
@@ -1655,6 +1681,13 @@ mod tests {
             .as_object_mut()
             .and_then(|dump| dump.remove("data_dir"));
         assert!(data_dir.is_some_and(|dir| dir.is_string()));
+        // Its hash changes with every rule's wording.
+        let prompt = plain
+            .as_object_mut()
+            .and_then(|dump| dump.remove("prompt"))
+            .unwrap();
+        assert_eq!(prompt["dropped"], json!([]));
+        assert_eq!(prompt["rules_sha"].as_str().map(str::len), Some(12));
         assert_eq!(
             plain,
             json!({

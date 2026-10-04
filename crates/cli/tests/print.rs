@@ -73,8 +73,14 @@ fn model(body: &str) -> String {
 /// Runs `letronna` with `flags` in `work`, set up in `data`, its stdin and
 /// stdout pipes as a script's are.
 fn run(data: &Path, work: &Path, flags: &[&str]) -> Output {
+    run_leaving(data, work, flags, "")
+}
+
+/// `run`, with `LETRONNA_PROMPT_RULES` set to `rules`.
+fn run_leaving(data: &Path, work: &Path, flags: &[&str], rules: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_letronna"))
         .args(flags)
+        .env("LETRONNA_PROMPT_RULES", rules)
         .current_dir(work)
         // Nothing here may reach the real data folder or home.
         .env("AGENT_DATA_DIR", data)
@@ -134,4 +140,32 @@ fn a_run_in_another_mode_or_asked_over_stdin_does_not_warn() {
         assert!(out.status.success(), "{name}: {said}");
         assert!(!said.contains(UNANSWERED), "{name}: {said}");
     }
+}
+
+#[test]
+fn a_wrong_rule_id_stops_a_print_run_before_it_starts() {
+    let (data, work) = scratch("rules-wrong");
+    for rules in ["-nope", "-approval", "+compute"] {
+        let out = run_leaving(&data, &work, &["-p", "--output", "json", "hello"], rules);
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{rules}: {said}");
+        assert!(said.contains("LETRONNA_PROMPT_RULES"), "{rules}: {said}");
+        assert!(out.stdout.is_empty(), "{rules}");
+    }
+}
+
+#[test]
+fn a_print_run_reports_the_rules_it_left_out() {
+    let (data, work) = scratch("rules-left-out");
+    let flags = ["-p", "--output", "json", "hello"];
+    let told = |rules: &str| -> serde_json::Value {
+        let out = run_leaving(&data, &work, &flags, rules);
+        assert!(out.status.success(), "{rules}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let all = told("");
+    let fewer = told("-compute, -literals");
+    assert_eq!(all["prompt"]["dropped"], json!([]));
+    assert_eq!(fewer["prompt"]["dropped"], json!(["compute", "literals"]));
+    assert_ne!(all["prompt"]["rules_sha"], fewer["prompt"]["rules_sha"]);
 }
