@@ -15,11 +15,15 @@
 //! for the one it has open -- since a notice is heard only in the process it
 //! is left in. That front end takes the wake-up out of the file under the
 //! lock before it leaves the notice, so two Letronnas never both fire it.
-//! While it serves any session it looks by the wall clock every minute, as
-//! another Letronna may leave one meanwhile and the timer thread's clock
-//! stops while the machine sleeps. One missed while nothing served it fires
-//! once, saying how late it is; one more than a day late leaves a note for
-//! the next turn rather than starting one, and ends a loop waiting on it.
+//! The window fires one it did not arm a minute after it is due, so the
+//! terminal the user has the session open in fires it first, and the turn
+//! runs where they are looking. While it serves any session it looks by the
+//! wall clock every minute, as another Letronna may leave one meanwhile and
+//! the timer thread's clock stops while the machine sleeps. One missed while
+//! nothing served it fires once, saying how late it is; one more than a day
+//! late leaves a note for the next turn rather than starting one, and ends a
+//! loop waiting on it. One whose session was deleted goes from the file at
+//! the next look, as nothing would ever fire it.
 //!
 //! `/loop` and `/heartbeat` keep a session going on the same footing. A loop
 //! leaves its prompt in the mailbox as a tick, the first at once and each
@@ -83,13 +87,18 @@ struct Wake {
 /// The sessions whose wake-ups this Letronna fires, and its next look.
 struct Served {
     sessions: BTreeSet<u64>,
+    /// Whether it fires every other session's too, a beat after it is due,
+    /// as the window does, which lists them all.
+    every: bool,
     /// Set while it serves any.
     timer: Option<TimerId>,
 }
 
-/// What this Letronna serves, none until wake_me or `serve` names one.
+/// What this Letronna serves, none until wake_me, `serve` or `serve_every`
+/// names some.
 static SERVED: Mutex<Served> = Mutex::new(Served {
     sessions: BTreeSet::new(),
+    every: false,
     timer: None,
 });
 
@@ -219,7 +228,25 @@ pub fn serve(sessions: impl IntoIterator<Item = u64>) {
     if !inbox::listened() {
         return;
     }
-    served().sessions = sessions.into_iter().collect();
+    let mut served = served();
+    served.sessions = sessions.into_iter().collect();
+    served.every = false;
+    drop(served);
+    look_in(backend::data_dir(), Duration::ZERO);
+}
+
+/// Fire the wake-ups of every session in the data folder from now on, those
+/// armed elsewhere a beat after they come due, and any missed meanwhile at
+/// once; for the window, which lists every session.
+pub fn serve_every() {
+    if !inbox::listened() {
+        return;
+    }
+    let mut served = served();
+    // Called again for another profile, whose sessions these ids are not.
+    served.sessions.clear();
+    served.every = true;
+    drop(served);
     look_in(backend::data_dir(), Duration::ZERO);
 }
 
@@ -302,26 +329,47 @@ fn put(dir: &Path, wake: Wake) -> Result<(), String> {
     })
 }
 
-/// Take the wake-ups of `served` sessions due by `now` out of the file under
-/// its lock, so no other Letronna fires them too, with when the next of
-/// theirs still waiting comes due.
-fn claim(dir: &Path, served: &BTreeSet<u64>, now: u64) -> Result<(Vec<Wake>, Option<u64>), String> {
+/// Take the wake-ups of `served` sessions due by `now`, and with `every`
+/// those of other sessions a beat late by then, out of the file under its
+/// lock, so no other Letronna fires them too, with when the next of theirs
+/// still waiting comes due. Those of deleted sessions go too.
+fn claim(
+    dir: &Path,
+    served: &BTreeSet<u64>,
+    every: bool,
+    now: u64,
+) -> Result<(Vec<Wake>, Option<u64>), String> {
     if !path(dir).exists() {
         return Ok((Vec::new(), None));
     }
     let _held = lock(dir)?;
-    let (due, waiting): (Vec<Wake>, Vec<Wake>) = load(dir)?
+    let wakes = load(dir)?;
+    let had = wakes.len();
+    // When it is this Letronna's to fire: a beat late for one another
+    // Letronna may have open, which fires it first if it does.
+    let comes = |wake: &Wake| {
+        if served.contains(&wake.session) {
+            Some(wake.due)
+        } else {
+            every.then(|| wake.due.saturating_add(BEAT.as_secs()))
+        }
+    };
+    let (due, waiting): (Vec<Wake>, Vec<Wake>) = wakes
         .into_iter()
-        .partition(|wake| served.contains(&wake.session) && wake.due <= now);
-    if !due.is_empty() {
+        .filter(|wake| !gone(dir, wake.session))
+        .partition(|wake| comes(wake).is_some_and(|at| at <= now));
+    if waiting.len() != had {
         save(dir, &waiting)?;
     }
-    let next = waiting
-        .iter()
-        .filter(|wake| served.contains(&wake.session))
-        .map(|wake| wake.due)
-        .min();
+    let next = waiting.iter().filter_map(comes).min();
     Ok((due, next))
+}
+
+/// Whether session `session` is surely gone from data folder `dir`: a file
+/// that merely cannot be read now does not count.
+fn gone(dir: &Path, session: u64) -> bool {
+    std::fs::metadata(crate::store::session_in(dir, session))
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Leave a claimed wake-up in its session's mailbox, saying when it was due
@@ -406,12 +454,15 @@ fn late_by(seconds: u64) -> String {
 /// Fire what is due among the wake-ups this Letronna serves in data folder
 /// `dir`, and look again while it serves any.
 fn look(dir: PathBuf) {
-    let served = served().sessions.clone();
-    if served.is_empty() {
+    let (served, every) = {
+        let served = served();
+        (served.sessions.clone(), served.every)
+    };
+    if served.is_empty() && !every {
         return;
     }
     let now = backend::now();
-    let wait = match claim(&dir, &served, now) {
+    let wait = match claim(&dir, &served, every, now) {
         Ok((due, next)) => {
             for wake in &due {
                 deliver(wake, now);
@@ -880,6 +931,16 @@ mod tests {
         }
     }
 
+    /// Save `sessions` in data folder `dir`, as the session of a wake-up that
+    /// fires is.
+    fn saved(dir: &Path, sessions: &[u64]) {
+        for &session in sessions {
+            let file = crate::store::session_in(dir, session);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "").unwrap();
+        }
+    }
+
     /// A data folder of the test's own, set as `AGENT_DATA_DIR` while the
     /// guards are held, for code that finds the wake-ups through it.
     fn data_folder(name: &str) -> (MutexGuard<'static, ()>, MutexGuard<'static, ()>, Scratch) {
@@ -1096,6 +1157,7 @@ mod tests {
         let (_data, _bell, dir) = data_folder("wakes-fallback");
         inbox::listen();
         let session = 912;
+        saved(&dir, &[session]);
         command(session, "/loop", "watch the deploy")
             .unwrap()
             .unwrap();
@@ -1116,7 +1178,7 @@ mod tests {
         assert_eq!(turn_ended(session, Some("Back in 20 minutes.")), None);
         assert!(loops()[&session].timer.is_some());
         let due = load(&dir).unwrap()[0].due;
-        let (woken, _) = claim(&dir, &BTreeSet::from([session]), due).unwrap();
+        let (woken, _) = claim(&dir, &BTreeSet::from([session]), false, due).unwrap();
         deliver(&woken[0], due);
         assert!(loops()[&session].timer.is_none());
         let tick = take_tick(session);
@@ -1179,6 +1241,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = Scratch::new("wakes-restart");
         let session = 921;
+        saved(&dir, &[session]);
         // All that is left of it once the Letronna that armed it quit.
         let mut armed = wake(session, 1_000_000, "check CI");
         armed.prompt = "Look at the last run.".into();
@@ -1187,13 +1250,16 @@ mod tests {
         // A Letronna that does not serve the session leaves it be.
         let missed = 1_000_000 + 42 * 60;
         let other = BTreeSet::from([922]);
-        assert_eq!(claim(&dir, &other, missed).unwrap(), (Vec::new(), None));
+        assert_eq!(
+            claim(&dir, &other, false, missed).unwrap(),
+            (Vec::new(), None)
+        );
         // One that does names when it is due, until it is.
         assert_eq!(
-            claim(&dir, &served, 999_000).unwrap(),
+            claim(&dir, &served, false, 999_000).unwrap(),
             (Vec::new(), Some(1_000_000))
         );
-        let (due, next) = claim(&dir, &served, missed).unwrap();
+        let (due, next) = claim(&dir, &served, false, missed).unwrap();
         assert_eq!(next, None);
         deliver(&due[0], missed);
         let taken = inbox::take(session, true);
@@ -1206,7 +1272,7 @@ mod tests {
         // It went out of the file as it fired, so it never fires again.
         assert!(!path(&dir).exists());
         assert_eq!(
-            claim(&dir, &served, missed + 3_600).unwrap(),
+            claim(&dir, &served, false, missed + 3_600).unwrap(),
             (Vec::new(), None)
         );
         assert_eq!(late_by(5 * 60 * 60 + 100), "5 h late");
@@ -1215,16 +1281,22 @@ mod tests {
     #[test]
     fn two_letronnas_never_fire_the_same_wake() {
         let dir = Scratch::new("wakes-two");
+        saved(&dir, &[931, 932]);
         put(&dir, wake(931, 100, "check CI")).unwrap();
         put(&dir, wake(932, 100, "the deploy")).unwrap();
-        // Each claim opens the lock afresh, as another process does.
+        // Each claim opens the lock afresh, as another process does; half
+        // are terminals open on both sessions, half windows serving all.
         let start = Arc::new(Barrier::new(8));
         let claims: Vec<_> = (0..8)
-            .map(|_| {
+            .map(|n| {
                 let (dir, start) = (dir.to_path_buf(), Arc::clone(&start));
                 std::thread::spawn(move || {
+                    let (open, every) = match n % 2 {
+                        0 => (BTreeSet::from([931, 932]), false),
+                        _ => (BTreeSet::new(), true),
+                    };
                     start.wait();
-                    claim(&dir, &BTreeSet::from([931, 932]), 200).unwrap().0
+                    claim(&dir, &open, every, 200).unwrap().0
                 })
             })
             .collect();
@@ -1298,6 +1370,7 @@ mod tests {
         let (_data, _bell, dir) = data_folder("wakes-serve");
         inbox::listen();
         let (first, second) = (961, 962);
+        saved(&dir, &[first, second]);
         // Both came due while nothing served them, as over a restart.
         let missed = backend::now() - 5 * 60;
         put(&dir, wake(first, missed, "check CI")).unwrap();
@@ -1332,6 +1405,7 @@ mod tests {
         let (_data, _bell, dir) = data_folder("wakes-stale-loop");
         inbox::listen();
         let session = 942;
+        saved(&dir, &[session]);
         command(session, "/loop", "watch the deploy")
             .unwrap()
             .unwrap();
@@ -1349,7 +1423,7 @@ mod tests {
         assert_eq!(turn_ended(session, Some("Back tomorrow.")), None);
         // A laptop shut for two days finds it a day late once it opens.
         let opened = load(&dir).unwrap()[0].due + STALE + 60;
-        let (woken, _) = claim(&dir, &BTreeSet::from([session]), opened).unwrap();
+        let (woken, _) = claim(&dir, &BTreeSet::from([session]), false, opened).unwrap();
         deliver(&woken[0], opened);
         assert!(looping(session).is_none());
         let taken = inbox::take(session, true);
@@ -1362,6 +1436,68 @@ mod tests {
             "{}",
             taken[0].text
         );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn the_window_fires_a_wake_a_beat_after_the_terminal_would() {
+        let dir = Scratch::new("wakes-window");
+        saved(&dir, &[981, 982]);
+        put(&dir, wake(981, 1_000, "check CI")).unwrap();
+        let open = BTreeSet::from([981]);
+        let none = BTreeSet::new();
+        // At its time the window leaves it to a terminal open on it...
+        assert_eq!(
+            claim(&dir, &none, true, 1_000).unwrap(),
+            (Vec::new(), Some(1_000 + BEAT.as_secs()))
+        );
+        // ...which fires it, and then the window has nothing left to fire.
+        let (fired, _) = claim(&dir, &open, false, 1_000).unwrap();
+        assert_eq!(fired.len(), 1);
+        let late = 1_000 + BEAT.as_secs();
+        assert_eq!(claim(&dir, &none, true, late).unwrap(), (Vec::new(), None));
+        // With no terminal on it, the window fires it a beat on.
+        put(&dir, wake(982, 1_000, "the deploy")).unwrap();
+        let (fired, next) = claim(&dir, &none, true, late).unwrap();
+        assert_eq!(fired, [wake(982, 1_000, "the deploy")]);
+        assert_eq!(next, None);
+        // One the window armed itself it fires on time.
+        put(&dir, wake(981, 2_000, "again")).unwrap();
+        let (fired, _) = claim(&dir, &open, true, 2_000).unwrap();
+        assert_eq!(fired.len(), 1);
+    }
+
+    #[test]
+    fn a_wake_whose_session_is_gone_leaves_the_file() {
+        let dir = Scratch::new("wakes-gone");
+        saved(&dir, &[991]);
+        put(&dir, wake(991, 5_000, "kept")).unwrap();
+        put(&dir, wake(992, 5_000, "deleted")).unwrap();
+        // Any look takes it out, even by a Letronna that serves neither and
+        // before either is due.
+        let none = BTreeSet::new();
+        assert_eq!(claim(&dir, &none, false, 100).unwrap(), (Vec::new(), None));
+        let left: Vec<u64> = load(&dir).unwrap().iter().map(|w| w.session).collect();
+        assert_eq!(left, [991]);
+    }
+
+    #[test]
+    fn deleting_a_session_takes_back_its_wake() {
+        let (_data, _bell, dir) = data_folder("wakes-deleted");
+        saved(&dir, &[993, 994]);
+        put(&dir, wake(993, 5_000, "check CI")).unwrap();
+        put(&dir, wake(994, 5_000, "the deploy")).unwrap();
+        let mut store = crate::store::Store::default();
+        for id in [993, 994] {
+            store.conversations.push(crate::store::Conversation {
+                id,
+                ..Default::default()
+            });
+        }
+        store.remove(0);
+        // So a new session given its id is not woken by it.
+        let left: Vec<u64> = load(&dir).unwrap().iter().map(|w| w.session).collect();
+        assert_eq!(left, [994]);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 

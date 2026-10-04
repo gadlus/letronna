@@ -1070,6 +1070,10 @@ fn erase(id: u64, lock: Option<Lock>) {
     crate::lsp::forget(id);
     crate::tasklist::forget(id);
     crate::memory::forget(id);
+    // Nor be woken by this one's wake-up. One that cannot be taken back now
+    // goes at the next look, which finds the session gone, unless a new
+    // session took the id by then.
+    let _ = crate::wake::cancel(id);
     #[cfg(feature = "workflows")]
     crate::script::forget(id);
 }
@@ -2995,7 +2999,12 @@ pub fn sessions_dir() -> PathBuf {
 }
 
 pub(crate) fn session_path(id: u64) -> PathBuf {
-    sessions_dir().join(format!("{id}.jsonl"))
+    session_in(&backend::data_dir(), id)
+}
+
+/// Where session `id` is saved in data folder `data`.
+pub(crate) fn session_in(data: &std::path::Path, id: u64) -> PathBuf {
+    data.join("sessions").join(format!("{id}.jsonl"))
 }
 
 /// Where the helpers of a session keep their conversations.

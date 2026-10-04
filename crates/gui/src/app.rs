@@ -1094,6 +1094,10 @@ impl Chat {
         Self::watch_runs(ended_runs, cx);
         Self::watch_updates(cx);
         Self::watch_inbox(cx);
+        // After the inbox listens, as a wake-up is a notice left in it. Every
+        // session's, since the window lists them all; a terminal open on one
+        // fires its own first.
+        letronna_core::wake::serve_every();
         Self::watch_sessions(cx);
         Self::serve_approvals(cx);
         Self::watch_ended(cx);
