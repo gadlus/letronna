@@ -1607,6 +1607,10 @@ fn body_hashed(
     }
     let marks = marks_cache(connection);
     if marks {
+        // Anthropic's own API spends the fourth marker on the tools instead.
+        if !crate::wire_anthropic::speaks(&connection.endpoint) {
+            split_system(&mut context[0], system.identity);
+        }
         mark_cache(&mut context);
     }
     // The context window can drop the call that made the plan, and a long
@@ -2039,8 +2043,13 @@ fn apply_quirk(body: &mut Value, quirk: Quirk) -> bool {
             tools.retain(|tool| tool["type"] != "web_search");
             tools.len() < offered
         }
-        // Markers ride on message parts, not at the top.
-        Quirk::CacheControl => remove_everywhere(body, "cache_control"),
+        // Markers ride on message parts, not at the top. A server that
+        // turns them down may turn down a system message in parts too.
+        Quirk::CacheControl => {
+            let found = remove_everywhere(body, "cache_control");
+            rejoin_system(body);
+            found
+        }
         Quirk::ToolChoice => fields.remove("tool_choice").is_some(),
         Quirk::ParallelCalls => fields.remove("parallel_tool_calls").is_some(),
         Quirk::Replay => fields.get_mut("messages").is_some_and(|messages| {
@@ -2057,6 +2066,30 @@ fn apply_quirk(body: &mut Value, quirk: Quirk) -> bool {
         Quirk::Thinking => false,
         // Not fields of the chat body: `to_responses` reads them.
         Quirk::Responses | Quirk::Summary => false,
+    }
+}
+
+/// The system message of `body` as one string again where it went in text
+/// parts.
+fn rejoin_system(body: &mut Value) {
+    let first = body
+        .get_mut("messages")
+        .and_then(|messages| messages.get_mut(0));
+    let Some(system) = first.filter(|m| m["role"] == "system") else {
+        return;
+    };
+    let Some(parts) = system["content"].as_array() else {
+        return;
+    };
+    let texts: Option<Vec<&str>> = parts
+        .iter()
+        .map(|part| match part["type"].as_str() {
+            Some("text") => part["text"].as_str(),
+            _ => None,
+        })
+        .collect();
+    if let Some(texts) = texts {
+        system["content"] = texts.concat().into();
     }
 }
 
@@ -2358,10 +2391,34 @@ fn marks_cache(connection: &Connection) -> bool {
             .is_ok_and(|models| !models.contains(model))
 }
 
+/// The system message as two text parts cut at `at`, the first marked, so a
+/// memory write or a new day writes the cache again from the second part,
+/// not from the tools on.
+// The first is who Letronna is and its rules, which hold all session; the
+// second the project's instructions, memory, skills, the date and the model,
+// which change. Joined they are the text, so the model reads the same words.
+fn split_system(system: &mut Value, at: usize) {
+    let Some(text) = system["content"].as_str() else {
+        return;
+    };
+    let (Some(head), Some(tail)) = (text.get(..at), text.get(at..)) else {
+        return;
+    };
+    // A look's own system text has no second part, nor a first.
+    if head.trim().is_empty() || tail.trim().is_empty() {
+        return;
+    }
+    system["content"] = json!([
+        {"type": "text", "text": head, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": tail},
+    ]);
+}
+
 /// Mark the end of the system message and of the last two messages with
 /// text. The newest marker writes the prefix for the next request, and the
 /// one before it finds what the last request wrote. Three of the four
-/// markers Anthropic allows.
+/// markers Anthropic allows: the fourth goes inside the system message
+/// (`split_system`) or, on Anthropic's own API, on the tools.
 fn mark_cache(context: &mut [Value]) {
     let Some((system, rest)) = context.split_first_mut() else {
         return;
@@ -9651,7 +9708,9 @@ mod tests {
             let payload = body_with(&c, &tool_turn(), None, None, &Budget::SMALL, &[]);
             let context = payload["messages"].as_array().unwrap();
             let marks: Vec<Vec<String>> = context.iter().map(marked).collect();
-            assert_eq!(marks[0].len(), 1, "{model}: the system is marked");
+            // Who Letronna is and its rules, then what changes in a session.
+            assert_eq!(marks[0].len(), 2, "{model}: both system parts are marked");
+            assert!(marks[0][1].contains("\n\nToday is"), "{model}");
             // The call with only spaces beside it is passed over for the
             // opener before it, and nothing earlier is marked.
             assert_eq!(marks[5], ["the file"], "{model}");
@@ -9664,6 +9723,69 @@ mod tests {
             let total = payload.to_string().matches("cache_control").count();
             assert!(total <= 4, "{model}: {total} markers");
         }
+    }
+
+    #[test]
+    fn the_two_system_parts_join_to_the_system_text() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("split-system");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let c = Connection {
+            endpoint: "https://openrouter.ai/api/v1".into(),
+            model: "anthropic/claude-sonnet-4.5".into(),
+            tools: true,
+            workspace: Some("/w".into()),
+            ..connection()
+        };
+        let payload = body(&c, &[said("user", "hi")], None, None);
+        let parts = payload["messages"][0]["content"].as_array().unwrap();
+        let joined: String = parts.iter().map(|p| p["text"].as_str().unwrap()).collect();
+        let prompt = system_prompt(&c, None);
+        assert_eq!(joined, prompt.text);
+        assert_eq!(parts[0]["text"], &prompt.text[..prompt.identity]);
+        // Anthropic's own API spends that marker on the tools instead.
+        let direct = Connection {
+            endpoint: "https://api.anthropic.com/v1".into(),
+            model: "claude-opus-5".into(),
+            ..c.clone()
+        };
+        let payload = body(&direct, &[said("user", "hi")], None, None);
+        let parts = payload["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        // A look that brings its own system text keeps it in one part.
+        let look = Connection {
+            system: Some("Say yes.".into()),
+            ..c
+        };
+        let payload = body(&look, &[said("user", "hi")], None, None);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert_eq!(
+            payload["messages"][0]["content"],
+            json!([{"type": "text", "text": "Say yes.", "cache_control": {"type": "ephemeral"}}])
+        );
+    }
+
+    #[test]
+    fn stripped_markers_rejoin_the_system_into_one_string() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("rejoin-system");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let c = Connection {
+            endpoint: "https://openrouter.ai/api/v1".into(),
+            model: "anthropic/claude-sonnet-4.5".into(),
+            ..connection()
+        };
+        let mut payload = body(&c, &tool_turn(), None, None);
+        let text = system_prompt(&c, None).text;
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert!(payload["messages"][0]["content"].is_array());
+        assert!(apply_quirk(&mut payload, Quirk::CacheControl));
+        assert_eq!(payload["messages"][0]["content"], text.as_str());
+        assert!(!payload.to_string().contains("cache_control"));
     }
 
     #[test]
