@@ -82,6 +82,8 @@ pub mod review;
 pub mod sandbox;
 mod scan;
 pub mod schedule;
+#[cfg(feature = "workflows")]
+mod script;
 pub mod search;
 mod side;
 pub mod skills;

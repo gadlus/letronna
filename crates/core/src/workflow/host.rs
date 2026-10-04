@@ -21,7 +21,8 @@
 //! stops with an error no try can catch. The heap and the stack have limits
 //! of their own, so a script that grows without end fails instead of taking
 //! the process down. Boa, the pure-Rust engine tried first, added 8.7 MB to
-//! the terminal and could do none of this.
+//! the terminal and could do none of this. The `script` tool runs on the
+//! same engine, held to the same limits.
 
 use super::{Run, Step};
 use rquickjs::context::{EvalOptions, intrinsic};
@@ -53,7 +54,7 @@ const HEAP: usize = 256 * 1024 * 1024;
 /// deep, and a script nested past that fails to parse rather than overflow.
 const JS_STACK: usize = 1024 * 1024;
 /// The script thread's stack: the engine's, with room for the host around it.
-const STACK: usize = 8 * 1024 * 1024;
+pub(crate) const STACK: usize = 8 * 1024 * 1024;
 /// How deep meta's objects and arrays may nest: it is two or three deep.
 const META_DEPTH: usize = 16;
 /// Lines of a run's log kept from one launch, Claude Code's cap, so a
@@ -146,7 +147,7 @@ struct Host {
 
 /// The engine time and turns a script has used, which the engine's question
 /// whether to go on is answered from.
-struct Clock {
+pub(crate) struct Clock {
     /// Engine time used before the current stretch.
     used: Cell<Duration>,
     /// When the current stretch of engine time began, while the script runs.
@@ -161,15 +162,26 @@ struct Clock {
 
 /// A limit that stops a script.
 #[derive(Clone, Copy)]
-enum Limit {
+pub(crate) enum Limit {
     Turns,
     Time,
 }
 
 impl Clock {
+    /// A clock for a script that may use `most` engine time in all.
+    pub(crate) fn new(most: Duration) -> Self {
+        Self {
+            used: Cell::new(Duration::ZERO),
+            since: Cell::new(None),
+            asked: Cell::new(0),
+            most,
+            hit: Cell::new(None),
+        }
+    }
+
     /// Whether the engine should stop the script, as it asks now and then
     /// while it runs; once a limit is hit, it stays hit.
-    fn stop(&self) -> bool {
+    pub(crate) fn stop(&self) -> bool {
         self.asked.set(self.asked.get() + 1);
         let elapsed = self
             .since
@@ -184,7 +196,7 @@ impl Clock {
     }
 
     /// Runs `work` in the engine, counting the time and turns it takes.
-    fn stretch<T>(&self, work: impl FnOnce() -> T) -> T {
+    pub(crate) fn stretch<T>(&self, work: impl FnOnce() -> T) -> T {
         self.since.set(Some(Instant::now()));
         self.asked.set(0);
         let done = work();
@@ -194,9 +206,14 @@ impl Clock {
         done
     }
 
+    /// The limit that stopped the script, once one has.
+    pub(crate) fn hit(&self) -> Option<Limit> {
+        self.hit.get()
+    }
+
     /// Why the script was stopped, when a limit stopped it.
     fn why(&self) -> Option<String> {
-        Some(match self.hit.get()? {
+        Some(match self.hit()? {
             Limit::Turns => format!(
                 "The workflow script was stopped: it made more than {TURNS} loop turns and calls \
                  without waiting for a helper. Look for a loop that never ends."
@@ -218,24 +235,34 @@ impl Clock {
 /// Runs the script to its end on an engine of its own, which is gone, and
 /// the run with it, by the time this returns.
 fn drive(run: Run, find: Find, body: &str, args: &str, most: Duration) -> End {
-    let clock = Rc::new(Clock {
-        used: Cell::new(Duration::ZERO),
-        since: Cell::new(None),
-        asked: Cell::new(0),
-        most,
-        hit: Cell::new(None),
-    });
+    let clock = Rc::new(Clock::new(most));
     let host = Rc::new(RefCell::new(Host {
         run,
         find,
         log: None,
         lines: 0,
     }));
+    let asking = clock.clone();
+    let (_runtime, context) = match engine(move || asking.stop()) {
+        Ok(engine) => engine,
+        Err(e) => return End::Failed(e),
+    };
+    let end = context.with(|ctx| turns(&ctx, &host, &clock, body, args));
+    // However it ended, its agents are stopped and waited for, so none is
+    // still writing when the run lets its folder go and a resume can start.
+    let mut host = host.borrow_mut();
+    host.run.cancel.set();
+    while host.run.step().is_some() {}
+    end
+}
+
+/// An engine held to the heap and stack limits, asking `stop` now and then
+/// while a script runs whether to stop it, with a context of its own.
+pub(crate) fn engine(stop: impl FnMut() -> bool + 'static) -> Result<(Runtime, Context), String> {
     let engine = Runtime::new().and_then(|runtime| {
         runtime.set_memory_limit(HEAP);
         runtime.set_max_stack_size(JS_STACK);
-        let asking = clock.clone();
-        runtime.set_interrupt_handler(Some(Box::new(move || asking.stop())));
+        runtime.set_interrupt_handler(Some(Box::new(stop)));
         // No WeakRef, which shows when the collector runs, and no
         // performance clock: only what a script needs.
         type Intrinsics = (
@@ -251,17 +278,7 @@ fn drive(run: Run, find: Find, body: &str, args: &str, most: Duration) -> End {
         );
         Context::custom::<Intrinsics>(&runtime).map(|context| (runtime, context))
     });
-    let (_runtime, context) = match engine {
-        Ok(engine) => engine,
-        Err(e) => return End::Failed(format!("Could not start the script engine: {e}")),
-    };
-    let end = context.with(|ctx| turns(&ctx, &host, &clock, body, args));
-    // However it ended, its agents are stopped and waited for, so none is
-    // still writing when the run lets its folder go and a resume can start.
-    let mut host = host.borrow_mut();
-    host.run.cancel.set();
-    while host.run.step().is_some() {}
-    end
+    engine.map_err(|e| format!("Could not start the script engine: {e}"))
 }
 
 /// The host's loop: runs what the script can, then waits for its next answer
@@ -353,7 +370,7 @@ fn begin<'js>(
 
 /// How a script is evaluated: as global code, not strict unless it says so,
 /// named `file` where its errors say where they were.
-fn options(file: &str) -> EvalOptions {
+pub(crate) fn options(file: &str) -> EvalOptions {
     // Made from the default, as the engine may add fields to it.
     let mut options = EvalOptions::default();
     options.strict = false;
@@ -367,11 +384,17 @@ fn failed(ctx: &Ctx, clock: &Clock, error: rquickjs::Error) -> String {
     if let Some(why) = clock.why() {
         return why;
     }
+    format!("The workflow script failed: {}", thrown(ctx, error))
+}
+
+/// What a script threw, or the engine's own error: its name and message,
+/// then where in the script, without the prelude's own frames.
+pub(crate) fn thrown(ctx: &Ctx, error: rquickjs::Error) -> String {
     if !matches!(error, rquickjs::Error::Exception) {
-        return format!("The workflow script failed: {error}");
+        return error.to_string();
     }
     let thrown = ctx.catch();
-    let text = if let Some(exception) = thrown.as_exception() {
+    if let Some(exception) = thrown.as_exception() {
         let name: String = exception.get("name").unwrap_or_else(|_| "Error".into());
         let message = exception.message().unwrap_or_default();
         // Where in the script, without the prelude's own frames.
@@ -391,8 +414,7 @@ fn failed(ctx: &Ctx, clock: &Clock, error: rquickjs::Error) -> String {
             .flatten()
             .and_then(|text| text.to_string().ok())
             .unwrap_or_else(|| "a value that is not an error".into())
-    };
-    format!("The workflow script failed: {text}")
+    }
 }
 
 /// An error the script can catch, saying `message`.
