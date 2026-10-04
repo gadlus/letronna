@@ -323,6 +323,54 @@ fn edit_in(
     loaded(data, &skill.folder)
 }
 
+/// Copy a skill that comes with Letronna into the user's folder, with the
+/// files beside its page, so it can be edited; the copy takes its place.
+pub fn copy_built_in(name: &str) -> Result<Skill, String> {
+    copy_built_in_in(&backend::data_dir(), name)
+}
+
+fn copy_built_in_in(data: &Path, name: &str) -> Result<Skill, String> {
+    let ours = built_in(&data.join(BUILT_IN_DIR));
+    let Some(skill) = find(&ours, name) else {
+        return Err(format!(
+            "\"{name}\" does not come with Letronna, so there is nothing to copy."
+        ));
+    };
+    let files = BUILT_IN
+        .iter()
+        .find(|(dir, _)| skill.folder.file_name().is_some_and(|f| f == *dir))
+        .map_or(&[][..], |(_, files)| *files);
+    // First, as `create` does, so the copy cannot keep skills.json from
+    // arriving.
+    let _ = migrate_in(data);
+    let root = data.join(SKILLS_DIR);
+    if find(&read_root(&root, Source::User), &skill.name).is_some() {
+        return Err(format!(
+            "You already have a skill called \"{}\".",
+            skill.name
+        ));
+    }
+    let folder = free_folder(&root, &slug(&skill.name));
+    let written = files.iter().try_for_each(|(path, text)| {
+        let file = folder.join(path);
+        match path {
+            &SKILL_FILE => write_skill(&folder, text),
+            _ => file
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&file, text))
+                .map_err(|e| format!("Could not save the skill in {}: {e}", folder.display())),
+        }
+    });
+    // Whole or not at all: half a copy would hide the built-in skill and
+    // lose the files its page points to.
+    if let Err(why) = written {
+        let _ = std::fs::remove_dir_all(&folder);
+        return Err(why);
+    }
+    loaded(data, &folder)
+}
+
 /// Take one of the user's skills out of the list by moving its folder into
 /// `skills-archive`, and say where it went.
 pub fn remove(name: &str) -> Result<PathBuf, String> {
@@ -1516,8 +1564,9 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        INDEX_CHARS, PAGE_CHARS, Skill, Source, context_in, create_in, defaults, edit_in, find,
-        list_in, load, migrate_in, remove_in, scalar, set_enabled_in, slug, split, value,
+        BUILT_IN, INDEX_CHARS, PAGE_CHARS, Skill, Source, context_in, copy_built_in_in, create_in,
+        defaults, edit_in, find, list_in, load, migrate_in, read_root, remove_in, scalar,
+        set_enabled_in, slug, split, value,
     };
     use crate::chat::{Connection, Remote};
     use std::path::{Path, PathBuf};
@@ -2562,6 +2611,52 @@ mod tests {
                 "{refused}"
             );
         }
+    }
+
+    #[test]
+    fn a_copy_of_the_built_in_skill_comes_whole_takes_its_place_and_can_be_edited() {
+        let data = scratch("copy-built-in");
+        let copy = copy_built_in_in(&data, "Letronna").unwrap();
+        assert_eq!(copy.source, Source::User);
+        assert_eq!(copy.name, "letronna");
+        // The files its page points to come too, or the copy would lose them.
+        let folder = data.join("skills/letronna");
+        assert_eq!(copy.folder, folder);
+        for (path, text) in BUILT_IN[0].1 {
+            assert_eq!(&std::fs::read_to_string(folder.join(path)).unwrap(), text);
+        }
+        let listed = list_in(&data, None).unwrap();
+        let named: Vec<&Skill> = listed
+            .iter()
+            .filter(|s| s.name.eq_ignore_ascii_case("letronna"))
+            .collect();
+        assert_eq!(named.len(), 1, "{listed:?}");
+        assert_eq!(named[0].source, Source::User);
+
+        let changed = format!("{}\nAlso: ask before guessing.", named[0].body);
+        edit_in(&data, "letronna", "letronna", None, &changed).unwrap();
+        let loaded = load(&data, None, "letronna", None, 0).unwrap();
+        assert!(loaded.contains("ask before guessing."), "{loaded}");
+        let apps = load(&data, None, "letronna", Some("chat-apps.md"), 0).unwrap();
+        assert!(apps.contains("Pair a chat"), "{apps}");
+
+        // One copy at a time, and it is the user's to remove, which brings
+        // the built-in skill back.
+        let again = copy_built_in_in(&data, "letronna").unwrap_err();
+        assert!(again.starts_with("You already have"), "{again}");
+        remove_in(&data, "letronna").unwrap();
+        let listed = list_in(&data, None).unwrap();
+        assert_eq!(find(&listed, "letronna").unwrap().source, Source::BuiltIn);
+    }
+
+    #[test]
+    fn only_a_skill_that_comes_with_letronna_can_be_copied() {
+        let data = scratch("copy-other");
+        create_in(&data, "mine", "", "Mine.").unwrap();
+        let before = read_root(&data.join("skills"), Source::User).len();
+        let refused = copy_built_in_in(&data, "mine").unwrap_err();
+        assert!(refused.contains("does not come with Letronna"), "{refused}");
+        assert_eq!(read_root(&data.join("skills"), Source::User).len(), before);
     }
 
     #[test]
