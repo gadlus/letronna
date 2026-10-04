@@ -706,13 +706,21 @@
   },
   {
     "function": {
-      "description": "Fetch a web page (http or https) and return its text: HTML is reduced to readable markdown with its links as full addresses, plain text and JSON come back as they are, and a PDF is saved as a file. A page read in the last 15 minutes is given again from memory unless `fresh` is true. Use it to read a page the user mentions, or one a search turned up.",
+      "description": "Fetch a web page (http or https) and return its text: HTML is reduced to readable markdown with its links as full addresses and its forms' fields (hidden ones too), plain text and JSON come back as they are, and a PDF is saved as a file. A page read in the last 15 minutes is given again from memory unless `fresh` is true. Use it to read a page the user mentions, or one a search turned up.",
       "name": "web_fetch",
       "parameters": {
         "properties": {
+          "find": {
+            "description": "Words to look for in the page's text; each match comes back with its heading and the lines after it.",
+            "type": "string"
+          },
           "fresh": {
             "description": "Fetch it again even if it was read in the last 15 minutes, for a page that has changed since.",
             "type": "boolean"
+          },
+          "from": {
+            "description": "The line to carry on from when the page was cut.",
+            "type": "integer"
           },
           "url": {
             "description": "The full address, starting with https:// or http://.",

@@ -815,6 +815,8 @@ pub(crate) fn run_found(
 /// first line is Letronna's own, naming the file it saved, as is an MCP result's that
 /// names a picture its server sent; it stays above the fence, where the
 /// window looks for it and nothing a page or server writes can reach.
+/// web_fetch's note on what it showed of a long page is first for the same
+/// reason, and goes after the fence, where the model reads on from it.
 fn fenced(name: &str, args: &Value, text: &str) -> Result<String, String> {
     let shot = [crate::browser::BROWSE, crate::computer::COMPUTER].contains(&name)
         && args["action"] == "screenshot";
@@ -823,6 +825,10 @@ fn fenced(name: &str, args: &Value, text: &str) -> Result<String, String> {
         Some((own, rest)) if saves && crate::media::saved(own).is_some() => {
             let room = MAX_OUTPUT.saturating_sub(own.len() + 1);
             Ok(format!("{own}\n{}", crate::untrusted::fence(rest, room)?))
+        }
+        Some((own, rest)) if name == "web_fetch" && crate::web::noted(own) => {
+            let room = MAX_OUTPUT.saturating_sub(own.len() + 1);
+            Ok(format!("{}\n{own}", crate::untrusted::fence(rest, room)?))
         }
         _ => crate::untrusted::fence(text, MAX_OUTPUT),
     }
@@ -1035,7 +1041,17 @@ pub fn summary(name: &str, args: &str) -> String {
         "run_command" => v["command"].as_str().unwrap_or_default().to_owned(),
         // Left out, the path is the workspace root, which "." names.
         "list_dir" => path_arg(&v).to_owned(),
-        "web_fetch" => v["url"].as_str().unwrap_or_default().to_owned(),
+        // Reading on through a long page shows where, or every call of it
+        // would look the same.
+        "web_fetch" => {
+            let url = v["url"].as_str().unwrap_or_default();
+            let find = v["find"].as_str().filter(|words| !words.trim().is_empty());
+            match (find, v["from"].as_u64()) {
+                (Some(words), _) => format!("{url} \"{words}\""),
+                (None, Some(from)) => format!("{url} from line {from}"),
+                (None, None) => url.to_owned(),
+            }
+        }
         crate::patch::APPLY_PATCH => crate::patch::paths(&v).unwrap_or_default().join(", "),
         "read_job" | "stop_job" => format!("#{}", v["id"].as_u64().unwrap_or(0)),
         "wait" => match (v["job"].as_u64(), v["until"].as_str()) {
@@ -6131,6 +6147,21 @@ mod tests {
     fn a_web_search_shows_its_query_in_quotes() {
         let args = r#"{"query":"gpui text wrap","count":5}"#;
         assert_eq!(summary("search_web", args), "\"gpui text wrap\"");
+    }
+
+    #[test]
+    fn a_page_read_on_through_shows_where() {
+        let url = "https://docs.example/api";
+        let call = |args: Value| summary("web_fetch", &args.to_string());
+        assert_eq!(call(json!({"url": url})), url);
+        assert_eq!(
+            call(json!({"url": url, "find": "rate limit", "from": 40})),
+            format!("{url} \"rate limit\"")
+        );
+        assert_eq!(
+            call(json!({"url": url, "find": " ", "from": 40})),
+            format!("{url} from line 40")
+        );
     }
 
     #[test]
