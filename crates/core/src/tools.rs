@@ -3709,6 +3709,9 @@ impl Tool for ReadFile {
         if let Some(copy) = open_picture(&path, raw)? {
             return Ok(copy);
         }
+        if let Some(older) = crate::docs::older(&path) {
+            return Err(crate::docs::convert(raw, &older));
+        }
         let before = crate::filestate::stat(&path);
         if let Some(view) = crate::docs::view(&path)? {
             let (shown, _) = page(&mut view.as_bytes(), offset, limit, false)?;
@@ -3825,28 +3828,11 @@ fn not_text(path: &Path, raw: &str) -> String {
              --convert-to {newer}`, and read that."
         );
     }
-    let extension = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_ascii_lowercase());
-    let (newer, mac) = match extension.as_deref() {
-        Some("doc") => (
-            "docx",
-            " On macOS, `textutil -convert txt` makes a .txt of it.",
-        ),
-        Some("xls") => ("xlsx", ""),
-        Some("ppt") => ("pptx", ""),
-        _ => {
-            return format!(
-                "`{raw}` is not a text file. Read it with a command made for its format, \
-                 such as `pdftotext` for a PDF or `unzip -l` for an archive, or convert a \
-                 picture to PNG and read that."
-            );
-        }
-    };
+    // An Office file from before 2007 is named by `docs::older` first.
     format!(
-        "`{raw}` is an Office file from before 2007, which read_file cannot read. Convert \
-         it to .{newer} first, as LibreOffice's `soffice --headless --convert-to {newer}` \
-         does, and read that.{mac}"
+        "`{raw}` is not a text file. Read it with a command made for its format, such as \
+         `pdftotext` for a PDF or `unzip -l` for an archive, or convert a picture to PNG \
+         and read that."
     )
 }
 
@@ -4197,6 +4183,12 @@ impl Tool for Search {
                  programs keep their settings and tokens, so search leaves it out.",
                 path_arg(args)
             ));
+        }
+        // One such file named says what read_file would, rather than no matches.
+        if root.is_file()
+            && let Some(older) = crate::docs::older(&root)
+        {
+            return Err(crate::docs::convert(path_arg(args), &older));
         }
         let query = crate::grep::Query::from_args(args, &root, workspace.map(PathBuf::as_path))?;
         let (found, documents) =
@@ -4737,17 +4729,40 @@ mod tests {
                 && cut.ends_with("; `pdftotext` may still read it."),
             "{cut}"
         );
-        // A Word file from before 2007 is no zip, so it is named as one to convert.
+        // A Word file from before 2007 is no zip, so it is named as one to
+        // convert, as is rich text, whose markup would bury its words.
         std::fs::write(dir.join("memo.doc"), b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1\0").unwrap();
-        let old = ReadFile
-            .run(&json!({"path": "memo.doc"}), &ctx)
-            .unwrap_err();
-        assert!(
-            old.starts_with("`memo.doc` is an Office file from before 2007")
-                && old.contains("`soffice --headless --convert-to docx`")
-                && old.contains("`textutil -convert txt`"),
-            "{old}"
-        );
+        std::fs::write(
+            dir.join("Old Deck.ppt"),
+            b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1\0",
+        )
+        .unwrap();
+        std::fs::write(dir.join("letter.rtf"), r"{\rtf1\ansi Dear\par}").unwrap();
+        for (file, about, command) in [
+            (
+                "memo.doc",
+                "a Word 97-2003 document",
+                "--convert-to docx --outdir . memo.doc`",
+            ),
+            (
+                "Old Deck.ppt",
+                "a PowerPoint 97-2003 presentation",
+                "--convert-to pptx --outdir . 'Old Deck.ppt'`",
+            ),
+            (
+                "letter.rtf",
+                "a rich text (RTF) document",
+                "--convert-to docx --outdir . letter.rtf`",
+            ),
+        ] {
+            let old = ReadFile.run(&json!({"path": file}), &ctx).unwrap_err();
+            let start = format!("`{file}` is {about}, which read_file cannot read. ");
+            assert!(old.starts_with(&start) && old.contains(command), "{old}");
+        }
+        // Text merely named so is read as text.
+        std::fs::write(dir.join("notes.doc"), "Just words").unwrap();
+        let notes = ReadFile.run(&json!({"path": "notes.doc"}), &ctx).unwrap();
+        assert!(notes.contains("1|Just words"), "{notes}");
         // So is a password-protected workbook, though named as a new one.
         std::fs::write(dir.join("pay.xlsx"), b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1\0").unwrap();
         let locked = ReadFile
