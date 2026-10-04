@@ -1,7 +1,7 @@
 [
   {
     "function": {
-      "description": "Read a text file, or look at a PNG, JPEG, GIF or WebP picture. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from. A Jupyter notebook (.ipynb) reads as numbered cells with short outputs, and N counts the lines of that view.",
+      "description": "Read a text file, or look at a PNG, JPEG, GIF, WebP or BMP picture; one too big to send is scaled down. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from. A Jupyter notebook (.ipynb) reads as numbered cells with short outputs, and N counts the lines of that view.",
       "name": "read_file",
       "parameters": {
         "properties": {
@@ -116,7 +116,7 @@
   },
   {
     "function": {
-      "description": "Replace `old` with `new` in a file you have read. `old` must match exactly once, unless replace_all is set to change every match. Line endings, trailing spaces, indentation and curly quotes need not match; the file keeps its own. For several changes to one file, pass `edits` instead: they are made in order, and if one fails none is made.",
+      "description": "Replace `old` with `new` in a file you have read. `old` must match exactly once, unless replace_all is set to change every match. Line endings, trailing spaces, indentation, curly quotes and invisible characters need not match; the file keeps its own. For several changes to one file, pass `edits` instead: they are made in order, and if one fails none is made.",
       "name": "edit_file",
       "parameters": {
         "properties": {
@@ -185,7 +185,7 @@
   },
   {
     "function": {
-      "description": "Run a shell (sh) command in the project folder. Waits for it to finish and returns its output, with a 2 minute limit. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead.",
+      "description": "Run a bash command in the project folder, or in the folder inside it that workdir names. Each call is a fresh shell: cd, export and source do not carry over to the next call, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish, for up to 2 minutes or the `timeout` given, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0. Past its timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, with a file for read_file named in the cut, so a build or test run need not be piped through tail, which would also hide its exit code. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead.",
       "name": "run_command",
       "parameters": {
         "properties": {
@@ -194,6 +194,7 @@
             "type": "boolean"
           },
           "command": {
+            "description": "The command line; it runs as one script.",
             "type": "string"
           },
           "notify_on": {
@@ -203,9 +204,17 @@
             },
             "type": "array"
           },
+          "timeout": {
+            "description": "Seconds to wait for it to finish, 1 to 1800; 120 if left out. Give a slow build, install or test suite longer.",
+            "type": "number"
+          },
           "unsandboxed": {
             "description": "Run it outside the sandbox. Only after a sandboxed run of it failed for want of the network or of writing outside the project; it needs the user's approval.",
             "type": "boolean"
+          },
+          "workdir": {
+            "description": "The folder to run it in, inside the project: relative to the project folder, or absolute. Left out, it runs in the project folder.",
+            "type": "string"
           }
         },
         "required": [
@@ -325,7 +334,7 @@
   },
   {
     "function": {
-      "description": "Run a prompt later on this computer, each time in a fresh session with nobody there to answer: every N minutes, daily at a time, or once in N minutes. Also lists the schedules and removes one you added. Adding or removing waits for the user's yes.",
+      "description": "Run a prompt later on this computer, each time in a fresh session with nobody there to answer: every N minutes, daily at a time, or once at a date and time or in N minutes. Also lists the schedules and removes one you added. Adding or removing waits for the user's yes.",
       "name": "schedule",
       "parameters": {
         "properties": {
@@ -335,6 +344,10 @@
               "list",
               "remove"
             ],
+            "type": "string"
+          },
+          "at": {
+            "description": "For add: run once at this local date and time, YYYY-MM-DD HH:MM.",
             "type": "string"
           },
           "daily_at": {
@@ -617,7 +630,7 @@
   },
   {
     "function": {
-      "description": "Save a way of working you figured out as a skill, so later sessions can load it, or fix one you saved that turned out wrong. action create takes name, description and body (the instructions, in Markdown). action patch replaces the exact text old with new in a skill's body, or its description with field set to description; old must appear exactly once. action undo puts back a skill as it was before your last patch; undo again to redo it. action archive puts a skill away. Only skills you created can be changed; the user's own, installed and project skills are refused.",
+      "description": "Save a way of working you figured out as a skill, so later sessions can load it, or fix one you saved that turned out wrong. A skill you create starts switched off: it is not offered to you, and cannot be loaded, until the user switches it on in Skills. action create takes name, description and body (the instructions, in Markdown). action patch replaces the exact text old with new in a skill's body, or its description with field set to description; old must appear exactly once. action undo puts back a skill as it was before your last patch; undo again to redo it. action archive puts a skill away. Only skills you created can be changed; the user's own, installed and project skills are refused.",
       "name": "skill_manage",
       "parameters": {
         "properties": {
@@ -706,7 +719,7 @@
   },
   {
     "function": {
-      "description": "Fetch a web page (http or https) and return its text: HTML is reduced to readable markdown with its links as full addresses, plain text and JSON come back as they are, and a PDF is saved as a file. A page read in the last 15 minutes is given again from memory unless `fresh` is true. Use it to read a page the user mentions, or one a search turned up.",
+      "description": "Fetch a web page (http or https) and return its text: HTML is reduced to readable markdown with its links as full addresses and its forms' fields (hidden ones too), plain text and JSON come back as they are, and a PDF is saved as a file. A page read in the last 15 minutes is given again from memory unless `fresh` is true. Use it to read a page the user mentions, or one a search turned up.",
       "name": "web_fetch",
       "parameters": {
         "properties": {
@@ -959,7 +972,7 @@
   },
   {
     "function": {
-      "description": "Act on the page open in browse, the way a person would: `click` an element, `type` into a field (it replaces what is there; `submit` presses Enter after), `press` a key such as Enter, Tab, Escape or ArrowDown, `select` a dropdown's option by its text (a site's own dropdown too: it is opened and the option clicked), `upload` files from the project into a file field, `drag` an element onto another (`to`) or to a point, or `eval` a JavaScript expression and get its value back. Elements are named by the refs browse lists, such as e12; one listed under a frame's header marked cross-origin or opaque origin also needs `frame`, the origin that header names after \"frame\", and each such action is asked about on its own. `click` also takes a point instead of a ref, and names what was there: `x` and `y` in CSS pixels from the top left of the view, which is as big as the latest screenshot's result says -- not the picture's own pixels, which may have been shrunk on the way to you, and read off a screenshot of the view, not of the whole page. It is refused once the page has changed or scrolled since it was last seen, and inside a frame from another origin than the page's. `batch` runs `steps`, a list of these actions and browse's hover, wait and scroll, each written as its own call would be, in order in one call, stopping at the first that fails (a wait whose text does not come counts), and gives each step's short result; each step is asked about as it would be alone. Returns what changed on the page afterwards: the lines that are new (`>`) or gone (`<`), with the lines around them and where they are, measured against the page as you last saw it listed in this tab; the whole page instead after it loaded another page, when there is no earlier listing to measure against, or with `listing` set to `full`. It names any file an action downloaded, saved in the project's media/downloads folder (one the page starts a little later is named in the next result). A question the page asks, such as \"Are you sure?\", is answered Cancel unless `confirm` is true. Close a cookie banner or popup before acting on what it covers. Use a site's own search, filters and sort before paging through its results. After typing into a field that suggests as you type, click the suggestion that fits from what changed -- or wait for it with browse's wait if none shows yet -- rather than pressing Enter or using `submit`. Fill a form with one batch that ends with the click that sends it, unless a field suggests as you type or the form pays, buys, deletes or sends a message: then look at the filled form before sending. Read a long page with browse's look and `find` before asking for `full`. Before saying a task on the web is done, check that the page shows it done, and give the user only names, prices and addresses the pages showed, saying so when something asked for was not there.",
+      "description": "Act on the page open in browse, the way a person would: `click` an element, `type` into a field (it replaces what is there; `submit` presses Enter after), `press` a key such as Enter, Tab, Escape or ArrowDown, `select` a dropdown's option by its text (a site's own dropdown too: it is opened and the option clicked), `upload` files from the project into a file field, `drag` an element onto another (`to`) or to a point, or `eval` a JavaScript expression and get its value back. Elements are named by the refs browse lists, such as e12; one listed under a frame's header marked cross-origin or opaque origin also needs `frame`, the origin that header names after \"frame\", and each such action is asked about on its own. `click` also takes a point instead of a ref, and names what was there: `x` and `y` in CSS pixels from the top left of the view, which is as big as the latest screenshot's result says -- not the picture's own pixels, which may have been shrunk on the way to you, and read off a screenshot of the view, not of the whole page. It is refused once the page has changed or scrolled since it was last seen, and inside a frame from another origin than the page's. `batch` runs `steps`, a list of these actions and browse's hover, wait and scroll, each written as its own call would be, in order in one call, stopping at the first that fails (a wait whose text does not come counts, as does a field left holding other text than was typed), and gives each step's short result; each step is asked about as it would be alone. Returns what changed on the page afterwards: the lines that are new (`>`) or gone (`<`), with the lines around them and where they are, measured against the page as you last saw it listed in this tab; the whole page instead after it loaded another page, when there is no earlier listing to measure against, or with `listing` set to `full`. It names any file an action downloaded, saved in the project's media/downloads folder (one the page starts a little later is named in the next result). A question the page asks, such as \"Are you sure?\", is answered Cancel unless `confirm` is true. Close a cookie banner or popup before acting on what it covers. Use a site's own search, filters and sort before paging through its results. After typing into a field that suggests as you type, click the suggestion that fits from what changed -- or wait for it with browse's wait if none shows yet, or type it again with `keys` true if none comes at all -- rather than pressing Enter or using `submit`. Fill a form with one batch that ends with the click that sends it, unless a field suggests as you type or the form pays, buys, deletes or sends a message: then look at the filled form before sending. Read a long page with browse's look and `find` before asking for `full`. Before saying a task on the web is done, check that the page shows it done, and give the user only names, prices and addresses the pages showed, saying so when something asked for was not there.",
       "name": "use_page",
       "parameters": {
         "properties": {
@@ -995,6 +1008,10 @@
             "description": "For press: Enter, Tab, Escape, Backspace, Delete, an arrow such as ArrowDown, Home, End, PageUp, PageDown, Space, or one character. With a ref, the element is focused first.",
             "type": "string"
           },
+          "keys": {
+            "description": "For type: press a key for each character, as a person types, instead of putting the text in at once. It is slower, so it is for short text, such as a city or an address, in a field that suggests only as keys are pressed.",
+            "type": "boolean"
+          },
           "listing": {
             "description": "What to show of the page after: `changes` (the default) for only what changed, `full` for the whole listing.",
             "enum": [
@@ -1019,7 +1036,7 @@
             "type": "array"
           },
           "submit": {
-            "description": "For type: press Enter afterwards.",
+            "description": "For type: press Enter afterwards, unless the field then holds other text than was typed.",
             "type": "boolean"
           },
           "text": {
@@ -1118,7 +1135,7 @@
       "parameters": {
         "properties": {
           "background": {
-            "description": "Default true in the window and terminal: return now and get a notice when it finishes. false waits for the report.",
+            "description": "Default true in the window and terminal, unless the type says otherwise: return now and get a notice when it finishes. false waits for the report.",
             "type": "boolean"
           },
           "description": {
