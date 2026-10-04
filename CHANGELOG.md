@@ -202,7 +202,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — A blocked goal gets one more try, then pauses instead of being dropped.
 - **All** — Plan mode can keep every tool, so switching it keeps the cache (off unless chosen).
 - **All** — The gate reads a call's arguments under the names the tool accepts; `run_command` says how to read its result and that it has no keyboard.
-- **All** — The checklist tool says when to use it and what done means; a summary keeps your rules word for word and marks what is done.
+- **All** — The checklist tool says when to use it and what done means; a summary keeps your rules word for word and marks what is done. `/init` writes gotchas as short rules, without a tour of the folders.
 ### Fixed
 - **All** — A command that uploads a key file (curl, wget, scp, rsync) is refused in every mode, and .gnupg, .pgpass, .vault-token, .azure and gcloud settings count as secret.
 - **All** — An edit whose old text is missing says so instead of "already applied", plain text is no longer saved as a .docx, .xlsx, .pptx, .zip or .pdf, and a command that exits non-zero counts as failed.
