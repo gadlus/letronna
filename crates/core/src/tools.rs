@@ -3687,7 +3687,7 @@ impl Tool for ReadFile {
         true
     }
     fn description(&self) -> &'static str {
-        "Read a text file, a PDF, Word, Excel or PowerPoint file, or look at a PNG, JPEG, GIF, WebP or BMP picture; one too big to send is scaled down. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from. A Jupyter notebook (.ipynb) reads as numbered cells with short outputs, a document as its text with a heading for each page, sheet or slide, and N counts the lines of that view."
+        "Read a text file, a PDF, Word, Excel, PowerPoint or OpenDocument file, or look at a PNG, JPEG, GIF, WebP or BMP picture; one too big to send is scaled down. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from. A Jupyter notebook (.ipynb) reads as numbered cells with short outputs, a document as its text with a heading for each page, sheet or slide, and N counts the lines of that view."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -4156,9 +4156,9 @@ impl Tool for Search {
          each file's matching lines as `12: text` and context lines as `13- text`; files \
          lists the matching files, newest first; count gives matching lines per file. Mode \
          files with no pattern lists the files a glob or type picks. Ignores case unless \
-         case_sensitive is set. Paths come back ready for read_file. PDF, Word, Excel and \
-         PowerPoint files are searched as read_file reads them only when type, glob or path \
-         names them."
+         case_sensitive is set. Paths come back ready for read_file. PDF, Word, Excel, \
+         PowerPoint and OpenDocument files are searched as read_file reads them only when \
+         type, glob or path names them."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
