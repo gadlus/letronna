@@ -1131,12 +1131,13 @@ fn system_prompt(
         };
     }
     let mut system = identity(connection, crate::styles::chosen());
+    let head = system.len();
     let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
     if connection.tools && !shared {
         // A chat app is not the terminal or the window, and /resume means
         // nothing there; the remote text below says where the session is.
         if connection.remote.is_none() {
-            system.push_str(" You are Letronna, running in the user's terminal or desktop window; you are not any other assistant, and commands from other tools do not apply here. The user's earlier conversations are sessions: list_sessions shows them, and the user picks one up with the /resume command or `letronna --resume <id>`.");
+            system.push_str(" You run in Letronna, not in any other assistant; other tools' commands do not apply here. The user's earlier conversations are sessions: list_sessions shows them, and the user picks one up with the /resume command or `letronna --resume <id>`.");
         }
         system.push_str(" You have tools to read, search, write and edit files and to run commands in the user's project; use them instead of guessing.");
         system.push_str(&crate::prompt_rules::told(
@@ -1190,6 +1191,11 @@ fn system_prompt(
     // Said once here, not with every fenced result: a result pays only for
     // its tags, and this part of the prompt stays cached.
     system.push_str(&format!(" {}", crate::untrusted::RULE));
+    // A chosen style ends in a blank line, which the next sentence's space
+    // would follow. A SOUL.md is trimmed, so only a style ends so.
+    if system[..head].ends_with('\n') && system[head..].starts_with(' ') {
+        system.remove(head);
+    }
     // The project's rules and skills first: they change rarely, so the
     // prompt's start stays cacheable; the summary of dropped turns changes
     // as the conversation grows.
@@ -4456,6 +4462,54 @@ mod tests {
         let plain = without["messages"][0]["content"].as_str().unwrap();
         assert!(!plain.contains("summarized"));
     }
+    #[test]
+    fn a_styled_prompt_has_no_space_after_its_blank_line() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("styled-space");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let settings = json!({"endpoint": "", "model": "m", "style": "concise"});
+        std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+        let styled = system_with_tools(connection());
+        let toolless = body(&connection(), &[], None, None)["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        let style = "Use a list only when the content is a list.\n\n";
+        assert!(
+            styled.contains(&format!("{style}You run in Letronna")),
+            "{styled}"
+        );
+        assert!(
+            toolless.contains(&format!("{style}You have no tools")),
+            "{toolless}"
+        );
+        for system in [styled, toolless] {
+            assert!(!system.contains("\n\n "), "{system}");
+        }
+    }
+
+    #[test]
+    fn a_soul_md_session_is_not_told_it_is_letronna() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("soul-voice");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        std::fs::write(dir.join("SOUL.md"), "You are a ship's cook.").unwrap();
+        let soul = system_with_tools(connection());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert!(
+            soul.starts_with(
+                "You are a ship's cook. You run in Letronna, not in any other assistant"
+            ),
+            "{soul}"
+        );
+        assert!(!soul.contains("You are Letronna"), "{soul}");
+    }
+
     #[test]
     fn replies_are_told_to_lead_with_the_answer_unless_a_soul_md_says_who_letronna_is() {
         let _turn = crate::store::tests::DATA_DIR
