@@ -2527,6 +2527,12 @@ impl Tool for RunCommand {
             }
             let limit = command_timeout(args)?;
             let before = crate::filestate::before(ctx.conversation);
+            // The model sees a script's command only as the script passes it
+            // on, so what it prints is no read, as with read_file.
+            let cat = match ctx.caller.script {
+                true => None,
+                false => crate::cat::Cat::of(command, &dir),
+            };
             let save = spill_path(ctx).map(|path| SaveTo {
                 path,
                 cap: PIPE_SPILL_BYTES,
@@ -2545,6 +2551,10 @@ impl Tool for RunCommand {
                 watch.after(first.is_some_and(|line| line.contains(MOVED)));
             }
             let note = crate::filestate::note(ctx.conversation, before, cwd);
+            // A note means a file moved while it ran, so nothing is sure.
+            if let (Some(cat), Ok(text), true) = (cat, &out, note.is_empty()) {
+                cat.read(ctx.conversation, text);
+            }
             // The note goes first, so cutting long output short cannot drop it.
             return match out {
                 Ok(text) => Ok(note + &text),

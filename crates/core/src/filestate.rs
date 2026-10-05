@@ -19,8 +19,9 @@
 //! dropped or summarised. Pages of a file add up while it stays unchanged:
 //! once they have shown every line, and the request goes out with each of
 //! them whole rather than cleared to save room, they count as one read of
-//! all of it. A rewind forgets the conversation's entries, since the
-//! positions they were stamped with are used again.
+//! all of it. A plain `cat` of a file whose output came back whole counts as
+//! a read of all of it too (see `cat`). A rewind forgets the conversation's
+//! entries, since the positions they were stamped with are used again.
 //!
 //! The check and the write happen under one lock, on the same bytes, so
 //! two calls in this process cannot both pass and then clobber each other.
@@ -1148,6 +1149,247 @@ mod tests {
         let seen = &state.seen[&(ctx.conversation, key(&dir.join("short.docx")))];
         assert!(!seen.whole && seen.pages.is_empty());
         drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `command` run in the project as the model's call, and what it returned.
+    #[cfg(unix)]
+    fn shell(ctx: &ToolContext, command: &str) -> String {
+        let args = serde_json::json!({ "command": command }).to_string();
+        run("run_command", &args, ctx).unwrap()
+    }
+
+    /// The refusal write_file gives for `name` in the reply the session is at.
+    #[cfg(unix)]
+    fn refused_write(ctx: &ToolContext, name: &str) -> String {
+        let args = serde_json::json!({ "path": name, "content": "new\n" }).to_string();
+        run("write_file", &args, ctx).unwrap_err()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_cat_counts_as_a_read_of_what_it_printed() {
+        let (dir, ctx) = project("cat", 117);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "three\n").unwrap();
+        std::fs::write(dir.join("c.txt"), "four\nfive").unwrap();
+        assert_eq!(shell(&ctx, "cat a.txt b.txt"), "one\ntwo\nthree\n");
+        assert_eq!(shell(&ctx, "cat -n c.txt"), "     1\tfour\n     2\tfive");
+        // Printed in the reply that writes, it was not yet seen, as with a
+        // read.
+        let write = r#"{"path":"a.txt","content":"1\n"}"#;
+        let refused = run("write_file", write, &ctx).unwrap_err();
+        assert!(refused.contains("in this same reply"), "{refused}");
+
+        reply(&ctx, 3);
+        run("write_file", write, &ctx).unwrap();
+        let edit = r#"{"path":"b.txt","old":"three","new":"3"}"#;
+        run("edit_file", edit, &ctx).unwrap();
+        run("write_file", r#"{"path":"c.txt","content":"4\n"}"#, &ctx).unwrap();
+        assert_eq!(read_to(&dir, "a.txt"), "1\n");
+        assert_eq!(read_to(&dir, "b.txt"), "3\n");
+        assert_eq!(read_to(&dir, "c.txt"), "4\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cat_after_a_cd_counts_for_the_files_of_that_folder() {
+        let (dir, ctx) = project("cat-cd", 118);
+        std::fs::create_dir_all(dir.join("in/app")).unwrap();
+        std::fs::write(dir.join("in/app/config.py"), "A = 1\n").unwrap();
+        std::fs::write(dir.join("in/x.py"), "X = 1\n").unwrap();
+        std::fs::write(dir.join("config.py"), "B = 1\n").unwrap();
+        assert_eq!(shell(&ctx, "cd in/app && cat config.py"), "A = 1\n");
+        // The folder `workdir` names moves it just the same.
+        let args = r#"{"command":"cat x.py","workdir":"in"}"#;
+        assert_eq!(run("run_command", args, &ctx).unwrap(), "X = 1\n");
+        reply(&ctx, 3);
+        let edit = r#"{"path":"in/app/config.py","old":"1","new":"2"}"#;
+        run("edit_file", edit, &ctx).unwrap();
+        let edit = r#"{"path":"in/x.py","old":"1","new":"2"}"#;
+        run("edit_file", edit, &ctx).unwrap();
+        // The file of the same name in the project folder was not printed.
+        let edit = r#"{"path":"config.py","old":"1","new":"2"}"#;
+        let refused = run("edit_file", edit, &ctx).unwrap_err();
+        assert!(refused.contains("have not read"), "{refused}");
+        assert_eq!(read_to(&dir, "in/app/config.py"), "A = 2\n");
+        assert_eq!(read_to(&dir, "in/x.py"), "X = 2\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cat_cut_to_fit_the_result_is_not_a_read() {
+        let (dir, ctx) = project("cat-cut", 119);
+        std::fs::write(dir.join("long.txt"), lines("line")).unwrap();
+        let shown = shell(&ctx, "cat long.txt");
+        assert!(shown.contains("left out"), "{shown}");
+        let _ = std::fs::remove_dir_all(crate::tools::results_dir(119));
+        reply(&ctx, 3);
+        let refused = refused_write(&ctx, "long.txt");
+        assert!(refused.contains("have not read"), "{refused}");
+        let edit = r#"{"path":"long.txt","old":"line 300","new":"end"}"#;
+        let refused = run("edit_file", edit, &ctx).unwrap_err();
+        assert!(refused.contains("have not read"), "{refused}");
+        assert_eq!(read_to(&dir, "long.txt"), lines("line"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cat_with_anything_more_in_the_line_is_not_a_read() {
+        let (dir, ctx) = project("cat-more", 120);
+        let cases = [
+            ("pipe.txt", "cat pipe.txt | cat"),
+            ("glob.txt", "cat glo*.txt"),
+            ("redirect.txt", "cat redirect.txt > out.txt"),
+            ("variable.txt", "cat \"$PWD/variable.txt\""),
+            ("substitution.txt", "cat $(echo substitution.txt)"),
+            ("after.txt", "cat after.txt; true"),
+            ("both.txt", "cat both.txt && true"),
+            ("options.txt", "cat -A options.txt"),
+            ("semicolon.txt", "cd . ; cat semicolon.txt"),
+        ];
+        for (name, command) in cases {
+            std::fs::write(dir.join(name), "one\n").unwrap();
+            shell(&ctx, command);
+        }
+        reply(&ctx, 3);
+        for (name, command) in cases {
+            let refused = refused_write(&ctx, name);
+            assert!(refused.contains("have not read"), "{command}: {refused}");
+            assert_eq!(read_to(&dir, name), "one\n");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cat_that_failed_is_not_a_read() {
+        let (dir, ctx) = project("cat-failed", 121);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "two\n").unwrap();
+        // The first printed whole before the second was found missing.
+        let shown = shell(&ctx, "cat a.txt missing.txt");
+        assert!(shown.starts_with("one\n"), "{shown}");
+        assert!(shown.contains("[exit code 1]"), "{shown}");
+        let shown = shell(&ctx, "cat missing.txt b.txt");
+        assert!(shown.contains("[exit code 1]"), "{shown}");
+        reply(&ctx, 3);
+        for name in ["a.txt", "b.txt"] {
+            let refused = refused_write(&ctx, name);
+            assert!(refused.contains("have not read"), "{name}: {refused}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cat_that_reached_the_model_as_something_else_is_not_a_read() {
+        let (dir, ctx) = project("cat-changed-on-the-way", 122);
+        let files: [(&str, &[u8]); 3] = [
+            // Escape sequences are stripped from a command's output.
+            ("colour.txt", b"\x1b[31mred\x1b[0m\n"),
+            // As are characters nobody sees.
+            ("hidden.txt", "a\u{200B}b\n".as_bytes()),
+            // A key's shape is hidden.
+            ("key.txt", b"KEY=sk-abcd1234efgh5678ijkl9012mnop3456\n"),
+        ];
+        for (name, bytes) in files {
+            std::fs::write(dir.join(name), bytes).unwrap();
+            shell(&ctx, &format!("cat {name}"));
+        }
+        reply(&ctx, 3);
+        for (name, bytes) in files {
+            let refused = refused_write(&ctx, name);
+            assert!(refused.contains("have not read"), "{name}: {refused}");
+            assert_eq!(std::fs::read(dir.join(name)).unwrap(), bytes);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_changed_after_a_cat_has_to_be_read_again() {
+        let (dir, ctx) = project("cat-then-changed", 123);
+        std::fs::write(dir.join("a.txt"), "one two\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "one two\n").unwrap();
+        shell(&ctx, "cat a.txt b.txt");
+        reply(&ctx, 3);
+        // The same length, so only the hash can tell.
+        std::fs::write(dir.join("a.txt"), "one TWO\n").unwrap();
+        let refused = refused_write(&ctx, "a.txt");
+        assert!(refused.contains("changed on disk"), "{refused}");
+        assert_eq!(read_to(&dir, "a.txt"), "one TWO\n");
+        // The file the cat printed that did not change is still its own.
+        run("write_file", r#"{"path":"b.txt","content":"b\n"}"#, &ctx).unwrap();
+
+        // A cat of it as it is now is the read it asks for.
+        shell(&ctx, "cat a.txt");
+        reply(&ctx, 5);
+        run("write_file", r#"{"path":"a.txt","content":"a\n"}"#, &ctx).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_moved_while_the_cat_ran_is_not_a_read() {
+        let (dir, ctx) = project("cat-moved", 124);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        let cat = crate::cat::Cat::of("cat a.txt", &dir).unwrap();
+        // The model was shown "one", and the file is now another length.
+        std::fs::write(dir.join("a.txt"), "two!\n").unwrap();
+        cat.read(124, "two!\n");
+        reply(&ctx, 3);
+        let refused = refused_write(&ctx, "a.txt");
+        assert!(refused.contains("have not read"), "{refused}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_result_that_is_not_what_the_files_hold_is_not_a_read() {
+        let (dir, ctx) = project("cat-other-result", 126);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        let sandboxed = format!("{}\none\n", crate::sandbox::NOTE);
+        // As long as the file or longer, so only comparing them tells.
+        let results = ["two\n", "one\n\n", "one\n[exit code 1]", sandboxed.as_str()];
+        for shown in results {
+            let cat = crate::cat::Cat::of("cat a.txt", &dir).unwrap();
+            cat.read(126, shown);
+            reply(&ctx, 3);
+            let refused = refused_write(&ctx, "a.txt");
+            assert!(refused.contains("have not read"), "{shown}: {refused}");
+        }
+        // What the file holds, which was not wrong in itself.
+        crate::cat::Cat::of("cat a.txt", &dir)
+            .unwrap()
+            .read(126, "one\n");
+        reply(&ctx, 5);
+        run("write_file", r#"{"path":"a.txt","content":"a\n"}"#, &ctx).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn what_a_script_cats_is_not_a_read() {
+        let (dir, ctx) = project("cat-script", 125);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        let mut caller = ctx.caller.clone();
+        caller.script = true;
+        let scripted = ToolContext {
+            caller,
+            ..ctx.clone()
+        };
+        assert_eq!(shell(&scripted, "cat a.txt"), "one\n");
+        reply(&ctx, 3);
+        let refused = refused_write(&ctx, "a.txt");
+        assert!(refused.contains("have not read"), "{refused}");
+        // The model's own cat is.
+        shell(&ctx, "cat a.txt");
+        reply(&ctx, 5);
+        run("write_file", r#"{"path":"a.txt","content":"a\n"}"#, &ctx).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
