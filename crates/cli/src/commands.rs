@@ -3686,10 +3686,14 @@ fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
         model: from.model.clone(),
         gateway: from.gateway.clone(),
         effort: from.effort.clone(),
+        // A private chat's copy is private too, and knows what it knew.
+        memory_saving: from.memory_saving,
+        memory_scope: from.memory_scope,
         ..Default::default()
     };
     copy.copy_summaries(from);
     history::share(from.id, copy.id);
+    let notes = letronna_core::memory::copy_chat_notes(from.id, copy.id);
     runner.store.conversations.push(copy);
     letronna_core::review::stop(&runner.review);
     *session = runner.store.conversations.len() - 1;
@@ -3700,6 +3704,9 @@ fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
     render::line(&render::dim(&format!(
         "Now in {title}. The original is kept; /resume goes back to it."
     )));
+    if let Err(error) = notes {
+        render::line(&render::red(&error));
+    }
 }
 
 /// Models listed at once where they cannot be steered through. Some gateways

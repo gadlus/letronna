@@ -597,6 +597,7 @@ impl Chat {
         };
         fork.copy_summaries(source);
         history::share(source.id, id);
+        let notes = letronna_core::memory::copy_chat_notes(source.id, id);
         self.leave_for(self.store.conversations.len());
         self.store.conversations.push(fork);
         self.store.active = self.store.conversations.len() - 1;
@@ -605,6 +606,9 @@ impl Chat {
         self.save();
         self.swap_draft(window, cx);
         self.follow();
+        if let Err(error) = notes {
+            self.error = Some(error);
+        }
     }
 
     /// The right-click menu for a turn: the same actions as its buttons.
