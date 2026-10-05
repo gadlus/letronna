@@ -9,6 +9,8 @@
 //! `Retry-After`. Someone watching would rather be told than sit through a
 //! wait of minutes, so a longer one gives up at once; a schedule or a chat
 //! app, which nobody may be watching, gets more tries and a longer wait.
+//! A reply whose stream is cut part way is tried again the same way, and
+//! what it had said so far is dropped, never kept or run as if whole.
 //!
 //! A wait sleeps in short slices and ends as soon as the frontend stops
 //! listening, which is how both of them stop a turn.
@@ -40,6 +42,11 @@ const PATIENCE_UNATTENDED: Duration = Duration::from_secs(10 * 60);
 /// How often a wait looks to see whether the turn was stopped.
 const SLICE: Duration = Duration::from_millis(100);
 
+/// What a frontend that cannot take back the words of a cut reply says
+/// after them.
+pub const DROPPED: &str =
+    "The provider closed the stream early, so that reply is dropped and asked for again.";
+
 /// A failed call about to be made again, as the frontends are told of it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Retry {
@@ -51,6 +58,9 @@ pub struct Retry {
     pub of: u32,
     /// How long until it is made.
     pub wait: Duration,
+    /// The last try broke off part way through its reply, so what it said
+    /// is dropped and the next try's reply comes in its place.
+    pub dropped: bool,
 }
 
 impl fmt::Display for Retry {
@@ -58,6 +68,7 @@ impl fmt::Display for Retry {
         let why = match self.kind {
             FailureKind::RateLimit => "Rate limited",
             FailureKind::Overloaded => "The provider is overloaded",
+            FailureKind::Network if self.dropped => "The provider closed the stream early",
             FailureKind::Network => "The connection failed",
             _ => "The provider had an error",
         };
@@ -99,6 +110,7 @@ pub fn after(failure: &Failure, tried: u32, unattended: bool) -> Option<Retry> {
         attempt: tried + 1,
         of,
         wait,
+        dropped: false,
     })
 }
 
@@ -241,10 +253,20 @@ mod tests {
             attempt: 2,
             of: 6,
             wait: Duration::from_millis(1_100),
+            dropped: false,
         };
         assert_eq!(
             retry.to_string(),
             "Rate limited, trying again in 2s (try 2 of 6)"
+        );
+        let cut = Retry {
+            kind: FailureKind::Network,
+            dropped: true,
+            ..retry
+        };
+        assert_eq!(
+            cut.to_string(),
+            "The provider closed the stream early, trying again in 2s (try 2 of 6)"
         );
     }
 
