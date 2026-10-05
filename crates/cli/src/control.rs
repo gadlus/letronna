@@ -34,6 +34,7 @@ use letronna_core::chat::ToolCall;
 use letronna_core::driver::Report;
 use letronna_core::gate::{self, Gate, Grants, Mode};
 use letronna_core::permissions::{self, Rule};
+use letronna_core::prompt_rules;
 use letronna_core::tools;
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -88,6 +89,8 @@ struct Running {
     id: u64,
     before: usize,
     cancel: Cancel,
+    /// What its result line says of the prompt's rules.
+    prompt: Value,
 }
 
 /// One line as `next_line` read it.
@@ -246,7 +249,15 @@ pub fn run(runner: &mut Runner, session: usize, args: &Args) -> i32 {
                     continue;
                 };
                 let output = args.output;
-                failed |= !crate::finish(runner, session, turn.id, turn.before, report, output);
+                let ended = crate::finish(
+                    runner,
+                    session,
+                    (turn.id, turn.before),
+                    report,
+                    output,
+                    turn.prompt,
+                );
+                failed |= !ended;
                 // A session deleted or cut short elsewhere meanwhile is not
                 // taken back, and the next message would land on another.
                 lost |= runner
@@ -341,6 +352,7 @@ fn start(
         id: spec.id,
         before,
         cancel: spec.cancel.clone(),
+        prompt: prompt_rules::seen(&spec.connection).unwrap_or_default(),
     };
     let (events, output) = (events.clone(), args.output);
     std::thread::spawn(move || {

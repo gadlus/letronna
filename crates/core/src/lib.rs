@@ -75,6 +75,7 @@ pub mod plugins;
 mod prefilter;
 pub mod preview;
 pub mod profiles;
+pub mod prompt_rules;
 mod redact;
 pub mod references;
 pub mod remote;

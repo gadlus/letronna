@@ -74,6 +74,10 @@ With -p, from the environment, saving none of it
                            gateway set up, unless --gateway names one
   AGENT_API_KEY            the key to send it
   AGENT_MODEL              the model to ask, unless --model names one
+  LETRONNA_PROMPT_RULES    rules to leave out of the system prompt of a run
+                           nobody watches, as -compute,-done, for measuring
+                           what each is worth; a wrong id stops the run and
+                           lists them
 ";
 
 /// What to open with.
