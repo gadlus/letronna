@@ -369,18 +369,7 @@ impl Chat {
         if gone == 0 {
             return;
         }
-        let mut body = if back.is_some() {
-            format!(
-                "This message and {} after it leave the session, and its text goes back in the \
-                 box.",
-                message_count(gone - 1)
-            )
-        } else {
-            format!("{} after this leave the session.", message_count(gone))
-        };
-        if files.is_empty() {
-            body.push_str(" Files the agent changed stay as they are.");
-        }
+        let body = rewind_says(back.is_some(), gone, !files.is_empty());
         let session = self.store.conversations[self.store.active].id;
         // Unticked to start with, as the terminal's /undo needs --files:
         // putting files back replaces what is on disk, so it is asked for.
@@ -1491,12 +1480,39 @@ fn message_count(n: usize) -> String {
     }
 }
 
+/// What the rewind question says: what going back removes, from your
+/// message when `yours`, and that changes to files stay unless `listed`.
+fn rewind_says(yours: bool, gone: usize, listed: bool) -> String {
+    let mut says = match (yours, gone) {
+        (true, 0 | 1) => {
+            "This message is removed from the chat, and its text goes back in the box.".to_owned()
+        }
+        (true, n) => format!(
+            "This message and the {} after it are removed from the chat, and its text goes \
+             back in the box.",
+            message_count(n - 1)
+        ),
+        (false, 1) => "The message after this is removed from the chat.".to_owned(),
+        (false, n) => format!(
+            "The {} after this are removed from the chat.",
+            message_count(n)
+        ),
+    };
+    // Listed, the files go back only if the box under them is ticked,
+    // which says so itself.
+    if !listed {
+        says.push_str(" Changes to files are not undone.");
+    }
+    says
+}
+
 #[cfg(test)]
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        Span, Stop, line_totals, message_count, scrolls, shows_bar, step_stop, stops, turns,
+        Span, Stop, line_totals, message_count, rewind_says, scrolls, shows_bar, step_stop, stops,
+        turns,
     };
     use letronna_core::chat::Message;
     use letronna_core::history::Lines;
@@ -1617,6 +1633,36 @@ mod tests {
     fn counts_read_as_words() {
         assert_eq!(message_count(1), "1 message");
         assert_eq!(message_count(3), "3 messages");
+    }
+
+    #[test]
+    fn the_rewind_question_says_what_goes_and_that_files_are_not_undone() {
+        assert_eq!(
+            rewind_says(true, 2, false),
+            "This message and the 1 message after it are removed from the chat, and its text \
+             goes back in the box. Changes to files are not undone."
+        );
+        assert_eq!(
+            rewind_says(true, 1, false),
+            "This message is removed from the chat, and its text goes back in the box. Changes \
+             to files are not undone."
+        );
+        assert_eq!(
+            rewind_says(false, 1, false),
+            "The message after this is removed from the chat. Changes to files are not undone."
+        );
+        assert_eq!(
+            rewind_says(false, 4, false),
+            "The 4 messages after this are removed from the chat. Changes to files are not \
+             undone."
+        );
+        // With files to put back, the box under the question says what
+        // becomes of them.
+        assert_eq!(
+            rewind_says(true, 4, true),
+            "This message and the 3 messages after it are removed from the chat, and its text \
+             goes back in the box."
+        );
     }
 
     #[test]
