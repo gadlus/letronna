@@ -699,6 +699,12 @@ fn main() {
         println!("{BRAND} {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    // Started by Claude Code as its hook, to wait for Letronna's messages:
+    // no window, and before the single-instance check, which would see the
+    // window already open and quit.
+    if let Some(port_file) = plugins::claude_code::hook_arg() {
+        std::process::exit(plugins::claude_code::hook(&port_file));
+    }
     if std::env::args().any(|a| a == "--uninstall") {
         platform::install::uninstall();
     }
@@ -728,6 +734,7 @@ fn main() {
                     plugins::PresenceMode::Detailed,
                 )),
                 Box::new(plugins::hello::Hello::new()),
+                Box::new(plugins::claude_code::ClaudeCode::new()),
             ],
         );
         // MCP servers can take seconds to start; started with the window,
