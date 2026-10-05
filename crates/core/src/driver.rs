@@ -4357,8 +4357,17 @@ pub(crate) mod tests {
         let sent = provider.sent();
 
         // The edit ran unjudged, the command on the judge's word, and the
-        // floor refused the last before any judge saw it.
-        assert_eq!(tidied(&dir, &sent), (true, true));
+        // floor refused the last before any judge saw it. The command ran in
+        // the OS sandbox where this system has one, whose own rules say
+        // whether it may make a folder at the project's top.
+        let (edited, made) = tidied(&dir, &sent);
+        let ran = results(sent.last().unwrap())[1];
+        assert!(edited, "{ran}");
+        if crate::sandbox::available() {
+            assert!(ran.contains(crate::sandbox::NOTE), "{ran}");
+        } else {
+            assert!(made, "{ran}");
+        }
         let judge: Vec<&Value> = sent.iter().filter(|body| body["stream"] == false).collect();
         assert_eq!(judge.len(), 1);
         assert_eq!(judge[0]["model"], "test-model");

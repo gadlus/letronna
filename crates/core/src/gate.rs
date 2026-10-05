@@ -692,7 +692,10 @@ fn ladder(
     }
     // Layer 7: a command that would otherwise ask runs confined instead,
     // where it can break nothing an edit could not and send nothing out.
-    if confined {
+    // Not where nobody could have been asked, as in a schedule or a piped
+    // -p run: there the sandbox would be a yes nobody gave, so auto mode's
+    // judge decides it and Accept edits refuses it, as each mode says.
+    if confined && gate.human {
         return Outcome::Sandboxed;
     }
     // Then the judge.
@@ -706,7 +709,12 @@ fn ladder(
         };
         let verdict = judge(why);
         *layer = Some(Layer::Judge(verdict.clone()));
-        return self::ruling(tool.name(), verdict, gate.human);
+        // A command it allows runs in the sandbox layer 7 would have put it
+        // in, never outside with the network.
+        return match self::ruling(tool.name(), verdict, gate.human) {
+            Outcome::Run if confined => Outcome::Sandboxed,
+            outcome => outcome,
+        };
     }
     if gate.human {
         return Outcome::Ask;
@@ -3147,6 +3155,57 @@ mod tests {
         assert_eq!(
             decide_with(&command("cargo test"), &gate, None, true),
             Outcome::Ask
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Given a system that confines commands, with nobody there to ask the
+    /// sandbox stands in for no yes: Accept edits refuses a command no rule
+    /// allows, and auto mode refuses one its judge is unsure of and runs one
+    /// it allows sandboxed, as a rule's still runs.
+    #[test]
+    fn with_nobody_to_ask_a_command_is_refused_or_judged_rather_than_sandboxed() {
+        let dir = project_dir("unasked");
+        let ctx = ToolContext {
+            workspace: Some(dir.join("project")),
+            ..Default::default()
+        };
+        let none = Grants::new();
+        let allowed = [Rule {
+            tool: "run_command".into(),
+            pattern: "cargo test".into(),
+            effect: permissions::Effect::Allow,
+            project: None,
+        }];
+        let nobody = |mode| Gate {
+            ctx: &ctx,
+            mode,
+            grants: &none,
+            rules: &[],
+            broken: None,
+            human: false,
+        };
+        let test = command("cargo test");
+        let Outcome::Refuse(why) = decide_with(&test, &nobody(Mode::AcceptEdits), None, true)
+        else {
+            panic!("a command ran sandboxed with nobody to allow it");
+        };
+        assert!(why.contains("nobody is here"), "{why}");
+        let ruled = Gate {
+            rules: &allowed,
+            ..nobody(Mode::AcceptEdits)
+        };
+        assert_eq!(decide_with(&test, &ruled, None, true), Outcome::Sandboxed);
+        let auto = nobody(Mode::Auto);
+        let unsure = |_: &ToolCall, _: &str| Verdict::Unsure("no answer".into());
+        let Outcome::Refuse(why) = decide_with(&test, &auto, Some(&unsure), true) else {
+            panic!("a command its judge was unsure of ran with nobody to ask");
+        };
+        assert!(why.contains("nobody is here to decide"), "{why}");
+        let allow = |_: &ToolCall, _: &str| Verdict::Allow;
+        assert_eq!(
+            traced(&test, &auto, Some(&allow), true),
+            (Outcome::Sandboxed, Some(Layer::Judge(Verdict::Allow)))
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
