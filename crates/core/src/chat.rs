@@ -5499,7 +5499,7 @@ mod tests {
             "each quote from a source, exactly",
             "name it by its kind",
             "unless a tool call in this run took it",
-            "insufficient_evidence",
+            "insufficient_evidence, rather than filling the gap from general knowledge",
         ] {
             assert!(unwatched.contains(rule), "{rule}: {unwatched}");
             assert!(!watched.contains(rule), "{rule}: {watched}");
