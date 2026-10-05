@@ -1759,6 +1759,64 @@ pub(crate) mod tests {
         out
     }
 
+    /// What a gateway to DeepSeek answered a request that sent back a call
+    /// whose arguments were not JSON, turning the whole request down.
+    const NOT_JSON: &str =
+        "Upstream request failed: [400] Assistant tool call function.arguments must be valid JSON.";
+
+    /// A write_file call's arguments cut off part way, with the model's own
+    /// call markup leaking into them, as DeepSeek V4 Flash once sent them.
+    const BROKEN: &str = r#"{"path": "index.html", "content": "<!doctype html>\n<p>Hello</p>\n<｜tool▁call▁begin｜>write_file<｜tool▁sep｜>{\"path\": \"style.css\", \"content\": \"body {"#;
+
+    /// `provider`, but turning down a request that sends back a call whose
+    /// arguments are not JSON, as that gateway did, and answering nothing
+    /// after it.
+    fn strict(replies: Vec<String>) -> (String, Stub) {
+        let (server, endpoint) = listen();
+        let address = server.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut sent = Vec::new();
+            for reply in &replies {
+                let (mut socket, _) = server.accept().unwrap();
+                let body = request(&mut socket);
+                let broken = messages(&body)
+                    .iter()
+                    .flat_map(|message| message["tool_calls"].as_array().into_iter().flatten())
+                    .any(|call| {
+                        let arguments = call["function"]["arguments"].as_str();
+                        arguments.is_none_or(|text| serde_json::from_str::<Value>(text).is_err())
+                    });
+                sent.push(body);
+                if broken {
+                    let error = json!({"error": {"message": NOT_JSON}}).to_string();
+                    write!(socket, "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}", error.len()).unwrap();
+                    break;
+                }
+                answer(&mut socket, reply);
+            }
+            sent
+        });
+        (endpoint, Stub { address, worker })
+    }
+
+    /// A streamed reply that makes a write_file call with `BROKEN` and ends
+    /// as a whole reply does, not at the output limit.
+    fn broken_call() -> String {
+        let call = json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call-0",
+            "function": {"name": "write_file", "arguments": BROKEN}}]},
+            "finish_reason": "tool_calls"}]});
+        format!("data: {call}\n\ndata: [DONE]\n\n")
+    }
+
+    /// The first call of the last reply a request sent back, and the results it sent.
+    fn sent_back(body: &Value) -> (&Value, Vec<&str>) {
+        let wired = messages(body);
+        let reply = wired
+            .iter()
+            .rfind(|message| message["tool_calls"].is_array());
+        (&reply.unwrap()["tool_calls"][0], results(body))
+    }
+
     fn read_notes() -> (&'static str, Value) {
         ("read_file", json!({"path": "notes.txt"}))
     }
@@ -3985,6 +4043,89 @@ pub(crate) mod tests {
 
         assert_eq!(report.value, Some(given));
         assert_eq!(results(&sent[1]), [CUT_OFF]);
+    }
+
+    #[test]
+    fn a_call_whose_arguments_are_not_json_is_answered_and_the_run_goes_on() {
+        let dir = scratch("broken-call");
+        let (endpoint, provider) = strict(vec![broken_call(), reply("Written in parts.", &[])]);
+        let report = finished(spec(endpoint, &dir, AGENTS + 280));
+        let sent = provider.sent();
+
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "Written in parts.");
+        // Sent back empty, beside the result saying why it never ran.
+        let (call, answered) = sent_back(&sent[1]);
+        assert_eq!(call["id"], "call-0");
+        assert_eq!(
+            call["function"],
+            json!({"name": "write_file", "arguments": "{}"})
+        );
+        assert_eq!(answered, [tools::parse_args(BROKEN).unwrap_err()]);
+        assert!(!dir.join("index.html").exists());
+        // Kept as it came, for the user to see.
+        let saved = written(&dir.join("helper.jsonl"));
+        assert!(
+            saved
+                .iter()
+                .any(|m| m["tool_calls"][0]["arguments"] == BROKEN)
+        );
+    }
+
+    #[test]
+    fn a_resumed_session_holding_a_call_that_is_not_json_goes_on() {
+        let dir = scratch("broken-resumed");
+        let why = tools::parse_args(BROKEN).unwrap_err();
+        // As an earlier run left the session: the call answered with why it
+        // never ran, all of it saved.
+        let mut earlier = spec(String::new(), &dir, AGENTS + 290).transcript;
+        earlier.conversation.messages.extend([
+            Message {
+                role: "assistant".into(),
+                tool_calls: vec![ToolCall {
+                    id: "call-0".into(),
+                    name: "write_file".into(),
+                    arguments: BROKEN.into(),
+                }],
+                ..Default::default()
+            },
+            Message {
+                role: "tool".into(),
+                content: why.clone(),
+                tool_call_id: "call-0".into(),
+                name: "write_file".into(),
+                args: BROKEN.into(),
+                is_error: true,
+                ..Default::default()
+            },
+        ]);
+        earlier.save().unwrap();
+        let (endpoint, provider) = strict(vec![reply("Written in parts.", &[])]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 290);
+        // Read back from its file, as resuming a session does, and asked again.
+        spec.transcript = Transcript::at(earlier.path).unwrap();
+        spec.transcript.conversation.messages.push(Message {
+            role: "user".into(),
+            content: "Write it in parts.".into(),
+            ..Default::default()
+        });
+        let report = finished(spec);
+        let sent = provider.sent();
+
+        assert_eq!(report.status, Outcome::Done);
+        let (call, answered) = sent_back(&sent[0]);
+        assert_eq!(call["id"], "call-0");
+        assert_eq!(
+            call["function"],
+            json!({"name": "write_file", "arguments": "{}"})
+        );
+        assert_eq!(answered, [why]);
+        let saved = written(&dir.join("helper.jsonl"));
+        assert!(
+            saved
+                .iter()
+                .any(|m| m["tool_calls"][0]["arguments"] == BROKEN)
+        );
     }
 
     #[test]
