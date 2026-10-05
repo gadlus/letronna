@@ -44,7 +44,7 @@ pub(crate) struct WaitingRetry {
 
 impl Chat {
     /// An id for part of a message that also names its session, so state
-    /// kept by id -- a reply's parsed markdown, its fade-in -- never shows
+    /// kept by id -- a reply's parsed markdown -- never shows
     /// in another session with a message at the same place.
     pub(crate) fn row_id(&self, name: &str, index: usize) -> ElementId {
         let session = self.store.conversations[self.store.active].id;
@@ -448,12 +448,6 @@ impl Chat {
                 )
             })
             .children(under)
-            .with_animation(
-                self.row_id("appear", index),
-                Animation::new(std::time::Duration::from_millis(260))
-                    .with_easing(gpui::ease_out_quint()),
-                |el, delta| el.opacity(delta).mt(px(10. * (1. - delta))),
-            )
             .into_any_element()
     }
 

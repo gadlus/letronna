@@ -383,6 +383,10 @@ pub struct Settings {
     /// the transcript, code or diffs.
     #[serde(default = "yes")]
     pub grain: bool,
+    /// Dialogs, panels, new rows and a new theme ease in and out; always off
+    /// while the computer asks for reduced motion.
+    #[serde(default = "yes")]
+    pub motion: bool,
     /// Tell the computer when a run ends or needs an answer while nobody is
     /// looking at the window or the terminal.
     #[serde(default = "yes")]
@@ -522,7 +526,7 @@ pub struct Settings {
     pub keyless_search: bool,
 }
 
-// Written out rather than derived so the film grain, notifications,
+// Written out rather than derived so the film grain, motion, notifications,
 // previews opening by themselves and keyless search start on for a first
 // run too, as they do for a settings file from before them.
 impl Default for Settings {
@@ -563,6 +567,7 @@ impl Default for Settings {
             preview_opens_by_itself: true,
             appearance: String::new(),
             grain: true,
+            motion: true,
             notifications: true,
             voice: false,
             verify_edits: true,
@@ -5532,6 +5537,7 @@ pub(crate) mod tests {
         let mut store = load();
         assert_eq!(store.settings.appearance, "");
         assert!(store.settings.grain);
+        assert!(store.settings.motion);
         assert_eq!(store.settings.mode, crate::gate::Mode::Bypass);
         // Saved and read again, the grain is still on and nothing else moved.
         store.save().unwrap();
@@ -5543,6 +5549,7 @@ pub(crate) mod tests {
         std::fs::remove_file(&file).unwrap();
         let first = load().settings;
         assert_eq!((first.appearance.as_str(), first.grain), ("", true));
+        assert!(first.motion);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 

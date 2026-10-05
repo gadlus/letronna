@@ -342,9 +342,16 @@ impl Chat {
         }
         self.focus_composer(window, cx);
         cx.notify();
+        // With motion off there is nothing to watch go.
+        if cx.reduce_motion() {
+            self.settings_open = false;
+            self.settings_closing = false;
+            self.drop_backdrop(cx);
+            return;
+        }
         cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(std::time::Duration::from_millis(170))
+                .timer(crate::ui::motion::QUICK)
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.settings_open = false;
@@ -376,9 +383,14 @@ impl Chat {
             return None;
         }
         let closing = self.settings_closing;
+        // In at the standard pace, out quicker, so the click after closing
+        // never meets it.
         let anim = || {
-            Animation::new(std::time::Duration::from_millis(180))
-                .with_easing(gpui::ease_out_quint())
+            if closing {
+                crate::ui::motion::exit(crate::ui::motion::QUICK)
+            } else {
+                crate::ui::motion::enter(crate::ui::motion::STANDARD)
+            }
         };
         let blur = self.settings_backdrop.clone().map(|image| {
             img(image)
@@ -396,10 +408,13 @@ impl Chat {
             .absolute()
             .size_full()
             .bg(gpui::black())
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| this.close_settings(window, cx)),
-            )
+            // Going, it leaves a click to what is under it.
+            .when(!closing, |scrim| {
+                scrim.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.close_settings(window, cx)),
+                )
+            })
             .with_animation(
                 if closing { "scrim-out" } else { "scrim-in" },
                 anim(),
@@ -419,7 +434,7 @@ impl Chat {
                 anim(),
                 move |el, delta| {
                     let p = if closing { 1. - delta } else { delta };
-                    el.opacity(p).mt(px(-14. * (1. - p)))
+                    el.opacity(p).mt(px(-crate::ui::motion::RISE * (1. - p)))
                 },
             );
         Some(
@@ -611,14 +626,11 @@ impl Chat {
                                     .overflow_y_scroll()
                                     .px_8()
                                     .py_6()
-                                    .child(
-                                        div().child(body).with_animation(
-                                            SharedString::from(format!("page-{current_page}")),
-                                            Animation::new(std::time::Duration::from_millis(200))
-                                                .with_easing(gpui::ease_out_quint()),
-                                            |el, delta| el.opacity(delta).mt(px(6. * (1. - delta))),
-                                        ),
-                                    ),
+                                    .child(div().child(body).with_animation(
+                                        SharedString::from(format!("page-{current_page}")),
+                                        crate::ui::motion::enter(crate::ui::motion::QUICK),
+                                        |el, delta| el.opacity(delta).mt(px(6. * (1. - delta))),
+                                    )),
                             )
                             .child(
                                 div().absolute().top_3().right_3().child(
@@ -1337,6 +1349,16 @@ fn appearance_page(
         cx,
         std::rc::Rc::new(move |this: &mut Chat| this.store.settings.grain = !grain),
     );
+    let motion = settings.motion;
+    let motion = toggle_row(
+        "motion",
+        "Motion",
+        "Dialogs, panels and new messages ease in. Always off while your computer is set to reduce motion.",
+        motion,
+        chat,
+        cx,
+        std::rc::Rc::new(move |this: &mut Chat| this.store.settings.motion = !motion),
+    );
 
     v_flex()
         .gap_4()
@@ -1347,6 +1369,7 @@ fn appearance_page(
         ))
         .child(v_flex().gap_1().child(label("Theme", cx)).child(looks))
         .child(grain)
+        .child(motion)
 }
 
 fn model_page(
