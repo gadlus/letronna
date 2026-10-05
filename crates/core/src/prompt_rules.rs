@@ -48,6 +48,8 @@ enum To {
     /// Where the system message speaks of `exit_plan`: plan mode outside a
     /// chat app, with someone there to approve a plan.
     Plan,
+    /// A model other than Claude.
+    NotClaude,
 }
 
 impl To {
@@ -59,6 +61,7 @@ impl To {
             To::Unwatched => !watched(connection),
             To::OnScreen => connection.human && connection.remote.is_none(),
             To::Parallel => crate::store::parallel_tool_calls(),
+            To::NotClaude => not_claude(connection),
             To::Plan => crate::tools::offers_plan(connection),
         }
     }
@@ -87,6 +90,12 @@ pub(crate) fn watched(connection: &Connection) -> bool {
     connection.human || connection.remote.is_some()
 }
 
+/// A model other than Claude, by its name under any provider's prefix: a
+/// custom or local name counts too, as no family list would know it.
+fn not_claude(connection: &Connection) -> bool {
+    !connection.model.to_ascii_lowercase().contains("claude")
+}
+
 /// The rules right after who Letronna is, which a SOUL.md replaces along
 /// with it and a chosen style follows and can override.
 // No list of banned words: Letronna runs many models, and naming a word can
@@ -101,8 +110,9 @@ pub(crate) const PROSE: [Rule; 1] = [Rule {
 /// The rules after what the tools are for, in order: what to leave alone;
 /// how calls are approved or, in a run nobody watches, what it is told in
 /// place of approvals and `ask_user`, neither of which it has; then checking
-/// the work, making calls, ending a turn and the steps to ask about first.
-pub(crate) const TOOLS: [Rule; 20] = [
+/// the work, making calls, ending a turn, where facts come from and the
+/// steps to ask about first.
+pub(crate) const TOOLS: [Rule; 21] = [
     // Undoing what the user changed is the git rule's. New files and tests
     // are not forbidden, as checks and required outputs need them.
     Rule {
@@ -219,6 +229,14 @@ pub(crate) const TOOLS: [Rule; 20] = [
         id: "turn-end",
         to: To::Every,
         text: "A reply with no tool call ends your turn: make any call you announce in that same reply, and end with the result, what blocks it, or work already under way, never a promise.",
+    },
+    // Other models answer from what they remember of a file or a version
+    // more readily. Not dates, which the prompt gives, nor sums, whose
+    // script would wait for approval where someone watches.
+    Rule {
+        id: "facts",
+        to: To::NotClaude,
+        text: "Take file contents, git state, versions and other facts that change from a tool, not from what you recall.",
     },
     // Where the user turned the card off, by Bypass, a grant for the tool or
     // a rule, nothing else stops a push or a message. Asking here, in the
@@ -582,6 +600,38 @@ mod tests {
         // same, so its hash counts the row.
         assert!(To::Plan.reaches_run(&window()));
         assert!(!To::Plan.reaches_run(&headless()));
+    }
+
+    #[test]
+    fn a_gpt_an_open_or_a_custom_model_is_told_to_take_facts_from_a_tool() {
+        for model in [
+            "gpt-5.4",
+            "openai/gpt-5",
+            "qwen/qwen3-coder",
+            "my-local-model",
+        ] {
+            let connection = Connection {
+                model: model.into(),
+                ..headless()
+            };
+            assert!(tells(&connection, "facts"), "{model}");
+        }
+    }
+
+    #[test]
+    fn claude_and_prefixed_claude_models_are_not_told_it() {
+        for model in [
+            "claude-sonnet-4.6",
+            "anthropic/claude-opus-4.8",
+            " Claude-Haiku ",
+        ] {
+            let connection = Connection {
+                model: model.into(),
+                ..window()
+            };
+            assert!(!tells(&connection, "facts"), "{model}");
+            assert!(!told(&connection, &TOOLS).contains("from a tool, not from what you recall"));
+        }
     }
 
     #[test]
