@@ -1894,8 +1894,6 @@ fn about(at: u64, now: DateTime<Local>) -> String {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute here.
-    #[cfg(unix)]
-    use super::check;
     use super::{
         AT_ONCE, Answer, Checked, Ended, Event, HEADER, Kept, LIMIT, Listed, Runner, Schedule,
         Seen, Started, Trigger, act, adding, armed_now, drafted, edit_list, is_due, lately_in,
