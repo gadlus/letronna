@@ -67,6 +67,7 @@ use crate::inbox::{self, Notice, When};
 use crate::inputs;
 use crate::judge;
 use crate::limits::{self, Permit};
+use crate::messaging::notify;
 use crate::permissions::{self, Rule};
 use crate::store::{Todo, Transcript};
 use crate::structured;
@@ -86,7 +87,14 @@ pub type AgentId = u64;
 
 /// Tools no helper may call whatever it was allowed, since each reaches past
 /// its run: to the user, to what Letronna remembers, or to a later time.
-pub(crate) const DENY: [&str; 5] = [tools::ASK_USER, "memory", "wake_me", "schedule", "workflow"];
+pub(crate) const DENY: [&str; 6] = [
+    tools::ASK_USER,
+    "memory",
+    "wake_me",
+    "schedule",
+    "workflow",
+    notify::NOTIFY,
+];
 
 /// What a helper is told when it asks the user something.
 const NO_QUESTIONS: &str = "Questions are not available to helpers. Decide for yourself, or end with the open question in your report.";
@@ -999,6 +1007,12 @@ fn refused(spec: &Spec, name: &str) -> Option<String> {
         // it, and approving it would end no plan mode.
         if spec.depth > 0 && name == tools::EXIT_PLAN {
             return Some(format!("`{name}` is not available to this helper."));
+        }
+        // A session's own run posts to the chat apps with the user's yes on
+        // each message; with nobody there to give it, the message is left
+        // to its answer as pending, and the tool out of its requests.
+        if spec.depth == 0 && name == notify::NOTIFY {
+            return unwatched(spec).then(|| notify::UNANSWERED.into());
         }
         return refusal(&spec.allow, name);
     }
@@ -4727,6 +4741,31 @@ pub(crate) mod tests {
         spec.depth = 1;
         let why = refused(&spec, "schedule");
         assert!(why.is_some_and(|why| why.contains("not available to this helper")));
+    }
+
+    #[test]
+    fn notify_is_left_to_a_session_with_someone_there_and_refused_to_helpers() {
+        let dir = scratch("notify-tool");
+        let mut spec = spec(String::new(), &dir, AGENTS + 387);
+        spec.connection.human = true;
+        // A helper's words reach the user through its report.
+        let why = refused(&spec, notify::NOTIFY);
+        assert!(why.is_some_and(|why| why.contains("not available to this helper")));
+        spec.allow = Allow::Only(vec![notify::NOTIFY.into()]);
+        assert!(refused(&spec, notify::NOTIFY).is_some());
+        // An editor's turn, `-p` at a keyboard or a chat's run: asked there.
+        spec.depth = 0;
+        spec.allow = Allow::All;
+        assert_eq!(refused(&spec, notify::NOTIFY), None);
+        assert!(!hidden(&spec).iter().any(|name| name == notify::NOTIFY));
+        // With nobody there, as under `-p` with no terminal, it is left out
+        // of the run's requests and, named anyway, listed as pending.
+        spec.connection.human = false;
+        assert_eq!(
+            refused(&spec, notify::NOTIFY).as_deref(),
+            Some(notify::UNANSWERED)
+        );
+        assert!(hidden(&spec).iter().any(|name| name == notify::NOTIFY));
     }
 
     #[test]

@@ -39,5 +39,6 @@ Paste both tokens on the Slack page, switch on Listen for messages, press Pair a
 - Let messages use tools is off unless switched on, per app on its page. Off, a message can read and search but not write or run anything, because nobody on the other end can answer an approval card.
 - A voice note is transcribed only once that chat has said yes to it, since transcribing costs credit.
 - Scheduled jobs report how they ended to Telegram and Slack once paired (Slack in the DM), and on Discord to the bot's DM and the webhook.
+- Asked to, in a session at the window, the terminal, an editor or a private chat let use tools, Letronna posts a message now to those same places with its notify tool, each once the user says yes to its card, so no webhook URL or token is needed.
 
 The settings are in `messaging.json` in the data folder; on macOS and Windows the tokens are moved to the Keychain or Credential Manager (see `settings-and-data.md`).

@@ -366,6 +366,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(Todo),
         Arc::new(crate::messaging::ReadChat),
         Arc::new(crate::messaging::files::SendFile),
+        Arc::new(crate::messaging::notify::Notify),
         Arc::new(Sessions),
         Arc::new(crate::memory::Remember),
         Arc::new(crate::skills::UseSkill),
@@ -1200,7 +1201,9 @@ pub fn summary(name: &str, args: &str) -> String {
             .or(v["job"].as_str())
             .unwrap_or_default()
             .to_owned(),
-        "speak" => v["text"].as_str().unwrap_or_default().to_owned(),
+        "speak" | crate::messaging::notify::NOTIFY => {
+            v["text"].as_str().unwrap_or_default().to_owned()
+        }
         "agent" => v["description"].as_str().unwrap_or_default().to_owned(),
         "agents" => format!(
             "{} {}",
@@ -7303,6 +7306,106 @@ mod tests {
                 .any(|s| s["function"]["name"] == "schedule")
         );
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn notify_is_offered_where_someone_can_say_yes_with_a_chat_app_to_post_to() {
+        use crate::chat::Remote;
+        use crate::messaging::notify::NOTIFY;
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = Scratch::new("offers-notify");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let listed = |connection: &Connection| {
+            specs(connection)
+                .iter()
+                .any(|spec| spec["function"]["name"] == NOTIFY)
+        };
+        let window = Connection {
+            tools: true,
+            human: true,
+            ..Default::default()
+        };
+        let chat = |shared| Connection {
+            remote: Some(Remote {
+                place: "a Telegram chat".into(),
+                shared,
+                history: None,
+            }),
+            ..window.clone()
+        };
+        // With no chat app set up there is nowhere to post.
+        let bare = listed(&window);
+        let paired = r#"{"telegram": {"enabled": true, "token": "1:t", "chat": 42}}"#;
+        std::fs::write(dir.join("messaging.json"), paired).unwrap();
+        let job = crate::schedule::Schedule {
+            id: 1,
+            name: "Daily".into(),
+            prompt: "Say hello.".into(),
+            workspace: None,
+            trigger: crate::schedule::Trigger::Every { minutes: 60 },
+            enabled: true,
+            last_run: 0,
+            mode: crate::gate::Mode::Default,
+            by_model: false,
+            quiet: false,
+            check: None,
+        };
+        let session = 9_700_301;
+        let _listed = crate::schedule::Listed::new(session, &job);
+        let planning = Connection {
+            plan: true,
+            ..window.clone()
+        };
+        // An editor over ACP connects as the window does; a `-p` run with
+        // nobody there and a helper are left out by the driver.
+        let cases = [
+            ("the window", window.clone(), true),
+            (
+                "the terminal",
+                Connection {
+                    plain_terminal: true,
+                    ..window.clone()
+                },
+                true,
+            ),
+            ("a chat with its owner", chat(false), true),
+            ("a chat others read", chat(true), false),
+            (
+                "a scheduled run's own turn",
+                Connection {
+                    human: false,
+                    conversation: session,
+                    ..window.clone()
+                },
+                false,
+            ),
+            ("plan mode", planning.clone(), false),
+        ];
+        let offered: Vec<(&str, bool, bool)> = (cases.iter())
+            .map(|(what, connection, offered)| (*what, listed(connection), *offered))
+            .collect();
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"endpoint": "", "model": "m", "plan_keeps_tools": true}"#,
+        )
+        .unwrap();
+        let kept_in_plan_mode = listed(&planning);
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"endpoint": "", "model": "m", "disabled_tools": ["notify"]}"#,
+        )
+        .unwrap();
+        let switched_off = listed(&window);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+
+        assert!(!bare);
+        for (what, listed, offered) in offered {
+            assert_eq!(listed, offered, "{what}");
+        }
+        assert!(kept_in_plan_mode);
+        assert!(!switched_off);
     }
 
     #[test]

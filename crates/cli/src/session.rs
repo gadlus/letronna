@@ -1147,7 +1147,10 @@ impl Runner {
                 }
             }
             None => {
-                detail = card_lines(&tools::preview(&call.name, &call.arguments, &ctx));
+                detail = card_detail(
+                    &call.name,
+                    &tools::preview(&call.name, &call.arguments, &ctx),
+                );
             }
         }
 
@@ -1711,6 +1714,16 @@ fn card_lines(preview: &str) -> Vec<String> {
     lines
 }
 
+/// `card_lines` for a call to the tool `name`, but whole for a message to
+/// post: its words are what the yes is for, and `notify` holds them to one
+/// message already.
+fn card_detail(name: &str, preview: &str) -> Vec<String> {
+    match name {
+        letronna_core::messaging::notify::NOTIFY => preview.lines().map(str::to_owned).collect(),
+        _ => card_lines(preview),
+    }
+}
+
 pub fn intent(name: &str, summary: &str) -> String {
     match name {
         "write_file" => format!("write {summary}"),
@@ -1822,6 +1835,16 @@ mod tests {
             card[DETAIL_LINES],
             format!("… {} more lines", 30 - DETAIL_LINES)
         );
+    }
+
+    #[test]
+    fn a_message_to_post_shows_whole_on_its_card_and_any_other_preview_is_cut() {
+        let long = vec!["a line"; DETAIL_LINES + 8].join("\n");
+        let message = format!("Post to Slack:\n\n{long}");
+        let card = card_detail(letronna_core::messaging::notify::NOTIFY, &message);
+        assert_eq!(card.len(), DETAIL_LINES + 10);
+        assert_eq!(card.join("\n"), message);
+        assert_eq!(card_detail("run_command", &long), card_lines(&long));
     }
 
     #[test]
