@@ -1193,6 +1193,14 @@ fn system_prompt(
     // disk, and goes looking for it there.
     if let Some(remote) = &connection.remote {
         system.push_str(&format!(" You are talking through {}, and your reply is posted there as a chat message, so keep it short and conversational.", remote.place));
+        // Without tools there is no result to point at.
+        let rows = &crate::prompt_rules::CHAT_APP;
+        let rows = if connection.tools {
+            &rows[..]
+        } else {
+            &rows[..1]
+        };
+        system.push_str(&crate::prompt_rules::told(connection, rows));
         if remote.history.is_some() && connection.tools {
             system.push_str(" You only see the messages addressed to you. When the user refers to the conversation, asks what was said, or wants a summary, read it with read_chat before answering.");
         }
@@ -5688,6 +5696,58 @@ mod tests {
             "{watched}"
         );
         assert!(!watched.contains("Nobody is watching"), "{watched}");
+    }
+
+    #[test]
+    fn a_chat_app_session_is_told_tables_do_not_display_and_results_are_unseen() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("chat-app-rows");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let chat_app = |shared: bool| {
+            let c = Connection {
+                human: true,
+                remote: Some(Remote {
+                    place: "a Telegram chat".into(),
+                    shared,
+                    ..Default::default()
+                }),
+                ..connection()
+            };
+            system_with_tools(c)
+        };
+        let (dm, shared) = (chat_app(false), chat_app(true));
+        let window = system_with_tools(Connection {
+            human: true,
+            ..connection()
+        });
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        let rows = "so keep it short and conversational. Tables do not display there; use plain \
+                    lists. Nobody there sees what your tools return, so state the result";
+        for chat in [dm, shared] {
+            assert!(chat.contains(rows), "{chat}");
+        }
+        // Without tools there is nothing whose result could go unseen.
+        let toolless = system_prompt(
+            &Connection {
+                human: true,
+                remote: Some(Remote {
+                    place: "a Telegram chat".into(),
+                    ..Default::default()
+                }),
+                ..connection()
+            },
+            None,
+        )
+        .text;
+        assert!(
+            toolless.contains(" Tables do not display there"),
+            "{toolless}"
+        );
+        assert!(!toolless.contains("Nobody there sees"), "{toolless}");
+        assert!(!window.contains("Tables do not display"), "{window}");
+        assert!(!window.contains("Nobody there sees"), "{window}");
     }
 
     /// A distinctive part of the rules for a turn someone at this computer
