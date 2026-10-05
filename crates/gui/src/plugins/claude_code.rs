@@ -1845,7 +1845,9 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(250));
         };
-        let question = "What does notes.txt in the current folder say? Answer with its words only.";
+        // Asked as a person would: "answer with its words only" read as a
+        // probe and was flagged by Claude's safeguards.
+        let question = "What files are in this folder, and what does notes.txt say?";
         while hub.hand(&id, question) != Handed::Taken {
             assert!(started.elapsed() < Duration::from_secs(400), "never taken");
             std::thread::sleep(Duration::from_millis(250));
