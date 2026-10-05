@@ -952,7 +952,7 @@
   },
   {
     "function": {
-      "description": "Look at web pages in a real browser: Chrome, Edge or Brave on a profile of its own, which the user can watch and step into from Letronna's window. Use it for pages that need script, a sign-in, or clicking through. `open` loads an address and lists the page, one element a line, each with a ref such as e12 for use_page, and what its frames hold under a header naming each frame's origin; a file it downloads is saved in the project's media/downloads folder and named in the result, or in the next one if the page starts it a little later; a name of a kind that could run gets .download after it. `look` lists the page again: `full` adds all its text, `find` searches all its text for some words and shows each match with the lines after it, `from` carries on from a line when a page was cut short. `scroll` moves a screen down or up, or with `ref` the panel that element is in instead, such as a list beside a map, by most of its height, `back` goes back, `tabs` lists the tabs or switches to one, `console` shows the page's recent errors and log lines, `screenshot` takes a picture of what is in view, or of the whole page from its top with `full` (a very long page is cut, and the result says so), which the user sees in the chat and you see too when your model takes images, `pdf` saves the page as a PDF, named from its title, in the project's media/downloads folder and gives its path, `hover` rests the pointer on an element by its ref and shows what changed on the page after, as use_page does, so a menu that opens on hover shows -- the page takes it as a real mouse's, and may act on it as a page can -- and `wait` waits until some text shows in the page's own text, not its frames' -- or with `gone` until it has gone, as a spinner's words do -- for up to `seconds`, then lists the page.",
+      "description": "Look at web pages in a real browser (Chrome, Edge or Brave) on a profile of its own, which the user can watch and step into from Letronna's window. For pages that need script, a sign-in or clicking through. Actions:\n- open: loads `url` and lists the page, one element a line with a ref such as e12 for use_page, and each frame's contents under a header naming its origin. A download is saved in the project's media/downloads folder and named in this result or the next; a name that could run gets .download added.\n- look: lists the page again. On a long page use `find` (each match with the lines after it) before `full`.\n- scroll: about a screen, or the panel holding `ref`.\n- back\n- tabs: lists them.\n- console: recent errors and log lines.\n- screenshot: the view, or the whole page with `full` (a very long page is cut and says so). The user sees it, and you see it when your model takes images.\n- pdf: saves the page as a PDF in the same folder and gives its path.\n- hover: rests the mouse on `ref`, which the page takes as a real one's and may act on, and shows what changed, as use_page does.\n- wait: until `text` shows in the page's own text, not its frames', or with `gone` has left it, then lists the page.",
       "name": "browse",
       "parameters": {
         "properties": {
@@ -984,7 +984,7 @@
             "type": "string"
           },
           "frame": {
-            "description": "For hover or scroll on an element in a frame from another origin: that origin, as its header in the listing names it.",
+            "description": "For an element in a frame from another origin: that origin, as its header names it.",
             "type": "string"
           },
           "from": {
@@ -992,15 +992,14 @@
             "type": "integer"
           },
           "full": {
-            "description": "For look and scroll: all the page's text, not only what can be used. For screenshot: the whole page, not only what is in view.",
+            "description": "For look and scroll: all the page's text, not only what can be used. For screenshot: the whole page.",
             "type": "boolean"
           },
           "gone": {
-            "description": "For wait: wait until the text has gone from the page instead.",
             "type": "boolean"
           },
           "listing": {
-            "description": "For hover: `full` to list the whole page after, instead of only what changed.",
+            "description": "For hover: `full` lists the whole page after.",
             "enum": [
               "changes",
               "full"
@@ -1008,7 +1007,7 @@
             "type": "string"
           },
           "ref": {
-            "description": "For hover: the element, by its ref in the listing, such as e12. For scroll: an element in the panel to move instead of the page, or the panel itself.",
+            "description": "For hover: the element's ref. For scroll: an element in the panel to move, or the panel.",
             "type": "string"
           },
           "seconds": {
@@ -1016,15 +1015,14 @@
             "type": "integer"
           },
           "tab": {
-            "description": "For tabs: the tab to switch to, by its number in the list.",
+            "description": "For tabs: the number of the tab to switch to.",
             "type": "integer"
           },
           "text": {
-            "description": "For wait: the words to wait for, as written; case does not count.",
+            "description": "For wait: the words; case does not count.",
             "type": "string"
           },
           "url": {
-            "description": "For open: the address.",
             "type": "string"
           }
         },
@@ -1038,7 +1036,7 @@
   },
   {
     "function": {
-      "description": "Act on the page open in browse, the way a person would: `click` an element, `type` into a field (it replaces what is there; `submit` presses Enter after), `press` a key such as Enter, Tab, Escape or ArrowDown, `select` a dropdown's option by its text (a site's own dropdown too: it is opened and the option clicked), `upload` files from the project into a file field, `drag` an element onto another (`to`) or to a point, or `eval` a JavaScript expression and get its value back. Elements are named by the refs browse lists, such as e12; one listed under a frame's header marked cross-origin or opaque origin also needs `frame`, the origin that header names after \"frame\", and each such action is asked about on its own. `click` also takes a point instead of a ref, and names what was there: `x` and `y` in CSS pixels from the top left of the view, which is as big as the latest screenshot's result says -- not the picture's own pixels, which may have been shrunk on the way to you, and read off a screenshot of the view, not of the whole page. It is refused once the page has changed or scrolled since it was last seen, and inside a frame from another origin than the page's. `batch` runs `steps`, a list of these actions and browse's hover, wait and scroll, each written as its own call would be, in order in one call, stopping at the first that fails (a wait whose text does not come counts, as does a field left holding other text than was typed), and gives each step's short result; each step is asked about as it would be alone. Returns what changed on the page afterwards: the lines that are new (`>`) or gone (`<`), with the lines around them and where they are, measured against the page as you last saw it listed in this tab; the whole page instead after it loaded another page, when there is no earlier listing to measure against, or with `listing` set to `full`. It names any file an action downloaded, saved in the project's media/downloads folder (one the page starts a little later is named in the next result). A question the page asks, such as \"Are you sure?\", is answered Cancel unless `confirm` is true. Close a cookie banner or popup before acting on what it covers. Use a site's own search, filters and sort before paging through its results. After typing into a field that suggests as you type, click the suggestion that fits from what changed -- or wait for it with browse's wait if none shows yet, or type it again with `keys` true if none comes at all -- rather than pressing Enter or using `submit`. Fill a form with one batch that ends with the click that sends it, unless a field suggests as you type or the form pays, buys, deletes or sends a message: then look at the filled form before sending. Read a long page with browse's look and `find` before asking for `full`. Before saying a task on the web is done, check that the page shows it done, and give the user only names, prices and addresses the pages showed, saying so when something asked for was not there.",
+      "description": "Act on the page open in browse, as a person would, by the refs browse lists. Actions:\n- click: an element, or a point `x`, `y` in CSS pixels of the view, sized as the latest screenshot's result says (the picture itself may be shrunk), read off a screenshot of the view, not of the whole page. A point is refused once the page changed or scrolled since, and inside a frame from another origin.\n- type: replaces the field's text (a date, time, colour or range field is set instead), all at once or with `keys` as a real key press for each character, and reads it back: if the field holds other text the result says so and `submit` (Enter after) is not pressed.\n- press: a real key press of `key`.\n- select: a dropdown's option by its text, a site's own dropdown too.\n- upload: files from the project into a file field.\n- drag: an element onto another (`to`) or a point.\n- eval: a JavaScript expression, and returns its value.\n- batch: `steps` in order in one call, each written as its own call (browse's hover, wait and scroll too), stopping at the first that fails -- a wait whose text does not come, or a field left holding other text than was typed -- and giving each step's short result.\nAn element under a frame header marked cross-origin or opaque origin also needs `frame`; each such action, and each step, is asked about on its own. Returns what changed since you last saw this tab's page listed: new lines (`>`) and gone ones (`<`) with the lines around them, or the whole page once another has loaded or when none was listed before. Names a file an action downloaded, as browse does. A question the page asks, such as \"Are you sure?\", is answered Cancel unless `confirm` is true. Fill a form with one batch ending in the click that sends it, unless a field suggests as you type or the form pays, buys, deletes or sends a message: then look at the filled form before sending. Before saying a task on the web is done, check that the page shows it done, and give the user only names, prices and addresses the pages showed, saying so when something asked for was not there.",
       "name": "use_page",
       "parameters": {
         "properties": {
@@ -1060,14 +1058,14 @@
             "type": "boolean"
           },
           "files": {
-            "description": "For upload: the files to put in the field, by their paths in the project.",
+            "description": "For upload: the files' paths in the project.",
             "items": {
               "type": "string"
             },
             "type": "array"
           },
           "frame": {
-            "description": "For an element in a frame from another origin than the page's, or keys typed or pressed while focus is in one: that origin, as the frame's header in the listing names it, such as https://pay.example, or opaque:https://pay.example for one whose origin is opaque, as a sandboxed frame's is. Left out otherwise.",
+            "description": "For an element in a frame from another origin, or keys sent while focus is in one: its origin as its header names it, such as https://pay.example (opaque:https://pay.example if opaque).",
             "type": "string"
           },
           "key": {
@@ -1075,11 +1073,11 @@
             "type": "string"
           },
           "keys": {
-            "description": "For type: press a key for each character, as a person types, instead of putting the text in at once. It is slower, so it is for short text, such as a city or an address, in a field that suggests only as keys are pressed.",
+            "description": "For type: slower, so for short text in a field that suggests only as keys are pressed.",
             "type": "boolean"
           },
           "listing": {
-            "description": "What to show of the page after: `changes` (the default) for only what changed, `full` for the whole listing.",
+            "description": "`full` lists the whole page after.",
             "enum": [
               "changes",
               "full"
@@ -1087,38 +1085,37 @@
             "type": "string"
           },
           "ref": {
-            "description": "The element, by its ref in the listing, such as e12. For drag: the one picked up.",
+            "description": "The element's ref, such as e12. For drag: the one picked up.",
             "type": "string"
           },
           "script": {
-            "description": "For eval: a JavaScript expression, run in the page.",
+            "description": "For eval: the expression.",
             "type": "string"
           },
           "steps": {
-            "description": "For batch: the actions to run in order, at most 20, each an object with `action` and what that action takes, such as {\"action\": \"type\", \"ref\": \"e4\", \"text\": \"Ada\"}. A step is one of click, type, press, select, upload and drag, or browse's hover, wait and scroll.",
+            "description": "For batch: up to 20 actions, each an object with `action` and its fields, such as {\"action\": \"type\", \"ref\": \"e4\", \"text\": \"Ada\"}.",
             "items": {
               "type": "object"
             },
             "type": "array"
           },
           "submit": {
-            "description": "For type: press Enter afterwards, unless the field then holds other text than was typed.",
             "type": "boolean"
           },
           "text": {
-            "description": "For type: what to type. For select: the option's text, in a <select> or a site's own dropdown.",
+            "description": "For type: the text. For select: the option's text.",
             "type": "string"
           },
           "to": {
-            "description": "For drag: the element to drop onto, by its ref.",
+            "description": "For drag: the ref to drop onto.",
             "type": "string"
           },
           "x": {
-            "description": "For click without a ref, or drag without `to`: the point's CSS pixels from the left of the view.",
+            "description": "For a point click or a drag without `to`: CSS pixels from the view's left.",
             "type": "number"
           },
           "y": {
-            "description": "With x: the point's CSS pixels from the top of the view.",
+            "description": "With x: CSS pixels from the view's top.",
             "type": "number"
           }
         },

@@ -1324,8 +1324,9 @@ and "check" them`,
     #[test]
     fn a_script_runs_its_agents_through_the_driver() {
         let data = Data::new("host-driver");
+        // The prompt, not a word: the tools' own descriptions say "colour" too.
         let (endpoint, provider) = provider(2, |body| {
-            if body.contains("colour") {
+            if body.contains("Name a colour") {
                 "Blue."
             } else {
                 "A fig."
