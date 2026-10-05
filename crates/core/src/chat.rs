@@ -10222,15 +10222,16 @@ mod tests {
 
     #[test]
     fn a_request_no_window_can_hold_is_refused_before_it_is_sent() {
-        // The first request teaches a window smaller than the newest message.
+        // The first request teaches a window smaller than the newest message
+        // but with room for the instructions and a short one.
         let (endpoint, worker) = serve(vec![(
             "400 Bad Request",
             "application/json",
-            r#"{"error":{"code":400,"message":"the request exceeds the available context size, try increasing it","type":"exceed_context_size_error","n_prompt_tokens":520,"n_ctx":300}}"#,
+            r#"{"error":{"code":400,"message":"the request exceeds the available context size, try increasing it","type":"exceed_context_size_error","n_prompt_tokens":520,"n_ctx":400}}"#,
         )]);
         let c = Connection {
             endpoint,
-            model: "reads-300".into(),
+            model: "reads-400".into(),
             ..connection()
         };
         let long = vec![Message {
