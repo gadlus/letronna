@@ -778,6 +778,20 @@ pub(crate) fn offers_schedule(connection: &Connection) -> bool {
         && !switched_off("schedule", &turned_off())
 }
 
+/// Whether `letronna_info` is in the `tools` array over `connection`.
+// Repeats the filters of `specs_of` for this one tool, as `offers_schedule`
+// does, so that the rule naming it is never told where the array leaves it
+// out: in a chat others read, in a scheduled run and where the user switched
+// it off. A run nobody watches, which the driver leaves it out of, is told
+// no such rule either.
+pub(crate) fn offers_info(connection: &Connection) -> bool {
+    let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
+    connection.tools
+        && !shared
+        && crate::info::LetronnaInfo.offered(connection)
+        && !switched_off(crate::info::LETRONNA_INFO, &turned_off())
+}
+
 /// Every tool the user switched off: those the settings' `disabled_tools`
 /// names, then those a rule in permissions.json denies every call of.
 pub fn turned_off() -> Vec<String> {
@@ -7307,6 +7321,101 @@ mod tests {
                 .iter()
                 .any(|s| s["function"]["name"] == "schedule")
         );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn the_prompt_speaks_of_letronna_info_only_where_the_array_has_it() {
+        use crate::chat::Remote;
+        use crate::info::LETRONNA_INFO;
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = Scratch::new("offers-info");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let window = Connection {
+            tools: true,
+            human: true,
+            ..Default::default()
+        };
+        let chat = |shared| Connection {
+            remote: Some(Remote {
+                place: "a Telegram chat".into(),
+                shared,
+                history: None,
+            }),
+            ..window.clone()
+        };
+        let job = crate::schedule::Schedule {
+            id: 1,
+            name: "Daily".into(),
+            prompt: "Say hello.".into(),
+            workspace: None,
+            trigger: crate::schedule::Trigger::Every { minutes: 60 },
+            enabled: true,
+            last_run: 0,
+            mode: crate::gate::Mode::Default,
+            by_model: false,
+            quiet: false,
+            check: None,
+        };
+        let session = 9_800_301;
+        let _listed = crate::schedule::Listed::new(session, &job);
+        // A print run's own requests leave it out by the driver, and its
+        // prompt is told no rule of it, as no run nobody watches is.
+        let cases = [
+            ("a window", window.clone(), true),
+            (
+                "plan mode",
+                Connection {
+                    plan: true,
+                    ..window.clone()
+                },
+                true,
+            ),
+            ("a chat with its owner", chat(false), true),
+            ("a chat others read", chat(true), false),
+            (
+                "a scheduled run's own turn",
+                Connection {
+                    human: false,
+                    conversation: session,
+                    ..window.clone()
+                },
+                false,
+            ),
+            (
+                "a scheduled run the window serves in Default mode",
+                Connection {
+                    conversation: session,
+                    ..window.clone()
+                },
+                false,
+            ),
+        ];
+        let listed = |connection: &Connection| {
+            specs(connection)
+                .iter()
+                .any(|spec| spec["function"]["name"] == LETRONNA_INFO)
+        };
+        for (what, connection, offered) in &cases {
+            assert_eq!(listed(connection), *offered, "{what}: the array");
+            assert_eq!(offers_info(connection), *offered, "{what}: the prompt");
+        }
+        // No tools go out at all on a gateway without them.
+        let toolless = Connection {
+            tools: false,
+            ..window.clone()
+        };
+        assert!(!offers_info(&toolless));
+        // The user's own switch takes it from both.
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"endpoint": "", "model": "m", "disabled_tools": ["letronna_info"]}"#,
+        )
+        .unwrap();
+        assert!(!offers_info(&window));
+        assert!(!listed(&window));
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
