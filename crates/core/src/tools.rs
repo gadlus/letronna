@@ -1107,7 +1107,12 @@ pub fn summary(name: &str, args: &str) -> String {
     let mut v: Value = serde_json::from_str(args).unwrap_or(Value::Null);
     rename_aliases(name, &mut v);
     let text = match name {
-        "search_sessions" if v["session"].is_u64() => {
+        // A session named with words and no message is searched, as below.
+        "search_sessions"
+            if v["session"].is_u64()
+                && (!v["around"].is_null()
+                    || v["query"].as_str().is_none_or(|q| q.trim().is_empty())) =>
+        {
             format!(
                 "session {} #{}",
                 v["session"],
@@ -2713,21 +2718,22 @@ impl Tool for SearchSessions {
         true
     }
     fn description(&self) -> &'static str {
-        "Search what was said in the user's earlier Letronna sessions, ignoring case. A match holds every word of the query (\"quoted words\" stay together), or when nothing does, some of them; matches on rarer words come first. Titles and tool call arguments are searched too; the current session is left out. Each match gives the session's id, title and age and the message's #. To read the messages around a match, call again with session and around. Use it when the user refers to something from an earlier conversation, or when an earlier session may already hold the answer."
+        "Search what was said in the user's earlier Letronna sessions, ignoring case. A match holds every word of the query (\"quoted words\" stay together), or when nothing does, some of them; matches on rarer words come first. Titles and tool call arguments are searched too; the current session is left out unless named as session, which searches that session alone. Each match gives the session's id, title and age and the message's #. To read the messages around a match, call again with session and around. Use it when the user refers to something from an earlier conversation, or when an earlier session may already hold the answer."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
-            "query": {"type": "string", "description": "The words to find. With session, the words to center long messages on."},
+            "query": {"type": "string", "description": "The words to find. With session and around, the words to center long messages on."},
             "limit": {"type": "integer", "description": "How many matches at most. Default 20."},
             "after": {"type": "string", "description": "Only sessions last used on or after this date, such as 2026-09-01, or this many days ago, such as 7d."},
             "before": {"type": "string", "description": "Only sessions last used before this date, or this many days ago."},
-            "session": {"type": "integer", "description": "Read the messages of this session around one message instead of searching."},
+            "session": {"type": "integer", "description": "Search this session alone, the current one too; with around, or with no query, read its messages around one message instead."},
             "around": {"type": "integer", "description": "With session: the # of the message to read, with the three either side of it. Default 0."}
         }})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let query = args["query"].as_str().unwrap_or_default().trim();
-        if let Some(id) = args["session"].as_u64() {
+        let session = args["session"].as_u64();
+        if let Some(id) = session.filter(|_| query.is_empty() || !args["around"].is_null()) {
             let around = args["around"].as_u64().unwrap_or(0) as usize;
             return read_around(id, around, query);
         }
@@ -2742,14 +2748,30 @@ impl Tool for SearchSessions {
                 .map(|text| day_or_days(text, now))
                 .transpose()
         };
-        let within = crate::store::Within {
-            exclude: ctx.conversation,
-            after: date("after")?,
-            before: date("before")?,
+        // A session named is searched whatever its dates, the current one
+        // too, which is where the system prompt sends the model for the
+        // exact words of the turns its window dropped.
+        let within = match session {
+            Some(id) => crate::store::Within {
+                only: id,
+                ..Default::default()
+            },
+            None => crate::store::Within {
+                exclude: ctx.conversation,
+                after: date("after")?,
+                before: date("before")?,
+                only: 0,
+            },
         };
         let hits = crate::store::search(query, &within, limit);
         if hits.is_empty() {
-            return Ok(format!("No earlier session mentions \"{query}\"."));
+            return match session {
+                Some(id) if crate::store::saved(id).is_none() => {
+                    Err(format!("There is no saved session {id}."))
+                }
+                Some(id) => Ok(format!("Session {id} does not mention \"{query}\".")),
+                None => Ok(format!("No earlier session mentions \"{query}\".")),
+            };
         }
         let lines: Vec<String> = hits
             .iter()

@@ -1190,6 +1190,12 @@ fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Option<Message>, 
         // A fork's is its parent's, so its requests start as the parent's do.
         floor: spec.transcript.conversation.floor(),
         no_mcp: !reaches_mcp(&spec.allow),
+        // Only a fork of the session's own agent starts from its messages;
+        // one a helper made starts from the helper's.
+        forked_from: (spec.fork && spec.owner == spec.root).then(|| {
+            let messages = &spec.transcript.conversation.messages;
+            (spec.root, crate::agents::copied(messages, spec.from))
+        }),
     };
     // The turn's, as the window and the terminal send, since at the round
     // cap it alone asks for the wrap-up with no calls.

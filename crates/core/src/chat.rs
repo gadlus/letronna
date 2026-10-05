@@ -720,7 +720,7 @@ impl ContextParts {
 /// summary of what the window dropped is left out, as making one can take
 /// a model call.
 fn context_parts(connection: &Connection, messages: &[Message], floor: usize) -> ContextParts {
-    let prompt = system_prompt(connection, None);
+    let prompt = system_prompt(connection, None, None);
     let text = prompt.text.as_str();
     let part = |range: &Range<usize>| tokens(&text[range.clone()]) as u64;
     let system = tokens(&text[..prompt.identity])
@@ -1034,7 +1034,15 @@ fn body_with(
         tools: extra.to_vec(),
         ..Default::default()
     };
-    body_hashed(connection, window, summary, plan, budget, &extra, None)
+    body_hashed(
+        connection,
+        window,
+        (summary, None),
+        plan,
+        budget,
+        &extra,
+        None,
+    )
 }
 
 /// The system message of a request, and where in it lie the parts its
@@ -1090,10 +1098,14 @@ const NAME_CHARS: usize = 60;
 const NAME_END: usize = 16;
 
 /// The system message for a request over `connection`, with what a shorter
-/// window already dropped folded in as `summary` at the end. Apart from
-/// `body_hashed` so `context_parts` prices the prompt a request sends
-/// without building one.
-fn system_prompt(connection: &Connection, summary: Option<&str>) -> SystemPrompt {
+/// window already dropped folded in as `summary` at the end, and `words`, the
+/// user's own words from it, after that. Apart from `body_hashed` so
+/// `context_parts` prices the prompt a request sends without building one.
+fn system_prompt(
+    connection: &Connection,
+    summary: Option<&str>,
+    words: Option<&str>,
+) -> SystemPrompt {
     // Who Letronna is, its style, memory and the project's files would only
     // cost such a look and pull against what it was told. A look is one
     // message, so it has no summary of dropped turns to carry either.
@@ -1246,6 +1258,11 @@ fn system_prompt(connection: &Connection, summary: Option<&str>) -> SystemPrompt
              differ, though only the user's own words change a rule the user set.\n{}",
             crate::untrusted::steady_fence(summary)
         ));
+        // Outside the fence, as they are the user's, and only with a summary,
+        // which says what became of what they asked.
+        if let Some(words) = words {
+            system.push_str(&format!("\n\n{words}"));
+        }
     }
     SystemPrompt {
         text: system,
@@ -1415,17 +1432,19 @@ fn mode_notes(connection: &Connection, window: &[Message]) -> Vec<Option<Mode>> 
 }
 
 /// `body_with`, keeping the hashes of its cached prefix in `prefix` when
-/// given one: only a request that is sent needs them.
+/// given one: only a request that is sent needs them. What stands for the
+/// turns the window dropped comes as `(summary, kept)`: their summary and
+/// the user's own words from them.
 fn body_hashed(
     connection: &Connection,
     window: &[Message],
-    summary: Option<&str>,
+    (summary, kept): (Option<&str>, Option<&str>),
     plan: Option<&str>,
     budget: &Budget,
     extra: &Extra,
     mut prefix: Option<&mut crate::cache_miss::Prefix>,
 ) -> Value {
-    let system = system_prompt(connection, summary);
+    let system = system_prompt(connection, summary, kept);
     // Hashed apart from the model line, so that a switch of model is named
     // as that rather than as the system prompt.
     if let Some(prefix) = prefix.as_deref_mut() {
@@ -1436,7 +1455,7 @@ fn body_hashed(
         let remembered = &text[system.remembered.clone()];
         prefix.set(Reason::Memory, (&text[system.memory.clone()], remembered));
         prefix.set(Reason::Skills, &text[system.skills.clone()]);
-        prefix.set(Reason::Summary, summary);
+        prefix.set(Reason::Summary, (summary, kept));
         // Another gateway holds no cache of this one's, whatever the model.
         let route = (connection.endpoint.trim(), connection.model.trim());
         prefix.set(Reason::Model, route);
@@ -3111,6 +3130,10 @@ pub struct Extra {
     /// The run may call no MCP server's tool, so it is not told which
     /// servers are not ready.
     pub no_mcp: bool,
+    /// For a fork, the saved session its first messages are copied from and
+    /// how many: the line saying where dropped turns are kept names it as
+    /// the session's own requests do, so the fork's start with their bytes.
+    pub forked_from: Option<(u64, usize)>,
 }
 
 /// A reply to `messages`, streamed, after which the summary the next turn's
@@ -3350,10 +3373,21 @@ pub fn compact(
     }
     let sums = token_sums(messages, budget.tool_chars);
     let fixed = fixed_tokens(connection);
-    // A summary goes out only when the window leaves something out.
+    // A summary goes out only when the window leaves something out, and
+    // the user's own words from what it left out beside it.
     let cost = |start: usize, summary: Option<&str>| {
-        let summary = summary.filter(|_| start > 0).map_or(0, tokens);
-        fixed + summary + sums[messages.len()] - sums[start]
+        let Some(summary) = summary.filter(|_| start > 0) else {
+            return fixed + sums[messages.len()] - sums[start];
+        };
+        let kept = crate::compact::kept(
+            connection,
+            &messages[..start],
+            summary,
+            budget.step / 8,
+            None,
+        );
+        let beside = kept.as_deref().map_or(0, tokens);
+        fixed + tokens(summary) + beside + sums[messages.len()] - sums[start]
     };
     let (text, paid) = crate::compact::manual(connection, &messages[..end], budget.tokens)
         .map_err(|e| format!("The summary failed, so every turn is kept as it was: {e}"))?;
@@ -3494,12 +3528,28 @@ fn stream(
     if let Some(note) = crate::side::notice(connection.conversation) {
         let _ = sender.send_blocking(Event::Note(note));
     }
+    // Made here, from the messages, so it is never kept with the summary
+    // nor read back by the summarizer at the next step. Their share is an
+    // eighth of the step, a sixteenth of the room the window has: unlike
+    // what the messages may cost, it moves only when the model's window or
+    // the cap does, or when the fixed part of the prompt passes half the
+    // room, which changes the prompt anyway, so between steps the words
+    // kept stay byte for byte the same.
+    let kept = summary.as_deref().and_then(|summary| {
+        crate::compact::kept(
+            connection,
+            dropped,
+            summary,
+            budget.step / 8,
+            extra.forked_from,
+        )
+    });
     let ending = ending(connection, messages, lsp, extra);
     let mut prefix = crate::cache_miss::Prefix::default();
     let sent = body_hashed(
         connection,
         window,
-        summary.as_deref(),
+        (summary.as_deref(), kept.as_deref()),
         Some(ending.as_str()).filter(|ending| !ending.is_empty()),
         budget,
         extra,
@@ -5419,7 +5469,7 @@ mod tests {
                 ..Default::default()
             };
             let budget = Budget::SMALL;
-            let body = body_hashed(&with_tools, &[], None, None, &budget, &extra, None);
+            let body = body_hashed(&with_tools, &[], (None, None), None, &budget, &extra, None);
             body["tools"].as_array().unwrap().clone()
         };
         let every = offered(Vec::new());
@@ -6066,7 +6116,7 @@ mod tests {
         let plain = context_parts(&c, &[], 0);
         let settings = serde_json::json!({"endpoint": "", "model": "m", "style": "concise"});
         std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
-        let prompt = system_prompt(&c, None);
+        let prompt = system_prompt(&c, None, None);
         let sent = body(&c, &[], None, None)["messages"][0]["content"].clone();
         let styled = context_parts(&c, &[], 0);
         let memory = crate::memory::context(&c);
@@ -6102,7 +6152,7 @@ mod tests {
                 conversation,
                 ..connection()
             };
-            let prompt = system_prompt(&c, None);
+            let prompt = system_prompt(&c, None, None);
             crate::memory::forget(conversation);
             prompt
         };
@@ -6186,7 +6236,7 @@ mod tests {
             human,
             ..connection()
         };
-        let prompt = system_prompt(&c, None);
+        let prompt = system_prompt(&c, None, None);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
 
         let text = &prompt.text;
@@ -6541,7 +6591,11 @@ mod tests {
         let messages = three_turns("now");
         let done = compact(&c, &messages, 0, None, messages.len()).unwrap();
         assert_eq!((done.upto, done.text.as_str()), (6, "Read main.rs."));
-        assert!(done.before > done.after + 900, "{}", done.report());
+        // Less the start of the first message's 4,000-character paste, which
+        // goes beside the summary as the user's own words, counted in what
+        // the window costs after.
+        let saved = done.before - done.after;
+        assert!((400..900).contains(&saved), "{}", done.report());
         assert!(
             done.report().starts_with("Compacted: "),
             "{}",
@@ -6709,8 +6763,14 @@ mod tests {
         // The turn that no longer fits is summed up, and only the summary of
         // it goes out with the window.
         assert!(bodies[0].contains("write the big file"));
-        assert!(!bodies[1].contains("write the big file"));
+        assert!(!bodies[1].contains(&"x".repeat(1_000)));
         assert!(bodies[1].contains("A big file was written."));
+        // But for what the user said in it, beside the summary.
+        assert!(
+            bodies[1].contains("#0: write the big file"),
+            "{}",
+            bodies[1]
+        );
         assert!(bodies[1].contains("thanks"));
     }
 
@@ -6743,11 +6803,78 @@ mod tests {
                 assert!(done.is_ok(), "{done:?}");
             }
         }
-        // It fits the window whole, yet what the user summed up stays out.
-        let sent = worker.join().unwrap();
-        assert!(!sent.contains("first floor sent"), "{sent}");
-        assert!(sent.contains("The user had main.rs read."), "{sent}");
-        assert!(sent.contains("second floor sent") && sent.contains("third"));
+        // It fits the window whole, yet what the user summed up stays out,
+        // but for their own words beside the summary.
+        let sent: Value = serde_json::from_str(&worker.join().unwrap()).unwrap();
+        let system = sent["messages"][0]["content"].as_str().unwrap();
+        let window = Value::from(sent["messages"].as_array().unwrap()[1..].to_vec()).to_string();
+        assert!(!window.contains("first floor sent"), "{window}");
+        assert!(system.contains("The user had main.rs read."), "{system}");
+        assert!(system.contains("#0: first floor sent"), "{system}");
+        assert!(window.contains("second floor sent") && window.contains("third"));
+    }
+
+    #[test]
+    fn the_summarizer_never_sees_the_kept_words() {
+        use std::io::Write;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            // The summary of what fell out, then the reply.
+            let replies = [
+                (
+                    "application/json",
+                    r#"{"choices":[{"message":{"content":"They wrote the ledger file."}}]}"#,
+                ),
+                (
+                    "text/event-stream",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Welcome\"}}]}\n\ndata: [DONE]\n\n",
+                ),
+            ];
+            let mut bodies = Vec::new();
+            for (kind, reply) in replies {
+                let (mut socket, _) = server.accept().unwrap();
+                bodies.push(request_body(&mut socket));
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            }
+            bodies
+        });
+        let c = Connection {
+            endpoint,
+            ..connection()
+        };
+        let rule = "write the ledger file, and never touch src/api.rs";
+        let mut messages = a_big_write();
+        messages[0].content = rule.into();
+        let rx = start(c, messages);
+        let mut made = None;
+        while let Ok(event) = rx.recv_blocking() {
+            match event {
+                Event::Summarized { text, .. } => made = Some(text),
+                Event::Finished(done) => assert!(done.is_ok(), "{done:?}"),
+                _ => {}
+            }
+        }
+        let bodies = worker.join().unwrap();
+        // The summarizer reads the message in the transcript, never the kept
+        // words, and what the session keeps, which the next step folds into,
+        // is the summary alone.
+        assert!(bodies[0].contains(rule), "{}", bodies[0]);
+        assert!(
+            !bodies[0].contains("own messages from those turns"),
+            "{}",
+            bodies[0]
+        );
+        assert_eq!(made.as_deref(), Some("They wrote the ledger file."));
+        // The request carries them after the summary's fence, as the user's.
+        let sent: Value = serde_json::from_str(&bodies[1]).unwrap();
+        let system = sent["messages"][0]["content"].as_str().unwrap();
+        let fenced = system.rfind("</untrusted-content-").unwrap();
+        let words = system
+            .find("The user's own messages from those turns")
+            .unwrap_or_else(|| panic!("{system}"));
+        assert!(fenced < words, "{system}");
+        assert!(system.ends_with(&format!("\n\n#0: {rule}")), "{system}");
     }
 
     #[test]
@@ -8524,7 +8651,7 @@ mod tests {
             body_hashed(
                 connection,
                 &[],
-                None,
+                (None, None),
                 None,
                 &budget,
                 &extra,
@@ -10836,7 +10963,7 @@ mod tests {
             tools: true,
             ..connection()
         };
-        let alone = system_prompt(&c, None).text;
+        let alone = system_prompt(&c, None, None).text;
         let shared = Connection {
             remote: Some(Remote {
                 place: "a group chat".into(),
@@ -10845,7 +10972,7 @@ mod tests {
             }),
             ..c
         };
-        let shared = system_prompt(&shared, None).text;
+        let shared = system_prompt(&shared, None, None).text;
         let folder = fallback_folder().unwrap();
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
         std::fs::remove_dir_all(&dir).unwrap();

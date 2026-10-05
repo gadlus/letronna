@@ -739,7 +739,7 @@
   },
   {
     "function": {
-      "description": "Search what was said in the user's earlier Letronna sessions, ignoring case. A match holds every word of the query (\"quoted words\" stay together), or when nothing does, some of them; matches on rarer words come first. Titles and tool call arguments are searched too; the current session is left out. Each match gives the session's id, title and age and the message's #. To read the messages around a match, call again with session and around. Use it when the user refers to something from an earlier conversation, or when an earlier session may already hold the answer.",
+      "description": "Search what was said in the user's earlier Letronna sessions, ignoring case. A match holds every word of the query (\"quoted words\" stay together), or when nothing does, some of them; matches on rarer words come first. Titles and tool call arguments are searched too; the current session is left out unless named as session, which searches that session alone. Each match gives the session's id, title and age and the message's #. To read the messages around a match, call again with session and around. Use it when the user refers to something from an earlier conversation, or when an earlier session may already hold the answer.",
       "name": "search_sessions",
       "parameters": {
         "properties": {
@@ -760,11 +760,11 @@
             "type": "integer"
           },
           "query": {
-            "description": "The words to find. With session, the words to center long messages on.",
+            "description": "The words to find. With session and around, the words to center long messages on.",
             "type": "string"
           },
           "session": {
-            "description": "Read the messages of this session around one message instead of searching.",
+            "description": "Search this session alone, the current one too; with around, or with no query, read its messages around one message instead.",
             "type": "integer"
           }
         },

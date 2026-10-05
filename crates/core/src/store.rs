@@ -2670,6 +2670,9 @@ pub struct Within {
     /// A session left out, such as the one asking, which already has what it
     /// said; 0 for none.
     pub exclude: u64,
+    /// The one session looked through, the one asking too, with as many of
+    /// its matches as asked for; 0 for every session.
+    pub only: u64,
     /// Only sessions last used at or after this time, in seconds since 1970.
     pub after: Option<u64>,
     /// Only sessions last used before this time, in seconds since 1970.
@@ -2859,6 +2862,7 @@ fn ranked<'a>(
         };
         let updated = conversation.updated;
         if conversation.id == within.exclude
+            || (within.only != 0 && conversation.id != within.only)
             || within.after.is_some_and(|t| updated < t)
             || within.before.is_some_and(|t| updated >= t)
         {
@@ -2879,7 +2883,9 @@ fn ranked<'a>(
             .collect();
         // Best first, and in the order said among equals, the title first.
         matches.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-        matches.truncate(HITS_PER_SESSION);
+        if within.only == 0 {
+            matches.truncate(HITS_PER_SESSION);
+        }
         let Some(&(best, _)) = matches.first() else {
             continue;
         };
@@ -3545,9 +3551,9 @@ pub(crate) mod tests {
     #[cfg(unix)]
     use super::write_private;
     use super::{
-        ASIDE_STALE, Conversation, Judged, Lock, SNIPPET_SIDE, Store, Todo, Transcript, Within,
-        apply_todo, fill, load, load_listing, modified, replay, search, search_in, search_through,
-        summaries, todos_in,
+        ASIDE_STALE, Conversation, HITS_PER_SESSION, Judged, Lock, SNIPPET_SIDE, Store, Todo,
+        Transcript, Within, apply_todo, fill, load, load_listing, modified, replay, search,
+        search_in, search_through, summaries, todos_in,
     };
     use crate::chat::{Message, ToolCall};
 
@@ -4252,6 +4258,62 @@ pub(crate) mod tests {
         let past = crate::tools::run("search_sessions", args, &ctx);
         assert!(past.is_err_and(|e| e.contains("#0 to #11")));
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn search_sessions_finds_text_in_the_current_session_by_query() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("search-current");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        // Numbered on disk as in memory, where the system prompt numbers
+        // the user's kept words: after a rewind, a notice and a failure too.
+        let mut store = Store::default();
+        store.conversations.push(numbered(4));
+        store.save().unwrap();
+        store.conversations[0].rewind(2);
+        store.conversations[0].messages.extend([
+            Message {
+                notice: true,
+                ..said("user", "Job #2 finished.")
+            },
+            said(crate::failure::ROLE, "The gateway was busy."),
+            said("user", "never touch the fig module"),
+            said("assistant", "Understood."),
+        ]);
+        // More of its messages match than a search of every session gives
+        // one session.
+        for i in 0..HITS_PER_SESSION {
+            let fig = said("user", &format!("the fig module, take {i}"));
+            store.conversations[0].messages.push(fig);
+        }
+        store.save().unwrap();
+        let at = (store.conversations[0].messages.iter())
+            .position(|m| m.content.contains("fig module"))
+            .unwrap();
+        let ctx = crate::tools::ToolContext {
+            conversation: 1,
+            ..Default::default()
+        };
+        let search = |args: &str| crate::tools::run("search_sessions", args, &ctx);
+        let everywhere = search(r#"{"query":"fig"}"#);
+        let here = search(r#"{"session":1,"query":"fig module"}"#);
+        let around = search(&format!(r#"{{"session":1,"around":{at}}}"#));
+        let missing = search(r#"{"session":9,"query":"fig"}"#);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+
+        // Searching every session still leaves the one asking out.
+        let everywhere = everywhere.unwrap();
+        assert!(everywhere.starts_with("No earlier session"), "{everywhere}");
+        let here = here.unwrap();
+        let said = format!("#{at} user: never touch the fig module");
+        assert!(here.contains(&said), "{here}");
+        assert_eq!(
+            here.matches("fig module").count(),
+            HITS_PER_SESSION + 1,
+            "{here}"
+        );
+        assert!(around.unwrap().contains(&said));
+        assert!(missing.is_err_and(|e| e.contains("no saved session 9")));
     }
 
     #[test]
