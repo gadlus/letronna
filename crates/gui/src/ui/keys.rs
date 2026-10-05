@@ -82,23 +82,23 @@ impl Chat {
                 self.picked = self
                     .picked
                     .or(Some(self.store.conversations[self.store.active].id));
-                window.focus(&self.sidebar_focus);
+                window.focus(&self.sidebar_focus, cx);
             }
-            Region::Transcript if self.page != Page::Chat => window.focus(&self.page_focus),
+            Region::Transcript if self.page != Page::Chat => window.focus(&self.page_focus, cx),
             // The question waiting, else the newest turn, whose buttons
             // then show; the transcript itself only when it has neither, or
             // that turn is scrolled out of the list's reach.
             Region::Transcript => match self.stops().last() {
-                Some(&stop) => self.go_to_stop(stop, false, window),
-                None => window.focus(&self.transcript_focus),
+                Some(&stop) => self.go_to_stop(stop, false, window, cx),
+                None => window.focus(&self.transcript_focus, cx),
             },
-            Region::Strip => window.focus(&self.strip_focus),
+            Region::Strip => window.focus(&self.strip_focus, cx),
             Region::Composer => self.focus_composer(window, cx),
             Region::Preview => {
                 let focus = self.browser.read(cx).preview_focus.clone();
-                window.focus(&focus);
+                window.focus(&focus, cx);
             }
-            Region::Panel => window.focus(&self.panel_focus),
+            Region::Panel => window.focus(&self.panel_focus, cx),
         }
         self.region = Some(region);
         cx.notify();

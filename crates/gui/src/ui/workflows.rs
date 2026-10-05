@@ -216,7 +216,7 @@ impl Chat {
         self.workflows.open = name;
         self.workflows.error = None;
         self.workflows.result = None;
-        window.focus(&self.workflows.focus);
+        window.focus(&self.workflows.focus, cx);
         cx.notify();
     }
 
@@ -517,7 +517,7 @@ impl Chat {
                             .child(model.spend.clone()),
                     )
                     .child(
-                        gpui_component::progress::Progress::new()
+                        gpui_component::progress::Progress::new("run-spend")
                             .h(px(4.))
                             .value(model.share),
                     )

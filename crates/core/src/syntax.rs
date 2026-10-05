@@ -25,6 +25,7 @@
 //! millisecond; the old text is parsed only when the new text does not, and
 //! parsing that runs long is given up on, saying nothing.
 
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tree_sitter::{Language, Node, ParseOptions, ParseState, Parser, Tree};
@@ -152,7 +153,13 @@ fn clean(grammar: &Grammar, text: &str, deadline: Instant) -> bool {
 fn tree(grammar: &Grammar, text: &str, deadline: Instant) -> Option<Tree> {
     let mut parser = Parser::new();
     parser.set_language(&grammar.language).ok()?;
-    let mut late = |_: &ParseState| Instant::now() >= deadline;
+    let mut late = |_: &ParseState| {
+        if Instant::now() >= deadline {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    };
     let options = ParseOptions::new().progress_callback(&mut late);
     let bytes = text.as_bytes();
     parser.parse_with_options(

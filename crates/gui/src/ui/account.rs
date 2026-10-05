@@ -229,12 +229,14 @@ pub(crate) fn account_page(chat: &Entity<Chat>, this: &Chat, cx: &App) -> Div {
                 .gap_2()
                 .child(
                     Button::new("dashboard")
+                        .secondary()
                         .small()
                         .label("Open dashboard")
                         .on_click(|_, _, cx| cx.open_url(&auth::dashboard())),
                 )
                 .child(
                     Button::new("refresh-account")
+                        .secondary()
                         .small()
                         .loading(busy)
                         .disabled(busy)
@@ -245,6 +247,7 @@ pub(crate) fn account_page(chat: &Entity<Chat>, this: &Chat, cx: &App) -> Div {
                 )
                 .child(
                     Button::new("sign-out")
+                        .secondary()
                         .small()
                         .disabled(busy)
                         .label("Sign out")
@@ -265,6 +268,7 @@ fn billing(chat: &Entity<Chat>, this: &Chat, account: &Account, cx: &App) -> Div
         Button::new(("bill", key))
             .small()
             .when(on, |b| b.primary())
+            .when(!on, |b| b.secondary())
             .disabled(busy || on)
             .label(label)
             .on_click(move |_, _, cx| {

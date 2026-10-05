@@ -233,7 +233,7 @@ impl Render for ImportPicker {
                 range.filter_map(|row| this.row(row, now, cx)).collect()
             }),
         )
-        .track_scroll(self.scroll.clone())
+        .track_scroll(&self.scroll)
         .h(ROW * (rows as f32).min(ROWS_SHOWN));
         v_flex()
             .key_context("ImportPicker")

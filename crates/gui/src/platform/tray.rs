@@ -125,7 +125,7 @@ mod linux_impl {
                     .timer(Duration::from_millis(200))
                     .await;
                 while let Ok(event) = MenuEvent::receiver().try_recv() {
-                    let _ = cx.update(|cx| match event.id.0.as_str() {
+                    cx.update(|cx| match event.id.0.as_str() {
                         SHOW => show_main_window(cx),
                         QUICK_ENTRY => crate::ui::quick::toggle(cx),
                         UPDATES => check_for_updates(cx),
@@ -184,14 +184,11 @@ mod windows_impl {
                 else {
                     continue;
                 };
-                let shown = cx.update(|cx| match button {
+                cx.update(|cx| match button {
                     MouseButton::Left => show_main_window(cx),
                     MouseButton::Right => open_menu(position.x as f32, position.y as f32, cx),
                     MouseButton::Middle => {}
                 });
-                if shown.is_err() {
-                    break;
-                }
             }
         })
         .detach();

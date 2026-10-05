@@ -141,10 +141,16 @@ fn insights_section(found: &Insights, cx: &App) -> Div {
         v_flex().gap_1().child(subheading(title, cx)).child(
             div().h(px(140.)).child(
                 BarChart::new(data)
-                    .x(|(label, _): &(String, f64)| label.clone())
-                    .y(|(_, value): &(String, f64)| *value)
-                    .fill(move |_: &(String, f64)| bar_color)
-                    .tick_margin(every),
+                    // Both charts are built on this line, which is the id
+                    // each would take otherwise.
+                    .id(SharedString::from(title.to_owned()))
+                    .band(|(label, _): &(String, f64)| label.clone())
+                    .value(|(_, value): &(String, f64)| *value)
+                    .fill(move |_: &(String, f64), _, _, _| bar_color)
+                    .tick_margin(every)
+                    // Still under the pointer, and drawn at once.
+                    .interactive(false)
+                    .appear(false),
             ),
         )
     };
@@ -187,6 +193,7 @@ fn ranked(title: &str, rows: Vec<(String, u64, u64, String)>, cx: &App) -> Div {
         .into_iter()
         .fold(v_flex(), |list, (name, value, most, note)| {
             let share = value as f32 * 100. / most.max(1) as f32;
+            let bar = SharedString::from(format!("{title}-{name}"));
             list.child(
                 h_flex()
                     .gap_3()
@@ -206,7 +213,7 @@ fn ranked(title: &str, rows: Vec<(String, u64, u64, String)>, cx: &App) -> Div {
                         div()
                             .w(px(120.))
                             .flex_shrink_0()
-                            .child(Progress::new().value(share)),
+                            .child(Progress::new(bar).value(share)),
                     )
                     .child(
                         div()

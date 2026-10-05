@@ -16,8 +16,16 @@ serde_json.workspace = true
 async-channel.workspace = true
 reqwest.workspace = true
 chrono.workspace = true
-gpui = "=0.2.2"
-gpui-component = "=0.5.1"
+# GPUI comes as the `gpui-pre` snapshot of zed's crates that GPUI Kit pins,
+# under the names GPUI Kit gives them; `gpui_platform` opens the window
+# system. The `tree-sitter` feature is the code highlighter, and the
+# grammars it is given are below.
+gpui = { package = "gpui-pre", version = "=0.3.8" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8", features = ["font-kit", "x11", "wayland"] }
+gpui-component = { version = "=0.7.1", features = ["tree-sitter"] }
+# Already in the tree via gpui-component; a reply is drawn with its text view
+# (see theme::reply_text_style).
+gpui-base = "=0.7.1"
 discord-rich-presence = "1"
 # Already in the tree via letronna-core. The Claude Code plugin's link proves
 # both ends know its token (HMAC) and draws the token and nonces.
@@ -25,16 +33,16 @@ ring = "0.17"
 image = "0.25"
 # Already in the tree via gpui-component. The system says when the terminal
 # writes a session, so the window follows it without polling the folder.
-notify = "7"
+notify = "8"
 # Plays speech a tool made, in the chat: playback and the formats voices come
 # back in, and no recording.
 rodio = { version = "0.22", default-features = false, features = ["playback", "mp3", "wav", "flac", "vorbis"] }
 # Grammars registered by hand with gpui-component's `LanguageRegistry`
 # (see src/highlight.rs), instead of its `tree-sitter-languages` feature,
-# which links all 27 of its bundled grammars whether a chat shows them or
+# which links all 33 of its bundled grammars whether a chat shows them or
 # not. `tree-sitter` itself and `tree-sitter-json` come in already, via
 # gpui-component.
-tree-sitter = "0.25"
+tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.23"
@@ -54,7 +62,7 @@ cpal = "0.17"
 tray-icon = "0.25"
 raw-window-handle = "0.6"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_System_Threading", "Win32_Security", "Win32_Graphics_Gdi", "Win32_Storage_Xps"] }
-# Already in the tree via gpui. The shell's own thumbnailer gives the first
+# Already in the tree via cpal. The shell's own thumbnailer gives the first
 # frame of a video a tool made, as Explorer shows it, and Media Foundation
 # decodes the video to play it in the chat.
 windows = { version = "0.61", features = [
@@ -76,7 +84,7 @@ windows = { version = "0.61", features = [
 [target.'cfg(target_os = "macos")'.dependencies]
 # Command Line Tools ship no `xcrun metal`, so let the Metal driver compile the
 # shaders at startup rather than at build time.
-gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8", features = ["runtime_shaders"] }
 # Both already in the tree via gpui; used to reach the NSWindow behind a gpui
 # window and give it the dark appearance.
 raw-window-handle = "0.6"

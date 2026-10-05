@@ -159,7 +159,7 @@ impl Chat {
                     div().absolute().top_0().right_0().child(
                         deferred(
                             anchored()
-                                .anchor(Corner::BottomRight)
+                                .anchor(Anchor::BottomRight)
                                 .snap_to_window_with_margin(px(8.))
                                 .child(
                                     div()
@@ -368,7 +368,7 @@ impl Chat {
         // A page without the composer takes the keys instead; a composer
         // that is not drawn would take them nowhere, shortcuts included.
         if self.page != Page::Chat {
-            window.focus(&self.page_focus);
+            window.focus(&self.page_focus, cx);
             return;
         }
         self.composer
@@ -605,7 +605,7 @@ impl Chat {
                     }),
                 )
         });
-        menu.focus_handle(cx).focus(window);
+        menu.focus_handle(cx).focus(window, cx);
         cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
             this.mode_menu = None;
             cx.notify();
@@ -700,7 +700,7 @@ impl Chat {
                 self.completion_keys(
                     div()
                         .w_full()
-                        .child(Input::new(&self.composer).w_full().appearance(false)),
+                        .child(Textarea::new(&self.composer).w_full().appearance(false)),
                     cx,
                 ),
             );

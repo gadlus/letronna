@@ -102,9 +102,10 @@ impl Chat {
 
     fn new_skill(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editing_skill = Some(String::new());
-        for input in [&self.skill_name, &self.skill_prompt] {
-            input.update(cx, |input, cx| input.set_value("", window, cx));
-        }
+        self.skill_name
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.skill_prompt
+            .update(cx, |input, cx| input.set_value("", window, cx));
         cx.notify();
     }
 
@@ -240,7 +241,7 @@ impl Chat {
                             .text_color(cx.theme().muted_foreground)
                             .child("Instructions"),
                     )
-                    .child(Input::new(&self.skill_prompt).small().w_full()),
+                    .child(Textarea::new(&self.skill_prompt).small().w_full()),
             )
             .child(
                 h_flex()

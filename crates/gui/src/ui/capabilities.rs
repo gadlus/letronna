@@ -65,10 +65,10 @@ pub(crate) struct Capabilities {
     pub(crate) off: Vec<String>,
     /// Why the last switch on the Tools tab did not all take.
     tools_note: Option<String>,
-    paste: Entity<InputState>,
+    paste: Entity<TextareaState>,
     server_name: Entity<InputState>,
     server_target: Entity<InputState>,
-    server_extras: Entity<InputState>,
+    server_extras: Entity<TextareaState>,
     /// Why the pasted text filled nothing in, or what the last add came to.
     server_note: Option<Result<String, String>>,
 }
@@ -78,12 +78,11 @@ impl Capabilities {
     /// from what is pasted.
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Chat>) -> (Self, Subscription) {
         let paste = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .auto_grow(1, 6)
                 .placeholder("Paste a server's JSON from its README, or the line that starts it")
         });
-        let [server_name, server_target, server_extras] =
+        let (server_name, server_target, server_extras) =
             server_fields(&Draft::default(), window, cx);
         let filled = cx.subscribe_in(&paste, window, |this, _, event, window, cx| {
             if matches!(event, InputEvent::Change) {
@@ -256,7 +255,7 @@ impl Chat {
         let draft = Draft {
             name: value(&self.capabilities.server_name),
             target: value(&self.capabilities.server_target),
-            extras: value(&self.capabilities.server_extras),
+            extras: self.capabilities.server_extras.read(cx).value().to_string(),
         };
         let added = mcp_paste::add(&draft);
         if added.is_ok() {
@@ -275,7 +274,7 @@ impl Chat {
 
     /// Put `draft` in the add form's fields.
     fn set_server_fields(&mut self, draft: &Draft, window: &mut Window, cx: &mut Context<Self>) {
-        let [name, target, extras] = server_fields(draft, window, cx);
+        let (name, target, extras) = server_fields(draft, window, cx);
         self.capabilities.server_name = name;
         self.capabilities.server_target = target;
         self.capabilities.server_extras = extras;
@@ -474,7 +473,7 @@ impl Chat {
                  fields it fills in.",
                 cx,
             ))
-            .child(Input::new(&state.paste).small().w_full())
+            .child(Textarea::new(&state.paste).small().w_full())
             .child(
                 h_flex()
                     .gap_3()
@@ -490,10 +489,15 @@ impl Chat {
                             .min_w_0(),
                     ),
             )
-            .child(field(
-                "Variables or headers, one a line",
-                &state.server_extras,
-            ))
+            .child(
+                v_flex()
+                    .gap_1p5()
+                    .child(super::settings::label(
+                        "Variables or headers, one a line",
+                        cx,
+                    ))
+                    .child(Textarea::new(&state.server_extras).small().w_full()),
+            )
             .child(
                 h_flex()
                     .gap_3()
@@ -521,7 +525,11 @@ fn server_fields(
     draft: &Draft,
     window: &mut Window,
     cx: &mut Context<Chat>,
-) -> [Entity<InputState>; 3] {
+) -> (
+    Entity<InputState>,
+    Entity<InputState>,
+    Entity<TextareaState>,
+) {
     let name = cx.new(|cx| {
         InputState::new(window, cx)
             .placeholder("github")
@@ -533,13 +541,12 @@ fn server_fields(
             .default_value(draft.target.clone())
     });
     let extras = cx.new(|cx| {
-        InputState::new(window, cx)
-            .multi_line(true)
+        TextareaState::new(window, cx)
             .auto_grow(1, 4)
             .placeholder("API_KEY=… for a command, or Authorization: Bearer … for an address")
             .default_value(draft.extras.clone())
     });
-    [name, target, extras]
+    (name, target, extras)
 }
 
 /// A switch that Tab reaches and Enter or Space flips, as a click does:

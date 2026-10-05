@@ -342,7 +342,7 @@ impl BrowserView {
         self.dismissed = false;
         self.open(cx);
         if self.url.is_empty() {
-            window.focus(&self.focus);
+            window.focus(&self.focus, cx);
         }
         if !letronna_core::browser::has_page() {
             self.resume(HOME.to_owned(), cx);
@@ -569,7 +569,7 @@ impl BrowserView {
         if typed.is_empty() {
             return;
         }
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         self.open_address(typed, cx);
     }
 
@@ -947,7 +947,7 @@ impl BrowserView {
             .plain(cx)
             .xsmall()
             .icon(Icon::new(AppIcon::View))
-            .dropdown_menu_with_anchor(gpui::Corner::TopRight, move |menu, _, _| {
+            .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
                 let act = |apply: fn(&mut BrowserView, &mut Window, &mut Context<BrowserView>)| {
                     let view = view.clone();
                     move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
@@ -1184,7 +1184,7 @@ impl BrowserView {
                 .on_mouse_down(
                     button,
                     cx.listener(|view, event: &MouseDownEvent, window, cx| {
-                        window.focus(&view.focus);
+                        window.focus(&view.focus, cx);
                         if event.button == MouseButton::Left
                             && matches!(view.pointing, Some(Pointing::Armed))
                         {

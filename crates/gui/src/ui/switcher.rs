@@ -128,7 +128,7 @@ impl Chat {
             focus: focus.clone(),
             _leaving: [blurred, away],
         });
-        window.focus(&focus);
+        window.focus(&focus, cx);
         cx.notify();
     }
 
@@ -147,7 +147,7 @@ impl Chat {
             .filter(|&ix| ix != self.store.active || self.page != Page::Chat);
         let Some(ix) = picked else {
             match switcher.before {
-                Some(before) => window.focus(&before),
+                Some(before) => window.focus(&before, cx),
                 None => self.focus_composer(window, cx),
             }
             return;

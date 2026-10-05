@@ -527,8 +527,6 @@ impl Chat {
                                 .child(div().w_full().overflow_hidden().child(TextView::markdown(
                                     SharedString::from(format!("plan-{}", call.id)),
                                     plan,
-                                    window,
-                                    cx,
                                 ))),
                         )
                         .vertical_scrollbar(&scroll),
