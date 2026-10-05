@@ -63,6 +63,9 @@ pub struct Runner {
     /// Stops the memory review a turn started, when the next one begins, the
     /// exchange it read is taken back or the session is left.
     pub review: Cancel,
+    /// Replies print here at the prompt, which shows only bold and code;
+    /// false for `-p`, the control protocol and an editor.
+    pub plain_terminal: bool,
 }
 
 impl Runner {
@@ -103,6 +106,7 @@ impl Runner {
             // Its own: the judge runs on `model`.
             session_model: String::new(),
             system: None,
+            plain_terminal: self.plain_terminal,
         }
     }
 
@@ -2188,6 +2192,7 @@ mod tests {
             ended: None,
             voice: None,
             review: Default::default(),
+            plain_terminal: false,
         };
         // Newer sessions in another folder, and one in none, are passed over.
         let opened = runner.open(true, Some("/work/site".into()));
@@ -2237,6 +2242,7 @@ mod tests {
             ended: None,
             voice: None,
             review: Default::default(),
+            plain_terminal: false,
         };
         runner.store.conversations.push(Conversation::default());
         assert!(runner.connection(0).unattended);

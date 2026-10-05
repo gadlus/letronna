@@ -3422,6 +3422,32 @@ mod tests {
     }
 
     #[test]
+    fn a_helper_of_a_terminal_session_keeps_its_hint_and_so_the_prefix_they_share() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = Scratch::new("agents-terminal-hint");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let terminal = Connection {
+            tools: true,
+            human: true,
+            plain_terminal: true,
+            ..Default::default()
+        };
+        let helper = child(&terminal, &AgentDef::default(), None, &usual(), FIRST_ID);
+        let system = |c: &Connection| {
+            crate::chat::body(c, &[], None, None)["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let (session, helper) = (system(&terminal), system(&helper));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert!(session.contains("print in a terminal"), "{session}");
+        assert_eq!(helper, session);
+    }
+
+    #[test]
     fn a_review_helper_is_not_told_about_plans() {
         let review = AgentDef {
             name: "review".into(),

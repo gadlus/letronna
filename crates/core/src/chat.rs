@@ -301,6 +301,11 @@ pub struct Connection {
     /// The whole system message, in place of Letronna's own, for a quick
     /// look that brings its own instructions.
     pub system: Option<Arc<str>>,
+    /// Replies print in the interactive terminal, which shows only bold and
+    /// code: set by its prompt alone, not for `-p` or an editor. Its helpers
+    /// keep it, so their system message stays the session's and the cache
+    /// serves both.
+    pub plain_terminal: bool,
 }
 
 impl Connection {
@@ -1138,6 +1143,10 @@ fn system_prompt(
         // nothing there; the remote text below says where the session is.
         if connection.remote.is_none() {
             system.push_str(" You run in Letronna, not in any other assistant; other tools' commands do not apply here. The user's earlier conversations are sessions: list_sessions shows them, and the user picks one up with the /resume command or `letronna --resume <id>`.");
+            system.push_str(&crate::prompt_rules::told(
+                connection,
+                &crate::prompt_rules::TERMINAL,
+            ));
         }
         system.push_str(" You have tools to read, search, write and edit files and to run commands in the user's project; use them instead of guessing.");
         system.push_str(&crate::prompt_rules::told(
@@ -5750,6 +5759,36 @@ mod tests {
         assert!(!window.contains("Nobody there sees"), "{window}");
     }
 
+    #[test]
+    fn the_terminal_prompt_carries_the_plain_hint_and_nothing_else_does() {
+        let hint = " Replies to the user print in a terminal that shows only **bold** and `code`:";
+        let terminal = system_with_tools(Connection {
+            human: true,
+            plain_terminal: true,
+            ..connection()
+        });
+        assert!(
+            terminal.contains(&format!("`letronna --resume <id>`.{hint}")),
+            "{terminal}"
+        );
+        let window = system_with_tools(Connection {
+            human: true,
+            ..connection()
+        });
+        assert!(!window.contains(hint), "{window}");
+        // A chat app is not the terminal, whatever started it.
+        let chat_app = system_with_tools(Connection {
+            human: true,
+            plain_terminal: true,
+            remote: Some(Remote {
+                place: "a Telegram chat".into(),
+                ..Default::default()
+            }),
+            ..connection()
+        });
+        assert!(!chat_app.contains(hint), "{chat_app}");
+    }
+
     /// A distinctive part of the rules for a turn someone at this computer
     /// watches: how to end a task and what a message typed meanwhile means.
     const ON_SCREEN: [&str; 2] = [
@@ -6826,6 +6865,14 @@ mod tests {
     /// user's, and with the date and the system, which change by the day and
     /// the machine, as placeholders.
     fn golden_prompt(human: bool) -> String {
+        golden_prompt_of(Connection {
+            human,
+            ..connection()
+        })
+    }
+
+    /// `golden_prompt` over `c`, with tools and the project folder `/w`.
+    fn golden_prompt_of(c: Connection) -> String {
         let _turn = crate::store::tests::DATA_DIR
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -6834,8 +6881,7 @@ mod tests {
         let c = Connection {
             tools: true,
             workspace: Some("/w".into()),
-            human,
-            ..connection()
+            ..c
         };
         let prompt = system_prompt(&c, None, None);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
@@ -6868,6 +6914,16 @@ mod tests {
     #[test]
     fn the_headless_system_prompt_matches_its_golden_copy() {
         golden("system_prompt_headless.txt", &golden_prompt(false));
+    }
+
+    #[test]
+    fn the_terminal_system_prompt_matches_its_golden_copy() {
+        let terminal = golden_prompt_of(Connection {
+            human: true,
+            plain_terminal: true,
+            ..connection()
+        });
+        golden("system_prompt_terminal.txt", &terminal);
     }
 
     #[test]

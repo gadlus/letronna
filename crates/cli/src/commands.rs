@@ -4470,6 +4470,7 @@ mod tests {
             ended: None,
             voice: None,
             review: Default::default(),
+            plain_terminal: false,
         };
         let flow = command(&mut runner, "/mode auto", &mut 0, None);
         assert!(matches!(flow, Flow::Handled));
@@ -4494,6 +4495,7 @@ mod tests {
             ended: None,
             voice: None,
             review: Default::default(),
+            plain_terminal: false,
         };
         runner.store.conversations.push(Default::default());
         let sent = |runner: &mut Runner, line: &str| match command(runner, line, &mut 0, None) {

@@ -1965,6 +1965,8 @@ impl Chat {
             // Its own: the judge runs on `model`.
             session_model: String::new(),
             system: None,
+            // The window shows Markdown whole.
+            plain_terminal: false,
         };
         backend::validate(&connection)?;
         Ok(connection)
