@@ -53,9 +53,9 @@ enum To {
     /// Where replies print in the interactive terminal, which someone at
     /// this computer watches.
     Terminal,
-    /// Where someone can say yes to a schedule: a watched session that has
-    /// the `schedule` tool once plan mode is off.
-    Schedules,
+    /// Where someone watches a session that has `letronna_info`: the
+    /// window's, the terminal's, an editor's or a chat app's private chat.
+    Letronna,
 }
 
 impl To {
@@ -70,7 +70,7 @@ impl To {
             To::NotClaude => not_claude(connection),
             To::Terminal => connection.plain_terminal,
             To::Plan => crate::tools::offers_plan(connection),
-            To::Schedules => watched(connection) && crate::tools::offers_schedule(connection),
+            To::Letronna => watched(connection) && crate::tools::offers_info(connection),
         }
     }
 
@@ -90,7 +90,7 @@ impl To {
     fn droppable(self) -> bool {
         !matches!(
             self,
-            To::Watched | To::OnScreen | To::Plan | To::Terminal | To::Schedules
+            To::Watched | To::OnScreen | To::Plan | To::Terminal | To::Letronna
         )
     }
 }
@@ -121,9 +121,8 @@ pub(crate) const PROSE: [Rule; 1] = [Rule {
 /// The rules after what the tools are for, in order: what to leave alone;
 /// how calls are approved or, in a run nobody watches, what it is told in
 /// place of approvals and `ask_user`, neither of which it has; then checking
-/// the work, making calls, ending a turn, where facts come from, what a
-/// recurring task or a notification is built with and the steps to ask about
-/// first.
+/// the work, making calls, ending a turn, where facts come from, where to
+/// look first and the steps to ask about first.
 pub(crate) const TOOLS: [Rule; 22] = [
     // Undoing what the user changed is the git rule's. New files and tests
     // are not forbidden, as checks and required outputs need them.
@@ -250,16 +249,16 @@ pub(crate) const TOOLS: [Rule; 22] = [
         to: To::NotClaude,
         text: "Take file contents, git state, versions and other facts that change from a tool, not from what you recall.",
     },
-    // A scheduled run's answer goes to the chat apps set up, and `notify`
-    // posts there now, so a message needs no scheduler, webhook or key of
-    // its own, and one found on the disk, in the registry or in the
-    // environment is at best a copy kept for something else. The tool goes
-    // unnamed, as the row is told where it may not be offered; the line on
-    // where runs report names it. What the user names stays theirs to name.
+    // Letronna holds the user's setup and acts on it itself: a scheduled
+    // run's answer goes to the chat apps set up, and `notify` posts to them
+    // now, so neither needs the operating system's scheduler, and a key or a
+    // webhook found elsewhere on the computer is at best a copy kept for
+    // something else. Told only where `letronna_info` is offered, as it names
+    // it. What the user names stays theirs to name.
     Rule {
-        id: "schedules",
-        to: To::Schedules,
-        text: "For a recurring task or a notification, use Letronna's own schedules and chat apps before the operating system's scheduler (Task Scheduler, cron, launchd). Letronna already holds the chat apps' connections and keys and posts through them itself, so never search files, the registry, environment variables or other programs' settings for a webhook, token or key, or post to a chat app with curl or a script. Do otherwise only if the user asks.",
+        id: "letronna-first",
+        to: To::Letronna,
+        text: "To find something out or get it done, go in this order: Letronna itself, through its tools, letronna_info and the letronna skill, for anything about it or the user's setup in it (account, plan, keys, models, chat apps, schedules, MCP servers, settings); then the project folder; and only when those lack it, the rest of the computer (system settings, environment variables, other programs' files, wide searches), never to find a key or token unless the user asks.",
     },
     // Where the user turned the card off, by Bypass, a grant for the tool or
     // a rule, nothing else stops a push or a message. Asking here, in the
@@ -731,62 +730,99 @@ mod tests {
     }
 
     #[test]
-    fn the_schedules_row_reaches_only_a_session_that_can_add_a_schedule() {
+    fn the_letronna_row_reaches_only_a_session_offered_letronna_info() {
         let _turn = settings_held();
-        let dir = crate::store::tests::Scratch::new("rules-schedules");
+        let dir = crate::store::tests::Scratch::new("rules-letronna-first");
         unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
-        assert!(tells(&window(), "schedules"));
-        assert!(tells(&chat_app(false), "schedules"));
+        assert!(tells(&window(), "letronna-first"));
+        assert!(tells(&chat_app(false), "letronna-first"));
         let terminal = Connection {
             plain_terminal: true,
             ..window()
         };
-        assert!(tells(&terminal, "schedules"));
-        // A shared chat is offered no tool of this computer, a `-p` run has
-        // nobody to say yes, and a gateway without tools has none to call.
-        assert!(!tells(&chat_app(true), "schedules"));
-        assert!(!tells(&headless(), "schedules"));
-        let toolless = Connection {
-            tools: false,
-            ..window()
-        };
-        assert!(!tells(&toolless, "schedules"));
-        // Plan mode holds the tool back only until a plan is approved, and
-        // a plan may be to add a schedule.
+        assert!(tells(&terminal, "letronna-first"));
+        // Plan mode keeps the tool, which changes nothing.
         let planning = Connection {
             plan: true,
             ..window()
         };
-        assert!(tells(&planning, "schedules"));
-        // Nor where the user switched the tool off.
+        assert!(tells(&planning, "letronna-first"));
+        // A shared chat is offered no tool of this computer, a `-p` run with
+        // its output piped is left without it, and a gateway without tools
+        // has none to call.
+        assert!(!tells(&chat_app(true), "letronna-first"));
+        assert!(!tells(&headless(), "letronna-first"));
+        let toolless = Connection {
+            tools: false,
+            ..window()
+        };
+        assert!(!tells(&toolless, "letronna-first"));
+        // A scheduled run is offered no letronna_info, its answer going to
+        // every chat app set up.
+        let job = crate::schedule::Schedule {
+            id: 1,
+            name: "Daily".into(),
+            prompt: "Say hello.".into(),
+            workspace: None,
+            trigger: crate::schedule::Trigger::Every { minutes: 60 },
+            enabled: true,
+            last_run: 0,
+            mode: crate::gate::Mode::Default,
+            by_model: false,
+            quiet: false,
+            check: None,
+        };
+        let session = 9_800_201;
+        let listed = crate::schedule::Listed::new(session, &job);
+        let scheduled = Connection {
+            conversation: session,
+            ..window()
+        };
+        let in_a_run = tells(&scheduled, "letronna-first");
+        drop(listed);
+        // The schedule tool switched off leaves it, as it speaks of Letronna
+        // as a whole; letronna_info switched off takes it away.
         std::fs::write(
             dir.join("settings.json"),
             r#"{"endpoint": "", "model": "m", "disabled_tools": ["schedule"]}"#,
         )
         .unwrap();
-        assert!(!tells(&window(), "schedules"));
+        let without_schedule = tells(&window(), "letronna-first");
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"endpoint": "", "model": "m", "disabled_tools": ["letronna_info"]}"#,
+        )
+        .unwrap();
+        let without_info = tells(&window(), "letronna-first");
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+
+        assert!(!in_a_run);
+        assert!(without_schedule);
+        assert!(!without_info);
     }
 
     #[test]
-    fn the_schedules_row_comes_before_the_steps_to_ask_about_and_cannot_be_dropped() {
+    fn the_letronna_row_comes_before_the_steps_to_ask_about_and_cannot_be_dropped() {
         let _turn = settings_held();
-        let dir = crate::store::tests::Scratch::new("rules-schedules-order");
+        let dir = crate::store::tests::Scratch::new("rules-letronna-first-order");
         unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
         let told = told_without(&window(), &TOOLS, &[]);
         let unwatched = told_without(&headless(), &TOOLS, &[]);
-        let row = " For a recurring task or a notification, use Letronna's own schedules and chat apps before the operating system's scheduler (Task Scheduler, cron, launchd). Letronna already holds the chat apps' connections and keys and posts through them itself, so never search files, the registry, environment variables or other programs' settings for a webhook, token or key, or post to a chat app with curl or a script. Do otherwise only if the user asks.";
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        let row = " To find something out or get it done, go in this order: Letronna itself, through its tools, letronna_info and the letronna skill, for anything about it or the user's setup in it (account, plan, keys, models, chat apps, schedules, MCP servers, settings); then the project folder; and only when those lack it, the rest of the computer (system settings, environment variables, other programs' files, wide searches), never to find a key or token unless the user asks.";
         let at = told.find(row).expect("the window is told the row");
+        assert!(told[..at].ends_with(" not from what you recall."), "{told}");
         assert!(told[at..].contains(" Before a step that changes something outside"));
-        assert!(!unwatched.contains("Task Scheduler"), "{unwatched}");
+        assert!(!unwatched.contains("letronna_info"), "{unwatched}");
+        // The row on schedules it took the place of is gone.
+        assert!(!told.contains("Task Scheduler"), "{told}");
         // Only a watched session is told it, so no run nobody watches is
         // measured without it.
-        let rule = all().find(|rule| rule.id == "schedules").unwrap();
+        let rule = all().find(|rule| rule.id == "letronna-first").unwrap();
         assert!(!rule.to.droppable());
-        assert!(parse("-schedules").is_err());
-        assert!(To::Schedules.reaches_run(&window()));
-        assert!(!To::Schedules.reaches_run(&headless()));
-        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert!(parse("-letronna-first").is_err());
+        assert!(To::Letronna.reaches_run(&window()));
+        assert!(!To::Letronna.reaches_run(&headless()));
     }
 
     #[test]

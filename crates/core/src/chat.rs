@@ -1267,9 +1267,10 @@ fn system_prompt(connection: &Connection, summary: Option<&str>) -> SystemPrompt
     // Where a scheduled run's answer goes, and what `notify` posts now, so a
     // message wanted every day is one schedule and one wanted now one call,
     // and neither a webhook looked for in the environment. Here, as it
-    // changes only when the user sets up a chat app, and only where the rule
-    // on schedules is told, as no other session can add one.
-    if crate::prompt_rules::tells(connection, "schedules")
+    // changes only when the user sets up a chat app, and only where someone
+    // watches a session offered the schedule tool, as no other can add one.
+    if crate::prompt_rules::watched(connection)
+        && crate::tools::offers_schedule(connection)
         && let Some(line) = reports_line(&crate::messaging::load(), offers_notify())
     {
         system.push_str(&line);
@@ -5760,8 +5761,9 @@ mod tests {
         let told = |connection: Connection| {
             let system = system_with_tools(connection);
             let line = system.contains(" Scheduled runs and the notify tool post to: ");
-            // The rule and the line go together, and the line follows it.
-            let rule = system.contains("use Letronna's own schedules and chat apps before");
+            // In these sessions letronna_info goes with the schedule tool,
+            // so the rule naming it goes with the line, which follows it.
+            let rule = system.contains("To find something out or get it done, go in this order");
             assert_eq!(line, rule, "{system}");
             line
         };
@@ -5796,13 +5798,16 @@ mod tests {
         // Without tools there is none to call.
         let toolless = system_prompt(&window, None).text;
         assert!(!toolless.contains("Scheduled runs"), "{toolless}");
-        // And not where the user switched the tool off.
+        // And not where the user switched the tool off, though the rule on
+        // where to look stays, as letronna_info is still offered.
         std::fs::write(
             dir.join("settings.json"),
             r#"{"endpoint": "", "model": "m", "disabled_tools": ["schedule"]}"#,
         )
         .unwrap();
-        assert!(!told(window));
+        let without = system_with_tools(window);
+        assert!(!without.contains("Scheduled runs"), "{without}");
+        assert!(without.contains("go in this order"), "{without}");
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
