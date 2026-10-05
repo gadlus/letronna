@@ -25,7 +25,8 @@ actions!(
         FocusComposer,
         ShowKeys,
         ToggleCrew,
-        DismissCrew
+        DismissCrew,
+        Quit
     ]
 );
 

@@ -619,6 +619,9 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             None,
         ),
     ];
+    // A Mac app quits on Cmd+Q from its menu, and the window sets none.
+    #[cfg(target_os = "macos")]
+    keys.push((KeyBinding::new("cmd-q", Quit, None), Some("Quit Letronna")));
     // Windows hands Shift and a digit over as the character they type,
     // Ctrl+Shift+4 as "ctrl-$", which a binding written "shift-4" never
     // meets. The platform's keyboard mapper binds the character the
@@ -748,6 +751,7 @@ fn main() {
                 .into_iter()
                 .map(|(binding, _)| binding),
         );
+        cx.on_action(|_: &Quit, cx| cx.quit());
         ui::quick::init(cx);
         platform::tray::init(cx);
         cx.on_window_closed(|cx, _| {
@@ -827,15 +831,31 @@ mod tests {
     use super::keys;
 
     #[test]
-    fn every_key_but_the_window_wide_three_is_bound_in_a_context() {
+    fn every_key_but_the_window_wide_ones_is_bound_in_a_context() {
         // gpui ranks a binding with no context above every other, so a new
-        // one would take its key from every dialog, menu and text box.
+        // one would take its key from every dialog, menu and text box. A new
+        // session, the sidebar, settings, and on macOS quitting.
         let window_wide: Vec<String> = keys(&gpui::DummyKeyboardMapper)
             .iter()
             .filter(|(binding, _)| binding.predicate().is_none())
             .map(|(binding, _)| binding.keystrokes()[0].unparse())
             .collect();
-        assert_eq!(window_wide.len(), 3, "{window_wide:?}");
+        let expected = if cfg!(target_os = "macos") { 4 } else { 3 };
+        assert_eq!(window_wide.len(), expected, "{window_wide:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cmd_q_quits_from_anywhere_in_the_window() {
+        let quit: Vec<_> = keys(&gpui::DummyKeyboardMapper)
+            .into_iter()
+            .filter(|(binding, _)| binding.keystrokes()[0].unparse() == "cmd-q")
+            .collect();
+        assert_eq!(quit.len(), 1);
+        let (binding, about) = &quit[0];
+        assert!(binding.action().partial_eq(&crate::app::Quit));
+        assert!(binding.predicate().is_none());
+        assert!(about.is_some());
     }
 
     #[test]
