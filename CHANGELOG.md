@@ -23,6 +23,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Schedules in a mode of their own, memory you can review and edit, and a window that uses far less memory and processor while it works or sits idle.
 
 ### Added
+- **All** — Letronna Cloud (Pro): `letronna cloud "task"` in the terminal and `/cloud <task>` in the window run a task on Letronna's servers, in a repository you name or none, and bring the answer back; a thread carries the work on, asleep on the server between messages. Billed from your credit.
 - **All** — `letronna doctor` checks the setup, and a local log and crash files help find out what went wrong.
 - **App** — The window wears letronna.ai's colours; Settings choose its colours and whether it shows film grain.
 - **All** — Letronna knows each model's context window and output limit.

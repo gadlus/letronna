@@ -13,6 +13,7 @@ You run inside Letronna, an agent with a window (`letronna gui`) and a terminal 
 ## Command line
 
 - `letronna` opens a conversation in the terminal. `--memory when-asked|ask|auto` sets when that session saves to memory, `--memory-scope auto|project|chat` where it keeps memory and what of it loads, and `--private` starts a private chat whose notes stay its own.
+- `letronna cloud "task"` runs it on Letronna's servers (Pro, from credit); `--repo <url>`, `--tier light|normal|heavy`, `--thread <id>`; `letronna cloud list|show|stop`.
 - `letronna -p "question"` (`--print`, or just `letronna "question"`) asks once, prints the answer and exits. With -p: `--output text|json|stream-json`, `--max-rounds <n>` (tool rounds a message gets, 100 unless set), `--tools a,b` (only those tools), `--budget <tokens>` (stops once that many are spent), `--input-format stream-json` (messages, interrupts and answers as JSON lines on stdin), `--permission-prompt-tool stdio` (asks stdin about each call that needs a yes), `--json-schema <file>` (answers as JSON that the schema checks; a new session only). `--dump-config` prints the settings and limits a -p run would get, as JSON. Its environment variables are in `settings-and-data.md`.
 - `letronna --continue` (`-c`) picks up this folder's latest session, `letronna --resume` (`-r`) offers the recent ones, `letronna --resume <id>` opens the one whose id `/where` shows. `--worktree` starts a new session in a git worktree of its own, on a branch made from HEAD, leaving the checkout alone; not with -c or -r.
 - `--mode <mode>`: default (asks before writing or running), accept-edits (project edits run, commands ask), plan (reads and searches only), auto (edits run, the user's model judges the rest), dont-ask (runs only what rules allow), bypass (runs without asking, bar risky calls and the user's rules). `--yes` is bypass, `--plan` is plan.
@@ -45,6 +46,7 @@ Then `letronna mcp list`, `get <name>`, `remove <name>`, and `login <name>` or `
 - Web and voice: /search (lets the model search the web; /search services sets up a search service of the user's own), /voice (read replies aloud), /notify (say when a reply ends or needs the user).
 - Sessions: /resume, /branch (carry on in a copy), /undo (`--files` puts files back too), /retry, /compact (summarize earlier turns now), /diff, /where, /import (from Claude Code or Codex), /btw (an aside that is not kept), /image <path>, /preview <path>, /usage, /insights.
 - Long work: /goal (keep working until a goal is met, `--check <command>`), /loop (run a prompt every so often; /loop stop), /heartbeat (look in on this session every so many minutes), /jobs (background commands), /agents (helpers), /workflows, /crew (workflows of helpers for big tasks).
+- /cloud <task> runs it on Letronna's servers, the answer shown under the chat.
 - Keeping and adding: /remember (keep something now, or change when this chat saves), /memory (`/memory edit, log or restore user|memory|project|soul`), /memory-review, /retention (delete old sessions), /init (write AGENTS.md), /skills, /mcp, /plugins.
 
 ## The window

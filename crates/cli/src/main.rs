@@ -14,6 +14,7 @@ mod acp;
 mod args;
 mod banner;
 mod bar;
+mod cloud;
 mod commands;
 mod control;
 mod diff;
@@ -121,6 +122,9 @@ fn main() {
     letronna_core::vault::open();
     if let Some(words) = &args.mcp {
         std::process::exit(mcp::run(words));
+    }
+    if let Some(words) = &args.cloud {
+        std::process::exit(cloud::run(words));
     }
     if args.acp {
         std::process::exit(acp::run());

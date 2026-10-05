@@ -12,6 +12,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("new", "start a fresh session"),
     ("mode", "change how much runs without asking"),
     ("btw", "ask a side question that stays out of the session"),
+    (
+        "cloud",
+        "run a task in Letronna Cloud, on Letronna's servers",
+    ),
     ("init", "study the project and write its AGENTS.md"),
 ];
 

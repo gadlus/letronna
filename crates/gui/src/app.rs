@@ -35,7 +35,7 @@ const FOLLOW_SLACK: Pixels = px(48.);
 
 /// The composer's own slash commands, without the slash, which win over any
 /// the user, a project or a skill adds.
-const OWN_COMMANDS: &[&str] = &["btw", "init"];
+const OWN_COMMANDS: &[&str] = &["btw", "cloud", "init"];
 
 /// The chat column's widest, gutters included: about 90 characters of
 /// text, which reads as one measure. A wider window gets wider margins
@@ -81,6 +81,8 @@ pub(crate) struct Aside {
     pub(crate) cancel: letronna_core::cancel::Cancel,
     /// When it was asked, which tells its answer from an earlier one's.
     asked: std::time::Instant,
+    /// A task sent to Letronna Cloud with /cloud, not a question to a fork.
+    pub(crate) cloud: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1400,6 +1402,13 @@ impl Chat {
         if prompt.starts_with("/mcp__") {
             return self.send_mcp_prompt(prompt, window, cx);
         }
+        // Run on Letronna's servers, its answer shown as an aside's is.
+        if let Some(task) = cloud_task(&prompt) {
+            let task = task.to_owned();
+            self.composer
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            return self.run_in_cloud(task, cx);
+        }
         // Asked beside the session, so it waits for no reply to end.
         if let Some(question) = side_question(&prompt) {
             let question = question.to_owned();
@@ -1676,6 +1685,7 @@ impl Chat {
             answer: None,
             cancel: cancel.clone(),
             asked,
+            cloud: false,
         });
         let (sender, receiver) = async_channel::bounded(1);
         std::thread::spawn(move || {
@@ -1687,6 +1697,43 @@ impl Chat {
             if let Ok(answer) = receiver.recv().await {
                 let _ = this.update(cx, |this, cx| {
                     // One closed or asked again since has no place for it.
+                    if let Some(aside) = this.aside.as_mut().filter(|a| a.asked == asked) {
+                        aside.answer = Some(answer);
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+        self.follow();
+        cx.notify();
+    }
+
+    /// Runs `task` in Letronna Cloud on the signed-in account, and shows its
+    /// answer under the active session as an aside, never in it. Closing the
+    /// aside stops the run.
+    fn run_in_cloud(&mut self, task: String, cx: &mut Context<Self>) {
+        let ix = self.store.active;
+        if let Some(earlier) = self.aside.take() {
+            earlier.cancel.set();
+        }
+        let cancel = letronna_core::cancel::Cancel::default();
+        let asked = std::time::Instant::now();
+        self.aside = Some(Aside {
+            session: self.store.conversations[ix].id,
+            question: task.clone(),
+            answer: None,
+            cancel: cancel.clone(),
+            asked,
+            cloud: true,
+        });
+        let (sender, receiver) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = sender.send_blocking(cloud_answer(&task, &cancel));
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(answer) = receiver.recv().await {
+                let _ = this.update(cx, |this, cx| {
                     if let Some(aside) = this.aside.as_mut().filter(|a| a.asked == asked) {
                         aside.answer = Some(answer);
                         cx.notify();
@@ -4682,6 +4729,52 @@ fn goal_command(prompt: &str) -> Option<&str> {
     (rest.is_empty() || rest.starts_with(char::is_whitespace)).then_some(rest)
 }
 
+/// Start `task` in the cloud and wait for its answer, stopping the run if
+/// `cancel` is set first.
+fn cloud_answer(task: &str, cancel: &letronna_core::cancel::Cancel) -> Result<Message, String> {
+    use letronna_core::cloud;
+    if task.is_empty() {
+        return Err("Say what to run, like: /cloud add a test for the parser".into());
+    }
+    let started = cloud::start(&cloud::Task {
+        prompt: task.to_owned(),
+        ..Default::default()
+    })?;
+    let run = loop {
+        if cancel.is_set() {
+            let _ = cloud::stop(&started.id);
+            return Err("Stopped.".into());
+        }
+        let now = cloud::run(&started.id)?;
+        if now.over() {
+            break now;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    };
+    match run.status.as_str() {
+        "done" => Ok(Message {
+            role: "assistant".into(),
+            content: format!(
+                "{}\n\n*Ran in Letronna Cloud: {}, {} s, thread {}.*",
+                run.answer.trim(),
+                run.id,
+                run.seconds,
+                run.thread
+            ),
+            ..Default::default()
+        }),
+        "stopped" => Err("The cloud run was stopped.".into()),
+        _ => Err(format!("The cloud run failed: {}", run.error.trim())),
+    }
+}
+
+/// The task a /cloud line gives, empty when it names none, or None for any
+/// other line.
+fn cloud_task(prompt: &str) -> Option<&str> {
+    let rest = prompt.strip_prefix("/cloud")?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
+}
+
 /// The question a /btw line asks, empty when it names none, or None for any
 /// other line.
 fn side_question(prompt: &str) -> Option<&str> {
@@ -4714,7 +4807,7 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        card_is_up, cuts_in, escape_closes_aside, front_call, run_ended, running_calls,
+        card_is_up, cloud_task, cuts_in, escape_closes_aside, front_call, run_ended, running_calls,
         side_question, until_repeated_id, untouched,
     };
     use letronna_core::agent::{MAX_BATCH, Next, Turn};
@@ -4929,6 +5022,14 @@ mod tests {
         assert!(escape_closes_aside(1, 1, Some(2)));
         // An aside of another session is hidden, so escape is not for it.
         assert!(!escape_closes_aside(1, 2, None));
+    }
+
+    #[test]
+    fn only_a_cloud_line_runs_in_the_cloud() {
+        assert_eq!(cloud_task("/cloud fix the build"), Some("fix the build"));
+        assert_eq!(cloud_task("/cloud"), Some(""));
+        assert_eq!(cloud_task("/cloudy"), None);
+        assert_eq!(cloud_task("run /cloud"), None);
     }
 
     #[test]

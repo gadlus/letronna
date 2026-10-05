@@ -20,6 +20,7 @@ pub mod cancel;
 mod cat;
 mod cdp;
 pub mod chat;
+pub mod cloud;
 pub mod command;
 pub mod commit;
 pub mod compact;
