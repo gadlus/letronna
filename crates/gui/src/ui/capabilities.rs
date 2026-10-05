@@ -550,7 +550,8 @@ fn server_fields(
 }
 
 /// A switch that Tab reaches and Enter or Space flips, as a click does:
-/// gpui-component's own takes no focus.
+/// one stop, as gpui-component's own, a stop of its own since GPUI Kit
+/// 0.7, is kept out of the order and a click never gives it the keys.
 pub(crate) fn switch(
     id: SharedString,
     on: bool,
@@ -574,7 +575,12 @@ pub(crate) fn switch(
         .border_color(cx.theme().transparent)
         .focus(|s| s.border_color(cx.theme().ring))
         .cursor_pointer()
-        .child(Switch::new(SharedString::from(format!("{id}-switch"))).checked(on))
+        .capture_any_mouse_down(|_, window, _| window.prevent_default())
+        .child(
+            Switch::new(SharedString::from(format!("{id}-switch")))
+                .checked(on)
+                .tab_stop(false),
+        )
         .on_click(flip)
 }
 

@@ -1653,7 +1653,8 @@ pub(crate) fn toggle_row(
 type Turn = std::rc::Rc<dyn Fn(&bool, &mut Window, &mut App)>;
 
 /// A switch on a settings page that Tab reaches and Space or Enter turns,
-/// as they press a button: gpui-component's own takes no focus.
+/// as they press a button: one stop, as gpui-component's own, a stop of
+/// its own since GPUI Kit 0.7, is kept out of the order.
 #[derive(IntoElement)]
 pub(crate) struct KeyedSwitch {
     id: SharedString,
@@ -1696,7 +1697,9 @@ impl RenderOnce for KeyedSwitch {
             .read(cx)
             .clone();
         let (checked, turn) = (self.checked, self.on_click);
-        let mut switch = gpui_component::switch::Switch::new(self.id.clone()).checked(checked);
+        let mut switch = gpui_component::switch::Switch::new(self.id.clone())
+            .checked(checked)
+            .tab_stop(false);
         if let Some(turn) = turn.clone() {
             switch = switch.on_click(move |on, window, cx| turn(on, window, cx));
         }
@@ -1712,8 +1715,9 @@ impl RenderOnce for KeyedSwitch {
             .border_color(cx.theme().transparent)
             .focus(|s| s.border_color(cx.theme().ring))
             // A click stays the switch's own, turning it as it is pressed
-            // and leaving the keys where they were, as a button's does.
-            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+            // and leaving the keys where they were, as a button's does:
+            // stopped on the way in, before the switch inside takes them.
+            .capture_any_mouse_down(|_, window, _| window.prevent_default())
             .when_some(turn, |this, turn| {
                 this.on_click(move |event, window, cx| {
                     if event.is_keyboard() {
