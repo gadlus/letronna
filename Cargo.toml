@@ -24,7 +24,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 [patch.crates-io]
 # gpui-pre-windows 0.3.8 -- zed's gpui_windows, the snapshot GPUI Kit 0.7.1
 # pins -- as published on crates.io, less its Cargo.lock, so the Windows
-# renderer can be changed without a fork of all of zed.
+# renderer can be changed without a fork of all of zed. What differs from it:
+# - Windows: the path textures (MSAA, 20 bytes a pixel) are made for the
+#   first path a frame draws, and handed back to the driver 5 s after the last
+#   or when the window leaves the front
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
 
 [profile.release]
