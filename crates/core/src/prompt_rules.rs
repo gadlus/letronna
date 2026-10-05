@@ -198,10 +198,12 @@ pub(crate) const TOOLS: [Rule; 21] = [
         to: To::Unwatched,
         text: "Do not write that an action was taken, such as deployed, sent, rolled back or re-run, unless a tool call in this run took it or an input says it was; write what is still to do as pending.",
     },
+    // Not just "guessing": a gap filled from what a model knows is no guess
+    // to it, and reads as an answer the inputs gave.
     Rule {
         id: "insufficient",
         to: To::Unwatched,
-        text: "Where the inputs do not answer something, say so in the form the task asks for, such as insufficient_evidence, instead of guessing.",
+        text: "Where the inputs do not support an answer to something asked, say so plainly, in the task's own wording for it if it gives one, such as insufficient_evidence, rather than filling the gap from general knowledge or a guess.",
     },
     // In the reply that makes the call, since a reply with no call ends the
     // turn; a log rebuilt without the calls still says what each step was
