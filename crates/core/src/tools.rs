@@ -5210,6 +5210,10 @@ mod tests {
 
         let err = write(json!({"path": "package.json", "content": "{\"a\": 1,}"})).unwrap_err();
         assert!(err.contains("nothing was written"), "{err}");
+        assert!(
+            err.ends_with("at line 1 column 9, near `{\"a\": 1,}`"),
+            "{err}"
+        );
         assert!(write(json!({"path": "new/tsconfig.json", "content": "{\n// ok\n}"})).is_ok());
         let edit = json!({"path": "Cargo.toml", "old": "name = \"a\"", "new": "name = a"});
         assert!(EditFile.run(&edit, &ctx).is_err());

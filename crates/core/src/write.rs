@@ -259,12 +259,39 @@ fn parse(kind: &str, text: &str) -> Result<(), String> {
     match kind {
         "JSON" => serde_json::from_str::<serde_json::Value>(text)
             .map(drop)
-            .map_err(|e| e.to_string()),
+            .map_err(|e| format!("{e}{}", near(text, e.line(), e.column()))),
         _ => text
             .parse::<toml::Table>()
             .map(drop)
             .map_err(|e| e.to_string()),
     }
+}
+
+/// How many bytes of the broken line are quoted each side of the break: the
+/// key and its neighbours, but not the whole of a file kept on one line.
+const NEAR_BYTES: usize = 30;
+
+/// What to add to a JSON error to show the text at its `line` and `column`,
+/// or nothing where that line is empty or not in `text`.
+fn near(text: &str, line: usize, column: usize) -> String {
+    // A model cannot count columns in text it sent, so it is shown the text.
+    let Some(row) = line.checked_sub(1).and_then(|n| text.lines().nth(n)) else {
+        return String::new();
+    };
+    // serde_json counts bytes, from 1, so a column can fall inside a character.
+    let at = column.saturating_sub(1).min(row.len());
+    let from = row.floor_char_boundary(at.saturating_sub(NEAR_BYTES));
+    let to = row.ceil_char_boundary(at + NEAR_BYTES);
+    // The cut can leave part of a saved key at either end, which the scrub of
+    // the whole result, finding values whole, would let through.
+    let shown = crate::redact::scrub_cut(&row[from..to], false);
+    let shown = shown.trim();
+    if shown.is_empty() {
+        return String::new();
+    }
+    let before = if from > 0 { "…" } else { "" };
+    let after = if to < row.len() { "…" } else { "" };
+    format!(", near `{before}{shown}{after}`")
 }
 
 /// JSON files whose own tools allow comments and trailing commas: those of
@@ -559,6 +586,79 @@ mod tests {
         let err = check_syntax(cargo, Some(b"[package]"), "[package\nname = a").unwrap_err();
         assert!(err.contains("TOML"), "{err}");
         assert!(check_syntax(Path::new("notes.md"), None, "{").is_ok());
+    }
+
+    #[test]
+    fn a_refused_json_names_the_line_and_column_the_reason_and_the_text_there() {
+        let package = Path::new("package.json");
+        let missing = "{\n  \"a\": 1\n  \"b\": 2\n}\n";
+        assert_eq!(
+            check_syntax(package, None, missing).unwrap_err(),
+            "This would leave `package.json` as invalid JSON, so nothing was written: \
+             expected `,` or `}` at line 3 column 3, near `\"b\": 2`"
+        );
+        // A quote inside a string ends it early; the text shows where.
+        let quoted = "{\n  \"a\": \"say \"hi\" now\",\n  \"b\": 2\n}\n";
+        let err = check_syntax(package, None, quoted).unwrap_err();
+        assert!(
+            err.ends_with("at line 2 column 14, near `\"a\": \"say \"hi\" now\",`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_refused_json_on_a_long_line_quotes_only_the_text_around_the_break() {
+        let items = "\"k\": 1, ".repeat(100);
+        let text = format!("{{{items}\"z\": ,{items}}}");
+        let err = check_syntax(Path::new("data.json"), None, &text).unwrap_err();
+        let (reason, near) = err.split_once(", near ").unwrap();
+        assert!(
+            reason.ends_with("expected value at line 1 column 807"),
+            "{err}"
+        );
+        assert!(near.starts_with("`…") && near.ends_with("…`"), "{near}");
+        assert!(near.contains("\"z\": ,\"k\": 1"), "{near}");
+        assert!(near.len() < 90, "{near}");
+    }
+
+    #[test]
+    fn the_text_at_a_break_is_cut_on_a_character_not_a_byte() {
+        // Two bytes to a letter, so the byte column is nowhere near the
+        // character column and the cut falls inside letters either side.
+        let text = format!(
+            "{{\"é\": \"{}\" \"b\": 2, \"é\": \"{}\"}}",
+            "é".repeat(40),
+            "é".repeat(40)
+        );
+        let err = check_syntax(Path::new("data.json"), None, &text).unwrap_err();
+        assert!(err.contains("at line 1 column 91, near `…é"), "{err}");
+        assert!(err.contains("é\" \"b\": 2, \"é\": \"éé"), "{err}");
+    }
+
+    #[test]
+    fn a_saved_key_cut_through_by_the_quoted_text_is_hidden() {
+        let key = "QWERTYUIOPasdfghjklZXCVBNM0123456789qwerty";
+        // The environment is the one place a test can save a key without a
+        // data folder, and no other test's text holds this one.
+        unsafe { std::env::set_var("AGENT_API_KEY", key) };
+        let text = format!("{{\"k\": \"{key}\" \"b\": 2}}");
+        let err = check_syntax(Path::new("data.json"), None, &text).unwrap_err();
+        unsafe { std::env::remove_var("AGENT_API_KEY") };
+        assert!(err.contains("column 52, near `…"), "{err}");
+        assert!(!err.contains("ZXCVBNM0123456789"), "{err}");
+        assert!(err.contains(crate::redact::MARKER), "{err}");
+    }
+
+    #[test]
+    fn a_json_that_ends_early_or_a_toml_gets_no_quoted_text_added() {
+        let package = Path::new("package.json");
+        let err = check_syntax(package, None, "{\n  \"a\": 1\n").unwrap_err();
+        assert!(
+            err.ends_with("EOF while parsing an object at line 3 column 0"),
+            "{err}"
+        );
+        let err = check_syntax(Path::new("Cargo.toml"), None, "[package\nname = a\n").unwrap_err();
+        assert!(!err.contains(", near "), "{err}");
     }
 
     #[test]
