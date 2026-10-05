@@ -314,7 +314,7 @@ fn path(dir: &Path) -> PathBuf {
 
 /// The schedules on disk: none when there is no file yet, and why not when
 /// there is one this build cannot read -- which is then never saved over.
-fn load(dir: &Path) -> Result<Vec<Schedule>, String> {
+pub(crate) fn load(dir: &Path) -> Result<Vec<Schedule>, String> {
     let bytes = match std::fs::read(path(dir)) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -520,7 +520,15 @@ impl Running {
 
 /// The tools a scheduled run's own turn is refused, and with nobody there to
 /// answer it not offered either, whichever frontend runs the turn.
-pub(crate) const NOT_AVAILABLE: [&str; 4] = [tools::ASK_USER, "wake_me", "schedule", "workflow"];
+// `letronna_info` too: a run's answer goes to every chat app set up, a
+// webhook's channel others read among them.
+pub(crate) const NOT_AVAILABLE: [&str; 5] = [
+    tools::ASK_USER,
+    "wake_me",
+    "schedule",
+    "workflow",
+    crate::info::LETRONNA_INFO,
+];
 
 /// The scheduled run going on in session `session` here, if there is one. A
 /// call from it or from one of its helpers is decided in its schedule's mode,

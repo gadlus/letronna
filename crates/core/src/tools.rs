@@ -361,6 +361,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(Wait),
         Arc::new(crate::wake::WakeMe),
         Arc::new(crate::schedule::Scheduler),
+        Arc::new(crate::info::LetronnaInfo),
         Arc::new(AskUser),
         Arc::new(ExitPlan),
         Arc::new(Todo),
@@ -1249,6 +1250,7 @@ pub fn summary(name: &str, args: &str) -> String {
             (None, Some(id)) => format!("{} #{id}", v["action"].as_str().unwrap_or_default()),
             (None, None) => v["action"].as_str().unwrap_or_default().to_owned(),
         },
+        crate::info::LETRONNA_INFO => v["topic"].as_str().unwrap_or_default().to_owned(),
         #[cfg(feature = "workflows")]
         "workflow" => crate::workflow::tool::summary(&v),
         // A tool with no path, such as list_jobs or most MCP tools, shows

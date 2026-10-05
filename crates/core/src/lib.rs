@@ -47,6 +47,7 @@ pub mod history;
 pub mod hooks;
 pub mod import;
 pub mod inbox;
+pub mod info;
 pub mod init;
 mod inputs;
 pub mod insights;
