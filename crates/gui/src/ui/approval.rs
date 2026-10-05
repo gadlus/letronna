@@ -1299,7 +1299,7 @@ mod tests {
         // A text style of the card's would stand in for the hint's own whole,
         // and its text would take the button's colour over the hint's box.
         let mut hint = key_hint("enter");
-        assert!(gpui::Styled::style(&mut hint).text.is_none());
+        assert_eq!(gpui::Styled::style(&mut hint).text, Default::default());
     }
 
     #[test]

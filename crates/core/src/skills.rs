@@ -1576,7 +1576,9 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        BUILT_IN, INDEX_CHARS, PAGE_CHARS, Skill, Source, context_in, copy_built_in_in, create_in, defaults, edit_in, find, list_in, load, migrate_in, read_root, remove_in, scalar, set_enabled_in, slug, split, value, OFF_FILE, offers_skills,
+        BUILT_IN, INDEX_CHARS, OFF_FILE, PAGE_CHARS, Skill, Source, context_in, copy_built_in_in,
+        create_in, defaults, edit_in, find, list_in, load, migrate_in, offers_skills, read_root,
+        remove_in, scalar, set_enabled_in, slug, split, value,
     };
     use crate::chat::{Connection, Remote};
     use std::path::{Path, PathBuf};

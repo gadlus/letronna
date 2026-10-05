@@ -5575,6 +5575,7 @@ mod tests {
                 ..connection()
             },
             None,
+            None,
         )
         .text;
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
@@ -5844,6 +5845,7 @@ mod tests {
                 ..connection()
             },
             None,
+            None,
         )
         .text;
         assert!(
@@ -6027,7 +6029,7 @@ mod tests {
             ..window.clone()
         }));
         // Without tools there is none to call.
-        let toolless = system_prompt(&window, None).text;
+        let toolless = system_prompt(&window, None, None).text;
         assert!(!toolless.contains("Scheduled runs"), "{toolless}");
         // And not where the user switched the tool off, though the rule on
         // where to look stays, as letronna_info is still offered.
@@ -6087,7 +6089,7 @@ mod tests {
                     let _ = std::fs::remove_file(dir.join("messaging.json"));
                 }
             }
-            let prompt = system_prompt(&window, None);
+            let prompt = system_prompt(&window, None, None);
             let payload = body(&window, &[said("user", "hi")], None, None);
             let parts: Vec<String> = payload["messages"][0]["content"]
                 .as_array()
@@ -10404,7 +10406,7 @@ mod tests {
         let payload = body(&c, &[said("user", "hi")], None, None);
         let parts = payload["messages"][0]["content"].as_array().unwrap();
         let joined: String = parts.iter().map(|p| p["text"].as_str().unwrap()).collect();
-        let prompt = system_prompt(&c, None);
+        let prompt = system_prompt(&c, None, None);
         assert_eq!(joined, prompt.text);
         assert_eq!(parts[0]["text"], &prompt.text[..prompt.identity]);
         // Anthropic's own API spends that marker on the tools instead.
@@ -10442,7 +10444,7 @@ mod tests {
             ..connection()
         };
         let mut payload = body(&c, &tool_turn(), None, None);
-        let text = system_prompt(&c, None).text;
+        let text = system_prompt(&c, None, None).text;
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
         assert!(payload["messages"][0]["content"].is_array());
         assert!(apply_quirk(&mut payload, Quirk::CacheControl));

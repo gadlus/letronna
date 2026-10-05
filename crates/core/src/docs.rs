@@ -18,8 +18,8 @@
 //! on a thread of its own, which a deadline stops waiting for. The last few
 //! views are kept, so paging through a document reads it once.
 
-mod odf;
 mod epub;
+mod odf;
 mod pdf;
 
 use quick_xml::XmlVersion;

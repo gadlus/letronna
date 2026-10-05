@@ -129,7 +129,7 @@ impl Plugin for ClaudeCode {
                 cx.background_executor()
                     .timer(Duration::from_millis(500))
                     .await;
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     hub.lock().folder = chat_folder(cx);
                     // The window may not be open yet at the first start.
                     if hub.rewire.swap(false, Ordering::Relaxed) && !wire(&hub, cx) {
@@ -1451,9 +1451,11 @@ mod tests {
     // would shadow the built-in attribute.
     use super::{
         Answer, Handed, Heard, Hub, MODEL_PATH, PORT_FILE, Session, WAIT_SECS, accept, answer,
-        hooks, is_ours, listen, newest, project_folder, quoted, read, read_link, say, script,
-        serving, sign, terminals, verify, wait, write_private,
+        hooks, is_ours, listen, newest, project_folder, read, read_link, say, serving, sign,
+        terminals, verify, wait, write_private,
     };
+    #[cfg(unix)]
+    use super::{quoted, script};
     use serde_json::{Value, json};
     use std::collections::VecDeque;
     use std::io::BufReader;

@@ -1570,8 +1570,8 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        Span, Stop, code_spans, line_totals, message_count, scrolls, shows_bar, step_stop, stops, rewind_says,
-        turns,
+        Span, Stop, code_spans, line_totals, message_count, rewind_says, scrolls, shows_bar,
+        step_stop, stops, turns,
     };
     use letronna_core::chat::Message;
     use letronna_core::history::Lines;

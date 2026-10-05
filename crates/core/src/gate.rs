@@ -4978,7 +4978,7 @@ mod tests {
         // A target that cannot be told, a `cd` that may have left the user's
         // file where the write lands, and anything outside the project.
         let outside = dir.join("new.txt");
-        let mut refused = vec![
+        let refused = vec![
             command(&heredoc("$OUT")),
             command(&format!("cd \"$DIR\" && {}", heredoc("answers.json"))),
             command(&format!("cd out/.. && {}", heredoc("fresh.txt"))),
