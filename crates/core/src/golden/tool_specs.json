@@ -686,7 +686,7 @@
   },
   {
     "function": {
-      "description": "Save a way of working you figured out as a skill, so later sessions can load it, or fix one you saved that turned out wrong. A skill you create starts switched off: it is not offered to you, and cannot be loaded, until the user switches it on in Skills. action create takes name, description and body (the instructions, in Markdown). action patch replaces the exact text old with new in a skill's body, or its description with field set to description; old must appear exactly once. action undo puts back a skill as it was before your last patch; undo again to redo it. action archive puts a skill away. Only skills you created can be changed; the user's own, installed and project skills are refused.",
+      "description": "Save a way of working as a skill, so later sessions can load it, or fix one you saved that turned out wrong. Save only work likely to recur, and only steps you saw work or the user gave: short, ordered, each saying how to tell it worked. Leave out task results, one-off details, failed attempts, and claims that a tool does not work; save the fix that did. A skill you create starts switched off: it is not offered to you, and cannot be loaded, until the user switches it on in Skills. action create takes name, description and body (the instructions, in Markdown, at most 20,000 bytes). action patch replaces the exact text old with new in a skill's body, or its description with field set to description; old must appear exactly once. action undo puts back a skill as it was before your last patch; undo again to redo it. action archive puts a skill away. Only skills you created can be changed; the user's own, installed and project skills are refused.",
       "name": "skill_manage",
       "parameters": {
         "properties": {
@@ -704,7 +704,7 @@
             "type": "string"
           },
           "description": {
-            "description": "For create: one line saying when to use the skill.",
+            "description": "For create: one line that starts with when to use the skill.",
             "type": "string"
           },
           "field": {
