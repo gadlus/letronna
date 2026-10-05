@@ -250,14 +250,16 @@ pub(crate) const TOOLS: [Rule; 22] = [
         to: To::NotClaude,
         text: "Take file contents, git state, versions and other facts that change from a tool, not from what you recall.",
     },
-    // A scheduled run's answer goes to the chat apps set up, so a daily
-    // message needs no scheduler, webhook or key of its own, and one found
-    // on the disk, in the registry or in the environment is at best a copy
-    // kept for something else. What the user names stays theirs to name.
+    // A scheduled run's answer goes to the chat apps set up, and `notify`
+    // posts there now, so a message needs no scheduler, webhook or key of
+    // its own, and one found on the disk, in the registry or in the
+    // environment is at best a copy kept for something else. The tool goes
+    // unnamed, as the row is told where it may not be offered; the line on
+    // where runs report names it. What the user names stays theirs to name.
     Rule {
         id: "schedules",
         to: To::Schedules,
-        text: "For a recurring task or a notification, use Letronna's own schedules and chat apps before the operating system's scheduler (Task Scheduler, cron, launchd). Letronna already holds the chat apps' connections and keys, so never search files, the registry, environment variables or other programs' settings for a webhook, token or key. Do otherwise only if the user asks.",
+        text: "For a recurring task or a notification, use Letronna's own schedules and chat apps before the operating system's scheduler (Task Scheduler, cron, launchd). Letronna already holds the chat apps' connections and keys and posts through them itself, so never search files, the registry, environment variables or other programs' settings for a webhook, token or key, or post to a chat app with curl or a script. Do otherwise only if the user asks.",
     },
     // Where the user turned the card off, by Bypass, a grant for the tool or
     // a rule, nothing else stops a push or a message. Asking here, in the
@@ -342,7 +344,7 @@ pub(crate) const HELPER: [Rule; 2] = [
     Rule {
         id: "helper-limits",
         to: To::Every,
-        text: "You cannot ask the user anything or use the memory or schedule tools: decide, and say what you assumed.",
+        text: "You cannot ask the user anything or use the memory, schedule or notify tools: decide, and say what you assumed.",
     },
     Rule {
         id: "helper-plan",
@@ -773,7 +775,7 @@ mod tests {
         unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
         let told = told_without(&window(), &TOOLS, &[]);
         let unwatched = told_without(&headless(), &TOOLS, &[]);
-        let row = " For a recurring task or a notification, use Letronna's own schedules and chat apps before the operating system's scheduler (Task Scheduler, cron, launchd). Letronna already holds the chat apps' connections and keys, so never search files, the registry, environment variables or other programs' settings for a webhook, token or key. Do otherwise only if the user asks.";
+        let row = " For a recurring task or a notification, use Letronna's own schedules and chat apps before the operating system's scheduler (Task Scheduler, cron, launchd). Letronna already holds the chat apps' connections and keys and posts through them itself, so never search files, the registry, environment variables or other programs' settings for a webhook, token or key, or post to a chat app with curl or a script. Do otherwise only if the user asks.";
         let at = told.find(row).expect("the window is told the row");
         assert!(told[at..].contains(" Before a step that changes something outside"));
         assert!(!unwatched.contains("Task Scheduler"), "{unwatched}");

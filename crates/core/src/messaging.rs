@@ -350,12 +350,18 @@ pub fn card_text(name: &str, arguments: &str, preview: &str) -> String {
         });
         return text;
     }
+    // A message to post is shown whole, as its words are what the yes is
+    // for, and `notify` holds them to one message already.
+    let shown = match name {
+        notify::NOTIFY => preview.to_owned(),
+        _ => trim_to(preview, 800),
+    };
     // Fenced, so what would run shows exactly as written rather than with
     // its asterisks and underscores read as formatting.
     format!(
         "Letronna wants to use {name}:\n{}\n\nTap Allow or Deny, or reply yes, or no and why \
          not. Anything else declines.",
-        format::fenced(&trim_to(preview, 800))
+        format::fenced(&shown)
     )
 }
 
@@ -500,11 +506,77 @@ pub fn save(config: &Config) -> Result<(), String> {
 }
 
 pub mod files;
+pub mod notify;
 
-/// Tell every channel that can take it how a scheduled run ended. Nobody asked
-/// for this message, so Telegram and Slack get it only once a chat or member
-/// is paired: that is the one the bot may talk to. Returns what failed to
-/// send.
+/// A place a scheduled run's answer goes, and a message `notify` posts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Place {
+    Webhook,
+    DiscordBot,
+    Slack,
+    Telegram,
+    Email,
+}
+
+impl Place {
+    /// Every place, in the order a message is sent to them.
+    const ALL: [Place; 5] = [
+        Place::Webhook,
+        Place::DiscordBot,
+        Place::Slack,
+        Place::Telegram,
+        Place::Email,
+    ];
+
+    /// What the system prompt, a card and a result call it: never by its
+    /// token, webhook, address or ID.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Place::Webhook => "Discord (webhook)",
+            Place::DiscordBot => "Discord (bot DM)",
+            Place::Slack => "Slack",
+            Place::Telegram => "Telegram",
+            Place::Email => "email",
+        }
+    }
+
+    /// Whether `config` has it set up to post to.
+    // Nobody asked for these messages, so Telegram and Slack count only once
+    // a chat or member is paired: that is the one the bot may talk to.
+    fn ready(self, config: &Config) -> bool {
+        match self {
+            Place::Webhook => config.discord.ready(),
+            Place::DiscordBot => config.discord.bot_ready(),
+            Place::Slack => config.slack.ready() && !config.slack.owner.trim().is_empty(),
+            Place::Telegram => config.telegram.ready() && config.telegram.chat.is_some(),
+            Place::Email => config.email.ready(),
+        }
+    }
+}
+
+/// The places `config` has set up to post to, in the order a message is
+/// sent to them.
+pub(crate) fn places(config: &Config) -> Vec<Place> {
+    Place::ALL
+        .into_iter()
+        .filter(|place| place.ready(config))
+        .collect()
+}
+
+/// Where the chat apps' web APIs are: their own, or a test's fakes.
+#[derive(Clone, Copy)]
+struct Apis<'a> {
+    telegram: &'a str,
+    discord: &'a str,
+    slack: &'a str,
+}
+
+/// The subject of a mail with no title of its own, a message the user said
+/// yes to: who it is from.
+const UNTITLED: &str = "Letronna";
+
+/// Tell every channel that can take it how a scheduled run ended. Returns
+/// what failed to send.
 pub fn report(config: &Config, title: &str, body: &str) -> Vec<String> {
     report_via(&api(), smtp::tls(), config, title, body)
 }
@@ -516,61 +588,57 @@ fn report_via(
     title: &str,
     body: &str,
 ) -> Vec<String> {
-    let mut failed = Vec::new();
-    if config.discord.ready() {
-        let text = format!("**{title}**\n{body}");
-        if let Err(error) = discord_send(&config.discord.webhook, &text) {
-            failed.push(error);
-        }
-    }
-    if config.discord.bot_ready() {
-        let text = format!("**{title}**\n{body}");
-        let sent = discord_open_dm(&config.discord.bot_token, &config.discord.owner)
-            .and_then(|(channel, _)| discord_post(&config.discord.bot_token, &channel, &text));
-        if let Err(error) = sent {
-            failed.push(error);
-        }
-    }
-    if config.slack.ready() && !config.slack.owner.trim().is_empty() {
-        let text = format!("**{title}**\n{body}");
-        if let Err(error) = slack_post(&config.slack.bot_token, &config.slack.owner, None, &text) {
-            failed.push(error);
-        }
-    }
-    if let (true, Some(chat)) = (config.telegram.ready(), config.telegram.chat) {
-        let text = format!("**{title}**\n{body}");
-        if let Err(error) = send_via(api, &config.telegram.token, chat, &text, None) {
-            failed.push(error);
-        }
-    }
-    if config.email.ready() {
-        let sent = tls
-            .ok_or_else(|| "Cannot initialize connection.".to_owned())
-            .and_then(|tls| smtp::send(tls, &config.email, title, body));
-        if let Err(error) = sent {
-            failed.push(error);
-        }
-    }
-    failed
+    let apis = Apis {
+        telegram: api,
+        discord: DISCORD_API,
+        slack: SLACK_API,
+    };
+    places(config)
+        .into_iter()
+        .filter_map(|place| post_via(apis, tls, config, place, Some(title), body).err())
+        .collect()
 }
 
 /// The places `report` would send a scheduled run's answer to, by name.
-// The conditions of `report_via`, which sends nowhere else: if one changes,
-// so must this. Names only, as the system prompt lists them, so never a
-// token, webhook, address or ID.
 pub fn reporting(config: &Config) -> Vec<&'static str> {
-    let slack_paired = config.slack.ready() && !config.slack.owner.trim().is_empty();
-    let telegram_paired = config.telegram.ready() && config.telegram.chat.is_some();
-    [
-        (config.discord.ready(), "Discord (webhook)"),
-        (config.discord.bot_ready(), "Discord (bot DM)"),
-        (slack_paired, "Slack"),
-        (telegram_paired, "Telegram"),
-        (config.email.ready(), "email"),
-    ]
-    .into_iter()
-    .filter_map(|(ready, name)| ready.then_some(name))
-    .collect()
+    places(config).into_iter().map(Place::name).collect()
+}
+
+/// Post `body` to `place` as `config` has it set up, through the apps at
+/// `apis` and mail over `tls`: under `title` in bold, or as a mail's
+/// subject, when there is one.
+fn post_via(
+    apis: Apis,
+    tls: Option<&std::sync::Arc<rustls::ClientConfig>>,
+    config: &Config,
+    place: Place,
+    title: Option<&str>,
+    body: &str,
+) -> Result<(), String> {
+    let text = match title {
+        Some(title) => format!("**{title}**\n{body}"),
+        None => body.to_owned(),
+    };
+    match place {
+        Place::Webhook => discord_send(&config.discord.webhook, &text),
+        Place::DiscordBot => {
+            let token = &config.discord.bot_token;
+            let (channel, _) = discord_open_dm_via(apis.discord, token, &config.discord.owner)?;
+            discord_post_via(apis.discord, token, &channel, &text, None).map(|_| ())
+        }
+        Place::Slack => {
+            let (token, owner) = (&config.slack.bot_token, &config.slack.owner);
+            slack_post_via(apis.slack, token, owner, None, &text)
+        }
+        Place::Telegram => {
+            let chat = config.telegram.chat.ok_or("No Telegram chat is paired.")?;
+            send_via(apis.telegram, &config.telegram.token, chat, &text, None).map(|_| ())
+        }
+        Place::Email => {
+            let tls = tls.ok_or("Cannot initialize connection.")?;
+            smtp::send(tls, &config.email, title.unwrap_or(UNTITLED), body)
+        }
+    }
 }
 
 /// The owner's own private chat with the app, the one place a card waiting
@@ -1151,7 +1219,7 @@ pub(crate) mod tests {
     }
 
     /// As `requests`, each answered with its status and the body beside it.
-    fn replies(
+    pub(super) fn replies(
         replies: &[(&str, &str)],
     ) -> (String, std::thread::JoinHandle<Vec<(String, Value)>>) {
         let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3020,6 +3088,17 @@ mod card_tests {
         // Out of range, or not a number: the reply is the answer.
         assert_eq!(answer("3"), "3");
         assert_eq!(answer("a website"), "a website");
+    }
+
+    #[test]
+    fn a_message_to_post_shows_whole_on_a_chats_card_and_any_other_preview_is_cut() {
+        let words = "word ".repeat(300);
+        let message = format!("Post to Slack:\n\n{words}");
+        let posted = card_text(super::notify::NOTIFY, "{}", &message);
+        assert!(posted.contains(&message), "{posted}");
+        let command = card_text("run_command", "{}", &words);
+        assert!(!command.contains(&words), "{command}");
+        assert!(command.contains("\u{2026} (trimmed)"), "{command}");
     }
 
     #[test]

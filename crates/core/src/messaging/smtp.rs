@@ -429,7 +429,7 @@ impl Session {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::{Config, Email, report_via};
     use super::{Arc, ClientConfig, STANDARD, check_via, deliver, header_text};
     use base64::Engine;
@@ -463,7 +463,7 @@ mod tests {
     }
 
     /// Client TLS that trusts the test certificate and nothing else.
-    fn trusting() -> Arc<ClientConfig> {
+    pub(in crate::messaging) fn trusting() -> Arc<ClientConfig> {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(der(CERT).into()).unwrap();
         let config = ClientConfig::builder_with_provider(provider())
@@ -514,15 +514,15 @@ mod tests {
     /// What a fake server heard: each command, after "tls " once TLS was on
     /// for it, and the mail as DATA carried it, a line to a line.
     #[derive(Default)]
-    struct Heard {
+    pub(in crate::messaging) struct Heard {
         commands: Vec<String>,
-        mail: Vec<String>,
+        pub(in crate::messaging) mail: Vec<String>,
     }
 
     /// A fake mail server for one conversation, so nothing reaches a real
     /// one: TLS from the first byte when `implicit`, else offered by STARTTLS
     /// when `starttls`. `login` is its answer to AUTH.
-    fn server(
+    pub(in crate::messaging) fn server(
         implicit: bool,
         starttls: bool,
         login: &'static str,
@@ -574,7 +574,7 @@ mod tests {
         (port, worker)
     }
 
-    fn mailbox(port: u16) -> Email {
+    pub(in crate::messaging) fn mailbox(port: u16) -> Email {
         Email {
             enabled: true,
             smtp_host: "127.0.0.1".into(),
@@ -587,7 +587,7 @@ mod tests {
     }
 
     /// The text of a mail heard, decoded.
-    fn text(mail: &[String]) -> String {
+    pub(in crate::messaging) fn text(mail: &[String]) -> String {
         let blank = mail.iter().position(String::is_empty).unwrap();
         String::from_utf8(der(&mail[blank + 1..].concat())).unwrap()
     }

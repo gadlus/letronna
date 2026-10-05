@@ -576,6 +576,36 @@
   },
   {
     "function": {
+      "description": "Post a message now through the chat apps the user connected to Letronna, where scheduled runs report: to all of them, or to the one in `to`. Letronna sends it with the connections and keys it holds, so use this rather than a webhook, curl or a script of your own. Each message waits for the user's yes.",
+      "name": "notify",
+      "parameters": {
+        "properties": {
+          "text": {
+            "description": "The message as it should arrive, at most 1,900 characters.",
+            "type": "string"
+          },
+          "to": {
+            "description": "One of the places set up; leave out for all of them.",
+            "enum": [
+              "Discord (webhook)",
+              "Discord (bot DM)",
+              "Slack",
+              "Telegram",
+              "email"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
       "description": "List the user's earlier Letronna sessions: id, title, when they were last used, how many messages, and which project folder. Use this when asked about past sessions or which one to pick up. It returns no conversation text. The user opens one with the /resume command, or `letronna --resume <id>`.",
       "name": "list_sessions",
       "parameters": {

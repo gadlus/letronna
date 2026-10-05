@@ -1264,12 +1264,13 @@ fn system_prompt(connection: &Connection, summary: Option<&str>) -> SystemPrompt
             system.push_str(&line);
         }
     }
-    // Where a scheduled run's answer goes, so a message wanted every day is
-    // one schedule and not a webhook looked for in the environment. Here, as
-    // it changes only when the user sets up a chat app, and only where the
-    // rule on schedules is told, as no other session can add one.
+    // Where a scheduled run's answer goes, and what `notify` posts now, so a
+    // message wanted every day is one schedule and one wanted now one call,
+    // and neither a webhook looked for in the environment. Here, as it
+    // changes only when the user sets up a chat app, and only where the rule
+    // on schedules is told, as no other session can add one.
     if crate::prompt_rules::tells(connection, "schedules")
-        && let Some(line) = reports_line(&crate::messaging::load())
+        && let Some(line) = reports_line(&crate::messaging::load(), offers_notify())
     {
         system.push_str(&line);
     }
@@ -1314,12 +1315,31 @@ fn system_prompt(connection: &Connection, summary: Option<&str>) -> SystemPrompt
 }
 
 /// The sentence naming where a scheduled run's answer goes with the chat apps
-/// as `config` has them, or none when none is set up.
+/// as `config` has them, and a `notify` call's too when `notify` is offered,
+/// or none when none is set up.
 // Names only, from `messaging::reporting`: the webhook, token, address and
 // IDs stay in the settings and out of every request.
-fn reports_line(config: &crate::messaging::Config) -> Option<String> {
+fn reports_line(config: &crate::messaging::Config, notify: bool) -> Option<String> {
     let places = crate::messaging::reporting(config);
-    (!places.is_empty()).then(|| format!(" Scheduled runs report to: {}.", places.join(", ")))
+    let lead = match notify {
+        true => "Scheduled runs and the notify tool post to",
+        false => "Scheduled runs report to",
+    };
+    (!places.is_empty()).then(|| format!(" {lead}: {}.", places.join(", ")))
+}
+
+/// Whether `notify` is offered where the line on schedules is told: with a
+/// chat app to post to, which the line itself needs, unless the user
+/// switched it off.
+// The rest of what offers it holds wherever the line is told: a shared chat
+// and a scheduled run's own turn are told no line, plan mode holds both
+// tools back alike, and a helper, which shares the line, is told in its
+// first message that it may use neither.
+fn offers_notify() -> bool {
+    !crate::tools::switched_off(
+        crate::messaging::notify::NOTIFY,
+        &crate::tools::turned_off(),
+    )
 }
 
 /// What runs nobody watches are told of the commands on PATH and the top of
@@ -5655,7 +5675,7 @@ mod tests {
         unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
         let told = |config: &str| {
             let system = window_system_with(&dir, config);
-            let (_, line) = system.split_once(" Scheduled runs report to: ")?;
+            let (_, line) = system.split_once(" Scheduled runs and the notify tool post to: ")?;
             Some(line.split_once('.')?.0.to_owned())
         };
         let webhook =
@@ -5683,13 +5703,25 @@ mod tests {
             human: true,
             ..connection()
         });
-        assert!(!bare.contains("Scheduled runs report"), "{bare}");
+        assert!(!bare.contains("Scheduled runs"), "{bare}");
         let unpaired = r#"{"telegram": {"enabled": true, "token": "1:t"},
                            "slack": {"enabled": true, "app_token": "xapp-1", "bot_token": "xoxb-1"},
                            "discord": {"enabled": false, "webhook": "https://discord.com/api/webhooks/1/t"}}"#;
         for config in ["{}", unpaired, "{not json"] {
             assert_eq!(told(config), None, "{config}");
         }
+        // With `notify` switched off, the line speaks of scheduled runs alone.
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"endpoint": "", "model": "m", "disabled_tools": ["notify"]}"#,
+        )
+        .unwrap();
+        let alone = window_system_with(&dir, telegram);
+        assert!(
+            alone.contains(" Scheduled runs report to: Telegram."),
+            "{alone}"
+        );
+        assert!(!alone.contains("notify"), "{alone}");
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
@@ -5727,7 +5759,7 @@ mod tests {
         let _listed = crate::schedule::Listed::new(session, &job);
         let told = |connection: Connection| {
             let system = system_with_tools(connection);
-            let line = system.contains(" Scheduled runs report to: ");
+            let line = system.contains(" Scheduled runs and the notify tool post to: ");
             // The rule and the line go together, and the line follows it.
             let rule = system.contains("use Letronna's own schedules and chat apps before");
             assert_eq!(line, rule, "{system}");
@@ -5763,7 +5795,7 @@ mod tests {
         }));
         // Without tools there is none to call.
         let toolless = system_prompt(&window, None).text;
-        assert!(!toolless.contains("Scheduled runs report"), "{toolless}");
+        assert!(!toolless.contains("Scheduled runs"), "{toolless}");
         // And not where the user switched the tool off.
         std::fs::write(
             dir.join("settings.json"),
@@ -5789,7 +5821,7 @@ mod tests {
         };
         let request = body(&window, &[said("user", "hi")], None, None).to_string();
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
-        assert!(system.contains(" Scheduled runs report to: Discord (webhook)"));
+        assert!(system.contains(" Scheduled runs and the notify tool post to: Discord (webhook)"));
         for secret in CHAT_APP_SECRETS {
             assert!(!system.contains(secret), "{secret}: {system}");
             assert!(!request.contains(secret), "{secret}: {request}");
@@ -5811,7 +5843,7 @@ mod tests {
             workspace: Some("/w".into()),
             ..connection()
         };
-        let line = " Scheduled runs report to: Discord (webhook), Discord (bot DM), Slack, Telegram, email.";
+        let line = " Scheduled runs and the notify tool post to: Discord (webhook), Discord (bot DM), Slack, Telegram, email.";
         let sent = |config: Option<&str>| {
             match config {
                 Some(config) => std::fs::write(dir.join("messaging.json"), config).unwrap(),
@@ -5842,7 +5874,7 @@ mod tests {
         assert_eq!(set_up.text.replacen(line, "", 1), bare.text);
         assert!(set_up.text[set_up.skills.end..set_up.model].ends_with(line));
         assert_eq!(set_up_parts[1].replacen(line, "", 1), bare_parts[1]);
-        assert!(!set_up_parts[0].contains("Scheduled runs report"));
+        assert!(!set_up_parts[0].contains("Scheduled runs"));
     }
 
     #[test]

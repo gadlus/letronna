@@ -1158,8 +1158,14 @@ fn permission_request(id: u64, request: &Request) -> Value {
     // The preview is what a card in the terminal or the window shows.
     asked["content"] = json!([{"type": "content",
         "content": {"type": "text", "text": request.preview}}]);
-    // A memory save is asked about each time, with where to keep it.
+    // A memory save is asked about each time, with where to keep it; any
+    // other call asked about each time, as a message to post is, has no yes
+    // for the session, which the gate would not keep.
     let options = match request.places.as_slice() {
+        [] if tools::asked_each_time(&call.name) => json!([
+            {"optionId": "allow-once", "name": "Allow", "kind": "allow_once"},
+            {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"},
+        ]),
         [] => json!([
             {"optionId": "allow-once", "name": "Allow", "kind": "allow_once"},
             {"optionId": "allow-always", "name": "Allow for this session", "kind": "allow_always"},
@@ -1938,6 +1944,36 @@ mod tests {
         let notes = memory::chat_notes(id);
         assert_eq!(notes.entries.unwrap(), ["Uses pnpm."]);
         let _ = std::fs::remove_dir_all(notes.path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_message_to_post_shows_the_editor_its_words_and_offers_no_yes_for_the_session() {
+        let dir = scratch("notify");
+        let post = json!({"text": "Good morning.", "to": "Telegram"});
+        let endpoint = provider(vec![reply("", &[("notify", post)]), reply("Left it.", &[])]);
+        let mut editor = Editor::connect(endpoint, SESSIONS + 210);
+        // A paired Telegram chat, so there is somewhere to post; taken away
+        // again once asked, as every test here shares the data folder.
+        let settings = letronna_core::messaging::path();
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let paired = r#"{"telegram": {"enabled": true, "token": "1:t", "chat": 42}}"#;
+        std::fs::write(&settings, paired).unwrap();
+        let session = editor.open(&dir);
+        let prompt = start(&mut editor, &session, "Say good morning on my Telegram.");
+
+        let (_, asked) = asked_or_ended(&editor, prompt);
+        let _ = std::fs::remove_file(&settings);
+        assert!(is_permission(&asked), "the message went unasked");
+        let params = &asked["params"];
+        let shown = &params["toolCall"]["content"][0]["content"]["text"];
+        assert_eq!(shown, "Post to Telegram:\n\nGood morning.");
+        let options: Vec<&str> = (params["options"].as_array().unwrap().iter())
+            .map(|option| option["optionId"].as_str().unwrap())
+            .collect();
+        assert_eq!(options, ["allow-once", "reject-once"]);
+        choose(&editor, &asked, "reject-once");
+        let (_, ended) = editor.reply(prompt);
+        assert_eq!(ended["result"]["stopReason"], "end_turn");
     }
 
     #[test]

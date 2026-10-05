@@ -561,6 +561,7 @@ mod tests {
             "run_command",
             "read_chat",
             "send_file",
+            "notify",
         ] {
             assert!(!offered.contains(&kept_out), "{kept_out}");
             assert!(

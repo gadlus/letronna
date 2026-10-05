@@ -3397,8 +3397,8 @@ mod tests {
         assert!(
             told.contains(
                 "Tools you may use: read_file. Any other tool is refused. You cannot ask the user \
-                 anything or use the memory or schedule tools: decide, and say what you assumed. \
-                 Write your plan in your answer, not through exit_plan.\n"
+                 anything or use the memory, schedule or notify tools: decide, and say what you \
+                 assumed. Write your plan in your answer, not through exit_plan.\n"
             ),
             "{told}"
         );
@@ -3462,8 +3462,8 @@ mod tests {
         assert!(
             told.contains(
                 "what you could not do, and open questions. Do not replay your steps. You cannot \
-                 ask the user anything or use the memory or schedule tools: decide, and say what \
-                 you assumed. That answer is all"
+                 ask the user anything or use the memory, schedule or notify tools: decide, and \
+                 say what you assumed. That answer is all"
             ),
             "{told}"
         );

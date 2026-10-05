@@ -24,6 +24,7 @@ use crate::chat::{Connection, ToolCall};
 use crate::command::{self, Dialect, Risk};
 use crate::judge::{self, Verdict};
 use crate::memory::Saving;
+use crate::messaging::notify;
 use crate::permissions::{self, Rule};
 use crate::tools::{self, Tool, ToolContext};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -614,6 +615,21 @@ fn ladder(
                  is here to give it. Say what you would have scheduled instead."
                     .into(),
             )
+        };
+    }
+    // A message to the chat apps reaches the user's accounts and cannot be
+    // taken back, so a person reads each one on its card, its words and
+    // where they go, in every mode and whatever the session has read: no
+    // grant, rule or judge sends one. One that could not go is refused
+    // before a card, and a scheduled run's answer is posted as it ends.
+    if tool.name() == notify::NOTIFY {
+        if let Err(why) = notify::drafted(&args, &crate::messaging::load()) {
+            return Outcome::Refuse(why);
+        }
+        let scheduled = crate::schedule::running(gate.ctx.conversation).is_some();
+        return match gate.human && !scheduled {
+            true => Outcome::Ask,
+            false => Outcome::Refuse(notify::UNANSWERED.into()),
         };
     }
     // A rules file that cannot be read could deny this call, so no setting,
@@ -2491,6 +2507,115 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_message_to_the_chat_apps_waits_for_a_person_in_every_mode_whatever_the_session_read() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::store::tests::Scratch::new("gate-notify");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let paired = r#"{"telegram": {"enabled": true, "token": "1:t", "chat": 42}}"#;
+        std::fs::write(dir.join("messaging.json"), paired).unwrap();
+        let session = 731_301;
+        let fresh = ToolContext {
+            conversation: session,
+            ..Default::default()
+        };
+        // A session that read a page, which could have worded the message.
+        let read = ToolContext {
+            conversation: session + 1,
+            ..Default::default()
+        };
+        crate::taint::mark(&read);
+        let tool = HashSet::from([notify::NOTIFY.to_owned()]);
+        let granted = Grants::from([(session, tool.clone()), (session + 1, tool)]);
+        let allowed = [Rule {
+            tool: notify::NOTIFY.into(),
+            pattern: "*".into(),
+            effect: permissions::Effect::Allow,
+            project: None,
+        }];
+        let unasked = |_: &ToolCall, _: &str| -> Verdict { panic!("the judge was asked") };
+        let post = call(notify::NOTIFY, serde_json::json!({"text": "Good morning."}));
+        let modes = [
+            Mode::Default,
+            Mode::AcceptEdits,
+            Mode::Auto,
+            Mode::Bypass,
+            Mode::DontAsk,
+        ];
+        let mut outcomes = Vec::new();
+        for ctx in [&fresh, &read] {
+            for mode in modes {
+                for human in [true, false] {
+                    let gate = Gate {
+                        ctx,
+                        mode,
+                        grants: &granted,
+                        rules: &allowed,
+                        broken: None,
+                        human,
+                    };
+                    let outcome = decide_with(&post, &gate, Some(&unasked), false);
+                    outcomes.push((human, mode, outcome));
+                }
+            }
+        }
+        // One that cannot go is refused before any card.
+        let gate = Gate {
+            ctx: &fresh,
+            mode: Mode::Default,
+            grants: &granted,
+            rules: &[],
+            broken: None,
+            human: true,
+        };
+        let elsewhere = call(
+            notify::NOTIFY,
+            serde_json::json!({"text": "Good morning.", "to": "Slack"}),
+        );
+        let nowhere = decide(&elsewhere, &gate);
+        // A scheduled run's answer is posted as it ends, even where its
+        // calls wait for the user.
+        let job = crate::schedule::Schedule {
+            id: 1,
+            name: "Daily".into(),
+            prompt: "Say hello.".into(),
+            workspace: None,
+            trigger: crate::schedule::Trigger::Every { minutes: 60 },
+            enabled: true,
+            last_run: 0,
+            mode: Mode::Default,
+            by_model: false,
+            quiet: false,
+            check: None,
+        };
+        let scheduled = {
+            let _listed = crate::schedule::Listed::new(session, &job);
+            decide(&post, &gate)
+        };
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+
+        for (human, mode, outcome) in outcomes {
+            match (human, mode) {
+                (true, Mode::DontAsk) => {
+                    assert!(matches!(outcome, Outcome::Refuse(_)), "{outcome:?}");
+                }
+                (true, _) => assert_eq!(outcome, Outcome::Ask, "{mode:?}"),
+                // With nobody to say yes, it is listed as pending.
+                (false, _) => {
+                    let pending = Outcome::Refuse(notify::UNANSWERED.into());
+                    assert_eq!(outcome, pending, "{mode:?}");
+                }
+            }
+        }
+        assert!(
+            matches!(&nowhere, Outcome::Refuse(why) if why.starts_with("`to` names none")),
+            "{nowhere:?}"
+        );
+        assert_eq!(scheduled, Outcome::Refuse(notify::UNANSWERED.into()));
     }
 
     #[test]
