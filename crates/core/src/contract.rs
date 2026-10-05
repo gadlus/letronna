@@ -10,9 +10,10 @@
 //!
 //! Both halves are plain text matching rather than a model's reading, so
 //! nothing is invented, and the matching leans to missing: a file counts only
-//! where the words the user typed ask for it to be made, and one named to
-//! read, ask about, move, leave alone or not make, or inside code, a diff or
-//! a page quoted in, is no output. What it misses goes unchecked, which costs
+//! where the words the user typed ask for it to be made -- one outside `out/`
+//! only by its whole path, right after them -- and one named to read, ask
+//! about, move, leave alone or not make, or inside code, a diff or a page
+//! quoted in, is no output. What it misses goes unchecked, which costs
 //! less than sending a run back for a file nobody asked for: that costs a
 //! round, and where only the last message is passed on, as from `-p`, a
 //! schedule, a chat app or MCP, the answer given before it unless the model
@@ -128,6 +129,17 @@ const MAKES: [&str; 13] = [
     "puts",
     "delivers",
 ];
+
+/// Words a sentence may open with before the making word that asks for a
+/// file elsewhere, as in "Also create" or "Then write".
+const OPENERS: [&str; 8] = [
+    "also", "then", "finally", "next", "lastly", "now", "and", "please",
+];
+
+/// The most words a making word's object may run to before "to", "as" or
+/// "into" leads to a file elsewhere: enough for "the totals for each
+/// region", and a longer run is likely a clause about something else.
+const OBJECT: usize = 6;
 
 /// The kinds of file a request gives a header for.
 const TABLES: [&str; 4] = ["csv", "tsv", "xls", "xlsx"];
@@ -283,7 +295,12 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
                 }
                 // As in "out/a.json but not out/b.json" or "no out/b.json".
                 let not = ["not", "no"].contains(&previous.as_str());
-                let Some(path) = output_path(word, workspace).filter(|_| !using && !not) else {
+                // A path elsewhere is as often an input, or a file code the run
+                // writes is to make when it runs, so it counts only where the
+                // sentence asks for it outright.
+                let elsewhere = || elsewhere(word, workspace).filter(|_| asks_for(before, word));
+                let path = output_path(word, workspace).or_else(elsewhere);
+                let Some(path) = path.filter(|_| !using && !not) else {
                     continue;
                 };
                 if !outputs.iter().any(|output| output.path == path) {
@@ -672,10 +689,77 @@ fn output_path(word: &str, workspace: &Path) -> Option<String> {
             .find(|(at, _)| same_folder(&word[..*at], workspace))?;
         word[at + 1..].to_owned()
     };
+    known_file(path)
+}
+
+/// `path`, from the workspace, when it names one file of a known kind.
+fn known_file(path: String) -> Option<String> {
     // A placeholder such as `<warehouse>` names no one file.
     let placeholder = path.contains(['<', '>', '{', '}', '$', '*', '?']);
     let climbs = path.split('/').any(|part| part.is_empty() || part == "..");
     (!placeholder && !climbs && KINDS.contains(&kind(&path).as_str())).then_some(path)
+}
+
+/// `word` as a path from the workspace, when it names a file of a known kind
+/// outside `out/` by its whole path: a name alone, or one from a folder, may
+/// mean `out/` or a folder named before it, which would be a guess.
+fn elsewhere(word: &str, workspace: &Path) -> Option<String> {
+    let word = word.replace('\\', "/");
+    if !Path::new(&word).is_absolute() {
+        return None;
+    }
+    let path = (word.match_indices('/'))
+        .find(|(at, _)| same_folder(&word[..*at], workspace))
+        .map(|(at, _)| word[at + 1..].to_owned())?;
+    known_file(path).filter(|path| !path.starts_with("out/"))
+}
+
+/// Whether `sentence` asks outright for the file `path` names: it opens with
+/// a making word, as "Write" or "Also create" do, that takes the path
+/// straight after it or after "to", "as" or "into" ending a few words of
+/// its own, and it holds no condition, as "when it is called" is.
+fn asks_for(sentence: &str, path: &str) -> bool {
+    let all: Vec<String> = words(sentence).map(str::to_lowercase).collect();
+    let Some(at) = words(sentence).position(|word| word == path) else {
+        return false;
+    };
+    // A list's mark, its number, or a word such as "also" before the verb.
+    let opens = all.iter().position(|word| {
+        word.chars().any(char::is_alphabetic) && !OPENERS.contains(&word.as_str())
+    });
+    // A heading such as "Read these to write the outputs:" makes its items
+    // asked for though they are read, so a path elsewhere needs its own verb.
+    let Some(verb) = opens.filter(|&verb| verb < at) else {
+        return false;
+    };
+    if !MAKING.contains(&all[verb].as_str())
+        || says(sentence, &["if", "when", "whenever", "unless"])
+    {
+        return false;
+    }
+    let between = &all[verb + 1..at];
+    // "Write a.json and b.json" names both.
+    if between
+        .iter()
+        .all(|word| word == "and" || word.contains('/'))
+    {
+        return true;
+    }
+    let Some((last, object)) = between.split_last() else {
+        return true;
+    };
+    // "Write a script that saves ..." or "a tool to export ..." asks for
+    // what makes the file, not the file.
+    let ordinary = |word: &String| {
+        word.chars().all(char::is_alphanumeric)
+            && ![MAKING.as_slice(), &MAKES, &USING, &CHANGING]
+                .iter()
+                .any(|kind| kind.contains(&word.as_str()))
+            && !["that", "which", "who", "so", "to"].contains(&word.as_str())
+    };
+    ["to", "as", "into"].contains(&last.as_str())
+        && object.len() <= OBJECT
+        && object.iter().all(ordinary)
 }
 
 /// Whether `given`, as a request writes it, is `workspace`, though either
@@ -702,7 +786,7 @@ fn same_folder(given: &str, workspace: &Path) -> bool {
 /// Which output `word` names, by its path or by its name alone when only one
 /// output has that name, or None for any other file, such as an input.
 fn named(word: &str, outputs: &[Output], workspace: &Path) -> Option<usize> {
-    if let Some(path) = output_path(word, workspace) {
+    if let Some(path) = output_path(word, workspace).or_else(|| elsewhere(word, workspace)) {
         return outputs.iter().position(|output| output.path == path);
     }
     if word.contains(['/', '\\']) {
@@ -1080,6 +1164,54 @@ mod tests {
         );
         let contract = from_request(&request, &dir);
         assert_eq!(paths(&contract), ["out/summary.json", "out/notes.md"]);
+    }
+
+    #[test]
+    fn a_file_elsewhere_counts_only_by_its_whole_path_where_asked_outright() {
+        let dir = Scratch::new("contract-elsewhere");
+        let workspace = dir.display().to_string().replace('\\', "/");
+        let request = format!(
+            "Also create `{workspace}/db/check_report.md` describing the duplicates.\n\
+             - Write {workspace}/notes/a.json and {workspace}/notes/b.json.\n\
+             Save the chart as {workspace}/docs/chart.png.\n\
+             Write {workspace}/in/audit.json when the exporter runs.\n\
+             Write a script that saves {workspace}/data/x.json.\n\
+             Add a tool to generate {workspace}/data/y.json.\n\
+             Create a summary of {workspace}/in/notes.md in out/summary.md.\n\
+             Read these to write the outputs:\n- {workspace}/in/rules.md\n\n\
+             Create progress.md and docs/plan.md. Do not write {workspace}/z.json."
+        );
+        let contract = from_request(&request, &dir);
+        assert_eq!(
+            paths(&contract),
+            [
+                "db/check_report.md",
+                "notes/a.json",
+                "notes/b.json",
+                "docs/chart.png",
+                "out/summary.md"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_asked_for_by_its_whole_path_is_checked_as_one_under_out_is() {
+        let dir = Scratch::new("contract-elsewhere-checked");
+        let workspace = dir.display().to_string().replace('\\', "/");
+        let request = format!(
+            "Write {workspace}/data/state.json with keys: run, done.\n\
+             Also create {workspace}/docs/notes.md."
+        );
+        let contract = from_request(&request, &dir);
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::write(dir.join("data/state.json"), br#"{"run": 1}"#).unwrap();
+        assert_eq!(
+            problems(&contract, &dir),
+            [
+                "`data/state.json` lacks keys the request names: `done`.",
+                "`docs/notes.md` does not exist.",
+            ]
+        );
     }
 
     #[test]
