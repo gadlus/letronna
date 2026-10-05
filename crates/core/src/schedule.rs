@@ -1535,14 +1535,14 @@ impl Tool for Scheduler {
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
             "action": {"type": "string", "enum": ["add", "list", "remove"]},
-            "name": {"type": "string", "description": "For add: a few words for the list; defaults to the prompt's start."},
+            "name": {"type": "string", "description": "For add: a few words for the list."},
             "prompt": {"type": "string", "description": "For add: what each run is told. It starts with no memory of this chat, so say everything it needs."},
             "every_minutes": {"type": "integer", "description": "For add: run every N minutes."},
             "daily_at": {"type": "string", "description": "For add: HH:MM each day, in this computer's time zone."},
             "weekdays_only": {"type": "boolean", "description": "With daily_at: Monday to Friday only."},
             "at": {"type": "string", "description": "For add: run once at this local date and time, YYYY-MM-DD HH:MM."},
             "in_minutes": {"type": "integer", "description": "For add: run once, N minutes from now."},
-            "mode": {"type": "string", "enum": ["default", "accept-edits", "plan", "auto", "bypass"], "description": "For add: what each run may do unasked; with nobody there, what would ask is refused. Defaults to default; pick more only when the user asked for it."},
+            "mode": {"type": "string", "enum": ["default", "accept-edits", "plan", "auto", "bypass"], "description": "For add: what each run may do unasked; what would ask is refused. Leave it default unless the user asked for more."},
             "quiet": {"type": "boolean", "description": "For add: post a run only when it has news. Use for watches and alerts, not digests or reminders."},
             "check": {"type": "string", "description": "For add: a command run first each time; when its output matches last time's, the run is skipped. Print only what matters (e.g. `curl -s URL | jq .price`), never a clock."},
             "id": {"type": "integer", "description": "For remove: the schedule's number from list."}

@@ -123,7 +123,7 @@ impl Tool for EditImage {
         "edit_image"
     }
     fn description(&self) -> &'static str {
-        "Change pictures as a description says -- edit one, combine several, or redraw only where a mask marks -- and save the result as a file. The pictures are files in the project, or ones already in this conversation by the path their result named. It goes to the chat's own gateway: on Letronna's hosted models it is paid from the user's credit, a few cents an image. Use it only when the user asks for a picture to be changed."
+        "Change pictures as a description says -- edit one, combine several, or redraw only where a mask marks -- and save the result as a file. It goes to the chat's own gateway: on Letronna's hosted models it is paid from the user's credit, a few cents an image. Use it only when the user asks for a picture to be changed."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
