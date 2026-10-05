@@ -23,6 +23,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Schedules in a mode of their own, memory you can review and edit, and a window that uses far less memory and processor while it works or sits idle.
 
 ### Added
+- **All** — Letronna Cloud keeps apps running: a cloud run can leave any server (Next.js, a Rust API, anything on a port) at its own address; it wakes on a visit, sleeps after 10 minutes without one, and is billed only while awake. Threads unused for 14 days are cleaned up.
 - **All** — A cloud run that makes a page gives a private live link to it, served with nothing running; `letronna cloud relay on` has the cloud answer your Telegram chat while this computer is off; `letronna cloud support <run> on` lets support read a run, and each look is logged.
 - **Web** — Cloud admin at letronna.ai/dashboard/admin, signed in with your account: the pool, running work, usage and the audit log.
 - **All** — The agent picks where to build what you ask: one self-contained page, chart or small app as a file you preview first, then the project on this computer, and Letronna Cloud only when this computer cannot (with your yes, as it spends credit).
