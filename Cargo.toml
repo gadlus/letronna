@@ -28,6 +28,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # - Windows: the path textures (MSAA, 20 bytes a pixel) are made for the
 #   first path a frame draws, and handed back to the driver 5 s after the last
 #   or when the window leaves the front
+# - Windows: windows that are minimized or hidden are not asked to redraw
+#   at every refresh of the display
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
 
 [profile.release]
