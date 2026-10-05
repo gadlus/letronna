@@ -240,6 +240,8 @@ impl Chat {
         self.schedules = runner.list();
         self.schedule_runner = runner;
         Self::watch_schedules(events, cx);
+        // Likewise the wake-ups, which are kept in the profile's folder.
+        letronna_core::wake::serve_every();
         // Whatever is kept here is saved back, so left alone these would put
         // the old profile's tokens into the new one.
         self.messaging = letronna_core::messaging::load();
