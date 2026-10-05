@@ -94,11 +94,12 @@
   },
   {
     "function": {
-      "description": "Create or overwrite a text file in the project folder. Parent folders are created. A file that exists keeps its line endings and byte order mark. Overwriting needs the whole file read first, in an earlier step; to change part of a file, use edit_file.",
+      "description": "Create or overwrite a text file in the project folder. Parent folders are created. A file that exists keeps its line endings and byte order mark. Overwriting needs the whole file read first with read_file in an earlier reply, or written with write_file, and not changed since; to change part of a file, use edit_file.",
       "name": "write_file",
       "parameters": {
         "properties": {
           "content": {
+            "description": "The whole new text of the file; none of the old text is kept.",
             "type": "string"
           },
           "path": {
@@ -116,7 +117,7 @@
   },
   {
     "function": {
-      "description": "Replace `old` with `new` in a file you have read. `old` must match exactly once, unless replace_all is set to change every match. Line endings, trailing spaces, indentation, curly quotes and invisible characters need not match; the file keeps its own. For several changes to one file, pass `edits` instead: they are made in order, and if one fails none is made.",
+      "description": "Replace `old` with `new` in a file you read with read_file in an earlier reply, or wrote with write_file, if it has not changed since; search hits and command output do not count as reads. `old` must match exactly once, unless replace_all is set to change every match. Line endings, trailing spaces, indentation, curly quotes and invisible characters need not match; the file keeps its own. For several changes to one file, pass `edits` instead: they are made in order, and if one fails none is made. A failed edit changes nothing and says why; a successful one need not be read back.",
       "name": "edit_file",
       "parameters": {
         "properties": {
@@ -166,7 +167,7 @@
   },
   {
     "function": {
-      "description": "Add, delete, update and move files with one patch, approved as one change. The patch runs from `*** Begin Patch` to `*** End Patch`. Each file in it starts with `*** Add File: <path>` followed by its lines, each starting with +; `*** Delete File: <path>`; or `*** Update File: <path>`, optionally followed by `*** Move to: <new path>`, then its hunks. A hunk starts with an `@@` line, which may name the function or class it is in, then lines starting with a space (kept), - (removed) or + (added), with about three kept lines around each change. Paths are relative to the project folder. Update or delete only files you have read. If any hunk does not apply, no file is changed.",
+      "description": "Add, delete, update and move files with one patch, approved as one change. The patch runs from `*** Begin Patch` to `*** End Patch`. Each file in it starts with `*** Add File: <path>` followed by its lines, each starting with +; `*** Delete File: <path>`; or `*** Update File: <path>`, optionally followed by `*** Move to: <new path>`, then its hunks. A hunk starts with an `@@` line, which may name the function or class it is in, then lines starting with a space (kept), - (removed) or + (added), with about three kept lines around each change. Paths are relative to the project folder. Update or delete only files you have read. If any hunk does not apply, no file is changed. A patch that applied need not be read back.",
       "name": "apply_patch",
       "parameters": {
         "properties": {

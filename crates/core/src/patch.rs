@@ -86,7 +86,7 @@ impl Tool for ApplyPatch {
         APPLY_PATCH
     }
     fn description(&self) -> &'static str {
-        "Add, delete, update and move files with one patch, approved as one change. The patch runs from `*** Begin Patch` to `*** End Patch`. Each file in it starts with `*** Add File: <path>` followed by its lines, each starting with +; `*** Delete File: <path>`; or `*** Update File: <path>`, optionally followed by `*** Move to: <new path>`, then its hunks. A hunk starts with an `@@` line, which may name the function or class it is in, then lines starting with a space (kept), - (removed) or + (added), with about three kept lines around each change. Paths are relative to the project folder. Update or delete only files you have read. If any hunk does not apply, no file is changed."
+        "Add, delete, update and move files with one patch, approved as one change. The patch runs from `*** Begin Patch` to `*** End Patch`. Each file in it starts with `*** Add File: <path>` followed by its lines, each starting with +; `*** Delete File: <path>`; or `*** Update File: <path>`, optionally followed by `*** Move to: <new path>`, then its hunks. A hunk starts with an `@@` line, which may name the function or class it is in, then lines starting with a space (kept), - (removed) or + (added), with about three kept lines around each change. Paths are relative to the project folder. Update or delete only files you have read. If any hunk does not apply, no file is changed. A patch that applied need not be read back."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
