@@ -6,14 +6,14 @@
 //! What the model may never read is dropped in the walk's own filter, which
 //! no ignore rule or glob can overrule.
 //!
-//! PDF, Word, Excel and PowerPoint files are searched as read_file shows
-//! them, and only when the type, the glob or the path names them: reading
-//! one takes far longer than a text file, so a plain search passes them by
-//! and says how many it passed. A match in one shows the heading of the
-//! page, sheet or slide it is on, and the lines are fenced, being someone
-//! else's words as a page of one read is. Office files from before 2007 and
-//! rich text files are not read, and are counted, as read_file says how to
-//! convert them.
+//! PDF, Word, Excel, PowerPoint and OpenDocument files are searched as
+//! read_file shows them, and only when the type, the glob or the path names
+//! them: reading one takes far longer than a text file, so a plain search
+//! passes them by and says how many it passed. A match in one shows the
+//! heading of the page, sheet or slide it is on, and the lines are fenced,
+//! being someone else's words as a page of one read is. Office files from
+//! before 2007 and rich text files are not read, and are counted, as
+//! read_file says how to convert them.
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::OverrideBuilder;
@@ -1307,6 +1307,39 @@ mod tests {
             ) && alone.contains("--convert-to xlsx --outdir . old.xls`"),
             "{alone}"
         );
+    }
+
+    #[test]
+    fn a_search_reads_opendocument_files_under_their_headings() {
+        let dir = tree("opendocument", &[("notes.txt", "Rent is due")]);
+        let odf = crate::docs::tests::odf;
+        let sheet = r#"<table:table table:name="May"><table:table-row><table:table-cell><text:p>Rent</text:p></table:table-cell><table:table-cell><text:p>900</text:p></table:table-cell></table:table-row></table:table>"#;
+        std::fs::write(dir.join("budget.ods"), odf("spreadsheet", "", sheet)).unwrap();
+        let text =
+            r#"<text:h text:outline-level="1">Lease</text:h><text:p>Rent is due monthly.</text:p>"#;
+        std::fs::write(dir.join("lease.odt"), odf("text", "", text)).unwrap();
+        // Passed by unless named, as any document is.
+        assert_eq!(
+            run(&dir, json!({"pattern": "rent"})),
+            "notes.txt\n  1: Rent is due\n\
+             … 2 PDF/Office files were not searched; name them with type or glob."
+        );
+        let found = run(
+            &dir,
+            json!({"pattern": "rent", "glob": "*.{ods,odt}", "context": 1}),
+        );
+        assert!(
+            found.contains(
+                "budget.ods\n  1- ## Sheet \"May\" (1 rows x 2 cols)\n  2: Rent\t900\n\
+                 lease.odt\n  1- # Lease\n  2: Rent is due monthly.\n</untrusted-content-"
+            ),
+            "{found}"
+        );
+        let found = run(
+            &dir,
+            json!({"pattern": "rent", "type": "odt", "mode": "count"}),
+        );
+        assert_eq!(found, "lease.odt: 1\n… 1 matching lines in 1 files.");
     }
 
     #[test]

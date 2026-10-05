@@ -1,7 +1,8 @@
-//! Word, Excel, PowerPoint and PDF files as read_file shows them: a
-//! document's text, a workbook's sheets as rows of the values they last
-//! showed, a deck's slides with their notes, and a PDF's pages, in place of
-//! the zip of XML or the PDF on disk.
+//! Word, Excel, PowerPoint and PDF files, and OpenDocument's text,
+//! spreadsheets and presentations, as read_file shows them: a document's
+//! text, a workbook's sheets as rows of the values they last showed, a
+//! deck's slides with their notes, and a PDF's pages, in place of the zip of
+//! XML or the PDF on disk.
 //!
 //! A Word heading becomes `#` marks and a table markdown rows. Each sheet
 //! opens with `## Sheet "Name" (R rows x C cols)`, its rows following one
@@ -17,6 +18,7 @@
 //! on a thread of its own, which a deadline stops waiting for. The last few
 //! views are kept, so paging through a document reads it once.
 
+mod odf;
 mod pdf;
 
 use quick_xml::XmlVersion;
@@ -78,6 +80,10 @@ enum Kind {
     Excel,
     PowerPoint,
     Pdf,
+    /// OpenDocument's, each read into the view of its Office kin.
+    Text,
+    Spreadsheet,
+    Presentation,
 }
 
 /// The kind of document `path` is named as.
@@ -94,6 +100,10 @@ fn kind_of(extension: &str) -> Option<Kind> {
         "xlsx" | "xlsm" | "xltx" | "xltm" => Some(Kind::Excel),
         "pptx" | "pptm" | "potx" | "potm" | "ppsx" | "ppsm" => Some(Kind::PowerPoint),
         "pdf" => Some(Kind::Pdf),
+        // OpenDocument's, each with its template.
+        "odt" | "ott" => Some(Kind::Text),
+        "ods" | "ots" => Some(Kind::Spreadsheet),
+        "odp" | "otp" => Some(Kind::Presentation),
         _ => None,
     }
 }
@@ -114,9 +124,9 @@ pub(crate) fn is_extension(extension: &str) -> bool {
 pub(crate) fn places(path: &Path, lines: &[&[u8]]) -> Vec<usize> {
     let starts: &[&[u8]] = match kind(path) {
         Some(Kind::Pdf) => &[b"## Page "],
-        Some(Kind::Excel) => &[b"## Sheet \""],
-        Some(Kind::PowerPoint) => &[b"## Slide "],
-        Some(Kind::Word) => &[b"# ", b"## ", b"### ", b"#### ", b"##### ", b"###### "],
+        Some(Kind::Excel | Kind::Spreadsheet) => &[b"## Sheet \""],
+        Some(Kind::PowerPoint | Kind::Presentation) => &[b"## Slide "],
+        Some(Kind::Word | Kind::Text) => &[b"# ", b"## ", b"### ", b"#### ", b"##### ", b"###### "],
         None => &[],
     };
     (0..lines.len())
@@ -131,7 +141,9 @@ pub(crate) fn plain(path: &Path) -> Option<&'static str> {
         Kind::Word => "docx",
         Kind::Excel => "xlsx",
         Kind::PowerPoint => "pptx",
-        Kind::Pdf => return None,
+        // OpenDocument's lock with a password inside the zip, so one that
+        // is no zip was never one.
+        Kind::Pdf | Kind::Text | Kind::Spreadsheet | Kind::Presentation => return None,
     })
 }
 
@@ -390,6 +402,9 @@ fn read(path: &Path, kind: Kind, until: Instant) -> Result<String, String> {
         Kind::Word => document,
         Kind::Excel => workbook,
         Kind::PowerPoint => deck,
+        Kind::Text => odf::text,
+        Kind::Spreadsheet => odf::spreadsheet,
+        Kind::Presentation => odf::presentation,
         Kind::Pdf => return pdf::read(path, until),
     };
     let mut package = Package::open(path, until)?;
@@ -1129,41 +1144,52 @@ fn workbook(package: &mut Package, view: &mut View) -> Result<(), String> {
         }
         let room = VIEW_BYTES.saturating_sub(view.text.len());
         let grid = grid(package, &link.target, &cells, room)?;
-        // A sheet not read to its end holds at least what was read of it.
-        let least = if grid.cut || grid.full {
-            "at least "
-        } else {
-            ""
-        };
-        let size = match grid.height {
-            0 if least.is_empty() => "empty".to_owned(),
-            height => format!("{least}{height} rows x {} cols", grid.width),
-        };
-        view.heading(&format!("## Sheet \"{name}\" ({hidden}{size})"));
-        for line in &grid.lines {
-            view.line(line);
-        }
-        if grid.more_rows {
-            view.line(&format!("[Only the first {ROWS} rows are shown.]"));
-        }
-        if grid.more_columns {
-            view.line(&format!(
-                "[Only the first {COLUMNS} columns, A to IV, are shown.]"
-            ));
-        }
-        if grid.full {
-            view.full = true;
-            break;
-        }
-        if grid.cut {
-            view.line(&format!(
-                "[The rest is not read: the workbook unpacks to more than {} MB.]",
-                UNPACKED_BYTES / (1024 * 1024)
-            ));
+        if !show_sheet(view, name, sheet.hidden, &grid) {
             break;
         }
     }
     Ok(())
+}
+
+/// Adds the sheet `name` as `grid` read it, under a heading with its size;
+/// false when no more of the workbook is read, the view being full or the
+/// workbook unpacking to more than it may.
+fn show_sheet(view: &mut View, name: &str, hidden: bool, grid: &Grid) -> bool {
+    let hidden = if hidden { "hidden, " } else { "" };
+    // A sheet not read to its end holds at least what was read of it.
+    let least = if grid.cut || grid.full {
+        "at least "
+    } else {
+        ""
+    };
+    let size = match grid.height {
+        0 if least.is_empty() => "empty".to_owned(),
+        height => format!("{least}{height} rows x {} cols", grid.width),
+    };
+    view.heading(&format!("## Sheet \"{name}\" ({hidden}{size})"));
+    for line in &grid.lines {
+        view.line(line);
+    }
+    if grid.more_rows {
+        view.line(&format!("[Only the first {ROWS} rows are shown.]"));
+    }
+    if grid.more_columns {
+        view.line(&format!(
+            "[Only the first {COLUMNS} columns, A to IV, are shown.]"
+        ));
+    }
+    if grid.full {
+        view.full = true;
+        return false;
+    }
+    if grid.cut {
+        view.line(&format!(
+            "[The rest is not read: the workbook unpacks to more than {} MB.]",
+            UNPACKED_BYTES / (1024 * 1024)
+        ));
+        return false;
+    }
+    true
 }
 
 /// What a workbook's cells need to be shown as Excel shows them.
@@ -1530,6 +1556,7 @@ pub(crate) mod tests {
     use super::*;
     use std::io::Write;
 
+    pub(crate) use super::odf::tests::odf;
     pub(crate) use super::pdf::tests::text_pdf;
 
     const W: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#;
@@ -1632,7 +1659,7 @@ pub(crate) mod tests {
     }
 
     /// The view of `bytes` saved as `name` in a folder of its own.
-    fn view_of(name: &str, bytes: &[u8]) -> Result<Option<String>, String> {
+    pub(crate) fn view_of(name: &str, bytes: &[u8]) -> Result<Option<String>, String> {
         let dir = std::env::temp_dir().join(format!("letronna-docs-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
@@ -1644,7 +1671,7 @@ pub(crate) mod tests {
 
     /// Rewrites what `zip` says its part `name` unpacks to, in its local
     /// header and in the central directory both.
-    fn say_unpacked(zip: &mut [u8], name: &str, size: u32) {
+    pub(crate) fn say_unpacked(zip: &mut [u8], name: &str, size: u32) {
         for at in 0..zip.len().saturating_sub(46) {
             let (name_at, size_at, length_at) = match &zip[at..at + 4] {
                 b"PK\x03\x04" => (30, 22, 26),
