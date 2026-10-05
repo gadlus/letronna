@@ -9,9 +9,11 @@
 //!
 //! Only the app's own window is ever read, which no platform asks the user
 //! about: `PrintWindow` on Windows, the window server's picture of the window
-//! on macOS, which needs no Screen Recording permission, and `GetImage` on
-//! X11. Wayland has no portable way for a client to read its own surface
-//! back, and from macOS 26 the window server no longer gives that picture, so
+//! on macOS up to 15, which needs no Screen Recording permission, and
+//! `GetImage` on X11. From macOS 26 the window server no longer gives that
+//! picture, so gpui's renderer reads back the next frame it draws instead:
+//! `ask` asks for it, and the overlay waits that frame for `capture`.
+//! Wayland has no portable way for a client to read its own surface back, so
 //! there the overlay keeps its plain scrim.
 
 use crate::prelude::*;
@@ -30,7 +32,7 @@ const RADIUS: i32 = 1;
 /// use the plain scrim", so there is nothing else to handle.
 pub(crate) fn capture(window: &Window) -> Option<Arc<RenderImage>> {
     let (width, height, bgra) = read(window)?;
-    let (small_w, small_h, mut small) = shrink(width, height, &bgra);
+    let (small_w, small_h, mut small) = shrink(width, height, &bgra, SHRINK);
     for _ in 0..PASSES {
         small = box_blur(small_w, small_h, &small);
     }
@@ -38,6 +40,21 @@ pub(crate) fn capture(window: &Window) -> Option<Arc<RenderImage>> {
     let buffer = image::RgbaImage::from_raw(small_w, small_h, small)?;
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
 }
+
+#[cfg(target_os = "macos")]
+pub(crate) use mac::{ask, forget};
+
+/// Where the window cannot be read at once, ask for it to be read from the
+/// next frame it draws, which `capture` then blurs once drawn, a frame or
+/// two from now; until then it gives None. Only macOS 26 asks.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn ask(_window: &Window) -> bool {
+    false
+}
+
+/// Stop waiting for the frame `ask` asked for.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn forget(_window: &Window) {}
 
 #[cfg(windows)]
 use windows_impl::read;
@@ -63,19 +80,19 @@ fn lift(pixels: &mut [u8]) {
     }
 }
 
-/// Average blocks of `SHRINK` pixels into one. Cheap and already a soft blur.
-fn shrink(width: u32, height: u32, bgra: &[u8]) -> (u32, u32, Vec<u8>) {
-    let out_w = (width / SHRINK).max(1);
-    let out_h = (height / SHRINK).max(1);
+/// Average blocks of `by` pixels into one. Cheap and already a soft blur.
+fn shrink(width: u32, height: u32, bgra: &[u8], by: u32) -> (u32, u32, Vec<u8>) {
+    let out_w = (width / by).max(1);
+    let out_h = (height / by).max(1);
     let mut out = vec![0u8; (out_w * out_h * 4) as usize];
     for y in 0..out_h {
         for x in 0..out_w {
             let mut sum = [0u32; 4];
             let mut count = 0u32;
-            for dy in 0..SHRINK {
-                for dx in 0..SHRINK {
-                    let sx = x * SHRINK + dx;
-                    let sy = y * SHRINK + dy;
+            for dy in 0..by {
+                for dx in 0..by {
+                    let sx = x * by + dx;
+                    let sy = y * by + dy;
                     if sx >= width || sy >= height {
                         continue;
                     }
@@ -249,6 +266,83 @@ mod mac {
         fn CGImageGetBitmapInfo(image: *const std::ffi::c_void) -> u32;
     }
 
+    /// The window's AppKit view, which gpui draws into.
+    #[cfg(target_os = "macos")]
+    fn view(window: &Window) -> Option<*mut objc::runtime::Object> {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let handle = HasWindowHandle::window_handle(window).ok()?;
+        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+            return None;
+        };
+        Some(h.ns_view.as_ptr().cast())
+    }
+
+    /// Whether this is macOS 26 or later.
+    #[cfg(target_os = "macos")]
+    fn tahoe() -> bool {
+        use objc::runtime::{BOOL, NO, Object};
+        use objc::{class, msg_send, sel, sel_impl};
+        // macOS 26 calls itself 16 to a program built with an older SDK.
+        let version = Version {
+            major: 16,
+            minor: 0,
+            patch: 0,
+        };
+        let tahoe: BOOL = unsafe {
+            let info: *mut Object = msg_send![class!(NSProcessInfo), processInfo];
+            msg_send![info, isOperatingSystemAtLeastVersion: version]
+        };
+        tahoe != NO
+    }
+
+    /// The Metal layer gpui's renderer draws the window into.
+    #[cfg(target_os = "macos")]
+    fn layer(window: &Window) -> Option<*mut std::ffi::c_void> {
+        use objc::runtime::Object;
+        use objc::{msg_send, sel, sel_impl};
+        let view = view(window)?;
+        let layer: *mut Object = unsafe { msg_send![view, layer] };
+        (!layer.is_null()).then(|| layer.cast())
+    }
+
+    /// Where the window cannot be read at once, from macOS 26, ask gpui's
+    /// renderer to read back the next frame it draws, the app's own, which
+    /// asks the user nothing; `capture` blurs it once drawn, a frame or two
+    /// from now, and gives None until then. True when asked.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn ask(window: &Window) -> bool {
+        let Some(layer) = layer(window).filter(|_| tahoe()) else {
+            return false;
+        };
+        gpui_apple::metal_renderer::read_next_frame(layer);
+        true
+    }
+
+    /// Stop waiting for the frame `ask` asked for.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn forget(window: &Window) {
+        if let Some(layer) = layer(window) {
+            gpui_apple::metal_renderer::forget_read_frame(layer);
+        }
+    }
+
+    /// The frame `ask` asked for, once drawn, at one pixel a point, as the
+    /// window server's picture is.
+    #[cfg(target_os = "macos")]
+    fn drawn(window: &Window) -> Option<(u32, u32, Vec<u8>)> {
+        let frame = gpui_apple::metal_renderer::take_read_frame(layer(window)?)?;
+        let mut bgra = frame.bgra;
+        // Opaque, whatever the window cleared to.
+        for pixel in bgra.as_chunks_mut::<4>().0 {
+            pixel[3] = 255;
+        }
+        let points = window.scale_factor().round().max(1.) as u32;
+        if points == 1 {
+            return Some((frame.width, frame.height, bgra));
+        }
+        Some(super::shrink(frame.width, frame.height, &bgra, points))
+    }
+
     /// The window's pixels as BGRA, or `None` where they cannot be read.
     #[cfg(target_os = "macos")]
     pub(super) fn read(window: &Window) -> Option<(u32, u32, Vec<u8>)> {
@@ -257,36 +351,22 @@ mod mac {
             create_image, kCGWindowImageBoundsIgnoreFraming, kCGWindowImageNominalResolution,
             kCGWindowListOptionIncludingWindow,
         };
-        use objc::runtime::{BOOL, NO, Object};
-        use objc::{class, msg_send, sel, sel_impl};
-        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        let handle = HasWindowHandle::window_handle(window).ok()?;
-        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-            return None;
-        };
-        let view = h.ns_view.as_ptr() as *mut Object;
-        let (number, tahoe) = unsafe {
-            let ns_window: *mut Object = msg_send![view, window];
+        use objc::runtime::Object;
+        use objc::{msg_send, sel, sel_impl};
+        // From macOS 26 the window server gives an app no picture of its own
+        // window (Chromium stopped asking it for one there), and a picture has
+        // been seen to take thirty seconds, which would hang the window; the
+        // frame `ask` asked the renderer for stands in for it.
+        if tahoe() {
+            return drawn(window);
+        }
+        let number: isize = unsafe {
+            let ns_window: *mut Object = msg_send![view(window)?, window];
             if ns_window.is_null() {
                 return None;
             }
-            let number: isize = msg_send![ns_window, windowNumber];
-            // macOS 26 calls itself 16 to a program built with an older SDK.
-            let version = Version {
-                major: 16,
-                minor: 0,
-                patch: 0,
-            };
-            let info: *mut Object = msg_send![class!(NSProcessInfo), processInfo];
-            let tahoe: BOOL = msg_send![info, isOperatingSystemAtLeastVersion: version];
-            (number, tahoe != NO)
+            msg_send![ns_window, windowNumber]
         };
-        // From macOS 26 the window server gives an app no picture of its own
-        // window (Chromium stopped asking it for one there), and a picture has
-        // been seen to take thirty seconds, which would hang the window.
-        if tahoe {
-            return None;
-        }
         let number = u32::try_from(number).ok().filter(|&number| number > 0)?;
         // The app's own window alone, which needs no Screen Recording
         // permission, so macOS never asks for it. One pixel a point is

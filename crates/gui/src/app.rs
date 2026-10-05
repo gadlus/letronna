@@ -184,6 +184,8 @@ pub(crate) struct Chat {
     pub(crate) settings_backdrop: Option<std::sync::Arc<RenderImage>>,
     pub(crate) grains: crate::ui::grain::Grains,
     pub(crate) settings_closing: bool,
+    /// Settings is open, but waits out the frame read behind it.
+    pub(crate) settings_reading: bool,
     pub(crate) rename: Entity<InputState>,
     pub(crate) page: Page,
     /// The session the first-run setup page is drawn over: the empty chat
@@ -913,6 +915,7 @@ impl Chat {
             settings_backdrop: None,
             grains: crate::ui::grain::Grains::new(cx),
             settings_closing: false,
+            settings_reading: false,
             rename,
             busy: false,
             compacting: Default::default(),

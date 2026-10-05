@@ -31,6 +31,15 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # - Windows: windows that are minimized or hidden are not asked to redraw
 #   at every refresh of the display
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
+# gpui-pre-apple 0.3.8 -- zed's gpui_apple, the Metal renderer behind every
+# macOS window, from the same snapshot -- as published on crates.io, less its
+# Cargo.lock. What differs from it:
+# - macOS: a window can ask for the next frame it draws to be read back.
+#   That one frame is drawn readable -- framebufferOnly off, which would cost
+#   every frame its presentation if left so -- and copied out once the GPU
+#   is done with it, for the blur behind Settings on macOS 26, where the
+#   window server gives an app no picture of its own window
+gpui-pre-apple = { path = "vendor/gpui-pre-apple" }
 
 [profile.release]
 opt-level = 2
