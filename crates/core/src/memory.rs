@@ -88,6 +88,9 @@ const KEY_HELD: &str = "[an entry that held a key]";
 /// answers.
 pub(crate) const ALREADY_KEPT: &str = "Already kept.";
 
+/// What a call whose changes undid one another answers.
+const NO_CHANGE: &str = "No change: the operations cancel out, so nothing was saved.";
+
 /// How the model is told to use its memory, where it keeps the tool and
 /// keeps memory everywhere: this, then the sentence on when to save that
 /// `Saving::told` gives, then `FACTS`. The stores are not named here: their
@@ -1190,6 +1193,16 @@ impl Target {
         }
     }
 
+    /// Where a row says an entry went, as the user reads it.
+    fn place(self) -> &'static str {
+        match self {
+            Self::User => "what Letronna knows about you",
+            Self::Memory => "Letronna's own notes",
+            Self::Project => "this project's notes",
+            Self::Chat => "this chat's notes",
+        }
+    }
+
     fn limit(self) -> usize {
         match self {
             Self::User => USER_LIMIT,
@@ -1565,7 +1578,7 @@ fn change(dir: &Path, target: Target, ops: &[Op], origin: Origin) -> Result<Stri
         let said = if ops.len() == 1 || ops.iter().all(|op| op.action == "add") {
             ALREADY_KEPT
         } else {
-            "No change: the operations cancel out, so nothing was saved."
+            NO_CHANGE
         };
         return Ok(format!("{said}\n\n{}", listing(target, &saved.before)));
     }
@@ -2136,11 +2149,7 @@ impl Tool for Remember {
         let moved = if target == asked {
             String::new()
         } else {
-            format!(
-                "As the user chose, this goes to {} rather than {}. ",
-                target.name(),
-                asked.name()
-            )
+            moved(target, asked)
         };
         let (dir, root) =
             place(target, ctx.project(), session_of(ctx)).map_err(|e| format!("{moved}{e}"))?;
@@ -2159,6 +2168,49 @@ impl Tool for Remember {
         }
         Ok(out)
     }
+}
+
+/// What a save's result opens with when the user's choice kept it in `to`
+/// rather than the `from` the call named.
+fn moved(to: Target, from: Target) -> String {
+    format!(
+        "As the user chose, this goes to {} rather than {}. ",
+        to.name(),
+        from.name()
+    )
+}
+
+/// What a finished memory call's row says, given the `actions` it made to
+/// the store `target` it named and the `result` it gave back: what it did,
+/// or with `done` false what it tried, and the store the entry went to,
+/// which the user's choice can make another than the one named.
+pub(crate) fn row(target: &str, actions: &[&str], result: &str, done: bool) -> Option<String> {
+    let asked = Target::parse(target).ok()?;
+    if actions.is_empty() {
+        return None;
+    }
+    let stores = [Target::User, Target::Memory, Target::Project, Target::Chat];
+    let (went, said) = (stores.iter())
+        .flat_map(|&to| stores.iter().map(move |&from| (to, from)))
+        .find_map(|(to, from)| Some((to, result.strip_prefix(&moved(to, from))?)))
+        .unwrap_or((asked, result));
+    let place = went.place();
+    let (trying, did) = if actions.iter().all(|action| *action == "add") {
+        ("Save to", "Saved to")
+    } else if actions.iter().all(|action| *action == "remove") {
+        ("Remove from", "Removed from")
+    } else {
+        ("Update", "Updated")
+    };
+    Some(if !done {
+        format!("{trying} {place}")
+    } else if said.starts_with(ALREADY_KEPT) {
+        format!("Already in {place}")
+    } else if said.starts_with(NO_CHANGE) {
+        format!("No change to {place}")
+    } else {
+        format!("{did} {place}")
+    })
 }
 
 /// A store as a person sees it: what it holds and how much of its budget
@@ -4498,6 +4550,65 @@ mod tests {
         assert_eq!(said("Remember that I use pnpm."), None);
         // Words that ask for nothing name no place.
         assert_eq!(said("Fix this project's build."), None);
+    }
+
+    #[test]
+    fn a_row_names_the_store_the_save_went_to() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let data = scratch("row");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*data) };
+        let project = data.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let session = 9_500_050;
+        let ctx = ToolContext::of(&Connection {
+            workspace: Some(project.clone()),
+            conversation: session,
+            ..Default::default()
+        });
+        // The row of a call with `args` once it ran here.
+        let row = |args: Value| {
+            let out = Remember.run(&args, &ctx);
+            let (Ok(result) | Err(result)) = &out;
+            crate::tools::summary_after("memory", &args.to_string(), result, out.is_ok())
+        };
+        let add = |target: &str, content: &str| json!({"action": "add", "target": target, "content": content});
+
+        choose_scope(session, Some(Scope::Project));
+        let named = add("user", "Builds with make.");
+        // Before it runs, all there is to go on is the store it named.
+        assert_eq!(
+            crate::tools::summary("memory", &named.to_string()),
+            "add user"
+        );
+        assert_eq!(row(named.clone()), "Saved to this project's notes");
+        assert_eq!(row(named), "Already in this project's notes");
+
+        choose_scope(session, Some(Scope::Chat));
+        assert_eq!(
+            row(add("memory", "Planning a trip.")),
+            "Saved to this chat's notes"
+        );
+        let batch = json!({"target": "user", "operations": [
+            {"action": "replace", "old_text": "trip", "content": "Planning a trip to Bali."},
+            {"action": "add", "content": "Flies on Friday."}
+        ]});
+        assert_eq!(row(batch), "Updated this chat's notes");
+        // One that fails says what it tried, and where.
+        let missing = json!({"action": "remove", "target": "user", "old_text": "tea"});
+        assert_eq!(row(missing), "Remove from this chat's notes");
+
+        choose_scope(session, Some(Scope::Auto));
+        assert_eq!(
+            row(add("user", "Called by a nickname.")),
+            "Saved to what Letronna knows about you"
+        );
+        let gone = json!({"action": "remove", "target": "memory", "old_text": "Uses"});
+        std::fs::write(data.join("MEMORY.md"), "Uses a Mac.\n").unwrap();
+        assert_eq!(row(gone), "Removed from Letronna's own notes");
+        forget(session);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
     #[test]

@@ -1123,7 +1123,12 @@ impl Chat {
                         .min_w_0()
                         .max_w(relative(0.6))
                         .truncate()
-                        .child(tools::summary(&message.name, &message.args)),
+                        .child(tools::summary_after(
+                            &message.name,
+                            &message.args,
+                            &message.content,
+                            !message.is_error,
+                        )),
                 )
                 .child(div().min_w_0().text_color(color).truncate().child(status))
                 .into_any_element();
