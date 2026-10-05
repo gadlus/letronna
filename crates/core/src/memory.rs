@@ -88,10 +88,11 @@ const KEY_HELD: &str = "[an entry that held a key]";
 /// answers.
 pub(crate) const ALREADY_KEPT: &str = "Already kept.";
 
-/// How the model is told to use its memory, when it has the tool to and
-/// keeps it everywhere: this, then the sentence on when to save that
-/// `Saving::told` gives, then `GUIDANCE_ENDS` and `FACTS`.
-const GUIDANCE: &str = " You have a memory that outlasts this session: what you know about the user (USER.md), your own notes (MEMORY.md) and, when a project folder is attached, your notes on that project (Project memory), shown below when there is anything in them, and kept with the memory tool.";
+/// How the model is told to use its memory, where it keeps the tool and
+/// keeps memory everywhere: this, then the sentence on when to save that
+/// `Saving::told` gives, then `FACTS`. The stores are not named here: their
+/// headings below and the memory tool's targets name them.
+const GUIDANCE: &str = " You have a memory that outlasts this session, shown below when there is anything in it and kept with the memory tool.";
 
 /// What opens the guidance in place of `GUIDANCE` when memory is kept for
 /// the project alone.
@@ -101,11 +102,10 @@ const GUIDANCE_PROJECT: &str = " You have a memory that outlasts this session: y
 /// the chat alone, which says nothing of what is kept elsewhere.
 const GUIDANCE_CHAT: &str = " You have notes for this chat alone (Chat notes), shown below when there is anything in them and kept with the memory tool; no other chat sees them, and a summary of the conversation does not lose them.";
 
-/// The guidance's sentence on project memory, when every store is used.
-const GUIDANCE_ENDS: &str = " Keep what is true of one project alone, such as how to build and test it, in its project memory.";
-
-/// The guidance's last sentence, whatever is kept where.
-const FACTS: &str = " Write facts, not instructions to yourself.";
+/// The guidance's last sentence, whatever is kept where. An order kept in
+/// memory is read back in a later session as one the user gave.
+const FACTS: &str =
+    " Write facts, not instructions to yourself: \"prefers pnpm\", not \"always use pnpm\".";
 
 /// Runs of words that keep what the user asks to save to this chat alone,
 /// written as `words` writes them.
@@ -232,19 +232,25 @@ impl Saving {
         ))
     }
 
-    /// The guidance's sentence on when to save what will matter `later`.
-    fn told(self, later: &str) -> String {
-        match self {
+    /// The guidance's sentence on when to save what will matter `later`,
+    /// in a session someone `watched` or, nobody watching, a scheduled run:
+    /// none there when every save waits for a yes nobody can give.
+    fn told(self, later: &str, watched: bool) -> Option<String> {
+        Some(match self {
+            Saving::WhenAsked if !watched => {
+                " Save to it only when the task asks you to remember or forget something.".into()
+            }
+            Saving::Ask if !watched => return None,
             Saving::WhenAsked => format!(
                 " Save to it only when the user asks you to remember or forget something; when they say something that will still matter {later}, such as a preference or a correction, you may offer in one line: \"Want me to remember that?\""
             ),
             Saving::Ask => format!(
-                " Save what will still matter {later} -- the user's name and preferences, their setup, corrections they gave you -- and not the progress of the task at hand; the user says yes to each save."
+                " Save what will still matter {later} -- the user's name and preferences, their setup, corrections they gave you -- not the progress of the task at hand, nor that a tool failed (keep the fix, if one worked); the user says yes to each save."
             ),
             Saving::Auto => format!(
-                " Save what will still matter {later} -- the user's name and preferences, their setup, corrections they gave you -- and not the progress of the task at hand."
+                " Save what will still matter {later} -- the user's name and preferences, their setup, corrections they gave you -- not the progress of the task at hand, nor that a tool failed (keep the fix, if one worked)."
             ),
-        }
+        })
     }
 }
 
@@ -348,24 +354,24 @@ impl<'de> Deserialize<'de> for Scope {
 }
 
 /// How the model is told to use its memory in a session that saves as
-/// `saving` says and keeps memory in `scope`, as it holds there.
-fn guidance(saving: Saving, scope: Scope) -> String {
-    let (opens, later, lands, ends) = match scope {
-        Scope::Auto => (GUIDANCE, "in a later session", "", GUIDANCE_ENDS),
+/// `saving` says and keeps memory in `scope`, as it holds there with
+/// someone `watched` or not; none where it can save nothing.
+fn guidance(saving: Saving, scope: Scope, watched: bool) -> Option<String> {
+    let (opens, later, lands) = match scope {
+        Scope::Auto => (GUIDANCE, "in a later session", ""),
         Scope::Project => (
             GUIDANCE_PROJECT,
             "in a later session",
             " Whatever target you name, what you save goes to the project's memory.",
-            "",
         ),
         Scope::Chat => (
             GUIDANCE_CHAT,
             "later in this chat",
             " Whatever target you name, what you save goes to this chat's notes.",
-            "",
         ),
     };
-    format!("{opens}{}{lands}{ends}{FACTS}", saving.told(later))
+    let told = saving.told(later, watched)?;
+    Some(format!("{opens}{told}{lands}{FACTS}"))
 }
 
 impl Serialize for Saving {
@@ -626,9 +632,10 @@ pub fn context(connection: &Connection) -> String {
 }
 
 /// What the session remembers, for the end of the prompt: how to use its
-/// memory, then the stores its scope loads. After everything every session
-/// shares, so what one session leaves out or writes changes no other's
-/// cached prefix. Nothing where others read the replies.
+/// memory, where it keeps the tool, then the stores its scope loads. After
+/// everything every session shares, so what one session leaves out or
+/// writes changes no other's cached prefix. Nothing where others read the
+/// replies.
 pub fn remembered(connection: &Connection) -> String {
     remembered_in(&crate::chat::data_dir(), connection)
 }
@@ -642,8 +649,17 @@ fn remembered_in(dir: &Path, connection: &Connection) -> String {
     let workspace = connection.workspace.as_deref();
     let scope = scope(session).with(workspace.is_some());
     let mut out = String::new();
-    if connection.tools {
-        out.push_str(&guidance(saving(session), scope));
+    // Where the system prompt says nobody is watching, only a scheduled run
+    // keeps the tool, -p and the rest being refused it, and it is told only
+    // what holds with nobody there to ask or to say yes. What is kept still
+    // loads, as it is about the user.
+    let watched = connection.human || connection.remote.is_some();
+    let keeps = watched || crate::schedule::running(session).is_some();
+    if connection.tools
+        && keeps
+        && let Some(guidance) = guidance(saving(session), scope, watched)
+    {
+        out.push_str(&guidance);
     }
     for &target in scope.loads() {
         let folder = match target {
@@ -2030,7 +2046,7 @@ impl Tool for Remember {
         "memory"
     }
     fn description(&self) -> &'static str {
-        "Keep something for later sessions, or correct what is kept. target \"user\" is what you know about the user (USER.md); target \"memory\" is your own notes (MEMORY.md); target \"project\" is your notes on the project folder attached to this session, for what is true of it alone. They are shown to you at the start of every session (a project's only while it is attached) and have small budgets. action \"add\" keeps content as a new entry; \"replace\" swaps the entry containing old_text for content; \"remove\" deletes the entry containing old_text. To make several changes to one target, pass operations instead, in one call: they are made in order, all or none, and the budget is checked on the result, so a call can make room and add. When one is full, replace or remove before adding."
+        "Keep something for later sessions, or correct what is kept. target \"user\" is what you know about the user (USER.md); target \"memory\" is your own notes (MEMORY.md); target \"project\" is your notes on the project folder attached to this session, for what is true of it alone, such as how to build and test it. They are shown to you at the start of every session (a project's only while it is attached) and have small budgets. action \"add\" keeps content as a new entry; \"replace\" swaps the entry containing old_text for content; \"remove\" deletes the entry containing old_text. To make several changes to one target, pass operations instead, in one call: they are made in order, all or none, and the budget is checked on the result, so a call can make room and add. When one is full, replace or remove before adding."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -2666,6 +2682,7 @@ mod tests {
             tools: true,
             workspace: Some(project),
             conversation: 9_500_001,
+            human: true,
             ..Default::default()
         };
         let kept = remembered_with(&dir, &connection, Scope::Auto);
@@ -4131,6 +4148,7 @@ mod tests {
             let connection = Connection {
                 tools: true,
                 conversation: session,
+                human: true,
                 ..Default::default()
             };
             let text = remembered_with(&dir, &connection, Scope::Auto);
@@ -4138,20 +4156,115 @@ mod tests {
             text
         };
         let auto = said(9_100_001, Saving::Auto);
-        // Word for word what every session was told before there was a choice.
+        // Word for word what a session that saves of itself is told.
         assert_eq!(
             auto,
-            " You have a memory that outlasts this session: what you know about the user (USER.md), your own notes (MEMORY.md) and, when a project folder is attached, your notes on that project (Project memory), shown below when there is anything in them, and kept with the memory tool. Save what will still matter in a later session -- the user's name and preferences, their setup, corrections they gave you -- and not the progress of the task at hand. Keep what is true of one project alone, such as how to build and test it, in its project memory. Write facts, not instructions to yourself."
+            " You have a memory that outlasts this session, shown below when there is anything in it and kept with the memory tool. Save what will still matter in a later session -- the user's name and preferences, their setup, corrections they gave you -- not the progress of the task at hand, nor that a tool failed (keep the fix, if one worked). Write facts, not instructions to yourself: \"prefers pnpm\", not \"always use pnpm\"."
         );
         for saving in [Saving::WhenAsked, Saving::Ask] {
             let text = said(9_100_002, saving);
             let later = "in a later session";
             assert_eq!(
-                text.replace(&saving.told(later), &Saving::Auto.told(later)),
+                text.replace(
+                    &saving.told(later, true).unwrap(),
+                    &Saving::Auto.told(later, true).unwrap()
+                ),
                 auto
             );
         }
         assert!(said(9_100_003, Saving::WhenAsked).contains("\"Want me to remember that?\""));
+    }
+
+    #[test]
+    fn the_memory_guidance_gives_the_facts_not_orders_example() {
+        let dir = scratch("guidance-facts");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(dir.join("USER.md"), "Prefers pnpm.\n").unwrap();
+        let session = 9_100_005;
+        let told = |saving: Saving, scope: Scope, workspace: Option<&Path>, human: bool| {
+            choose(session, Some(saving));
+            let connection = Connection {
+                tools: true,
+                workspace: workspace.map(Path::to_path_buf),
+                conversation: session,
+                human,
+                ..Default::default()
+            };
+            remembered_with(&dir, &connection, scope)
+        };
+        // A scheduled run, which keeps the tool with nobody watching.
+        let job = crate::schedule::Schedule {
+            id: 1,
+            name: "nightly".into(),
+            prompt: "Tidy the notes folder.".into(),
+            workspace: None,
+            trigger: crate::schedule::Trigger::Every { minutes: 60 },
+            enabled: true,
+            last_run: 0,
+            mode: crate::gate::Mode::Default,
+            by_model: false,
+            quiet: false,
+            check: None,
+        };
+        let facts = " Write facts, not instructions to yourself: \"prefers pnpm\", not \"always use pnpm\".";
+        // Every way of saving, in every place memory is kept, with a project
+        // attached and without, where someone watches and in a scheduled
+        // run, says only what holds there.
+        for watched in [true, false] {
+            let _listed = (!watched).then(|| crate::schedule::Listed::new(session, &job));
+            for saving in Saving::OFFERED {
+                for scope in Scope::OFFERED {
+                    for workspace in [Some(project.as_path()), None] {
+                        let text = told(saving, scope, workspace, watched);
+                        let at = format!("{watched} {saving:?} {scope:?} {workspace:?}: {text}");
+                        // Nothing where every save waits for a yes nobody
+                        // can give.
+                        let guided = watched || saving != Saving::Ask;
+                        assert_eq!(text.contains(facts), guided, "{at}");
+                        // What the model chooses to keep, never that a tool
+                        // failed.
+                        let failed = "nor that a tool failed (keep the fix, if one worked)";
+                        let chooses = saving == Saving::Auto || (watched && saving == Saving::Ask);
+                        assert_eq!(text.contains(failed), chooses, "{at}");
+                        assert_eq!(
+                            text.contains("the user says yes to each save"),
+                            watched && saving == Saving::Ask,
+                            "{at}"
+                        );
+                        assert_eq!(
+                            text.contains("only when the user asks"),
+                            watched && saving == Saving::WhenAsked,
+                            "{at}"
+                        );
+                        assert_eq!(
+                            text.contains("only when the task asks"),
+                            !watched && saving == Saving::WhenAsked,
+                            "{at}"
+                        );
+                        let held = scope.with(workspace.is_some());
+                        assert_eq!(
+                            text.contains("goes to the project's memory"),
+                            guided && held == Scope::Project,
+                            "{at}"
+                        );
+                        assert_eq!(
+                            text.contains("goes to this chat's notes"),
+                            guided && held == Scope::Chat,
+                            "{at}"
+                        );
+                        assert_eq!(text.contains("Prefers pnpm."), held == Scope::Auto, "{at}");
+                    }
+                }
+            }
+        }
+        // Another run nobody watches, which is refused the tool, as -p is,
+        // is told nothing of saving, and still sees what is kept about the
+        // user.
+        let unwatched = told(Saving::Auto, Scope::Auto, Some(&project), false);
+        forget(session);
+        assert!(!unwatched.contains("memory tool"), "{unwatched}");
+        assert!(unwatched.contains("Prefers pnpm."), "{unwatched}");
     }
 
     #[test]
@@ -4207,6 +4320,7 @@ mod tests {
             tools: true,
             workspace: workspace.map(Path::to_path_buf),
             conversation,
+            human: true,
             ..Default::default()
         };
         let all = [

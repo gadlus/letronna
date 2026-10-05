@@ -970,10 +970,11 @@ fn hidden(spec: &Spec) -> Vec<String> {
     if spec.connection.human || !own {
         return Vec::new();
     }
-    // Every run with tools is told to keep what will matter with memory, and
-    // a provider that checks a reply's calls against the array fails a call
-    // of one it left out, where a refusal at the call costs a round.
-    let told = |name: &&str| *name == "memory";
+    // A scheduled run keeps memory, as its job may ask it to keep something,
+    // so a fork of one is offered it too, sharing its parent's prefix, and is
+    // refused it at the call as any helper is.
+    let scheduled = crate::schedule::running(spec.root).is_some();
+    let kept = |name: &&str| scheduled && *name == "memory";
     // On demand, an MCP tool that --tools allows is reached only through
     // this pair, as a helper's is (`agents::usable`).
     let mcp = match &spec.allow {
@@ -986,7 +987,7 @@ fn hidden(spec: &Spec) -> Vec<String> {
     tools::all()
         .iter()
         .map(|tool| tool.name())
-        .filter(|name| !told(name) && !reaching(name))
+        .filter(|name| !kept(name) && !reaching(name))
         .filter(|name| refused(spec, name).is_some())
         .map(str::to_owned)
         .collect()
@@ -2061,16 +2062,95 @@ pub(crate) mod tests {
         let helper = first_offered(&dir, AGENTS + 730, |_| ());
 
         assert!(offers(&unwatched, "read_file"), "{unwatched:?}");
-        for name in DENY.into_iter().filter(|name| *name != "memory") {
+        for name in DENY {
             assert!(!offers(&unwatched, name), "{name}: {unwatched:?}");
         }
-        // The prompt tells it to keep things with memory, so it stays.
-        assert!(offers(&unwatched, "memory"), "{unwatched:?}");
         // Someone is there to be asked, so it goes out as it always has.
         assert!(offers(&watched, tools::ASK_USER), "{watched:?}");
         // A helper that is no fork is offered them all, refused at the call.
         assert!(offers(&helper, tools::ASK_USER), "{helper:?}");
         assert!(offers(&helper, "memory"), "{helper:?}");
+    }
+
+    /// The tools and the system prompt of the first request of `spec`'s run
+    /// once `change` has been made to it, the run answered at once.
+    fn first_sent(
+        dir: &Path,
+        id: AgentId,
+        change: impl FnOnce(&mut Spec),
+    ) -> (Vec<String>, String) {
+        let (endpoint, provider) = provider(vec![reply("Nothing to do.", &[])]);
+        let mut spec = spec(endpoint, dir, id);
+        change(&mut spec);
+        assert_eq!(finished(spec).status, Outcome::Done);
+        let sent = provider.sent();
+        let names = sent[0]["tools"].as_array().unwrap().iter();
+        let names = names.filter_map(|tool| tool["function"]["name"].as_str());
+        let system = sent[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap_or_default();
+        (names.map(str::to_owned).collect(), system.to_owned())
+    }
+
+    #[test]
+    fn a_print_run_is_neither_told_about_nor_offered_memory() {
+        let dir = scratch("print-memory");
+        let (offered, told) = first_sent(&dir, AGENTS + 1_100, |spec| spec.depth = 0);
+        let watched = first_sent(&dir, AGENTS + 1_110, |spec| {
+            spec.depth = 0;
+            spec.connection.human = true;
+        });
+
+        // It would be refused every save, so nothing points it at memory.
+        let memory = "kept with the memory tool";
+        assert!(!offered.iter().any(|name| name == "memory"), "{offered:?}");
+        assert!(!told.contains(memory), "{told}");
+        // Watched, the same run is told and offered both, as it was.
+        assert!(
+            watched.0.iter().any(|name| name == "memory"),
+            "{:?}",
+            watched.0
+        );
+        assert!(watched.1.contains(memory), "{}", watched.1);
+    }
+
+    #[test]
+    fn a_scheduled_run_keeps_memory_and_is_told_only_what_holds_there() {
+        use crate::memory::{Saving, Scope};
+        let dir = scratch("scheduled-memory");
+        let session = AGENTS + 1_120;
+        let _listed = crate::schedule::Listed::new(session, &job(&dir, gate::Mode::Default));
+        let sent = |saving: Saving, id: AgentId| {
+            crate::memory::choose(session, Some(saving));
+            crate::memory::choose_scope(session, Some(Scope::Auto));
+            let sent = first_sent(&dir, id, |spec| {
+                spec.depth = 0;
+                spec.root = session;
+            });
+            crate::memory::forget(session);
+            sent
+        };
+        let (offered, asked) = sent(Saving::WhenAsked, AGENTS + 1_125);
+        let (_, auto) = sent(Saving::Auto, AGENTS + 1_126);
+        let (_, ask) = sent(Saving::Ask, AGENTS + 1_127);
+
+        // It may keep what its job asks it to, so the tool stays, and it is
+        // told to keep facts, but never to offer a save or wait for a yes,
+        // with nobody there to answer.
+        assert!(offered.iter().any(|name| name == "memory"), "{offered:?}");
+        let only = "Save to it only when the task asks you to remember or forget something.";
+        assert!(asked.contains(only), "{asked}");
+        assert!(auto.contains("nor that a tool failed"), "{auto}");
+        for told in [&asked, &auto] {
+            assert!(
+                told.contains("\"prefers pnpm\", not \"always use pnpm\""),
+                "{told}"
+            );
+            assert!(!told.contains("Want me to remember that?"), "{told}");
+            assert!(!told.contains("says yes"), "{told}");
+        }
+        // Where every save waits for a yes nobody can give, nothing.
+        assert!(!ask.contains("kept with the memory tool"), "{ask}");
     }
 
     #[test]
@@ -2108,7 +2188,7 @@ pub(crate) mod tests {
             spec.depth = 0;
             spec.allow = only(&["read_file", "list_dir"]);
         });
-        assert_eq!(offered, ["read_file", "list_dir", "memory"]);
+        assert_eq!(offered, ["read_file", "list_dir"]);
     }
 
     #[test]

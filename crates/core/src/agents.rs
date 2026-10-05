@@ -4250,7 +4250,14 @@ mod tests {
             reply("", Some(("memory", keep))),
             reply("Left it.", None),
         ]);
-        call(session.context(endpoint), args).unwrap();
+        // A watched session's, whose fork is offered all its parent is; a run
+        // nobody watches leaves memory out of both.
+        let ctx = session.context(endpoint);
+        let watched = Connection {
+            human: true,
+            ..ctx.caller.connection.as_deref().unwrap().clone()
+        };
+        call(ToolContext::of(&watched), args).unwrap();
         let sent = stub.sent();
         let offered: Vec<&str> = sent[0]["tools"]
             .as_array()
