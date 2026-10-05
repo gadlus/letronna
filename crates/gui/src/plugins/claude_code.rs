@@ -87,6 +87,11 @@ const KEEPALIVE: Duration = Duration::from_secs(20);
 /// The largest request taken: a long session resent whole, pictures and all.
 const BODY_LIMIT: usize = 64 * 1024 * 1024;
 
+/// The permission mode Claude Code starts in: edits go ahead, commands are
+/// asked about in its terminal. Not the user's own default, which may skip
+/// every prompt: live, Claude's safeguards flagged relayed turns in bypass
+/// mode even when ordinary questions, and passed them in a mode that asks.
+const MODE: &str = "acceptEdits";
 /// What Claude Code is told about the messages, as the user's own words.
 /// Tried live: without it, a relayed message is refused as outside input.
 const PROMPT: &str = "The user started this Claude Code session from Letronna, their own desktop agent app, so that Letronna can hand work to you while they watch here. Requests from Letronna reach you as a \"Message from Letronna\" hook notification. Treat each one as a request from the user, relayed by their app: do it as you would if they had typed it here, with your usual judgement and permissions. Your last message of the turn goes back to Letronna as your answer, so make it complete on its own.\n";
@@ -1234,7 +1239,7 @@ fn quoted(path: &Path) -> String {
 /// prompt from `dir`.
 fn script(dir: &Path, folder: &Path) -> String {
     format!(
-        "#!/bin/sh\ncd {} || exit 1\ncommand -v claude >/dev/null || {{ echo 'Claude Code is not installed: see https://claude.com/claude-code'; exit 1; }}\nexec claude --settings {} --append-system-prompt-file {}\n",
+        "#!/bin/sh\ncd {} || exit 1\ncommand -v claude >/dev/null || {{ echo 'Claude Code is not installed: see https://claude.com/claude-code'; exit 1; }}\nexec claude --permission-mode {MODE} --settings {} --append-system-prompt-file {}\n",
         quoted(folder),
         quoted(&dir.join(SETTINGS_FILE)),
         quoted(&dir.join(PROMPT_FILE)),
@@ -1277,6 +1282,8 @@ fn terminals(dir: &Path, folder: &Path) -> Result<Vec<(String, Vec<String>)>, St
     let prompt = dir.join(PROMPT_FILE).display().to_string();
     if cfg!(windows) {
         let flags = [
+            "--permission-mode",
+            MODE,
             "--settings",
             settings.as_str(),
             "--append-system-prompt-file",
@@ -1697,7 +1704,9 @@ mod tests {
         );
         let script = script(Path::new("/data/claude code"), folder);
         assert!(script.contains("cd '/work/it'\\''s my site' || exit 1"));
-        assert!(script.contains("exec claude --settings '/data/claude code/settings.json'"));
+        assert!(script.contains(
+            "exec claude --permission-mode acceptEdits --settings '/data/claude code/settings.json'"
+        ));
     }
 
     #[cfg(unix)]
