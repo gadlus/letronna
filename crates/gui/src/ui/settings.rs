@@ -310,7 +310,15 @@ impl Chat {
         // Snapshot the window before the overlay covers it. Platforms that
         // cannot sample it return None, which falls back to the plain scrim.
         self.drop_backdrop(cx);
-        self.settings_backdrop = crate::platform::backdrop::capture(window);
+        // macOS 26 reads it from the next frame drawn, which the overlay
+        // waits out so that frame is the window without it.
+        self.settings_reading = crate::platform::backdrop::ask(window);
+        if self.settings_reading {
+            window.refresh();
+            self.read_backdrop(0, window, cx);
+        } else {
+            self.settings_backdrop = crate::platform::backdrop::capture(window);
+        }
         self.settings_open = true;
         self.gateway_pick.update(cx, |g, _| g.clear());
         self.settings_closing = false;
@@ -331,11 +339,36 @@ impl Chat {
         cx.notify();
     }
 
+    /// Pick up the frame asked for behind settings once it is drawn, a frame
+    /// or two from now; a few frames without it, and settings opens over the
+    /// plain scrim.
+    fn read_backdrop(&mut self, tries: u8, window: &mut Window, cx: &mut Context<Self>) {
+        cx.on_next_frame(window, move |this, window, cx| {
+            if !this.settings_reading {
+                return;
+            }
+            this.settings_backdrop = crate::platform::backdrop::capture(window);
+            if this.settings_backdrop.is_none() && tries < 3 {
+                // Drawn again, so there is a frame to read.
+                window.refresh();
+                return this.read_backdrop(tries + 1, window, cx);
+            }
+            if this.settings_backdrop.is_none() {
+                crate::platform::backdrop::forget(window);
+            }
+            this.settings_reading = false;
+            cx.notify();
+        });
+    }
+
     pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings_closing {
             return;
         }
         self.settings_closing = true;
+        if std::mem::take(&mut self.settings_reading) {
+            crate::platform::backdrop::forget(window);
+        }
         // A readiness note on the Tools tab may have sent the user here.
         if self.page == Page::Capabilities {
             self.reload_tools();
@@ -379,7 +412,9 @@ impl Chat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !self.settings_open {
+        // Not while the frame behind it is read: that frame is the window
+        // without it.
+        if !self.settings_open || self.settings_reading {
             return None;
         }
         let closing = self.settings_closing;

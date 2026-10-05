@@ -2822,8 +2822,6 @@ dependencies = [
 [[package]]
 name = "gpui-pre-apple"
 version = "0.3.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfdd914311cd12894367c8b9908947bb0c27fd42f8b9a5ff7a0730551a83fa4c"
 dependencies = [
  "anyhow",
  "async-task",
@@ -4204,6 +4202,7 @@ dependencies = [
  "gpui-base",
  "gpui-component",
  "gpui-pre",
+ "gpui-pre-apple",
  "gpui-pre-platform",
  "image",
  "letronna-core",

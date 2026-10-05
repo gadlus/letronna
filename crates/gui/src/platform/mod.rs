@@ -5,9 +5,9 @@
 //! differs is how much of it is real. Windows has all of it. Linux has install,
 //! single instance, a tray, sound and, on X11, the backdrop blur, but no video
 //! stills or playback, and no true hide-to-tray. macOS plays sound, blurs the
-//! backdrop up to macOS 15, notifies when it runs as an app bundle, and
-//! otherwise falls back to doing nothing, which leaves a working app that
-//! simply runs in place.
+//! backdrop, notifies when it runs as an app bundle, and otherwise falls
+//! back to doing nothing, which leaves a working app that simply runs in
+//! place.
 //! Callers never branch on the platform.
 
 pub(crate) mod audio;
