@@ -2447,12 +2447,13 @@ fn wire_message(m: &Message, tool_chars: usize) -> Value {
             .map(|c| {
                 // A call with no arguments streams none, but a gateway that
                 // turns this into Anthropic's tool_use rejects "" as input:
-                // it has to be an object.
-                let arguments = if c.arguments.trim().is_empty() {
-                    "{}"
-                } else {
-                    &c.arguments
-                };
+                // it has to be an object. One cut off or garbled was never
+                // run and its result says why, yet DeepSeek turns the whole
+                // request down over arguments that are not JSON, so those go
+                // back empty too; the session keeps what the model sent.
+                let whole =
+                    serde_json::from_str::<Value>(&c.arguments).is_ok_and(|args| args.is_object());
+                let arguments = if whole { c.arguments.as_str() } else { "{}" };
                 json!({"id": c.id, "type": "function",
                     "function": {"name": c.name, "arguments": arguments}})
             })
@@ -4736,6 +4737,98 @@ mod tests {
         };
         let wired = wire_message(&reply, MAX_TOOL_CHARS);
         assert_eq!(wired["tool_calls"][0]["function"]["arguments"], "{}");
+    }
+
+    #[test]
+    fn a_call_whose_arguments_are_not_json_goes_back_empty_on_every_wire() {
+        // Cut off with the model's own call markup in it, as DeepSeek sent
+        // one; whole but with markup after it; and markup alone.
+        let broken = [
+            r#"{"path": "index.html", "content": "<p>Hi</p><｜tool▁call▁begin｜>write_file<｜tool▁sep｜>{\"path\": \"st"#,
+            r#"{"path": "index.html"}<｜tool▁call▁end｜>"#,
+            "<tool_call>write_file</tool_call>",
+        ];
+        let anthropic = Connection {
+            endpoint: "https://api.anthropic.com/v1".into(),
+            model: "claude-opus-5".into(),
+            ..connection()
+        };
+        let openai = on_openai("gpt-5");
+        let endpoint = validate(&openai).unwrap();
+        for arguments in broken {
+            let why = crate::tools::parse_args(arguments).unwrap_err();
+            let window = [
+                said("user", "make the page"),
+                Message {
+                    tool_calls: vec![
+                        call("c1", "read_file", r#"{"path":"a.rs"}"#),
+                        call("c2", "write_file", arguments),
+                    ],
+                    ..said("assistant", "")
+                },
+                Message {
+                    tool_call_id: "c1".into(),
+                    name: "read_file".into(),
+                    ..said("tool", "fn main() {}")
+                },
+                Message {
+                    tool_call_id: "c2".into(),
+                    name: "write_file".into(),
+                    args: arguments.into(),
+                    is_error: true,
+                    ..said("tool", &why)
+                },
+            ];
+            // Still the call its result answers, under its own id and name.
+            let chat = body(&connection(), &window, None, None)["messages"].clone();
+            assert_eq!(
+                chat[2]["tool_calls"][0]["function"]["arguments"],
+                r#"{"path":"a.rs"}"#
+            );
+            assert_eq!(
+                chat[2]["tool_calls"][1],
+                json!({"id": "c2", "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"}})
+            );
+            assert_eq!(
+                (&chat[4]["tool_call_id"], &chat[4]["content"]),
+                (&json!("c2"), &json!(why))
+            );
+
+            let posted = as_messages(&anthropic, &body(&anthropic, &window, None, None));
+            let used = &posted["messages"][1]["content"];
+            assert_eq!(used[0]["input"], json!({"path": "a.rs"}));
+            assert_eq!(
+                (&used[1]["id"], &used[1]["input"]),
+                (&json!("c2"), &json!({}))
+            );
+            let answered = &posted["messages"][2]["content"][1];
+            assert_eq!(answered["tool_use_id"], "c2");
+
+            let (_, sent) =
+                to_responses(&openai, &endpoint, &body(&openai, &window, None, None)).unwrap();
+            let items = sent["input"].as_array().unwrap();
+            let calls: Vec<(&Value, &Value)> = (items.iter())
+                .filter(|item| item["type"] == "function_call")
+                .map(|item| (&item["call_id"], &item["arguments"]))
+                .collect();
+            assert_eq!(calls[1], (&json!("c2"), &json!("{}")));
+            assert_eq!(calls[0].1, r#"{"path":"a.rs"}"#);
+            let output = items
+                .iter()
+                .find(|item| item["type"] == "function_call_output" && item["call_id"] == "c2");
+            assert_eq!(output.unwrap()["output"], why);
+        }
+        // JSON that is not an object, which a gateway making it Anthropic's
+        // tool_use turns down.
+        for arguments in [r#"["index.html"]"#, r#""index.html""#, "null"] {
+            let reply = Message {
+                tool_calls: vec![call("c1", "write_file", arguments)],
+                ..said("assistant", "")
+            };
+            let wired = wire_message(&reply, MAX_TOOL_CHARS);
+            assert_eq!(wired["tool_calls"][0]["function"]["arguments"], "{}");
+        }
     }
 
     #[test]
