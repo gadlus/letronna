@@ -385,6 +385,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(crate::agents::Agent),
         Arc::new(crate::agents::Agents),
         Arc::new(crate::tasklist::Board),
+        Arc::new(crate::cloud::CloudTask),
     ];
     // In place of the MCP tools when those are too many to send; see
     // `specs`. Here, so that no plugin can take their names.
@@ -7185,7 +7186,11 @@ mod tests {
             })
             .collect();
         // read_chat fences other people's lines itself, and not the user's.
-        assert_eq!(fenced, ["web_fetch", "browse", "use_page", "computer"]);
+        // cloud_task too, as a run in the cloud reads what a repository says.
+        assert_eq!(
+            fenced,
+            ["web_fetch", "browse", "use_page", "computer", "cloud_task"]
+        );
         assert!(crate::search::SearchWeb.untrusted());
     }
 
