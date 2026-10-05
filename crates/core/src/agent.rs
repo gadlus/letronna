@@ -1176,6 +1176,7 @@ mod tests {
         };
         let mut turn = turn();
         turn.connection.plan = true;
+        turn.connection.human = true;
         assert!(offers(&turn, tools::EXIT_PLAN) && !offers(&turn, "write_file"));
 
         turn.begin(vec![call(tools::EXIT_PLAN)]);

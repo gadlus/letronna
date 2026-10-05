@@ -487,7 +487,7 @@
       "parameters": {
         "properties": {
           "plan": {
-            "description": "The plan in markdown: what will change, where, and how it will be checked.",
+            "description": "The plan in markdown, short enough to review: the goal, the changes in order, how they will be checked, and any assumptions you made. Settle the choices the work needs, so approving the plan approves them.",
             "type": "string"
           }
         },
