@@ -570,15 +570,7 @@ impl Chat {
         // Enter and Escape answer while the keys are on the card or in an
         // empty composer, and say so on the buttons they press.
         let keyed = self.question_focus.is_focused(window) || self.composer_idle(window, cx);
-        let hint = |key: &str| {
-            keyed.then(|| {
-                Kbd::new(Keystroke {
-                    key: key.to_owned(),
-                    ..Default::default()
-                })
-                .text_xs()
-            })
-        };
+        let hint = |key: &str| keyed.then(|| key_hint(key));
         let answers = if !shown.places.is_empty() {
             // Where it goes now first, as Enter keeps it; each other place
             // keeps it there instead. The reason goes under them, where the
@@ -991,6 +983,17 @@ fn own_folder_note(name: &str, folder: &std::path::Path) -> String {
     )
 }
 
+/// The key that answers a card, as its button shows it.
+fn key_hint(key: &str) -> Kbd {
+    // In its own colours and size: any text style given to it replaces its
+    // own whole, colour and all, which left a blue button's white text on
+    // the hint's page-coloured box, blank in Paper.
+    Kbd::new(Keystroke {
+        key: key.to_owned(),
+        ..Default::default()
+    })
+}
+
 /// The place of the card coming up in `reply` after the card `before`, with
 /// `behind` of the reply's calls still to come that will wait on the user.
 fn place(reply: (u64, usize), before: Option<Place>, behind: usize) -> Place {
@@ -1106,8 +1109,8 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        CardFor, CardKey, Press, asks_for_folder, option_letter, options_in, own_folder_note,
-        own_folder_words, place, pressed,
+        CardFor, CardKey, Press, asks_for_folder, key_hint, option_letter, options_in,
+        own_folder_note, own_folder_words, place, pressed,
     };
     use letronna_core::tools::ToolContext;
     use std::path::PathBuf;
@@ -1187,5 +1190,13 @@ mod tests {
              /home/me/Letronna"
         );
         assert!(own_folder_note("edit_file", &own).contains("the file is edited in"));
+    }
+
+    #[test]
+    fn a_key_hint_keeps_its_own_text_colour_on_any_button() {
+        // A text style of the card's would stand in for the hint's own whole,
+        // and its text would take the button's colour over the hint's box.
+        let mut hint = key_hint("enter");
+        assert!(gpui::Styled::style(&mut hint).text.is_none());
     }
 }
