@@ -381,14 +381,14 @@ impl Tool for SearchWeb {
         "search_web"
     }
     fn description(&self) -> &'static str {
-        "Search the web. Returns a numbered list of results, each with its title, address and a snippet. Snippets are cut short and may be stale: before you state a fact from a search, read the page that settles it in full with web_fetch, preferring the primary source (the official site or the project's own docs) over a page summarizing it, and give that page's address beside the fact. allowed_domains keeps only results from those sites and blocked_domains drops them, subdomains included; a site in both is blocked. Some services apply site filters after answering, so fewer results may come back. freshness keeps to pages from the last day, week, month or year. The same search again within 10 minutes gives the earlier answer."
+        "Search the web. Returns a numbered list of results, each with its title, address and a snippet. Snippets are cut short and may be stale: before you state a fact from a search, read the page that settles it in full with web_fetch, preferring the primary source (the official site or the project's own docs) over a page summarizing it, and give that page's address beside the fact. The same search again within 10 minutes gives the earlier answer."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
-            "query": {"type": "string", "description": "What to search for, as you would type it into a search engine."},
-            "count": {"type": "integer", "description": "How many results, 1 to 10. Left out, 5."},
-            "allowed_domains": {"type": "array", "items": {"type": "string"}, "description": "Only results from these sites and their subdomains, such as [\"docs.rs\"]."},
-            "blocked_domains": {"type": "array", "items": {"type": "string"}, "description": "No results from these sites or their subdomains."},
+            "query": {"type": "string", "description": "As you would type it into a search engine."},
+            "count": {"type": "integer", "description": "1 to 10; 5 if left out."},
+            "allowed_domains": {"type": "array", "items": {"type": "string"}, "description": "Only results from these sites and their subdomains, such as [\"docs.rs\"]; some services filter after answering, so fewer may come back."},
+            "blocked_domains": {"type": "array", "items": {"type": "string"}, "description": "No results from these sites or their subdomains, even if allowed."},
             "freshness": {"type": "string", "enum": ["day", "week", "month", "year"], "description": "Only pages from this last stretch of time."}
         }, "required": ["query"]})
     }

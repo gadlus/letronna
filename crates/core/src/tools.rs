@@ -2439,19 +2439,19 @@ impl Tool for RunCommand {
     }
     fn description(&self) -> &'static str {
         if cfg!(windows) {
-            "Run a Windows PowerShell 5.1 command in the project folder, or in the folder inside it that workdir names. `&&` and `||` are syntax errors in 5.1: separate commands with `;`, or write `first; if ($?) { second }` to run the second only when the first succeeded. Each call is a fresh PowerShell: cd and $env: changes do not carry over to the next call, so keep steps that depend on each other in one command and pass workdir instead of cd. Waits for it to finish, for up to 2 minutes or the `timeout` given, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0. Past its timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, with a file for read_file named in the cut, so a build or test run need not be piped through Select-Object -Last. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
+            "Run a Windows PowerShell 5.1 command in the project folder. `&&` and `||` are syntax errors in 5.1: separate commands with `;`, or write `first; if ($?) { second }` to run the second only when the first succeeded. Each call is a fresh PowerShell: cd and $env: changes do not carry over, so keep steps that depend on each other in one command and pass workdir instead of cd. Waits for it to finish, up to `timeout`, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0; past the timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, and the cut names a file read_file can page through, so a build or test run need not be piped through Select-Object -Last. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For a dev server, a watcher or anything else meant to keep running, pass background: true."
         } else if bash() {
-            "Run a bash command in the project folder, or in the folder inside it that workdir names. Each call is a fresh shell: cd, export and source do not carry over to the next call, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish, for up to 2 minutes or the `timeout` given, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0. Past its timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, with a file for read_file named in the cut, so a build or test run need not be piped through tail, which would also hide its exit code. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
+            "Run a bash command in the project folder. Each call is a fresh shell: cd, export and source do not carry over, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish, up to `timeout`, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0; past the timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, and the cut names a file read_file can page through, so a build or test run need not be piped through tail, which also hides its exit code. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For a dev server, a watcher or anything else meant to keep running, pass background: true."
         } else {
-            "Run a shell (sh) command in the project folder, or in the folder inside it that workdir names. Each call is a fresh shell: cd, export and source do not carry over to the next call, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish, for up to 2 minutes or the `timeout` given, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0. Past its timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, with a file for read_file named in the cut, so a build or test run need not be piped through tail, which would also hide its exit code. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
+            "Run a shell (sh) command in the project folder. Each call is a fresh shell: cd, export and source do not carry over, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish, up to `timeout`, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0; past the timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, and the cut names a file read_file can page through, so a build or test run need not be piped through tail, which also hides its exit code. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For a dev server, a watcher or anything else meant to keep running, pass background: true."
         }
     }
     fn parameters(&self) -> Value {
         let mut parameters = json!({"type": "object", "properties": {
             "command": {"type": "string", "description": "The command line; it runs as one script."},
-            "workdir": {"type": "string", "description": "The folder to run it in, inside the project: relative to the project folder, or absolute. Left out, it runs in the project folder."},
-            "background": {"type": "boolean", "description": "Leave the command running and return a job number straight away. A notice comes when it exits; read its output meanwhile with read_job, and end it with stop_job."},
-            "notify_on": {"type": "array", "items": {"type": "string"}, "description": "With background: a notice when an output line contains one of these, such as \"ready\" or \"error\". At most one notice every 15 s; exiting always sends one."},
+            "workdir": {"type": "string", "description": "A folder inside the project to run it in instead, relative to the project folder or absolute."},
+            "background": {"type": "boolean", "description": "Leave it running and return a job number at once; a notice comes when it exits. read_job reads its output and stop_job ends it."},
+            "notify_on": {"type": "array", "items": {"type": "string"}, "description": "With background: also a notice when a line of output contains one of these, such as \"ready\" or \"error\"; at most one every 15 s."},
             "unsandboxed": {"type": "boolean", "description": "Run it outside the sandbox. Only after a sandboxed run of it failed for want of the network or of writing outside the project; it needs the user's approval."},
             "timeout": {"type": "number", "description": format!("Seconds to wait for it to finish, 1 to {MAX_COMMAND_SECS}; {} if left out. Give a slow build, install or test suite longer.", COMMAND_TIMEOUT.as_secs())}
         }, "required": ["command"]});
@@ -2650,7 +2650,7 @@ impl Tool for Sessions {
         true
     }
     fn description(&self) -> &'static str {
-        "List the user's earlier Letronna sessions: id, title, when they were last used, how many messages, and which project folder. Use this when asked about past sessions or which one to pick up. It returns no conversation text. The user opens one with the /resume command, or `letronna --resume <id>`."
+        "List the user's earlier Letronna sessions: id, title, when they were last used, how many messages, and which project folder. It returns no conversation text."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -2714,7 +2714,7 @@ impl Tool for SearchSessions {
         true
     }
     fn description(&self) -> &'static str {
-        "Search what was said in the user's earlier Letronna sessions, ignoring case. A match holds every word of the query (\"quoted words\" stay together), or when nothing does, some of them; matches on rarer words come first. Titles and tool call arguments are searched too; the current session is left out. Each match gives the session's id, title and age and the message's #. To read the messages around a match, call again with session and around. Use it when the user refers to something from an earlier conversation, or when an earlier session may already hold the answer."
+        "Search what was said in the user's earlier Letronna sessions, ignoring case. A match holds every word of the query (\"quoted words\" stay together), or when nothing does, some of them; matches on rarer words come first. Titles and tool call arguments are searched too; the current session is left out. Each match gives the session's id, title and age and the message's #. Use it when the user refers to something from an earlier conversation, or when an earlier session may already hold the answer."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -2871,7 +2871,7 @@ impl Tool for ReadJob {
         true
     }
     fn description(&self) -> &'static str {
-        "Read what a background job has printed so far, and whether it is still running. Pass offset and limit to read a long log a page of lines at a time."
+        "Read what a background job has printed so far, and whether it is still running."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -3009,7 +3009,7 @@ impl Tool for SendJob {
         "send_job"
     }
     fn description(&self) -> &'static str {
-        "Type into a tty job and return what it prints next. keys: enter, tab, esc, up, down, ctrl-c, ctrl-d. Never for passwords."
+        "Type into a tty job and return what it prints next. Never for passwords."
     }
     fn parameters(&self) -> Value {
         let keys: Vec<&str> = KEYS.iter().map(|(name, _)| *name).collect();
@@ -4166,7 +4166,7 @@ impl Tool for Search {
             "pattern": {"type": "string", "description": "A regex. One that does not parse, or finds nothing, is tried as plain text."},
             "path": {"type": "string", "description": "Folder or file to search. Defaults to the workspace root."},
             "glob": {"type": "string", "description": "Only paths under `path` matching this, e.g. `*.rs` or `src/**/*.{ts,tsx}`; a leading `!` leaves them out instead."},
-            "type": {"type": "string", "description": "Only files of this type: rust, py, ts, js, go, java, cpp, md and so on, or a bare extension."},
+            "type": {"type": "string", "description": "Only files of this type, such as rust, py, ts or md, or a bare extension."},
             "mode": {"type": "string", "enum": ["content", "files", "count"]},
             "context": {"type": "integer", "description": "Lines shown either side of each match, up to 5."},
             "case_sensitive": {"type": "boolean"},

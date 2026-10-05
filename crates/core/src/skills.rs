@@ -446,7 +446,7 @@ impl Tool for UseSkill {
         "skill"
     }
     fn description(&self) -> &'static str {
-        "Load a skill listed in your instructions: instructions for a kind of task. It comes with the folder it lives in and the files beside it, such as scripts to run and references to read; pass file with one of those paths to read it. Long text comes in pages: pass the offset a page ends with to read on."
+        "Load a skill listed in your instructions: instructions for a kind of task. It comes with the folder it lives in and the files beside it, such as scripts to run and references to read. Long text comes in pages."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {

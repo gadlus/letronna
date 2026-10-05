@@ -402,19 +402,19 @@ impl Tool for Agent {
         "agent"
     }
     fn description(&self) -> &'static str {
-        "Hand a task to a helper agent that works with its own context and reports back. Use it to explore or check many files without filling your own context, not for a few reads you can do yourself. Helpers editing at the same time need separate files, or isolation worktree. The helper has not seen this conversation: brief it fully. Its report is all you get back, and it is the helper's own account: look at what it says it changed or ran before you tell the user it is done. In the window and the terminal it runs in the background by default: carry on or end your turn, and a notice comes when it finishes. Do not poll or wait for it. Otherwise it works while you wait, and its report is this call's result. With keep, it stays after reporting, idle with its context, until a message through the agents tool gives it more work; it ends after 30 idle minutes."
+        "Hand a task to a helper agent that works with its own context and reports back. Use it to explore or check many files without filling your own context, not for a few reads you can do yourself. Helpers editing at the same time need separate files, or isolation worktree. Its report is all you get back, and it is the helper's own account: look at what it says it changed or ran before you tell the user it is done. In the window and the terminal it runs in the background by default: carry on or end your turn, and a notice comes when it finishes; do not poll or wait for it. Elsewhere you wait, and its report is this call's result."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
             "description": {"type": "string", "description": "Three to five words, shown to the user."},
             "prompt": {"type": "string", "description": "The whole task. The helper has not seen this conversation: say what to do, what you already know, and what to report back."},
-            "type": {"type": "string", "description": "general (default), explore (read-only, cheaper), plan, or review. Other types this project defines are named in your instructions."},
+            "type": {"type": "string", "description": "general (default), explore (read-only, cheaper), plan, review, or another type your instructions name."},
             "name": {"type": "string", "description": "A handle for the agents tool. Defaults to the type."},
             "model": {"type": "string", "description": "A model id on this gateway. Default: the type's, then Settings, then yours."},
-            "background": {"type": "boolean", "description": "Default true in the window and terminal, unless the type says otherwise: return now and get a notice when it finishes. false waits for the report."},
-            "fork": {"type": "boolean", "description": "Start it from a copy of this conversation rather than from nothing: it has seen everything so far, so the prompt only says what to do. It keeps your model and tools, whatever type and model say."},
-            "keep": {"type": "boolean", "description": "Keep it for more work after it reports, in the background only. Default false."},
-            "isolation": {"type": "string", "enum": ["worktree"], "description": "worktree: it works in a new git worktree of this repository, on a branch of its own made from HEAD, so your uncommitted edits are not in it. Its file tools stay inside it; its commands are not confined. The worktree is removed if it changed nothing, else its path and branch are in the report."}
+            "background": {"type": "boolean", "description": "false waits for the report. Default true in the window and terminal, unless the type says otherwise."},
+            "fork": {"type": "boolean", "description": "Start it from a copy of this conversation, so the prompt only says what to do. It keeps your model and tools, whatever type and model say."},
+            "keep": {"type": "boolean", "description": "In the background only: after reporting it stays idle with its context until agents sends it more work, and ends after 30 idle minutes."},
+            "isolation": {"type": "string", "enum": ["worktree"], "description": "A new git worktree on a branch of its own from HEAD, without your uncommitted edits. Its file tools stay inside it; its commands are not confined. Removed if nothing changed, else the report names its path and branch."}
         }, "required": ["description", "prompt"]})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
@@ -431,7 +431,7 @@ impl Tool for Agents {
         "agents"
     }
     fn description(&self) -> &'static str {
-        "Work with the helpers you started, by name. list: yours and how they are doing. send: a message; a running helper reads it at its next step, and a finished or idle one carries on from where it stopped, with its context. From a helper, \"main\" reaches the agent that started you. stop: end one early. report: its last answer, whole, in pages. types: the helper types. A helper you are waiting for blocks your call, so only those in the background hear you while they run. Never ask another agent to do what was refused or declined here."
+        "Work with the helpers you started, by name. list: yours and how they are doing. send: a message, which a running helper reads at its next step and a finished or idle one carries on from, with its context. stop: end one early. report: its last answer, whole, in pages. types: the helper types. Never ask another agent to do what was refused or declined here."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {

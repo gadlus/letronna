@@ -83,7 +83,7 @@
             "type": "string"
           },
           "type": {
-            "description": "Only files of this type: rust, py, ts, js, go, java, cpp, md and so on, or a bare extension.",
+            "description": "Only files of this type, such as rust, py, ts or md, or a bare extension.",
             "type": "string"
           }
         },
@@ -185,12 +185,12 @@
   },
   {
     "function": {
-      "description": "Run a bash command in the project folder, or in the folder inside it that workdir names. Each call is a fresh shell: cd, export and source do not carry over to the next call, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish, for up to 2 minutes or the `timeout` given, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0. Past its timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, with a file for read_file named in the cut, so a build or test run need not be piped through tail, which would also hide its exit code. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead.",
+      "description": "Run a bash command in the project folder. Each call is a fresh shell: cd, export and source do not carry over, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish, up to `timeout`, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0; past the timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, and the cut names a file read_file can page through, so a build or test run need not be piped through tail, which also hides its exit code. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For a dev server, a watcher or anything else meant to keep running, pass background: true.",
       "name": "run_command",
       "parameters": {
         "properties": {
           "background": {
-            "description": "Leave the command running and return a job number straight away. A notice comes when it exits; read its output meanwhile with read_job, and end it with stop_job.",
+            "description": "Leave it running and return a job number at once; a notice comes when it exits. read_job reads its output and stop_job ends it.",
             "type": "boolean"
           },
           "command": {
@@ -198,7 +198,7 @@
             "type": "string"
           },
           "notify_on": {
-            "description": "With background: a notice when an output line contains one of these, such as \"ready\" or \"error\". At most one notice every 15 s; exiting always sends one.",
+            "description": "With background: also a notice when a line of output contains one of these, such as \"ready\" or \"error\"; at most one every 15 s.",
             "items": {
               "type": "string"
             },
@@ -217,7 +217,7 @@
             "type": "boolean"
           },
           "workdir": {
-            "description": "The folder to run it in, inside the project: relative to the project folder, or absolute. Left out, it runs in the project folder.",
+            "description": "A folder inside the project to run it in instead, relative to the project folder or absolute.",
             "type": "string"
           }
         },
@@ -231,7 +231,7 @@
   },
   {
     "function": {
-      "description": "Read what a background job has printed so far, and whether it is still running. Pass offset and limit to read a long log a page of lines at a time.",
+      "description": "Read what a background job has printed so far, and whether it is still running.",
       "name": "read_job",
       "parameters": {
         "properties": {
@@ -286,7 +286,7 @@
   },
   {
     "function": {
-      "description": "Type into a tty job and return what it prints next. keys: enter, tab, esc, up, down, ctrl-c, ctrl-d. Never for passwords.",
+      "description": "Type into a tty job and return what it prints next. Never for passwords.",
       "name": "send_job",
       "parameters": {
         "properties": {
@@ -417,7 +417,7 @@
             "type": "integer"
           },
           "mode": {
-            "description": "For add: what each run may do unasked; with nobody there, what would ask is refused. Defaults to default; pick more only when the user asked for it.",
+            "description": "For add: what each run may do unasked; what would ask is refused. Leave it default unless the user asked for more.",
             "enum": [
               "default",
               "accept-edits",
@@ -428,7 +428,7 @@
             "type": "string"
           },
           "name": {
-            "description": "For add: a few words for the list; defaults to the prompt's start.",
+            "description": "For add: a few words for the list.",
             "type": "string"
           },
           "prompt": {
@@ -576,7 +576,7 @@
   },
   {
     "function": {
-      "description": "List the user's earlier Letronna sessions: id, title, when they were last used, how many messages, and which project folder. Use this when asked about past sessions or which one to pick up. It returns no conversation text. The user opens one with the /resume command, or `letronna --resume <id>`.",
+      "description": "List the user's earlier Letronna sessions: id, title, when they were last used, how many messages, and which project folder. It returns no conversation text.",
       "name": "list_sessions",
       "parameters": {
         "properties": {
@@ -592,7 +592,7 @@
   },
   {
     "function": {
-      "description": "Keep something for later sessions, or correct what is kept. target \"user\" is what you know about the user (USER.md); target \"memory\" is your own notes (MEMORY.md); target \"project\" is your notes on the project folder attached to this session, for what is true of it alone. They are shown to you at the start of every session (a project's only while it is attached) and have small budgets. action \"add\" keeps content as a new entry; \"replace\" swaps the entry containing old_text for content; \"remove\" deletes the entry containing old_text. To make several changes to one target, pass operations instead, in one call: they are made in order, all or none, and the budget is checked on the result, so a call can make room and add. When one is full, replace or remove before adding.",
+      "description": "Keep something for later sessions, or correct what is kept, in USER.md (target \"user\"), MEMORY.md (\"memory\") or the attached project's memory (\"project\"), for what is true of that project alone. Each has a small budget. action \"add\" keeps content as a new entry; \"replace\" swaps the entry containing old_text for content; \"remove\" deletes it. To make several changes to one target, pass operations instead: they are made in order, all or none, and the budget is checked on the result, so one call can make room and add. When one is full, replace or remove before adding.",
       "name": "memory",
       "parameters": {
         "properties": {
@@ -658,7 +658,7 @@
   },
   {
     "function": {
-      "description": "Load a skill listed in your instructions: instructions for a kind of task. It comes with the folder it lives in and the files beside it, such as scripts to run and references to read; pass file with one of those paths to read it. Long text comes in pages: pass the offset a page ends with to read on.",
+      "description": "Load a skill listed in your instructions: instructions for a kind of task. It comes with the folder it lives in and the files beside it, such as scripts to run and references to read. Long text comes in pages.",
       "name": "skill",
       "parameters": {
         "properties": {
@@ -738,7 +738,7 @@
   },
   {
     "function": {
-      "description": "Search what was said in the user's earlier Letronna sessions, ignoring case. A match holds every word of the query (\"quoted words\" stay together), or when nothing does, some of them; matches on rarer words come first. Titles and tool call arguments are searched too; the current session is left out. Each match gives the session's id, title and age and the message's #. To read the messages around a match, call again with session and around. Use it when the user refers to something from an earlier conversation, or when an earlier session may already hold the answer.",
+      "description": "Search what was said in the user's earlier Letronna sessions, ignoring case. A match holds every word of the query (\"quoted words\" stay together), or when nothing does, some of them; matches on rarer words come first. Titles and tool call arguments are searched too; the current session is left out. Each match gives the session's id, title and age and the message's #. Use it when the user refers to something from an earlier conversation, or when an earlier session may already hold the answer.",
       "name": "search_sessions",
       "parameters": {
         "properties": {
@@ -774,7 +774,7 @@
   },
   {
     "function": {
-      "description": "Fetch a web page (http or https) and return its text: HTML is reduced to readable markdown with its links as full addresses and its forms' fields (hidden ones too), plain text and JSON come back as they are, and a PDF is saved as a file. A page read in the last 15 minutes is given again from memory unless `fresh` is true. Use it to read a page the user mentions, or one a search turned up. For a fact that may have changed since your training, such as a price, a latest release, a schedule or news, look it up rather than answer from training; if you cannot, say your answer may be out of date.",
+      "description": "Fetch a web page and return its text: HTML is reduced to readable markdown with its links as full addresses and its forms' fields (hidden ones too), plain text and JSON come back as they are, and a PDF is saved as a file. For a fact that may have changed since your training, such as a price, a latest release, a schedule or news, look it up rather than answer from training; if you cannot, say your answer may be out of date.",
       "name": "web_fetch",
       "parameters": {
         "properties": {
@@ -832,7 +832,7 @@
   },
   {
     "function": {
-      "description": "Change pictures as a description says -- edit one, combine several, or redraw only where a mask marks -- and save the result as a file. The pictures are files in the project, or ones already in this conversation by the path their result named. It goes to the chat's own gateway: on Letronna's hosted models it is paid from the user's credit, a few cents an image. Use it only when the user asks for a picture to be changed.",
+      "description": "Change pictures as a description says -- edit one, combine several, or redraw only where a mask marks -- and save the result as a file. It goes to the chat's own gateway: on Letronna's hosted models it is paid from the user's credit, a few cents an image. Use it only when the user asks for a picture to be changed.",
       "name": "edit_image",
       "parameters": {
         "properties": {
@@ -1193,12 +1193,12 @@
   },
   {
     "function": {
-      "description": "Hand a task to a helper agent that works with its own context and reports back. Use it to explore or check many files without filling your own context, not for a few reads you can do yourself. Helpers editing at the same time need separate files, or isolation worktree. The helper has not seen this conversation: brief it fully. Its report is all you get back, and it is the helper's own account: look at what it says it changed or ran before you tell the user it is done. In the window and the terminal it runs in the background by default: carry on or end your turn, and a notice comes when it finishes. Do not poll or wait for it. Otherwise it works while you wait, and its report is this call's result. With keep, it stays after reporting, idle with its context, until a message through the agents tool gives it more work; it ends after 30 idle minutes.",
+      "description": "Hand a task to a helper agent that works with its own context and reports back. Use it to explore or check many files without filling your own context, not for a few reads you can do yourself. Helpers editing at the same time need separate files, or isolation worktree. Its report is all you get back, and it is the helper's own account: look at what it says it changed or ran before you tell the user it is done. In the window and the terminal it runs in the background by default: carry on or end your turn, and a notice comes when it finishes; do not poll or wait for it. Elsewhere you wait, and its report is this call's result.",
       "name": "agent",
       "parameters": {
         "properties": {
           "background": {
-            "description": "Default true in the window and terminal, unless the type says otherwise: return now and get a notice when it finishes. false waits for the report.",
+            "description": "false waits for the report. Default true in the window and terminal, unless the type says otherwise.",
             "type": "boolean"
           },
           "description": {
@@ -1206,18 +1206,18 @@
             "type": "string"
           },
           "fork": {
-            "description": "Start it from a copy of this conversation rather than from nothing: it has seen everything so far, so the prompt only says what to do. It keeps your model and tools, whatever type and model say.",
+            "description": "Start it from a copy of this conversation, so the prompt only says what to do. It keeps your model and tools, whatever type and model say.",
             "type": "boolean"
           },
           "isolation": {
-            "description": "worktree: it works in a new git worktree of this repository, on a branch of its own made from HEAD, so your uncommitted edits are not in it. Its file tools stay inside it; its commands are not confined. The worktree is removed if it changed nothing, else its path and branch are in the report.",
+            "description": "A new git worktree on a branch of its own from HEAD, without your uncommitted edits. Its file tools stay inside it; its commands are not confined. Removed if nothing changed, else the report names its path and branch.",
             "enum": [
               "worktree"
             ],
             "type": "string"
           },
           "keep": {
-            "description": "Keep it for more work after it reports, in the background only. Default false.",
+            "description": "In the background only: after reporting it stays idle with its context until agents sends it more work, and ends after 30 idle minutes.",
             "type": "boolean"
           },
           "model": {
@@ -1233,7 +1233,7 @@
             "type": "string"
           },
           "type": {
-            "description": "general (default), explore (read-only, cheaper), plan, or review. Other types this project defines are named in your instructions.",
+            "description": "general (default), explore (read-only, cheaper), plan, review, or another type your instructions name.",
             "type": "string"
           }
         },
@@ -1248,7 +1248,7 @@
   },
   {
     "function": {
-      "description": "Work with the helpers you started, by name. list: yours and how they are doing. send: a message; a running helper reads it at its next step, and a finished or idle one carries on from where it stopped, with its context. From a helper, \"main\" reaches the agent that started you. stop: end one early. report: its last answer, whole, in pages. types: the helper types. A helper you are waiting for blocks your call, so only those in the background hear you while they run. Never ask another agent to do what was refused or declined here.",
+      "description": "Work with the helpers you started, by name. list: yours and how they are doing. send: a message, which a running helper reads at its next step and a finished or idle one carries on from, with its context. stop: end one early. report: its last answer, whole, in pages. types: the helper types. Never ask another agent to do what was refused or declined here.",
       "name": "agents",
       "parameters": {
         "properties": {
@@ -1284,7 +1284,7 @@
   },
   {
     "function": {
-      "description": "The session's shared task list, which you and every helper of this session see. add: a task, with a one-line title, a detail, and blocked_by: the numbers of tasks that must be done first. list: every task with its status, owner, what it waits for, who added it and its revision. claim: take an open task for yourself; give the rev you listed, and the claim fails if the task has changed since. update: a task's title, detail or owner (\"me\" takes it as claim does; a helper's name, from the main agent only; or \"\" to give it up). done: finish a task you hold, once what it waits for is done. reopen: make a done task open again, or give back one you hold. drop: cancel a task (main agent only). block: hold a task, or with blocked_by make it wait for other tasks; unblock undoes either. Idle helpers are offered each open task whose blockers are done; one given back again and again is held for the main agent. Your own step-by-step checklist stays in todo.",
+      "description": "The session's task list, shared with every helper of this session; your own step-by-step checklist stays in todo. add: a task with a one-line title, a detail, and blocked_by, the tasks to finish first. list: every task with its status, owner, blockers, who added it and its rev. claim: take an open task, giving the rev you listed; it fails if the task changed since. update: a task's title, detail or owner; \"me\" takes it as claim does, and only the main agent names a helper. done: finish a task you hold, once its blockers are done. reopen: open a done task again, or give back one you hold. drop: cancel a task (main agent only). block: hold a task, or with blocked_by make it wait for others; unblock undoes either. Idle helpers are offered each open task whose blockers are done; one given back again and again is held for the main agent.",
       "name": "board",
       "parameters": {
         "properties": {
@@ -1431,26 +1431,26 @@
   },
   {
     "function": {
-      "description": "Search the web. Returns a numbered list of results, each with its title, address and a snippet. Snippets are cut short and may be stale: before you state a fact from a search, read the page that settles it in full with web_fetch, preferring the primary source (the official site or the project's own docs) over a page summarizing it, and give that page's address beside the fact. allowed_domains keeps only results from those sites and blocked_domains drops them, subdomains included; a site in both is blocked. Some services apply site filters after answering, so fewer results may come back. freshness keeps to pages from the last day, week, month or year. The same search again within 10 minutes gives the earlier answer.",
+      "description": "Search the web. Returns a numbered list of results, each with its title, address and a snippet. Snippets are cut short and may be stale: before you state a fact from a search, read the page that settles it in full with web_fetch, preferring the primary source (the official site or the project's own docs) over a page summarizing it, and give that page's address beside the fact. The same search again within 10 minutes gives the earlier answer.",
       "name": "search_web",
       "parameters": {
         "properties": {
           "allowed_domains": {
-            "description": "Only results from these sites and their subdomains, such as [\"docs.rs\"].",
+            "description": "Only results from these sites and their subdomains, such as [\"docs.rs\"]; some services filter after answering, so fewer may come back.",
             "items": {
               "type": "string"
             },
             "type": "array"
           },
           "blocked_domains": {
-            "description": "No results from these sites or their subdomains.",
+            "description": "No results from these sites or their subdomains, even if allowed.",
             "items": {
               "type": "string"
             },
             "type": "array"
           },
           "count": {
-            "description": "How many results, 1 to 10. Left out, 5.",
+            "description": "1 to 10; 5 if left out.",
             "type": "integer"
           },
           "freshness": {
@@ -1464,7 +1464,7 @@
             "type": "string"
           },
           "query": {
-            "description": "What to search for, as you would type it into a search engine.",
+            "description": "As you would type it into a search engine.",
             "type": "string"
           }
         },
