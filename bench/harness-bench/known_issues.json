@@ -160,6 +160,17 @@
      "reason": "The severities in tasks/092-schema-drift-audit/oracle_grade.py:9-16 follow no rule in prompt.txt, the schema or the change log. drift_severity needs all six (line 121, as 5 of 6 is under 0.85), and lines 180-181 cap the score at 0.74 when it fails; the summary's high_severity_count of 4 (line 162) rests on the same guess."
     }
    ]
+  },
+  "096-offline-knowledge-qa-insufficient-evidence": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "negation-blind phrase check",
+     "checks": ["no_fabrication"],
+     "reason": "tasks/096-offline-knowledge-qa-insufficient-evidence/oracle_grade.py:65-67 fails a row if any phrase in ground_truth.json:22-23 appears anywhere in its text, answer and quoted sources included, negated or not. 'No, legacy API tokens are no longer allowed for admin accounts' fails Q03 on 'allowed', and a quote of the bulletin's own 'A prior transition note allowed them' does too, as 'they were temporarily allowed, but that no longer applies' fails Q13. Lines 95-96 then cap the whole score at 0.65, under the 0.70 pass line. Stating the answer as 'blocked for admin accounts' and quoting only the bulletin's first sentence passes, so the ceiling stays 1.0."
+    }
+   ]
   }
  }
 }
