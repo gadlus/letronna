@@ -573,6 +573,8 @@ mod tests {
         );
         let kept = std::fs::read_to_string(data.join("USER.md")).unwrap();
         assert_eq!(kept, "Works in Rust.\n§\nPrefers short answers.\n");
+        // Read from the same folder, as which tools are offered turns on it.
+        let offered = Value::Array(tools::specs(&connection));
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
 
         let sent = stub.sent();
@@ -583,7 +585,7 @@ mod tests {
             .map(|m| m["content"].as_str().unwrap())
             .collect();
         assert_eq!(texts, ["ask 0", "ok", "ask 1", "ok", PROMPT]);
-        assert_eq!(sent[0]["tools"], Value::Array(tools::specs(&connection)));
+        assert_eq!(sent[0]["tools"], offered);
         // Held back, the adds left the system prompt as it was for the second call.
         assert_eq!(first[0], sent[1]["messages"][0]);
     }

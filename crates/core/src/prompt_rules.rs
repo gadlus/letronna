@@ -307,6 +307,14 @@ pub(crate) const CHAT_APP: [Rule; 2] = [
     },
 ];
 
+/// The rule that heads the index of the skills switched on.
+// A skill that does not fit is worse than none; a clear match still loads.
+pub(crate) const SKILLS: [Rule; 1] = [Rule {
+    id: "skill-fit",
+    to: To::Every,
+    text: "When a task clearly matches one's description, load it before you start and follow it; on a loose fit, load none.",
+}];
+
 /// The rules a helper's first message gives after the tools it may use, and
 /// a fork's after the report it owes: it shares its parent's system message,
 /// which speaks of asking the user, of memory and, in plan mode, of
@@ -337,13 +345,14 @@ pub(crate) const INSTRUCTIONS: [Rule; 1] = [Rule {
 }];
 
 /// Every table of rules, for finding a row by its id.
-const TABLES: [&[Rule]; 8] = [
+const TABLES: [&[Rule]; 9] = [
     &PROSE,
     &TERMINAL,
     &TOOLS,
     &PROJECT,
     &PLAN,
     &CHAT_APP,
+    &SKILLS,
     &HELPER,
     &INSTRUCTIONS,
 ];

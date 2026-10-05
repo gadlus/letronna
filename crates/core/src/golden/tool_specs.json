@@ -661,7 +661,7 @@
   },
   {
     "function": {
-      "description": "Load a skill: instructions for a kind of task. The ones you can load are listed in your instructions; when a task matches one's description, load it before you start and follow it. It comes with the folder it lives in and the files beside it, such as scripts to run and references to read; pass file with one of those paths to read it. Long text comes in pages: pass the offset a page ends with to read on.",
+      "description": "Load a skill listed in your instructions: instructions for a kind of task. It comes with the folder it lives in and the files beside it, such as scripts to run and references to read; pass file with one of those paths to read it. Long text comes in pages: pass the offset a page ends with to read on.",
       "name": "skill",
       "parameters": {
         "properties": {
