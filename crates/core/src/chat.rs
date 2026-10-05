@@ -5335,10 +5335,57 @@ mod tests {
             human: true,
             ..connection()
         });
-        // Its approval and ask_user sentences, as they were.
-        let before = " Writes and commands are shown to the user for approval; a denial is final for that action. Ask with ask_user when a decision is the user's to make, such as a project name.";
-        assert!(watched.contains(before), "{watched}");
+        let approval = " Depending on the session's mode and the user's rules, a write or command runs at once, waits for the user's approval, or is refused; a denial or refusal is final for that action: do not reach the same result another way. Ask with ask_user only for a choice that is the user's and that the request and project do not settle, such as a name; otherwise take the sensible default and mention it.";
+        assert!(watched.contains(approval), "{watched}");
+        assert!(
+            !watched.contains("shown to the user for approval"),
+            "{watched}"
+        );
         assert!(!watched.contains("Nobody is watching"), "{watched}");
+    }
+
+    /// A distinctive part of the rules for a turn someone at this computer
+    /// watches: how to end a task and what a message typed meanwhile means.
+    const ON_SCREEN: [&str; 2] = [
+        "When you finish a task, end with a short report",
+        "A message the user types while you work steers the task in hand",
+    ];
+
+    #[test]
+    fn the_window_prompt_carries_the_report_and_steering_rules() {
+        let window = system_with_tools(Connection {
+            human: true,
+            ..connection()
+        });
+        for rule in ON_SCREEN {
+            assert!(window.contains(rule), "{rule}: {window}");
+        }
+    }
+
+    #[test]
+    fn a_chat_app_or_a_print_run_gets_no_report_or_steering_rule() {
+        let chat_app = system_with_tools(Connection {
+            human: true,
+            remote: Some(Remote {
+                place: "a Telegram chat".into(),
+                ..Default::default()
+            }),
+            ..connection()
+        });
+        assert!(
+            chat_app.contains("Ask with ask_user only for a choice"),
+            "{chat_app}"
+        );
+        let print = system_with_tools(connection());
+        for rule in ON_SCREEN {
+            assert!(!chat_app.contains(rule), "{rule}: {chat_app}");
+            assert!(!print.contains(rule), "{rule}: {print}");
+        }
+        assert!(
+            !print.contains("Depending on the session's mode"),
+            "{print}"
+        );
+        assert!(!print.contains("Ask with ask_user"), "{print}");
     }
 
     /// A distinctive part of each work rule's sentence.
@@ -11021,6 +11068,14 @@ mod tests {
         for mode in modes {
             assert_eq!(system(mode), system(Mode::Default), "{mode:?}");
         }
+        // Its approval sentence is true in each of them.
+        let approval = "Depending on the session's mode and the user's rules";
+        assert!(
+            system(Mode::Bypass)["content"]
+                .as_str()
+                .unwrap()
+                .contains(approval)
+        );
         // The mode is told in the conversation instead, as a notice ahead
         // of what the user said, and Default is told nothing.
         assert!(mode_notes_in(&sent_for(&in_mode(Mode::Default), &asked)).is_empty());
