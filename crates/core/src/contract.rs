@@ -5,8 +5,9 @@
 //! every check that reads it, however good the rest of the work is. A model
 //! saying it is done is no proof of that, so a session's own run looks
 //! before it ends: the request is read for the files it names under `out/`,
-//! with any CSV header or JSON keys it spells out for them, and each file is
-//! looked at on disk.
+//! with what it spells out for them -- a CSV header or the columns it names,
+//! JSON keys and the keys each item of a list holds, the few values a field
+//! may take -- and each file is looked at on disk.
 //!
 //! Both halves are plain text matching rather than a model's reading, so
 //! nothing is invented, and the matching leans to missing: a file counts only
@@ -23,9 +24,15 @@
 //! end with its whole answer again, since this reading can still be wrong;
 //! nothing here edits a file, since rewriting work that was right loses more
 //! than it mends.
+//!
+//! A list of values counts only where it is all a field may hold, never where
+//! it gives examples or holds for some rows, and is held only to a field the
+//! file has; keys named for each item of a list must be in every item of a
+//! list holding any of them, since one holding none is about something else.
 
-use serde_json::Value;
-use std::collections::HashSet;
+use serde_json::{Map, Value};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -189,6 +196,64 @@ const NOT_KEPT: [&str; 9] = [
     "not include",
 ];
 
+/// The kinds of file a request may give a field's values for: its tables
+/// and data files.
+const RECORDS: [&str; 8] = ["csv", "tsv", "xls", "xlsx", "json", "jsonl", "yaml", "yml"];
+
+/// Words that make the values a sentence lists for a field a start or only
+/// examples, as in "such as `ok` or `late`", rather than all it may hold.
+const OPEN: [&str; 4] = ["such as", "like", "etc", "including"];
+
+/// Words that make what a sentence says a field or a list's items hold true
+/// only of some, as in "If it is late, `status` must be one of ...".
+const CONDITIONS: [&str; 5] = ["if", "when", "whenever", "unless", "otherwise"];
+
+/// Words that may come between a field's "be" and its values, as in "must
+/// be exactly one of" or "can only be".
+const QUALIFIERS: [&str; 5] = ["exactly", "only", "always", "strictly", "any"];
+
+/// Words before "be" that make it say what a field holds, as in "must be"
+/// or "has to be".
+const MODALS: [&str; 7] = ["must", "should", "shall", "will", "can", "may", "to"];
+
+/// Words a field is called by besides its name, as in "the status column",
+/// so its name is the word before.
+const NOUNS: [&str; 4] = ["column", "field", "key", "value"];
+
+/// Words after "each item" that list what every item holds, as in "each
+/// item must include" or "each entry has".
+const HAVING: [&str; 10] = [
+    "include", "includes", "contain", "contains", "have", "has", "hold", "holds", "with", "carry",
+];
+
+/// Words between "each" and a `HAVING` one that make what follows not hold
+/// of every item, as in "each item may include".
+const HEDGES: [&str; 9] = [
+    "may",
+    "can",
+    "could",
+    "might",
+    "not",
+    "never",
+    "optionally",
+    "if",
+    "when",
+];
+
+/// The items of a list, as "an array of objects with" names them.
+const PLURALS: [&str; 6] = ["objects", "records", "items", "entries", "elements", "rows"];
+
+/// Words that say the columns a sentence names come in the order given.
+const ORDER: [&str; 7] = [
+    "in order",
+    "in this order",
+    "in that order",
+    "in the order",
+    "same order",
+    "exact order",
+    "and order",
+];
+
 /// Bad lines reported for one file: three show the pattern, and more would
 /// crowd out the other files.
 const LINES: usize = 3;
@@ -200,6 +265,10 @@ const LISTED: usize = 12;
 /// The largest file read to check its format, 16 MiB; past that only being
 /// there is checked, so a huge output does not hold up the run's end.
 const LARGEST: u64 = 16 << 20;
+
+/// The characters of a value a notice shows: enough for any label, and a
+/// sentence written where a label belongs does not crowd out the rest.
+const SHOWN: usize = 40;
 
 /// What a request asks a run to leave in its workspace.
 #[derive(Debug, Default, PartialEq)]
@@ -216,13 +285,38 @@ struct Output {
     header: Option<String>,
     /// Keys the request says the JSON holds.
     keys: Vec<String>,
+    /// Keys the request says each item of a list in the JSON holds, a set
+    /// for each list it speaks of.
+    each: Vec<Vec<String>>,
+    /// Columns the request names in prose rather than as a header line.
+    columns: Vec<String>,
+    /// Whether the request says those columns come in the order given.
+    ordered: bool,
+    /// The fields the request says hold one of the values it lists.
+    values: Vec<Values>,
     /// The file's size and change time as the request was read, if it was
     /// there then.
     found: Option<Stamp>,
 }
 
+/// A field the request says holds one of the values it lists.
+#[derive(Debug, PartialEq)]
+struct Values {
+    /// The column or key, as the request writes it.
+    field: String,
+    /// Every value it may hold.
+    allowed: Vec<String>,
+    /// Whether each value was in quotes or backticks, so is matched as
+    /// written; a bare word may be capitalised, as prose is.
+    quoted: bool,
+}
+
 /// A file's size and the time it was last changed, where the system keeps one.
 type Stamp = (u64, Option<SystemTime>);
+
+/// The values a field has in a file, gathered by where in it each is, with
+/// the line each is on where that is known.
+type Places<'a> = BTreeMap<String, Vec<(Option<usize>, Cow<'a, str>)>>;
 
 /// One CSV record: the line it starts on, counting from 1, and its fields.
 struct Record {
@@ -292,6 +386,10 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
                         path,
                         header: None,
                         keys: Vec::new(),
+                        each: Vec::new(),
+                        columns: Vec::new(),
+                        ordered: false,
+                        values: Vec::new(),
                         found,
                     });
                 }
@@ -320,11 +418,16 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
         }
     }
     // A header belongs to the one table its sentence names, or else to the
-    // table named last before it, and keys likewise to a data file; and to
-    // no output when that one is an input or not a CSV or JSON file, which
-    // the request may well describe the same way, nor when the sentence
-    // giving them is about a file already there.
-    let (mut table, mut data) = (None, None);
+    // table named last before it, and keys likewise to a data file, and the
+    // values a field holds to either; and to no output when that one is an
+    // input or not a CSV or JSON file, which the request may well describe
+    // the same way, nor when the sentence giving them is about a file
+    // already there.
+    let (mut table, mut data, mut record) = (None, None, None);
+    // The heading of the list going on, when it makes what its items say a
+    // field holds true of some rows only, as "For late rows:" does: how far
+    // in it is, and whether it is an item itself.
+    let mut some_rows: Option<(usize, bool)> = None;
     for (at, line) in lines.iter().enumerate() {
         // A line of its own on another output, such as "report.md
         // requirements:", is no longer about the table or data file before
@@ -335,6 +438,25 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
                 let other = kind(&outputs[i].path);
                 table = table.filter(|_| TABLES.contains(&other.as_str()));
                 data = data.filter(|_| DATA.contains(&other.as_str()));
+                record = record.filter(|_| RECORDS.contains(&other.as_str()));
+            }
+        }
+        if !line.trim().is_empty() {
+            let indent = line.len() - line.trim_start().len();
+            // An item's list ends at a line no further in than it, and a
+            // heading's at the next line that is neither an item nor in.
+            if let Some((from, item)) = some_rows
+                && (if item {
+                    indent <= from
+                } else {
+                    !listed(line) && indent == 0
+                })
+            {
+                some_rows = None;
+            }
+            let last = sentences(line).last().copied().unwrap_or_default();
+            if some_rows.is_none() && line.trim_end().ends_with(':') && conditional(last) {
+                some_rows = Some((indent, listed(line)));
             }
         }
         for word in words(line) {
@@ -343,6 +465,9 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
                 table = named(word, &outputs, workspace);
             } else if DATA.contains(&kind.as_str()) {
                 data = named(word, &outputs, workspace);
+            }
+            if RECORDS.contains(&kind.as_str()) {
+                record = named(word, &outputs, workspace);
             }
         }
         // A sentence naming files, none of them a table, is about those: a
@@ -365,6 +490,7 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
         // A table in a README or in markdown may go unnamed, so a header in
         // a sentence naming no file but one of those is no CSV's.
         let document = |sentence: &str| files(sentence).is_empty() && says(sentence, &DOCUMENT);
+        let under = || listed_under(&raw, &lines, at);
         for sentence in sentences(line).into_iter().filter(|s| !given(s)) {
             if let Some(i) = bound(sentence, &TABLES, table, &outputs, workspace)
                 && kind(&outputs[i].path) == "csv"
@@ -373,12 +499,32 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
                 && !document(sentence)
             {
                 outputs[i].header = header_in(sentence, next_line(&raw, &lines, at));
+                // A header given word for word names every column already.
+                if outputs[i].header.is_none() && outputs[i].columns.is_empty() {
+                    (outputs[i].columns, outputs[i].ordered) = columns_in(sentence, under);
+                }
             }
             if let Some(i) = bound(sentence, &DATA, data, &outputs, workspace)
-                && kind(&outputs[i].path) == "json"
+                && matches!(kind(&outputs[i].path).as_str(), "json" | "jsonl")
                 && about(sentence, &DATA)
             {
-                outputs[i].keys.extend(keys_in(sentence));
+                let each = each_keys_in(sentence);
+                let keys = keys_in(sentence)
+                    .into_iter()
+                    .filter(|key| !each.contains(key));
+                outputs[i].keys.extend(keys);
+                if !each.is_empty() {
+                    outputs[i].each.push(each);
+                }
+            }
+            if some_rows.is_none()
+                && let Some(i) = bound(sentence, &RECORDS, record, &outputs, workspace)
+                && matches!(kind(&outputs[i].path).as_str(), "csv" | "json" | "jsonl")
+                && about(sentence, &RECORDS)
+                && !document(sentence)
+                && let Some(values) = values_in(sentence, under)
+            {
+                outputs[i].values.push(values);
             }
         }
     }
@@ -823,6 +969,393 @@ fn keys_in(line: &str) -> Vec<String> {
         .collect()
 }
 
+/// The keys `sentence` says each item of a list holds, as in "Each item must
+/// include `id` and `name`" or "an array of objects with id, name".
+fn each_keys_in(sentence: &str) -> Vec<String> {
+    let lower = sentence.to_ascii_lowercase();
+    // Where each word starts, to take the list from the sentence as typed.
+    let words: Vec<(usize, &str)> = lower
+        .split_ascii_whitespace()
+        .scan(0, |from, word| {
+            let at = *from + lower[*from..].find(word)?;
+            *from = at + word.len();
+            Some((at, word))
+        })
+        .collect();
+    let bare = |j: usize| words[j].1.trim_end_matches([':', ',']);
+    for i in 0..words.len() {
+        let verb = if ["each", "every"].contains(&words[i].1) {
+            // "Each line item must include", but not "each item may
+            // include" or "each ticket's `tags` include", whose list is of
+            // values.
+            let ordinary = |j: usize| {
+                !HEDGES.contains(&words[j].1)
+                    && words[j]
+                        .1
+                        .chars()
+                        .all(|c| c.is_ascii_alphabetic() || c == '-')
+            };
+            (i + 1..words.len().min(i + 6))
+                .take_while(|&j| HAVING.contains(&bare(j)) || ordinary(j))
+                .find(|&j| HAVING.contains(&bare(j)))
+        } else if ["array", "list"].contains(&words[i].1)
+            && words.get(i + 1).is_some_and(|w| w.1 == "of")
+        {
+            (i + 2..words.len().min(i + 5))
+                .find(|&j| words[j].1 == "with" && PLURALS.contains(&words[j - 1].1))
+        } else {
+            None
+        };
+        // "If there are returns, ... each item has" speaks of a list that
+        // may rightly not be there.
+        let Some(j) = verb.filter(|_| !conditional(&sentence[..words[i].0])) else {
+            continue;
+        };
+        let mut list = sentence[words[j].0 + words[j].1.len()..].trim_start();
+        for lead in ["at least", "the following", "these", "the"] {
+            list = word_after(list, lead).unwrap_or(list);
+        }
+        // "these keys (empty when unknown): id, name" gives them after its
+        // colon, unless they follow straight on.
+        let named = ["keys", "fields", "properties"].iter().find_map(|word| {
+            let rest = list.get(word.len()..)?;
+            let ends = rest.chars().next().is_none_or(|c| !c.is_alphanumeric());
+            (ends && list[..word.len()].eq_ignore_ascii_case(word)).then_some(rest)
+        });
+        if let Some(rest) = named {
+            list = match rest.split_once(':') {
+                Some((_, after)) if !rest.trim_start().starts_with(['`', '"']) => after,
+                _ => rest,
+            };
+        }
+        let keys = names(list.trim_start_matches([':', ' ']));
+        if !keys.is_empty() {
+            return keys;
+        }
+    }
+    Vec::new()
+}
+
+/// The names `text` lists first, as far as each is a plain name: "`id`,
+/// `name` and a note" gives id and name, and a choice, as in "`id` or
+/// `name`", gives none.
+fn names(text: &str) -> Vec<String> {
+    let clause = text.split(';').next().unwrap_or_default();
+    if says(clause, &["or"]) {
+        return Vec::new();
+    }
+    clause
+        .replace(" and ", ", ")
+        .split(',')
+        .map(|item| {
+            let item = item.trim();
+            let item = item.strip_prefix("and ").unwrap_or(item);
+            item.trim_matches(|c: char| c.is_whitespace() || "`*\"'.".contains(c))
+        })
+        .filter(|name| !name.is_empty())
+        .take_while(|name| {
+            name.chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The columns `sentence` names in prose, as in "with columns `id`, `name`
+/// and `total`", or on the lines `under` it when it ends in a colon, and
+/// whether it says they come in that order.
+fn columns_in(sentence: &str, under: impl Fn() -> String) -> (Vec<String>, bool) {
+    let lower = sentence.to_ascii_lowercase();
+    let cue = ["columns", "header"]
+        .into_iter()
+        .filter_map(|word| Some((whole(&lower, word)?, word)))
+        .min();
+    let Some((at, word)) = cue else {
+        return (Vec::new(), false);
+    };
+    let mut list = sentence[at + word.len()..].to_owned();
+    // "columns, in this order: id, name" gives them after its colon.
+    if let Some((before, after)) = list.split_once(':')
+        && !before.contains(['`', '"'])
+    {
+        list = after.to_owned();
+    }
+    if list.trim().is_empty() {
+        list = under();
+    }
+    let columns = names(&list);
+    if columns.len() < 2 {
+        return (Vec::new(), false);
+    }
+    // A header is a line, so its names have their order, unless all asked
+    // is that it include them.
+    let partial = lower.contains("include") || lower.contains("contain");
+    (
+        columns,
+        says(sentence, &ORDER) || (word == "header" && !partial),
+    )
+}
+
+/// Where `word` first stands whole in `text`, not inside a longer word.
+fn whole(text: &str, word: &str) -> Option<usize> {
+    text.match_indices(word)
+        .map(|(at, _)| at)
+        .find(|&at| alone(text, at, word.len()))
+}
+
+/// Whether the `len` bytes of `text` at `at` are a word of their own.
+fn alone(text: &str, at: usize, len: usize) -> bool {
+    text[..at]
+        .chars()
+        .next_back()
+        .is_none_or(|c| !c.is_alphanumeric())
+        && text[at + len..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric())
+}
+
+/// What line `at` leads to with a colon: the items of the list under it,
+/// joined with commas, or else the next line, as `next_line` finds it.
+fn listed_under(raw: &[&str], lines: &[&str], at: usize) -> String {
+    let Some(first) = (at + 1..raw.len()).find(|&i| !raw[i].trim().is_empty()) else {
+        return String::new();
+    };
+    if !listed(lines[first]) {
+        return next_line(raw, lines, at).unwrap_or_default().to_owned();
+    }
+    let indent = |line: &str| line.len() - line.trim_start().len();
+    lines[first..]
+        .iter()
+        .take_while(|line| listed(line) && indent(line) == indent(lines[first]))
+        .map(|line| {
+            let trimmed = line.trim_start();
+            let rest = trimmed.trim_start_matches(|c: char| c.is_ascii_digit());
+            let rest = rest.strip_prefix(['.', ')', '-', '*', '+']).unwrap_or(rest);
+            rest.trim()
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The field `sentence` says holds one of the values it lists, and those
+/// values, as in "`status` must be one of `ok`, `late` or `missing`",
+/// "status: one of ok, late" or "`kind` must be exactly `a` or `b`", taking
+/// them from the lines `under` it when it ends in a colon; None for a list
+/// of examples, one true of some rows only, or one with more in it than
+/// values.
+fn values_in(sentence: &str, under: impl Fn() -> String) -> Option<Values> {
+    let lower = sentence.to_ascii_lowercase();
+    if EXAMPLES.iter().any(|words| lower.contains(words)) || says(sentence, &OPEN) {
+        return None;
+    }
+    let mut cues: Vec<(usize, &str)> = ["one of", "either", "∈", "be", "is", "are"]
+        .into_iter()
+        .flat_map(|cue| lower.match_indices(cue))
+        .filter(|&(at, cue)| alone(&lower, at, cue.len()))
+        .collect();
+    cues.sort_unstable();
+    // The first that follows a field, since a sentence may say "one of" of
+    // something else first, as in "Pick one of the files and ...".
+    for (at, cue) in cues {
+        let end = at + cue.len();
+        // "Must be `a` or `b`" lists quoted values with no "one of".
+        let copula = matches!(cue, "be" | "is" | "are");
+        let lead = if copula {
+            &sentence[..end]
+        } else {
+            &sentence[..at]
+        };
+        let Some((field, before)) = field_before(lead, cue == "∈") else {
+            continue;
+        };
+        if conditional(before) {
+            return None;
+        }
+        let mut list = sentence[end..].trim_start();
+        if copula {
+            while let Some(rest) = QUALIFIERS.iter().find_map(|word| word_after(list, word)) {
+                list = rest;
+            }
+            if !list.starts_with(['`', '"', '\'', '“', '‘']) {
+                continue;
+            }
+        } else if let Some((between, after)) = list.split_once(':')
+            && between.split_whitespace().count() <= 3
+            && !between.contains([',', '`', '"'])
+        {
+            // "one of the following:" or "one of these values:"
+            list = after;
+        }
+        let list = if list.trim().is_empty() {
+            under()
+        } else {
+            list.to_owned()
+        };
+        let Some((allowed, quoted, or)) = alternatives(&list, cue == "one of") else {
+            continue;
+        };
+        // With no "one of", quoted values joined by "or" are a choice, where
+        // bare words may be a description, as "short, factual or blank" is.
+        if copula && !(quoted && or) {
+            continue;
+        }
+        return Some(Values {
+            field,
+            allowed,
+            quoted,
+        });
+    }
+    None
+}
+
+/// The field `lead` names last, before the words that say it holds what
+/// follows -- "`status` must be exactly", "status:" or "the status column
+/// is" -- or straight before what follows when `direct`, with what comes
+/// before the field.
+fn field_before(lead: &str, direct: bool) -> Option<(String, &str)> {
+    let mut rest = lead.trim_end();
+    if let Some(before) = rest.strip_suffix([':', '(']) {
+        rest = before;
+    } else if !direct {
+        while let Some(before) = without_last(rest, &QUALIFIERS) {
+            rest = before;
+        }
+        if let Some(before) = without_last(rest, &["is", "are", "as"]) {
+            rest = before;
+        } else {
+            rest = without_last(rest, &["be"])?;
+            while let Some(before) = without_last(rest, &QUALIFIERS) {
+                rest = before;
+            }
+            rest = without_last(rest, &MODALS)?;
+            rest = without_last(rest, &["has", "have", "needs", "need"]).unwrap_or(rest);
+        }
+    }
+    let (mut before, mut field) = last_name(rest)?;
+    if NOUNS.iter().any(|noun| field.eq_ignore_ascii_case(noun)) {
+        (before, field) = last_name(before)?;
+    }
+    Some((field.to_owned(), before))
+}
+
+/// The name `text` ends with -- in backticks or quotes, or a word, in bold
+/// or not -- and the text before it.
+fn last_name(text: &str) -> Option<(&str, &str)> {
+    let text = text.trim_end().trim_end_matches('*');
+    let (before, name) = match text.chars().next_back()? {
+        quote @ ('`' | '"' | '\'') => {
+            let inner = &text[..text.len() - 1];
+            let open = inner.rfind(quote)?;
+            (&inner[..open], &inner[open + 1..])
+        }
+        _ => text.rsplit_once(char::is_whitespace).unwrap_or(("", text)),
+    };
+    let name = name.trim_start_matches(['*', '(']);
+    let plain = name
+        .chars()
+        .all(|c| c.is_alphanumeric() || "_-. ".contains(c));
+    (plain && name.chars().any(char::is_alphanumeric)).then_some((before, name))
+}
+
+/// `text` without its last word, when that word is one of `words`.
+fn without_last<'a>(text: &'a str, words: &[&str]) -> Option<&'a str> {
+    let text = text.trim_end();
+    let (before, last) = text.rsplit_once(char::is_whitespace).unwrap_or(("", text));
+    words
+        .iter()
+        .any(|word| last.eq_ignore_ascii_case(word))
+        .then_some(before)
+}
+
+/// `text` after `word` and the space after it, when it starts with them.
+fn word_after<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+    let rest = text.get(word.len()..)?;
+    (text[..word.len()].eq_ignore_ascii_case(word) && rest.starts_with(char::is_whitespace))
+        .then(|| rest.trim_start())
+}
+
+/// Whether `text`, said before a field or a list's items, makes what follows
+/// true of some only, as "If it is late," "Where it is late," or "For
+/// rejected rows," do; "For each row" and "an array where each item" do
+/// not.
+fn conditional(text: &str) -> bool {
+    let plain = plain(text);
+    let mut words = plain.split_whitespace();
+    let some = match words.next() {
+        Some("for") => words
+            .next()
+            .is_none_or(|next| !["each", "every", "all"].contains(&next)),
+        Some("where") => true,
+        _ => false,
+    };
+    some || says(text, &CONDITIONS)
+}
+
+/// The values `text` lists and nothing more, as "`a`, `b` or `c`", "a, b,
+/// c" or "{a | b}", with whether each was quoted and whether "or" joined
+/// them; None for anything else, or a value alone.
+fn alternatives(text: &str, and: bool) -> Option<(Vec<String>, bool, bool)> {
+    let mut rest = text.trim();
+    if let Some(inner) = rest.strip_prefix('{') {
+        rest = inner.split_once('}')?.0;
+    } else {
+        // A list ends with its sentence, a clause after it, or the
+        // parenthesis it is in.
+        rest = rest.split([';', ')']).next().unwrap_or_default();
+        for dash in [" -- ", " — ", " – ", " - "] {
+            rest = rest.split(dash).next().unwrap_or_default();
+        }
+        rest = rest.trim().trim_end_matches('.');
+    }
+    let (mut values, mut quoted, mut or) = (Vec::new(), true, false);
+    loop {
+        let (value, was_quoted, after) = value_at(rest)?;
+        values.push(value.to_owned());
+        quoted &= was_quoted;
+        let mut after = after.trim_start();
+        if after.is_empty() {
+            break;
+        }
+        let comma = after.starts_with([',', '|']);
+        if comma {
+            after = after[1..].trim_start();
+        }
+        if let Some(next) = word_after(after, "or") {
+            (after, or) = (next, true);
+        } else if let Some(next) = word_after(after, "and").filter(|_| and) {
+            after = next;
+        } else if !comma {
+            return None;
+        }
+        rest = after;
+    }
+    let open = values
+        .iter()
+        .any(|value| ["etc", "...", "…"].contains(&value.to_ascii_lowercase().as_str()));
+    (values.len() > 1 && !open).then_some((values, quoted, or))
+}
+
+/// The value `text` starts with -- in backticks or quotes, or a bare word --
+/// with whether it was quoted, and the text after it.
+fn value_at(text: &str) -> Option<(&str, bool, &str)> {
+    let text = text.trim_start();
+    let first = text.chars().next()?;
+    let close = match first {
+        '`' | '"' | '\'' => first,
+        '“' => '”',
+        '‘' => '’',
+        _ => {
+            let end = text
+                .find(|c: char| !(c.is_alphanumeric() || "_-.+/".contains(c)))
+                .unwrap_or(text.len());
+            return (end > 0).then(|| (&text[..end], false, &text[end..]));
+        }
+    };
+    let (value, after) = text[first.len_utf8()..].split_once(close)?;
+    (!value.trim().is_empty()).then_some((value, true, after))
+}
+
 /// The stamp of `file` as it is now, or None when it is no file.
 fn stamp(file: &Path) -> Option<Stamp> {
     let meta = std::fs::metadata(file).ok()?;
@@ -884,7 +1417,7 @@ fn text(output: &Output, bytes: &[u8]) -> Vec<String> {
     };
     match kind(name).as_str() {
         "json" => problems.extend(json(output, text)),
-        "jsonl" => problems.extend(json_lines(name, text)),
+        "jsonl" => problems.extend(json_lines(output, text)),
         _ => problems.extend(csv(output, text)),
     }
     problems
@@ -902,37 +1435,264 @@ fn json(output: &Output, text: &str) -> Vec<String> {
         Ok(value) => value,
         Err(e) => return vec![format!("`{name}` is not valid JSON: {e}.")],
     };
-    // Anywhere in it, since the request may mean each item of a list or an
-    // object inside: a key missing everywhere is wrong whichever it meant.
-    let mut found = HashSet::new();
-    keys_of(&value, &mut found);
-    let missing: Vec<String> = output
-        .keys
-        .iter()
-        .filter(|key| !found.contains(key.as_str()))
-        .map(|key| format!("`{key}`"))
-        .collect();
-    if missing.is_empty() {
-        return Vec::new();
-    }
-    vec![format!(
-        "`{name}` lacks keys the request names: {}.",
-        missing.join(", ")
-    )]
+    held(output, &[(None, value)])
 }
 
-/// Every key of every object in `value`, at any depth.
-fn keys_of<'a>(value: &'a Value, found: &mut HashSet<&'a str>) {
+/// What is wrong with what JSON `output` holds -- its one value, or each
+/// line's in JSON Lines, with the line it is on -- against the keys and
+/// values its request names.
+fn held(output: &Output, values: &[(Option<usize>, Value)]) -> Vec<String> {
+    let name = &output.path;
+    if output.keys.is_empty() && output.each.is_empty() && output.values.is_empty() {
+        return Vec::new();
+    }
+    // A JSON Lines file is one list, each line an item of it.
+    let lines = kind(name) == "jsonl";
+    let mut found = HashSet::new();
+    let mut lists: BTreeMap<String, Vec<&Map<String, Value>>> = BTreeMap::new();
+    // The values each listed field has, gathered by where each is.
+    let mut places: Vec<Places> = output.values.iter().map(|_| BTreeMap::new()).collect();
+    let asks_keys = !output.keys.is_empty() || !output.each.is_empty();
+    for (line, value) in values {
+        let mut at = String::from(if lines { "[]" } else { "" });
+        walk(value, &mut at, lines, &mut |at, inner, item| {
+            let Value::Object(object) = inner else {
+                return;
+            };
+            if asks_keys {
+                found.extend(object.keys().map(String::as_str));
+            }
+            if item && !output.each.is_empty() {
+                gather(&mut lists, at, object);
+            }
+            for (listed, place) in output.values.iter().zip(&mut places) {
+                if let Some(text) = object.get(listed.field.as_str()).and_then(scalar) {
+                    gather(place, at, (*line, text));
+                }
+            }
+        });
+    }
+    let mut problems = Vec::new();
+    // Anywhere in it, since the request may mean each item of a list or an
+    // object inside: a key missing everywhere is wrong whichever it meant,
+    // and so is one it names for each item of a list.
+    let mut missing: Vec<String> = Vec::new();
+    for key in output.keys.iter().chain(output.each.iter().flatten()) {
+        let named = format!("`{key}`");
+        if !found.contains(key.as_str()) && !missing.contains(&named) {
+            missing.push(named);
+        }
+    }
+    if !missing.is_empty() {
+        problems.push(format!(
+            "`{name}` lacks keys the request names: {}.",
+            missing.join(", ")
+        ));
+    }
+    for keys in &output.each {
+        let somewhere: Vec<&str> = (keys.iter())
+            .map(String::as_str)
+            .filter(|key| found.contains(key))
+            .collect();
+        problems.extend(each_item(name, &somewhere, &lists, lines));
+    }
+    for (listed, place) in output.values.iter().zip(places) {
+        problems.extend(unlisted(name, listed, place.into_values()));
+    }
+    problems
+}
+
+/// Adds `item` to the group `groups` keeps for `at`, keyed by a copy of it
+/// only the first time.
+fn gather<T>(groups: &mut BTreeMap<String, Vec<T>>, at: &str, item: T) {
+    match groups.get_mut(at) {
+        Some(group) => group.push(item),
+        None => {
+            groups.insert(at.to_owned(), vec![item]);
+        }
+    }
+}
+
+/// Calls `visit` with each value in `value`, where it is, as
+/// `orders[].lines[]` for the items of every order's `lines`, and
+/// whether it is an item of a list, as `value` is when `item`.
+fn walk<'a>(
+    value: &'a Value,
+    at: &mut String,
+    item: bool,
+    visit: &mut impl FnMut(&str, &'a Value, bool),
+) {
+    visit(at, value, item);
+    // One string grown and cut back as it goes in and out, since a large file
+    // holds a great many places.
+    let end = at.len();
     match value {
         Value::Object(map) => {
+            // An object of objects alone, as one keyed by name is, holds
+            // them as a list holds its items, all in one place.
+            let keyed = map.len() > 1 && map.values().all(Value::is_object);
             for (key, inner) in map {
-                found.insert(key);
-                keys_of(inner, found);
+                if end > 0 {
+                    at.push('.');
+                }
+                at.push_str(if keyed { "*" } else { key });
+                walk(inner, at, keyed, visit);
+                at.truncate(end);
             }
         }
-        Value::Array(items) => items.iter().for_each(|item| keys_of(item, found)),
+        Value::Array(items) => {
+            at.push_str("[]");
+            for inner in items {
+                walk(inner, at, true, visit);
+            }
+            at.truncate(end);
+        }
         _ => {}
     }
+}
+
+/// What is wrong with the items of `lists`, gathered by where each list is,
+/// against `keys` the request says each item holds: nothing when one list
+/// holding any of them has them all in every item, else what the list
+/// holding most of them lacks.
+fn each_item(
+    name: &str,
+    keys: &[&str],
+    lists: &BTreeMap<String, Vec<&Map<String, Value>>>,
+    lines: bool,
+) -> Option<String> {
+    let present = |list: &[&Map<String, Value>]| {
+        (keys.iter())
+            .filter(|key| list.iter().any(|item| item.contains_key(**key)))
+            .count()
+    };
+    // A list holding none of them is about something else, as is every list
+    // when the keys sit in one object of its own.
+    let mut candidates = lists
+        .iter()
+        .filter(|(_, list)| present(list) > 0)
+        .peekable();
+    candidates.peek()?;
+    let full = |list: &[&Map<String, Value>]| {
+        (list.iter()).all(|item| keys.iter().all(|key| item.contains_key(*key)))
+    };
+    if lists.values().any(|list| full(list)) {
+        return None;
+    }
+    // The list it most likely means: the one holding most of its keys, then
+    // the longest.
+    let (at, list) = candidates.max_by_key(|(_, list)| (present(list), list.len()))?;
+    let lacking: Vec<String> = keys
+        .iter()
+        .filter_map(|key| {
+            let count = list.iter().filter(|item| !item.contains_key(*key)).count();
+            (count > 0).then(|| format!("`{key}` (missing from {count})"))
+        })
+        .collect();
+    let count = list.len();
+    let (whole, of) = match at.strip_suffix("[]") {
+        Some(whole) => (whole, "items"),
+        None => (at.trim_end_matches(['*', '.']), "entries"),
+    };
+    let place = match whole {
+        "" if lines => format!("its {count} lines"),
+        "" => format!("its {count} {of}"),
+        whole => format!("the {count} {of} of `{whole}`"),
+    };
+    Some(format!(
+        "`{name}` lacks keys the request names for each item, in {place}: {}.",
+        lacking.join(", ")
+    ))
+}
+
+/// `value` as the word a request would list it by, or None for what no
+/// list of words names: null, a list or an object.
+fn scalar(value: &Value) -> Option<Cow<'_, str>> {
+    match value {
+        Value::String(text) => Some(Cow::Borrowed(text)),
+        Value::Number(number) => Some(Cow::Owned(number.to_string())),
+        Value::Bool(flag) => Some(Cow::Owned(flag.to_string())),
+        _ => None,
+    }
+}
+
+/// What is wrong with the values `listed.field` has in `name`, gathered by
+/// where each is, with its line where known: those the request does not
+/// list, unless one place holds listed ones alone, as the request may mean
+/// that place.
+fn unlisted(
+    name: &str,
+    listed: &Values,
+    places: impl IntoIterator<Item = Vec<(Option<usize>, impl AsRef<str>)>>,
+) -> Option<String> {
+    let mut wrong = Vec::new();
+    for place in places {
+        // An empty cell or string is a value left out, which a list of words
+        // does not forbid.
+        let filled: Vec<_> = place
+            .into_iter()
+            .filter(|(_, value)| !value.as_ref().trim().is_empty())
+            .collect();
+        if filled.is_empty() {
+            continue;
+        }
+        let before = wrong.len();
+        let unlisted = filled
+            .into_iter()
+            .filter(|(_, value)| !allows(listed, value.as_ref()));
+        wrong.extend(unlisted);
+        if wrong.len() == before {
+            return None;
+        }
+    }
+    let mut seen = HashSet::new();
+    let shown: Vec<String> = wrong
+        .iter()
+        .filter(|(_, value)| seen.insert(value.as_ref()))
+        .map(|(line, value)| {
+            let mut value = value
+                .as_ref()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if value.chars().count() > SHOWN {
+                value = value.chars().take(SHOWN).collect::<String>() + "...";
+            }
+            match line {
+                Some(line) => format!("`{value}` (line {line})"),
+                None => format!("`{value}`"),
+            }
+        })
+        .collect();
+    let more = match shown.len().saturating_sub(LINES) {
+        0 => String::new(),
+        more => format!(" and {more} more"),
+    };
+    let allowed: Vec<String> = listed
+        .allowed
+        .iter()
+        .map(|value| format!("`{value}`"))
+        .collect();
+    (!shown.is_empty()).then(|| {
+        format!(
+            "`{name}` has `{}` values the request does not list: {}{more}; it lists {}.",
+            listed.field,
+            shown[..shown.len().min(LINES)].join(", "),
+            allowed.join(", ")
+        )
+    })
+}
+
+/// Whether `listed` holds `value`: as written where it was quoted, in any
+/// case where it was a bare word, and as any number equal to it.
+fn allows(listed: &Values, value: &str) -> bool {
+    listed.allowed.iter().any(|allowed| {
+        allowed == value
+            || (!listed.quoted && allowed.eq_ignore_ascii_case(value))
+            || allowed
+                .parse::<f64>()
+                .is_ok_and(|number| value.parse::<f64>() == Ok(number))
+    })
 }
 
 /// `text` as JSON, with the bare NaN, Infinity and -Infinity that Python's
@@ -971,22 +1731,35 @@ fn zeroed(text: &str) -> String {
     out
 }
 
-/// What is wrong with JSON Lines file `name` holding `text`: its first lines
-/// that do not parse.
-fn json_lines(name: &str, text: &str) -> Vec<String> {
-    text.lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .filter_map(|(at, line)| {
-            let e = parsed(line).err()?;
-            Some(format!("`{name}` line {} is not valid JSON: {e}.", at + 1))
-        })
-        .take(LINES)
-        .collect()
+/// What is wrong with JSON Lines `output` holding `text`: its first lines
+/// that do not parse or, when all do, what they hold.
+fn json_lines(output: &Output, text: &str) -> Vec<String> {
+    let name = &output.path;
+    let (mut values, mut problems) = (Vec::new(), Vec::new());
+    for (at, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match parsed(line) {
+            Ok(value) => values.push((Some(at + 1), value)),
+            Err(e) => problems.push(format!("`{name}` line {} is not valid JSON: {e}.", at + 1)),
+        }
+        if problems.len() == LINES {
+            break;
+        }
+    }
+    // A line that will not parse may hold any key, so what the lines hold is
+    // looked at once they all do.
+    if !problems.is_empty() {
+        return problems;
+    }
+    held(output, &values)
 }
 
 /// What is wrong with CSV `output` holding `text`: a header other than the
-/// one asked for, and rows with more or fewer fields than the header.
+/// one asked for, columns missing or out of the order asked for, rows with
+/// more or fewer fields than the header, and values the request does not
+/// list.
 fn csv(output: &Output, text: &str) -> Vec<String> {
     let name = &output.path;
     let records = match records(text) {
@@ -1009,6 +1782,9 @@ fn csv(output: &Output, text: &str) -> Vec<String> {
             head.fields.join(",")
         ));
     }
+    if output.header.is_none() {
+        problems.extend(columns(output, &head.fields));
+    }
     let width = head.fields.len();
     let uneven = rows.iter().filter(|row| row.fields.len() != width);
     problems.extend(uneven.take(LINES).map(|row| {
@@ -1023,7 +1799,51 @@ fn csv(output: &Output, text: &str) -> Vec<String> {
             row.line
         )
     }));
+    for listed in &output.values {
+        let Some(at) = head.fields.iter().position(|field| *field == listed.field) else {
+            continue;
+        };
+        let cells = rows
+            .iter()
+            .filter_map(|row| Some((Some(row.line), row.fields.get(at)?.as_str())));
+        problems.extend(unlisted(name, listed, [cells.collect()]));
+    }
     problems
+}
+
+/// What is wrong with the header `head` of CSV `output` against the columns
+/// its request names in prose: one missing, or another order where it gives
+/// one.
+fn columns(output: &Output, head: &[String]) -> Option<String> {
+    let name = &output.path;
+    let quoted = |columns: Vec<&String>| {
+        let columns: Vec<String> = columns.iter().map(|column| format!("`{column}`")).collect();
+        columns.join(", ")
+    };
+    let missing: Vec<&String> = (output.columns.iter())
+        .filter(|column| !head.contains(column))
+        .collect();
+    if !missing.is_empty() {
+        let missing = quoted(missing);
+        return Some(format!(
+            "`{name}` lacks columns the request names: {missing}."
+        ));
+    }
+    let at: Vec<usize> = (output.columns.iter())
+        .filter_map(|column| head.iter().position(|field| field == column))
+        .collect();
+    if !output.ordered || at.is_sorted() {
+        return None;
+    }
+    let found = quoted(
+        head.iter()
+            .filter(|field| output.columns.contains(field))
+            .collect(),
+    );
+    let given = quoted(output.columns.iter().collect());
+    Some(format!(
+        "`{name}` has the columns the request names in the order {found} where it gives {given}."
+    ))
 }
 
 /// What is wrong with `name`, which should be a `what`: a zip holding `part`.
@@ -1518,5 +2338,202 @@ mod tests {
         assert_eq!(headers, [Some("id,name"), Some("x,y"), None, None]);
         assert_eq!(contract.outputs[2].keys, ["id", "name"]);
         assert_eq!(contract.outputs[3].keys, ["x", "y"]);
+    }
+
+    #[test]
+    fn the_values_a_field_must_be_one_of_are_read_however_the_request_lists_them() {
+        let request = "Write out/a.json.\n\
+                       - `decision` must be one of `accept`, `reject`, or `hold_for_review`.\n\
+                       - status must be one of: open, closed, stale.\n\
+                       - `kind` should be exactly `unit` or `integration`.\n\
+                       - level: one of low, high\n\
+                       - The tier column can only be either gold or silver.\n\
+                       - size ∈ { small, large }.\n\
+                       - `label` must be exactly one of:\n  - `spam`\n  - `ham`\n\
+                       - `team` must be one of the following:\n  `ops`, `dev`\n\
+                       - `mode` is `fast` or `slow`.\n\
+                       - 'tone' must be one of calm, firm.";
+        let contract = from_request(request, Path::new("/workspace"));
+        let read: Vec<(&str, Vec<&str>, bool)> = contract.outputs[0]
+            .values
+            .iter()
+            .map(|values| {
+                let allowed = values.allowed.iter().map(String::as_str).collect();
+                (values.field.as_str(), allowed, values.quoted)
+            })
+            .collect();
+        assert_eq!(
+            read,
+            [
+                (
+                    "decision",
+                    vec!["accept", "reject", "hold_for_review"],
+                    true
+                ),
+                ("status", vec!["open", "closed", "stale"], false),
+                ("kind", vec!["unit", "integration"], true),
+                ("level", vec!["low", "high"], false),
+                ("tier", vec!["gold", "silver"], false),
+                ("size", vec!["small", "large"], false),
+                ("label", vec!["spam", "ham"], true),
+                ("team", vec!["ops", "dev"], true),
+                ("mode", vec!["fast", "slow"], true),
+                ("tone", vec!["calm", "firm"], false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_value_the_request_does_not_list_for_a_field_is_reported() {
+        let request = "Write out/ledger.csv with columns id,status and out/runs.jsonl.\n\
+                       - In ledger.csv, `status` must be one of `matched`, `unmatched` or `duplicate`.\n\
+                       - In runs.jsonl, verdict must be one of pass, fail.";
+        let ledger = b"id,status\n1,matched\n2,reconciled\n3,\n4,pending\n5,reconciled\n";
+        let runs = b"{\"verdict\": \"pass\"}\n{\"verdict\": \"PASS\"}\n{\"verdict\": \"passed\"}\n";
+        let problems = checked(
+            request,
+            &[("out/ledger.csv", ledger), ("out/runs.jsonl", runs)],
+        );
+        assert_eq!(
+            problems,
+            [
+                "`out/ledger.csv` has `status` values the request does not list: `reconciled` (line 3), `pending` (line 5); it lists `matched`, `unmatched`, `duplicate`.",
+                "`out/runs.jsonl` has `verdict` values the request does not list: `passed` (line 3); it lists `pass`, `fail`.",
+            ]
+        );
+    }
+
+    #[test]
+    fn values_given_as_examples_or_for_some_rows_only_are_not_held_to() {
+        let request = "Write out/a.csv with columns id,status,notes,reason,mode.\n\
+                       - Use a short status word, e.g. `ok`, `late` or `missing`.\n\
+                       - `status` must be one of `ok`, `late`, etc.\n\
+                       - `status` must be one of the codes listed above.\n\
+                       - If the row is late, `status` must be one of `late` or `lost`.\n\
+                       - For rejected rows, `reason` must be one of `a`, `b`.\n\
+                       - `notes` must be short, factual or blank.\n\
+                       - `mode` is fast or slow.\n\
+                       - `status` must not be one of `x`, `y`.\n\
+                       - `status` should be one of `ok`, `late` (or a word you choose).\n\
+                       - For late rows:\n  - `reason` must be one of `traffic`, `weather`.\n\
+                       For late rows:\n\
+                       - `reason` must be one of `traffic`, `weather`.";
+        let contract = from_request(request, Path::new("/workspace"));
+        assert_eq!(contract.outputs[0].values, []);
+    }
+
+    #[test]
+    fn values_or_keys_given_for_a_file_only_read_bind_no_output() {
+        let request = "Write out/summary.csv and out/summary.json.\n\
+                       Read in/orders.csv, whose `status` is one of `paid` or `void`.\n\
+                       The input `kind` column is one of `a`, `b`.\n\
+                       In in/items.json each item has keys: sku, qty.";
+        let contract = from_request(request, Path::new("/workspace"));
+        assert_eq!(paths(&contract), ["out/summary.csv", "out/summary.json"]);
+        assert!(
+            (contract.outputs.iter())
+                .all(|output| output.values.is_empty() && output.each.is_empty())
+        );
+    }
+
+    #[test]
+    fn listed_values_in_another_case_left_empty_or_in_another_place_pass() {
+        let request = "Write out/a.csv and out/b.json.\n\
+                       - In a.csv, status must be one of pass, fail.\n\
+                       - In a.csv, `score` must be one of 1, 2 or 3.\n\
+                       - In b.json, `status` must be one of `pass` or `fail`.\n\
+                       - In b.json, `grade` must be one of `x`, `y`.";
+        let csv = b"id,status,score\n1,Pass,2\n2,FAIL,3.0\n3,,1\n";
+        // The run's own status is no result's, and `grade` is not there.
+        let json =
+            br#"{"status": "complete", "results": [{"status": "pass"}, {"status": "fail"}]}"#;
+        let problems = checked(request, &[("out/a.csv", csv), ("out/b.json", json)]);
+        assert_eq!(problems, Vec::<String>::new());
+    }
+
+    #[test]
+    fn keys_named_for_each_item_must_be_in_every_item_of_the_list() {
+        let request = "Write out/meetings.json, an object with a `meetings` array. \
+                       Each meeting must include: start, end, room.\n\
+                       Write out/events.jsonl; each line has keys: ts, kind.\n\
+                       Write out/log.jsonl with keys: at, what.\n\
+                       Write out/orders.json with key `orders`.\n\
+                       - Each order must include `order_id` and `lines`.\n\
+                       - Each line item must include `sku` and `qty`.";
+        // As the run wrote them: the shared key once at the top, not in
+        // each item.
+        let meetings =
+            br#"{"room": "B2", "meetings": [{"start": 1, "end": 2}, {"start": 3, "end": 4}]}"#;
+        let events = b"{\"ts\": 1, \"kind\": \"a\"}\n{\"ts\": 2}\n{\"ts\": 3, \"kind\": \"b\"}\n";
+        let log = b"{\"at\": 1}\n{\"at\": 2}\n";
+        let orders = br#"{"orders": [
+            {"order_id": 1, "lines": [{"sku": "a", "qty": 1}]},
+            {"order_id": 2, "lines": [{"sku": "c"}]}
+        ]}"#;
+        let problems = checked(
+            request,
+            &[
+                ("out/meetings.json", meetings),
+                ("out/events.jsonl", events),
+                ("out/log.jsonl", log),
+                ("out/orders.json", orders),
+            ],
+        );
+        assert_eq!(
+            problems,
+            [
+                "`out/meetings.json` lacks keys the request names for each item, in the 2 items of `meetings`: `room` (missing from 2).",
+                "`out/events.jsonl` lacks keys the request names for each item, in its 3 lines: `kind` (missing from 1).",
+                "`out/log.jsonl` lacks keys the request names: `what`.",
+                "`out/orders.json` lacks keys the request names for each item, in the 2 items of `orders[].lines`: `qty` (missing from 1).",
+            ]
+        );
+    }
+
+    #[test]
+    fn keys_named_for_each_item_ask_nothing_of_lists_that_hold_none_of_them() {
+        let request = "Write out/one.json, out/keyed.json and out/mixed.json.\n\
+                       - In one.json, each finding must include id, severity.\n\
+                       - In keyed.json, each value must contain total, owner.\n\
+                       - In mixed.json, each finding must include `id` and `severity`.\n\
+                       - In mixed.json, each item may include `note`.\n\
+                       - In mixed.json, each ticket's `tags` include `urgent`.";
+        let one = br#"{"id": "F1", "severity": "high", "notes": [{"text": "x"}]}"#;
+        let keyed =
+            br#"{"A": {"total": 1, "owner": 2, "rows": [{"n": 1}]}, "B": {"total": 3, "owner": 4}}"#;
+        let mixed = br#"{"run": [{"id": 1}], "findings": [{"id": 2, "severity": "low"}]}"#;
+        let problems = checked(
+            request,
+            &[
+                ("out/one.json", one),
+                ("out/keyed.json", keyed),
+                ("out/mixed.json", mixed),
+            ],
+        );
+        assert_eq!(problems, Vec::<String>::new());
+        let contract = from_request(request, Path::new("/workspace"));
+        assert_eq!(contract.outputs[2].each, [["id", "severity"]]);
+    }
+
+    #[test]
+    fn columns_named_in_prose_must_be_there_and_in_the_order_asked_for() {
+        let request = "Write out/a.csv with columns, in this order: `id`, `name`, `total`.\n\
+                       Write out/b.csv with columns `region`, `amount` and `notes` (optional).\n\
+                       Write out/c.csv. Its header must include: id, owner, status";
+        let problems = checked(
+            request,
+            &[
+                ("out/a.csv", b"id,total,name\n1,2,x\n"),
+                ("out/b.csv", b"amount,region,extra\n1,north,y\n"),
+                ("out/c.csv", b"status,id,state\n1,2,3\n"),
+            ],
+        );
+        assert_eq!(
+            problems,
+            [
+                "`out/a.csv` has the columns the request names in the order `id`, `total`, `name` where it gives `id`, `name`, `total`.",
+                "`out/c.csv` lacks columns the request names: `owner`.",
+            ]
+        );
     }
 }
