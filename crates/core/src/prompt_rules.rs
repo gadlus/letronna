@@ -45,6 +45,9 @@ enum To {
     OnScreen,
     /// Where the reads and searches of one reply run at once.
     Parallel,
+    /// Where the system message speaks of `exit_plan`: plan mode outside a
+    /// chat app.
+    Plan,
 }
 
 impl To {
@@ -56,7 +59,15 @@ impl To {
             To::Unwatched => !watched(connection),
             To::OnScreen => connection.human && connection.remote.is_none(),
             To::Parallel => crate::store::parallel_tool_calls(),
+            To::Plan => crate::tools::offers_plan(connection),
         }
+    }
+
+    /// Whether a run over `connection` carries the rule in any request, its
+    /// helpers' included: its explore and plan helpers are in plan mode
+    /// whatever the run is.
+    fn reaches_run(self, connection: &Connection) -> bool {
+        self == To::Plan || self.reaches(connection)
     }
 
     /// Whether a run nobody watches can carry the rule, and so be measured
@@ -226,8 +237,27 @@ pub(crate) const PROJECT: [Rule; 1] = [Rule {
     text: "Changes in the project you did not make are the user's: work with them. Unless asked, never revert or discard them (git checkout --, git restore, git reset --hard), commit, or rewrite git history; never commit secrets.",
 }];
 
+/// The rules a helper's first message gives after the tools it may use, and
+/// a fork's after the report it owes: it shares its parent's system message,
+/// which speaks of asking the user, of memory and, in plan mode, of
+/// `exit_plan`, none of which a helper may use.
+// Not "nobody can answer": the user and its parent can still write to it,
+// and its calls that need a yes still reach the user.
+pub(crate) const HELPER: [Rule; 2] = [
+    Rule {
+        id: "helper-limits",
+        to: To::Every,
+        text: "You cannot ask the user anything or use the memory tool: decide, and say what you assumed.",
+    },
+    Rule {
+        id: "helper-plan",
+        to: To::Plan,
+        text: "Write your plan in your answer, not through exit_plan.",
+    },
+];
+
 /// Every table of rules, for finding a row by its id.
-const TABLES: [&[Rule]; 3] = [&PROSE, &TOOLS, &PROJECT];
+const TABLES: [&[Rule]; 4] = [&PROSE, &TOOLS, &PROJECT, &HELPER];
 
 /// Every row of every table.
 fn all() -> impl Iterator<Item = &'static Rule> {
@@ -312,11 +342,12 @@ fn parse(given: &str) -> Result<Vec<&'static str>, String> {
         .collect())
 }
 
-/// What a request over `connection` is told of these rules, as a `-p` run
-/// reports it: the ids left out of it and a hash of the rows it carries.
+/// What a run over `connection` is told of these rules, its helpers
+/// included, as a `-p` run reports it: the ids left out of it and a hash of
+/// the rows it carries.
 // Over the rows, not the whole system message, which changes with the
-// folder and the date on every run; and only those that reach this
-// connection, so rows for another kind of session do not move it.
+// folder and the date on every run; and only those that reach this run,
+// so rows for another kind of session do not move it.
 pub fn seen(connection: &Connection) -> Result<Value, String> {
     check()?;
     Ok(seen_without(connection, drops()))
@@ -324,9 +355,10 @@ pub fn seen(connection: &Connection) -> Result<Value, String> {
 
 /// `seen`, with `dropped` as the ids the variable names.
 fn seen_without(connection: &Connection, dropped: &[&str]) -> Value {
-    let reaching = || all().filter(|rule| rule.to.reaches(connection));
+    let reaching = || all().filter(|rule| rule.to.reaches_run(connection));
+    // As `carries` has it, for a row the run's own requests may not carry.
     let left: Vec<&str> = reaching()
-        .filter(|rule| !carries(connection, rule, dropped))
+        .filter(|rule| !watched(connection) && dropped.contains(&rule.id))
         .map(|rule| rule.id)
         .collect();
     let mut hash = digest::Context::new(&digest::SHA256);
@@ -495,6 +527,20 @@ mod tests {
         assert_eq!(watched["dropped"], json!([]));
         assert_eq!(watched, seen_without(&window(), &[]));
         assert_ne!(watched["rules_sha"], all_told["rules_sha"]);
+    }
+
+    #[test]
+    fn a_run_not_in_plan_mode_reports_the_plan_row_its_helpers_leave_out() {
+        // Its explore and plan helpers are in plan mode all the same.
+        let planning = Connection {
+            plan: true,
+            ..headless()
+        };
+        assert!(tells(&planning, "helper-plan"));
+        assert!(!tells(&headless(), "helper-plan"));
+        let report = seen_without(&headless(), &["helper-plan"]);
+        assert_eq!(report["dropped"], json!(["helper-plan"]));
+        assert_ne!(report, seen_without(&headless(), &[]));
     }
 
     #[test]

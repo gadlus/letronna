@@ -515,6 +515,11 @@ impl Run {
             ..self.connection.clone()
         };
         let tools = usable(&connection, &def);
+        // One given a schema answers through structured_output, which the
+        // driver offers it beside these.
+        let named: Vec<String> = (tools.iter().cloned())
+            .chain((asked.schema.is_some()).then(|| driver::STRUCTURED_OUTPUT.to_owned()))
+            .collect();
         self.transcripts += 1;
         let transcript = Transcript {
             path: self
@@ -526,7 +531,7 @@ impl Run {
                 title: label.clone(),
                 updated: chat::now(),
                 workspace: self.connection.workspace.clone(),
-                messages: vec![task(&def, &tools, &self.request, &prompt)],
+                messages: vec![task(&connection, &def, &named, &self.request, &prompt)],
                 ..Default::default()
             },
         };
@@ -1052,17 +1057,27 @@ fn usable(connection: &Connection, def: &AgentDef) -> Vec<String> {
         .iter()
         .filter_map(|spec| spec["function"]["name"].as_str())
         .filter(|name| {
-            def.allows(name) && !driver::DENY.contains(name) && !NOT_FOR_AGENTS.contains(name)
+            def.allows(name)
+                && !driver::DENY.contains(name)
+                && !NOT_FOR_AGENTS.contains(name)
+                && *name != tools::EXIT_PLAN
         })
         .map(str::to_owned)
         .collect()
 }
 
-/// A workflow agent's first message: the user's `request` when the run
-/// relays one, what it is, what it may use and who reads its answer, then its
-/// task. The request and the task are indented, so no line of either reads as
-/// the start of a header or of something else the user said.
-fn task(def: &AgentDef, tools: &[String], request: &str, prompt: &str) -> Message {
+/// A workflow agent's first message over `connection`: the user's `request`
+/// when the run relays one, what it is, what it may use and who reads its
+/// answer, then its task. The request and the task are indented, so no line
+/// of either reads as the start of a header or of something else the user
+/// said.
+fn task(
+    connection: &Connection,
+    def: &AgentDef,
+    tools: &[String],
+    request: &str,
+    prompt: &str,
+) -> Message {
     let about = format!("You are a helper ({}). {}", def.name, def.prompt);
     let tools = if tools.is_empty() {
         "none".to_owned()
@@ -1075,10 +1090,12 @@ fn task(def: &AgentDef, tools: &[String], request: &str, prompt: &str) -> Messag
         let request = chat::trim(request, REQUEST);
         format!("{REQUEST_HEADER}\n{}\n", indented(&request))
     };
+    let rules = crate::prompt_rules::told(connection, &crate::prompt_rules::HELPER);
     Message {
         role: "user".into(),
         content: format!(
-            "{relayed}{TASK_HEADER}\n{}\nTools you may use: {tools}.\n{LAST_WORD}\nTask:\n{}",
+            "{relayed}{TASK_HEADER}\n{}\nTools you may use: {tools}. Any other tool is \
+             refused.{rules}\n{LAST_WORD}\nTask:\n{}",
             about.trim_end(),
             indented(prompt)
         ),
@@ -1296,6 +1313,38 @@ mod tests {
             .filter(|line| line["type"] == kind)
             .map(|line| line["key"].as_str().unwrap().to_owned())
             .collect()
+    }
+
+    #[test]
+    fn a_workflow_agent_is_told_it_cannot_ask_the_user() {
+        // Watched, so no rule a run nobody watches may drop is left out.
+        let agent = Connection {
+            tools: true,
+            human: true,
+            ..Default::default()
+        };
+        let first = task(
+            &agent,
+            &AgentDef::default(),
+            &["read_file".into()],
+            "",
+            "Look.",
+        )
+        .content;
+        assert!(
+            first.contains(
+                "Tools you may use: read_file. Any other tool is refused. You cannot ask the user \
+                 anything or use the memory tool: decide, and say what you assumed.\n"
+            ),
+            "{first}"
+        );
+        assert!(!first.contains("exit_plan"), "{first}");
+        let planning = Connection {
+            plan: true,
+            ..agent
+        };
+        let first = task(&planning, &AgentDef::default(), &[], "", "Look.").content;
+        assert!(first.contains("not through exit_plan"), "{first}");
     }
 
     #[test]

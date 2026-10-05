@@ -995,6 +995,11 @@ fn refused(spec: &Spec, name: &str) -> Option<String> {
         if name == "memory" && remembers(spec) {
             return None;
         }
+        // A helper's plan goes in its report: nobody can approve one from
+        // it, and approving it would end no plan mode.
+        if spec.depth > 0 && name == tools::EXIT_PLAN {
+            return Some(format!("`{name}` is not available to this helper."));
+        }
         return refusal(&spec.allow, name);
     }
     // It may remember things as a chat may, but has nobody to ask and no
@@ -4722,6 +4727,16 @@ pub(crate) mod tests {
         spec.depth = 1;
         let why = refused(&spec, "schedule");
         assert!(why.is_some_and(|why| why.contains("not available to this helper")));
+    }
+
+    #[test]
+    fn exit_plan_is_refused_to_a_helper_and_left_to_a_run_of_its_own() {
+        let dir = scratch("exit-plan-helper");
+        let mut spec = spec(String::new(), &dir, AGENTS + 385);
+        let why = refused(&spec, tools::EXIT_PLAN);
+        assert!(why.is_some_and(|why| why.contains("not available to this helper")));
+        spec.depth = 0;
+        assert_eq!(refused(&spec, tools::EXIT_PLAN), None);
     }
 
     #[test]
