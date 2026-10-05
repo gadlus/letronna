@@ -23,6 +23,8 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Schedules in a mode of their own, memory you can review and edit, and a window that uses far less memory and processor while it works or sits idle.
 
 ### Added
+- **All** — A cloud run that makes a page gives a private live link to it, served with nothing running; `letronna cloud relay on` has the cloud answer your Telegram chat while this computer is off; `letronna cloud support <run> on` lets support read a run, and each look is logged.
+- **Web** — Cloud admin at letronna.ai/dashboard/admin, signed in with your account: the pool, running work, usage and the audit log.
 - **All** — The agent picks where to build what you ask: one self-contained page, chart or small app as a file you preview first, then the project on this computer, and Letronna Cloud only when this computer cannot (with your yes, as it spends credit).
 - **App** — Enter and Escape answer a card from the composer after a send; Tab moves past each switch once and Space turns it; Cmd+Q quits Letronna on macOS from anywhere in the window.
 - **All** — Letronna Cloud (Pro): `letronna cloud "task"` in the terminal and `/cloud <task>` in the window run a task on Letronna's servers, in a repository you name or none, and bring the answer back; a thread carries the work on, asleep on the server between messages. Billed from your credit.
@@ -146,6 +148,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Questions name a recommended answer, and the terminal takes free-form ones.
 - **All** — Recurring tasks and notifications use Letronna's own schedules and chat apps first, with your yes.
 ### Changed
+- **All** — A cloud run uses its own short-lived token that only reaches the models, never your sign-in.
 - **All** — A failed model request says what went wrong: the key, credit, a rate limit, a busy provider, a conversation too long, and so on.
 - **All** — OpenAI's reasoning models work, and a server that turns down a field is sent the request again without it.
 - **All** — The context window counts tool calls, pictures and Chinese, Japanese and Korean text, so long conversations are trimmed where they should be.
