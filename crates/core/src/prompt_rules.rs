@@ -53,6 +53,9 @@ enum To {
     /// Where replies print in the interactive terminal, which someone at
     /// this computer watches.
     Terminal,
+    /// Where someone can say yes to a schedule: a watched session that has
+    /// the `schedule` tool once plan mode is off.
+    Schedules,
 }
 
 impl To {
@@ -67,6 +70,7 @@ impl To {
             To::NotClaude => not_claude(connection),
             To::Terminal => connection.plain_terminal,
             To::Plan => crate::tools::offers_plan(connection),
+            To::Schedules => watched(connection) && crate::tools::offers_schedule(connection),
         }
     }
 
@@ -84,7 +88,10 @@ impl To {
     /// Whether a run nobody watches can carry the rule, and so be measured
     /// without it.
     fn droppable(self) -> bool {
-        !matches!(self, To::Watched | To::OnScreen | To::Plan | To::Terminal)
+        !matches!(
+            self,
+            To::Watched | To::OnScreen | To::Plan | To::Terminal | To::Schedules
+        )
     }
 }
 
@@ -114,9 +121,10 @@ pub(crate) const PROSE: [Rule; 1] = [Rule {
 /// The rules after what the tools are for, in order: what to leave alone;
 /// how calls are approved or, in a run nobody watches, what it is told in
 /// place of approvals and `ask_user`, neither of which it has; then checking
-/// the work, making calls, ending a turn, where facts come from and the
-/// steps to ask about first.
-pub(crate) const TOOLS: [Rule; 21] = [
+/// the work, making calls, ending a turn, where facts come from, what a
+/// recurring task or a notification is built with and the steps to ask about
+/// first.
+pub(crate) const TOOLS: [Rule; 22] = [
     // Undoing what the user changed is the git rule's. New files and tests
     // are not forbidden, as checks and required outputs need them.
     Rule {
@@ -242,6 +250,14 @@ pub(crate) const TOOLS: [Rule; 21] = [
         to: To::NotClaude,
         text: "Take file contents, git state, versions and other facts that change from a tool, not from what you recall.",
     },
+    // A scheduled run's answer goes to the chat apps set up, so a daily
+    // message needs no scheduler, webhook or key of its own. What the user
+    // names stays theirs to name.
+    Rule {
+        id: "schedules",
+        to: To::Schedules,
+        text: "For a recurring task or a notification, use Letronna's own schedules and chat apps before the operating system's scheduler (Task Scheduler, cron, launchd) or webhooks and keys found in environment variables, unless the user asks for those.",
+    },
     // Where the user turned the card off, by Bypass, a grant for the tool or
     // a rule, nothing else stops a push or a message. Asking here, in the
     // project's instructions or through a skill counts, so a task that names
@@ -325,7 +341,7 @@ pub(crate) const HELPER: [Rule; 2] = [
     Rule {
         id: "helper-limits",
         to: To::Every,
-        text: "You cannot ask the user anything or use the memory tool: decide, and say what you assumed.",
+        text: "You cannot ask the user anything or use the memory or schedule tools: decide, and say what you assumed.",
     },
     Rule {
         id: "helper-plan",
@@ -697,6 +713,77 @@ mod tests {
             assert!(!tells(&connection, "facts"), "{model}");
             assert!(!told(&connection, &TOOLS).contains("from a tool, not from what you recall"));
         }
+    }
+
+    /// A private chat with the owner, answered through a chat app.
+    fn chat_app(shared: bool) -> Connection {
+        Connection {
+            remote: Some(Remote {
+                place: "a Telegram chat".into(),
+                shared,
+                ..Default::default()
+            }),
+            ..window()
+        }
+    }
+
+    #[test]
+    fn the_schedules_row_reaches_only_a_session_that_can_add_a_schedule() {
+        let _turn = settings_held();
+        let dir = crate::store::tests::Scratch::new("rules-schedules");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        assert!(tells(&window(), "schedules"));
+        assert!(tells(&chat_app(false), "schedules"));
+        let terminal = Connection {
+            plain_terminal: true,
+            ..window()
+        };
+        assert!(tells(&terminal, "schedules"));
+        // A shared chat is offered no tool of this computer, a `-p` run has
+        // nobody to say yes, and a gateway without tools has none to call.
+        assert!(!tells(&chat_app(true), "schedules"));
+        assert!(!tells(&headless(), "schedules"));
+        let toolless = Connection {
+            tools: false,
+            ..window()
+        };
+        assert!(!tells(&toolless, "schedules"));
+        // Plan mode holds the tool back only until a plan is approved, and
+        // a plan may be to add a schedule.
+        let planning = Connection {
+            plan: true,
+            ..window()
+        };
+        assert!(tells(&planning, "schedules"));
+        // Nor where the user switched the tool off.
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"endpoint": "", "model": "m", "disabled_tools": ["schedule"]}"#,
+        )
+        .unwrap();
+        assert!(!tells(&window(), "schedules"));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn the_schedules_row_comes_before_the_steps_to_ask_about_and_cannot_be_dropped() {
+        let _turn = settings_held();
+        let dir = crate::store::tests::Scratch::new("rules-schedules-order");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let told = told_without(&window(), &TOOLS, &[]);
+        let unwatched = told_without(&headless(), &TOOLS, &[]);
+        let row = " For a recurring task or a notification, use Letronna's own schedules and chat apps before the operating system's scheduler (Task Scheduler, cron, launchd) or webhooks and keys found in environment variables, unless the user asks for those.";
+        let at = told.find(row).expect("the window is told the row");
+        assert!(told[at..].contains(" Before a step that changes something outside"));
+        assert!(!unwatched.contains("Task Scheduler"), "{unwatched}");
+        // Only a watched session is told it, so no run nobody watches is
+        // measured without it.
+        let rule = all().find(|rule| rule.id == "schedules").unwrap();
+        assert!(!rule.to.droppable());
+        assert!(parse("-schedules").is_err());
+        assert!(To::Schedules.reaches_run(&window()));
+        assert!(!To::Schedules.reaches_run(&headless()));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
     #[test]

@@ -731,9 +731,7 @@ pub(crate) fn specs_of(
     // A scheduled run's own turn that nobody answers is told so by the
     // system prompt, whether the driver or the window runs it, so its array
     // leaves out what the run would be refused.
-    let scheduled = !connection.human
-        && connection.remote.is_none()
-        && crate::schedule::running(connection.conversation).is_some();
+    let scheduled = scheduled_turn(connection);
     let planning = connection.plan && !keeps_tools(connection);
     let plan = offers_plan(connection);
     tools
@@ -749,6 +747,28 @@ pub(crate) fn specs_of(
         .filter(|t| t.suits(&connection.model))
         .map(|t| spec(t.as_ref()))
         .collect()
+}
+
+/// Whether `connection` is a scheduled run's own turn, which nobody answers.
+fn scheduled_turn(connection: &Connection) -> bool {
+    !connection.human
+        && connection.remote.is_none()
+        && crate::schedule::running(connection.conversation).is_some()
+}
+
+/// Whether the `schedule` tool is in the `tools` array over `connection`
+/// once plan mode, which holds it back only until a plan is approved, is off.
+// Repeats the filters of `specs_of` for this one tool, so that what the system
+// prompt says of schedules is never about a tool the array leaves out: it is
+// left out in a chat others read, in a scheduled run's own turn and where the
+// user switched it off. Plan mode is not one, as the prompt would then change
+// with each switch of it, and a plan may well be to add a schedule.
+pub(crate) fn offers_schedule(connection: &Connection) -> bool {
+    let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
+    connection.tools
+        && !shared
+        && !scheduled_turn(connection)
+        && !switched_off("schedule", &turned_off())
 }
 
 /// Every tool the user switched off: those the settings' `disabled_tools`
@@ -7016,6 +7036,109 @@ mod tests {
         .iter()
         .map(|t| t["function"]["name"].as_str().unwrap().to_owned())
         .collect()
+    }
+
+    #[test]
+    fn the_prompt_speaks_of_schedules_only_where_the_array_offers_the_tool() {
+        use crate::chat::Remote;
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = Scratch::new("offers-schedule");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let window = Connection {
+            tools: true,
+            human: true,
+            ..Default::default()
+        };
+        let chat = |shared| Connection {
+            remote: Some(Remote {
+                place: "a Telegram chat".into(),
+                shared,
+                history: None,
+            }),
+            ..window.clone()
+        };
+        let job = crate::schedule::Schedule {
+            id: 1,
+            name: "Daily".into(),
+            prompt: "Say hello.".into(),
+            workspace: None,
+            trigger: crate::schedule::Trigger::Every { minutes: 60 },
+            enabled: true,
+            last_run: 0,
+            mode: crate::gate::Mode::Default,
+            by_model: false,
+            quiet: false,
+            check: None,
+        };
+        let session = 9_700_001;
+        let _listed = crate::schedule::Listed::new(session, &job);
+        let planning = Connection {
+            plan: true,
+            ..window.clone()
+        };
+        let cases = [
+            ("a window", window.clone(), true),
+            (
+                "a print run",
+                Connection {
+                    human: false,
+                    ..window.clone()
+                },
+                true,
+            ),
+            ("a chat with its owner", chat(false), true),
+            ("a chat others read", chat(true), false),
+            (
+                "a scheduled run's own turn",
+                Connection {
+                    human: false,
+                    conversation: session,
+                    ..window.clone()
+                },
+                false,
+            ),
+        ];
+        let listed = |connection: &Connection| {
+            specs(connection)
+                .iter()
+                .any(|spec| spec["function"]["name"] == "schedule")
+        };
+        for (what, connection, offered) in &cases {
+            assert_eq!(listed(connection), *offered, "{what}: the array");
+            assert_eq!(offers_schedule(connection), *offered, "{what}: the prompt");
+        }
+        // Plan mode holds the tool back only until a plan is approved, so the
+        // prompt keeps speaking of it, and does not change with each switch.
+        assert!(!listed(&planning));
+        assert!(offers_schedule(&planning));
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"endpoint": "", "model": "m", "plan_keeps_tools": true}"#,
+        )
+        .unwrap();
+        assert!(listed(&planning));
+        assert!(offers_schedule(&planning));
+        // No tools go out at all on a gateway without them.
+        let toolless = Connection {
+            tools: false,
+            ..window.clone()
+        };
+        assert!(!offers_schedule(&toolless));
+        // The user's own switch takes it from both.
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"endpoint": "", "model": "m", "disabled_tools": ["schedule"]}"#,
+        )
+        .unwrap();
+        assert!(!offers_schedule(&window));
+        assert!(
+            !specs(&window)
+                .iter()
+                .any(|s| s["function"]["name"] == "schedule")
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
     #[test]

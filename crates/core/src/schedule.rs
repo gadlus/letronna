@@ -1522,7 +1522,7 @@ impl Tool for Scheduler {
         "schedule"
     }
     fn description(&self) -> &'static str {
-        "Run a prompt later on this computer, each time in a fresh session with nobody there to answer: every N minutes, daily at a time, or once at a date and time or in N minutes. Also lists the schedules and removes one you added. Adding or removing waits for the user's yes."
+        "Run a prompt later on this computer, each time in a fresh session with nobody there to answer: every N minutes, daily at a time, or once at a date and time or in N minutes. When a run ends, its final answer is posted to the chat apps the user has connected, so to have something sent there regularly, schedule the prompt that writes it; runs happen only while Letronna's window, an open terminal or `letronna serve` is running. Also lists the schedules and removes one you added. Adding or removing waits for the user's yes."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
