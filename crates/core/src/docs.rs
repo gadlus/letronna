@@ -135,6 +135,155 @@ pub(crate) fn plain(path: &Path) -> Option<&'static str> {
     })
 }
 
+/// What a file in OLE's format, as Office saved documents before 2007,
+/// starts with.
+const OLE: &[u8] = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1";
+
+/// A file read_file names rather than shows: an Office file from before
+/// 2007, whose binary format it has no reader for, or a rich text file,
+/// whose markup would bury its words.
+pub(crate) struct Older {
+    /// What it is, such as "a Word 97-2003 document".
+    about: &'static str,
+    /// The kind LibreOffice converts it to, such as "docx".
+    newer: &'static str,
+    /// Whether macOS's own textutil reads it as well.
+    textutil: bool,
+}
+
+/// What the file at `path` is when it is such a file: by its name, and by
+/// its first bytes, which tell it from text merely named so and from a
+/// newer file's zip renamed.
+pub(crate) fn older(path: &Path) -> Option<Older> {
+    let extension = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    let word = matches!(extension.as_str(), "doc" | "dot");
+    let (about, newer, textutil) = match extension.as_str() {
+        _ if word => ("a Word 97-2003 document", "docx", true),
+        "xls" | "xlt" => ("an Excel 97-2003 workbook", "xlsx", false),
+        "ppt" | "pot" | "pps" => ("a PowerPoint 97-2003 presentation", "pptx", false),
+        "rtf" => ("a rich text (RTF) document", "docx", true),
+        _ => return None,
+    };
+    let mut start = [0; 1024];
+    let read_in = File::open(path)
+        .and_then(|mut file| file.read(&mut start))
+        .ok()?;
+    let start = &start[..read_in];
+    // Rich text is text, so it is told by how it starts; Word saves it
+    // under .doc as well.
+    if start.starts_with(b"{\\rtf") && (word || extension == "rtf") {
+        return Some(Older {
+            about: "a rich text (RTF) document",
+            newer: "docx",
+            textutil: true,
+        });
+    }
+    let binary = start.starts_with(OLE) || (start.contains(&0) && !start.starts_with(b"PK"));
+    (binary && extension != "rtf").then_some(Older {
+        about,
+        newer,
+        textutil,
+    })
+}
+
+/// What read_file and search say of `raw`, the file `older` describes: what
+/// it is, and the command that makes a file they read of it.
+pub(crate) fn convert(raw: &str, older: &Older) -> String {
+    convert_with(raw, older, libreoffice())
+}
+
+/// The message `convert` gives, with LibreOffice's command line when it is
+/// installed.
+fn convert_with(raw: &str, older: &Older, soffice: Option<String>) -> String {
+    let Older {
+        about,
+        newer,
+        textutil,
+    } = older;
+    let folder = Path::new(raw)
+        .parent()
+        .map(|folder| folder.to_string_lossy())
+        .filter(|folder| !folder.is_empty())
+        .unwrap_or(".".into());
+    let command = |program: &str| {
+        format!(
+            "`{program} --headless --convert-to {newer} --outdir {} {}`",
+            quoted(&folder),
+            quoted(raw)
+        )
+    };
+    let start = format!("`{raw}` is {about}, which read_file cannot read.");
+    match soffice {
+        Some(program) => format!(
+            "{start} LibreOffice is installed: {} writes a .{newer} beside it to read instead.",
+            command(&program)
+        ),
+        None => {
+            let mac = match textutil {
+                true => format!(
+                    " On macOS, `textutil -convert {newer} {}` does too.",
+                    quoted(raw)
+                ),
+                false => String::new(),
+            };
+            format!(
+                "{start} Convert it to .{newer} and read that: LibreOffice does it with {} once \
+                 installed.{mac}",
+                command("soffice")
+            )
+        }
+    }
+}
+
+/// LibreOffice's command line, on PATH or where its installer puts it.
+fn libreoffice() -> Option<String> {
+    if let Some(name) = ["soffice", "libreoffice"]
+        .into_iter()
+        .find(|name| crate::files::on_path(name).is_some())
+    {
+        return Some(name.to_owned());
+    }
+    let usual: Vec<PathBuf> = if cfg!(windows) {
+        ["ProgramFiles", "ProgramFiles(x86)"]
+            .iter()
+            .filter_map(std::env::var_os)
+            .map(|folder| PathBuf::from(folder).join(r"LibreOffice\program\soffice.exe"))
+            .collect()
+    } else if cfg!(target_os = "macos") {
+        vec![PathBuf::from(
+            "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        )]
+    } else {
+        Vec::new()
+    };
+    let found = usual.into_iter().find(|path| path.is_file())?;
+    let found = quoted(&found.to_string_lossy());
+    // PowerShell, which runs commands on Windows, runs a quoted path only
+    // after `&`.
+    Some(match cfg!(windows) && found.starts_with('\'') {
+        true => format!("& {found}"),
+        false => found,
+    })
+}
+
+/// `text` as one word on a command line: in single quotes, which sh and
+/// PowerShell both take as they are, when it has anything beyond letters,
+/// digits and the `._/-\:` of a path.
+fn quoted(text: &str) -> String {
+    let plain = text
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._/-\\:".contains(c));
+    if plain && !text.is_empty() {
+        return text.to_owned();
+    }
+    // A quote inside is ended and escaped in sh, and doubled in PowerShell.
+    let inside = match cfg!(windows) {
+        true => text.replace('\'', "''"),
+        false => text.replace('\'', r"'\''"),
+    };
+    format!("'{inside}'")
+}
+
 /// The view of the document at `path`; None for a file not named as one,
 /// or not a zip or a PDF as one is, which is read as any other file.
 pub(crate) fn view(path: &Path) -> Result<Option<String>, String> {
@@ -1949,6 +2098,91 @@ pub(crate) mod tests {
         );
         // Only the spaces the lines were split at are gone.
         assert_eq!(lines.concat().replace("word", "").len(), 450 - 2);
+    }
+
+    #[test]
+    fn old_office_and_rtf_files_are_told_by_their_first_bytes_as_well_as_their_names() {
+        let dir = std::env::temp_dir().join(format!("letronna-older-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ole = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1\0\0";
+        let about = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            older(&path).map(|older| (older.about, older.newer))
+        };
+        let word = Some(("a Word 97-2003 document", "docx"));
+        let rtf = Some(("a rich text (RTF) document", "docx"));
+        assert_eq!(about("memo.DOC", ole), word);
+        assert_eq!(about("memo.dot", b"\x31\xBE\0\0 Word 2"), word);
+        assert_eq!(
+            about("pay.xls", ole),
+            Some(("an Excel 97-2003 workbook", "xlsx"))
+        );
+        assert_eq!(
+            about("show.pps", ole),
+            Some(("a PowerPoint 97-2003 presentation", "pptx"))
+        );
+        assert_eq!(about("letter.rtf", br"{\rtf1\ansi Dear\par}"), rtf);
+        // Word saves rich text under .doc too.
+        assert_eq!(about("saved.doc", br"{\rtf1 Hi}"), rtf);
+        // Text, an empty file, a newer file's zip renamed, or a file with no
+        // name of the kind, is none of them.
+        assert_eq!(about("notes.doc", b"Just words"), None);
+        assert_eq!(about("empty.xls", b""), None);
+        assert_eq!(about("renamed.doc", &tests::docx("<w:p/>")), None);
+        assert_eq!(about("notes.rtf", b"plain"), None);
+        assert_eq!(about("binary.rtf", b"\0\0"), None);
+        assert_eq!(about("memo.docx", ole), None);
+        assert_eq!(about("memo", ole), None);
+        assert!(older(&dir.join("missing.doc")).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_old_file_is_named_with_the_command_that_converts_it() {
+        let word = Older {
+            about: "a Word 97-2003 document",
+            newer: "docx",
+            textutil: true,
+        };
+        assert_eq!(
+            convert_with("letters/memo 1.doc", &word, Some("soffice".into())),
+            "`letters/memo 1.doc` is a Word 97-2003 document, which read_file cannot read. \
+             LibreOffice is installed: `soffice --headless --convert-to docx --outdir letters \
+             'letters/memo 1.doc'` writes a .docx beside it to read instead."
+        );
+        // What sh would expand stays as it is.
+        let unix = if cfg!(windows) {
+            "'it''s $HOME.doc'"
+        } else {
+            r"'it'\''s $HOME.doc'"
+        };
+        assert!(
+            convert_with("it's $HOME.doc", &word, None).contains(&format!("--outdir . {unix}`")),
+            "{unix}"
+        );
+        assert_eq!(
+            convert_with("memo.doc", &word, None),
+            "`memo.doc` is a Word 97-2003 document, which read_file cannot read. Convert it to \
+             .docx and read that: LibreOffice does it with `soffice --headless --convert-to docx \
+             --outdir . memo.doc` once installed. On macOS, `textutil -convert docx memo.doc` \
+             does too."
+        );
+        let sheet = Older {
+            about: "an Excel 97-2003 workbook",
+            newer: "xlsx",
+            textutil: false,
+        };
+        // The program as found where Windows installs it, run by PowerShell.
+        let windows = r"& 'C:\Program Files\LibreOffice\program\soffice.exe'";
+        assert_eq!(
+            convert_with("work/pay.xls", &sheet, Some(windows.into())),
+            format!(
+                "`work/pay.xls` is an Excel 97-2003 workbook, which read_file cannot read. \
+                 LibreOffice is installed: `{windows} --headless --convert-to xlsx --outdir work \
+                 work/pay.xls` writes a .xlsx beside it to read instead."
+            )
+        );
     }
 
     #[test]

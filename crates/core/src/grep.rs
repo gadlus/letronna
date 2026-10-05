@@ -11,7 +11,9 @@
 //! one takes far longer than a text file, so a plain search passes them by
 //! and says how many it passed. A match in one shows the heading of the
 //! page, sheet or slide it is on, and the lines are fenced, being someone
-//! else's words as a page of one read is.
+//! else's words as a page of one read is. Office files from before 2007 and
+//! rich text files are not read, and are counted, as read_file says how to
+//! convert them.
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::OverrideBuilder;
@@ -206,6 +208,8 @@ struct Walked {
     documents: usize,
     /// PDF and Office files that could not be read.
     unread: usize,
+    /// Office files from before 2007 and rich text files passed by.
+    older: usize,
 }
 
 /// Runs `query` until `deadline` or `files` files, and renders the page;
@@ -339,6 +343,18 @@ fn render(query: &Query, page: Page, note: Option<String>) -> Result<String, Str
         out.push_str(&format!(
             "\n… {files} not searched; name them with type or glob."
         ));
+    }
+    if walked.older > 0 {
+        let files = match walked.older {
+            1 => "1 file in an old Office format or RTF was not searched; read_file says how \
+                  to convert it"
+                .to_owned(),
+            n => format!(
+                "{n} files in old Office formats or RTF were not searched; read_file says how \
+                 to convert them"
+            ),
+        };
+        out.push_str(&format!("\n… {files}."));
     }
     if walked.unread > 0 {
         out.push_str(&format!(
@@ -489,15 +505,17 @@ fn find(
         (_, None) => return Err("Pattern is empty.".into()),
     }
     (page.walked.documents, page.walked.unread) = (passed.documents, passed.unread);
+    page.walked.older = passed.older;
     Ok(page)
 }
 
-/// The PDF and Office files a pass went by: those nothing named, and those
-/// it could not read.
+/// The PDF and Office files a pass went by: those nothing named, those it
+/// could not read, and those in a format from before 2007 or RTF.
 #[derive(Default)]
 struct Passed {
     documents: usize,
     unread: usize,
+    older: usize,
 }
 
 /// What of a file a search reads.
@@ -515,6 +533,11 @@ enum Content {
 /// documents, else the file's text, counting in `passed` what it goes by.
 fn content(entry: &DirEntry, query: &Query, deadline: Instant, passed: &mut Passed) -> Content {
     let path = entry.path();
+    // Its bytes or markup would match where its words do not.
+    if crate::docs::older(path).is_some() {
+        passed.older += 1;
+        return Content::Passed;
+    }
     if crate::docs::named(path) {
         if !query.documents {
             passed.documents += 1;
@@ -1242,6 +1265,47 @@ mod tests {
                 .lines()
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn a_search_counts_old_office_and_rtf_files_and_names_one_searched_alone() {
+        let dir = tree(
+            "older",
+            &[
+                ("notes.txt", "budget for May"),
+                ("letter.rtf", r"{\rtf1\ansi budget\par}"),
+                // Text merely named as an old file is searched as text.
+                ("plain.doc", "budget as plain text"),
+            ],
+        );
+        std::fs::write(
+            dir.join("old.xls"),
+            b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1\0budget",
+        )
+        .unwrap();
+        assert_eq!(
+            run(&dir, json!({"pattern": "budget"})),
+            "notes.txt\n  1: budget for May\nplain.doc\n  1: budget as plain text\n\
+             … 2 files in old Office formats or RTF were not searched; read_file says how to \
+             convert them."
+        );
+        assert_eq!(
+            run(&dir, json!({"pattern": "budget", "glob": "*.rtf"})),
+            "No matches.\n… 1 file in an old Office format or RTF was not searched; read_file \
+             says how to convert it."
+        );
+        let ctx = crate::tools::ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let alone = crate::tools::run("search", r#"{"pattern":"budget","path":"old.xls"}"#, &ctx)
+            .unwrap_err();
+        assert!(
+            alone.starts_with(
+                "`old.xls` is an Excel 97-2003 workbook, which read_file cannot read."
+            ) && alone.contains("--convert-to xlsx --outdir . old.xls`"),
+            "{alone}"
         );
     }
 
