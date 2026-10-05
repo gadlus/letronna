@@ -295,6 +295,15 @@ mod kernel {
         let hold = move || {
             // Its own session leaves it without a terminal, whose keys it
             // could otherwise push into the shell that started Letronna.
+            // `run_shell_into` has made it lead a group by now, so that it
+            // can stop all the command starts, and setsid refuses a group's
+            // leader: it goes back to its parent's group first. The group
+            // of the session it then leads has the same id, so that stop
+            // still reaches it all.
+            let leads = unsafe { libc::getpgrp() == libc::getpid() };
+            if leads && unsafe { libc::setpgid(0, libc::getpgid(libc::getppid())) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             if unsafe { libc::setsid() } == -1 {
                 return Err(std::io::Error::last_os_error());
             }

@@ -4381,6 +4381,36 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The same on Linux, where the sandbox starts the command in a session
+    /// of its own although `run_shell_into` has put it in a group.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_sandboxed_command_runs_confined_on_linux_and_says_so() {
+        // A kernel without Landlock, or a container that turns it off.
+        if !crate::sandbox::available() {
+            return;
+        }
+        let dir = Scratch::new("tools-sandboxed-linux");
+        // Linux's sandbox makes nothing directly in the project folder.
+        std::fs::create_dir(dir.join("src")).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.to_path_buf()),
+            sandboxed: true,
+            ..Default::default()
+        };
+        let out = run(
+            "run_command",
+            r#"{"command":"echo hi > src/sandboxed.txt"}"#,
+            &ctx,
+        )
+        .unwrap();
+        assert!(out.starts_with(crate::sandbox::NOTE), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/sandboxed.txt")).unwrap(),
+            "hi\n"
+        );
+    }
+
     #[test]
     fn a_multibyte_character_split_across_reads_survives() {
         // The é (0xC3 0xA9) comes in two reads, as it can from a pipe; the
