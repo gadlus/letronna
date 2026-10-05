@@ -987,11 +987,18 @@ pub(crate) fn body(
     body_with(connection, window, summary, plan, &Budget::SMALL, &[])
 }
 
-/// Who Letronna is, then the reply style `style` when there is one.
-fn identity(style: Option<String>) -> String {
+/// Who Letronna is and how it writes, as told over `connection`, then the
+/// reply style `style` when there is one.
+fn identity(connection: &Connection, style: Option<String>) -> String {
     // The user's SOUL.md, when there is one, says who Letronna is instead.
     let mut system = crate::memory::soul().unwrap_or_else(|| {
-        String::from("You are Letronna, a personal assistant. Be clear, concise, and honest.")
+        let mut own =
+            String::from("You are Letronna, a personal assistant. Be clear, concise, and honest.");
+        own.push_str(&crate::prompt_rules::told(
+            connection,
+            &crate::prompt_rules::PROSE,
+        ));
+        own
     });
     // Right after who Letronna is, since a tone colours all that follows;
     // choosing another moves the cached prefix, which a pick rarely does.
@@ -1121,7 +1128,7 @@ fn system_prompt(
             remembered: end..end,
         };
     }
-    let mut system = identity(crate::styles::chosen());
+    let mut system = identity(connection, crate::styles::chosen());
     let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
     if connection.tools && !shared {
         // A chat app is not the terminal or the window, and /resume means
@@ -4416,6 +4423,28 @@ mod tests {
         assert!(!plain.contains("summarized"));
     }
     #[test]
+    fn replies_are_told_to_lead_with_the_answer_unless_a_soul_md_says_who_letronna_is() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("soul-prose");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let lead = "Lead with the answer or the result, in plain words.";
+        let own = system_with_tools(connection());
+        assert!(
+            own.starts_with(&format!(
+                "You are Letronna, a personal assistant. Be clear, concise, and honest. {lead}"
+            )),
+            "{own}"
+        );
+        std::fs::write(dir.join("SOUL.md"), "You are a ship's cook.").unwrap();
+        let soul = system_with_tools(connection());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert!(soul.starts_with("You are a ship's cook."), "{soul}");
+        assert!(!soul.contains(lead), "{soul}");
+        assert!(!soul.contains("'If you want, I can"), "{soul}");
+    }
+    #[test]
     fn the_chosen_style_follows_right_after_who_letronna_is() {
         let _turn = crate::store::tests::DATA_DIR
             .lock()
@@ -4426,10 +4455,10 @@ mod tests {
         unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
         // Handed the text rather than saved, since tests running beside this
         // one read the same settings file and compare their prompts.
-        let styled = identity(Some("Say arr.".into()));
+        let styled = identity(&connection(), Some("Say arr.".into()));
         assert!(
             styled.ends_with(
-                "Be clear, concise, and honest.\n\nWrite your replies in this style:\nSay arr.\n\n"
+                "'If you want, I can…' close.\n\nWrite your replies in this style:\nSay arr.\n\n"
             ),
             "{styled}"
         );

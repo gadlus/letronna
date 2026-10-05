@@ -72,6 +72,17 @@ fn watched(connection: &Connection) -> bool {
     connection.human || connection.remote.is_some()
 }
 
+/// The rules right after who Letronna is, which a SOUL.md replaces along
+/// with it and a chosen style follows and can override.
+// No list of banned words: Letronna runs many models, and naming a word can
+// plant it. Only contrasts nobody raised go, as "in A, not B" is plain
+// engineering; a specific next step stays welcome.
+pub(crate) const PROSE: [Rule; 1] = [Rule {
+    id: "prose",
+    to: To::Every,
+    text: "Lead with the answer or the result, in plain words. Do not restate the request, praise the question or your own plan, or contrast your answer with an alternative nobody raised. Skip filler such as 'Great question'. Suggest a next step only when it is specific, never as a generic 'If you want, I can…' close.",
+}];
+
 /// The rules after what the tools are for, in order: what to leave alone;
 /// how calls are approved or, in a run nobody watches, what it is told in
 /// place of approvals and `ask_user`, neither of which it has; then checking
@@ -216,7 +227,7 @@ pub(crate) const PROJECT: [Rule; 1] = [Rule {
 }];
 
 /// Every table of rules, for finding a row by its id.
-const TABLES: [&[Rule]; 2] = [&TOOLS, &PROJECT];
+const TABLES: [&[Rule]; 3] = [&PROSE, &TOOLS, &PROJECT];
 
 /// Every row of every table.
 fn all() -> impl Iterator<Item = &'static Rule> {
