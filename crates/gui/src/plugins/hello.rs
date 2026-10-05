@@ -103,7 +103,7 @@ impl Plugin for Hello {
                         )
                         .child(
                             div().flex_shrink_0().cursor_pointer().child(
-                                gpui_component::switch::Switch::new("hello-log")
+                                crate::ui::settings::KeyedSwitch::new("hello-log")
                                     .checked(logging)
                                     .on_click(move |_, _, cx| {
                                         let now = !log.load(Ordering::Relaxed);
