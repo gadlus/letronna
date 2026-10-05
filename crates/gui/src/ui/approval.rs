@@ -33,6 +33,9 @@ pub(crate) struct CardFor {
     /// Where a memory save may be kept, where it goes now first; empty for
     /// any other call.
     places: Vec<Scope>,
+    /// Letronna's own folder, where the call works when the session has no
+    /// project folder; `None` when it has one, or has no such folder.
+    fallback: Option<PathBuf>,
 }
 
 impl CardFor {
@@ -49,6 +52,7 @@ impl CardFor {
                 "memory" => memory::places(ctx),
                 _ => Vec::new(),
             },
+            fallback: ctx.workspace.clone().filter(|_| ctx.fallback),
         }
     }
 
@@ -243,7 +247,7 @@ impl Chat {
     /// a permission card in sight for the session on screen, with the keys
     /// on the card or in an empty composer, and nothing open that Escape
     /// closes first. Enter does not answer a card asking for a project
-    /// folder, which has no Allow.
+    /// folder with no folder of Letronna's own to offer, which has no Allow.
     fn keys_answer(&self, enter: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let here = self.store.conversations[self.store.active].id;
         let open = self.settings_open
@@ -269,7 +273,10 @@ impl Chat {
         if call.name == tools::ASK_USER || call.name == tools::EXIT_PLAN {
             return false;
         }
-        if enter && asks_for_folder(&call.name, self.card_folder().is_some()) {
+        let own_folder = (self.card_for.as_ref())
+            .filter(|shown| shown.is_for(&call))
+            .is_some_and(|shown| shown.fallback.is_some());
+        if enter && asks_for_folder(&call.name, self.card_folder().is_some()) && !own_folder {
             return false;
         }
         // Enter on a button of the card presses that button instead.
@@ -556,6 +563,10 @@ impl Chat {
             other => format!("Letronna wants to use {other}"),
         };
         let folder = self.card_folder();
+        // With no project folder, a command or a write can still work in
+        // Letronna's own, which the card says before it is allowed.
+        let own_folder =
+            (shown.fallback.as_ref()).filter(|_| asks_for_folder(&call.name, folder.is_some()));
         // Enter and Escape answer while the keys are on the card or in an
         // empty composer, and say so on the buttons they press.
         let keyed = self.question_focus.is_focused(window) || self.composer_idle(window, cx);
@@ -608,6 +619,49 @@ impl Chat {
                         .on_click(cx.listener(|this, _, window, cx| this.deny_call(window, cx))),
                 );
             v_flex().gap_2().child(keep).child(refuse)
+        } else if own_folder.is_some() {
+            // Wraps, so a narrow window keeps every answer in sight.
+            h_flex()
+                .gap_2()
+                .items_center()
+                .flex_wrap()
+                .child(
+                    Button::new("allow")
+                        .primary()
+                        .small()
+                        .label(own_folder_words(&call.name))
+                        .children(hint("enter"))
+                        .on_click(cx.listener(|this, _, window, cx| this.allow_call(window, cx))),
+                )
+                .children(shown.for_session.then(|| {
+                    Button::new("allow-session")
+                        .framed(cx)
+                        .small()
+                        .label("Allow for this session")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.take_reason(window, cx);
+                            this.keys_back(false, window, cx);
+                            this.resolve_call(Verdict::Allow { remember: true }, cx)
+                        }))
+                }))
+                .child(
+                    Button::new("approval-folder")
+                        .framed(cx)
+                        .small()
+                        .icon(Icon::new(AppIcon::Folder))
+                        .label("Choose a project folder")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.attach_workspace(window, cx)),
+                        ),
+                )
+                .child(
+                    Button::new("deny")
+                        .plain(cx)
+                        .small()
+                        .label("Deny")
+                        .children(hint("escape"))
+                        .on_click(cx.listener(|this, _, window, cx| this.deny_call(window, cx))),
+                )
         } else if asks_for_folder(&call.name, folder.is_some()) {
             h_flex()
                 .gap_2()
@@ -737,6 +791,15 @@ impl Chat {
                             )
                         },
                     )
+                    // Wrapped rather than cut, so the whole path is there to read.
+                    .when_some(own_folder, |this, own| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(own_folder_note(&call.name, own)),
+                        )
+                    })
                     // Why Auto mode's judge left it to the user.
                     .when_some(self.why.clone(), |this, why| {
                         this.child(
@@ -905,6 +968,29 @@ fn asks_for_folder(name: &str, has_folder: bool) -> bool {
     !has_folder && matches!(name, "run_command" | "write_file" | "edit_file")
 }
 
+/// The button that lets a call of `name` work in Letronna's own folder.
+fn own_folder_words(name: &str) -> &'static str {
+    match name {
+        "write_file" => "Save in Letronna's folder",
+        "edit_file" => "Edit in Letronna's folder",
+        _ => "Run in Letronna's folder",
+    }
+}
+
+/// What a card says about a call of `name` working in `folder`, Letronna's
+/// own, for want of a project folder.
+fn own_folder_note(name: &str, folder: &std::path::Path) -> String {
+    let what = match name {
+        "write_file" => "the file is saved",
+        "edit_file" => "the file is edited",
+        _ => "this runs",
+    };
+    format!(
+        "No project folder is attached, so {what} in Letronna's own folder: {}",
+        folder.display()
+    )
+}
+
 /// The place of the card coming up in `reply` after the card `before`, with
 /// `behind` of the reply's calls still to come that will wait on the user.
 fn place(reply: (u64, usize), before: Option<Place>, behind: usize) -> Place {
@@ -1019,7 +1105,12 @@ fn permission(
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{CardKey, Press, asks_for_folder, option_letter, options_in, place, pressed};
+    use super::{
+        CardFor, CardKey, Press, asks_for_folder, option_letter, options_in, own_folder_note,
+        own_folder_words, place, pressed,
+    };
+    use letronna_core::tools::ToolContext;
+    use std::path::PathBuf;
 
     #[test]
     fn a_question_offers_its_answers_in_order_each_under_a_letter() {
@@ -1071,5 +1162,30 @@ mod tests {
         assert!(asks_for_folder("edit_file", false));
         assert!(!asks_for_folder("run_command", true));
         assert!(!asks_for_folder("search_web", false));
+    }
+
+    #[test]
+    fn a_command_with_no_project_folder_is_offered_letronnas_own() {
+        let call = letronna_core::chat::ToolCall {
+            id: "1".into(),
+            name: "run_command".into(),
+            arguments: r#"{"command":"ls"}"#.into(),
+        };
+        let own = PathBuf::from("/home/me/Letronna");
+        let mut ctx = ToolContext::default();
+        ctx.workspace = Some(own.clone());
+        ctx.fallback = true;
+        assert_eq!(CardFor::of(&call, &ctx).fallback, Some(own.clone()));
+        // A folder the user attached is the project, not Letronna's own.
+        ctx.fallback = false;
+        assert_eq!(CardFor::of(&call, &ctx).fallback, None);
+        assert_eq!(own_folder_words("run_command"), "Run in Letronna's folder");
+        assert_eq!(own_folder_words("write_file"), "Save in Letronna's folder");
+        assert_eq!(
+            own_folder_note("run_command", &own),
+            "No project folder is attached, so this runs in Letronna's own folder: \
+             /home/me/Letronna"
+        );
+        assert!(own_folder_note("edit_file", &own).contains("the file is edited in"));
     }
 }
