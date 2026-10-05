@@ -83,11 +83,17 @@ raw-window-handle = "0.6"
 objc = "0.2"
 # The completion handlers the user notification centre takes.
 block = "0.1"
+# Already in the tree via gpui: the window server's picture of the window,
+# which the modal backdrop blurs.
+core-graphics = "0.24"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # KSNI speaks StatusNotifierItem over D-Bus on a worker thread, so there is no
 # GTK main loop to reconcile with gpui's, and no appindicator/libxdo to install.
 tray-icon = { version = "0.25", default-features = false, features = ["ksni"] }
+# Already in the tree via gpui: reading the window back for the modal
+# backdrop, over a connection of our own.
+x11rb = "0.13"
 
 [build-dependencies]
 embed-resource = "3"

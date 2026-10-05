@@ -51,9 +51,9 @@ Or download or build it and run it.
 
 On **Windows**, first launch copies the executable to `%LOCALAPPDATA%\Programs\Letronna`, adds a Start Menu entry so it shows up in Windows search, and registers in Apps & features. Newer builds re-register on launch. Uninstall from Apps & features, or run `Letronna.exe --uninstall`.
 
-On **Linux**, first launch copies the binary to `~/.local/bin/letronna` and writes `~/.local/share/applications/letronna.desktop`, so it appears in the application menu. Uninstall with `letronna --uninstall`. The tray icon uses StatusNotifierItem over D-Bus, which needs a panel that supports it (KDE does; GNOME needs an extension such as AppIndicator Support). There is no backdrop blur behind dialogs, and closing the window minimises rather than hiding to the tray.
+On **Linux**, first launch copies the binary to `~/.local/bin/letronna` and writes `~/.local/share/applications/letronna.desktop`, so it appears in the application menu. Uninstall with `letronna --uninstall`. The tray icon uses StatusNotifierItem over D-Bus, which needs a panel that supports it (KDE does; GNOME needs an extension such as AppIndicator Support). Dialogs get the backdrop blur on X11 but not on Wayland, and closing the window minimises rather than hiding to the tray.
 
-On **macOS** the app runs in place: no install, no tray, no blur. `scripts/bundle-macos.sh` wraps the release binary in `target/Letronna.app`, which macOS needs before it will show a Dock icon and the right name; drag it wherever you like. It does not register itself, so `--uninstall` has nothing to do and a second launch opens a second window.
+On **macOS** the app runs in place: no install, no tray, and no backdrop blur from macOS 26 on. `scripts/bundle-macos.sh` wraps the release binary in `target/Letronna.app`, which macOS needs before it will show a Dock icon and the right name; drag it wherever you like. It does not register itself, so `--uninstall` has nothing to do and a second launch opens a second window.
 
 | | Windows | Linux | macOS |
 |---|---|---|---|
@@ -61,7 +61,7 @@ On **macOS** the app runs in place: no install, no tray, no blur. `scripts/bundl
 | Install / uninstall | yes | yes | no |
 | Single instance | yes, focuses the open window | yes, second launch exits | no |
 | Tray icon | yes, themed menu | yes, native menu | no |
-| Backdrop blur | yes | no | no |
+| Backdrop blur | yes | X11 only | up to macOS 15 |
 
 If Discord is running, Letronna shows a rich presence (Idle, or Chatting with the model). Set `LETRONNA_DISCORD_APP_ID` to your own Discord application id, and upload a `letronna` art asset to it, for the icon to appear.
 

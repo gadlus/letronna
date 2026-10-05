@@ -3817,6 +3817,7 @@ dependencies = [
  "async-channel 2.5.0",
  "block",
  "chrono",
+ "core-graphics 0.24.0",
  "cpal",
  "discord-rich-presence",
  "embed-resource",
@@ -3844,6 +3845,7 @@ dependencies = [
  "tree-sitter-yaml",
  "windows 0.61.3",
  "windows-sys 0.59.0",
+ "x11rb",
 ]
 
 [[package]]
