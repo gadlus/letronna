@@ -10053,17 +10053,32 @@ mod tests {
 
     #[test]
     fn a_request_no_window_can_hold_is_refused_before_it_is_sent() {
+        // The window is sized from the prompt the request carries, not a
+        // fixed number, so a longer system prompt or tool list does not
+        // leave the short message below with no room.
+        let model = "reads-just-the-prompt";
+        let fixed = fixed_tokens(&Connection {
+            model: model.into(),
+            ..connection()
+        });
+        // Room for a short message but far less than the long one below.
+        let window = fixed + 50;
         // The first request teaches a window smaller than the newest message.
-        let (endpoint, worker) = serve(vec![(
-            "400 Bad Request",
-            "application/json",
-            r#"{"error":{"code":400,"message":"the request exceeds the available context size, try increasing it","type":"exceed_context_size_error","n_prompt_tokens":520,"n_ctx":300}}"#,
-        )]);
+        let reply: &'static str = Box::leak(
+            format!(
+                r#"{{"error":{{"code":400,"message":"the request exceeds the available context size, try increasing it","type":"exceed_context_size_error","n_prompt_tokens":{},"n_ctx":{window}}}}}"#,
+                window + 220
+            )
+            .into_boxed_str(),
+        );
+        let (endpoint, worker) = serve(vec![("400 Bad Request", "application/json", reply)]);
         let c = Connection {
             endpoint,
-            model: "reads-300".into(),
+            model: model.into(),
             ..connection()
         };
+        // The endpoint must not change the prompt, or the window above is off.
+        assert_eq!(fixed_tokens(&c), fixed);
         let long = vec![Message {
             role: "user".into(),
             content: "word ".repeat(400),
