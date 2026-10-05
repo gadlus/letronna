@@ -15,6 +15,8 @@ Run a task in Letronna Cloud, on Letronna's servers (Pro)
   letronna cloud stop <run>            stop it
   letronna cloud support <run> on|off  let Letronna's support read its task and
                                        answer, or take that back
+  letronna cloud relay on|off          have the cloud answer your Telegram bot
+                                       while this computer is off
 
 Options
       --repo <https-url>     a git repository to work in, cloned first
@@ -47,6 +49,13 @@ pub fn run(words: &[String]) -> i32 {
             println!("Stopped {id}.");
             Ok(())
         }),
+        Some("relay") => match words.get(1).map(String::as_str) {
+            Some("on") => cloud::relay(true).map(|()| {
+                println!("Letronna Cloud now answers your Telegram chat whenever this computer has been off for three minutes.");
+            }),
+            Some("off") => cloud::relay(false).map(|()| println!("The cloud no longer answers your Telegram chat.")),
+            _ => Err("Say on or off: letronna cloud relay on".into()),
+        },
         Some("support") => match &words[1..] {
             [id, on] if on == "on" || on == "off" => cloud::support(id, on == "on").map(|()| {
                 if on == "on" {

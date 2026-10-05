@@ -139,6 +139,37 @@ pub fn support(id: &str, allow: bool) -> Result<(), String> {
     .map(drop)
 }
 
+/// Have Letronna Cloud answer the paired Telegram bot while this computer is
+/// off, or stop; the setting is kept with the chat apps' own.
+pub fn relay(on: bool) -> Result<(), String> {
+    let mut config = crate::messaging::load();
+    if on {
+        let telegram = &config.telegram;
+        let chat = telegram
+            .chat
+            .filter(|_| !telegram.token.trim().is_empty())
+            .ok_or("Set up Telegram and pair a chat first, in Messaging.")?;
+        send(
+            client()?
+                .post(url("/v1/relay/telegram"))
+                .json(&serde_json::json!({
+                    "token": telegram.token.trim(),
+                    "chat": chat,
+                    "owner": telegram.owner.unwrap_or(0),
+                })),
+        )?;
+    } else {
+        send(client()?.post(url("/v1/relay/off")))?;
+    }
+    config.telegram.cloud = on;
+    crate::messaging::save(&config)
+}
+
+/// Tell Letronna Cloud this computer is up and listening to its chat apps.
+pub fn heartbeat() -> Result<(), String> {
+    send(client()?.post(url("/v1/relay/heartbeat"))).map(drop)
+}
+
 /// Stop a run, queued or running.
 pub fn stop(id: &str) -> Result<(), String> {
     send(client()?.post(url(&format!("/v1/runs/{id}/stop")))).map(drop)

@@ -104,6 +104,10 @@ pub struct Telegram {
     /// approval card has no one to ask on the other end.
     #[serde(default)]
     pub allow_tools: bool,
+    /// Letronna Cloud answers this bot while this computer is off; set by
+    /// `letronna cloud relay on`.
+    #[serde(default)]
+    pub cloud: bool,
 }
 
 impl Telegram {
@@ -1138,7 +1142,16 @@ pub fn poll(
         let Some(client) = client() else { return };
         let api = api();
         let mut offset: Option<u64> = None;
+        let mut said_up: Option<std::time::Instant> = None;
         while !stop.load(Ordering::Relaxed) {
+            // Up and listening: Letronna Cloud leaves the bot alone while
+            // this is said once a minute.
+            if said_up.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(60)) {
+                said_up = Some(std::time::Instant::now());
+                if load().telegram.cloud {
+                    let _ = crate::cloud::heartbeat();
+                }
+            }
             let mut request = client
                 .get(format!("{api}/bot{}/getUpdates", token.trim()))
                 .query(&[("timeout", POLL_SECONDS.to_string())])
