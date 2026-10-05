@@ -247,6 +247,11 @@ pub const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// a slow build or a full test suite, and what runs longer belongs in the
 /// background, where it does not hold the turn up.
 const MAX_COMMAND_SECS: u64 = 1800;
+/// How long `wait` pauses when the call gives no time.
+const WAIT_SECS: u64 = 10;
+/// The longest one `wait` call pauses; a longer one asked for is cut to
+/// this, as the `seconds` parameter says.
+const MAX_WAIT_SECS: u64 = 120;
 /// How much of a file one read shows, in bytes, which is never more
 /// characters: under the chat's cap on a tool result with room for the
 /// footer, so a page reaches the model whole instead of losing its middle.
@@ -3002,11 +3007,11 @@ impl Tool for StopJob {
         "stop_job"
     }
     fn description(&self) -> &'static str {
-        "Stop a background job."
+        "Stop a background job, killing the processes it started if it still runs. No exit notice follows; read_job still shows its log for a while."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
-            "id": {"type": "integer"}
+            "id": {"type": "integer", "description": "The job's number, from list_jobs or the call that started it."}
         }, "required": ["id"]})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
@@ -3312,13 +3317,16 @@ impl Tool for Wait {
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
-            "seconds": {"type": "number", "description": "How long to wait. Also the limit when waiting for output."},
+            "seconds": {"type": "number", "description": format!("How long to wait, {WAIT_SECS} unless given and {MAX_WAIT_SECS} at most. Also the limit when waiting for output.")},
             "job": {"type": "integer", "description": "Wait for this job to print `until`, or to exit."},
             "until": {"type": "string", "description": "Text to watch for in what the job prints from now on, such as `ready` or `listening`."}
         }})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
-        let seconds = args["seconds"].as_f64().unwrap_or(10.).clamp(0., 120.);
+        let seconds = args["seconds"]
+            .as_f64()
+            .unwrap_or(WAIT_SECS as f64)
+            .clamp(0., MAX_WAIT_SECS as f64);
         let limit = std::time::Duration::from_secs_f64(seconds);
         let Some(id) = args["job"].as_u64() else {
             if !ctx.cancel.sleep(limit) {
@@ -4148,11 +4156,11 @@ impl Tool for ListDir {
         true
     }
     fn description(&self) -> &'static str {
-        "List the entries of a folder. Folders end with a slash."
+        "List one folder's entries, one a line, not what its subfolders hold. Folders end with a slash. To find files by name across the tree, use search with mode files and a glob."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
-            "path": {"type": "string", "description": "Defaults to the workspace root."}
+            "path": {"type": "string", "description": "The folder, relative to the workspace; the workspace root if left out."}
         }})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
@@ -7820,5 +7828,25 @@ mod tests {
             std::fs::read_to_string(folder.join("made.txt")).unwrap(),
             "hi\n"
         );
+    }
+
+    #[test]
+    fn the_wait_description_states_the_limits_the_pause_applies() {
+        let spec = Wait.parameters();
+        let seconds = spec["properties"]["seconds"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            seconds.contains(&format!("{WAIT_SECS} unless given")),
+            "{seconds}"
+        );
+        assert!(
+            seconds.contains(&format!("{MAX_WAIT_SECS} at most")),
+            "{seconds}"
+        );
+        let out = Wait
+            .run(&json!({"seconds": -5}), &ToolContext::default())
+            .unwrap();
+        assert_eq!(out, "Waited 0s.");
     }
 }
