@@ -30,7 +30,7 @@ use crate::tools::{self, Tool, ToolContext};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// The tools the user stopped being asked about, by the session they said so
 /// in; they last until the program closes.
@@ -882,6 +882,9 @@ enum Reach {
     SendsOut,
     /// It deletes or overwrites a file the session did not make.
     Destroys,
+    /// A command writes a file outside the project folder, where write_file
+    /// never writes.
+    Outside,
     /// It sends a file to a chat app.
     Posts,
     /// It changes something through an MCP tool that reaches other machines
@@ -898,6 +901,7 @@ impl Reach {
         match self {
             Reach::SendsOut => "sends data to another machine",
             Reach::Destroys => "deletes or overwrites a file the session did not make",
+            Reach::Outside => "writes a file outside the project folder",
             Reach::Posts => "sends a file to a chat app",
             Reach::Writes => {
                 "changes something through an MCP server, on another machine or in a way \
@@ -923,6 +927,11 @@ fn reach(tool: &dyn Tool, args: &Value, ctx: &ToolContext) -> Option<Reach> {
     match tool.name() {
         "run_command" => {
             let line = args["command"].as_str().unwrap_or_default();
+            // Where it runs: `workdir` moves where its relative paths lead.
+            // A folder the tool refuses runs nothing, so the project folder
+            // stands in, and the tool says what is wrong with it.
+            let runs_in = tools::workdir(args, ctx).ok();
+            let dir = runs_in.as_deref().or(dir);
             reach_of(&command::assess(line, Dialect::here(), dir).commands, ctx)
         }
         // A shell runs what is typed into it as it runs a command line.
@@ -950,10 +959,14 @@ fn reach(tool: &dyn Tool, args: &Value, ctx: &ToolContext) -> Option<Reach> {
 }
 
 /// What the `commands` of a line could do past the user: delete or write
-/// over a file the session did not make, or send data out.
+/// over a file the session did not make, write outside the project folder,
+/// or send data out.
 fn reach_of(commands: &[command::Command], ctx: &ToolContext) -> Option<Reach> {
     if commands.iter().any(|command| destroys(command, ctx)) {
         return Some(Reach::Destroys);
+    }
+    if commands.iter().any(|command| strays(command, ctx)) {
+        return Some(Reach::Outside);
     }
     (commands.iter())
         .any(|command| command::sends_out(command, Dialect::here()))
@@ -961,20 +974,67 @@ fn reach_of(commands: &[command::Command], ctx: &ToolContext) -> Option<Reach> {
 }
 
 /// Whether `command`, or a line it hands to another shell, deletes a file
-/// the session did not make, or writes its output over one.
+/// the session did not make, or writes its output over one, in any folder
+/// it may run in.
 fn destroys(command: &command::Command, ctx: &ToolContext) -> bool {
-    let dir = command.dir.as_deref();
     let removes = (command.argv.get(command.at)).is_some_and(|word| command::name_of(word) == "rm");
-    let deletes = removes && {
-        let mut paths = (command.argv[command.at + 1..].iter())
-            .filter(|arg| !arg.starts_with('-'))
-            .peekable();
-        // With none named, it deletes what it is handed.
-        paths.peek().is_none() || paths.any(|raw| !own(raw, dir, ctx))
+    let destroys_in = |dir: Option<&Path>| {
+        let deletes = removes && {
+            let mut paths = (command.argv[command.at + 1..].iter())
+                .filter(|arg| !arg.starts_with('-'))
+                .peekable();
+            // With none named, it deletes what it is handed.
+            paths.peek().is_none() || paths.any(|raw| !own(raw, dir, ctx))
+        };
+        deletes || command.writes.iter().any(|raw| replaces(raw, dir, ctx))
     };
-    deletes
-        || command.writes.iter().any(|raw| replaces(raw, dir, ctx))
+    folders(command).into_iter().any(destroys_in)
         || command.nested.iter().any(|nested| destroys(nested, ctx))
+}
+
+/// Whether `command`, or a line it hands to another shell, writes its output
+/// into a file outside the project folder, where write_file never writes,
+/// from any folder it may run in.
+fn strays(command: &command::Command, ctx: &ToolContext) -> bool {
+    let strays_from = |dir: Option<&Path>| {
+        (command.writes.iter())
+            .any(|raw| named(raw, dir, ctx).is_some_and(|path| !inside(&path, ctx)))
+    };
+    folders(command).into_iter().any(strays_from)
+        || command.nested.iter().any(|nested| strays(nested, ctx))
+}
+
+/// The folders `command` may run in, or one not known when that cannot be
+/// told, in which only an absolute path names a file.
+fn folders(command: &command::Command) -> Vec<Option<&Path>> {
+    match &command.dirs {
+        Some(dirs) => dirs.iter().map(|dir| Some(dir.as_path())).collect(),
+        None => vec![None],
+    }
+}
+
+/// Whether a write to `path` lands in the project folder, judged as
+/// write_file judges where it writes: never through `..`, which a folder the
+/// line makes first could send elsewhere, and with links followed on the
+/// part of it that is there.
+fn inside(path: &Path, ctx: &ToolContext) -> bool {
+    let root = ctx.workspace.as_deref().map(std::fs::canonicalize);
+    let Some(Ok(root)) = root else {
+        return false;
+    };
+    if path.components().any(|part| part == Component::ParentDir) {
+        return false;
+    }
+    let mut there = path;
+    // Not `exists`, which follows links: a link to a missing file writes
+    // wherever it points.
+    while there.symlink_metadata().is_err() {
+        let Some(parent) = there.parent() else {
+            return false;
+        };
+        there = parent;
+    }
+    std::fs::canonicalize(there).is_ok_and(|real| real.starts_with(&root))
 }
 
 /// Whether `raw`, from `dir`, names a file the session's file tools made.
@@ -4863,6 +4923,100 @@ mod tests {
                 }
             }
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_steered_sessions_redirect_is_judged_as_write_file_to_the_same_path_would_be() {
+        let dir = project_dir("steered-redirect");
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join("out")).unwrap();
+        std::fs::write(project.join("out/data.csv"), "the user's").unwrap();
+        let session = |conversation| ToolContext {
+            workspace: Some(project.clone()),
+            conversation,
+            ..Default::default()
+        };
+        let (steered, clean) = (session(731_121), session(731_122));
+        let made = serde_json::json!({ "path": "out/made.json", "content": "{}" });
+        tools::run("write_file", &made.to_string(), &steered).unwrap();
+        crate::taint::mark(&steered);
+        let none = Grants::new();
+        let heredoc = |path: &str| format!("cat > {path} <<'EOF'\n{{\"a\": 1}}\nEOF");
+        let in_out = |line: String| {
+            call(
+                "run_command",
+                serde_json::json!({ "command": line, "workdir": "out" }),
+            )
+        };
+        let moved = |line: String| command(&format!("cd out && {line}"));
+        // Each command beside the file write_file would write.
+        let alike = [
+            (moved(heredoc("answers.json")), "out/answers.json"),
+            (command(&heredoc("out/answers.json")), "out/answers.json"),
+            (in_out(heredoc("answers.json")), "out/answers.json"),
+            (moved(heredoc("made.json")), "out/made.json"),
+            (moved(heredoc("data.csv")), "out/data.csv"),
+            (in_out(heredoc("data.csv")), "out/data.csv"),
+            (in_out(heredoc("notes.txt")), "out/notes.txt"),
+            (command(&heredoc("notes.txt")), "notes.txt"),
+        ];
+        for human in [false, true] {
+            let gate = bypassed(&steered, &none, human);
+            for (queued, path) in &alike {
+                let what = format!("{} with human {human}", queued.arguments);
+                assert_eq!(decide(queued, &gate), decide(&edit(path), &gate), "{what}");
+            }
+        }
+        let gate = bypassed(&steered, &none, false);
+        assert_eq!(decide(&moved(heredoc("answers.json")), &gate), Outcome::Run);
+        assert!(matches!(
+            decide(&in_out(heredoc("data.csv")), &gate),
+            Outcome::Refuse(_)
+        ));
+
+        // A target that cannot be told, a `cd` that may have left the user's
+        // file where the write lands, and anything outside the project.
+        let outside = dir.join("new.txt");
+        let mut refused = vec![
+            command(&heredoc("$OUT")),
+            command(&format!("cd \"$DIR\" && {}", heredoc("answers.json"))),
+            command(&format!("cd out/.. && {}", heredoc("fresh.txt"))),
+            command(&format!("cd out; {}", heredoc("notes.txt"))),
+            command(&heredoc("../new.txt")),
+            command(&heredoc(&outside.to_string_lossy())),
+            command(&format!(
+                "mkdir -p a/b && {}",
+                heredoc("a/b/../../../new.txt")
+            )),
+            in_out(heredoc("../../new.txt")),
+        ];
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&dir, project.join("away")).unwrap();
+            refused.push(command(&heredoc("away/new.txt")));
+            refused.push(command(&format!("cd away && {}", heredoc("new.txt"))));
+        }
+        for queued in &refused {
+            let what = &queued.arguments;
+            let Outcome::Refuse(why) = decide(queued, &bypassed(&steered, &none, false)) else {
+                panic!("{what} ran");
+            };
+            assert!(why.contains("the user may have written"), "{what}: {why}");
+            let asked = decide(queued, &bypassed(&steered, &none, true));
+            assert_eq!(asked, Outcome::Ask, "{what}");
+            let untouched = decide(queued, &bypassed(&clean, &none, false));
+            assert_eq!(
+                untouched,
+                Outcome::Run,
+                "{what} in a session that read nothing"
+            );
+        }
+        // A heredoc piped into a shell runs what it holds, and is refused.
+        let piped = command("cat <<'EOF' | sh\nrm notes.txt\nEOF");
+        let decided = decide(&piped, &bypassed(&steered, &none, false));
+        assert!(matches!(decided, Outcome::Refuse(_)), "{decided:?}");
+        assert!(!outside.exists() && !dir.join("project/new.txt").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

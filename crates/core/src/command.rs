@@ -232,6 +232,14 @@ const BLOCKS: &[&str] = &[
     "for", "case", "select", "function", "foreach", "switch", "trap",
 ];
 
+/// Shell grammar that may run the commands in it more than once.
+const LOOPS: &[&str] = &["for", "while", "until", "select", "function", "foreach"];
+
+/// Folders a command is followed into at most, each `cd` named plainly
+/// adding where it leads from each: a line moves through one or two, and
+/// past this many where it runs counts as not known.
+const FOLDERS: usize = 8;
+
 /// Interpreters handed their program inline, which this cannot read.
 const INLINE: &[(&str, &str)] = &[
     ("python", "-c"),
@@ -466,6 +474,11 @@ pub struct Command {
     /// this does not know, or spelt by braces the shell expands -- and
     /// nothing is piped in for it to act on.
     pub spelled_out: bool,
+    /// Every folder it may run in, where its relative paths lead: the line's
+    /// own, and where each `cd` before it that names a folder plainly leads,
+    /// as that `cd` may have failed or run in a subshell; None once one leads
+    /// where cannot be told.
+    pub dirs: Option<Vec<PathBuf>>,
 }
 
 /// A line judged: each command in it, and the worst of them.
@@ -486,6 +499,11 @@ fn assess_in(line: &str, dialect: Dialect, places: &Places, depth: u8) -> Assess
     let (found, unfinished) = scan(line, dialect, &places.vars);
     // A `cd` moves the commands after it, so each is judged where it runs.
     let mut here = places.clone();
+    // A loop can run a `cd` again and again, past every folder followed.
+    here.looped |= found.iter().any(|simple| {
+        let first = simple.words.first().map(|w| w.text.to_lowercase());
+        first.is_some_and(|word| LOOPS.contains(&word.as_str()))
+    });
     let commands: Vec<Command> = found
         .iter()
         .map(|simple| {
@@ -517,6 +535,12 @@ struct Places {
     /// The folder a command runs in as the file system spells it, for
     /// following links; forgotten after a change of folder.
     dir: Option<PathBuf>,
+    /// Every folder a command may run in as the file system spells it, as
+    /// `Command::dirs` gives them. Apart from `dir`, which stays the folder
+    /// reads are held to, so a `cd` cannot take a reader out of the project.
+    runs_in: Option<Vec<PathBuf>>,
+    /// The line has a loop, whose `cd` may run any number of times.
+    looped: bool,
     /// Letronna's own folder and program with links followed, so a link
     /// into them is seen through.
     linked: Vec<Vec<String>>,
@@ -545,6 +569,8 @@ impl Places {
             exe: exe.as_deref().and_then(path),
             cwd: cwd.and_then(path),
             dir: cwd.map(Path::to_path_buf),
+            runs_in: cwd.map(|cwd| vec![cwd.to_path_buf()]),
+            looped: false,
             linked: [Some(crate::chat::data_dir()), exe]
                 .into_iter()
                 .flatten()
@@ -657,6 +683,34 @@ impl Places {
         let to = match glued {
             Some(rest) => Some(rest.to_owned()),
             None => destination(&argv[at + 1..], dialect),
+        };
+        // A folder named plainly is followed, so a write after `cd out` is
+        // judged where it lands. Not through `..`, which sh folds by the path
+        // typed where the file system follows a link, nor to `~` or `-`, nor
+        // where Windows would sign in to another computer to look.
+        let plain = to.as_deref().filter(|to| {
+            known
+                && !self.looped
+                && name != "popd"
+                && !to.starts_with(['~', '-', '+'])
+                && !to.split(['/', '\\']).any(|part| part == "..")
+                && crate::paths::unsafe_raw(to, None).is_none()
+        });
+        self.runs_in = match (self.runs_in.take(), plain) {
+            (Some(mut dirs), Some(to)) if dirs.len() < FOLDERS => {
+                let to = match dialect {
+                    Dialect::Sh => to.to_owned(),
+                    _ => to.replace('\\', "/"),
+                };
+                let led: Vec<PathBuf> = dirs.iter().map(|dir| dir.join(&to)).collect();
+                for dir in led {
+                    if !dirs.contains(&dir) {
+                        dirs.push(dir);
+                    }
+                }
+                Some(dirs)
+            }
+            _ => None,
         };
         self.dir = None;
         self.cwd = match to.as_deref() {
@@ -1332,6 +1386,7 @@ fn judge(simple: &Simple, dialect: Dialect, places: &Places, depth: u8) -> Comma
             .collect(),
         dir: places.dir.clone(),
         spelled_out,
+        dirs: places.runs_in.clone(),
     }
 }
 
@@ -4152,12 +4207,37 @@ mod tests {
     }
 
     #[test]
-    fn each_command_knows_the_folder_it_runs_in_until_one_moves() {
+    fn each_command_knows_every_folder_it_may_run_in_while_a_move_can_be_told() {
+        let last = |line: &str| {
+            let commands = assess(line, Dialect::Sh, Some(Path::new("/work"))).commands;
+            commands.last().and_then(|command| command.dirs.clone())
+        };
+        let folders = |dirs: &[&str]| Some(dirs.iter().map(PathBuf::from).collect::<Vec<_>>());
         let line = "echo a > x.txt; cd sub; echo b > y.txt";
         let commands = assess(line, Dialect::Sh, Some(Path::new("/work"))).commands;
-        let dirs: Vec<Option<&Path>> = commands.iter().map(|c| c.dir.as_deref()).collect();
-        let work = Some(Path::new("/work"));
-        assert_eq!(dirs, [work, work, None]);
+        let dirs: Vec<Option<Vec<PathBuf>>> = commands.iter().map(|c| c.dirs.clone()).collect();
+        let (work, both) = (folders(&["/work"]), folders(&["/work", "/work/sub"]));
+        assert_eq!(dirs, [work.clone(), work, both.clone()]);
+        // The folder before a `cd` stays one, as the `cd` may have failed.
+        assert_eq!(last("cd 'sub' && cat > y.txt"), both);
+        assert_eq!(
+            last("cd sub && cd /tmp && echo b > y.txt"),
+            folders(&["/work", "/work/sub", "/tmp"])
+        );
+        // Where it cannot be told, or may lead past every folder followed.
+        for line in [
+            "cd $DIR && echo b > y.txt",
+            "cd \"$(mktemp -d)\" && echo b > y.txt",
+            "cd sub/.. && echo b > y.txt",
+            "cd ~/sub && echo b > y.txt",
+            "cd - && echo b > y.txt",
+            "cd && echo b > y.txt",
+            "pushd sub; popd; echo b > y.txt",
+            "while true; do cd sub; done; echo b > y.txt",
+            "cd $DIR; cd sub; echo b > y.txt",
+        ] {
+            assert_eq!(last(line), None, "{line}");
+        }
     }
 
     #[test]
