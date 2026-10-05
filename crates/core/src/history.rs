@@ -453,14 +453,51 @@ pub fn unkept(dropped: &[Message]) -> Vec<String> {
                 }
                 None => return None,
             };
-            let line = args["command"].as_str()?.lines().next().unwrap_or_default();
-            let mut shown: String = line.chars().take(COMMAND_CHARS).collect();
-            if shown.len() < line.len() {
-                shown.push('…');
-            }
-            Some(format!("`{shown}`: {why}."))
+            Some(format!("`{}`: {why}.", shown_command(&args)?))
         })
         .collect()
+}
+
+/// The first line of a call's command, cut to `COMMAND_CHARS`.
+fn shown_command(args: &serde_json::Value) -> Option<String> {
+    let line = args["command"].as_str()?.lines().next().unwrap_or_default();
+    let mut shown: String = line.chars().take(COMMAND_CHARS).collect();
+    if shown.len() < line.len() {
+        shown.push('…');
+    }
+    Some(shown)
+}
+
+/// A line naming the commands of `dropped` whose changes `plan` puts back,
+/// each once, so a rewind says so before it is confirmed; `None` when it
+/// puts back none of theirs.
+pub fn undone_commands(dropped: &[Message], plan: &[Restore]) -> Option<String> {
+    let mut named: Vec<String> = Vec::new();
+    let undone = dropped
+        .iter()
+        .filter(|m| m.role == "tool" && m.name == "run_command")
+        .filter(|m| {
+            (m.files.iter()).any(|change| plan.iter().any(|file| file.path == change.path))
+        });
+    for m in undone {
+        let args: serde_json::Value = serde_json::from_str(&m.args).unwrap_or_default();
+        let Some(shown) = shown_command(&args).map(|shown| format!("`{shown}`")) else {
+            continue;
+        };
+        if !named.contains(&shown) {
+            named.push(shown);
+        }
+    }
+    match named.as_slice() {
+        [] => None,
+        [one] => Some(format!(
+            "This also undoes what this command changed: {one}."
+        )),
+        all => Some(format!(
+            "This also undoes what these commands changed: {}.",
+            all.join(", ")
+        )),
+    }
 }
 
 /// The files the tools wrote in `messages` that are inside `workspace`, each
@@ -2178,6 +2215,36 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "no exit notice");
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rewind_names_each_command_whose_changes_it_puts_back_once() {
+        let files = [("a.txt", "one\n"), ("b.txt", "bee\n")];
+        let (project, kept) = repository("command-named", &files);
+        let ctx = context(&project, &kept);
+        let turns = [
+            ran(&ctx, "sed -i.bak 's/one/two/' a.txt && rm a.txt.bak"),
+            ran(&ctx, "cat b.txt"),
+            ran(&ctx, "rm b.txt"),
+        ];
+        let plan = plan_in(&kept, &turns, Some(&project));
+        assert_eq!(
+            undone_commands(&turns, &plan).as_deref(),
+            Some(
+                "This also undoes what these commands changed: \
+                 `sed -i.bak 's/one/two/' a.txt && rm a.txt.bak`, `rm b.txt`."
+            )
+        );
+        // A command run twice is named once, and one a plan does not put
+        // back is not named at all.
+        let again = [ran(&ctx, "echo x >> c.txt"), ran(&ctx, "echo x >> c.txt")];
+        let plan = plan_in(&kept, &again, Some(&project));
+        assert_eq!(
+            undone_commands(&again, &plan).as_deref(),
+            Some("This also undoes what this command changed: `echo x >> c.txt`.")
+        );
+        assert_eq!(undone_commands(&turns, &[]), None);
     }
 
     #[cfg(unix)]
