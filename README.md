@@ -69,6 +69,8 @@ Closing the window keeps Letronna in the notification area. Left-click the tray 
 
 First launch uses the Letronna gateway: sign in (`/login` in the terminal, or **Account** in Settings) and the hosted models are charged to your account's credit, with no key to paste. Open **Settings** to pick another gateway and use your own API key instead.
 
+A run in Bypass that nobody watches, such as `letronna -p --yes`, `letronna mcp serve --yes` or a Bypass schedule, deletes a folder that lies strictly inside its project, as in `rm -rf out/tmp`, on macOS and Linux. It still refuses to delete the project itself, `.git`, anything outside the project or reached through a link that leads out of it, and a path it cannot read in full, such as one holding a `$VAR`.
+
 `LETRONNA_DISPOSABLE=1` declares the machine thrown away after the run, as a benchmark's container is. Any run in Bypass that nobody watches, such as `letronna -p --yes`, `letronna mcp serve --yes` or a Bypass schedule, then does commands that are hard to take back, such as `rm -r` or `git reset --hard`, instead of refusing them. It still refuses those Letronna never runs, such as deleting the home folder, and any that sends a `.env` file off the computer or reaches a cloud machine's metadata service. Never set it on a machine whose files matter.
 
 ## Gateways
