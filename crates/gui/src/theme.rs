@@ -277,11 +277,17 @@ pub(crate) fn apply(appearance: &str, window: &mut Window, cx: &mut App) {
     // The app's appearance, not the window's: gpui caches the window's and
     // only updates it once this change has settled.
     let p = palette_for(appearance, cx.window_appearance());
+    let before = cx.theme().background;
     Theme::change(p.mode, None, cx);
-    GENERATION.fetch_add(1, Ordering::Relaxed);
+    let first = GENERATION.fetch_add(1, Ordering::Relaxed) == 0;
     // Through `update`: an edit made in place reaches only the colours, and
     // the dialogs, the scrollbars and the text views read their copies.
     Theme::update(cx, |t| paint(t, p));
+    // The old page lifts off the new colours, unless there were none
+    // before, at the first frame, or they are the same.
+    if !first && cx.theme().background != before {
+        crate::ui::motion::veil(before, cx);
+    }
     window.refresh();
 }
 

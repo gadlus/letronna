@@ -299,9 +299,11 @@ mod windows_impl {
                 .child(self.item("quit", format!("Quit {BRAND}"), cx, |_, cx| cx.quit()))
                 .with_animation(
                     "tray-menu",
-                    Animation::new(std::time::Duration::from_millis(160))
-                        .with_easing(gpui::ease_out_quint()),
-                    |el, delta| el.opacity(delta).mt(px(8. * (1. - delta))),
+                    crate::ui::motion::enter(crate::ui::motion::QUICK),
+                    |el, delta| {
+                        el.opacity(delta)
+                            .mt(px(crate::ui::motion::RISE * (1. - delta)))
+                    },
                 )
         }
     }

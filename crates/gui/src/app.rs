@@ -191,6 +191,8 @@ pub(crate) struct Chat {
     /// brought it back. Any other session shows its own conversation.
     pub(crate) show_setup: Option<u64>,
     pub(crate) sidebar_open: bool,
+    /// The sidebar, the panel and the chat's rows coming in.
+    pub(crate) motion: crate::ui::motion::Moves,
     pub(crate) greeting: &'static str,
     /// Who is signed in, as `account.json` last said; shared with the terminal.
     pub(crate) account: Option<letronna_core::auth::Account>,
@@ -869,6 +871,7 @@ impl Chat {
             page: Page::Chat,
             show_setup,
             sidebar_open: true,
+            motion: Default::default(),
             greeting,
             account,
             account_note: None,
@@ -3314,6 +3317,7 @@ impl Chat {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::ui::actions::shows_bar;
+        use crate::ui::motion::Row;
         let Some(&span) = self.turns.get(n) else {
             return self.under_turns(column, window, cx);
         };
@@ -3334,6 +3338,7 @@ impl Chat {
         self.note_edits(span.first, span.last);
         let conversation = &self.store.conversations[self.store.active];
         let messages = &conversation.messages;
+        let arrivals = &self.motion.rows;
         let mut rows = Vec::new();
         // The message a search hit opened, marked on the first row drawn
         // from it on: a reply that only called tools has none of its own.
@@ -3383,11 +3388,12 @@ impl Chat {
                 // calls kept in sight under it included.
                 let marked =
                     folded.is_some() && hit.take_if(|&mut (_, at)| at <= run.last).is_some();
-                rows.push(if marked {
+                let line = if marked {
                     self.mark_hit(line, cx)
                 } else {
                     line
-                });
+                };
+                rows.push(arrivals.rise(Row::Message, run.first, line, window, cx));
                 // What its calls made stays in sight, small, while folded.
                 if folded.is_some() {
                     rows.extend(self.run_media(run, window, cx));
@@ -3404,11 +3410,12 @@ impl Chat {
                 continue;
             }
             let row = self.message_row(i, m, labeled, false, bar, window, cx);
-            rows.push(if hit.take_if(|&mut (_, at)| i >= at).is_some() {
+            let row = if hit.take_if(|&mut (_, at)| i >= at).is_some() {
                 self.mark_hit(row, cx)
             } else {
                 row
-            });
+            };
+            rows.push(arrivals.rise(Row::Message, i, row, window, cx));
         }
         // Past the last row drawn, the last row stands for it.
         if let Some(row) = rows.pop_if(|_| hit.is_some()) {
@@ -3416,7 +3423,7 @@ impl Chat {
         }
         // The newest finished turn ends with the files it changed.
         if !live && let Some(card) = self.files_card(span, cx) {
-            rows.push(card);
+            rows.push(arrivals.rise(Row::Files, span.first, card, window, cx));
         }
         if live {
             // While tools are queued the card below speaks for the turn;
@@ -3441,13 +3448,17 @@ impl Chat {
                 // so finishing does not start its markdown or its fade-in
                 // over again. Labelled when it opens the turn.
                 let opens = span.first == messages.len();
-                rows.push(self.message_row(messages.len(), &reply, opens, true, None, window, cx));
+                let row = self.message_row(messages.len(), &reply, opens, true, None, window, cx);
+                rows.push(arrivals.rise(Row::Message, messages.len(), row, window, cx));
             }
             if let Some(card) = self.approval_card(window, cx) {
-                rows.push(card);
+                let place = messages.len();
+                rows.push(arrivals.rise(Row::Card, place, card, window, cx));
             }
             for (k, text) in self.follow_ups.iter().enumerate() {
-                rows.push(self.queued_row(k, text, cx));
+                let row = self.queued_row(k, text, cx);
+                let place = messages.len() + k;
+                rows.push(arrivals.rise(Row::Queued, place, row, window, cx));
             }
         }
         // No min_w_0 or clipping here: both break list layout in the
@@ -4125,6 +4136,7 @@ impl Chat {
 impl Render for Chat {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let drawn = std::mem::replace(&mut self.drawn, true);
+        crate::ui::motion::follow_setting(self.store.settings.motion, cx);
         // The panel shows the browser of the session on screen.
         let on_screen = self.store.conversations[self.store.active].id;
         if self.browser_for != on_screen {
@@ -4147,6 +4159,10 @@ impl Render for Chat {
             self.viewing = None;
         }
         self.open_on_screen(cx);
+        // What the session holds as it comes on screen was there already;
+        // only what comes in while it is rises in.
+        let shown = &self.store.conversations[self.store.active];
+        (self.motion.rows).note(shown.id, shown.messages.len(), shown.unfilled());
         self.lay_out_turns();
         self.watch_turn_files(cx);
         self.keep_files_current(window, cx);
@@ -4357,6 +4373,8 @@ impl Render for Chat {
                 this.children(self.ring(crate::ui::keys::Region::Transcript, cx))
             });
 
+        let sidebar_in =
+            (self.motion.sidebar).track(self.sidebar_open, crate::ui::motion::STANDARD, window, cx);
         v_flex()
             .size_full()
             .bg(cx.theme().background)
@@ -4537,13 +4555,24 @@ impl Render for Chat {
                     .flex_1()
                     .min_h_0()
                     .when(self.sidebar_open, |this| {
-                        this.child(self.sidebar(window, cx))
+                        let sidebar = self.sidebar(window, cx).into_any_element();
+                        // In from the left edge, in a box only while it moves.
+                        this.child(if sidebar_in < 1. {
+                            let moving = div().h_full().flex_shrink_0().relative();
+                            crate::ui::motion::slide(moving, sidebar_in, -1.)
+                                .child(sidebar)
+                                .into_any_element()
+                        } else {
+                            sidebar
+                        })
                     })
                     .child(main)
                     .children(self.right_panel(window, cx)),
             )
             .children(self.settings_overlay(window, cx))
             .children(self.switcher(cx))
+            // Last, over everything, as the colours of a new theme come in.
+            .children(crate::ui::motion::veil_layer(window, cx))
     }
 }
 

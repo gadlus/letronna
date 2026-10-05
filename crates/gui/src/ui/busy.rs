@@ -51,8 +51,13 @@ impl Sizable for Spinner {
 
 impl RenderOnce for Spinner {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        next_frame(window, cx);
-        let turned = ease_in_out(phase(TURN));
+        // Still, as gpui-component's is, while motion is reduced.
+        let turned = if cx.reduce_motion() {
+            0.
+        } else {
+            next_frame(window, cx);
+            ease_in_out(phase(TURN))
+        };
         div().child(
             Icon::new(IconName::Loader)
                 .with_size(self.size)
@@ -65,6 +70,9 @@ impl RenderOnce for Spinner {
 /// The opacity of the dot beside a reply coming in, now: in and out once a
 /// second.
 pub(crate) fn breathing(window: &mut Window, cx: &mut App) -> f32 {
+    if cx.reduce_motion() {
+        return 1.;
+    }
     next_frame(window, cx);
     let wave = 1.0 - (ease_in_out(phase(BREATH)) * 2.0 - 1.0).abs();
     0.25 + 0.75 * wave

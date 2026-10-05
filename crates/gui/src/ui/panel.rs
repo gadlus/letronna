@@ -691,8 +691,14 @@ impl Chat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let (shown, open) = self.panel_view(cx)?;
-        let place = self.place_of(open, window, cx);
+        let view = self.panel_view(cx);
+        let place = view
+            .as_ref()
+            .map(|&(_, open)| self.place_of(open, window, cx));
+        // In from the right edge, or up into its corner, as it opens.
+        let beside = place.is_some_and(|place| place != Place::Over);
+        let t = (self.motion.panel).track(beside, crate::ui::motion::STANDARD, window, cx);
+        let ((shown, open), place) = (view?, place?);
         if place == Place::Over {
             return None;
         }
@@ -700,6 +706,7 @@ impl Chat {
         Some(match place {
             Place::Docked(width) => panel
                 .relative()
+                .when(t < 1., |panel| crate::ui::motion::slide(panel, t, 1.))
                 .h_full()
                 .w(width)
                 .flex_shrink_0()
@@ -726,7 +733,8 @@ impl Chat {
             _ => panel
                 .absolute()
                 // Top right, clear of the composer and the newest messages.
-                .top(FLOAT_TOP)
+                .top(FLOAT_TOP + px(crate::ui::motion::RISE * (1. - t)))
+                .opacity(t)
                 .right(px(16.))
                 .w(FLOAT_WIDTH)
                 .max_h(window.viewport_size().height - FLOAT_CLEAR)
