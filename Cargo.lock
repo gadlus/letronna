@@ -3829,6 +3829,7 @@ dependencies = [
  "objc",
  "raw-window-handle",
  "reqwest",
+ "ring",
  "rodio",
  "serde_json",
  "tray-icon",
