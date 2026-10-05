@@ -82,7 +82,7 @@ impl Chat {
             }));
         let chat = cx.entity();
         Popover::new("memory-menu")
-            .anchor(gpui::Corner::BottomLeft)
+            .anchor(gpui::Anchor::BottomLeft)
             .appearance(false)
             .overlay_closable(false)
             .open(self.memory_menu.is_some())
@@ -168,7 +168,7 @@ impl Chat {
                         .on_click(pick(Choice::MakeDefault)),
                 )
         });
-        menu.focus_handle(cx).focus(window);
+        menu.focus_handle(cx).focus(window, cx);
         cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
             this.memory_menu = None;
             cx.notify();

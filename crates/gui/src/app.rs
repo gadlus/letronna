@@ -128,7 +128,7 @@ impl Page {
 
 pub(crate) struct Chat {
     pub(crate) store: Store,
-    pub(crate) composer: Entity<InputState>,
+    pub(crate) composer: Entity<TextareaState>,
     pub(crate) search: Entity<InputState>,
     /// What the sidebar's search found in what was said.
     pub(crate) found: Vec<crate::ui::search::Found>,
@@ -284,7 +284,7 @@ pub(crate) struct Chat {
     /// Id of the schedule being edited on the Scheduled jobs page.
     pub(crate) editing: Option<u64>,
     pub(crate) job_name: Entity<InputState>,
-    pub(crate) job_prompt: Entity<InputState>,
+    pub(crate) job_prompt: Entity<TextareaState>,
     /// The name field on the New profile dialog.
     pub(crate) profile_name: Entity<InputState>,
     /// The active profile's name for the title bar, once there are several.
@@ -358,7 +358,7 @@ pub(crate) struct Chat {
     /// The name of the skill being edited, or empty for a new one.
     pub(crate) editing_skill: Option<String>,
     pub(crate) skill_name: Entity<InputState>,
-    pub(crate) skill_prompt: Entity<InputState>,
+    pub(crate) skill_prompt: Entity<TextareaState>,
     /// What you sent while a reply was running in its session, oldest
     /// first. It goes in at the reply's next step, as Claude Code does, or
     /// as the next prompt if the reply ends first.
@@ -440,7 +440,7 @@ pub(crate) struct Chat {
     /// Your message being changed in place, by session id and place.
     pub(crate) editing_message: Option<(u64, usize)>,
     /// The box a message is changed in.
-    pub(crate) edit_message: Entity<InputState>,
+    pub(crate) edit_message: Entity<TextareaState>,
     /// Thoughts and tool outputs shown open, by session id and place.
     pub(crate) thinking_open: std::collections::HashSet<(u64, usize)>,
     /// Runs of tool calls shown as their rows rather than one line, by
@@ -618,8 +618,7 @@ impl Chat {
         }
         let greeting = GREETINGS[(backend::now() % GREETINGS.len() as u64) as usize];
         let composer = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .auto_grow(1, 6)
                 .placeholder(greeting)
         });
@@ -719,8 +718,7 @@ impl Chat {
         let skill_name =
             cx.new(|cx| InputState::new(window, cx).placeholder("Review these changes"));
         let skill_prompt = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .auto_grow(3, 10)
                 .placeholder("What should Letronna do?")
         });
@@ -729,17 +727,12 @@ impl Chat {
             InputState::new(window, cx).placeholder("GitHub repo, link to a SKILL.md, or a folder")
         });
         let job_prompt = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .auto_grow(2, 6)
                 .placeholder("Run the tests and tell me what broke.")
         });
         let profile_name = cx.new(|cx| InputState::new(window, cx).placeholder("Work"));
-        let edit_message = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .auto_grow(1, 12)
-        });
+        let edit_message = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 12));
         let steer =
             cx.new(|cx| InputState::new(window, cx).placeholder("What it should know or do now"));
         let (capabilities, filled) = crate::ui::capabilities::Capabilities::new(window, cx);
@@ -759,7 +752,9 @@ impl Chat {
             }),
             cx.subscribe_in(&composer, window, |this, input, event, window, cx| {
                 match event {
-                    InputEvent::PressEnter { secondary: false } => this.send(window, cx),
+                    InputEvent::PressEnter {
+                        secondary: false, ..
+                    } => this.send(window, cx),
                     // Send lights up once there is something to send. Redraw
                     // only when that flips, not on every key.
                     InputEvent::Change => {
@@ -781,7 +776,13 @@ impl Chat {
                 cx.notify();
             }),
             cx.subscribe_in(&edit_message, window, |this, _, event, window, cx| {
-                if matches!(event, InputEvent::PressEnter { secondary: false }) {
+                if matches!(
+                    event,
+                    InputEvent::PressEnter {
+                        secondary: false,
+                        ..
+                    }
+                ) {
                     this.send_edit(window, cx);
                 }
             }),
@@ -3242,7 +3243,7 @@ impl Chat {
 
     /// How far above the bottom of the chat, in pixels.
     pub(crate) fn distance_from_bottom(&self) -> Pixels {
-        self.list.max_offset_for_scrollbar().height + self.list.scroll_px_offset_for_scrollbar().y
+        self.list.max_offset_for_scrollbar().y + self.list.scroll_px_offset_for_scrollbar().y
     }
 
     /// Go to the newest message and stay with it as more arrives.
@@ -3320,7 +3321,7 @@ impl Chat {
         // there to take the keys.
         if !live && self.focusing == Some((session, span.first)) {
             self.focusing = None;
-            window.focus(&focus);
+            window.focus(&focus, cx);
         }
         // What a preview's long lines wrap to depends on it.
         self.column = column;
@@ -3573,6 +3574,7 @@ impl Chat {
                 .justify_center()
                 .child(
                     Button::new("jump-to-latest")
+                        .secondary()
                         .icon(Icon::new(IconName::ArrowDown))
                         .small()
                         .rounded_full()
@@ -4206,7 +4208,7 @@ impl Render for Chat {
                                     cx.background_executor()
                                         .timer(std::time::Duration::from_secs(2))
                                         .await;
-                                    let _ = copied.update(cx, |c, cx| {
+                                    copied.update(cx, |c, cx| {
                                         *c = false;
                                         cx.notify();
                                     });
@@ -4347,8 +4349,7 @@ impl Render for Chat {
             // nowhere else to show that F6 put the keys on it.
             .when(self.page != Page::Chat, |this| {
                 this.children(self.ring(crate::ui::keys::Region::Transcript, cx))
-            })
-            .children(Root::render_notification_layer(window, cx));
+            });
 
         v_flex()
             .size_full()
@@ -4537,7 +4538,6 @@ impl Render for Chat {
             )
             .children(self.settings_overlay(window, cx))
             .children(self.switcher(cx))
-            .children(Root::render_dialog_layer(window, cx))
     }
 }
 

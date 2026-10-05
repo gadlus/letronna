@@ -79,7 +79,7 @@ impl Chat {
                 .background_executor()
                 .spawn(async move { messaging::check(&token).map(|name| (name, token)) })
                 .await;
-            let _ = entity.update(cx, |this, cx| {
+            entity.update(cx, |this, cx| {
                 this.connecting = false;
                 match check {
                     Ok((name, token)) => {
@@ -611,7 +611,7 @@ impl Chat {
                     Ok::<_, String>((hook, bot, webhook, token, owner))
                 })
                 .await;
-            let _ = entity.update(cx, |this, cx| {
+            entity.update(cx, |this, cx| {
                 this.connecting = false;
                 match check {
                     Ok((hook, bot, webhook, token, owner)) => {
@@ -957,7 +957,7 @@ impl Chat {
                     Ok::<_, String>((name, app, bot))
                 })
                 .await;
-            let _ = entity.update(cx, |this, cx| {
+            entity.update(cx, |this, cx| {
                 this.connecting = false;
                 match check {
                     Ok((name, app, bot)) => {

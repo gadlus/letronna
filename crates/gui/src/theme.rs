@@ -235,6 +235,42 @@ fn paper_highlight(base: &HighlightTheme) -> HighlightTheme {
     theme
 }
 
+/// How a reply's Markdown is drawn: the style gpui-component gives every
+/// text view from the theme, with a whole rem under a heading where it
+/// leaves 0.3. gpui-component's own `TextViewStyle` has no say over
+/// headings, so a reply is drawn with gpui-base's text view and this.
+pub(crate) fn reply_text_style(theme: &Theme) -> gpui_base::TextViewStyle {
+    let radius = Some(theme.semantic_tokens().radius.md.into());
+    let rounded = StyleRefinement {
+        corner_radii: CornersRefinement {
+            top_left: radius,
+            top_right: radius,
+            bottom_left: radius,
+            bottom_right: radius,
+        },
+        ..Default::default()
+    };
+    let table_head = StyleRefinement::default()
+        .bg(theme.table_head)
+        .text_color(theme.table_head_foreground);
+    gpui_base::TextViewStyle::default()
+        .with_foreground(theme.foreground)
+        .with_muted_foreground(theme.muted_foreground)
+        .with_link(theme.link)
+        .with_selection(theme.selection)
+        .with_code_background(theme.muted)
+        .with_border(theme.border)
+        .with_code_block(rounded.clone())
+        .with_table(rounded)
+        .with_table_head(table_head)
+        .with_inline_code(HighlightStyle {
+            background_color: Some(theme.accent),
+            ..Default::default()
+        })
+        .with_dark(theme.is_dark())
+        .with_heading(|_| StyleRefinement::default().pb(rems(1.)))
+}
+
 /// Colour the window as the appearance setting asks.
 pub(crate) fn apply(appearance: &str, window: &mut Window, cx: &mut App) {
     crate::platform::window::pin_chrome(window, pinned_dark(appearance));
@@ -243,7 +279,14 @@ pub(crate) fn apply(appearance: &str, window: &mut Window, cx: &mut App) {
     let p = palette_for(appearance, cx.window_appearance());
     Theme::change(p.mode, None, cx);
     GENERATION.fetch_add(1, Ordering::Relaxed);
-    let t = Theme::global_mut(cx);
+    // Through `update`: an edit made in place reaches only the colours, and
+    // the dialogs, the scrollbars and the text views read their copies.
+    Theme::update(cx, |t| paint(t, p));
+    window.refresh();
+}
+
+/// Letronna's colours, corners and fonts over gpui-component's theme.
+fn paint(t: &mut Theme, p: &Palette) {
     if !p.mode.is_dark() {
         t.highlight_theme = Arc::new(paper_highlight(&t.highlight_theme));
     }
@@ -264,7 +307,7 @@ pub(crate) fn apply(appearance: &str, window: &mut Window, cx: &mut App) {
     t.secondary = raised;
     t.muted = rgb(p.code).into();
     t.popover = raised;
-    t.list = raised;
+    t.colors.list = raised;
     t.table = raised;
     t.border = hairline;
     t.input = hairline;
@@ -306,18 +349,37 @@ pub(crate) fn apply(appearance: &str, window: &mut Window, cx: &mut App) {
     // danger.
     t.primary_hover = t.primary;
     t.secondary_hover = t.secondary;
-    t.list_hover = t.list;
-    t.accordion_hover = t.accordion;
+    t.list_hover = t.colors.list;
     t.table_hover = t.table;
     t.danger_hover = t.danger;
     t.scrollbar_thumb_hover = t.scrollbar_thumb;
+    // Buttons have colours of their own, filled in from the theme file's
+    // when it loads, so these carry the ones above over to them: blue, red
+    // and raised buttons as they are, and one with no variant on the page
+    // inside the input's hairline (`framed`), none of them changing under
+    // the pointer.
+    t.button_primary = t.primary;
+    t.button_primary_hover = t.primary;
+    t.button_primary_active = t.primary_active;
+    t.button_primary_foreground = t.primary_foreground;
+    t.button_danger = t.danger;
+    t.button_danger_hover = t.danger;
+    t.button_danger_active = t.danger_active;
+    t.button_danger_foreground = t.danger_foreground;
+    t.button_secondary = t.secondary;
+    t.button_secondary_hover = t.secondary;
+    t.button_secondary_active = t.secondary_active;
+    t.button_secondary_foreground = t.secondary_foreground;
+    t.button = t.background;
+    t.button_hover = t.background;
+    t.button_active = t.secondary_active;
+    t.button_foreground = t.secondary_foreground;
     // Hairlines rather than shadows, and near-square corners, like the site.
     t.shadow = false;
     t.radius = px(2.);
     t.radius_lg = px(4.);
     t.font_family = BODY_FONT.into();
     t.mono_font_family = MONO_FONT.into();
-    window.refresh();
 }
 
 #[cfg(test)]

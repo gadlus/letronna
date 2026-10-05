@@ -239,7 +239,9 @@ impl QuickEntry {
         let subscriptions = vec![
             cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
                 // The secondary one is `OpenMain`, bound in this context.
-                InputEvent::PressEnter { secondary: false } => this.send(window, cx),
+                InputEvent::PressEnter {
+                    secondary: false, ..
+                } => this.send(window, cx),
                 InputEvent::Change if this.error.take().is_some() => cx.notify(),
                 _ => {}
             }),

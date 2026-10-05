@@ -148,8 +148,8 @@ impl Chat {
     }
 
     /// Give the tree the keys, as the tab is shown.
-    pub(crate) fn focus_files(&self, window: &mut Window) {
-        window.focus(&self.files.focus);
+    pub(crate) fn focus_files(&self, window: &mut Window, cx: &mut App) {
+        window.focus(&self.files.focus, cx);
     }
 
     /// Read the tree again, and the file previewed, when the tab is on
@@ -422,7 +422,7 @@ impl Chat {
             // would have no height to fill; it shrinks in a short window.
             .map(|tab| match docked {
                 true => tab.flex_1(),
-                false => tab.h(FLOAT_HEIGHT).flex_shrink(),
+                false => tab.h(FLOAT_HEIGHT).flex_shrink_1(),
             })
             .key_context("Files")
             .on_action(
@@ -474,7 +474,7 @@ impl Chat {
                     .border_t_1()
                     .border_color(border)
                     .child(self.preview_head(muted, cx))
-                    .child(self.preview_body(window, cx))
+                    .child(self.preview_body(cx))
             }))
             .into_any_element()
     }
@@ -495,7 +495,7 @@ impl Chat {
             }),
         )
         .size_full()
-        .track_scroll(self.files.scroll.clone())
+        .track_scroll(&self.files.scroll)
     }
 
     /// What the picked row can do, beside its name.
@@ -597,7 +597,7 @@ impl Chat {
 
     /// The previewed file: rendered, as numbered lines, as a picture, or
     /// handed to the system.
-    fn preview_body(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn preview_body(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(shown) = self.files.shown.as_ref() else {
             return Empty.into_any_element();
         };
@@ -627,9 +627,7 @@ impl Chat {
                             .track_scroll(&self.files.preview_scroll)
                             .px_3()
                             .pb_3()
-                            .child(
-                                TextView::markdown(id, text.clone(), window, cx).selectable(true),
-                            ),
+                            .child(TextView::markdown(id, text.clone()).selectable(true)),
                     )
                     .vertical_scrollbar(&self.files.preview_scroll)
                     .into_any_element()

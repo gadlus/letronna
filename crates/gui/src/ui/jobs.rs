@@ -224,8 +224,8 @@ impl Chat {
     }
 
     /// Give the job list the keys, as the tab is shown.
-    pub(crate) fn focus_jobs(&self, window: &mut Window) {
-        window.focus(&self.jobs.list_focus);
+    pub(crate) fn focus_jobs(&self, window: &mut Window, cx: &mut App) {
+        window.focus(&self.jobs.list_focus, cx);
     }
 
     /// Read the chosen job's output again when the tab is on screen and it
@@ -288,7 +288,7 @@ impl Chat {
         // back to.
         let at_end = {
             let scroll = &self.jobs.scroll.0.borrow().base_handle;
-            scroll.offset().y <= -scroll.max_offset().height + px(4.)
+            scroll.offset().y <= -scroll.max_offset().y + px(4.)
         };
         self.jobs.lines = tail_lines(&jobs::log(id).unwrap_or_default());
         self.jobs.widest = widest(&self.jobs.lines);
@@ -358,7 +358,7 @@ impl Chat {
             },
             _ => Picked::one(line),
         });
-        window.focus(&self.jobs.log_focus);
+        window.focus(&self.jobs.log_focus, cx);
         cx.notify();
     }
 
@@ -443,11 +443,11 @@ impl Chat {
     ) {
         let chat = cx.entity();
         let place = folder.display().to_string();
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_alert_dialog(cx, move |dialog, _, cx| {
             let (chat, command, folder) = (chat.clone(), command.clone(), folder.clone());
             dialog
                 .title(div().font_family(HEADING_FONT).child("Run this command?"))
-                .w(px(460.))
+                .width(px(460.))
                 .confirm()
                 .button_props(DialogButtonProps::default().ok_text("Run"))
                 .child(
@@ -518,7 +518,7 @@ impl Chat {
             // window.
             .map(|tab| match docked {
                 true => tab.flex_1(),
-                false => tab.h(FLOAT_HEIGHT).flex_shrink(),
+                false => tab.h(FLOAT_HEIGHT).flex_shrink_1(),
             })
             .child(self.run_line(cx))
             .child(self.job_list(&list, window, cx))
@@ -598,7 +598,7 @@ impl Chat {
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.choose_job(id, cx);
-                    this.focus_jobs(window);
+                    this.focus_jobs(window, cx);
                 }))
         });
         let empty = list.is_empty().then(|| {
@@ -713,7 +713,7 @@ impl Chat {
                     .collect()
             }),
         )
-        .track_scroll(self.jobs.scroll.clone())
+        .track_scroll(&self.jobs.scroll)
         .flex_1()
         .min_h_0()
         .font_family(MONO_FONT)

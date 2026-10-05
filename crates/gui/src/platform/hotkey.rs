@@ -45,9 +45,7 @@ pub(crate) fn init(spec: &str, cx: &mut App) {
             if event.state() != HotKeyState::Pressed {
                 continue;
             }
-            if cx.update(crate::ui::quick::toggle).is_err() {
-                break;
-            }
+            cx.update(crate::ui::quick::toggle);
         }
     })
     .detach();

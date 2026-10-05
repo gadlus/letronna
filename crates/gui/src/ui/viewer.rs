@@ -96,7 +96,7 @@ pub(crate) fn open(path: PathBuf, window: &mut Window, cx: &mut App) {
             .child(shown.clone())
     });
     let focus = viewer.read(cx).focus.clone();
-    window.focus(&focus);
+    window.focus(&focus, cx);
 }
 
 /// `picture`, showing the one at `path`, as a tab stop that Enter or a

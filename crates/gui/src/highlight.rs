@@ -9,7 +9,7 @@ struct Grammar {
 
 /// Registers the eight grammars the roadmap asks for (Rust, TypeScript,
 /// JavaScript, Python, JSON, TOML, YAML, Bash, Diff), instead of turning on
-/// gpui-component's `tree-sitter-languages` feature, which links all 27 of
+/// gpui-component's `tree-sitter-languages` feature, which links all 33 of
 /// its bundled grammars into the binary whether a chat ever shows them or
 /// not. JSON needs no entry: `tree-sitter-json` is gpui-component's one
 /// unconditional grammar, already registered before this runs.
@@ -159,6 +159,8 @@ mod tests {
                 "rust",
                 "sh",
                 "shell",
+                // gpui-component's plain entry, there before this runs.
+                "text",
                 "toml",
                 "ts",
                 "typescript",
@@ -204,9 +206,9 @@ mod tests {
         use gpui_component::highlighter::{HighlightTheme, SyntaxHighlighter};
         register();
         let mut highlighter = SyntaxHighlighter::new(lang);
-        highlighter.update(None, &Rope::from_str(code));
+        highlighter.update(None, &Rope::from_str(code), None);
         highlighter
-            .styles(&(0..code.len()), &HighlightTheme::default_dark())
+            .styles(&(0..code.len()), &*HighlightTheme::default_dark())
             .iter()
             .map(|(range, _)| code[range.clone()].to_string())
             .collect()
@@ -234,24 +236,14 @@ mod tests {
         }
     }
 
-    // gpui-component's own fallback, in a build with the `tree-sitter-languages`
-    // feature off, is `Language::from_str` always returning `Json` and
-    // `Language::name` always returning "json" (crates/ui/src/highlighter/
-    // languages.rs), so `LanguageRegistry::language` never returns `None`: a
-    // name nothing registered still resolves to whatever is registered under
-    // "json". A code fence tagged with a language this app does not know
-    // about is therefore drawn with JSON's grammar rather than left plain.
-    // Fixing that needs a `Plain` entry in that no-feature build of
-    // `Language` (mirroring the one the feature-gated build already has),
-    // which is a change inside the gpui-kit fork; this test records the
-    // current behaviour rather than the one the roadmap item asked for.
+    // gpui-component 0.5 resolved a name nothing registered to the JSON
+    // grammar, so a fence tagged with a language this app does not know about
+    // was drawn as JSON. Now it resolves to nothing, and the fence is
+    // left plain, as the roadmap item asked.
     #[test]
-    fn a_language_nothing_registered_still_borrows_the_json_grammar() {
+    fn a_language_nothing_registered_resolves_to_no_grammar() {
         register();
         let registry = LanguageRegistry::singleton();
-        let unknown = registry
-            .language("not-a-real-language")
-            .expect("the no-feature build's registry always resolves a name");
-        assert_eq!(unknown.name.as_ref(), "json");
+        assert!(registry.language("not-a-real-language").is_none());
     }
 }

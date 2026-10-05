@@ -183,7 +183,7 @@ impl Chat {
             ))
             .child(field(
                 "Prompt to send",
-                Input::new(&self.job_prompt).small().w_full(),
+                Textarea::new(&self.job_prompt).small().w_full(),
                 cx,
             ))
             .child(

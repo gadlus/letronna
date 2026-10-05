@@ -64,7 +64,7 @@ impl Chat {
         let picked: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
         let name_input = self.profile_name.clone();
         let chat = cx.entity();
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_alert_dialog(cx, move |dialog, _, cx| {
             let (chat, name_input) = (chat.clone(), name_input.clone());
             let (profiles, picked) = (profiles.clone(), picked.clone());
             let current = picked.get();
@@ -76,6 +76,7 @@ impl Chat {
                     // Picking the chosen one again changes nothing, and a
                     // disabled primary would read as the one not on offer.
                     .when(chosen, |b| b.primary())
+                    .when(!chosen, |b| b.secondary())
                     .label(label)
                     .on_click(move |_, window, _| {
                         picked.set(index);
@@ -91,7 +92,7 @@ impl Chat {
             }
             dialog
                 .title(div().font_family(HEADING_FONT).child("New profile"))
-                .w(px(420.))
+                .width(px(420.))
                 .confirm()
                 .child(Input::new(&name_input))
                 .child(

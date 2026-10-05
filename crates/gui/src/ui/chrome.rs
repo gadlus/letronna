@@ -185,7 +185,7 @@ impl Chat {
                             .text_color(cx.theme().muted_foreground),
                     ),
             )
-            .dropdown_menu_with_anchor(gpui::Corner::TopRight, move |menu, window, cx| {
+            .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, window, cx| {
                 let (settings, account, auth) = (chat.clone(), chat.clone(), chat.clone());
                 let (usage, setup) = (chat.clone(), chat.clone());
                 let menu = menu
@@ -443,7 +443,7 @@ impl Chat {
         let (chat, report) = (cx.entity(), self.context_report);
         Some(
             Popover::new("context-popover")
-                .anchor(gpui::Corner::BottomRight)
+                .anchor(gpui::Anchor::BottomRight)
                 // The built-in appearance shadows the panel; a hairline
                 // border says the same thing without one.
                 .appearance(false)

@@ -50,35 +50,31 @@ use gpui_component::{
 const CODE_LINE: Pixels = px(18.);
 
 /// Button looks that stay still under the pointer and fill only while
-/// pressed. gpui-component works a ghost button's hover out from `secondary`
-/// and fills an outline one with `secondary_hover` over the page, so no theme
-/// token can hold either still; as custom variants they can.
+/// pressed. gpui-component works a ghost button's hover out from `accent`,
+/// so no theme token can hold it still; as a custom variant it can. A button
+/// with no variant takes the theme's `button` colours, which the theme holds
+/// still on the page with a hairline edge.
 pub(crate) trait NoHover: ButtonVariants {
     /// No fill and no edge, in place of `ghost`.
     fn plain(self, cx: &App) -> Self {
-        self.custom(pressed_only(
-            cx.theme().transparent,
-            cx.theme().transparent,
-            cx,
-        ))
+        self.custom(pressed_only(cx.theme().transparent, cx))
     }
 
     /// A hairline edge on the page colour, in place of `outline`.
-    fn framed(self, cx: &App) -> Self {
-        self.custom(pressed_only(cx.theme().background, cx.theme().border, cx))
+    fn framed(self, _: &App) -> Self {
+        self.with_variant(ButtonVariant::Default)
     }
 }
 
 impl NoHover for Button {}
 
 /// A custom look whose hover is its resting fill, pressed and selected
-/// showing `secondary_active` as an outline button does (a ghost one
-/// pressed to a lighter `secondary`).
-fn pressed_only(ground: Hsla, edge: Hsla, cx: &App) -> ButtonCustomVariant {
+/// showing `secondary_active` as a framed button does (a ghost one pressed
+/// to a lighter `secondary`).
+fn pressed_only(ground: Hsla, cx: &App) -> ButtonCustomVariant {
     ButtonCustomVariant::new(cx)
         .color(ground)
         .hover(ground)
-        .border(edge)
         .foreground(cx.theme().secondary_foreground)
         .active(cx.theme().secondary_active)
 }
@@ -148,11 +144,11 @@ pub(crate) fn confirm_delete(
     delete: impl Fn(&mut Window, &mut App) + 'static,
 ) {
     let delete = std::rc::Rc::new(delete);
-    window.open_dialog(cx, move |dialog, _, cx| {
+    window.open_alert_dialog(cx, move |dialog, _, cx| {
         let delete = delete.clone();
         dialog
             .title(div().font_family(HEADING_FONT).child(title))
-            .w(px(420.))
+            .width(px(420.))
             .confirm()
             .button_props(
                 DialogButtonProps::default()
@@ -477,7 +473,7 @@ pub(crate) fn preview_block(
             .child(inked(rest.shown, cut, ink, cx));
         // The row stands where the hidden lines are: over a tail, under a head.
         let more = more_row(
-            ElementId::NamedChild(Box::new(id), "more".into()),
+            ElementId::NamedChild(id.into(), "more".into()),
             match cut {
                 Cut::Tail => earlier_lines(rest.hidden),
                 Cut::Head => more_lines(rest.hidden),
@@ -509,7 +505,7 @@ pub(crate) fn preview_block(
             cx,
         ))
         .child(more_row(
-            ElementId::NamedChild(Box::new(id), "more".into()),
+            ElementId::NamedChild(id.into(), "more".into()),
             "Show less".to_owned(),
             true,
             toggle,
@@ -542,7 +538,7 @@ pub(crate) fn more_row(
 ) -> impl IntoElement {
     let focus = window
         .use_keyed_state(
-            ElementId::NamedChild(Box::new(id.clone()), "focus".into()),
+            ElementId::NamedChild(id.clone().into(), "focus".into()),
             cx,
             |_, cx| cx.focus_handle().tab_stop(true),
         )

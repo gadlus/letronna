@@ -27,8 +27,8 @@ pub(crate) struct MemoryPage {
     soul: Option<memory::Store>,
     /// The entry being edited: its store, number and text as shown.
     editing: Option<(&'static str, usize, String)>,
-    entry: Entity<InputState>,
-    soul_text: Entity<InputState>,
+    entry: Entity<TextareaState>,
+    soul_text: Entity<TextareaState>,
     /// SOUL.md as it was last put in its box, which a save is pinned to.
     soul_loaded: String,
     /// Whether the box differs from it, as last drawn.
@@ -47,14 +47,9 @@ struct Shown {
 
 impl MemoryPage {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let entry = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .auto_grow(1, 10)
-        });
+        let entry = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 10));
         let soul_text = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .auto_grow(4, 16)
                 .placeholder("You are Letronna, a careful assistant who…")
         });
@@ -454,7 +449,9 @@ impl MemoryPage {
         let target = store.target;
         let over = store.used > store.limit;
         let share = store.used as f32 / store.limit.max(1) as f32 * 100.;
-        let meter = Progress::new().value(share).h(px(4.));
+        let meter = Progress::new(SharedString::from(format!("{target}-budget")))
+            .value(share)
+            .h(px(4.));
         v_flex()
             .gap_2()
             .child(
@@ -581,7 +578,7 @@ impl MemoryPage {
             .flex_1()
             .min_w_0()
             .gap_2()
-            .child(Input::new(&self.entry).small().w_full())
+            .child(Textarea::new(&self.entry).small().w_full())
             .child(
                 h_flex()
                     .gap_2()
@@ -689,7 +686,7 @@ impl MemoryPage {
                     cx,
                 ))
                 .children(error)
-                .child(Input::new(&self.soul_text).w_full())
+                .child(Textarea::new(&self.soul_text).w_full())
                 .child(
                     h_flex()
                         .gap_2()

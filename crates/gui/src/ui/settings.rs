@@ -316,7 +316,7 @@ impl Chat {
         self.settings_closing = false;
         // Somewhere inside the chat has to hold focus for escape to reach
         // it; opened from a menu, nothing does.
-        self.settings_focus.focus(window);
+        self.settings_focus.focus(window, cx);
         // The terminal may have signed in or out since this last looked.
         self.refresh_account(cx);
         if *self.settings_page.read(cx) == "Usage" {
@@ -477,7 +477,7 @@ impl Chat {
                     at.saturating_sub(1)
                 };
                 show_page(PAGES[next].0, &page, &chat, cx);
-                window.focus(&handles[next]);
+                window.focus(&handles[next], cx);
             }
         };
         let back = step.clone();
@@ -1208,6 +1208,7 @@ fn updates(chat: &Entity<Chat>, this: &Chat, cx: &App) -> Div {
                 .gap_2()
                 .child(
                     Button::new("check-updates")
+                        .secondary()
                         .small()
                         .label("Check for updates")
                         .disabled(looking)

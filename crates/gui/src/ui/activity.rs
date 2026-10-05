@@ -219,14 +219,14 @@ impl Chat {
     pub(crate) fn open_activity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.page = Page::Activity;
         self.viewing = None;
-        self.focus_activity(window);
+        self.focus_activity(window, cx);
         cx.notify();
     }
 
     /// Gives the keyboard to the page, so Tab goes on through its buttons
     /// when the one it was on is gone.
-    fn focus_activity(&self, window: &mut Window) {
-        self.activity_focus.focus(window);
+    fn focus_activity(&self, window: &mut Window, cx: &mut App) {
+        self.activity_focus.focus(window, cx);
     }
 
     fn open_transcript(&mut self, id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
@@ -254,7 +254,7 @@ impl Chat {
             messages: transcript.conversation.messages,
             scroll,
         });
-        self.focus_activity(window);
+        self.focus_activity(window, cx);
         cx.notify();
     }
 
@@ -275,7 +275,7 @@ impl Chat {
             return false;
         };
         let scroll = &viewing.scroll;
-        let at_end = scroll.max_offset().height + scroll.offset().y <= FOLLOW;
+        let at_end = scroll.max_offset().y + scroll.offset().y <= FOLLOW;
         viewing.messages = transcript.conversation.messages;
         viewing.length = length;
         if at_end {
@@ -328,7 +328,7 @@ impl Chat {
     /// the box that had it is gone.
     pub(crate) fn close_steer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.steering = None;
-        self.focus_activity(window);
+        self.focus_activity(window, cx);
         cx.notify();
     }
 
@@ -344,7 +344,7 @@ impl Chat {
         if self.page == Page::Chat {
             self.focus_composer(window, cx);
         } else {
-            self.focus_activity(window);
+            self.focus_activity(window, cx);
         }
         cx.notify();
     }
@@ -614,7 +614,7 @@ impl Chat {
                 .map(|(i, todo)| todo_row(i, todo, cx).into_any_element()),
         );
         if focus_first {
-            window.focus(first.as_ref().unwrap_or(&self.strip_focus));
+            window.focus(first.as_ref().unwrap_or(&self.strip_focus), cx);
         }
         v_flex()
             .id("running-list")
@@ -1169,7 +1169,7 @@ impl Chat {
             .when(!message.content.is_empty(), |this| {
                 this.child(
                     div().w_full().overflow_hidden().child(
-                        TextView::markdown(md, message.content.clone(), window, cx)
+                        TextView::markdown(md, message.content.clone())
                             .selectable(!window.has_active_dialog(cx)),
                     ),
                 )

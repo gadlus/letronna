@@ -59,8 +59,14 @@ impl Render for Grain {
                         let mut x = bounds.left();
                         while x < bounds.right() {
                             let at = Bounds::new(point(x, y), size(side, side));
-                            let _ =
-                                window.paint_image(at, Corners::default(), tile.clone(), 0, false);
+                            let _ = window.paint_image(
+                                at,
+                                at,
+                                Corners::default(),
+                                tile.clone(),
+                                0,
+                                false,
+                            );
                             x += side;
                         }
                         y += side;
@@ -95,7 +101,7 @@ impl Grains {
 impl Chat {
     /// A surface's grain over the whole of its parent, or nothing when
     /// Appearance has it off.
-    pub(crate) fn grain(&self, layer: &Entity<Grain>) -> Option<AnyView> {
+    pub(crate) fn grain(&self, layer: &Entity<Grain>) -> Option<impl IntoElement + use<>> {
         let over_parent = StyleRefinement::default()
             .absolute()
             .top_0()

@@ -95,7 +95,7 @@ fn next_frame(window: &mut Window, cx: &mut App) {
     }
     cx.spawn(async move |cx| {
         cx.background_executor().timer(TICK).await;
-        let _ = cx.update(|cx| {
+        cx.update(|cx| {
             cx.default_global::<Asked>().0.remove(&id);
             let _ = handle.update(cx, |_, window, _| window.refresh());
         });

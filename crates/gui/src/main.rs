@@ -177,7 +177,10 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
         (
             KeyBinding::new(
                 "shift-enter",
-                gpui_component::input::Enter { secondary: true },
+                gpui_component::input::Enter {
+                    secondary: true,
+                    shift: true,
+                },
                 Some("Input"),
             ),
             Some("A new line in the message"),
@@ -717,7 +720,7 @@ fn main() {
     // still in a file is moved there.
     letronna_core::vault::open();
     letronna_core::diag::init("gui");
-    Application::new().with_assets(Assets).run(|cx| {
+    gpui_platform::application().with_assets(Assets).run(|cx| {
         letronna_core::diag::mark("app");
         gpui_component::init(cx);
         highlight::register();
@@ -740,7 +743,7 @@ fn main() {
         );
         ui::quick::init(cx);
         platform::tray::init(cx);
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
             }

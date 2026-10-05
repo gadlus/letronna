@@ -133,7 +133,7 @@ impl Chat {
             let forks = self.asked_after(index);
             v_flex()
                 .gap_2()
-                .child(Input::new(&self.edit_message).appearance(false))
+                .child(Textarea::new(&self.edit_message).appearance(false))
                 .child(
                     h_flex()
                         .gap_2()
@@ -208,14 +208,14 @@ impl Chat {
                     .max_h(leading * PROMPT_ROWS as f32)
                     .overflow_hidden()
                     .child(
-                        TextView::markdown(self.text_id("md-cut", index), cut.shown, window, cx)
+                        TextView::markdown(self.text_id("md-cut", index), cut.shown)
                             .selectable(selectable)
                             .text_size(px(15.))
                             .font_weight(FontWeight::MEDIUM)
                             .line_height(leading),
                     )
                     .into_any_element(),
-                None => TextView::markdown(md, said, window, cx)
+                None => TextView::markdown(md, said)
                     .selectable(selectable)
                     .text_size(px(15.))
                     .font_weight(FontWeight::MEDIUM)
@@ -260,14 +260,16 @@ impl Chat {
             } else {
                 md
             };
-            let style = gpui_component::text::TextViewStyle::default().heading_gap(gpui::rems(1.));
+            let style = crate::theme::reply_text_style(cx.theme());
             let style = if fences_open {
                 style
             } else {
                 // The block's 12px padding above the rows, and a sliver of
                 // the next row's leading below them to say it goes on.
                 let cap = px(12.) + leading * FENCE_ROWS as f32 + px(4.);
-                style.code_block(StyleRefinement::default().max_h(cap).overflow_hidden())
+                let mut code_block = style.code_block().clone();
+                code_block.refine(&StyleRefinement::default().max_h(cap).overflow_hidden());
+                style.with_code_block(code_block)
             };
             // At the size the block draws its code, less a little, as a row
             // breaks before a word that does not fit: an estimate short of
@@ -276,7 +278,7 @@ impl Chat {
             let per_row = crate::ui::per_row(self.text_width(px(24.)), size, window);
             let per_row = per_row - per_row / 8;
             let chat = cx.weak_entity();
-            TextView::markdown(md, message.content.clone(), window, cx)
+            gpui_base::TextView::markdown(md, message.content.clone())
                 .selectable(selectable)
                 .line_height(leading)
                 .style(style)
@@ -550,7 +552,7 @@ impl Chat {
                 .gap_1()
                 .text_color(muted)
                 .child(
-                    TextView::markdown(self.row_id("aside", 0), reply.content.clone(), window, cx)
+                    TextView::markdown(self.row_id("aside", 0), reply.content.clone())
                         .selectable(!window.has_active_dialog(cx))
                         .line_height(px(26.)),
                 )
@@ -1659,8 +1661,6 @@ impl Chat {
                             TextView::markdown(
                                 self.text_id("reason", index),
                                 message.reasoning.clone(),
-                                window,
-                                cx,
                             )
                             .selectable(!window.has_active_dialog(cx))
                             .line_height(px(21.)),
@@ -2372,7 +2372,7 @@ fn sound_button(index: usize, path: PathBuf, cx: &mut Context<Chat>) -> Button {
                     loop {
                         cx.background_executor().timer(quarter).await;
                         let on = cx.update(|_| crate::platform::audio::playing(&sound));
-                        if !on.unwrap_or(false) {
+                        if !on {
                             break;
                         }
                     }

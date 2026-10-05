@@ -165,15 +165,15 @@ impl Chat {
                 }
             }))
             .on_action(
-                cx.listener(move |_, _: &sessions::PreviousSession, window, _| {
+                cx.listener(move |_, _: &sessions::PreviousSession, window, cx| {
                     if let Some(up) = &up {
-                        window.focus(up);
+                        window.focus(up, cx);
                     }
                 }),
             )
             .on_action(cx.listener(
                 move |this, _: &sessions::NextSession, window, cx| match &down {
-                    Some(down) => window.focus(down),
+                    Some(down) => window.focus(down, cx),
                     None => this.down_to_sessions(window, cx),
                 },
             ))
@@ -203,7 +203,7 @@ impl Chat {
             return;
         };
         self.picked = Some(self.store.conversations[first].id);
-        window.focus(&self.sidebar_focus);
+        window.focus(&self.sidebar_focus, cx);
         cx.notify();
     }
 
@@ -545,7 +545,7 @@ impl Chat {
                     if this.at_first_session(cx)
                         && let Some(last) = &last
                     {
-                        window.focus(last);
+                        window.focus(last, cx);
                         return cx.notify();
                     }
                     this.pick_session(false, cx)

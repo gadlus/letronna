@@ -120,8 +120,8 @@ fn settle(
     let (chat, waiting) = (chat.clone(), waiting.clone());
     cx.spawn(async move |cx| {
         settled.await;
-        let _ = waiting.update(cx, |waiting, _| *waiting = false);
-        let _ = chat.update(cx, |_, cx| cx.notify());
+        waiting.update(cx, |waiting, _| *waiting = false);
+        chat.update(cx, |_, cx| cx.notify());
     })
     .detach();
 }
@@ -568,7 +568,7 @@ fn begin(
                     .spawn(async move { mcp_auth::open_browser(&url) })
                     .detach();
                 let shown = Some(sign_in.clone());
-                let _ = signing.update(cx, |signing, _| {
+                signing.update(cx, |signing, _| {
                     if let Some(ours) = signing
                         .as_mut()
                         .filter(|ours| Arc::ptr_eq(&ours.stop, &stop))
@@ -576,7 +576,7 @@ fn begin(
                         ours.sign_in = shown;
                     }
                 });
-                let _ = chat.update(cx, |_, cx| cx.notify());
+                chat.update(cx, |_, cx| cx.notify());
                 let (done, finished) = async_channel::bounded(1);
                 std::thread::spawn(move || done.send_blocking(sign_in.finish()));
                 finished
@@ -591,7 +591,7 @@ fn begin(
             }
             Err(error) => Err(error),
         };
-        let _ = cx.update(|cx| {
+        cx.update(|cx| {
             // Only this sign-in is cleared: one started again since stays.
             signing.update(cx, |signing, _| {
                 if signing

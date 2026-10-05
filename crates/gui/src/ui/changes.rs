@@ -91,7 +91,7 @@ pub(crate) struct Changes {
     /// The model is writing a commit message.
     suggesting: bool,
     /// The commit message, kept across reads until a commit takes it.
-    message: Entity<InputState>,
+    message: Entity<TextareaState>,
     pub(crate) focus: FocusHandle,
     scroll: UniformListScrollHandle,
     /// Diffs asked for so far, to tell each answer's ask apart.
@@ -138,8 +138,7 @@ enum Listing {
 impl Changes {
     pub(crate) fn new(window: &mut Window, cx: &mut App) -> Self {
         let message = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .auto_grow(3, 8)
                 .placeholder("Commit message")
         });
@@ -385,7 +384,7 @@ impl Chat {
     pub(crate) fn show_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_tab(crate::ui::panel::PanelTab::Changes, window, cx);
         self.refresh_changes(cx);
-        window.focus(&self.changes.focus);
+        window.focus(&self.changes.focus, cx);
     }
 
     pub(crate) fn switch_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
@@ -798,11 +797,11 @@ impl Chat {
         let title = format!("Push {} to {}", plan.branch, plan.remote);
         let command = plan.command();
         let chat = cx.entity();
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_alert_dialog(cx, move |dialog, _, cx| {
             let (chat, folder, plan) = (chat.clone(), folder.clone(), plan.clone());
             dialog
                 .title(div().font_family(HEADING_FONT).child(title.clone()))
-                .w(px(460.))
+                .width(px(460.))
                 .confirm()
                 .button_props(DialogButtonProps::default().ok_text("Push"))
                 .child(
@@ -915,11 +914,11 @@ impl Chat {
         let body = "This session's edits to it are undone, back to how the session found it. \
                     What it is now is kept first, so this can be undone by hand.";
         let chat = cx.entity();
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_alert_dialog(cx, move |dialog, _, cx| {
             let (chat, plan) = (chat.clone(), plan.clone());
             dialog
                 .title(div().font_family(HEADING_FONT).child(title.clone()))
-                .w(px(460.))
+                .width(px(460.))
                 .confirm()
                 .button_props(
                     DialogButtonProps::default()
@@ -1105,8 +1104,8 @@ impl Chat {
             .on_action(cx.listener(|this, _: &CommitAndPush, window, cx| {
                 this.commit_staged(true, window, cx)
             }))
-            .on_action(cx.listener(move |_, _: &LeaveMessage, window, _| window.focus(&focus)))
-            .child(Input::new(&self.changes.message).small().w_full())
+            .on_action(cx.listener(move |_, _: &LeaveMessage, window, cx| window.focus(&focus, cx)))
+            .child(Textarea::new(&self.changes.message).small().w_full())
             .child(
                 h_flex()
                     .gap_1()
@@ -1208,7 +1207,7 @@ impl Chat {
                                 .id(("tree-file", row))
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.changes.selected = index;
-                                    window.focus(&focused);
+                                    window.focus(&focused, cx);
                                     this.open_selected(true, cx);
                                 }))
                                 .into_any_element(),
@@ -1217,7 +1216,7 @@ impl Chat {
                     .collect()
             }),
         )
-        .track_scroll(self.changes.scroll.clone())
+        .track_scroll(&self.changes.scroll)
         .h(height)
         .flex_shrink_0()
         .border_b_1()
@@ -1244,7 +1243,7 @@ impl Chat {
                             .id(("changed-file", at))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.changes.selected = at;
-                                window.focus(&focused);
+                                window.focus(&focused, cx);
                                 this.open_selected(true, cx);
                             }))
                             .into_any_element()
@@ -1252,7 +1251,7 @@ impl Chat {
                     .collect()
             }),
         )
-        .track_scroll(self.changes.scroll.clone())
+        .track_scroll(&self.changes.scroll)
         .h(height)
         .flex_shrink_0()
         .border_b_1()

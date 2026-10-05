@@ -5,7 +5,7 @@ pub(crate) use gpui_component::{
     WindowExt,
     button::{Button, ButtonVariants},
     h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState, Textarea, TextareaState},
     kbd::Kbd,
     menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
     scroll::ScrollableElement,

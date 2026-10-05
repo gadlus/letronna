@@ -369,10 +369,10 @@ impl Chat {
             self.browser.update(cx, |view, cx| view.ask(window, cx));
         }
         if tab == PanelTab::Files {
-            self.focus_files(window);
+            self.focus_files(window, cx);
         }
         if tab == PanelTab::Jobs {
-            self.focus_jobs(window);
+            self.focus_jobs(window, cx);
         }
         cx.notify();
     }

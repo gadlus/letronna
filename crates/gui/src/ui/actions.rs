@@ -386,13 +386,13 @@ impl Chat {
         // putting files back replaces what is on disk, so it is asked for.
         let put_back = Rc::new(Cell::new(false));
         let chat = cx.entity();
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_alert_dialog(cx, move |dialog, _, cx| {
             let (chat, back) = (chat.clone(), back.clone());
             let (files, put_back) = (files.clone(), put_back.clone());
             let ticked = put_back.get();
             dialog
                 .title(div().font_family(HEADING_FONT).child("Rewind to here"))
-                .w(px(460.))
+                .width(px(460.))
                 .confirm()
                 .button_props(
                     DialogButtonProps::default()
@@ -691,7 +691,7 @@ impl Chat {
         let Some(next) = step_stop(stops.len(), at, down) else {
             return;
         };
-        self.go_to_stop(stops[next], true, window);
+        self.go_to_stop(stops[next], true, window, cx);
         self.region = Some(crate::ui::keys::Region::Transcript);
         cx.notify();
     }
@@ -699,11 +699,17 @@ impl Chat {
     /// Give `stop` the keys, and with `reveal` scroll a turn into sight. A
     /// turn's focus lives only while the list draws it, so the transcript
     /// holds the keys until `turn_row` hands them over at the next draw.
-    pub(crate) fn go_to_stop(&mut self, stop: Stop, reveal: bool, window: &mut Window) {
+    pub(crate) fn go_to_stop(
+        &mut self,
+        stop: Stop,
+        reveal: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         match stop {
             Stop::Turn(first) => {
                 let session = self.store.conversations[self.store.active].id;
-                window.focus(&self.transcript_focus);
+                window.focus(&self.transcript_focus, cx);
                 self.focus_turn = Some((session, first));
                 // Held there as a search hit is, until scrolled by hand.
                 if reveal {
@@ -716,7 +722,7 @@ impl Chat {
             // Always brought into sight: the card is at the end, where the
             // newest is, and out of sight it could not be answered.
             Stop::Question => {
-                window.focus(&self.question_focus);
+                window.focus(&self.question_focus, cx);
                 self.follow();
             }
         }
@@ -805,7 +811,7 @@ impl Chat {
         };
         let build = self.turn_menu(span, cx);
         let menu = PopupMenu::build(window, cx, build);
-        menu.focus_handle(cx).focus(window);
+        menu.focus_handle(cx).focus(window, cx);
         cx.subscribe_in(
             &menu,
             window,
@@ -813,7 +819,7 @@ impl Chat {
                 // Escape gives the keys back to the turn; an item that moved
                 // them, to the composer or a dialog, keeps them there.
                 if menu.focus_handle(cx).contains_focused(window, cx) {
-                    window.focus(&turn);
+                    window.focus(&turn, cx);
                 }
                 this.turn_menu = None;
                 cx.notify();
@@ -877,9 +883,9 @@ impl Chat {
         if !shown {
             // Your prompt's sits at the right end of its label.
             let corner = if span.yours {
-                gpui::Corner::TopRight
+                gpui::Anchor::TopRight
             } else {
-                gpui::Corner::TopLeft
+                gpui::Anchor::TopLeft
             };
             return Button::new(self.row_id("more", span.first))
                 .plain(cx)
