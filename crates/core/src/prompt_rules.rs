@@ -8,8 +8,8 @@
 //! read as a rule that changes nothing; a row only watched sessions are told
 //! cannot be named at all. A watched session, the window's, the terminal's,
 //! an editor's or a chat app's, is told every row whatever the variable
-//! says. With nothing dropped the text is byte for byte what it was, so the
-//! prefix a provider cached still holds.
+//! says. With nothing dropped a run is told every row its build ships, the
+//! same each time, so the prefix a provider cached still holds.
 
 use crate::chat::Connection;
 use ring::digest;
@@ -40,6 +40,8 @@ enum To {
     Watched,
     /// A run nobody watches.
     Unwatched,
+    /// Where the reads and searches of one reply run at once.
+    Parallel,
 }
 
 impl To {
@@ -49,6 +51,7 @@ impl To {
             To::Every => true,
             To::Watched => watched(connection),
             To::Unwatched => !watched(connection),
+            To::Parallel => crate::store::parallel_tool_calls(),
         }
     }
 
@@ -65,10 +68,18 @@ fn watched(connection: &Connection) -> bool {
     connection.human || connection.remote.is_some()
 }
 
-/// The rules after what the tools are for, in order: how calls are approved,
-/// or, in a run nobody watches, what it is told in place of approvals and
-/// `ask_user`, neither of which it has; then checking the work.
-pub(crate) const TOOLS: [Rule; 14] = [
+/// The rules after what the tools are for, in order: what to leave alone;
+/// how calls are approved or, in a run nobody watches, what it is told in
+/// place of approvals and `ask_user`, neither of which it has; then checking
+/// the work, making calls, ending a turn and the steps to ask about first.
+pub(crate) const TOOLS: [Rule; 18] = [
+    // Undoing what the user changed is the git rule's. New files and tests
+    // are not forbidden, as checks and required outputs need them.
+    Rule {
+        id: "scope",
+        to: To::Every,
+        text: "Do not refactor, rename or reformat code the task does not need changed, or add dependencies it does not need, and do not paste code into your reply in place of editing the file.",
+    },
     Rule {
         id: "approval",
         to: To::Watched,
@@ -141,15 +152,52 @@ pub(crate) const TOOLS: [Rule; 14] = [
         to: To::Unwatched,
         text: "Start each reply that calls a tool with one short line saying what you are doing and why.",
     },
+    // The narrowest check first, as a full suite after every edit costs
+    // minutes; a result in hand, not pasted logs; a test edited to pass is
+    // no check at all.
     Rule {
         id: "done",
         to: To::Every,
-        text: "After changing code, verify it (build, test, or run) before reporting done.",
+        text: "After changing code, run the narrowest check that exercises the change, and broader ones only when it could break more. Say done, fixed or passing only when a result you got shows it. A test your change breaks is yours to fix; name, don't fix, failures it did not cause, and edit a test only when the task changes what it checks. If a check fails or cannot run here, say so; never invent output or results.",
+    },
+    // Left out when calls run one at a time, so the prompt never asks for
+    // what the run will not do.
+    Rule {
+        id: "batch",
+        to: To::Parallel,
+        text: "Make calls that do not depend on each other, such as several reads or searches, in one reply: reads and searches run at once, other calls in the order given, and each extra round resends the whole conversation.",
+    },
+    // Work already under way, such as a helper in the background, is a fine
+    // place to end; a question goes through ask_user, which a run nobody
+    // watches and a helper do not have.
+    Rule {
+        id: "turn-end",
+        to: To::Every,
+        text: "A reply with no tool call ends your turn: make any call you announce in that same reply, and end with the result, what blocks it, or work already under way, never a promise.",
+    },
+    // Where the user turned the card off, by Bypass, a grant for the tool or
+    // a rule, nothing else stops a push or a message. Asking here, in the
+    // project's instructions or through a skill counts, so a task that names
+    // the step runs without a question. Fetching a page or a package changes
+    // nothing outside, so it is not one.
+    Rule {
+        id: "outward",
+        to: To::Every,
+        text: "Before a step that changes something outside this computer or cannot be undone (messaging other people, posting, pushing, publishing, deploying, paying, or deleting data you did not make that the task does not need gone), check that the user asked for that step itself, in this conversation, in the project's instructions or through a skill they invoked. If not, do the work up to it, then ask; with nobody to ask, list it as pending.",
     },
 ];
 
+/// The rules after where the project folder is.
+// Not "ask about uncommitted changes", which stalls work in any repository
+// someone is using; and a push is the outward rule's.
+pub(crate) const PROJECT: [Rule; 1] = [Rule {
+    id: "git",
+    to: To::Every,
+    text: "Changes in the project you did not make are the user's: work with them. Unless asked, never revert or discard them (git checkout --, git restore, git reset --hard), commit, or rewrite git history; never commit secrets.",
+}];
+
 /// Every table of rules, for finding a row by its id.
-const TABLES: [&[Rule]; 1] = [&TOOLS];
+const TABLES: [&[Rule]; 2] = [&TOOLS, &PROJECT];
 
 /// Every row of every table.
 fn all() -> impl Iterator<Item = &'static Rule> {
@@ -272,6 +320,14 @@ mod tests {
     use super::*;
     use crate::chat::Remote;
 
+    /// The data folder held still: the batching row reads the settings file
+    /// each time it is told, and these tests compare two tellings.
+    fn settings_held() -> std::sync::MutexGuard<'static, ()> {
+        crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     fn headless() -> Connection {
         Connection {
             tools: true,
@@ -307,21 +363,23 @@ mod tests {
     #[test]
     fn nothing_dropped_leaves_the_rules_as_one_line_of_sentences() {
         let headless = told_without(&headless(), &TOOLS, &[]);
+        assert!(headless.starts_with(" Do not refactor"), "{headless}");
         assert!(
-            headless.starts_with(" Nobody is watching this run"),
+            headless.contains(" Nobody is watching this run"),
             "{headless}"
         );
-        assert!(headless.ends_with(" before reporting done."), "{headless}");
+        assert!(headless.ends_with(" list it as pending."), "{headless}");
         assert!(!headless.contains("for approval"), "{headless}");
         let window = told_without(&window(), &TOOLS, &[]);
-        assert_eq!(
-            window,
-            " Writes and commands are shown to the user for approval; a denial is final for that action. Ask with ask_user when a decision is the user's to make, such as a project name. After changing code, verify it (build, test, or run) before reporting done."
+        assert!(
+            window.contains(" in place of editing the file. Writes and commands are shown to the user for approval; a denial is final for that action. Ask with ask_user when a decision is the user's to make, such as a project name. After changing code, run the narrowest check"),
+            "{window}"
         );
     }
 
     #[test]
     fn a_dropped_rule_leaves_a_run_nobody_watches_and_nothing_else() {
+        let _turn = settings_held();
         let full = told_without(&headless(), &TOOLS, &[]);
         let without = told_without(&headless(), &TOOLS, &["compute", "narrate"]);
         assert_eq!(
@@ -337,6 +395,7 @@ mod tests {
 
     #[test]
     fn the_switch_never_changes_a_watched_prompt() {
+        let _turn = settings_held();
         let every: Vec<&str> = all().map(|rule| rule.id).collect();
         let chat_app = Connection {
             remote: Some(Remote {
@@ -383,6 +442,7 @@ mod tests {
 
     #[test]
     fn the_report_names_what_was_dropped_and_hashes_what_was_left() {
+        let _turn = settings_held();
         let all_told = seen_without(&headless(), &[]);
         assert_eq!(all_told["dropped"], json!([]));
         let sha = all_told["rules_sha"].as_str().unwrap();

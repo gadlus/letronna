@@ -1140,6 +1140,10 @@ fn system_prompt(
                 if let Some(note) = crate::worktree::note(w) {
                     system.push_str(&format!(" {note}"));
                 }
+                system.push_str(&crate::prompt_rules::told(
+                    connection,
+                    &crate::prompt_rules::PROJECT,
+                ));
             }
             // The folder is the same for every request on this computer,
             // so the cached prefix holds.
@@ -5274,9 +5278,13 @@ mod tests {
 
     #[test]
     fn a_run_nobody_watches_is_told_nobody_will_answer() {
+        // Held, as the batching row reads the settings each time it is told.
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let unwatched = system_with_tools(connection());
         let rules = crate::prompt_rules::told(&connection(), &crate::prompt_rules::TOOLS);
-        assert!(rules.starts_with(" Nobody is watching this run"), "{rules}");
+        assert!(rules.contains(" Nobody is watching this run"), "{rules}");
         assert!(unwatched.contains(&rules), "{unwatched}");
         assert!(!unwatched.contains("for approval"), "{unwatched}");
         assert!(!unwatched.contains("Ask with ask_user"), "{unwatched}");
@@ -5327,10 +5335,139 @@ mod tests {
             human: true,
             ..connection()
         });
-        // Word for word as it was, so the prefix a provider cached still holds.
-        let before = " You have tools to read, search, write and edit files and to run commands in the user's project; use them instead of guessing. Writes and commands are shown to the user for approval; a denial is final for that action. Ask with ask_user when a decision is the user's to make, such as a project name. After changing code, verify it (build, test, or run) before reporting done.";
+        // Its approval and ask_user sentences, as they were.
+        let before = " Writes and commands are shown to the user for approval; a denial is final for that action. Ask with ask_user when a decision is the user's to make, such as a project name.";
         assert!(watched.contains(before), "{watched}");
         assert!(!watched.contains("Nobody is watching"), "{watched}");
+    }
+
+    /// A distinctive part of each work rule's sentence.
+    const WORK_RULES: [&str; 6] = [
+        "Do not refactor, rename or reformat",
+        "never invent output or results",
+        "Make calls that do not depend on each other",
+        "A reply with no tool call ends your turn",
+        "check that the user asked for that step itself",
+        "Changes in the project you did not make are the user's",
+    ];
+
+    #[test]
+    fn every_tool_session_is_told_to_show_a_result_before_saying_done() {
+        // An empty data folder, so the batching sentence is not left out by
+        // someone's own settings.
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::store::tests::Scratch::new("chat-work-rules");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let chat_app = Connection {
+            remote: Some(Remote {
+                place: "a Telegram chat".into(),
+                ..Default::default()
+            }),
+            ..connection()
+        };
+        let watched = Connection {
+            human: true,
+            ..connection()
+        };
+        let systems: Vec<String> = [connection(), watched, chat_app]
+            .into_iter()
+            .map(|c| {
+                system_with_tools(Connection {
+                    workspace: Some("/w".into()),
+                    ..c
+                })
+            })
+            .collect();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        for system in systems {
+            for rule in WORK_RULES {
+                assert!(system.contains(rule), "{rule}: {system}");
+            }
+            assert!(
+                !system.contains("verify it (build, test, or run)"),
+                "{system}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_git_rule_follows_the_project_folder_and_needs_one() {
+        let project = system_with_tools(Connection {
+            workspace: Some("/w".into()),
+            ..connection()
+        });
+        assert!(
+            project.contains(
+                "The project folder is `/w`. Changes in the project you did not make are the user's"
+            ),
+            "{project}"
+        );
+        let none = system_with_tools(connection());
+        assert!(none.contains("No project folder is attached"), "{none}");
+        assert!(!none.contains("Changes in the project"), "{none}");
+        assert!(
+            none.contains("A reply with no tool call ends your turn"),
+            "{none}"
+        );
+    }
+
+    #[test]
+    fn a_shared_chat_or_a_session_without_tools_gets_none_of_the_work_rules() {
+        let chat = |place: &str, shared: bool| {
+            system_with_tools(Connection {
+                workspace: Some("/w".into()),
+                remote: Some(Remote {
+                    place: place.into(),
+                    shared,
+                    ..Default::default()
+                }),
+                ..connection()
+            })
+        };
+        // A chat only the user reads is told them.
+        let dm = chat("a Discord DM", false);
+        assert!(dm.contains(WORK_RULES[0]), "{dm}");
+        let shared = chat("#general in a Discord server", true);
+        let toolless = body(
+            &Connection {
+                workspace: Some("/w".into()),
+                ..connection()
+            },
+            &[],
+            None,
+            None,
+        )["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for system in [shared, toolless] {
+            for rule in WORK_RULES {
+                assert!(!system.contains(rule), "{rule}: {system}");
+            }
+        }
+    }
+
+    #[test]
+    fn with_calls_run_one_at_a_time_the_batching_sentence_is_left_out() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::store::tests::Scratch::new("chat-one-at-a-time");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let batching = system_with_tools(connection());
+        let settings = json!({"endpoint": "", "model": "m", "parallel_tool_calls": false});
+        std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+        let alone = system_with_tools(connection());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        let sentence = "Make calls that do not depend on each other";
+        assert!(batching.contains(sentence), "{batching}");
+        assert!(!alone.contains(sentence), "{alone}");
+        assert!(
+            alone.contains("A reply with no tool call ends your turn"),
+            "{alone}"
+        );
     }
 
     #[test]
