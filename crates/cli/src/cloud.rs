@@ -13,12 +13,16 @@ Run a task in Letronna Cloud, on Letronna's servers (Pro)
   letronna cloud list                  your recent runs
   letronna cloud show <run>            one run's answer, or how it stands
   letronna cloud stop <run>            stop it
+  letronna cloud support <run> on|off  let Letronna's support read its task and
+                                       answer, or take that back
 
 Options
       --repo <https-url>     a git repository to work in, cloned first
       --branch <name>        the branch to clone
       --tier <tier>          light (512 MB), normal (1 GB) or heavy (2 GB);
                              light unless set
+      --model <name>         a hosted model (see letronna.ai/dashboard/models);
+                             the cloud's default unless set
       --thread <id>          carry on an earlier run's thread: its folder and
                              conversation, kept on the server between runs
       --no-wait              start it and print its id
@@ -43,6 +47,16 @@ pub fn run(words: &[String]) -> i32 {
             println!("Stopped {id}.");
             Ok(())
         }),
+        Some("support") => match &words[1..] {
+            [id, on] if on == "on" || on == "off" => cloud::support(id, on == "on").map(|()| {
+                if on == "on" {
+                    println!("Letronna's support can now read {id}'s task and answer; each look is logged.");
+                } else {
+                    println!("Support can no longer read {id}.");
+                }
+            }),
+            _ => Err("Say which run, and on or off: letronna cloud support run_abc123 on".into()),
+        },
         Some(_) => parse(words).and_then(|(task, wait)| start(&task, wait)),
     };
     match outcome {
@@ -83,6 +97,7 @@ fn parse(words: &[String]) -> Result<(Task, bool), String> {
                 }
             }
             "--thread" => task.thread = value("--thread")?,
+            "--model" => task.model = value("--model")?,
             "--no-wait" => wait = false,
             flag if flag.starts_with("--") => {
                 return Err(format!("Unknown option {flag}. See letronna cloud --help."));
@@ -138,7 +153,15 @@ fn show(id: String) -> Result<(), String> {
 
 fn print_run(run: &Run) {
     match run.status.as_str() {
-        "done" => println!("{}", run.answer.trim()),
+        "done" => {
+            println!("{}", run.answer.trim());
+            if let Some(preview) = &run.preview {
+                println!(
+                    "
+See what it made: {preview}"
+                );
+            }
+        }
         "failed" => eprintln!("{}", render::red(&format!("Failed: {}", run.error.trim()))),
         status => println!("{} is {status}.", run.id),
     }

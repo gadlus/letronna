@@ -12049,6 +12049,9 @@ mod tests {
 
     #[test]
     fn one_note_is_sent_per_mode_change_and_none_repeated() {
+        // The requests read the settings, which a test moving the data
+        // folder meanwhile would change between them.
+        let _held = (crate::store::tests::DATA_DIR.lock()).unwrap_or_else(|e| e.into_inner());
         let mut session = in_mode(Mode::Default);
         let mut window = vec![said("user", "look around")];
         window.push(replied(&session));

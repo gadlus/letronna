@@ -4764,8 +4764,12 @@ fn cloud_answer(task: &str, cancel: &letronna_core::cancel::Cancel) -> Result<Me
         "done" => Ok(Message {
             role: "assistant".into(),
             content: format!(
-                "{}\n\n*Ran in Letronna Cloud: {}, {} s, thread {}.*",
+                "{}{}\n\n*Ran in Letronna Cloud: {}, {} s, thread {}.*",
                 run.answer.trim(),
+                run.preview
+                    .as_ref()
+                    .map(|link| format!("\n\n[See what it made]({link})"))
+                    .unwrap_or_default(),
                 run.id,
                 run.seconds,
                 run.thread

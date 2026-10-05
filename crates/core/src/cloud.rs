@@ -30,6 +30,9 @@ pub struct Task {
     pub branch: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub tier: String,
+    /// A hosted model; the cloud's own default when empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub model: String,
     /// A thread to carry on, from an earlier run.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub thread: String,
@@ -53,6 +56,9 @@ pub struct Run {
     pub seconds: i64,
     #[serde(default)]
     pub created_at: i64,
+    /// Where what it made can be seen, once it is done and made a page.
+    #[serde(default)]
+    pub preview: Option<String>,
 }
 
 impl Run {
@@ -121,6 +127,16 @@ pub fn runs(limit: u32) -> Result<Vec<Run>, String> {
         .json::<Listed>()
         .map(|listed| listed.runs)
         .map_err(|e| e.to_string())
+}
+
+/// Let Letronna's support read a run's task and answer, or take that back.
+pub fn support(id: &str, allow: bool) -> Result<(), String> {
+    send(
+        client()?
+            .post(url(&format!("/v1/runs/{id}/support")))
+            .json(&serde_json::json!({ "allow": allow })),
+    )
+    .map(drop)
 }
 
 /// Stop a run, queued or running.
@@ -196,6 +212,7 @@ impl crate::tools::Tool for CloudTask {
             branch: field("branch"),
             tier: field("tier"),
             thread: field("thread"),
+            model: String::new(),
         };
         if task.prompt.is_empty() {
             return Err("Say what to do in `task`.".into());
@@ -211,10 +228,15 @@ impl crate::tools::Tool for CloudTask {
                 break now;
             }
         };
-        let said = format!(
+        let mut said = format!(
             "Ran in Letronna Cloud as {} ({}, {} s); to carry on there, pass thread {}.",
             run.id, run.tier, run.seconds, run.thread
         );
+        if let Some(preview) = &run.preview {
+            said.push_str(&format!(
+                " What it made can be seen at {preview}; give the user that link."
+            ));
+        }
         match run.status.as_str() {
             "done" => Ok(format!("{said}\n\n{}", run.answer.trim())),
             "stopped" => Err(format!("{said} It was stopped.")),
