@@ -624,8 +624,14 @@ mod tests {
     fn a_turns_calls_under_yes_still_meet_the_floor_and_the_deny_rules() {
         let none = Ok(Vec::new());
         assert_eq!(decided(&command("ls"), 1, true, &none), Decision::Once);
-        let Decision::Deny(why) = decided(&command("rm -rf victim"), 1, true, &none) else {
-            panic!("a folder was deleted with nobody to ask");
+        // A folder inside the project goes where commands run in sh, and one
+        // outside it still needs a person.
+        if cfg!(unix) {
+            let inside = decided(&command("rm -rf victim"), 1, true, &none);
+            assert_eq!(inside, Decision::Once);
+        }
+        let Decision::Deny(why) = decided(&command("rm -rf ../victim"), 1, true, &none) else {
+            panic!("a folder outside the project was deleted with nobody to ask");
         };
         assert!(why.contains("nobody"), "{why}");
         let denied = Ok(vec![Rule {

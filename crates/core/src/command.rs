@@ -461,6 +461,11 @@ pub struct Command {
     /// The folder it runs in, where its relative paths lead, or None once
     /// the line has changed folder.
     pub dir: Option<PathBuf>,
+    /// Whether it acts only on what its words spell out: each is known
+    /// before it runs -- none made by running something, holding a variable
+    /// this does not know, or spelt by braces the shell expands -- and
+    /// nothing is piped in for it to act on.
+    pub spelled_out: bool,
 }
 
 /// A line judged: each command in it, and the worst of them.
@@ -708,6 +713,17 @@ fn within(path: &[String], folder: &[String]) -> bool {
         (Some((a, p)), Some((b, f))) if a != b && (a == "/" || b == "/") => p.starts_with(f),
         _ => path.starts_with(folder),
     }
+}
+
+/// Whether `path` is one of the folders an operating system cannot do
+/// without, as `SYSTEM` lists them, read without the `\\?\` that Windows
+/// puts on a canonical path.
+pub(crate) fn system(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    let parts = Places::default().path(text).unwrap_or_default();
+    let under_root = parts.get(1..).unwrap_or_default().join("/");
+    SYSTEM.contains(&under_root.as_str())
 }
 
 /// A word as the shell hands it to the command, with quotes and escapes
@@ -1296,6 +1312,12 @@ fn judge(simple: &Simple, dialect: Dialect, places: &Places, depth: u8) -> Comma
         ));
     }
     let leaks = sends || metadata || nested.iter().any(|command| command.leaks);
+    let spelled_out = !simple.piped
+        && !simple.opaque
+        && simple
+            .words
+            .iter()
+            .all(|w| !w.opaque && !w.var && !w.expands());
     Command {
         argv,
         risk,
@@ -1309,6 +1331,7 @@ fn judge(simple: &Simple, dialect: Dialect, places: &Places, depth: u8) -> Comma
             .map(|w| w.text.clone())
             .collect(),
         dir: places.dir.clone(),
+        spelled_out,
     }
 }
 
@@ -2551,14 +2574,14 @@ fn dotted(raw: &str) -> bool {
 }
 
 /// Whether `raw` holds a wildcard that some shell matches against files.
-fn glob(raw: &str) -> bool {
+pub(crate) fn glob(raw: &str) -> bool {
     raw.contains(['*', '?', '['])
 }
 
 /// The files `path` names once each part with a wildcard is matched against
 /// what is there, the last part in every folder below as well when `deep`;
 /// None when that means looking at more than `GLOB_ENTRIES` entries.
-fn expand(path: &Path, deep: bool) -> Option<Vec<PathBuf>> {
+pub(crate) fn expand(path: &Path, deep: bool) -> Option<Vec<PathBuf>> {
     let parts: Vec<_> = path.components().collect();
     let mut budget = GLOB_ENTRIES;
     let mut found = vec![PathBuf::new()];
@@ -4135,5 +4158,39 @@ mod tests {
         let dirs: Vec<Option<&Path>> = commands.iter().map(|c| c.dir.as_deref()).collect();
         let work = Some(Path::new("/work"));
         assert_eq!(dirs, [work, work, None]);
+    }
+
+    #[test]
+    fn a_command_is_spelled_out_only_with_every_word_known_and_nothing_piped_in() {
+        let spelled = |line: &str| -> Vec<bool> {
+            let line = assess_in(line, Dialect::Sh, &linux(), 0);
+            line.commands.iter().map(|c| c.spelled_out).collect()
+        };
+        // A variable this knows is filled in.
+        assert_eq!(spelled("rm -rf out/tmp ~/x $HOME/y 2>/dev/null"), [true]);
+        for line in [
+            "rm -rf $TARGET",
+            "rm -rf \"out/$NAME\"",
+            "rm -rf out/{tmp,..}",
+            "rm -rf out/$'\\x2e\\x2e'",
+        ] {
+            assert_eq!(spelled(line), [false], "{line}");
+        }
+        // The substitution's own command is spelled out, the one it is in
+        // is not.
+        assert_eq!(spelled("rm -rf $(echo out)"), [true, false]);
+        assert_eq!(spelled("rm -rf `echo out`"), [true, false]);
+        assert_eq!(spelled("echo out | rm -rf tmp"), [true, false]);
+        assert_eq!(spelled("cat <<EOF\nrm -rf /\nEOF"), [false]);
+    }
+
+    #[test]
+    fn a_folder_the_system_needs_is_known_by_its_place_under_the_root() {
+        for path in ["/usr", "/home", r"C:\Windows\System32", r"\\?\C:\Users"] {
+            assert!(system(Path::new(path)), "{path}");
+        }
+        for path in ["/", "/usr/src/app", "/home/ada/code", r"\\?\C:\Users\ada"] {
+            assert!(!system(Path::new(path)), "{path}");
+        }
     }
 }

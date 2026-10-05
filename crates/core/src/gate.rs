@@ -543,8 +543,12 @@ fn ladder(
     // for a line that sends a .env file away or reaches a cloud machine's
     // metadata service, whose keys outlive the machine; each command is
     // asked, since another part's reason can outrank that one in the risk.
+    // On any machine such a run may delete folders that lie strictly inside
+    // the project, under the same deny rule: refused, it deleted the files
+    // in them one by one instead, which the floor lets through.
     if let Some(Risk::Dangerous(why)) = risk
         && !(disposable(gate) && ruling.denies.is_none() && !leaks(tool.name(), &args, gate.ctx))
+        && !(ruling.denies.is_none() && cleans_up(tool.name(), &args, gate))
     {
         return dangerous(why, gate);
     }
@@ -1192,6 +1196,112 @@ fn leaks(tool: &str, args: &Value, ctx: &ToolContext) -> bool {
         let assessed = command::assess(line, Dialect::here(), ctx.workspace.as_deref());
         assessed.commands.iter().any(|command| command.leaks)
     })
+}
+
+/// Whether `run_command` called with `args` under `gate`, a run in Bypass
+/// that nobody watches, does nothing hard to take back but delete whole
+/// folders by name that each lie strictly inside the project.
+fn cleans_up(tool: &str, args: &Value, gate: &Gate) -> bool {
+    // A chat app's session is driven by whoever writes in it, as for
+    // `disposable`. sh's rm deletes a link inside the folder as a link,
+    // where PowerShell's Remove-Item has followed one to what it leads to.
+    let unwatched = gate.mode == Mode::Bypass && !gate.human && gate.ctx.remote.is_none();
+    if tool != "run_command" || !unwatched || Dialect::here() != Dialect::Sh {
+        return false;
+    }
+    let Ok(dir) = tools::workdir(args, gate.ctx) else {
+        return false;
+    };
+    let line = args["command"].as_str().unwrap_or_default();
+    let assessed = command::assess(line, Dialect::here(), Some(&dir));
+    assessed.commands.iter().all(|command| match command.risk {
+        Risk::Hardline(_) => false,
+        Risk::Dangerous(_) => clears(command, gate.ctx),
+        _ => true,
+    })
+}
+
+/// Whether `command` is rm by the name the path finds, run as itself with
+/// every word spelled out, writing and sending nothing, and each word
+/// `deletable` from the folder it runs in.
+fn clears(command: &command::Command, ctx: &ToolContext) -> bool {
+    let (Some((name, paths)), Some(dir)) = (command.argv.split_first(), command.dir.as_deref())
+    else {
+        return false;
+    };
+    // A wrapper such as `xargs`, or a pipe, would hand it more to delete.
+    // Options count as paths too, as BSD's rm reads every word after its
+    // first path as one.
+    command.at == 0
+        && !name.contains(['/', '\\'])
+        && command::name_of(name) == "rm"
+        && command.spelled_out
+        && command.writes.is_empty()
+        && !command.leaks
+        && !paths.is_empty()
+        && paths.iter().all(|raw| deletable(raw, dir, ctx))
+}
+
+/// Whether deleting what `raw` names from `dir` whole stays inside `ctx`'s
+/// project: each path its globs match, or the path itself when they match
+/// nothing, is `clearable`.
+fn deletable(raw: &str, dir: &Path, ctx: &ToolContext) -> bool {
+    // `~name` is another user's home, and `~+` and `~-` folders the shell
+    // was in, which `named` would take as names in `dir`.
+    let tilde = raw
+        .strip_prefix('~')
+        .is_some_and(|rest| !rest.starts_with('/'));
+    let Some(path) = named(raw, Some(dir), ctx).filter(|_| !tilde) else {
+        return false;
+    };
+    if !command::glob(raw) {
+        return clearable(&path, ctx);
+    }
+    // Some shells match `..` with `.*`, which would step out of the folder.
+    let upward = path.iter().any(|part| {
+        let part = part.to_string_lossy();
+        part.starts_with('.') && command::glob(&part) && command::fits(&part, "..")
+    });
+    // Everything in a folder is as good as the folder, as the floor reads
+    // it, so `rm -r *` in the project deletes the project.
+    let everything = path
+        .file_name()
+        .is_some_and(|name| matches!(name.to_str(), Some("*" | "*.*")));
+    if everything && !path.parent().is_some_and(|folder| clearable(folder, ctx)) {
+        return false;
+    }
+    let Some(found) = command::expand(&path, false).filter(|_| !upward) else {
+        return false;
+    };
+    // The shell hands on a glob that matches nothing as it is written.
+    if found.is_empty() {
+        return clearable(&path, ctx);
+    }
+    found.iter().all(|path| clearable(path, ctx))
+}
+
+/// Whether a delete may take `path` whole with nobody to ask: with links
+/// followed it lies strictly inside `ctx`'s project, which is not the home
+/// folder, above it, a drive's root or a folder the system needs, and it is
+/// neither protected, a folder holding what is, as `.github` holds its
+/// workflows, among the home folder's settings nor in Letronna's own folder.
+fn clearable(path: &Path, ctx: &ToolContext) -> bool {
+    let Some(workspace) = &ctx.workspace else {
+        return false;
+    };
+    let (Ok(root), Some(path)) = (std::fs::canonicalize(workspace), landing(path)) else {
+        return false;
+    };
+    let Ok(inside) = path.strip_prefix(&root) else {
+        return false;
+    };
+    let home = tools::home().and_then(|home| std::fs::canonicalize(home).ok());
+    !inside.as_os_str().is_empty()
+        && !protected(inside)
+        && !leads_to_protected(inside)
+        && !touches_home(&root, &path, home.as_deref())
+        && !command::system(&root)
+        && !tools::private(&path, &crate::chat::data_dir())
 }
 
 /// Whether `LETRONNA_DISPOSABLE` is 1, declaring this machine thrown away
@@ -1941,6 +2051,282 @@ mod tests {
         let asks = [rule("rm", permissions::Effect::Ask)];
         refused(&gate(&asks, None), "rm -r out/tmp");
         refused(&gate(&[], Some("permissions.json is not JSON")), DANGEROUS);
+    }
+
+    /// A project for one test as `project_dir` makes it, with a draft in
+    /// `out/tmp` and a folder `other` beside the project, outside it.
+    fn cleanup_project(name: &str) -> (PathBuf, ToolContext) {
+        let dir = project_dir(name);
+        std::fs::create_dir_all(dir.join("project/out/tmp")).unwrap();
+        std::fs::write(dir.join("project/out/tmp/draft.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.join("other")).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.join("project")),
+            ..Default::default()
+        };
+        (dir, ctx)
+    }
+
+    /// The gate of a run in Bypass with nobody watching it and no rules.
+    fn unwatched<'a>(ctx: &'a ToolContext, none: &'a Grants) -> Gate<'a> {
+        Gate {
+            ctx,
+            mode: Mode::Bypass,
+            grants: none,
+            rules: &[],
+            broken: None,
+            human: false,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unwatched_bypass_run_deletes_a_folder_strictly_inside_the_project() {
+        let (dir, ctx) = cleanup_project("cleanup-inside");
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join("out/cache")).unwrap();
+        // rm deletes a link it is given, or finds inside a folder, as a link.
+        std::os::unix::fs::symlink(project.join("out/tmp"), project.join("out/alias")).unwrap();
+        std::os::unix::fs::symlink(dir.join("other"), project.join("out/cache/away")).unwrap();
+        let none = Grants::new();
+        let gate = unwatched(&ctx, &none);
+        let absolute = format!("rm -rf {}", project.join("out/tmp").display());
+        for line in [
+            "rm -rf out/tmp",
+            "rm -r ./out/tmp/",
+            "rm -rf out/../out/tmp",
+            "rm -rf -- out/tmp out/cache",
+            "rm -rf out/tmp/*",
+            "rm -rf out/alias",
+            "rm -rf out/cache",
+            "rm -rf build",
+            "mkdir -p out && rm -rf out/tmp 2>/dev/null && echo done",
+            &absolute,
+        ] {
+            assert_eq!(decide(&command(line), &gate), Outcome::Run, "{line}");
+        }
+        // From the folder `workdir` names too.
+        let inside = call(
+            "run_command",
+            serde_json::json!({ "command": "rm -rf tmp", "workdir": "out" }),
+        );
+        assert_eq!(decide(&inside, &gate), Outcome::Run);
+        // As `-p --yes` with no terminal and a Bypass schedule in the window
+        // build their gates.
+        let rules = Ok(Vec::new());
+        for gate in [
+            Gate::for_terminal(&ctx, &none, &rules, Mode::Bypass, false),
+            Gate::for_window(&ctx, &none, &rules, Mode::Default, Some(Mode::Bypass)),
+        ] {
+            assert_eq!(decide(&command("rm -rf out/tmp"), &gate), Outcome::Run);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unwatched_bypass_run_still_refuses_to_delete_the_project_or_past_it() {
+        let (dir, ctx) = cleanup_project("cleanup-past");
+        let project = dir.join("project");
+        let none = Grants::new();
+        let gate = unwatched(&ctx, &none);
+        let refused = |gate: &Gate, line: &str| {
+            let outcome = decide(&command(line), gate);
+            assert!(matches!(outcome, Outcome::Refuse(_)), "{line}: {outcome:?}");
+        };
+        let itself = format!("rm -rf {}", project.display());
+        let other = format!("rm -rf {}", dir.join("other").display());
+        for line in [
+            // The project itself, however it is spelled.
+            "rm -rf .",
+            "rm -rf ./",
+            "rm -rf out/..",
+            "rm -rf *",
+            "rm -rf ./*",
+            &itself,
+            // What lies past it.
+            "rm -rf ../other",
+            "rm -rf out/tmp ../other",
+            &other,
+            // Git's folder, what is in it, and a folder holding a protected one.
+            "rm -rf .git",
+            "rm -rf .git/hooks",
+            "rm -rf out/../.git",
+            "rm -rf .github",
+            // The home folder, another user's, and the root.
+            "rm -rf ~",
+            "rm -rf ~/",
+            "rm -rf ~root/out",
+            "rm -rf /",
+            // Some shells match `..` with `.*`.
+            "rm -rf .*",
+            "rm -rf out/.*",
+        ] {
+            refused(&gate, line);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            // A link inside the project that leads out of it, to it or to
+            // its `.git`, given as the path or taken in by a glob.
+            symlink(dir.join("other"), project.join("out/away")).unwrap();
+            symlink(&project, project.join("out/root")).unwrap();
+            symlink(project.join(".git"), project.join("out/hidden")).unwrap();
+            for line in [
+                "rm -rf out/away",
+                "rm -rf out/away/",
+                "rm -rf out/away/*",
+                "rm -rf out/root",
+                "rm -rf out/hidden",
+                "rm -rf out/*",
+            ] {
+                refused(&gate, line);
+            }
+            // A project that is the home folder or one the system needs.
+            let missing = "rm -rf letronna-cleanup-missing";
+            for workspace in [tools::home(), Some(PathBuf::from("/usr"))] {
+                let ctx = ToolContext {
+                    workspace,
+                    ..Default::default()
+                };
+                refused(&unwatched(&ctx, &none), missing);
+            }
+        }
+        // Everything in the project is the project, with no `.git` too.
+        std::fs::remove_dir_all(project.join(".git")).unwrap();
+        refused(&gate, "rm -rf *");
+        refused(&gate, "rm -rf ./*");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unwatched_bypass_run_still_refuses_a_delete_it_cannot_read_in_full() {
+        let (dir, ctx) = cleanup_project("cleanup-unread");
+        let none = Grants::new();
+        let gate = unwatched(&ctx, &none);
+        for line in [
+            // Parts only known when it runs, or spelt by braces.
+            "rm -rf $TARGET",
+            "rm -rf \"out/$NAME\"",
+            "rm -rf $(echo out/tmp)",
+            "rm -rf `echo out/tmp`",
+            "rm -rf out/$(printf ../..)",
+            "rm -rf out/{tmp,..}",
+            // Handed more than it names, or not the rm the path finds.
+            "echo .. | xargs rm -rf out/tmp",
+            "find . | rm -rf out/tmp",
+            "sudo rm -rf out/tmp",
+            "env rm -rf out/tmp",
+            "/bin/rm -rf out/tmp",
+            // Naming a cloud machine's metadata service, in another shell,
+            // after a change of folder, writing a file, or beside another
+            // command that is hard to take back.
+            "rm -rf out/169.254.169.254",
+            "sh -c 'rm -rf out/tmp'",
+            "cd out && rm -rf tmp",
+            "rm -rf out/tmp > notes.txt",
+            "rm -rf out/tmp; git reset --hard HEAD~1",
+        ] {
+            let outcome = decide(&command(line), &gate);
+            assert!(matches!(outcome, Outcome::Refuse(_)), "{line}: {outcome:?}");
+        }
+        // Typed into a job's shell, which may have moved anywhere.
+        let typed = call(
+            "send_job",
+            serde_json::json!({ "job": 1, "text": "rm -rf out/tmp", "keys": ["enter"] }),
+        );
+        let outcome = decide(&typed, &gate);
+        assert!(matches!(outcome, Outcome::Refuse(_)), "{outcome:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_an_unwatched_bypass_run_outside_a_chat_deletes_a_folder_unasked() {
+        let (dir, ctx) = cleanup_project("cleanup-modes");
+        let chat = ToolContext {
+            remote: chat().remote,
+            ..ctx.clone()
+        };
+        let none = Grants::new();
+        let delete = command("rm -rf out/tmp");
+        let gate = |ctx, mode, human| Gate {
+            ctx,
+            mode,
+            grants: &none,
+            rules: &[],
+            broken: None,
+            human,
+        };
+        let refused = |gate: &Gate| {
+            let outcome = decide(&delete, gate);
+            assert!(matches!(outcome, Outcome::Refuse(_)), "{outcome:?}");
+        };
+        // Someone watching is asked, as an editor over ACP always is.
+        assert_eq!(
+            decide(&delete, &gate(&ctx, Mode::Bypass, true)),
+            Outcome::Ask
+        );
+        let rules = Ok(Vec::new());
+        let editor = Gate::for_terminal(&ctx, &none, &rules, Mode::Bypass, true);
+        assert_eq!(decide(&delete, &editor), Outcome::Ask);
+        // Every mode that asks before a command still refuses, and so does a
+        // helper, which never runs in Bypass.
+        let helper = Mode::narrow(Mode::Bypass, Mode::Bypass);
+        for mode in [
+            Mode::Default,
+            Mode::AcceptEdits,
+            Mode::Plan,
+            Mode::Auto,
+            Mode::DontAsk,
+            helper,
+        ] {
+            refused(&gate(&ctx, mode, false));
+        }
+        // A chat's message is not the user's yes.
+        for human in [true, false] {
+            refused(&gate(&chat, Mode::Bypass, human));
+        }
+        // A session that read words someone else wrote may be acting on them.
+        let steered = ToolContext {
+            conversation: 731_131,
+            ..ctx.clone()
+        };
+        crate::taint::mark(&steered);
+        refused(&gate(&steered, Mode::Bypass, false));
+        // The floor comes before Auto mode's judge, which is never asked.
+        let unasked = |_: &ToolCall, _: &str| -> Verdict { panic!("the judge was asked") };
+        let judged = |human| {
+            decide_with(
+                &delete,
+                &gate(&ctx, Mode::Auto, human),
+                Some(&unasked),
+                false,
+            )
+        };
+        assert_eq!(judged(true), Outcome::Ask);
+        let nobody = judged(false);
+        assert!(matches!(nobody, Outcome::Refuse(_)), "{nobody:?}");
+        // A deny rule on the tool, an ask rule for rm and a rules file that
+        // cannot be read each still hold it back.
+        let rule = |pattern: &str, effect| Rule {
+            tool: "run_command".into(),
+            pattern: pattern.into(),
+            effect,
+            project: None,
+        };
+        let denied = [rule("git push", permissions::Effect::Deny)];
+        let asks = [rule("rm", permissions::Effect::Ask)];
+        for (rules, broken) in [
+            (&denied[..], None),
+            (&asks[..], None),
+            (&[][..], Some("permissions.json is not JSON")),
+        ] {
+            refused(&Gate {
+                rules,
+                broken,
+                ..gate(&ctx, Mode::Bypass, false)
+            });
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
