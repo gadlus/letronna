@@ -53,7 +53,7 @@ The sidebar has New session, Capabilities (tabs Skills, Tools and MCP) and Activ
 
 ## Skills, profiles and schedules
 
-- Skills: `/skills` switches them on or off, `/skills <name>` puts one in the message box, and `/skills add <owner/repo, link or path>` installs from GitHub, a link or a folder (`anthropics/skills` has Word, Excel, PowerPoint and PDF ones). This one comes with Letronna and can be switched off; a skill of the user's called `letronna` takes its place.
+- Skills: `/skills` switches them on or off, `/skills <name>` puts one in the message box, and `/skills add <owner/repo, link or path>` installs from GitHub, a link or a folder (`anthropics/skills` has Word, Excel, PowerPoint and PDF ones). This one comes with Letronna and can be switched off; a skill of the user's called `letronna` takes its place, and Copy to edit on the window's Skills page makes one from this.
 - Profiles: separate data folders for separate identities, switched or made (empty, or cloned) under Profile in the window's account menu. See `settings-and-data.md`.
 - Schedules: a prompt that runs on a timer, made with New job on the Scheduled jobs page, or by asking in a chat, which adds one once the user says yes. They run while the window, the terminal or `letronna serve` is open.
 

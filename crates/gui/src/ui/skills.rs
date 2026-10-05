@@ -152,6 +152,21 @@ impl Chat {
         });
     }
 
+    /// Make a copy of a skill that comes with Letronna in the user's own
+    /// skills, which takes its place in the list and can be edited.
+    fn copy_skill(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.skills_note = Some(skills::copy_built_in(name).map(|copy| {
+            format!(
+                "Copied {} to your skills. Edit it here; it takes the place of the one that \
+                 comes with Letronna.",
+                copy.name
+            )
+        }));
+        self.skills_refused.clear();
+        self.reload_skills();
+        cx.notify();
+    }
+
     fn edit_skill(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(skill) = skills::find(&self.skills, name) else {
             return;
@@ -255,6 +270,8 @@ impl Chat {
         let (name, enabled) = (skill.name.clone(), skill.enabled);
         // A project's skills are changed in the project's folder.
         let yours = skill.source == Source::User;
+        // Letronna's own is changed by copying it into the user's.
+        let built_in = skill.source == Source::BuiltIn;
         let badge = match (skill.source, skill.learned) {
             (Source::Project, _) => Some("Project"),
             (Source::Plugin, _) => Some("Plugin"),
@@ -262,7 +279,8 @@ impl Chat {
             (Source::User, true) => Some("Learned"),
             (Source::User, false) => None,
         };
-        let (edit_name, delete_name, switch_name) = (name.clone(), name.clone(), name.clone());
+        let (edit_name, delete_name, switch_name, copy_name) =
+            (name.clone(), name.clone(), name.clone(), name.clone());
         h_flex()
             .w_full()
             .items_center()
@@ -332,6 +350,17 @@ impl Chat {
                                 this.use_skill(&name, window, cx)
                             })),
                     )
+                    .when(built_in, |this| {
+                        this.child(
+                            Button::new(("copy-skill", index))
+                                .plain(cx)
+                                .xsmall()
+                                .label("Copy to edit")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.copy_skill(&copy_name, cx)
+                                })),
+                        )
+                    })
                     .when(yours, |this| {
                         this.child(
                             Button::new(("edit-skill", index))
