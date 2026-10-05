@@ -4197,6 +4197,14 @@ impl Render for Chat {
         // And the composer holds its draft, however the session was switched
         // to: a click, or a message from a chat app.
         self.swap_draft(window, cx);
+        // And whether it is empty is read from it: GPUI Kit sends no change
+        // when the text is set rather than typed, as when a send clears it.
+        self.composer_empty = self
+            .composer
+            .read(cx)
+            .text()
+            .chars()
+            .all(char::is_whitespace);
         // And the Changes tab and the status bar speak of its folder.
         self.keep_changes_current(cx);
         // And the switcher counts it as the one used last.
