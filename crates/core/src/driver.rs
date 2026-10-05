@@ -75,7 +75,7 @@ use crate::tools::{self, Caller, ToolContext};
 use crate::unchanged::{self, Unchanged};
 use serde_json::{Value, json};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -133,9 +133,74 @@ const CHECK_EDITS: &str = "Before ending, run the project's tests or build to ch
 /// says no more about what to run.
 const NAMED: usize = 5;
 
-/// Extensions of files written to be read, such as a report or notes, which
-/// no build or test checks.
-const NOTES: [&str; 2] = ["md", "txt"];
+/// Extensions of source code, which a build compiles or a test runs. Data,
+/// reports and pictures, such as a `.csv`, `.json` or `.md` a task writes
+/// out, are none of them: nothing in the folder checks those.
+const CODE: &[&str] = &[
+    "rs", "py", "pyi", "pyx", "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "vue",
+    "svelte", "go", "java", "kt", "kts", "scala", "groovy", "gradle", "clj", "cljs", "c", "h",
+    "cc", "cpp", "cxx", "hpp", "hh", "m", "mm", "cs", "fs", "fsx", "vb", "swift", "rb", "php",
+    "pl", "pm", "lua", "dart", "ex", "exs", "erl", "hrl", "hs", "ml", "mli", "elm", "zig", "nim",
+    "jl", "r", "sh", "bash", "ps1", "sql", "proto", "css", "scss", "sass", "less",
+];
+
+/// Names of the files and folders that say how a folder is built or tested,
+/// as spelled on disk. A change to one of the files is checked by the build
+/// that reads it, as source is.
+const BUILDS: &[&str] = &[
+    "Cargo.toml",
+    "package.json",
+    "tsconfig.json",
+    "deno.json",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "tox.ini",
+    "noxfile.py",
+    "pytest.ini",
+    "conftest.py",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "build.sbt",
+    "build.xml",
+    "CMakeLists.txt",
+    "meson.build",
+    "Makefile",
+    "makefile",
+    "GNUmakefile",
+    "justfile",
+    "Rakefile",
+    "Gemfile",
+    "composer.json",
+    "mix.exs",
+    "rebar.config",
+    "Package.swift",
+    "pubspec.yaml",
+    "stack.yaml",
+    "dune-project",
+    "build.zig",
+    "BUILD",
+    "BUILD.bazel",
+    "MODULE.bazel",
+    "deps.edn",
+    "project.clj",
+    "Project.toml",
+    "tests",
+    "test",
+    "__tests__",
+];
+
+/// Extensions of project files that say the same, named after the project.
+const PROJECTS: &[&str] = &[
+    "sln", "csproj", "fsproj", "vbproj", "cabal", "gemspec", "nimble",
+];
+
+/// Entries of one folder looked through for those. A project's folders
+/// rarely hold more, so a listing stops here rather than read a folder of
+/// data whole.
+const LISTED: usize = 1_000;
 
 /// What a run did, told as it happens to a frontend that shows the run live.
 #[derive(Clone)]
@@ -1440,8 +1505,9 @@ pub fn last_said(messages: &[Message]) -> String {
 }
 
 /// The notice sending a session's own run back once to check the source it
-/// changed after its last passing build or test, when it can run a command
-/// and the user has not switched checking edits off.
+/// changed after its last passing build or test, when it can run a command,
+/// the folder has a build or tests to run, and the user has not switched
+/// checking edits off.
 fn unchecked_edits(spec: &Spec, turn: &Turn, begun: usize) -> Option<Message> {
     // A helper's edits are its parent's to check, and past the round cap
     // nothing more can run.
@@ -1454,8 +1520,12 @@ fn unchecked_edits(spec: &Spec, turn: &Turn, begun: usize) -> Option<Message> {
     let workspace = spec.connection.workspace.as_deref()?;
     let messages = spec.transcript.conversation.messages.get(begun..)?;
     let files = unchecked(messages, workspace);
-    // Read last, so a run that changed no source never reads the file.
-    if files.is_empty() || !crate::store::current_settings().verifies_edits() {
+    // Read last, so a run that changed no source, or nothing here could
+    // check, never reads the file.
+    if files.is_empty()
+        || !buildable(workspace, &files)
+        || !crate::store::current_settings().verifies_edits()
+    {
         return None;
     }
     let mut named: Vec<String> = files.iter().take(NAMED).map(|f| format!("`{f}`")).collect();
@@ -1503,7 +1573,7 @@ fn unchecked(messages: &[Message], workspace: &Path) -> Vec<String> {
             _ => Vec::new(),
         };
         for path in changed {
-            if !note(&path) && !files.contains(&path) {
+            if code(&path) && !files.contains(&path) {
                 files.push(path);
             }
         }
@@ -1529,14 +1599,76 @@ fn passed(result: &Message, args: &Value, workspace: &Path) -> bool {
     crate::command::assess(line, dialect, Some(workspace)).risk != crate::command::Risk::ReadOnly
 }
 
-/// Whether `path` is a note, such as a report, rather than anything a build
-/// or test would run.
-fn note(path: &str) -> bool {
-    let extension = Path::new(path).extension().and_then(|e| e.to_str());
-    let extension = extension.unwrap_or_default();
-    NOTES
+/// Whether `path` is source code or a build's own file, which a build or test
+/// would check, rather than data or a report.
+fn code(path: &str) -> bool {
+    let path = Path::new(path);
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    CODE.iter().any(|code| extension.eq_ignore_ascii_case(code)) || BUILDS.contains(&name)
+}
+
+/// Whether the project folder `workspace`, or a folder in it on the way to
+/// one of `files`, holds what builds or tests them, such as a Cargo.toml, a
+/// package.json, a Makefile or a tests folder. Only those folders are
+/// listed, so a run that wrote deep in a big tree costs a few listings.
+fn buildable(workspace: &Path, files: &[String]) -> bool {
+    let mut folders = vec![workspace.to_path_buf()];
+    for file in files {
+        let file = Path::new(file);
+        let inside = file.strip_prefix(workspace).unwrap_or(file);
+        // A path that climbs out with `..`, or names another place, is
+        // looked at no further than the project folder.
+        let plain = inside
+            .components()
+            .all(|part| matches!(part, Component::Normal(_) | Component::CurDir));
+        if !plain {
+            continue;
+        }
+        let between = inside.ancestors().skip(1);
+        for folder in between.filter(|folder| !folder.as_os_str().is_empty()) {
+            let folder = workspace.join(folder);
+            if !folders.contains(&folder) {
+                folders.push(folder);
+            }
+        }
+    }
+    folders.iter().any(|folder| builds(folder))
+}
+
+/// Whether `folder` holds one of `BUILDS`, a project file `PROJECTS` names,
+/// or a file of tests.
+fn builds(folder: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).take(LISTED).any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let extension = Path::new(name.as_ref()).extension();
+        let extension = extension.and_then(|e| e.to_str()).unwrap_or_default();
+        BUILDS.contains(&name.as_ref())
+            || PROJECTS
+                .iter()
+                .any(|project| extension.eq_ignore_ascii_case(project))
+            || tests(&name)
+    })
+}
+
+/// Whether `name` is source named as test runners find their tests, such as
+/// `test_app.py`, `app_test.go` or `app.spec.ts`.
+fn tests(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let marked = ["_test.", ".test.", "_spec.", ".spec."]
         .iter()
-        .any(|note| extension.eq_ignore_ascii_case(note))
+        .any(|mark| lower.contains(mark));
+    (lower.starts_with("test_") || marked) && code(name)
 }
 
 /// Tells the run's watcher about `step`, if it has one.
@@ -3053,6 +3185,7 @@ pub(crate) mod tests {
         let _data = data("scheduled");
         for (n, mode) in [Mode::Bypass, Mode::Default].into_iter().enumerate() {
             let dir = scratch(&format!("scheduled-{}", mode.name()));
+            std::fs::write(dir.join("Cargo.toml"), "").unwrap();
             let session = AGENTS + 300 + n as u64;
             let _listed = crate::schedule::Listed::new(session, &job(&dir, mode));
             // A frontend serves the approvals, and turns down what reaches it.
@@ -4816,6 +4949,7 @@ pub(crate) mod tests {
     fn an_answer_after_unchecked_edits_is_sent_back_to_verify_once_at_depth_zero() {
         let _data = data("verify");
         let dir = scratch("verify");
+        std::fs::write(dir.join("Cargo.toml"), "").unwrap();
         let (endpoint, provider) = provider(vec![
             reply("", &[write_made()]),
             reply("Wrote made.txt.", &[]),
@@ -4846,6 +4980,7 @@ pub(crate) mod tests {
         // The settings ask for the check, so only the depth keeps it away.
         let _data = data("verify-helper");
         let dir = scratch("verify-helper");
+        std::fs::write(dir.join("Cargo.toml"), "").unwrap();
         let (endpoint, provider) = provider(vec![
             reply("", &[write_made()]),
             reply("Wrote made.txt.", &[]),
@@ -4865,6 +5000,7 @@ pub(crate) mod tests {
         // The settings ask for the check, so only the tools allowed keep it away.
         let _data = data("verify-no-commands");
         let dir = scratch("verify-no-commands");
+        std::fs::write(dir.join("Cargo.toml"), "").unwrap();
         let (endpoint, provider) = provider(vec![
             reply("", &[write_made()]),
             reply("Wrote made.txt.", &[]),
@@ -4965,21 +5101,16 @@ pub(crate) mod tests {
         let (endpoint, provider) = provider(vec![
             reply("", &[("write_file", summary)]),
             reply("Done.", &[]),
-            reply("Done; there is nothing here to build or test.", &[]),
         ]);
         let mut spec = asked_for_a_summary(endpoint, &dir, AGENTS + 500);
         // Edits in the project run, with nobody there to approve them.
         spec.connection.mode = crate::gate::Mode::AcceptEdits;
         let report = finished(spec);
         assert_eq!(report.status, Outcome::Done);
-        // The one note after "Done." is the reminder to check the edit (a
-        // .json arms it), not a word on the outputs, which are right.
-        let sent = provider.sent();
-        assert_eq!(sent.len(), 3);
-        let asked = messages(&sent[2]).last().unwrap()["content"]
-            .as_str()
-            .unwrap();
-        assert!(asked.contains("You changed these files"), "{asked}");
+        // Nothing follows "Done.": the outputs are right, and a .json written
+        // out is no source for a build or test to check.
+        assert_eq!(provider.sent().len(), 2);
+        assert_eq!(report.text, "Done.");
         assert!(dir.join("out/summary.json").exists());
         assert!(report.contract.is_empty());
     }
@@ -5208,6 +5339,7 @@ pub(crate) mod tests {
     fn edits_after_the_last_clean_test_are_sent_back_once() {
         let _data = data("unchecked");
         let dir = scratch("unchecked");
+        std::fs::write(dir.join("pyproject.toml"), "").unwrap();
         let ended = "Nothing here runs tests. Done: lib.py holds the fix.";
         let (endpoint, provider) = provider(vec![
             reply("", &[write_to("app.py")]),
@@ -5259,6 +5391,7 @@ pub(crate) mod tests {
         let data = data("unchecked-off");
         let edited = || vec![reply("", &[write_to("app.py")]), reply("Done.", &[])];
         let dir = scratch("unchecked-helper");
+        std::fs::write(dir.join("pyproject.toml"), "").unwrap();
         let (endpoint, stub) = provider(edited());
         let mut helper = own(endpoint, &dir, AGENTS + 620);
         helper.depth = 1;
@@ -5268,6 +5401,7 @@ pub(crate) mod tests {
         let settings = r#"{"endpoint": "", "model": "m", "verify_edits": false}"#;
         std::fs::write(data.folder.join("settings.json"), settings).unwrap();
         let dir = scratch("unchecked-off");
+        std::fs::write(dir.join("pyproject.toml"), "").unwrap();
         let (endpoint, stub) = provider(edited());
         assert_eq!(
             finished(own(endpoint, &dir, AGENTS + 630)).status,
@@ -5323,6 +5457,91 @@ pub(crate) mod tests {
         // A command the user would not allow is not to be asked for again.
         messages.push(tool("run_command", pytest, NOT_APPROVED, true));
         assert!(unchecked(&messages, &dir).is_empty());
+
+        // Data and reports a task writes out are no source; a build's own
+        // file is.
+        for path in ["out/audit.csv", "out/answers.json", "out/summary.MD"] {
+            messages.push(wrote(path));
+        }
+        assert!(unchecked(&messages, &dir).is_empty());
+        messages.push(wrote("Cargo.toml"));
+        messages.push(wrote("web/App.TSX"));
+        assert_eq!(unchecked(&messages, &dir), ["Cargo.toml", "web/App.TSX"]);
+    }
+
+    #[test]
+    fn data_and_reports_written_where_nothing_builds_are_not_sent_back() {
+        let _data = data("unchecked-data");
+        let dir = scratch("unchecked-data");
+        let (endpoint, provider) = provider(vec![
+            reply(
+                "",
+                &[
+                    write_to("out/audit.csv"),
+                    write_to("out/answers.json"),
+                    write_to("out/summary.md"),
+                ],
+            ),
+            reply("Done: the audit is in out/.", &[]),
+        ]);
+        let report = finished(own(endpoint, &dir, AGENTS + 650));
+        assert_eq!(provider.sent().len(), 2);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "Done: the audit is in out/.");
+    }
+
+    #[test]
+    fn code_written_where_nothing_builds_or_tests_it_is_not_sent_back() {
+        let _data = data("unchecked-loose");
+        let dir = scratch("unchecked-loose");
+        let (endpoint, provider) = provider(vec![
+            reply(
+                "",
+                &[write_to("tools/count.py"), write_to("out/counts.csv")],
+            ),
+            reply("Done.", &[]),
+        ]);
+        let report = finished(own(endpoint, &dir, AGENTS + 660));
+        assert_eq!(provider.sent().len(), 2);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "Done.");
+    }
+
+    #[test]
+    fn a_way_to_build_is_looked_for_only_on_the_way_to_the_code() {
+        let dir = scratch("buildable");
+        let code = |files: &[&str]| files.iter().map(|f| f.to_string()).collect::<Vec<_>>();
+        std::fs::create_dir_all(dir.join("crates/app/src")).unwrap();
+        std::fs::create_dir_all(dir.join("other")).unwrap();
+        std::fs::write(dir.join("other/Cargo.toml"), "").unwrap();
+        assert!(!buildable(&dir, &code(&["crates/app/src/lib.rs"])));
+        // Nor through a path that leaves the folder.
+        assert!(!buildable(
+            &dir,
+            &code(&["../other/x.rs", "/elsewhere/other/x.rs"])
+        ));
+        assert!(buildable(&dir, &code(&["other/x.rs"])));
+
+        std::fs::write(dir.join("crates/app/Cargo.toml"), "").unwrap();
+        let named_from_the_top = dir.join("crates/app/src/lib.rs");
+        let named_from_the_top = named_from_the_top.to_string_lossy();
+        assert!(buildable(&dir, &code(&[&named_from_the_top])));
+        assert!(buildable(&dir, &code(&["./crates/app/src/lib.rs"])));
+
+        // A project file named after its project, or a folder of tests, at the top.
+        let dotnet = scratch("buildable-dotnet");
+        assert!(!buildable(&dotnet, &code(&["Program.cs"])));
+        std::fs::write(dotnet.join("App.CSPROJ"), "").unwrap();
+        assert!(buildable(&dotnet, &code(&["Program.cs"])));
+        let loose = scratch("buildable-tests");
+        std::fs::create_dir(loose.join("tests")).unwrap();
+        assert!(buildable(&loose, &code(&["count.py"])));
+        // Or a file of tests beside the code, which data named alike is not.
+        let beside = scratch("buildable-beside");
+        std::fs::write(beside.join("cases.test.csv"), "").unwrap();
+        assert!(!buildable(&beside, &code(&["count.py"])));
+        std::fs::write(beside.join("test_count.py"), "").unwrap();
+        assert!(buildable(&beside, &code(&["count.py"])));
     }
 
     /// A session's own run in `dir`, in a mode that lets it edit, asked to
