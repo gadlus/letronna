@@ -136,6 +136,12 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Letronna has a built-in skill that explains its own commands and settings.
 - **All** — Core can send a card waiting in the window to the owner's DM in a chat app.
 - **All** — Editors over ACP can pick the agent's mode.
+- **All** — Hand work to Claude Code, or pick it as a model.
+- **All** — `read_file` reads OpenDocument text, spreadsheets and presentations, and EPUB books chapter by chapter; old .doc, .xls, .ppt and .rtf files say how to make them readable.
+- **App** — The window shows a card for typing into a background job, fires wake-ups too, and can switch off DuckDuckGo search when no key is set.
+- **App** — The Skills page can copy the built-in help skill to edit, and a memory row says where the entry went.
+- **All** — Questions name a recommended answer, and the terminal takes free-form ones.
+- **All** — Recurring tasks and notifications use Letronna's own schedules and chat apps first, with your yes.
 ### Changed
 - **All** — A failed model request says what went wrong: the key, credit, a rate limit, a busy provider, a conversation too long, and so on.
 - **All** — OpenAI's reasoning models work, and a server that turns down a field is sent the request again without it.
@@ -203,6 +209,15 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Plan mode can keep every tool, so switching it keeps the cache (off unless chosen).
 - **All** — The gate reads a call's arguments under the names the tool accepts; `run_command` says how to read its result and that it has no keyboard.
 - **All** — The checklist tool says when to use it and what done means; a summary keeps your rules word for word and marks what is done. `/init` writes gotchas as short rules, without a tour of the folders.
+- **All** — Shorter, clearer instructions to the model: replies lead with the answer, say what counts as done, batch calls, ask first when unsure, and the user wins over a project file; fifteen tools now say each fact once, 490 tokens off every request.
+- **All** — Plan mode treats a request as a plan to make; helpers are told what they cannot do and report what they checked; non-Claude models take changing facts from a tool.
+- **All** — Text from outside that tries to instruct the agent is named, never copied; the untrusted-text rule is said once.
+- **All** — Auto mode allows project installs and local git but not pushes nobody asked for; an unwatched `--yes` run deletes a folder only inside its project; a redirect is judged where it lands.
+- **All** — Outputs are held to the values, keys and columns a request lists, and only code a folder can build or test sends a run back to check it.
+- **All** — Chat-app replies use lists, not tables; terminal replies use bold lines and lists.
+- **All** — Memory guidance is shorter and keeps facts, not orders or failures; saved skills keep steps that worked; a memory or skill change no longer rewrites the cached rules.
+- **App** — The window is built on GPUI Kit 0.7.1; panels and new messages ease in (still with reduced motion); Settings opens over the blurred window on X11 and macOS; Tab reaches every switch in Settings.
+- **App** — The title bar shows Letronna's name on the left instead of the session's, and About is shorter.
 ### Fixed
 - **All** — A command that uploads a key file (curl, wget, scp, rsync) is refused in every mode, and .gnupg, .pgpass, .vault-token, .azure and gcloud settings count as secret.
 - **All** — An edit whose old text is missing says so instead of "already applied", plain text is no longer saved as a .docx, .xlsx, .pptx, .zip or .pdf, and a command that exits non-zero counts as failed.
@@ -230,6 +245,10 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — A command stopped at a terminal prompt is ended and says why, and a page's error answer comes back with what the page said.
 - **All** — An image edit on a gateway without the route points to a script instead of failing.
 - **Terminal** — `letronna -p` over stream-json no longer hangs on Windows when it starts.
+- **App** — Clicking the title bar's search box opens the palette again, instead of starting a window move.
+- **All** — A reply the provider cuts off part way is asked for again, and a call whose arguments are not JSON no longer ends the run.
+- **All** — Sandboxed commands start on Linux instead of failing to spawn.
+- **App** — The rewind question says plainly what goes and what is not undone, and card hints read properly in Paper and narrow windows.
 ## [0.1.0-alpha.2] - 2026-09-27
 
 ### Added
