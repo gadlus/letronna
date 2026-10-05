@@ -23,6 +23,8 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Schedules in a mode of their own, memory you can review and edit, and a window that uses far less memory and processor while it works or sits idle.
 
 ### Added
+- **All** — The agent picks where to build what you ask: one self-contained page, chart or small app as a file you preview first, then the project on this computer, and Letronna Cloud only when this computer cannot (with your yes, as it spends credit).
+- **App** — Enter and Escape answer a card from the composer after a send; Tab moves past each switch once and Space turns it; Cmd+Q quits Letronna on macOS from anywhere in the window.
 - **All** — Letronna Cloud (Pro): `letronna cloud "task"` in the terminal and `/cloud <task>` in the window run a task on Letronna's servers, in a repository you name or none, and bring the answer back; a thread carries the work on, asleep on the server between messages. Billed from your credit.
 - **All** — `letronna doctor` checks the setup, and a local log and crash files help find out what went wrong.
 - **App** — The window wears letronna.ai's colours; Settings choose its colours and whether it shows film grain.
