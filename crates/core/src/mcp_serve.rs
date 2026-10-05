@@ -562,6 +562,7 @@ mod tests {
             "read_chat",
             "send_file",
             "notify",
+            "letronna_info",
         ] {
             assert!(!offered.contains(&kept_out), "{kept_out}");
             assert!(

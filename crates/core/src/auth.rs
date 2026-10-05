@@ -189,8 +189,13 @@ pub fn sign_out() -> Result<Option<String>, String> {
 /// Ask the API who this token belongs to and what they have, and keep the
 /// answer. A token the dashboard signed out is dropped here too.
 pub fn refresh() -> Result<Account, String> {
+    refresh_within(Duration::from_secs(15))
+}
+
+/// `refresh`, giving up on the API after `wait`.
+pub(crate) fn refresh_within(wait: Duration) -> Result<Account, String> {
     let mut account = account().ok_or("Not signed in.")?;
-    let response = client(Duration::from_secs(15))?
+    let response = client(wait)?
         .get(api("/me"))
         .bearer_auth(&account.token)
         .send()

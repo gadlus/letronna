@@ -82,7 +82,7 @@ READER = "cat {file}"
 NATIVE = (
     "read_file", "list_dir", "search", "write_file", "edit_file", "apply_patch",
     "run_command", "read_job", "list_jobs", "stop_job", "wait", "wake_me",
-    "schedule", "ask_user", "exit_plan", "todo", "read_chat", "send_file",
+    "schedule", "letronna_info", "ask_user", "exit_plan", "todo", "read_chat", "send_file",
     "notify", "list_sessions", "memory", "skill", "skill_manage", "search_sessions",
     "web_fetch", "make_image", "edit_image", "speak", "transcribe", "make_video",
     "browse", "use_page", "computer", "agent", "agents", "board", "find_tools",

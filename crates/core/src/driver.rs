@@ -924,14 +924,24 @@ pub(crate) fn refusal(allow: &Allow, name: &str) -> Option<String> {
 
 /// Why this agent may not call `name`, when it may not: a scheduled run's
 /// own agent as such, another nobody watches as such when it asks the user,
-/// a chat app's run or an editor's turn not for memory, any other as
-/// `refusal` says.
+/// any agent of one nobody watches when it reads Letronna's setup, a chat
+/// app's run or an editor's turn not for memory, any other as `refusal`
+/// says.
 fn refused(spec: &Spec, name: &str) -> Option<String> {
     if spec.depth > 0 || crate::schedule::running(spec.root).is_none() {
         // Not a helper, so not told to end on the open question: with
         // nobody to read it, that ends the run with the task undone.
         if name == tools::ASK_USER && unwatched(spec) {
             return Some(NOBODY_HERE.into());
+        }
+        // What Letronna holds of the user's setup is theirs to read, and a
+        // run nobody watches may print it where a script, a log or CI shows
+        // it: left out of such a run's requests, and its forks', so they
+        // start alike, and refused to its helpers.
+        if name == crate::info::LETRONNA_INFO
+            && !crate::info::read_by_the_user_alone(&spec.connection, spec.root)
+        {
+            return Some(crate::info::WITHHELD.into());
         }
         // The gate holds each save to when and where the session saves,
         // and refuses it where other people read the chat.
@@ -4340,6 +4350,35 @@ pub(crate) mod tests {
             Some(notify::UNANSWERED)
         );
         assert!(hidden(&spec).iter().any(|name| name == notify::NOTIFY));
+    }
+
+    #[test]
+    fn letronna_info_is_left_out_of_a_run_nobody_watches_and_no_other() {
+        use crate::info::{LETRONNA_INFO, WITHHELD};
+        let dir = scratch("info-tool");
+        let mut spec = spec(String::new(), &dir, AGENTS + 389);
+        // A helper of a watched session reads it as its type allows: its
+        // report goes only to the agent that started it.
+        spec.connection.human = true;
+        assert_eq!(refused(&spec, LETRONNA_INFO), None);
+        spec.allow = Allow::Only(vec!["read_file".into()]);
+        assert!(refused(&spec, LETRONNA_INFO).is_some());
+        // The window's turn, an editor's or `-p` at a keyboard.
+        spec.depth = 0;
+        spec.allow = Allow::All;
+        assert_eq!(refused(&spec, LETRONNA_INFO), None);
+        assert!(!hidden(&spec).iter().any(|name| name == LETRONNA_INFO));
+        // With nobody there, as under `-p` with its output piped, it is left
+        // out of the run's requests and refused when named anyway.
+        spec.connection.human = false;
+        assert_eq!(refused(&spec, LETRONNA_INFO).as_deref(), Some(WITHHELD));
+        assert!(hidden(&spec).iter().any(|name| name == LETRONNA_INFO));
+        // Its forks leave it out as it does, and its helpers are refused it.
+        spec.depth = 1;
+        spec.fork = true;
+        assert!(hidden(&spec).iter().any(|name| name == LETRONNA_INFO));
+        spec.fork = false;
+        assert_eq!(refused(&spec, LETRONNA_INFO).as_deref(), Some(WITHHELD));
     }
 
     #[test]
