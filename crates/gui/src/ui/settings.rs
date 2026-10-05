@@ -683,7 +683,7 @@ fn plugins_page(chat: &Entity<Chat>, cx: &App) -> Div {
             )
             .child(
                 div().flex_shrink_0().cursor_pointer().child(
-                    gpui_component::switch::Switch::new(SharedString::from(format!("plugin-{id}")))
+                    KeyedSwitch::new(SharedString::from(format!("plugin-{id}")))
                         .checked(enabled)
                         .on_click(move |_, _, cx| {
                             plugins::set_enabled(cx, id, !enabled);
@@ -1015,7 +1015,7 @@ fn privacy_page(
         )
         .child(
             div().flex_shrink_0().cursor_pointer().child(
-                gpui_component::switch::Switch::new("browser-shared")
+                KeyedSwitch::new("browser-shared")
                     .checked(shared)
                     .on_click({
                         let chat = chat.clone();
@@ -1056,22 +1056,18 @@ fn privacy_page(
                         ),
                 ),
         )
-        .child(
-            div().flex_shrink_0().cursor_pointer().child(
-                gpui_component::switch::Switch::new("browser-seen")
-                    .checked(!unseen)
-                    .on_click({
-                        let chat = chat.clone();
-                        move |_, _, cx| {
-                            chat.update(cx, |this, cx| {
-                                this.store.settings.browse_unseen = !unseen;
-                                this.save();
-                                cx.notify();
-                            })
-                        }
-                    }),
-            ),
-        );
+        .child(div().flex_shrink_0().cursor_pointer().child(
+            KeyedSwitch::new("browser-seen").checked(!unseen).on_click({
+                let chat = chat.clone();
+                move |_, _, cx| {
+                    chat.update(cx, |this, cx| {
+                        this.store.settings.browse_unseen = !unseen;
+                        this.save();
+                        cx.notify();
+                    })
+                }
+            }),
+        ));
 
     v_flex()
         .gap_4()
@@ -1589,19 +1585,93 @@ pub(crate) fn toggle_row(
                 ),
         )
         .child(
-            div().cursor_pointer().child(
-                gpui_component::switch::Switch::new(id)
-                    .checked(on)
-                    .on_click(move |_, _, cx| {
-                        let set = set.clone();
-                        chat.update(cx, |this, cx| {
-                            set(this);
-                            this.save();
-                            cx.notify();
-                        })
-                    }),
-            ),
+            div()
+                .cursor_pointer()
+                .child(KeyedSwitch::new(id).checked(on).on_click(move |_, _, cx| {
+                    let set = set.clone();
+                    chat.update(cx, |this, cx| {
+                        set(this);
+                        this.save();
+                        cx.notify();
+                    })
+                })),
         )
+}
+
+/// What turning a switch does, given whether it is now on.
+type Turn = std::rc::Rc<dyn Fn(&bool, &mut Window, &mut App)>;
+
+/// A switch on a settings page that Tab reaches and Space or Enter turns,
+/// as they press a button: gpui-component's own takes no focus.
+#[derive(IntoElement)]
+pub(crate) struct KeyedSwitch {
+    id: SharedString,
+    checked: bool,
+    on_click: Option<Turn>,
+}
+
+impl KeyedSwitch {
+    pub(crate) fn new(id: impl Into<SharedString>) -> Self {
+        Self {
+            id: id.into(),
+            checked: false,
+            on_click: None,
+        }
+    }
+
+    pub(crate) fn checked(mut self, checked: bool) -> Self {
+        self.checked = checked;
+        self
+    }
+
+    /// What turning it does, given whether it is now on.
+    pub(crate) fn on_click(
+        mut self,
+        handler: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_click = Some(std::rc::Rc::new(handler));
+        self
+    }
+}
+
+impl RenderOnce for KeyedSwitch {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let focus = window
+            .use_keyed_state(
+                SharedString::from(format!("{}-focus", self.id)),
+                cx,
+                |_, cx| cx.focus_handle(),
+            )
+            .read(cx)
+            .clone();
+        let (checked, turn) = (self.checked, self.on_click);
+        let mut switch = gpui_component::switch::Switch::new(self.id.clone()).checked(checked);
+        if let Some(turn) = turn.clone() {
+            switch = switch.on_click(move |on, window, cx| turn(on, window, cx));
+        }
+        // Ringed as the Capabilities page's switches are, the edge always
+        // there so the ring the keys bring moves nothing.
+        div()
+            .id(self.id)
+            .track_focus(&focus.tab_stop(true))
+            .flex_shrink_0()
+            .p_0p5()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().transparent)
+            .focus(|s| s.border_color(cx.theme().ring))
+            // A click stays the switch's own, turning it as it is pressed
+            // and leaving the keys where they were, as a button's does.
+            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+            .when_some(turn, |this, turn| {
+                this.on_click(move |event, window, cx| {
+                    if event.is_keyboard() {
+                        turn(&!checked, window, cx)
+                    }
+                })
+            })
+            .child(switch)
+    }
 }
 
 /// One gateway as the settings list shows it.
