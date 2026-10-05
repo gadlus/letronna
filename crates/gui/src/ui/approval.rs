@@ -17,6 +17,9 @@ const PLAN_MAX: Pixels = px(320.);
 /// The share of the window's height a plan takes at most, for a short
 /// window where `PLAN_MAX` would still push the buttons out of sight.
 const PLAN_SHARE: f32 = 0.4;
+/// The least room the reason box on a card takes: its whole hint, "Why
+/// not? (optional)", with room to spare in each platform's font.
+const REASON_MIN: Rems = Rems(12.);
 
 /// What the card for a call waiting on the user shows, worked out once when
 /// it comes up: the preview reads the user's keys from disk to hide them,
@@ -685,9 +688,12 @@ impl Chat {
                         .child("No project folder is attached yet."),
                 )
         } else {
+            // Wraps, so a narrow window keeps the reason's whole hint in
+            // sight, its box and Deny on a line of their own.
             h_flex()
                 .gap_2()
                 .items_center()
+                .flex_wrap()
                 .child(
                     Button::new("allow")
                         .primary()
@@ -719,21 +725,29 @@ impl Chat {
                             this.resolve_call(Verdict::AllowHere, cx)
                         }))
                 }))
-                // Beside Deny, which sends what is typed here; enter in the
-                // field denies too.
+                // Beside Deny, which sends what is typed here, and wrapping
+                // with it; enter in the field denies too.
                 .child(
-                    div()
+                    h_flex()
                         .flex_1()
-                        .min_w_0()
-                        .child(Input::new(&self.deny_reason).small().w_full()),
-                )
-                .child(
-                    Button::new("deny")
-                        .plain(cx)
-                        .small()
-                        .label("Deny")
-                        .children(hint("escape"))
-                        .on_click(cx.listener(|this, _, window, cx| this.deny_call(window, cx))),
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(REASON_MIN)
+                                .child(Input::new(&self.deny_reason).small().w_full()),
+                        )
+                        .child(
+                            Button::new("deny")
+                                .plain(cx)
+                                .small()
+                                .label("Deny")
+                                .children(hint("escape"))
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.deny_call(window, cx)),
+                                ),
+                        ),
                 )
         };
         // A stop for Tab, F6 and Alt+Up, where Enter and Escape answer it.
