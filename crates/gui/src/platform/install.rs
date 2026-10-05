@@ -258,7 +258,7 @@ mod windows_impl {
         let exe = target.display().to_string();
         set_value(&key, "DisplayName", BRAND);
         set_value(&key, "DisplayVersion", VERSION);
-        set_value(&key, "Publisher", "Gadlus Engineering");
+        set_value(&key, "Publisher", "Gadlus LLC");
         set_value(&key, "InstallLocation", &dir.display().to_string());
         set_value(&key, "DisplayIcon", &exe);
         set_value(&key, "UninstallString", &format!("\"{exe}\" --uninstall"));

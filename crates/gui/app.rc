@@ -12,14 +12,14 @@ BEGIN
   BEGIN
     BLOCK "040904b0"
     BEGIN
-      VALUE "CompanyName", "Gadlus Engineering"
+      VALUE "CompanyName", "Gadlus LLC"
       VALUE "FileDescription", "Letronna"
       VALUE "FileVersion", "0.1.0-alpha.1"
       VALUE "InternalName", "Letronna"
       VALUE "OriginalFilename", "Letronna.exe"
       VALUE "ProductName", "Letronna"
       VALUE "ProductVersion", "0.1.0-alpha.1"
-      VALUE "LegalCopyright", "Copyright (c) 2026 Gadlus Engineering"
+      VALUE "LegalCopyright", "Copyright (c) 2026 Gadlus LLC"
     END
   END
   BLOCK "VarFileInfo"

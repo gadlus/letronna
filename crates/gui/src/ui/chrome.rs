@@ -4,11 +4,20 @@ use gpui_component::popover::Popover;
 /// The user guide on the website, opened from the account menu.
 const GUIDE: &str = "https://letronna.ai/docs";
 /// The window width from which the palette's button says what it does:
-/// below it, its words would take the session name's room.
+/// below it, its words would crowd the bar.
 const COMMAND_WORDS: Pixels = px(960.);
 /// The chat pane's width from which the memory chip says what it is set
 /// to: below it, the words would push the status bar past its edge.
 const MEMORY_WORDS: Pixels = px(760.);
+
+/// `control` in the title bar, kept from moving the window: the bar starts a
+/// move on a press that then moves at all, which would take the click, so a
+/// press on a control stops there.
+fn no_drag(control: impl IntoElement) -> impl IntoElement {
+    div()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(control)
+}
 
 impl Chat {
     pub(crate) fn title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -30,36 +39,36 @@ impl Chat {
                     .gap_2()
                     // Nothing follows the chip on macOS, so keep it off the edge.
                     .when(cfg!(target_os = "macos"), |bar| bar.pr_3())
-                    // Both sides grow alike from nothing, so the name sits
-                    // in the middle of the bar, not of what the buttons
-                    // leave; a side wider than its half only pushes it over.
-                    .child(
-                        h_flex().flex_1().items_center().child(
-                            Button::new("toggle-sidebar")
-                                .plain(cx)
-                                .small()
-                                .icon(
-                                    Icon::new(if self.sidebar_open {
-                                        IconName::PanelLeftClose
-                                    } else {
-                                        IconName::PanelLeftOpen
-                                    })
-                                    .size_4(),
-                                )
-                                .tooltip_with_action("Toggle sidebar", &ToggleSidebar, None)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.sidebar_open = !this.sidebar_open;
-                                    cx.notify();
-                                })),
-                        ),
-                    )
                     .child(
                         h_flex()
-                            .min_w_0()
-                            .justify_center()
-                            .when(self.page == Page::Chat, |this| {
-                                this.child(self.session_title(cx))
-                            }),
+                            .flex_1()
+                            .items_center()
+                            .gap_2()
+                            .child(no_drag(
+                                Button::new("toggle-sidebar")
+                                    .plain(cx)
+                                    .small()
+                                    .icon(
+                                        Icon::new(if self.sidebar_open {
+                                            IconName::PanelLeftClose
+                                        } else {
+                                            IconName::PanelLeftOpen
+                                        })
+                                        .size_4(),
+                                    )
+                                    .tooltip_with_action("Toggle sidebar", &ToggleSidebar, None)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.sidebar_open = !this.sidebar_open;
+                                        cx.notify();
+                                    })),
+                            ))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_family(HEADING_FONT)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child("Letronna"),
+                            ),
                     )
                     .child(
                         h_flex()
@@ -67,8 +76,8 @@ impl Chat {
                             .items_center()
                             .justify_end()
                             .gap_2()
-                            .child(self.command_button(window, cx))
-                            .child(
+                            .child(no_drag(self.command_button(window, cx)))
+                            .child(no_drag(
                                 Button::new("toggle-panel")
                                     .plain(cx)
                                     .small()
@@ -81,14 +90,14 @@ impl Chat {
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.toggle_panel(window, cx)
                                     })),
-                            )
+                            ))
                             .children(self.profile_label.clone().map(|name| {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(name)
                             }))
-                            .child(self.account_chip(cx)),
+                            .child(no_drag(self.account_chip(cx))),
                     ),
             )
     }
@@ -98,8 +107,8 @@ impl Chat {
     fn command_button(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let key = crate::ui::keys::bound_key(&crate::ui::palette::OpenPalette, cx);
-        // In a narrow window the words go first, so the session's name
-        // keeps its room; the glass and the key say enough.
+        // In a narrow window the words go first, so the bar is not
+        // crowded; the glass and the key say enough.
         let words = window.viewport_size().width >= COMMAND_WORDS;
         Button::new("command")
             .framed(cx)
@@ -117,29 +126,6 @@ impl Chat {
             )
             .when(!words, |this| this.tooltip("Search or run a command"))
             .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx)))
-    }
-
-    /// The open session's name, so it is clear which one this is; click
-    /// to rename it.
-    fn session_title(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let index = self.store.active;
-        let title = self.store.conversations[index].title.clone();
-        Button::new("session-title")
-            .plain(cx)
-            .xsmall()
-            .tooltip("Rename")
-            // Set as the window's title, not as a hint beside it.
-            .child(
-                div()
-                    .max_w(px(420.))
-                    .truncate()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(title),
-            )
-            .on_click(
-                cx.listener(move |this, _, window, cx| this.rename_session(index, window, cx)),
-            )
     }
 
     fn account_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {

@@ -406,6 +406,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Small, focused pull requests are welcome
 
 ## License
 
-MIT, © 2026 Gadlus Engineering. GPUI and gpui-component are Apache-2.0. Phosphor Icons are MIT.
+MIT, © 2026 Gadlus LLC. GPUI and gpui-component are Apache-2.0. Phosphor Icons are MIT.
 
-Developed by the Gadlus Engineering team.
+Developed by Gadlus LLC.

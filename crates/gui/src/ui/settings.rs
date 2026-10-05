@@ -1216,24 +1216,8 @@ fn about_page(chat: &Entity<Chat>, this: &Chat, cx: &App) -> Div {
         .child(updates(chat, this, cx))
         .child(
             div()
-                .text_sm()
-                .pt_3()
-                .child("A small native desktop agent. Rust, GPU rendered, no browser inside."),
-        )
-        .child(line("Developed by the Gadlus Engineering team.", 13.))
-        .child(
-            v_flex()
                 .pt_6()
-                .gap_1()
-                .items_center()
-                .child(line(
-                    "© 2026 Gadlus Engineering. Released under the MIT License.",
-                    12.,
-                ))
-                .child(line(
-                    "Built with GPUI and gpui-component (Apache-2.0). Icons by Phosphor (MIT).",
-                    12.,
-                )),
+                .child(line("© 2026 Gadlus LLC · MIT License", 12.)),
         )
 }
 
