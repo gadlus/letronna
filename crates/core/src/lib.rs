@@ -17,6 +17,7 @@ pub mod browser;
 pub mod budget;
 pub mod cache_miss;
 pub mod cancel;
+mod cat;
 mod cdp;
 pub mod chat;
 pub mod command;
