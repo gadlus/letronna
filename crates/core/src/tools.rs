@@ -3330,6 +3330,37 @@ fn typing(args: &Value, ctx: &ToolContext) -> String {
     }
 }
 
+/// What a send_job call types, in the parts a card lays out apart.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Typing {
+    /// The job, as a line naming its command.
+    pub job: String,
+    /// The last line the job printed, empty when it printed none.
+    pub last: String,
+    /// What earlier calls typed on the line with no enter yet, which enter
+    /// sends too.
+    pub earlier: String,
+    /// What is typed, control characters but line breaks written out.
+    pub text: String,
+    /// The keys pressed after it, by their names in lower case, in order.
+    pub keys: Vec<String>,
+}
+
+/// `args`, a send_job call's, as the window's card shows it.
+pub fn typing_of(args: &Value, ctx: &ToolContext) -> Typing {
+    let mut args = args.clone();
+    rename_aliases("send_job", &mut args);
+    let (job, last) = typed_into(&args, ctx);
+    let keys = keys_named(&args["keys"]);
+    Typing {
+        job,
+        last,
+        earlier: visible(&typed_earlier(&args, ctx)),
+        text: visible(args["text"].as_str().unwrap_or_default()),
+        keys: keys.iter().map(|key| key.trim().to_lowercase()).collect(),
+    }
+}
+
 /// Whether `output`, what a job printed since `typed` was typed into it,
 /// shows `until` more often than the terminal's echo of `typed` can, as the
 /// sentinel of `make; echo DONE` is in the echo before make has run. A line
@@ -8122,6 +8153,25 @@ mod tests {
             "#4 a\\u{1b}[2K"
         );
         assert_eq!(row(json!({"job": 4, "keys": ["enter"]})), "#4 enter");
+    }
+
+    #[test]
+    fn a_send_job_card_gets_the_job_the_text_and_the_keys_apart() {
+        let ctx = ToolContext {
+            conversation: 7_202,
+            ..Default::default()
+        };
+        let args = json!({"id": 4, "text": "a\u{1b}[2K\nb", "keys": [" Ctrl-C", "up"]});
+        assert_eq!(
+            typing_of(&args, &ctx),
+            Typing {
+                job: "Job #4, which this conversation did not start".into(),
+                last: String::new(),
+                earlier: String::new(),
+                text: "a\\u{1b}[2K\nb".into(),
+                keys: vec!["ctrl-c".into(), "up".into()],
+            }
+        );
     }
 
     #[test]
