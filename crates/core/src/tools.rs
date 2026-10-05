@@ -3460,6 +3460,19 @@ fn notify_on(args: &Value) -> Result<Vec<String>, String> {
         .collect()
 }
 
+/// What follows the option `ask_user` is asked to offer first, the one it
+/// recommends.
+const RECOMMENDED: &str = " (Recommended)";
+
+/// The user's answer to `ask_user` as the model gets it: an option picked
+/// as offered, without the mark that it was the recommended one.
+pub(crate) fn answered(answer: &str) -> &str {
+    match answer.trim_end().strip_suffix(RECOMMENDED) {
+        Some(option) if !option.trim().is_empty() => option.trim_end(),
+        _ => answer,
+    }
+}
+
 /// Answered in the chat, and run only in an unattended session to say nobody will.
 struct AskUser;
 impl Tool for AskUser {
@@ -3467,12 +3480,12 @@ impl Tool for AskUser {
         ASK_USER
     }
     fn description(&self) -> &'static str {
-        "Ask the user a question and wait for the answer. Use it when the task is ambiguous or needs a decision, such as a project name or framework."
+        "Ask the user one question and wait for the answer. Only for a decision that is theirs and that the request, the project and sensible defaults do not settle; never to ask whether to go ahead with work the user already asked for. Returns their answer: one of the options, or their own words; if nobody can answer it says so, and you decide."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
-            "question": {"type": "string"},
-            "options": {"type": "array", "items": {"type": "string"}, "description": "Optional choices to offer."}
+            "question": {"type": "string", "description": "One short question, with the context needed to answer it."},
+            "options": {"type": "array", "items": {"type": "string"}, "description": format!("Optional answers to pick from, two to four short ones. Put the one you recommend first, with \"{}\" after it. Leave them out when the answer is open.", RECOMMENDED.trim_start())}
         }, "required": ["question"]})
     }
     fn needs_approval(&self) -> bool {

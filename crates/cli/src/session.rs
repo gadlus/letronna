@@ -28,6 +28,9 @@ use crate::render::{self, Stream};
 
 /// Lines of a tool's output to show before clipping.
 const DETAIL_LINES: usize = 12;
+/// The last answer offered to a question with options, which takes a line
+/// typed instead.
+const OWN_WORDS: &str = "Answer in my own words";
 
 pub struct Runner {
     pub store: Store,
@@ -1063,14 +1066,16 @@ impl Runner {
                 })
                 .unwrap_or_default();
 
-            // Offered answers are picked, not typed; an open question still
-            // wants the line.
+            // An open question wants the line; offered answers are picked,
+            // or passed over for one in the user's own words, as the
+            // window's card takes one.
             let reply = if options.is_empty() {
                 render::blank();
                 render::said(&render::blue("●"), &bold_question(&question));
                 self.bar.reply().ok_or("No answer given.")?
             } else {
-                let choices: Vec<&str> = options.iter().map(String::as_str).collect();
+                let mut choices: Vec<&str> = options.iter().map(String::as_str).collect();
+                choices.push(OWN_WORDS);
                 // Escape turns the question down, which ends the turn as it
                 // does when a call is asked about.
                 let Some(picked) = self.bar.choose(&question, Vec::new(), &choices) else {
@@ -1081,9 +1086,14 @@ impl Runner {
                 };
                 render::blank();
                 render::said(&render::blue("●"), &bold_question(&question));
-                render::said(&render::blue("›"), &render::bold(&options[picked]));
-                render::blank();
-                options[picked].clone()
+                match options.get(picked) {
+                    Some(option) => {
+                        render::said(&render::blue("›"), &render::bold(option));
+                        render::blank();
+                        option.clone()
+                    }
+                    None => self.bar.reply().ok_or("No answer given.")?,
+                }
             };
             turn.finish_call(Ok(reply));
             return Ok(true);
