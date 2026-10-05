@@ -1,8 +1,8 @@
-//! Word, Excel, PowerPoint and PDF files, and OpenDocument's text,
-//! spreadsheets and presentations, as read_file shows them: a document's
+//! Word, Excel, PowerPoint and PDF files, OpenDocument's text, spreadsheets
+//! and presentations, and EPUB books, as read_file shows them: a document's
 //! text, a workbook's sheets as rows of the values they last showed, a
-//! deck's slides with their notes, and a PDF's pages, in place of the zip of
-//! XML or the PDF on disk.
+//! deck's slides with their notes, a PDF's pages, and a book's chapters, in
+//! place of the zip of XML or the PDF on disk.
 //!
 //! A Word heading becomes `#` marks and a table markdown rows. Each sheet
 //! opens with `## Sheet "Name" (R rows x C cols)`, its rows following one
@@ -19,6 +19,7 @@
 //! views are kept, so paging through a document reads it once.
 
 mod odf;
+mod epub;
 mod pdf;
 
 use quick_xml::XmlVersion;
@@ -84,6 +85,7 @@ enum Kind {
     Text,
     Spreadsheet,
     Presentation,
+    Epub,
 }
 
 /// The kind of document `path` is named as.
@@ -104,6 +106,7 @@ fn kind_of(extension: &str) -> Option<Kind> {
         "odt" | "ott" => Some(Kind::Text),
         "ods" | "ots" => Some(Kind::Spreadsheet),
         "odp" | "otp" => Some(Kind::Presentation),
+        "epub" => Some(Kind::Epub),
         _ => None,
     }
 }
@@ -120,12 +123,13 @@ pub(crate) fn is_extension(extension: &str) -> bool {
 
 /// The lines of `lines`, the view of the document at `path`, that say where
 /// in it the lines after them are: a PDF's pages, a workbook's sheets, a
-/// deck's slides, or a Word document's headings.
+/// deck's slides, a book's chapters, or a Word document's headings.
 pub(crate) fn places(path: &Path, lines: &[&[u8]]) -> Vec<usize> {
     let starts: &[&[u8]] = match kind(path) {
         Some(Kind::Pdf) => &[b"## Page "],
         Some(Kind::Excel | Kind::Spreadsheet) => &[b"## Sheet \""],
         Some(Kind::PowerPoint | Kind::Presentation) => &[b"## Slide "],
+        Some(Kind::Epub) => &[b"## Chapter "],
         Some(Kind::Word | Kind::Text) => &[b"# ", b"## ", b"### ", b"#### ", b"##### ", b"###### "],
         None => &[],
     };
@@ -144,6 +148,7 @@ pub(crate) fn plain(path: &Path) -> Option<&'static str> {
         // OpenDocument's lock with a password inside the zip, so one that
         // is no zip was never one.
         Kind::Pdf | Kind::Text | Kind::Spreadsheet | Kind::Presentation => return None,
+        Kind::Epub => return None,
     })
 }
 
@@ -405,6 +410,7 @@ fn read(path: &Path, kind: Kind, until: Instant) -> Result<String, String> {
         Kind::Text => odf::text,
         Kind::Spreadsheet => odf::spreadsheet,
         Kind::Presentation => odf::presentation,
+        Kind::Epub => epub::book,
         Kind::Pdf => return pdf::read(path, until),
     };
     let mut package = Package::open(path, until)?;
@@ -587,7 +593,8 @@ fn reference(name: &BytesRef) -> Option<String> {
         return Some(c.to_string());
     }
     let name = name.decode().ok()?;
-    quick_xml::escape::resolve_xml_entity(&name).map(str::to_owned)
+    // HTML's too, such as `&nbsp;`, which a book's chapters declare.
+    quick_xml::escape::resolve_predefined_entity(&name).map(str::to_owned)
 }
 
 /// The name of `tag` without its prefix.
@@ -1556,6 +1563,7 @@ pub(crate) mod tests {
     use super::*;
     use std::io::Write;
 
+    pub(crate) use super::epub::tests::{epub, xhtml};
     pub(crate) use super::odf::tests::odf;
     pub(crate) use super::pdf::tests::text_pdf;
 
