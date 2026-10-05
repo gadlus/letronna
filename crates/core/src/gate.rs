@@ -4443,7 +4443,6 @@ mod tests {
         let tagged = [
             (read, "no approval needed"),
             (fetch, "allowed this session"),
-            (command("cargo test --release"), "rule: cargo test"),
             (click, "rule: use_page"),
             (command("ls"), "only reads"),
             (edit("src/new.rs"), "in workspace"),
@@ -4456,6 +4455,15 @@ mod tests {
                 Some(expected)
             );
         }
+        // Where this system confines commands, the rule leaves its command in
+        // the sandbox, and `reason` names only what lets a call run outright.
+        let ruled = command("cargo test --release");
+        assert_eq!(tag(&ruled, &block).as_deref(), Some("rule: cargo test"));
+        let outright = (!crate::sandbox::available()).then_some("rule: cargo test");
+        assert_eq!(
+            reason(&ruled, &gate).map(|layer| layer.tag()).as_deref(),
+            outright
+        );
         let build = command("cargo build");
         assert_eq!(tag(&build, &allow).as_deref(), Some("auto: allowed"));
         let (outcome, layer) = traced(&build, &gate, Some(&block), false);

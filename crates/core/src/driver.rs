@@ -4245,11 +4245,17 @@ pub(crate) mod tests {
         ("run_command", json!({"command": line}))
     }
 
+    /// `command` asked to run outside the OS sandbox, which only a yes or
+    /// the judge allows, so Auto mode puts it to the judge on every system.
+    fn outside(line: &str) -> (&'static str, Value) {
+        ("run_command", json!({"command": line, "unsandboxed": true}))
+    }
+
     #[test]
     fn a_helper_in_auto_runs_what_the_judge_allows_on_what_the_user_typed() {
         let dir = scratch("judge-allows");
         let (endpoint, provider) = judged(
-            vec![reply("", &[command("echo judged")]), reply("Ran it.", &[])],
+            vec![reply("", &[outside("echo judged")]), reply("Ran it.", &[])],
             Some("ALLOW"),
         );
         let mut spec = in_auto(endpoint, &dir, AGENTS + 200, "Say judged in the shell.");
@@ -4281,8 +4287,11 @@ pub(crate) mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let requests = approvals::serve();
         let dir = scratch("judge-unsure");
-        let replies = || vec![reply("", &[command("echo unsure")]), reply("Gave up.", &[])];
-        let (endpoint, provider) = judged(replies(), None);
+        let replies =
+            |call: (&'static str, Value)| vec![reply("", &[call]), reply("Gave up.", &[])];
+        // With someone to ask, a command the sandbox could hold runs there
+        // unjudged, so the judge's doubt is about one asked to run outside.
+        let (endpoint, provider) = judged(replies(outside("echo unsure")), None);
         let spec = in_auto(endpoint, &dir, AGENTS + 210, "Say unsure in the shell.");
         let running = spawn(spec, |_| ()).unwrap();
         let request = requests.recv_timeout(WAIT).unwrap();
@@ -4297,7 +4306,7 @@ pub(crate) mod tests {
         assert_eq!(results(&sent[2]), [NOT_APPROVED]);
 
         // With nobody to answer, the judge's doubt is a refusal, and no card.
-        let (endpoint, provider) = judged(replies(), None);
+        let (endpoint, provider) = judged(replies(command("echo unsure")), None);
         let mut spec = in_auto(endpoint, &dir, AGENTS + 220, "Say unsure in the shell.");
         spec.connection.human = false;
         assert_eq!(finished(spec).status, Outcome::Done);
@@ -4317,7 +4326,7 @@ pub(crate) mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let requests = approvals::serve();
         let dir = scratch("judge-denied");
-        let retried = || reply("", &[command("echo retried")]);
+        let retried = || reply("", &[outside("echo retried")]);
         // The judge is unsure of the first, and would allow it after.
         let (endpoint, provider) = judged_in_turn(
             vec![retried(), retried(), reply("Gave up.", &[])],
