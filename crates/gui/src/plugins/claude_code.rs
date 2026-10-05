@@ -724,7 +724,8 @@ impl Hub {
         {
             return;
         }
-        let folder = self.lock().folder.clone();
+        // The window's own folder is for a request whose prompt names none.
+        let folder = project_folder(&request).or_else(|| self.lock().folder.clone());
         let mut quiet = Instant::now();
         let asked = self.ask(folder, &message, || {
             std::thread::sleep(STEP);
@@ -956,17 +957,39 @@ fn newest(request: &Value) -> Option<String> {
     if last["role"] != "user" {
         return None;
     }
-    let text = match &last["content"] {
-        Value::String(text) => text.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter_map(|part| part["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => return None,
-    };
+    let text = text_of(&last["content"])?;
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// The project folder Letronna's system prompt names for the session the
+/// request comes from, so a turn from the terminal goes to the Claude Code
+/// in that session's folder rather than the window's.
+fn project_folder(request: &Value) -> Option<PathBuf> {
+    const SAID: &str = "The project folder is `";
+    let system = request["messages"]
+        .as_array()?
+        .iter()
+        .find(|message| message["role"] == "system")?;
+    let text = text_of(&system["content"])?;
+    let start = text.find(SAID)? + SAID.len();
+    let end = text[start..].find('`')?;
+    Some(PathBuf::from(&text[start..start + end]))
+}
+
+/// A message's words, whether given as one string or as parts.
+fn text_of(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => Some(
+            parts
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
+    }
 }
 
 /// Point the Custom gateway at the model endpoint while it runs, and take it
@@ -1421,8 +1444,8 @@ mod tests {
     // would shadow the built-in attribute.
     use super::{
         Answer, Handed, Heard, Hub, MODEL_PATH, PORT_FILE, Session, WAIT_SECS, accept, answer,
-        hooks, is_ours, listen, newest, quoted, read, read_link, say, script, serving, sign,
-        terminals, verify, wait, write_private,
+        hooks, is_ours, listen, newest, project_folder, quoted, read, read_link, say, script,
+        serving, sign, terminals, verify, wait, write_private,
     };
     use serde_json::{Value, json};
     use std::collections::VecDeque;
@@ -1748,14 +1771,16 @@ mod tests {
     fn a_turn_on_the_model_goes_to_claude_code_and_streams_back_its_answer() {
         let dir = scratch("model-turn");
         let hub = hub(&dir);
-        hub.lock().folder = Some(PathBuf::from("/work/site"));
+        // The window shows another session; the request's own prompt names
+        // the folder it comes from.
+        hub.lock().folder = Some(PathBuf::from("/work/other"));
         let start = waiting(&dir, hook_input("s1", "SessionStart", ""));
         until(|| has_waiter(&hub, "s1"));
         let body = json!({
             "model": "claude-code",
             "stream": true,
             "messages": [
-                {"role": "system", "content": "Letronna's own prompt"},
+                {"role": "system", "content": "You are Letronna. The project folder is `/work/site`. Be brief."},
                 {"role": "user", "content": "an earlier question"},
                 {"role": "assistant", "content": "an earlier answer"},
                 {"role": "user", "content": [{"type": "text", "text": "rename the tests"}]},
@@ -1806,6 +1831,25 @@ mod tests {
         assert_eq!(newest(&asked).as_deref(), Some("look at this"));
         let after_a_tool = json!({"messages": [{"role": "tool", "content": "42"}]});
         assert_eq!(newest(&after_a_tool), None);
+    }
+
+    #[test]
+    fn the_folder_comes_from_the_prompt_of_the_session_that_asked() {
+        let parts = json!({"messages": [
+            {"role": "system", "content": [
+                {"type": "text", "text": "You are Letronna."},
+                {"type": "text", "text": "The project folder is `/work/it's here`.", "cache_control": {"type": "ephemeral"}},
+            ]},
+            {"role": "user", "content": "hi"},
+        ]});
+        assert_eq!(
+            project_folder(&parts),
+            Some(PathBuf::from("/work/it's here"))
+        );
+        let none = json!({"messages": [
+            {"role": "system", "content": "No project folder is attached."},
+        ]});
+        assert_eq!(project_folder(&none), None);
     }
 
     #[test]
