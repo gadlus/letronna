@@ -1278,6 +1278,15 @@ fn system_prompt(
             system.push_str(&line);
         }
     }
+    // Where a scheduled run's answer goes, so a message wanted every day is
+    // one schedule and not a webhook looked for in the environment. Here, as
+    // it changes only when the user sets up a chat app, and only where the
+    // rule on schedules is told, as no other session can add one.
+    if crate::prompt_rules::tells(connection, "schedules")
+        && let Some(line) = reports_line(&crate::messaging::load())
+    {
+        system.push_str(&line);
+    }
     let model = system.len();
     system.push_str(&format!(" The model behind you is {}.", connection.model));
     // Memory goes after all that sessions share, as what one session loads
@@ -1321,6 +1330,15 @@ fn system_prompt(
         model,
         remembered,
     }
+}
+
+/// The sentence naming where a scheduled run's answer goes with the chat apps
+/// as `config` has them, or none when none is set up.
+// Names only, from `messaging::reporting`: the webhook, token, address and
+// IDs stay in the settings and out of every request.
+fn reports_line(config: &crate::messaging::Config) -> Option<String> {
+    let places = crate::messaging::reporting(config);
+    (!places.is_empty()).then(|| format!(" Scheduled runs report to: {}.", places.join(", ")))
 }
 
 /// What runs nobody watches are told of the commands on PATH and the top of
@@ -5814,6 +5832,248 @@ mod tests {
         assert!(!toolless.contains("Nobody there sees"), "{toolless}");
         assert!(!window.contains("Tables do not display"), "{window}");
         assert!(!window.contains("Nobody there sees"), "{window}");
+    }
+
+    /// The chat apps set up in `messaging.json`, one of each kind, paired
+    /// where they take pairing, with a recognizable value in every field a
+    /// prompt must never carry.
+    const EVERY_CHAT_APP: &str = r#"{
+        "telegram": {"enabled": true, "token": "7123456789:AAHtelegramtoken", "chat": 777123456},
+        "discord": {"enabled": true, "webhook": "https://discord.com/api/webhooks/5551234/hooktoken",
+                    "bot_token": "discordbottoken", "owner": "888123456789"},
+        "slack": {"enabled": true, "app_token": "xapp-slackapp", "bot_token": "xoxb-slackbot",
+                  "owner": "U0SLACKOWNER"},
+        "email": {"enabled": true, "smtp_host": "smtp.mailhost.example", "port": 465,
+                  "username": "mailuser", "password": "mailpassword",
+                  "from": "from@mailfrom.example", "to": "owner@mailto.example"}
+    }"#;
+
+    /// What nobody may find in a request: each secret, address and ID in
+    /// `EVERY_CHAT_APP`.
+    const CHAT_APP_SECRETS: [&str; 14] = [
+        "AAHtelegramtoken",
+        "777123456",
+        "hooktoken",
+        "5551234",
+        "discordbottoken",
+        "888123456789",
+        "xapp-slackapp",
+        "xoxb-slackbot",
+        "U0SLACKOWNER",
+        "mailhost.example",
+        "mailuser",
+        "mailpassword",
+        "mailfrom.example",
+        "mailto.example",
+    ];
+
+    /// The system message a window session sends with the chat apps `config`
+    /// has set up, as `messaging.json` is written.
+    fn window_system_with(dir: &std::path::Path, config: &str) -> String {
+        std::fs::write(dir.join("messaging.json"), config).unwrap();
+        system_with_tools(Connection {
+            human: true,
+            ..connection()
+        })
+    }
+
+    #[test]
+    fn a_session_that_can_schedule_is_told_where_a_scheduled_run_reports() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("report-line");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let told = |config: &str| {
+            let system = window_system_with(&dir, config);
+            let (_, line) = system.split_once(" Scheduled runs report to: ")?;
+            Some(line.split_once('.')?.0.to_owned())
+        };
+        let webhook =
+            r#"{"discord": {"enabled": true, "webhook": "https://discord.com/api/webhooks/1/t"}}"#;
+        let bot = r#"{"discord": {"enabled": true, "bot_token": "t", "owner": "1"}}"#;
+        let telegram = r#"{"telegram": {"enabled": true, "token": "1:t", "chat": 42}}"#;
+        let slack = r#"{"slack": {"enabled": true, "app_token": "xapp-1", "bot_token": "xoxb-1", "owner": "U1"}}"#;
+        let email = r#"{"email": {"enabled": true, "smtp_host": "smtp.example.com", "to": "a@example.com"}}"#;
+        let both = r#"{"discord": {"enabled": true, "webhook": "https://discord.com/api/webhooks/1/t"},
+                       "email": {"enabled": true, "smtp_host": "smtp.example.com", "to": "a@example.com"}}"#;
+        assert_eq!(told(webhook).as_deref(), Some("Discord (webhook)"));
+        assert_eq!(told(bot).as_deref(), Some("Discord (bot DM)"));
+        assert_eq!(told(telegram).as_deref(), Some("Telegram"));
+        assert_eq!(told(slack).as_deref(), Some("Slack"));
+        assert_eq!(told(email).as_deref(), Some("email"));
+        assert_eq!(told(both).as_deref(), Some("Discord (webhook), email"));
+        assert_eq!(
+            told(EVERY_CHAT_APP).as_deref(),
+            Some("Discord (webhook), Discord (bot DM), Slack, Telegram, email")
+        );
+        // Nothing set up says nothing: no file, an empty one, one switched
+        // off, a bot nobody paired, and a file that cannot be read.
+        let _ = std::fs::remove_file(dir.join("messaging.json"));
+        let bare = system_with_tools(Connection {
+            human: true,
+            ..connection()
+        });
+        assert!(!bare.contains("Scheduled runs report"), "{bare}");
+        let unpaired = r#"{"telegram": {"enabled": true, "token": "1:t"},
+                           "slack": {"enabled": true, "app_token": "xapp-1", "bot_token": "xoxb-1"},
+                           "discord": {"enabled": false, "webhook": "https://discord.com/api/webhooks/1/t"}}"#;
+        for config in ["{}", unpaired, "{not json"] {
+            assert_eq!(told(config), None, "{config}");
+        }
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn only_a_session_offered_the_schedule_tool_is_told_where_runs_report() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("report-line-surfaces");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        std::fs::write(dir.join("messaging.json"), EVERY_CHAT_APP).unwrap();
+        let chat = |shared| Connection {
+            human: true,
+            remote: Some(Remote {
+                place: "a Telegram chat".into(),
+                shared,
+                ..Default::default()
+            }),
+            ..connection()
+        };
+        let job = crate::schedule::Schedule {
+            id: 1,
+            name: "Daily".into(),
+            prompt: "Say hello.".into(),
+            workspace: None,
+            trigger: crate::schedule::Trigger::Every { minutes: 60 },
+            enabled: true,
+            last_run: 0,
+            mode: Mode::Default,
+            by_model: false,
+            quiet: false,
+            check: None,
+        };
+        let session = 9_700_002;
+        let _listed = crate::schedule::Listed::new(session, &job);
+        let told = |connection: Connection| {
+            let system = system_with_tools(connection);
+            let line = system.contains(" Scheduled runs report to: ");
+            // The rule and the line go together, and the line follows it.
+            let rule = system.contains("use Letronna's own schedules and chat apps before");
+            assert_eq!(line, rule, "{system}");
+            line
+        };
+        // The window, an editor over ACP, the terminal and a chat with its owner.
+        let window = Connection {
+            human: true,
+            ..connection()
+        };
+        assert!(told(window.clone()));
+        assert!(told(Connection {
+            human: true,
+            plain_terminal: true,
+            ..connection()
+        }));
+        assert!(told(chat(false)));
+        // A `-p` run has nobody to say yes to a schedule.
+        assert!(!told(connection()));
+        // A scheduled run's own turn is offered no `schedule`, so it is not
+        // told to use it, nor of where its own answer goes.
+        assert!(!told(Connection {
+            conversation: session,
+            ..connection()
+        }));
+        // A chat others read is offered no tool of this computer.
+        assert!(!told(chat(true)));
+        // Plan mode holds the schedule tool back until a plan is approved, and
+        // a plan may be to add one, so the prompt does not change with it.
+        assert!(told(Connection {
+            plan: true,
+            ..window.clone()
+        }));
+        // Without tools there is none to call.
+        let toolless = system_prompt(&window, None).text;
+        assert!(!toolless.contains("Scheduled runs report"), "{toolless}");
+        // And not where the user switched the tool off.
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"endpoint": "", "model": "m", "disabled_tools": ["schedule"]}"#,
+        )
+        .unwrap();
+        assert!(!told(window));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn no_token_webhook_address_or_id_of_a_chat_app_reaches_a_request() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("report-line-secrets");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let system = window_system_with(&dir, EVERY_CHAT_APP);
+        let window = Connection {
+            human: true,
+            tools: true,
+            ..connection()
+        };
+        let request = body(&window, &[said("user", "hi")], None, None).to_string();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert!(system.contains(" Scheduled runs report to: Discord (webhook)"));
+        for secret in CHAT_APP_SECRETS {
+            assert!(!system.contains(secret), "{secret}: {system}");
+            assert!(!request.contains(secret), "{secret}: {request}");
+        }
+    }
+
+    #[test]
+    fn the_line_changes_nothing_before_the_part_a_provider_caches() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("report-line-cache");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let window = Connection {
+            endpoint: "https://openrouter.ai/api/v1".into(),
+            model: "anthropic/claude-sonnet-4.5".into(),
+            tools: true,
+            human: true,
+            workspace: Some("/w".into()),
+            ..connection()
+        };
+        let line = " Scheduled runs report to: Discord (webhook), Discord (bot DM), Slack, Telegram, email.";
+        let sent = |config: Option<&str>| {
+            match config {
+                Some(config) => std::fs::write(dir.join("messaging.json"), config).unwrap(),
+                None => {
+                    let _ = std::fs::remove_file(dir.join("messaging.json"));
+                }
+            }
+            let prompt = system_prompt(&window, None);
+            let payload = body(&window, &[said("user", "hi")], None, None);
+            let parts: Vec<String> = payload["messages"][0]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|part| part["text"].as_str().unwrap().to_owned())
+                .collect();
+            (prompt, parts)
+        };
+        let (bare, bare_parts) = sent(None);
+        let (set_up, set_up_parts) = sent(Some(EVERY_CHAT_APP));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+
+        // The marked part, which holds for the session, is the same bytes.
+        assert_eq!(bare.identity, set_up.identity);
+        assert_eq!(bare_parts[0], set_up_parts[0]);
+        assert_eq!(set_up.text[..set_up.identity], bare.text[..bare.identity]);
+        // The line is the only difference, in the part that already
+        // changes: after the skills and before the model.
+        assert_eq!(set_up.text.replacen(line, "", 1), bare.text);
+        assert!(set_up.text[set_up.skills.end..set_up.model].ends_with(line));
+        assert_eq!(set_up_parts[1].replacen(line, "", 1), bare_parts[1]);
+        assert!(!set_up_parts[0].contains("Scheduled runs report"));
     }
 
     #[test]

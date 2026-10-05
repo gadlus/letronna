@@ -554,6 +554,25 @@ fn report_via(
     failed
 }
 
+/// The places `report` would send a scheduled run's answer to, by name.
+// The conditions of `report_via`, which sends nowhere else: if one changes,
+// so must this. Names only, as the system prompt lists them, so never a
+// token, webhook, address or ID.
+pub fn reporting(config: &Config) -> Vec<&'static str> {
+    let slack_paired = config.slack.ready() && !config.slack.owner.trim().is_empty();
+    let telegram_paired = config.telegram.ready() && config.telegram.chat.is_some();
+    [
+        (config.discord.ready(), "Discord (webhook)"),
+        (config.discord.bot_ready(), "Discord (bot DM)"),
+        (slack_paired, "Slack"),
+        (telegram_paired, "Telegram"),
+        (config.email.ready(), "email"),
+    ]
+    .into_iter()
+    .filter_map(|(ready, name)| ready.then_some(name))
+    .collect()
+}
+
 /// The owner's own private chat with the app, the one place a card waiting
 /// in the window may go: never a group, a server channel or a webhook,
 /// which other people read.
@@ -1091,7 +1110,7 @@ pub(crate) mod tests {
     // would shadow the built-in attribute.
     use super::{
         Config, Dm, Incoming, Sent, Source, discord_post_via, discord_send, parse_updates, report,
-        report_via, send_via, settle_via, tell_dm_via, typing_via, unbutton_via,
+        report_via, reporting, send_via, settle_via, tell_dm_via, typing_via, unbutton_via,
     };
     use serde_json::{Value, json};
 
@@ -1216,6 +1235,81 @@ pub(crate) mod tests {
         assert!(failed.is_empty());
         // Nothing set up at all is equally quiet.
         assert!(report(&Config::default(), "Nightly", "ok").is_empty());
+    }
+
+    /// Every place a report can go, each set up as far as it takes.
+    fn everywhere() -> Config {
+        let mut config = paired();
+        config.discord.enabled = true;
+        config.discord.webhook = "https://discord.com/api/webhooks/1/t".into();
+        config.discord.bot_token = "bot-token".into();
+        config.discord.owner = "99".into();
+        config.slack.enabled = true;
+        config.slack.app_token = "xapp-1".into();
+        config.slack.bot_token = "xoxb-1".into();
+        config.slack.owner = "U1".into();
+        config.email.enabled = true;
+        config.email.smtp_host = "smtp.example.com".into();
+        config.email.to = "me@example.com".into();
+        config
+    }
+
+    #[test]
+    fn a_scheduled_run_reports_to_each_place_set_up_in_the_order_it_sends() {
+        assert!(reporting(&Config::default()).is_empty());
+        assert_eq!(
+            reporting(&everywhere()),
+            [
+                "Discord (webhook)",
+                "Discord (bot DM)",
+                "Slack",
+                "Telegram",
+                "email"
+            ]
+        );
+        let mut webhook = Config::default();
+        webhook.discord.enabled = true;
+        webhook.discord.webhook = "https://discord.com/api/webhooks/1/t".into();
+        assert_eq!(reporting(&webhook), ["Discord (webhook)"]);
+    }
+
+    #[test]
+    fn a_telegram_or_slack_nobody_paired_is_no_place_a_run_reports_to() {
+        let mut config = everywhere();
+        config.telegram.chat = None;
+        config.slack.owner = "  ".into();
+        assert_eq!(
+            reporting(&config),
+            ["Discord (webhook)", "Discord (bot DM)", "email"]
+        );
+    }
+
+    #[test]
+    fn a_place_switched_off_or_missing_what_it_needs_is_not_one_either() {
+        let mut config = everywhere();
+        config.discord.enabled = false;
+        config.slack.bot_token.clear();
+        config.email.to = " ".into();
+        assert_eq!(reporting(&config), ["Telegram"]);
+        let mut config = everywhere();
+        // A webhook that is not a web address cannot post; a bot with no
+        // one to talk to cannot either.
+        config.discord.webhook = "not a url".into();
+        config.discord.owner.clear();
+        config.telegram.enabled = false;
+        assert_eq!(reporting(&config), ["Slack", "email"]);
+    }
+
+    #[test]
+    fn the_places_named_are_the_ones_a_report_tries() {
+        for chat in [Some(42), None] {
+            let mut config = paired();
+            config.telegram.chat = chat;
+            // An address that refuses connections: a place tried fails loudly.
+            let tried =
+                !report_via("http://127.0.0.1:1", None, &config, "Nightly", "ok").is_empty();
+            assert_eq!(tried, reporting(&config) == ["Telegram"], "{chat:?}");
+        }
     }
 
     #[test]
