@@ -16,6 +16,10 @@ Run a task in Letronna Cloud, on Letronna's servers (Pro)
                                        answer, or take that back
   letronna cloud relay on|off          have the cloud answer your Telegram bot
                                        while this computer is off
+  letronna cloud apps                  the apps and workers your runs left running
+  letronna cloud logs <thread>         what one printed last
+  letronna cloud down <thread>         take one down
+  letronna cloud up <thread>           bring a stopped worker back
 
 Options
       --repo <https-url>     a git repository to work in, cloned first
@@ -43,6 +47,21 @@ pub fn run(words: &[String]) -> i32 {
         Some("stop") => one_id(&words[1..]).and_then(|id| {
             cloud::stop(&id)?;
             println!("Stopped {id}.");
+            Ok(())
+        }),
+        Some("apps") => apps(),
+        Some("logs") => one_id(&words[1..]).and_then(|thread| {
+            let (logs, failure) = cloud::app_logs(&thread)?;
+            if !failure.is_empty() {
+                eprintln!("{}", render::red(&failure));
+            }
+            println!("{}", if logs.trim().is_empty() { "(nothing printed yet)" } else { logs.trim_end() });
+            Ok(())
+        }),
+        Some(power @ ("down" | "up")) => one_id(&words[1..]).and_then(|thread| {
+            let up = power == "up";
+            cloud::app_power(&thread, up)?;
+            println!("{}", if up { format!("{thread} is starting again.") } else { format!("{thread} is down.") });
             Ok(())
         }),
         Some("relay") => match words.get(1).map(String::as_str) {
@@ -182,6 +201,33 @@ See what it made: {preview}"
             run.id, run.tier, run.seconds, run.thread, run.thread
         ))
     );
+}
+
+fn apps() -> Result<(), String> {
+    let apps = cloud::apps()?;
+    if apps.is_empty() {
+        println!(
+            "Nothing is left running. A run leaves an app or a worker when you ask it to keep one up."
+        );
+        return Ok(());
+    }
+    for app in apps {
+        let at = app.address.as_deref().unwrap_or("-");
+        println!(
+            "{:<26} {:<7} {:<9} {:>4} MB  {at}",
+            app.thread, app.kind, app.state, app.mb
+        );
+        if !app.failure.is_empty() {
+            eprintln!(
+                "{}",
+                render::dim(&format!(
+                    "  {}",
+                    app.failure.lines().next().unwrap_or_default()
+                ))
+            );
+        }
+    }
+    Ok(())
 }
 
 fn list() -> Result<(), String> {

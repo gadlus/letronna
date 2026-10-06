@@ -256,6 +256,51 @@ pub fn heartbeat() -> Result<(), String> {
     send(client()?.post(url("/v1/relay/heartbeat"))).map(drop)
 }
 
+/// An app or worker a cloud run left running.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct App {
+    pub thread: String,
+    /// app (wakes on a visit) or worker (stays up).
+    pub kind: String,
+    /// running, asleep, starting or stopped.
+    pub state: String,
+    pub mb: u32,
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub failure: String,
+}
+
+/// The account's apps and workers.
+pub fn apps() -> Result<Vec<App>, String> {
+    #[derive(Deserialize)]
+    struct Listed {
+        apps: Vec<App>,
+    }
+    send(client()?.get(url("/v1/apps")))?
+        .json::<Listed>()
+        .map(|listed| listed.apps)
+        .map_err(|e| e.to_string())
+}
+
+/// What the app or worker on `thread` printed last, and why it stopped if
+/// it did.
+pub fn app_logs(thread: &str) -> Result<(String, String), String> {
+    let v: serde_json::Value = send(client()?.get(url(&format!("/v1/apps/{thread}/logs"))))?
+        .json()
+        .map_err(|e| e.to_string())?;
+    Ok((
+        v["logs"].as_str().unwrap_or_default().to_owned(),
+        v["failure"].as_str().unwrap_or_default().to_owned(),
+    ))
+}
+
+/// Take the app or worker on `thread` down, or (`up`) bring a worker back.
+pub fn app_power(thread: &str, up: bool) -> Result<(), String> {
+    let path = format!("/v1/apps/{thread}/{}", if up { "up" } else { "down" });
+    send(client()?.post(url(&path))).map(drop)
+}
+
 /// Stop a run, queued or running.
 pub fn stop(id: &str) -> Result<(), String> {
     send(client()?.post(url(&format!("/v1/runs/{id}/stop")))).map(drop)
