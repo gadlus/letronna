@@ -1020,6 +1020,7 @@ fn progress(status: &Status) -> Value {
         "input": status.input.load(Ordering::Relaxed),
         "cached": status.cached.load(Ordering::Relaxed),
         "output": status.output.load(Ordering::Relaxed),
+        "doing": status.doing.lock().map(|d| d.clone()).unwrap_or_default(),
     })
 }
 

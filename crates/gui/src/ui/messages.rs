@@ -540,10 +540,10 @@ impl Chat {
         let answer = match &aside.answer {
             None => div()
                 .text_color(muted)
-                .child(if aside.cloud {
-                    "Running in Letronna Cloud…"
-                } else {
-                    "Thinking…"
+                .child(match (aside.cloud, &aside.progress) {
+                    (true, Some(doing)) => format!("Letronna Cloud: {doing}"),
+                    (true, None) => "Running in Letronna Cloud…".to_owned(),
+                    (false, _) => "Thinking…".to_owned(),
                 })
                 .into_any_element(),
             Some(Ok(reply)) => v_flex()

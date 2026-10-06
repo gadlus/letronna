@@ -103,6 +103,92 @@ fn send(request: reqwest::blocking::RequestBuilder) -> Result<reqwest::blocking:
     }
 }
 
+/// What a run says as it goes, as `follow` hears it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Heard {
+    /// queued, running, done, failed or stopped.
+    Status(String),
+    /// The tool steps of the round under way, and rounds so far.
+    Doing { rounds: u64, doing: String },
+}
+
+/// Follow run `id` to its end, telling `heard` what it says on the way, and
+/// give it back as it ended. Its events come over SSE as they happen; if
+/// that stream breaks, it is asked every two seconds instead. `stopped` is
+/// looked at between events, at least every ten seconds, and stops the run.
+pub fn follow(
+    id: &str,
+    heard: &mut dyn FnMut(Heard),
+    stopped: &dyn Fn() -> bool,
+) -> Result<Run, String> {
+    if let Ok(run) = follow_events(id, heard, stopped) {
+        return Ok(run);
+    }
+    loop {
+        if stopped() {
+            let _ = stop(id);
+            return Err("Stopped; the cloud run was stopped too.".into());
+        }
+        let now = run(id)?;
+        if now.over() {
+            return Ok(now);
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// One SSE event's data, as `Heard`; Ok(true) once it says the run ended.
+fn heard_of(data: &str) -> Option<(Heard, bool)> {
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+    match v["type"].as_str()? {
+        "status" => Some((Heard::Status(v["status"].as_str()?.to_owned()), false)),
+        "end" => Some((
+            Heard::Status(v["status"].as_str().unwrap_or("done").to_owned()),
+            true,
+        )),
+        "progress" => Some((
+            Heard::Doing {
+                rounds: v["rounds"].as_u64().unwrap_or(0),
+                doing: v["doing"].as_str().unwrap_or_default().to_owned(),
+            },
+            false,
+        )),
+        _ => None,
+    }
+}
+
+fn follow_events(
+    id: &str,
+    heard: &mut dyn FnMut(Heard),
+    stopped: &dyn Fn() -> bool,
+) -> Result<Run, String> {
+    use std::io::BufRead;
+    // No limit on the whole answer, which lasts as long as the run.
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(None)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let res = send(client.get(url(&format!("/v1/runs/{id}/events"))))?;
+    for line in std::io::BufReader::new(res).lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        if stopped() {
+            let _ = stop(id);
+            return Err("Stopped; the cloud run was stopped too.".into());
+        }
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        if let Some((said, end)) = heard_of(data.trim()) {
+            heard(said);
+            if end {
+                return run(id);
+            }
+        }
+    }
+    Err("The run's events ended early.".into())
+}
+
 /// Start `task`; it waits in the queue until there is room for it.
 pub fn start(task: &Task) -> Result<Run, String> {
     send(client()?.post(url("/v1/runs")).json(task))?
@@ -249,16 +335,7 @@ impl crate::tools::Tool for CloudTask {
             return Err("Say what to do in `task`.".into());
         }
         let started = start(&task)?;
-        let run = loop {
-            if !ctx.cancel.sleep(Duration::from_secs(2)) {
-                let _ = stop(&started.id);
-                return Err("Stopped; the cloud run was stopped too.".into());
-            }
-            let now = run(&started.id)?;
-            if now.over() {
-                break now;
-            }
-        };
+        let run = follow(&started.id, &mut |_| {}, &|| ctx.cancel.is_set())?;
         let mut said = format!(
             "Ran in Letronna Cloud as {} ({}, {} s); to carry on there, pass thread {}.",
             run.id, run.tier, run.seconds, run.thread
@@ -284,6 +361,29 @@ fn or_light(tier: &str) -> &str {
 mod tests {
     use super::*;
     use crate::tools::Tool;
+
+    #[test]
+    fn events_read_as_what_the_run_says() {
+        assert_eq!(
+            heard_of(r#"{"type":"status","status":"running"}"#),
+            Some((Heard::Status("running".into()), false))
+        );
+        assert_eq!(
+            heard_of(r#"{"type":"progress","rounds":2,"doing":"run_command: cargo build"}"#),
+            Some((
+                Heard::Doing {
+                    rounds: 2,
+                    doing: "run_command: cargo build".into()
+                },
+                false
+            ))
+        );
+        assert_eq!(
+            heard_of(r#"{"type":"end","status":"done"}"#),
+            Some((Heard::Status("done".into()), true))
+        );
+        assert_eq!(heard_of("not json"), None);
+    }
 
     #[test]
     fn the_cloud_tool_says_where_things_are_built_and_asks_first() {

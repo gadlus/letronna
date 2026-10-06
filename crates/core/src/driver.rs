@@ -304,6 +304,30 @@ pub struct Status {
     /// Characters of the reply still streaming, its words and its thinking,
     /// which no count above holds until the provider reports it at the end.
     pub streamed: AtomicU64,
+    /// The calls of the round under way, as the window's rows name them.
+    pub doing: std::sync::Mutex<String>,
+}
+
+/// The calls of a round in a line: each tool with what it works on.
+fn doing_line(calls: &[crate::chat::ToolCall]) -> String {
+    let named: Vec<String> = calls
+        .iter()
+        .take(3)
+        .map(|call| {
+            let what = crate::tools::one_line(&tools::summary(&call.name, &call.arguments));
+            let what: String = what.chars().take(80).collect();
+            if what.is_empty() {
+                call.name.clone()
+            } else {
+                format!("{}: {what}", call.name)
+            }
+        })
+        .collect();
+    let more = calls.len().saturating_sub(3);
+    match more {
+        0 => named.join(", "),
+        n => format!("{} and {n} more", named.join(", ")),
+    }
 }
 
 /// How a run ended and what it came to.
@@ -676,6 +700,9 @@ fn steps(
         // A wrap-up in prose is no answer for a run with a schema, so at the
         // cap it takes the answer the reply holds, if any, instead.
         let capped = spec.schema.is_some() && report.rounds >= spec.rounds;
+        if let Ok(mut doing) = spec.status.doing.lock() {
+            *doing = doing_line(&calls);
+        }
         if capped || !turn.begin(calls) {
             return at_limit(spec, report);
         }

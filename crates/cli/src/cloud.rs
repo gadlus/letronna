@@ -4,7 +4,6 @@
 use crate::render;
 use letronna_core::cloud::{self, Run, TIERS, Task};
 use std::io::Write;
-use std::time::Duration;
 
 const HELP: &str = "\
 Run a task in Letronna Cloud, on Letronna's servers (Pro)
@@ -31,9 +30,6 @@ Options
 
 Runs are billed from your Letronna credit: model tokens as usual, and the
 run's memory by the second.";
-
-/// How often a waiting run is asked how it stands.
-const POLL: Duration = Duration::from_secs(2);
 
 /// Run `letronna cloud <words>` and give the exit code.
 pub fn run(words: &[String]) -> i32 {
@@ -135,17 +131,22 @@ fn start(task: &Task, wait: bool) -> Result<(), String> {
         ))
     );
     let mut said = String::new();
-    let run = loop {
-        let now = cloud::run(&run.id)?;
-        if now.status != said {
-            eprintln!("{}", render::dim(&format!("{}…", now.status)));
-            said.clone_from(&now.status);
-        }
-        if now.over() {
-            break now;
-        }
-        std::thread::sleep(POLL);
-    };
+    let mut doing = String::new();
+    let run = cloud::follow(
+        &run.id,
+        &mut |heard| match heard {
+            cloud::Heard::Status(status) if status != said => {
+                eprintln!("{}", render::dim(&format!("{status}…")));
+                said = status;
+            }
+            cloud::Heard::Doing { doing: now, .. } if !now.is_empty() && now != doing => {
+                eprintln!("{}", render::dim(&format!("  · {now}")));
+                doing = now;
+            }
+            _ => {}
+        },
+        &|| false,
+    )?;
     print_run(&run);
     let _ = std::io::stdout().flush();
     if run.status == "done" {

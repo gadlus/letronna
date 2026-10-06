@@ -84,6 +84,8 @@ pub(crate) struct Aside {
     asked: std::time::Instant,
     /// A task sent to Letronna Cloud with /cloud, not a question to a fork.
     pub(crate) cloud: bool,
+    /// What the cloud run is doing now, as it says while it works.
+    pub(crate) progress: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1687,6 +1689,7 @@ impl Chat {
             cancel: cancel.clone(),
             asked,
             cloud: false,
+            progress: None,
         });
         let (sender, receiver) = async_channel::bounded(1);
         std::thread::spawn(move || {
@@ -1727,11 +1730,31 @@ impl Chat {
             cancel: cancel.clone(),
             asked,
             cloud: true,
+            progress: None,
         });
         let (sender, receiver) = async_channel::bounded(1);
+        let (said, hearing) = async_channel::unbounded::<String>();
         std::thread::spawn(move || {
-            let _ = sender.send_blocking(cloud_answer(&task, &cancel));
+            let _ = sender.send_blocking(cloud_answer(&task, &cancel, &said));
         });
+        cx.spawn(async move |this, cx| {
+            while let Ok(doing) = hearing.recv().await {
+                let gone = this
+                    .update(cx, |this, cx| {
+                        let Some(aside) = this.aside.as_mut().filter(|a| a.asked == asked) else {
+                            return true;
+                        };
+                        aside.progress = Some(doing);
+                        cx.notify();
+                        false
+                    })
+                    .unwrap_or(true);
+                if gone {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             if let Ok(answer) = receiver.recv().await {
                 let _ = this.update(cx, |this, cx| {
@@ -4740,7 +4763,11 @@ fn goal_command(prompt: &str) -> Option<&str> {
 
 /// Start `task` in the cloud and wait for its answer, stopping the run if
 /// `cancel` is set first.
-fn cloud_answer(task: &str, cancel: &letronna_core::cancel::Cancel) -> Result<Message, String> {
+fn cloud_answer(
+    task: &str,
+    cancel: &letronna_core::cancel::Cancel,
+    said: &async_channel::Sender<String>,
+) -> Result<Message, String> {
     use letronna_core::cloud;
     if task.is_empty() {
         return Err("Say what to run, like: /cloud add a test for the parser".into());
@@ -4749,17 +4776,18 @@ fn cloud_answer(task: &str, cancel: &letronna_core::cancel::Cancel) -> Result<Me
         prompt: task.to_owned(),
         ..Default::default()
     })?;
-    let run = loop {
-        if cancel.is_set() {
-            let _ = cloud::stop(&started.id);
-            return Err("Stopped.".into());
-        }
-        let now = cloud::run(&started.id)?;
-        if now.over() {
-            break now;
-        }
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    };
+    let run = cloud::follow(
+        &started.id,
+        &mut |heard| {
+            let line = match heard {
+                cloud::Heard::Status(status) => format!("{status}…"),
+                cloud::Heard::Doing { doing, .. } if !doing.is_empty() => doing,
+                cloud::Heard::Doing { .. } => return,
+            };
+            let _ = said.send_blocking(line);
+        },
+        &|| cancel.is_set(),
+    )?;
     match run.status.as_str() {
         "done" => Ok(Message {
             role: "assistant".into(),
