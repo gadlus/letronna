@@ -13,6 +13,8 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.3] - 2026-10-06
+
 ### Highlights
 - **All** — Helpers that work side by side, fork, wait for more work and share a task list, plus workflows that run many agents from a script you approve.
 - **All** — Auto mode: a judge on your own model decides what would otherwise ask, and on macOS and Linux commands can run confined by the OS instead.
