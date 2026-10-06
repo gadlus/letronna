@@ -6444,6 +6444,9 @@ mod tests {
 
     #[test]
     fn hiding_every_tool_offered_hides_none() {
+        // Which tools are offered reads the data folder (a sign-in offers
+        // cloud_task), which a test moving it meanwhile would change.
+        let _held = (crate::store::tests::DATA_DIR.lock()).unwrap_or_else(|e| e.into_inner());
         let with_tools = Connection {
             tools: true,
             ..connection()
