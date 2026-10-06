@@ -23,6 +23,9 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Schedules in a mode of their own, memory you can review and edit, and a window that uses far less memory and processor while it works or sits idle.
 
 ### Added
+- **All** — Letronna Cloud is asked for in the chat: say to run something there or keep a bot online 24/7, ask how it is doing, or to stop or restart it. `/cloud` is gone.
+- **Web** — A Cloud page on letronna.ai shows what you host (bots and apps) with their output, Stop, Start, Restart and what each has cost, and the runs you sent.
+- **Web** — Usage shows what text, media and the cloud cost, thirty days day by day, each model's published price beside what you paid, and how much you saved.
 - **All** — Letronna Cloud runs bots and other always-on programs 24/7 when you ask for them to stay online: restarted if they stop, stopped after a crash loop or when credit runs out, billed by the hour. `letronna cloud apps`, `logs`, `down` and `up` manage them. Cloud compute now costs about $6 a GB-month, so a small bot online all month is about $0.75 of credit.
 - **All** — Letronna Cloud keeps apps running: a cloud run can leave any server (Next.js, a Rust API, anything on a port) at its own address; it wakes on a visit, sleeps after 10 minutes without one, and is billed only while awake. Threads unused for 14 days are cleaned up.
 - **All** — A cloud run that makes a page gives a private live link to it, served with nothing running; `letronna cloud relay on` has the cloud answer your Telegram chat while this computer is off; `letronna cloud support <run> on` lets support read a run, and each look is logged.
