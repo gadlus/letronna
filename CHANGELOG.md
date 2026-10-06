@@ -149,6 +149,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Questions name a recommended answer, and the terminal takes free-form ones.
 - **All** — Recurring tasks and notifications use Letronna's own schedules and chat apps first, with your yes.
 ### Changed
+- **All** — Cloud runs show what they are doing as it happens: `letronna cloud` prints each step, and the window's `/cloud` shows the step under way, streamed over SSE (with polling if the stream drops). Apps in the cloud can stream to visitors (SSE) for as long as they like.
 - **All** — A cloud run uses its own short-lived token that only reaches the models, never your sign-in.
 - **All** — A failed model request says what went wrong: the key, credit, a rate limit, a busy provider, a conversation too long, and so on.
 - **All** — OpenAI's reasoning models work, and a server that turns down a field is sent the request again without it.
