@@ -13,6 +13,9 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ## [Unreleased]
 
+### Added
+- **Web** — Letronna Cloud takes more servers: admins add a VPS from the admin page with one setup command, and runs and 24/7 bots spread across every server.
+
 ## [0.1.0-alpha.3] - 2026-10-06
 
 ### Highlights
