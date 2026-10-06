@@ -540,11 +540,7 @@ impl Chat {
         let answer = match &aside.answer {
             None => div()
                 .text_color(muted)
-                .child(match (aside.cloud, &aside.progress) {
-                    (true, Some(doing)) => format!("Letronna Cloud: {doing}"),
-                    (true, None) => "Running in Letronna Cloud…".to_owned(),
-                    (false, _) => "Thinking…".to_owned(),
-                })
+                .child("Thinking…")
                 .into_any_element(),
             Some(Ok(reply)) => v_flex()
                 .gap_1()
@@ -554,10 +550,7 @@ impl Chat {
                         .selectable(!window.has_active_dialog(cx))
                         .line_height(px(26.)),
                 )
-                // A cloud run's cost is on the account, not in its reply.
-                .when(!aside.cloud, |this| {
-                    this.child(div().text_xs().child(usage_line(reply)))
-                })
+                .child(div().text_xs().child(usage_line(reply)))
                 .into_any_element(),
             Some(Err(error)) => div()
                 .text_color(cx.theme().danger)
@@ -574,11 +567,7 @@ impl Chat {
                     .text_xs()
                     .font_family(HEADING_FONT)
                     .text_color(cx.theme().muted_foreground)
-                    .child(if aside.cloud {
-                        "Letronna Cloud · not kept in the session"
-                    } else {
-                        "Aside · not kept in the session"
-                    })
+                    .child("Aside · not kept in the session")
                     .child(
                         Button::new("aside-close")
                             .plain(cx)

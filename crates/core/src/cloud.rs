@@ -320,7 +320,7 @@ impl crate::tools::Tool for CloudTask {
         "cloud_task"
     }
     fn description(&self) -> &'static str {
-        "Run a task in Letronna Cloud, on Letronna's servers, and get its answer. Where to build what the user asks for, in order: a page, chart, document or small app that one self-contained file can hold is written here as an .html or .svg file the user previews; anything else is built here, in the project, with the tools on this computer; only when this computer cannot (a tool it needs is not on PATH and cannot be installed, it would take more memory or time than this machine has, or the user asks for the cloud) send it here. The cloud cannot see this computer's files: give it everything it needs in `task`, or an https `repo` it clones. Say in your reply that it ran in the cloud. It costs the user's credit, so each call is asked about."
+        "Run a task in Letronna Cloud, on Letronna's servers, and get its answer. Where to build what the user asks for, in order: a page, chart, document or small app that one self-contained file can hold is written here as an .html or .svg file the user previews; anything else is built here, in the project, with the tools on this computer; only when this computer cannot (a tool it needs is not on PATH and cannot be installed, it would take more memory or time than this machine has, or the user asks for the cloud) send it here. It also hosts: a web app it leaves wakes on each visit, and a bot or worker the user wants kept online (a Discord or Telegram bot listening for events, a scheduler) runs 24/7 from their credit; say so in `task` only when the user asked for it to stay up, and put any keys it needs in `task` for /work/.env. cloud_apps shows what is left running and cloud_app_power takes it down or back up. The cloud cannot see this computer's files: give it everything it needs in `task`, or an https `repo` it clones. Say in your reply that it ran in the cloud. It costs the user's credit, so each call is asked about."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "required": ["task"], "properties": {
@@ -395,6 +395,139 @@ impl crate::tools::Tool for CloudTask {
             "stopped" => Err(format!("{said} It was stopped.")),
             _ => Err(format!("{said} It failed: {}", run.error.trim())),
         }
+    }
+}
+
+/// `cloud_apps`: what the user's cloud runs left running, and what one
+/// printed. Reading only, so never asked about.
+pub struct CloudApps;
+
+impl crate::tools::Tool for CloudApps {
+    fn name(&self) -> &'static str {
+        "cloud_apps"
+    }
+    fn description(&self) -> &'static str {
+        "The apps and 24/7 workers (bots and the like) the user's Letronna Cloud runs left running. With no `thread`, lists each with its thread, state and address; with one, shows what it printed last and why it stopped. Use it when the user asks about or checks on something hosted in the cloud; cloud_app_power takes one down or brings it back."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {
+            "thread": {"type": "string", "description": "One app's or worker's thread, to read what it printed."}
+        }})
+    }
+    fn open_world(&self) -> bool {
+        true
+    }
+    fn machine(&self) -> bool {
+        false
+    }
+    fn untrusted(&self) -> bool {
+        true
+    }
+    fn offered(&self, _: &crate::chat::Connection) -> bool {
+        !inside_a_run() && crate::auth::signed_in()
+    }
+    fn run(
+        &self,
+        args: &serde_json::Value,
+        _: &crate::tools::ToolContext,
+    ) -> Result<String, String> {
+        let thread = args["thread"].as_str().unwrap_or_default().trim();
+        if !thread.is_empty() {
+            let (logs, failure) = app_logs(thread)?;
+            let logs = if logs.trim().is_empty() {
+                "(nothing printed yet)"
+            } else {
+                logs.trim_end()
+            };
+            return Ok(if failure.is_empty() {
+                logs.to_owned()
+            } else {
+                format!(
+                    "{failure}
+
+{logs}"
+                )
+            });
+        }
+        let all = apps()?;
+        if all.is_empty() {
+            return Ok("Nothing is left running in Letronna Cloud.".into());
+        }
+        Ok(all
+            .iter()
+            .map(|a| {
+                let mut line = format!("{} {} {} ({} MB)", a.thread, a.kind, a.state, a.mb);
+                if let Some(at) = &a.address {
+                    line.push_str(&format!(" at {at}"));
+                }
+                if let Some(why) = a.failure.lines().next().filter(|w| !w.is_empty()) {
+                    line.push_str(&format!(": {why}"));
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            ))
+    }
+}
+
+/// `cloud_app_power`: take an app or worker down, or bring a worker back.
+pub struct CloudAppPower;
+
+impl crate::tools::Tool for CloudAppPower {
+    fn name(&self) -> &'static str {
+        "cloud_app_power"
+    }
+    fn description(&self) -> &'static str {
+        "Take one of the user's Letronna Cloud apps or 24/7 workers down (`up` false), or bring a stopped worker back (`up` true; billed from credit again while it runs). Its thread comes from cloud_apps."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "required": ["thread", "up"], "properties": {
+            "thread": {"type": "string"},
+            "up": {"type": "boolean", "description": "true to bring it back, false to take it down."}
+        }})
+    }
+    fn needs_approval(&self) -> bool {
+        true
+    }
+    fn mutates(&self) -> bool {
+        true
+    }
+    fn open_world(&self) -> bool {
+        true
+    }
+    fn machine(&self) -> bool {
+        false
+    }
+    fn offered(&self, _: &crate::chat::Connection) -> bool {
+        !inside_a_run() && crate::auth::signed_in()
+    }
+    fn preview(&self, args: &serde_json::Value, _: &crate::tools::ToolContext) -> String {
+        let thread = args["thread"].as_str().unwrap_or_default();
+        if args["up"].as_bool() == Some(true) {
+            format!("Bring {thread} back up in Letronna Cloud, billed from credit")
+        } else {
+            format!("Take {thread} down in Letronna Cloud")
+        }
+    }
+    fn run(
+        &self,
+        args: &serde_json::Value,
+        _: &crate::tools::ToolContext,
+    ) -> Result<String, String> {
+        let thread = args["thread"].as_str().unwrap_or_default().trim();
+        if thread.is_empty() {
+            return Err("Say which one in `thread`; cloud_apps lists them.".into());
+        }
+        let up = args["up"].as_bool() == Some(true);
+        app_power(thread, up)?;
+        Ok(if up {
+            format!("{thread} is starting again; it is billed from credit while it runs.")
+        } else {
+            format!("{thread} is down.")
+        })
     }
 }
 

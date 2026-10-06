@@ -46,7 +46,7 @@ Then `letronna mcp list`, `get <name>`, `remove <name>`, and `login <name>` or `
 - Web and voice: /search (lets the model search the web; /search services sets up a search service of the user's own), /voice (read replies aloud), /notify (say when a reply ends or needs the user).
 - Sessions: /resume, /branch (carry on in a copy), /undo (`--files` puts files back too), /retry, /compact (summarize earlier turns now), /diff, /where, /import (from Claude Code or Codex), /btw (an aside that is not kept), /image <path>, /preview <path>, /usage, /insights.
 - Long work: /goal (keep working until a goal is met, `--check <command>`), /loop (run a prompt every so often; /loop stop), /heartbeat (look in on this session every so many minutes), /jobs (background commands), /agents (helpers), /workflows, /crew (workflows of helpers for big tasks).
-- /cloud <task> runs it on Letronna's servers, the answer shown under the chat.
+- Cloud: just ask in chat to run or host something (a bot 24/7), check it or take it down.
 - Keeping and adding: /remember (keep something now, or change when this chat saves), /memory (`/memory edit, log or restore user|memory|project|soul`), /memory-review, /retention (delete old sessions), /init (write AGENTS.md), /skills, /mcp, /plugins.
 
 ## The window
