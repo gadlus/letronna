@@ -1757,7 +1757,7 @@ impl Chat {
             let saved = letronna_core::workflow::saved::typed(&prompt);
             let shown = letronna_core::init::typed(&prompt).or(saved.as_deref());
             let shown = shown.unwrap_or(&prompt);
-            conversation.title = shown.chars().take(40).collect();
+            conversation.title = letronna_core::store::name_from(shown);
         }
         conversation.updated = backend::now();
         // What came in meanwhile goes first, so the prompt is read last.

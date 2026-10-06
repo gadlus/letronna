@@ -273,7 +273,7 @@ impl Chat {
                     })
                     .into_any_element()
             })
-            .child(div().flex_1().min_w_0().truncate().child(c.title.clone()))
+            .child(div().flex_1().min_w_0().truncate().child(c.shown_title()))
             // A run beside the chat holds it.
             .when(self.runs.contains_key(&c.id), |this| {
                 this.child(

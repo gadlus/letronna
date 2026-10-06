@@ -1828,7 +1828,7 @@ impl Chat {
                 self.recent_row(
                     ("recent-session", id as usize),
                     AppIcon::MessageSquare,
-                    (c.title.clone().into(), age_label(c.updated, now).into()),
+                    (c.shown_title().into(), age_label(c.updated, now).into()),
                     false,
                     window,
                     cx,

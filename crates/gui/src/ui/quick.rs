@@ -186,7 +186,7 @@ impl Watch {
             .or(kept.map(|message| message.content.as_str()))
             .unwrap_or_default();
         Glance {
-            title: conversation.title.clone().into(),
+            title: conversation.shown_title().into(),
             stage,
             lines: tail(text, LINES, PAINTED),
         }

@@ -117,7 +117,7 @@ impl Chat {
             .iter()
             .rev()
             .filter(|c| c.id != active.id)
-            .map(|c| (c.id, c.title.clone()))
+            .map(|c| (c.id, c.shown_title()))
             .collect();
         let query = query.to_owned();
         cx.spawn(async move |this, cx| {

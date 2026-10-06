@@ -623,7 +623,23 @@ pub struct Store {
     pub settings_written: serde_json::Value,
 }
 
+/// A session's name from what was said in it: its first line with words,
+/// at most 40 characters, or "Untitled session" when nothing has words (a
+/// picture alone, a blank line).
+pub fn name_from(text: &str) -> String {
+    match text.lines().map(str::trim).find(|line| !line.is_empty()) {
+        Some(line) => line.chars().take(40).collect(),
+        None => "Untitled session".into(),
+    }
+}
+
 impl Conversation {
+    /// The name to show: never blank, never starting on an empty line,
+    /// whatever an older version kept.
+    pub fn shown_title(&self) -> String {
+        name_from(&self.title)
+    }
+
     /// How long the conversation is, whether or not it has been read off the
     /// disk yet. Once it is in memory the messages are the truth; before
     /// that, the count taken while listing is.
@@ -3346,6 +3362,28 @@ fn retire_gateway(s: &mut Settings) {
 #[cfg(test)]
 mod retire_tests {
     use super::*;
+
+    #[test]
+    fn a_session_is_named_by_its_first_line_with_words() {
+        assert_eq!(
+            name_from(
+                "
+
+  hello there
+more"
+            ),
+            "hello there"
+        );
+        assert_eq!(name_from(""), "Untitled session");
+        assert_eq!(
+            name_from(
+                " 
+	"
+            ),
+            "Untitled session"
+        );
+        assert_eq!(name_from(&"x".repeat(50)).len(), 40);
+    }
 
     #[test]
     fn old_gateways_move_to_letronna_and_known_ones_stay() {

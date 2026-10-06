@@ -200,7 +200,7 @@ impl Chat {
                             .rounded_full()
                             .when(running, |dot| dot.bg(cx.theme().green)),
                     )
-                    .child(div().flex_1().min_w_0().truncate().child(c.title.clone()))
+                    .child(div().flex_1().min_w_0().truncate().child(c.shown_title()))
                     .when_some(folder, |row, folder| {
                         row.child(
                             div()

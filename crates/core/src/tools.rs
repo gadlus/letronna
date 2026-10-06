@@ -7192,7 +7192,14 @@ mod tests {
         // and cloud_apps, as what a hosted program prints is anyone's.
         assert_eq!(
             fenced,
-            ["web_fetch", "browse", "use_page", "computer", "cloud_task", "cloud_apps"]
+            [
+                "web_fetch",
+                "browse",
+                "use_page",
+                "computer",
+                "cloud_task",
+                "cloud_apps"
+            ]
         );
         assert!(crate::search::SearchWeb.untrusted());
     }

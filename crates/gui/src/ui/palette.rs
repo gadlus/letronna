@@ -457,7 +457,7 @@ impl Chat {
             .into_iter()
             .map(|c| Row {
                 note: age_label(c.updated, now).into(),
-                ..Row::new(AppIcon::MessageSquare, c.title.clone(), Pick::Session(c.id))
+                ..Row::new(AppIcon::MessageSquare, c.shown_title(), Pick::Session(c.id))
             })
             .collect();
 
