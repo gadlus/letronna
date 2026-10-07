@@ -38,7 +38,8 @@ gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
 #   That one frame is drawn readable -- framebufferOnly off, which would cost
 #   every frame its presentation if left so -- and copied out once the GPU
 #   is done with it, for the blur behind Settings on macOS 26, where the
-#   window server gives an app no picture of its own window
+#   window server gives an app no picture of its own window. A frame read
+#   back is not shown, so it can be the window without Settings over it
 gpui-pre-apple = { path = "vendor/gpui-pre-apple" }
 
 [profile.release]

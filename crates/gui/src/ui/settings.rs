@@ -323,8 +323,8 @@ impl Chat {
         // Snapshot the window before the overlay covers it. Platforms that
         // cannot sample it return None, which falls back to the plain scrim.
         self.drop_backdrop(cx);
-        // macOS 26 reads it from the next frame drawn, which the overlay
-        // waits out so that frame is the window without it.
+        // macOS 26 reads it from the next frame drawn, which the overlay is
+        // see-through for, so that frame is the window without it.
         self.settings_reading = crate::platform::backdrop::ask(window);
         if self.settings_reading {
             window.refresh();
@@ -364,18 +364,42 @@ impl Chat {
             if !this.settings_reading {
                 return;
             }
-            this.settings_backdrop = crate::platform::backdrop::capture(window);
-            if this.settings_backdrop.is_none() && tries < 3 {
+            let read = crate::platform::backdrop::capture(window);
+            if read.is_none() && tries < 3 {
                 // Drawn again, so there is a frame to read.
                 window.refresh();
                 return this.read_backdrop(tries + 1, window, cx);
             }
-            if this.settings_backdrop.is_none() {
+            if read.is_none() {
                 crate::platform::backdrop::forget(window);
             }
+            // A blur from before wears the window as it was.
+            this.drop_backdrop(cx);
+            this.settings_backdrop = read;
             this.settings_reading = false;
             cx.notify();
         });
+    }
+
+    /// Blur the window behind settings again, as it now looks: once the
+    /// theme changes, the snapshot taken on opening wears the old colours.
+    /// Settings stays open meanwhile, drawn see-through for the frame read,
+    /// and the old blur stays until the new one is in.
+    pub(crate) fn retake_backdrop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Only where one was taken: anywhere else settings is over the plain
+        // scrim.
+        if !self.settings_open || self.settings_closing || self.settings_backdrop.is_none() {
+            return;
+        }
+        self.settings_reading = true;
+        window.refresh();
+        if crate::platform::backdrop::ask(window) {
+            self.read_backdrop(0, window, cx);
+        } else {
+            // Read off the screen, so once the frame without settings is on
+            // it: drawn next frame, and shown by the one after.
+            cx.on_next_frame(window, |this, window, cx| this.read_backdrop(0, window, cx));
+        }
     }
 
     pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -432,9 +456,7 @@ impl Chat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        // Not while the frame behind it is read: that frame is the window
-        // without it.
-        if !self.settings_open || self.settings_reading {
+        if !self.settings_open {
             return None;
         }
         let closing = self.settings_closing;
@@ -499,6 +521,10 @@ impl Chat {
                 .flex()
                 .items_center()
                 .justify_center()
+                // See-through while the frame behind it is read, as that
+                // frame is the window without it; still laid out, so it
+                // keeps its focus and its animations do not start over.
+                .when(self.settings_reading, |overlay| overlay.opacity(0.))
                 .children(blur)
                 .child(scrim)
                 .children(self.grain(&self.grains.settings))
@@ -1420,10 +1446,10 @@ fn appearance_page(
                     chat.update(cx, |this, cx| {
                         this.store.settings.appearance = value.to_string();
                         this.save();
-                        // The blurred snapshot behind settings still wears
-                        // the old colours; the live window shows through.
-                        this.drop_backdrop(cx);
                         crate::theme::apply(value, window, cx);
+                        // The blurred snapshot behind settings still wears
+                        // the old colours.
+                        this.retake_backdrop(window, cx);
                         cx.notify();
                     })
                 }),

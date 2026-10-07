@@ -830,10 +830,10 @@ impl Chat {
             // other settings pin the window's own look.
             cx.observe_window_appearance(window, |this, window, cx| {
                 if crate::theme::follows_system(&this.store.settings.appearance) {
+                    crate::theme::apply(&this.store.settings.appearance, window, cx);
                     // As when the theme is picked: the blurred snapshot behind
                     // settings wears the old colours.
-                    this.drop_backdrop(cx);
-                    crate::theme::apply(&this.store.settings.appearance, window, cx);
+                    this.retake_backdrop(window, cx);
                 }
             }),
             // Also on coming to the front, for a change the system did not
@@ -4630,8 +4630,14 @@ impl Render for Chat {
             )
             .children(self.settings_overlay(window, cx))
             .children(self.switcher(cx))
-            // Last, over everything, as the colours of a new theme come in.
-            .children(crate::ui::motion::veil_layer(window, cx))
+            // Last, over everything, as the colours of a new theme come in;
+            // not in a frame read for the blur behind settings, which is to
+            // show the window in them.
+            .children(
+                (!self.settings_reading)
+                    .then(|| crate::ui::motion::veil_layer(window, cx))
+                    .flatten(),
+            )
     }
 }
 
