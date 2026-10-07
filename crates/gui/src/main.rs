@@ -477,6 +477,16 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             KeyBinding::new("down", ui::settings::NextSettingsPage, Some("SettingsNav")),
             Some("In settings: the page below"),
         ),
+        // Settings is modal: Tab and Shift-Tab go round its own controls,
+        // nearer than gpui-component's, which go on to the window behind.
+        (
+            KeyBinding::new("tab", ui::settings::SettingsTab, Some("Settings")),
+            None,
+        ),
+        (
+            KeyBinding::new("shift-tab", ui::settings::SettingsTabBack, Some("Settings")),
+            None,
+        ),
         // Saves the Memory page's box with focus; nothing else there has a
         // save key.
         (

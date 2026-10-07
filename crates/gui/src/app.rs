@@ -179,6 +179,8 @@ pub(crate) struct Chat {
     pub(crate) settings_open: bool,
     /// Held by the settings panel while it is open, so escape reaches it.
     pub(crate) settings_focus: FocusHandle,
+    /// Where the keys were when settings opened, given back when it closes.
+    pub(crate) settings_before: Option<FocusHandle>,
     /// Held by the pages without a composer, so the window's shortcuts still
     /// reach the chat there.
     pub(crate) page_focus: FocusHandle,
@@ -917,6 +919,7 @@ impl Chat {
             memory,
             settings_open: false,
             settings_focus: cx.focus_handle(),
+            settings_before: None,
             page_focus: cx.focus_handle(),
             settings_backdrop: None,
             grains: crate::ui::grain::Grains::new(cx),

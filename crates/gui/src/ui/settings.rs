@@ -1,6 +1,14 @@
 use crate::prelude::*;
 
-actions!(settings, [PreviousSettingsPage, NextSettingsPage]);
+actions!(
+    settings,
+    [
+        PreviousSettingsPage,
+        NextSettingsPage,
+        SettingsTab,
+        SettingsTabBack
+    ]
+);
 
 type ApplyMode = std::rc::Rc<dyn Fn(plugins::PresenceMode, &mut App)>;
 
@@ -324,6 +332,10 @@ impl Chat {
         } else {
             self.settings_backdrop = crate::platform::backdrop::capture(window);
         }
+        // Only as it opens: opened again on another page, the keys are in it.
+        if !self.settings_open {
+            self.settings_before = window.focused(cx);
+        }
         self.settings_open = true;
         self.gateway_pick.update(cx, |g, _| g.clear());
         self.settings_closing = false;
@@ -378,7 +390,10 @@ impl Chat {
         if self.page == Page::Capabilities {
             self.reload_tools();
         }
-        self.focus_composer(window, cx);
+        match keys_back(self.settings_before.take(), window) {
+            Some(before) => window.focus(&before, cx),
+            None => self.focus_composer(window, cx),
+        }
         cx.notify();
         // With motion off there is nothing to watch go.
         if cx.reduce_motion() {
@@ -639,8 +654,7 @@ impl Chat {
             )
             .into_any_element(),
         };
-        div()
-            .track_focus(&self.settings_focus)
+        keeps_keys(div(), &self.settings_focus)
             .w(vp.width - gap * 2.)
             .bg(cx.theme().background)
             .border_1()
@@ -686,6 +700,56 @@ impl Chat {
                     ),
             )
     }
+}
+
+/// `panel`'s own focus on `el`, with Tab and Shift-Tab going round the
+/// controls inside it: settings is modal, so the keys never reach the
+/// window behind it.
+fn keeps_keys(el: Div, panel: &FocusHandle) -> Div {
+    let (next, back) = (panel.clone(), panel.clone());
+    el.track_focus(panel)
+        .key_context("Settings")
+        .on_action(move |_: &SettingsTab, window, cx| tab_within(&next, false, window, cx))
+        .on_action(move |_: &SettingsTabBack, window, cx| tab_within(&back, true, window, cx))
+}
+
+/// Move the keys to the next control inside `panel`, or with `back` the one
+/// before, from its last round to its first and from its first to its last.
+/// Not gpui-component's focus trap, which steps through the whole window
+/// behind to come round and gives up after a hundred stops.
+fn tab_within(panel: &FocusHandle, back: bool, window: &mut Window, cx: &mut App) {
+    if back {
+        window.focus_prev(cx);
+    } else {
+        window.focus_next(cx);
+    }
+    if panel.contains_focused(window, cx) {
+        return;
+    }
+    // Past one end, so to the other: the panel's own focus comes just before
+    // its first control, and its last is the one the next after is outside.
+    panel.focus(window, cx);
+    window.focus_next(cx);
+    let Some(first) = window.focused(cx).filter(|_| back) else {
+        return;
+    };
+    let mut last = first.clone();
+    loop {
+        window.focus_next(cx);
+        match window.focused(cx) {
+            Some(at) if at != first && panel.contains_focused(window, cx) => last = at,
+            _ => break,
+        }
+    }
+    window.focus(&last, cx);
+}
+
+/// Where the keys go as settings closes: back to `before`, where they were
+/// as it opened, while that is still drawn in the chat. A menu or the
+/// palette it was opened from has gone by then.
+fn keys_back(before: Option<FocusHandle>, window: &Window) -> Option<FocusHandle> {
+    // Escape is the chat's own, so it is there for anything drawn in it.
+    before.filter(|before| window.is_action_available_in(&Dismiss, before))
 }
 
 /// Show settings page `name`, reading usage afresh for its page.
@@ -2219,4 +2283,122 @@ fn gateway_page(
             cx,
         ))
         .child(gateway_list(rows, pick, endpoint, key, page, chat, cx))
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
+    // would shadow the built-in attribute.
+    use super::{KeyedSwitch, keeps_keys, keys_back};
+    use crate::app::Dismiss;
+    use gpui::{
+        AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
+        ParentElement as _, Render, Styled as _, TestAppContext, VisualTestContext, Window, div,
+        px,
+    };
+    use gpui_component::{Root, button::Button};
+
+    /// A chat with a status bar of two stops, and settings over it: a page
+    /// in its list, a switch and its close button.
+    struct Over {
+        behind: [FocusHandle; 2],
+        panel: FocusHandle,
+        page: FocusHandle,
+    }
+
+    impl Render for Over {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let stop = |focus: &FocusHandle| div().track_focus(focus).w(px(40.)).h(px(20.));
+            div()
+                .size_full()
+                .key_context("Chat")
+                .on_action(|_: &Dismiss, _, _| {})
+                .child(stop(&self.behind[0]))
+                .child(stop(&self.behind[1]))
+                .child(
+                    keeps_keys(div(), &self.panel)
+                        .child(stop(&self.page))
+                        .child(KeyedSwitch::new("grain"))
+                        .child(Button::new("close-settings").label("Close")),
+                )
+        }
+    }
+
+    /// The window with settings open, its keys bound as the app binds them.
+    fn open(cx: &mut TestAppContext) -> (Entity<Over>, &mut VisualTestContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.bind_keys(
+                crate::keys(&gpui::DummyKeyboardMapper)
+                    .into_iter()
+                    .map(|(binding, _)| binding),
+            );
+        });
+        let over = cx.new(|cx| Over {
+            behind: [
+                cx.focus_handle().tab_stop(true),
+                cx.focus_handle().tab_stop(true),
+            ],
+            panel: cx.focus_handle(),
+            page: cx.focus_handle().tab_stop(true),
+        });
+        let chat = over.clone();
+        let (_, cx) = cx.add_window_view(|window, cx| Root::new(chat, window, cx));
+        (over, cx)
+    }
+
+    fn focused(cx: &mut VisualTestContext) -> Option<FocusHandle> {
+        cx.update(|window, cx| window.focused(cx))
+    }
+
+    #[gpui::test]
+    fn tab_goes_round_the_controls_in_settings_and_never_behind(cx: &mut TestAppContext) {
+        let (over, cx) = open(cx);
+        let (panel, page) = cx.read(|cx| (over.read(cx).panel.clone(), over.read(cx).page.clone()));
+        // As settings opens: the panel itself holds the keys.
+        cx.update(|window, cx| panel.focus(window, cx));
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            cx.simulate_keystrokes("tab");
+            let at = focused(cx).unwrap();
+            assert!(cx.update(|window, cx| panel.contains_focused(window, cx)));
+            assert!(!seen.contains(&at));
+            seen.push(at);
+        }
+        // The page in the list, the switch, the close button, then round.
+        assert_eq!(seen[0], page);
+        cx.simulate_keystrokes("tab");
+        assert_eq!(focused(cx), Some(page.clone()));
+        // Back from the first goes round to the close button, and on back.
+        cx.simulate_keystrokes("shift-tab");
+        assert_eq!(focused(cx).as_ref(), Some(&seen[2]));
+        cx.simulate_keystrokes("shift-tab");
+        assert_eq!(focused(cx).as_ref(), Some(&seen[1]));
+        // From the panel itself, as it opens, back goes to the last too.
+        cx.update(|window, cx| panel.focus(window, cx));
+        cx.simulate_keystrokes("shift-tab");
+        assert_eq!(focused(cx).as_ref(), Some(&seen[2]));
+    }
+
+    #[gpui::test]
+    fn the_keys_go_back_where_they_were_when_settings_closes(cx: &mut TestAppContext) {
+        let (over, cx) = open(cx);
+        let (panel, behind) =
+            cx.read(|cx| (over.read(cx).panel.clone(), over.read(cx).behind[1].clone()));
+        // The status bar had them as settings opened.
+        cx.update(|window, cx| behind.focus(window, cx));
+        let before = focused(cx);
+        cx.update(|window, cx| panel.focus(window, cx));
+        cx.simulate_keystrokes("tab tab");
+        // As it closes.
+        cx.update(|window, cx| {
+            if let Some(back) = keys_back(before, window) {
+                window.focus(&back, cx);
+            }
+        });
+        assert_eq!(focused(cx), Some(behind));
+        // A menu it was opened from is gone by then, so it gets nothing back.
+        let menu = cx.update(|_, cx| cx.focus_handle().tab_stop(true));
+        cx.update(|window, _| assert_eq!(keys_back(Some(menu), window), None));
+    }
 }
