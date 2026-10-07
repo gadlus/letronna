@@ -32,6 +32,13 @@ pub(crate) const GENTLE: Duration = Duration::from_millis(220);
 /// How far, in pixels, something travels as it comes in: enough to say
 /// where it came from, too little to read as a move across the window.
 pub(crate) const RISE: f32 = 8.;
+/// New words of a reply coming in, settling from faint to their full
+/// colour: long enough to read as settling, short enough that the newest
+/// words are never left faint behind a fast stream.
+pub(crate) const SETTLE: Duration = Duration::from_millis(200);
+/// How strong a new piece of a reply starts out: about as faint as muted
+/// text, not invisible, so the line never looks as if it were missing words.
+const FAINT: f32 = 0.45;
 
 /// An animation for something coming in.
 pub(crate) fn enter(duration: Duration) -> Animation {
@@ -41,6 +48,17 @@ pub(crate) fn enter(duration: Duration) -> Animation {
 /// An animation for something leaving.
 pub(crate) fn exit(duration: Duration) -> Animation {
     Animation::new(duration).with_easing(ease_in_cubic)
+}
+
+/// How a reply's text lets in the words the stream adds: each piece starts
+/// `FAINT` and settles to its full colour over `SETTLE`. gpui-base's text
+/// view repaints it some 30 times a second, not at every refresh, only while
+/// a piece is settling, and not at all while motion is reduced.
+pub(crate) fn settling() -> gpui_base::text::TextViewMotion {
+    let settles = |t: f32| FAINT + (1. - FAINT) * ease_out_cubic(t);
+    gpui_base::text::TextViewMotion::default()
+        .with_stream_fade(SETTLE)
+        .with_stream_fade_easing(gpui_base::motion::Easing::Custom(std::rc::Rc::new(settles)))
 }
 
 /// How far in something is that started coming at `since`, eased: 1 once it
@@ -289,7 +307,11 @@ pub(crate) fn veil_layer(window: &mut Window, cx: &mut App) -> Option<Div> {
 mod tests {
     // Not `use super::*`: the prelude's gpui `test` macro would shadow the
     // built-in attribute.
-    use super::{Arrivals, Entrance, Row, Switch, fraction, switched};
+    use super::{Arrivals, Entrance, Row, SETTLE, Switch, fraction, settling, switched};
+    use gpui::{Context, IntoElement, Render, SharedString, TestAppContext};
+    use gpui::{Window, WindowHandle, px, size};
+    use std::cell::Cell;
+    use std::rc::Rc;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -366,5 +388,72 @@ mod tests {
         rows.note(1, 10, false);
         assert_eq!(rows.since(Row::Message, 9, now), None);
         assert_eq!(rows.since(Row::Message, 10, now), Some(now));
+    }
+
+    /// A reply as the chat draws it, counting the frames it is drawn in.
+    struct Reply {
+        text: SharedString,
+        frames: Rc<Cell<usize>>,
+    }
+
+    impl Render for Reply {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.frames.set(self.frames.get() + 1);
+            gpui_base::TextView::markdown("reply", self.text.clone()).motion(settling())
+        }
+    }
+
+    /// A window drawing the start of a reply, and its frame count.
+    fn reply(reduce: bool, cx: &mut TestAppContext) -> (WindowHandle<Reply>, Rc<Cell<usize>>) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_reduce_motion(reduce);
+        });
+        let frames = Rc::new(Cell::new(0));
+        let shared = frames.clone();
+        let window = cx.open_window(size(px(400.), px(200.)), move |_, _| Reply {
+            text: "Streaming text".into(),
+            frames: shared,
+        });
+        cx.run_until_parked();
+        (window, frames)
+    }
+
+    /// The stream adds to the reply, and the window takes it in.
+    fn more_words(window: &WindowHandle<Reply>, cx: &mut TestAppContext) {
+        let added = window.update(cx, |reply, _, cx| {
+            reply.text = "Streaming text arrives a few words at a time".into();
+            cx.notify();
+        });
+        assert!(added.is_ok());
+        cx.run_until_parked();
+    }
+
+    /// Let `time` go by on the window's clock, and say how many frames it drew.
+    fn frames_in(time: Duration, frames: &Rc<Cell<usize>>, cx: &mut TestAppContext) -> usize {
+        let before = frames.get();
+        cx.executor().advance_clock(time);
+        cx.run_until_parked();
+        frames.get() - before
+    }
+
+    #[gpui::test]
+    fn new_words_are_drawn_again_while_they_settle_and_not_after(cx: &mut TestAppContext) {
+        let (window, frames) = reply(false, cx);
+        more_words(&window, cx);
+        // Some 30 frames a second while the new words settle.
+        assert_eq!(frames_in(Duration::from_millis(40), &frames, cx), 1);
+        assert_eq!(frames_in(Duration::from_millis(40), &frames, cx), 1);
+        // Settled, a last frame draws them whole and asks for no more.
+        std::thread::sleep(SETTLE + Duration::from_millis(50));
+        frames_in(Duration::from_millis(40), &frames, cx);
+        assert_eq!(frames_in(Duration::from_secs(1), &frames, cx), 0);
+    }
+
+    #[gpui::test]
+    fn new_words_come_in_at_once_while_motion_is_reduced(cx: &mut TestAppContext) {
+        let (window, frames) = reply(true, cx);
+        more_words(&window, cx);
+        assert_eq!(frames_in(Duration::from_millis(200), &frames, cx), 0);
     }
 }

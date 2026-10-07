@@ -106,5 +106,9 @@ tray-icon = { version = "0.25", default-features = false, features = ["ksni"] }
 # backdrop, over a connection of our own.
 x11rb = "0.13"
 
+[dev-dependencies]
+# Test windows, for the tests of where the keys go.
+gpui = { package = "gpui-pre", version = "=0.3.8", features = ["test-support"] }
+
 [build-dependencies]
 embed-resource = "3"

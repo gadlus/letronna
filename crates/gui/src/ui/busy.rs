@@ -110,3 +110,52 @@ fn next_frame(window: &mut Window, cx: &mut App) {
     })
     .detach();
 }
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the prelude's gpui `test` macro would shadow the
+    // built-in attribute.
+    use super::{Asked, TICK, breathing};
+    use gpui::{Styled as _, TestAppContext, VisualTestContext, div, point, px, size};
+
+    /// How many windows have a frame asked for.
+    fn asked(cx: &mut VisualTestContext) -> usize {
+        cx.update(|_, cx| cx.try_global::<Asked>().map_or(0, |asked| asked.0.len()))
+    }
+
+    /// Draw a frame with the dot at the end of a reply coming in, and say
+    /// how strong it was drawn.
+    fn draw_dot(cx: &mut VisualTestContext) -> f32 {
+        let mut drawn = 0.;
+        let space = size(px(40.), px(20.));
+        cx.draw(point(px(0.), px(0.)), space, |window, cx| {
+            drawn = breathing(window, cx);
+            div().size(px(6.)).opacity(drawn)
+        });
+        drawn
+    }
+
+    #[gpui::test]
+    fn the_dot_asks_for_one_frame_a_tick_ahead_and_none_once_it_is_gone(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        draw_dot(cx);
+        draw_dot(cx);
+        assert_eq!(asked(cx), 1);
+        // A tick on, the window is drawn again; the reply done, without
+        // the dot, nothing more is asked.
+        cx.executor().advance_clock(TICK);
+        cx.run_until_parked();
+        assert_eq!(asked(cx), 0);
+        cx.executor().advance_clock(TICK * 10);
+        cx.run_until_parked();
+        assert_eq!(asked(cx), 0);
+    }
+
+    #[gpui::test]
+    fn the_dot_stays_still_and_asks_for_nothing_while_motion_is_reduced(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let cx = cx.add_empty_window();
+        assert_eq!(draw_dot(cx), 1.);
+        assert_eq!(asked(cx), 0);
+    }
+}

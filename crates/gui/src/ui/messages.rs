@@ -95,18 +95,6 @@ impl Chat {
         let is_user = message.role == "user";
         let session = self.store.conversations[self.store.active].id;
         let editing = is_user && self.editing_message == Some((session, index));
-        // Where the turn's buttons go: at the end of your prompt's label, in
-        // a reply's copy-and-usage line, or under a reply that has neither.
-        // In the two lines they take no room of their own.
-        let usage_row =
-            !is_user && !message.content.is_empty() && (!streaming || message.tokens > 0);
-        let (on_label, in_usage, under) = match (is_user, usage_row) {
-            (true, _) => (bar.filter(|_| !editing), None, None),
-            (false, true) => (None, bar, None),
-            (false, false) => (None, None, bar),
-        };
-        // A reply that only asked for tools: its tool rows say what happened.
-        let tool_only = !is_user && message.content.is_empty() && !message.tool_calls.is_empty();
         // The call the model is writing now, while this reply streams.
         let writing = self
             .turn
@@ -114,6 +102,21 @@ impl Chat {
             .filter(|_| streaming && !is_user)
             .and_then(|turn| turn.live.drafts.last())
             .map(letronna_core::chat::Draft::label);
+        // A reply coming in ends on a breathing dot, until it stops to write
+        // a call, which then says so instead.
+        let caret = !is_user && streaming && !message.content.is_empty() && writing.is_none();
+        // Where the turn's buttons go: at the end of your prompt's label, in
+        // a reply's copy-and-usage line, or under a reply that has neither.
+        // In the two lines they take no room of their own.
+        let usage_row =
+            !is_user && !message.content.is_empty() && (!streaming || message.tokens > 0 || caret);
+        let (on_label, in_usage, under) = match (is_user, usage_row) {
+            (true, _) => (bar.filter(|_| !editing), None, None),
+            (false, true) => (None, bar, None),
+            (false, false) => (None, None, bar),
+        };
+        // A reply that only asked for tools: its tool rows say what happened.
+        let tool_only = !is_user && message.content.is_empty() && !message.tool_calls.is_empty();
         let label: String = if message.model.is_empty() {
             self.store.model(self.store.active).1.to_owned()
         } else {
@@ -281,6 +284,7 @@ impl Chat {
             gpui_base::TextView::markdown(md, message.content.clone())
                 .selectable(selectable)
                 .line_height(leading)
+                .motion(crate::ui::motion::settling())
                 .style(style)
                 .code_block_actions(move |block, _, cx| {
                     let code = block.code();
@@ -359,16 +363,7 @@ impl Chat {
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(cx.theme().link)
                                 .child(label),
-                        )
-                        .when(streaming, |this| {
-                            this.child(
-                                div()
-                                    .size(px(6.))
-                                    .rounded_full()
-                                    .bg(cx.theme().primary)
-                                    .opacity(crate::ui::busy::breathing(window, cx)),
-                            )
-                        }),
+                        ),
                 )
             })
             // Thinking is shown when it was asked for, the same switch the
@@ -423,6 +418,19 @@ impl Chat {
                         .items_center()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
+                        // In the copy button's place, so nothing moves as the
+                        // button takes over at the end.
+                        .when(caret, |row| {
+                            row.child(
+                                div().size_5().flex().items_center().justify_center().child(
+                                    div()
+                                        .size(px(6.))
+                                        .rounded_full()
+                                        .bg(cx.theme().primary)
+                                        .opacity(crate::ui::busy::breathing(window, cx)),
+                                ),
+                            )
+                        })
                         // Read when copied, not copied out at every frame.
                         .when(!streaming, |row| {
                             let chat = cx.weak_entity();
