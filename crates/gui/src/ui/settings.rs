@@ -520,6 +520,7 @@ impl Chat {
         let gap = px(44.);
         let height = vp.height - gap * 2.;
         let current_page = *page.read(cx);
+        let body_scroll = super::scroll_of(&"settings-body".into(), window, cx);
         // A tab stop a row, so Tab reaches the pages, and Up and Down step
         // through them from the one with the keys.
         let handles: std::rc::Rc<[FocusHandle]> = PAGES
@@ -675,7 +676,9 @@ impl Chat {
                             .h_full()
                             .child(
                                 div()
+                                    .on_children_prepainted(super::follow_keys(&body_scroll))
                                     .id("settings-body")
+                                    .track_scroll(&body_scroll)
                                     .size_full()
                                     .overflow_y_scroll()
                                     .px_8()
@@ -1765,6 +1768,7 @@ impl RenderOnce for KeyedSwitch {
             )
             .read(cx)
             .clone();
+        let shown = SharedString::from(format!("{}-shown", self.id));
         let (checked, turn) = (self.checked, self.on_click);
         let mut switch = gpui_component::switch::Switch::new(self.id.clone())
             .checked(checked)
@@ -1774,9 +1778,8 @@ impl RenderOnce for KeyedSwitch {
         }
         // Ringed as the Capabilities page's switches are, the edge always
         // there so the ring the keys bring moves nothing.
-        div()
-            .id(self.id)
-            .track_focus(&focus.tab_stop(true))
+        let row = div().id(self.id).track_focus(&focus.clone().tab_stop(true));
+        super::shown_on_focus(row, shown, &focus, window, cx)
             .flex_shrink_0()
             .p_0p5()
             .rounded(cx.theme().radius)
