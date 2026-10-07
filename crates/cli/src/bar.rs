@@ -164,6 +164,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "plugins: add from git, switch on or off, allow servers, update, remove, market",
     },
     Command {
+        name: "/wallet",
+        blurb: "the wallet the agent pays from: balances, limits, x402, networks, history",
+    },
+    Command {
         name: "/memory",
         blurb: "what is kept between sessions; /memory edit, log or restore user|memory|project|soul",
     },
@@ -250,6 +254,42 @@ const SKILL_VERBS: &[Command<'static>] = &[
     Command {
         name: "off",
         blurb: "switch one off, out of the model's sight",
+    },
+];
+
+/// What `/wallet` does, offered under it.
+const WALLET_VERBS: &[Command<'static>] = &[
+    Command {
+        name: "balance",
+        blurb: "what each wallet holds on every network",
+    },
+    Command {
+        name: "limits",
+        blurb: "the caps on what the agent spends",
+    },
+    Command {
+        name: "x402",
+        blurb: "what the agent does when a site asks to be paid",
+    },
+    Command {
+        name: "chains",
+        blurb: "switch networks on or off",
+    },
+    Command {
+        name: "history",
+        blurb: "the latest payments",
+    },
+    Command {
+        name: "pause",
+        blurb: "stop the agent paying; resume lets it again",
+    },
+    Command {
+        name: "new",
+        blurb: "make a wallet with a new recovery phrase",
+    },
+    Command {
+        name: "import",
+        blurb: "bring one in by its recovery phrase or a key",
     },
 ];
 
@@ -422,8 +462,8 @@ fn matches<'a>(text: &str, added: &'a Added) -> Vec<Row<'a>> {
     found
 }
 
-/// The rows under `/skills ` or `/mcp ` while the one word after it is
-/// typed: every skill, or each MCP prompt, then what else the command does,
+/// The rows under `/skills `, `/mcp ` or `/wallet ` while the one word after
+/// it is typed: every skill, or each MCP prompt, then what else the command does,
 /// those with the word in their name, the ones starting with it first.
 /// Before a letter, the first row is the command alone, so enter still
 /// lists them as it did. None for any other text.
@@ -451,6 +491,12 @@ fn under<'a>(text: &str, added: &'a Added) -> Option<Vec<Row<'a>>> {
                 .filter_map(|(name, blurb)| Some((name.strip_prefix("/mcp__")?, blurb)))
                 .collect(),
             MCP_VERBS,
+        ),
+        "/wallet" => (
+            "/wallet ",
+            "wallets, rules and what was spent",
+            Vec::new(),
+            WALLET_VERBS,
         ),
         _ => return None,
     };

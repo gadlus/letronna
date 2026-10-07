@@ -315,6 +315,10 @@ pub fn command(
             plugins(runner, rest);
             Flow::Handled
         }
+        "/wallet" => {
+            wallet(runner, rest);
+            Flow::Handled
+        }
         "/memory" => {
             crate::memory::memory(runner, rest, workspace);
             Flow::Handled
@@ -2696,6 +2700,43 @@ fn switch_plugins(runner: &mut Runner) -> bool {
     switch_list(runner, "Plugins", rows, &mut |name, on| {
         plugins::set_enabled(name, on)
     })
+}
+
+/// `/wallet`: the verbs of `letronna wallet`, asked in the box; the
+/// networks as a list of switches when there is a keyboard to turn them.
+fn wallet(runner: &mut Runner, rest: &str) {
+    let words: Vec<String> = rest.split_whitespace().map(str::to_owned).collect();
+    if words.iter().map(String::as_str).eq(["chains"]) {
+        let kept = letronna_core::wallet::load();
+        let rows = letronna_core::wallet::networks(&kept)
+            .into_iter()
+            .map(|chain| crate::bar::Switch {
+                about: if chain.testnet {
+                    "test network".into()
+                } else {
+                    chain.id.clone()
+                },
+                name: chain.name,
+                on: chain.on,
+            })
+            .collect();
+        let mut flip = |name: &str, on: bool| {
+            letronna_core::wallet::set_network(name, Some(on), None).map(|_| ())
+        };
+        if switch_list(runner, "Networks", rows, &mut flip) {
+            return;
+        }
+    }
+    render::blank();
+    match crate::wallet::verb(&words, &mut runner.bar) {
+        Ok(text) => {
+            render::said(&render::blue("●"), &render::bold("Wallet"));
+            for line in text.lines() {
+                render::line(line);
+            }
+        }
+        Err(why) => render::line(&render::red(&why)),
+    }
 }
 
 fn plugins(runner: &mut Runner, rest: &str) {

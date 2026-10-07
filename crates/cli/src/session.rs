@@ -1736,6 +1736,8 @@ pub fn intent(name: &str, summary: &str) -> String {
         "browse" | "use_page" => summary.to_owned(),
         "search_web" => "search the web".to_owned(),
         "memory" => "change what it remembers".to_owned(),
+        "wallet_send" => "send money from your wallet".to_owned(),
+        "paid_fetch" => "pay for a page from your wallet".to_owned(),
         other => format!("use {other}"),
     }
 }
