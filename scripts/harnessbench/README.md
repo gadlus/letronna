@@ -111,6 +111,11 @@ folder and gives the mean combined score of the valid ones per harness
 entry. A task that raised an error writes no result at all; `run-suite`
 lists it with `"ok": false`.
 
+The patch makes the judge ask again when the gateway is busy: a 429, a 5xx
+or a dropped connection is tried three more times, 10, 30 and 60 seconds
+apart, and a reply with no JSON in it is asked for once more. A 400 is not
+retried.
+
 Each round's metadata in the result holds the run's own JSON (`status`,
 `rounds`, tokens, `files`), `timed_out`, and `model_calls`, the calls the
 proxy saw answered in that round.
@@ -128,10 +133,11 @@ proxy saw answered in that round.
 - Letronna gives up on a reply that stays quiet for five minutes, and the
   proxy passes a reply on only once it is whole, so a single reply that
   takes longer than that to generate fails.
-- Sandboxes are secret: each holds the provider key in `.letronna/keys.json`,
-  and the proxy's records in `usage-proxy/responses/` keep each request's
-  headers, `Authorization` included. `--delete-sandbox` removes them after
-  scoring.
+- Sandboxes are secret: each holds the provider key in `.letronna/keys.json`.
+  The proxy's records in `usage-proxy/responses/` keep each request's
+  headers with `Authorization` and the other key headers blanked, so they
+  can be kept for grading a run again. `--delete-sandbox` removes it all
+  after scoring.
 
 ## Smoke run with no provider
 
