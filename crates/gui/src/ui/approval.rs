@@ -1032,10 +1032,18 @@ fn key_hint(key: &str) -> Kbd {
     // In its own colours and size: any text style given to it replaces its
     // own whole, colour and all, which left a blue button's white text on
     // the hint's page-coloured box, blank in Paper.
-    Kbd::new(Keystroke {
+    Kbd::new(hint_key(key))
+}
+
+/// The key `key` as a card's hint shows it. Escape is spelt Esc everywhere,
+/// as Windows and Linux show it: macOS's own sign for it reads as a
+/// circular arrow.
+fn hint_key(key: &str) -> Keystroke {
+    let key = if key == "escape" { "esc" } else { key };
+    Keystroke {
         key: key.to_owned(),
         ..Default::default()
-    })
+    }
 }
 
 /// The place of the card coming up in `reply` after the card `before`, with
@@ -1217,7 +1225,7 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        CardFor, CardKey, Press, asks_for_folder, key_hint, option_letter, options_in,
+        CardFor, CardKey, Press, asks_for_folder, hint_key, key_hint, option_letter, options_in,
         own_folder_note, own_folder_words, place, pressed, stroke_of,
     };
     use letronna_core::tools::ToolContext;
@@ -1306,6 +1314,14 @@ mod tests {
         // and its text would take the button's colour over the hint's box.
         let mut hint = key_hint("enter");
         assert_eq!(gpui::Styled::style(&mut hint).text, Default::default());
+    }
+
+    #[test]
+    fn a_card_writes_esc_for_escape_and_enter_as_before() {
+        use gpui_component::kbd::Kbd;
+        assert_eq!(Kbd::format(&hint_key("escape")), "Esc");
+        let enter = gpui::Keystroke::parse("enter").unwrap();
+        assert_eq!(Kbd::format(&hint_key("enter")), Kbd::format(&enter));
     }
 
     #[test]
