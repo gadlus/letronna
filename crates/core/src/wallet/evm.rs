@@ -456,12 +456,18 @@ mod tests {
 
     #[test]
     fn a_token_domain_is_the_one_its_contract_reports() {
-        // DOMAIN_SEPARATOR() as USDC's contracts answer it on Base and Base
-        // Sepolia (read with eth_call on 2026-10-07).
+        // DOMAIN_SEPARATOR() as the contracts answer it (read with eth_call
+        // on 2026-10-07).
         let base = evm_bytes("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").unwrap();
         assert_eq!(
             to_hex(&domain_separator("USD Coin", "2", 8453, &base)),
             "02fa7265e7c5d81118673727957699e4d68f74cd74b7db77da710fe8a2c7834f"
+        );
+        // Paxos's USDG on Robinhood Chain, whose version() reverts.
+        let usdg = evm_bytes("0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168").unwrap();
+        assert_eq!(
+            to_hex(&domain_separator("Global Dollar", "1", 4663, &usdg)),
+            "7a3d7400b27830f4f91c2c16a082486d67c1befecaec2f53b33f1f35d5b62036"
         );
         let sepolia = evm_bytes("0x036CbD53842c5426634e7929541eC2318f3dCF7e").unwrap();
         assert_eq!(

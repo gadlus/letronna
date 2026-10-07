@@ -627,6 +627,23 @@ mod tests {
     /// The signer of a version 2 EVM payment, checked as a facilitator
     /// would: the signature recovers to `from` over the authorization.
     fn signer(payment: &str) -> Option<String> {
+        signed_under(
+            payment,
+            "USDC",
+            "2",
+            84532,
+            "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+        )
+    }
+
+    /// The signer of an EVM payment signed under a token's EIP-712 domain.
+    fn signed_under(
+        payment: &str,
+        name: &str,
+        version: &str,
+        chain_id: u64,
+        contract: &str,
+    ) -> Option<String> {
         let body: Value = serde_json::from_slice(&STANDARD.decode(payment).ok()?).ok()?;
         let payload = &body["payload"];
         let auth = &payload["authorization"];
@@ -643,13 +660,8 @@ mod tests {
             valid_before: auth["validBefore"].as_str()?.parse().ok()?,
             nonce,
         };
-        let digest = super::super::evm::test_digest(
-            "USDC",
-            "2",
-            84532,
-            "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
-            &authorization,
-        );
+        let digest =
+            super::super::evm::test_digest(name, version, chain_id, contract, &authorization);
         let signature = k256::ecdsa::Signature::from_slice(&bytes[..64]).ok()?;
         let id = k256::ecdsa::RecoveryId::from_byte(bytes[64] - 27)?;
         let key = k256::ecdsa::VerifyingKey::recover_from_prehash(&digest, &signature, id).ok()?;
@@ -853,6 +865,37 @@ mod tests {
         );
         assert_eq!(remembered(&dear).unwrap().usd, Some(500_000));
         assert_eq!(policy::ledger().len(), 1);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_usdg_offer_on_robinhood_chain_is_signed_as_global_dollar_unnamed() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = Scratch::new("wallet-usdg");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        let made = super::super::import("Main", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", 0).unwrap();
+        // A version 1 offer that names the network by its old name and does
+        // not say how the token signs.
+        let usdg = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168";
+        let offer = json!({
+            "scheme": "exact", "network": "robinhood", "maxAmountRequired": "10000",
+            "asset": usdg, "payTo": "0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+            "resource": "https://x.dev/a", "description": "", "maxTimeoutSeconds": 60
+        });
+        let quote = Quote {
+            version: 1,
+            resource: Value::Null,
+            accepts: vec![offer],
+            error: String::new(),
+        };
+        let plan = choose(&quote, &super::super::load(), "x.dev", false).unwrap();
+        assert_eq!(plan.price(), "0.01 USDG ($0.01) on Robinhood Chain");
+        let (header, value) = pay(&plan).unwrap();
+        assert_eq!(header, "X-PAYMENT");
+        assert_eq!(
+            signed_under(&value, "Global Dollar", "1", 4663, usdg),
+            Some(made.evm)
+        );
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }
