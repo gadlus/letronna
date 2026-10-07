@@ -1,23 +1,39 @@
 <p align="center">
-  <img src="assets/letronna-front.png" width="320" alt="Letronna">
+  <img src="crates/gui/assets/letronna-front.png" width="280" alt="Letronna">
 </p>
 
 <h1 align="center">Letronna</h1>
 
 <p align="center">
-  A small native desktop agent. Rust, GPU rendered, no browser inside.<br>
-  <b>Alpha.</b> Expect rough edges and breaking changes.
+  A native desktop and terminal agent, with a cloud that keeps working when you close your laptop.<br>
+  Rust, GPU rendered, no browser inside. <b>Alpha</b>: expect rough edges and breaking changes.
+</p>
+
+<p align="center">
+  <a href="https://github.com/gadlus/letronna/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/gadlus/letronna?include_prereleases&label=release&color=1f4fd8"></a>
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-1f4fd8"></a>
+  <a href="https://letronna.ai"><img alt="letronna.ai" src="https://img.shields.io/badge/web-letronna.ai-00126b"></a>
+  <a href="https://github.com/sponsors/gadlus"><img alt="Sponsor" src="https://img.shields.io/badge/sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white"></a>
+</p>
+
+<p align="center">
+  <a href="https://letronna.ai/dashboard/download">Download</a> ·
+  <a href="https://letronna.ai/docs">Docs</a> ·
+  <a href="https://letronna.ai/changelog">Changelog</a> ·
+  <a href="https://github.com/sponsors/gadlus">Sponsor</a>
 </p>
 
 ## What it is
 
-Letronna is a chat-first desktop app built on [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) and [gpui-component](https://github.com/longbridge/gpui-component). It talks to any OpenAI-compatible endpoint through a gateway you pick, streams replies, and keeps sessions on your machine.
+Letronna is an agent that works on your computer: it reads and edits your files, runs commands, browses, and remembers what you tell it. It comes as a desktop app built on [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) and [GPUI Kit](https://github.com/longbridge/gpui-component), and as a terminal app, both on one Rust core. It talks to any OpenAI-compatible endpoint through a gateway you pick and keeps sessions on your machine.
 
-- Sessions sidebar with search, pinning and date groups
-- Markdown replies, streaming, multi-line composer
-- Gateways: Letronna (hosted models on your account), OpenAI, Anthropic, OpenRouter, Ollama, or a custom base URL
-- Searchable model picker fed by the gateway's model list
-- Single ~24 MB executable, no runtime, no Electron
+- **An agent, not only a chat**: files, commands, the web, a browser beside the chat, images, speech and video, with approvals or an auto mode that judges what is safe
+- **Helpers and workflows**: agents that work side by side and share a task list, and scripts that run many of them
+- **Gateways**: Letronna (hosted models on your account), OpenAI, Anthropic, OpenRouter, Ollama, or any base URL
+- **Extensible**: MCP servers (local or over HTTP), plugins from git, skills, language servers, and Zed or JetBrains over ACP
+- **Chat apps**: answer from Telegram, Discord, Slack and more, with `letronna serve` and no window open
+- **Letronna Cloud** (Pro): run a task on Letronna's servers from the chat, host a bot that stays online 24/7, or a web app at `lc-<id>.letronna.si`
+- **Small**: one executable per app, no runtime, no Electron
 
 ## Install
 
@@ -37,11 +53,7 @@ curl -fsSL https://letronna.ai/install.sh | sh
 
 The script only delivers the program. It downloads the latest release and hands over to `letronna setup`, which asks what to call you, signs you in, picks a provider and a model (keys are typed as dots and never printed), and installs the window, the terminal or both. Nothing needs administrator rights and nothing goes outside your own account. Run `letronna setup` again any time to change the answers; it also runs by itself the first time Letronna starts with nothing set up.
 
-Until letronna.ai serves the scripts, the same ones are attached to each release:
-
-```powershell
-iex (irm https://github.com/gadlus/letronna/releases/latest/download/install.ps1)
-```
+The same scripts are attached to each [release](https://github.com/gadlus/letronna/releases/latest).
 
 Set `LETRONNA_DOWNLOAD` to install from a different archive (a URL or a local file), or `LETRONNA_NO_SETUP=1` to unpack without the questions.
 
@@ -104,87 +116,6 @@ The Web toggle is the gateway's own search, and only some gateways have one. A s
 | Exa      | `https://api.exa.ai/search`                       | an API key          |
 | SearXNG  | your own server, such as `http://mac-mini:8888`   | its json format on  |
 | DuckDuckGo | `https://html.duckduckgo.com/html`              | nothing; unofficial, may be rate-limited |
-
-The one set up last is used. Each is reached at its official address unless you give another, such as a proxy; Reset, or `official` in the terminal, goes back to it. A SearXNG answers searches from Letronna only with `json` among the `formats` in its `settings.yml`. Keys are kept with the gateways' (see Local data).
-
-## Images, speech and video
-
-Signed in, the agent can also make things on Letronna's hosted models, whichever gateway the chat itself uses:
-
-| Tool         | Makes                                                     | Paid by       |
-|--------------|-----------------------------------------------------------|---------------|
-| `make_image` | an image from a description                               | the image     |
-| `speak`      | text read aloud                                           | the character |
-| `transcribe` | the words in an audio or video file, up to 25 MB          | the minute    |
-| `make_video` | a short MP4 from a description, in a few minutes          | the second    |
-
-`edit_image` changes pictures instead of making one: one or more from the project, or already in the conversation, with an optional mask marking where to redraw. It goes to the chat's own gateway, so it also works on OpenAI or any OpenAI-compatible server with an `/images/edits` route, paid there; on Letronna it is paid by the image. A picture is never taken from outside the project or Letronna's media folder, nor from a file of keys, and one the route would refuse for its size is stopped before it is uploaded.
-
-Each one asks first, since it spends your credit, and none is offered in plan mode or in a shared chat. Unless a model is named, the cheapest one working is used; the prices are on the dashboard's models page. What is made is saved in `media/` in the project folder, or in the data folder when no project is attached. The window shows a made image in the chat, and opens any made file.
-
-## Browser
-
-The agent can use a real web browser: the Chrome, Edge or Brave already installed (Edge comes with Windows), driven over the DevTools protocol. Nothing is downloaded and no Node or Python is needed.
-
-| Tool       | Does                                                                            |
-|------------|---------------------------------------------------------------------------------|
-| `browse`   | opens a page and lists it, scrolls, goes back, switches tabs, reads the console, takes a screenshot |
-| `use_page` | clicks, types, presses keys, picks from dropdowns, runs JavaScript              |
-
-A page reaches the model as its accessibility tree, one element a line with a ref such as `e12` to click or type into; screenshots show in the chat, and a model that takes images sees the newest one. Each session browses in a browser of its own, as a separate agent would: a private one, as an incognito window is, with its own sign-ins and tabs, forgotten when Letronna quits. The window's browser panel shows the one of the session on screen. **One browser for every session** (Settings, Privacy) shares a single one instead, on its own profile in the data folder, never your usual one, where a site signed in to once stays signed in. It is one browser either way, the sessions' private ones living inside it, and at most four private ones are kept at once. It has no window of its own, and closes when Letronna exits, or once nothing has used it for a while (15 seconds after the panel closes, 3 minutes after the agent's last step), to start again when next needed with each session's page and sign-ins as they were; `LETRONNA_BROWSER_HEADLESS=0` gives it one, for the terminal or for a site that turns away a browser without one. `LETRONNA_BROWSER` picks the browser by its path.
-
-The browser can be elsewhere instead: a cloud browser, or Chrome on another machine. Give its address under **Browser elsewhere** (Settings, Privacy), or in `LETRONNA_BROWSER_URL`: a cloud service's connect address with its key in it as the service gives it (`wss://…?token=…` or `?apiKey=…`), or `http://its-address:9222` for a Chrome started with `--remote-debugging-port=9222` (through an SSH tunnel is safest; the port lets anyone who reaches it drive the browser). The address is kept with the keys, since it may carry a key. Everything works the same there, the panel included, over the one connection such a browser gives, with some differences: it has no window here; it draws at its own screen's scale (start it with `--force-device-scale-factor` to match yours); it cannot open addresses on this computer, as `localhost` is its own; each step crosses the network, so it is as quick as the link is; and when Letronna quits or the browser goes idle, it is let go of, with the private browsers made in it, rather than closed, as it may be somebody else's. A cloud service's session ends there.
-
-Both tools ask first, as a web address can carry things out as well as bring them in. Looking is allowed in plan mode and acting is not; neither is offered in a shared chat. An address carrying one of your own keys or tokens is never opened, nor a cloud machine's metadata service.
-
-The window shows the browser beside the chat, live, while the agent uses it or once **Browser** in the menu is clicked, which opens on the session's page, or on Google: a pointer goes to what the agent is about to click or type into, outlines it, and lands as the action happens, with a line saying what it is doing. It is yours to use too: type an address, go back and forward, reload, and click, type, scroll, copy and paste on the page. A question the page asks waits there for your answer, and a sign-in or a site's check is got past there. The panel's view menu lays the page out in portrait, as a phone does, or in landscape, as a desktop browser does in a wider panel, and zooms it (also Ctrl and +, -, 0, or the wheel); drag the panel's edge to widen it, and its window button gives the browser a window of its own, with the same page and sign-ins, until clicked again. The page is drawn as sharp as the screen: the browser's own pictures of it, sent only when it changes, 30 a second at most, and made sharp once it stands still, so a page standing still costs nothing, and none are sent once the panel is closed. A narrow window floats the panel in a corner, showing the page smaller. With **Show the page as the agent browses** (Settings, Privacy) off, the agent browses unseen, lighter on memory, and the panel opens only from the menu. The terminal shows none of this and waits for no pointer.
-
-## Local data
-
-`%LOCALAPPDATA%\Letronna\` on Windows, `~/Library/Application Support/Letronna/` on macOS, `~/.local/share/Letronna/` on Linux. `AGENT_DATA_DIR` overrides all three.
-
-- `chats.json` sessions and the selected gateway, endpoint and model
-- `keys.json` API keys per gateway, plain text on your disk only; on macOS and Windows, in the usual data folder, they are moved to the Keychain or Credential Manager (under Letronna), and so are the sign-in and chat-app tokens, with `vault.json` listing which. On Windows that keeps them out of backups and sync but not from other programs you run, as Credential Manager lets any of them read them. `"keys_in": "files"` in `settings.json` keeps them in the files instead, moving them all back at the next start; set it and start Letronna once before going back to a version older than this, which only reads the files. `letronna doctor` says where they are
-- `account.json` the Letronna sign-in for this computer
-- `SOUL.md` who Letronna is, in your words; replaces the built-in first line of the prompt (optional, yours to write)
-- `USER.md` what Letronna knows about you, and `MEMORY.md` its own notes; it keeps both with its `memory` tool, and you can edit them. Both go into every conversation except chats other people can read, so they stay small (1,375 and 2,200 characters)
-- `mcp.json` MCP servers whose tools Letronna may use (optional, see below)
-- `lsp.json` language servers that check the files Letronna edits (optional, see below)
-- `search.json` the search service in use, and any address given for one
-- `media/` images, speech and video made with no project attached, and browser screenshots
-- `browser/` the browser's own profile: delete it to sign out of everything there
-
-With a project folder attached, its `AGENTS.md` (or `CLAUDE.md`) is read as the project's instructions, and so is the one in each folder above it up to the repository's root. An `AGENTS.local.md` (or `CLAUDE.local.md`) beside one, for rules of your own that you keep out of git, is read after it.
-
-Chat text is sent to the gateway you selected and nowhere else.
-
-## MCP servers
-
-Letronna can use the tools of any [MCP](https://modelcontextprotocol.io) server that runs as a local command. List them in `mcp.json` in the data folder, in the same shape Claude Desktop and Cursor use, so an existing config can be copied over:
-
-```json
-{
-  "mcpServers": {
-    "everything": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-everything"],
-      "autoApprove": ["echo"]
-    }
-  }
-}
-
-A model whose list says nothing of its limits and that Letronna does not know, as behind vLLM or a LiteLLM proxy, gets 6,000 tokens of the conversation and replies of 8,192. `"context_window"` and `"max_output"` in `settings.json`, set with Letronna closed, or `LETRONNA_CONTEXT_WINDOW` and `LETRONNA_MAX_OUTPUT` for one run, give it its real ones; a limit the provider's error names still lowers them.
-
-## Web search
-
-The Web toggle is the gateway's own search, and only some gateways have one. A search service of your own works with any of them: set one up in Settings under Search, or with `/search services` in the terminal, and the agent gets a `search_web` tool that asks before each search.
-
-| Service  | Official address                                  | Needs               |
-|----------|---------------------------------------------------|---------------------|
-| Brave    | `https://api.search.brave.com/res/v1/web/search`  | an API key          |
-| Tavily   | `https://api.tavily.com/search`                   | an API key          |
-| Exa      | `https://api.exa.ai/search`                       | an API key          |
-| SearXNG  | your own server, such as `http://mac-mini:8888`   | its json format on  |
 
 The one set up last is used. Each is reached at its official address unless you give another, such as a proxy; Reset, or `official` in the terminal, goes back to it. A SearXNG answers searches from Letronna only with `json` among the `formats` in its `settings.yml`. Keys are kept with the gateways' (see Local data).
 
@@ -368,44 +299,25 @@ Icons are Phosphor Light. `scripts/icons.sh` re-syncs them from npm.
 ## Layout
 
 ```
-src/main.rs         entry point: wires plugins, tray, window
-src/app.rs          Chat state, sessions, sending, render root
-src/prelude.rs      shared imports
-src/theme.rs        fonts and palette
-src/assets.rs       embedded icons and the AppIcon enum
-
-src/core/           domain layer (no UI, no OS)
-  chat.rs           HTTP: validation, streaming, model lists, reasoning, usage
-  gateway.rs        gateway presets
-  store.rs          on-disk sessions and keys
-
-src/ui/             view surfaces (impl Chat blocks)
-  sidebar.rs composer.rs messages.rs settings.rs sessions.rs chrome.rs
-
-src/plugins/        optional integrations behind a Plugin trait + event bus
-  mod.rs            Plugin trait, AppEvent, registry, emit()
-  discord.rs        Discord rich presence
-
-src/platform/       OS integration; same API everywhere, per-OS behind cfg
-  install.rs        first-run registration and --uninstall
-  tray.rs           notification-area icon and menu
-  window.rs         Win32 window helpers
-  backdrop.rs       captures and blurs the window for modal backdrops
-
-assets/             icon, avatar, SVG icons
-scripts/            icon sync, macOS .app bundling, window capture for UI checks
+crates/core/   the agent: chat and streaming, gateways, tools, sessions and
+               settings, memory, skills, MCP, the cloud client; no UI
+crates/cli/    `letronna`, the terminal app, its setup and `letronna serve`
+crates/gui/    the desktop window (GPUI), its views under src/ui, tray,
+               install and per-OS integration under src/platform
+vendor/        the GPUI snapshot the window builds against
+scripts/       installers, the release script, icon sync, macOS bundling
 ```
-
-Adding an integration (a new plugin) is one file in `src/plugins` implementing
-`Plugin`, plus one line in `main`. The app only emits `AppEvent`s; it never
-calls a plugin directly.
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Small, focused pull requests are welcome.
 
+## Sponsor
+
+Letronna is made by Gadlus LLC. If it saves you time, you can [sponsor it on GitHub](https://github.com/sponsors/gadlus) or [go Pro on letronna.ai](https://letronna.ai/dashboard/billing), which pays for hosted models and the cloud.
+
 ## License
 
-MIT, © 2026 Gadlus LLC. GPUI and gpui-component are Apache-2.0. Phosphor Icons are MIT.
+MIT, © 2026 Gadlus LLC. GPUI and GPUI Kit are Apache-2.0. Phosphor Icons are MIT.
 
 Developed by Gadlus LLC.
