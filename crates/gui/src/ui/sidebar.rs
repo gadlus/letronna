@@ -7,11 +7,12 @@ pub(crate) const SIDEBAR_WIDTH: Pixels = px(250.);
 
 /// The pages folded under the sidebar's More row, in the order it lists
 /// them; Workflows only while there is a run to show.
-const MORE: [Page; 5] = [
+const MORE: [Page; 6] = [
     Page::Plugins,
     Page::Messaging,
     Page::Artifacts,
     Page::Jobs,
+    Page::Wallet,
     Page::Workflows,
 ];
 
@@ -45,6 +46,7 @@ fn page_icon(page: Page) -> AppIcon {
         Page::Jobs => AppIcon::Clock,
         Page::Activity => AppIcon::Robot,
         Page::Workflows => AppIcon::Workflow,
+        Page::Wallet => AppIcon::Wallet,
     }
 }
 
@@ -188,6 +190,7 @@ impl Chat {
             Page::Activity => return self.open_activity(window, cx),
             Page::Workflows => return self.open_workflows(window, cx),
             Page::Artifacts => self.read_artifacts(cx),
+            Page::Wallet => self.read_wallet(true, cx),
             Page::Plugins => self.reload_plugins(),
             Page::Chat | Page::Messaging => {}
         }
@@ -720,6 +723,7 @@ mod tests {
             "Messaging",
             "Artifacts",
             "Scheduled jobs",
+            "Wallet",
         ];
         assert_eq!(names(&nav_rows(true, Page::Chat, false)), open);
         open.push("Workflows");

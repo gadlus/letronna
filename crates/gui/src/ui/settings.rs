@@ -14,6 +14,7 @@ pub(crate) const PAGES: &[(&str, AppIcon)] = &[
     ("Thinking", AppIcon::Sparkles),
     ("Memory", AppIcon::FileText),
     ("Privacy", AppIcon::Shield),
+    ("Wallet", AppIcon::Wallet),
     ("Shortcuts", AppIcon::Keyboard),
     ("Plugins", AppIcon::Puzzle),
     ("About", AppIcon::Info),
@@ -330,6 +331,9 @@ impl Chat {
         if *self.settings_page.read(cx) == "Usage" {
             self.load_usage(cx);
         }
+        if *self.settings_page.read(cx) == "Wallet" {
+            self.read_wallet(false, cx);
+        }
         // Memory may have been written since, by the model or by hand.
         let on_screen = self.store.conversations.get(self.store.active);
         let workspace = on_screen.and_then(|conversation| conversation.workspace.clone());
@@ -602,6 +606,7 @@ impl Chat {
             "Thinking" => thinking_page(&chat, &self.store, window, cx).into_any_element(),
             "Shortcuts" => shortcuts_page(&hotkey, &chat, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
+            "Wallet" => super::wallet::wallet_settings(&chat, &self.wallet, cx).into_any_element(),
             "Memory" => v_flex()
                 .gap_5()
                 .child(heading(
@@ -691,6 +696,10 @@ fn show_page(name: &'static str, page: &Entity<&'static str>, chat: &Entity<Chat
     });
     if name == "Usage" {
         chat.update(cx, |this, cx| this.load_usage(cx));
+    }
+    // The terminal may have changed the wallet since this last looked.
+    if name == "Wallet" {
+        chat.update(cx, |this, cx| this.read_wallet(false, cx));
     }
 }
 

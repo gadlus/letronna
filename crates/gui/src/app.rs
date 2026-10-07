@@ -94,6 +94,7 @@ pub(crate) enum Page {
     Jobs,
     Activity,
     Workflows,
+    Wallet,
 }
 impl Page {
     pub(crate) fn title(self) -> &'static str {
@@ -106,6 +107,7 @@ impl Page {
             Page::Jobs => "Scheduled jobs",
             Page::Activity => "Activity",
             Page::Workflows => "Workflows",
+            Page::Wallet => "Wallet",
         }
     }
     pub(crate) fn blurb(self) -> &'static str {
@@ -123,6 +125,8 @@ impl Page {
             }
             // Workflows renders its own page too.
             Page::Workflows => "Runs of helpers Letronna started.",
+            // Wallet renders its own page too.
+            Page::Wallet => "The wallets Letronna pays from.",
         }
     }
 }
@@ -385,6 +389,8 @@ pub(crate) struct Chat {
     pub(crate) skills_refused: Vec<String>,
     /// The Capabilities page's tabs beside Skills.
     pub(crate) capabilities: crate::ui::capabilities::Capabilities,
+    /// The Wallet page's and Settings › Wallet's own state.
+    pub(crate) wallet: crate::ui::wallet::WalletPage,
     /// The Plugins page: what is installed and the marketplaces.
     pub(crate) plugins: crate::ui::plugin_page::PluginsPage,
     /// The side question on show, if one is.
@@ -741,6 +747,7 @@ impl Chat {
         let steer =
             cx.new(|cx| InputState::new(window, cx).placeholder("What it should know or do now"));
         let (capabilities, filled) = crate::ui::capabilities::Capabilities::new(window, cx);
+        let wallet = crate::ui::wallet::WalletPage::new(window, cx);
         let subscriptions = vec![
             filled,
             cx.subscribe_in(&model_search, window, |this, _, event, window, cx| {
@@ -997,6 +1004,7 @@ impl Chat {
             skills_note: None,
             skills_refused: Vec::new(),
             capabilities,
+            wallet,
             plugins,
             aside: None,
             waiting_retry: None,
@@ -4276,6 +4284,8 @@ impl Render for Chat {
             self.workflows_page(window, cx).into_any_element()
         } else if self.page == Page::Artifacts {
             self.artifacts_page(cx).into_any_element()
+        } else if self.page == Page::Wallet {
+            self.wallet_page(cx).into_any_element()
         } else if self.page == Page::Capabilities {
             self.capabilities_page(window, cx).into_any_element()
         } else if self.page == Page::Plugins {
@@ -4489,6 +4499,11 @@ impl Render for Chat {
                     this.open_capabilities(window, cx)
                 },
             ))
+            .on_action(
+                cx.listener(|this, _: &crate::ui::wallet::OpenWallet, window, cx| {
+                    this.open_wallet(window, cx)
+                }),
+            )
             .on_action(cx.listener(
                 |this, _: &crate::ui::capabilities::NextCapabilityTab, window, cx| {
                     this.step_capability(1, window, cx)

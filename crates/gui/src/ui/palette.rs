@@ -111,6 +111,7 @@ fn commands() -> Vec<(&'static str, Rc<dyn Action>)> {
         ),
         ("Open settings", Rc::new(OpenSettings)),
         ("Open usage", Rc::new(super::usage::OpenUsage)),
+        ("Open the wallet", Rc::new(super::wallet::OpenWallet)),
         ("Open activity", Rc::new(OpenActivity)),
         (
             "Show what is running",
@@ -137,6 +138,7 @@ const PAGES: &[(Page, AppIcon)] = &[
     (Page::Activity, AppIcon::Robot),
     (Page::Jobs, AppIcon::Clock),
     (Page::Workflows, AppIcon::Workflow),
+    (Page::Wallet, AppIcon::Wallet),
 ];
 
 /// The appearances the palette offers, as the setting stores them.
@@ -609,6 +611,7 @@ mod tests {
             Page::Jobs,
             Page::Activity,
             Page::Workflows,
+            Page::Wallet,
         ];
         for page in pages {
             let listed = PAGES.iter().any(|&(p, _)| p == page);
