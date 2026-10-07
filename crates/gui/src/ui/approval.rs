@@ -366,7 +366,7 @@ impl Chat {
                 .into_iter()
                 .map(|call| {
                     let checking = self.judging.as_ref().is_some_and(|(id, _)| *id == call.id);
-                    h_flex()
+                    let line = h_flex()
                         .gap_2()
                         .items_center()
                         .text_xs()
@@ -382,9 +382,15 @@ impl Chat {
                                 .font_family(MONO_FONT)
                                 .child(tools::summary(&call.name, &call.arguments)),
                         )
-                        .when(checking, |row| row.child("checking…"))
+                        .when(checking, |row| row.child("checking…"));
+                    // The sweep under it as wide as what it says.
+                    v_flex()
+                        .gap(px(3.))
+                        .child(line)
+                        .child(crate::ui::busy::Sweep)
                 });
-            return Some(v_flex().gap_1().children(lines).into_any_element());
+            let lines = v_flex().items_start().gap_1().children(lines);
+            return Some(lines.into_any_element());
         }
 
         // Worked out when the card came up; here only if it somehow was not.

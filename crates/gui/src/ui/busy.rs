@@ -1,5 +1,6 @@
-//! The marks that say something is under way -- the spinner and the dot
-//! beside a reply coming in -- drawn some 25 times a second.
+//! The marks that say something is under way -- the spinner, the dot
+//! beside a reply coming in and the sweep under a running call -- drawn
+//! some 25 times a second.
 //!
 //! gpui's own animations ask for a frame at every refresh of the display, 165
 //! a second on a fast panel, and nothing in the window is cached, so one
@@ -67,6 +68,44 @@ impl RenderOnce for Spinner {
     }
 }
 
+/// A thin line under a call that is running, a short soft stretch of the
+/// theme's accent passing along it once every `motion::PASS`: it says the
+/// call is at work, not how far along. An empty line of the same height
+/// while motion is reduced, so the row does not move.
+#[derive(IntoElement)]
+pub(crate) struct Sweep;
+
+/// How much of the line the moving stretch covers.
+const STRETCH: f32 = 0.3;
+
+impl RenderOnce for Sweep {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let line = div().relative().w_full().h(px(1.5)).overflow_hidden();
+        if cx.reduce_motion() {
+            return line;
+        }
+        next_frame(window, cx);
+        let accent = cx.theme().primary.opacity(0.6);
+        let clear = accent.opacity(0.);
+        // From just out of sight at the left to just out of sight at the right.
+        let at = ease_in_out(phase(crate::ui::motion::PASS)) * (1. + STRETCH) - STRETCH;
+        let half = |from, to| {
+            let (from, to) = (linear_color_stop(from, 0.), linear_color_stop(to, 1.));
+            div().h_full().flex_1().bg(linear_gradient(90., from, to))
+        };
+        line.child(
+            h_flex()
+                .absolute()
+                .top_0()
+                .h_full()
+                .left(relative(at))
+                .w(relative(STRETCH))
+                .child(half(clear, accent))
+                .child(half(accent, clear)),
+        )
+    }
+}
+
 /// The opacity of the dot beside a reply coming in, now: in and out once a
 /// second.
 pub(crate) fn breathing(window: &mut Window, cx: &mut App) -> f32 {
@@ -95,7 +134,7 @@ impl Global for Asked {}
 
 /// Ask for this window to be drawn again a tick from now, once however many
 /// marks it draws.
-fn next_frame(window: &mut Window, cx: &mut App) {
+pub(crate) fn next_frame(window: &mut Window, cx: &mut App) {
     let handle = window.window_handle();
     let id = handle.window_id();
     if !cx.default_global::<Asked>().0.insert(id) {
@@ -111,17 +150,62 @@ fn next_frame(window: &mut Window, cx: &mut App) {
     .detach();
 }
 
+/// How many windows have a frame asked for, for the window's tests.
+#[cfg(test)]
+pub(crate) fn asked(cx: &App) -> usize {
+    cx.try_global::<Asked>().map_or(0, |asked| asked.0.len())
+}
+
 #[cfg(test)]
 mod tests {
     // Not `use super::*`: the prelude's gpui `test` macro would shadow the
     // built-in attribute.
-    use super::{Asked, TICK, breathing};
-    use gpui::{Styled as _, TestAppContext, VisualTestContext, div, point, px, size};
+    use super::{Sweep, TICK, asked, breathing};
+    use gpui::prelude::FluentBuilder as _;
+    use gpui::{ParentElement as _, Styled as _, TestAppContext, VisualTestContext, div};
+    use gpui::{point, px, size};
 
-    /// How many windows have a frame asked for.
-    fn asked(cx: &mut VisualTestContext) -> usize {
-        cx.update(|_, cx| cx.try_global::<Asked>().map_or(0, |asked| asked.0.len()))
+    /// Draw a frame with a running call's sweep in it, or without one.
+    fn draw(cx: &mut VisualTestContext, running: bool) {
+        let space = size(px(320.), px(20.));
+        cx.draw(point(px(0.), px(0.)), space, |_, _| {
+            div().w(px(320.)).when(running, |line| line.child(Sweep))
+        });
     }
+
+    fn asked_now(cx: &mut VisualTestContext) -> usize {
+        cx.update(|_, cx| asked(cx))
+    }
+
+    #[gpui::test]
+    fn a_running_call_asks_for_one_frame_a_tick_ahead_and_none_once_it_is_done(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::theme::init);
+        let cx = cx.add_empty_window();
+        draw(cx, true);
+        assert_eq!(asked_now(cx), 1);
+        cx.executor().advance_clock(TICK);
+        cx.run_until_parked();
+        assert_eq!(asked_now(cx), 0);
+        // Done: drawn without its sweep, the window asks for nothing more.
+        draw(cx, false);
+        cx.executor().advance_clock(TICK * 10);
+        cx.run_until_parked();
+        assert_eq!(asked_now(cx), 0);
+    }
+
+    #[gpui::test]
+    fn a_running_call_asks_for_nothing_while_motion_is_reduced(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::theme::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let cx = cx.add_empty_window();
+        draw(cx, true);
+        assert_eq!(asked_now(cx), 0);
+    }
+
 
     /// Draw a frame with the dot at the end of a reply coming in, and say
     /// how strong it was drawn.
@@ -140,15 +224,15 @@ mod tests {
         let cx = cx.add_empty_window();
         draw_dot(cx);
         draw_dot(cx);
-        assert_eq!(asked(cx), 1);
+        assert_eq!(asked_now(cx), 1);
         // A tick on, the window is drawn again; the reply done, without
         // the dot, nothing more is asked.
         cx.executor().advance_clock(TICK);
         cx.run_until_parked();
-        assert_eq!(asked(cx), 0);
+        assert_eq!(asked_now(cx), 0);
         cx.executor().advance_clock(TICK * 10);
         cx.run_until_parked();
-        assert_eq!(asked(cx), 0);
+        assert_eq!(asked_now(cx), 0);
     }
 
     #[gpui::test]
@@ -156,6 +240,6 @@ mod tests {
         cx.update(|cx| cx.set_reduce_motion(true));
         let cx = cx.add_empty_window();
         assert_eq!(draw_dot(cx), 1.);
-        assert_eq!(asked(cx), 0);
+        assert_eq!(asked_now(cx), 0);
     }
 }

@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use crate::ui::motion::{Fold, Row};
 use gpui_component::notification::Notification;
 use letronna_core::failure::{self, Failure, FailureKind, Fix, Kept};
 use letronna_core::tool_runs::Run;
@@ -40,6 +41,47 @@ pub(crate) struct WaitingRetry {
     pub(crate) session: u64,
     /// When, in seconds since 1970.
     pub(crate) at: u64,
+}
+
+/// How long each call the window ran took, for its row to say: timed from
+/// when it started to when its result came back, by the call's id while it
+/// runs, then by the result's place in its session once kept there. Calls
+/// run before the window opened, or by another Letronna, are not timed.
+#[derive(Default)]
+pub(crate) struct CallTimes {
+    started: std::collections::HashMap<String, std::time::Instant>,
+    ran: std::collections::HashMap<String, std::time::Duration>,
+    kept: std::collections::HashMap<(u64, usize), std::time::Duration>,
+}
+
+impl CallTimes {
+    /// Call `id` starts running.
+    pub(crate) fn start(&mut self, id: &str) {
+        let now = std::time::Instant::now();
+        self.started.insert(id.to_owned(), now);
+    }
+
+    /// Call `id`'s result came back.
+    pub(crate) fn stop(&mut self, id: &str) {
+        if let Some(started) = self.started.remove(id) {
+            self.ran.insert(id.to_owned(), started.elapsed());
+        }
+    }
+
+    /// `results` are kept in `session`, from place `first` on.
+    pub(crate) fn keep(&mut self, session: u64, first: usize, results: &[Message]) {
+        for (n, result) in results.iter().enumerate() {
+            if let Some(took) = self.ran.remove(&result.tool_call_id) {
+                self.kept.insert((session, first + n), took);
+            }
+        }
+    }
+
+    /// How long the call whose result is at `key`, a session and a place,
+    /// ran.
+    pub(crate) fn took(&self, key: (u64, usize)) -> Option<std::time::Duration> {
+        self.kept.get(&key).copied()
+    }
 }
 
 impl Chat {
@@ -1037,8 +1079,22 @@ impl Chat {
             if !this.thinking_open.remove(&key) {
                 this.thinking_open.insert(key);
             }
+            this.motion.opened.note(Fold::Output, key, cx);
             cx.notify();
         };
+        // How it ended, for a call that ran: done, or failed. A call turned
+        // down or a question answered says so in words.
+        let mark = if failed {
+            Some((IconName::Close, cx.theme().danger))
+        } else if message.is_error || message.name == letronna_core::tools::ASK_USER {
+            None
+        } else {
+            Some((IconName::Check, cx.theme().muted_foreground))
+        };
+        let ended = mark.map(|mark| {
+            let came = self.motion.rows.came(Row::Message, index, cx);
+            outcome(mark, self.call_times.took(key), came, window, cx)
+        });
         let session = key.0;
         let copied = edited.map(|edit| edit.text.clone());
         v_flex()
@@ -1114,6 +1170,7 @@ impl Chat {
                                 .child(from),
                         )
                     })
+                    .children(ended)
                     .when(open || page, |row| row.child(div().flex_1()))
                     // All of it, however little the preview shows; read when
                     // copied, not copied out at every frame.
@@ -1224,16 +1281,16 @@ impl Chat {
                     window,
                     cx,
                 );
-                this.child(
-                    div()
-                        .ml_2()
-                        .pl_3()
-                        .min_w_0()
-                        .border_l_2()
-                        .border_color(cx.theme().border)
-                        .text_color(cx.theme().muted_foreground)
-                        .child(preview),
-                )
+                let output = div()
+                    .ml_2()
+                    .pl_3()
+                    .min_w_0()
+                    .border_l_2()
+                    .border_color(cx.theme().border)
+                    .text_color(cx.theme().muted_foreground)
+                    .child(preview)
+                    .into_any_element();
+                this.child((self.motion.opened).ease(Fold::Output, key, output, window, cx))
             })
     }
 
@@ -1471,6 +1528,20 @@ impl Chat {
                 _ => None,
             }
         });
+        // Done, or with a call that failed, once nothing in it runs. While
+        // one does, the line under the turn that says so has the sweep.
+        let ended = running.is_none().then(|| {
+            let failed = (run.first..=run.last).any(|i| {
+                (conversation.messages.get(i)).is_some_and(letronna_core::tool_runs::failed)
+            });
+            let mark = if failed {
+                (IconName::Close, cx.theme().danger)
+            } else {
+                (IconName::Check, cx.theme().muted_foreground)
+            };
+            let came = self.motion.rows.came(Row::Message, run.last, cx);
+            outcome(mark, None, came, window, cx)
+        });
         let theme = cx.theme();
         let (muted, plain, danger) = (theme.muted_foreground, theme.foreground, theme.danger);
         let line: Vec<AnyElement> = match running {
@@ -1518,6 +1589,7 @@ impl Chat {
             if !this.runs_open.remove(&key) {
                 this.runs_open.insert(key);
             }
+            this.motion.opened.note(Fold::Run, key, cx);
             cx.notify();
         };
         h_flex()
@@ -1547,6 +1619,7 @@ impl Chat {
                 .size_3(),
             )
             .children(line)
+            .children(ended)
             // As on a tool row, a press leaves the keys in the composer;
             // Tab is what picks the line out.
             .on_any_mouse_down(|_, window, _| window.prevent_default())
@@ -1592,6 +1665,7 @@ impl Chat {
             if !this.thinking_open.remove(&key) {
                 this.thinking_open.insert(key);
             }
+            this.motion.opened.note(Fold::Thought, key, cx);
             cx.notify();
         };
         let label = if live {
@@ -1602,6 +1676,43 @@ impl Chat {
                 None => "Thought".to_owned(),
             }
         };
+        let opened = open.then(|| {
+            let theme = cx.theme();
+            let inset = div()
+                .ml_2()
+                .pl_3()
+                .border_l_2()
+                .border_color(theme.border)
+                .text_color(theme.muted_foreground);
+            let body = if live {
+                // Plain text, not markdown parsed again at every token: the
+                // newest rows, held to the bottom of a box that grows to
+                // eight rows and then stays.
+                let rows = crate::ui::PREVIEW_ROWS;
+                let tail = crate::ui::rest(&message.reasoning, crate::ui::Cut::Tail, 200, rows)
+                    .map_or_else(
+                        || message.reasoning.trim_end().to_owned(),
+                        |rest| rest.shown,
+                    );
+                inset
+                    .flex()
+                    .flex_col()
+                    .justify_end()
+                    .max_h(crate::ui::CODE_LINE * rows as f32)
+                    .overflow_hidden()
+                    .text_xs()
+                    .line_height(crate::ui::CODE_LINE)
+                    .child(tail)
+            } else {
+                inset.text_sm().child(
+                    TextView::markdown(self.text_id("reason", index), message.reasoning.clone())
+                        .selectable(!window.has_active_dialog(cx))
+                        .line_height(px(21.)),
+                )
+            };
+            let body = body.into_any_element();
+            (self.motion.opened).ease(Fold::Thought, key, body, window, cx)
+        });
         let theme = cx.theme();
         v_flex()
             .w_full()
@@ -1639,52 +1750,7 @@ impl Chat {
                     }))
                     .on_action(cx.listener(move |this, _: &ToggleRun, _, cx| toggle(this, cx))),
             )
-            .when(open && live, |this| {
-                // Plain text, not markdown parsed again at every token: the
-                // newest rows, held to the bottom of a box that grows to
-                // eight rows and then stays.
-                let rows = crate::ui::PREVIEW_ROWS;
-                let tail = crate::ui::rest(&message.reasoning, crate::ui::Cut::Tail, 200, rows)
-                    .map_or_else(
-                        || message.reasoning.trim_end().to_owned(),
-                        |rest| rest.shown,
-                    );
-                this.child(
-                    div()
-                        .ml_2()
-                        .pl_3()
-                        .border_l_2()
-                        .border_color(theme.border)
-                        .flex()
-                        .flex_col()
-                        .justify_end()
-                        .max_h(crate::ui::CODE_LINE * rows as f32)
-                        .overflow_hidden()
-                        .text_xs()
-                        .line_height(crate::ui::CODE_LINE)
-                        .text_color(theme.muted_foreground)
-                        .child(tail),
-                )
-            })
-            .when(open && !live, |this| {
-                this.child(
-                    div()
-                        .ml_2()
-                        .pl_3()
-                        .border_l_2()
-                        .border_color(cx.theme().border)
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(
-                            TextView::markdown(
-                                self.text_id("reason", index),
-                                message.reasoning.clone(),
-                            )
-                            .selectable(!window.has_active_dialog(cx))
-                            .line_height(px(21.)),
-                        ),
-                )
-            })
+            .children(opened)
     }
 
     /// Time the thinking of the reply coming in, from its first reasoning
@@ -2134,6 +2200,46 @@ fn without_exit(output: &str) -> &str {
     }
 }
 
+/// How a call ended, as its row's end says it: how long it ran, when the
+/// window timed it, and its mark, both coming in -- the mark growing to its
+/// size -- if the call ended a moment ago, at `came`.
+fn outcome(
+    (mark, color): (IconName, Hsla),
+    took: Option<std::time::Duration>,
+    came: Option<std::time::Instant>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let t = came.map_or(1., |came| {
+        crate::ui::motion::progress_ticked(came, crate::ui::motion::QUICK, window, cx)
+    });
+    let scale = crate::ui::motion::MARK_FROM + (1. - crate::ui::motion::MARK_FROM) * t;
+    h_flex()
+        .flex_none()
+        .gap_1()
+        .items_center()
+        .opacity(t)
+        .children(took.and_then(ran_for))
+        .child(
+            Icon::new(mark)
+                .size_3()
+                .text_color(color)
+                .transform(Transformation::scale(size(scale, scale))),
+        )
+        .into_any_element()
+}
+
+/// How long a call ran: to a tenth of a second under ten seconds, then as
+/// a thought's time; nothing for a call quicker than a tenth, which is no
+/// news.
+fn ran_for(took: std::time::Duration) -> Option<String> {
+    match took.as_millis() {
+        0..100 => None,
+        100..10_000 => Some(format!("{:.1}s", took.as_secs_f32())),
+        _ => Some(took_for(took)),
+    }
+}
+
 /// How long thinking took, as its line says it: "12s", "1m 5s".
 fn took_for(time: std::time::Duration) -> String {
     match time.as_secs() {
@@ -2433,8 +2539,8 @@ mod tests {
     // Deliberately not `use super::*`: the prelude re-exports gpui, whose own
     // `test` macro would shadow the built-in attribute here.
     use super::{
-        countdown, edited_by, ends_thinking, exit_code, prompt_rest, retry_due, rewind_leaves,
-        took_for, usage_line, without_exit,
+        CallTimes, countdown, edited_by, ends_thinking, exit_code, prompt_rest, ran_for, retry_due,
+        rewind_leaves, took_for, usage_line, without_exit,
     };
     use letronna_core::chat::{Draft, Event, Message};
 
@@ -2597,5 +2703,39 @@ mod tests {
             ..ran(Some(why))
         };
         assert_eq!(rewind_leaves(&wrote), None);
+    }
+
+    #[test]
+    fn a_call_is_timed_from_its_start_to_its_result_and_kept_by_its_place() {
+        let mut times = CallTimes::default();
+        times.start("call_1");
+        times.start("call_2");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        times.stop("call_2");
+        // A result that comes back for a call never started has no time.
+        times.stop("call_9");
+        let result = |id: &str| Message {
+            role: "tool".into(),
+            tool_call_id: id.into(),
+            ..Default::default()
+        };
+        times.keep(7, 4, &[result("call_9"), result("call_2")]);
+        assert_eq!(times.took((7, 4)), None);
+        let took = times.took((7, 5));
+        assert!(took.is_some_and(|took| took.as_millis() >= 20));
+        // Still running, so not kept yet; kept once, never again.
+        times.keep(7, 6, &[result("call_1"), result("call_2")]);
+        assert_eq!(times.took((7, 6)), None);
+        assert_eq!(times.took((7, 7)), None);
+    }
+
+    #[test]
+    fn how_long_a_call_ran_reads_in_tenths_then_whole_seconds_and_a_blink_not_at_all() {
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(ran_for(ms(40)), None);
+        assert_eq!(ran_for(ms(100)).as_deref(), Some("0.1s"));
+        assert_eq!(ran_for(ms(4_260)).as_deref(), Some("4.3s"));
+        assert_eq!(ran_for(ms(12_400)).as_deref(), Some("12s"));
+        assert_eq!(ran_for(ms(125_000)).as_deref(), Some("2m 5s"));
     }
 }

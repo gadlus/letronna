@@ -451,6 +451,8 @@ pub(crate) struct Chat {
     /// Runs of tool calls shown as their rows rather than one line, by
     /// session id and the place of the run's first call.
     pub(crate) runs_open: std::collections::HashSet<(u64, usize)>,
+    /// How long the calls run here took, for their rows.
+    pub(crate) call_times: crate::ui::messages::CallTimes,
     /// The files the newest finished turn changed, for the card after it,
     /// and the session and length last read for it, read or not yet.
     pub(crate) turn_files: Option<crate::ui::actions::TurnFiles>,
@@ -1025,6 +1027,7 @@ impl Chat {
             edit_message,
             thinking_open: std::collections::HashSet::new(),
             runs_open: std::collections::HashSet::new(),
+            call_times: Default::default(),
             turn_files: None,
             turn_files_for: None,
             video: None,
@@ -2631,8 +2634,10 @@ impl Chat {
                     .unwrap_or_default();
                 if let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) {
                     let conversation = &mut self.store.conversations[ix];
+                    let first = conversation.messages.len();
                     conversation.messages.extend(results);
                     let session = conversation.id;
+                    (self.call_times).keep(session, first, &conversation.messages[first..]);
                     // The files the tools wrote are noted on these results,
                     // which are in the conversation only from here.
                     self.refresh_changes(cx);
@@ -2735,6 +2740,7 @@ impl Chat {
         ctx.cancel = self.turn_stop.clone();
         self.call_running = true;
         let (id, name) = (call.id.clone(), call.name.clone());
+        self.call_times.start(&id);
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let _ = tx.send_blocking(letronna_core::tools::run(&call.name, &call.arguments, &ctx));
@@ -2760,6 +2766,7 @@ impl Chat {
     /// Record the outcome of a call that ran, and move on once the rest of
     /// its batch is back too.
     fn record_ran(&mut self, id: &str, result: Result<String, String>, cx: &mut Context<Self>) {
+        self.call_times.stop(id);
         self.outstanding = self.outstanding.saturating_sub(1);
         self.call_running = self.outstanding > 0;
         if let Some(turn) = self.turn.as_mut() {
@@ -3321,7 +3328,7 @@ impl Chat {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::ui::actions::shows_bar;
-        use crate::ui::motion::Row;
+        use crate::ui::motion::{Fold, Row};
         let Some(&span) = self.turns.get(n) else {
             return self.under_turns(column, window, cx);
         };
@@ -3414,6 +3421,14 @@ impl Chat {
                 continue;
             }
             let row = self.message_row(i, m, labeled, false, bar, window, cx);
+            // The calls of a run just opened come in with it.
+            let row = match run.filter(|_| folded.is_none()) {
+                Some(run) => {
+                    let key = (conversation.id, run.first);
+                    (self.motion.opened).ease(Fold::Run, key, row, window, cx)
+                }
+                None => row,
+            };
             let row = if hit.take_if(|&mut (_, at)| i >= at).is_some() {
                 self.mark_hit(row, cx)
             } else {

@@ -39,6 +39,12 @@ pub(crate) const SETTLE: Duration = Duration::from_millis(200);
 /// How strong a new piece of a reply starts out: about as faint as muted
 /// text, not invisible, so the line never looks as if it were missing words.
 const FAINT: f32 = 0.45;
+/// One pass of the thin sweep under a call that is running: unhurried, as
+/// it says only that the call is still at work, not how far along it is.
+pub(crate) const PASS: Duration = Duration::from_millis(1400);
+/// How small a call's outcome mark starts as it comes in, against its
+/// full size.
+pub(crate) const MARK_FROM: f32 = 0.85;
 
 /// An animation for something coming in.
 pub(crate) fn enter(duration: Duration) -> Animation {
@@ -71,6 +77,25 @@ pub(crate) fn progress(since: Instant, duration: Duration, window: &mut Window, 
     let t = fraction(since, cx.background_executor().now(), duration);
     if t < 1. {
         window.request_animation_frame();
+    }
+    ease_out_cubic(t)
+}
+
+/// As `progress`, for something small that comes in beside work under way:
+/// the next frame is asked for a tick ahead, as the busy marks ask, rather
+/// than at the next refresh.
+pub(crate) fn progress_ticked(
+    since: Instant,
+    duration: Duration,
+    window: &mut Window,
+    cx: &mut App,
+) -> f32 {
+    if cx.reduce_motion() {
+        return 1.;
+    }
+    let t = fraction(since, cx.background_executor().now(), duration);
+    if t < 1. {
+        crate::ui::busy::next_frame(window, cx);
     }
     ease_out_cubic(t)
 }
@@ -150,12 +175,13 @@ fn switched(on: bool, held: Option<bool>, flag: bool) -> Switch {
 }
 
 /// The pieces of the window that come in: the sidebar, the panel beside the
-/// chat and the rows of the chat.
+/// chat, the rows of the chat and what the user opens in them.
 #[derive(Default)]
 pub(crate) struct Moves {
     pub(crate) sidebar: Entrance,
     pub(crate) panel: Entrance,
     pub(crate) rows: Arrivals,
+    pub(crate) opened: Opened,
 }
 
 /// Something that comes in whenever it is shown, as the sidebar does, and
@@ -253,6 +279,12 @@ impl Arrivals {
         rising(element, progress(since, GENTLE, window, cx))
     }
 
+    /// When the `row` at `place` came in, or None for one that was there
+    /// all along.
+    pub(crate) fn came(&self, row: Row, place: usize, cx: &App) -> Option<Instant> {
+        self.since(row, place, cx.background_executor().now())
+    }
+
     /// When the `row` at `place` was first drawn, or None for one that was
     /// there all along.
     fn since(&self, row: Row, place: usize, now: Instant) -> Option<Instant> {
@@ -260,6 +292,48 @@ impl Arrivals {
             return None;
         }
         Some(*self.since.borrow_mut().entry((row, place)).or_insert(now))
+    }
+}
+
+/// What can be opened in the chat and folded again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Fold {
+    /// A reply's thinking.
+    Thought,
+    /// A call's output.
+    Output,
+    /// A run of calls drawn as one line.
+    Run,
+}
+
+/// When each thing in the chat was last opened or folded by the user, by
+/// session and place, so what opens eases in. Its height is there at once:
+/// gpui lays it out whole, and what a reply's text needs is only known a
+/// moment later, once its markdown is laid out.
+#[derive(Default)]
+pub(crate) struct Opened(HashMap<(Fold, u64, usize), Instant>);
+
+impl Opened {
+    /// The user opened or folded `fold` at `key`, a session and a place.
+    pub(crate) fn note(&mut self, fold: Fold, key: (u64, usize), cx: &App) {
+        let now = cx.background_executor().now();
+        self.0.insert((fold, key.0, key.1), now);
+    }
+
+    /// `element`, what `fold` at `key` shows open, coming in if it was
+    /// opened a moment ago.
+    pub(crate) fn ease(
+        &self,
+        fold: Fold,
+        key: (u64, usize),
+        element: AnyElement,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let Some(&since) = self.0.get(&(fold, key.0, key.1)) else {
+            return element;
+        };
+        rising(element, progress_ticked(since, STANDARD, window, cx))
     }
 }
 
@@ -307,9 +381,11 @@ pub(crate) fn veil_layer(window: &mut Window, cx: &mut App) -> Option<Div> {
 mod tests {
     // Not `use super::*`: the prelude's gpui `test` macro would shadow the
     // built-in attribute.
-    use super::{Arrivals, Entrance, Row, SETTLE, Switch, fraction, settling, switched};
-    use gpui::{Context, IntoElement, Render, SharedString, TestAppContext};
-    use gpui::{Window, WindowHandle, px, size};
+    use super::{Arrivals, Entrance, Fold, Opened, Row, SETTLE, STANDARD, Switch};
+    use super::{fraction, progress_ticked, settling, switched};
+    use crate::ui::busy::asked;
+    use gpui::{Context, IntoElement, Render, SharedString, TestAppContext, VisualTestContext};
+    use gpui::{Window, WindowHandle, div, point, px, size};
     use std::cell::Cell;
     use std::rc::Rc;
     use std::time::{Duration, Instant};
@@ -388,6 +464,43 @@ mod tests {
         rows.note(1, 10, false);
         assert_eq!(rows.since(Row::Message, 9, now), None);
         assert_eq!(rows.since(Row::Message, 10, now), Some(now));
+    }
+
+    /// Draw a frame with what `fold` at `key` shows open, and say how many
+    /// windows then have a frame asked for.
+    fn draw_open(opened: &Opened, key: (u64, usize), cx: &mut VisualTestContext) -> usize {
+        let space = size(px(320.), px(40.));
+        cx.draw(point(px(0.), px(0.)), space, |window, cx| {
+            opened.ease(Fold::Output, key, div().into_any_element(), window, cx)
+        });
+        cx.update(|_, cx| asked(cx))
+    }
+
+    #[gpui::test]
+    fn what_the_user_opens_eases_in_a_tick_at_a_time_and_then_stays(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let mut opened = Opened::default();
+        // Open since the session came up, as a failed call's output is.
+        assert_eq!(draw_open(&opened, (1, 4), cx), 0);
+        cx.update(|_, cx| opened.note(Fold::Output, (1, 4), cx));
+        assert_eq!(draw_open(&opened, (1, 4), cx), 1);
+        // In, it asks for nothing more.
+        let settled = STANDARD + Duration::from_millis(40);
+        cx.executor().advance_clock(settled);
+        cx.run_until_parked();
+        assert_eq!(draw_open(&opened, (1, 4), cx), 0);
+    }
+
+    #[gpui::test]
+    fn what_the_user_opens_is_there_at_once_while_motion_is_reduced(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let cx = cx.add_empty_window();
+        let mut opened = Opened::default();
+        cx.update(|_, cx| opened.note(Fold::Output, (1, 4), cx));
+        assert_eq!(draw_open(&opened, (1, 4), cx), 0);
+        let since = cx.update(|_, cx| cx.background_executor().now());
+        let t = cx.update(|window, cx| progress_ticked(since, STANDARD, window, cx));
+        assert_eq!(t, 1.);
     }
 
     /// A reply as the chat draws it, counting the frames it is drawn in.
