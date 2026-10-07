@@ -3,6 +3,17 @@
  "repository": "https://github.com/Qihoo360/harness-bench",
  "commit": "1025086a446653702b80cfb48babbeec35db6b2c",
  "tasks": {
+  "011-code-debug": {
+   "ceiling": 0.8725,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "hard ceiling",
+     "checks": ["fix_quality"],
+     "reason": "tasks/011-code-debug/oracle_grade.py:133-140 adds 0.05 each for a FIX comment, a log naming layer, fix and issue, and all layers fixed, so quality is 0.15 at most, but line 146 passes the check only above 0.5. Line 142 then weighs that 0.15 by the check's 0.15 again, so a run that fixes all five layers in the optimal five rounds with a perfect log scores 0.60 + 0.25 + 0.0225 = 0.8725 and never passes."
+    }
+   ]
+  },
   "012-doc-synthesis": {
    "ceiling": 0.75,
    "exclude_from_tuning": true,
@@ -131,6 +142,17 @@
      "kind": "negation-blind phrase check",
      "checks": ["no_false_repro"],
      "reason": "tasks/073-research-repro-package/oracle_grade.py:84-86 fails the report on any phrase in ground_truth.json:17-24, negated or not, so 'not fully reproducible' counts as claiming success."
+    }
+   ]
+  },
+  "076-medical-admin-claim-check": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["stale_mismatched_docs"],
+     "reason": "tasks/076-medical-admin-claim-check/oracle_grade.py:48-49 wants the lowercase strings in ground_truth.json:23-27, \"proof_of_payment stale\" and \"provider_order mismatched\", word for word in missing_items.md or admin_notes, while prompt.txt:22 asks only to mention that proof_of_payment (as submitted) is administratively stale and that provider_order (as submitted) is claim_id mismatched. That sentence copied as written fails, and so does \"the proof_of_payment is stale\"; only the two words side by side pass. The check weighs 0.06 of 1.00, so an answer otherwise right scores 0.94."
     }
    ]
   },
