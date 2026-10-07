@@ -32,6 +32,10 @@ pub(crate) const GENTLE: Duration = Duration::from_millis(220);
 /// How far, in pixels, something travels as it comes in: enough to say
 /// where it came from, too little to read as a move across the window.
 pub(crate) const RISE: f32 = 8.;
+/// One pass of the light across a label for what is under way, as
+/// "Thinking…" or a call running: slow enough to stay calm, quick enough
+/// that the window never looks stuck.
+pub(crate) const SWEEP: Duration = Duration::from_millis(1800);
 /// New words of a reply coming in, settling from faint to their full
 /// colour: long enough to read as settling, short enough that the newest
 /// words are never left faint behind a fast stream.

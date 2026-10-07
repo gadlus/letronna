@@ -272,28 +272,35 @@ impl Chat {
             // no such reply of its own -- and long done thinking.
             div().into_any_element()
         } else if message.content.is_empty() {
-            h_flex()
-                .gap_2()
-                .items_center()
-                .text_color(cx.theme().muted_foreground)
-                .child(
-                    crate::ui::busy::Spinner::new()
-                        .xsmall()
-                        .color(cx.theme().primary),
-                )
-                .child({
-                    let live = self.turn.as_ref().filter(|_| streaming).map(|t| &t.live);
-                    match (
-                        live.and_then(|l| l.retrying),
-                        live.is_some_and(|l| l.compacting),
-                    ) {
-                        (Some(retry), _) => retry.to_string(),
-                        (None, true) => "Compacting…".to_owned(),
-                        // A long write streams for a while; say so, not Thinking.
-                        (None, false) => writing.clone().unwrap_or("Thinking…".to_owned()),
-                    }
-                })
-                .into_any_element()
+            let live = self.turn.as_ref().filter(|_| streaming).map(|t| &t.live);
+            let doing = match (
+                live.and_then(|l| l.retrying),
+                live.is_some_and(|l| l.compacting),
+            ) {
+                (Some(retry), _) => Some(retry.to_string()),
+                (None, true) => Some("Compacting…".to_owned()),
+                // A long write streams for a while; say so, not Thinking.
+                (None, false) => writing.clone(),
+            };
+            // Thinking shown as it comes in says Thinking above this already.
+            let thinking_shown = !message.reasoning.is_empty() && self.store.settings.thinking;
+            if doing.is_none() && thinking_shown {
+                div().into_any_element()
+            } else {
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        crate::ui::busy::Spinner::new()
+                            .xsmall()
+                            .color(cx.theme().primary),
+                    )
+                    .child(crate::ui::busy::Shimmer::new(
+                        doing.unwrap_or("Thinking…".to_owned()),
+                    ))
+                    .into_any_element()
+            }
         } else {
             // Each fence rests at its first rows; one button beside any long
             // one shows them all, and the reply is drawn again in a view of
@@ -437,7 +444,7 @@ impl Chat {
                                     .xsmall()
                                     .color(cx.theme().primary),
                             )
-                            .child(label),
+                            .child(crate::ui::busy::Shimmer::new(label)),
                     )
                 },
             )
@@ -590,7 +597,7 @@ impl Chat {
         let answer = match &aside.answer {
             None => div()
                 .text_color(muted)
-                .child("Thinking…")
+                .child(crate::ui::busy::Shimmer::new("Thinking…"))
                 .into_any_element(),
             Some(Ok(reply)) => v_flex()
                 .gap_1()
@@ -1545,23 +1552,23 @@ impl Chat {
         let theme = cx.theme();
         let (muted, plain, danger) = (theme.muted_foreground, theme.foreground, theme.danger);
         let line: Vec<AnyElement> = match running {
-            Some(call) => vec![
-                crate::ui::busy::Spinner::new()
-                    .xsmall()
-                    .color(theme.primary)
-                    .into_any_element(),
-                div()
-                    .flex_none()
-                    .text_color(plain)
-                    .child(call.name.clone())
-                    .into_any_element(),
-                div()
-                    .font_family(MONO_FONT)
-                    .min_w_0()
-                    .truncate()
-                    .child(letronna_core::tools::summary(&call.name, &call.arguments))
-                    .into_any_element(),
-            ],
+            Some(call) => {
+                let summary = letronna_core::tools::summary(&call.name, &call.arguments);
+                let (name, summary) = crate::ui::busy::Shimmer::label(call.name.clone(), summary);
+                vec![
+                    crate::ui::busy::Spinner::new()
+                        .xsmall()
+                        .color(theme.primary)
+                        .into_any_element(),
+                    div().flex_none().child(name).into_any_element(),
+                    div()
+                        .font_family(MONO_FONT)
+                        .min_w_0()
+                        .truncate()
+                        .child(summary)
+                        .into_any_element(),
+                ]
+            }
             None => {
                 let told = letronna_core::tool_runs::tell(&conversation.messages, run, tools);
                 let coloured = [(told.did, plain), (told.failed, danger), (told.took, muted)];
@@ -1741,7 +1748,13 @@ impl Chat {
                         })
                         .size_3(),
                     )
-                    .child(label)
+                    .map(|row| {
+                        if live {
+                            row.child(crate::ui::busy::Shimmer::new(label))
+                        } else {
+                            row.child(label)
+                        }
+                    })
                     .on_any_mouse_down(|_, window, _| window.prevent_default())
                     .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                         if !event.is_keyboard() {

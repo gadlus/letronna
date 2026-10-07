@@ -376,12 +376,13 @@ impl Chat {
                                 .xsmall()
                                 .color(cx.theme().primary),
                         )
-                        .child(call.name.clone())
-                        .child(
-                            div()
-                                .font_family(MONO_FONT)
-                                .child(tools::summary(&call.name, &call.arguments)),
-                        )
+                        .map(|row| {
+                            let summary = tools::summary(&call.name, &call.arguments);
+                            let (name, summary) =
+                                crate::ui::busy::Shimmer::label(call.name.clone(), summary);
+                            row.child(name)
+                                .child(div().font_family(MONO_FONT).child(summary))
+                        })
                         .when(checking, |row| row.child("checking…"));
                     // The sweep under it as wide as what it says.
                     v_flex()
