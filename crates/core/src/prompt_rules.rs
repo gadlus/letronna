@@ -123,7 +123,7 @@ pub(crate) const PROSE: [Rule; 1] = [Rule {
 /// place of approvals and `ask_user`, neither of which it has; then checking
 /// the work, making calls, ending a turn, where facts come from, where to
 /// look first and the steps to ask about first.
-pub(crate) const TOOLS: [Rule; 22] = [
+pub(crate) const TOOLS: [Rule; 23] = [
     // Undoing what the user changed is the git rule's. New files and tests
     // are not forbidden, as checks and required outputs need them.
     Rule {
@@ -211,6 +211,13 @@ pub(crate) const TOOLS: [Rule; 22] = [
         id: "insufficient",
         to: To::Unwatched,
         text: "Where the inputs do not support an answer to something asked, say so plainly, in the task's own wording for it if it gives one, such as insufficient_evidence, rather than filling the gap from general knowledge or a guess.",
+    },
+    // Item by item, not "be thorough": a required source left out leaves an
+    // answer that reads as whole, and only going down the list finds it.
+    Rule {
+        id: "cited",
+        to: To::Unwatched,
+        text: "When the task asks for sources, citations or evidence, check before you finish that every claim, item, clause or source it requires is in your output, each with its citation in the form the task asks for, and add any that is missing.",
     },
     // In the reply that makes the call, since a reply with no call ends the
     // turn; a log rebuilt without the calls still says what each step was
