@@ -85,7 +85,7 @@ impl Default for Policy {
             sites_allow: Vec::new(),
             sites_block: Vec::new(),
             testnets: false,
-            prefer: vec![super::chains::BASE.into(), super::chains::SOLANA.into()],
+            prefer: vec![super::chains::SOLANA.into(), super::chains::BASE.into()],
         }
     }
 }

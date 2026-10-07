@@ -898,4 +898,37 @@ mod tests {
         );
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
+
+    #[test]
+    fn solana_is_tried_before_base_unless_the_user_says_otherwise() {
+        let base = json!({
+            "scheme": "exact", "network": chains::BASE, "amount": "10000",
+            "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "payTo": "0x209693Bc6afc0C5328bA36FaF03C514EF312287C", "maxTimeoutSeconds": 60,
+            "extra": {"name": "USD Coin", "version": "2"}
+        });
+        let solana = json!({
+            "scheme": "exact", "network": chains::SOLANA, "amount": "10000",
+            "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "payTo": "2wKupLR9q6wXYppw8Gr2NvWxKBUqm4PPJKkQfoxHDBg4", "maxTimeoutSeconds": 60,
+            "extra": {"feePayer": "EwWqGE4ZFKLofuestmU4LDdK7XM1N4ALgdZccwYugwGd"}
+        });
+        // Base listed first by the site, Solana chosen all the same.
+        let quote = Quote {
+            version: 2,
+            resource: Value::Null,
+            accepts: vec![base, solana],
+            error: String::new(),
+        };
+        let mut wallet = wallet();
+        assert_eq!(
+            choose(&quote, &wallet, "x.dev", false).unwrap().chain.id,
+            chains::SOLANA
+        );
+        wallet.policy.prefer = vec![chains::BASE.into()];
+        assert_eq!(
+            choose(&quote, &wallet, "x.dev", false).unwrap().chain.id,
+            chains::BASE
+        );
+    }
 }
