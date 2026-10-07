@@ -1218,6 +1218,12 @@ impl Conversation {
         if self.gone {
             return Ok(());
         }
+        // A session nothing was said in yet is not one: it gets its file with
+        // its first message, as the terminal's does, rather than being listed
+        // empty everywhere the moment New session is clicked.
+        if self.written.is_none() && self.messages.is_empty() {
+            return Ok(());
+        }
         self.append_to(&session_path(self.id), true)
     }
 
@@ -6787,6 +6793,45 @@ pub(crate) mod tests {
         assert_eq!(back.messages.len(), 1);
         // A new session's number counts it as taken.
         assert_eq!(super::load().next_id(), 7);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_new_session_gets_its_file_with_its_first_message() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("first-message");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        let id = store.reserve_id();
+        store.conversations.push(Conversation {
+            id,
+            title: "New session".into(),
+            ..Default::default()
+        });
+        // Saved as anything else changing saves, with nothing said yet.
+        store.save().unwrap();
+        assert!(summaries().iter().all(|s| s.id != id), "listed empty");
+        let reserved = std::fs::metadata(super::session_path(id)).unwrap();
+        assert_eq!(reserved.len(), 0);
+
+        store.conversations[0]
+            .messages
+            .push(said("user", "the first question"));
+        store.save().unwrap();
+        assert!(summaries().iter().any(|s| s.id == id && s.messages == 1));
+
+        // One left unsent still gives its number back on the way out.
+        let unsent = store.reserve_id();
+        store.conversations.push(Conversation {
+            id: unsent,
+            title: "New session".into(),
+            ..Default::default()
+        });
+        store.save().unwrap();
+        store.release_unused();
+        assert!(!super::session_path(unsent).exists());
+        assert!(super::session_path(id).exists());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
