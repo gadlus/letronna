@@ -122,6 +122,7 @@ pub(crate) fn secrets() -> Vec<String> {
         chats.email.password,
     ]);
     all.extend(crate::mcp::secrets());
+    all.extend(crate::wallet::secrets());
     let mut all: Vec<String> = all
         .into_iter()
         .map(|secret| secret.trim().to_owned())
