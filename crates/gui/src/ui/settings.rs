@@ -19,6 +19,11 @@ pub(crate) const PAGES: &[(&str, AppIcon)] = &[
     ("About", AppIcon::Info),
 ];
 
+/// How far down the window toasts start: below settings' close button and
+/// its focus ring, past settings' 44px margin and the button's row, 12px
+/// in and 20px tall. At gpui-component's 50px an error covered both.
+pub(crate) const TOASTS_TOP: Pixels = px(88.);
+
 impl Chat {
     /// Open a gateway's row to set it up, or close it if it is already open.
     pub(crate) fn select_gateway(
