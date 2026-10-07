@@ -441,8 +441,8 @@ impl Chat {
         self.streaming_id.filter(|&id| self.busy && id != on_screen)
     }
 
-    /// While a reply runs in another session this one cannot send, so say
-    /// where it is and whether it waits on the user, with a way there.
+    /// While the reply in another session waits on the user, say where, with
+    /// a way there; one that is only working leaves this one free to send.
     pub(crate) fn busy_note(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let id = self.busy_elsewhere()?;
         let title = &self.store.conversations[self.store.index_of(id)?].title;
@@ -450,11 +450,10 @@ impl Chat {
             matches!(turn.next(|_| letronna_core::gate::Outcome::Ask),
                 letronna_core::agent::Next::AskUser(call) if self.decide(&call, &self.rules) == letronna_core::gate::Outcome::Ask)
         });
-        let text = if waiting {
-            format!("\u{201c}{title}\u{201d} is waiting on you. Answer it there, then send here.")
-        } else {
-            format!("Letronna is replying in \u{201c}{title}\u{201d}. Send here once it is done.")
-        };
+        if !waiting {
+            return None;
+        }
+        let text = format!("\u{201c}{title}\u{201d} is waiting on you.");
         Some(
             h_flex()
                 .gap_2()
@@ -624,7 +623,9 @@ impl Chat {
             .plain(cx)
             .xsmall()
             .icon(Icon::new(IconName::Plus))
-            .disabled(self.busy)
+            // Pictures go with a message sent now, not one queued: not while
+            // the reply or the run is here, but beside a reply elsewhere.
+            .disabled((self.busy && self.busy_elsewhere().is_none()) || self.run_holds_open())
             .dropdown_menu(move |menu, _, _| {
                 let files = chat.clone();
                 let folder = chat.clone();
@@ -683,7 +684,7 @@ impl Chat {
             // Ctrl+Enter sends now what Enter would queue for the next step.
             // With nothing running it stays the new line it always was.
             .on_action(cx.listener(|this, _: &SendNow, window, cx| {
-                if !this.busy {
+                if !this.busy || this.busy_elsewhere().is_some() {
                     return cx.propagate();
                 }
                 this.send(window, cx);
@@ -774,9 +775,12 @@ impl Chat {
             .child(self.mic_button(cx))
             // Stop only where the reply is: in another session it would end
             // a reply that is not on screen.
-            // And between turns, while its goal is looked at.
+            // And between turns, while its goal is looked at, and while the
+            // session's own run beside the chat goes.
             .when(
-                (self.busy && self.busy_elsewhere().is_none()) || self.checking_goal(),
+                (self.busy && self.busy_elsewhere().is_none())
+                    || self.checking_goal()
+                    || self.run_holds_open(),
                 |row| {
                     // A turn can wait on a slow tool or a card nobody answers;
                     // this is the way out that does not need a restart.
@@ -787,27 +791,34 @@ impl Chat {
                             .rounded_full()
                             .icon(Icon::new(IconName::CircleX))
                             .tooltip_with_action("Stop", &Dismiss, None)
-                            .on_click(cx.listener(|this, _, _, cx| this.stop_turn(cx))),
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.run_holds_open() {
+                                    let id = this.store.conversations[this.store.active].id;
+                                    this.stop_run(id, cx);
+                                } else {
+                                    this.stop_turn(cx);
+                                }
+                            })),
                     )
                 },
             )
             // While a reply runs, sending queues the message for its next
-            // step, as in Claude Code, rather than doing nothing.
+            // step, as in Claude Code, rather than doing nothing; with the
+            // reply in another session, it runs beside it.
             .child(
                 Button::new("send")
                     .primary()
                     .xsmall()
                     .rounded_full()
                     .icon(Icon::new(IconName::ArrowUp))
-                    .tooltip(if self.busy {
+                    .tooltip(if self.run_holds_open() {
+                        "Send once this run is done (Enter)"
+                    } else if self.busy && self.busy_elsewhere().is_none() {
                         "Send after this step (Enter)"
                     } else {
                         "Send (Enter)"
                     })
-                    .disabled(
-                        (self.composer_empty && self.attached().is_empty())
-                            || self.busy_elsewhere().is_some(),
-                    )
+                    .disabled(self.composer_empty && self.attached().is_empty())
                     .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
             );
         let frame = if compact {

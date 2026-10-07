@@ -355,6 +355,8 @@ impl Chat {
         let filter = self.session_filter();
         (0..self.store.conversations.len())
             .rev()
+            // A new session is listed once something is said in it.
+            .filter(|&i| !untouched(&self.store.conversations[i]))
             .filter(|&i| {
                 query.is_empty()
                     || self.store.conversations[i]
@@ -518,13 +520,19 @@ impl Chat {
             }
         }
         if visible.is_empty() {
+            // Only a new session nothing was said in: there is none to match.
+            let none_yet = self.store.conversations.iter().all(untouched);
             sessions = sessions.child(
                 div()
                     .px_2()
                     .py_1()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("No sessions match"),
+                    .child(if none_yet {
+                        "No sessions yet"
+                    } else {
+                        "No sessions match"
+                    }),
             );
         }
 

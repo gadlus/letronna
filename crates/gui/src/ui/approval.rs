@@ -881,7 +881,7 @@ impl Chat {
             .find(|request| request.root == root)?;
         let call = &request.call;
         let summary = tools::summary(&call.name, &call.arguments);
-        let title = wants(&format!("Helper {}", request.label), &call.name, &summary);
+        let title = wants(&self.asker(request), &call.name, &summary);
         let answer = |decision: Decision| {
             let (label, id) = (request.label.clone(), call.id.clone());
             cx.listener(move |this, _, _, cx| {

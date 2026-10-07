@@ -309,6 +309,8 @@ pub(crate) struct Chat {
     pub(crate) runs: std::collections::BTreeMap<u64, crate::runs::Run>,
     /// Where each held run's thread sends its end.
     pub(crate) run_ends: async_channel::Sender<crate::runs::Finished>,
+    /// Where each held run's thread tells its steps, as they happen.
+    pub(crate) run_steps: async_channel::Sender<(u64, letronna_core::driver::Step)>,
     /// The session each chat app is talking in, and the card each was sent.
     pub(crate) remote: letronna_core::remote::Dispatcher,
     /// Bumped when a turn is stopped. The stream thread of the stopped turn
@@ -863,6 +865,7 @@ impl Chat {
         };
         let draft_for = store.conversations[store.active].id;
         let (run_ends, ended_runs) = async_channel::unbounded();
+        let (run_steps, run_stepped) = async_channel::unbounded();
         let account = letronna_core::auth::account();
         // Nothing reachable yet: no account, and no key or URL saved for a
         // gateway that needs one. Ollama needs neither, so it is not asked.
@@ -967,6 +970,7 @@ impl Chat {
             slack_state: None,
             runs: Default::default(),
             run_ends,
+            run_steps,
             remote: Default::default(),
             generation: 0,
             reading: None,
@@ -1099,6 +1103,13 @@ impl Chat {
         let focus = this.changes.focus.clone();
         let tab = cx.on_focus_in(&focus, window, |this, _, cx| this.refresh_changes(cx));
         this._subscriptions.push(tab);
+        // A new session nothing was said in gives back the number it held,
+        // as the terminal's does on its way out.
+        let quitting = cx.on_app_quit(|this, _| {
+            this.store.release_unused();
+            async {}
+        });
+        this._subscriptions.push(quitting);
         this.load_models(window, cx);
         // Directly, not through `focus_composer`: the window's root does
         // not exist yet to ask about dialogs, and there can be none.
@@ -1106,6 +1117,7 @@ impl Chat {
             .update(cx, |input, cx| input.focus(window, cx));
         Self::watch_schedules(schedule_events, cx);
         Self::watch_runs(ended_runs, cx);
+        Self::watch_run_steps(run_stepped, cx);
         Self::watch_updates(cx);
         Self::watch_inbox(cx);
         // After the inbox listens, as a wake-up is a notice left in it. Every
@@ -1479,18 +1491,15 @@ impl Chat {
             None => {}
         }
         if self.run_holds_open() && (!prompt.is_empty() || !self.attached().is_empty()) {
-            self.error = Some(
-                "This session is running beside the chat. Wait for its answer, or stop it with \
-                 Escape."
-                    .into(),
-            );
-            cx.notify();
-            return;
+            return self.queue_after_run(prompt, window, cx);
         }
-        if self.busy && !prompt.is_empty() {
+        // A reply in another session leaves this one free: what is sent here
+        // runs beside it rather than waiting for it.
+        let elsewhere = self.busy_elsewhere().is_some();
+        if self.busy && !elsewhere && !prompt.is_empty() {
             return self.queue_follow_up(prompt, window, cx);
         }
-        if self.busy {
+        if self.busy && !elsewhere {
             return;
         }
         let images = self.attached().to_vec();
@@ -1528,7 +1537,12 @@ impl Chat {
             .update(cx, |input, cx| input.set_value("", window, cx));
         // Setting the box raises no change, so the chip is put right here.
         self.crew_reset(cx);
-        if self.dispatch(prompt, images, None, cx).is_err() {
+        let sent = if elsewhere {
+            self.send_beside(prompt, images, cx)
+        } else {
+            self.dispatch(prompt, images, None, cx)
+        };
+        if sent.is_err() {
             self.open_settings(window, cx);
         } else {
             self.attachments.remove(&session);
@@ -1572,27 +1586,35 @@ impl Chat {
                     Some(format!(
                         "{command} was not sent: its answer came after the box or the session changed."
                     ))
-                } else if this.busy && this.streaming_id != Some(session) {
-                    Some(
-                        "Another session is working. Send this when it is done, or stop it first."
-                            .into(),
-                    )
                 } else {
                     None
                 };
+                // Sent as a typed message is: after the run or the reply in
+                // this session, or beside a reply in another.
+                let elsewhere = this.busy_elsewhere().is_some();
                 match (expanded, refused) {
                     (Err(why), _) | (Ok(_), Some(why)) => {
                         this.error = Some(why);
                         cx.notify();
                     }
-                    (Ok(text), None) if this.busy => this.queue_follow_up(text, window, cx),
+                    (Ok(text), None) if this.run_holds_open() => {
+                        this.queue_after_run(text, window, cx)
+                    }
+                    (Ok(text), None) if this.busy && !elsewhere => {
+                        this.queue_follow_up(text, window, cx)
+                    }
                     (Ok(text), None) => {
                         this.composer
                             .update(cx, |input, cx| input.set_value("", window, cx));
                         tell_crew(session, &typed, crew::Source::Composer);
                         // Pictures attached go with it, as with a typed message.
                         let images = this.attached().to_vec();
-                        if this.dispatch(text, images, None, cx).is_err() {
+                        let sent = if elsewhere {
+                            this.send_beside(text, images, cx)
+                        } else {
+                            this.dispatch(text, images, None, cx)
+                        };
+                        if sent.is_err() {
                             this.open_settings(window, cx);
                         } else {
                             this.attachments.remove(&session);
@@ -1755,16 +1777,7 @@ impl Chat {
         }
         let conversation = &mut self.store.conversations[self.store.active];
         goal::interrupted(&mut conversation.goal);
-        // Name an untitled session after its first prompt, but leave a name
-        // that was set deliberately, such as a scheduled job's.
-        if conversation.messages.is_empty()
-            && (conversation.title.is_empty() || conversation.title == "New session")
-        {
-            let saved = letronna_core::workflow::saved::typed(&prompt);
-            let shown = letronna_core::init::typed(&prompt).or(saved.as_deref());
-            let shown = shown.unwrap_or(&prompt);
-            conversation.title = letronna_core::store::name_from(shown);
-        }
+        name_after(conversation, &prompt);
         conversation.updated = backend::now();
         // What came in meanwhile goes first, so the prompt is read last.
         conversation
@@ -1891,13 +1904,21 @@ impl Chat {
     ) -> Result<(), String> {
         // A second turn started over a running one would replace its agent
         // loop; the composer queues a follow-up here, which the bar cannot.
-        if self.busy {
+        // A reply in another session leaves this one free, and a new one is
+        // free whatever runs.
+        let previous = self.store.active;
+        let landing = (!new_session).then(|| self.store.conversations[previous].id);
+        if landing.is_some_and(|id| self.busy && self.streaming_id == Some(id)) {
             return Err("A reply is still running. Send this when it is done.".into());
+        }
+        if landing.is_some_and(|id| self.runs.contains_key(&id)) {
+            return Err(
+                "That session is running beside the chat. Send this when it is done.".into(),
+            );
         }
         if prompt.chars().count() > 12_000 {
             return Err("Please keep each message under 12,000 characters.".into());
         }
-        let previous = self.store.active;
         if new_session {
             let workspace = self.store.conversations[previous].workspace.clone();
             self.store.conversations.push(Conversation {
@@ -1912,6 +1933,7 @@ impl Chat {
         let session = self.store.conversations[self.store.active].id;
         tell_crew(session, &prompt, crew::Source::Composer);
         let sent = match self.prompt_for(prompt, cx) {
+            Some(prompt) if self.busy => self.send_beside(prompt, images, cx).is_ok(),
             Some(prompt) => self.dispatch(prompt, images, None, cx).is_ok(),
             None => false,
         };
@@ -2227,10 +2249,14 @@ impl Chat {
         }
         if !(self.page == Page::Chat && self.store.active == ix) {
             let title = &self.store.conversations[ix].title;
-            self.error = Some(format!(
-                "Helper {} in \"{title}\" is waiting for your answer.",
-                request.label
-            ));
+            self.error = Some(if self.own_run(&request) {
+                format!("\"{title}\" is waiting for your answer.")
+            } else {
+                format!(
+                    "Helper {} in \"{title}\" is waiting for your answer.",
+                    request.label
+                )
+            });
         }
         let mut ctx = letronna_core::tools::ToolContext::default();
         ctx.conversation = request.root;
@@ -3389,7 +3415,9 @@ impl Chat {
                 && !(streaming_here && i + 1 == messages.len());
             let bar = (!m.notice && (span.yours || ends)).then(|| {
                 let focused = focus.contains_focused(window, cx) && !in_menu;
-                let shown = shows_bar(span, messages.len(), streaming_here, focused);
+                // A run beside the chat is still answering the last turn too.
+                let answering = streaming_here || self.runs.contains_key(&session);
+                let shown = shows_bar(span, messages.len(), answering, focused);
                 self.turn_bar(span, shown, cx)
             });
             let run = letronna_core::tool_runs::holding(&runs, i);
@@ -3539,6 +3567,7 @@ impl Chat {
     ) -> AnyElement {
         let session = self.store.conversations[self.store.active].id;
         let mut rows: Vec<AnyElement> = Vec::new();
+        rows.extend(self.run_live(session, window, cx));
         rows.extend(self.helper_card(session, window, cx));
         rows.extend(self.aside_row(session, window, cx));
         h_flex()
@@ -4696,8 +4725,22 @@ fn escape_closes_aside(asked: u64, here: u64, replying: Option<u64>) -> bool {
     asked == here && replying != Some(here)
 }
 
-/// Whether a session is a new one nothing was said in yet.
-fn untouched(conversation: &Conversation) -> bool {
+/// Name an untitled session after its first prompt, but leave a name that
+/// was set deliberately, such as a scheduled job's.
+pub(crate) fn name_after(conversation: &mut Conversation, prompt: &str) {
+    if conversation.messages.is_empty()
+        && (conversation.title.is_empty() || conversation.title == "New session")
+    {
+        let saved = letronna_core::workflow::saved::typed(prompt);
+        let shown = letronna_core::init::typed(prompt).or(saved.as_deref());
+        let shown = shown.unwrap_or(prompt);
+        conversation.title = letronna_core::store::name_from(shown);
+    }
+}
+
+/// Whether a session is a new one nothing was said in yet: open in the
+/// window, but listed nowhere and kept off the disk until its first message.
+pub(crate) fn untouched(conversation: &Conversation) -> bool {
     conversation.messages.is_empty()
         && !conversation.unfilled()
         && conversation.title == "New session"
@@ -4741,7 +4784,7 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        card_is_up, cuts_in, escape_closes_aside, front_call, run_ended, running_calls,
+        card_is_up, cuts_in, escape_closes_aside, front_call, name_after, run_ended, running_calls,
         side_question, until_repeated_id, untouched,
     };
     use letronna_core::agent::{MAX_BATCH, Next, Turn};
@@ -4967,6 +5010,31 @@ mod tests {
         assert_eq!(side_question("/btw"), Some(""));
         assert_eq!(side_question("/btwx"), None);
         assert_eq!(side_question("tell me /btw"), None);
+    }
+
+    #[test]
+    fn a_new_session_is_named_after_its_first_prompt_only() {
+        use letronna_core::chat::Message;
+        use letronna_core::store::Conversation;
+        let mut new = Conversation {
+            title: "New session".into(),
+            ..Default::default()
+        };
+        name_after(&mut new, "fix the login page so it remembers me");
+        assert_eq!(new.title, "fix the login page so it remembers me");
+
+        // Once something was said, a later prompt leaves the name.
+        new.messages.push(Message::default());
+        name_after(&mut new, "and the logout");
+        assert_eq!(new.title, "fix the login page so it remembers me");
+
+        // As does a name given on purpose, as a scheduled job's.
+        let mut named = Conversation {
+            title: "Morning digest".into(),
+            ..Default::default()
+        };
+        name_after(&mut named, "what is new");
+        assert_eq!(named.title, "Morning digest");
     }
 
     #[test]

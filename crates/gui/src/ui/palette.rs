@@ -451,7 +451,10 @@ impl Chat {
         }));
 
         let now = backend::now();
-        let mut by_age: Vec<&Conversation> = self.store.conversations.iter().collect();
+        // A new session is listed once something is said in it.
+        let mut by_age: Vec<&Conversation> = (self.store.conversations.iter())
+            .filter(|c| !untouched(c))
+            .collect();
         by_age.sort_by_key(|c| std::cmp::Reverse(c.updated));
         let sessions = by_age
             .into_iter()
