@@ -391,6 +391,22 @@
     }
    ]
   },
+  "077-archive-manifest-defense": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["reject_core_required", "reject_duplicate_required", "reject_no_extra"],
+     "reason": "tasks/077-archive-manifest-defense/oracle_grade.py:59-61 keys a reject row on its archive_chain text, which lines 53-56 normalize only from 'incoming_a.zip/nested/...', and lines 124-126 compare those keys with ground_truth.json:77-101's 'incoming_a.zip>nested/payload.tar.gz'. prompt.txt:35-36 gives the CSV header but no chain format, and the only format it shows is the manifest's JSON list (line 26). The list written out as JSON text fails all three checks, single-archive rows such as '[\"incoming_b.tar\"]' included; 'incoming_a.zip > nested/payload.tar.gz' with spaces, which three of four runs wrote, fails the core and no-extra checks; only the bare '>' passes. That is 6 or 5 of 29 weight points."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["summary_terms"],
+     "reason": "tasks/077-archive-manifest-defense/oracle_grade.py:129 wants ground_truth.json:113-119's 'path traversal', with a space, in audit_summary.md, while prompt.txt:20 names the file and sets no content, and fixtures/in/expected_manifest_rules.json:11 names the reason 'path_traversal'. A summary that counts rejections by their reason tokens, as all four runs did, fails; adding the words with a space passes. 2 of 29 weight points."
+    }
+   ]
+  },
   "079-smallfile-batch-reject-ledger": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
