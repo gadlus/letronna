@@ -787,6 +787,16 @@
      "kind": "ambiguous convention",
      "checks": ["ledger"],
      "reason": "prompt_round2.txt:22 and idempotency_policy.md:6 name the four row categories but no columns. tasks/105-partial-batch-resume-ledger/oracle_grade.py:41-42 reads the category from status, then ledger_action, then action, so a ledger that keeps the category in row_type or disposition beside a status column of completed or rejected reads every row as completed and scores 0.2-0.35 against line 116's 0.75."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["partial_results"],
+     "reason": "tasks/105-partial-batch-resume-ledger/oracle_grade.py:122-146 scores round 1's partial_results.json from completed_ids, failed_ids, pending_ids and round, or from per_item_results or results entries whose status is completed (lines 126-132, through _results at lines 31-38), while prompt_round1.txt:10 names the file with no fields and line 18 gives these names to state.json alone. The run's completed_items, with each item's score, and failed_at ITEM-006 score 0.5; the check weighs 0 (line 147), but lines 165-166 cap the task at 0.70 below 0.75 and line 159 carries a quarter of the partial score into report_and_inputs, so the run fell from 0.874 to 0.70."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "tasks/105-partial-batch-resume-ledger/oracle_grade.py:81-83 gives 0.15 of final_results only when resume_audit holds skipped_preexisting_ids and retried_ids (line 82), while prompt_round2.txt:23 asks for resume_audit and names no keys. The run's skipped_preexisting and retried, the categories of prompt_round2.txt:22, cost 0.045 of the score inside a check that passes at 0.85, so no check fails but 1.0 is out of reach."
     }
    ]
   }
