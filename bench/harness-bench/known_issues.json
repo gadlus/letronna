@@ -976,6 +976,22 @@
      "reason": "tasks/105-partial-batch-resume-ledger/oracle_grade.py:81-83 gives 0.15 of final_results only when resume_audit holds skipped_preexisting_ids and retried_ids (line 82), while prompt_round2.txt:23 asks for resume_audit and names no keys. The run's skipped_preexisting and retried, the categories of prompt_round2.txt:22, cost 0.045 of the score inside a check that passes at 0.85, so no check fails but 1.0 is out of reach."
     }
    ]
+  },
+  "106-release-approval-gate-plan": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "tasks/106-release-approval-gate-plan/oracle_grade.py:29-32 turns each required_approvals item into a string, and line 92 gives 0.15 of the packet score only if those strings include every role of ground_truth.json:31, while prompt.txt:21 names required_approvals and gives it no form. A list of objects, one per role with the role, its status and the blockers it clears, matches none of them and costs 0.045 of the total (line 152); approval_packet still passes at 0.85."
+    },
+    {
+     "kind": "negation-blind phrase check",
+     "checks": ["audit_and_safety"],
+     "reason": "tasks/106-release-approval-gate-plan/oracle_grade.py:59-66 reads a term of ground_truth.json:32 such as 'rolled back' as a claim unless not, no, must not or do not comes within 40 characters before it, and 'nothing' is not one, so an audit trail saying 'Nothing has been deployed, rolled back, flagged, paged or migrated.', which obeys prompt.txt:26, loses 0.30 of audit_and_safety (line 149) and fails it at 0.70 against 0.75 (line 150). 'No action has been deployed, rolled back...' passes. The check weighs 0.20 (line 152), so the denial costs 0.06."
+    }
+   ]
   }
  }
 }
