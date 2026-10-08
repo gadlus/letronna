@@ -391,6 +391,17 @@
     }
    ]
   },
+  "088-api-contract-mock-client-compat": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["hidden_api_compat"],
+     "reason": "tasks/088-api-contract-mock-client-compat/oracle_grade.py:86 calls list_users(base + \"/v2/users?cursor=bad\", version=\"v2\"), handing the client an endpoint URL with a query string where fixtures/in/apiclient/contract.md:3 and the client's own signature (fixtures/in/apiclient/client.py:34-35) take the base URL. A client that builds on that base as client.py:45-52 does requests /v2/users?cursor=bad/v2/users; the hidden server reads the cursor as bad/v2/users rather than bad (lines 60-65) and serves the start page with nextCursor c2 (fixtures/in/mock_api/users_v2_start.json:1), and the next request, /v2/users?cursor=bad/v2/users?cursor=c2, gets the same page and the same cursor forever, so line 97's 20-second timeout fails hidden_api_compat. Lines 85-88 accept any return or exception but a hang, so only a guard against a repeated cursor, which neither prompt.txt nor contract.md asks for, passes. The check weighs 0.40 and lines 136-137 cap the task at 0.65, so a client right by the contract scores 0.6."
+    }
+   ]
+  },
   "089-ab-test-caveat-analysis": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
