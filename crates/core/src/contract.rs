@@ -8,8 +8,9 @@
 //! with what it spells out for them -- a CSV header or the columns it names,
 //! JSON keys and the keys each item of a list holds, the few values a field
 //! may take and the records it is left empty in, the names and words a file
-//! must use or must not, the codes the files it names to read hold bare --
-//! and each file is looked at on disk.
+//! must use or must not, the codes the files it names to read hold bare,
+//! the paths of inputs, alone and as the inputs write them -- and each file
+//! is looked at on disk.
 //!
 //! Both halves are plain text matching rather than a model's reading, so
 //! nothing is invented, and the matching leans to missing: a file counts only
@@ -342,6 +343,14 @@ const BEING: [&str; 11] = [
     "be", "is", "are", "to", "left", "kept", "stay", "remain", "must", "should", "shall",
 ];
 
+/// The last words of a key or column that say it names a file, as in
+/// `winning_source`, `source_file` or `superseded_sources`.
+const NAMING: [&str; 6] = ["source", "sources", "file", "files", "path", "paths"];
+
+/// The most entries under `in/` looked at to know which files are there:
+/// more than a task hands over, and past them a path goes unchecked.
+const LOOKED: usize = 5_000;
+
 /// Bad lines reported for one file: three show the pattern, and more would
 /// crowd out the other files.
 const LINES: usize = 3;
@@ -392,6 +401,9 @@ struct Output {
     codes: Vec<Codes>,
     /// The fields the request says to leave empty in records a code marks.
     empty: Vec<Empty>,
+    /// The files under `in/` and how the inputs write their paths, which a
+    /// field naming a source is held to.
+    sources: Sources,
     /// The file's size and change time as the request was read, if it was
     /// there then.
     found: Option<Stamp>,
@@ -434,6 +446,17 @@ struct Empty {
     /// The request's words for it, as "empty/null for true insufficient
     /// evidence".
     said: String,
+}
+
+/// The files under `in/` and the paths the inputs write for them, as an
+/// appendix writes `sources/a.md` for `in/sources/a.md`.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sources {
+    /// Each file under `in/`, from the workspace, as `in/sources/a.md`.
+    files: HashSet<String>,
+    /// For each file an input writes a path for with a folder in it, each
+    /// such path and the input writing it.
+    written: BTreeMap<String, Vec<(String, String)>>,
 }
 
 /// A file's size and the time it was last changed, where the system keeps one.
@@ -524,6 +547,7 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
                         forbidden: Vec::new(),
                         codes: Vec::new(),
                         empty: Vec::new(),
+                        sources: Sources::default(),
                         found,
                     });
                 }
@@ -724,6 +748,13 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
             }
         }
     }
+    // The files under `in/`, looked for only where an output has fields
+    // that may name one, and the paths the inputs write for them.
+    let mut known = Sources::default();
+    let fielded = |output: &Output| matches!(kind(&output.path).as_str(), "csv" | "json" | "jsonl");
+    if outputs.iter().any(fielded) {
+        known.files = files_under(workspace);
+    }
     // A file named to read may list what not to state, as a policy's
     // judgments never to write do, and that holds for every output too.
     let (mut sources, mut codes) = (Vec::new(), Vec::new());
@@ -734,6 +765,7 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
             continue;
         };
         codes.extend(codes_in(&input, &content));
+        written_in(&input, &content, &mut known);
         let lines: Vec<&str> = content.lines().collect();
         let stated: Vec<String> = (0..lines.len())
             .flat_map(|at| stated_at(&lines, at))
@@ -753,6 +785,7 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
         forbid(output, &everywhere);
         if matches!(kind(&output.path).as_str(), "csv" | "json" | "jsonl") {
             output.codes = codes.clone();
+            output.sources = known.clone();
         }
     }
     Contract { outputs }
@@ -819,6 +852,72 @@ fn codes_in(input: &str, content: &str) -> Vec<Codes> {
         _ => {}
     }
     found
+}
+
+/// The files under `workspace`'s `in/`, from the workspace with `/` between
+/// folders, as far as `LOOKED` entries go; a link is left out, as it leads
+/// elsewhere.
+fn files_under(workspace: &Path) -> HashSet<String> {
+    let mut files = HashSet::new();
+    let (mut folders, mut looked) = (vec![workspace.join("in")], 0);
+    while let Some(folder) = folders.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            looked += 1;
+            if looked > LOOKED {
+                return files;
+            }
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => folders.push(path),
+                Ok(kind) if kind.is_file() => {
+                    if let Ok(inside) = path.strip_prefix(workspace) {
+                        let parts: Vec<_> =
+                            inside.iter().map(|part| part.to_string_lossy()).collect();
+                        files.insert(parts.join("/"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    files
+}
+
+/// Adds to `known` the paths `content`, the input `input`, writes for files
+/// under `in/` with a folder in them, as `sources/a.md`; a name alone may be
+/// from the input's own folder.
+fn written_in(input: &str, content: &str, known: &mut Sources) {
+    if known.files.is_empty() {
+        return;
+    }
+    for word in words(content) {
+        let path = word.split('#').next().unwrap_or_default();
+        let path = path.strip_prefix("./").unwrap_or(path);
+        if !path.contains('/') {
+            continue;
+        }
+        let Some(file) = input_file(path, &known.files) else {
+            continue;
+        };
+        let forms = known.written.entry(file).or_default();
+        if !forms.iter().any(|(form, _)| form == path) {
+            forms.push((path.to_owned(), input.to_owned()));
+        }
+    }
+}
+
+/// The file among `files` that `path` names, from the workspace or from
+/// `in/`, as `in/a.md` and `a.md` both name `in/a.md`.
+fn input_file(path: &str, files: &HashSet<String>) -> Option<String> {
+    let path = path.strip_prefix("./").unwrap_or(path);
+    if files.contains(path) {
+        return Some(path.to_owned());
+    }
+    let inside = format!("in/{path}");
+    files.contains(&inside).then_some(inside)
 }
 
 /// The names in code form `lines` use, each once: those in backticks, as
@@ -2354,7 +2453,8 @@ fn json(output: &Output, text: &str) -> Vec<String> {
 fn held(output: &Output, values: &[(Option<usize>, Value)]) -> Vec<String> {
     let name = &output.path;
     let nothing = output.keys.is_empty() && output.each.is_empty() && output.values.is_empty();
-    if nothing && output.codes.is_empty() && output.empty.is_empty() {
+    let sourced = !output.sources.files.is_empty();
+    if nothing && output.codes.is_empty() && output.empty.is_empty() && !sourced {
         return Vec::new();
     }
     // A JSON Lines file is one list, each line an item of it.
@@ -2365,6 +2465,8 @@ fn held(output: &Output, values: &[(Option<usize>, Value)]) -> Vec<String> {
     let mut places: Vec<Places> = output.values.iter().map(|_| BTreeMap::new()).collect();
     // The text each key named for codes holds, alone or in a list, by key.
     let mut coded: BTreeMap<String, Vec<(Option<usize>, &str)>> = BTreeMap::new();
+    // The text each key naming a source holds, alone or in a list, by key.
+    let mut named: BTreeMap<String, Vec<(Option<usize>, &str)>> = BTreeMap::new();
     // What each field to leave empty in some records holds in them, with
     // the line or id of each.
     let mut filled: Vec<Vec<(String, Option<String>)>> =
@@ -2397,6 +2499,18 @@ fn held(output: &Output, values: &[(Option<usize>, Value)]) -> Vec<String> {
                     found.push((text, place.or_else(|| record_id(object, &empty.field))));
                 }
             }
+            for (key, inner) in object {
+                if !sourced || !NAMING.contains(&last_word(key).as_str()) {
+                    continue;
+                }
+                let texts = match inner {
+                    Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+                    inner => inner.as_str().into_iter().collect::<Vec<_>>(),
+                };
+                for text in texts {
+                    gather(&mut named, key, (*line, text));
+                }
+            }
             if output.codes.is_empty() {
                 return;
             }
@@ -2422,6 +2536,9 @@ fn held(output: &Output, values: &[(Option<usize>, Value)]) -> Vec<String> {
         let applies = |codes: &&Codes| codes.column.as_ref().map_or(flags, |column| column == key);
         let mut sets = output.codes.iter().filter(applies);
         problems.extend(sets.find_map(|codes| with_notes(name, key, codes, texts.iter().copied())));
+    }
+    for (key, texts) in &named {
+        problems.extend(misnamed(name, key, &output.sources, texts.iter().copied()));
     }
     for (empty, found) in output.empty.iter().zip(&filled) {
         problems.extend(left_filled(name, empty, found));
@@ -2768,6 +2885,16 @@ fn csv(output: &Output, text: &str) -> Vec<String> {
         let mut sets = (output.codes.iter()).filter(|codes| codes.column.as_ref() == Some(field));
         problems.extend(sets.find_map(|codes| with_notes(name, field, codes, cells())));
     }
+    // A column naming a source holds inputs' paths alone, as they write them.
+    for (at, field) in head.fields.iter().enumerate() {
+        if output.sources.files.is_empty() || !NAMING.contains(&last_word(field).as_str()) {
+            continue;
+        }
+        let cells = rows
+            .iter()
+            .filter_map(|row| Some((Some(row.line), row.fields.get(at)?.as_str())));
+        problems.extend(misnamed(name, field, &output.sources, cells));
+    }
     for empty in &output.empty {
         let Some(at) = head.fields.iter().position(|field| *field == empty.field) else {
             continue;
@@ -2937,6 +3064,123 @@ fn noted(value: &str, codes: &[String]) -> bool {
             && !identifier(token)
             && !["and", "or"].contains(&token.to_lowercase().as_str())
     })
+}
+
+/// What `field` of `name` holds among `cells`, each with its line where
+/// known, that adds text to an input's path or writes the path otherwise
+/// than the inputs do, as `known` has them.
+fn misnamed<'a>(
+    name: &str,
+    field: &str,
+    known: &Sources,
+    cells: impl IntoIterator<Item = (Option<usize>, &'a str)>,
+) -> Vec<String> {
+    let (mut noted, mut other) = (Vec::new(), Vec::new());
+    // The first path given text, as the inputs write it where they do, and
+    // how an input writes the first path written otherwise.
+    let (mut alone, mut form) = (None, None);
+    for (line, value) in cells {
+        let (paths, text) = paths_in(value, &known.files);
+        let Some((first, file)) = paths.first() else {
+            continue;
+        };
+        if text {
+            if alone.is_none() {
+                let written = known.written.get(file).and_then(|forms| forms.first());
+                alone = Some(written.map_or(*first, |(form, _)| form.as_str()));
+            }
+            noted.push((line, value));
+            continue;
+        }
+        for (path, file) in &paths {
+            let Some(forms) = known.written.get(file) else {
+                continue;
+            };
+            if !forms.iter().any(|(written, _)| written == path) {
+                form = form.or_else(|| forms.first());
+                other.push((line, *path));
+            }
+        }
+    }
+    let mut problems = Vec::new();
+    if let Some(alone) = alone {
+        problems.push(format!(
+            "`{name}` has `{field}` values that add text to an input's path: {}; write the path alone, as `{alone}`, or as `{alone}#part` for a part of it, and move the rest to a free-text field.",
+            sample(&noted)
+        ));
+    }
+    if let Some((form, input)) = form {
+        problems.push(format!(
+            "`{name}` has `{field}` paths the inputs write otherwise: {}; `{input}` writes `{form}`, so write each path as the inputs do.",
+            sample(&other)
+        ));
+    }
+    problems
+}
+
+/// The inputs `value` names by their paths, each as written with the file
+/// it is, and whether it holds text besides them, a part of one after a `#`
+/// or `:`, and the names of other files.
+fn paths_in<'a>(value: &'a str, files: &HashSet<String>) -> (Vec<(&'a str, String)>, bool) {
+    let value = value.trim();
+    let value = value.strip_prefix("./").unwrap_or(value);
+    // Whole first, since a name with a space in it is found only so.
+    if let Some(file) = input_file(value, files) {
+        return (vec![(value, file)], false);
+    }
+    let (mut paths, mut text) = (Vec::new(), false);
+    // A part after a `#` or `:` runs to a space or a semicolon, as in
+    // `a.md#S-1|S-2`, `a.csv#row,col` or `a.json:items[0]`.
+    for chunk in value.split(|c: char| c.is_whitespace() || c == ';') {
+        let head = chunk.split(['#', ':']).next().unwrap_or_default();
+        for piece in head.split(|c: char| ",|()[]{}<>\"'`".contains(c)) {
+            let piece = piece.trim_matches('*').trim_end_matches(['.', '!', '?']);
+            let path = piece.strip_prefix("./").unwrap_or(piece);
+            if let Some(file) = input_file(path, files) {
+                paths.push((path, file));
+            } else if piece.chars().any(char::is_alphanumeric)
+                && !["and", "or"].contains(&piece.to_lowercase().as_str())
+                && !file_like(piece)
+            {
+                text = true;
+            }
+        }
+    }
+    (paths, text)
+}
+
+/// Whether `word` is the name or path of a file, as `notes.md` and
+/// `docs/a.md` are, and so no text added to a path.
+fn file_like(word: &str) -> bool {
+    let kind = kind(word);
+    word.contains(['/', '\\'])
+        || ((1..=5).contains(&kind.len()) && kind.chars().any(char::is_alphabetic))
+}
+
+/// `found`'s values, each once, cut to `SHOWN` characters and with its line
+/// where known, as far as `LINES` go, and how many more there are.
+fn sample(found: &[(Option<usize>, &str)]) -> String {
+    let (mut seen, mut shown) = (HashSet::new(), Vec::new());
+    for (line, value) in found {
+        let mut value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        if value.chars().count() > SHOWN {
+            value = value.chars().take(SHOWN).collect::<String>() + "...";
+        }
+        // Values alike as far as shown would read as one given twice.
+        if !seen.insert(value.clone()) {
+            continue;
+        }
+        shown.push(match line {
+            Some(line) => format!("`{value}` (line {line})"),
+            None => format!("`{value}`"),
+        });
+    }
+    let more = match shown.len().saturating_sub(LINES) {
+        0 => String::new(),
+        more => format!(" and {more} more"),
+    };
+    shown.truncate(LINES);
+    shown.join(", ") + &more
 }
 
 /// What is wrong with the header `head` of CSV `output` against the columns
@@ -3953,5 +4197,74 @@ mod tests {
             checked(request, &[("out/summary.json", summary)]),
             Vec::<String>::new()
         );
+    }
+
+    /// A reading list naming two notes by their paths from `in/`, with those
+    /// notes and two files it does not name.
+    const NOTES: [(&str, &str); 5] = [
+        (
+            "in/index.md",
+            "# Reading list\n\nThe pilot is covered in notes/alpha.md and notes/beta.md.\n",
+        ),
+        (
+            "in/notes/alpha.md",
+            "# Alpha\n\nThe pilot ran for six weeks.\n",
+        ),
+        (
+            "in/notes/beta.md",
+            "# Beta\n\nThe pilot cost less than planned.\n",
+        ),
+        ("in/notes/gamma.md", "# Gamma\n\nNo figures yet.\n"),
+        (
+            "in/notes/two words.md",
+            "# Two words\n\nA name with a space.\n",
+        ),
+    ];
+
+    #[test]
+    fn a_path_given_more_text_or_written_otherwise_than_the_inputs_write_it_is_reported() {
+        let request = "Read in/index.md and the notes it lists.\n\n\
+                       Create:\n- out/picks.json\n- out/links.csv";
+        let picks = br#"[{"id": "P-1", "chosen_source": "in/notes/alpha.md (A-1, A-2)"},
+                         {"id": "P-2", "chosen_source": "notes/beta.md"}]"#;
+        let links = b"id,expected_file\nL-1,in/notes/beta.md\nL-2,notes/alpha.md\n";
+        let problems = checked_reading(
+            &NOTES,
+            request,
+            &[("out/picks.json", picks), ("out/links.csv", links)],
+        );
+        assert_eq!(
+            problems,
+            [
+                "`out/picks.json` has `chosen_source` values that add text to an input's path: `in/notes/alpha.md (A-1, A-2)`; write the path alone, as `notes/alpha.md`, or as `notes/alpha.md#part` for a part of it, and move the rest to a free-text field.",
+                "`out/links.csv` has `expected_file` paths the inputs write otherwise: `in/notes/beta.md` (line 2); `in/index.md` writes `notes/beta.md`, so write each path as the inputs do.",
+            ]
+        );
+    }
+
+    #[test]
+    fn paths_alone_with_a_part_or_joined_and_text_in_fields_naming_no_file_pass() {
+        let request = "Read in/index.md and the notes it lists.\n\n\
+                       Create:\n- out/picks.json\n- out/links.csv";
+        // A part after `#` or `:`, paths joined or listed, a file no input
+        // names, a name with a space, a label, an output, and text beside a
+        // path in a note or a reference.
+        let picks = br#"[{"id": "P-1", "chosen_source": "notes/alpha.md#A-1|A-2",
+                          "source_files": ["notes/alpha.md", "./notes/beta.md"],
+                          "note": "notes/alpha.md (A-1, A-2)", "evidence_ref": "notes/beta.md (cost)"},
+                         {"id": "P-2", "chosen_source": "notes/beta.md:3",
+                          "source_path": "in/notes/gamma.md", "file": "in/notes/two words.md",
+                          "path": "the alpha note"},
+                         {"id": "P-3", "chosen_source": "notes/alpha.md; notes/beta.md",
+                          "output_file": "out/links.csv (draft)"}]"#;
+        let links = b"id,expected_file,sources\n\
+                      L-1,notes/beta.md,notes/alpha.md and notes/beta.md\n\
+                      L-2,notes/alpha.md#S-1,\"notes/alpha.md, notes/beta.md\"\n";
+        let problems = checked_reading(
+            &NOTES,
+            request,
+            &[("out/picks.json", picks), ("out/links.csv", links)],
+        );
+        assert_eq!(problems, Vec::<String>::new());
     }
 }
