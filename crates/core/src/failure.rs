@@ -72,6 +72,9 @@ pub struct Failure {
     /// Part of the reply was already passed on, so it cannot be asked for
     /// again without showing a second one after it.
     pub stands: bool,
+    /// The reply reached its token limit before it wrote anything, all of
+    /// it spent thinking, so a longer limit could mend it.
+    pub out_of_room: bool,
     message: String,
 }
 
@@ -95,6 +98,7 @@ impl Failure {
             retry_after: None,
             overflow: None,
             stands: false,
+            out_of_room: false,
             message: message.into(),
         }
     }
@@ -270,6 +274,7 @@ pub fn classify(status: Option<u16>, headers: &HeaderMap, body: &Value) -> Failu
         retry_after: retry_after(headers),
         overflow,
         stands: false,
+        out_of_room: false,
         message: words(status, body),
     }
 }
