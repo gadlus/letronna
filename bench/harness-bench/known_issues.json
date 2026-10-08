@@ -380,6 +380,17 @@
     }
    ]
   },
+  "080-schema-roundtrip-conversion": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["conflicts"],
+     "reason": "tasks/080-schema-roundtrip-conversion/oracle_grade.py:60-66 counts a reported conflict only when its winner sits under chosen_source, resolved_from or resolved_by (line 61), chosen_source being the ground truth's key (ground_truth.json:36 and :41), while prompt.txt:23 says only that the conflict must be reported and fixtures/in/schema.json gives no report format. All four models reported both conflicts with JSON winning, under resolved_source, winning_source or winner, and failed; the check weighs 2 of 23, so an answer otherwise right scores 0.913."
+    }
+   ]
+  },
   "089-ab-test-caveat-analysis": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
