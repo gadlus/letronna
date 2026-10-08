@@ -839,6 +839,17 @@
     }
    ]
   },
+  "097-research-claims-batch-evidence-audit": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "tasks/097-research-claims-batch-evidence-audit/ground_truth.json:7 and :10 want CL-05's evidence_location to name results/subgroup_ablation.csv and CL-08's to name raw/events.parquet (oracle_grade.py:64), files the package does not hold, while the evidence for both is fixtures/in/sources/repro_readme.md:3-7, which says they are missing, and prompt.txt:17 asks for a row, field or section only for numeric claims. A location of 'repro_readme.md line 3' fails both rows. locations passes at 12 of 14 (line 94), so an answer otherwise right loses 0.0171 (line 119), but one more miss fails the check and lines 124-125 cap the score at 0.72."
+    }
+   ]
+  },
   "098-three-source-decision-record-synthesis": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
