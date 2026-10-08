@@ -667,6 +667,22 @@
     }
    ]
   },
+  "084-js-state-type-bug": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "tasks/084-js-state-type-bug/oracle_grade.py:70 scores session_fix_report.md by the substrings immut, role, cache and node, a quarter each, while prompt.txt:15 asks the report only to summarize the root cause and verification; a report saying login and setPreference wrote into the session passed in and now never modify it misses 'immut' and loses 0.0125 of the total (line 73). Line 62 likewise gives a quarter of implementation quality to using four of '...', 'Object.assign', 'map(', 'Array.isArray' and 'String(', which the prompt never names, so a fix that copies roles with .slice() loses 0.0063. fix_report and implementation_quality still pass."
+    },
+    {
+     "kind": "substring false positive",
+     "checks": [],
+     "reason": "tasks/084-js-state-type-bug/oracle_grade.py:64 takes 0.20 off implementation quality when the text JSON.stringify appears in sessionStore.js more than once, comments included, so a serializeSession that uses it once beside a comment saying state updates never go through it, as prompt.txt:22 requires, loses 0.02 of the total (line 73). Rewording the comment passes, and implementation_quality still passes either way."
+    }
+   ]
+  },
   "087-cli-parser-bug-tests": {
    "ceiling": 0.95,
    "exclude_from_tuning": true,
