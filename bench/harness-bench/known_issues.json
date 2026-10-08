@@ -583,6 +583,11 @@
      "kind": "negation-blind phrase check",
      "checks": ["no_false_repro"],
      "reason": "tasks/073-research-repro-package/oracle_grade.py:84-86 fails the report on any phrase in ground_truth.json:17-24, negated or not, so 'not fully reproducible' counts as claiming success."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["required_terms"],
+     "reason": "tasks/073-research-repro-package/oracle_grade.py:81-82 wants every term of ground_truth.json:7-16 in the report as a substring, '0.038' among them (line 15). The paper gives that claim as '3.8 percentage points' (fixtures/in/paper_claims.md:5) and no input writes 0.038, while prompt.txt:18 asks the report only to explain the CSV/paper deltas. A report quoting the paper's figure against results.csv's 0.031 fails; one that also converts it to the CSV's decimal form passes. The check weighs 0.10 of 1.0 (line 82), so an answer otherwise right scores 0.9."
     }
    ]
   },
