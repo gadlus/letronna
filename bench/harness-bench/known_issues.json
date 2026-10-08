@@ -369,6 +369,17 @@
     }
    ]
   },
+  "079-smallfile-batch-reject-ledger": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["reject_rows"],
+     "reason": "tasks/079-smallfile-batch-reject-ledger/oracle_grade.py:108-110 matches reject rows on source_path and error_type after an alias map (lines 51-55) that adds only unknown_extension and missing_required_fields to ground_truth.json's own tokens, missing_required_field (lines 290, 310 and 325) and duplicate_record_id (lines 295 and 320), while prompt.txt:22 fixes only the header, prompt.txt:30 names the categories in prose and fixtures/in/normalization_rules.yaml lists none. A ledger with every row right but missing_field and duplicate_id fails, and so do the prompt's own words made plural, unknown_extensions and duplicate_record_ids. The check weighs 4.0 of 42.42, so an answer otherwise right scores 0.9057."
+    }
+   ]
+  },
   "089-ab-test-caveat-analysis": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
