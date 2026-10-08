@@ -549,6 +549,22 @@
     }
    ]
   },
+  "100-financial-kyc-admin-check": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["policy_basis_tokens"],
+     "reason": "tasks/100-financial-kyc-admin-check/oracle_grade.py:90-91 wants every clause id of ground_truth.json:41 in the policy_basis column, KYC-2 included. The business customer's two rows (ground_truth.json:34-35) are invalid documents, a wrong address and an unsigned form, whose basis fixtures/in/document_validity_rules.md:6-7 and :15-16 state; KYC-2 (fixtures/in/kyc_requirements.md:9-14) is only the list that makes them required. prompt.txt:25-26 gives the header and asks for nothing more, so a column citing the validity rule for invalid rows and the KYC list for missing ones still fails, as all four runs did. 0.08 of 1.21, and lines 125-126 cap the score at 0.74."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["boundary_sentence"],
+     "reason": "tasks/100-financial-kyc-admin-check/oracle_grade.py:107 also wants 'kyc-4' somewhere in the three outputs, while prompt.txt:28-30 asks only for the exact sentence and an explanation that watchlist_stub.csv is an administrative manual-review signal and not a sanctions conclusion. A boundary note that does both, with the rows recorded as manual_review_needed but the clause not named, fails. 0.07 of 1.21, and lines 123-124 cap the score at 0.70."
+    }
+   ]
+  },
   "104-async-ops-window-rollup": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
