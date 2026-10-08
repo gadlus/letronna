@@ -411,6 +411,17 @@
     }
    ]
   },
+  "065-capacity-planning": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "tasks/065-capacity-planning/ground_truth.json:25 wants '30%' and '20%' in cost_notes.md (oracle_grade.py:93-94), but fixtures/in/instance_types.json:4-5 gives required_headroom_pct as 0.30 and 0.20 and prompt.txt:26 asks only that the notes explain the headroom, naming no format. Notes that write the inputs' 0.30 and 0.20 lose two of eleven keywords, 0.0255 of the total; four of six runs did. cost_notes still passes."
+    }
+   ]
+  },
   "068-product-launch-ops": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
