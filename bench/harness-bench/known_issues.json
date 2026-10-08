@@ -389,6 +389,17 @@
     }
    ]
   },
+  "062-k8s-config-audit": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "The severities in tasks/062-k8s-config-audit/ground_truth.json:3-10 follow no rule in prompt.txt, which asks only for a severity column (line 12), or in fixtures/in/policy.md, which calls the latest tag and NodePort exposure forbidden (lines 7 and 9) and ranks nothing. liveness_probe, image_tag_policy and service_type_policy must be medium; all four models' runs called them high. Each row's severity is 0.25 of it (oracle_grade.py:59), 0.0237 of the total. Lines 4-5 also want the word 'missing' in the probe rows (line 56), so 'No readinessProbe defined' loses 0.0118 a row. k8s_audit_csv still passes."
+    }
+   ]
+  },
   "064-service-dependency-triage": {
    "ceiling": 0.8372,
    "exclude_from_tuning": true,
