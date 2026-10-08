@@ -226,6 +226,11 @@
      "kind": "ambiguous convention",
      "checks": ["fixed_references_complete"],
      "reason": "tasks/031-cross-doc-citation-check/oracle_grade.py:39-40 wants ground_truth.json:11's '[S4] CSAT survey extract - sources/csat.md' verbatim, reusing for the CSAT source the id that fixtures/in/appendix.md:6 says 'is retired and must not be used'; appendix.md:7 gives CSAT no id and prompt.txt:17-18 only fixes the format. Numbering it [S5], as all four runs did, fails; only the retired id passes. 1 of 9 equal checks."
+    },
+    {
+     "kind": "negation-blind phrase check",
+     "checks": ["fixed_references_avoid_retired_sources"],
+     "reason": "tasks/031-cross-doc-citation-check/oracle_grade.py:41-42 fails fixed_references.md on ground_truth.json:13's 'Renewal briefing' or 'retired' anywhere in it, negated or not, so a corrected list whose note says the retired [S4] is not reused, as fixtures/in/appendix.md:6 requires, fails as a list citing it would; prompt.txt:17-20 sets the reference format and forbids only invented sources and edits to the inputs. The same note without the word passes. 1 of 9 equal checks."
     }
    ]
   },
