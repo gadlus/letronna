@@ -500,6 +500,22 @@
     }
    ]
   },
+  "104-async-ops-window-rollup": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "float threshold",
+     "checks": ["state"],
+     "reason": "tasks/104-async-ops-window-rollup/oracle_grade.py:92-99 sums the state parts as floats and line 100 passes the check at state_score >= 0.75. With every part right but seen_update_ids, 0.15 + 0.15 + 0.15 + 0.20 + 0.10 comes to 0.7499999999999999, so the check fails while its detail prints 0.75. The outcome at line 151 uses the score itself and loses nothing to this, but the task cannot pass."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["state"],
+     "reason": "tasks/104-async-ops-window-rollup/prompt.txt:21 names seen_update_ids beside duplicate_update_ids and ignored_update_ids and never defines it, and prompt.txt:17 uses first seen for arrival order; oracle_grade.py:94 gives its 0.25 only for exactly the five in-window ids of ground_truth.json:5. Three of four runs listed every id they read, the ignored UP-OLD and UP-LATE included, and lost 0.25 of state, 0.1125 of the score, which with the float sum above also fails the check."
+    }
+   ]
+  },
   "105-partial-batch-resume-ledger": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
