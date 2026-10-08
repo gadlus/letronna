@@ -873,6 +873,11 @@
      "kind": "ambiguous convention",
      "checks": ["source_conflicts"],
      "reason": "tasks/098-three-source-decision-record-synthesis/oracle_grade.py:114 counts ground_truth.json:21's terms in source_conflicts.csv, among them the decision keys 'feature_scope' and 'budget_cap', which neither prompt.txt (line 15 asks only for a decision_key) nor any fixture names, and 'real-time export' with its hyphen. Keys such as 'launch_scope', 'support_budget' and 'real_time_export' leave 5 of 8 and a score of 0.7375 against line 116's 0.80; naming the feature in prose reaches 6 of 8 and passes, but only the two hidden keys give the full 0.09 of the total (line 138)."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["winning_sources"],
+     "reason": "tasks/098-three-source-decision-record-synthesis/oracle_grade.py:24-29 matches a winning_source only as the ground truth's path, with or without in/ and a #anchor, or a string ending in it, while prompt.txt:15 names the field and gives it no form. 'docs/security_review.md (SEC-1, SEC-2)' and 'email/thread.json (email-004)', which name the governing section as well, fail, and 'docs/security_review.md#SEC-1' passes. Under 4 of 5 the check fails (line 99) and lines 142-143 cap the score at 0.74; it weighs 0.14 of the total (line 136)."
     }
    ]
   },
