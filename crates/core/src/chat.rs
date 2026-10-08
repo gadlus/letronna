@@ -2364,7 +2364,14 @@ pub(crate) fn as_chat(connection: &Connection, reply: Value) -> Value {
 fn speaks_responses(connection: &Connection) -> bool {
     let model = connection.model.trim();
     crate::wire_responses::serves(&connection.endpoint, model)
-        && (crate::wire_responses::only(model) || !has_quirk(connection, Quirk::Responses))
+        && (only_responses(connection) || !has_quirk(connection, Quirk::Responses))
+}
+
+/// Whether the Responses API is the only route to `connection`'s model: a
+/// codex or pro model, or any on a gateway a plugin added that speaks it alone.
+fn only_responses(connection: &Connection) -> bool {
+    crate::wire_responses::only(connection.model.trim())
+        || crate::gateway::responses_at(&connection.endpoint)
 }
 
 /// The Responses API's URL and form of `body`, built chat-shaped as every
@@ -2443,7 +2450,7 @@ fn learn_responses(
     };
     as_written
         && failure.overflow.is_none()
-        && !crate::wire_responses::only(&model)
+        && !only_responses(connection)
         && goes_without(Quirk::Responses)
 }
 
@@ -11591,6 +11598,31 @@ mod tests {
         ));
         let (url, _) = to_responses(&c, &endpoint, &sent).unwrap();
         assert_eq!(url, "https://api.openai.com/v1/responses");
+    }
+
+    #[test]
+    fn a_gateway_that_speaks_responses_alone_gets_every_model_there() {
+        let base = "http://127.0.0.1:9/responses-only/v1";
+        crate::gateway::add(crate::gateway::Added {
+            name: "Responses only",
+            base: base.into(),
+            key: "k".into(),
+            responses: true,
+        });
+        let c = Connection {
+            endpoint: base.into(),
+            model: "some-model".into(),
+            ..connection()
+        };
+        let endpoint = validate(&c).unwrap();
+        let sent = body(&c, &hi(), None, None);
+        let (url, posted) = to_responses(&c, &endpoint, &sent).unwrap();
+        let refusal = r#"{"error":{"message":"Unsupported parameter: 'truncation'.","type":"invalid_request_error","param":"truncation","code":"unsupported_parameter"}}"#;
+        let falls_back = learn_responses(&c, &sent, &posted, &refused(400, refusal), refusal);
+        let still = to_responses(&c, &endpoint, &sent).is_some();
+        crate::gateway::remove("Responses only");
+        assert_eq!(url, format!("{base}/responses"));
+        assert!(!falls_back && still);
     }
 
     #[test]

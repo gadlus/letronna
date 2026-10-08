@@ -25,12 +25,14 @@ pub(crate) fn reasons(model: &str) -> bool {
 }
 
 /// Whether `model` at `endpoint` is sent the Responses API: GPT-5, the
-/// o-series and the codex models on OpenAI's own API.
+/// o-series and the codex models on OpenAI's own API, and every model on a
+/// gateway a plugin added that speaks it alone.
 pub(crate) fn serves(endpoint: &str, model: &str) -> bool {
     // GPT-5's chat models do not reason, so they stay on chat/completions.
-    crate::chat::host(endpoint).as_deref() == Some("api.openai.com")
+    let openai = crate::chat::host(endpoint).as_deref() == Some("api.openai.com")
         && reasons(model)
-        && !model.to_lowercase().contains("chat")
+        && !model.to_lowercase().contains("chat");
+    openai || crate::gateway::responses_at(endpoint)
 }
 
 /// Whether `model` is served by the Responses API alone, as OpenAI's codex
