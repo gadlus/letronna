@@ -264,6 +264,11 @@
      "kind": "ambiguous convention",
      "checks": ["priority_reasoning"],
      "reason": "tasks/035-conflicting-source-resolution/oracle_grade.py:102-105 counts a priority_reason only if it holds 'rank' or 'priority' and one of override, supersede, contradict, conflict, 'not ' or reject, while prompt.txt:18 asks only that each evidence item carry a priority_reason. A reason that names the source and claim it beat with 'outranks', or says the notice 'controls launch timing over lower-priority drafts and rumors', counts for nothing. Under 5 of 7 the check fails (line 130), and under 0.6 lines 180-181 cap the whole score at 0.84, so an output with every fact, source file and quote right loses 0.16 for its verbs."
+    },
+    {
+     "kind": "negation-blind phrase check",
+     "checks": ["scoped_fields", "reject_low_priority"],
+     "reason": "tasks/035-conflicting-source-resolution/oracle_grade.py:111-117 fails service_scope on ground_truth.json:23's 'airport connector' anywhere in it, and lines 118-123 fail the final facts on any of ground_truth.json:12's rejected signals, 'cancelled' and 'airport connector trips' among them, negated or not. prompt.txt:21 asks service_scope to distinguish the contract-planned scope from the regulator-authorized launch-day scope, so 'East Market corridor only (launch-day authorized scope per RF-77A); airport connector trips are not authorized for launch-day service' fails both checks, and a project_status of 'limited commercial service (not cancelled)' fails reject_low_priority. A service_scope naming only the authorized corridor passes. scoped_fields below 1.0 caps the score at 0.84 (lines 180-181), and reject_low_priority costs 0.06 of the total (line 179)."
     }
    ]
   },
