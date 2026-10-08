@@ -245,6 +245,17 @@
     }
    ]
   },
+  "034-evidence-matrix-claims": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["evidence"],
+     "reason": "tasks/034-evidence-matrix-claims/oracle_grade.py:39-41 counts a claim's evidence_phrase only if it holds both of the claim's tokens in ground_truth.json:3-7, and line 51 passes the check at 4 of 5, while prompt.txt:15 asks only for a short evidence signal that explains the classification. C1 wants '7 pending' beside '118 enrolled', though the pending invitations (fixtures/in/sources/field_report.txt:3) bear on no enrolled count; C2 and C5 want words from two sentences each (field_report.txt:5, board_minutes.txt:3), 'battery cabinets' with 'not as the primary' and 'tabled' with 'No approval vote', so a paraphrase such as 'diesel not the primary resilience measure' misses. One decisive source sentence per claim matches 2 of 5 and scores 0.88; the check weighs 0.20 (line 56), and only all five pairs give 1.0."
+    }
+   ]
+  },
   "035-conflicting-source-resolution": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
