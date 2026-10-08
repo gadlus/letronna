@@ -167,6 +167,17 @@
     }
    ]
   },
+  "035-conflicting-source-resolution": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["priority_reasoning"],
+     "reason": "tasks/035-conflicting-source-resolution/oracle_grade.py:102-105 counts a priority_reason only if it holds 'rank' or 'priority' and one of override, supersede, contradict, conflict, 'not ' or reject, while prompt.txt:18 asks only that each evidence item carry a priority_reason. A reason that names the source and claim it beat with 'outranks', or says the notice 'controls launch timing over lower-priority drafts and rumors', counts for nothing. Under 5 of 7 the check fails (line 130), and under 0.6 lines 180-181 cap the whole score at 0.84, so an output with every fact, source file and quote right loses 0.16 for its verbs."
+    }
+   ]
+  },
   "036-citation-consistency-audit": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
