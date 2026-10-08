@@ -7,8 +7,9 @@
 //! before it ends: the request is read for the files it names under `out/`,
 //! with what it spells out for them -- a CSV header or the columns it names,
 //! JSON keys and the keys each item of a list holds, the few values a field
-//! may take, the names and words a file must use or must not, the codes the
-//! files it names to read hold bare -- and each file is looked at on disk.
+//! may take and the records it is left empty in, the names and words a file
+//! must use or must not, the codes the files it names to read hold bare --
+//! and each file is looked at on disk.
 //!
 //! Both halves are plain text matching rather than a model's reading, so
 //! nothing is invented, and the matching leans to missing: a file counts only
@@ -319,6 +320,28 @@ const CODED: [&str; 8] = [
 /// hold the names a markdown input gives, as `manual_review_needed`.
 const FLAGS: [&str; 4] = ["flag", "flags", "code", "codes"];
 
+/// Words that say a field holds nothing, longest first, as in "or
+/// empty/null for" or "leave `note` blank when".
+const EMPTY: [&str; 7] = [
+    "empty/null",
+    "null/empty",
+    "empty or null",
+    "null or empty",
+    "empty",
+    "null",
+    "blank",
+];
+
+/// Words after an `EMPTY` one that say in which records, as "for" does in
+/// "null for missing rows"; not "unless", which means the others.
+const WHEN: [&str; 5] = ["for", "when", "whenever", "if", "where"];
+
+/// Words that may come between a field and an `EMPTY` word after it, as in
+/// "`note` must be left empty" or "set `note` to null".
+const BEING: [&str; 11] = [
+    "be", "is", "are", "to", "left", "kept", "stay", "remain", "must", "should", "shall",
+];
+
 /// Bad lines reported for one file: three show the pattern, and more would
 /// crowd out the other files.
 const LINES: usize = 3;
@@ -367,6 +390,8 @@ struct Output {
     forbidden: Vec<String>,
     /// The codes the files the request names to read hold bare.
     codes: Vec<Codes>,
+    /// The fields the request says to leave empty in records a code marks.
+    empty: Vec<Empty>,
     /// The file's size and change time as the request was read, if it was
     /// there then.
     found: Option<Stamp>,
@@ -394,6 +419,21 @@ struct Codes {
     column: Option<String>,
     /// Each code, as the input writes it.
     codes: Vec<String>,
+}
+
+/// A field the request says to leave empty in the records a code marks, as
+/// "`applicable_policy`: a path, or empty/null for true insufficient
+/// evidence" does where `decision` is `insufficient_evidence`.
+#[derive(Debug, PartialEq)]
+struct Empty {
+    /// The column or key, as the request writes it.
+    field: String,
+    /// The code marking such a record: another field's value, or the name
+    /// of a field that is true.
+    code: String,
+    /// The request's words for it, as "empty/null for true insufficient
+    /// evidence".
+    said: String,
 }
 
 /// A file's size and the time it was last changed, where the system keeps one.
@@ -483,6 +523,7 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
                         terms: Vec::new(),
                         forbidden: Vec::new(),
                         codes: Vec::new(),
+                        empty: Vec::new(),
                         found,
                     });
                 }
@@ -517,6 +558,9 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
     // the same way, nor when the sentence giving them is about a file
     // already there.
     let (mut table, mut data, mut record) = (None, None, None);
+    // The names in code form the request uses, one of which a condition
+    // such as "for true insufficient evidence" may mean.
+    let names = code_names(&lines);
     // The heading of the list going on, when it makes what its items say a
     // field holds true of some rows only, as "For late rows:" does: how far
     // in it is, and whether it is an item itself.
@@ -641,6 +685,14 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
                 && let Some(values) = values_in(sentence, under)
             {
                 outputs[i].values.push(values);
+            }
+            if some_rows.is_none()
+                && let Some(i) = bound(sentence, &RECORDS, record, &outputs, workspace)
+                && matches!(kind(&outputs[i].path).as_str(), "csv" | "json" | "jsonl")
+                && about(sentence, &RECORDS)
+                && let Some(empty) = empty_in(sentence, &names)
+            {
+                outputs[i].empty.push(empty);
             }
         }
         // Not only the sentences `given` leaves, since "Use the verbs soften
@@ -767,6 +819,107 @@ fn codes_in(input: &str, content: &str) -> Vec<Codes> {
         _ => {}
     }
     found
+}
+
+/// The names in code form `lines` use, each once: those in backticks, as
+/// `insufficient_evidence`, and words in snake case.
+fn code_names(lines: &[&str]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for line in lines {
+        let quoted = line
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|name| code_like(name));
+        let words = (line.split(|c: char| !(c.is_alphanumeric() || c == '_')))
+            .filter(|word| snake_case(word));
+        for name in quoted.chain(words) {
+            if !names.iter().any(|known| known == name) {
+                names.push(name.to_owned());
+            }
+        }
+    }
+    names
+}
+
+/// The field `sentence` says to leave empty in the records a code marks,
+/// as "`applicable_policy`: a path, or empty/null for true insufficient
+/// evidence" or "leave `note` blank when `status` is `skipped`" do; None
+/// where the condition names none of `names` in a row of its words, nor a
+/// code in backticks, since then no record can be told to be one.
+fn empty_in(sentence: &str, names: &[String]) -> Option<Empty> {
+    let lower = sentence.to_ascii_lowercase();
+    for words in EMPTY {
+        for (at, _) in lower.match_indices(words) {
+            if !alone(&lower, at, words.len()) {
+                continue;
+            }
+            let after = sentence[at + words.len()..].trim_start();
+            let Some(rest) = WHEN.iter().find_map(|cue| word_after(after, cue)) else {
+                continue;
+            };
+            // The condition ends with its clause.
+            let start = sentence.len() - rest.len();
+            let end = start + rest.find([';', ',', ')']).unwrap_or(rest.len());
+            let condition = sentence[start..end].trim().trim_end_matches('.');
+            // "`F`: a path, or empty for ..." names the field before its
+            // colon; "leave `F` empty when ..." just before the word.
+            let field = match sentence.find(':') {
+                Some(colon) if colon < at => {
+                    field_before(&sentence[..=colon], true).map(|(field, _)| field)
+                }
+                _ => named_before(&sentence[..at]),
+            };
+            let (Some(field), Some(code)) = (field, marking(condition, names)) else {
+                continue;
+            };
+            let said = sentence[at..end].trim().trim_end_matches('.').to_owned();
+            return Some(Empty { field, code, said });
+        }
+    }
+    None
+}
+
+/// The field named just before `text` ends, past words such as "must be"
+/// or "to", as in "leave `note`" or "`note` must be", when it is in
+/// backticks or snake case, as a field is and a word of prose is not.
+fn named_before(text: &str) -> Option<String> {
+    let mut rest = text.trim_end();
+    while let Some(before) = without_last(rest, &BEING) {
+        rest = before;
+    }
+    let quoted = rest.ends_with('`');
+    let (_, name) = last_name(rest)?;
+    (quoted || snake_case(name)).then(|| name.to_owned())
+}
+
+/// The code `condition` speaks of: the last it gives in backticks, as in
+/// "when `status` is `skipped`", or else one of `names` whose words it has
+/// in a row, as "true insufficient evidence" has `insufficient_evidence`.
+fn marking(condition: &str, names: &[String]) -> Option<String> {
+    let quoted = condition
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|name| code_like(name));
+    if let Some(code) = quoted.last() {
+        return Some(code.to_owned());
+    }
+    let words: Vec<String> = (condition.split(|c: char| !c.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    // Of two words or more, since one may be a word of prose, as "missing".
+    names
+        .iter()
+        .find(|name| {
+            let parts: Vec<String> = name.split(['_', '-']).map(str::to_lowercase).collect();
+            parts.len() > 1
+                && words
+                    .windows(parts.len())
+                    .any(|run| run == parts.as_slice())
+        })
+        .cloned()
 }
 
 /// Adds `phrases` to those `output` must not hold, each once.
@@ -2201,7 +2354,7 @@ fn json(output: &Output, text: &str) -> Vec<String> {
 fn held(output: &Output, values: &[(Option<usize>, Value)]) -> Vec<String> {
     let name = &output.path;
     let nothing = output.keys.is_empty() && output.each.is_empty() && output.values.is_empty();
-    if nothing && output.codes.is_empty() {
+    if nothing && output.codes.is_empty() && output.empty.is_empty() {
         return Vec::new();
     }
     // A JSON Lines file is one list, each line an item of it.
@@ -2212,6 +2365,10 @@ fn held(output: &Output, values: &[(Option<usize>, Value)]) -> Vec<String> {
     let mut places: Vec<Places> = output.values.iter().map(|_| BTreeMap::new()).collect();
     // The text each key named for codes holds, alone or in a list, by key.
     let mut coded: BTreeMap<String, Vec<(Option<usize>, &str)>> = BTreeMap::new();
+    // What each field to leave empty in some records holds in them, with
+    // the line or id of each.
+    let mut filled: Vec<Vec<(String, Option<String>)>> =
+        output.empty.iter().map(|_| Vec::new()).collect();
     let asks_keys = !output.keys.is_empty() || !output.each.is_empty();
     for (line, value) in values {
         let mut at = String::from(if lines { "[]" } else { "" });
@@ -2228,6 +2385,16 @@ fn held(output: &Output, values: &[(Option<usize>, Value)]) -> Vec<String> {
             for (listed, place) in output.values.iter().zip(&mut places) {
                 if let Some(text) = object.get(listed.field.as_str()).and_then(scalar) {
                     gather(place, at, (*line, text));
+                }
+            }
+            for (empty, found) in output.empty.iter().zip(&mut filled) {
+                let Some(value) = object.get(&empty.field).filter(|value| !blank(value)) else {
+                    continue;
+                };
+                if marked(object, empty) {
+                    let text = scalar(value).map_or_else(|| value.to_string(), Cow::into_owned);
+                    let place = (*line).map(|line| format!("line {line}"));
+                    found.push((text, place.or_else(|| record_id(object, &empty.field))));
                 }
             }
             if output.codes.is_empty() {
@@ -2255,6 +2422,9 @@ fn held(output: &Output, values: &[(Option<usize>, Value)]) -> Vec<String> {
         let applies = |codes: &&Codes| codes.column.as_ref().map_or(flags, |column| column == key);
         let mut sets = output.codes.iter().filter(applies);
         problems.extend(sets.find_map(|codes| with_notes(name, key, codes, texts.iter().copied())));
+    }
+    for (empty, found) in output.empty.iter().zip(&filled) {
+        problems.extend(left_filled(name, empty, found));
     }
     // Anywhere in it, since the request may mean each item of a list or an
     // object inside: a key missing everywhere is wrong whichever it meant,
@@ -2598,7 +2768,91 @@ fn csv(output: &Output, text: &str) -> Vec<String> {
         let mut sets = (output.codes.iter()).filter(|codes| codes.column.as_ref() == Some(field));
         problems.extend(sets.find_map(|codes| with_notes(name, field, codes, cells())));
     }
+    for empty in &output.empty {
+        let Some(at) = head.fields.iter().position(|field| *field == empty.field) else {
+            continue;
+        };
+        let flag = head.fields.iter().position(|field| *field == empty.code);
+        let marked_row = |row: &Record| {
+            let cells = row.fields.iter().enumerate().filter(|(n, _)| *n != at);
+            (cells.map(|(_, cell)| cell.trim())).any(|cell| cell.eq_ignore_ascii_case(&empty.code))
+                || (flag.and_then(|n| row.fields.get(n)))
+                    .is_some_and(|cell| cell.trim().eq_ignore_ascii_case("true"))
+        };
+        let found: Vec<(String, Option<String>)> = rows
+            .iter()
+            .filter(|row| marked_row(row))
+            .filter_map(|row| {
+                let cell = row.fields.get(at).filter(|cell| !cell.trim().is_empty())?;
+                Some((cell.clone(), Some(format!("line {}", row.line))))
+            })
+            .collect();
+        problems.extend(left_filled(name, empty, &found));
+    }
     problems
+}
+
+/// Whether JSON `object` is a record `empty.code` marks: another of its
+/// fields holds that code, or one named as the code is true.
+fn marked(object: &Map<String, Value>, empty: &Empty) -> bool {
+    object.iter().any(|(key, value)| {
+        let holds = value
+            .as_str()
+            .is_some_and(|text| text.trim().eq_ignore_ascii_case(&empty.code));
+        *key != empty.field && (holds || (*key == empty.code && *value == Value::Bool(true)))
+    })
+}
+
+/// Whether `value` holds nothing: null, or an empty string, list or object.
+fn blank(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(items) => items.is_empty(),
+        Value::Object(map) => map.is_empty(),
+        _ => false,
+    }
+}
+
+/// The id of the record `object` is, as "case_id `C-8`", from a key that is
+/// id or ends in it, other than `field`, so a notice can say which it is.
+fn record_id(object: &Map<String, Value>, field: &str) -> Option<String> {
+    object.iter().find_map(|(key, value)| {
+        let id = key != field && (key == "id" || key.ends_with("_id"));
+        let value = scalar(value).filter(|_| id)?;
+        Some(format!("{key} `{value}`"))
+    })
+}
+
+/// What `name` holds in `empty.field` of the records the request says to
+/// leave it empty in, as `found` gives each with its line or id.
+fn left_filled(name: &str, empty: &Empty, found: &[(String, Option<String>)]) -> Option<String> {
+    if found.is_empty() {
+        return None;
+    }
+    let shown: Vec<String> = (found.iter().take(LINES))
+        .map(|(value, place)| {
+            let mut value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+            if value.chars().count() > SHOWN {
+                value = value.chars().take(SHOWN).collect::<String>() + "...";
+            }
+            match place {
+                Some(place) => format!("`{value}` ({place})"),
+                None => format!("`{value}`"),
+            }
+        })
+        .collect();
+    let more = match found.len().saturating_sub(LINES) {
+        0 => String::new(),
+        more => format!(" and {more} more"),
+    };
+    Some(format!(
+        "`{name}` fills `{}` in records marked `{}`: {}{more}; the request says {}, so leave it empty there.",
+        empty.field,
+        empty.code,
+        shown.join(", "),
+        empty.said
+    ))
 }
 
 /// The last word of `key`, in lower case, as `flags` is of
@@ -3661,5 +3915,43 @@ mod tests {
             &[("out/report.csv", report), ("out/review.json", review)],
         );
         assert_eq!(problems, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_field_to_leave_empty_in_records_a_code_marks_is_reported_where_filled() {
+        let request = "Create:\n\n1. `out/rulings.json`\n   - A JSON array, one item per case.\n\
+                       \x20  - `decision`: exactly `granted`, `refused`, or `not_enough_info`\n\
+                       \x20  - `rule_file`: path under `rules/`, or empty/null for real not enough info\n\
+                       2. `out/rulings.csv`\n   - Leave `note` blank when the decision is `refused`.";
+        let rulings = br#"[{"case_id": "K-1", "decision": "granted", "rule_file": "rules/a.md"},
+                           {"case_id": "K-2", "decision": "not_enough_info", "rule_file": "rules/b.md"},
+                           {"case_id": "K-3", "decision": "not_enough_info", "rule_file": null}]"#;
+        let table =
+            b"case_id,decision,note\nK-1,granted,\nK-2,refused,the file was late\nK-3,refused,\n";
+        assert_eq!(
+            checked(
+                request,
+                &[("out/rulings.json", rulings), ("out/rulings.csv", table)]
+            ),
+            [
+                "`out/rulings.json` fills `rule_file` in records marked `not_enough_info`: `rules/b.md` (case_id `K-2`); the request says empty/null for real not enough info, so leave it empty there.",
+                "`out/rulings.csv` fills `note` in records marked `refused`: `the file was late` (line 3); the request says blank when the decision is `refused`, so leave it empty there.",
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_for_a_case_no_code_names_or_as_one_choice_of_two_asks_nothing() {
+        let request = "Write out/summary.json as a JSON array.\n\
+                       - `status`: exactly `open`, `closed` or `on_hold`\n\
+                       - `top_severity`: the highest open severity; use null if a project has no open items.\n\
+                       - `reason`: why it is held, or empty unless the status is `on_hold`.\n\
+                       - `owner_team`: leave empty or name a related team.";
+        let summary = br#"[{"project": "p1", "status": "closed", "top_severity": "high",
+                            "reason": "done early", "owner_team": "ops"}]"#;
+        assert_eq!(
+            checked(request, &[("out/summary.json", summary)]),
+            Vec::<String>::new()
+        );
     }
 }
