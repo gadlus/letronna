@@ -162,6 +162,16 @@
      "kind": "negation-blind phrase check",
      "checks": ["summary_avoids_forbidden_advice"],
      "reason": "tasks/027-contract-summary-risk/oracle_grade.py:50-51 fails the summary on any forbidden term anywhere in it, so a disclaimer saying it is not legal advice fails, and deleting the disclaimer passes."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["risk_C-01_auto-renewal_notice", "risk_C-03_security_notice", "risk_C-05_termination_notice"],
+     "reason": "tasks/027-contract-summary-risk/oracle_grade.py:40 wants ground_truth.json:3, :6 and :8's '60 days', '72 hours' and '30 days' as substrings of recommended_action, while prompt.txt:11-15 sets no wording for that column. The same terms written as adjectives, 'Request 60-day non-renewal notice', 'Request 72-hour notice' and 'Request 30-day notice period', fail; 'at least 60 days' passes. This fails C-03's security row and C-05 apart from the risk_type wording recorded above. Each is 1 of 14 equal checks."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["risk_C-03_data_residency", "risk_C-01_auto-renewal_notice"],
+     "reason": "tasks/027-contract-summary-risk/oracle_grade.py:40 wants ground_truth.json:5's 'approved regions' in C-03's residency action, so an action naming the regions fixtures/in/company_policy.md:5 lists, 'Request US/EU/Canada-only storage' or 'restriction to US / EU / Canada', fails. Line 38 wants ground_truth.json:3's 'auto-renewal notice' inside C-01's risk_type, so 'Renewal notice period' and 'Auto-renewal' fail; prompt.txt:11-15 sets no wording for either column. Each is 1 of 14 equal checks."
     }
    ]
   },
