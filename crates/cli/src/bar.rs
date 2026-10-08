@@ -104,6 +104,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "let the model search the web; /search services for your own, /search keyless for DuckDuckGo",
     },
     Command {
+        name: "/tool-search",
+        blurb: "how find_tools ranks the tools left out: by Jev or by name, and where Jev is asked",
+    },
+    Command {
         name: "/notify",
         blurb: "say when a reply ends or needs you while you are away, or stop",
     },
