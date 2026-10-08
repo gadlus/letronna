@@ -264,6 +264,17 @@
     }
    ]
   },
+  "041-frontend-state-bug": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "tasks/041-frontend-state-bug/oracle_grade.py:80-84 scores implementation quality by identifiers: ground_truth.json:3 wants the names schemaVersion and history in the source, and ground_truth.json:4 forbids the text JSON.parse(JSON.stringify. prompt.txt:11 asks only for 'a schema version' and line 8 for undo/redo, naming neither field, and line 16 forbids only external dependencies and network calls. A solution that passes node_tests and every hidden invariant but stores version and past, with a JSON round-trip fallback behind structuredClone, loses 0.0225 of the total; implementation_quality still passes."
+    }
+   ]
+  },
   "042-api-schema-migration": {
    "ceiling": 0.9592,
    "exclude_from_tuning": true,
