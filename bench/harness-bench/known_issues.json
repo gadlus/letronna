@@ -643,6 +643,16 @@
      "kind": "ambiguous convention",
      "checks": ["reject_rows"],
      "reason": "tasks/079-smallfile-batch-reject-ledger/oracle_grade.py:108-110 matches reject rows on source_path and error_type after an alias map (lines 51-55) that adds only unknown_extension and missing_required_fields to ground_truth.json's own tokens, missing_required_field (lines 290, 310 and 325) and duplicate_record_id (lines 295 and 320), while prompt.txt:22 fixes only the header, prompt.txt:30 names the categories in prose and fixtures/in/normalization_rules.yaml lists none. A ledger with every row right but missing_field and duplicate_id fails, and so do the prompt's own words made plural, unknown_extensions and duplicate_record_ids. The check weighs 4.0 of 42.42, so an answer otherwise right scores 0.9057."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["summary_success_count", "summary_reject_count", "summary_by_type"],
+     "reason": "tasks/079-smallfile-batch-reject-ledger/oracle_grade.py:58-67 reads batch_summary.json's counts only under fixed names, five for success_count, six for reject_count and three for by_type, and lines 119-123 compare them with ground_truth.json:377-384, while prompt.txt:19 names the file and gives it no keys. The names are arbitrary: normalized_records passes and records_normalized fails, rejected_records passes and records_rejected fails, so a summary with every count right under records_normalized, reject_rows and records_by_type fails two checks. Each weighs 1.0 of 42.42."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["content_customer_C-001.json", "content_customer_C-002.json", "content_note_CASE-500.json", "content_note_CASE-501.json", "content_order_O-100.json", "content_order_O-101.json", "content_customer_C-003.json", "content_note_CASE-502.json", "content_order_O-102.json"],
+     "reason": "tasks/079-smallfile-batch-reject-ledger/oracle_grade.py:28-48 passes a normalized record only if it holds every key of its ground_truth.json:67-131 entry, record_type and record_id among them, and nothing else but source_path (lines 47-48), while prompt.txt:7-8 and :27 ask for one normalized JSON file per record and give no fields. A record that keeps the input's own id, case or order_id beside record_id fails, and so do the input's fields alone or nested under a fields key, with every value right. Each of the nine content checks weighs 2.0 of 42.42 (line 87), 0.4243 of the score together."
     }
    ]
   },
