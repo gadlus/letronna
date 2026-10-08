@@ -173,6 +173,11 @@
      "kind": "ambiguous convention",
      "checks": ["deduped_forwarded_message", "final_todos_complete"],
      "reason": "tasks/028-email-thread-merge/oracle_grade.py:53 passes dedup only if 'm-101' occurs exactly once anywhere in the thread object, so a correctly deduplicated thread that also lists its message ids or records the removed forward (email_003.json) fails; prompt.txt:12 asks only to deduplicate. Lines 69-70 want ground_truth.json:5's 'send security questionnaire' and 'confirm procurement not approved' word for word, while prompt.txt:14 only asks for final_todos. Each check is 1 of 11."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["reply_contains_required_facts"],
+     "reason": "tasks/028-email-thread-merge/oracle_grade.py:75-76 fails the reply unless it holds every string in ground_truth.json:6, one of them the literal 'not approved'. prompt.txt:20 asks only that the reply avoid claiming procurement approval is complete, so 'procurement approval is still pending' and 'procurement is not yet approved' fail, while 'procurement is not approved yet', copied from fixtures/in/emails/email_004.json, passes. 1 of 11 equal checks."
     }
    ]
   },
