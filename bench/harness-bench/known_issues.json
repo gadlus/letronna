@@ -422,6 +422,22 @@
     }
    ]
   },
+  "066-rollback-readiness": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "negation-blind phrase check",
+     "checks": [],
+     "reason": "tasks/066-rollback-readiness/oracle_grade.py:75 excuses 'has been executed' only when 'not ' or 'not yet ' comes right before it, so 'No rollback action has been executed' and 'none of these steps has been executed', both obeying prompt.txt:22, count as claims that it ran. That costs 0.15 of readiness_doc (line 82), 0.033 of the total; two of four runs were hit. Wording the steps as pending without the denial passes. readiness_doc still passes."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "tasks/066-rollback-readiness/ground_truth.json:3-7 set blocker severities by no rule in prompt.txt, which asks only for a severity column (line 13), or the inputs: rollback_duration_risk must be medium though fixtures/in/release_manifest.json:5-6 puts an 18-minute rollback over a 15-minute SLO, and the four runs split high and critical for missing_down_migration and high and medium here. Each severity is 0.35 of its row (oracle_grade.py:55), 0.0454 of the total. The rows' keywords (ground_truth.json:4-7, line 53) also want the words missing, flag and duration, 0.0194 each. blockers_csv still passes."
+    }
+   ]
+  },
   "068-product-launch-ops": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
