@@ -683,6 +683,27 @@
     }
    ]
   },
+  "086-sql-migration-preflight-rollback": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["data_preservation", "idempotent"],
+     "reason": "tasks/086-sql-migration-preflight-rollback/oracle_grade.py:40-42 matches the moved orphan p4 only if its reason holds 'missing', 'non-existent' or 'nonexistent' and 'invoice', while prompt.txt:16 and fixtures/in/billingdb/migration_policy.md:5 ask for a reason column and give it no wording. 'invoice_id not found in invoices at migration time' and 'orphan invoice_id has no matching invoice' fail data_preservation (line 67), and the same row read after the second run fails idempotent (line 85); 'missing invoice' passes. data_preservation below 1.0 caps the score at 0.70 (lines 133-134)."
+    },
+    {
+     "kind": "substring false positive",
+     "checks": [],
+     "reason": "tasks/086-sql-migration-preflight-rollback/oracle_grade.py:92 takes 0.2 off sql_quality for 'delete from payments' anywhere in migration.sql, so the DELETE that completes moving orphans out of payments, which prompt.txt:16 asks for, and a DELETE FROM payments_new that empties a staging table both cost 0.016 of the total (line 132). Folding the move into the payments rebuild passes. sql_quality still passes."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "tasks/086-sql-migration-preflight-rollback/oracle_grade.py:91 wants the words 'foreign key' in migration.sql, comments stripped (line 90), while prompt.txt:17 asks only that future payments.invoice_id references be enforced, so a reference declared inline as REFERENCES invoices(id) costs 0.0128 of the total; line 125 wants 'idempotent' in migration_report.md, which prompt.txt:10 names without contents, so a section headed Idempotency costs 0.0055. sql_quality and documentation still pass."
+    }
+   ]
+  },
   "087-cli-parser-bug-tests": {
    "ceiling": 0.95,
    "exclude_from_tuning": true,
