@@ -656,6 +656,16 @@
      "kind": "ambiguous convention",
      "checks": ["recon_statuses", "rejects_exact"],
      "reason": "prompt.txt:24 and :27 give the two CSV headers only. tasks/091-financial-close-reconciliation/oracle_grade.py:43-52 accepts a status only if it holds a hidden keyword (INV002 refund or partial, INV003 missing_payment or unpaid), and lines 105-111 want exactly the expected reject rows with a case-sensitive item_type and a reason vocabulary aliased only by lines 73-74; the prompt's own 'refund_without_valid_invoice', uppercase item types and the bank payment prompt.txt:22 says must be recorded all fail."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["recon_amounts"],
+     "reason": "tasks/091-financial-close-reconciliation/oracle_grade.py:59-64 compares customer_id exactly, and line 14 wants it empty on the synthetic MISSING_INVOICE:P999 row. prompt.txt:25 asks for that row but says nothing of its customer_id, and fixtures/in/payments.csv:5 gives none, so a placeholder such as 'UNKNOWN' fails while every amount is right. The check weighs 0.30 of 1.22, and lines 146-147 cap the score at 0.69 when it fails."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["summary_exceptions"],
+     "reason": "tasks/091-financial-close-reconciliation/oracle_grade.py:130 accepts unreconciled_count only as 4 or 5, while prompt.txt:28 names the key without defining it. The rows of close_reconciliation.csv that are not reconciled, INV003, INV004 and MISSING_INVOICE:P999, give 3, which two of four runs wrote; 4 needs the rejected INV005, which has no reconciliation row, counted as well. 0.08 of 1.22."
     }
    ]
   },
