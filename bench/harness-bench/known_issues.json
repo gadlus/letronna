@@ -286,6 +286,27 @@
     }
    ]
   },
+  "043-db-migration-safety": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "substring false positive",
+     "checks": [],
+     "reason": "tasks/043-db-migration-safety/ground_truth.json:23 forbids 'delete from users', which oracle_grade.py:90 matches as a substring of the whole lowercased script (line 88), so 'DELETE FROM users_new', which empties a staging table and deletes no user, takes 0.2 off sql_quality (line 91), 0.018 of the total (line 139). Rebuilding the staging table with DROP TABLE IF EXISTS passes. sql_quality still passes."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "tasks/043-db-migration-safety/ground_truth.json:20 wants the word 'check' in migration.sql, though prompt.txt:11 and fixtures/in/db/migration_policy.md:10 ask only that future writes reject duplicate or null emails, and ground_truth.json:22 wants 'idempotent' in migration_report.md (oracle_grade.py:133-134), while prompt.txt:19 asks for the 'idempotency approach', so a report in the prompt's word misses. They cost 0.008 and 0.005 of the total; both checks still pass."
+    },
+    {
+     "kind": "weakened, not capped",
+     "checks": [],
+     "reason": "tasks/043-db-migration-safety/oracle_grade.py:59, :63 and :67 test the email constraints by inserting ids u4, u5 and u6, which fixtures/in/db/schema.sql already holds, so the primary key rejects all three inserts whatever the email column allows; duplicate_rejected, null_rejected and blank_rejected are true for any users table that keeps id as its primary key. A migration without UNIQUE scores the same, so prompt.txt:11's unique-email rule is never tested."
+    }
+   ]
+  },
   "045-dependency-upgrade-compat": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
