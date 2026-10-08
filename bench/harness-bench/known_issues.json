@@ -462,6 +462,17 @@
     }
    ]
   },
+  "095-policy-version-conflict-resolution": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["scope"],
+     "reason": "tasks/095-policy-version-conflict-resolution/oracle_grade.py:62-64 passes a case's scope only if its coverage_scope, conflict reason and caveat together hold every scope token in ground_truth.json, and line 90 needs 9 of 11 cases, while prompt.txt:24 names coverage_scope and gives it no vocabulary. The run's general for C-001 (line 8 wants global), the policy in effect for C-007 (line 50 wants then) and does not apply to internal team meals for C-010 (line 71 wants not change) fail though each says the same; the words come from prompt.txt:36, fixtures/in/cases/policy_questions.json:63 and fixtures/in/policy_versions/regional_addendum_france_2025-02.md:7, so only an answer quoting those passes. At 8 of 11, lines 114-115 cap the task at 0.74; the total is partial credit, so 1.0 needs all 11, and line 103's audit sub-score also wants four of newer, scoped, effective, supersede and expired, which prompt.txt:30 does not name either."
+    }
+   ]
+  },
   "096-offline-knowledge-qa-insufficient-evidence": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
