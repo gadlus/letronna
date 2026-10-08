@@ -327,7 +327,8 @@ impl Tool for FindTools {
             }
             _ => Vec::new(),
         };
-        Ok(search(&tools, query, ctx.plan, &rare))
+        let connection = ctx.caller.connection.as_deref();
+        Ok(search(&tools, query, ctx.plan, &rare, connection))
     }
     fn concurrent(&self) -> bool {
         true
@@ -362,8 +363,15 @@ impl Tool for CallMcpTool {
 
 /// What a search for `query` among the MCP tools in `tools` and the `rare`
 /// ones left out finds; in plan mode only among those that change nothing,
-/// as plan mode would offer.
-fn search(tools: &[Arc<dyn Tool>], query: &str, plan: bool, rare: &[String]) -> String {
+/// as plan mode would offer. Ranked by Jev for a search on `connection`
+/// where it is asked, else by the words.
+fn search(
+    tools: &[Arc<dyn Tool>],
+    query: &str,
+    plan: bool,
+    rare: &[String],
+    connection: Option<&Connection>,
+) -> String {
     let every: Vec<&Arc<dyn Tool>> = tools
         .iter()
         .filter(|tool| is_mcp(tool.name()) || rare.iter().any(|name| name == tool.name()))
@@ -381,13 +389,39 @@ fn search(tools: &[Arc<dyn Tool>], query: &str, plan: bool, rare: &[String]) -> 
                 tools left out qualifies."
             .into();
     }
-    let ranked = ranked(&tools, query);
+    // A search that names a tool exactly finds it without asking anyone.
+    let exact = tools.iter().any(|tool| tool.name() == query.trim());
+    let judged = connection
+        .filter(|_| !exact)
+        .and_then(|connection| crate::jev::rank(connection, query, &options(&tools, query)));
+    let mut out = String::new();
+    let ranked = match judged {
+        Some(crate::jev::Judged::Ranked(names)) => {
+            let chosen: Vec<&Arc<dyn Tool>> = names
+                .iter()
+                .filter_map(|name| tools.iter().find(|tool| tool.name() == name).copied())
+                .collect();
+            if chosen.is_empty() {
+                ranked(&tools, query)
+            } else {
+                chosen
+            }
+        }
+        Some(crate::jev::Judged::Nothing) => {
+            out.push_str("None of these tools seems to do that; the nearest by name are below.\n");
+            ranked(&tools, query)
+        }
+        None => ranked(&tools, query),
+    };
     if ranked.is_empty() {
-        let mut out = format!("No tool matches \"{}\". The tools are:", query.trim());
+        out.push_str(&format!(
+            "No tool matches \"{}\". The tools are:",
+            query.trim()
+        ));
         list(&mut out, &names(&tools), FOUND_BYTES);
         return out;
     }
-    let mut out = String::from(
+    out.push_str(
         "Call one with call_mcp_tool: its name in `name` and its arguments in `arguments`.\n",
     );
     let mut shown = 0;
@@ -411,6 +445,23 @@ fn search(tools: &[Arc<dyn Tool>], query: &str, plan: bool, rare: &[String]) -> 
         list(&mut out, &names(rest), crate::chat::MAX_TOOL_CHARS - 100);
     }
     out
+}
+
+/// The names and descriptions of `tools` Jev chooses among for `query`:
+/// those the words rank first go first, so they are among the ones it is
+/// shown when there are more than it takes.
+fn options(tools: &[&Arc<dyn Tool>], query: &str) -> Vec<(&'static str, &'static str)> {
+    let mut order = ranked(tools, query);
+    let rest: Vec<&Arc<dyn Tool>> = tools
+        .iter()
+        .filter(|tool| !order.iter().any(|first| first.name() == tool.name()))
+        .copied()
+        .collect();
+    order.extend(rest);
+    order
+        .iter()
+        .map(|tool| (tool.name(), tool.description()))
+        .collect()
 }
 
 /// How `tool` shows in a search's result, with `schema` for its arguments
@@ -582,6 +633,7 @@ fn words(text: &str) -> Vec<String> {
 pub(crate) mod tests {
     use super::*;
     use crate::chat::Message;
+    use std::time::Duration;
 
     /// An MCP server's tool, as far as the rest of Letronna can tell.
     pub(crate) struct Fake {
@@ -766,6 +818,126 @@ pub(crate) mod tests {
         };
         wrap(&mut wired, &connection(), mcp);
         assert_eq!(wired, saved());
+    }
+
+    /// A Jev on this computer that answers every question with `answer`
+    /// after `wait`, giving its address and the questions it was put.
+    fn jev(answer: Value, wait: Duration) -> (String, std::sync::mpsc::Receiver<Value>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/systemone", server.local_addr().unwrap());
+        let (sent, asked) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for mut stream in server.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let line = line.trim_end().to_ascii_lowercase();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some(n) = line.strip_prefix("content-length:") {
+                        length = n.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let _ = sent.send(serde_json::from_slice(&body).unwrap_or_default());
+                std::thread::sleep(wait);
+                let reply = answer.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        (url, asked)
+    }
+
+    /// Jev's answer choosing `best` and giving `second` a little chance.
+    fn chose(best: &str, second: &str) -> Value {
+        json!({"model": "jev-latest", "answers": {
+            "tool": {"type": "choice", "choice": best, "confidence": 0.8,
+                "probabilities": {best: 0.86, second: 0.1, "speak": 0.01, "none": 0.03}},
+            "needs_tool": {"type": "noul", "noul": 0.97}}})
+    }
+
+    /// What a lean run on a hosted chat finds for `query`, with the settings
+    /// ranking by `mode` and asking Jev at `url`; and the same search ranked
+    /// by the words alone.
+    fn searched(url: &str, mode: &str, query: &str) -> (String, String) {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::store::tests::Scratch::new("mcp-find-jev");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let settings =
+            json!({"endpoint": "", "model": "", "tool_search": mode, "jev_endpoint": url});
+        std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+        let lean = Connection {
+            endpoint: "https://openrouter.ai/api/v1".into(),
+            lean_tools: true,
+            ..connection()
+        };
+        let tools = crate::tools::all();
+        let rare = rare_offered(&lean);
+        let found = search(&tools, query, false, &rare, Some(&lean));
+        let by_words = search(&tools, query, false, &rare, None);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        (found, by_words)
+    }
+
+    /// Where the entry for the tool called `name` starts in `found`.
+    fn at(found: &str, name: &str) -> usize {
+        found
+            .find(&format!("\n{name}: "))
+            .unwrap_or_else(|| panic!("no {name} in {found}"))
+    }
+
+    #[test]
+    fn jev_ranks_the_tools_a_search_finds_by_what_they_do() {
+        let (url, asked) = jev(chose("use_page", "browse"), Duration::ZERO);
+        let query = "sign up on the shop's site for me";
+        let (found, _) = searched(&url, "jev", query);
+        assert!(at(&found, "use_page") < at(&found, "browse"), "{found}");
+        // It was told the search and the tools, and nothing of the chat.
+        let question = asked.try_recv().expect("Jev was not asked");
+        assert_eq!(question["state"], json!({"request": query}));
+        let criteria = question["questions"]["tool"]["criteria"]
+            .as_object()
+            .unwrap();
+        assert!(criteria.contains_key("browse") && criteria.contains_key("none"));
+        assert!(
+            !criteria.keys().any(|name| name == "read_file"),
+            "{criteria:?}"
+        );
+    }
+
+    #[test]
+    fn jev_saying_no_tool_does_it_is_passed_on_with_the_nearest_by_name() {
+        let (url, _asked) = jev(chose("none", "browse"), Duration::ZERO);
+        let (found, by_words) = searched(&url, "jev", "browse the web");
+        assert!(
+            found.starts_with("None of these tools seems to do that"),
+            "{found}"
+        );
+        assert!(found.ends_with(&by_words), "{found}");
+    }
+
+    #[test]
+    fn a_jev_too_slow_or_switched_off_leaves_the_ranking_to_the_words() {
+        let (url, _asked) = jev(chose("use_page", "browse"), Duration::from_secs(2));
+        let (found, by_words) = searched(&url, "jev", "open a web page in a browser");
+        assert_eq!(found, by_words);
+        let (url, asked) = jev(chose("use_page", "browse"), Duration::ZERO);
+        let (found, by_words) = searched(&url, "names", "open a web page in a browser");
+        assert_eq!(found, by_words);
+        assert!(asked.try_recv().is_err(), "Jev was asked with names chosen");
     }
 
     #[test]
@@ -981,16 +1153,16 @@ pub(crate) mod tests {
             fake("read_file", "Letronna's own, never searched.", false),
         ];
         tools.extend(server(8, 2));
-        let found = search(&tools, "create issue", false, &[]);
+        let found = search(&tools, "create issue", false, &[], None);
         let at = |name: &str| found.find(&format!("\n{name}: ")).unwrap();
         assert!(at("mcp__gh__create_issue") < at("mcp__gh__list_issues"));
         assert!(at("mcp__gh__list_issues") < at("mcp__gh__get_file"));
         assert!(found.contains(r#""path":{"type":"string"}"#));
         assert!(!found.contains("read_file"));
         // The exact name comes first, whatever else its words match.
-        let exact = search(&tools, "mcp__gh__list_issues", false, &[]);
+        let exact = search(&tools, "mcp__gh__list_issues", false, &[], None);
         assert!(exact.find("list_issues") < exact.find("create_issue"));
-        let many = search(&tools, "thing", false, &[]);
+        let many = search(&tools, "thing", false, &[], None);
         assert_eq!(many.matches("\nmcp__big__tool_").count(), MAX_FOUND);
         assert!(many.ends_with(
             "Also matched, each shown whole when searched for by name: mcp__big__tool_5, \
@@ -1005,10 +1177,12 @@ pub(crate) mod tests {
             fake("mcp__db__query", "Run a query.", false),
         ];
         assert_eq!(
-            search(&tools, "weather", false, &[]),
+            search(&tools, "weather", false, &[], None),
             "No tool matches \"weather\". The tools are: mcp__gh__create_issue, mcp__db__query."
         );
-        assert!(search(&[], "weather", false, &[]).starts_with("No MCP server has any tools"));
+        assert!(
+            search(&[], "weather", false, &[], None).starts_with("No MCP server has any tools")
+        );
     }
 
     #[test]
@@ -1017,11 +1191,13 @@ pub(crate) mod tests {
             fake("mcp__gh__create_issue", "Create an issue.", true),
             fake("mcp__gh__list_issues", "List issues.", false),
         ];
-        let planning = search(&tools, "issue", true, &[]);
+        let planning = search(&tools, "issue", true, &[], None);
         assert!(planning.contains("list_issues") && !planning.contains("create_issue"));
-        assert!(search(&tools, "issue", false, &[]).contains("create_issue"));
+        assert!(search(&tools, "issue", false, &[], None).contains("create_issue"));
         // Rather than claim there are no tools at all.
-        assert!(search(&tools[..1], "issue", true, &[]).starts_with("In plan mode only tools"));
+        assert!(
+            search(&tools[..1], "issue", true, &[], None).starts_with("In plan mode only tools")
+        );
     }
 
     /// A tool whose schema has `properties` arguments, each described at
@@ -1047,7 +1223,7 @@ pub(crate) mod tests {
             large("mcp__notion__make_page", 40, 100),
             large("mcp__notion__make_note", 40, 100),
         ];
-        let found = search(&tools, "make page", false, &[]);
+        let found = search(&tools, "make page", false, &[], None);
         assert!(
             found.len() <= crate::chat::MAX_TOOL_CHARS,
             "{}",
@@ -1070,6 +1246,7 @@ pub(crate) mod tests {
             "page",
             false,
             &[],
+            None,
         );
         assert!(
             found.len() <= crate::chat::MAX_TOOL_CHARS,
@@ -1089,6 +1266,7 @@ pub(crate) mod tests {
             "repos",
             false,
             &[],
+            None,
         );
         assert!(found.contains("\nmcp__gh__list_repos: Lists repositories. mcp__gh__delete_repo:"));
         assert!(!found.contains("\nmcp__gh__delete_repo"));
@@ -1098,6 +1276,7 @@ pub(crate) mod tests {
             "repos",
             false,
             &[],
+            None,
         );
         let line = found
             .lines()
