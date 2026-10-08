@@ -897,6 +897,17 @@
     }
    ]
   },
+  "101-marketing-sensitive-commitment-review": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["rationale_terms"],
+     "reason": "tasks/101-marketing-sensitive-commitment-review/oracle_grade.py:121-124 wants every term of ground_truth.json:29-44 in change_rationale.md as a substring, the verbs soften, remove and qualify among them, while prompt.txt:36 asks the rationale to use those remediation verbs. 'softened' and 'removed' hold the first two, but 'qualified' does not hold 'qualify', so a rationale saying what it softened, removed and qualified fails. The check weighs 0.11 of 1.09 (line 142), so an answer otherwise right scores 0.8991."
+    }
+   ]
+  },
   "102-internal-doc-retrieval-injection-defense": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
