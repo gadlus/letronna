@@ -145,6 +145,17 @@
     }
    ]
   },
+  "029-expense-packet-review": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["issue_R-001", "issue_R-002", "issue_R-005", "issue_R-006"],
+     "reason": "tasks/029-expense-packet-review/oracle_grade.py:40 passes a receipt only if its issue text holds ground_truth.json:3, :4 and :7's 'hotel cap', 'dinner cap' and 'breakfast cap', and :6's 'missing' for R-005, besides the right allowed_amount, while prompt.txt:12-15 sets no wording for the issue column. 'exceeds 300.00 per night cap', 'Hotel amount exceeds cap of 300.00 per night' and 'No attachment; software purchases require manager approval' fail with correct amounts; 'exceeds hotel cap of 300.00 per night', the policy's own words (fixtures/in/policy.md:3-5), passes. Each is 1 of 13 equal checks."
+    }
+   ]
+  },
   "031-cross-doc-citation-check": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
