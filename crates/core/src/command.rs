@@ -1948,6 +1948,86 @@ pub(crate) fn sends_out(command: &Command, dialect: Dialect) -> bool {
         || (command.nested.iter()).any(|nested| sends_out(nested, dialect))
 }
 
+/// curl's and wget's options that send a request through some other place
+/// or read their settings from elsewhere: a SOCKS proxy, a name resolved to
+/// another address, a config file, or wget's wgetrc commands. A word naming
+/// a proxy is caught by its name.
+const REROUTES: &[&str] = &[
+    "--socks",
+    "--connect-to",
+    "--resolve",
+    "--doh-url",
+    "--config",
+    "-K",
+    "-e",
+    "--execute",
+];
+
+/// Where a curl or wget `command` sends its request, each place as
+/// `host:port`, when every one is spelled out as an http or https address
+/// and nothing routes it elsewhere; None when that cannot be told, which
+/// leaves the call counted as sending data out.
+pub(crate) fn fetch_targets(command: &Command) -> Option<Vec<String>> {
+    let name = name_of(command.argv.get(command.at)?);
+    if !matches!(name.as_str(), "curl" | "wget")
+        || !command.spelled_out
+        || !command.nested.is_empty()
+    {
+        return None;
+    }
+    let reroutes = |word: &String| {
+        word.to_lowercase().contains("proxy")
+            || REROUTES.iter().any(|option| word.starts_with(option))
+            // curl's `-x` takes a proxy, alone or in a group such as `-sx`.
+            || (name == "curl" && word.starts_with('-') && !word.starts_with("--") && word.contains('x'))
+    };
+    if command.argv.iter().any(reroutes) {
+        return None;
+    }
+    let takes = if name == "wget" {
+        [WGET_FILES, WGET_POSTS].concat()
+    } else {
+        [CURL_LETTERS, CURL_SENDS, CURL_POSTS].concat()
+    };
+    // Every word that is not an option or its value must be an address: an
+    // option this does not know leaves its value here, and then nothing is
+    // told for sure.
+    let (_, words) = given(&command.argv[command.at + 1..], &takes);
+    let targets: Option<Vec<String>> = words.iter().map(|word| host_port(word)).collect();
+    targets.filter(|targets| !targets.is_empty())
+}
+
+/// `url`'s host and port as `host:port`, lowercased, with the port its
+/// scheme implies when it names none; None for anything but an http or
+/// https address.
+pub(crate) fn host_port(url: &str) -> Option<String> {
+    let lower = url.to_lowercase();
+    let (rest, implied) = match lower.split_once("://")? {
+        ("http", rest) => (rest, 80),
+        ("https", rest) => (rest, 443),
+        _ => return None,
+    };
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let place = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, place)| place);
+    let (host, port) = match place.strip_prefix('[') {
+        Some(inside) => {
+            let (host, after) = inside.split_once(']')?;
+            let port = match after {
+                "" => implied,
+                after => after.strip_prefix(':')?.parse().ok()?,
+            };
+            (format!("[{host}]"), port)
+        }
+        None => match place.split_once(':') {
+            Some((host, port)) => (host.to_owned(), port.parse::<u16>().ok()?),
+            None => (place.to_owned(), implied),
+        },
+    };
+    (!host.is_empty()).then(|| format!("{host}:{port}"))
+}
+
 /// Whether scp or rsync, given `args` with `takes` its options that take a
 /// value, copies to another machine, which it names last.
 fn copies_out(args: &[String], takes: &[&str], dialect: Dialect) -> bool {
@@ -4271,6 +4351,58 @@ mod tests {
         }
         for path in ["/", "/usr/src/app", "/home/ada/code", r"\\?\C:\Users\ada"] {
             assert!(!system(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn host_port_reads_http_and_https_addresses_only() {
+        for (url, place) in [
+            ("http://127.0.0.1:38750/search?q=1", Some("127.0.0.1:38750")),
+            (
+                "HTTPS://user:pw@API.Example.com/v2#top",
+                Some("api.example.com:443"),
+            ),
+            ("http://localhost", Some("localhost:80")),
+            ("https://[::1]:8443/x", Some("[::1]:8443")),
+            ("http://[::1]/", Some("[::1]:80")),
+            ("ftp://example.com/a", None),
+            ("127.0.0.1:38750/search", None),
+            ("http://example.com:port/", None),
+            ("http:///path", None),
+        ] {
+            assert_eq!(host_port(url).as_deref(), place, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_fetchs_places_are_told_only_when_every_one_is_spelled_out() {
+        let targets = |line: &str| {
+            let commands = assess(line, Dialect::Sh, None).commands;
+            fetch_targets(&commands[0])
+        };
+        assert_eq!(
+            targets("curl -sS -X POST http://127.0.0.1:38750/search -d q=1"),
+            Some(vec!["127.0.0.1:38750".to_owned()])
+        );
+        assert_eq!(
+            targets("wget --post-data=q=1 https://example.com/a"),
+            Some(vec!["example.com:443".to_owned()])
+        );
+        for line in [
+            "curl -d q=1 \"$URL\"",
+            "curl -d q=1 127.0.0.1:38750/search",
+            "curl -x http://example.com:3128 -d q=1 http://127.0.0.1:1/",
+            "curl -sx example.com:3128 -d q=1 http://127.0.0.1:1/",
+            "curl --proxy http://example.com:3128 -d q=1 http://127.0.0.1:1/",
+            "HTTP_PROXY=http://example.com:3128 curl -d q=1 http://127.0.0.1:1/",
+            "curl --resolve example.org:80:203.0.113.5 -d q=1 http://example.org/",
+            "curl -K settings.txt -d q=1 http://127.0.0.1:1/",
+            "curl --output out.txt -d q=1 http://127.0.0.1:1/",
+            "wget -e use_proxy=on --post-data=q=1 http://127.0.0.1:1/",
+            "sh -c 'curl -d q=1 http://127.0.0.1:1/'",
+            "scp notes.txt user@127.0.0.1:",
+        ] {
+            assert_eq!(targets(line), None, "{line}");
         }
     }
 }
