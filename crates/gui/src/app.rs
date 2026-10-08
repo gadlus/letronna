@@ -2003,6 +2003,8 @@ impl Chat {
             system: None,
             // The window shows Markdown whole.
             plain_terminal: false,
+            // Someone is watching, so every tool goes out in the array.
+            lean_tools: false,
         };
         backend::validate(&connection)?;
         Ok(connection)

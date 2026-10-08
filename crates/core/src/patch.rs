@@ -1231,7 +1231,7 @@ mod tests {
                 model: model.into(),
                 ..Default::default()
             };
-            !crate::tools::specs_of(&tools, &connection, false).is_empty()
+            !crate::tools::specs_of(&tools, &connection, Default::default()).is_empty()
         };
         assert!(offered("gpt-4.1"));
         assert!(!offered("claude-sonnet-4-5"));

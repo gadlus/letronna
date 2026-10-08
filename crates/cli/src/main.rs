@@ -712,6 +712,10 @@ fn begin(
     let (id, before) = (conversation.id, conversation.messages.len());
     // What the user asked for, which Auto mode's judge reads as their wishes.
     connection.typed = letronna_core::judge::typed(&conversation.messages).into();
+    // A run that did not name its tools gets Letronna's less used ones on
+    // demand, which keeps each request some 3,000 tokens smaller; one that
+    // named them gets what it named in the array.
+    connection.lean_tools = args.tools.is_none();
     let context = tools::ToolContext::of(&connection);
     let spec = Spec {
         connection,

@@ -107,6 +107,8 @@ impl Runner {
             session_model: String::new(),
             system: None,
             plain_terminal: self.plain_terminal,
+            // Set by `-p` alone, once it knows whether its tools were named.
+            lean_tools: false,
         }
     }
 

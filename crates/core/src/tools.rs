@@ -722,15 +722,15 @@ pub(crate) fn keeps_tools(connection: &Connection) -> bool {
 /// `call_mcp_tool` (see `mcp_find`).
 pub fn specs(connection: &Connection) -> Vec<Value> {
     let tools = all();
-    let on_demand = crate::mcp_find::on_demand(&tools);
+    let on_demand = crate::mcp_find::OnDemand::of(connection, &tools);
     specs_of(&tools, connection, on_demand)
 }
 
-/// `specs` of `tools`, with the MCP tools among them `on_demand` or not.
+/// `specs` of `tools`, less those left out `on_demand`.
 pub(crate) fn specs_of(
     tools: &[Arc<dyn Tool>],
     connection: &Connection,
-    on_demand: bool,
+    on_demand: crate::mcp_find::OnDemand,
 ) -> Vec<Value> {
     let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
     let history = connection
