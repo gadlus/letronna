@@ -69,6 +69,17 @@
     }
    ]
   },
+  "019-incident-runbook-synthesis": {
+   "ceiling": 0.925,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "hard ceiling",
+     "checks": [],
+     "reason": "tasks/019-incident-runbook-synthesis/ground_truth.json:2 wants the incident_id INC-2026-04-07-APAC-CHECKOUT, which is in no fixture and not in prompt.txt, whose line 15 only names the field. It is 0.15 of incident_report's score (oracle_grade.py:43), which weighs 0.50 (ground_truth.json:17), so every output loses 0.075. incident_report still passes at 0.85 with everything else right, so no failed check names the loss."
+    }
+   ]
+  },
   "021-batch-rename-transform": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
