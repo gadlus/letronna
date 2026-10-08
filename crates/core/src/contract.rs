@@ -7,8 +7,8 @@
 //! before it ends: the request is read for the files it names under `out/`,
 //! with what it spells out for them -- a CSV header or the columns it names,
 //! JSON keys and the keys each item of a list holds, the few values a field
-//! may take, the names and words a file must use -- and each file is looked
-//! at on disk.
+//! may take, the names and words a file must use or must not -- and each
+//! file is looked at on disk.
 //!
 //! Both halves are plain text matching rather than a model's reading, so
 //! nothing is invented, and the matching leans to missing: a file counts only
@@ -291,6 +291,24 @@ const SPAN: u32 = 20;
 /// files and pictures.
 const READABLE: [&str; 7] = ["md", "txt", "json", "jsonl", "csv", "yaml", "yml"];
 
+/// Words for the wording a list forbids, as in "Do not include the phrases:"
+/// or "Do not use these words:".
+const PHRASING: [&str; 7] = [
+    "phrase", "phrases", "word", "words", "term", "terms", "wording",
+];
+
+/// Words for putting wording in a file that a list after them forbids, as
+/// "Do not state:" or "Do not include the phrases:" do.
+const SAYING: [&str; 5] = ["include", "use", "write", "say", "state"];
+
+/// The `SAYING` words whose list is of things said even with no word for
+/// wording before it, as in "Do not state:".
+const STATING: [&str; 2] = ["state", "say"];
+
+/// Words that turn a `SAYING` word after them into a ban, as in "Do not" or
+/// "must never".
+const NOTS: [&str; 4] = ["not", "never", "don't", "dont"];
+
 /// Bad lines reported for one file: three show the pattern, and more would
 /// crowd out the other files.
 const LINES: usize = 3;
@@ -334,6 +352,9 @@ struct Output {
     /// Names and words the request says the file must have in it, as it
     /// writes them.
     terms: Vec<String>,
+    /// Phrases the request or a file it names to read forbids the file to
+    /// hold.
+    forbidden: Vec<String>,
     /// The file's size and change time as the request was read, if it was
     /// there then.
     found: Option<Stamp>,
@@ -436,6 +457,7 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
                         ordered: false,
                         values: Vec::new(),
                         terms: Vec::new(),
+                        forbidden: Vec::new(),
                         found,
                     });
                 }
@@ -478,6 +500,8 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
     // for notes.md:" or an item naming it heads the lines under it: how far
     // in it is, whether it is an item, and which output.
     let mut topic: Option<(usize, bool, usize)> = None;
+    // Wording forbidden in a section about no one output, so in every one.
+    let mut everywhere: Vec<String> = Vec::new();
     for (at, line) in lines.iter().enumerate() {
         // A line of its own on another output, such as "report.md
         // requirements:", is no longer about the table or data file before
@@ -611,8 +635,55 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
                 }
             }
         }
+        // Wording a list forbids holds for the output its section is about,
+        // and for every one when it is in none, as under "Forbidden:".
+        let phrases = forbidden_at(&lines, at);
+        if !phrases.is_empty() {
+            let topic = topic.map(|(.., i)| i);
+            if topic.is_none() && outputs_in(line, &outputs, workspace).is_empty() {
+                everywhere.extend(phrases);
+            } else if let Some(i) = subject(line, line, topic, &outputs, workspace) {
+                forbid(&mut outputs[i], &phrases);
+            }
+        }
+    }
+    // A file named to read may list what not to state, as a policy's
+    // judgments never to write do, and that holds for every output too.
+    let mut sources = Vec::new();
+    for input in crate::inputs::named(crate::references::typed(text), workspace) {
+        let file = workspace.join(&input);
+        let small = std::fs::metadata(&file).is_ok_and(|meta| meta.len() <= LARGEST);
+        let Some(content) = small.then(|| std::fs::read_to_string(&file).ok()).flatten() else {
+            continue;
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        let stated: Vec<String> = (0..lines.len())
+            .flat_map(|at| stated_at(&lines, at))
+            .collect();
+        if stated.is_empty() {
+            sources.push(content.to_lowercase());
+        }
+        everywhere.extend(stated);
+    }
+    // Not what a source holds as well, since an output may have to quote it;
+    // only a list for one output's own section forbids that.
+    everywhere.retain(|phrase| {
+        let phrase = phrase.to_lowercase();
+        !sources.iter().any(|source| holds_word(source, &phrase))
+    });
+    for output in &mut outputs {
+        forbid(output, &everywhere);
     }
     Contract { outputs }
+}
+
+/// Adds `phrases` to those `output` must not hold, each once.
+fn forbid(output: &mut Output, phrases: &[String]) {
+    for phrase in phrases {
+        if !output.forbidden.contains(phrase) {
+            output.forbidden.push(phrase.clone());
+        }
+    }
 }
 
 /// What is wrong with each file `contract` asks for, as it stands in
@@ -1670,6 +1741,166 @@ fn to_say(sentence: &str) -> Option<&str> {
     None
 }
 
+/// The phrases line `at` of `lines` forbids a file to hold: those listed
+/// after "Do not include the phrases:" or "Do not call anyone a", under "Do
+/// not state:", or in quotes after "Do not say" under a heading such as
+/// "Forbidden:"; none for any other rule, as "Do not use the network" is.
+fn forbidden_at(lines: &[&str], at: usize) -> Vec<String> {
+    let line = lines[at];
+    let under = forbidding(lines, at);
+    let mut phrases = Vec::new();
+    for sentence in sentences(line) {
+        let words = spans(sentence);
+        let bare: Vec<String> = (words.iter())
+            .map(|(_, word)| {
+                let word = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'');
+                word.to_lowercase()
+            })
+            .collect();
+        for (i, word) in bare.iter().enumerate() {
+            let negated = i > 0 && NOTS.contains(&bare[i - 1].as_str());
+            let (start, said) = words[i];
+            let rest = &sentence[start + said.len()..];
+            let list = if negated && ["call", "describe"].contains(&word.as_str()) {
+                let who = ["anyone", "anybody"]
+                    .iter()
+                    .find_map(|who| word_after(rest.trim_start(), who));
+                // "Call anyone a cheat" or "describe anyone as a cheat", and
+                // not "call anyone names".
+                who.and_then(|after| {
+                    let after = word_after(after, "as").unwrap_or(after);
+                    ["a", "an"].iter().find_map(|a| word_after(after, a))
+                })
+                .map(str::to_owned)
+            } else if SAYING.contains(&word.as_str()) && (negated || under) {
+                match rest.split_once(':') {
+                    // "Do not include these phrases as claims: a, b" or "Do
+                    // not state:" over a list, but not "Do not include:
+                    // emails, phone numbers", which lists what, not wording.
+                    Some((object, list))
+                        if !object.contains(['"', '“', '`', ';'])
+                            && object.split_whitespace().count() <= 6
+                            && (says(object, &PHRASING)
+                                || (object.trim().is_empty()
+                                    && STATING.contains(&word.as_str()))) =>
+                    {
+                        if list.trim().is_empty() && line.trim_end().ends_with(':') {
+                            Some(listed_under(lines, lines, at))
+                        } else {
+                            Some(list.to_owned())
+                        }
+                    }
+                    // `write "a" or "b"` under "Forbidden:".
+                    _ if under => quoted_after(rest),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(list) = list {
+                phrases.extend(phrases_in(&list));
+                break;
+            }
+        }
+    }
+    phrases
+}
+
+/// The phrases listed under line `at` of `lines` when it is a heading such
+/// as "Do not state:" or "Never use these words:", as a policy's judgments
+/// not to write are; none under "Agents must not state:", a rule for others
+/// that the task may be to check.
+fn stated_at(lines: &[&str], at: usize) -> Vec<String> {
+    let plain = plain(lines[at]);
+    let told = [" do not ", " don't ", " dont ", " never "]
+        .iter()
+        .find_map(|not| plain.strip_prefix(not))
+        .unwrap_or_default();
+    // "Do not state:" alone, since "Do not say anything about:" lists
+    // topics, not wording.
+    let (verb, object) = told.split_once(' ').unwrap_or_default();
+    let wording = SAYING.contains(&verb)
+        && (says(object, &PHRASING) || (object.is_empty() && STATING.contains(&verb)));
+    let first = (at + 1..lines.len()).find(|&i| !lines[i].trim().is_empty());
+    let heads = lines[at].trim_end().ends_with(':') && first.is_some_and(|i| listed(lines[i]));
+    if !wording || !heads {
+        return Vec::new();
+    }
+    phrases_in(&listed_under(lines, lines, at))
+}
+
+/// Whether line `at` of `lines` is an item under a heading such as
+/// "Forbidden:" or "Do not:", whose items need not say "not" themselves.
+fn forbidding(lines: &[&str], at: usize) -> bool {
+    if !listed(lines[at]) {
+        return false;
+    }
+    let heading = lines[..at]
+        .iter()
+        .rev()
+        .find(|line| !listed(line) && !line.trim().is_empty());
+    heading.is_some_and(|heading| {
+        let plain = plain(heading);
+        heading.trim_end().ends_with(':')
+            && (says(heading, &["forbidden", "prohibited"])
+                || [" do not ", " don't ", " never "].contains(&plain.as_str()))
+    })
+}
+
+/// The text after `rest`'s optional "the phrase" or "these words" when it
+/// opens with a quote, as `"a" or "b"` does.
+fn quoted_after(rest: &str) -> Option<String> {
+    let mut rest = rest.trim_start();
+    for lead in ["the", "these", "any", "phrases", "phrase", "words", "word"] {
+        rest = word_after(rest, lead).unwrap_or(rest);
+    }
+    rest.starts_with(['"', '“', '`']).then(|| rest.to_owned())
+}
+
+/// The phrases `list` gives: those in quotes where it quotes any, or else
+/// each between its commas and "or", as far as each is a few plain words.
+fn phrases_in(list: &str) -> Vec<String> {
+    let list = list.split(';').next().unwrap_or_default();
+    let list = list.trim().trim_end_matches('.');
+    let mut quoted = Vec::new();
+    let mut rest = list;
+    while let Some(open) = rest.find(['"', '“', '`']) {
+        let mark = rest[open..].chars().next().unwrap_or('"');
+        let close = if mark == '“' { '”' } else { mark };
+        let after = &rest[open + mark.len_utf8()..];
+        let Some(end) = after.find(close) else {
+            break;
+        };
+        quoted.push(&after[..end]);
+        rest = &after[end + close.len_utf8()..];
+    }
+    let items: Vec<&str> = if quoted.is_empty() {
+        (list.split(','))
+            .flat_map(|item| {
+                let item = item.trim();
+                let item = (item
+                    .strip_prefix("or ")
+                    .or_else(|| item.strip_prefix("and ")))
+                .unwrap_or(item);
+                item.split(" or ")
+            })
+            .collect()
+    } else {
+        quoted
+    };
+    items
+        .into_iter()
+        .map(|item| item.trim_matches(|c: char| c.is_whitespace() || "*`\"“”".contains(c)))
+        .filter(|item| {
+            let count = item.split_whitespace().count();
+            (1..=5).contains(&count)
+                && item.chars().count() > 2
+                && (item.chars()).all(|c| c.is_alphanumeric() || " -'/&.".contains(c))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
 /// The words of `text` split at white space, each with where it starts.
 fn spans(text: &str) -> Vec<(usize, &str)> {
     let mut spans = Vec::new();
@@ -1763,7 +1994,40 @@ fn wrong(output: &Output, file: &Path) -> Vec<String> {
         _ => Vec::new(),
     };
     problems.extend(unsaid(output, &bytes));
+    problems.extend(repeated(output, &bytes));
     problems
+}
+
+/// The wording `output`, holding `bytes`, repeats of what its request
+/// forbids, with the line each is first on.
+fn repeated(output: &Output, bytes: &[u8]) -> Option<String> {
+    if output.forbidden.is_empty() || !READABLE.contains(&kind(&output.path).as_str()) {
+        return None;
+    }
+    let text = String::from_utf8_lossy(bytes).to_lowercase();
+    let mut found: Vec<(usize, &String)> = Vec::new();
+    for (at, line) in text.lines().enumerate() {
+        for phrase in &output.forbidden {
+            let first = !found.iter().any(|(_, seen)| *seen == phrase);
+            if first && holds_word(line, &phrase.to_lowercase()) {
+                found.push((at + 1, phrase));
+            }
+        }
+    }
+    let shown: Vec<String> = (found.iter().take(LINES))
+        .map(|(line, phrase)| format!("`{phrase}` (line {line})"))
+        .collect();
+    let more = match found.len().saturating_sub(LINES) {
+        0 => String::new(),
+        more => format!(" and {more} more"),
+    };
+    (!found.is_empty()).then(|| {
+        format!(
+            "`{}` repeats wording the task forbids: {}{more}; leave it out even to say it was avoided, and name it by its kind.",
+            output.path,
+            shown.join(", ")
+        )
+    })
 }
 
 /// What `output`, holding `bytes`, lacks of the terms its request names for
@@ -2283,6 +2547,27 @@ mod tests {
     fn checked(request: &str, files: &[(&str, &[u8])]) -> Vec<String> {
         let dir = Scratch::new("contract");
         std::fs::create_dir_all(dir.join("out")).unwrap();
+        let contract = from_request(request, &dir);
+        for (path, bytes) in files {
+            std::fs::write(dir.join(path), bytes).unwrap();
+        }
+        problems(&contract, &dir)
+    }
+
+    /// What is wrong with the files `request` asks for, as `checked` finds
+    /// it, with `inputs` there in the workspace before the request is read.
+    fn checked_reading(
+        inputs: &[(&str, &str)],
+        request: &str,
+        files: &[(&str, &[u8])],
+    ) -> Vec<String> {
+        let dir = Scratch::new("contract-inputs");
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        for (path, text) in inputs {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
         let contract = from_request(request, &dir);
         for (path, bytes) in files {
             std::fs::write(dir.join(path), bytes).unwrap();
@@ -3042,6 +3327,73 @@ mod tests {
                 ("out/a.md", b"# Notes\n"),
                 ("out/b.md", b"# Runs\n"),
                 ("out/c.csv", b"id,total\n1,2\n"),
+            ],
+        );
+        assert_eq!(problems, Vec::<String>::new());
+    }
+
+    #[test]
+    fn wording_the_request_or_a_file_it_names_forbids_is_reported_where_repeated() {
+        let rules = "# Rules\n\nDo not state:\n- route closed\n- driver at fault\n";
+        let request = "Read in/rules.md.\n\nCreate:\n- out/summary.md\n- out/log.csv\n\
+                       - out/fixed_copy.md\n\n\
+                       Requirements for fixed_copy.md:\n\
+                       - Do not include the phrases: always on time, zero delays.\n\n\
+                       Forbidden:\n- Do not call anyone a reckless driver or liar.\n\
+                       - Do not use the network.";
+        // Denied, the wording is still repeated; the copy's list holds for
+        // the copy alone.
+        let summary = b"# Summary\n\nNo driver at fault was named.\nNobody was called a liar.\n";
+        let problems = checked_reading(
+            &[("in/rules.md", rules)],
+            request,
+            &[
+                ("out/summary.md", summary),
+                ("out/log.csv", b"id,note\n1,always on time\n"),
+                (
+                    "out/fixed_copy.md",
+                    b"Deliveries keep to schedule.\nWe promise zero delays.\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            problems,
+            [
+                "`out/summary.md` repeats wording the task forbids: `driver at fault` (line 3), `liar` (line 4); leave it out even to say it was avoided, and name it by its kind.",
+                "`out/fixed_copy.md` repeats wording the task forbids: `zero delays` (line 2); leave it out even to say it was avoided, and name it by its kind.",
+            ]
+        );
+    }
+
+    #[test]
+    fn rules_naming_no_wording_rules_for_others_and_wording_a_source_holds_forbid_nothing() {
+        let rules = "Agents must not state:\n- refund guaranteed\n\n\
+                     Do not include:\n- phone numbers\n\n\
+                     Do not say anything about:\n- pricing\n";
+        let chat = "Caller: you said refund guaranteed and called me a liar.\n";
+        let request = "Read in/rules.md and in/chat.md.\n\n\
+                       Create:\n- out/rewrite.md\n- out/rationale.md\n- out/audit.json\n\n\
+                       Requirements for rewrite.md:\n\
+                       - Do not include the phrases: best price ever, risk-free.\n\n\
+                       Requirements for rationale.md:\n- Explain why each phrase was removed.\n\n\
+                       Forbidden:\n- Do not call anyone a liar.\n\
+                       - Do not include: emails, phone numbers.\n\
+                       - Do not call anyone names.\n- Do not write the audit as CSV.";
+        let audit = br#"{"quote": "you said refund guaranteed and called me a liar.",
+                        "note": "phone numbers and pricing left out"}"#;
+        let problems = checked_reading(
+            &[("in/rules.md", rules), ("in/chat.md", chat)],
+            request,
+            &[
+                (
+                    "out/rewrite.md",
+                    b"The risk_free_returns flag stays; prices are fair.\n",
+                ),
+                (
+                    "out/rationale.md",
+                    b"Removed \"best price ever\" and \"risk-free\".\n",
+                ),
+                ("out/audit.json", audit),
             ],
         );
         assert_eq!(problems, Vec::<String>::new());
