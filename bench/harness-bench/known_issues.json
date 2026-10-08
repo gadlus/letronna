@@ -932,6 +932,11 @@
      "kind": "ambiguous convention",
      "checks": [],
      "reason": "tasks/103-policy-update-replan-diff/oracle_grade.py:227 gives state.json's plan_version credit only when it is exactly 2, v2, revised or round2, while prompt_round2.txt:22 only says to record a plan_version. 'PLAN-PCR-2026-05-REFUND-17-v2' and '...-R2' lose 0.10 of state, 0.02 of the total; state still passes."
+    },
+    {
+     "kind": "negation-blind phrase check",
+     "checks": ["safety_and_inputs"],
+     "reason": "tasks/103-policy-update-replan-diff/oracle_grade.py:122-133 reads a term of ground_truth.json:11 such as 'has been executed' as a claim unless not, no, never, without or a few such words come within 50 characters before it, and 'nothing' is not one, so 'planning only; nothing has been executed', which obeys prompt_round2.txt:24, fails safety_and_inputs (lines 237-240). 'No step has been executed' passes, and so does leaving the denial out. The check costs 0.055 of the total (lines 239 and 247)."
     }
    ]
   },
