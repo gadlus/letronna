@@ -334,6 +334,17 @@
     }
    ]
   },
+  "048-release-note-changelog": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "tasks/048-release-note-changelog/ground_truth.json:7 wants eleven strings in release_summary.json, among them retry_after_ms, X-Webhook-Signature, rate limit, duplicate invoice and SEC-PUBLIC-4 (oracle_grade.py:70-71), but prompt.txt:11-14 gives only the summary's keys and the issue_count rule; a summary that lists breaking changes by ID, as release_decisions.json does, loses up to 0.40 of it, 0.072 of the total. ground_truth.json:9 wants 'defer' and ISSUE-108 in upgrade_notes.md, which prompt.txt:15-18 asks only for breaking-change guidance, reverted work and no embargoed detail, 0.0184 of the total. ground_truth.json:5 wants 'duplicate invoice' from fixtures/in/release/commits.json:6 in the changelog, and issues.csv:3's 'duplicated invoices' misses, 0.0057. Every check still passes."
+    }
+   ]
+  },
   "055-funnel-dropoff-analysis": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
