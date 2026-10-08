@@ -51,7 +51,7 @@ use serde_json::{Value, json};
 use session::Runner;
 use std::io::IsTerminal;
 use std::io::Write;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
 /// How often a session start quietly asks whether there is a newer version.
@@ -245,7 +245,7 @@ fn main() {
     let first_run = runner.store.settings.model.is_empty() && !routed;
     if first_run && (args.once() || args.serve) {
         let error = "Nothing is set up yet. Run `letronna setup` first.";
-        show(args.output, &failed(error.into()), None);
+        show(args.output, &failed(error.into()), None, false);
         std::process::exit(1);
     }
     if args.serve {
@@ -275,6 +275,7 @@ fn main() {
                     args.output,
                     &failed(format!("No session with the id {id}.")),
                     None,
+                    false,
                 );
                 std::process::exit(1);
             }
@@ -292,7 +293,7 @@ fn main() {
     };
     if let Err(error) = placed {
         runner.store.release_unused();
-        show(args.output, &failed(error), None);
+        show(args.output, &failed(error), None, false);
         std::process::exit(1);
     }
     // The one it opened with, whose worktree is seen to on the way out
@@ -559,7 +560,7 @@ fn ask_once(
     let deadline = match deadline_of(std::env::var(DEADLINE).ok().as_deref(), started) {
         Ok(deadline) => deadline,
         Err(error) => {
-            show(args.output, &failed(error), None);
+            show(args.output, &failed(error), None, false);
             return false;
         }
     };
@@ -568,7 +569,7 @@ fn ask_once(
     let (mut spec, context, before) = match begin(runner, session, prompt, args, budget) {
         Ok(begun) => begun,
         Err(error) => {
-            show(args.output, &failed(error), None);
+            show(args.output, &failed(error), None, false);
             return false;
         }
     };
@@ -578,8 +579,9 @@ fn ask_once(
     let id = spec.id;
     // Stopped through the run's own token, not `interrupted`, so a run out
     // of time exits 0 with what it has rather than as a Ctrl-C does.
+    let ran_out = Arc::new(AtomicBool::new(false));
     if let Some(deadline) = deadline {
-        hold_to_deadline(started, deadline, id, spec.cancel.clone());
+        hold_to_deadline(started, deadline, id, spec.cancel.clone(), ran_out.clone());
     }
     // Served before the run starts, since a request with nobody serving is
     // declined at once.
@@ -595,7 +597,16 @@ fn ask_once(
     }
     let prompt = prompt_rules::seen(&spec.connection).unwrap_or_default();
     let report = run_following(spec, args.output);
-    finish(runner, session, (id, before), report, args.output, prompt)
+    let ran_out = ran_out.load(Ordering::SeqCst);
+    finish(
+        runner,
+        session,
+        (id, before),
+        report,
+        args.output,
+        prompt,
+        ran_out,
+    )
 }
 
 /// The deadline `value` sets for a run started at `started`, or None when it
@@ -619,12 +630,13 @@ fn deadline_of(
 
 /// Tells run `id` how long it has left once most of the time from `started`
 /// to `deadline` has gone, then stops it through `cancel` at the deadline,
-/// unless `cancel` is set first.
+/// unless `cancel` is set first, setting `ran_out` when it does.
 fn hold_to_deadline(
     started: std::time::Instant,
     deadline: std::time::Instant,
     id: u64,
     cancel: Cancel,
+    ran_out: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     let warn = started + deadline.saturating_duration_since(started).mul_f64(WARN_AT);
     std::thread::spawn(move || {
@@ -647,6 +659,7 @@ fn hold_to_deadline(
             },
         );
         if cancel.sleep(left) {
+            ran_out.store(true, Ordering::SeqCst);
             cancel.set();
         }
     })
@@ -820,7 +833,8 @@ fn run_following(spec: Spec, output: Output) -> Report {
 
 /// Takes the session back from run `id`, whose messages follow the first
 /// `before`, and prints how the run ended with what it was told of the
-/// prompt's rules, saying whether it ended without failing.
+/// prompt's rules, and whether its deadline stopped it, saying whether it
+/// ended without failing.
 fn finish(
     runner: &mut Runner,
     session: usize,
@@ -828,6 +842,7 @@ fn finish(
     mut report: Report,
     output: Output,
     prompt: Value,
+    ran_out: bool,
 ) -> bool {
     // On stderr, apart from the answer: what a hook said or could not do.
     for problem in hooks::problems() {
@@ -840,7 +855,7 @@ fn finish(
         report.text = said;
         extras = Some(Extras::of(runner, session, before, prompt));
     }
-    show(output, &report, extras.as_ref());
+    show(output, &report, extras.as_ref(), ran_out);
     !matches!(report.status, Outcome::Failed(_))
 }
 
@@ -885,18 +900,30 @@ fn failed(error: String) -> Report {
 
 /// Prints how a run ended in the form asked for, with `extras` in the JSON
 /// forms, so a script reading JSON gets JSON for a run that never began too.
-fn show(output: Output, report: &Report, extras: Option<&Extras>) {
+/// A run stopped once it `ran_out` of time says so.
+fn show(output: Output, report: &Report, extras: Option<&Extras>, ran_out: bool) {
     match output {
-        Output::Text => print_answer(report),
+        Output::Text => print_answer(report, ran_out && report.status == Outcome::Stopped),
         Output::Json => {
-            emit(&as_json(report, extras));
+            emit(&result_of(report, extras, ran_out));
         }
         Output::StreamJson => {
-            let mut result = as_json(report, extras);
+            let mut result = result_of(report, extras, ran_out);
             result["type"] = "result".into();
             emit(&result);
         }
     }
+}
+
+/// `as_json` for a run that ended, whose status is "deadline" rather than
+/// "stopped" when it was stopped once it `ran_out` of time, so a harness can
+/// tell its own time limit from a stop it made.
+fn result_of(report: &Report, extras: Option<&Extras>, ran_out: bool) -> Value {
+    let mut result = as_json(report, extras);
+    if ran_out && report.status == Outcome::Stopped {
+        result["status"] = "deadline".into();
+    }
+    result
 }
 
 /// Writes one JSON line, saying whether it could: a reader that has gone
@@ -1025,8 +1052,8 @@ fn progress(status: &Status) -> Value {
 }
 
 /// Prints the answer as the conversation would, or its checked value as JSON,
-/// and a line after it when the run did not finish.
-fn print_answer(report: &Report) {
+/// and a line after it when the run did not finish, `timed_out` or not.
+fn print_answer(report: &Report, timed_out: bool) {
     // With a schema the checked value is what was asked for, and one line of
     // JSON is what a script reads; the words around it are left out.
     if let Some(value) = &report.value {
@@ -1043,6 +1070,9 @@ fn print_answer(report: &Report) {
             "Stopped: it used every tool round it was given, and --max-rounds allows more.",
         ),
         Outcome::OverBudget => render::dim("Stopped: the token budget is spent."),
+        Outcome::Stopped if timed_out => render::dim(&format!(
+            "Stopped: the seconds {DEADLINE} gives the run are up."
+        )),
         Outcome::Stopped => render::dim("Stopped."),
     };
     render::line(&note);
@@ -1919,11 +1949,13 @@ mod tests {
         // 85 of its 100 s gone: past the warning, short of the deadline.
         let started = std::time::Instant::now() - std::time::Duration::from_secs(85);
         let (id, cancel) = (9_250_001, Cancel::default());
+        let ran_out = Arc::new(AtomicBool::new(false));
         let timer = hold_to_deadline(
             started,
             started + std::time::Duration::from_secs(100),
             id,
             cancel.clone(),
+            ran_out.clone(),
         );
         let notices = told(id);
         let texts: Vec<&str> = notices.iter().map(|n| n.text.as_str()).collect();
@@ -1931,21 +1963,47 @@ mod tests {
         assert!(texts[0].starts_with("About 15 s are left"), "{texts:?}");
         assert!(texts[0].contains("write every output"), "{texts:?}");
         assert!(!cancel.is_set(), "stopped before its deadline");
-        // A run stopped meanwhile is told nothing more, and the timer goes.
+        // A run stopped meanwhile is told nothing more, and the timer goes
+        // without counting the stop as its own.
         cancel.set();
         timer.join().unwrap();
         assert!(inbox::take(id, true).is_empty());
+        assert!(!ran_out.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_run_its_deadline_stopped_says_so() {
+        assert_eq!(
+            result_of(&report(Outcome::Stopped), None, true)["status"],
+            "deadline"
+        );
+        assert_eq!(
+            result_of(&report(Outcome::Stopped), None, false)["status"],
+            "stopped"
+        );
+        // An answer that came in as time ran out stands as an answer.
+        assert_eq!(
+            result_of(&report(Outcome::Done), None, true)["status"],
+            "done"
+        );
     }
 
     #[test]
     fn a_run_past_its_deadline_stops() {
         let started = std::time::Instant::now();
         let deadline = started + std::time::Duration::from_millis(300);
-        let cancel = Cancel::default();
-        hold_to_deadline(started, deadline, 9_250_002, cancel.clone())
-            .join()
-            .unwrap();
+        let (cancel, ran_out) = (Cancel::default(), Arc::new(AtomicBool::new(false)));
+        hold_to_deadline(
+            started,
+            deadline,
+            9_250_002,
+            cancel.clone(),
+            ran_out.clone(),
+        )
+        .join()
+        .unwrap();
         assert!(cancel.is_set());
+        assert!(ran_out.load(Ordering::SeqCst));
         assert!(std::time::Instant::now() >= deadline, "stopped early");
         assert_eq!(inbox::take(9_250_002, true).len(), 1);
     }
