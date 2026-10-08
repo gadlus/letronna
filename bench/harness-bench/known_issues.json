@@ -558,6 +558,22 @@
     }
    ]
   },
+  "087-cli-parser-bug-tests": {
+   "ceiling": 0.95,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "hard ceiling",
+     "checks": [],
+     "reason": "tasks/087-cli-parser-bug-tests/oracle_grade.py:78 weighs pytest 0.25, hidden CLI behavior 0.35, existing-test integrity 0.15, regression tests 0.10 and implementation quality 0.10, which add up to 0.95, so an output passing every check at full score gets 0.95 and no failed check names the rest."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "tasks/087-cli-parser-bug-tests/oracle_grade.py:71 takes 0.25 off implementation quality for any .split(\",\") in cli.py or filtering.py, but --select takes a comma-separated field list (prompt.txt:10) and the fixture splits it that way (fixtures/in/csvtool/csvtool/filtering.py:14); prompt.txt:22 forbids only splitting CSV lines on commas. All four models' runs kept it and lost 0.025; implementation_quality still passes at exactly its 0.75 bar (line 76)."
+    }
+   ]
+  },
   "088-api-contract-mock-client-compat": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
