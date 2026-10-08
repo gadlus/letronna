@@ -44,6 +44,16 @@
      "kind": "weakened, not capped",
      "checks": ["decomposition"],
      "reason": "tasks/014-task-decomposition/oracle_grade.py:21-23 has 012's path bug, so expected_subtask_topics is empty and lines 46-47 skip topic coverage. Decomposition is then the count alone, min(1, n/5) at line 38: the three subtasks prompt.txt:9 asks for at least score 0.6 and fail, while four or more pass whatever they cover."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["progress_tracking"],
+     "reason": "tasks/014-task-decomposition/oracle_grade.py:111-122 scores progress.md 1.0 only when it holds 'pending', 'done', 'start' and 'end', and 0.4 without 'pending', under line 126's 0.5 pass. prompt.txt:17 asks progress.md only for start/end times and a note per subtask; 'pending' is the subtask files' initial status (line 13), which a log of finished work has no call to repeat. Such a log fails and loses 0.6 of the check's 0.10 (line 136), 0.06; one line saying the subtasks went from pending to done passes."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "tasks/014-task-decomposition/oracle_grade.py:91 gives a quarter of the report's element score to the word 'timeline', while prompt.txt:22 asks the launch plan for its 'time' and 'timeline' appears only as an example subtask at line 9. A report without the word loses 0.125 of report_score (lines 94-95), 0.031 of the total (line 135); report_quality still passes, so no failed check names the loss."
     }
    ]
   },
