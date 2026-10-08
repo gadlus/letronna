@@ -747,6 +747,16 @@
      "kind": "negation-blind phrase check",
      "checks": ["forbidden"],
      "reason": "tasks/098-three-source-decision-record-synthesis/oracle_grade.py:44-50, despite its name _has_unnegated_forbidden_value, fails a decision whose value holds a superseded value at all, so 'mode B; mode A is blocked' and 'July 15, 2026 (June 20 superseded)' fail, capped at 0.84."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["rejected", "actions"],
+     "reason": "tasks/098-three-source-decision-record-synthesis/oracle_grade.py:87 wants each rejected option's source string inside the rejected_options text, and ground_truth.json:11 gives the June 20 one as 'email/thread.json#email-004'; line 128 wants ground_truth.json:16's 'email/thread.json#email-006' and 'June 5' in action_items.csv. prompt.txt:16 and :26 ask for a source_file and name no anchor form, so 'in/email/thread.json' with email-004 in the evidence, 'in/email/thread.json (email-004)' and a due date of 2026-06-05 alone all fail. ground_truth.json:10 and :12 also want the document that blocked an option, not the one that proposed it, which source_file leaves open. rejected passes only at 3 of 3 (line 101) and actions only at 4 of 4 (line 131's 0.85), so no run passed either; in the total (lines 135-139) they weigh 0.12 and 0.08."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["source_conflicts"],
+     "reason": "tasks/098-three-source-decision-record-synthesis/oracle_grade.py:114 counts ground_truth.json:21's terms in source_conflicts.csv, among them the decision keys 'feature_scope' and 'budget_cap', which neither prompt.txt (line 15 asks only for a decision_key) nor any fixture names, and 'real-time export' with its hyphen. Keys such as 'launch_scope', 'support_budget' and 'real_time_export' leave 5 of 8 and a score of 0.7375 against line 116's 0.80; naming the feature in prose reaches 6 of 8 and passes, but only the two hidden keys give the full 0.09 of the total (line 138)."
     }
    ]
   },
