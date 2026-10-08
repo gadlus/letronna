@@ -3,6 +3,17 @@
  "repository": "https://github.com/Qihoo360/harness-bench",
  "commit": "1025086a446653702b80cfb48babbeec35db6b2c",
  "tasks": {
+  "004-meeting-summary": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["phrase_action"],
+     "reason": "tasks/004-meeting-summary/oracle_grade.py:60 tests each phrase in ground_truth.json:6-13 as a case-sensitive substring, and line 13 is 'action'. prompt.txt:4 calls that content 'clear follow-ups' and asks for no such word, so a summary that lists them under 'Follow-ups:' fails, and so does one under the transcript's own heading 'Action items' (fixtures/in/meeting_transcript.txt:20), whose capital A does not match. 'agreed action items' in lower case passes. 1 of 9 equal checks (lines 43-44)."
+    }
+   ]
+  },
   "011-code-debug": {
    "ceiling": 0.8725,
    "exclude_from_tuning": true,
