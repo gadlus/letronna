@@ -668,6 +668,11 @@
      "kind": "ambiguous convention",
      "checks": ["sessions_exact", "rejects_identity"],
      "reason": "Following prompt.txt and session_rules.md literally reproduces ground_truth's sessions but one cell: U200-2's campaign_source is 'email', while that session's only event (clickstream.jsonl:13) has an empty campaign, so it comes only from carrying the previous session's campaign forward, a rule stated nowhere; oracle_grade.py:84 compares exactly and lines 153-154 cap the score. Line 116 also wants exactly five reject rows with reasons from the alias list at lines 38-48, so the prompt's own 'malformed' fails."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["summary_exact"],
+     "reason": "tasks/093-jsonl-sessionization-analysis/oracle_grade.py:129-138 compares session_summary.json with one fixed object in which excluded_bot_users is the list ['U300'] (line 132), while prompt.txt:28 names the key and nothing more. Its neighbours total_sessions and converted_sessions are counts and every list key ends in _ids or _numbers, so the count 1 that two of four runs wrote is a fair reading and fails; as the whole object is compared, so does any key beyond the seven the file must contain. The check weighs 0.12 of 1.225, 0.098 of the score."
     }
    ]
   },
