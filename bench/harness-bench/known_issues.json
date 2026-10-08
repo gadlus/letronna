@@ -460,6 +460,17 @@
     }
    ]
   },
+  "070-hr-resume-screening": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "substring false positive",
+     "checks": ["no_sensitive_terms"],
+     "reason": "tasks/070-hr-resume-screening/oracle_grade.py:45 fails both outputs on any of ground_truth.json:11's terms as a bare substring, so 'age' fires inside managers, management, stage and coverage. fixtures/in/resumes/candidate_A.md:3 says the strongest candidate wrote summaries 'for support managers', and notes that cite that evidence, as prompt.txt:21 asks, fail; leaving the word out passes. The check weighs 0.12 of 1.0."
+    }
+   ]
+  },
   "071-ecommerce-support-routing": {
    "ceiling": 0.93,
    "exclude_from_tuning": true,
