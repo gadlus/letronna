@@ -156,10 +156,14 @@ pub(crate) const TOOLS: [Rule; 23] = [
         to: To::OnScreen,
         text: "A message the user types while you work steers the task in hand: take it in and keep going, answering any question in a line alongside your next tool call; stop only if it says to stop, wait or do something else instead.",
     },
+    // An assumption written into a deliverable changes what it says: a note
+    // naming an excluded source or a withheld feature mentions it again.
+    // Allowing a notes section there made runs add one, so the answer is
+    // the place unless the task asks.
     Rule {
         id: "assume",
         to: To::Unwatched,
-        text: "Nobody is watching this run and nobody will answer questions: decide for yourself and write any assumption into your answer or deliverables.",
+        text: "Nobody is watching this run and nobody will answer questions: decide for yourself and state any assumption in your answer, not in a deliverable unless the task asks for it there.",
     },
     Rule {
         id: "paths",
