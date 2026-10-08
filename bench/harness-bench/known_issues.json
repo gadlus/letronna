@@ -721,6 +721,17 @@
     }
    ]
   },
+  "103-policy-update-replan-diff": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "tasks/103-policy-update-replan-diff/oracle_grade.py:227 gives state.json's plan_version credit only when it is exactly 2, v2, revised or round2, while prompt_round2.txt:22 only says to record a plan_version. 'PLAN-PCR-2026-05-REFUND-17-v2' and '...-R2' lose 0.10 of state, 0.02 of the total; state still passes."
+    }
+   ]
+  },
   "104-async-ops-window-rollup": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
