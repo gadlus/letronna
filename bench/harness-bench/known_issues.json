@@ -210,6 +210,11 @@
      "kind": "ambiguous convention",
      "checks": ["audit_Claim_B"],
      "reason": "tasks/031-cross-doc-citation-check/oracle_grade.py:33 wants ground_truth.json:3's 'wrong title' in the S2 row's issue and 'Claim B' in its location, while prompt.txt:14 names the issue kinds as incorrect, missing or unsupported and sets no wording. The bad title is on the References line (report.md:10), so a location pointing there fails too. 1 of 9 equal checks."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["fixed_references_complete"],
+     "reason": "tasks/031-cross-doc-citation-check/oracle_grade.py:39-40 wants ground_truth.json:11's '[S4] CSAT survey extract - sources/csat.md' verbatim, reusing for the CSAT source the id that fixtures/in/appendix.md:6 says 'is retired and must not be used'; appendix.md:7 gives CSAT no id and prompt.txt:17-18 only fixes the format. Numbering it [S5], as all four runs did, fails; only the retired id passes. 1 of 9 equal checks."
     }
    ]
   },
