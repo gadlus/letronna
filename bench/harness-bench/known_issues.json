@@ -227,6 +227,22 @@
     }
    ]
   },
+  "045-dependency-upgrade-compat": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["compat_matrix"],
+     "reason": "tasks/045-dependency-upgrade-compat/oracle_grade.py:129 looks for ground_truth.json:6's terms in compat_matrix.json, and three of them are snake_case ids -- default_ascii, invalid_separator, non_string -- that prompt.txt:9 never gives: it names the cases 'default ASCII output', 'invalid separators' and 'non-string input'. A matrix that names its cases in the prompt's words matches 4 of 7, scores 0.7214 by line 136, fails line 139's 0.85, and loses 0.09 x 0.2786, 0.025; ids such as ascii_default miss as well."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "tasks/045-dependency-upgrade-compat/oracle_grade.py:142 scores compat_risks.md by ground_truth.json:7's eight terms, one of them 'minimal', which prompt.txt:10 does not ask that file to cover (line 8 asks it of compat_decision.md); line 122 likewise scores compat_decision.md on 'signature' (ground_truth.json:5), which line 8 does not ask for. Each missing term costs 0.01 (line 146) while compat_risks and compat_decision still pass (lines 143 and 123), so no failed check names the loss."
+    }
+   ]
+  },
   "047-code-review-risk-report": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
