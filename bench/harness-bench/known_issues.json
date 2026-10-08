@@ -69,6 +69,27 @@
     }
    ]
   },
+  "018-provider-failover-audit": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "tasks/018-provider-failover-audit/ground_truth.json:4 wants gemini as strict_json_tools' fallback, but both gemini strict_json_tools traces (fixtures/in/traces/gemini.jsonl:3 and :5) end in schema_enum_drift with schema_valid false, fixtures/in/provider_capabilities.json:19 says gemini needs a fallback for strict JSON, and fixtures/in/incident_notes.md:8-9 leaves the claim that a newer revision fixed the drift to be checked against those traces; anthropic's run of the workload (anthropic.jsonl:4) is schema-valid. Every run on every model chose anthropic, which loses 0.25 of that row (oracle_grade.py:60 and :63), 0.0124 of the total. scorecard still passes, so no failed check names the loss."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "tasks/018-provider-failover-audit/prompt.txt:31 writes the hyphen in the required statement's 'cross-provider' as a non-breaking hyphen (U+2011), while ground_truth.json:17 has an ASCII hyphen and oracle_grade.py:100 matches it as a plain substring, so copying the prompt's sentence exactly misses it; four of six runs did. ground_truth.json:22 also wants 'cost per 1K tokens' in the playbook, which prompt.txt:29-32 never asks for. Each phrase is a sixth of 0.55 of the playbook score (line 103), 0.0183 of the total, and playbook still passes."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "tasks/018-provider-failover-audit/ground_truth.json:24-25 raise the minimums to 3 reason codes and 2 risk notes per workload (read at oracle_grade.py:44-45, checked at :61-62), while prompt.txt:20-21 asks for at least 2 and at least 1. A scorecard at the prompt's minimums loses 0.30 of every row, 0.0893 of the total; scorecard still passes at 0.745 with every provider right."
+    }
+   ]
+  },
   "019-incident-runbook-synthesis": {
    "ceiling": 0.925,
    "exclude_from_tuning": true,
