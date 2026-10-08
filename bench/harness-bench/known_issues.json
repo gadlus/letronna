@@ -624,6 +624,17 @@
     }
    ]
   },
+  "078-local-api-cursor-retry-ledger": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["quality_terms"],
+     "reason": "tasks/078-local-api-cursor-retry-ledger/oracle_grade.py:64 passes data_quality_report.md only if it holds every term of ground_truth.json:38-44, 'cursor', '429' and '503' among them, while prompt.txt:31-32 asks the report to mention the duplicate and orphan artifacts, and line 34 gives the retries a file of their own, retry_ledger.csv. A report covering the duplicate and the orphan fails beside a ledger that records the 429, the 503 and the expired cursor; adding a paragraph on the retries passes. The check weighs 3 of 27 (line 65), so an answer otherwise right scores 0.8889."
+    }
+   ]
+  },
   "079-smallfile-batch-reject-ledger": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
