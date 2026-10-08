@@ -291,6 +291,16 @@
      "kind": "ambiguous convention",
      "checks": ["line_item_rulings"],
      "reason": "tasks/037-policy-clause-retrieval/oracle_grade.py:76-84 passes a T110 line only if its secondary_clauses hold the base clause the amendment overrides, TR-1 for L1 and EQ-1 for L3 (ground_truth.json:16-18), while prompt.txt:16 says to list exception clauses and otherwise an empty array. L3 also needs both business and project in missing_information, so the policy's own 'assigned-work business purpose' fails. All three lines must pass (line 96), and lines 123-124 cap the score at 0.74."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["blocking_conditions"],
+     "reason": "tasks/037-policy-clause-retrieval/oracle_grade.py:44-45 passes a case's blocking_condition only if it holds a word from each of its token groups in ground_truth.json, and line 94 passes the check at 9 of 11, while prompt.txt:20 asks only that it explain the key condition. The groups take 'exceed' for T101 (ground_truth.json:4) but only 'above' or 'over' for T105 (:8), and want 'missing' or 'lacks' for T104 (:7) and 'without', 'missing' or 'false' for T108 (:11), so 'Meal USD 82 exceeds the USD 65 cap', 'no itemized hotel receipt' and 'no client attendee list is in the record' fail; T107 (:10) wants 'missing' or 'not attached', so its record's own 'no approval record is attached' (fixtures/in/cases.json:9) fails, as it did in all seven runs. Three such rows fail the check, and lines 121-122 cap the score at 0.78."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "tasks/037-policy-clause-retrieval/ground_truth.json:13 wants T110's secondary_clauses to be exactly AM-1, ME-2, EQ-1 and AM-3 (oracle_grade.py:43), the three lines' clauses and L3's base clause EQ-1 but not L1's TR-1, while prompt.txt:16 asks for the exception clauses that also affect the ruling, and wants 'mixed' in its quote (line 39), which AM-2's rule (fixtures/in/policy_amendment.md:9-12) does not hold. ground_truth.json:10 rules T107 under TR-1 with EX-1 and EX-2 and a quote holding 'under USD 220' and 'conflicting documentation', though policy_amendment.md:6 states its case, pre-approval mentioned with no record attached, and ground_truth.json:16 gives AM-1 to the like line L1. An answer otherwise right that quotes AM-1 for T107 with EX-2, as AM-1 directs, and AM-2's rule for T110 with EX-1 and EX-2 scores 0.9764, and 0.9655 with T107 ruled under AM-1, as two runs did; clauses, quotes and secondary_clauses still pass."
     }
    ]
   },
