@@ -347,6 +347,17 @@
     }
    ]
   },
+  "075-platform-appeal-review": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["policy_basis_tokens"],
+     "reason": "tasks/075-platform-appeal-review/oracle_grade.py:78-86 wants every token of ground_truth.json:36 in A-05's policy_basis, PRECVIO-1 and EDGE-1, while prompt.txt:26 asks for every applicable clause and fixtures/in/policy_amendments.md:7, the PRECVIO-1 that decides A-05 (fixtures/in/case_files/case_5.json:3 and :7), says EDGE-1 relief does not apply. The ground truth is uneven as well: A-07 at line 48 wants META-2 and EDGE-1 but not the PRECVIO-1 that META-2 blocks there. Only prompt.txt:26's separator example, PRECVIO-1;EDGE-1, hints at it. Five outputs from four models left EDGE-1 out of A-05 and failed; the check weighs 0.09 of 1.0 (line 92), so an answer otherwise right scores 0.91."
+    }
+   ]
+  },
   "076-medical-admin-claim-check": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
