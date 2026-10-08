@@ -500,6 +500,17 @@
     }
    ]
   },
+  "094-metric-definition-migration-diff": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["diff_directions"],
+     "reason": "tasks/094-metric-definition-migration-diff/oracle_grade.py:85 and :90 need 4 of 5 expected_direction cells to match lines 10-14 through the alias list at lines 42-47, while prompt.txt:22 names the column and gives no values. Line 13 wants retention_rate 'stable', which fixtures/in/migration_policy.md:5 never says (it only names the cohort field to use), and line 12 wants gross_margin 'unknown', where the aliases reject '-', 'n/a' and an empty cell, the forms three of four runs wrote; an empty cell does not match the alias 'blank'. Every run scored 3 of 5. The check weighs 0.04 of 1.15, so an answer otherwise right scores 0.9652."
+    }
+   ]
+  },
   "095-policy-version-conflict-resolution": {
    "ceiling": 1.0,
    "exclude_from_tuning": true,
