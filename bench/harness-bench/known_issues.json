@@ -248,6 +248,22 @@
     }
    ]
   },
+  "039-repo-architecture-map": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["doc_code_discrepancies"],
+     "reason": "tasks/039-repo-architecture-map/ground_truth.json:49 counts the retry discrepancy only when the claim column holds 'retry' (oracle_grade.py:163), but the claim is fixtures/in/repo/README.md:7, which says 'retries', and all seven runs quoted it as written. That loses 0.29/3 of doc_code_discrepancies (line 170), and with the 0.85 bar at line 171 it fails the check for three runs that pass once the claim starts with prompt.txt:19's words 'Retry behavior'."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": [],
+     "reason": "tasks/039-repo-architecture-map/ground_truth.json:46 wants the word 'unsupported' somewhere in the discrepancy rows (oracle_grade.py:155), though prompt.txt:19-20 asks only that the three named claims be covered and the code contradicts all three, so a correct three-row answer has none. ground_truth.json:39 and :42 also want the HTTP flow to name 'repo.save' between create_order and order_event (oracle_grade.py:124-126), so 'OrderRepository.save', the same call (fixtures/in/repo/minisvc/api/handlers.py:12), misses. Together they cost 0.0192 of the total; module_map_content and doc_code_discrepancies still pass on the main5 run."
+    }
+   ]
+  },
   "042-api-schema-migration": {
    "ceiling": 0.9592,
    "exclude_from_tuning": true,
