@@ -446,7 +446,12 @@
     {
      "kind": "ambiguous convention",
      "checks": ["skip_audit"],
-     "reason": "tasks/057-interruption-resume/oracle_grade.py:50-58 counts a preexisting item as skipped only if its step is one of three values and a field named status holds one of four, while prompt_round2.txt:9 asks only that processing_log distinguish reused or skipped preexisting work and names no field. Runs that marked it in event, kind, note or step fail; the check weighs 0.10 of 1.30, so an answer otherwise right scores 0.9231."
+     "reason": "tasks/057-interruption-resume/oracle_grade.py:50-58 counts a preexisting item as skipped only if its step is one of three values and a field named status holds one of four, while prompt_round2.txt:9 asks only that processing_log distinguish reused or skipped preexisting work and names no field. Runs that marked it in event, kind, note or step fail; the check weighs 0.10 of 1.30, 0.0769 of the score."
+    },
+    {
+     "kind": "ambiguous convention",
+     "checks": ["state_scores", "resume_log"],
+     "reason": "tasks/057-interruption-resume/oracle_grade.py:43-45 reads per_item_results only as an object keyed by item id, while prompt_round1.txt:18 asks for per_item_results for the three completed items and gives no shape, so a list of the same results, each with its id and risk_score, fails state_scores. Line 49 counts every processing_log entry for C-101 to C-103 whose step is round2 as reprocessing, so a round-2 entry that carries an item forward with step round2 and event reused_preexisting, the distinction prompt_round2.txt:9 asks for, fails resume_log (line 56). Each check weighs 0.15 of 1.30; with the skip audit recorded above, an answer otherwise right scores 0.6923."
     }
    ]
   },
