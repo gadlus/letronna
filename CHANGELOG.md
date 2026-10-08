@@ -16,7 +16,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 ### Added
 - **Web** — Letronna Cloud takes more servers: admins add a VPS from the admin page with one setup command, and runs and 24/7 bots spread across every server.
 - **Web** — letronna.ai shows Letronna Cloud on the home page and has a Cloud page in the docs; phone apps for iPhone and Android are marked coming soon.
-- **All** — The README shows its logo again, has a Sponsor button, and no longer repeats sections.
+- **All** — A shorter README, and a full guide in `docs/`: install, the app and terminal, gateways, tools, extending, the cloud, configuration, data, architecture, building and benchmarks.
 
 ## [0.1.0-alpha.3] - 2026-10-06
 
