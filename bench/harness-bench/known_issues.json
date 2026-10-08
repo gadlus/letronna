@@ -298,6 +298,17 @@
     }
    ]
   },
+  "058-multiday-project-state": {
+   "ceiling": 1.0,
+   "exclude_from_tuning": true,
+   "issues": [
+    {
+     "kind": "ambiguous convention",
+     "checks": ["log_content", "decision_register"],
+     "reason": "tasks/058-multiday-project-state/oracle_grade.py:189-192 wants every risk id in ground_truth.json:3 in project_log.md, R-budget included, but R-budget is in no fixture and prompt_day3.txt:11 asks for it only in final_plan.json's risk_register, so a log that records the budget cut without that id fails. Lines 196-206 want ground_truth.json:10's 'conditional_go' token in decision_register.csv, while prompt_day3.txt:13 sets that value only for launch_recommendation and :15 gives the register just its header; the match at lines 93-97 ignores case but keeps the underscore, so a decision row reading 'Conditional go' fails. Each check weighs 0.10 of 1.28: an answer otherwise right scores 0.9219 with one of them and 0.8438 with both."
+    }
+   ]
+  },
   "064-service-dependency-triage": {
    "ceiling": 0.8372,
    "exclude_from_tuning": true,
