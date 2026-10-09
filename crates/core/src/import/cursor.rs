@@ -249,6 +249,7 @@ fn dashed(name: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     const TRANSCRIPT: &str = concat!(
         r#"{"role":"user","message":{"content":[{"type":"text","text":"<git_status>clean</git_status>\n<agent_skills>none</agent_skills>"}]}}"#,
         "\n",

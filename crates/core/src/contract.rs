@@ -2513,7 +2513,7 @@ fn unsaid(output: &Output, bytes: &[u8]) -> Option<String> {
         .to_lowercase()
         .replace("\\_", "_");
     let lacking: Vec<String> = (output.terms.iter())
-        .filter(|term| !holds_word(&text, &term.to_lowercase()))
+        .filter(|term| !holds_term(&text, &term.to_lowercase()))
         .map(|term| format!("`{term}`"))
         .collect();
     (!lacking.is_empty()).then(|| {
@@ -2523,6 +2523,18 @@ fn unsaid(output: &Output, bytes: &[u8]) -> Option<String> {
             lacking.join(", ")
         )
     })
+}
+
+/// Whether `term` is in `text`: a plain word in any form of it, as
+/// "softened" covers "soften"; a code-like id, with a digit, `_` or `-`,
+/// only written whole.
+fn holds_term(text: &str, term: &str) -> bool {
+    if !term.chars().all(|c| c.is_alphabetic() || c == ' ') {
+        return holds_word(text, term);
+    }
+    let part = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    text.match_indices(term)
+        .any(|(at, _)| !part(text[..at].chars().next_back()))
 }
 
 /// Whether `word` stands in `text` with no letter, digit or underscore on
@@ -3258,7 +3270,9 @@ fn misnamed<'a>(
             let Some(forms) = known.written.get(file) else {
                 continue;
             };
-            if !forms.iter().any(|(written, _)| written == path) {
+            // The file's own path in the workspace, `in/` and all, is never
+            // wrong, whatever shorter form an input uses for it.
+            if *path != file.as_str() && !forms.iter().any(|(written, _)| written == path) {
                 form = form.or_else(|| forms.first());
                 other.push((line, *path));
             }
@@ -4223,7 +4237,8 @@ mod tests {
                        - Mention `evidence_log` gaps and CLAIM-1 … CLAIM-3.\n\
                        - Use the remediation verbs soften, remove, and qualify.\n\n\
                        Create also:\n- out/notes.md\n  Must explicitly cover: INTERNAL-2, verbs keep/drop.";
-        // A heading in words, a range left short and a verb in another form.
+        // A heading in words and a range left short; a verb in another form
+        // ("softened") still covers it.
         let rationale =
             b"## Evidence log\nCLAIM-1 and CLAIM-3 were softened; remove one; qualify two.\n";
         let notes = b"internal-2 holds. We keep one and drop two.\n";
@@ -4238,7 +4253,7 @@ mod tests {
         assert_eq!(
             problems,
             [
-                "`out/rationale.md` lacks terms the request names for it: `evidence_log`, `CLAIM-2`, `soften`; write each as the request does."
+                "`out/rationale.md` lacks terms the request names for it: `evidence_log`, `CLAIM-2`; write each as the request does."
             ]
         );
     }
@@ -4475,7 +4490,7 @@ mod tests {
             problems,
             [
                 "`out/picks.json` has `chosen_source` values that add text to an input's path: `in/notes/alpha.md (A-1, A-2)`; write the path alone, as `notes/alpha.md`, or as `notes/alpha.md#part` for a part of it, and move the rest to a free-text field.",
-                "`out/links.csv` has `expected_file` paths the inputs write otherwise: `in/notes/beta.md` (line 2); `in/index.md` writes `notes/beta.md`, so write each path as the inputs do.",
+                // `in/notes/beta.md` is the file's own path, so it stands.
             ]
         );
     }
