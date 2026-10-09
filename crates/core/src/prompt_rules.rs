@@ -123,7 +123,7 @@ pub(crate) const PROSE: [Rule; 1] = [Rule {
 /// place of approvals and `ask_user`, neither of which it has; then checking
 /// the work, making calls, ending a turn, where facts come from, where to
 /// look first and the steps to ask about first.
-pub(crate) const TOOLS: [Rule; 23] = [
+pub(crate) const TOOLS: [Rule; 24] = [
     // Undoing what the user changed is the git rule's. New files and tests
     // are not forbidden, as checks and required outputs need them.
     Rule {
@@ -192,6 +192,14 @@ pub(crate) const TOOLS: [Rule; 23] = [
         id: "literals",
         to: To::Unwatched,
         text: "Copy each heading, label, key name and sentence the task gives, and each quote from a source, exactly: case, punctuation and markup too.",
+    },
+    // An id made up, a code with a note in it, or a paraphrase in an
+    // evidence field each reads as the same thing to a person, but no
+    // longer matches the input it came from for whoever checks it there.
+    Rule {
+        id: "inputs-own-form",
+        to: To::Unwatched,
+        text: "Where an output records something from the inputs, keep the inputs' own form: refer to items by the ids the inputs give them rather than making new ones, copy codes and table values exactly with any note in a free-text field, and fill evidence or quote fields with the source's words, not a paraphrase.",
     },
     // Named by its kind, not quoted, because a check for a phrase finds it
     // just the same in "not X".
