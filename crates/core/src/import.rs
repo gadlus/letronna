@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 mod cursor;
 mod gemini;
 mod kimi;
+mod kiro;
 mod opencode;
 mod pi;
 
@@ -46,6 +47,7 @@ pub enum Tool {
     OpenClaw,
     Pi,
     Kimi,
+    Kiro,
 }
 
 impl Tool {
@@ -60,6 +62,7 @@ impl Tool {
             Tool::OpenClaw => "OpenClaw",
             Tool::Pi => "pi",
             Tool::Kimi => "Kimi CLI",
+            Tool::Kiro => "Kiro",
         }
     }
 }
@@ -135,6 +138,9 @@ pub fn list(limit: usize) -> Vec<Candidate> {
     if let Some(root) = kimi::root() {
         files.extend(kimi::files(&root).into_iter().map(|p| (Tool::Kimi, p)));
     }
+    if let Some(root) = kiro::root() {
+        files.extend(kiro::files(&root).into_iter().map(|p| (Tool::Kiro, p)));
+    }
     let mut found = newest_titled(files, limit);
     found.extend(opencode::list(limit));
     found.sort_by_key(|c| std::cmp::Reverse(c.updated));
@@ -190,6 +196,7 @@ fn head(tool: Tool, path: &Path) -> (String, String, Option<PathBuf>) {
         Tool::Cursor => cursor::head(path),
         Tool::OpenClaw | Tool::Pi => pi::head(path),
         Tool::Kimi => kimi::head(path),
+        Tool::Kiro => kiro::head(path),
     }
 }
 
@@ -205,6 +212,7 @@ pub fn import(candidate: &Candidate) -> Result<Imported, String> {
         Tool::Cursor => cursor::import(&candidate.path),
         Tool::OpenClaw | Tool::Pi => pi::import(&candidate.path, candidate.tool),
         Tool::Kimi => kimi::import(&candidate.path),
+        Tool::Kiro => kiro::import(&candidate.path),
     }
 }
 
@@ -255,6 +263,9 @@ fn tool_at(path: &Path) -> Option<Tool> {
     if inside(".kimi") {
         return Some(Tool::Kimi);
     }
+    if inside(".kiro") {
+        return Some(Tool::Kiro);
+    }
     if path.extension().is_some_and(|e| e == "json") {
         // One document, read whole to tell whose it is.
         let doc: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
@@ -275,6 +286,9 @@ fn tool_at(path: &Path) -> Option<Tool> {
     }
     if first["type"] == "session_meta" {
         return Some(Tool::Codex);
+    }
+    if first["version"] == "v1" && first["kind"].is_string() {
+        return Some(Tool::Kiro);
     }
     // pi's header; OpenClaw writes the same, and is told by its folder.
     if first["type"] == "session" {
@@ -1738,6 +1752,13 @@ mod tests {
                 "{\"role\":\"_system_prompt\",\"content\":\"hi\"}\n"
             ),
             Some(Tool::Kimi)
+        );
+        assert_eq!(
+            tool(
+                "j.jsonl",
+                "{\"version\":\"v1\",\"kind\":\"Prompt\",\"data\":{\"content\":[]}}\n"
+            ),
+            Some(Tool::Kiro)
         );
         assert_eq!(tool("e.json", "{\"some\": \"settings\"}"), None);
     }
