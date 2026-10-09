@@ -263,9 +263,12 @@ fn claude_code_head(path: &Path) -> (String, Option<PathBuf>) {
         {
             workspace = Some(PathBuf::from(cwd));
         }
-        if title.is_empty() && record["type"].as_str() == Some("user") {
+        if title.is_empty()
+            && record["type"].as_str() == Some("user")
+            && record["isMeta"].as_bool() != Some(true)
+        {
             let text = claude_user_text(&record["message"]["content"]);
-            if !text.trim().is_empty() {
+            if !text.trim().is_empty() && !injected(&text) && !reports(&text) {
                 title = short_title(&text);
             }
         }
@@ -300,6 +303,9 @@ fn import_claude_code(path: &Path) -> Result<Imported, String> {
             workspace = Some(PathBuf::from(cwd));
         }
         match record["type"].as_str().unwrap_or_default() {
+            // What Claude Code adds as the user's turn for its own reasons,
+            // such as the caveat before a slash command's output.
+            "user" if record["isMeta"].as_bool() == Some(true) => {}
             "user" => claude_user_record(&record, &mut messages, &tool_names, &mut skipped),
             "assistant" => {
                 claude_assistant_record(&record, &mut messages, &mut tool_names, &mut skipped)
@@ -341,10 +347,11 @@ fn claude_user_record(
     if let Some(text) = content.as_str() {
         if text.trim().is_empty() {
             *skipped += 1;
-        } else {
+        } else if !injected(text) {
             messages.push(Message {
                 role: "user".into(),
                 content: text.to_owned(),
+                notice: reports(text),
                 ..Default::default()
             });
         }
@@ -358,7 +365,7 @@ fn claude_user_record(
     for block in blocks {
         match block["type"].as_str().unwrap_or_default() {
             "text" => {
-                if let Some(text) = block["text"].as_str() {
+                if let Some(text) = block["text"].as_str().filter(|t| !injected(t)) {
                     said.push(text.to_owned());
                 }
             }
@@ -380,9 +387,11 @@ fn claude_user_record(
         }
     }
     if !said.is_empty() {
+        let content = said.join("\n");
         messages.push(Message {
             role: "user".into(),
-            content: said.join("\n"),
+            notice: reports(&content),
+            content,
             ..Default::default()
         });
     }
@@ -543,7 +552,7 @@ fn codex_head(path: &Path) -> (String, String, Option<PathBuf>) {
                     && payload["role"].as_str() == Some("user")
                 {
                     let text = codex_content_text(&payload["content"]);
-                    if !text.trim().is_empty() {
+                    if !text.trim().is_empty() && !injected(&text) {
                         title = short_title(&text);
                     }
                 }
@@ -641,6 +650,10 @@ fn codex_response_item(
         "message" => {
             let role = payload["role"].as_str().unwrap_or_default();
             let text = codex_content_text(&payload["content"]);
+            // Codex's environment and instructions, sent as the user's turn.
+            if role == "user" && injected(&text) {
+                return;
+            }
             if (role == "user" || role == "assistant") && !text.trim().is_empty() {
                 messages.push(Message {
                     role: role.to_owned(),
@@ -962,6 +975,52 @@ fn chat_text(content: &Value) -> String {
 
 // -- Shared ----------------------------------------------------------------
 
+/// Tags the tools wrap context in when they send it as the user's turn,
+/// though nobody typed it: Claude Code's notes on a slash command and what
+/// it printed, Codex's environment and instructions.
+const INJECTED: &[&str] = &[
+    "local-command-caveat",
+    "command-name",
+    "command-message",
+    "command-args",
+    "local-command-stdout",
+    "local-command-stderr",
+    "system-reminder",
+    "environment_context",
+    "user_instructions",
+    "recommended_plugins",
+    "permissions instructions",
+    "permissions_instructions",
+    "skills_instructions",
+    "apps_instructions",
+    "turn_context",
+    "collaboration_mode",
+];
+
+/// Whether `text` is context a tool added as the user's turn rather than
+/// anything typed, which would otherwise title the session and stand as a
+/// message no one wrote.
+fn injected(text: &str) -> bool {
+    let text = text.trim_start();
+    // Codex before it tagged the project's instructions.
+    if text.starts_with("# AGENTS.md instructions for ") {
+        return true;
+    }
+    let Some(rest) = text.strip_prefix('<') else {
+        return false;
+    };
+    INJECTED.iter().any(|tag| {
+        rest.strip_prefix(tag)
+            .is_some_and(|after| after.starts_with(['>', ' ']))
+    })
+}
+
+/// Whether `text` reports something that happened meanwhile, such as a
+/// background task ending, which is kept as a notice the model still sees.
+fn reports(text: &str) -> bool {
+    text.trim_start().starts_with("<task-notification>")
+}
+
 /// The non-empty lines of `path`, read one at a time so a transcript that has
 /// grown to gigabytes is never held whole; bytes that are not UTF-8 are
 /// replaced rather than ending the read, and a read that fails ends it.
@@ -1048,12 +1107,12 @@ fn modified_secs(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// A title from the first user message in `messages`: the words on one
-/// line, to the length every session's title is cut to.
+/// A title from the first thing the user said in `messages`: the words on
+/// one line, to the length every session's title is cut to.
 fn first_user_title(messages: &[Message]) -> String {
     messages
         .iter()
-        .find(|m| m.role == "user" && !m.content.trim().is_empty())
+        .find(|m| m.role == "user" && !m.notice && !m.content.trim().is_empty())
         .map(|m| short_title(&m.content))
         .unwrap_or_default()
 }
@@ -1406,6 +1465,77 @@ mod tests {
             into_conversation(imported(Some(here.clone())), 1).workspace,
             Some(here)
         );
+    }
+
+    #[test]
+    fn context_a_tool_slipped_in_neither_titles_the_session_nor_stands_as_said() {
+        let dir = scratch("injected");
+        let claude = concat!(
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: the messages below were generated by the user while running local commands.</local-command-caveat>"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to opus</local-command-stdout>"}}"#,
+            "\n",
+            r#"{"type":"user","cwd":"/w","message":{"role":"user","content":[{"type":"text","text":"Fix the login bug"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"<task-notification>The build finished.</task-notification>"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"On it."}]}}"#,
+            "\n",
+        );
+        let path = write(&dir, "abc.jsonl", claude);
+        let imported = import_claude_code(&path).unwrap();
+        assert_eq!(imported.title, "Fix the login bug");
+        let said: Vec<&str> = imported
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "Fix the login bug",
+                "<task-notification>The build finished.</task-notification>",
+                "On it."
+            ]
+        );
+        // The model still hears that the build finished, as a notice.
+        assert!(imported.messages[1].notice);
+        // Left out on purpose, so not counted as parts that were lost.
+        assert_eq!(imported.skipped, 0);
+        let listed = newest_titled(vec![(Tool::ClaudeCode, path)], 1);
+        assert_eq!(listed[0].title, "Fix the login bug");
+
+        let codex = concat!(
+            r#"{"type":"session_meta","payload":{"id":"c1","cwd":"/w"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/w</cwd>\n</environment_context>"}]}}"#,
+            "\n",
+            r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /w\n\n<INSTRUCTIONS>be brief</INSTRUCTIONS>"}]}}"##,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Add a health check"}]}}"#,
+            "\n",
+        );
+        let path = write(&dir, "rollout-x.jsonl", codex);
+        let imported = import_codex(&path).unwrap();
+        assert_eq!(imported.title, "Add a health check");
+        assert_eq!(imported.messages.len(), 1);
+        assert_eq!(imported.skipped, 0);
+        let listed = newest_titled(vec![(Tool::Codex, path)], 1);
+        assert_eq!(listed[0].title, "Add a health check");
+    }
+
+    #[test]
+    fn a_message_that_only_mentions_a_tag_is_still_said() {
+        assert!(!injected("Why does <command-name> show up in my log?"));
+        assert!(!injected("<command-namespace> is a word I made up"));
+        assert!(injected(
+            "  <system-reminder>\nbe careful</system-reminder>"
+        ));
+        assert!(injected(
+            "<permissions instructions>\nAsk first.</permissions instructions>"
+        ));
     }
 
     #[test]
