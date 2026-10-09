@@ -41,7 +41,7 @@ Most settings are in the window's Settings and in `/` commands. Both are stored 
 
 | Variable | Effect |
 |---|---|
-| `AGENT_BASE_URL`, `AGENT_API_KEY`, `AGENT_MODEL` | A Custom gateway for this run only. Nothing is saved. |
+| `AGENT_BASE_URL`, `AGENT_API_KEY`, `AGENT_MODEL` | A Custom gateway for this run only (`-p`, or the terminal with `LETRONNA_DISPOSABLE=1`). Nothing is saved. |
 | `LETRONNA_DEADLINE` | Seconds the run may take. Set it a little under the harness's kill time so the run ends with its result line. |
 | `LETRONNA_DISPOSABLE=1` | Declares the machine throwaway, as in a benchmark container. Unattended Bypass runs may then use commands that are hard to undo, such as `rm -r` or `git reset --hard`. Never set it on a machine whose files matter. |
 
