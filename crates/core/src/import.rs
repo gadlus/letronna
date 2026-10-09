@@ -21,6 +21,7 @@ use std::io::{BufRead as _, Read as _};
 use std::path::{Path, PathBuf};
 
 mod gemini;
+mod opencode;
 
 /// Enough of a file to find its title without reading the whole thing: a
 /// session's first prompt is always near the top, and a file that keeps
@@ -36,6 +37,7 @@ pub enum Tool {
     /// A session Letronna exported as JSON.
     Letronna,
     GeminiCli,
+    Opencode,
 }
 
 impl Tool {
@@ -45,6 +47,7 @@ impl Tool {
             Tool::Codex => "Codex",
             Tool::Letronna => "Letronna",
             Tool::GeminiCli => "Gemini CLI",
+            Tool::Opencode => "opencode",
         }
     }
 }
@@ -104,7 +107,11 @@ pub fn list(limit: usize) -> Vec<Candidate> {
                 .map(|p| (Tool::GeminiCli, p)),
         );
     }
-    newest_titled(files, limit)
+    let mut found = newest_titled(files, limit);
+    found.extend(opencode::list(limit));
+    found.sort_by_key(|c| std::cmp::Reverse(c.updated));
+    found.truncate(limit);
+    found
 }
 
 /// The newest `limit` of `files`, each titled from its head. Sorted and cut
@@ -151,6 +158,7 @@ fn head(tool: Tool, path: &Path) -> (String, String, Option<PathBuf>) {
             None => (String::new(), String::new(), None),
         },
         Tool::GeminiCli => gemini::head(path),
+        Tool::Opencode => opencode::head(path),
     }
 }
 
@@ -162,6 +170,7 @@ pub fn import(candidate: &Candidate) -> Result<Imported, String> {
         Tool::Codex => import_codex(&candidate.path),
         Tool::Letronna => import_letronna(&candidate.path),
         Tool::GeminiCli => gemini::import(&candidate.path),
+        Tool::Opencode => opencode::import(&candidate.path, &candidate.session_id),
     }
 }
 
@@ -211,6 +220,9 @@ fn tool_at(path: &Path) -> Option<Tool> {
         }
         if doc["sessionId"].is_string() && doc["projectHash"].is_string() {
             return Some(Tool::GeminiCli);
+        }
+        if opencode::is_export_doc(&doc) {
+            return Some(Tool::Opencode);
         }
         return None;
     }
@@ -1619,6 +1631,13 @@ mod tests {
                 "{\n  \"sessionId\": \"g\",\n  \"projectHash\": \"h\",\n  \"messages\": []\n}"
             ),
             Some(Tool::GeminiCli)
+        );
+        assert_eq!(
+            tool(
+                "f.json",
+                "{\"info\": {\"id\": \"ses_1\", \"title\": \"t\"}, \"messages\": []}"
+            ),
+            Some(Tool::Opencode)
         );
         assert_eq!(tool("e.json", "{\"some\": \"settings\"}"), None);
     }
