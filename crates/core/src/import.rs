@@ -5,9 +5,10 @@
 //! Both tools keep their own transcripts under the user's home directory,
 //! one JSON object per line: Claude Code under
 //! `~/.claude/projects/<escaped project path>/<session id>.jsonl`, Codex
-//! under `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. Nothing here ever
-//! writes to those files; it only reads them, and everything it makes lands
-//! in a normal `Conversation`.
+//! under `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. A session Letronna
+//! exported as JSON, from this machine or another, comes back in the same
+//! way. Nothing here ever writes to those files; it only reads them, and
+//! everything it makes lands in a normal `Conversation`.
 
 use crate::chat::{MAX_TOOL_CHARS, Message, ToolCall};
 use crate::store::Conversation;
@@ -29,6 +30,8 @@ const HEAD_CAP_BYTES: u64 = 64 * 1024;
 pub enum Tool {
     ClaudeCode,
     Codex,
+    /// A session Letronna exported as JSON.
+    Letronna,
 }
 
 impl Tool {
@@ -36,6 +39,7 @@ impl Tool {
         match self {
             Tool::ClaudeCode => "Claude Code",
             Tool::Codex => "Codex",
+            Tool::Letronna => "Letronna",
         }
     }
 }
@@ -113,6 +117,10 @@ fn newest_titled(files: Vec<(Tool, PathBuf)>, limit: usize) -> Vec<Candidate> {
                     (session_id.unwrap_or_default().to_owned(), title, workspace)
                 }
                 Tool::Codex => codex_head(&path),
+                Tool::Letronna => match letronna_candidate(&path) {
+                    Some(found) => (found.session_id, found.title, found.workspace),
+                    None => (String::new(), String::new(), None),
+                },
             };
             Candidate {
                 tool,
@@ -132,6 +140,7 @@ pub fn import(candidate: &Candidate) -> Result<Imported, String> {
     match candidate.tool {
         Tool::ClaudeCode => import_claude_code(&candidate.path),
         Tool::Codex => import_codex(&candidate.path),
+        Tool::Letronna => import_letronna(&candidate.path),
     }
 }
 
@@ -141,6 +150,9 @@ pub fn import(candidate: &Candidate) -> Result<Imported, String> {
 pub fn candidate_at(path: &Path) -> Option<Candidate> {
     if !path.is_file() {
         return None;
+    }
+    if path.extension().is_some_and(|e| e == "json") {
+        return letronna_candidate(path);
     }
     let codex = path
         .file_name()
@@ -201,13 +213,13 @@ fn nothing_to_import(path: &Path, skipped: usize) -> String {
     )
 }
 
-fn claude_code_root() -> Option<PathBuf> {
+pub(crate) fn claude_code_root() -> Option<PathBuf> {
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| crate::tools::home().map(|h| h.join(".claude")))
 }
 
-fn codex_root() -> Option<PathBuf> {
+pub(crate) fn codex_root() -> Option<PathBuf> {
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| crate::tools::home().map(|h| h.join(".codex")))
@@ -766,6 +778,186 @@ fn codex_output_text(output: &Value) -> String {
     } else {
         output.to_string()
     }
+}
+
+// -- Letronna ---------------------------------------------------------------
+
+/// A Letronna JSON export, read whole: it is one document, not lines.
+fn read_letronna(path: &Path) -> Result<Value, String> {
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("Could not read {}: {e}", path.display()))?;
+    let doc: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("{} is not JSON Letronna can read: {e}", path.display()))?;
+    if doc["format"].as_str() != Some(crate::export::FORMAT) {
+        return Err(format!(
+            "{} is not a session Letronna exported.",
+            path.display()
+        ));
+    }
+    if doc["version"]
+        .as_u64()
+        .is_some_and(|v| v > crate::export::VERSION)
+    {
+        return Err(format!(
+            "{} was exported by a newer Letronna. Update to import it.",
+            path.display()
+        ));
+    }
+    Ok(doc)
+}
+
+/// The export at `path` as a candidate; `None` for JSON that is not one.
+fn letronna_candidate(path: &Path) -> Option<Candidate> {
+    let doc = read_letronna(path).ok()?;
+    Some(Candidate {
+        tool: Tool::Letronna,
+        session_id: letronna_id(&doc, path),
+        title: doc["title"].as_str().unwrap_or_default().to_owned(),
+        workspace: doc["workspace"].as_str().map(PathBuf::from),
+        updated: doc["updated"]
+            .as_u64()
+            .unwrap_or_else(|| modified_secs(path)),
+        path: path.to_owned(),
+    })
+}
+
+/// The id an export was written under, or for a file without one, its name.
+fn letronna_id(doc: &Value, path: &Path) -> String {
+    doc["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .or_else(|| path.file_stem().and_then(|s| s.to_str()))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn import_letronna(path: &Path) -> Result<Imported, String> {
+    let doc = read_letronna(path)?;
+    let mut skipped = 0usize;
+    let items = doc["messages"].as_array().map_or(&[][..], Vec::as_slice);
+    let messages = chat_messages(items, &mut skipped);
+    if messages.is_empty() {
+        return Err(nothing_to_import(path, skipped));
+    }
+    let title = match doc["title"].as_str().map(str::trim) {
+        Some(title) if !title.is_empty() => title.to_owned(),
+        _ => first_user_title(&messages),
+    };
+    Ok(Imported {
+        source: Source {
+            tool: Tool::Letronna,
+            session_id: letronna_id(&doc, path),
+            path: path.to_owned(),
+        },
+        title,
+        workspace: doc["workspace"].as_str().map(PathBuf::from),
+        updated: doc["updated"]
+            .as_u64()
+            .unwrap_or_else(|| modified_secs(path)),
+        messages,
+        skipped,
+    })
+}
+
+/// Messages in the shape chat APIs take them -- `role` and `content`, with
+/// `tool_calls` and `tool_call_id` for calls and their results -- as
+/// Letronna's JSON export writes them.
+fn chat_messages(items: &[Value], skipped: &mut usize) -> Vec<Message> {
+    let mut out = Vec::new();
+    let mut names: HashMap<String, String> = HashMap::new();
+    for item in items {
+        let content = chat_text(&item["content"]);
+        match item["role"].as_str().unwrap_or_default() {
+            "user" if !content.trim().is_empty() => out.push(Message {
+                role: "user".into(),
+                content,
+                notice: item["notice"].as_bool().unwrap_or(false),
+                ..Default::default()
+            }),
+            "assistant" => {
+                let tool_calls: Vec<ToolCall> = item["tool_calls"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(chat_call)
+                    .collect();
+                if content.trim().is_empty() && tool_calls.is_empty() {
+                    *skipped += 1;
+                    continue;
+                }
+                for call in &tool_calls {
+                    names.insert(call.id.clone(), call.name.clone());
+                }
+                out.push(Message {
+                    role: "assistant".into(),
+                    content,
+                    model: item["model"].as_str().unwrap_or_default().to_owned(),
+                    reasoning: item["reasoning"].as_str().unwrap_or_default().to_owned(),
+                    tool_calls,
+                    ..Default::default()
+                });
+            }
+            "tool" => {
+                let Some(id) = item["tool_call_id"].as_str().filter(|id| !id.is_empty()) else {
+                    *skipped += 1;
+                    continue;
+                };
+                let name = match item["name"].as_str() {
+                    Some(name) if !name.is_empty() => name.to_owned(),
+                    _ => names.get(id).cloned().unwrap_or_default(),
+                };
+                out.push(Message {
+                    role: "tool".into(),
+                    content: keep_ends(content, MAX_TOOL_CHARS, ""),
+                    tool_call_id: id.to_owned(),
+                    name,
+                    is_error: item["is_error"].as_bool().unwrap_or(false),
+                    ..Default::default()
+                });
+            }
+            // The other app's instructions to its model, not anything said
+            // in the session.
+            "system" | "developer" => {}
+            _ => *skipped += 1,
+        }
+    }
+    out
+}
+
+/// One of `tool_calls`: an id, and a function's name and arguments, which
+/// are a JSON string in the chat shape but an object in some files.
+fn chat_call(call: &Value) -> Option<ToolCall> {
+    let id = call["id"].as_str().filter(|id| !id.is_empty())?;
+    let function = &call["function"];
+    let name = function["name"].as_str().filter(|n| !n.is_empty())?;
+    let arguments = match &function["arguments"] {
+        Value::String(text) => text.clone(),
+        Value::Null => "{}".to_owned(),
+        other => other.to_string(),
+    };
+    Some(ToolCall {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        arguments,
+    })
+}
+
+/// A chat message's `content`: a string, or the text of each part of an
+/// array, joined; a picture in the mix contributes nothing.
+fn chat_text(content: &Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.to_owned();
+    }
+    content
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
 }
 
 // -- Shared ----------------------------------------------------------------

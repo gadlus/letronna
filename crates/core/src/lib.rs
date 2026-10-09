@@ -34,6 +34,7 @@ mod docs;
 mod downloads;
 pub mod driver;
 mod edit;
+pub mod export;
 pub mod failure;
 pub mod fallback;
 pub mod files;
