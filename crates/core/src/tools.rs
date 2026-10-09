@@ -1009,7 +1009,13 @@ pub(crate) fn addressed_note(text: &str) -> Option<String> {
     // Named, so the rest, such as other files a command printed, still reads
     // as fit to use.
     let said = crate::scan::paragraphs_said_to_an_ai(text);
-    let all = crate::scan::paragraphs(&crate::scan::cleaned(text).0).len();
+    // A command's closing `[exit code N]` is not a paragraph of its output:
+    // counted, it would turn "this output" into "the paragraph starting…".
+    let body = match text.trim_end().rsplit_once('\n') {
+        Some((head, last)) if last.starts_with("[exit code ") => head,
+        _ => text,
+    };
+    let all = crate::scan::paragraphs(&crate::scan::cleaned(body).0).len();
     let place = match said.as_slice() {
         [one] if said.len() < all => {
             format!("the paragraph starting {} in this output", opening(one))

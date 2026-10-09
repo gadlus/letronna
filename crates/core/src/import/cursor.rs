@@ -266,6 +266,9 @@ mod tests {
         "\n",
     );
 
+    // The name is built from a canonical path, which on Windows is `\?\C:\…`
+    // and never what Cursor names a project there.
+    #[cfg(unix)]
     #[test]
     fn a_transcript_gives_each_call_an_id_and_says_its_result_was_not_kept() {
         let base = std::env::temp_dir().join("letronna-import-cursor");
