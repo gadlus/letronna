@@ -35,6 +35,7 @@ mod downloads;
 pub mod driver;
 mod echo;
 mod edit;
+pub mod export;
 pub mod failure;
 pub mod fallback;
 pub mod files;
