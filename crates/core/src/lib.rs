@@ -54,6 +54,7 @@ pub mod init;
 mod inputs;
 pub mod insights;
 pub mod interrupt;
+pub mod jev;
 pub mod jobs;
 pub mod judge;
 pub mod limits;

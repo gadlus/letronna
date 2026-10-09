@@ -524,6 +524,18 @@ pub struct Settings {
     /// add a key.
     #[serde(default = "yes")]
     pub keyless_search: bool,
+    /// How find_tools ranks the tools it finds: "auto" or empty for Jev
+    /// where it can be reached and the chat is hosted anyway, "jev" for Jev
+    /// wherever it can be reached, "names" for the words alone (`jev`).
+    #[serde(default)]
+    pub tool_search: String,
+    /// Where Jev is asked: empty for the user's Letronna account, or a
+    /// System One address of their own, with its key in the `Jev` slot.
+    #[serde(default)]
+    pub jev_endpoint: String,
+    /// The Jev model asked; empty for jev-latest.
+    #[serde(default)]
+    pub jev_model: String,
 }
 
 // Written out rather than derived so the film grain, motion, notifications,
@@ -552,6 +564,9 @@ impl Default for Settings {
             memory_saving: crate::memory::Saving::WhenAsked,
             memory_scope: crate::memory::Scope::Auto,
             keyless_search: true,
+            tool_search: String::new(),
+            jev_endpoint: String::new(),
+            jev_model: String::new(),
             gateway: String::new(),
             custom_endpoint: String::new(),
             presence: String::new(),
