@@ -7,8 +7,8 @@
 //! before it ends: the request is read for the files it names under `out/`,
 //! with what it spells out for them -- a CSV header or the columns it names,
 //! JSON keys and the keys each item of a list holds, the few values a field
-//! may take, the names and words a file must use or must not -- and each
-//! file is looked at on disk.
+//! may take, the names and words a file must use or must not, the codes the
+//! files it names to read hold bare -- and each file is looked at on disk.
 //!
 //! Both halves are plain text matching rather than a model's reading, so
 //! nothing is invented, and the matching leans to missing: a file counts only
@@ -309,6 +309,16 @@ const STATING: [&str; 2] = ["state", "say"];
 /// "must never".
 const NOTS: [&str; 4] = ["not", "never", "don't", "dont"];
 
+/// The last words of a JSON key whose value is codes, as `policy_basis` and
+/// `risk_level` are, when an input's column of that name holds codes.
+const CODED: [&str; 8] = [
+    "flag", "flags", "code", "codes", "status", "basis", "level", "type",
+];
+
+/// The last words of a JSON key for a list of flags or codes, which may
+/// hold the names a markdown input gives, as `manual_review_needed`.
+const FLAGS: [&str; 4] = ["flag", "flags", "code", "codes"];
+
 /// Bad lines reported for one file: three show the pattern, and more would
 /// crowd out the other files.
 const LINES: usize = 3;
@@ -355,6 +365,8 @@ struct Output {
     /// Phrases the request or a file it names to read forbids the file to
     /// hold.
     forbidden: Vec<String>,
+    /// The codes the files the request names to read hold bare.
+    codes: Vec<Codes>,
     /// The file's size and change time as the request was read, if it was
     /// there then.
     found: Option<Stamp>,
@@ -370,6 +382,18 @@ struct Values {
     /// Whether each value was in quotes or backticks, so is matched as
     /// written; a bare word may be capitalised, as prose is.
     quoted: bool,
+}
+
+/// Codes an input holds bare, as CLAIM-1 or `manual_review_needed`.
+#[derive(Clone, Debug, PartialEq)]
+struct Codes {
+    /// The input, as `in/terms.csv`.
+    input: String,
+    /// The column of a CSV input holding nothing but them, or None for the
+    /// names a markdown input gives in backticks.
+    column: Option<String>,
+    /// Each code, as the input writes it.
+    codes: Vec<String>,
 }
 
 /// A file's size and the time it was last changed, where the system keeps one.
@@ -458,6 +482,7 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
                         values: Vec::new(),
                         terms: Vec::new(),
                         forbidden: Vec::new(),
+                        codes: Vec::new(),
                         found,
                     });
                 }
@@ -649,13 +674,14 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
     }
     // A file named to read may list what not to state, as a policy's
     // judgments never to write do, and that holds for every output too.
-    let mut sources = Vec::new();
+    let (mut sources, mut codes) = (Vec::new(), Vec::new());
     for input in crate::inputs::named(crate::references::typed(text), workspace) {
         let file = workspace.join(&input);
         let small = std::fs::metadata(&file).is_ok_and(|meta| meta.len() <= LARGEST);
         let Some(content) = small.then(|| std::fs::read_to_string(&file).ok()).flatten() else {
             continue;
         };
+        codes.extend(codes_in(&input, &content));
         let lines: Vec<&str> = content.lines().collect();
         let stated: Vec<String> = (0..lines.len())
             .flat_map(|at| stated_at(&lines, at))
@@ -673,8 +699,74 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
     });
     for output in &mut outputs {
         forbid(output, &everywhere);
+        if matches!(kind(&output.path).as_str(), "csv" | "json" | "jsonl") {
+            output.codes = codes.clone();
+        }
     }
     Contract { outputs }
+}
+
+/// The codes `content`, the input file `input`, holds bare: each column of
+/// a CSV whose every value is one, as a `policy_basis` column of CLAIM-1
+/// and CLAIM-4 is, or the names in snake case a markdown file gives in
+/// backticks.
+fn codes_in(input: &str, content: &str) -> Vec<Codes> {
+    let code = |value: &str| identifier(value) || snake_case(value);
+    let mut found = Vec::new();
+    match kind(input).as_str() {
+        "csv" => {
+            let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
+            let Ok(records) = records(content) else {
+                return found;
+            };
+            let Some((head, rows)) = records.split_first() else {
+                return found;
+            };
+            for (at, column) in head.fields.iter().enumerate() {
+                let mut codes: Vec<String> = Vec::new();
+                let cells = rows.iter().filter_map(|row| row.fields.get(at));
+                for cell in cells
+                    .map(|cell| cell.trim())
+                    .filter(|cell| !cell.is_empty())
+                {
+                    if !code(cell) {
+                        codes.clear();
+                        break;
+                    }
+                    if !codes.iter().any(|known| known == cell) {
+                        codes.push(cell.to_owned());
+                    }
+                }
+                if !codes.is_empty() {
+                    found.push(Codes {
+                        input: input.to_owned(),
+                        column: Some(column.trim().to_owned()),
+                        codes,
+                    });
+                }
+            }
+        }
+        "md" => {
+            let mut codes: Vec<String> = Vec::new();
+            // Line by line, so a backtick left open ends with its line.
+            for line in content.lines() {
+                for name in line.split('`').skip(1).step_by(2) {
+                    if snake_case(name) && !codes.iter().any(|known| known == name) {
+                        codes.push(name.to_owned());
+                    }
+                }
+            }
+            if !codes.is_empty() {
+                found.push(Codes {
+                    input: input.to_owned(),
+                    column: None,
+                    codes,
+                });
+            }
+        }
+        _ => {}
+    }
+    found
 }
 
 /// Adds `phrases` to those `output` must not hold, each once.
@@ -2108,7 +2200,8 @@ fn json(output: &Output, text: &str) -> Vec<String> {
 /// values its request names.
 fn held(output: &Output, values: &[(Option<usize>, Value)]) -> Vec<String> {
     let name = &output.path;
-    if output.keys.is_empty() && output.each.is_empty() && output.values.is_empty() {
+    let nothing = output.keys.is_empty() && output.each.is_empty() && output.values.is_empty();
+    if nothing && output.codes.is_empty() {
         return Vec::new();
     }
     // A JSON Lines file is one list, each line an item of it.
@@ -2117,6 +2210,8 @@ fn held(output: &Output, values: &[(Option<usize>, Value)]) -> Vec<String> {
     let mut lists: BTreeMap<String, Vec<&Map<String, Value>>> = BTreeMap::new();
     // The values each listed field has, gathered by where each is.
     let mut places: Vec<Places> = output.values.iter().map(|_| BTreeMap::new()).collect();
+    // The text each key named for codes holds, alone or in a list, by key.
+    let mut coded: BTreeMap<String, Vec<(Option<usize>, &str)>> = BTreeMap::new();
     let asks_keys = !output.keys.is_empty() || !output.each.is_empty();
     for (line, value) in values {
         let mut at = String::from(if lines { "[]" } else { "" });
@@ -2135,9 +2230,32 @@ fn held(output: &Output, values: &[(Option<usize>, Value)]) -> Vec<String> {
                     gather(place, at, (*line, text));
                 }
             }
+            if output.codes.is_empty() {
+                return;
+            }
+            for (key, inner) in object {
+                if !CODED.contains(&last_word(key).as_str()) {
+                    continue;
+                }
+                let texts = match inner {
+                    Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+                    inner => inner.as_str().into_iter().collect::<Vec<_>>(),
+                };
+                for text in texts {
+                    gather(&mut coded, key, (*line, text));
+                }
+            }
         });
     }
     let mut problems = Vec::new();
+    // Codes from an input's column of the same name, or for a list of flags
+    // or codes, the names a markdown input gives.
+    for (key, texts) in &coded {
+        let flags = FLAGS.contains(&last_word(key).as_str());
+        let applies = |codes: &&Codes| codes.column.as_ref().map_or(flags, |column| column == key);
+        let mut sets = output.codes.iter().filter(applies);
+        problems.extend(sets.find_map(|codes| with_notes(name, key, codes, texts.iter().copied())));
+    }
     // Anywhere in it, since the request may mean each item of a list or an
     // object inside: a key missing everywhere is wrong whichever it meant,
     // and so is one it names for each item of a list.
@@ -2473,7 +2591,98 @@ fn csv(output: &Output, text: &str) -> Vec<String> {
             .filter_map(|row| Some((Some(row.line), row.fields.get(at)?.as_str())));
         problems.extend(unlisted(name, listed, [cells.collect()]));
     }
+    // A column named as an input's column of codes holds them as it does.
+    for (at, field) in head.fields.iter().enumerate() {
+        let cells =
+            || (rows.iter()).filter_map(|row| Some((Some(row.line), row.fields.get(at)?.as_str())));
+        let mut sets = (output.codes.iter()).filter(|codes| codes.column.as_ref() == Some(field));
+        problems.extend(sets.find_map(|codes| with_notes(name, field, codes, cells())));
+    }
     problems
+}
+
+/// The last word of `key`, in lower case, as `flags` is of
+/// `manual_review_flags`.
+fn last_word(key: &str) -> String {
+    key.rsplit(['_', '-', '.', ' '])
+        .next()
+        .unwrap_or(key)
+        .to_lowercase()
+}
+
+/// What `field` of `name` holds among `cells`, each with its line where
+/// known, that adds words of its own to `codes`, which an input holds bare.
+fn with_notes<'a>(
+    name: &str,
+    field: &str,
+    codes: &Codes,
+    cells: impl IntoIterator<Item = (Option<usize>, &'a str)>,
+) -> Option<String> {
+    let (mut seen, mut shown) = (HashSet::new(), Vec::new());
+    // The code the first starts from, to show how the input writes it.
+    let mut code = None;
+    for (line, value) in cells {
+        if !noted(value, &codes.codes) {
+            continue;
+        }
+        code = code.or_else(|| (codes.codes.iter()).find(|code| holds_word(value, code)));
+        let mut value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        if value.chars().count() > SHOWN {
+            value = value.chars().take(SHOWN).collect::<String>() + "...";
+        }
+        // Values alike as far as shown would read as one given twice.
+        if !seen.insert(value.clone()) {
+            continue;
+        }
+        shown.push(match line {
+            Some(line) => format!("`{value}` (line {line})"),
+            None => format!("`{value}`"),
+        });
+    }
+    let code = code?;
+    let more = match shown.len().saturating_sub(LINES) {
+        0 => String::new(),
+        more => format!(" and {more} more"),
+    };
+    let held = match &codes.column {
+        Some(column) => format!("holds codes such as `{code}` bare in its `{column}` column"),
+        None => format!("gives codes such as `{code}` bare"),
+    };
+    Some(format!(
+        "`{name}` has `{field}` values that add a note to a code: {}{more}; `{}` {held}, so write the codes alone and move any note to a free-text field.",
+        shown[..shown.len().min(LINES)].join(", "),
+        codes.input
+    ))
+}
+
+/// Whether `value` holds one of `codes` and words of its own, as "CLAIM-1
+/// (escalation noted)" or "manual_review_needed: see the log" do; not codes
+/// alone, as "CLAIM-1; CLAIM-4" or "CLAIM-1 and INTERNAL-1" are, nor a value
+/// holding none of them.
+fn noted(value: &str, codes: &[String]) -> bool {
+    let value = value.trim();
+    if codes.iter().any(|code| code == value) {
+        return false;
+    }
+    let tokens: Vec<&str> = value
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+        .filter(|token| !token.is_empty())
+        .collect();
+    if !tokens
+        .iter()
+        .any(|token| codes.iter().any(|code| code == token))
+    {
+        return false;
+    }
+    // A name in code form beside them is another code, not a note.
+    tokens.iter().any(|token| {
+        let letters = token.chars().filter(|c| c.is_alphabetic()).count();
+        token.starts_with(char::is_alphabetic)
+            && letters > 1
+            && !snake_case(token)
+            && !identifier(token)
+            && !["and", "or"].contains(&token.to_lowercase().as_str())
+    })
 }
 
 /// What is wrong with the header `head` of CSV `output` against the columns
@@ -3395,6 +3604,61 @@ mod tests {
                 ),
                 ("out/audit.json", audit),
             ],
+        );
+        assert_eq!(problems, Vec::<String>::new());
+    }
+
+    /// A schedule whose `policy_basis` column holds codes alone, and notes
+    /// that give a flag's code in backticks, as inputs of a review.
+    const SCHEDULE: [(&str, &str); 2] = [
+        (
+            "in/terms.csv",
+            "term,risk_level,policy_basis\nfree trial,high,RULE-1\nno fees,medium,RULE-2\n\
+             trial_flag,low,RULE-3\n",
+        ),
+        (
+            "in/policy.md",
+            "# Rules\n\nA name match is recorded only as `needs_manual_check`.\n",
+        ),
+    ];
+
+    #[test]
+    fn a_note_added_to_codes_an_input_holds_bare_is_reported_with_where_they_come_from() {
+        let request = "Read in/terms.csv and in/policy.md.\n\n\
+                       Create:\n- out/report.csv\n- out/review.json";
+        let report = b"term,policy_basis\nfree trial,RULE-1; RULE-2 (sales asked to keep it)\n\
+                       no fees,RULE-2\ntrial_flag,RULE-3 benign label only\n";
+        let review = br#"[{"id": "A-1", "review_flags": ["needs_manual_check: a name match in an old list"]},
+                          {"id": "A-2", "review_flags": ["needs_manual_check"]}]"#;
+        let problems = checked_reading(
+            &SCHEDULE,
+            request,
+            &[("out/report.csv", report), ("out/review.json", review)],
+        );
+        assert_eq!(
+            problems,
+            [
+                "`out/report.csv` has `policy_basis` values that add a note to a code: `RULE-1; RULE-2 (sales asked to keep it)` (line 2), `RULE-3 benign label only` (line 4); `in/terms.csv` holds codes such as `RULE-1` bare in its `policy_basis` column, so write the codes alone and move any note to a free-text field.",
+                "`out/review.json` has `review_flags` values that add a note to a code: `needs_manual_check: a name match in an o...`; `in/policy.md` gives codes such as `needs_manual_check` bare, so write the codes alone and move any note to a free-text field.",
+            ]
+        );
+    }
+
+    #[test]
+    fn codes_alone_or_joined_and_notes_in_fields_not_named_for_codes_pass() {
+        let request = "Read in/terms.csv and in/policy.md.\n\n\
+                       Create:\n- out/report.csv\n- out/review.json";
+        // A term in its own words, codes joined, a note in a column of its
+        // own; a markdown name in a status or summary, which may be prose.
+        let report = b"term,policy_basis,basis_note\nfree trial (headline),RULE-1; RULE-2,RULE-1 since sales asked\n\
+                       no fees,RULE-2 and OTHER-9,\ntrial_flag,RULE-3,\n";
+        let review = br#"[{"id": "A-1", "status": "needs_manual_check: see the log",
+                           "summary": "RULE-1 applies to the trial", "policy_basis": "RULE-1",
+                           "review_flags": ["needs_manual_check", "other_flag"]}]"#;
+        let problems = checked_reading(
+            &SCHEDULE,
+            request,
+            &[("out/report.csv", report), ("out/review.json", review)],
         );
         assert_eq!(problems, Vec::<String>::new());
     }
