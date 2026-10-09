@@ -54,10 +54,7 @@ const LEAST_CHANCE: f64 = 0.05;
 
 /// How long a search waits for Jev before ranking by words instead: a
 /// second or so is usual, and a search should never stall a turn.
-#[cfg(not(test))]
 const DEADLINE: Duration = Duration::from_secs(3);
-#[cfg(test)]
-const DEADLINE: Duration = Duration::from_millis(500);
 
 /// How many answers are kept, so a search made again costs nothing.
 const REMEMBERED: usize = 64;

@@ -931,13 +931,128 @@ pub(crate) mod tests {
 
     #[test]
     fn a_jev_too_slow_or_switched_off_leaves_the_ranking_to_the_words() {
-        let (url, _asked) = jev(chose("use_page", "browse"), Duration::from_secs(2));
+        let (url, _asked) = jev(chose("use_page", "browse"), Duration::from_secs(4));
         let (found, by_words) = searched(&url, "jev", "open a web page in a browser");
         assert_eq!(found, by_words);
         let (url, asked) = jev(chose("use_page", "browse"), Duration::ZERO);
         let (found, by_words) = searched(&url, "names", "open a web page in a browser");
         assert_eq!(found, by_words);
         assert!(asked.try_recv().is_err(), "Jev was asked with names chosen");
+    }
+
+    /// A request in words of its own, with the tools that do what it asks.
+    type Ask = (String, Vec<String>);
+
+    /// The catalogue the search is measured on -- GitHub's MCP server's tools
+    /// and Letronna's less used ones -- and the requests, each in words of
+    /// its own with the tools that do it, or none where no tool is needed.
+    fn quality_set() -> (Vec<Arc<dyn Tool>>, Vec<Ask>) {
+        let leak = |text: &str| -> &'static str { Box::leak(text.to_owned().into_boxed_str()) };
+        let catalogue: Value =
+            serde_json::from_str(include_str!("bench/tool_search_catalogue.json")).unwrap();
+        let mut tools: Vec<Arc<dyn Tool>> = catalogue["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| {
+                let name = leak(tool["name"].as_str().unwrap());
+                fake(name, leak(tool["description"].as_str().unwrap()), false)
+            })
+            .collect();
+        tools.extend(
+            crate::tools::all()
+                .into_iter()
+                .filter(|t| is_rare(t.name())),
+        );
+        let asks = include_str!("bench/tool_search_asks.jsonl")
+            .lines()
+            .map(|line| {
+                let ask: Value = serde_json::from_str(line).unwrap();
+                let want = ask["want"].as_array().unwrap();
+                let want = want.iter().map(|w| w.as_str().unwrap().to_owned());
+                (ask["ask"].as_str().unwrap().to_owned(), want.collect())
+            })
+            .collect();
+        (tools, asks)
+    }
+
+    /// How `rank` did on `asks`, in percent: of those a tool does, how many
+    /// it put a right tool first for, and among its first three; then of
+    /// the `none` that need no tool, how many it gave one for anyway.
+    fn scored(asks: &[Ask], rank: impl Fn(&str) -> Vec<String>) -> (f64, f64, usize, usize) {
+        let (mut first, mut three, mut needless, mut none) = (0, 0, 0, 0);
+        for (ask, want) in asks {
+            let found = rank(ask);
+            if want.is_empty() {
+                none += 1;
+                needless += usize::from(!found.is_empty());
+                continue;
+            }
+            first += usize::from(found.first().is_some_and(|name| want.contains(name)));
+            three += usize::from(found.iter().take(3).any(|name| want.contains(name)));
+        }
+        let asked = (asks.len() - none) as f64;
+        let share = |n: usize| n as f64 * 100.0 / asked;
+        (share(first), share(three), needless, none)
+    }
+
+    /// What the words alone rank first for `ask` among `tools`.
+    fn by_words(tools: &[Arc<dyn Tool>], ask: &str) -> Vec<String> {
+        let refs: Vec<&Arc<dyn Tool>> = tools.iter().collect();
+        ranked(&refs, ask)
+            .iter()
+            .map(|tool| tool.name().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_word_ranking_is_measured_on_requests_put_in_other_words() {
+        let (tools, asks) = quality_set();
+        let (first, three, needless, none) = scored(&asks, |ask| by_words(&tools, ask));
+        println!(
+            "by words: first {first:.1}%, first three {three:.1}%, a tool for {needless} of {none} needing none"
+        );
+        // Where the ranking stands, so a change that loses ground shows.
+        assert!(three >= 30.0, "{three:.1}% in the first three");
+    }
+
+    #[test]
+    #[ignore = "asks the live Jev: JEV_KEY=<key> [JEV_ENDPOINT=<url>] cargo test -p letronna-core --lib -- --ignored jev_is_measured --nocapture"]
+    fn jev_is_measured_on_the_same_requests() {
+        let key = std::env::var("JEV_KEY").expect("a Jev key in JEV_KEY");
+        let endpoint = std::env::var("JEV_ENDPOINT").unwrap_or_default();
+        let (tools, asks) = quality_set();
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::store::tests::Scratch::new("mcp-find-jev-quality");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let settings =
+            json!({"endpoint": "", "model": "", "tool_search": "jev", "jev_endpoint": endpoint});
+        std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+        crate::store::save_key(crate::jev::KEY_SLOT, Some(&key)).unwrap();
+        let options: Vec<(&str, &str)> =
+            tools.iter().map(|t| (t.name(), t.description())).collect();
+        let hosted = Connection {
+            endpoint: "https://openrouter.ai/api/v1".into(),
+            ..connection()
+        };
+        let started = std::time::Instant::now();
+        let (first, three, needless, none) = scored(&asks, |ask| {
+            match crate::jev::rank(&hosted, ask, &options) {
+                Some(crate::jev::Judged::Ranked(names)) => names,
+                Some(crate::jev::Judged::Nothing) => Vec::new(),
+                None => panic!("Jev gave no answer for {ask:?}"),
+            }
+        });
+        let each = started.elapsed().as_secs_f64() / asks.len() as f64;
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        let (w1, w3, wn, _) = scored(&asks, |ask| by_words(&tools, ask));
+        println!("| ranker | first | first three | a tool where none is needed |");
+        println!("| words | {w1:.1}% | {w3:.1}% | {wn} of {none} |");
+        println!(
+            "| Jev | {first:.1}% | {three:.1}% | {needless} of {none} | ({each:.2} s a search)"
+        );
     }
 
     #[test]
