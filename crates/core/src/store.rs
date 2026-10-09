@@ -113,8 +113,8 @@ pub struct Conversation {
     /// and kept this copy's over theirs, so the window can say so.
     #[serde(skip)]
     pub diverged: bool,
-    /// Where this session came from, for one imported from Claude Code or
-    /// Codex rather than started here.
+    /// Where this session came from, for one imported from another tool, or
+    /// from a Letronna export, rather than started here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imported_from: Option<crate::import::Source>,
     /// The summaries the user asked for that still hold, oldest first: how

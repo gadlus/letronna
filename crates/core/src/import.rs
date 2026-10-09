@@ -1,14 +1,15 @@
-//! Reading Claude Code and Codex sessions from disk, and turning one into a
-//! session of this app's own -- so picking up a conversation started
-//! elsewhere is no different from continuing one Letronna started.
+//! Reading other tools' sessions from disk, and turning one into a session
+//! of this app's own -- so picking up a conversation started elsewhere is
+//! no different from continuing one Letronna started.
 //!
-//! Both tools keep their own transcripts under the user's home directory,
-//! one JSON object per line: Claude Code under
+//! Claude Code and Codex, read here, keep their transcripts under the
+//! user's home directory, one JSON object per line: Claude Code under
 //! `~/.claude/projects/<escaped project path>/<session id>.jsonl`, Codex
-//! under `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. A session Letronna
-//! exported as JSON, from this machine or another, comes back in the same
-//! way. Nothing here ever writes to those files; it only reads them, and
-//! everything it makes lands in a normal `Conversation`.
+//! under `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. The other tools
+//! each have a module below. A session Letronna exported as JSON, from
+//! this machine or another, comes back in the same way. Nothing here ever
+//! writes to those files; it only reads them, and everything it makes lands
+//! in a normal `Conversation`.
 
 use crate::chat::{MAX_TOOL_CHARS, Message, ToolCall};
 use crate::store::Conversation;
@@ -18,6 +19,8 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead as _, Read as _};
 use std::path::{Path, PathBuf};
+
+mod gemini;
 
 /// Enough of a file to find its title without reading the whole thing: a
 /// session's first prompt is always near the top, and a file that keeps
@@ -32,6 +35,7 @@ pub enum Tool {
     Codex,
     /// A session Letronna exported as JSON.
     Letronna,
+    GeminiCli,
 }
 
 impl Tool {
@@ -40,6 +44,7 @@ impl Tool {
             Tool::ClaudeCode => "Claude Code",
             Tool::Codex => "Codex",
             Tool::Letronna => "Letronna",
+            Tool::GeminiCli => "Gemini CLI",
         }
     }
 }
@@ -78,7 +83,8 @@ pub struct Imported {
     pub skipped: usize,
 }
 
-/// Sessions from Claude Code and Codex, newest first, `limit` at most.
+/// Sessions from every tool Letronna can read them from, newest first,
+/// `limit` at most.
 pub fn list(limit: usize) -> Vec<Candidate> {
     let mut files = Vec::new();
     if let Some(root) = claude_code_root() {
@@ -90,6 +96,13 @@ pub fn list(limit: usize) -> Vec<Candidate> {
     }
     if let Some(root) = codex_root() {
         files.extend(codex_files(&root).into_iter().map(|p| (Tool::Codex, p)));
+    }
+    if let Some(root) = gemini::root() {
+        files.extend(
+            gemini::files(&root)
+                .into_iter()
+                .map(|p| (Tool::GeminiCli, p)),
+        );
     }
     newest_titled(files, limit)
 }
@@ -110,18 +123,7 @@ fn newest_titled(files: Vec<(Tool, PathBuf)>, limit: usize) -> Vec<Candidate> {
     files
         .into_iter()
         .map(|(updated, tool, path)| {
-            let (session_id, title, workspace) = match tool {
-                Tool::ClaudeCode => {
-                    let (title, workspace) = claude_code_head(&path);
-                    let session_id = path.file_stem().and_then(|s| s.to_str());
-                    (session_id.unwrap_or_default().to_owned(), title, workspace)
-                }
-                Tool::Codex => codex_head(&path),
-                Tool::Letronna => match letronna_candidate(&path) {
-                    Some(found) => (found.session_id, found.title, found.workspace),
-                    None => (String::new(), String::new(), None),
-                },
-            };
+            let (session_id, title, workspace) = head(tool, &path);
             Candidate {
                 tool,
                 session_id,
@@ -134,6 +136,24 @@ fn newest_titled(files: Vec<(Tool, PathBuf)>, limit: usize) -> Vec<Candidate> {
         .collect()
 }
 
+/// A session's id, title and project folder, from as little of its file as
+/// the tool's format lets them be read from.
+fn head(tool: Tool, path: &Path) -> (String, String, Option<PathBuf>) {
+    match tool {
+        Tool::ClaudeCode => {
+            let (title, workspace) = claude_code_head(path);
+            let session_id = path.file_stem().and_then(|s| s.to_str());
+            (session_id.unwrap_or_default().to_owned(), title, workspace)
+        }
+        Tool::Codex => codex_head(path),
+        Tool::Letronna => match letronna_candidate(path) {
+            Some(found) => (found.session_id, found.title, found.workspace),
+            None => (String::new(), String::new(), None),
+        },
+        Tool::GeminiCli => gemini::head(path),
+    }
+}
+
 /// Read `candidate`'s file in full and turn it into messages this app knows
 /// how to save.
 pub fn import(candidate: &Candidate) -> Result<Imported, String> {
@@ -141,32 +161,24 @@ pub fn import(candidate: &Candidate) -> Result<Imported, String> {
         Tool::ClaudeCode => import_claude_code(&candidate.path),
         Tool::Codex => import_codex(&candidate.path),
         Tool::Letronna => import_letronna(&candidate.path),
+        Tool::GeminiCli => gemini::import(&candidate.path),
     }
 }
 
-/// A candidate for a file named directly, as `/import <path>` takes: the
-/// tool is told from where the file lives, a raw path carrying no other
-/// hint of which format it is in. `None` for a path that is not a file.
+/// A candidate for a file named directly, as `/import <path>` takes. `None`
+/// for a path that is not a file, or not a session Letronna can read.
 pub fn candidate_at(path: &Path) -> Option<Candidate> {
     if !path.is_file() {
         return None;
     }
-    if path.extension().is_some_and(|e| e == "json") {
+    let tool = tool_at(path)?;
+    if tool == Tool::Letronna {
         return letronna_candidate(path);
     }
-    let codex = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with("rollout-"))
-        || path.components().any(|c| c.as_os_str() == ".codex");
-    let (tool, session_id, title, workspace) = if codex {
-        let (session_id, title, workspace) = codex_head(path);
-        (Tool::Codex, session_id, title, workspace)
-    } else {
-        let session_id = path.file_stem().and_then(|s| s.to_str())?.to_owned();
-        let (title, workspace) = claude_code_head(path);
-        (Tool::ClaudeCode, session_id, title, workspace)
-    };
+    let (session_id, title, workspace) = head(tool, path);
+    if session_id.is_empty() {
+        return None;
+    }
     Some(Candidate {
         tool,
         session_id,
@@ -175,6 +187,53 @@ pub fn candidate_at(path: &Path) -> Option<Candidate> {
         title,
         workspace,
     })
+}
+
+/// Which tool wrote the session at `path`: told by the folder each tool
+/// keeps its sessions in, or for a file moved out of it, by how it begins.
+fn tool_at(path: &Path) -> Option<Tool> {
+    let inside = |dir: &str| path.components().any(|c| c.as_os_str() == dir);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if name.starts_with("rollout-") || inside(".codex") {
+        return Some(Tool::Codex);
+    }
+    if inside(".gemini") {
+        return Some(Tool::GeminiCli);
+    }
+    if path.extension().is_some_and(|e| e == "json") {
+        // One document, read whole to tell whose it is.
+        let doc: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        if doc["format"].as_str() == Some(crate::export::FORMAT) {
+            return Some(Tool::Letronna);
+        }
+        if doc["sessionId"].is_string() && doc["projectHash"].is_string() {
+            return Some(Tool::GeminiCli);
+        }
+        return None;
+    }
+    let first = first_object(path);
+    if first["sessionId"].is_string() && first["projectHash"].is_string() {
+        return Some(Tool::GeminiCli);
+    }
+    if first["type"] == "session_meta" {
+        return Some(Tool::Codex);
+    }
+    Some(Tool::ClaudeCode)
+}
+
+/// The first line of `path` that holds a JSON object, or null.
+fn first_object(path: &Path) -> Value {
+    head_text(path)
+        .lines()
+        .find_map(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .filter(Value::is_object)
+        })
+        .unwrap_or(Value::Null)
 }
 
 /// `imported` as a session of its own, at `id`.
@@ -1536,6 +1595,32 @@ mod tests {
         assert!(injected(
             "<permissions instructions>\nAsk first.</permissions instructions>"
         ));
+    }
+
+    #[test]
+    fn a_file_moved_out_of_its_tools_folder_is_told_by_how_it_begins() {
+        let dir = scratch("told-apart");
+        let tool = |name: &str, text: &str| {
+            let path = write(&dir, name, text);
+            candidate_at(&path).map(|c| c.tool)
+        };
+        assert_eq!(tool("a.jsonl", CLAUDE_CODE_FIXTURE), Some(Tool::ClaudeCode));
+        assert_eq!(tool("b.jsonl", CODEX_FIXTURE), Some(Tool::Codex));
+        assert_eq!(
+            tool(
+                "c.jsonl",
+                "{\"sessionId\":\"g\",\"projectHash\":\"h\"}\n{\"id\":\"1\",\"type\":\"user\",\"content\":\"hi\"}\n"
+            ),
+            Some(Tool::GeminiCli)
+        );
+        assert_eq!(
+            tool(
+                "d.json",
+                "{\n  \"sessionId\": \"g\",\n  \"projectHash\": \"h\",\n  \"messages\": []\n}"
+            ),
+            Some(Tool::GeminiCli)
+        );
+        assert_eq!(tool("e.json", "{\"some\": \"settings\"}"), None);
     }
 
     #[test]
