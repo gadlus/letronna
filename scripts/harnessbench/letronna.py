@@ -8,11 +8,13 @@ rounds find those settings and the session already there, and `-c` carries
 the conversation on: with no session yet, `-c` starts one, so it is passed
 every time.
 
-Letronna has no wall-clock limit of its own, so the adapter owns the task's
-timeout. It interrupts Letronna as Ctrl-C would, which is how Letronna ends
-its commands, browser and MCP servers, and kills everything left in its
-session if that takes too long. A round that ran out of time still returns,
-so the oracle scores what reached out/.
+The adapter owns the task's timeout. Letronna is given a deadline
+TURN_MARGIN_SEC short of it, so it is told to write its outputs and ends
+itself with its result line in time; past the timeout, the adapter
+interrupts it as Ctrl-C would, which is how Letronna ends its commands,
+browser and MCP servers, and kills everything left in its session if that
+takes too long. A round that ran out of time still returns, so the oracle
+scores what reached out/.
 
 This file lives in Letronna's repo as scripts/harnessbench/letronna.py, and
 fork.patch there puts a copy in Harness-Bench as
@@ -40,6 +42,18 @@ ROUTE = "/letronna/main"
 # Tool rounds a message gets. Letronna's own default of 25 stops long tasks
 # well short of their timeouts, which are 180 to 3600 seconds.
 MAX_ROUNDS = 150
+
+# Seconds of the task's timeout kept back from Letronna's own deadline, as
+# OpenHuman's benchmark rig keeps them from a harness's turn: at the
+# deadline Letronna stops with its result line, before the interrupt. A
+# timeout barely over this keeps at least half of itself.
+TURN_MARGIN_SEC = 120
+
+# Seconds a reply may stay quiet before Letronna gives up on it. The usage
+# proxy passes a reply on only once it is whole, so a reply reads as silent
+# until then, and Letronna's own 300 fails any that takes longer; this is
+# how long the proxy itself waits on its upstream.
+READ_TIMEOUT_SEC = 1200
 
 # Seconds Letronna has after the interrupt before its group is killed. It
 # gives its commands two seconds to end (END_WAIT in crates/cli/src/main.rs),
@@ -115,14 +129,20 @@ class LetronnaAdapter(BaseAdapter):
                 # Nothing may open a sign-in page or any other in a browser.
                 "BROWSER": "/usr/bin/false",
                 "NO_COLOR": "1",
+                "LETRONNA_DEADLINE": str(deadline(ctx.timeout_sec)),
             }
         )
+        env.setdefault("LETRONNA_READ_TIMEOUT", str(READ_TIMEOUT_SEC))
         # A debug build files keys in the Keychain under this name.
         env.pop("LETRONNA_VAULT_SERVICE", None)
 
         log = ctx.sandbox / "usage-proxy" / "requests.jsonl"
         answered_before = answered_calls(log)
         returncode, stdout, stderr, timed_out = run_owned(cmd, ctx.workspace, env, ctx.timeout_sec)
+        result = last_json(stdout)
+        # Stopped at its deadline ("deadline"; "stopped" before #594), the round
+        # ran out of time, and the harness runs no round after it either.
+        timed_out = timed_out or (result or {}).get("status") in ("deadline", "stopped")
         answered = answered_calls(log) - answered_before
         if answered == 0:
             time.sleep(LOG_SETTLE_SEC)
@@ -130,7 +150,7 @@ class LetronnaAdapter(BaseAdapter):
         metadata: dict[str, Any] = {
             "returncode": returncode,
             "timed_out": timed_out,
-            "result": last_json(stdout),
+            "result": result,
             "model_calls": answered,
             "invalid_run": answered == 0,
         }
@@ -143,6 +163,11 @@ class LetronnaAdapter(BaseAdapter):
             stderr=stderr,
             metadata=metadata,
         )
+
+
+def deadline(timeout: float) -> int:
+    """The whole seconds a round of `timeout` gives Letronna: TURN_MARGIN_SEC fewer, but at least half, and at least 1."""
+    return max(1, int(max(timeout - TURN_MARGIN_SEC, timeout / 2)))
 
 
 def seed(data: Path, endpoint: str, model: str, key: str) -> None:
