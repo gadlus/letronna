@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 mod cursor;
 mod gemini;
 mod opencode;
+mod pi;
 
 /// Enough of a file to find its title without reading the whole thing: a
 /// session's first prompt is always near the top, and a file that keeps
@@ -40,6 +41,9 @@ pub enum Tool {
     GeminiCli,
     Opencode,
     Cursor,
+    #[serde(rename = "openclaw")]
+    OpenClaw,
+    Pi,
 }
 
 impl Tool {
@@ -51,6 +55,8 @@ impl Tool {
             Tool::GeminiCli => "Gemini CLI",
             Tool::Opencode => "opencode",
             Tool::Cursor => "Cursor",
+            Tool::OpenClaw => "OpenClaw",
+            Tool::Pi => "pi",
         }
     }
 }
@@ -113,6 +119,16 @@ pub fn list(limit: usize) -> Vec<Candidate> {
     if let Some(root) = cursor::root() {
         files.extend(cursor::files(&root).into_iter().map(|p| (Tool::Cursor, p)));
     }
+    if let Some(root) = pi::openclaw_root() {
+        files.extend(
+            pi::openclaw_files(&root)
+                .into_iter()
+                .map(|p| (Tool::OpenClaw, p)),
+        );
+    }
+    if let Some(root) = pi::pi_root() {
+        files.extend(pi::pi_files(&root).into_iter().map(|p| (Tool::Pi, p)));
+    }
     let mut found = newest_titled(files, limit);
     found.extend(opencode::list(limit));
     found.sort_by_key(|c| std::cmp::Reverse(c.updated));
@@ -166,6 +182,7 @@ fn head(tool: Tool, path: &Path) -> (String, String, Option<PathBuf>) {
         Tool::GeminiCli => gemini::head(path),
         Tool::Opencode => opencode::head(path),
         Tool::Cursor => cursor::head(path),
+        Tool::OpenClaw | Tool::Pi => pi::head(path),
     }
 }
 
@@ -179,6 +196,7 @@ pub fn import(candidate: &Candidate) -> Result<Imported, String> {
         Tool::GeminiCli => gemini::import(&candidate.path),
         Tool::Opencode => opencode::import(&candidate.path, &candidate.session_id),
         Tool::Cursor => cursor::import(&candidate.path),
+        Tool::OpenClaw | Tool::Pi => pi::import(&candidate.path, candidate.tool),
     }
 }
 
@@ -223,6 +241,9 @@ fn tool_at(path: &Path) -> Option<Tool> {
     if inside("agent-transcripts") {
         return Some(Tool::Cursor);
     }
+    if inside(".openclaw") {
+        return Some(Tool::OpenClaw);
+    }
     if path.extension().is_some_and(|e| e == "json") {
         // One document, read whole to tell whose it is.
         let doc: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
@@ -243,6 +264,10 @@ fn tool_at(path: &Path) -> Option<Tool> {
     }
     if first["type"] == "session_meta" {
         return Some(Tool::Codex);
+    }
+    // pi's header; OpenClaw writes the same, and is told by its folder.
+    if first["type"] == "session" {
+        return Some(Tool::Pi);
     }
     // A line per message with no record type, unlike Claude Code's.
     if first["role"].is_string() && first["message"].is_object() && first.get("type").is_none() {
@@ -1660,6 +1685,13 @@ mod tests {
                 "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"<user_query>hi</user_query>\"}]}}\n"
             ),
             Some(Tool::Cursor)
+        );
+        assert_eq!(
+            tool(
+                "h.jsonl",
+                "{\"type\":\"session\",\"version\":3,\"id\":\"p\",\"cwd\":\"/w\"}\n"
+            ),
+            Some(Tool::Pi)
         );
         assert_eq!(tool("e.json", "{\"some\": \"settings\"}"), None);
     }
