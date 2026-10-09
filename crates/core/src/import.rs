@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 mod cursor;
 mod gemini;
+mod hermes;
 mod kimi;
 mod kiro;
 mod opencode;
@@ -48,6 +49,8 @@ pub enum Tool {
     Pi,
     Kimi,
     Kiro,
+    /// A session Hermes exported, as Hermes keeps its own in SQLite.
+    Hermes,
 }
 
 impl Tool {
@@ -63,6 +66,7 @@ impl Tool {
             Tool::Pi => "pi",
             Tool::Kimi => "Kimi CLI",
             Tool::Kiro => "Kiro",
+            Tool::Hermes => "Hermes",
         }
     }
 }
@@ -197,6 +201,10 @@ fn head(tool: Tool, path: &Path) -> (String, String, Option<PathBuf>) {
         Tool::OpenClaw | Tool::Pi => pi::head(path),
         Tool::Kimi => kimi::head(path),
         Tool::Kiro => kiro::head(path),
+        Tool::Hermes => match hermes::candidates(path).into_iter().next() {
+            Some(found) => (found.session_id, found.title, found.workspace),
+            None => (String::new(), String::new(), None),
+        },
     }
 }
 
@@ -213,31 +221,43 @@ pub fn import(candidate: &Candidate) -> Result<Imported, String> {
         Tool::OpenClaw | Tool::Pi => pi::import(&candidate.path, candidate.tool),
         Tool::Kimi => kimi::import(&candidate.path),
         Tool::Kiro => kiro::import(&candidate.path),
+        Tool::Hermes => hermes::import(&candidate.path, &candidate.session_id),
     }
 }
 
-/// A candidate for a file named directly, as `/import <path>` takes. `None`
-/// for a path that is not a file, or not a session Letronna can read.
-pub fn candidate_at(path: &Path) -> Option<Candidate> {
+/// The sessions in a file named directly, as `/import <path>` takes: one,
+/// for most tools' files, but every session in a Hermes export. Empty for a
+/// path that is not a file, or holds no session Letronna can read.
+pub fn candidates_at(path: &Path) -> Vec<Candidate> {
     if !path.is_file() {
-        return None;
+        return Vec::new();
     }
-    let tool = tool_at(path)?;
-    if tool == Tool::Letronna {
-        return letronna_candidate(path);
+    let Some(tool) = tool_at(path) else {
+        return Vec::new();
+    };
+    match tool {
+        Tool::Letronna => letronna_candidate(path).into_iter().collect(),
+        Tool::Hermes => hermes::candidates(path),
+        _ => {
+            let (session_id, title, workspace) = head(tool, path);
+            if session_id.is_empty() {
+                return Vec::new();
+            }
+            vec![Candidate {
+                tool,
+                session_id,
+                updated: modified_secs(path),
+                path: path.to_owned(),
+                title,
+                workspace,
+            }]
+        }
     }
-    let (session_id, title, workspace) = head(tool, path);
-    if session_id.is_empty() {
-        return None;
-    }
-    Some(Candidate {
-        tool,
-        session_id,
-        updated: modified_secs(path),
-        path: path.to_owned(),
-        title,
-        workspace,
-    })
+}
+
+/// The first session in a file named directly, as `candidates_at` finds them.
+pub fn candidate_at(path: &Path) -> Option<Candidate> {
+    candidates_at(path).into_iter().next()
 }
 
 /// Which tool wrote the session at `path`: told by the folder each tool
@@ -281,6 +301,9 @@ fn tool_at(path: &Path) -> Option<Tool> {
         return None;
     }
     let first = first_object(path);
+    if hermes::is_session(&first) {
+        return Some(Tool::Hermes);
+    }
     if first["sessionId"].is_string() && first["projectHash"].is_string() {
         return Some(Tool::GeminiCli);
     }
@@ -306,12 +329,18 @@ fn tool_at(path: &Path) -> Option<Tool> {
     Some(Tool::ClaudeCode)
 }
 
-/// The first line of `path` that holds a JSON object, or null.
+/// The lines read to find the first JSON object in a file.
+const FIRST_LINES: usize = 5;
+
+/// The first line of `path` that holds a JSON object, or null. Read whole,
+/// unlike a head: a line of a Hermes export holds a whole session.
 fn first_object(path: &Path) -> Value {
-    head_text(path)
-        .lines()
+    read_lines(path)
+        .into_iter()
+        .flatten()
+        .take(FIRST_LINES)
         .find_map(|line| {
-            serde_json::from_str::<Value>(line)
+            serde_json::from_str::<Value>(&line)
                 .ok()
                 .filter(Value::is_object)
         })
@@ -1759,6 +1788,13 @@ mod tests {
                 "{\"version\":\"v1\",\"kind\":\"Prompt\",\"data\":{\"content\":[]}}\n"
             ),
             Some(Tool::Kiro)
+        );
+        assert_eq!(
+            tool(
+                "k.jsonl",
+                "{\"id\":\"20261001_a\",\"source\":\"cli\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}\n"
+            ),
+            Some(Tool::Hermes)
         );
         assert_eq!(tool("e.json", "{\"some\": \"settings\"}"), None);
     }
