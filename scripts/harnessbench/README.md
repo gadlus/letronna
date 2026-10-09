@@ -116,8 +116,8 @@ lists it with `"ok": false`.
 
 The patch makes the judge ask again when the gateway is busy: a 429, a 5xx
 or a dropped connection is tried three more times, 10, 30 and 60 seconds
-apart, and a reply with no JSON in it is asked for once more. A 400 is not
-retried.
+apart, and a reply with no JSON in it, or with no scores in its JSON, is
+asked for once more. A 400 is not retried.
 
 Each round's metadata in the result holds the run's own JSON (`status`,
 `rounds`, tokens, `files`), `timed_out` (also true when Letronna stopped

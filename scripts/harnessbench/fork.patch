@@ -362,7 +362,7 @@ index 0000000..30b8cde
 +            count += 1
 +    return count
 diff --git a/src/harnessbench/grading/rubric_llm.py b/src/harnessbench/grading/rubric_llm.py
-index 73f500e..9c16914 100644
+index 73f500e..6d9e50f 100644
 --- a/src/harnessbench/grading/rubric_llm.py
 +++ b/src/harnessbench/grading/rubric_llm.py
 @@ -5,6 +5,7 @@ import base64
@@ -399,7 +399,7 @@ index 73f500e..9c16914 100644
  def run_llm_rubric(
      *,
      system: str,
-@@ -289,33 +309,37 @@ def run_llm_rubric(
+@@ -289,33 +309,38 @@ def run_llm_rubric(
              timeout_sec,
              int(os.environ.get("HARNESSBENCH_RUBRIC_VISION_TIMEOUT_SEC", "300")),
          )
@@ -428,8 +428,9 @@ index 73f500e..9c16914 100644
 -            "notes": "",
 -            "rubric_model": mdl,
 -        }
-+    # A reply with no JSON object in it is asked for once more: on a long trace
-+    # the judge sometimes carries on writing the trace instead of grading it.
++    # A reply with no JSON object in it, or one without scores, is asked for
++    # once more: on a long trace the judge sometimes carries on writing the
++    # trace instead of grading it, and that can parse as an object too.
 +    for _ in range(2):
 +        try:
 +            data = _post_with_retries(req, effective_timeout)
@@ -458,7 +459,7 @@ index 73f500e..9c16914 100644
 +            }
 +
 +        parsed = _parse_json_object(content) if isinstance(content, str) else None
-+        if parsed:
++        if parsed and isinstance(parsed.get("scores"), dict) and parsed["scores"]:
 +            break
      if not parsed:
          return {
