@@ -65,6 +65,15 @@ pub struct Retry {
 
 impl fmt::Display for Retry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Only a reply cut off before it wrote anything is asked for again
+        // after a bad reply, at once and with a longer limit.
+        if self.kind == FailureKind::BadReply {
+            return write!(
+                f,
+                "The model spent its whole reply thinking, asking again with more room (try {} of {})",
+                self.attempt, self.of
+            );
+        }
         let why = match self.kind {
             FailureKind::RateLimit => "Rate limited",
             FailureKind::Overloaded => "The provider is overloaded",

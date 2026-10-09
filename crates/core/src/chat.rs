@@ -3630,6 +3630,19 @@ fn doomed(connection: &Connection, messages: &[Message], budget: &Budget) -> Opt
 /// that leaves less room than this for the reply cuts the prompt instead.
 const LEAST_REPLY: usize = 1_024;
 
+/// The budget to send again with after a reply spent all of `sent`'s reply
+/// thinking: the same window with the longest reply the model is known to
+/// take, up to `MAX_REPLY_TOKENS` and a quarter of its window. None when
+/// that is no longer than what was sent, so it is sent again at most once.
+fn roomier(connection: &Connection, sent: &Budget) -> Option<Budget> {
+    let facts = crate::models::facts(&connection.endpoint, connection.model.trim());
+    let reply = facts
+        .max_output
+        .map_or(MAX_REPLY_TOKENS, |n| (n as usize).min(MAX_REPLY_TOKENS))
+        .min(facts.context.map_or(usize::MAX, |n| n as usize / 4));
+    (reply > sent.reply).then_some(Budget { reply, ..*sent })
+}
+
 /// The budget to send again with after `failure`, once, when it is an
 /// overflow a smaller window or a shorter reply can mend. What the error gave
 /// away is learned for the model first, so the requests after it are sized
@@ -3860,6 +3873,24 @@ fn stream(
             // it gets here on the try it came back on. The one request sent
             // again after it has tries of its own for what does pass.
             if !begun && let Some(budget) = refit(connection, &failure, budget) {
+                return send_window(connection, messages, &budget, extra, lsp, sender);
+            }
+            // A reply that thought until its limit and wrote nothing goes
+            // again once with the longest reply the model takes. What it
+            // thought is dropped: the next try thinks afresh.
+            if failure.out_of_room
+                && let Some(budget) = roomier(connection, budget)
+            {
+                let retry = crate::retry::Retry {
+                    kind: failure.kind,
+                    attempt: 2,
+                    of: 2,
+                    wait: Duration::ZERO,
+                    dropped: begun,
+                };
+                sender
+                    .send_blocking(Event::Retrying(retry))
+                    .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
                 return send_window(connection, messages, &budget, extra, lsp, sender);
             }
             return Err(failure);
@@ -4295,7 +4326,9 @@ impl Reply {
                 // then takes the thinking as the answer.
                 _ => return Ok(()),
             };
-            return Err(Failure::new(FailureKind::BadReply, why));
+            let mut failure = Failure::new(FailureKind::BadReply, why);
+            failure.out_of_room = self.finish == Some(FinishReason::Length);
+            return Err(failure);
         }
         let carries = !replay.reasoning_details.is_empty()
             || !replay.extra_content.is_empty()
@@ -10742,6 +10775,75 @@ mod tests {
         let bodies = worker.join().unwrap();
         // Nothing named a limit, so only the results were cleared.
         assert_eq!(cleared_and_asked(&bodies[1]), (7, 8_192));
+    }
+
+    /// A reply that only thinks until its limit, as a reasoning model at a
+    /// high effort does with 8,192 tokens.
+    const THOUGHT_OUT: &str = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n";
+
+    #[test]
+    fn a_reply_that_thinks_away_its_limit_is_asked_again_with_more_room() {
+        let (endpoint, worker) = serve(vec![
+            ("200 OK", "text/event-stream", THOUGHT_OUT),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Done\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
+        let rx = start(
+            Connection {
+                endpoint,
+                model: "thinks-to-its-limit".into(),
+                ..connection()
+            },
+            reads(1, 10),
+        );
+        let mut retried = None;
+        let mut said = String::new();
+        let finished = loop {
+            match rx.recv_blocking().unwrap() {
+                Event::Retrying(retry) => retried = Some(retry),
+                Event::Delta(text) => said.push_str(&text),
+                Event::Finished(result) => break result,
+                _ => {}
+            }
+        };
+        assert!(finished.is_ok(), "{finished:?}");
+        assert_eq!(said, "Done");
+        // What it thought was shown, so the frontends drop it.
+        let retry = retried.expect("no retry was announced");
+        assert!(retry.dropped);
+        assert_eq!(retry.kind, FailureKind::BadReply);
+        let bodies = worker.join().unwrap();
+        let asked = |body: &str| serde_json::from_str::<Value>(body).unwrap()["max_tokens"].clone();
+        assert_eq!(asked(&bodies[0]), 8_192);
+        assert_eq!(asked(&bodies[1]), MAX_REPLY_TOKENS);
+    }
+
+    #[test]
+    fn a_reply_that_thinks_away_the_longer_limit_too_stands() {
+        let (endpoint, worker) = serve(vec![
+            ("200 OK", "text/event-stream", THOUGHT_OUT),
+            ("200 OK", "text/event-stream", THOUGHT_OUT),
+        ]);
+        let rx = start(
+            Connection {
+                endpoint,
+                model: "thinks-past-every-limit".into(),
+                ..connection()
+            },
+            reads(1, 10),
+        );
+        let failure = loop {
+            if let Event::Finished(result) = rx.recv_blocking().unwrap() {
+                break result.expect_err("a second cut-off went through");
+            }
+        };
+        assert_eq!(failure.kind, FailureKind::BadReply);
+        assert!(failure.out_of_room);
+        // Sent twice and no more.
+        assert_eq!(worker.join().unwrap().len(), 2);
     }
 
     #[test]
