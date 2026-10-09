@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::io::{BufRead as _, Read as _};
 use std::path::{Path, PathBuf};
 
+mod cursor;
 mod gemini;
 mod opencode;
 
@@ -38,6 +39,7 @@ pub enum Tool {
     Letronna,
     GeminiCli,
     Opencode,
+    Cursor,
 }
 
 impl Tool {
@@ -48,6 +50,7 @@ impl Tool {
             Tool::Letronna => "Letronna",
             Tool::GeminiCli => "Gemini CLI",
             Tool::Opencode => "opencode",
+            Tool::Cursor => "Cursor",
         }
     }
 }
@@ -107,6 +110,9 @@ pub fn list(limit: usize) -> Vec<Candidate> {
                 .map(|p| (Tool::GeminiCli, p)),
         );
     }
+    if let Some(root) = cursor::root() {
+        files.extend(cursor::files(&root).into_iter().map(|p| (Tool::Cursor, p)));
+    }
     let mut found = newest_titled(files, limit);
     found.extend(opencode::list(limit));
     found.sort_by_key(|c| std::cmp::Reverse(c.updated));
@@ -159,6 +165,7 @@ fn head(tool: Tool, path: &Path) -> (String, String, Option<PathBuf>) {
         },
         Tool::GeminiCli => gemini::head(path),
         Tool::Opencode => opencode::head(path),
+        Tool::Cursor => cursor::head(path),
     }
 }
 
@@ -171,6 +178,7 @@ pub fn import(candidate: &Candidate) -> Result<Imported, String> {
         Tool::Letronna => import_letronna(&candidate.path),
         Tool::GeminiCli => gemini::import(&candidate.path),
         Tool::Opencode => opencode::import(&candidate.path, &candidate.session_id),
+        Tool::Cursor => cursor::import(&candidate.path),
     }
 }
 
@@ -212,6 +220,9 @@ fn tool_at(path: &Path) -> Option<Tool> {
     if inside(".gemini") {
         return Some(Tool::GeminiCli);
     }
+    if inside("agent-transcripts") {
+        return Some(Tool::Cursor);
+    }
     if path.extension().is_some_and(|e| e == "json") {
         // One document, read whole to tell whose it is.
         let doc: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
@@ -232,6 +243,10 @@ fn tool_at(path: &Path) -> Option<Tool> {
     }
     if first["type"] == "session_meta" {
         return Some(Tool::Codex);
+    }
+    // A line per message with no record type, unlike Claude Code's.
+    if first["role"].is_string() && first["message"].is_object() && first.get("type").is_none() {
+        return Some(Tool::Cursor);
     }
     Some(Tool::ClaudeCode)
 }
@@ -1638,6 +1653,13 @@ mod tests {
                 "{\"info\": {\"id\": \"ses_1\", \"title\": \"t\"}, \"messages\": []}"
             ),
             Some(Tool::Opencode)
+        );
+        assert_eq!(
+            tool(
+                "g.jsonl",
+                "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"<user_query>hi</user_query>\"}]}}\n"
+            ),
+            Some(Tool::Cursor)
         );
         assert_eq!(tool("e.json", "{\"some\": \"settings\"}"), None);
     }
