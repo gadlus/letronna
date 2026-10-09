@@ -12,6 +12,8 @@ oracle; and a pass afterwards marks the runs whose grading did not happen.
 | `letronna.py` | The adapter, `LetronnaAdapter`, for Harness-Bench's `adapters/` |
 | `fork.patch` | Adds that adapter, its registry branch and an example entry to Harness-Bench at `1025086a446653702b80cfb48babbeec35db6b2c` |
 | `validate.py` | Marks results invalid after a suite and says which to leave out |
+| `corrected-graders.patch` | Fixes, on top of `fork.patch`, the oracle checks the bench ledger records as rejecting correct answers |
+| `rescore.py` | Grades saved results again with another copy of the graders, keeping the judge's scores |
 | `stub_server.py` | A stand-in model server for a smoke run with no provider |
 | `test_letronna.py`, `test_validate.py` | Tests, with a fake `letronna` and no network |
 
@@ -183,3 +185,33 @@ cp scripts/harnessbench/letronna.py /path/to/harness-bench/src/harnessbench/adap
 git -C /path/to/harness-bench add -A src config
 git -C /path/to/harness-bench diff --cached > scripts/harnessbench/fork.patch
 ```
+
+## Corrected graders
+
+`bench/harness-bench/known_issues.json` records the checks that reject a
+correct answer: wording, IDs, formats or severities the prompt never asks
+for, phrase checks blind to negation, substring matches, a float threshold,
+and weights that cannot reach 1.0. Each entry was proven by running the
+oracle on a correct, prompt-compliant answer. `corrected-graders.patch` fixes
+those checks for 61 of the ledger's tasks (017's defect is in the judge), so
+that a right answer passes and a wrong one still fails:
+
+```sh
+git apply /path/to/letronna/scripts/harnessbench/fork.patch
+git apply /path/to/letronna/scripts/harnessbench/corrected-graders.patch
+```
+
+Saved runs need not be run again. `rescore.py` grades each result's own
+workspace with the corrected graders and keeps the judge's process and
+security scores; put the bench's Python environment first on `PATH`, as some
+graders run pytest themselves:
+
+```sh
+python3 /path/to/letronna/scripts/harnessbench/rescore.py \
+    /path/to/harness-bench /srv/hb/run1/results /srv/hb/run1/results-corrected
+```
+
+Report corrected scores beside the official ones, never in their place: the
+paper's numbers use the shipped graders, so only official scores compare
+with them.
+
