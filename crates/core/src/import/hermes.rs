@@ -128,8 +128,10 @@ mod tests {
         "\n",
     );
 
-    fn export() -> PathBuf {
-        let dir = std::env::temp_dir().join("letronna-import-hermes");
+    /// A folder per test: tests run at once, and one clearing a shared
+    /// folder would pull the file from under the other.
+    fn export(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("letronna-import-hermes-{test}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hermes.jsonl");
@@ -139,7 +141,7 @@ mod tests {
 
     #[test]
     fn each_session_in_an_export_is_offered_on_its_own() {
-        let path = export();
+        let path = export("offered");
         let found = candidates(&path);
         let ids: Vec<&str> = found.iter().map(|c| c.session_id.as_str()).collect();
         assert_eq!(ids, ["20261001_aaa", "20261002_bbb"]);
@@ -152,7 +154,7 @@ mod tests {
 
     #[test]
     fn a_session_imports_with_its_calls_and_its_summary_as_a_notice() {
-        let path = export();
+        let path = export("imports");
         let imported = import(&path, "20261001_aaa").unwrap();
         assert_eq!(imported.source.tool, Tool::Hermes);
         assert_eq!(imported.title, "Health check");
