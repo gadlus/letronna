@@ -30,6 +30,12 @@
 //! A helper may use the MCP tools its type allows whether they are sent or
 //! looked up: its tools are listed as if every one were sent, and
 //! `find_tools` finds it only those.
+//!
+//! A lean run -- `-p` that did not name its tools -- also leaves out
+//! Letronna's own less used tools (`RARE`), which took some 3,000 of the
+//! 6,700 tokens its array came to and which such a run seldom needs. They
+//! are found and called through the same pair, and a call that names one
+//! directly still runs it.
 
 use crate::chat::{Connection, ToolCall};
 use crate::tools::{Tool, ToolContext};
@@ -42,6 +48,25 @@ pub(crate) const CALL_MCP_TOOL: &str = "call_mcp_tool";
 
 /// What every MCP tool's name starts with; see `mcp::tool_name`.
 const PREFIX: &str = "mcp__";
+
+/// Letronna's own tools a lean run offers on demand: the largest of those a
+/// run nobody watches seldom needs -- the browser, the computer, pictures,
+/// sound, skills being written, the crew's board and past sessions.
+const RARE: [&str; 13] = [
+    "browse",
+    "use_page",
+    "computer",
+    "edit_image",
+    "make_image",
+    "make_video",
+    "transcribe",
+    "speak",
+    "skill_manage",
+    "board",
+    "search_sessions",
+    "list_sessions",
+    "read_chat",
+];
 
 /// Past this many estimated tokens of MCP tool schemas, the MCP tools go out
 /// on demand. It is about what Letronna's own tools take, so MCP tools at
@@ -77,13 +102,47 @@ pub(crate) fn is_mcp(name: &str) -> bool {
     name.starts_with(PREFIX)
 }
 
-/// Whether the tool called `name` goes in the `tools` array: the MCP tools
-/// or the pair that stands in for them, never both.
-pub(crate) fn in_array(name: &str, on_demand: bool) -> bool {
+/// Whether `name` is one of Letronna's own tools a lean run offers on demand.
+pub(crate) fn is_rare(name: &str) -> bool {
+    RARE.contains(&name)
+}
+
+/// Which tools a request leaves out of its array, for `find_tools` to find.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct OnDemand {
+    /// The MCP tools, once their schemas passed the budget.
+    pub(crate) mcp: bool,
+    /// Letronna's own less used tools, in a lean run.
+    pub(crate) rare: bool,
+}
+
+impl OnDemand {
+    /// What a request over `connection`, out of `tools`, leaves out.
+    pub(crate) fn of(connection: &Connection, tools: &[Arc<dyn Tool>]) -> Self {
+        Self {
+            mcp: on_demand(tools),
+            rare: connection.lean_tools,
+        }
+    }
+
+    /// Whether anything is left out, so the pair stands in for it.
+    pub(crate) fn any(self) -> bool {
+        self.mcp || self.rare
+    }
+
+    /// Whether the tool called `name` is left out.
+    pub(crate) fn leaves_out(self, name: &str) -> bool {
+        (self.mcp && is_mcp(name)) || (self.rare && is_rare(name))
+    }
+}
+
+/// Whether the tool called `name` goes in the `tools` array: a tool left out
+/// `on_demand` or the pair that stands in for those, never both.
+pub(crate) fn in_array(name: &str, on_demand: OnDemand) -> bool {
     if name == FIND_TOOLS || name == CALL_MCP_TOOL {
-        on_demand
+        on_demand.any()
     } else {
-        !on_demand || !is_mcp(name)
+        !on_demand.leaves_out(name)
     }
 }
 
@@ -129,7 +188,7 @@ fn schema_tokens(tools: &[Arc<dyn Tool>]) -> usize {
         .sum()
 }
 
-/// Makes each `call_mcp_tool` call the call of the MCP tool it names, before
+/// Makes each `call_mcp_tool` call the call of the tool it names, before
 /// anything decides about it, saying whether it made any. A call that names
 /// none is left as it is, for the tool to say what was wrong.
 pub(crate) fn resolve(calls: &mut [ToolCall]) -> bool {
@@ -147,16 +206,16 @@ pub(crate) fn resolve(calls: &mut [ToolCall]) -> bool {
     resolved
 }
 
-/// The MCP tool a `call_mcp_tool` call names, with its arguments as JSON,
-/// or why it names none.
+/// The tool a `call_mcp_tool` call names, with its arguments as JSON, or
+/// why it names none.
 fn named(args: &Value) -> Result<(String, String), String> {
     let name = args["name"].as_str().map(str::trim).unwrap_or_default();
     if name.is_empty() {
         return Err("Put the tool's name in `name`, as find_tools gave it.".into());
     }
-    if !is_mcp(name) {
+    if !is_mcp(name) && !is_rare(name) {
         return Err(format!(
-            "`{name}` is not a tool of an MCP server, so call_mcp_tool cannot call it; \
+            "`{name}` is not a tool find_tools finds, so call_mcp_tool cannot call it; \
              call it directly."
         ));
     }
@@ -183,17 +242,20 @@ fn beside(args: &Value) -> Value {
     Value::Object(fields)
 }
 
-/// Puts each MCP tool's call in `wired`, a message as a request sends it,
-/// back as a `call_mcp_tool` call, for a request on `connection` that
-/// offers the pair in their place. The same call goes out as the same bytes
-/// every time, so the cached prefix holds, and `resolve` reads it back as it
-/// was saved.
-pub(crate) fn wrap(wired: &mut Value, connection: &Connection) {
+/// Puts each call in `wired`, a message as a request sends it, of a tool
+/// left out `on_demand`, back as a `call_mcp_tool` call, for a request on
+/// `connection` that offers the pair in their place. The same call goes out
+/// as the same bytes every time, so the cached prefix holds, and `resolve`
+/// reads it back as it was saved.
+pub(crate) fn wrap(wired: &mut Value, connection: &Connection, on_demand: OnDemand) {
     let Some(calls) = wired["tool_calls"].as_array_mut() else {
         return;
     };
     for function in calls.iter_mut().map(|call| &mut call["function"]) {
-        let Some(name) = function["name"].as_str().filter(|name| is_mcp(name)) else {
+        let Some(name) = function["name"]
+            .as_str()
+            .filter(|name| on_demand.leaves_out(name))
+        else {
             continue;
         };
         let saved = function["arguments"].as_str().unwrap_or("{}").to_owned();
@@ -227,14 +289,15 @@ pub(crate) fn fit(tools: &mut [Value], connection: &Connection) {
     }
 }
 
-/// Searches the MCP tools, handing back the best matches whole.
+/// Searches the tools left out of the array, handing back the best matches
+/// whole.
 struct FindTools;
 impl Tool for FindTools {
     fn name(&self) -> &'static str {
         FIND_TOOLS
     }
     fn description(&self) -> &'static str {
-        "Search the tools of the user's MCP servers, which are too many to list here. Give a few words for what you need done, or a tool's exact name; the matching tools come back with their descriptions and arguments. Then call one with call_mcp_tool."
+        "Search the tools left out of this list: the user's MCP servers' tools when they are too many to list, and in a run nobody watches Letronna's less used ones -- browse, use_page, computer, edit_image, make_image, make_video, transcribe, speak, skill_manage, board, search_sessions and list_sessions. Give a few words for what you need done, or a tool's exact name; the matching tools come back with their descriptions and arguments. Then call one with call_mcp_tool."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -251,31 +314,44 @@ impl Tool for FindTools {
                 .is_none_or(|names| names.iter().any(|name| name == tool.name()))
         };
         let tools: Vec<Arc<dyn Tool>> = crate::tools::all().into_iter().filter(allowed).collect();
-        Ok(search(&tools, query, ctx.plan))
+        // Letronna's own tools a lean run left out, as far as it would offer
+        // them at all.
+        let rare: Vec<String> = match ctx.caller.connection.as_deref() {
+            Some(connection) if connection.lean_tools => {
+                crate::tools::specs_of(&tools, connection, OnDemand::default())
+                    .iter()
+                    .filter_map(|spec| spec["function"]["name"].as_str())
+                    .filter(|name| is_rare(name))
+                    .map(str::to_owned)
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        Ok(search(&tools, query, ctx.plan, &rare))
     }
     fn concurrent(&self) -> bool {
         true
     }
 }
 
-/// Calls an MCP tool that find_tools found. Only in name: see `resolve`.
+/// Calls a tool that find_tools found. Only in name: see `resolve`.
 struct CallMcpTool;
 impl Tool for CallMcpTool {
     fn name(&self) -> &'static str {
         CALL_MCP_TOOL
     }
     fn description(&self) -> &'static str {
-        "Call a tool of the user's MCP servers that find_tools found: its exact name in `name`, and in `arguments` the arguments find_tools gave for it."
+        "Call a tool that find_tools found: its exact name in `name`, and in `arguments` the arguments find_tools gave for it."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
-            "name": {"type": "string", "description": "The tool's name as find_tools gave it, starting with mcp__."},
+            "name": {"type": "string", "description": "The tool's name as find_tools gave it."},
             "arguments": {"type": "object", "description": "The tool's arguments."}
         }, "required": ["name", "arguments"]})
     }
     fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
-        // A call that names an MCP tool never gets here: it became that
-        // tool's own call as the reply came in. This one only says what was
+        // A call that names a tool it can call never gets here: it became
+        // that tool's own call as the reply came in. This one only says what was
         // wrong, and runs nothing.
         Err(match named(args) {
             Err(why) => why,
@@ -284,10 +360,14 @@ impl Tool for CallMcpTool {
     }
 }
 
-/// What a search for `query` among the MCP tools in `tools` finds; in plan
-/// mode only among those that change nothing, as plan mode would offer.
-fn search(tools: &[Arc<dyn Tool>], query: &str, plan: bool) -> String {
-    let every: Vec<&Arc<dyn Tool>> = tools.iter().filter(|tool| is_mcp(tool.name())).collect();
+/// What a search for `query` among the MCP tools in `tools` and the `rare`
+/// ones left out finds; in plan mode only among those that change nothing,
+/// as plan mode would offer.
+fn search(tools: &[Arc<dyn Tool>], query: &str, plan: bool, rare: &[String]) -> String {
+    let every: Vec<&Arc<dyn Tool>> = tools
+        .iter()
+        .filter(|tool| is_mcp(tool.name()) || rare.iter().any(|name| name == tool.name()))
+        .collect();
     if every.is_empty() {
         return "No MCP server has any tools here: none is set up, or they are still starting."
             .into();
@@ -298,12 +378,12 @@ fn search(tools: &[Arc<dyn Tool>], query: &str, plan: bool) -> String {
         .collect();
     if tools.is_empty() {
         return "In plan mode only tools that change nothing can be found, and none of the \
-                MCP tools qualifies."
+                tools left out qualifies."
             .into();
     }
     let ranked = ranked(&tools, query);
     if ranked.is_empty() {
-        let mut out = format!("No MCP tool matches \"{}\". The tools are:", query.trim());
+        let mut out = format!("No tool matches \"{}\". The tools are:", query.trim());
         list(&mut out, &names(&tools), FOUND_BYTES);
         return out;
     }
@@ -595,13 +675,107 @@ pub(crate) mod tests {
         }
     }
 
+    /// The names of Letronna's own less used tools a request over
+    /// `connection` would send if none were left out.
+    fn rare_offered(connection: &Connection) -> Vec<String> {
+        let every = crate::tools::all();
+        names(&crate::tools::specs_of(
+            &every,
+            connection,
+            OnDemand::default(),
+        ))
+        .into_iter()
+        .filter(|name| is_rare(name))
+        .collect()
+    }
+
+    #[test]
+    fn a_lean_run_leaves_the_less_used_tools_to_find_tools() {
+        let lean = Connection {
+            lean_tools: true,
+            ..connection()
+        };
+        let rare = rare_offered(&lean);
+        assert!(rare.iter().any(|name| name == "browse"), "{rare:?}");
+        let sent = names(&crate::tools::specs(&lean));
+        assert!(!sent.iter().any(|name| is_rare(name)), "{sent:?}");
+        assert!(sent.iter().any(|name| name == FIND_TOOLS));
+        assert!(sent.iter().any(|name| name == CALL_MCP_TOOL));
+        // Every other tool goes out as before.
+        let full = names(&crate::tools::specs(&connection()));
+        let kept: Vec<&String> = full.iter().filter(|name| !is_rare(name)).collect();
+        assert!(kept.iter().all(|name| sent.contains(name)), "{sent:?}");
+        // Most of the array was those few: what is left is far smaller.
+        let tokens =
+            |c: &Connection| crate::chat::tokens(&Value::Array(crate::tools::specs(c)).to_string());
+        assert!(
+            tokens(&connection()) - tokens(&lean) > 2_000,
+            "{} -> {}",
+            tokens(&connection()),
+            tokens(&lean)
+        );
+    }
+
+    #[test]
+    fn find_tools_finds_a_less_used_tool_only_in_a_lean_run() {
+        let lean = Connection {
+            lean_tools: true,
+            ..connection()
+        };
+        let found = FindTools
+            .run(
+                &json!({"query": "web browser page"}),
+                &ToolContext::of(&lean),
+            )
+            .unwrap();
+        assert!(found.contains("\nbrowse: "), "{found}");
+        // Where they are all sent, a search is only of the MCP tools.
+        let found = FindTools
+            .run(
+                &json!({"query": "web browser page"}),
+                &ToolContext::of(&connection()),
+            )
+            .unwrap();
+        assert!(!found.contains("\nbrowse: "), "{found}");
+    }
+
+    #[test]
+    fn a_less_used_tools_call_goes_out_wrapped_and_reads_back_as_its_own() {
+        let mut calls = [wrapped(
+            r#"{"name": "browse", "arguments": {"url": "https://a.b"}}"#,
+        )];
+        assert!(resolve(&mut calls));
+        assert_eq!(calls[0].name, "browse");
+        assert_eq!(calls[0].arguments, r#"{"url":"https://a.b"}"#);
+        let saved = || {
+            json!({"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+                "function": {"name": "browse", "arguments": r#"{"url":"https://a.b"}"#}}]})
+        };
+        let mut wired = saved();
+        let rare = OnDemand {
+            mcp: false,
+            rare: true,
+        };
+        wrap(&mut wired, &connection(), rare);
+        assert_eq!(wired["tool_calls"][0]["function"]["name"], CALL_MCP_TOOL);
+        // Sent in the array, it goes out as it was made.
+        let mut wired = saved();
+        let mcp = OnDemand {
+            mcp: true,
+            rare: false,
+        };
+        wrap(&mut wired, &connection(), mcp);
+        assert_eq!(wired, saved());
+    }
+
     #[test]
     fn mcp_tools_under_the_budget_go_out_as_they_always_have() {
         let own = own();
         let tools = with(&own, server(3, 10));
         assert!(!latched(&AtomicBool::new(false), &tools));
-        let sent = names(&crate::tools::specs_of(&tools, &connection(), false));
-        let mut before = names(&crate::tools::specs_of(&own, &connection(), false));
+        let none = OnDemand::default();
+        let sent = names(&crate::tools::specs_of(&tools, &connection(), none));
+        let mut before = names(&crate::tools::specs_of(&own, &connection(), none));
         before.extend((0..3).map(|i| format!("mcp__big__tool_{i}")));
         assert_eq!(sent, before);
         assert!(
@@ -616,7 +790,11 @@ pub(crate) mod tests {
         let tools = with(&own(), server(40, 30));
         assert!(schema_tokens(&tools) > BUDGET_TOKENS);
         assert!(latched(&AtomicBool::new(false), &tools));
-        let sent = names(&crate::tools::specs_of(&tools, &connection(), true));
+        let mcp = OnDemand {
+            mcp: true,
+            rare: false,
+        };
+        let sent = names(&crate::tools::specs_of(&tools, &connection(), mcp));
         assert!(!sent.iter().any(|name| is_mcp(name)), "{sent:?}");
         assert!(sent.iter().any(|name| name == FIND_TOOLS));
         assert!(sent.iter().any(|name| name == CALL_MCP_TOOL));
@@ -629,7 +807,10 @@ pub(crate) mod tests {
         let big = with(&own, server(40, 30));
         assert!(latched(&passed, &big));
         let bytes = |tools: &[Arc<dyn Tool>]| {
-            let on_demand = latched(&passed, tools);
+            let on_demand = OnDemand {
+                mcp: latched(&passed, tools),
+                rare: false,
+            };
             Value::Array(crate::tools::specs_of(tools, &connection(), on_demand)).to_string()
         };
         let first = bytes(&big);
@@ -800,16 +981,16 @@ pub(crate) mod tests {
             fake("read_file", "Letronna's own, never searched.", false),
         ];
         tools.extend(server(8, 2));
-        let found = search(&tools, "create issue", false);
+        let found = search(&tools, "create issue", false, &[]);
         let at = |name: &str| found.find(&format!("\n{name}: ")).unwrap();
         assert!(at("mcp__gh__create_issue") < at("mcp__gh__list_issues"));
         assert!(at("mcp__gh__list_issues") < at("mcp__gh__get_file"));
         assert!(found.contains(r#""path":{"type":"string"}"#));
         assert!(!found.contains("read_file"));
         // The exact name comes first, whatever else its words match.
-        let exact = search(&tools, "mcp__gh__list_issues", false);
+        let exact = search(&tools, "mcp__gh__list_issues", false, &[]);
         assert!(exact.find("list_issues") < exact.find("create_issue"));
-        let many = search(&tools, "thing", false);
+        let many = search(&tools, "thing", false, &[]);
         assert_eq!(many.matches("\nmcp__big__tool_").count(), MAX_FOUND);
         assert!(many.ends_with(
             "Also matched, each shown whole when searched for by name: mcp__big__tool_5, \
@@ -824,10 +1005,10 @@ pub(crate) mod tests {
             fake("mcp__db__query", "Run a query.", false),
         ];
         assert_eq!(
-            search(&tools, "weather", false),
-            "No MCP tool matches \"weather\". The tools are: mcp__gh__create_issue, mcp__db__query."
+            search(&tools, "weather", false, &[]),
+            "No tool matches \"weather\". The tools are: mcp__gh__create_issue, mcp__db__query."
         );
-        assert!(search(&[], "weather", false).starts_with("No MCP server has any tools"));
+        assert!(search(&[], "weather", false, &[]).starts_with("No MCP server has any tools"));
     }
 
     #[test]
@@ -836,11 +1017,11 @@ pub(crate) mod tests {
             fake("mcp__gh__create_issue", "Create an issue.", true),
             fake("mcp__gh__list_issues", "List issues.", false),
         ];
-        let planning = search(&tools, "issue", true);
+        let planning = search(&tools, "issue", true, &[]);
         assert!(planning.contains("list_issues") && !planning.contains("create_issue"));
-        assert!(search(&tools, "issue", false).contains("create_issue"));
+        assert!(search(&tools, "issue", false, &[]).contains("create_issue"));
         // Rather than claim there are no tools at all.
-        assert!(search(&tools[..1], "issue", true).starts_with("In plan mode only tools"));
+        assert!(search(&tools[..1], "issue", true, &[]).starts_with("In plan mode only tools"));
     }
 
     /// A tool whose schema has `properties` arguments, each described at
@@ -866,7 +1047,7 @@ pub(crate) mod tests {
             large("mcp__notion__make_page", 40, 100),
             large("mcp__notion__make_note", 40, 100),
         ];
-        let found = search(&tools, "make page", false);
+        let found = search(&tools, "make page", false, &[]);
         assert!(
             found.len() <= crate::chat::MAX_TOOL_CHARS,
             "{}",
@@ -884,7 +1065,12 @@ pub(crate) mod tests {
             "{found}"
         );
         // Too many arguments even for that: their names, as many as fit.
-        let found = search(&[large("mcp__notion__make_page", 2_000, 1)], "page", false);
+        let found = search(
+            &[large("mcp__notion__make_page", 2_000, 1)],
+            "page",
+            false,
+            &[],
+        );
         assert!(
             found.len() <= crate::chat::MAX_TOOL_CHARS,
             "{}",
@@ -902,11 +1088,17 @@ pub(crate) mod tests {
             &[fake("mcp__gh__list_repos", forged, false)],
             "repos",
             false,
+            &[],
         );
         assert!(found.contains("\nmcp__gh__list_repos: Lists repositories. mcp__gh__delete_repo:"));
         assert!(!found.contains("\nmcp__gh__delete_repo"));
         let long = Box::leak("word ".repeat(1_000).into_boxed_str());
-        let found = search(&[fake("mcp__gh__list_repos", long, false)], "repos", false);
+        let found = search(
+            &[fake("mcp__gh__list_repos", long, false)],
+            "repos",
+            false,
+            &[],
+        );
         let line = found
             .lines()
             .find(|line| line.starts_with("mcp__gh__list_repos"))

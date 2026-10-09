@@ -306,6 +306,10 @@ pub struct Connection {
     /// keep it, so their system message stays the session's and the cache
     /// serves both.
     pub plain_terminal: bool,
+    /// Letronna's less used tools go out behind `find_tools` rather than in
+    /// every request: set for a `-p` run that did not name its tools. Its
+    /// helpers keep it, so their array stays the session's.
+    pub lean_tools: bool,
 }
 
 impl Connection {
@@ -735,7 +739,7 @@ fn context_parts(connection: &Connection, messages: &[Message], floor: usize) ->
         + tokens(&text[prompt.remembered.end..]);
     let (tools, mcp) = if connection.tools {
         let every = crate::tools::all();
-        let on_demand = crate::mcp_find::on_demand(&every);
+        let on_demand = crate::mcp_find::OnDemand::of(connection, &every);
         let is_mcp = |spec: &Value| {
             let name = spec["function"]["name"].as_str().unwrap_or_default();
             crate::mcp_find::is_mcp(name)
@@ -1018,11 +1022,11 @@ fn identity(connection: &Connection, style: Option<String>) -> String {
 }
 
 /// The tools a request over `connection` offers out of `every`, before any
-/// a caller adds; `on_demand` when the MCP tools go out behind `find_tools`.
+/// a caller adds, less those that go out behind `find_tools` `on_demand`.
 fn offered(
     connection: &Connection,
     every: &[std::sync::Arc<dyn crate::tools::Tool>],
-    on_demand: bool,
+    on_demand: crate::mcp_find::OnDemand,
 ) -> Vec<Value> {
     let mut tools = crate::tools::specs_of(every, connection, on_demand);
     crate::mcp_find::fit(&mut tools, connection);
@@ -1568,14 +1572,18 @@ fn body_hashed(
     let stubs = stubs(window, old, budget.squeezed);
     let hints = crate::subfolders::hints(window, connection);
     let turn = window.iter().rposition(opens_turn);
-    // Once, so the calls in the history and the array agree on whether the
-    // MCP tools go out on demand.
+    // Once, so the calls in the history and the array agree on which tools
+    // go out on demand.
     let every = if connection.tools {
         crate::tools::all()
     } else {
         Vec::new()
     };
-    let on_demand = connection.tools && crate::mcp_find::on_demand(&every);
+    let on_demand = if connection.tools {
+        crate::mcp_find::OnDemand::of(connection, &every)
+    } else {
+        crate::mcp_find::OnDemand::default()
+    };
     let notes = mode_notes(connection, window);
     let mut advised = false;
     for (i, m) in window.iter().enumerate() {
@@ -1630,8 +1638,8 @@ fn body_hashed(
                 }
             }
         }
-        if on_demand {
-            crate::mcp_find::wrap(&mut wired, connection);
+        if on_demand.any() {
+            crate::mcp_find::wrap(&mut wired, connection, on_demand);
         }
         // A model that cannot view what the user attached is told so, and
         // how else to look, rather than only that it is there.
