@@ -68,14 +68,22 @@ pub struct Runner {
     pub plain_terminal: bool,
 }
 
+/// The Custom gateway's key when the environment gave it (`AGENT_API_KEY`
+/// on a thrown-away machine, as main's `take_route` says): held by this
+/// process alone, never saved with the keys.
+pub static GIVEN_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 impl Runner {
     /// Where a session's requests go and the key or sign-in token they carry.
     pub fn route(&self, session: usize) -> (String, String) {
         let (gateway, _) = self.store.model(session);
-        let saved = letronna_core::store::load_keys()
-            .get(letronna_core::gateway::key_slot(gateway))
-            .cloned()
-            .unwrap_or_default();
+        let saved = match GIVEN_KEY.get() {
+            Some(key) if gateway == "Custom" => key.clone(),
+            _ => letronna_core::store::load_keys()
+                .get(letronna_core::gateway::key_slot(gateway))
+                .cloned()
+                .unwrap_or_default(),
+        };
         let custom = &self.store.settings.custom_endpoint;
         letronna_core::gateway::resolve(gateway, custom, &saved)
     }

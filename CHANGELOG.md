@@ -14,6 +14,8 @@ This file is also the App tab of https://letronna.ai/changelog.
 ## [Unreleased]
 
 ### Added
+- **Web** — A terminal in the browser: the Cloud page opens Letronna itself, running in Letronna Cloud on a new thread or one you have, to type into as on your own computer.
+- **Terminal** — On a machine that is thrown away after (`LETRONNA_DISPOSABLE=1`, as in Letronna Cloud), the terminal takes its server, key and model from `AGENT_BASE_URL`, `AGENT_API_KEY` and `AGENT_MODEL`, as `-p` does, and saves none of it.
 - **Web** — Letronna Cloud takes more servers: admins add a VPS from the admin page with one setup command, and runs and 24/7 bots spread across every server.
 - **Web** — letronna.ai shows Letronna Cloud on the home page and has a Cloud page in the docs; phone apps for iPhone and Android are marked coming soon.
 - **All** — A shorter README, and a full guide in `docs/`: install, the app and terminal, gateways, tools, extending, the cloud, configuration, data, architecture, building and benchmarks.

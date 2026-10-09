@@ -240,8 +240,13 @@ fn main() {
     // the setup -- the same one the installers hand over to. Asking a
     // question from a pipe cannot wait for answers, so that one stops here,
     // and so does serving, which nobody sits at. A question the environment
-    // routes has its server and model from there, and needs none of it.
-    let routed = args.once() && given_route(&args, |name| std::env::var(name).ok()).is_some();
+    // routes has its server and model from there, and needs none of it; so
+    // does the terminal on a thrown-away machine, as in Letronna Cloud.
+    let routed = env_routes(&args, disposable())
+        && given_route(&args, |name| std::env::var(name).ok()).is_some();
+    if routed && !args.once() {
+        take_route(&mut runner, &args);
+    }
     let first_run = runner.store.settings.model.is_empty() && !routed;
     if first_run && (args.once() || args.serve) {
         let error = "Nothing is set up yet. Run `letronna setup` first.";
@@ -1189,6 +1194,39 @@ fn gateway_named(name: &str) -> Result<&'static str, String> {
     ))
 }
 
+/// Whether `AGENT_BASE_URL` and the rest are read: always for `-p`, and in
+/// the terminal only on a machine `LETRONNA_DISPOSABLE` says is thrown away
+/// after, such as a Letronna Cloud container, so a shell that happens to
+/// export them changes nothing on someone's own computer.
+fn env_routes(args: &Args, disposable: bool) -> bool {
+    args.once() || disposable
+}
+
+fn disposable() -> bool {
+    std::env::var_os("LETRONNA_DISPOSABLE").is_some_and(|value| value == "1")
+}
+
+/// The environment's route made the terminal's, for this process alone: the
+/// Custom gateway at its server with its model, and its key held in memory
+/// (`session::GIVEN_KEY`). A server with no model stops here, as `-p` does.
+fn take_route(runner: &mut Runner, args: &Args) {
+    let Some(route) = given_route(args, |name| std::env::var(name).ok()) else {
+        return;
+    };
+    let (endpoint, key, model) = match route {
+        Ok(route) => route,
+        Err(error) => {
+            eprintln!("{}", render::red(&error));
+            std::process::exit(1);
+        }
+    };
+    let _ = session::GIVEN_KEY.set(key);
+    let settings = &mut runner.store.settings;
+    settings.gateway = "Custom".into();
+    settings.custom_endpoint = endpoint;
+    settings.model = model;
+}
+
 /// The Custom route, as (endpoint, key, model), that `AGENT_BASE_URL`,
 /// `AGENT_API_KEY` and `--model` or `AGENT_MODEL` give a `-p` run when `var`
 /// reads them and `--gateway` names no gateway of its own.
@@ -2043,6 +2081,13 @@ mod tests {
             given("flag-model")
         );
         assert_eq!(route(&["-p", "q", "--gateway", "Ollama"]), None);
+    }
+
+    #[test]
+    fn the_terminal_takes_the_environment_only_on_a_thrown_away_machine() {
+        assert!(env_routes(&parsed(&["-p", "q"]), false));
+        assert!(!env_routes(&parsed(&[]), false));
+        assert!(env_routes(&parsed(&[]), true));
     }
 
     #[test]
