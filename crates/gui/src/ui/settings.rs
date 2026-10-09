@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use letronna_core::jev::KEY_SLOT;
 
 actions!(
     settings,
@@ -215,6 +216,83 @@ impl Chat {
         self.key
             .update(cx, |input, cx| input.set_value(key, window, cx));
         cx.notify();
+    }
+
+    /// Open Jev's row to give it a key or an address, or close it if open.
+    /// It shares the gateways' fields: one row is open at a time.
+    pub(crate) fn select_jev(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let open = *self.gateway_pick.read(cx) == JEV_ROW;
+        self.gateway_pick.update(cx, |g, cx| {
+            *g = if open { String::new() } else { JEV_ROW.into() };
+            cx.notify();
+        });
+        if open {
+            return;
+        }
+        let address = self.store.settings.jev_endpoint.clone();
+        self.endpoint
+            .update(cx, |input, cx| input.set_value(address, window, cx));
+        let key = self.keys.get(KEY_SLOT).cloned().unwrap_or_default();
+        self.key
+            .update(cx, |input, cx| input.set_value(key, window, cx));
+        cx.notify();
+    }
+
+    /// Save Jev's open row: its key in the key store, its address in the
+    /// settings, unless the address is one a key must not go to.
+    pub(crate) fn save_jev(&mut self, cx: &mut Context<Self>) {
+        let address = self.endpoint.read(cx).value().trim().to_string();
+        let here = ["http://localhost", "http://127.0.0.1", "http://[::1]"];
+        if !address.is_empty()
+            && !address.starts_with("https://")
+            && !here.iter().any(|h| address.starts_with(h))
+        {
+            self.error = Some(
+                "Jev's address must start with https://, or be on this computer, as its key \
+                 goes with every search."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let key = self.key.read(cx).value().trim().to_string();
+        if key.is_empty() {
+            self.keys.remove(KEY_SLOT);
+        } else {
+            self.keys.insert(KEY_SLOT.to_owned(), key);
+        }
+        self.write_keys(KEY_SLOT);
+        self.store.settings.jev_endpoint = address;
+        self.save();
+        self.gateway_pick.update(cx, |g, cx| {
+            g.clear();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Forget Jev's key and address, so it is asked through the account.
+    pub(crate) fn remove_jev(&mut self, cx: &mut Context<Self>) {
+        self.keys.remove(KEY_SLOT);
+        self.write_keys(KEY_SLOT);
+        self.store.settings.jev_endpoint.clear();
+        self.save();
+        self.gateway_pick.update(cx, |g, cx| {
+            g.clear();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Where Jev is asked, as its row says it.
+    pub(crate) fn jev_status(&self) -> String {
+        let address = self.store.settings.jev_endpoint.trim();
+        let own_key = self.keys.get(KEY_SLOT).is_some_and(|key| !key.is_empty());
+        match (address, own_key) {
+            ("", true) => "Your key, at TypeSafe".into(),
+            ("", false) => "Your Letronna account".into(),
+            (address, _) => address.to_owned(),
+        }
     }
 
     /// Put the open search row's address back to the service's official one.
@@ -669,6 +747,15 @@ impl Chat {
                 &chat,
                 cx,
             )
+            .child(tool_search_section(
+                &self.store.settings.tool_search,
+                self.jev_status(),
+                &pick,
+                &endpoint,
+                &key,
+                &chat,
+                cx,
+            ))
             .into_any_element(),
             _ => gateway_page(
                 self.gateway_rows(),
@@ -2102,6 +2189,159 @@ fn search_page(
                 this.store.settings.keyless_search = !keyless_search
             }),
         ))
+}
+
+/// The row of the shared fields that Jev's address and key open in.
+const JEV_ROW: &str = "jev";
+
+/// How find_tools ranks the tools a request leaves out, by `mode`, and
+/// Jev's row, saying where it is asked (`status`), with its key and address
+/// in the shared fields when open.
+fn tool_search_section(
+    mode: &str,
+    status: String,
+    pick: &Entity<String>,
+    endpoint: &Entity<InputState>,
+    key: &Entity<InputState>,
+    chat: &Entity<Chat>,
+    cx: &App,
+) -> Div {
+    let choices = [
+        (
+            "auto",
+            "Jev while the chat is on a hosted model; by name for a model on this computer",
+        ),
+        ("jev", "Jev always, a model on this computer included"),
+        ("names", "By their names only, and nothing is sent"),
+    ];
+    let mode = match mode {
+        "jev" | "names" => mode,
+        _ => "auto",
+    };
+    let mut ways = v_flex().gap_2();
+    for (at, (value, text)) in choices.into_iter().enumerate() {
+        let active = mode == value;
+        let chat = chat.clone();
+        ways = ways.child(
+            h_flex()
+                .id(("tool-search", at))
+                .cursor_pointer()
+                .items_center()
+                .gap_2p5()
+                .p_2p5()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(if active {
+                    cx.theme().primary
+                } else {
+                    cx.theme().border
+                })
+                .child(div().text_sm().child(text))
+                .on_click(move |_, _, cx| {
+                    chat.update(cx, |this, cx| {
+                        this.store.settings.tool_search = value.to_owned();
+                        this.save();
+                        cx.notify();
+                    })
+                }),
+        );
+    }
+    let editing = pick.read(cx).as_str() == JEV_ROW;
+    let open = chat.clone();
+    let head = h_flex()
+        .px_4()
+        .py_3()
+        .gap_4()
+        .items_center()
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_family(HEADING_FONT)
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("Jev"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(status),
+                ),
+        )
+        .child(
+            Button::new("jev-edit")
+                .small()
+                .plain(cx)
+                .label(if editing { "Close" } else { "Edit" })
+                .on_click(move |_, window, cx| {
+                    open.update(cx, |this, cx| this.select_jev(window, cx))
+                }),
+        );
+    let mut row = v_flex()
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(cx.theme().radius)
+        .child(head);
+    if editing {
+        let (save, remove) = (chat.clone(), chat.clone());
+        row = row.child(
+            v_flex()
+                .px_4()
+                .pb_4()
+                .gap_3()
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(label("API key, blank for your Letronna account", cx))
+                        .child(Input::new(key)),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(label(
+                            "Address, blank for your Letronna account or, with a key, TypeSafe",
+                            cx,
+                        ))
+                        .child(Input::new(endpoint)),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("jev-remove")
+                                .plain(cx)
+                                .small()
+                                .label("Remove")
+                                .on_click(move |_, _, cx| {
+                                    remove.update(cx, |this, cx| this.remove_jev(cx))
+                                }),
+                        )
+                        .child(
+                            Button::new("jev-save")
+                                .primary()
+                                .small()
+                                .label("Save")
+                                .on_click(move |_, _, cx| {
+                                    save.update(cx, |this, cx| this.save_jev(cx))
+                                }),
+                        ),
+                ),
+        );
+    }
+    v_flex()
+        .gap_3()
+        .child(heading(
+            "Finding tools",
+            "A request can leave tools out -- the less used ones in a run nobody watches, an MCP server's when there are many -- and find_tools looks them up. Jev, a small decision model, ranks them by what they do. It is sent the search's words and the tools' names and descriptions, nothing of the chat.",
+            cx,
+        ))
+        .child(ways)
+        .child(row)
 }
 
 fn shortcuts_page(hotkey: &Entity<InputState>, chat: &Entity<Chat>, cx: &App) -> Div {
