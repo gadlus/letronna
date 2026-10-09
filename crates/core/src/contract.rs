@@ -8,8 +8,9 @@
 //! with what it spells out for them -- a CSV header or the columns it names,
 //! JSON keys and the keys each item of a list holds, the few values a field
 //! may take and the records it is left empty in, the names and words a file
-//! must use or must not, the codes the files it names to read hold bare --
-//! and each file is looked at on disk.
+//! must use or must not, the codes the files it names to read hold bare,
+//! the paths of inputs, alone and as the inputs write them, the ids the
+//! inputs give the items a file lists -- and each file is looked at on disk.
 //!
 //! Both halves are plain text matching rather than a model's reading, so
 //! nothing is invented, and the matching leans to missing: a file counts only
@@ -35,7 +36,7 @@
 
 use serde_json::{Map, Value};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -342,6 +343,33 @@ const BEING: [&str; 11] = [
     "be", "is", "are", "to", "left", "kept", "stay", "remain", "must", "should", "shall",
 ];
 
+/// The last words of a key or column that say it names a file, as in
+/// `winning_source`, `source_file` or `superseded_sources`.
+const NAMING: [&str; 6] = ["source", "sources", "file", "files", "path", "paths"];
+
+/// The most entries under `in/` looked at to know which files are there:
+/// more than a task hands over, and past them a path goes unchecked.
+const LOOKED: usize = 5_000;
+
+/// Words that, said with "id" or "ids", ask a run to make ids of its own,
+/// as in "assign each finding an id" or "use stable decision IDs".
+const MINTING: [&str; 14] = [
+    "assign",
+    "assigned",
+    "assigning",
+    "generate",
+    "generated",
+    "generating",
+    "create",
+    "created",
+    "new",
+    "stable",
+    "unique",
+    "own",
+    "sequential",
+    "numbered",
+];
+
 /// Bad lines reported for one file: three show the pattern, and more would
 /// crowd out the other files.
 const LINES: usize = 3;
@@ -392,6 +420,12 @@ struct Output {
     codes: Vec<Codes>,
     /// The fields the request says to leave empty in records a code marks.
     empty: Vec<Empty>,
+    /// The files under `in/` and how the inputs write their paths, which a
+    /// field naming a source is held to.
+    sources: Sources,
+    /// The fields for ids the request names and the ids given to the run,
+    /// which such a field's values are held to.
+    ids: Ids,
     /// The file's size and change time as the request was read, if it was
     /// there then.
     found: Option<Stamp>,
@@ -436,12 +470,39 @@ struct Empty {
     said: String,
 }
 
+/// The files under `in/` and the paths the inputs write for them, as an
+/// appendix writes `sources/a.md` for `in/sources/a.md`.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Sources {
+    /// Each file under `in/`, from the workspace, as `in/sources/a.md`.
+    files: HashSet<String>,
+    /// For each file an input writes a path for with a folder in it, each
+    /// such path and the input writing it.
+    written: BTreeMap<String, Vec<(String, String)>>,
+}
+
+/// The fields for ids a request names, as `blocker_ids`, and the ids the
+/// inputs and the request give, which a run's own ids are told from.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Ids {
+    /// Each field for ids the request names, none where it asks for ids to
+    /// be made.
+    fields: Vec<String>,
+    /// Each word reading as an id in the request, the files under `in/` and
+    /// their paths, in lower case.
+    given: HashSet<String>,
+}
+
 /// A file's size and the time it was last changed, where the system keeps one.
 type Stamp = (u64, Option<SystemTime>);
 
 /// The values a field has in a file, gathered by where in it each is, with
 /// the line each is on where that is known.
 type Places<'a> = BTreeMap<String, Vec<(Option<usize>, Cow<'a, str>)>>;
+
+/// One record holding a field for ids: the line it is on where known, the
+/// field's value, and the text each of its other fields holds.
+type Cited<'a> = (Option<usize>, &'a str, Vec<(&'a str, &'a str)>);
 
 /// One CSV record: the line it starts on, counting from 1, and its fields.
 struct Record {
@@ -524,6 +585,8 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
                         forbidden: Vec::new(),
                         codes: Vec::new(),
                         empty: Vec::new(),
+                        sources: Sources::default(),
+                        ids: Ids::default(),
                         found,
                     });
                 }
@@ -724,6 +787,13 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
             }
         }
     }
+    // The files under `in/`, looked for only where an output has fields
+    // that may name one, and the paths the inputs write for them.
+    let mut known = Sources::default();
+    let fielded = |output: &Output| matches!(kind(&output.path).as_str(), "csv" | "json" | "jsonl");
+    if outputs.iter().any(fielded) {
+        known.files = files_under(workspace);
+    }
     // A file named to read may list what not to state, as a policy's
     // judgments never to write do, and that holds for every output too.
     let (mut sources, mut codes) = (Vec::new(), Vec::new());
@@ -734,6 +804,7 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
             continue;
         };
         codes.extend(codes_in(&input, &content));
+        written_in(&input, &content, &mut known);
         let lines: Vec<&str> = content.lines().collect();
         let stated: Vec<String> = (0..lines.len())
             .flat_map(|at| stated_at(&lines, at))
@@ -749,13 +820,87 @@ pub(crate) fn from_request(text: &str, workspace: &Path) -> Contract {
         let phrase = phrase.to_lowercase();
         !sources.iter().any(|source| holds_word(source, &phrase))
     });
+    // The ids given to the run, read only where the request names a field
+    // for ids and does not ask for ids to be made.
+    let mut ids = Ids::default();
+    if outputs.iter().any(fielded) && !minting(&lines) {
+        ids.fields = id_fields(crate::references::typed(text));
+    }
+    if !ids.fields.is_empty() {
+        match given_ids(text, workspace, &known.files) {
+            Some(given) => ids.given = given,
+            // An input left unread may give any id.
+            None => ids.fields.clear(),
+        }
+    }
     for output in &mut outputs {
         forbid(output, &everywhere);
         if matches!(kind(&output.path).as_str(), "csv" | "json" | "jsonl") {
             output.codes = codes.clone();
+            output.sources = known.clone();
+            output.ids = ids.clone();
         }
     }
     Contract { outputs }
+}
+
+/// Whether `lines` ask for ids to be made rather than taken from the
+/// inputs, as "assign each finding an id", "use stable decision IDs" or "ids
+/// such as F-1" do.
+fn minting(lines: &[&str]) -> bool {
+    let ids = ["id", "ids", "identifier", "identifiers"];
+    lines
+        .iter()
+        .flat_map(|line| sentences(line))
+        .any(|sentence| {
+            let lower = sentence.to_ascii_lowercase();
+            let example = EXAMPLES.iter().any(|words| lower.contains(words));
+            says(sentence, &ids) && (example || says(sentence, &OPEN) || says(sentence, &MINTING))
+        })
+}
+
+/// The fields for ids `text` names, each once, as `blocker_ids` or
+/// `claim-id`; not a bare `id`, which a record of the run's own may have.
+fn id_fields(text: &str) -> Vec<String> {
+    let mut fields: Vec<String> = Vec::new();
+    for word in text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-')) {
+        let word = word.trim_matches(['-', '_']);
+        if word.contains(['-', '_']) && id_named(word) && !fields.iter().any(|known| known == word)
+        {
+            fields.push(word.to_owned());
+        }
+    }
+    fields
+}
+
+/// The words reading as ids in `request` and in the files under
+/// `workspace`'s `in/`, their text and their paths, in lower case; None
+/// where the files run past `LARGEST` in all or one will not open, since an
+/// input left unread may give any id.
+fn given_ids(request: &str, workspace: &Path, files: &HashSet<String>) -> Option<HashSet<String>> {
+    let mut given: HashSet<String> = id_words(request).collect();
+    let mut read = 0;
+    for file in files {
+        let path = workspace.join(file);
+        read += std::fs::metadata(&path).ok()?.len();
+        if read > LARGEST {
+            return None;
+        }
+        given.extend(id_words(file));
+        given.extend(id_words(&String::from_utf8_lossy(
+            &std::fs::read(&path).ok()?,
+        )));
+    }
+    Some(given)
+}
+
+/// The words of `text` reading as ids, in lower case, as `rr-7` is in
+/// `in/risks.csv#RR-7`.
+fn id_words(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+        .map(|word| word.trim_matches(['-', '_']))
+        .filter(|word| id_like(word))
+        .map(str::to_lowercase)
 }
 
 /// The codes `content`, the input file `input`, holds bare: each column of
@@ -819,6 +964,72 @@ fn codes_in(input: &str, content: &str) -> Vec<Codes> {
         _ => {}
     }
     found
+}
+
+/// The files under `workspace`'s `in/`, from the workspace with `/` between
+/// folders, as far as `LOOKED` entries go; a link is left out, as it leads
+/// elsewhere.
+fn files_under(workspace: &Path) -> HashSet<String> {
+    let mut files = HashSet::new();
+    let (mut folders, mut looked) = (vec![workspace.join("in")], 0);
+    while let Some(folder) = folders.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            looked += 1;
+            if looked > LOOKED {
+                return files;
+            }
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => folders.push(path),
+                Ok(kind) if kind.is_file() => {
+                    if let Ok(inside) = path.strip_prefix(workspace) {
+                        let parts: Vec<_> =
+                            inside.iter().map(|part| part.to_string_lossy()).collect();
+                        files.insert(parts.join("/"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    files
+}
+
+/// Adds to `known` the paths `content`, the input `input`, writes for files
+/// under `in/` with a folder in them, as `sources/a.md`; a name alone may be
+/// from the input's own folder.
+fn written_in(input: &str, content: &str, known: &mut Sources) {
+    if known.files.is_empty() {
+        return;
+    }
+    for word in words(content) {
+        let path = word.split('#').next().unwrap_or_default();
+        let path = path.strip_prefix("./").unwrap_or(path);
+        if !path.contains('/') {
+            continue;
+        }
+        let Some(file) = input_file(path, &known.files) else {
+            continue;
+        };
+        let forms = known.written.entry(file).or_default();
+        if !forms.iter().any(|(form, _)| form == path) {
+            forms.push((path.to_owned(), input.to_owned()));
+        }
+    }
+}
+
+/// The file among `files` that `path` names, from the workspace or from
+/// `in/`, as `in/a.md` and `a.md` both name `in/a.md`.
+fn input_file(path: &str, files: &HashSet<String>) -> Option<String> {
+    let path = path.strip_prefix("./").unwrap_or(path);
+    if files.contains(path) {
+        return Some(path.to_owned());
+    }
+    let inside = format!("in/{path}");
+    files.contains(&inside).then_some(inside)
 }
 
 /// The names in code form `lines` use, each once: those in backticks, as
@@ -2189,6 +2400,22 @@ fn identifier(word: &str) -> bool {
         })
 }
 
+/// Whether `value` reads as an id: letters and digits joined by `-` or
+/// `_`, with a digit or a dash, as `BLK-01` and `item_3` do and a word, a
+/// name in snake case or a path does not.
+fn id_like(value: &str) -> bool {
+    let parts = || value.split(['-', '_']);
+    parts().nth(1).is_some()
+        && parts().all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric()))
+        && value.chars().any(|c| c.is_ascii_alphabetic())
+        && (value.contains('-') || value.chars().any(|c| c.is_ascii_digit()))
+}
+
+/// Whether `key` is named for ids, as `blocker_ids` and `claim_id` are.
+fn id_named(key: &str) -> bool {
+    ["id", "ids"].contains(&last_word(key).as_str())
+}
+
 /// The names from `first` to `last`, as CLAIM-1 to CLAIM-7 run, when both
 /// are one identifier numbered and the run is short.
 fn range(first: &str, last: &str) -> Option<Vec<String>> {
@@ -2354,7 +2581,8 @@ fn json(output: &Output, text: &str) -> Vec<String> {
 fn held(output: &Output, values: &[(Option<usize>, Value)]) -> Vec<String> {
     let name = &output.path;
     let nothing = output.keys.is_empty() && output.each.is_empty() && output.values.is_empty();
-    if nothing && output.codes.is_empty() && output.empty.is_empty() {
+    let sourced = !output.sources.files.is_empty();
+    if nothing && output.codes.is_empty() && output.empty.is_empty() && !sourced {
         return Vec::new();
     }
     // A JSON Lines file is one list, each line an item of it.
@@ -2365,6 +2593,10 @@ fn held(output: &Output, values: &[(Option<usize>, Value)]) -> Vec<String> {
     let mut places: Vec<Places> = output.values.iter().map(|_| BTreeMap::new()).collect();
     // The text each key named for codes holds, alone or in a list, by key.
     let mut coded: BTreeMap<String, Vec<(Option<usize>, &str)>> = BTreeMap::new();
+    // The text each key naming a source holds, alone or in a list, by key.
+    let mut named: BTreeMap<String, Vec<(Option<usize>, &str)>> = BTreeMap::new();
+    // Each record holding a field for ids the request names, by the field.
+    let mut ided: BTreeMap<String, Vec<Cited>> = BTreeMap::new();
     // What each field to leave empty in some records holds in them, with
     // the line or id of each.
     let mut filled: Vec<Vec<(String, Option<String>)>> =
@@ -2397,6 +2629,30 @@ fn held(output: &Output, values: &[(Option<usize>, Value)]) -> Vec<String> {
                     found.push((text, place.or_else(|| record_id(object, &empty.field))));
                 }
             }
+            for (key, inner) in object {
+                if !sourced || !NAMING.contains(&last_word(key).as_str()) {
+                    continue;
+                }
+                let texts = match inner {
+                    Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+                    inner => inner.as_str().into_iter().collect::<Vec<_>>(),
+                };
+                for text in texts {
+                    gather(&mut named, key, (*line, text));
+                }
+            }
+            for (key, inner) in object {
+                let Some(value) = inner.as_str().filter(|_| output.ids.fields.contains(key)) else {
+                    continue;
+                };
+                let mut others = Vec::new();
+                for (other, inner) in object.iter().filter(|(other, _)| *other != key) {
+                    let mut texts = Vec::new();
+                    strings(inner, &mut texts);
+                    others.extend(texts.into_iter().map(|text| (other.as_str(), text)));
+                }
+                gather(&mut ided, key, (*line, value, others));
+            }
             if output.codes.is_empty() {
                 return;
             }
@@ -2422,6 +2678,12 @@ fn held(output: &Output, values: &[(Option<usize>, Value)]) -> Vec<String> {
         let applies = |codes: &&Codes| codes.column.as_ref().map_or(flags, |column| column == key);
         let mut sets = output.codes.iter().filter(applies);
         problems.extend(sets.find_map(|codes| with_notes(name, key, codes, texts.iter().copied())));
+    }
+    for (key, texts) in &named {
+        problems.extend(misnamed(name, key, &output.sources, texts.iter().copied()));
+    }
+    for (key, records) in &ided {
+        problems.extend(made_up(name, key, output, records));
     }
     for (empty, found) in output.empty.iter().zip(&filled) {
         problems.extend(left_filled(name, empty, found));
@@ -2768,6 +3030,33 @@ fn csv(output: &Output, text: &str) -> Vec<String> {
         let mut sets = (output.codes.iter()).filter(|codes| codes.column.as_ref() == Some(field));
         problems.extend(sets.find_map(|codes| with_notes(name, field, codes, cells())));
     }
+    // A column naming a source holds inputs' paths alone, as they write them.
+    for (at, field) in head.fields.iter().enumerate() {
+        if output.sources.files.is_empty() || !NAMING.contains(&last_word(field).as_str()) {
+            continue;
+        }
+        let cells = rows
+            .iter()
+            .filter_map(|row| Some((Some(row.line), row.fields.get(at)?.as_str())));
+        problems.extend(misnamed(name, field, &output.sources, cells));
+    }
+    // A column for ids the request names holds the ids the inputs give.
+    for (at, field) in head.fields.iter().enumerate() {
+        if !output.ids.fields.contains(field) {
+            continue;
+        }
+        let records: Vec<Cited> = (rows.iter())
+            .filter_map(|row| {
+                let value = row.fields.get(at).filter(|cell| !cell.trim().is_empty())?;
+                let others = (head.fields.iter().zip(&row.fields).enumerate())
+                    .filter(|(n, _)| *n != at)
+                    .map(|(_, (column, cell))| (column.as_str(), cell.as_str()))
+                    .collect();
+                Some((Some(row.line), value.as_str(), others))
+            })
+            .collect();
+        problems.extend(made_up(name, field, output, &records));
+    }
     for empty in &output.empty {
         let Some(at) = head.fields.iter().position(|field| *field == empty.field) else {
             continue;
@@ -2937,6 +3226,199 @@ fn noted(value: &str, codes: &[String]) -> bool {
             && !identifier(token)
             && !["and", "or"].contains(&token.to_lowercase().as_str())
     })
+}
+
+/// What `field` of `name` holds among `cells`, each with its line where
+/// known, that adds text to an input's path or writes the path otherwise
+/// than the inputs do, as `known` has them.
+fn misnamed<'a>(
+    name: &str,
+    field: &str,
+    known: &Sources,
+    cells: impl IntoIterator<Item = (Option<usize>, &'a str)>,
+) -> Vec<String> {
+    let (mut noted, mut other) = (Vec::new(), Vec::new());
+    // The first path given text, as the inputs write it where they do, and
+    // how an input writes the first path written otherwise.
+    let (mut alone, mut form) = (None, None);
+    for (line, value) in cells {
+        let (paths, text) = paths_in(value, &known.files);
+        let Some((first, file)) = paths.first() else {
+            continue;
+        };
+        if text {
+            if alone.is_none() {
+                let written = known.written.get(file).and_then(|forms| forms.first());
+                alone = Some(written.map_or(*first, |(form, _)| form.as_str()));
+            }
+            noted.push((line, value));
+            continue;
+        }
+        for (path, file) in &paths {
+            let Some(forms) = known.written.get(file) else {
+                continue;
+            };
+            if !forms.iter().any(|(written, _)| written == path) {
+                form = form.or_else(|| forms.first());
+                other.push((line, *path));
+            }
+        }
+    }
+    let mut problems = Vec::new();
+    if let Some(alone) = alone {
+        problems.push(format!(
+            "`{name}` has `{field}` values that add text to an input's path: {}; write the path alone, as `{alone}`, or as `{alone}#part` for a part of it, and move the rest to a free-text field.",
+            sample(&noted)
+        ));
+    }
+    if let Some((form, input)) = form {
+        problems.push(format!(
+            "`{name}` has `{field}` paths the inputs write otherwise: {}; `{input}` writes `{form}`, so write each path as the inputs do.",
+            sample(&other)
+        ));
+    }
+    problems
+}
+
+/// The inputs `value` names by their paths, each as written with the file
+/// it is, and whether it holds text besides them, a part of one after a `#`
+/// or `:`, and the names of other files.
+fn paths_in<'a>(value: &'a str, files: &HashSet<String>) -> (Vec<(&'a str, String)>, bool) {
+    let value = value.trim();
+    let value = value.strip_prefix("./").unwrap_or(value);
+    // Whole first, since a name with a space in it is found only so.
+    if let Some(file) = input_file(value, files) {
+        return (vec![(value, file)], false);
+    }
+    let (mut paths, mut text) = (Vec::new(), false);
+    // A part after a `#` or `:` runs to a space or a semicolon, as in
+    // `a.md#S-1|S-2`, `a.csv#row,col` or `a.json:items[0]`.
+    for chunk in value.split(|c: char| c.is_whitespace() || c == ';') {
+        let head = chunk.split(['#', ':']).next().unwrap_or_default();
+        for piece in head.split(|c: char| ",|()[]{}<>\"'`".contains(c)) {
+            let piece = piece.trim_matches('*').trim_end_matches(['.', '!', '?']);
+            let path = piece.strip_prefix("./").unwrap_or(piece);
+            if let Some(file) = input_file(path, files) {
+                paths.push((path, file));
+            } else if piece.chars().any(char::is_alphanumeric)
+                && !["and", "or"].contains(&piece.to_lowercase().as_str())
+                && !file_like(piece)
+            {
+                text = true;
+            }
+        }
+    }
+    (paths, text)
+}
+
+/// Whether `word` is the name or path of a file, as `notes.md` and
+/// `docs/a.md` are, and so no text added to a path.
+fn file_like(word: &str) -> bool {
+    let kind = kind(word);
+    word.contains(['/', '\\'])
+        || ((1..=5).contains(&kind.len()) && kind.chars().any(char::is_alphabetic))
+}
+
+/// `found`'s values, each once, cut to `SHOWN` characters and with its line
+/// where known, as far as `LINES` go, and how many more there are.
+fn sample(found: &[(Option<usize>, &str)]) -> String {
+    let (mut seen, mut shown) = (HashSet::new(), Vec::new());
+    for (line, value) in found {
+        let mut value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        if value.chars().count() > SHOWN {
+            value = value.chars().take(SHOWN).collect::<String>() + "...";
+        }
+        // Values alike as far as shown would read as one given twice.
+        if !seen.insert(value.clone()) {
+            continue;
+        }
+        shown.push(match line {
+            Some(line) => format!("`{value}` (line {line})"),
+            None => format!("`{value}`"),
+        });
+    }
+    let more = match shown.len().saturating_sub(LINES) {
+        0 => String::new(),
+        more => format!(" and {more} more"),
+    };
+    shown.truncate(LINES);
+    shown.join(", ") + &more
+}
+
+/// What `field` of `name` holds that no input gives, where each of
+/// `records` cites in its other fields one id of an input's column of ids,
+/// a different one each and all of them, so is that input's item under an
+/// id of the run's own; not where one holds that id in a field for ids,
+/// which links it to the item as a record of its own.
+fn made_up(name: &str, field: &str, output: &Output, records: &[Cited]) -> Option<String> {
+    // Mixed with ids given to the run, a field may rightly hold new ones too.
+    let fresh = |value: &str| {
+        let value = value.trim();
+        id_like(value) && !output.ids.given.contains(&value.to_lowercase())
+    };
+    if records.len() < 2 || !records.iter().all(|(_, value, _)| fresh(value)) {
+        return None;
+    }
+    // The ids each record's other fields hold, and those its fields for ids
+    // hold, found once, as a file of many rows would take long otherwise.
+    let cites: Vec<(HashSet<String>, HashSet<String>)> = (records.iter())
+        .map(|(_, _, others)| {
+            let (mut said, mut linked) = (HashSet::new(), HashSet::new());
+            for (key, text) in others {
+                let found = if id_named(key) {
+                    &mut linked
+                } else {
+                    &mut said
+                };
+                found.extend(id_words(text));
+            }
+            (said, linked)
+        })
+        .collect();
+    for codes in &output.codes {
+        if !codes.column.as_deref().is_some_and(id_named) || codes.codes.len() != records.len() {
+            continue;
+        }
+        let index: HashMap<String, usize> = (codes.codes.iter().enumerate())
+            .map(|(n, id)| (id.to_lowercase(), n))
+            .collect();
+        // Where in the column the id each record cites is.
+        let (mut cited, mut seen) = (Vec::new(), HashSet::new());
+        for (said, linked) in &cites {
+            let mut hits = said.iter().filter_map(|word| index.get(word));
+            let (Some(&n), None) = (hits.next(), hits.next()) else {
+                break;
+            };
+            if linked.iter().any(|word| index.contains_key(word)) || !seen.insert(n) {
+                break;
+            }
+            cited.push(n);
+        }
+        let Some(&first) = cited.first().filter(|_| cited.len() == records.len()) else {
+            continue;
+        };
+        let values: Vec<(Option<usize>, &str)> = (records.iter())
+            .map(|(line, value, _)| (*line, value.trim()))
+            .collect();
+        return Some(format!(
+            "`{name}` has `{field}` values no input gives: {}; each record cites one item of `{}` by its id, as `{}`, so refer to items by the ids the inputs give them.",
+            sample(&values),
+            codes.input,
+            codes.codes[first]
+        ));
+    }
+    None
+}
+
+/// Adds to `found` each string `value` holds, itself or in its lists and
+/// objects.
+fn strings<'a>(value: &'a Value, found: &mut Vec<&'a str>) {
+    match value {
+        Value::String(text) => found.push(text),
+        Value::Array(items) => items.iter().for_each(|item| strings(item, found)),
+        Value::Object(map) => map.values().for_each(|inner| strings(inner, found)),
+        _ => {}
+    }
 }
 
 /// What is wrong with the header `head` of CSV `output` against the columns
@@ -3953,5 +4435,166 @@ mod tests {
             checked(request, &[("out/summary.json", summary)]),
             Vec::<String>::new()
         );
+    }
+
+    /// A reading list naming two notes by their paths from `in/`, with those
+    /// notes and two files it does not name.
+    const NOTES: [(&str, &str); 5] = [
+        (
+            "in/index.md",
+            "# Reading list\n\nThe pilot is covered in notes/alpha.md and notes/beta.md.\n",
+        ),
+        (
+            "in/notes/alpha.md",
+            "# Alpha\n\nThe pilot ran for six weeks.\n",
+        ),
+        (
+            "in/notes/beta.md",
+            "# Beta\n\nThe pilot cost less than planned.\n",
+        ),
+        ("in/notes/gamma.md", "# Gamma\n\nNo figures yet.\n"),
+        (
+            "in/notes/two words.md",
+            "# Two words\n\nA name with a space.\n",
+        ),
+    ];
+
+    #[test]
+    fn a_path_given_more_text_or_written_otherwise_than_the_inputs_write_it_is_reported() {
+        let request = "Read in/index.md and the notes it lists.\n\n\
+                       Create:\n- out/picks.json\n- out/links.csv";
+        let picks = br#"[{"id": "P-1", "chosen_source": "in/notes/alpha.md (A-1, A-2)"},
+                         {"id": "P-2", "chosen_source": "notes/beta.md"}]"#;
+        let links = b"id,expected_file\nL-1,in/notes/beta.md\nL-2,notes/alpha.md\n";
+        let problems = checked_reading(
+            &NOTES,
+            request,
+            &[("out/picks.json", picks), ("out/links.csv", links)],
+        );
+        assert_eq!(
+            problems,
+            [
+                "`out/picks.json` has `chosen_source` values that add text to an input's path: `in/notes/alpha.md (A-1, A-2)`; write the path alone, as `notes/alpha.md`, or as `notes/alpha.md#part` for a part of it, and move the rest to a free-text field.",
+                "`out/links.csv` has `expected_file` paths the inputs write otherwise: `in/notes/beta.md` (line 2); `in/index.md` writes `notes/beta.md`, so write each path as the inputs do.",
+            ]
+        );
+    }
+
+    #[test]
+    fn paths_alone_with_a_part_or_joined_and_text_in_fields_naming_no_file_pass() {
+        let request = "Read in/index.md and the notes it lists.\n\n\
+                       Create:\n- out/picks.json\n- out/links.csv";
+        // A part after `#` or `:`, paths joined or listed, a file no input
+        // names, a name with a space, a label, an output, and text beside a
+        // path in a note or a reference.
+        let picks = br#"[{"id": "P-1", "chosen_source": "notes/alpha.md#A-1|A-2",
+                          "source_files": ["notes/alpha.md", "./notes/beta.md"],
+                          "note": "notes/alpha.md (A-1, A-2)", "evidence_ref": "notes/beta.md (cost)"},
+                         {"id": "P-2", "chosen_source": "notes/beta.md:3",
+                          "source_path": "in/notes/gamma.md", "file": "in/notes/two words.md",
+                          "path": "the alpha note"},
+                         {"id": "P-3", "chosen_source": "notes/alpha.md; notes/beta.md",
+                          "output_file": "out/links.csv (draft)"}]"#;
+        let links = b"id,expected_file,sources\n\
+                      L-1,notes/beta.md,notes/alpha.md and notes/beta.md\n\
+                      L-2,notes/alpha.md#S-1,\"notes/alpha.md, notes/beta.md\"\n";
+        let problems = checked_reading(
+            &NOTES,
+            request,
+            &[("out/picks.json", picks), ("out/links.csv", links)],
+        );
+        assert_eq!(problems, Vec::<String>::new());
+    }
+
+    /// A register giving three hazards ids, and notes giving none.
+    const HAZARDS: [(&str, &str); 2] = [
+        (
+            "in/hazards.csv",
+            "hazard_id,level,summary\nHZ-ROOF,high,Loose roof panels\n\
+             HZ-WIRE,medium,Exposed wiring\nHZ-EXIT,high,Blocked fire exit\n",
+        ),
+        (
+            "in/walk.md",
+            "# Site walk\n\nThe roof and the exit were flagged.\n",
+        ),
+    ];
+
+    /// Findings that cite each hazard once by its id, under ids of their own.
+    const FINDINGS: [(&str, &[u8]); 2] = [
+        (
+            "out/findings.csv",
+            b"finding_id,level,evidence_ref\nF-ROOF,high,in/hazards.csv#HZ-ROOF\n\
+              F-WIRE,medium,in/hazards.csv#HZ-WIRE\nF-EXIT,high,in/hazards.csv#HZ-EXIT; in/walk.md\n",
+        ),
+        (
+            "out/summary.json",
+            br#"{"findings": [{"finding_id": "F1-A", "evidence": ["hazards.csv: HZ-ROOF"]},
+                              {"finding_id": "F1-B", "evidence": ["HZ-WIRE"]},
+                              {"finding_id": "F1-C", "evidence": ["HZ-EXIT (blocked)"]}]}"#,
+        ),
+    ];
+
+    #[test]
+    fn ids_no_input_gives_are_reported_where_each_record_cites_one_input_item() {
+        let request = "Read in/hazards.csv and in/walk.md.\n\n\
+                       Create:\n- out/findings.csv\n- out/summary.json\n\n\
+                       Give each finding's finding_id, level and evidence.";
+        assert_eq!(
+            checked_reading(&HAZARDS, request, &FINDINGS),
+            [
+                "`out/findings.csv` has `finding_id` values no input gives: `F-ROOF` (line 2), `F-WIRE` (line 3), `F-EXIT` (line 4); each record cites one item of `in/hazards.csv` by its id, as `HZ-ROOF`, so refer to items by the ids the inputs give them.",
+                "`out/summary.json` has `finding_id` values no input gives: `F1-A`, `F1-B`, `F1-C`; each record cites one item of `in/hazards.csv` by its id, as `HZ-ROOF`, so refer to items by the ids the inputs give them.",
+            ]
+        );
+    }
+
+    #[test]
+    fn input_ids_mixed_or_linked_ids_and_ids_not_one_per_input_item_pass() {
+        let request = "Read in/hazards.csv and in/walk.md.\n\n\
+                       Create:\n- out/used.csv\n- out/mixed.csv\n- out/linked.json\n- out/partial.json\n\n\
+                       Give each finding's finding_id and evidence_ref, and the run_id.";
+        // The inputs' ids, one of them among new ones, new ones beside the
+        // inputs' in a field for ids, findings citing two hazards or fewer
+        // than all, one run, and checks the request does not ask for.
+        let used = b"finding_id,evidence_ref\nHZ-ROOF,HZ-ROOF\nHZ-WIRE,HZ-WIRE\nHZ-EXIT,HZ-EXIT\n";
+        let mixed = b"finding_id,evidence_ref\nHZ-ROOF,HZ-ROOF\nF-WIRE,HZ-WIRE\nF-EXIT,HZ-EXIT\n";
+        let linked = br#"[{"finding_id": "F-1", "hazard_id": "HZ-ROOF", "evidence_ref": "HZ-ROOF"},
+                          {"finding_id": "F-2", "hazard_id": "HZ-WIRE", "evidence_ref": "HZ-WIRE"},
+                          {"finding_id": "F-3", "hazard_id": "HZ-EXIT", "evidence_ref": "HZ-EXIT"}]"#;
+        let partial = br#"{"run_id": "RUN-7",
+                           "findings": [{"finding_id": "F-1", "evidence_ref": "HZ-ROOF and HZ-EXIT"},
+                                        {"finding_id": "F-2", "evidence_ref": "HZ-WIRE"}],
+                           "checks": [{"check_id": "C-1", "evidence_ref": "HZ-ROOF"},
+                                      {"check_id": "C-2", "evidence_ref": "HZ-WIRE"},
+                                      {"check_id": "C-3", "evidence_ref": "HZ-EXIT"}]}"#;
+        let problems = checked_reading(
+            &HAZARDS,
+            request,
+            &[
+                ("out/used.csv", used),
+                ("out/mixed.csv", mixed),
+                ("out/linked.json", linked),
+                ("out/partial.json", partial),
+            ],
+        );
+        assert_eq!(problems, Vec::<String>::new());
+    }
+
+    #[test]
+    fn ids_a_request_asks_to_be_made_are_not_held_to_the_inputs() {
+        for asked in [
+            "Assign each finding an id of its own.",
+            "Use ids like F-1 for findings.",
+        ] {
+            let request = format!(
+                "Read in/hazards.csv and in/walk.md.\n\n\
+                 Create:\n- out/findings.csv\n- out/summary.json\n\n\
+                 Give each finding's finding_id, level and evidence. {asked}"
+            );
+            assert_eq!(
+                checked_reading(&HAZARDS, &request, &FINDINGS),
+                Vec::<String>::new()
+            );
+        }
     }
 }
