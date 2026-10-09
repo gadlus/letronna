@@ -628,7 +628,9 @@ fn a_print_run_past_its_deadline_stops_with_its_result() {
         &flags,
         &[("LETRONNA_DEADLINE", "2")],
     );
-    assert_eq!(run.next()["status"], "stopped");
+    // Said as its own status, so a harness can tell its time limit from a
+    // stop it made.
+    assert_eq!(run.next()["status"], "deadline");
     // Out of time is not a Ctrl-C, so a harness counts the run as having ended.
     assert_eq!(run.close(), 0);
 }
