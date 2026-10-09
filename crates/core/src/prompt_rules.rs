@@ -123,7 +123,7 @@ pub(crate) const PROSE: [Rule; 1] = [Rule {
 /// place of approvals and `ask_user`, neither of which it has; then checking
 /// the work, making calls, ending a turn, where facts come from, where to
 /// look first and the steps to ask about first.
-pub(crate) const TOOLS: [Rule; 23] = [
+pub(crate) const TOOLS: [Rule; 24] = [
     // Undoing what the user changed is the git rule's. New files and tests
     // are not forbidden, as checks and required outputs need them.
     Rule {
@@ -156,10 +156,14 @@ pub(crate) const TOOLS: [Rule; 23] = [
         to: To::OnScreen,
         text: "A message the user types while you work steers the task in hand: take it in and keep going, answering any question in a line alongside your next tool call; stop only if it says to stop, wait or do something else instead.",
     },
+    // An assumption written into a deliverable changes what it says: a note
+    // naming an excluded source or a withheld feature mentions it again.
+    // Allowing a notes section there made runs add one, so the answer is
+    // the place unless the task asks.
     Rule {
         id: "assume",
         to: To::Unwatched,
-        text: "Nobody is watching this run and nobody will answer questions: decide for yourself and write any assumption into your answer or deliverables.",
+        text: "Nobody is watching this run and nobody will answer questions: decide for yourself and state any assumption in your answer, not in a deliverable unless the task asks for it there.",
     },
     Rule {
         id: "paths",
@@ -192,6 +196,14 @@ pub(crate) const TOOLS: [Rule; 23] = [
         id: "literals",
         to: To::Unwatched,
         text: "Copy each heading, label, key name and sentence the task gives, and each quote from a source, exactly: case, punctuation and markup too.",
+    },
+    // An id made up, a code with a note in it, or a paraphrase in an
+    // evidence field each reads as the same thing to a person, but no
+    // longer matches the input it came from for whoever checks it there.
+    Rule {
+        id: "inputs-own-form",
+        to: To::Unwatched,
+        text: "Where an output records something from the inputs, keep the inputs' own form: refer to items by the ids the inputs give them rather than making new ones, copy codes and table values exactly with any note in a free-text field, and fill evidence or quote fields with the source's words, not a paraphrase.",
     },
     // Named by its kind, not quoted, because a check for a phrase finds it
     // just the same in "not X".

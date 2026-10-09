@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 /// The hosted pool on your Letronna account: no key, charged to your credit.
 /// First in the list, and what a new install starts on.
@@ -50,6 +51,65 @@ pub const GATEWAYS: &[Gateway] = &[
     },
 ];
 
+/// A gateway a plugin of the window serves while it is on, as the Codex
+/// plugin serves a ChatGPT plan's models: listed and resolved like a
+/// built-in one, in the process the plugin runs in only.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Added {
+    pub name: &'static str,
+    pub base: String,
+    pub key: String,
+    /// Every model on it is sent the Responses API, which it alone speaks.
+    pub responses: bool,
+}
+
+/// The gateways plugins add. Kept here rather than in the window's plugin
+/// registry because requests resolve on worker threads with no `App` to hand.
+fn added() -> &'static Mutex<Vec<Added>> {
+    static ADDED: OnceLock<Mutex<Vec<Added>>> = OnceLock::new();
+    ADDED.get_or_init(Default::default)
+}
+
+/// Offer `gateway`, in place of any a plugin added under its name before.
+pub fn add(gateway: Added) {
+    if let Ok(mut list) = added().lock() {
+        list.retain(|g| g.name != gateway.name);
+        list.push(gateway);
+    }
+}
+
+/// Stop offering the gateway a plugin added as `name`.
+pub fn remove(name: &str) {
+    if let Ok(mut list) = added().lock() {
+        list.retain(|g| g.name != name);
+    }
+}
+
+fn added_as(name: &str) -> Option<Added> {
+    added()
+        .lock()
+        .ok()?
+        .iter()
+        .find(|g| g.name == name)
+        .cloned()
+}
+
+/// Whether `name` is a gateway on offer now: a built-in one, or one a plugin
+/// added and has not taken back.
+pub fn offered(name: &str) -> bool {
+    GATEWAYS.iter().any(|g| g.name == name) || added_as(name).is_some()
+}
+
+/// Whether requests to `endpoint` go to the Responses API whatever the model,
+/// because a plugin added a gateway there that speaks nothing else.
+pub(crate) fn responses_at(endpoint: &str) -> bool {
+    let endpoint = endpoint.trim().trim_end_matches('/');
+    added().lock().is_ok_and(|list| {
+        list.iter()
+            .any(|g| g.responses && g.base.trim_end_matches('/') == endpoint)
+    })
+}
+
 /// Where to send requests and what to send with them. A built-in gateway
 /// goes to its own URL with its saved key; Custom goes to `custom`, the URL
 /// that was pasted for it; the Letronna gateway uses the account API and the
@@ -60,6 +120,9 @@ pub fn resolve(name: &str, custom: &str, key: &str) -> (String, String) {
         let token = crate::auth::account().map(|a| a.token).unwrap_or_default();
         return (base_url(name, custom), token);
     }
+    if let Some(added) = added_as(name) {
+        return (added.base, added.key);
+    }
     (base_url(name, custom), key.to_owned())
 }
 
@@ -69,6 +132,9 @@ pub fn base_url(name: &str, custom: &str) -> String {
     if name == LETRONNA {
         return crate::auth::hosted_base();
     }
+    if let Some(added) = added_as(name) {
+        return added.base;
+    }
     let base = gateway(name).base;
     let base = if base.is_empty() { custom } else { base };
     base.to_owned()
@@ -76,8 +142,11 @@ pub fn base_url(name: &str, custom: &str) -> String {
 
 /// Every gateway set up on this computer, as (name, base URL, key): Letronna
 /// once signed in, a keyed gateway once its key is saved, Custom once it has
-/// a URL, and Ollama always (on this machine, a closed port answers at once).
+/// a URL, Ollama always (on this machine, a closed port answers at once),
+/// and those plugins added.
 pub fn ready(keys: &HashMap<String, String>, custom: &str) -> Vec<(&'static str, String, String)> {
+    let plugins = added().lock().map(|list| list.clone()).unwrap_or_default();
+    let plugins = plugins.into_iter().map(|g| (g.name, g.base, g.key));
     GATEWAYS
         .iter()
         .filter_map(|g| {
@@ -93,6 +162,7 @@ pub fn ready(keys: &HashMap<String, String>, custom: &str) -> Vec<(&'static str,
                 (g.name, base, key)
             })
         })
+        .chain(plugins)
         .collect()
 }
 
@@ -204,6 +274,26 @@ mod tests {
             status("Anthropic", &none, "", 0),
             ("Not set up".into(), false, false)
         );
+    }
+
+    #[test]
+    fn a_gateway_a_plugin_adds_is_offered_until_it_is_taken_back() {
+        let base = "http://127.0.0.1:9/plugged/v1";
+        assert!(!offered("Plugged"));
+        add(Added {
+            name: "Plugged",
+            base: base.into(),
+            key: "k".into(),
+            responses: true,
+        });
+        assert!(offered("Plugged") && responses_at(&format!("{base}/")));
+        assert_eq!(resolve("Plugged", "", ""), (base.into(), "k".into()));
+        let listed = ready(&HashMap::new(), "");
+        assert!(listed.contains(&("Plugged", base.into(), "k".into())));
+
+        remove("Plugged");
+        assert!(!offered("Plugged") && !responses_at(base));
+        assert!(!ready(&HashMap::new(), "").iter().any(|g| g.0 == "Plugged"));
     }
 
     #[test]

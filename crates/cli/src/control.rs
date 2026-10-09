@@ -154,7 +154,7 @@ pub fn run(runner: &mut Runner, session: usize, args: &Args) -> i32 {
                         running = Some(turn);
                     }
                     Err(error) => {
-                        crate::show(args.output, &crate::failed(error), None);
+                        crate::show(args.output, &crate::failed(error), None, false);
                         failed = true;
                     }
                 }
@@ -256,6 +256,7 @@ pub fn run(runner: &mut Runner, session: usize, args: &Args) -> i32 {
                     report,
                     output,
                     turn.prompt,
+                    false,
                 );
                 failed |= !ended;
                 // A session deleted or cut short elsewhere meanwhile is not

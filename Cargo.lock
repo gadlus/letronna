@@ -4185,6 +4185,7 @@ dependencies = [
  "image",
  "landlock",
  "libc",
+ "md-5",
  "pdf-extract",
  "quick-xml",
  "regex",

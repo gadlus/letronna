@@ -55,7 +55,10 @@ Add an entry to `config/harness.yaml` (the patch puts the same one, as
   writes it to the sandbox's own `keys.json`; leave it out for a server that
   takes no key.
 - Leave `timeout_sec` out, so each task's own timeout (180 to 3600 s)
-  applies; set here, it would override all of them.
+  applies; set here, it would override all of them. Letronna gets
+  `LETRONNA_DEADLINE` 120 s short of it (at least half of a short one), so
+  at 80% it is told to write its outputs and at the deadline it ends with
+  its result line, before the adapter's interrupt.
 - `max_rounds` is the tool rounds a message gets, 150 by default rather than
   Letronna's 25. `permission_mode` is `bypass` (`--yes`) by default; `auto`
   runs Letronna's approval judge instead, worth one run as an ablation. That
@@ -117,8 +120,9 @@ apart, and a reply with no JSON in it is asked for once more. A 400 is not
 retried.
 
 Each round's metadata in the result holds the run's own JSON (`status`,
-`rounds`, tokens, `files`), `timed_out`, and `model_calls`, the calls the
-proxy saw answered in that round.
+`rounds`, tokens, `files`), `timed_out` (also true when Letronna stopped
+at its deadline, which ends the task's rounds as a timeout does), and
+`model_calls`, the calls the proxy saw answered in that round.
 
 ## Reading the numbers
 
@@ -130,9 +134,11 @@ proxy saw answered in that round.
   rounds; the other multi-round tasks carry their state in files.
 - The sandbox's HOME has no Letronna account, so the tools that make
   pictures, speech and video on Letronna's hosted models are not offered.
-- Letronna gives up on a reply that stays quiet for five minutes, and the
-  proxy passes a reply on only once it is whole, so a single reply that
-  takes longer than that to generate fails.
+- The proxy passes a reply on only once it is whole, so a reply reads as
+  silent until then. The adapter sets `LETRONNA_READ_TIMEOUT=1200`, the
+  proxy's own wait on its upstream, unless the environment already sets
+  it; at Letronna's default of five minutes, a reply that took longer to
+  generate failed.
 - Sandboxes are secret: each holds the provider key in `.letronna/keys.json`.
   The proxy's records in `usage-proxy/responses/` keep each request's
   headers with `Authorization` and the other key headers blanked, so they

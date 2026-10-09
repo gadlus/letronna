@@ -67,6 +67,10 @@ tree-sitter-yaml = { version = "0.7", optional = true }
 pdf-extract = "0.12.1"
 flate2 = "1"
 weezl = "0.1"
+# Kimi CLI names each project's folder of sessions by the MD5 of its path,
+# which importing one needs to find the project again. Already built here,
+# for lopdf under pdf-extract.
+md-5 = "0.10"
 
 # Stopping a background job ends everything it started: a Job Object on
 # Windows, a process group elsewhere; a Ctrl-C is heard by a console handler

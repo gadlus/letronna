@@ -306,6 +306,10 @@ pub struct Connection {
     /// keep it, so their system message stays the session's and the cache
     /// serves both.
     pub plain_terminal: bool,
+    /// Letronna's less used tools go out behind `find_tools` rather than in
+    /// every request: set for a `-p` run that did not name its tools. Its
+    /// helpers keep it, so their array stays the session's.
+    pub lean_tools: bool,
 }
 
 impl Connection {
@@ -735,7 +739,7 @@ fn context_parts(connection: &Connection, messages: &[Message], floor: usize) ->
         + tokens(&text[prompt.remembered.end..]);
     let (tools, mcp) = if connection.tools {
         let every = crate::tools::all();
-        let on_demand = crate::mcp_find::on_demand(&every);
+        let on_demand = crate::mcp_find::OnDemand::of(connection, &every);
         let is_mcp = |spec: &Value| {
             let name = spec["function"]["name"].as_str().unwrap_or_default();
             crate::mcp_find::is_mcp(name)
@@ -1018,11 +1022,11 @@ fn identity(connection: &Connection, style: Option<String>) -> String {
 }
 
 /// The tools a request over `connection` offers out of `every`, before any
-/// a caller adds; `on_demand` when the MCP tools go out behind `find_tools`.
+/// a caller adds, less those that go out behind `find_tools` `on_demand`.
 fn offered(
     connection: &Connection,
     every: &[std::sync::Arc<dyn crate::tools::Tool>],
-    on_demand: bool,
+    on_demand: crate::mcp_find::OnDemand,
 ) -> Vec<Value> {
     let mut tools = crate::tools::specs_of(every, connection, on_demand);
     crate::mcp_find::fit(&mut tools, connection);
@@ -1568,14 +1572,18 @@ fn body_hashed(
     let stubs = stubs(window, old, budget.squeezed);
     let hints = crate::subfolders::hints(window, connection);
     let turn = window.iter().rposition(opens_turn);
-    // Once, so the calls in the history and the array agree on whether the
-    // MCP tools go out on demand.
+    // Once, so the calls in the history and the array agree on which tools
+    // go out on demand.
     let every = if connection.tools {
         crate::tools::all()
     } else {
         Vec::new()
     };
-    let on_demand = connection.tools && crate::mcp_find::on_demand(&every);
+    let on_demand = if connection.tools {
+        crate::mcp_find::OnDemand::of(connection, &every)
+    } else {
+        crate::mcp_find::OnDemand::default()
+    };
     let notes = mode_notes(connection, window);
     let mut advised = false;
     for (i, m) in window.iter().enumerate() {
@@ -1630,8 +1638,8 @@ fn body_hashed(
                 }
             }
         }
-        if on_demand {
-            crate::mcp_find::wrap(&mut wired, connection);
+        if on_demand.any() {
+            crate::mcp_find::wrap(&mut wired, connection, on_demand);
         }
         // A model that cannot view what the user attached is told so, and
         // how else to look, rather than only that it is there.
@@ -2364,7 +2372,14 @@ pub(crate) fn as_chat(connection: &Connection, reply: Value) -> Value {
 fn speaks_responses(connection: &Connection) -> bool {
     let model = connection.model.trim();
     crate::wire_responses::serves(&connection.endpoint, model)
-        && (crate::wire_responses::only(model) || !has_quirk(connection, Quirk::Responses))
+        && (only_responses(connection) || !has_quirk(connection, Quirk::Responses))
+}
+
+/// Whether the Responses API is the only route to `connection`'s model: a
+/// codex or pro model, or any on a gateway a plugin added that speaks it alone.
+fn only_responses(connection: &Connection) -> bool {
+    crate::wire_responses::only(connection.model.trim())
+        || crate::gateway::responses_at(&connection.endpoint)
 }
 
 /// The Responses API's URL and form of `body`, built chat-shaped as every
@@ -2443,7 +2458,7 @@ fn learn_responses(
     };
     as_written
         && failure.overflow.is_none()
-        && !crate::wire_responses::only(&model)
+        && !only_responses(connection)
         && goes_without(Quirk::Responses)
 }
 
@@ -3623,6 +3638,19 @@ fn doomed(connection: &Connection, messages: &[Message], budget: &Budget) -> Opt
 /// that leaves less room than this for the reply cuts the prompt instead.
 const LEAST_REPLY: usize = 1_024;
 
+/// The budget to send again with after a reply spent all of `sent`'s reply
+/// thinking: the same window with the longest reply the model is known to
+/// take, up to `MAX_REPLY_TOKENS` and a quarter of its window. None when
+/// that is no longer than what was sent, so it is sent again at most once.
+fn roomier(connection: &Connection, sent: &Budget) -> Option<Budget> {
+    let facts = crate::models::facts(&connection.endpoint, connection.model.trim());
+    let reply = facts
+        .max_output
+        .map_or(MAX_REPLY_TOKENS, |n| (n as usize).min(MAX_REPLY_TOKENS))
+        .min(facts.context.map_or(usize::MAX, |n| n as usize / 4));
+    (reply > sent.reply).then_some(Budget { reply, ..*sent })
+}
+
 /// The budget to send again with after `failure`, once, when it is an
 /// overflow a smaller window or a shorter reply can mend. What the error gave
 /// away is learned for the model first, so the requests after it are sized
@@ -3853,6 +3881,24 @@ fn stream(
             // it gets here on the try it came back on. The one request sent
             // again after it has tries of its own for what does pass.
             if !begun && let Some(budget) = refit(connection, &failure, budget) {
+                return send_window(connection, messages, &budget, extra, lsp, sender);
+            }
+            // A reply that thought until its limit and wrote nothing goes
+            // again once with the longest reply the model takes. What it
+            // thought is dropped: the next try thinks afresh.
+            if failure.out_of_room
+                && let Some(budget) = roomier(connection, budget)
+            {
+                let retry = crate::retry::Retry {
+                    kind: failure.kind,
+                    attempt: 2,
+                    of: 2,
+                    wait: Duration::ZERO,
+                    dropped: begun,
+                };
+                sender
+                    .send_blocking(Event::Retrying(retry))
+                    .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
                 return send_window(connection, messages, &budget, extra, lsp, sender);
             }
             return Err(failure);
@@ -4288,7 +4334,9 @@ impl Reply {
                 // then takes the thinking as the answer.
                 _ => return Ok(()),
             };
-            return Err(Failure::new(FailureKind::BadReply, why));
+            let mut failure = Failure::new(FailureKind::BadReply, why);
+            failure.out_of_room = self.finish == Some(FinishReason::Length);
+            return Err(failure);
         }
         let carries = !replay.reasoning_details.is_empty()
             || !replay.extra_content.is_empty()
@@ -10737,6 +10785,75 @@ mod tests {
         assert_eq!(cleared_and_asked(&bodies[1]), (7, 8_192));
     }
 
+    /// A reply that only thinks until its limit, as a reasoning model at a
+    /// high effort does with 8,192 tokens.
+    const THOUGHT_OUT: &str = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n";
+
+    #[test]
+    fn a_reply_that_thinks_away_its_limit_is_asked_again_with_more_room() {
+        let (endpoint, worker) = serve(vec![
+            ("200 OK", "text/event-stream", THOUGHT_OUT),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Done\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
+        let rx = start(
+            Connection {
+                endpoint,
+                model: "thinks-to-its-limit".into(),
+                ..connection()
+            },
+            reads(1, 10),
+        );
+        let mut retried = None;
+        let mut said = String::new();
+        let finished = loop {
+            match rx.recv_blocking().unwrap() {
+                Event::Retrying(retry) => retried = Some(retry),
+                Event::Delta(text) => said.push_str(&text),
+                Event::Finished(result) => break result,
+                _ => {}
+            }
+        };
+        assert!(finished.is_ok(), "{finished:?}");
+        assert_eq!(said, "Done");
+        // What it thought was shown, so the frontends drop it.
+        let retry = retried.expect("no retry was announced");
+        assert!(retry.dropped);
+        assert_eq!(retry.kind, FailureKind::BadReply);
+        let bodies = worker.join().unwrap();
+        let asked = |body: &str| serde_json::from_str::<Value>(body).unwrap()["max_tokens"].clone();
+        assert_eq!(asked(&bodies[0]), 8_192);
+        assert_eq!(asked(&bodies[1]), MAX_REPLY_TOKENS);
+    }
+
+    #[test]
+    fn a_reply_that_thinks_away_the_longer_limit_too_stands() {
+        let (endpoint, worker) = serve(vec![
+            ("200 OK", "text/event-stream", THOUGHT_OUT),
+            ("200 OK", "text/event-stream", THOUGHT_OUT),
+        ]);
+        let rx = start(
+            Connection {
+                endpoint,
+                model: "thinks-past-every-limit".into(),
+                ..connection()
+            },
+            reads(1, 10),
+        );
+        let failure = loop {
+            if let Event::Finished(result) = rx.recv_blocking().unwrap() {
+                break result.expect_err("a second cut-off went through");
+            }
+        };
+        assert_eq!(failure.kind, FailureKind::BadReply);
+        assert!(failure.out_of_room);
+        // Sent twice and no more.
+        assert_eq!(worker.join().unwrap().len(), 2);
+    }
+
     #[test]
     fn an_output_limit_clamps_the_reply_asked_for() {
         let (endpoint, worker) = serve(vec![
@@ -11591,6 +11708,31 @@ mod tests {
         ));
         let (url, _) = to_responses(&c, &endpoint, &sent).unwrap();
         assert_eq!(url, "https://api.openai.com/v1/responses");
+    }
+
+    #[test]
+    fn a_gateway_that_speaks_responses_alone_gets_every_model_there() {
+        let base = "http://127.0.0.1:9/responses-only/v1";
+        crate::gateway::add(crate::gateway::Added {
+            name: "Responses only",
+            base: base.into(),
+            key: "k".into(),
+            responses: true,
+        });
+        let c = Connection {
+            endpoint: base.into(),
+            model: "some-model".into(),
+            ..connection()
+        };
+        let endpoint = validate(&c).unwrap();
+        let sent = body(&c, &hi(), None, None);
+        let (url, posted) = to_responses(&c, &endpoint, &sent).unwrap();
+        let refusal = r#"{"error":{"message":"Unsupported parameter: 'truncation'.","type":"invalid_request_error","param":"truncation","code":"unsupported_parameter"}}"#;
+        let falls_back = learn_responses(&c, &sent, &posted, &refused(400, refusal), refusal);
+        let still = to_responses(&c, &endpoint, &sent).is_some();
+        crate::gateway::remove("Responses only");
+        assert_eq!(url, format!("{base}/responses"));
+        assert!(!falls_back && still);
     }
 
     #[test]

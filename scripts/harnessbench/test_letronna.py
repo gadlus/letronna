@@ -55,7 +55,8 @@ if os.environ.get("FAKE_SLEEP"):
         signal.signal(signal.SIGINT, stopped)
     time.sleep(float(os.environ["FAKE_SLEEP"]))
 print("a line that is not JSON")
-print(json.dumps({{"answer": "4", "rounds": 2, "files": ["out/linecount.txt"], "status": "done"}}))
+status = os.environ.get("FAKE_STATUS", "done")
+print(json.dumps({{"answer": "4", "rounds": 2, "files": ["out/linecount.txt"], "status": status}}))
 """
 
 
@@ -181,6 +182,33 @@ def test_the_round_runs_in_the_sandbox_with_none_of_the_operators_setup(
     assert seen["env"]["BROWSER"] == "/usr/bin/false"
     assert seen["env"]["LETRONNA_NO_LOGIN_ENV"] == "1"
     assert "LETRONNA_VAULT_SERVICE" not in seen["env"]
+
+
+def test_letronna_ends_itself_before_the_timeout_and_waits_out_a_whole_reply(
+    tmp_path: Path, fake: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("LETRONNA_READ_TIMEOUT", raising=False)
+    ctx = context(tmp_path, fake)
+    ctx.timeout_sec = 1200
+    letronna.LetronnaAdapter().run(ctx)
+    seen = records(tmp_path)[0]["env"]
+    assert seen["LETRONNA_DEADLINE"] == "1080"
+    assert seen["LETRONNA_READ_TIMEOUT"] == "1200"
+    # A short timeout keeps half of itself rather than the margin's leftover.
+    assert letronna.deadline(180) == 90
+    assert letronna.deadline(1) == 1
+    # A read timeout the operator set is theirs to keep.
+    monkeypatch.setenv("LETRONNA_READ_TIMEOUT", "600")
+    letronna.LetronnaAdapter().run(ctx)
+    assert records(tmp_path)[1]["env"]["LETRONNA_READ_TIMEOUT"] == "600"
+
+
+@pytest.mark.parametrize("status", ["deadline", "stopped"])
+def test_a_round_stopped_at_its_deadline_counts_as_out_of_time(tmp_path: Path, fake: Path, status: str) -> None:
+    result = letronna.LetronnaAdapter().run(context(tmp_path, fake, FAKE_STATUS=status))
+    assert result.metadata["returncode"] == 0
+    assert result.metadata["timed_out"] is True
+    assert not result.ok
 
 
 def test_the_last_json_line_becomes_metadata(tmp_path: Path, fake: Path) -> None:

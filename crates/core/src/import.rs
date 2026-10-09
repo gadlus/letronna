@@ -1,11 +1,13 @@
-//! Reading Claude Code and Codex sessions from disk, and turning one into a
-//! session of this app's own -- so picking up a conversation started
-//! elsewhere is no different from continuing one Letronna started.
+//! Reading other tools' sessions from disk, and turning one into a session
+//! of this app's own -- so picking up a conversation started elsewhere is
+//! no different from continuing one Letronna started.
 //!
-//! Both tools keep their own transcripts under the user's home directory,
-//! one JSON object per line: Claude Code under
+//! Claude Code and Codex, read here, keep their transcripts under the
+//! user's home directory, one JSON object per line: Claude Code under
 //! `~/.claude/projects/<escaped project path>/<session id>.jsonl`, Codex
-//! under `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. Nothing here ever
+//! under `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. The other tools
+//! each have a module below. A session Letronna exported as JSON, from
+//! this machine or another, comes back in the same way. Nothing here ever
 //! writes to those files; it only reads them, and everything it makes lands
 //! in a normal `Conversation`.
 
@@ -18,6 +20,14 @@ use std::collections::HashMap;
 use std::io::{BufRead as _, Read as _};
 use std::path::{Path, PathBuf};
 
+mod cursor;
+mod gemini;
+mod hermes;
+mod kimi;
+mod kiro;
+mod opencode;
+mod pi;
+
 /// Enough of a file to find its title without reading the whole thing: a
 /// session's first prompt is always near the top, and a file that keeps
 /// growing for hours must not cost more to list than one just begun.
@@ -29,6 +39,18 @@ const HEAD_CAP_BYTES: u64 = 64 * 1024;
 pub enum Tool {
     ClaudeCode,
     Codex,
+    /// A session Letronna exported as JSON.
+    Letronna,
+    GeminiCli,
+    Opencode,
+    Cursor,
+    #[serde(rename = "openclaw")]
+    OpenClaw,
+    Pi,
+    Kimi,
+    Kiro,
+    /// A session Hermes exported, as Hermes keeps its own in SQLite.
+    Hermes,
 }
 
 impl Tool {
@@ -36,6 +58,15 @@ impl Tool {
         match self {
             Tool::ClaudeCode => "Claude Code",
             Tool::Codex => "Codex",
+            Tool::Letronna => "Letronna",
+            Tool::GeminiCli => "Gemini CLI",
+            Tool::Opencode => "opencode",
+            Tool::Cursor => "Cursor",
+            Tool::OpenClaw => "OpenClaw",
+            Tool::Pi => "pi",
+            Tool::Kimi => "Kimi CLI",
+            Tool::Kiro => "Kiro",
+            Tool::Hermes => "Hermes",
         }
     }
 }
@@ -74,7 +105,8 @@ pub struct Imported {
     pub skipped: usize,
 }
 
-/// Sessions from Claude Code and Codex, newest first, `limit` at most.
+/// Sessions from every tool Letronna can read them from, newest first,
+/// `limit` at most.
 pub fn list(limit: usize) -> Vec<Candidate> {
     let mut files = Vec::new();
     if let Some(root) = claude_code_root() {
@@ -87,7 +119,37 @@ pub fn list(limit: usize) -> Vec<Candidate> {
     if let Some(root) = codex_root() {
         files.extend(codex_files(&root).into_iter().map(|p| (Tool::Codex, p)));
     }
-    newest_titled(files, limit)
+    if let Some(root) = gemini::root() {
+        files.extend(
+            gemini::files(&root)
+                .into_iter()
+                .map(|p| (Tool::GeminiCli, p)),
+        );
+    }
+    if let Some(root) = cursor::root() {
+        files.extend(cursor::files(&root).into_iter().map(|p| (Tool::Cursor, p)));
+    }
+    if let Some(root) = pi::openclaw_root() {
+        files.extend(
+            pi::openclaw_files(&root)
+                .into_iter()
+                .map(|p| (Tool::OpenClaw, p)),
+        );
+    }
+    if let Some(root) = pi::pi_root() {
+        files.extend(pi::pi_files(&root).into_iter().map(|p| (Tool::Pi, p)));
+    }
+    if let Some(root) = kimi::root() {
+        files.extend(kimi::files(&root).into_iter().map(|p| (Tool::Kimi, p)));
+    }
+    if let Some(root) = kiro::root() {
+        files.extend(kiro::files(&root).into_iter().map(|p| (Tool::Kiro, p)));
+    }
+    let mut found = newest_titled(files, limit);
+    found.extend(opencode::list(limit));
+    found.sort_by_key(|c| std::cmp::Reverse(c.updated));
+    found.truncate(limit);
+    found
 }
 
 /// The newest `limit` of `files`, each titled from its head. Sorted and cut
@@ -106,14 +168,7 @@ fn newest_titled(files: Vec<(Tool, PathBuf)>, limit: usize) -> Vec<Candidate> {
     files
         .into_iter()
         .map(|(updated, tool, path)| {
-            let (session_id, title, workspace) = match tool {
-                Tool::ClaudeCode => {
-                    let (title, workspace) = claude_code_head(&path);
-                    let session_id = path.file_stem().and_then(|s| s.to_str());
-                    (session_id.unwrap_or_default().to_owned(), title, workspace)
-                }
-                Tool::Codex => codex_head(&path),
-            };
+            let (session_id, title, workspace) = head(tool, &path);
             Candidate {
                 tool,
                 session_id,
@@ -126,43 +181,170 @@ fn newest_titled(files: Vec<(Tool, PathBuf)>, limit: usize) -> Vec<Candidate> {
         .collect()
 }
 
+/// A session's id, title and project folder, from as little of its file as
+/// the tool's format lets them be read from.
+fn head(tool: Tool, path: &Path) -> (String, String, Option<PathBuf>) {
+    match tool {
+        Tool::ClaudeCode => {
+            let (title, workspace) = claude_code_head(path);
+            let session_id = path.file_stem().and_then(|s| s.to_str());
+            (session_id.unwrap_or_default().to_owned(), title, workspace)
+        }
+        Tool::Codex => codex_head(path),
+        Tool::Letronna => match letronna_candidate(path) {
+            Some(found) => (found.session_id, found.title, found.workspace),
+            None => (String::new(), String::new(), None),
+        },
+        Tool::GeminiCli => gemini::head(path),
+        Tool::Opencode => opencode::head(path),
+        Tool::Cursor => cursor::head(path),
+        Tool::OpenClaw | Tool::Pi => pi::head(path),
+        Tool::Kimi => kimi::head(path),
+        Tool::Kiro => kiro::head(path),
+        Tool::Hermes => match hermes::candidates(path).into_iter().next() {
+            Some(found) => (found.session_id, found.title, found.workspace),
+            None => (String::new(), String::new(), None),
+        },
+    }
+}
+
 /// Read `candidate`'s file in full and turn it into messages this app knows
 /// how to save.
 pub fn import(candidate: &Candidate) -> Result<Imported, String> {
     match candidate.tool {
         Tool::ClaudeCode => import_claude_code(&candidate.path),
         Tool::Codex => import_codex(&candidate.path),
+        Tool::Letronna => import_letronna(&candidate.path),
+        Tool::GeminiCli => gemini::import(&candidate.path),
+        Tool::Opencode => opencode::import(&candidate.path, &candidate.session_id),
+        Tool::Cursor => cursor::import(&candidate.path),
+        Tool::OpenClaw | Tool::Pi => pi::import(&candidate.path, candidate.tool),
+        Tool::Kimi => kimi::import(&candidate.path),
+        Tool::Kiro => kiro::import(&candidate.path),
+        Tool::Hermes => hermes::import(&candidate.path, &candidate.session_id),
     }
 }
 
-/// A candidate for a file named directly, as `/import <path>` takes: the
-/// tool is told from where the file lives, a raw path carrying no other
-/// hint of which format it is in. `None` for a path that is not a file.
-pub fn candidate_at(path: &Path) -> Option<Candidate> {
+/// The sessions in a file named directly, as `/import <path>` takes: one,
+/// for most tools' files, but every session in a Hermes export. Empty for a
+/// path that is not a file, or holds no session Letronna can read.
+pub fn candidates_at(path: &Path) -> Vec<Candidate> {
     if !path.is_file() {
-        return None;
+        return Vec::new();
     }
-    let codex = path
+    let Some(tool) = tool_at(path) else {
+        return Vec::new();
+    };
+    match tool {
+        Tool::Letronna => letronna_candidate(path).into_iter().collect(),
+        Tool::Hermes => hermes::candidates(path),
+        _ => {
+            let (session_id, title, workspace) = head(tool, path);
+            if session_id.is_empty() {
+                return Vec::new();
+            }
+            vec![Candidate {
+                tool,
+                session_id,
+                updated: modified_secs(path),
+                path: path.to_owned(),
+                title,
+                workspace,
+            }]
+        }
+    }
+}
+
+/// The first session in a file named directly, as `candidates_at` finds them.
+pub fn candidate_at(path: &Path) -> Option<Candidate> {
+    candidates_at(path).into_iter().next()
+}
+
+/// Which tool wrote the session at `path`: told by the folder each tool
+/// keeps its sessions in, or for a file moved out of it, by how it begins.
+fn tool_at(path: &Path) -> Option<Tool> {
+    let inside = |dir: &str| path.components().any(|c| c.as_os_str() == dir);
+    let name = path
         .file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with("rollout-"))
-        || path.components().any(|c| c.as_os_str() == ".codex");
-    let (tool, session_id, title, workspace) = if codex {
-        let (session_id, title, workspace) = codex_head(path);
-        (Tool::Codex, session_id, title, workspace)
-    } else {
-        let session_id = path.file_stem().and_then(|s| s.to_str())?.to_owned();
-        let (title, workspace) = claude_code_head(path);
-        (Tool::ClaudeCode, session_id, title, workspace)
-    };
-    Some(Candidate {
-        tool,
-        session_id,
-        updated: modified_secs(path),
-        path: path.to_owned(),
-        title,
-        workspace,
-    })
+        .unwrap_or_default();
+    if name.starts_with("rollout-") || inside(".codex") {
+        return Some(Tool::Codex);
+    }
+    if inside(".gemini") {
+        return Some(Tool::GeminiCli);
+    }
+    if inside("agent-transcripts") {
+        return Some(Tool::Cursor);
+    }
+    if inside(".openclaw") {
+        return Some(Tool::OpenClaw);
+    }
+    if inside(".kimi") {
+        return Some(Tool::Kimi);
+    }
+    if inside(".kiro") {
+        return Some(Tool::Kiro);
+    }
+    if path.extension().is_some_and(|e| e == "json") {
+        // One document, read whole to tell whose it is.
+        let doc: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        if doc["format"].as_str() == Some(crate::export::FORMAT) {
+            return Some(Tool::Letronna);
+        }
+        if doc["sessionId"].is_string() && doc["projectHash"].is_string() {
+            return Some(Tool::GeminiCli);
+        }
+        if opencode::is_export_doc(&doc) {
+            return Some(Tool::Opencode);
+        }
+        return None;
+    }
+    let first = first_object(path);
+    if hermes::is_session(&first) {
+        return Some(Tool::Hermes);
+    }
+    if first["sessionId"].is_string() && first["projectHash"].is_string() {
+        return Some(Tool::GeminiCli);
+    }
+    if first["type"] == "session_meta" {
+        return Some(Tool::Codex);
+    }
+    if first["version"] == "v1" && first["kind"].is_string() {
+        return Some(Tool::Kiro);
+    }
+    // pi's header; OpenClaw writes the same, and is told by its folder.
+    if first["type"] == "session" {
+        return Some(Tool::Pi);
+    }
+    // Messages as chat APIs take them, a line each, with Kimi CLI's own
+    // records named `_system_prompt`, `_usage` and `_checkpoint`.
+    if first["role"].is_string() && first.get("message").is_none() && first.get("type").is_none() {
+        return Some(Tool::Kimi);
+    }
+    // A line per message with no record type, unlike Claude Code's.
+    if first["role"].is_string() && first["message"].is_object() && first.get("type").is_none() {
+        return Some(Tool::Cursor);
+    }
+    Some(Tool::ClaudeCode)
+}
+
+/// The lines read to find the first JSON object in a file.
+const FIRST_LINES: usize = 5;
+
+/// The first line of `path` that holds a JSON object, or null. Read whole,
+/// unlike a head: a line of a Hermes export holds a whole session.
+fn first_object(path: &Path) -> Value {
+    read_lines(path)
+        .into_iter()
+        .flatten()
+        .take(FIRST_LINES)
+        .find_map(|line| {
+            serde_json::from_str::<Value>(&line)
+                .ok()
+                .filter(Value::is_object)
+        })
+        .unwrap_or(Value::Null)
 }
 
 /// `imported` as a session of its own, at `id`.
@@ -201,13 +383,13 @@ fn nothing_to_import(path: &Path, skipped: usize) -> String {
     )
 }
 
-fn claude_code_root() -> Option<PathBuf> {
+pub(crate) fn claude_code_root() -> Option<PathBuf> {
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| crate::tools::home().map(|h| h.join(".claude")))
 }
 
-fn codex_root() -> Option<PathBuf> {
+pub(crate) fn codex_root() -> Option<PathBuf> {
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| crate::tools::home().map(|h| h.join(".codex")))
@@ -251,9 +433,12 @@ fn claude_code_head(path: &Path) -> (String, Option<PathBuf>) {
         {
             workspace = Some(PathBuf::from(cwd));
         }
-        if title.is_empty() && record["type"].as_str() == Some("user") {
+        if title.is_empty()
+            && record["type"].as_str() == Some("user")
+            && record["isMeta"].as_bool() != Some(true)
+        {
             let text = claude_user_text(&record["message"]["content"]);
-            if !text.trim().is_empty() {
+            if !text.trim().is_empty() && !injected(&text) && !reports(&text) {
                 title = short_title(&text);
             }
         }
@@ -288,6 +473,9 @@ fn import_claude_code(path: &Path) -> Result<Imported, String> {
             workspace = Some(PathBuf::from(cwd));
         }
         match record["type"].as_str().unwrap_or_default() {
+            // What Claude Code adds as the user's turn for its own reasons,
+            // such as the caveat before a slash command's output.
+            "user" if record["isMeta"].as_bool() == Some(true) => {}
             "user" => claude_user_record(&record, &mut messages, &tool_names, &mut skipped),
             "assistant" => {
                 claude_assistant_record(&record, &mut messages, &mut tool_names, &mut skipped)
@@ -329,10 +517,11 @@ fn claude_user_record(
     if let Some(text) = content.as_str() {
         if text.trim().is_empty() {
             *skipped += 1;
-        } else {
+        } else if !injected(text) {
             messages.push(Message {
                 role: "user".into(),
                 content: text.to_owned(),
+                notice: reports(text),
                 ..Default::default()
             });
         }
@@ -346,7 +535,7 @@ fn claude_user_record(
     for block in blocks {
         match block["type"].as_str().unwrap_or_default() {
             "text" => {
-                if let Some(text) = block["text"].as_str() {
+                if let Some(text) = block["text"].as_str().filter(|t| !injected(t)) {
                     said.push(text.to_owned());
                 }
             }
@@ -368,9 +557,11 @@ fn claude_user_record(
         }
     }
     if !said.is_empty() {
+        let content = said.join("\n");
         messages.push(Message {
             role: "user".into(),
-            content: said.join("\n"),
+            notice: reports(&content),
+            content,
             ..Default::default()
         });
     }
@@ -531,7 +722,7 @@ fn codex_head(path: &Path) -> (String, String, Option<PathBuf>) {
                     && payload["role"].as_str() == Some("user")
                 {
                     let text = codex_content_text(&payload["content"]);
-                    if !text.trim().is_empty() {
+                    if !text.trim().is_empty() && !injected(&text) {
                         title = short_title(&text);
                     }
                 }
@@ -629,6 +820,10 @@ fn codex_response_item(
         "message" => {
             let role = payload["role"].as_str().unwrap_or_default();
             let text = codex_content_text(&payload["content"]);
+            // Codex's environment and instructions, sent as the user's turn.
+            if role == "user" && injected(&text) {
+                return;
+            }
             if (role == "user" || role == "assistant") && !text.trim().is_empty() {
                 messages.push(Message {
                     role: role.to_owned(),
@@ -768,7 +963,256 @@ fn codex_output_text(output: &Value) -> String {
     }
 }
 
+// -- Letronna ---------------------------------------------------------------
+
+/// A Letronna JSON export, read whole: it is one document, not lines.
+fn read_letronna(path: &Path) -> Result<Value, String> {
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("Could not read {}: {e}", path.display()))?;
+    let doc: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("{} is not JSON Letronna can read: {e}", path.display()))?;
+    if doc["format"].as_str() != Some(crate::export::FORMAT) {
+        return Err(format!(
+            "{} is not a session Letronna exported.",
+            path.display()
+        ));
+    }
+    if doc["version"]
+        .as_u64()
+        .is_some_and(|v| v > crate::export::VERSION)
+    {
+        return Err(format!(
+            "{} was exported by a newer Letronna. Update to import it.",
+            path.display()
+        ));
+    }
+    Ok(doc)
+}
+
+/// The export at `path` as a candidate; `None` for JSON that is not one.
+fn letronna_candidate(path: &Path) -> Option<Candidate> {
+    let doc = read_letronna(path).ok()?;
+    Some(Candidate {
+        tool: Tool::Letronna,
+        session_id: letronna_id(&doc, path),
+        title: doc["title"].as_str().unwrap_or_default().to_owned(),
+        workspace: doc["workspace"].as_str().map(PathBuf::from),
+        updated: doc["updated"]
+            .as_u64()
+            .unwrap_or_else(|| modified_secs(path)),
+        path: path.to_owned(),
+    })
+}
+
+/// The id an export was written under, or for a file without one, its name.
+fn letronna_id(doc: &Value, path: &Path) -> String {
+    doc["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .or_else(|| path.file_stem().and_then(|s| s.to_str()))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn import_letronna(path: &Path) -> Result<Imported, String> {
+    let doc = read_letronna(path)?;
+    let mut skipped = 0usize;
+    let items = doc["messages"].as_array().map_or(&[][..], Vec::as_slice);
+    let messages = chat_messages(items, &mut skipped);
+    if messages.is_empty() {
+        return Err(nothing_to_import(path, skipped));
+    }
+    let title = match doc["title"].as_str().map(str::trim) {
+        Some(title) if !title.is_empty() => title.to_owned(),
+        _ => first_user_title(&messages),
+    };
+    Ok(Imported {
+        source: Source {
+            tool: Tool::Letronna,
+            session_id: letronna_id(&doc, path),
+            path: path.to_owned(),
+        },
+        title,
+        workspace: doc["workspace"].as_str().map(PathBuf::from),
+        updated: doc["updated"]
+            .as_u64()
+            .unwrap_or_else(|| modified_secs(path)),
+        messages,
+        skipped,
+    })
+}
+
+/// Messages in the shape chat APIs take them -- `role` and `content`, with
+/// `tool_calls` and `tool_call_id` for calls and their results -- as
+/// Letronna's JSON export writes them.
+fn chat_messages(items: &[Value], skipped: &mut usize) -> Vec<Message> {
+    let mut out = Vec::new();
+    let mut names: HashMap<String, String> = HashMap::new();
+    for item in items {
+        let content = chat_text(&item["content"]);
+        match item["role"].as_str().unwrap_or_default() {
+            "user" if !content.trim().is_empty() => out.push(Message {
+                role: "user".into(),
+                content,
+                notice: item["notice"].as_bool().unwrap_or(false),
+                ..Default::default()
+            }),
+            "assistant" => {
+                let tool_calls: Vec<ToolCall> = item["tool_calls"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(chat_call)
+                    .collect();
+                if content.trim().is_empty() && tool_calls.is_empty() {
+                    *skipped += 1;
+                    continue;
+                }
+                for call in &tool_calls {
+                    names.insert(call.id.clone(), call.name.clone());
+                }
+                let reasoning = match item["reasoning"]
+                    .as_str()
+                    .or_else(|| item["reasoning_content"].as_str())
+                {
+                    Some(reasoning) => reasoning.to_owned(),
+                    None => chat_thinking(&item["content"]),
+                };
+                out.push(Message {
+                    role: "assistant".into(),
+                    content,
+                    model: item["model"].as_str().unwrap_or_default().to_owned(),
+                    reasoning,
+                    tool_calls,
+                    ..Default::default()
+                });
+            }
+            "tool" => {
+                let Some(id) = item["tool_call_id"].as_str().filter(|id| !id.is_empty()) else {
+                    *skipped += 1;
+                    continue;
+                };
+                let name = match item["name"].as_str() {
+                    Some(name) if !name.is_empty() => name.to_owned(),
+                    _ => names.get(id).cloned().unwrap_or_default(),
+                };
+                out.push(Message {
+                    role: "tool".into(),
+                    content: keep_ends(content, MAX_TOOL_CHARS, ""),
+                    tool_call_id: id.to_owned(),
+                    name,
+                    is_error: item["is_error"].as_bool().unwrap_or(false),
+                    ..Default::default()
+                });
+            }
+            // The other app's instructions to its model, not anything said
+            // in the session.
+            "system" | "developer" => {}
+            _ => *skipped += 1,
+        }
+    }
+    out
+}
+
+/// One of `tool_calls`: an id, and a function's name and arguments, which
+/// are a JSON string in the chat shape but an object in some files.
+fn chat_call(call: &Value) -> Option<ToolCall> {
+    let id = call["id"].as_str().filter(|id| !id.is_empty())?;
+    let function = &call["function"];
+    let name = function["name"].as_str().filter(|n| !n.is_empty())?;
+    let arguments = match &function["arguments"] {
+        Value::String(text) => text.clone(),
+        Value::Null => "{}".to_owned(),
+        other => other.to_string(),
+    };
+    Some(ToolCall {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        arguments,
+    })
+}
+
+/// The thinking among a message's content parts, which Kimi CLI keeps as
+/// `think` parts beside its text.
+fn chat_thinking(content: &Value) -> String {
+    content
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|p| p["type"] == "think")
+                .filter_map(|p| p["think"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// A chat message's `content`: a string, or the text of each part of an
+/// array, joined; a picture in the mix contributes nothing.
+fn chat_text(content: &Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.to_owned();
+    }
+    content
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
 // -- Shared ----------------------------------------------------------------
+
+/// Tags the tools wrap context in when they send it as the user's turn,
+/// though nobody typed it: Claude Code's notes on a slash command and what
+/// it printed, Codex's environment and instructions.
+const INJECTED: &[&str] = &[
+    "local-command-caveat",
+    "command-name",
+    "command-message",
+    "command-args",
+    "local-command-stdout",
+    "local-command-stderr",
+    "system-reminder",
+    "environment_context",
+    "user_instructions",
+    "recommended_plugins",
+    "permissions instructions",
+    "permissions_instructions",
+    "skills_instructions",
+    "apps_instructions",
+    "turn_context",
+    "collaboration_mode",
+];
+
+/// Whether `text` is context a tool added as the user's turn rather than
+/// anything typed, which would otherwise title the session and stand as a
+/// message no one wrote.
+fn injected(text: &str) -> bool {
+    let text = text.trim_start();
+    // Codex before it tagged the project's instructions.
+    if text.starts_with("# AGENTS.md instructions for ") {
+        return true;
+    }
+    let Some(rest) = text.strip_prefix('<') else {
+        return false;
+    };
+    INJECTED.iter().any(|tag| {
+        rest.strip_prefix(tag)
+            .is_some_and(|after| after.starts_with(['>', ' ']))
+    })
+}
+
+/// Whether `text` reports something that happened meanwhile, such as a
+/// background task ending, which is kept as a notice the model still sees.
+fn reports(text: &str) -> bool {
+    text.trim_start().starts_with("<task-notification>")
+}
 
 /// The non-empty lines of `path`, read one at a time so a transcript that has
 /// grown to gigabytes is never held whole; bytes that are not UTF-8 are
@@ -856,12 +1300,12 @@ fn modified_secs(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// A title from the first user message in `messages`: the words on one
-/// line, to the length every session's title is cut to.
+/// A title from the first thing the user said in `messages`: the words on
+/// one line, to the length every session's title is cut to.
 fn first_user_title(messages: &[Message]) -> String {
     messages
         .iter()
-        .find(|m| m.role == "user" && !m.content.trim().is_empty())
+        .find(|m| m.role == "user" && !m.notice && !m.content.trim().is_empty())
         .map(|m| short_title(&m.content))
         .unwrap_or_default()
 }
@@ -1214,6 +1658,145 @@ mod tests {
             into_conversation(imported(Some(here.clone())), 1).workspace,
             Some(here)
         );
+    }
+
+    #[test]
+    fn context_a_tool_slipped_in_neither_titles_the_session_nor_stands_as_said() {
+        let dir = scratch("injected");
+        let claude = concat!(
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: the messages below were generated by the user while running local commands.</local-command-caveat>"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to opus</local-command-stdout>"}}"#,
+            "\n",
+            r#"{"type":"user","cwd":"/w","message":{"role":"user","content":[{"type":"text","text":"Fix the login bug"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"<task-notification>The build finished.</task-notification>"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"On it."}]}}"#,
+            "\n",
+        );
+        let path = write(&dir, "abc.jsonl", claude);
+        let imported = import_claude_code(&path).unwrap();
+        assert_eq!(imported.title, "Fix the login bug");
+        let said: Vec<&str> = imported
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "Fix the login bug",
+                "<task-notification>The build finished.</task-notification>",
+                "On it."
+            ]
+        );
+        // The model still hears that the build finished, as a notice.
+        assert!(imported.messages[1].notice);
+        // Left out on purpose, so not counted as parts that were lost.
+        assert_eq!(imported.skipped, 0);
+        let listed = newest_titled(vec![(Tool::ClaudeCode, path)], 1);
+        assert_eq!(listed[0].title, "Fix the login bug");
+
+        let codex = concat!(
+            r#"{"type":"session_meta","payload":{"id":"c1","cwd":"/w"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/w</cwd>\n</environment_context>"}]}}"#,
+            "\n",
+            r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /w\n\n<INSTRUCTIONS>be brief</INSTRUCTIONS>"}]}}"##,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Add a health check"}]}}"#,
+            "\n",
+        );
+        let path = write(&dir, "rollout-x.jsonl", codex);
+        let imported = import_codex(&path).unwrap();
+        assert_eq!(imported.title, "Add a health check");
+        assert_eq!(imported.messages.len(), 1);
+        assert_eq!(imported.skipped, 0);
+        let listed = newest_titled(vec![(Tool::Codex, path)], 1);
+        assert_eq!(listed[0].title, "Add a health check");
+    }
+
+    #[test]
+    fn a_message_that_only_mentions_a_tag_is_still_said() {
+        assert!(!injected("Why does <command-name> show up in my log?"));
+        assert!(!injected("<command-namespace> is a word I made up"));
+        assert!(injected(
+            "  <system-reminder>\nbe careful</system-reminder>"
+        ));
+        assert!(injected(
+            "<permissions instructions>\nAsk first.</permissions instructions>"
+        ));
+    }
+
+    #[test]
+    fn a_file_moved_out_of_its_tools_folder_is_told_by_how_it_begins() {
+        let dir = scratch("told-apart");
+        let tool = |name: &str, text: &str| {
+            let path = write(&dir, name, text);
+            candidate_at(&path).map(|c| c.tool)
+        };
+        assert_eq!(tool("a.jsonl", CLAUDE_CODE_FIXTURE), Some(Tool::ClaudeCode));
+        assert_eq!(tool("b.jsonl", CODEX_FIXTURE), Some(Tool::Codex));
+        assert_eq!(
+            tool(
+                "c.jsonl",
+                "{\"sessionId\":\"g\",\"projectHash\":\"h\"}\n{\"id\":\"1\",\"type\":\"user\",\"content\":\"hi\"}\n"
+            ),
+            Some(Tool::GeminiCli)
+        );
+        assert_eq!(
+            tool(
+                "d.json",
+                "{\n  \"sessionId\": \"g\",\n  \"projectHash\": \"h\",\n  \"messages\": []\n}"
+            ),
+            Some(Tool::GeminiCli)
+        );
+        assert_eq!(
+            tool(
+                "f.json",
+                "{\"info\": {\"id\": \"ses_1\", \"title\": \"t\"}, \"messages\": []}"
+            ),
+            Some(Tool::Opencode)
+        );
+        assert_eq!(
+            tool(
+                "g.jsonl",
+                "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"<user_query>hi</user_query>\"}]}}\n"
+            ),
+            Some(Tool::Cursor)
+        );
+        assert_eq!(
+            tool(
+                "h.jsonl",
+                "{\"type\":\"session\",\"version\":3,\"id\":\"p\",\"cwd\":\"/w\"}\n"
+            ),
+            Some(Tool::Pi)
+        );
+        assert_eq!(
+            tool(
+                "i.jsonl",
+                "{\"role\":\"_system_prompt\",\"content\":\"hi\"}\n"
+            ),
+            Some(Tool::Kimi)
+        );
+        assert_eq!(
+            tool(
+                "j.jsonl",
+                "{\"version\":\"v1\",\"kind\":\"Prompt\",\"data\":{\"content\":[]}}\n"
+            ),
+            Some(Tool::Kiro)
+        );
+        assert_eq!(
+            tool(
+                "k.jsonl",
+                "{\"id\":\"20261001_a\",\"source\":\"cli\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}\n"
+            ),
+            Some(Tool::Hermes)
+        );
+        assert_eq!(tool("e.json", "{\"some\": \"settings\"}"), None);
     }
 
     #[test]

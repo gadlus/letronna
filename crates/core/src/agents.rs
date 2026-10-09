@@ -1477,7 +1477,7 @@ fn helper_session_model(parent: &Connection, model: &str, fork: bool) -> String 
 /// comes last.
 fn usable(connection: &Connection, def: &AgentDef) -> Vec<String> {
     let every = tools::all();
-    let mut usable: Vec<String> = tools::specs_of(&every, connection, false)
+    let mut usable: Vec<String> = tools::specs_of(&every, connection, Default::default())
         .iter()
         .filter_map(|spec| spec["function"]["name"].as_str())
         .filter(|name| {
@@ -1485,7 +1485,8 @@ fn usable(connection: &Connection, def: &AgentDef) -> Vec<String> {
         })
         .map(str::to_owned)
         .collect();
-    if mcp_find::on_demand(&every) && usable.iter().any(|name| mcp_find::is_mcp(name)) {
+    let on_demand = mcp_find::OnDemand::of(connection, &every);
+    if usable.iter().any(|name| on_demand.leaves_out(name)) {
         usable.extend([mcp_find::FIND_TOOLS, mcp_find::CALL_MCP_TOOL].map(String::from));
     }
     usable
