@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 mod cursor;
 mod gemini;
+mod kimi;
 mod opencode;
 mod pi;
 
@@ -44,6 +45,7 @@ pub enum Tool {
     #[serde(rename = "openclaw")]
     OpenClaw,
     Pi,
+    Kimi,
 }
 
 impl Tool {
@@ -57,6 +59,7 @@ impl Tool {
             Tool::Cursor => "Cursor",
             Tool::OpenClaw => "OpenClaw",
             Tool::Pi => "pi",
+            Tool::Kimi => "Kimi CLI",
         }
     }
 }
@@ -129,6 +132,9 @@ pub fn list(limit: usize) -> Vec<Candidate> {
     if let Some(root) = pi::pi_root() {
         files.extend(pi::pi_files(&root).into_iter().map(|p| (Tool::Pi, p)));
     }
+    if let Some(root) = kimi::root() {
+        files.extend(kimi::files(&root).into_iter().map(|p| (Tool::Kimi, p)));
+    }
     let mut found = newest_titled(files, limit);
     found.extend(opencode::list(limit));
     found.sort_by_key(|c| std::cmp::Reverse(c.updated));
@@ -183,6 +189,7 @@ fn head(tool: Tool, path: &Path) -> (String, String, Option<PathBuf>) {
         Tool::Opencode => opencode::head(path),
         Tool::Cursor => cursor::head(path),
         Tool::OpenClaw | Tool::Pi => pi::head(path),
+        Tool::Kimi => kimi::head(path),
     }
 }
 
@@ -197,6 +204,7 @@ pub fn import(candidate: &Candidate) -> Result<Imported, String> {
         Tool::Opencode => opencode::import(&candidate.path, &candidate.session_id),
         Tool::Cursor => cursor::import(&candidate.path),
         Tool::OpenClaw | Tool::Pi => pi::import(&candidate.path, candidate.tool),
+        Tool::Kimi => kimi::import(&candidate.path),
     }
 }
 
@@ -244,6 +252,9 @@ fn tool_at(path: &Path) -> Option<Tool> {
     if inside(".openclaw") {
         return Some(Tool::OpenClaw);
     }
+    if inside(".kimi") {
+        return Some(Tool::Kimi);
+    }
     if path.extension().is_some_and(|e| e == "json") {
         // One document, read whole to tell whose it is.
         let doc: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
@@ -268,6 +279,11 @@ fn tool_at(path: &Path) -> Option<Tool> {
     // pi's header; OpenClaw writes the same, and is told by its folder.
     if first["type"] == "session" {
         return Some(Tool::Pi);
+    }
+    // Messages as chat APIs take them, a line each, with Kimi CLI's own
+    // records named `_system_prompt`, `_usage` and `_checkpoint`.
+    if first["role"].is_string() && first.get("message").is_none() && first.get("type").is_none() {
+        return Some(Tool::Kimi);
     }
     // A line per message with no record type, unlike Claude Code's.
     if first["role"].is_string() && first["message"].is_object() && first.get("type").is_none() {
@@ -1012,11 +1028,18 @@ fn chat_messages(items: &[Value], skipped: &mut usize) -> Vec<Message> {
                 for call in &tool_calls {
                     names.insert(call.id.clone(), call.name.clone());
                 }
+                let reasoning = match item["reasoning"]
+                    .as_str()
+                    .or_else(|| item["reasoning_content"].as_str())
+                {
+                    Some(reasoning) => reasoning.to_owned(),
+                    None => chat_thinking(&item["content"]),
+                };
                 out.push(Message {
                     role: "assistant".into(),
                     content,
                     model: item["model"].as_str().unwrap_or_default().to_owned(),
-                    reasoning: item["reasoning"].as_str().unwrap_or_default().to_owned(),
+                    reasoning,
                     tool_calls,
                     ..Default::default()
                 });
@@ -1064,6 +1087,22 @@ fn chat_call(call: &Value) -> Option<ToolCall> {
         name: name.to_owned(),
         arguments,
     })
+}
+
+/// The thinking among a message's content parts, which Kimi CLI keeps as
+/// `think` parts beside its text.
+fn chat_thinking(content: &Value) -> String {
+    content
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|p| p["type"] == "think")
+                .filter_map(|p| p["think"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
 }
 
 /// A chat message's `content`: a string, or the text of each part of an
@@ -1692,6 +1731,13 @@ mod tests {
                 "{\"type\":\"session\",\"version\":3,\"id\":\"p\",\"cwd\":\"/w\"}\n"
             ),
             Some(Tool::Pi)
+        );
+        assert_eq!(
+            tool(
+                "i.jsonl",
+                "{\"role\":\"_system_prompt\",\"content\":\"hi\"}\n"
+            ),
+            Some(Tool::Kimi)
         );
         assert_eq!(tool("e.json", "{\"some\": \"settings\"}"), None);
     }
