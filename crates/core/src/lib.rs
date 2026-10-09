@@ -33,6 +33,7 @@ pub mod diag;
 mod docs;
 mod downloads;
 pub mod driver;
+mod echo;
 mod edit;
 pub mod failure;
 pub mod fallback;
