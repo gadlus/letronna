@@ -12,6 +12,7 @@ use crate::chat::{Connection, Remote};
 use crate::driver::{AgentId, Allow};
 use crate::grep::{SEARCH_FILES, SEARCH_TIME};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -142,8 +143,22 @@ impl ToolContext {
 pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
+    /// The description a request over `connection` sends, where it depends
+    /// on the session, so it names no tool or way of working that session
+    /// lacks. `offered` names every tool that request can call, those left
+    /// out on demand among them.
+    fn description_for(&self, connection: &Connection, offered: &[&str]) -> Cow<'static, str> {
+        let _ = (connection, offered);
+        self.description().into()
+    }
     /// JSON schema for the arguments object.
     fn parameters(&self) -> Value;
+    /// The arguments a request over `connection` offers, less any that
+    /// would mean nothing in that session.
+    fn parameters_for(&self, connection: &Connection) -> Value {
+        let _ = connection;
+        self.parameters()
+    }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String>;
     /// Whether the user must approve each call before it runs.
     fn needs_approval(&self) -> bool {
@@ -740,6 +755,22 @@ pub(crate) fn specs_of(
     connection: &Connection,
     on_demand: crate::mcp_find::OnDemand,
 ) -> Vec<Value> {
+    let callable = callable(tools, connection);
+    let offered: Vec<&str> = callable.iter().map(|t| t.name()).collect();
+    callable
+        .iter()
+        .filter(|t| crate::mcp_find::in_array(t.name(), on_demand))
+        .map(|t| spec_for(t.as_ref(), connection, &offered))
+        .collect()
+}
+
+/// Which of `tools` a request over `connection` offers, in its array or on
+/// demand, the pair that stands in for those left out among them whether
+/// or not anything is (see `mcp_find::in_array`).
+pub(crate) fn callable<'a>(
+    tools: &'a [Arc<dyn Tool>],
+    connection: &Connection,
+) -> Vec<&'a Arc<dyn Tool>> {
     let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
     let history = connection
         .remote
@@ -756,14 +787,12 @@ pub(crate) fn specs_of(
         .iter()
         .filter(|t| !switched_off(t.name(), &disabled))
         .filter(|t| !scheduled || !crate::schedule::NOT_AVAILABLE.contains(&t.name()))
-        .filter(|t| crate::mcp_find::in_array(t.name(), on_demand))
         .filter(|t| !planning || !t.mutates() || t.name() == "run_command")
         .filter(|t| t.name() != EXIT_PLAN || plan)
         .filter(|t| !shared || !t.machine())
         .filter(|t| history || !t.needs_history())
         .filter(|t| t.offered(connection))
         .filter(|t| t.suits(&connection.model))
-        .map(|t| spec(t.as_ref()))
         .collect()
 }
 
@@ -823,6 +852,16 @@ pub(crate) fn spec(tool: &dyn Tool) -> Value {
         "name": tool.name(),
         "description": tool.description(),
         "parameters": tool.parameters(),
+    }})
+}
+
+/// How `tool` is offered in a request over `connection` that can call the
+/// tools `offered` names.
+fn spec_for(tool: &dyn Tool, connection: &Connection, offered: &[&str]) -> Value {
+    json!({"type": "function", "function": {
+        "name": tool.name(),
+        "description": tool.description_for(connection, offered),
+        "parameters": tool.parameters_for(connection),
     }})
 }
 
@@ -3668,6 +3707,10 @@ fn past_echo<'a>(output: &'a str, typed: &str, recalled: bool) -> &'a str {
     output.strip_prefix(typed.trim()).unwrap_or(output)
 }
 
+/// How `wait`'s description ends where wake_me is offered too.
+const WAKE_ME_INSTEAD: &str =
+    " If you have wake_me, use it instead of a plain pause over 30 seconds.";
+
 struct Wait;
 impl Tool for Wait {
     fn hides_key_shapes(&self) -> bool {
@@ -3678,6 +3721,15 @@ impl Tool for Wait {
     }
     fn description(&self) -> &'static str {
         "Pause before continuing: for a number of seconds, or until a background job prints something. Use it to let a server come up before calling it; waiting for a job's `until` ends as soon as it prints. Only what the job prints after the wait begins counts; read_job shows what it printed before. If you have wake_me, use it instead of a plain pause over 30 seconds."
+    }
+    // Where wake_me is not offered, as in a run nobody watches, the sentence
+    // on it would send the model looking for a tool it cannot have.
+    fn description_for(&self, _: &Connection, offered: &[&str]) -> Cow<'static, str> {
+        let said = self.description();
+        if offered.contains(&"wake_me") {
+            return said.into();
+        }
+        said.strip_suffix(WAKE_ME_INSTEAD).unwrap_or(said).into()
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -8847,5 +8899,67 @@ mod tests {
         assert!(edit.contains("search hits and command output do not count"));
         assert!(edit.contains("need not be read back"));
         assert!(WriteFile.description().contains("in an earlier reply"));
+    }
+
+    /// Whether `text` names the tool `name`: a name with an underscore
+    /// anywhere as a word of its own, and a plain word only where it is
+    /// plainly a tool's, in backticks or followed by "tool".
+    fn names_tool(text: &str, name: &str) -> bool {
+        if !name.contains('_') {
+            return text.contains(&format!("`{name}`")) || text.contains(&format!("{name} tool"));
+        }
+        let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        text.match_indices(name).any(|(at, _)| {
+            !text[..at].ends_with(word) && !text[at + name.len()..].starts_with(word)
+        })
+    }
+
+    #[test]
+    fn every_tool_an_offered_description_names_can_be_called() {
+        let every = all();
+        let named: Vec<&str> = every.iter().map(|tool| tool.name()).collect();
+        let unwatched = Connection {
+            tools: true,
+            ..Default::default()
+        };
+        let lean = Connection {
+            lean_tools: true,
+            ..unwatched.clone()
+        };
+        let watched = Connection {
+            human: true,
+            ..unwatched.clone()
+        };
+        for connection in [lean, unwatched, watched] {
+            let callable: Vec<&str> = callable(&every, &connection)
+                .iter()
+                .map(|tool| tool.name())
+                .collect();
+            for spec in specs(&connection) {
+                let text = spec["function"].to_string();
+                for name in named.iter().filter(|name| names_tool(&text, name)) {
+                    assert!(
+                        callable.contains(name),
+                        "{} names {name}, which is neither sent nor found",
+                        spec["function"]["name"]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wait_names_wake_me_only_where_it_is_offered() {
+        let lean = Connection {
+            tools: true,
+            lean_tools: true,
+            ..Default::default()
+        };
+        let without = Wait.description_for(&lean, &["wait"]);
+        assert!(!without.contains("wake_me"), "{without}");
+        assert!(without.ends_with("read_job shows what it printed before."));
+        let with = Wait.description_for(&lean, &["wait", "wake_me"]);
+        assert_eq!(with, Wait.description());
+        assert!(with.ends_with(WAKE_ME_INSTEAD));
     }
 }

@@ -1216,7 +1216,12 @@ fn system_prompt(
         // A chat app is not the terminal or the window, and /resume means
         // nothing there; the remote text below says where the session is.
         if connection.remote.is_none() {
-            system.push_str(" You run in Letronna, not in any other assistant; other tools' commands do not apply here. The user's earlier conversations are sessions: list_sessions shows them, and the user picks one up with the /resume command or `letronna --resume <id>`.");
+            system.push_str(" You run in Letronna, not in any other assistant; other tools' commands do not apply here.");
+            // Only someone there picks a session back up, and a run nobody
+            // watches finds list_sessions only on demand.
+            if crate::prompt_rules::watched(connection) {
+                system.push_str(" The user's earlier conversations are sessions: list_sessions shows them, and the user picks one up with the /resume command or `letronna --resume <id>`.");
+            }
             system.push_str(&crate::prompt_rules::told(
                 connection,
                 &crate::prompt_rules::TERMINAL,
@@ -6549,6 +6554,23 @@ mod tests {
 
         assert!(!watched.contains("on PATH"), "{watched}");
         assert!(!chat.contains("on PATH"), "{chat}");
+    }
+
+    #[test]
+    fn only_a_watched_session_is_told_how_to_pick_up_earlier_ones() {
+        let unwatched = system_with_tools(connection());
+        let watched = system_with_tools(Connection {
+            human: true,
+            ..connection()
+        });
+        let sentence = " The user's earlier conversations are sessions: list_sessions shows them";
+        assert!(watched.contains(sentence), "{watched}");
+        assert!(!unwatched.contains("list_sessions"), "{unwatched}");
+        assert!(!unwatched.contains("/resume"), "{unwatched}");
+        // Both still know where they run.
+        for system in [watched, unwatched] {
+            assert!(system.contains(" You run in Letronna, not in any other assistant;"));
+        }
     }
 
     #[test]
