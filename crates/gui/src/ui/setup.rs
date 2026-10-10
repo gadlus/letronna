@@ -24,8 +24,10 @@ impl Chat {
         cx.notify();
     }
 
-    /// Leave the page: Begin, or asking anything at all.
+    /// Leave the page: Begin, or asking anything at all. The app fades in
+    /// under the page's colour rather than appearing all at once.
     pub(crate) fn close_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        crate::ui::motion::veil(cx.theme().background, cx);
         self.show_setup = None;
         self.focus_composer(window, cx);
         cx.notify();
@@ -79,7 +81,7 @@ impl Chat {
                             .px_6()
                             .gap_8()
                             .child(progress(now, cx))
-                            .child(page),
+                            .child(arrive(page, now, cx)),
                     ),
             )
             .vertical_scrollbar(&scroll)
@@ -571,6 +573,24 @@ impl Chat {
 
 /// How many steps: welcome, connect, model, folder.
 const STEPS: usize = 4;
+
+/// A step coming in: it rises into place as it fades in, afresh on every
+/// change of step, back or on. Still while motion is reduced.
+fn arrive(page: AnyElement, step: usize, cx: &App) -> AnyElement {
+    use crate::ui::motion;
+    if cx.reduce_motion() {
+        return page;
+    }
+    div()
+        .relative()
+        .child(page)
+        .with_animation(
+            ("setup-step", step),
+            motion::enter(motion::GENTLE),
+            |el, t| motion::rise(el, t),
+        )
+        .into_any_element()
+}
 
 /// A thin bar per step, the ones done and the one open filled in.
 fn progress(now: usize, cx: &App) -> Div {
