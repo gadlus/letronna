@@ -82,6 +82,8 @@ windows = { version = "0.61", features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# The menu bar icon, top right; the menu is the system's own.
+tray-icon = "0.25"
 # Command Line Tools ship no `xcrun metal`, so let the Metal driver compile the
 # shaders at startup rather than at build time.
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8", features = ["runtime_shaders"] }

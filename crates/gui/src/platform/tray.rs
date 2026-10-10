@@ -3,30 +3,28 @@
 //! Windows draws its own themed popup on right click so the menu matches the
 //! app. Linux goes through KSNI, which speaks StatusNotifierItem over D-Bus
 //! from a worker thread: no GTK main loop to reconcile with gpui's, and the
-//! panel draws the menu itself, so there the menu is native.
+//! panel draws the menu itself, so there the menu is native. macOS puts the
+//! icon in the menu bar, top right, with the system's own menu on right click
+//! that also says how things stand: the account, the model, what is running.
 
 use crate::prelude::*;
 
 /// Install the tray icon, if this platform has one.
 pub(crate) fn init(cx: &mut App) {
-    #[cfg(any(windows, target_os = "linux"))]
     imp::init(cx);
-    #[cfg(not(any(windows, target_os = "linux")))]
-    let _ = cx;
 }
 
 /// Whether closing the window should leave the app running. Without a tray
-/// there would be no way back, so the app quits instead.
+/// there would be no way back, so the app quits instead. On macOS closing the
+/// window quits as before: the menu bar icon is for while it is open.
 pub(crate) fn available() -> bool {
     cfg!(any(windows, target_os = "linux"))
 }
 
-#[cfg(any(windows, target_os = "linux"))]
 fn main_window(cx: &App) -> Option<AnyWindowHandle> {
     cx.windows().into_iter().next()
 }
 
-#[cfg(any(windows, target_os = "linux"))]
 fn show_main_window(cx: &mut App) {
     if let Some(handle) = main_window(cx) {
         let _ = handle.update(cx, |_, window, _| super::window::show(window));
@@ -34,7 +32,6 @@ fn show_main_window(cx: &mut App) {
 }
 
 /// Bring the window forward on the About page and look for a new version.
-#[cfg(any(windows, target_os = "linux"))]
 fn check_for_updates(cx: &mut App) {
     show_main_window(cx);
     let Some(handle) = main_window(cx) else {
@@ -56,6 +53,14 @@ use windows_impl as imp;
 
 #[cfg(target_os = "linux")]
 use linux_impl as imp;
+
+#[cfg(target_os = "macos")]
+use macos_impl as imp;
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+mod imp {
+    pub(super) fn init(_: &mut crate::prelude::App) {}
+}
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
@@ -306,5 +311,167 @@ mod windows_impl {
                     },
                 )
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos_impl {
+    use super::{check_for_updates, show_main_window};
+    use crate::prelude::*;
+    use std::time::Duration;
+    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::{
+        Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
+    };
+
+    /// The icon, and the rows that say how things stand, rewritten as they
+    /// change.
+    struct Tray {
+        _icon: TrayIcon,
+        account: MenuItem,
+        credit: MenuItem,
+        model: MenuItem,
+        running: MenuItem,
+    }
+    impl Global for Tray {}
+
+    /// Ids are matched back from the menu event, so keep them stable.
+    const SHOW: &str = "show";
+    const QUICK_ENTRY: &str = "quick-entry";
+    const UPDATES: &str = "updates";
+    const QUIT: &str = "quit";
+
+    fn icon() -> Option<Icon> {
+        let bytes = crate::assets::Assets
+            .load("images/letronna.png")
+            .ok()
+            .flatten()?;
+        let image = image::load_from_memory(&bytes).ok()?.into_rgba8();
+        let (width, height) = image.dimensions();
+        Icon::from_rgba(image.into_raw(), width, height).ok()
+    }
+
+    /// A row that only informs: greyed out, does nothing when picked.
+    fn info(text: &str) -> MenuItem {
+        MenuItem::new(text, false, None)
+    }
+
+    pub(super) fn init(cx: &mut App) {
+        let menu = Menu::new();
+        let version = info(&format!("{BRAND} {}", env!("CARGO_PKG_VERSION")));
+        let (account, credit, model, running) = (info(""), info(""), info(""), info(""));
+        let show = MenuItem::with_id(SHOW, format!("Open {BRAND}"), true, None);
+        let quick_entry = MenuItem::with_id(QUICK_ENTRY, "Quick entry", true, None);
+        let updates = MenuItem::with_id(UPDATES, "Check for updates", true, None);
+        let quit = MenuItem::with_id(QUIT, format!("Quit {BRAND}"), true, None);
+        if menu
+            .append_items(&[
+                &version,
+                &account,
+                &credit,
+                &model,
+                &running,
+                &PredefinedMenuItem::separator(),
+                &show,
+                &quick_entry,
+                &PredefinedMenuItem::separator(),
+                &updates,
+                &quit,
+            ])
+            .is_err()
+        {
+            return;
+        }
+        let mut builder = TrayIconBuilder::new()
+            .with_tooltip(BRAND)
+            .with_menu(Box::new(menu))
+            // Left click opens the window; the menu is for the right.
+            .with_menu_on_left_click(false);
+        if let Some(icon) = icon() {
+            builder = builder.with_icon(icon);
+        }
+        let Ok(icon) = builder.build() else {
+            return;
+        };
+        cx.set_global(Tray {
+            _icon: icon,
+            account,
+            credit,
+            model,
+            running,
+        });
+
+        cx.spawn(async move |cx| {
+            let mut ticks = 0u32;
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        cx.update(show_main_window);
+                    }
+                }
+                while let Ok(event) = MenuEvent::receiver().try_recv() {
+                    cx.update(|cx| match event.id.0.as_str() {
+                        SHOW => show_main_window(cx),
+                        QUICK_ENTRY => crate::ui::quick::toggle(cx),
+                        UPDATES => check_for_updates(cx),
+                        QUIT => cx.quit(),
+                        _ => {}
+                    });
+                }
+                // Every two seconds is fresh enough for a menu opened by hand.
+                if ticks.is_multiple_of(10) {
+                    cx.update(refresh);
+                }
+                ticks = ticks.wrapping_add(1);
+            }
+        })
+        .detach();
+    }
+
+    fn dollars(cents: i64) -> String {
+        format!("${}.{:02}", cents / 100, cents.rem_euclid(100))
+    }
+
+    /// Rewrite the rows from the window's own state.
+    fn refresh(cx: &mut App) {
+        let Some(chat) = cx.try_global::<crate::ui::quick::MainChat>() else {
+            return;
+        };
+        let chat = chat.0.read(cx);
+        let (account, credit) = match &chat.account {
+            Some(a) => (
+                format!("{} · {}", a.email, a.plan_name()),
+                match &a.team {
+                    Some(team) => format!("Team {}: {} left", team.name, dollars(team.credits)),
+                    None => format!("Credit: {} left", dollars(a.credits)),
+                },
+            ),
+            None => (
+                "Not signed in".to_string(),
+                "Credit: sign in to use hosted models".to_string(),
+            ),
+        };
+        let model = match chat.store.settings.model.as_str() {
+            "" => "Model: none picked yet".to_string(),
+            m => format!("Model: {m}"),
+        };
+        let running = match chat.running_count() {
+            0 => "Nothing running".to_string(),
+            1 => "1 task running".to_string(),
+            n => format!("{n} tasks running"),
+        };
+        let tray = cx.global::<Tray>();
+        tray.account.set_text(account);
+        tray.credit.set_text(credit);
+        tray.model.set_text(model);
+        tray.running.set_text(running);
     }
 }
