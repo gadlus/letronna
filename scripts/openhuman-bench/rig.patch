@@ -1,18 +1,19 @@
 diff --git a/bundles/Dockerfile b/bundles/Dockerfile
-index 10cfec5..b5321f4 100644
+index 10cfec5..74cf63c 100644
 --- a/bundles/Dockerfile
 +++ b/bundles/Dockerfile
-@@ -69,3 +69,15 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+@@ -69,3 +69,16 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
  COPY adapters/deepseek-harness.sh /opt/harness/adapter.sh
  COPY adapters/deepseek-harness-base.sh /opt/harness/deepseek-harness-base.sh
  COPY dsh_run.py /opt/harness/dsh_run.py
 +
-+# Letronna from a prebuilt Linux binary: build.sh stages LETRONNA_LINUX_BIN as the `letronna`
-+# build context and passes LETRONNA_GIT_SHA, the commit it was built from, as GIT_SHA. Running
-+# it here fails the build, not a task, when it cannot start on Ubuntu 22.04.
++# Letronna from a prebuilt Linux binary: build.sh stages LETRONNA_LINUX_BIN as the `letronna-bin`
++# build context (not `letronna`, which would name this stage itself) and passes
++# LETRONNA_GIT_SHA, the commit it was built from, as GIT_SHA. Running it here fails the build,
++# not a task, when it cannot start on Ubuntu 22.04.
 +FROM base AS letronna
 +ARG GIT_SHA=unknown
-+COPY --from=letronna letronna /opt/harness/letronna/letronna
++COPY --from=letronna-bin letronna /opt/harness/letronna/letronna
 +RUN chmod +x /opt/harness/letronna/letronna \
 +    && /opt/harness/letronna/letronna --version \
 +    && echo "${GIT_SHA}" > /opt/harness/letronna/GIT_SHA
@@ -91,7 +92,7 @@ index 0000000..967d162
 +/opt/harness/letronna/letronna -p "$PROMPT" --output json --mode bypass --max-rounds 150 \
 +  | tee "${RESULT_DIR:-/results}/letronna.json"
 diff --git a/bundles/build.sh b/bundles/build.sh
-index 48d131c..f9b8d12 100755
+index 48d131c..764b2ec 100755
 --- a/bundles/build.sh
 +++ b/bundles/build.sh
 @@ -1,6 +1,6 @@
@@ -115,7 +116,7 @@ index 48d131c..f9b8d12 100755
 +    rm -rf "$staged"; mkdir -p "$staged"
 +    cp "$bin" "$staged/letronna"
 +    docker build -f "$here/bundles/Dockerfile" --platform "$platform" --target letronna "${args[@]}" \
-+      --build-context "letronna=$staged" --build-arg "GIT_SHA=$sha" -t "$image" "$here/bundles"
++      --build-context "letronna-bin=$staged" --build-arg "GIT_SHA=$sha" -t "$image" "$here/bundles"
 +    ;;
    deepseek-harness-minimal)
      # Same install as deepseek-harness; only the adapter (profile) differs.
