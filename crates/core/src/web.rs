@@ -181,6 +181,9 @@ impl Tool for WebFetch {
     fn untrusted(&self) -> bool {
         true
     }
+    fn fences_its_errors(&self) -> bool {
+        true
+    }
     fn preview(&self, args: &Value, _: &ToolContext) -> String {
         format!("GET {}", args["url"].as_str().unwrap_or_default())
     }
@@ -242,7 +245,7 @@ fn fetch(raw: &str, secrets: &[String], fresh: bool) -> Result<Page, String> {
         }
         let response = request
             .send()
-            .map_err(|e| format!("Could not fetch the page: {e}"))?;
+            .map_err(|e| unanswered("Could not fetch the page:", &e, !previous.is_empty()))?;
         let Some(next) = moved_to(&response) else {
             break response;
         };
@@ -293,13 +296,51 @@ fn fetch(raw: &str, secrets: &[String], fresh: bool) -> Result<Page, String> {
     {
         body
     } else {
-        return Err(format!("That is not a page of text ({kind})."));
+        // The kind is the server's to name, in any words it likes.
+        return Err(crate::untrusted::quoted(
+            "That is not a page of text; the server says it is:",
+            &kind,
+        ));
     };
     let text = format!("{address}\n\n{text}");
     if remember && let Ok(mut memo) = MEMO.lock() {
         memo.put([asked, memo_key(&reached)], text.clone(), Instant::now());
     }
     Ok(Page::Text(text))
+}
+
+/// `lead` over why a request got no answer, `moved` when a redirect sent it
+/// somewhere other than the address asked for. reqwest's words are
+/// Letronna's own until the server has a say in them: the address its
+/// redirect gave, or what its certificate names when the secure connection
+/// failed over it. Those are fenced as its words, which marks the session.
+pub(crate) fn unanswered(lead: &str, e: &reqwest::Error, moved: bool) -> String {
+    let said = match handshake_failure(e) {
+        Some(why) => format!("{e}; the secure connection failed: {why}"),
+        None if moved => e.to_string(),
+        None => return format!("{lead} {e}"),
+    };
+    crate::untrusted::quoted(lead, &said)
+}
+
+/// Why the TLS handshake `e` ended was turned down, when it was.
+fn handshake_failure(e: &reqwest::Error) -> Option<String> {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(error) = cause {
+        if let Some(tls) = error.downcast_ref::<rustls::Error>() {
+            return Some(tls.to_string());
+        }
+        // An I/O error hands on its inner error's cause, not the inner error,
+        // and rustls's travels inside one.
+        cause = match error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+        {
+            Some(inner) => Some(inner as &(dyn std::error::Error + 'static)),
+            None => error.source(),
+        };
+    }
+    None
 }
 
 /// The error `code` a page answered, over what it said with it when that is
@@ -1777,6 +1818,65 @@ or <a data-href="/x" href=/top#part>the top</a>.</p>
         assert!(!asked.iter().any(|path| path.contains(&key)), "{asked:?}");
         // The address asked for, then the five redirects that are followed.
         assert_eq!(asked.iter().filter(|path| *path == "/loop").count(), 6);
+    }
+
+    /// The stand-in site's answers that are no page: a redirect to where
+    /// nothing answers, and a file of a kind the server names.
+    fn no_page(path: &str) -> String {
+        match path {
+            "/away" => "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/obey-this\r\n\
+                        Content-Length: 0\r\nConnection: close\r\n\r\n"
+                .into(),
+            _ => "HTTP/1.1 200 OK\r\nContent-Type: application/x-obey-this\r\n\
+                  Content-Length: 1\r\nConnection: close\r\n\r\nx"
+                .into(),
+        }
+    }
+
+    #[test]
+    fn a_failure_fences_whatever_the_server_had_a_say_in_and_marks_only_then() {
+        let fenced = crate::untrusted::holds_fence;
+        // Nothing answers on port 1 of this machine.
+        let why = fetch("http://127.0.0.1:1/", &[], false).unwrap_err();
+        assert!(why.starts_with("Could not fetch the page: "), "{why}");
+        assert!(!fenced(&why), "{why}");
+        let (base, _) = serve(no_page);
+        let why = fetch(&format!("{base}/away"), &[], false).unwrap_err();
+        assert!(
+            why.starts_with("Could not fetch the page:\n<untrusted-"),
+            "{why}"
+        );
+        assert!(why.contains("127.0.0.1:1/obey-this"), "{why}");
+        let why = fetch(&format!("{base}/file"), &[], false).unwrap_err();
+        assert!(
+            fenced(&why) && why.contains("application/x-obey-this"),
+            "{why}"
+        );
+        // A server answering https in plain words turns the handshake down
+        // with what it sent.
+        let plain = TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = plain.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = plain.accept() {
+                let _ = socket.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+            }
+        });
+        let why = fetch(&format!("https://{at}/"), &[], false).unwrap_err();
+        assert!(fenced(&why), "{why}");
+        assert!(why.contains("the secure connection failed: "), "{why}");
+
+        let ctx = ToolContext::of(&crate::chat::Connection {
+            conversation: 731_081,
+            ..Default::default()
+        });
+        let call = |url: String| json!({ "url": url }).to_string();
+        crate::tools::run("web_fetch", &call("http://127.0.0.1:1/".into()), &ctx).unwrap_err();
+        assert!(!crate::taint::marked(&ctx), "an unreached page marked it");
+        crate::tools::run("web_fetch", &call(format!("{base}/away")), &ctx).unwrap_err();
+        assert!(
+            crate::taint::marked(&ctx),
+            "a redirect's address did not mark it"
+        );
     }
 
     /// The stand-in site's error answers, each with a body of its own.

@@ -425,6 +425,9 @@ impl Tool for SearchWeb {
     fn untrusted(&self) -> bool {
         true
     }
+    fn fences_its_errors(&self) -> bool {
+        true
+    }
     fn preview(&self, args: &Value, _: &ToolContext) -> String {
         let query = args["query"].as_str().unwrap_or_default();
         // Tavily and Exa are sent the sites too, and DuckDuckGo a single
@@ -871,13 +874,20 @@ fn ask(reach: &Reach, query: &str, count: u64, options: &Options) -> Result<Stri
             options,
         )),
     };
-    let reply = request.send().map_err(|e| match e.is_timeout() {
+    let unreached =
+        |e: reqwest::Error| format!("Could not reach {} at {address}: {e}", service.name);
+    let request = request.build().map_err(unreached)?;
+    let asked = request.url().clone();
+    let reply = client.execute(request).map_err(|e| match e.is_timeout() {
         true => format!(
             "{} did not answer within {} seconds.",
             service.name,
             SEARCH_TIME.as_secs()
         ),
-        false => format!("Could not reach {} at {address}: {e}", service.name),
+        false => {
+            let lead = format!("Could not reach {} at {address}:", service.name);
+            crate::web::unanswered(&lead, &e, e.url() != Some(&asked))
+        }
     })?;
     let status = reply.status();
     // The site a redirect points to, which only DuckDuckGo's are left unfollowed.
@@ -902,21 +912,26 @@ fn ask(reach: &Reach, query: &str, count: u64, options: &Options) -> Result<Stri
         // Sent on rather than answered is the query's doing, not a limit, so
         // it neither reads as one nor holds the next search off.
         if status.is_redirection() {
-            let to = elsewhere
-                .map(|host| format!(" to {host}"))
-                .unwrap_or_default();
             // It may redirect for reasons of its own too, where dropping a
             // bang the query does not have would be no help.
             let next = if sends_on(query) {
-                ", as it does for a word starting with ! or a query starting with \\. It was \
-                 not followed: search again without them."
+                "It does so for a word starting with ! or a query starting with \\. It was not \
+                 followed: search again without them."
             } else {
-                ". It was not followed: read a page you know with web_fetch, or search again \
-                 later."
+                "It was not followed: read a page you know with web_fetch, or search again later."
             };
-            return Err(format!(
-                "DuckDuckGo answered by sending this search on{to} rather than listing results{next}"
-            ));
+            // The site is the redirect's to name, in any words it likes.
+            let sent_on = match elsewhere {
+                Some(host) => {
+                    let lead = "DuckDuckGo answered by sending this search on rather than \
+                                listing results, to:";
+                    crate::untrusted::quoted(lead, &host) + "\n"
+                }
+                None => "DuckDuckGo answered by sending this search on rather than listing \
+                         results. "
+                    .to_owned(),
+            };
+            return Err(format!("{sent_on}{next}"));
         }
         let found = match status.as_u16() {
             202 | 401 | 403 | 429 => None,
@@ -1841,7 +1856,11 @@ mod tests {
         .unwrap_err();
         asked.join().unwrap();
         assert!(
-            error.starts_with("DuckDuckGo answered by sending this search on to 127.0.0.1 "),
+            error.starts_with("DuckDuckGo answered by sending this search on rather"),
+            "{error}"
+        );
+        assert!(
+            error.contains("\n127.0.0.1\n</untrusted-content-"),
             "{error}"
         );
         assert!(error.ends_with("search again without them."), "{error}");
@@ -1858,7 +1877,7 @@ mod tests {
         for (status, said) in [
             (
                 "302 Found\r\nLocation: /html/",
-                "search on to 127.0.0.1 rather",
+                "\n127.0.0.1\n</untrusted-content-",
             ),
             ("301 Moved Permanently", "search on rather"),
         ] {

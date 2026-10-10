@@ -206,6 +206,14 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether each error it returns was checked to fence whatever it quotes
+    /// from outside, so that an error without a fence tells nothing someone
+    /// else wrote reached the model. Off by default: an untrusted tool's
+    /// unchecked errors mark its session as its results do.
+    fn fences_its_errors(&self) -> bool {
+        false
+    }
+
     /// Whether the output comes from outside the user's files -- a command,
     /// a page, a server -- so words shaped like any vendor's key are hidden
     /// in it too, not only the keys Letronna holds.
@@ -875,8 +883,20 @@ pub(crate) fn run_found(
     // showing, and before anything is wrapped around the result.
     let shapes = tool.hides_key_shapes();
     let ran = tool.run(&args, ctx);
-    // Whether it worked or not: an error can quote a page or a server too.
-    if tool.untrusted() {
+    // An error can quote a page or a server too, but one in Letronna's own
+    // words, as when the page could not be reached, gave the model nothing
+    // to be talked into anything by; marked anyway, an offline session would
+    // be asked about its every cleanup as if it had read a page. An MCP
+    // server's errors are its own words however they read.
+    let reached = ran.as_ref().map_or_else(
+        |why| {
+            !tool.fences_its_errors()
+                || crate::mcp::is_tool(tool.name())
+                || crate::untrusted::holds_fence(why)
+        },
+        |_| true,
+    );
+    if tool.untrusted() && reached {
         crate::taint::mark(ctx);
     }
     let ran = ran.map_err(|e| crate::redact::scrub(&e, shapes) + &note + &heard)?;
