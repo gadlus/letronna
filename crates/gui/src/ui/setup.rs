@@ -587,7 +587,7 @@ fn arrive(page: AnyElement, step: usize, cx: &App) -> AnyElement {
         .with_animation(
             ("setup-step", step),
             motion::enter(motion::GENTLE),
-            |el, t| motion::rise(el, t),
+            motion::rise,
         )
         .into_any_element()
 }
