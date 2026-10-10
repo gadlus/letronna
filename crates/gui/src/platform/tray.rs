@@ -341,12 +341,11 @@ mod macos_impl {
     const UPDATES: &str = "updates";
     const QUIT: &str = "quit";
 
+    /// The portrait's ink alone, in a rounded frame: a template image, which
+    /// macOS tints to match the menu bar, light or dark, like its own icons.
     fn icon() -> Option<Icon> {
-        let bytes = crate::assets::Assets
-            .load("images/letronna.png")
-            .ok()
-            .flatten()?;
-        let image = image::load_from_memory(&bytes).ok()?.into_rgba8();
+        let bytes = include_bytes!("../../assets/letronna-menubar.png");
+        let image = image::load_from_memory(bytes).ok()?.into_rgba8();
         let (width, height) = image.dimensions();
         Icon::from_rgba(image.into_raw(), width, height).ok()
     }
@@ -388,7 +387,7 @@ mod macos_impl {
             // Left click opens the window; the menu is for the right.
             .with_menu_on_left_click(false);
         if let Some(icon) = icon() {
-            builder = builder.with_icon(icon);
+            builder = builder.with_icon(icon).with_icon_as_template(true);
         }
         let Ok(icon) = builder.build() else {
             return;
