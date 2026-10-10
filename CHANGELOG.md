@@ -23,9 +23,12 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ### Changed
 - **All** — A model whose window nothing gives is sized as if it held 64,000 tokens when its server takes a key, as a gateway or a LiteLLM proxy does, instead of the smallest window, so old tool results are cleared far later; a server without a key, such as Ollama, keeps the small window, and `LETRONNA_CONTEXT_WINDOW` sets it for a keyed proxy in front of a small local model.
+- **All** — Old tool results are cleared only once a request comes near its budget, and then in chunks of half the window rather than every eight results, so the provider's prompt cache keeps serving the requests in between; results under 600 characters are never cleared, and a cleared one reads as cleared from history, with the call to repeat, rather than to save room.
+- **All** — `/usage` names a cache miss that cleared results or reasoning no longer sent back caused as "an earlier message changed", and says of one where nothing Letronna sends changed that the provider served it without the cache.
 
 ### Fixed
 - **All** — A model its gateway lists only under another vendor's path, such as `deepseek/deepseek-v4.1-flash` listed as `opencode-go/deepseek-v4.1-flash`, is sized by that listed window instead of the smallest one, so old tool results are no longer cleared after a few thousand tokens.
+- **All** — On DeepSeek and Kimi, the reasoning sent back with the tool calls of the turn in progress counts toward the window, so a long turn clears old results before its requests outgrow the model.
 
 ## [0.1.0-alpha.3] - 2026-10-06
 

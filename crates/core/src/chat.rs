@@ -574,9 +574,9 @@ pub(crate) fn tokens(text: &str) -> usize {
 }
 
 /// About what `m` costs in a request that sends `tool_chars` of a tool
-/// result: its text as sent, the calls it makes with their arguments, and
-/// its role.
-fn message_tokens(m: &Message, tool_chars: usize) -> usize {
+/// result: its text as sent, the calls it makes with their arguments, its
+/// role, and its reasoning when it is `echoed` back (`echoes_reasoning`).
+fn message_tokens(m: &Message, tool_chars: usize, echoed: bool) -> usize {
     // A long tool result goes out trimmed to its ends. A string never has
     // fewer bytes than characters, so a short one is never trimmed.
     let content = if m.role == "tool" && m.content.len() > tool_chars {
@@ -589,21 +589,26 @@ fn message_tokens(m: &Message, tool_chars: usize) -> usize {
         .iter()
         .map(|c| tokens(&c.name) + tokens(&c.arguments))
         .sum();
-    MESSAGE_TOKENS + content + calls
+    let reasoning = if echoed { tokens(&m.reasoning) } else { 0 };
+    MESSAGE_TOKENS + content + calls + reasoning
 }
 
 /// The estimate for every start of `messages`: `sums[n]` is the first `n`
 /// messages', so any stretch of them costs one subtraction.
 ///
 /// Pictures are counted where they would go, whether or not the model takes
-/// them, so the window does not move when one turns out not to.
-fn token_sums(messages: &[Message], tool_chars: usize) -> Vec<usize> {
+/// them, so the window does not move when one turns out not to. Reasoning
+/// is counted where a request over `route` sends it back, as one over
+/// `messages` would; with no route, none is.
+fn token_sums(messages: &[Message], tool_chars: usize, route: Option<&Connection>) -> Vec<usize> {
     let pictures = pictures(messages);
+    let turn = messages.iter().rposition(opens_turn);
     let mut sums = Vec::with_capacity(messages.len() + 1);
     let mut total = 0;
     sums.push(total);
     for (i, m) in messages.iter().enumerate() {
-        total += message_tokens(m, tool_chars);
+        let echoed = route.is_some_and(|route| echoes_reasoning(m, route, in_turn(turn, i)));
+        total += message_tokens(m, tool_chars, echoed);
         total += PICTURE_TOKENS * pictures.iter().filter(|p| p.after == i).count();
         sums.push(total);
     }
@@ -636,6 +641,9 @@ struct Budget {
     tokens: usize,
     /// How far apart the places are where the window may start.
     step: usize,
+    /// What a request may carry besides the reply, before the system prompt
+    /// and the tools take their share of it.
+    room: usize,
     /// The most messages the window holds, whatever they cost.
     messages: usize,
     /// The most characters of one tool result that are sent.
@@ -652,6 +660,7 @@ impl Budget {
     const SMALL: Self = Self {
         tokens: CONTEXT_TOKENS,
         step: CONTEXT_TOKENS / 2,
+        room: CONTEXT_TOKENS,
         messages: MAX_MESSAGES,
         tool_chars: MAX_TOOL_CHARS,
         reply: REPLY_TOKENS,
@@ -777,8 +786,12 @@ fn context_parts(connection: &Connection, messages: &[Message], floor: usize) ->
         (0, 0)
     };
     let request_budget = budget(connection, crate::store::sizing());
-    let start = window_from(messages, &request_budget, floor);
-    let sums = token_sums(&messages[start..], request_budget.tool_chars);
+    let start = window_from(messages, &request_budget, floor, Some(connection));
+    let sums = token_sums(
+        &messages[start..],
+        request_budget.tool_chars,
+        Some(connection),
+    );
     let conversation = *sums.last().unwrap_or(&0) as u64;
     ContextParts {
         system: system as u64,
@@ -907,6 +920,7 @@ fn sized(context: Option<u64>, output: Option<u64>, cap: usize, fixed: usize) ->
     Budget {
         tokens,
         step,
+        room,
         messages: MAX_MESSAGES * room / CONTEXT_TOKENS,
         // Half the room in characters, about an eighth of it in tokens: the
         // turn in progress, which is never trimmed, still holds several
@@ -941,15 +955,22 @@ fn sized(context: Option<u64>, output: Option<u64>, cap: usize, fixed: usize) ->
 /// The one exception is `floor`, the end of a summary the user asked for,
 /// which the session's file keeps with it: the window starts no earlier, at
 /// the turn it ends on, and steps on from there as from any other place.
-fn window_from(messages: &[Message], budget: &Budget, floor: usize) -> usize {
+/// The reasoning a request over `route` sends back counts toward the budget.
+fn window_from(
+    messages: &[Message],
+    budget: &Budget,
+    floor: usize,
+    route: Option<&Connection>,
+) -> usize {
     let last_user = messages.iter().rposition(opens_turn).unwrap_or(0);
-    start_before(messages, budget, floor, last_user, 0, 0)
+    start_before(messages, budget, floor, last_user, 0, 0, route)
 }
 
 /// Where the window would start for the request after a reply to `messages`
 /// and a turn following it, which add `ahead` tokens between them.
 fn start_ahead(messages: &[Message], budget: &Budget, floor: usize, ahead: usize) -> usize {
-    start_before(messages, budget, floor, messages.len(), ahead, 2)
+    // In the turn that follows, none of this one's reasoning goes back.
+    start_before(messages, budget, floor, messages.len(), ahead, 2, None)
 }
 
 /// `window_from`, where the turn at `last_user` goes in whatever its size,
@@ -961,18 +982,20 @@ fn start_before(
     last_user: usize,
     ahead: usize,
     more: usize,
+    route: Option<&Connection>,
 ) -> usize {
-    let sums = token_sums(messages, budget.tool_chars);
+    let sums = token_sums(messages, budget.tool_chars, route);
     let total = sums[messages.len()] + ahead;
     // Toward the steps a message counts as at least its share of a window
     // full by the message guard, so a run of short ones, which meets the
     // guard long before the budget, still steps on. Pictures are left out:
     // they are counted at the newest few, and a new one must not move the
-    // places behind it.
+    // places behind it. So is reasoning, which goes back only in the turn
+    // in progress, so a place does not move when the turn ends.
     let least = CONTEXT_TOKENS / MAX_MESSAGES;
     let mut marks = vec![0];
     for (i, m) in messages.iter().enumerate() {
-        marks.push(marks[i] + message_tokens(m, budget.tool_chars).max(least));
+        marks.push(marks[i] + message_tokens(m, budget.tool_chars, false).max(least));
     }
     let mut start = summary_end(messages, floor);
     while start < last_user
@@ -1006,7 +1029,7 @@ pub fn opens_turn(message: &Message) -> bool {
 /// `window_from` with no summary the user asked for.
 #[cfg(test)]
 fn window_start(messages: &[Message], budget: &Budget) -> usize {
-    window_from(messages, budget, 0)
+    window_from(messages, budget, 0, None)
 }
 
 /// Where a summary of the first `upto` messages can end: the start of the
@@ -1615,10 +1638,22 @@ fn body_hashed(
     // is one turn, so without this every round would send every result the
     // turn has had again. The session keeps them whole; only the request
     // is shortened.
-    let old = old_before(window, budget);
+    let old = old_before(window, budget, Some(connection));
     let stubs = stubs(window, old, budget.squeezed);
     let hints = crate::subfolders::hints(window, connection);
     let turn = window.iter().rposition(opens_turn);
+    if let Some(prefix) = prefix.as_deref_mut() {
+        // What changes in messages sent before: the results and writes
+        // before `old` go out cleared, and on a route that wants reasoning
+        // back, the newest call whose reasoning went back in its own turn
+        // goes out without it once another turn starts.
+        let emptied = turn.and_then(|start| {
+            window[..start]
+                .iter()
+                .rposition(|m| echoes_reasoning(m, connection, true) && !m.reasoning.is_empty())
+        });
+        prefix.set(crate::cache_miss::Reason::History, (old, emptied));
+    }
     // Once, so the calls in the history and the array agree on which tools
     // go out on demand.
     let every = if connection.tools {
@@ -1642,12 +1677,7 @@ fn body_hashed(
             continue;
         }
         let mut wired = wire_message(m, budget.tool_chars);
-        carry_back(
-            &mut wired,
-            m,
-            connection,
-            turn.is_none_or(|start| i > start),
-        );
+        carry_back(&mut wired, m, connection, in_turn(turn, i));
         if let Some(stub) = &stubs[i] {
             wired["content"] = stub.as_str().into();
         }
@@ -2704,13 +2734,39 @@ fn wire_message(m: &Message, tool_chars: usize) -> Value {
     v
 }
 
+/// Whether `connection`'s model wants the reasoning behind its tool calls
+/// sent back with them: DeepSeek and Kimi in thinking mode do, and DeepSeek
+/// refuses a call without it.
+fn wants_reasoning(connection: &Connection) -> bool {
+    let lower = connection.model.trim().to_lowercase();
+    ["deepseek", "kimi", "moonshot"]
+        .iter()
+        .any(|family| lower.contains(family))
+}
+
+/// Whether `m` goes out over `connection` with its reasoning: a call made
+/// in the turn in progress (`this_turn`) by the model the request goes to,
+/// on a route that wants it back. `carry_back` sends it by this and the
+/// estimate counts it by this, so the window is sized by what is sent.
+fn echoes_reasoning(m: &Message, connection: &Connection, this_turn: bool) -> bool {
+    this_turn
+        && m.role == "assistant"
+        && !m.tool_calls.is_empty()
+        && m.model.trim() == connection.model.trim()
+        && wants_reasoning(connection)
+}
+
+/// Whether the message at `at` is in the turn that starts at `turn`, the
+/// last that opens one, as a request sends its reasoning back.
+fn in_turn(turn: Option<usize>, at: usize) -> bool {
+    turn.is_none_or(|start| at > start)
+}
+
 /// Give back with an assistant message what its provider asked for: the
 /// reasoning details and thought signatures it sent, to the endpoint and
-/// model that sent them and no other. DeepSeek and Kimi in thinking mode
-/// want the reasoning behind a tool call sent back with it, and DeepSeek
-/// refuses the call without it, so theirs get it on every call of the turn
-/// in progress, and an empty one on older calls, whose reasoning they no
-/// longer read.
+/// model that sent them and no other. A route that wants reasoning back
+/// gets it on every call of the turn in progress, and an empty one on older
+/// calls, whose reasoning it no longer reads.
 fn carry_back(wired: &mut Value, m: &Message, connection: &Connection, this_turn: bool) {
     if m.role != "assistant" {
         return;
@@ -2735,58 +2791,78 @@ fn carry_back(wired: &mut Value, m: &Message, connection: &Connection, this_turn
             wired["reasoning_items"] = replay.reasoning_items.clone().into();
         }
     }
-    let lower = model.to_lowercase();
-    let echoes = ["deepseek", "kimi", "moonshot"]
-        .iter()
-        .any(|family| lower.contains(family));
-    if echoes && !m.tool_calls.is_empty() {
-        let own = this_turn && m.model.trim() == model;
+    if !m.tool_calls.is_empty() && wants_reasoning(connection) {
+        let own = echoes_reasoning(m, connection, this_turn);
         wired["reasoning_content"] = if own { m.reasoning.as_str() } else { "" }.into();
     }
 }
 
 /// Results and file bodies shorter than this, in characters, go out as they
-/// are however old or repeated: a line saying what one was costs about as
-/// much, and the model reads it without calling again.
-const STUB_CHARS: usize = 200;
+/// are however old or repeated: a line saying what one was saves too little
+/// to be worth the call the model may make to get it back.
+const STUB_CHARS: usize = 600;
 /// The newest tool results always go out whole, however full the window:
 /// the model is most likely still working from them.
 const KEEP_RESULTS: usize = 5;
-/// How many tool results the boundary of the old ones moves by at once.
-/// Each move changes messages already sent, so the prompt cache misses from
-/// the first of them on; moving every eighth result keeps the requests in
-/// between identical from the front.
-const STUB_STEP: usize = 8;
+/// The least of the newest messages, in estimated tokens, that a move of
+/// the boundary of the old results leaves whole.
+const KEEP_TOKENS: usize = 4_000;
 
-/// Where the old part of `window` ends. Nothing is old until the window,
-/// with every result whole, costs more than half the budget; then what is
-/// old ends at the round holding the result on the last whole step of
-/// `STUB_STEP` results that leaves the newest `KEEP_RESULTS` out. A squeezed
-/// budget makes every result but those newest old at once.
+/// Where the old part of `window` ends, for a request over `route`, whose
+/// reasoning sent back counts. Nothing is old until the window, with every
+/// result whole, costs more than four fifths of the budget: each move of the
+/// boundary changes messages already sent, so the prompt cache misses from
+/// the first of them on, and on a provider that caches, sending a few more
+/// thousand tokens again costs less than that miss.
+///
+/// Then the boundary moves in chunks of a third of the room, or a step of
+/// the window if that is longer, so that the requests between two moves are
+/// identical from the front: what is old ends at the round holding the last
+/// whole chunk of tokens that leaves the newest `KEEP_TOKENS` (a sixteenth
+/// of the room, if that is more) out, and never past the round holding the
+/// newest `KEEP_RESULTS` results. A squeezed budget makes every result but
+/// those newest old at once: after an overflow the cache is missed anyway.
 ///
 /// The cost is taken without stubs, so the room they free cannot turn them
-/// off again on the next request, and results are only ever added, so the
-/// boundary only moves forward until the window itself moves on. A round --
-/// a reply's calls and their results -- is never split, so the one the model
-/// has not answered yet is never old.
-fn old_before(window: &[Message], budget: &Budget) -> usize {
-    if !budget.squeezed && token_sums(window, budget.tool_chars)[window.len()] <= budget.tokens / 2
-    {
-        return 0;
-    }
+/// off again on the next request, and both what is kept and the chunks come
+/// from the budget alone, so results only ever added move the boundary only
+/// forward until the window itself moves on. A round -- a reply's calls and
+/// their results -- is never split, so the one the model has not answered
+/// yet is never old.
+fn old_before(window: &[Message], budget: &Budget, route: Option<&Connection>) -> usize {
+    let round = |at: usize| window[..=at].iter().rposition(|m| m.role != "tool");
     let results: Vec<usize> = (0..window.len())
         .filter(|&i| window[i].role == "tool")
         .collect();
-    // After an overflow the cache is missed anyway, so nothing waits for a step.
-    let step = if budget.squeezed { 1 } else { STUB_STEP };
-    let boundary = results.len().saturating_sub(KEEP_RESULTS) / step * step;
-    if boundary == 0 {
+    let Some(newest) = results
+        .len()
+        .checked_sub(KEEP_RESULTS)
+        .filter(|&n| n > 0)
+        .and_then(|n| round(results[n]))
+    else {
+        return 0;
+    };
+    if budget.squeezed {
+        return newest;
+    }
+    let sums = token_sums(window, budget.tool_chars, route);
+    let total = sums[window.len()];
+    if total <= budget.tokens / 5 * 4 {
         return 0;
     }
-    window[..results[boundary]]
-        .iter()
-        .rposition(|m| m.role != "tool")
-        .unwrap_or(0)
+    let keep = (budget.room / 16).max(KEEP_TOKENS);
+    let chunk = (budget.room / 3).max(budget.step);
+    // No further than the newest results allow, and on a whole chunk still,
+    // so that newer results arriving do not move it on each request.
+    let reach = total.saturating_sub(keep).min(sums[newest + 1] - 1);
+    let target = reach / chunk * chunk;
+    if target == 0 {
+        return 0;
+    }
+    // The first message to take the cost past the target opens the round
+    // the old part ends at.
+    let crossing = sums.partition_point(|&sum| sum <= target) - 1;
+    round(crossing).unwrap_or(0)
 }
 
 /// What goes on the wire instead of each tool result in `window`, where
@@ -2860,8 +2936,8 @@ fn stubs(window: &[Message], old: usize, squeezed: bool) -> Vec<Option<String>> 
                     return None;
                 }
                 return Some(format!(
-                    "[skill \"{name}\" instructions of {size} chars cleared to save room; load it \
-                     again before relying on them]"
+                    "[skill \"{name}\" instructions of {size} chars cleared from history; load \
+                     it again before relying on them]"
                 ));
             }
             // The file a cut result was saved in gives it back without
@@ -2869,10 +2945,12 @@ fn stubs(window: &[Message], old: usize, squeezed: bool) -> Vec<Option<String>> 
             let again = match saved_note(&m.content) {
                 Some(note) => note,
                 None if gated.contains(&m.name) => "",
-                None => "; call it again if you need it",
+                None => "; repeat the call above if you need it",
             };
+            // Said as what became of the history, not that room ran short:
+            // told that, models read in smaller pieces and call more often.
             Some(format!(
-                "[{} result of {size} chars cleared to save room{again}]",
+                "[{} result of {size} chars cleared from history{again}]",
                 m.name
             ))
         })
@@ -3414,8 +3492,8 @@ fn begin(
 ) -> async_channel::Receiver<Event> {
     let budget = budget(&connection, crate::store::sizing());
     // Before the reply exists, so every call it makes is stamped with it.
-    let window = window_from(&messages, &budget, extra.floor);
-    let cleared = window + old_before(&messages[window..], &budget);
+    let window = window_from(&messages, &budget, extra.floor, Some(&connection));
+    let cleared = window + old_before(&messages[window..], &budget, Some(&connection));
     crate::filestate::asked(connection.conversation, messages.len(), window, cleared);
     // Only a reply that may call tools can save to memory.
     if connection.tools {
@@ -3526,7 +3604,7 @@ fn claim_next<'a>(
     let next = start_ahead(messages, budget, floor, budget.tokens / 4);
     // Only a place among the messages sent: where the reply's own turn falls
     // is not known yet.
-    if next <= window_from(messages, budget, floor) || next >= messages.len() {
+    if next <= window_from(messages, budget, floor, Some(connection)) || next >= messages.len() {
         return None;
     }
     // Nobody waits for it yet, so it is a background call: without a permit
@@ -3551,11 +3629,11 @@ fn send_window(
     if let Some(failure) = doomed(connection, messages, budget) {
         return Err(failure);
     }
-    let start = window_from(messages, budget, extra.floor);
+    let start = window_from(messages, budget, extra.floor, Some(connection));
     // A fallback or a refit can start later than the window stamped before
     // the call, and a read it leaves out must not let an edit through; a
     // squeezed refit clears more results too.
-    let cleared = start + old_before(&messages[start..], budget);
+    let cleared = start + old_before(&messages[start..], budget, Some(connection));
     crate::filestate::asked(connection.conversation, messages.len(), start, cleared);
     stream(connection, messages, start, budget, extra, lsp, sender)
 }
@@ -3606,11 +3684,11 @@ pub fn compact(
     }
     validate(connection)?;
     let budget = budget(connection, crate::store::sizing());
-    let start = window_from(messages, &budget, floor);
+    let start = window_from(messages, &budget, floor, Some(connection));
     if end <= start {
         return Err("Nothing to summarize: the turns before it are summarized already.".into());
     }
-    let sums = token_sums(messages, budget.tool_chars);
+    let sums = token_sums(messages, budget.tool_chars, Some(connection));
     let fixed = fixed_tokens(connection);
     // A summary goes out only when the window leaves something out, and
     // the user's own words from what it left out beside it.
@@ -3632,7 +3710,10 @@ pub fn compact(
         .map_err(|e| format!("The summary failed, so every turn is kept as it was: {e}"))?;
     let (before, after) = (
         cost(start, summary),
-        cost(window_from(messages, &budget, end), Some(&text)),
+        cost(
+            window_from(messages, &budget, end, Some(connection)),
+            Some(&text),
+        ),
     );
     // A summary as long as what it stands for would still keep the turns
     // from a bigger model's window, for nothing.
@@ -3671,7 +3752,10 @@ fn doomed(connection: &Connection, messages: &[Message], budget: &Budget) -> Opt
     let newest = messages
         .iter()
         .rfind(|m| m.role != crate::failure::ROLE)
-        .map_or(0, |m| message_tokens(m, budget.tool_chars));
+        .map_or(0, |m| {
+            let echoed = echoes_reasoning(m, connection, true);
+            message_tokens(m, budget.tool_chars, echoed)
+        });
     let fixed = fixed_tokens(connection) + newest;
     (fixed as u64 > context).then(|| {
         Failure::new(
@@ -4626,7 +4710,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        assert!(message_tokens(&messages[2], MAX_TOOL_CHARS) > CONTEXT_TOKENS);
+        assert!(message_tokens(&messages[2], MAX_TOOL_CHARS, false) > CONTEXT_TOKENS);
         let payload = body(
             &connection(),
             &messages[window_start(&messages, &Budget::SMALL)..],
@@ -6605,7 +6689,7 @@ mod tests {
         for start in &starts {
             assert_eq!(messages[*start].role, "user", "start {start} is not a turn");
         }
-        let sums = token_sums(&messages, MAX_TOOL_CHARS);
+        let sums = token_sums(&messages, MAX_TOOL_CHARS, None);
         assert!(sums[messages.len()] - sums[*starts.last().unwrap()] <= CONTEXT_TOKENS);
     }
 
@@ -7013,8 +7097,8 @@ mod tests {
                 .starts_with("(Attached")
         );
         // Each is counted where it goes.
-        let sums = token_sums(&messages, MAX_TOOL_CHARS);
-        let alone = |i: usize| message_tokens(&messages[i], MAX_TOOL_CHARS);
+        let sums = token_sums(&messages, MAX_TOOL_CHARS, None);
+        let alone = |i: usize| message_tokens(&messages[i], MAX_TOOL_CHARS, false);
         assert_eq!(sums[1], alone(0) + 2 * PICTURE_TOKENS);
         assert_eq!(sums[3] - sums[2], alone(2) + PICTURE_TOKENS);
         // A model its gateway lists as taking text alone is only told.
@@ -7534,10 +7618,10 @@ mod tests {
         };
         // What the user wrote goes out whole, a tool result as its ends.
         assert_eq!(
-            message_tokens(&said, MAX_TOOL_CHARS),
+            message_tokens(&said, MAX_TOOL_CHARS, false),
             MESSAGE_TOKENS + 10_000
         );
-        let sent = message_tokens(&result, MAX_TOOL_CHARS) - MESSAGE_TOKENS;
+        let sent = message_tokens(&result, MAX_TOOL_CHARS, false) - MESSAGE_TOKENS;
         assert!(sent.abs_diff(MAX_TOOL_CHARS / 4) < 16, "{sent}");
     }
 
@@ -7583,7 +7667,7 @@ mod tests {
         // A file written in one call goes out in full as the call's
         // arguments, however little the messages around it say.
         let messages = a_big_write();
-        assert!(message_tokens(&messages[1], MAX_TOOL_CHARS) > 10_000);
+        assert!(message_tokens(&messages[1], MAX_TOOL_CHARS, false) > 10_000);
         // The turn that wrote it no longer fits, so the window moves on.
         assert_eq!(window_start(&messages, &Budget::SMALL), 4);
     }
@@ -7643,11 +7727,11 @@ mod tests {
     fn the_window_never_starts_before_the_users_summary() {
         let messages = three_turns("floor");
         assert_eq!(window_start(&messages, &Budget::SMALL), 0);
-        assert_eq!(window_from(&messages, &Budget::SMALL, 4), 4);
+        assert_eq!(window_from(&messages, &Budget::SMALL, 4, None), 4);
         // Only ever where a turn starts, and never past the latest one.
-        assert_eq!(window_from(&messages, &Budget::SMALL, 5), 4);
-        assert_eq!(window_from(&messages, &Budget::SMALL, 99), 6);
-        assert_eq!(window_from(&messages, &Budget::SMALL, 2), 0);
+        assert_eq!(window_from(&messages, &Budget::SMALL, 5, None), 4);
+        assert_eq!(window_from(&messages, &Budget::SMALL, 99, None), 6);
+        assert_eq!(window_from(&messages, &Budget::SMALL, 2, None), 0);
     }
 
     #[test]
@@ -7660,13 +7744,13 @@ mod tests {
                 "assistant",
                 &format!("answer {i} {}", "y".repeat(600)),
             ));
-            starts.push(window_from(&messages, &Budget::SMALL, 4));
+            starts.push(window_from(&messages, &Budget::SMALL, 4, None));
         }
         assert!(starts[2..].iter().all(|&start| start >= 4), "{starts:?}");
         assert!(starts.windows(2).all(|w| w[0] <= w[1]), "{starts:?}");
         let moves = starts.windows(2).filter(|w| w[0] != w[1]).count();
         assert!((3..10).contains(&moves), "{starts:?}");
-        let sums = token_sums(&messages, MAX_TOOL_CHARS);
+        let sums = token_sums(&messages, MAX_TOOL_CHARS, None);
         let start = starts[39];
         assert!(sums[messages.len()] - sums[start] <= Budget::SMALL.tokens);
     }
@@ -7816,7 +7900,7 @@ mod tests {
             said("user", "last"),
         ];
         assert_eq!(summary_end(&messages, 5), 5);
-        assert_eq!(window_from(&messages, &Budget::SMALL, 5), 5);
+        assert_eq!(window_from(&messages, &Budget::SMALL, 5, None), 5);
         // A prompt sent while the second call was still running.
         messages.insert(3, said("user", "wait"));
         assert_eq!(summary_end(&messages, 4), 0);
@@ -8262,9 +8346,11 @@ mod tests {
         let messages = screenshots(&dir);
         // Counted from the conversation alone, so the files need not be there.
         std::fs::remove_dir_all(&dir).unwrap();
-        let sums = token_sums(&messages, MAX_TOOL_CHARS);
+        let sums = token_sums(&messages, MAX_TOOL_CHARS, None);
         let pictured: Vec<usize> = (0..messages.len())
-            .filter(|&i| sums[i + 1] - sums[i] != message_tokens(&messages[i], MAX_TOOL_CHARS))
+            .filter(|&i| {
+                sums[i + 1] - sums[i] != message_tokens(&messages[i], MAX_TOOL_CHARS, false)
+            })
             .collect();
         // The newer screenshot, after the last result of its batch; the
         // older one is never sent, so it costs only its text.
@@ -8272,7 +8358,7 @@ mod tests {
         assert_eq!(pictured, [last]);
         assert_eq!(
             sums[last + 1] - sums[last],
-            message_tokens(&messages[last], MAX_TOOL_CHARS) + PICTURE_TOKENS
+            message_tokens(&messages[last], MAX_TOOL_CHARS, false) + PICTURE_TOKENS
         );
     }
 
@@ -8673,7 +8759,7 @@ mod tests {
         let start = window_start(&messages, &Budget::SMALL);
         assert!(start > 0, "the window never left the user's message");
         assert!(messages[start].notice, "start {start} is not a notice");
-        let sums = token_sums(&messages, MAX_TOOL_CHARS);
+        let sums = token_sums(&messages, MAX_TOOL_CHARS, None);
         assert!(sums[messages.len()] - sums[start] <= CONTEXT_TOKENS);
     }
 
@@ -9524,7 +9610,7 @@ mod tests {
     #[test]
     fn a_bigger_model_keeps_more_history() {
         let messages: Vec<Message> = (0..400).flat_map(exchange).collect();
-        let sums = token_sums(&messages, MAX_TOOL_CHARS);
+        let sums = token_sums(&messages, MAX_TOOL_CHARS, None);
         let kept = |budget: &Budget| sums[messages.len()] - sums[window_start(&messages, budget)];
         let big = sized(Some(200_000), Some(64_000), CAP_TOKENS, 4_000);
         let (small, large) = (kept(&Budget::SMALL), kept(&big));
@@ -9868,7 +9954,7 @@ mod tests {
             let before = window_start(&messages, &budget);
             // The next round takes a new one.
             messages.extend(browse("b", "new"));
-            let sums = token_sums(&messages, budget.tool_chars);
+            let sums = token_sums(&messages, budget.tool_chars, None);
             let fits = sums[messages.len()] - sums[before] <= budget.tokens
                 && messages.len() - before <= budget.messages;
             if fits {
@@ -9916,6 +10002,58 @@ mod tests {
         };
         assert_eq!(hashed(&here), hashed(&connection()));
         assert_ne!(hashed(&here), hashed(&elsewhere));
+    }
+
+    #[test]
+    fn the_prefix_changes_with_the_history_only_where_an_earlier_message_did() {
+        let hashed = |connection: &Connection, window: &[Message]| {
+            let mut prefix = crate::cache_miss::Prefix::default();
+            let extra = Extra::default();
+            let budget = Budget::SMALL;
+            let summary = (None, None);
+            body_hashed(
+                connection,
+                window,
+                summary,
+                None,
+                &budget,
+                &extra,
+                Some(&mut prefix),
+            );
+            prefix
+        };
+        // Old results cleared as the boundary moves.
+        let turn = reads(40, 2_000);
+        let requests = requests_by_round(&connection(), &turn, &Budget::SMALL);
+        let changed: Vec<usize> = (2..=40)
+            .filter(|&n| {
+                hashed(&connection(), &turn[..2 * n + 1])
+                    != hashed(&connection(), &turn[..2 * n - 1])
+            })
+            .collect();
+        assert_eq!(changed, prefix_breaks(&requests));
+        // A new turn, after which a call's reasoning goes back empty.
+        let mut window = answered(thought_then_called("a", "deepseek-reasoner"));
+        let deepseek = Connection {
+            model: "deepseek-reasoner".into(),
+            ..connection()
+        };
+        let before = hashed(&deepseek, &window);
+        window.push(Message {
+            role: "user".into(),
+            content: "And now?".into(),
+            ..Default::default()
+        });
+        assert_ne!(hashed(&deepseek, &window), before);
+        // A model that is sent no reasoning back sees no change before it.
+        let other = Connection {
+            model: "qwen3:8b".into(),
+            ..connection()
+        };
+        assert_eq!(
+            hashed(&other, &window),
+            hashed(&other, &window[..window.len() - 1])
+        );
     }
 
     #[test]
@@ -10012,7 +10150,7 @@ mod tests {
     /// How many of `sent` go out as a line saying what they were.
     fn cleared(sent: &[String]) -> usize {
         sent.iter()
-            .filter(|s| s.contains("cleared to save room"))
+            .filter(|s| s.contains("cleared from history"))
             .count()
     }
 
@@ -10043,7 +10181,7 @@ mod tests {
         // A provider that sends no ids gets the same one in every round.
         let read = |path: &str, text: &str| {
             let arguments = json!({ "path": path }).to_string();
-            round("call_0", "read_file", arguments, text.repeat(300))
+            round("call_0", "read_file", arguments, text.repeat(700))
         };
         let mut messages = vec![Message {
             role: "user".into(),
@@ -10064,13 +10202,13 @@ mod tests {
             sent[2],
             "[Same result as the last read_file call with these arguments, above]"
         );
-        assert_eq!(sent[3], "a".repeat(300));
-        assert_eq!(sent[5], "a".repeat(300));
+        assert_eq!(sent[3], "a".repeat(700));
+        assert_eq!(sent[5], "a".repeat(700));
     }
 
     #[test]
     fn a_cleared_result_is_never_pointed_at() {
-        let mut messages = reads(20, 800);
+        let mut messages = reads(20, 2_000);
         let first = messages[1].tool_calls[0].arguments.clone();
         let file = messages[2].content.clone();
         // The first file read again, unchanged, once its first read is cleared.
@@ -10088,15 +10226,15 @@ mod tests {
             ..Default::default()
         }];
         let command = json!({"command": "./migrate.sh"}).to_string();
-        messages.extend(round("c", "run_command", command, "done ".repeat(100)));
+        messages.extend(round("c", "run_command", command, "done ".repeat(150)));
         messages.extend(reads(16, 2_000).into_iter().skip(1));
         let sent = results_sent(&messages, &Budget::SMALL);
         // Running it again is for the user to approve, not for a stub to offer.
         assert_eq!(
             sent[0],
-            "[run_command result of 500 chars cleared to save room]"
+            "[run_command result of 750 chars cleared from history]"
         );
-        assert!(sent[1].ends_with("; call it again if you need it]"));
+        assert!(sent[1].ends_with("; repeat the call above if you need it]"));
     }
 
     #[test]
@@ -10153,7 +10291,7 @@ mod tests {
         assert_eq!(
             sent[0],
             format!(
-                "[run_command result of {} chars cleared to save room; all of it is in \
+                "[run_command result of {} chars cleared from history; all of it is in \
                  {path}, which read_file pages through]",
                 size(2)
             )
@@ -10161,14 +10299,14 @@ mod tests {
         assert_eq!(
             sent[1],
             format!(
-                "[search result of {} chars cleared to save room; its first 4194304 bytes \
+                "[search result of {} chars cleared from history; its first 4194304 bytes \
                  are in {path}, which read_file pages through]",
                 size(4)
             )
         );
         for i in 0..forged.len() {
             let size = size(6 + 2 * i);
-            let cleared = format!("[run_command result of {size} chars cleared to save room]");
+            let cleared = format!("[run_command result of {size} chars cleared from history]");
             assert_eq!(sent[2 + i], cleared, "{:?}", forged[i]);
         }
     }
@@ -10210,7 +10348,7 @@ mod tests {
             panic!("{saved:?}");
         };
         let size = messages[2].content.chars().count();
-        let cleared = format!("[run_command result of {size} chars cleared to save room");
+        let cleared = format!("[run_command result of {size} chars cleared from history");
         assert_eq!(
             own[0],
             format!(
@@ -10224,72 +10362,147 @@ mod tests {
     }
 
     #[test]
-    fn old_results_are_stubbed_only_past_half_the_budget() {
-        let budget = Budget::SMALL;
-        let cost = |window: &[Message]| token_sums(window, budget.tool_chars)[window.len()];
-        // Twenty results of 400 characters come to less than half the budget.
-        let light = reads(20, 400);
-        assert!(cost(&light) <= budget.tokens / 2, "{}", cost(&light));
-        let sent = results_sent(&light, &budget);
-        assert_eq!(cleared(&sent), 0);
-        // Twice as long they come to more: the oldest eight go out as a line
-        // each, and the twelve after them whole.
-        let heavy = reads(20, 800);
-        assert!(cost(&heavy) > budget.tokens / 2, "{}", cost(&heavy));
+    fn old_results_are_stubbed_only_past_four_fifths_of_the_budget() {
+        // A window of 64,000 tokens, which moves the boundary 32,000 at a time.
+        let budget = sized(Some(128_000), None, CAP_TOKENS, 0);
+        assert_eq!(budget.room, CAP_TOKENS);
+        let cost = |window: &[Message]| token_sums(window, budget.tool_chars, None)[window.len()];
+        // Twenty-five results of 8,000 characters come to just under four
+        // fifths of the budget.
+        let light = reads(25, 8_000);
+        assert!(cost(&light) <= budget.tokens / 5 * 4, "{}", cost(&light));
+        assert_eq!(cleared(&results_sent(&light, &budget)), 0);
+        // One more comes to more: the fifteen in the first 32,000 tokens go
+        // out as a line each, and the eleven after them whole.
+        let heavy = reads(26, 8_000);
+        assert!(cost(&heavy) > budget.tokens / 5 * 4, "{}", cost(&heavy));
         let sent = results_sent(&heavy, &budget);
-        assert_eq!(cleared(&sent[..8]), 8);
+        assert_eq!(cleared(&sent), 15);
         assert_eq!(
             sent[0],
-            "[read_file result of 802 chars cleared to save room; call it again if you need it]"
+            "[read_file result of 8002 chars cleared from history; repeat the call above if you \
+             need it]"
         );
-        for (i, result) in sent.iter().enumerate().skip(8) {
+        for (i, result) in sent.iter().enumerate().skip(15) {
             assert_eq!(*result, heavy[2 + 2 * i].content, "{i}");
         }
     }
 
     #[test]
-    fn the_boundary_moves_in_steps_of_eight() {
-        // Past half the budget from the sixth result on.
-        let turn = reads(40, 2_000);
-        let requests: Vec<Vec<Value>> = (1..=40)
-            .map(|files| {
-                let payload = body_with(
-                    &connection(),
-                    &turn[..1 + 2 * files],
-                    None,
-                    None,
-                    &Budget::SMALL,
-                    &[],
-                );
-                payload["messages"].as_array().unwrap().clone()
+    fn a_result_shorter_than_the_stub_threshold_is_never_stubbed() {
+        let mut messages = reads(20, 2_000);
+        // 599 characters, as old as the oldest results cleared around it.
+        messages[4].content = "s".repeat(STUB_CHARS - 1);
+        let sent = results_sent(&messages, &Budget::SMALL);
+        assert_eq!(sent[1], messages[4].content);
+        assert_eq!(cleared(&sent[..1]), 1);
+        assert_eq!(cleared(&sent[2..3]), 1);
+    }
+
+    /// The requests a turn of `turn`'s messages sends over `c` under
+    /// `budget`, one a round as each result comes in: the messages of each
+    /// as they go on the wire.
+    fn requests_by_round(c: &Connection, turn: &[Message], budget: &Budget) -> Vec<String> {
+        (1..turn.len())
+            .step_by(2)
+            .map(|end| {
+                let payload = body_with(c, &turn[..end + 2], None, None, budget, &[]);
+                payload["messages"].to_string()
             })
-            .collect();
-        // A request goes out as the one before it did, from the front, but
-        // for when the boundary moves, which it does as the 13th, 21st, 29th
-        // and 37th result come in: always forward, and always leaving the
-        // five newest results whole at least.
-        let moved: Vec<usize> = (1..40)
+            .collect()
+    }
+
+    /// The rounds, counted from 1, whose request does not begin with the
+    /// bytes of every message the request before it sent.
+    fn prefix_breaks(requests: &[String]) -> Vec<usize> {
+        (1..requests.len())
             .filter(|&n| {
-                let (before, after) = (&requests[n - 1], &requests[n]);
-                after[..before.len()] != before[..]
+                let before = requests[n - 1].strip_suffix(']').unwrap();
+                !requests[n].starts_with(before)
             })
             .map(|n| n + 1)
+            .collect()
+    }
+
+    #[test]
+    fn the_history_sent_changes_only_where_a_whole_chunk_is_crossed() {
+        // A DeepSeek turn, whose reasoning goes back with every call and
+        // counts toward the boundary as it does on the wire.
+        let c = Connection {
+            model: "deepseek-reasoner".into(),
+            ..connection()
+        };
+        let mut turn = reads(40, 2_000);
+        for (i, m) in turn.iter_mut().enumerate() {
+            if m.role == "assistant" {
+                m.model = c.model.clone();
+                m.reasoning = format!("Reading the next file, {i}. {}", "Hmm. ".repeat(60));
+            }
+        }
+        let budget = Budget::SMALL;
+        let requests = requests_by_round(&c, &turn, &budget);
+        assert!(requests[0].contains("Reading the next file, 1."));
+        // Where the cost without stubs crosses into another whole chunk past
+        // what is kept, once past four fifths of the budget.
+        let (keep, chunk) = (KEEP_TOKENS, budget.step);
+        let chunks: Vec<usize> = (1..turn.len())
+            .step_by(2)
+            .map(|end| {
+                let total = token_sums(&turn[..end + 2], budget.tool_chars, Some(&c))[end + 2];
+                if total <= budget.tokens / 5 * 4 {
+                    0
+                } else {
+                    total.saturating_sub(keep) / chunk
+                }
+            })
             .collect();
-        assert_eq!(moved, [13, 21, 29, 37]);
+        let crossed: Vec<usize> = (1..chunks.len())
+            .filter(|&n| chunks[n] != chunks[n - 1])
+            .map(|n| n + 1)
+            .collect();
+        assert!(crossed.len() >= 4, "{crossed:?}");
+        assert_eq!(prefix_breaks(&requests), crossed);
+        // Each move clears more, never less, and leaves the five newest
+        // results whole at least.
         let counts: Vec<usize> = requests
             .iter()
-            .map(|messages| {
+            .map(|wire| {
+                let messages: Vec<Value> = serde_json::from_str(wire).unwrap();
                 let sent: Vec<String> = messages
                     .iter()
                     .filter_map(|m| m["content"].as_str().filter(|_| m["role"] == "tool"))
                     .map(str::to_owned)
                     .collect();
+                assert!(cleared(&sent[sent.len().saturating_sub(5)..]) == 0);
                 cleared(&sent)
             })
             .collect();
-        assert_eq!(counts[11], 0);
-        assert_eq!(&counts[12..20], [8; 8]);
-        assert_eq!(counts[39], 32);
+        assert!(
+            counts.windows(2).all(|pair| pair[0] <= pair[1]),
+            "{counts:?}"
+        );
+        assert!(counts[39] > 0);
+    }
+
+    #[test]
+    fn results_bigger_than_what_is_kept_still_move_the_boundary_in_chunks() {
+        // The newest five results come to far more than the 4,000 tokens
+        // kept, so it is they that hold the boundary back, but it still only
+        // moves on whole chunks rather than with every result.
+        let budget = sized(Some(128_000), None, CAP_TOKENS, 0);
+        let turn = reads(40, 24_000);
+        let requests = requests_by_round(&connection(), &turn, &budget);
+        let breaks = prefix_breaks(&requests);
+        let total = token_sums(&turn, budget.tool_chars, None)[turn.len()];
+        assert!(!breaks.is_empty());
+        assert!(breaks.len() <= total / budget.step, "{breaks:?}");
+        let last: Vec<Value> = serde_json::from_str(&requests[39]).unwrap();
+        let sent: Vec<String> = last
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["content"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(cleared(&sent[35..]), 0);
     }
 
     #[test]
@@ -10313,15 +10526,16 @@ mod tests {
                 role: "tool".into(),
                 tool_call_id: format!("b{i}"),
                 name: "read_file".into(),
-                content: format!("batch {i} {}", "z".repeat(2_000)),
+                content: format!("batch {i} {}", "z".repeat(2_400)),
                 ..Default::default()
             });
         }
-        // Eighteen results put the boundary at the ninth, inside the batch:
-        // it goes back to where the batch starts instead.
+        // The last whole chunk past what is kept ends inside the batch, among
+        // the newest five results: the boundary goes back to the last whole
+        // chunk before the batch starts.
         let sent = results_sent(&messages, &Budget::SMALL);
-        assert_eq!(cleared(&sent[..6]), 6);
-        assert_eq!(cleared(&sent[6..]), 0);
+        assert_eq!(cleared(&sent[..5]), 5);
+        assert_eq!(cleared(&sent[5..]), 0);
     }
 
     #[test]
@@ -10331,7 +10545,7 @@ mod tests {
             content: "set it up".into(),
             ..Default::default()
         }];
-        let answer = format!("Use the second option. {}", "Because ".repeat(40));
+        let answer = format!("Use the second option. {}", "Because ".repeat(100));
         messages.extend(round(
             "q",
             crate::tools::ASK_USER,
@@ -10340,9 +10554,9 @@ mod tests {
         ));
         messages.extend(reads(16, 2_000).into_iter().skip(1));
         let sent = results_sent(&messages, &Budget::SMALL);
-        // As old as the seven reads after it, but sent whole.
+        // As old as the five reads after it, but sent whole.
         assert_eq!(sent[0], answer);
-        assert_eq!(cleared(&sent[1..8]), 7);
+        assert_eq!(cleared(&sent[1..6]), 5);
     }
 
     /// A turn that loads the `pdf` skill, which says `instructions`, and then
@@ -10364,9 +10578,9 @@ mod tests {
         let instructions = "Fill each field from the data, then flatten it. ".repeat(40);
         let messages = skill_then_reads(&instructions);
         let sent = results_sent(&messages, &Budget::SMALL);
-        // As old as the seven reads after it, but sent whole.
+        // As old as the four reads after it, but sent whole.
         assert_eq!(sent[0], instructions);
-        assert_eq!(cleared(&sent[1..8]), 7);
+        assert_eq!(cleared(&sent[1..5]), 4);
     }
 
     #[test]
@@ -10380,7 +10594,7 @@ mod tests {
         let sent = results_sent(&messages, &squeezed);
         assert_eq!(
             sent[0],
-            "[skill \"pdf\" instructions of 1920 chars cleared to save room; load it again before \
+            "[skill \"pdf\" instructions of 1920 chars cleared from history; load it again before \
              relying on them]"
         );
     }
@@ -10394,7 +10608,7 @@ mod tests {
         messages.splice(3..3, round("t", "skill", next, second.clone()));
         let sent = results_sent(&messages, &Budget::SMALL);
         assert_eq!(sent[..2], [first, second]);
-        assert_eq!(cleared(&sent[2..8]), 6);
+        assert_eq!(cleared(&sent[2..5]), 3);
     }
 
     #[test]
@@ -10408,26 +10622,26 @@ mod tests {
         // A file beside the instructions and the listing are cleared as any
         // result is.
         let file = json!({"name": "pdf", "file": "forms.md"}).to_string();
-        messages.splice(5..5, round("f", "skill", file, "a field ".repeat(40)));
+        messages.splice(5..5, round("f", "skill", file, "a field ".repeat(100)));
         let listing = json!({"name": "?"}).to_string();
         messages.splice(
             7..7,
-            round("l", "skill", listing, "- pdf: forms ".repeat(40)),
+            round("l", "skill", listing, "- pdf: forms ".repeat(100)),
         );
         let sent = results_sent(&messages, &Budget::SMALL);
         assert_eq!(
             sent[0],
-            "[skill \"pdf\" instructions of 1000 chars cleared to save room; load it again before \
+            "[skill \"pdf\" instructions of 1000 chars cleared from history; load it again before \
              relying on them]"
         );
         assert_eq!(sent[1], new);
         assert_eq!(
             sent[2],
-            "[skill result of 320 chars cleared to save room; call it again if you need it]"
+            "[skill result of 800 chars cleared from history; repeat the call above if you need it]"
         );
         assert_eq!(
             sent[3],
-            "[skill result of 520 chars cleared to save room; call it again if you need it]"
+            "[skill result of 1300 chars cleared from history; repeat the call above if you need it]"
         );
     }
 
@@ -10436,20 +10650,20 @@ mod tests {
         // Both requests read the settings and memory, which a test moving the
         // data folder meanwhile would change between them.
         let _held = (crate::store::tests::DATA_DIR.lock()).unwrap_or_else(|e| e.into_inner());
-        let mut messages = reads(20, 800);
+        let mut messages = reads(20, 2_000);
         let newest = messages[messages.len() - 1].content.clone();
         let call = messages[messages.len() - 2].tool_calls[0].arguments.clone();
         messages.extend(round("again", "read_file", call, newest));
         let stored = serde_json::to_string(&messages).unwrap();
         let first = body_with(&connection(), &messages, None, None, &Budget::SMALL, &[]);
         let wire = first.to_string();
-        assert!(wire.contains("[read_file result of 802 chars cleared to save room"));
+        assert!(wire.contains("[read_file result of 2002 chars cleared from history"));
         assert!(wire.contains("[Same result as the last read_file call"));
         // The session still has every result whole, so the window is placed
         // and summarized from them, and the same history makes the same
         // request.
         assert_eq!(serde_json::to_string(&messages).unwrap(), stored);
-        assert_eq!(messages[2].content.len(), 802);
+        assert_eq!(messages[2].content.len(), 2_002);
         assert_eq!(
             body_with(&connection(), &messages, None, None, &Budget::SMALL, &[]),
             first
@@ -10477,7 +10691,7 @@ mod tests {
         declined[1].content = crate::tools::DECLINED.into();
         declined[1].is_error = true;
         messages.extend(declined);
-        messages.extend(reads(13, 800).into_iter().skip(1));
+        messages.extend(reads(13, 2_000).into_iter().skip(1));
         messages.extend(write("w1", "new.txt"));
         let payload = body_with(&connection(), &messages, None, None, &Budget::SMALL, &[]);
         let arguments = |id: &str| -> Value {
@@ -11184,8 +11398,9 @@ mod tests {
         };
         let (sender, _receiver) = async_channel::unbounded();
         let write = r#"{"path":"long.txt","content":"short\n"}"#;
-        // Past half the budget the first eight rounds go out cleared.
-        let heavy = reads(20, 800);
+        // Past four fifths of the budget the first seven rounds go out
+        // cleared, and the ninth round's page whole.
+        let heavy = reads(20, 1_600);
         send_window(&c, &heavy, &Budget::SMALL, &Extra::default(), None, &sender).unwrap();
         let refused = crate::tools::run("write_file", write, &ctx).unwrap_err();
         assert!(refused.contains("only part"), "{refused}");
@@ -11438,6 +11653,62 @@ mod tests {
                 .iter()
                 .all(|m| m.get("reasoning_content").is_none())
         );
+    }
+
+    #[test]
+    fn the_estimate_counts_the_reasoning_a_request_sends_back() {
+        let asked = |text: &str| Message {
+            role: "user".into(),
+            content: text.into(),
+            ..Default::default()
+        };
+        let window = vec![
+            asked("Read a.rs"),
+            thought_then_called("a", "deepseek-reasoner"),
+            result_of("a"),
+            asked("Now b.rs and c.rs"),
+            thought_then_called("b", "deepseek-reasoner"),
+            result_of("b"),
+            thought_then_called("c", "deepseek-chat"),
+            result_of("c"),
+        ];
+        // What each message adds to the estimate over one that counts no
+        // reasoning, and the reasoning its request sends with it.
+        let counted = |c: &Connection| -> Vec<(usize, String)> {
+            let with = token_sums(&window, MAX_TOOL_CHARS, Some(c));
+            let without = token_sums(&window, MAX_TOOL_CHARS, None);
+            let sent = body(c, &window, None, None);
+            (0..window.len())
+                .map(|i| {
+                    let extra = (with[i + 1] - with[i]) - (without[i + 1] - without[i]);
+                    let reasoning = sent["messages"][i + 1]["reasoning_content"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned();
+                    (extra, reasoning)
+                })
+                .collect()
+        };
+        let deepseek = Connection {
+            model: "deepseek-reasoner".into(),
+            ..connection()
+        };
+        let openai = Connection {
+            model: "gpt-5".into(),
+            ..connection()
+        };
+        for c in [&deepseek, &openai] {
+            for (i, (extra, reasoning)) in counted(c).into_iter().enumerate() {
+                assert_eq!(extra, tokens(&reasoning), "{} {i}", c.model);
+            }
+        }
+        // Only the turn's own call by the model asked carries it.
+        let carried: Vec<usize> = (counted(&deepseek).iter().enumerate())
+            .filter(|(_, (extra, _))| *extra > 0)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(carried, [4]);
+        assert!(counted(&openai).iter().all(|(extra, _)| *extra == 0));
     }
 
     #[test]
