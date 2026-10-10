@@ -4322,6 +4322,9 @@ impl Render for Chat {
         // no sidebar, composer or status bar around it, only the title bar
         // to drag the window by.
         let welcome = self.page == Page::Chat && self.show_setup == Some(conversation.id);
+        // An empty chat's grain runs behind the composer and the status bar
+        // too, to the window's edge, so the page reads as one surface.
+        let mut empty_chat = false;
 
         let body: AnyElement = if self.page == Page::Jobs {
             self.schedules_page(cx).into_any_element()
@@ -4352,6 +4355,7 @@ impl Render for Chat {
                 // than the greeting of a new session.
                 div().flex_1().into_any_element()
             } else {
+                empty_chat = true;
                 self.empty_state(window, cx).into_any_element()
             }
         } else {
@@ -4408,6 +4412,11 @@ impl Render for Chat {
             .when(self.page != Page::Chat, |this| {
                 this.track_focus(&self.page_focus)
             })
+            .children(
+                empty_chat
+                    .then(|| self.grain(&self.grains.empty_chat))
+                    .flatten(),
+            )
             // Around the page's focus, so its tab keys reach whatever in it
             // holds the keys.
             .when(self.page == Page::Capabilities, |this| {
