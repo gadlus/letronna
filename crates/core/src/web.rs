@@ -39,6 +39,12 @@
 //! how to read on: `from` carries on from a line and `find` shows the lines
 //! holding some words, both from the page in memory. Nothing is saved aside
 //! to page through instead, as read back it would come unfenced.
+//!
+//! A request to the web that could not connect at all, its name not found
+//! or its connection turned down, stops this and search_web for a while: the
+//! next would only wait to fail the same way, and a model told why turns to
+//! the project instead. Two minutes when someone watches the session; the
+//! rest of the run when nobody does. Any answer from the web ends it sooner.
 
 use crate::tools::{Tool, ToolContext};
 use serde_json::{Value, json};
@@ -161,10 +167,11 @@ impl Tool for WebFetch {
         }, "required": ["url"]})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
-        let page = fetch(
+        let page = fetch_for(
             args["url"].as_str().unwrap_or_default(),
             &crate::redact::secrets(),
             args["fresh"].as_bool() == Some(true),
+            &Asker::of(ctx),
         )?;
         match page {
             Page::Text(text) => Ok(shown(&text, args["find"].as_str(), args["from"].as_u64())),
@@ -200,8 +207,9 @@ enum Page {
 
 /// The page at `raw`, after its final address, unless it or a redirect on
 /// the way carries one of `secrets`; from memory when read lately, unless
-/// `fresh`.
-fn fetch(raw: &str, secrets: &[String], fresh: bool) -> Result<Page, String> {
+/// `fresh`. Fetched for `asker`, whose session a page that could not connect
+/// stops for longer when nobody watches it.
+fn fetch_for(raw: &str, secrets: &[String], fresh: bool, asker: &Asker) -> Result<Page, String> {
     let url =
         reqwest::Url::parse(raw.trim()).map_err(|_| format!("`{raw}` is not a web address."))?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -243,8 +251,10 @@ fn fetch(raw: &str, secrets: &[String], fresh: bool) -> Result<Page, String> {
         if let Some(from) = previous.last().and_then(|from| referer(from, &url)) {
             request = request.header(reqwest::header::REFERER, from);
         }
-        let response = request
-            .send()
+        stopped(&url, asker, Instant::now())?;
+        let response = request.send();
+        note_reach(&url, response.as_ref().err(), asker);
+        let response = response
             .map_err(|e| unanswered("Could not fetch the page:", &e, !previous.is_empty()))?;
         let Some(next) = moved_to(&response) else {
             break response;
@@ -317,10 +327,27 @@ fn fetch(raw: &str, secrets: &[String], fresh: bool) -> Result<Page, String> {
 pub(crate) fn unanswered(lead: &str, e: &reqwest::Error, moved: bool) -> String {
     let said = match handshake_failure(e) {
         Some(why) => format!("{e}; the secure connection failed: {why}"),
-        None if moved => e.to_string(),
-        None => return format!("{lead} {e}"),
+        None if moved => with_causes(e),
+        None => return format!("{lead} {}", with_causes(e)),
     };
     crate::untrusted::quoted(lead, &said)
+}
+
+/// `e` and each error under it. reqwest's own words are the same whether a
+/// name was not found, the connection was turned down or the address is
+/// wrong, and each of those calls for a different next step.
+fn with_causes(e: &reqwest::Error) -> String {
+    let mut said = e.to_string();
+    let mut cause = std::error::Error::source(e);
+    while let Some(error) = cause {
+        let more = error.to_string();
+        // Some errors repeat their cause in their own words.
+        if !said.contains(&more) {
+            said = format!("{said}: {more}");
+        }
+        cause = error.source();
+    }
+    said
 }
 
 /// Why the TLS handshake `e` ended was turned down, when it was.
@@ -341,6 +368,168 @@ fn handshake_failure(e: &reqwest::Error) -> Option<String> {
         };
     }
     None
+}
+
+/// How long a request to the web that could not connect stops the next one
+/// in a session someone watches: long enough that the model turns to the
+/// project rather than trying page after page and search after search, each
+/// failing the same way, and short enough that a moment's lost connection
+/// does not keep a link the user pastes unread for long.
+const UNREACHABLE_TIME: Duration = Duration::from_secs(2 * 60);
+
+/// What web_fetch and search_web say while a failed connection stops them,
+/// after the host and why. It does not say the computer is offline: the
+/// model's own requests are getting through.
+pub(crate) const UNAVAILABLE: &str =
+    "web_fetch and search_web are unavailable for now. Work from the project's files and commands.";
+
+/// Who a request is made for: the session, and whether anyone watches it.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Asker {
+    session: u64,
+    unwatched: bool,
+}
+
+impl Asker {
+    pub(crate) fn of(ctx: &ToolContext) -> Self {
+        Self {
+            session: ctx.caller.root,
+            // As the gate tells them apart: a card nobody can answer means
+            // nobody sees the connection come back either.
+            unwatched: (ctx.caller.connection.as_ref()).is_some_and(|c| !c.human),
+        }
+    }
+}
+
+/// The last request to the web that could not connect.
+struct Unreachable {
+    at: Instant,
+    host: String,
+    why: String,
+    session: u64,
+}
+
+impl Unreachable {
+    /// Whether this still stops a request `asker` makes at `now`. A run
+    /// nobody watches stays stopped for the rest of it, unless a request
+    /// gets through elsewhere: nobody is there to say the connection is
+    /// back, and each try would cost it a round.
+    fn stops(&self, asker: &Asker, now: Instant) -> bool {
+        now.saturating_duration_since(self.at) < UNREACHABLE_TIME
+            || (asker.unwatched && asker.session == self.session)
+    }
+}
+
+/// Shared by web_fetch and search_web across the process, as both go out
+/// over the same network.
+#[cfg(not(test))]
+static UNREACHABLE: Mutex<Option<Unreachable>> = Mutex::new(None);
+
+#[cfg(not(test))]
+fn with_unreachable<T>(f: impl FnOnce(&mut Option<Unreachable>) -> T) -> T {
+    f(&mut UNREACHABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Each test's own, so a test that stops the web does not stop another's.
+    static UNREACHABLE: std::cell::RefCell<Option<Unreachable>> = const { std::cell::RefCell::new(None) };
+    /// Set by a test that stands a server on this computer in for the web.
+    static LOCAL_IS_THE_WEB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn with_unreachable<T>(f: impl FnOnce(&mut Option<Unreachable>) -> T) -> T {
+    UNREACHABLE.with_borrow_mut(f)
+}
+
+/// Counts this thread's requests to this computer as ones to the web.
+#[cfg(test)]
+pub(crate) fn stand_in_for_the_web() {
+    LOCAL_IS_THE_WEB.set(true);
+}
+
+/// Whether a request to `url` says anything about reaching the web. One to
+/// this machine or the local network does not: a server there that is down
+/// or not up yet says nothing of the rest, and is no reason to stop them.
+fn over_the_web(url: &reqwest::Url) -> bool {
+    #[cfg(test)]
+    if LOCAL_IS_THE_WEB.get() {
+        return true;
+    }
+    !local(url)
+}
+
+/// Why a request `asker` would send to `url` at `now` is not sent: one to the
+/// web could not connect lately, and the next would only wait to fail too.
+pub(crate) fn stopped(url: &reqwest::Url, asker: &Asker, now: Instant) -> Result<(), String> {
+    if !over_the_web(url) {
+        return Ok(());
+    }
+    with_unreachable(|last| match last {
+        Some(last) if last.stops(asker, now) => Err(format!(
+            "Could not connect to {} ({}); {UNAVAILABLE}",
+            last.host, last.why
+        )),
+        _ => Ok(()),
+    })
+}
+
+/// Notes how a request to `url` went, `failure` when it got no answer: one
+/// that could not connect to the web stops the next, and any answer, an
+/// error page too, shows the web is in reach again.
+pub(crate) fn note_reach(url: &reqwest::Url, failure: Option<&reqwest::Error>, asker: &Asker) {
+    // A redirect reqwest followed may have failed somewhere else.
+    let url = failure.and_then(reqwest::Error::url).unwrap_or(url);
+    if !over_the_web(url) {
+        return;
+    }
+    let Some(e) = failure else {
+        with_unreachable(Option::take);
+        return;
+    };
+    if let Some(why) = unconnected(e) {
+        let last = Unreachable {
+            at: Instant::now(),
+            host: url.host_str().unwrap_or_default().to_owned(),
+            why,
+            session: asker.session,
+        };
+        with_unreachable(|unreachable| *unreachable = Some(last));
+    }
+}
+
+/// Why `e` never reached its server when that is the network's doing rather
+/// than the server's: its name could not be looked up, or nothing on the way
+/// to its address would take a connection. Not a timeout, which a slow page
+/// gives too, nor a failed handshake, which is one server's certificate.
+fn unconnected(e: &reqwest::Error) -> Option<String> {
+    if !e.is_connect() || e.is_timeout() || handshake_failure(e).is_some() {
+        return None;
+    }
+    let mut looked_up = false;
+    let mut cause: &dyn std::error::Error = e;
+    while let Some(under) = cause.source() {
+        // hyper names a failed lookup only in its words; the OS's error under
+        // it has no kind of its own.
+        looked_up |= under.to_string() == "dns error";
+        cause = under;
+    }
+    use std::io::ErrorKind::*;
+    let kind = cause.downcast_ref::<std::io::Error>()?.kind();
+    let network = matches!(
+        kind,
+        ConnectionRefused | NetworkUnreachable | HostUnreachable | NetworkDown | AddrNotAvailable
+    );
+    (looked_up || network).then(|| cause.to_string())
+}
+
+/// Whether `error` is web_fetch's or search_web's word that they are stopped,
+/// which is no failure of the call the model could change.
+pub(crate) fn says_unavailable(error: &str) -> bool {
+    error.ends_with(UNAVAILABLE)
 }
 
 /// The error `code` a page answered, over what it said with it when that is
@@ -1481,6 +1670,11 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
+    /// `fetch_for` for a session someone watches.
+    fn fetch(raw: &str, secrets: &[String], fresh: bool) -> Result<Page, String> {
+        fetch_for(raw, secrets, fresh, &Asker::default())
+    }
+
     const PAGE: &str = r#"<!DOCTYPE html>
 <html><head><title>Rust &amp; Letronna</title>
 <style>body { color: red; }</style>
@@ -1877,6 +2071,110 @@ or <a data-href="/x" href=/top#part>the top</a>.</p>
             crate::taint::marked(&ctx),
             "a redirect's address did not mark it"
         );
+    }
+
+    /// The stand-in site's answer that nothing is at the address asked for.
+    fn missing(_: &str) -> String {
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+    }
+
+    #[test]
+    fn a_page_that_could_not_connect_says_why_and_stops_the_web_tools() {
+        stand_in_for_the_web();
+        let (base, asked) = serve(site);
+        // Nothing answers on port 1 of this machine.
+        let why = fetch("http://127.0.0.1:1/", &[], false).unwrap_err();
+        assert!(why.starts_with("Could not fetch the page: "), "{why}");
+        // Under reqwest's "error sending request", which is all it said.
+        assert!(why.to_lowercase().contains("refused"), "{why}");
+        let stop = fetch(&format!("{base}/end"), &[], false).unwrap_err();
+        assert!(
+            stop.starts_with("Could not connect to 127.0.0.1 (")
+                && stop.to_lowercase().contains("refused")
+                && stop.ends_with(UNAVAILABLE),
+            "{stop}"
+        );
+        assert!(asked.lock().unwrap().is_empty(), "it tried the page");
+
+        // The tool says the same, at once, and its words mark nothing.
+        let ctx = ToolContext::of(&crate::chat::Connection {
+            conversation: 731_082,
+            human: true,
+            ..Default::default()
+        });
+        let call = json!({ "url": format!("{base}/end") }).to_string();
+        let error = crate::tools::run("web_fetch", &call, &ctx).unwrap_err();
+        assert!(says_unavailable(&error), "{error}");
+        assert!(!crate::taint::marked(&ctx));
+        assert!(asked.lock().unwrap().is_empty(), "the tool tried the page");
+
+        // A server on this computer is still fetched, and getting through to
+        // it says nothing of the web.
+        LOCAL_IS_THE_WEB.set(false);
+        let page = fetch(&format!("{base}/end"), &[], false).unwrap();
+        assert_eq!(page, Page::Text(format!("{base}/end\n\narrived")));
+        assert_eq!(*asked.lock().unwrap(), ["/end"]);
+        assert!(
+            with_unreachable(|last| last.is_some()),
+            "a local page cleared it"
+        );
+    }
+
+    #[test]
+    fn an_error_page_stops_nothing_and_any_answer_lets_the_web_tools_through() {
+        stand_in_for_the_web();
+        let (base, asked) = serve(missing);
+        let why = fetch(&format!("{base}/gone"), &[], false).unwrap_err();
+        assert!(why.contains("404"), "{why}");
+        assert!(
+            with_unreachable(|last| last.is_none()),
+            "a 404 stopped them"
+        );
+        fetch("http://127.0.0.1:1/", &[], false).unwrap_err();
+        // Two minutes on, a session someone watches tries again.
+        with_unreachable(|last| {
+            let last = last.as_mut().unwrap();
+            last.at = last.at.checked_sub(UNREACHABLE_TIME).unwrap();
+        });
+        fetch(&format!("{base}/again"), &[], false).unwrap_err();
+        assert_eq!(*asked.lock().unwrap(), ["/gone", "/again"]);
+        assert!(
+            with_unreachable(|last| last.is_none()),
+            "the answer left them stopped"
+        );
+    }
+
+    #[test]
+    fn a_failed_connection_stops_a_watched_session_for_minutes_and_an_unwatched_run_for_good() {
+        stand_in_for_the_web();
+        let run = Asker {
+            session: 7,
+            unwatched: true,
+        };
+        fetch_for("http://127.0.0.1:1/", &[], false, &run).unwrap_err();
+        let url = reqwest::Url::parse("https://example.com/").unwrap();
+        let now = Instant::now();
+        let watched = Asker {
+            session: 7,
+            unwatched: false,
+        };
+        let other_run = Asker {
+            session: 8,
+            unwatched: true,
+        };
+        let soon = now + Duration::from_secs(60);
+        let later = now + UNREACHABLE_TIME + Duration::from_secs(1);
+        let much_later = now + Duration::from_secs(24 * 60 * 60);
+        for asker in [&watched, &run, &other_run] {
+            assert!(stopped(&url, asker, soon).is_err());
+        }
+        assert!(stopped(&url, &watched, later).is_ok());
+        assert!(stopped(&url, &other_run, later).is_ok());
+        assert!(stopped(&url, &run, much_later).is_err());
+        // Nor is a page on this computer ever stopped.
+        LOCAL_IS_THE_WEB.set(false);
+        let local = reqwest::Url::parse("http://127.0.0.1:8080/").unwrap();
+        assert!(stopped(&local, &run, soon).is_ok());
     }
 
     /// The stand-in site's error answers, each with a body of its own.
