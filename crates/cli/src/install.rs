@@ -60,14 +60,11 @@ pub fn offer(runner: &mut Runner, number: usize, of: usize) {
         &render::blue("●"),
         &format!(
             "{}  {}",
-            render::bold("Where should it live?"),
+            render::bold("Install"),
             render::dim(&format!("{number} of {of}"))
         ),
     );
-    render::line(&render::dim(&format!(
-        "Everything goes in {}",
-        home().display()
-    )));
+    render::line(&render::dim(&format!("Into {}", home().display())));
 
     let Some(parts) = choose_parts(runner) else {
         render::line(&render::dim(
@@ -93,7 +90,7 @@ pub fn offer(runner: &mut Runner, number: usize, of: usize) {
 
 fn choose_parts(runner: &mut Runner) -> Option<Parts> {
     let picked = runner.bar.choose(
-        "What would you like installed?",
+        "What should go on this computer?",
         Vec::new(),
         &[
             "Both — the window and the terminal",
