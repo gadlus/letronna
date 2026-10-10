@@ -32,6 +32,11 @@ use std::time::SystemTime;
 /// than a few hundred, and each is one path.
 const MADE: usize = 4096;
 
+/// Entries looked at under a folder the session made before it no longer
+/// counts as its own. A cleanup's folder holds a few files and their caches;
+/// one past this is left to ask, and the look stays quick.
+const WALKED: usize = 500;
+
 /// Word pairs kept of the planted paragraphs one session read. One holds a
 /// few dozen, so this keeps dozens of them; past it the rest go unkept,
 /// which only lets a copy of their words pass, and each is a few bytes.
@@ -44,6 +49,9 @@ struct Session {
     read: bool,
     /// The files its file tools created, by real path.
     made: HashSet<PathBuf>,
+    /// The folders its file tools created for them, by real path, with when
+    /// the system says each was made, to tell what arrived in it later.
+    folders: HashMap<PathBuf, SystemTime>,
     /// The word pairs of the paragraphs it read that spoke to an AI.
     heard: HashSet<String>,
     /// When it last read such a paragraph.
@@ -98,14 +106,105 @@ pub(crate) fn made(ctx: &ToolContext, path: &Path) {
     }
 }
 
-/// Whether `path` is a file a file tool created in `ctx`'s session.
+/// Creates `folder` and any folder it is in that is missing, as a file tool
+/// does for the file it writes, noting each one it made as `ctx`'s
+/// session's own.
+pub(crate) fn create_folders(ctx: &ToolContext, folder: &Path) -> std::io::Result<()> {
+    // Found before, since afterwards nothing tells them from folders that
+    // were there.
+    let mut missing = Vec::new();
+    let mut probe = folder;
+    // Not `exists`, which follows links: a link to nowhere is not missing.
+    while probe.symlink_metadata().is_err() {
+        missing.push(probe.to_path_buf());
+        let Some(parent) = probe.parent() else {
+            break;
+        };
+        probe = parent;
+    }
+    std::fs::create_dir_all(folder)?;
+    let Some(id) = session(ctx) else {
+        return Ok(());
+    };
+    for folder in missing {
+        // Without a time of making, what arrives in it later cannot be told
+        // from what was moved in, so it stays the user's.
+        let real = std::fs::canonicalize(&folder);
+        let born = folder.symlink_metadata().and_then(|meta| meta.created());
+        let (Ok(real), Ok(born)) = (real, born) else {
+            continue;
+        };
+        let mut sessions = sessions();
+        let folders = &mut sessions.entry(id).or_default().folders;
+        if folders.len() < MADE {
+            folders.insert(real, born);
+        }
+    }
+    Ok(())
+}
+
+/// Whether `path` is a file a file tool created in `ctx`'s session, or a
+/// folder one created that holds nothing else: nothing that was there
+/// before it, moved in since, nor any link.
 pub(crate) fn own(ctx: &ToolContext, path: &Path) -> bool {
     let (Some(id), Ok(path)) = (session(ctx), std::fs::canonicalize(path)) else {
         return false;
     };
-    sessions()
-        .get(&id)
-        .is_some_and(|session| session.made.contains(&path))
+    let born = {
+        let sessions = sessions();
+        let Some(session) = sessions.get(&id) else {
+            return false;
+        };
+        if session.made.contains(&path) {
+            return true;
+        }
+        match session.folders.get(&path) {
+            Some(born) => *born,
+            None => return false,
+        }
+    };
+    // Looked through without the lock, which every session's calls share.
+    made_since(&path, born)
+}
+
+/// Whether the folder at `path`, real, is still the one made at `born` and
+/// everything in it, all the way down, was made after it and is no link.
+/// A file moved in keeps the time it was made, so the user's work moved
+/// into the folder is told from what the session and its programs made
+/// there, such as Python's caches.
+fn made_since(path: &Path, born: SystemTime) -> bool {
+    let made_at = |path: &Path| path.symlink_metadata().and_then(|meta| meta.created()).ok();
+    if made_at(path) != Some(born) {
+        return false;
+    }
+    let mut left = WALKED;
+    let mut folders = vec![path.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            return false;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return false;
+            };
+            left = match left.checked_sub(1) {
+                Some(left) => left,
+                None => return false,
+            };
+            let path = entry.path();
+            let Ok(meta) = path.symlink_metadata() else {
+                return false;
+            };
+            let later = meta.created().is_ok_and(|at| at >= born);
+            if meta.file_type().is_symlink() || !later {
+                return false;
+            }
+            if meta.is_dir() {
+                folders.push(path);
+            }
+        }
+    }
+    true
 }
 
 /// Keeps `pairs`, words of a paragraph that spoke to an AI, as read in
@@ -330,6 +429,23 @@ mod tests {
         assert!(!own(&ctx, &dir.join("moved.txt")));
         assert!(!own(&in_session(731_022), &dir.join("new.txt")));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_folders_its_tools_created_are_the_sessions_own_and_one_that_was_there_is_not() {
+        let dir = crate::store::tests::Scratch::new("taint-folders");
+        std::fs::create_dir_all(dir.join("there")).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.to_path_buf()),
+            ..in_session(731_081)
+        };
+        let write = |path: &str| json!({ "path": path, "content": "x" }).to_string();
+        tools::run("write_file", &write("new/deeper/a.txt"), &ctx).unwrap();
+        tools::run("write_file", &write("there/b.txt"), &ctx).unwrap();
+        assert!(own(&ctx, &dir.join("new")));
+        assert!(own(&ctx, &dir.join("new/deeper")));
+        assert!(!own(&ctx, &dir.join("there")));
+        assert!(!own(&in_session(731_082), &dir.join("new")));
     }
 
     #[test]

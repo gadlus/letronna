@@ -1528,16 +1528,26 @@ pub fn one_line(text: &str) -> String {
 /// Letronna's own folder or on the program that is running.
 pub(crate) fn resolve_write(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
     let me = std::env::current_exe().ok();
-    resolve_write_in(raw, ctx, &crate::chat::data_dir(), me.as_deref())
+    resolve_write_in(raw, ctx, &crate::chat::data_dir(), me.as_deref(), false)
+}
+
+/// `resolve_write` for write_file and edit_file, which may also make a new
+/// file in the system's temp folder or change one the session made there:
+/// a reproduction or a note to self that the project need not hold.
+pub(crate) fn resolve_write_or_scratch(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
+    let me = std::env::current_exe().ok();
+    resolve_write_in(raw, ctx, &crate::chat::data_dir(), me.as_deref(), true)
 }
 
 /// `resolve_write` with Letronna's folder at `data` and its program at `me`,
-/// checked on the nearest existing ancestor since the file need not exist yet.
+/// checked on the nearest existing ancestor since the file need not exist yet;
+/// with `scratch`, as `resolve_write_or_scratch`.
 fn resolve_write_in(
     raw: &str,
     ctx: &ToolContext,
     data: &Path,
     me: Option<&Path>,
+    scratch: bool,
 ) -> Result<PathBuf, String> {
     let workspace = ctx.working_folder()?;
     let root = std::fs::canonicalize(workspace).map_err(|_| "The project folder is missing.")?;
@@ -1569,8 +1579,15 @@ fn resolve_write_in(
             "`{raw}` goes through a link that leads nowhere, so where it lands cannot be checked."
         )
     })?;
-    if !existing.starts_with(&root) {
-        return Err(format!("`{raw}` is outside the project folder."));
+    if !existing.starts_with(&root) && !(scratch && in_scratch(&target, ctx, data)) {
+        return Err(match scratch {
+            true => format!(
+                "`{raw}` is outside the project folder; use the project folder, or a new file \
+                 under {}.",
+                std::env::temp_dir().display()
+            ),
+            false => format!("`{raw}` is outside the project folder."),
+        });
     }
     if private(&existing, data) {
         return Err(format!(
@@ -1586,6 +1603,53 @@ fn resolve_write_in(
         ));
     }
     Ok(target)
+}
+
+/// Whether a write to `path` may land in the system's temp folder, as
+/// scratch the project need not hold: a file not there yet, or one `ctx`'s
+/// session made, right in the temp folder or in a folder the session made
+/// there, with no link on the way below it and never in Letronna's own
+/// folder at `data`. Another program's file there, or one in its folder,
+/// stays out of reach: what reads it later trusts it.
+pub(crate) fn in_scratch(path: &Path, ctx: &ToolContext, data: &Path) -> bool {
+    let given = std::env::temp_dir();
+    let Ok(temp) = std::fs::canonicalize(&given) else {
+        return false;
+    };
+    // A temp folder set to the home folder or above it would make the
+    // user's own files scratch.
+    let home = home().and_then(|home| std::fs::canonicalize(home).ok());
+    if home.is_none_or(|home| home.starts_with(&temp)) {
+        return false;
+    }
+    // As the temp folder is named or as it really is, as on macOS, where
+    // it lies under a link.
+    let Some(rest) = (path.strip_prefix(&given).ok()).or_else(|| path.strip_prefix(&temp).ok())
+    else {
+        return false;
+    };
+    let mut there = temp.clone();
+    let mut parts = rest.components().peekable();
+    while let Some(part) = parts.next() {
+        let std::path::Component::Normal(name) = part else {
+            return false;
+        };
+        let next = there.join(name);
+        let Ok(meta) = next.symlink_metadata() else {
+            // The rest is new: the folder it goes in must be the temp
+            // folder itself or one the session made.
+            return (there == temp || crate::taint::own(ctx, &there)) && !private(&there, data);
+        };
+        let last = parts.peek().is_none();
+        if meta.file_type().is_symlink() || (!last && !meta.is_dir()) {
+            return false;
+        }
+        if last {
+            return meta.is_file() && crate::taint::own(ctx, &next) && !private(&next, data);
+        }
+        there = next;
+    }
+    false
 }
 
 /// Variables every command and every job starts with.
@@ -2497,7 +2561,7 @@ impl Tool for WriteFile {
         format!("Write {}:\n{content}", path_arg(args))
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
-        let path = resolve_write(path_arg(args), ctx)?;
+        let path = resolve_write_or_scratch(path_arg(args), ctx)?;
         let content = args["content"].as_str().ok_or("`content` is required.")?;
         check_document(&path, content)?;
         let change = crate::filestate::overwrite(ctx.conversation, &path, path_arg(args))?;
@@ -2508,7 +2572,7 @@ impl Tool for WriteFile {
         }
         crate::write::check_syntax(&path, before, &text)?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            crate::taint::create_folders(ctx, parent).map_err(|e| e.to_string())?;
         }
         let mut note = crate::write::csv_note(Path::new(path_arg(args)), change.before(), &text);
         note.push_str(&crate::write::syntax_note(
@@ -2630,7 +2694,7 @@ impl Tool for EditFile {
         format!("Edit {}:\n{}", path_arg(args), self.preview(args, ctx))
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
-        let path = resolve_write(path_arg(args), ctx)?;
+        let path = resolve_write_or_scratch(path_arg(args), ctx)?;
         let edits = edits(args)?;
         // A mistyped path is told apart from a new file before the error
         // sends the model to write_file for one.
@@ -6723,9 +6787,90 @@ mod tests {
         let refused = WriteFile
             .run(&json!({"path": "up/x.txt", "content": "escaped"}), &ctx)
             .unwrap_err();
-        assert_eq!(refused, "`up/x.txt` is outside the project folder.");
+        assert!(
+            refused.starts_with(
+                "`up/x.txt` is outside the project folder; use the project folder, or a new file \
+                 under "
+            ),
+            "{refused}"
+        );
         assert!(!dir.join("x.txt").exists());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_makes_new_scratch_files_in_the_temp_folder_and_changes_only_its_own_there() {
+        let temp = std::env::temp_dir();
+        let at = |what: &str| temp.join(format!("letronna-scratch-{what}-{}", std::process::id()));
+        let (project, theirs, folder, link) =
+            (at("project"), at("theirs"), at("folder"), at("link"));
+        let repro = at("repro.py");
+        for path in [&project, &folder] {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        for path in [&repro, &theirs, &link] {
+            let _ = std::fs::remove_file(path);
+        }
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(&theirs, "theirs").unwrap();
+        let ctx = ToolContext {
+            workspace: Some(project.clone()),
+            conversation: 731_171,
+            ..Default::default()
+        };
+        let write = |path: &Path, content: &str| {
+            let args = json!({"path": path.display().to_string(), "content": content});
+            WriteFile.run(&args, &ctx)
+        };
+        write(&repro, "print(1)").unwrap();
+        // Its own, it may write again and edit.
+        write(&repro, "print(2)").unwrap();
+        let edit = json!({"path": repro.display().to_string(), "old": "2", "new": "3"});
+        EditFile.run(&edit, &ctx).unwrap();
+        assert_eq!(std::fs::read_to_string(&repro).unwrap(), "print(3)");
+        // A folder it makes there is its own to write in again.
+        write(&folder.join("a.py"), "x").unwrap();
+        write(&folder.join("b.py"), "x").unwrap();
+        std::os::unix::fs::symlink(&folder, &link).unwrap();
+        // Another program's file, a folder that is not the session's, and a
+        // link on the way stay out of reach.
+        let elsewhere = [
+            theirs.clone(),
+            project.with_file_name("letronna-nowhere").join("new.txt"),
+            link.join("new.txt"),
+        ];
+        for path in &elsewhere[..1] {
+            let refused = write(path, "mine").unwrap_err();
+            assert!(refused.contains("a new file under"), "{refused}");
+        }
+        for path in &elsewhere[1..] {
+            write(path, "mine").unwrap_err();
+        }
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "theirs");
+        assert!(!folder.join("new.txt").exists());
+        // Another session did not make the file.
+        let other = ToolContext {
+            conversation: 731_172,
+            ..ctx.clone()
+        };
+        let args = json!({"path": repro.display().to_string(), "content": "x"});
+        WriteFile.run(&args, &other).unwrap_err();
+        // Letronna's own folder stays out of reach there too, here the
+        // folder the session made standing in for it; and apply_patch, which
+        // resolves without scratch, keeps to the project.
+        let new = folder.join("c.py").display().to_string();
+        resolve_write_in(&new, &ctx, &theirs, None, true).unwrap();
+        resolve_write_in(&new, &ctx, &folder, None, true).unwrap_err();
+        let me = std::env::current_exe().ok();
+        let refused = resolve_write_in(&new, &ctx, &theirs, me.as_deref(), false).unwrap_err();
+        assert_eq!(refused, format!("`{new}` is outside the project folder."));
+        for path in [project, folder] {
+            std::fs::remove_dir_all(path).unwrap();
+        }
+        for path in [repro, theirs, link] {
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
@@ -6743,7 +6888,7 @@ mod tests {
             workspace: Some(dir.clone()),
             ..Default::default()
         };
-        let write = |path: &str| resolve_write_in(path, &ctx, &data, Some(&me));
+        let write = |path: &str| resolve_write_in(path, &ctx, &data, Some(&me), false);
         for path in [
             "Letronna/settings.json",
             "Letronna/mcp.json",
@@ -6796,7 +6941,7 @@ mod tests {
             workspace: Some(dir.clone()),
             ..Default::default()
         };
-        let refused = resolve_write_in("notes.md", &ctx, &data, None).unwrap_err();
+        let refused = resolve_write_in("notes.md", &ctx, &data, None, false).unwrap_err();
         assert!(refused.contains("leads nowhere"), "{refused}");
         let args = json!({"path": "notes.md", "content": "{}"});
         let refused = WriteFile.run(&args, &ctx).unwrap_err();
@@ -6921,7 +7066,7 @@ mod tests {
             ("bin/letronna.new.exe.", "dot or a space"),
             ("bin/letronna.new.exe::$DATA", "hidden stream"),
         ] {
-            let refused = resolve_write_in(path, &ctx, &data, Some(&me)).unwrap_err();
+            let refused = resolve_write_in(path, &ctx, &data, Some(&me), false).unwrap_err();
             assert!(refused.contains(reason), "{path}: {refused}");
         }
         std::fs::remove_dir_all(dir).unwrap();
