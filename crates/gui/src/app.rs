@@ -4318,6 +4318,10 @@ impl Render for Chat {
             // Beside the docked panel, less again.
             - self.panel_width(window, cx);
         let column = pane.min(COLUMN).max(px(0.));
+        // The setup takes the whole window, as a first launch should look:
+        // no sidebar, composer or status bar around it, only the title bar
+        // to drag the window by.
+        let welcome = self.page == Page::Chat && self.show_setup == Some(conversation.id);
 
         let body: AnyElement = if self.page == Page::Jobs {
             self.schedules_page(cx).into_any_element()
@@ -4340,8 +4344,8 @@ impl Render for Chat {
             // place of the conversation as the setup page is: the composer
             // stays under it.
             panel
-        } else if self.show_setup == Some(conversation.id) {
-            self.setup_page(window, cx).into_any_element()
+        } else if welcome {
+            div().into_any_element()
         } else if !self.transcript_shown() {
             if conversation.unfilled() {
                 // Still being read in, which takes a moment: blank rather
@@ -4604,32 +4608,44 @@ impl Render for Chat {
                     cx.notify();
                 }
             }))
-            .child(
-                div()
-                    .relative()
-                    .flex_shrink_0()
-                    .child(self.title_bar(window, cx))
-                    .children(self.grain(&self.grains.title_bar)),
-            )
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .when(self.sidebar_open, |this| {
-                        let sidebar = self.sidebar(window, cx).into_any_element();
-                        // In from the left edge, in a box only while it moves.
-                        this.child(if sidebar_in < 1. {
-                            let moving = div().h_full().flex_shrink_0().relative();
-                            crate::ui::motion::slide(moving, sidebar_in, -1.)
-                                .child(sidebar)
-                                .into_any_element()
-                        } else {
-                            sidebar
+            .when(welcome, |this| {
+                this.child(
+                    TitleBar::new()
+                        .bg(cx.theme().background)
+                        .border_color(cx.theme().background),
+                )
+                .child(self.setup_page(window, cx))
+            })
+            .when(!welcome, |this| {
+                this.child(
+                    div()
+                        .relative()
+                        .flex_shrink_0()
+                        .child(self.title_bar(window, cx))
+                        .children(self.grain(&self.grains.title_bar)),
+                )
+            })
+            .when(!welcome, |this| {
+                this.child(
+                    h_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .when(self.sidebar_open, |this| {
+                            let sidebar = self.sidebar(window, cx).into_any_element();
+                            // In from the left edge, in a box only while it moves.
+                            this.child(if sidebar_in < 1. {
+                                let moving = div().h_full().flex_shrink_0().relative();
+                                crate::ui::motion::slide(moving, sidebar_in, -1.)
+                                    .child(sidebar)
+                                    .into_any_element()
+                            } else {
+                                sidebar
+                            })
                         })
-                    })
-                    .child(main)
-                    .children(self.right_panel(window, cx)),
-            )
+                        .child(main)
+                        .children(self.right_panel(window, cx)),
+                )
+            })
             .children(self.settings_overlay(window, cx))
             .children(self.switcher(cx))
             // Last, over everything, as the colours of a new theme come in;
