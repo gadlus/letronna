@@ -21,6 +21,9 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — A shorter README, and a full guide in `docs/`: install, the app and terminal, gateways, tools, extending, the cloud, configuration, data, architecture, building and benchmarks.
 - **All** — `letronna -p --output json` says which window the run's requests were sized by and where it came from (`"window": {"tokens", "source"}`), and names the model the run used, also when the environment or `--model` chose it.
 
+### Changed
+- **All** — A model whose window nothing gives is sized as if it held 64,000 tokens when its server takes a key, as a gateway or a LiteLLM proxy does, instead of the smallest window, so old tool results are cleared far later; a server without a key, such as Ollama, keeps the small window, and `LETRONNA_CONTEXT_WINDOW` sets it for a keyed proxy in front of a small local model.
+
 ### Fixed
 - **All** — A model its gateway lists only under another vendor's path, such as `deepseek/deepseek-v4.1-flash` listed as `opencode-go/deepseek-v4.1-flash`, is sized by that listed window instead of the smallest one, so old tool results are no longer cleared after a few thousand tokens.
 

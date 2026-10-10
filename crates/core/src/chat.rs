@@ -659,10 +659,23 @@ impl Budget {
     };
 }
 
+/// The window assumed for a model nothing gives the window of, over a server
+/// that takes a key: a hosted gateway or a proxy such as LiteLLM, whose
+/// models read far more than the small budget and which says so in an error
+/// when a request is too long, which `refit` learns from. A server without a
+/// key, such as Ollama or LM Studio, may cut a long prompt short without
+/// saying so, and keeps the small budget.
+const ASSUMED_WINDOW: u64 = 64_000;
+
+/// `ASSUMED_WINDOW` when `connection` goes to a server that takes a key.
+fn assumed_window(connection: &Connection) -> Option<u64> {
+    (!connection.key.trim().is_empty()).then_some(ASSUMED_WINDOW)
+}
+
 /// The budget for the next request over `connection`: its model's window as
-/// far as it is known or `sizing` assumes it, the user's cap (0 for the
-/// default), and what the system prompt, the tools, subfolders'
-/// instructions and the web advice take.
+/// far as it is known or `sizing` or `assumed_window` assumes it, the user's
+/// cap (0 for the default), and what the system prompt, the tools,
+/// subfolders' instructions and the web advice take.
 fn budget(connection: &Connection, sizing: crate::store::Sizing) -> Budget {
     let facts = crate::models::facts_or(
         &connection.endpoint,
@@ -675,7 +688,8 @@ fn budget(connection: &Connection, sizing: crate::store::Sizing) -> Budget {
     let fixed = fixed_tokens(connection)
         + crate::subfolders::reserve(connection)
         + crate::browser::reserve(connection);
-    sized(facts.context, facts.max_output, cap_tokens(cap), fixed)
+    let context = facts.context.or_else(|| assumed_window(connection));
+    sized(context, facts.max_output, cap_tokens(cap), fixed)
 }
 
 /// The most tokens a request carries besides the reply under a cap of `cap`
@@ -822,7 +836,8 @@ pub fn context_report(
 pub struct Window {
     /// None when nothing gives it, and requests get the small budget.
     pub tokens: Option<u64>,
-    /// Where it comes from: one of `models::Source`'s names, or `none`.
+    /// Where it comes from: one of `models::Source`'s names, `assumed` or
+    /// `none`.
     pub source: &'static str,
 }
 
@@ -836,9 +851,15 @@ pub fn window(connection: &Connection) -> Window {
             tokens: Some(tokens),
             source: source.name(),
         },
-        None => Window {
-            tokens: None,
-            source: "none",
+        None => match assumed_window(connection) {
+            Some(tokens) => Window {
+                tokens: Some(tokens),
+                source: "assumed",
+            },
+            None => Window {
+                tokens: None,
+                source: "none",
+            },
         },
     }
 }
@@ -9584,6 +9605,40 @@ mod tests {
         assert_eq!(sized(Some(200_000), None, 1_000, 2_000), Budget::SMALL);
         // Ollama's list says nothing and its models are in no table.
         assert_eq!(budget(&connection(), Sizing::default()), Budget::SMALL);
+        assert_eq!(
+            window(&connection()),
+            Window {
+                tokens: None,
+                source: "none"
+            }
+        );
+        // A server that takes a key is a gateway or a proxy, which reads more
+        // and says when a request is too long: it is sized as if its window
+        // were a moderate one, with the reply every model is asked for.
+        let keyed = Connection {
+            key: "test-key".into(),
+            ..connection()
+        };
+        let assumed = budget(&keyed, Sizing::default());
+        assert_eq!(
+            assumed,
+            sized(Some(ASSUMED_WINDOW), None, CAP_TOKENS, fixed_tokens(&keyed))
+        );
+        assert_eq!(assumed.reply, REPLY_TOKENS);
+        assert!(assumed.tokens > 4 * CONTEXT_TOKENS, "{assumed:?}");
+        assert_eq!(
+            window(&keyed),
+            Window {
+                tokens: Some(ASSUMED_WINDOW),
+                source: "assumed"
+            }
+        );
+        // A key with nothing in it is no key.
+        let blank = Connection {
+            key: "  ".into(),
+            ..connection()
+        };
+        assert_eq!(budget(&blank, Sizing::default()), Budget::SMALL);
         // A list that names the model only under another vendor's path is no
         // help on another host.
         let elsewhere = Connection {
@@ -10839,6 +10894,59 @@ mod tests {
         // Sent again sized by it, with all but the newest five results cleared.
         assert_eq!(cleared_and_asked(&bodies[0]), (0, 8_192));
         assert_eq!(cleared_and_asked(&bodies[1]), (7, 4_000));
+    }
+
+    /// Sends twelve read results to a keyed server whose model nothing gives
+    /// the window of, which turns the first request down with `overflow`
+    /// and answers the second, and gives the bodies of both.
+    fn overflow_from_the_assumed_window(model: &str, overflow: &'static str) -> Vec<String> {
+        let (endpoint, worker) = serve(vec![
+            ("400 Bad Request", "application/json", overflow),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
+        // Listed already, with nothing about this model, so the key asks the
+        // stub for no list.
+        crate::models::remember(&endpoint, &[serde_json::json!({"id": "another-model"})]);
+        let c = Connection {
+            endpoint,
+            model: model.into(),
+            key: "test-key".into(),
+            ..connection()
+        };
+        assert_eq!(window(&c).source, "assumed");
+        let rx = start(c, reads(12, 1_000));
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "Hello"));
+        assert!(matches!(
+            rx.recv_blocking().unwrap(),
+            Event::Finished(Ok(()))
+        ));
+        worker.join().unwrap()
+    }
+
+    #[test]
+    fn an_overflow_from_the_assumed_window_is_sent_again_sized_to_the_limit_it_named() {
+        let bodies = overflow_from_the_assumed_window(
+            "names-its-limit-past-the-assumed-one",
+            r#"{"error":{"message":"This model's maximum context length is 16000 tokens. However, your messages resulted in 20000 tokens. Please reduce the length of the messages.","type":"invalid_request_error","code":"context_length_exceeded"}}"#,
+        );
+        // Nothing was cleared under the assumed window, and the retry was
+        // sized by the limit, with all but the newest five results cleared.
+        assert_eq!(cleared_and_asked(&bodies[0]), (0, 8_192));
+        assert_eq!(cleared_and_asked(&bodies[1]), (7, 4_000));
+    }
+
+    #[test]
+    fn an_overflow_from_the_assumed_window_that_names_no_limit_is_sent_again_squeezed() {
+        let bodies = overflow_from_the_assumed_window(
+            "names-no-limit-past-the-assumed-one",
+            r#"{"error":{"message":"prompt is too long for this model","type":"invalid_request_error"}}"#,
+        );
+        assert_eq!(cleared_and_asked(&bodies[0]), (0, 8_192));
+        assert_eq!(cleared_and_asked(&bodies[1]), (7, 8_192));
     }
 
     #[test]
