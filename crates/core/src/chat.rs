@@ -817,6 +817,32 @@ pub fn context_report(
     }
 }
 
+/// The window requests over a connection are sized by, as a run reports it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Window {
+    /// None when nothing gives it, and requests get the small budget.
+    pub tokens: Option<u64>,
+    /// Where it comes from: one of `models::Source`'s names, or `none`.
+    pub source: &'static str,
+}
+
+/// `Window` for the next request over `connection`, so a run sized by the
+/// small budget because nothing gave its window can be told from one that
+/// was given it.
+pub fn window(connection: &Connection) -> Window {
+    let sizing = crate::store::sizing();
+    match crate::models::window_or(&connection.endpoint, connection.model.trim(), sizing.window) {
+        Some((tokens, source)) => Window {
+            tokens: Some(tokens),
+            source: source.name(),
+        },
+        None => Window {
+            tokens: None,
+            source: "none",
+        },
+    }
+}
+
 /// The budget for a model that reads `context` tokens and writes `output`,
 /// where they are known, under a cap of `cap` tokens, when `fixed` tokens of
 /// every request go to the system prompt and the tools.
@@ -9558,6 +9584,23 @@ mod tests {
         assert_eq!(sized(Some(200_000), None, 1_000, 2_000), Budget::SMALL);
         // Ollama's list says nothing and its models are in no table.
         assert_eq!(budget(&connection(), Sizing::default()), Budget::SMALL);
+        // A list that names the model only under another vendor's path is no
+        // help on another host.
+        let elsewhere = Connection {
+            endpoint: "https://unlisted-here.test/v1".into(),
+            model: "vendor/listed-elsewhere".into(),
+            ..connection()
+        };
+        let entry = serde_json::json!({"id": "router/listed-elsewhere", "context_length": 200_000});
+        crate::models::remember("https://listed-there.test/v1", &[entry]);
+        assert_eq!(budget(&elsewhere, Sizing::default()), Budget::SMALL);
+        assert_eq!(
+            window(&elsewhere),
+            Window {
+                tokens: None,
+                source: "none"
+            }
+        );
     }
 
     #[test]
@@ -9579,6 +9622,48 @@ mod tests {
             ..Sizing::default()
         };
         assert_eq!(budget(&gpt, capped).step, 10_000);
+        assert_eq!(
+            window(&gpt),
+            Window {
+                tokens: Some(128_000),
+                source: "family"
+            }
+        );
+    }
+
+    #[test]
+    fn a_model_its_gateway_lists_under_another_vendors_path_is_sized_from_that() {
+        let routed = Connection {
+            endpoint: "http://alias-sized.test:8080/v1".into(),
+            model: "deepseek/deepseek-v4.1-flash".into(),
+            tools: true,
+            ..connection()
+        };
+        let turn = tool_turn();
+        let small = budget(&routed, Sizing::default());
+        assert_eq!(small, Budget::SMALL);
+        let before = body_with(&routed, &turn, None, None, &small, &[]);
+        let list = serde_json::json!([
+            {"id": "opencode-go/deepseek-v4.1-flash", "context_length": 1_000_000},
+            {"id": "openrouter/deepseek/deepseek-v4.1-flash", "context_length": 1_048_576}
+        ]);
+        crate::models::remember(&routed.endpoint, list.as_array().unwrap());
+        let listed = budget(&routed, Sizing::default());
+        assert_eq!(listed.step, CAP_TOKENS / 2);
+        assert_eq!(listed.reply, REPLY_TOKENS);
+        assert!(listed.tool_chars > Budget::SMALL.tool_chars, "{listed:?}");
+        assert_eq!(
+            window(&routed),
+            Window {
+                tokens: Some(1_000_000),
+                source: "listed-alias"
+            }
+        );
+        // The first request goes out before the list is in, so the next must
+        // start with the same prompt and tools to read them from the cache.
+        let after = body_with(&routed, &turn, None, None, &listed, &[]);
+        assert_eq!(before["messages"][0], after["messages"][0]);
+        assert_eq!(before["tools"], after["tools"]);
     }
 
     #[test]

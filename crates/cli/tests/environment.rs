@@ -150,6 +150,10 @@ fn a_print_run_configured_only_by_the_environment_reaches_the_stub() {
     assert!(out.status.success(), "{stdout}{stderr}");
     let result: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(result["answer"], "Pong.");
+    // The result names the model the run used, not the session's setting,
+    // and that nothing gave its window.
+    assert_eq!(result["model"], "env-model");
+    assert_eq!(result["window"], json!({"tokens": null, "source": "none"}));
     let (headers, body) = requests.try_recv().expect("the stub was never asked");
     assert_eq!(body["model"], "env-model");
     assert!(

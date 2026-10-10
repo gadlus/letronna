@@ -19,6 +19,10 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **Web** — Letronna Cloud takes more servers: admins add a VPS from the admin page with one setup command, and runs and 24/7 bots spread across every server.
 - **Web** — letronna.ai shows Letronna Cloud on the home page and has a Cloud page in the docs; phone apps for iPhone and Android are marked coming soon.
 - **All** — A shorter README, and a full guide in `docs/`: install, the app and terminal, gateways, tools, extending, the cloud, configuration, data, architecture, building and benchmarks.
+- **All** — `letronna -p --output json` says which window the run's requests were sized by and where it came from (`"window": {"tokens", "source"}`), and names the model the run used, also when the environment or `--model` chose it.
+
+### Fixed
+- **All** — A model its gateway lists only under another vendor's path, such as `deepseek/deepseek-v4.1-flash` listed as `opencode-go/deepseek-v4.1-flash`, is sized by that listed window instead of the smallest one, so old tool results are no longer cleared after a few thousand tokens.
 
 ## [0.1.0-alpha.3] - 2026-10-06
 

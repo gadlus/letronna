@@ -601,6 +601,9 @@ fn ask_once(
         emit(&opening);
     }
     let prompt = prompt_rules::seen(&spec.connection).unwrap_or_default();
+    // The run's own, which the environment's route and --model may have set
+    // apart from the session's.
+    let connection = spec.connection.clone();
     let report = run_following(spec, args.output);
     let ran_out = ran_out.load(Ordering::SeqCst);
     finish(
@@ -609,7 +612,7 @@ fn ask_once(
         (id, before),
         report,
         args.output,
-        prompt,
+        (&connection, prompt),
         ran_out,
     )
 }
@@ -841,16 +844,16 @@ fn run_following(spec: Spec, output: Output) -> Report {
 }
 
 /// Takes the session back from run `id`, whose messages follow the first
-/// `before`, and prints how the run ended with what it was told of the
-/// prompt's rules, and whether its deadline stopped it, saying whether it
-/// ended without failing.
+/// `before`, and prints how the run over `connection` ended with what it was
+/// told of the prompt's rules, and whether its deadline stopped it, saying
+/// whether it ended without failing.
 fn finish(
     runner: &mut Runner,
     session: usize,
     (id, before): (u64, usize),
     mut report: Report,
     output: Output,
-    prompt: Value,
+    (connection, prompt): (&chat::Connection, Value),
     ran_out: bool,
 ) -> bool {
     // On stderr, apart from the answer: what a hook said or could not do.
@@ -862,7 +865,7 @@ fn finish(
     let mut extras = None;
     if let Some(said) = take_back(runner, session, id, before) {
         report.text = said;
-        extras = Some(Extras::of(runner, session, before, prompt));
+        extras = Some(Extras::of(runner, session, before, connection, prompt));
     }
     show(output, &report, extras.as_ref(), ran_out);
     !matches!(report.status, Outcome::Failed(_))
@@ -1119,6 +1122,10 @@ fn as_json(report: &Report, extras: Option<&Extras>) -> Value {
         out["session"] = extras.session.into();
         out["model"] = extras.model.as_str().into();
         out["gateway"] = extras.gateway.as_str().into();
+        out["window"] = json!({
+            "tokens": extras.window.tokens,
+            "source": extras.window.source,
+        });
         out["cost_usd"] = extras.cost.into();
         out["refused"] = extras.refused.into();
         out["prompt"] = extras.prompt.clone();
@@ -1136,6 +1143,8 @@ struct Extras {
     session: u64,
     model: String,
     gateway: String,
+    /// The window its requests were sized by, and where that came from.
+    window: chat::Window,
     /// What the run's own model calls cost in US dollars, over those whose
     /// cost is known; None when no call's is.
     cost: Option<f64>,
@@ -1146,16 +1155,23 @@ struct Extras {
 }
 
 impl Extras {
-    /// The extras of the run whose messages follow the first `before` in the
-    /// session at `session`, told `prompt` of the rules.
-    fn of(runner: &Runner, session: usize, before: usize, prompt: Value) -> Extras {
+    /// The extras of the run over `connection` whose messages follow the
+    /// first `before` in the session at `session`, told `prompt` of the rules.
+    fn of(
+        runner: &Runner,
+        session: usize,
+        before: usize,
+        connection: &chat::Connection,
+        prompt: Value,
+    ) -> Extras {
         let conversation = &runner.store.conversations[session];
         let own = conversation.messages.get(before..).unwrap_or_default();
-        let (gateway, model) = runner.store.model(session);
+        let (gateway, _) = runner.store.model(session);
         Extras {
             session: conversation.id,
-            model: model.to_owned(),
+            model: connection.model.trim().to_owned(),
             gateway: gateway.to_owned(),
+            window: chat::window(connection),
             cost: cost(own),
             refused: own.iter().filter(|message| refused(message)).count(),
             prompt,
@@ -1573,6 +1589,10 @@ mod tests {
             session: 137,
             model: "stub-model".into(),
             gateway: "Custom".into(),
+            window: chat::Window {
+                tokens: None,
+                source: "none",
+            },
             cost: Some(0.25),
             refused: 2,
             prompt: json!({"dropped": ["compute"], "rules_sha": "0123456789ab"}),
@@ -1596,6 +1616,18 @@ mod tests {
         );
         assert_eq!(out["answer"], "The notes say hello.");
         assert_eq!(out["prompt"]["dropped"], json!(["compute"]));
+        // A run sized by the small budget because nothing gave its window
+        // says so, as does one whose window came from somewhere.
+        assert_eq!(out["window"], json!({"tokens": null, "source": "none"}));
+        extras.window = chat::Window {
+            tokens: Some(1_000_000),
+            source: "listed-alias",
+        };
+        let out = as_json(&report(Outcome::Done), Some(&extras));
+        assert_eq!(
+            out["window"],
+            json!({"tokens": 1_000_000, "source": "listed-alias"})
+        );
         // A cost nobody knows is said to be unknown, not nothing.
         extras.cost = None;
         let out = as_json(&report(Outcome::Done), Some(&extras));
