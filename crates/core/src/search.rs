@@ -895,7 +895,7 @@ fn ask(
     let asked = request.url().clone();
     crate::web::stopped(&asked, asker, Instant::now())?;
     let reply = client.execute(request);
-    crate::web::note_reach(&asked, reply.as_ref().err(), asker);
+    crate::web::note_reach(&asked, reply.as_ref().err(), false, asker);
     let reply = reply.map_err(|e| match e.is_timeout() {
         true => format!(
             "{} did not answer within {} seconds.",

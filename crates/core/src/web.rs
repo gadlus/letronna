@@ -253,7 +253,7 @@ fn fetch_for(raw: &str, secrets: &[String], fresh: bool, asker: &Asker) -> Resul
         }
         stopped(&url, asker, Instant::now())?;
         let response = request.send();
-        note_reach(&url, response.as_ref().err(), asker);
+        note_reach(&url, response.as_ref().err(), !previous.is_empty(), asker);
         let response = response
             .map_err(|e| unanswered("Could not fetch the page:", &e, !previous.is_empty()))?;
         let Some(next) = moved_to(&response) else {
@@ -477,19 +477,32 @@ pub(crate) fn stopped(url: &reqwest::Url, asker: &Asker, now: Instant) -> Result
     })
 }
 
-/// Notes how a request to `url` went, `failure` when it got no answer: one
-/// that could not connect to the web stops the next, and any answer, an
-/// error page too, shows the web is in reach again.
-pub(crate) fn note_reach(url: &reqwest::Url, failure: Option<&reqwest::Error>, asker: &Asker) {
+/// Notes how a request to `url` went, `failure` when it got no answer and
+/// `moved` when a redirect chose `url`: one that could not connect to the
+/// web stops the next, and any answer, an error page too, shows the web is
+/// in reach again.
+pub(crate) fn note_reach(
+    url: &reqwest::Url,
+    failure: Option<&reqwest::Error>,
+    moved: bool,
+    asker: &Asker,
+) {
     // A redirect reqwest followed may have failed somewhere else.
-    let url = failure.and_then(reqwest::Error::url).unwrap_or(url);
-    if !over_the_web(url) {
+    let failed_at = failure.and_then(reqwest::Error::url).unwrap_or(url);
+    if !over_the_web(failed_at) {
         return;
     }
     let Some(e) = failure else {
         with_unreachable(Option::take);
         return;
     };
+    // A redirect's address is the server's to choose: one to where nothing
+    // answers says nothing of this computer's network, and its host, named
+    // in the stop every session would then be told, would be the server's
+    // words outside a fence.
+    if moved || failed_at != url {
+        return;
+    }
     if let Some(why) = unconnected(e) {
         let last = Unreachable {
             at: Instant::now(),
@@ -2118,6 +2131,26 @@ or <a data-href="/x" href=/top#part>the top</a>.</p>
             with_unreachable(|last| last.is_some()),
             "a local page cleared it"
         );
+    }
+
+    #[test]
+    fn a_redirect_to_where_nothing_answers_stops_nothing() {
+        stand_in_for_the_web();
+        let (base, _) = serve(no_page);
+        // Followed here, as web_fetch does.
+        let why = fetch(&format!("{base}/away"), &[], false).unwrap_err();
+        assert!(crate::untrusted::holds_fence(&why), "{why}");
+        assert!(with_unreachable(|last| last.is_none()), "web_fetch's stopped them");
+        // Followed by reqwest, as a search service's are.
+        let asked = reqwest::Url::parse(&format!("{base}/away")).unwrap();
+        let following = reqwest::blocking::Client::builder().no_proxy().build().unwrap();
+        let failure = following.get(asked.clone()).send().unwrap_err();
+        note_reach(&asked, Some(&failure), false, &Asker::default());
+        assert!(with_unreachable(|last| last.is_none()), "a search's stopped them");
+        // The same failure at the address asked for does.
+        let asked = failure.url().unwrap().clone();
+        note_reach(&asked, Some(&failure), false, &Asker::default());
+        assert!(with_unreachable(|last| last.is_some()));
     }
 
     #[test]

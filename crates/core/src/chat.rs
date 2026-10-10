@@ -714,9 +714,11 @@ pub fn cap_tokens(cap: u64) -> usize {
 }
 
 /// What the system prompt and the tools take of every request over
-/// `connection`: a request without messages.
+/// `connection`: a request without messages, and what rides on its first
+/// message from the user, which the message's own count leaves out.
 fn fixed_tokens(connection: &Connection) -> usize {
     tokens(&body_with(connection, &[], None, None, &Budget::SMALL, &[]).to_string())
+        + surroundings_note(connection).map_or(0, |note| tokens(&note))
 }
 
 /// How a request over `connection` would spend its tokens, named the way the
@@ -725,7 +727,8 @@ fn fixed_tokens(connection: &Connection) -> usize {
 pub struct ContextParts {
     /// Who Letronna is, its reply style and rules, the date and the model:
     /// the system prompt less memory, skills and the MCP servers' own
-    /// instructions, which are counted on their own.
+    /// instructions, which are counted on their own, and what a run nobody
+    /// watches is told of its surroundings with its first message.
     pub system: u64,
     /// The built-in tools' schemas, MCP's among them left out.
     pub tools: u64,
@@ -759,7 +762,8 @@ fn context_parts(connection: &Connection, messages: &[Message], floor: usize) ->
     let part = |range: &Range<usize>| tokens(&text[range.clone()]) as u64;
     let system = tokens(&text[..prompt.identity])
         + tokens(&text[prompt.skills.end..prompt.remembered.start])
-        + tokens(&text[prompt.remembered.end..]);
+        + tokens(&text[prompt.remembered.end..])
+        + surroundings_note(connection).map_or(0, |note| tokens(&note));
     let (tools, mcp) = if connection.tools {
         let every = crate::tools::all();
         let on_demand = crate::mcp_find::OnDemand::of(connection, &every);
@@ -1342,20 +1346,6 @@ fn system_prompt(
             None => offset.to_string(),
         };
         system.push_str(&format!(" This computer runs {os}, set to {zone}."));
-        // What the last run nobody watches to start in this folder found,
-        // not a fresh look, so a run's every request says the same; after
-        // the date, as it changes from one run to the next.
-        let unwatched = !(connection.human || connection.remote.is_some());
-        if connection.tools
-            && unwatched
-            && let Some(workspace) = &connection.workspace
-            && let Some(line) = surroundings()
-                .lock()
-                .ok()
-                .and_then(|seen| seen.get(workspace).cloned())
-        {
-            system.push_str(&line);
-        }
     }
     // Where a scheduled run's answer goes, and what `notify` posts now, so a
     // message wanted every day is one schedule and one wanted now one call,
@@ -1441,6 +1431,28 @@ fn offers_notify() -> bool {
     )
 }
 
+/// What a request over `connection` tells the model of the commands on PATH
+/// and the top of its project folder, as the latest run nobody watches to
+/// start there found them, not a fresh look, so a run's every request says
+/// the same. Only a run nobody watches is told, and at the head of the
+/// window's first message from the user rather than in the system prompt:
+/// a task in another folder then starts with the same system prompt and
+/// tools, which the templates of DeepSeek and Qwen put after it, so the
+/// provider's cache serves both across tasks. Only on the wire; the stored
+/// message never carries it.
+fn surroundings_note(connection: &Connection) -> Option<String> {
+    // A quick look brings its own instructions, and has no folder to tell.
+    if !connection.tools || connection.system.is_some() || crate::prompt_rules::watched(connection)
+    {
+        return None;
+    }
+    let workspace = connection.workspace.as_ref()?;
+    let line = surroundings().lock().ok()?.get(workspace).cloned()?;
+    Some(format!(
+        "(From Letronna, not part of the message below:{line})"
+    ))
+}
+
 /// What runs nobody watches are told of the commands on PATH and the top of
 /// their project folder, by folder, as the latest run there found them when
 /// it started.
@@ -1460,7 +1472,7 @@ pub(crate) fn look_around(workspace: &std::path::Path) {
 }
 
 /// Which of `COMMANDS` `found` finds, and what `workspace` holds at its top
-/// level, as the sentences the system prompt carries.
+/// level, as the sentences a run nobody watches is told.
 fn surroundings_of(workspace: &std::path::Path, found: &dyn Fn(&str) -> bool) -> String {
     let (on, off): (Vec<&str>, Vec<&str>) = COMMANDS.iter().partition(|name| found(name));
     let mut line = match (on.join(", "), off.join(", ")) {
@@ -1611,13 +1623,18 @@ fn body_hashed(
     mut prefix: Option<&mut crate::cache_miss::Prefix>,
 ) -> Value {
     let system = system_prompt(connection, summary, kept);
+    let mut around = surroundings_note(connection);
     // Hashed apart from the model line, so that a switch of model is named
-    // as that rather than as the system prompt.
+    // as that rather than as the system prompt. The surroundings told with
+    // the first message count with it, as the computer it runs on.
     if let Some(prefix) = prefix.as_deref_mut() {
         use crate::cache_miss::Reason;
         let text = system.text.as_str();
         let rest = &text[system.skills.end..system.model];
-        prefix.set(Reason::System, (&text[..system.identity], rest));
+        prefix.set(
+            Reason::System,
+            (&text[..system.identity], rest, around.as_deref()),
+        );
         let remembered = &text[system.remembered.clone()];
         prefix.set(Reason::Memory, (&text[system.memory.clone()], remembered));
         prefix.set(Reason::Skills, &text[system.skills.clone()]);
@@ -1738,6 +1755,14 @@ fn body_hashed(
                 })
                 .collect();
             wired["content"] = format!("{text}{unseen}").into();
+        }
+        // Ahead of the message, not after it, so it reads as the setting
+        // and the task stays the last word; once, on the first.
+        if m.role == "user"
+            && let Some(text) = wired["content"].as_str()
+            && let Some(note) = around.take()
+        {
+            wired["content"] = format!("{note}\n\n{text}").into();
         }
         let here = shown.iter().filter(|(picture, _)| picture.after == i);
         if m.role == "user" {
@@ -6502,6 +6527,18 @@ mod tests {
         );
     }
 
+    /// The messages a request over `c` sends with tools for `window`.
+    fn sent_with_tools(c: &Connection, window: &[Message]) -> Vec<Value> {
+        let with_tools = Connection {
+            tools: true,
+            ..c.clone()
+        };
+        body(&with_tools, window, None, None)["messages"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
     #[test]
     fn a_run_nobody_watches_is_told_which_commands_are_on_path() {
         let dir = crate::store::tests::Scratch::new("surroundings");
@@ -6513,20 +6550,101 @@ mod tests {
             .lock()
             .unwrap()
             .insert(dir.to_path_buf(), line.clone());
-        let unwatched = system_with_tools(Connection {
+        let unwatched = Connection {
             workspace: Some(dir.to_path_buf()),
             ..connection()
-        });
+        };
 
         assert_eq!(
             line,
             " Commands on PATH: python3, git; not found: python, pip3, pip, pytest, node, npm, curl, jq, sqlite3, pdftotext. When this run started, the project folder held: data.csv, src/."
         );
-        // After the computer, so the model line is still where it was.
-        assert!(
-            unwatched.contains(&format!("{line} The model behind you")),
-            "{unwatched}"
+        // On the first message from the user, ahead of it, and only on the
+        // wire: the stored message and the system prompt go without it.
+        let note = format!("(From Letronna, not part of the message below:{line})");
+        let window = [said("user", "fix the bug")];
+        let sent = sent_with_tools(&unwatched, &window);
+        let system = sent[0]["content"].as_str().unwrap();
+        assert!(!system.contains("on PATH"), "{system}");
+        assert!(system.contains(" This computer runs "), "{system}");
+        assert_eq!(sent[1]["content"], format!("{note}\n\nfix the bug"));
+        assert_eq!(window[0].content, "fix the bug");
+        // Each round sends it the same, and on that message alone.
+        let later = [
+            said("user", "fix the bug"),
+            said("assistant", "Which one?"),
+            said("user", "the parser"),
+        ];
+        let again = sent_with_tools(&unwatched, &later);
+        assert_eq!(again[1], sent[1]);
+        assert_eq!(again[3]["content"], "the parser");
+        // And it is paid for in every request's fixed part, as the system
+        // prompt it came out of was. Held, so no other test's data folder
+        // changes the rest of the request in between.
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let data = crate::store::tests::Scratch::new("surroundings-data");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &data) };
+        let told = Connection {
+            tools: true,
+            ..unwatched
+        };
+        let (fixed, parts) = (fixed_tokens(&told), context_parts(&told, &[], 0).system);
+        surroundings().lock().unwrap().remove(&dir.to_path_buf());
+        let (fixed_untold, parts_untold) =
+            (fixed_tokens(&told), context_parts(&told, &[], 0).system);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert_eq!(fixed - fixed_untold, tokens(&note));
+        assert_eq!(parts - parts_untold, tokens(&note) as u64);
+    }
+
+    #[test]
+    fn runs_nobody_watches_in_folders_that_differ_send_the_same_system_prompt_and_tools() {
+        // As tasks of a benchmark or a CI job start in one path with
+        // different files and commands: the folder sentence names the path,
+        // which stays, and nothing else of what is cached changes.
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let data = crate::store::tests::Scratch::new("surroundings-across-data");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &data) };
+        let dir = crate::store::tests::Scratch::new("surroundings-across");
+        let unwatched = Connection {
+            tools: true,
+            workspace: Some(dir.to_path_buf()),
+            ..connection()
+        };
+        let request = |line: &str| {
+            surroundings()
+                .lock()
+                .unwrap()
+                .insert(dir.to_path_buf(), line.to_owned());
+            let mut prefix = crate::cache_miss::Prefix::default();
+            let sent = body_hashed(
+                &unwatched,
+                &[said("user", "fix the bug")],
+                (None, None),
+                None,
+                &Budget::SMALL,
+                &Extra::default(),
+                Some(&mut prefix),
+            );
+            (sent, prefix)
+        };
+        let (one, one_hashed) = request(
+            " Commands on PATH: git. When this run started, the project folder held: a.py.",
         );
+        let (two, two_hashed) = request(
+            " Commands on PATH: node, npm. When this run started, the project folder held: package.json, src/.",
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert_eq!(one["messages"][0], two["messages"][0]);
+        assert_eq!(one["tools"].to_string(), two["tools"].to_string());
+        assert_ne!(one["messages"][1], two["messages"][1]);
+        // A run that finds its folder changed under it is told why its
+        // cache missed, as when the line was in the system prompt.
+        assert_ne!(one_hashed, two_hashed);
     }
 
     #[test]
@@ -6537,23 +6655,26 @@ mod tests {
             .lock()
             .unwrap()
             .insert(dir.to_path_buf(), line);
-        let watched = system_with_tools(Connection {
+        let watched = Connection {
             human: true,
             workspace: Some(dir.to_path_buf()),
             ..connection()
-        });
+        };
         // A chat app's run is answered through the chat, watched or not.
-        let chat = system_with_tools(Connection {
+        let chat = Connection {
             remote: Some(Remote {
                 place: "a Telegram chat".into(),
                 ..Default::default()
             }),
             workspace: Some(dir.to_path_buf()),
             ..connection()
-        });
+        };
 
-        assert!(!watched.contains("on PATH"), "{watched}");
-        assert!(!chat.contains("on PATH"), "{chat}");
+        for c in [watched, chat] {
+            let sent = sent_with_tools(&c, &[said("user", "fix the bug")]);
+            assert!(!sent[0]["content"].as_str().unwrap().contains("on PATH"));
+            assert_eq!(sent[1]["content"], "fix the bug");
+        }
     }
 
     #[test]

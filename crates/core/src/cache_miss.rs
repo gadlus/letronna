@@ -29,7 +29,8 @@ pub const SHOWN: usize = 5;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
-    /// Who Letronna is, its rules, the date or the computer it runs on.
+    /// Who Letronna is, its rules, the date or the computer it runs on,
+    /// which a run nobody watches is told with its first message.
     System,
     Memory,
     Skills,
