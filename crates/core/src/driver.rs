@@ -4787,22 +4787,20 @@ pub(crate) mod tests {
         crate::schedule::run_of(&job, None, connection, transcript)
     }
 
-    /// An edit in the project, a command that throws work away and one that
-    /// changes things, as a scheduled run's model makes them. The one that
-    /// changes things comes last: where the OS sandbox stops it, a command
-    /// that fails leaves the rest of its reply unrun.
+    /// An edit in the project, a command that changes things and one that
+    /// throws work away, as a scheduled run's model makes them.
     fn tidying() -> Vec<String> {
         let calls = [
             ("write_file", json!({"path": "made.txt", "content": "made"})),
-            command("git reset --hard HEAD~1"),
             command("mkdir made-dir"),
+            command("git reset --hard HEAD~1"),
         ];
         vec![reply("", &calls), reply("Tidied what I could.", &[])]
     }
 
     /// Whether the edit and the command of `tidying` ran in `dir`, after
-    /// checking that the call between them was refused: by the floor, or
-    /// by plan mode before the floor looked.
+    /// checking that the last call was refused: by the floor, or by plan
+    /// mode before the floor looked.
     fn tidied(dir: &Path, sent: &[Value]) -> (bool, bool) {
         let results = results(sent.last().unwrap());
         assert_eq!(results.len(), 3, "{results:?}");
@@ -4811,7 +4809,7 @@ pub(crate) mod tests {
             "`run_command` in plan mode only runs commands that just read",
         ];
         assert!(
-            refused.iter().any(|why| results[1].starts_with(why)),
+            refused.iter().any(|why| results[2].starts_with(why)),
             "{results:?}"
         );
         (dir.join("made.txt").exists(), dir.join("made-dir").exists())
@@ -4951,12 +4949,12 @@ pub(crate) mod tests {
         assert_eq!(finished(spec).status, Outcome::Done);
         let sent = provider.sent();
 
-        // The edit ran unjudged, the floor refused the reset before any
-        // judge saw it, and the command after it ran on the judge's word. It
-        // ran in the OS sandbox where this system has one, whose own rules
-        // say whether it may make a folder at the project's top.
+        // The edit ran unjudged, the command on the judge's word, and the
+        // floor refused the last before any judge saw it. The command ran in
+        // the OS sandbox where this system has one, whose own rules say
+        // whether it may make a folder at the project's top.
         let (edited, made) = tidied(&dir, &sent);
-        let ran = results(sent.last().unwrap())[2];
+        let ran = results(sent.last().unwrap())[1];
         assert!(edited, "{ran}");
         if crate::sandbox::available() {
             assert!(ran.contains(crate::sandbox::NOTE), "{ran}");
@@ -4984,7 +4982,7 @@ pub(crate) mod tests {
         let sent = provider.sent();
 
         assert_eq!(tidied(&dir, &sent), (true, false));
-        let refused = results(sent.last().unwrap())[2];
+        let refused = results(sent.last().unwrap())[1];
         assert!(refused.contains("nobody is here to decide"), "{refused}");
         assert!(requests.try_recv().is_err(), "a card with nobody there");
     }

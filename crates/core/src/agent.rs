@@ -1005,18 +1005,20 @@ fn result_shape(content: &str) -> String {
 }
 
 /// Whether a result leaves its reply's other calls unrun: a call that runs
-/// alone, such as an edit or a command, that failed or exited with a code.
-/// A read or search that fails cancels nothing, since the calls beside it
-/// run at once and count on nothing it did; nor does a question, which is
-/// no work the rest could count on. Nor does a call the user, the gate or
-/// a stop kept from running: each call of the reply is answered on its own
-/// there, as a read beside a write plan mode refuses still runs.
+/// alone, such as an edit or a command, that failed. A command that ran
+/// and exited with a code is no failure here: the code is its answer, as
+/// a test suite's is, and the description promises a command queued behind
+/// it its own. A read or search that fails cancels nothing, since the
+/// calls beside it run at once and count on nothing it did; nor does a
+/// question, which is no work the rest could count on. Nor does a call the
+/// user, the gate or a stop kept from running: each call of the reply is
+/// answered on its own there, as a read beside a write plan mode refuses
+/// still runs.
 fn fails_the_rest(result: &Message) -> bool {
     if tools::concurrent(&result.name) || result.name == tools::ASK_USER {
         return false;
     }
-    (result.is_error && !refused_or_stopped(&result.content))
-        || crate::tool_runs::exit_code(result).is_some()
+    result.is_error && !refused_or_stopped(&result.content)
 }
 
 /// Whether an error is a no from the user, the gate, a hook or Auto mode,
@@ -1649,7 +1651,7 @@ mod tests {
     }
 
     #[test]
-    fn a_command_that_exits_with_a_code_leaves_the_rest_of_its_reply_unrun() {
+    fn a_command_that_exits_with_a_code_leaves_the_rest_of_its_reply_to_run() {
         let mut turn = turn();
         let mut build = call("run_command");
         build.arguments = serde_json::json!({ "command": "cargo build" }).to_string();
@@ -1658,17 +1660,24 @@ mod tests {
             ..call("run_command")
         };
         test.arguments = serde_json::json!({ "command": "cargo test" }).to_string();
+        // Two suites sent together each report their own code, as the
+        // description promises, so a failure in the first is no reason to
+        // leave the second unrun.
         turn.begin(vec![build, test.clone()]);
         turn.finish_call(Ok("error[E0308]: mismatched types\n[exit code 101]".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Run(test.clone()));
+        turn.finish_call(Ok("test result: FAILED\n[exit code 1]".into()));
         assert_eq!(turn.next(|_| Outcome::Run), Next::Ask);
         let sent = turn.take_results();
         assert!(sent[0].content.ends_with("[exit code 101]") && !sent[0].is_error);
-        assert!(sent[1].content.starts_with("Not run: an earlier call"));
-        // One that ran clean lets the next run.
+        assert!(sent[1].content.ends_with("[exit code 1]") && !sent[1].is_error);
+        // One that could not run at all does leave the rest unrun.
         let mut turn = self::turn();
         turn.begin(vec![call("run_command"), test.clone()]);
-        turn.finish_call(Ok("Finished".into()));
-        assert_eq!(turn.next(|_| Outcome::Run), Next::Run(test));
+        turn.finish_call(Err("The command timed out.".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Ask);
+        let sent = turn.take_results();
+        assert!(sent[1].content.starts_with("Not run: an earlier call"));
     }
 
     #[test]
