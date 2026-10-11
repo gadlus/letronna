@@ -883,7 +883,7 @@ enum Reach {
     /// It deletes or overwrites a file the session did not make.
     Destroys,
     /// A command writes a file outside the project folder, where write_file
-    /// never writes.
+    /// writes only new scratch files in the temp folder.
     Outside,
     /// It sends a file to a chat app.
     Posts,
@@ -1028,12 +1028,17 @@ fn destroys(command: &command::Command, ctx: &ToolContext) -> bool {
 }
 
 /// Whether `command`, or a line it hands to another shell, writes its output
-/// into a file outside the project folder, where write_file never writes,
-/// from any folder it may run in.
+/// into a file outside the project folder from any folder it may run in. A
+/// new file in the temp folder, where write_file may make one too, is
+/// scratch and not counted.
 fn strays(command: &command::Command, ctx: &ToolContext) -> bool {
+    let data = crate::chat::data_dir();
+    let scratch =
+        |path: &Path| path.symlink_metadata().is_err() && tools::in_scratch(path, ctx, &data);
     let strays_from = |dir: Option<&Path>| {
-        (command.writes.iter())
-            .any(|raw| named(raw, dir, ctx).is_some_and(|path| !inside(&path, ctx)))
+        (command.writes.iter()).any(|raw| {
+            named(raw, dir, ctx).is_some_and(|path| !inside(&path, ctx) && !scratch(&path))
+        })
     };
     folders(command).into_iter().any(strays_from)
         || command.nested.iter().any(|nested| strays(nested, ctx))
@@ -4958,6 +4963,73 @@ mod tests {
                 }
             }
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_steered_session_deletes_a_folder_its_file_tools_made_but_nothing_moved_into_it() {
+        let dir = project_dir("made-folders");
+        let project = dir.join("project");
+        let ctx = ToolContext {
+            workspace: Some(project.clone()),
+            conversation: 731_141,
+            ..Default::default()
+        };
+        crate::taint::mark(&ctx);
+        let none = Grants::new();
+        let gate = bypassed(&ctx, &none, false);
+        let refused = |line: &str| matches!(decide(&command(line), &gate), Outcome::Refuse(_));
+        let write = |path: &str| serde_json::json!({ "path": path, "content": "x" }).to_string();
+        // What the user had before it was there, so made at another moment.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        tools::run("write_file", &write("a/b.py"), &ctx).unwrap();
+        // A cache the program it ran made there.
+        std::fs::create_dir_all(project.join("a/__pycache__")).unwrap();
+        std::fs::write(project.join("a/__pycache__/b.cpython-312.pyc"), "x").unwrap();
+        assert!(!refused("rm -rf a"));
+        let patch = "*** Begin Patch\n*** Add File: g/h/i.py\n+x\n*** End Patch";
+        let patch = serde_json::json!({ "patch": patch }).to_string();
+        tools::run(crate::patch::APPLY_PATCH, &patch, &ctx).unwrap();
+        assert!(!refused("rm -rf g/h") && !refused("rm -rf g"));
+        // The user's file moved in stays theirs, as does a link.
+        tools::run("write_file", &write("c/d.py"), &ctx).unwrap();
+        std::fs::rename(project.join("notes.txt"), project.join("c/notes.txt")).unwrap();
+        assert!(refused("rm -rf c"));
+        std::os::unix::fs::symlink(project.join(".git"), project.join("g/h/git")).unwrap();
+        assert!(refused("rm -rf g"));
+        // A folder that was there before the session wrote in it is not its own.
+        std::fs::create_dir_all(project.join("e")).unwrap();
+        tools::run("write_file", &write("e/f.py"), &ctx).unwrap();
+        assert!(refused("rm -rf e"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_steered_session_writes_a_new_scratch_file_in_the_temp_folder_and_no_other() {
+        let dir = project_dir("scratch");
+        let ctx = ToolContext {
+            workspace: Some(dir.join("project")),
+            conversation: 731_151,
+            ..Default::default()
+        };
+        crate::taint::mark(&ctx);
+        let none = Grants::new();
+        let gate = bypassed(&ctx, &none, false);
+        let scratch = std::env::temp_dir().join(format!("letronna-gate-{}.py", std::process::id()));
+        let _ = std::fs::remove_file(&scratch);
+        let line = format!("cat > {} <<'EOF'\nprint(1)\nEOF", scratch.display());
+        assert_eq!(decide(&command(&line), &gate), Outcome::Run);
+        // One there already is another program's, and the test's folder,
+        // though in the temp folder too, is not the session's.
+        std::fs::write(&scratch, "theirs").unwrap();
+        assert!(matches!(decide(&command(&line), &gate), Outcome::Refuse(_)));
+        let elsewhere = format!("echo x > {}", dir.join("new.txt").display());
+        assert!(matches!(
+            decide(&command(&elsewhere), &gate),
+            Outcome::Refuse(_)
+        ));
+        std::fs::remove_file(scratch).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 

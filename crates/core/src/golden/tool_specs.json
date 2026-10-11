@@ -1483,7 +1483,7 @@
   },
   {
     "function": {
-      "description": "Search the tools left out of this list: the user's MCP servers' tools when they are too many to list, and in a run nobody watches Letronna's less used ones -- browse, use_page, computer, edit_image, make_image, make_video, transcribe, speak, skill_manage, board, search_sessions and list_sessions. Give a few words for what you need done, or a tool's exact name; the matching tools come back with their descriptions and arguments. Then call one with call_mcp_tool.",
+      "description": "Search the tools left out of this list: the user's MCP servers' tools when they are too many to list. Give a few words for what you need done, or a tool's exact name; the matching tools come back with their descriptions and arguments. Then call one with call_mcp_tool.",
       "name": "find_tools",
       "parameters": {
         "properties": {

@@ -12,6 +12,7 @@ use crate::chat::{Connection, Remote};
 use crate::driver::{AgentId, Allow};
 use crate::grep::{SEARCH_FILES, SEARCH_TIME};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -142,8 +143,22 @@ impl ToolContext {
 pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
+    /// The description a request over `connection` sends, where it depends
+    /// on the session, so it names no tool or way of working that session
+    /// lacks. `offered` names every tool that request can call, those left
+    /// out on demand among them.
+    fn description_for(&self, connection: &Connection, offered: &[&str]) -> Cow<'static, str> {
+        let _ = (connection, offered);
+        self.description().into()
+    }
     /// JSON schema for the arguments object.
     fn parameters(&self) -> Value;
+    /// The arguments a request over `connection` offers, less any that
+    /// would mean nothing in that session.
+    fn parameters_for(&self, connection: &Connection) -> Value {
+        let _ = connection;
+        self.parameters()
+    }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String>;
     /// Whether the user must approve each call before it runs.
     fn needs_approval(&self) -> bool {
@@ -203,6 +218,14 @@ pub trait Tool: Send + Sync {
     /// errors are Letronna's: one quoting a page or a server fences the quote
     /// itself, with `untrusted::quoted`.
     fn untrusted(&self) -> bool {
+        false
+    }
+
+    /// Whether each error it returns was checked to fence whatever it quotes
+    /// from outside, so that an error without a fence tells nothing someone
+    /// else wrote reached the model. Off by default: an untrusted tool's
+    /// unchecked errors mark its session as its results do.
+    fn fences_its_errors(&self) -> bool {
         false
     }
 
@@ -732,6 +755,22 @@ pub(crate) fn specs_of(
     connection: &Connection,
     on_demand: crate::mcp_find::OnDemand,
 ) -> Vec<Value> {
+    let callable = callable(tools, connection);
+    let offered: Vec<&str> = callable.iter().map(|t| t.name()).collect();
+    callable
+        .iter()
+        .filter(|t| crate::mcp_find::in_array(t.name(), on_demand))
+        .map(|t| spec_for(t.as_ref(), connection, &offered))
+        .collect()
+}
+
+/// Which of `tools` a request over `connection` offers, in its array or on
+/// demand, the pair that stands in for those left out among them whether
+/// or not anything is (see `mcp_find::in_array`).
+pub(crate) fn callable<'a>(
+    tools: &'a [Arc<dyn Tool>],
+    connection: &Connection,
+) -> Vec<&'a Arc<dyn Tool>> {
     let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
     let history = connection
         .remote
@@ -748,14 +787,12 @@ pub(crate) fn specs_of(
         .iter()
         .filter(|t| !switched_off(t.name(), &disabled))
         .filter(|t| !scheduled || !crate::schedule::NOT_AVAILABLE.contains(&t.name()))
-        .filter(|t| crate::mcp_find::in_array(t.name(), on_demand))
         .filter(|t| !planning || !t.mutates() || t.name() == "run_command")
         .filter(|t| t.name() != EXIT_PLAN || plan)
         .filter(|t| !shared || !t.machine())
         .filter(|t| history || !t.needs_history())
         .filter(|t| t.offered(connection))
         .filter(|t| t.suits(&connection.model))
-        .map(|t| spec(t.as_ref()))
         .collect()
 }
 
@@ -818,6 +855,16 @@ pub(crate) fn spec(tool: &dyn Tool) -> Value {
     }})
 }
 
+/// How `tool` is offered in a request over `connection` that can call the
+/// tools `offered` names.
+fn spec_for(tool: &dyn Tool, connection: &Connection, offered: &[&str]) -> Value {
+    json!({"type": "function", "function": {
+        "name": tool.name(),
+        "description": tool.description_for(connection, offered),
+        "parameters": tool.parameters_for(connection),
+    }})
+}
+
 pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> {
     let tool = find(name).ok_or_else(|| unknown(name))?;
     let started = Instant::now();
@@ -875,8 +922,20 @@ pub(crate) fn run_found(
     // showing, and before anything is wrapped around the result.
     let shapes = tool.hides_key_shapes();
     let ran = tool.run(&args, ctx);
-    // Whether it worked or not: an error can quote a page or a server too.
-    if tool.untrusted() {
+    // An error can quote a page or a server too, but one in Letronna's own
+    // words, as when the page could not be reached, gave the model nothing
+    // to be talked into anything by; marked anyway, an offline session would
+    // be asked about its every cleanup as if it had read a page. An MCP
+    // server's errors are its own words however they read.
+    let reached = ran.as_ref().map_or_else(
+        |why| {
+            !tool.fences_its_errors()
+                || crate::mcp::is_tool(tool.name())
+                || crate::untrusted::holds_fence(why)
+        },
+        |_| true,
+    );
+    if tool.untrusted() && reached {
         crate::taint::mark(ctx);
     }
     let ran = ran.map_err(|e| crate::redact::scrub(&e, shapes) + &note + &heard)?;
@@ -1508,16 +1567,26 @@ pub fn one_line(text: &str) -> String {
 /// Letronna's own folder or on the program that is running.
 pub(crate) fn resolve_write(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
     let me = std::env::current_exe().ok();
-    resolve_write_in(raw, ctx, &crate::chat::data_dir(), me.as_deref())
+    resolve_write_in(raw, ctx, &crate::chat::data_dir(), me.as_deref(), false)
+}
+
+/// `resolve_write` for write_file and edit_file, which may also make a new
+/// file in the system's temp folder or change one the session made there:
+/// a reproduction or a note to self that the project need not hold.
+pub(crate) fn resolve_write_or_scratch(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
+    let me = std::env::current_exe().ok();
+    resolve_write_in(raw, ctx, &crate::chat::data_dir(), me.as_deref(), true)
 }
 
 /// `resolve_write` with Letronna's folder at `data` and its program at `me`,
-/// checked on the nearest existing ancestor since the file need not exist yet.
+/// checked on the nearest existing ancestor since the file need not exist yet;
+/// with `scratch`, as `resolve_write_or_scratch`.
 fn resolve_write_in(
     raw: &str,
     ctx: &ToolContext,
     data: &Path,
     me: Option<&Path>,
+    scratch: bool,
 ) -> Result<PathBuf, String> {
     let workspace = ctx.working_folder()?;
     let root = std::fs::canonicalize(workspace).map_err(|_| "The project folder is missing.")?;
@@ -1549,8 +1618,15 @@ fn resolve_write_in(
             "`{raw}` goes through a link that leads nowhere, so where it lands cannot be checked."
         )
     })?;
-    if !existing.starts_with(&root) {
-        return Err(format!("`{raw}` is outside the project folder."));
+    if !existing.starts_with(&root) && !(scratch && in_scratch(&target, ctx, data)) {
+        return Err(match scratch {
+            true => format!(
+                "`{raw}` is outside the project folder; use the project folder, or a new file \
+                 under {}.",
+                std::env::temp_dir().display()
+            ),
+            false => format!("`{raw}` is outside the project folder."),
+        });
     }
     if private(&existing, data) {
         return Err(format!(
@@ -1566,6 +1642,53 @@ fn resolve_write_in(
         ));
     }
     Ok(target)
+}
+
+/// Whether a write to `path` may land in the system's temp folder, as
+/// scratch the project need not hold: a file not there yet, or one `ctx`'s
+/// session made, right in the temp folder or in a folder the session made
+/// there, with no link on the way below it and never in Letronna's own
+/// folder at `data`. Another program's file there, or one in its folder,
+/// stays out of reach: what reads it later trusts it.
+pub(crate) fn in_scratch(path: &Path, ctx: &ToolContext, data: &Path) -> bool {
+    let given = std::env::temp_dir();
+    let Ok(temp) = std::fs::canonicalize(&given) else {
+        return false;
+    };
+    // A temp folder set to the home folder or above it would make the
+    // user's own files scratch.
+    let home = home().and_then(|home| std::fs::canonicalize(home).ok());
+    if home.is_none_or(|home| home.starts_with(&temp)) {
+        return false;
+    }
+    // As the temp folder is named or as it really is, as on macOS, where
+    // it lies under a link.
+    let Some(rest) = (path.strip_prefix(&given).ok()).or_else(|| path.strip_prefix(&temp).ok())
+    else {
+        return false;
+    };
+    let mut there = temp.clone();
+    let mut parts = rest.components().peekable();
+    while let Some(part) = parts.next() {
+        let std::path::Component::Normal(name) = part else {
+            return false;
+        };
+        let next = there.join(name);
+        let Ok(meta) = next.symlink_metadata() else {
+            // The rest is new: the folder it goes in must be the temp
+            // folder itself or one the session made.
+            return (there == temp || crate::taint::own(ctx, &there)) && !private(&there, data);
+        };
+        let last = parts.peek().is_none();
+        if meta.file_type().is_symlink() || (!last && !meta.is_dir()) {
+            return false;
+        }
+        if last {
+            return meta.is_file() && crate::taint::own(ctx, &next) && !private(&next, data);
+        }
+        there = next;
+    }
+    false
 }
 
 /// Variables every command and every job starts with.
@@ -2477,7 +2600,7 @@ impl Tool for WriteFile {
         format!("Write {}:\n{content}", path_arg(args))
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
-        let path = resolve_write(path_arg(args), ctx)?;
+        let path = resolve_write_or_scratch(path_arg(args), ctx)?;
         let content = args["content"].as_str().ok_or("`content` is required.")?;
         check_document(&path, content)?;
         let change = crate::filestate::overwrite(ctx.conversation, &path, path_arg(args))?;
@@ -2488,7 +2611,7 @@ impl Tool for WriteFile {
         }
         crate::write::check_syntax(&path, before, &text)?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            crate::taint::create_folders(ctx, parent).map_err(|e| e.to_string())?;
         }
         let mut note = crate::write::csv_note(Path::new(path_arg(args)), change.before(), &text);
         note.push_str(&crate::write::syntax_note(
@@ -2610,7 +2733,7 @@ impl Tool for EditFile {
         format!("Edit {}:\n{}", path_arg(args), self.preview(args, ctx))
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
-        let path = resolve_write(path_arg(args), ctx)?;
+        let path = resolve_write_or_scratch(path_arg(args), ctx)?;
         let edits = edits(args)?;
         // A mistyped path is told apart from a new file before the error
         // sends the model to write_file for one.
@@ -3584,6 +3707,10 @@ fn past_echo<'a>(output: &'a str, typed: &str, recalled: bool) -> &'a str {
     output.strip_prefix(typed.trim()).unwrap_or(output)
 }
 
+/// How `wait`'s description ends where wake_me is offered too.
+const WAKE_ME_INSTEAD: &str =
+    " If you have wake_me, use it instead of a plain pause over 30 seconds.";
+
 struct Wait;
 impl Tool for Wait {
     fn hides_key_shapes(&self) -> bool {
@@ -3594,6 +3721,15 @@ impl Tool for Wait {
     }
     fn description(&self) -> &'static str {
         "Pause before continuing: for a number of seconds, or until a background job prints something. Use it to let a server come up before calling it; waiting for a job's `until` ends as soon as it prints. Only what the job prints after the wait begins counts; read_job shows what it printed before. If you have wake_me, use it instead of a plain pause over 30 seconds."
+    }
+    // Where wake_me is not offered, as in a run nobody watches, the sentence
+    // on it would send the model looking for a tool it cannot have.
+    fn description_for(&self, _: &Connection, offered: &[&str]) -> Cow<'static, str> {
+        let said = self.description();
+        if offered.contains(&"wake_me") {
+            return said.into();
+        }
+        said.strip_suffix(WAKE_ME_INSTEAD).unwrap_or(said).into()
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -6703,9 +6839,98 @@ mod tests {
         let refused = WriteFile
             .run(&json!({"path": "up/x.txt", "content": "escaped"}), &ctx)
             .unwrap_err();
-        assert_eq!(refused, "`up/x.txt` is outside the project folder.");
+        assert!(
+            refused.starts_with(
+                "`up/x.txt` is outside the project folder; use the project folder, or a new file \
+                 under "
+            ),
+            "{refused}"
+        );
         assert!(!dir.join("x.txt").exists());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_makes_new_scratch_files_in_the_temp_folder_and_changes_only_its_own_there() {
+        let temp = std::env::temp_dir();
+        let at = |what: &str| temp.join(format!("letronna-scratch-{what}-{}", std::process::id()));
+        let (project, theirs, folder, link, nowhere) = (
+            at("project"),
+            at("theirs"),
+            at("folder"),
+            at("link"),
+            at("nowhere"),
+        );
+        let repro = at("repro.py");
+        for path in [&project, &folder, &nowhere] {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        for path in [&repro, &theirs, &link] {
+            let _ = std::fs::remove_file(path);
+        }
+        std::fs::create_dir_all(&project).unwrap();
+        // A folder the session did not make: made here, not by its tools.
+        std::fs::create_dir_all(&nowhere).unwrap();
+        std::fs::write(&theirs, "theirs").unwrap();
+        let ctx = ToolContext {
+            workspace: Some(project.clone()),
+            conversation: 731_171,
+            ..Default::default()
+        };
+        let write = |path: &Path, content: &str| {
+            let args = json!({"path": path.display().to_string(), "content": content});
+            WriteFile.run(&args, &ctx)
+        };
+        write(&repro, "print(1)").unwrap();
+        // Its own, it may write again and edit.
+        write(&repro, "print(2)").unwrap();
+        let edit = json!({"path": repro.display().to_string(), "old": "2", "new": "3"});
+        EditFile.run(&edit, &ctx).unwrap();
+        assert_eq!(std::fs::read_to_string(&repro).unwrap(), "print(3)");
+        // A folder it makes there is its own to write in again.
+        write(&folder.join("a.py"), "x").unwrap();
+        write(&folder.join("b.py"), "x").unwrap();
+        std::os::unix::fs::symlink(&folder, &link).unwrap();
+        // Another program's file, a folder that is not the session's, and a
+        // link on the way stay out of reach.
+        let elsewhere = [
+            theirs.clone(),
+            nowhere.join("new.txt"),
+            link.join("new.txt"),
+        ];
+        for path in &elsewhere[..1] {
+            let refused = write(path, "mine").unwrap_err();
+            assert!(refused.contains("a new file under"), "{refused}");
+        }
+        for path in &elsewhere[1..] {
+            write(path, "mine").unwrap_err();
+        }
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "theirs");
+        assert!(!nowhere.join("new.txt").exists());
+        assert!(!folder.join("new.txt").exists());
+        // Another session did not make the file.
+        let other = ToolContext {
+            conversation: 731_172,
+            ..ctx.clone()
+        };
+        let args = json!({"path": repro.display().to_string(), "content": "x"});
+        WriteFile.run(&args, &other).unwrap_err();
+        // Letronna's own folder stays out of reach there too, here the
+        // folder the session made standing in for it; and apply_patch, which
+        // resolves without scratch, keeps to the project.
+        let new = folder.join("c.py").display().to_string();
+        resolve_write_in(&new, &ctx, &theirs, None, true).unwrap();
+        resolve_write_in(&new, &ctx, &folder, None, true).unwrap_err();
+        let me = std::env::current_exe().ok();
+        let refused = resolve_write_in(&new, &ctx, &theirs, me.as_deref(), false).unwrap_err();
+        assert_eq!(refused, format!("`{new}` is outside the project folder."));
+        for path in [project, folder, nowhere] {
+            std::fs::remove_dir_all(path).unwrap();
+        }
+        for path in [repro, theirs, link] {
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
@@ -6723,7 +6948,7 @@ mod tests {
             workspace: Some(dir.clone()),
             ..Default::default()
         };
-        let write = |path: &str| resolve_write_in(path, &ctx, &data, Some(&me));
+        let write = |path: &str| resolve_write_in(path, &ctx, &data, Some(&me), false);
         for path in [
             "Letronna/settings.json",
             "Letronna/mcp.json",
@@ -6776,7 +7001,7 @@ mod tests {
             workspace: Some(dir.clone()),
             ..Default::default()
         };
-        let refused = resolve_write_in("notes.md", &ctx, &data, None).unwrap_err();
+        let refused = resolve_write_in("notes.md", &ctx, &data, None, false).unwrap_err();
         assert!(refused.contains("leads nowhere"), "{refused}");
         let args = json!({"path": "notes.md", "content": "{}"});
         let refused = WriteFile.run(&args, &ctx).unwrap_err();
@@ -6901,7 +7126,7 @@ mod tests {
             ("bin/letronna.new.exe.", "dot or a space"),
             ("bin/letronna.new.exe::$DATA", "hidden stream"),
         ] {
-            let refused = resolve_write_in(path, &ctx, &data, Some(&me)).unwrap_err();
+            let refused = resolve_write_in(path, &ctx, &data, Some(&me), false).unwrap_err();
             assert!(refused.contains(reason), "{path}: {refused}");
         }
         std::fs::remove_dir_all(dir).unwrap();
@@ -8682,5 +8907,67 @@ mod tests {
         assert!(edit.contains("search hits and command output do not count"));
         assert!(edit.contains("need not be read back"));
         assert!(WriteFile.description().contains("in an earlier reply"));
+    }
+
+    /// Whether `text` names the tool `name`: a name with an underscore
+    /// anywhere as a word of its own, and a plain word only where it is
+    /// plainly a tool's, in backticks or followed by "tool".
+    fn names_tool(text: &str, name: &str) -> bool {
+        if !name.contains('_') {
+            return text.contains(&format!("`{name}`")) || text.contains(&format!("{name} tool"));
+        }
+        let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        text.match_indices(name).any(|(at, _)| {
+            !text[..at].ends_with(word) && !text[at + name.len()..].starts_with(word)
+        })
+    }
+
+    #[test]
+    fn every_tool_an_offered_description_names_can_be_called() {
+        let every = all();
+        let named: Vec<&str> = every.iter().map(|tool| tool.name()).collect();
+        let unwatched = Connection {
+            tools: true,
+            ..Default::default()
+        };
+        let lean = Connection {
+            lean_tools: true,
+            ..unwatched.clone()
+        };
+        let watched = Connection {
+            human: true,
+            ..unwatched.clone()
+        };
+        for connection in [lean, unwatched, watched] {
+            let callable: Vec<&str> = callable(&every, &connection)
+                .iter()
+                .map(|tool| tool.name())
+                .collect();
+            for spec in specs(&connection) {
+                let text = spec["function"].to_string();
+                for name in named.iter().filter(|name| names_tool(&text, name)) {
+                    assert!(
+                        callable.contains(name),
+                        "{} names {name}, which is neither sent nor found",
+                        spec["function"]["name"]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wait_names_wake_me_only_where_it_is_offered() {
+        let lean = Connection {
+            tools: true,
+            lean_tools: true,
+            ..Default::default()
+        };
+        let without = Wait.description_for(&lean, &["wait"]);
+        assert!(!without.contains("wake_me"), "{without}");
+        assert!(without.ends_with("read_job shows what it printed before."));
+        let with = Wait.description_for(&lean, &["wait", "wake_me"]);
+        assert_eq!(with, Wait.description());
+        assert!(with.ends_with(WAKE_ME_INSTEAD));
     }
 }

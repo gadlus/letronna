@@ -2559,39 +2559,44 @@ pub(crate) mod tests {
         assert!(!reaches_mcp(&Allow::Own(Arc::new(|_| Ok(String::new())))));
     }
 
-    /// The system message the first request of `spec`'s run sends once
-    /// `change` has been made to it, the run answered at once.
-    fn first_system(dir: &Path, id: AgentId, change: impl FnOnce(&mut Spec)) -> String {
+    /// The system message and the first message from the user that the
+    /// first request of `spec`'s run sends once `change` has been made to
+    /// it, the run answered at once.
+    fn first_messages(dir: &Path, id: AgentId, change: impl FnOnce(&mut Spec)) -> (String, String) {
         let (endpoint, provider) = provider(vec![reply("Nothing to do.", &[])]);
         let mut spec = spec(endpoint, dir, id);
         change(&mut spec);
         assert_eq!(finished(spec).status, Outcome::Done);
         let sent = provider.sent();
-        sent[0]["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .to_owned()
+        let messages = sent[0]["messages"].as_array().unwrap();
+        let user = messages.iter().find(|m| m["role"] == "user").unwrap();
+        let text = |m: &Value| m["content"].as_str().unwrap().to_owned();
+        (text(&messages[0]), text(user))
     }
 
     #[test]
     fn a_run_nobody_watches_is_told_what_its_folder_held_as_it_started() {
         let dir = scratch("surroundings");
-        let first = first_system(&dir, AGENTS + 800, |spec| spec.depth = 0);
+        let (system, first) = first_messages(&dir, AGENTS + 800, |spec| spec.depth = 0);
         std::fs::write(dir.join("later.txt"), "written by the run").unwrap();
-        let fork = first_system(&dir, AGENTS + 805, |spec| spec.fork = true);
-        let watched = first_system(&dir, AGENTS + 810, |spec| {
+        let (_, fork) = first_messages(&dir, AGENTS + 805, |spec| spec.fork = true);
+        let (watched_system, watched) = first_messages(&dir, AGENTS + 810, |spec| {
             spec.depth = 0;
             spec.connection.human = true;
         });
-        let next = first_system(&dir, AGENTS + 820, |spec| spec.depth = 0);
+        let (_, next) = first_messages(&dir, AGENTS + 820, |spec| spec.depth = 0);
 
-        assert!(first.contains("on PATH"), "{first}");
-        assert!(first.contains("folder held: notes.txt."), "{first}");
+        // With its first message, so its system prompt is any folder's.
+        assert!(first.starts_with("(From Letronna, not part of the message below: Commands "));
+        assert!(first.contains("folder held: notes.txt.)\n\n"), "{first}");
+        assert!(!system.contains("on PATH"), "{system}");
         // A helper looks at nothing again, so a fork says what its parent's
         // run does, and the two still share a cached prefix.
         assert!(fork.contains("folder held: notes.txt."), "{fork}");
-        assert!(!watched.contains("on PATH"), "{watched}");
-        assert!(!watched.contains("folder held"), "{watched}");
+        for said in [watched_system, watched] {
+            assert!(!said.contains("on PATH"), "{said}");
+            assert!(!said.contains("folder held"), "{said}");
+        }
         assert!(next.contains("later.txt"), "{next}");
     }
 

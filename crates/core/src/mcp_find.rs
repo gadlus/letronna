@@ -40,6 +40,7 @@
 use crate::chat::{Connection, ToolCall};
 use crate::tools::{Tool, ToolContext};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -51,8 +52,10 @@ const PREFIX: &str = "mcp__";
 
 /// Letronna's own tools a lean run offers on demand: the largest of those a
 /// run nobody watches seldom needs -- the browser, the computer, pictures,
-/// sound, skills being written, the crew's board and past sessions.
-const RARE: [&str; 13] = [
+/// sound, skills being written, the crew's board, past sessions -- and its
+/// helpers and the list of its background jobs, as such a run waits for
+/// each helper's report and is given each job's number when it starts.
+const RARE: [&str; 15] = [
     "browse",
     "use_page",
     "computer",
@@ -66,6 +69,8 @@ const RARE: [&str; 13] = [
     "search_sessions",
     "list_sessions",
     "read_chat",
+    "agents",
+    "list_jobs",
 ];
 
 /// Past this many estimated tokens of MCP tool schemas, the MCP tools go out
@@ -297,7 +302,31 @@ impl Tool for FindTools {
         FIND_TOOLS
     }
     fn description(&self) -> &'static str {
-        "Search the tools left out of this list: the user's MCP servers' tools when they are too many to list, and in a run nobody watches Letronna's less used ones -- browse, use_page, computer, edit_image, make_image, make_video, transcribe, speak, skill_manage, board, search_sessions and list_sessions. Give a few words for what you need done, or a tool's exact name; the matching tools come back with their descriptions and arguments. Then call one with call_mcp_tool."
+        "Search the tools left out of this list: the user's MCP servers' tools when they are too many to list. Give a few words for what you need done, or a tool's exact name; the matching tools come back with their descriptions and arguments. Then call one with call_mcp_tool."
+    }
+    // A lean run names the less used tools it left out, and only those it
+    // would offer, so none is looked for that is not there. The names are
+    // the array's own, which keep from one request to the next.
+    fn description_for(&self, connection: &Connection, offered: &[&str]) -> Cow<'static, str> {
+        let said = self.description();
+        let rare: Vec<&str> = offered
+            .iter()
+            .copied()
+            .filter(|name| connection.lean_tools && is_rare(name))
+            .collect();
+        let Some((last, rest)) = rare.split_last() else {
+            return said.into();
+        };
+        let named = match rest {
+            [] => last.to_string(),
+            rest => format!("{} and {last}", rest.join(", ")),
+        };
+        said.replacen(
+            " too many to list.",
+            &format!(" too many to list, and Letronna's less used ones: {named}."),
+            1,
+        )
+        .into()
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -317,14 +346,12 @@ impl Tool for FindTools {
         // Letronna's own tools a lean run left out, as far as it would offer
         // them at all.
         let rare: Vec<String> = match ctx.caller.connection.as_deref() {
-            Some(connection) if connection.lean_tools => {
-                crate::tools::specs_of(&tools, connection, OnDemand::default())
-                    .iter()
-                    .filter_map(|spec| spec["function"]["name"].as_str())
-                    .filter(|name| is_rare(name))
-                    .map(str::to_owned)
-                    .collect()
-            }
+            Some(connection) if connection.lean_tools => crate::tools::callable(&tools, connection)
+                .iter()
+                .map(|tool| tool.name())
+                .filter(|name| is_rare(name))
+                .map(str::to_owned)
+                .collect(),
             _ => Vec::new(),
         };
         let connection = ctx.caller.connection.as_deref();
@@ -757,6 +784,40 @@ pub(crate) mod tests {
         let full = names(&crate::tools::specs(&connection()));
         let kept: Vec<&String> = full.iter().filter(|name| !is_rare(name)).collect();
         assert!(kept.iter().all(|name| sent.contains(name)), "{sent:?}");
+        // The helpers and the jobs' list are among them, and find_tools
+        // names each that is left out, and only in a lean run.
+        for name in ["agents", "list_jobs"] {
+            assert!(rare.iter().any(|rare| rare == name), "{rare:?}");
+            assert!(!sent.iter().any(|sent| sent == name), "{sent:?}");
+        }
+        let specs = crate::tools::specs(&lean);
+        let find = specs
+            .iter()
+            .find(|spec| spec["function"]["name"] == FIND_TOOLS)
+            .unwrap();
+        let said = find["function"]["description"].as_str().unwrap();
+        assert!(
+            rare.iter().all(|name| said.contains(name.as_str())),
+            "{said}"
+        );
+        assert!(
+            said.contains(&format!(
+                "{} and {}.",
+                rare[rare.len() - 2],
+                rare[rare.len() - 1]
+            )),
+            "{said}"
+        );
+        assert_eq!(
+            FindTools.description_for(&connection(), &["browse", FIND_TOOLS]),
+            FindTools.description()
+        );
+        assert!(!FindTools.description().contains("browse"));
+        // Each request of the run sends the same bytes.
+        assert_eq!(
+            Value::Array(specs).to_string(),
+            Value::Array(crate::tools::specs(&lean)).to_string()
+        );
         // Most of the array was those few: what is left is far smaller.
         let tokens =
             |c: &Connection| crate::chat::tokens(&Value::Array(crate::tools::specs(c)).to_string());
@@ -781,6 +842,19 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert!(found.contains("\nbrowse: "), "{found}");
+        // A tool left out is found by its exact name, and a call through
+        // call_mcp_tool becomes its own.
+        for name in ["agents", "list_jobs"] {
+            let found = FindTools
+                .run(&json!({"query": name}), &ToolContext::of(&lean))
+                .unwrap();
+            assert!(found.contains(&format!("\n{name}: ")), "{found}");
+            let mut calls = [wrapped(&format!(
+                r#"{{"name": "{name}", "arguments": {{}}}}"#
+            ))];
+            assert!(resolve(&mut calls));
+            assert_eq!(calls[0].name, name);
+        }
         // Where they are all sent, a search is only of the MCP tools.
         let found = FindTools
             .run(

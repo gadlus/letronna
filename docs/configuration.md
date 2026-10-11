@@ -19,7 +19,7 @@ Most settings are in the window's Settings and in `/` commands. Both are stored 
 | `LETRONNA_API` | Point the Letronna gateway at another API, such as a local one |
 | `LETRONNA_ALLOW_HTTP=1` | Allow plain-HTTP gateways on the local network, not just on localhost. The key travels unencrypted. |
 | `LETRONNA_READ_TIMEOUT` | Seconds of silence before a reply is given up on (30–3600; default 300) |
-| `LETRONNA_CONTEXT_WINDOW`, `LETRONNA_MAX_OUTPUT` | Override the model's context window and output limit, in tokens |
+| `LETRONNA_CONTEXT_WINDOW`, `LETRONNA_MAX_OUTPUT` | Override the model's context window and output limit, in tokens. When nothing gives a model's window, a server that takes a key is assumed to hold 64,000 tokens, and one that takes none, such as Ollama, a small window. Set it for a keyed proxy in front of a small local model, which may cut long prompts short without saying so. |
 
 ### Browser
 

@@ -109,6 +109,11 @@ pub(crate) fn quoted(lead: &str, text: &str) -> String {
     }
 }
 
+/// Whether `text` holds a fence: what someone other than the user wrote.
+pub(crate) fn holds_fence(text: &str) -> bool {
+    text.contains(&format!("<{TAG}-"))
+}
+
 /// A fresh id for one fence. Eight hex digits: a forger gets one guess per
 /// fence, at one in four billion.
 fn id() -> Result<String, String> {

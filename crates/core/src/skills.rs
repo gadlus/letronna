@@ -425,16 +425,30 @@ fn context_in(data: &Path, connection: &Connection) -> String {
     // A switch file that will not parse is reported where the list is shown.
     let skills = gather(data, connection.workspace.as_deref(), read_head).unwrap_or_default();
     let rule = crate::prompt_rules::told(connection, &crate::prompt_rules::SKILLS);
-    index(&skills, &rule)
+    index(&told_of(skills, connection), &rule)
 }
 
 /// Whether the skill tool is offered over `connection`: when the index
 /// lists a skill, or when the switches cannot be read, so a call can say why.
 fn offers_skills(data: &Path, connection: &Connection) -> bool {
     match gather(data, connection.workspace.as_deref(), read_head) {
-        Ok(skills) => skills.iter().any(|skill| skill.enabled),
+        Ok(skills) => told_of(skills, connection)
+            .iter()
+            .any(|skill| skill.enabled),
         Err(_) => true,
     }
+}
+
+/// The skills the index over `connection` lists, of `skills`. The one that
+/// comes with Letronna answers how to use and set it up, which nobody asks
+/// a run nobody watches, so such a run goes without it, as it goes without
+/// letronna_info; with no other skill, it then goes without the index and
+/// the skill tool too. A skill of the user's by that name stays.
+fn told_of(mut skills: Vec<Skill>, connection: &Connection) -> Vec<Skill> {
+    if !crate::prompt_rules::watched(connection) {
+        skills.retain(|skill| skill.source != Source::BuiltIn || !same(&skill.name, "letronna"));
+    }
+    skills
 }
 
 /// The skills switched on, by name, under `INDEX_CHARS`. Long descriptions
@@ -2099,9 +2113,11 @@ mod tests {
         assert!(listed.iter().any(|s| s.name == "Keep" && !s.enabled));
     }
 
+    /// A session someone watches, which is told of every skill switched on.
     fn with_tools(workspace: Option<PathBuf>) -> Connection {
         Connection {
             tools: true,
+            human: true,
             workspace,
             ..Default::default()
         }
@@ -2306,6 +2322,31 @@ mod tests {
         set_enabled_in(&data, "Run the tests", true).unwrap();
         assert!(offers_skills(&data, &with_tools(None)));
         assert!(!context_in(&data, &with_tools(None)).is_empty());
+    }
+
+    #[test]
+    fn a_run_nobody_watches_is_not_told_of_the_skill_on_letronna_itself() {
+        let data = scratch("offered-unwatched");
+        list_in(&data, None).unwrap();
+        let unwatched = Connection {
+            human: false,
+            ..with_tools(None)
+        };
+        // With only Letronna's own skill on, such a run has neither the
+        // index nor the skill tool, where a watched session has both.
+        assert!(offers_skills(&data, &with_tools(None)));
+        assert!(context_in(&data, &with_tools(None)).contains("- letronna: "));
+        assert!(!offers_skills(&data, &unwatched));
+        assert_eq!(context_in(&data, &unwatched), "");
+        // Any other skill on brings both back, without it.
+        set_enabled_in(&data, "Run the tests", true).unwrap();
+        assert!(offers_skills(&data, &unwatched));
+        let index = context_in(&data, &unwatched);
+        assert!(index.contains("Run the tests"), "{index}");
+        assert!(!index.contains("- letronna: "), "{index}");
+        // A skill of the user's by that name is theirs, and stays.
+        create_in(&data, "letronna", "Mine.", "Body.").unwrap();
+        assert!(context_in(&data, &unwatched).contains("- letronna: Mine."));
     }
 
     #[test]
