@@ -220,6 +220,12 @@ pub struct Turn {
     /// How often each call, by tool, arguments and result, has come back
     /// the same this turn.
     repeats: HashMap<(String, u64, u64), usize>,
+    /// How often each call, by what it amounts to and what its result
+    /// amounts to once ids, timings and dates are taken out, has come back
+    /// this turn, with the round it last did. Only an edit that went
+    /// through starts these again: a command spelled anew, as an experiment
+    /// a round is, changes nothing about what a read brings back.
+    alike: HashMap<(String, u64, u64), (usize, usize)>,
     /// Each change made this turn, by tool and arguments, so only a new one
     /// starts the counts again.
     changes: HashSet<(String, u64)>,
@@ -268,6 +274,7 @@ impl Turn {
             edited: false,
             asked_to_verify: false,
             repeats: HashMap::new(),
+            alike: HashMap::new(),
             changes: HashSet::new(),
             failures: HashMap::new(),
             failure_notes: 0,
@@ -601,11 +608,15 @@ impl Turn {
             content = tools::answered(&content).to_owned();
         }
         let times = self.repeated(&call, &content, is_error);
+        let (alike, last_round) = self.alike(&call, &content, is_error);
         let failures = self.failed(&call.name, &content, is_error);
-        if times >= REPEATS_NOTED {
+        // The two counts part only where one was cleared or left a call out,
+        // so the larger says how often the call came back the same.
+        let same = times.max(alike);
+        if same >= REPEATS_NOTED {
             content.push_str(&format!(
-                "\n\n[You have made this exact call {times} times this turn and got the same \
-                 result each time. Change your approach instead of repeating it.]"
+                "\n\n[You have made this call {same} times this turn and got the same result \
+                 each time. Change your approach instead of repeating it.]"
             ));
         } else if failures == FAILURES_NOTED && self.failure_notes < FAILURE_NOTES {
             self.failure_notes += 1;
@@ -615,6 +626,11 @@ impl Turn {
                  rather than retrying with small changes.]",
                 call.name
             ));
+        } else if alike == 2 {
+            // Said once, before the count says to change approach: twice can
+            // be a check that something held, and the model may not have
+            // noticed that it had the answer already.
+            content.push_str(&format!("\n\n[Same result as round {last_round}.]"));
         }
         if times >= REPEATS_STOPPED && self.unattended && self.looped.is_none() {
             self.looped = Some(format!(
@@ -660,6 +676,9 @@ impl Turn {
         } else if changes_code(result) {
             self.edited = true;
             self.rounds_since_edit = 0;
+            // What the project answers may differ now, so the same answer
+            // as before the change is news, not a repeat.
+            self.alike.clear();
         }
     }
 
@@ -723,6 +742,36 @@ impl Turn {
         let times = self.repeats.entry(key).or_default();
         *times += 1;
         *times
+    }
+
+    /// How many times this turn a call amounting to this one has now come
+    /// back with a result amounting to this one, and the round the last of
+    /// them came in; 0 for a tool made to be polled. `repeated` counts the
+    /// call spelled and answered exactly as before; this counts it past the
+    /// spellings that change nothing, as `command_shape` and `result_shape`
+    /// take them out, so a read that starts a few lines off, a command with
+    /// `2>&1` added or a test run with its timing changed is still seen to
+    /// bring nothing new.
+    fn alike(&mut self, call: &ToolCall, content: &str, is_error: bool) -> (usize, usize) {
+        // A refusal, a decline or a stop is no result of the call.
+        if POLLING.contains(&call.name.as_str()) || (is_error && refused_or_stopped(content)) {
+            return (0, 0);
+        }
+        let shape = call_shape(call, self.connection.workspace.as_deref());
+        let key = (
+            call.name.clone(),
+            hash(&shape),
+            hash(&(result_shape(content), is_error)),
+        );
+        let (times, round) = self.alike.entry(key).or_default();
+        // Calls made together were all made before any result was seen, so
+        // none of them repeats another.
+        if *round == self.rounds {
+            return (0, 0);
+        }
+        *times += 1;
+        let last = std::mem::replace(round, self.rounds);
+        (*times, last)
     }
 
     /// How many rounds in a row `name` has now failed this turn, or 0 when
@@ -853,6 +902,106 @@ fn sorted(value: serde_json::Value) -> serde_json::Value {
         serde_json::Value::Array(items) => items.into_iter().map(sorted).collect(),
         other => other,
     }
+}
+
+/// What a call amounts to, past the spellings that change nothing about
+/// its answer: a command as `command_shape` reads it; a read by its file
+/// and which fifty lines it starts in, since a read a few lines off brings
+/// the same page; a search by its folder, pattern and glob whatever their
+/// case; any other call by its arguments as `repeated` keys them.
+fn call_shape(call: &ToolCall, workspace: Option<&std::path::Path>) -> String {
+    let Ok(args) = tools::parse_args_for(&call.name, &call.arguments) else {
+        return call.arguments.clone();
+    };
+    let text = |key: &str| args[key].as_str().unwrap_or_default().to_owned();
+    match call.name.as_str() {
+        "run_command" => command_shape(&text("command"), workspace),
+        "read_file" => {
+            let page = args["offset"].as_u64().unwrap_or(1) / 50;
+            format!("{}\n{page}", text("path"))
+        }
+        "search" => {
+            format!("{}\n{}\n{}", text("path"), text("pattern"), text("glob")).to_lowercase()
+        }
+        _ => sorted(args).to_string(),
+    }
+}
+
+/// `command` with what changes nothing about what it runs taken out: its
+/// spacing, a `cd` into the workspace in front, and `2>&1`, `| cat` and a
+/// `| head -N` or `| tail -N` behind, so the same command sent again with
+/// those on or off is seen to be the same.
+fn command_shape(command: &str, workspace: Option<&std::path::Path>) -> String {
+    let mut shape = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some(workspace) = workspace {
+        let workspace = workspace.display().to_string();
+        let into = [
+            format!("cd {workspace} &&"),
+            format!("cd \"{workspace}\" &&"),
+            format!("cd '{workspace}' &&"),
+        ];
+        if let Some(rest) = into.iter().find_map(|cd| shape.strip_prefix(cd.as_str())) {
+            shape = rest.trim_start().to_owned();
+        }
+    }
+    loop {
+        let Some(rest) = shape
+            .strip_suffix("2>&1")
+            .or_else(|| shape.strip_suffix("| cat"))
+            .or_else(|| piped_to_head_or_tail(&shape))
+        else {
+            return shape;
+        };
+        shape = rest.trim_end().to_owned();
+    }
+}
+
+/// `command` up to a `| head -N` or `| tail -N` that ends it, in any of
+/// the spellings `-N`, `-nN` and `-n N`; None when it ends otherwise.
+fn piped_to_head_or_tail(command: &str) -> Option<&str> {
+    let (rest, last) = command.rsplit_once('|')?;
+    let mut words = last.split_whitespace();
+    if !matches!(words.next(), Some("head" | "tail")) {
+        return None;
+    }
+    let count = match words.next()? {
+        "-n" => words.next()?,
+        flag => flag.strip_prefix("-n").or_else(|| flag.strip_prefix('-'))?,
+    };
+    let lines = !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit());
+    (lines && words.next().is_none()).then_some(rest)
+}
+
+/// `content` with what changes between two runs of the same thing taken
+/// out: dates, clock times, timings, seeds, and ids of seven or more hex
+/// digits, as commits, objects and addresses have. What is left is hashed
+/// whole, so two results that differ anywhere else never count as one.
+fn result_shape(content: &str) -> String {
+    static CHANGEABLE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        // Spaces are written `\x20`: the verbose mode drops them, in a
+        // class too.
+        regex::Regex::new(
+            r"(?x)
+              \b\d{4}-\d{2}-\d{2}(?:[T\x20]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?\b  # a date, with its time or not
+            | \b\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\b                                # a clock time
+            | \b\d+(?:\.\d+)?\x20?(?:ms|us|µs|ns|secs?|seconds?|mins?|minutes?|s)\b  # a timing
+            | (?i:\bseed)[\x20=:]{1,3}\d+\b                                    # a seed
+            | \b(?:0x)?[0-9a-f]{7,}\b                                           # a hex id, with a digit in it
+            ",
+        )
+        .expect("the pattern is fixed")
+    });
+    CHANGEABLE
+        .replace_all(content, |found: &regex::Captures| {
+            let found = &found[0];
+            // A word that happens to be spelled in a to f, as "defaced", is no id.
+            if found.bytes().any(|b| b.is_ascii_digit()) {
+                "#".to_owned()
+            } else {
+                found.to_owned()
+            }
+        })
+        .into_owned()
 }
 
 /// Whether a result leaves its reply's other calls unrun: a call that runs
@@ -2373,7 +2522,10 @@ mod tests {
         let mut other = call("read_file");
         other.arguments = r#"{"path": "b.rs"}"#.into();
         repeat(&mut turn, &call("read_file"), "same", 2);
-        assert_eq!(repeat(&mut turn, &other, "same", 2), ["same", "same"]);
+        assert_eq!(
+            repeat(&mut turn, &other, "same", 2),
+            ["same", "same\n\n[Same result as round 3.]"]
+        );
         assert_eq!(
             repeat(&mut turn, &call("read_file"), "changed", 1),
             ["changed"]
@@ -2462,13 +2614,14 @@ mod tests {
     fn the_third_identical_result_tells_the_model_to_change_approach() {
         let mut turn = turn();
         let sent = repeat(&mut turn, &call("read_file"), "same", 4);
-        assert_eq!(sent[..2], ["same", "same"]);
+        // The second is only told so, in case it had not noticed.
+        assert_eq!(sent[..2], ["same", "same\n\n[Same result as round 1.]"]);
         assert_eq!(
             sent[2],
-            "same\n\n[You have made this exact call 3 times this turn and got the same \
-             result each time. Change your approach instead of repeating it.]"
+            "same\n\n[You have made this call 3 times this turn and got the same result \
+             each time. Change your approach instead of repeating it.]"
         );
-        assert!(sent[3].contains("made this exact call 4 times"));
+        assert!(sent[3].contains("made this call 4 times"));
         // Someone is watching, so it is told but never stopped.
         repeat(&mut turn, &call("read_file"), "same", 4);
         assert_eq!(turn.looping(), None);
@@ -2477,6 +2630,254 @@ mod tests {
             repeat(&mut self::turn(), &call("read_file"), "same", 1),
             ["same"]
         );
+    }
+
+    /// A turn whose project is `/w`, as a command's `cd` into it names it.
+    fn turn_in_w() -> Turn {
+        Turn::new(Connection {
+            workspace: Some("/w".into()),
+            ..turn().connection
+        })
+    }
+
+    /// The same result noted on the result of round `round`.
+    fn same_as(round: usize) -> String {
+        format!("\n\n[Same result as round {round}.]")
+    }
+
+    #[test]
+    fn a_command_spelled_another_way_with_the_same_result_is_noted_on_the_second() {
+        let mut turn = turn_in_w().unattended();
+        let run = |line: &str| serde_json::json!({ "command": line });
+        let passed = Ok("5 passed in 0.12s");
+        let sent = made(&mut turn, "run_command", run("python -m pytest x"), passed);
+        assert_eq!(sent, "5 passed in 0.12s");
+        // The same run, from the project, with its streams joined and cut
+        // short, and a little slower.
+        let again = run("cd /w &&  python -m pytest x 2>&1 | tail -5");
+        let sent = made(&mut turn, "run_command", again, Ok("5 passed in 0.15s"));
+        assert_eq!(sent, format!("5 passed in 0.15s{}", same_as(1)));
+        let sent = made(
+            &mut turn,
+            "run_command",
+            run("python -m pytest x | cat"),
+            passed,
+        );
+        assert!(
+            sent.ends_with(
+                "[You have made this call 3 times this turn and got the same result each \
+                 time. Change your approach instead of repeating it.]"
+            ),
+            "{sent}"
+        );
+        // Only the call spelled the same each time stops a run nobody watches.
+        made(
+            &mut turn,
+            "run_command",
+            run("python -m pytest x 2>&1"),
+            passed,
+        );
+        made(
+            &mut turn,
+            "run_command",
+            run("python -m pytest x | head -n 20"),
+            passed,
+        );
+        assert_eq!(turn.looping(), None);
+        // A `cd` elsewhere, or a cut by bytes, is part of the command.
+        let w = Some(std::path::Path::new("/w"));
+        let shape = "cd /w &&  python -m pytest x 2>&1 | tail -5";
+        assert_eq!(command_shape(shape, w), "python -m pytest x");
+        assert_eq!(
+            command_shape("cd '/w' && ls 2>&1 | head -n5 | cat", w),
+            "ls"
+        );
+        assert_eq!(
+            command_shape("cd /other && ls | head -3", w),
+            "cd /other && ls"
+        );
+        assert_eq!(command_shape("cd /w && ls | head -3", None), "cd /w && ls");
+        assert_eq!(command_shape("ls | head -c 20", w), "ls | head -c 20");
+        assert_eq!(command_shape("true || false", w), "true || false");
+    }
+
+    #[test]
+    fn reads_of_the_same_page_and_searches_in_another_case_are_the_same_call() {
+        let mut turn = turn();
+        let read = |offset: u64| serde_json::json!({ "path": "a.rs", "offset": offset });
+        assert_eq!(
+            made(&mut turn, "read_file", read(700), Ok("fn a() {}")),
+            "fn a() {}"
+        );
+        // Twenty lines on is the same page; sixty lines on is the next.
+        let sent = made(&mut turn, "read_file", read(720), Ok("fn a() {}"));
+        assert_eq!(sent, format!("fn a() {{}}{}", same_as(1)));
+        assert_eq!(
+            made(&mut turn, "read_file", read(760), Ok("fn a() {}")),
+            "fn a() {}"
+        );
+        // Another file's identical page is its own.
+        let other = serde_json::json!({ "path": "b.rs", "offset": 700 });
+        assert_eq!(
+            made(&mut turn, "read_file", other, Ok("fn a() {}")),
+            "fn a() {}"
+        );
+
+        let find = |pattern: &str| serde_json::json!({ "pattern": pattern, "glob": "*.rs" });
+        made(&mut turn, "search", find("Foo"), Ok("a.rs:1: Foo"));
+        let sent = made(&mut turn, "search", find("foo"), Ok("a.rs:1: Foo"));
+        assert_eq!(sent, format!("a.rs:1: Foo{}", same_as(5)));
+    }
+
+    #[test]
+    fn a_changed_result_or_an_edit_between_two_starts_the_count_again() {
+        let mut turn = turn();
+        let read = serde_json::json!({ "path": "a.rs" });
+        made(&mut turn, "read_file", read.clone(), Ok("fn a() {}"));
+        assert_eq!(
+            made(&mut turn, "read_file", read.clone(), Ok("fn b() {}")),
+            "fn b() {}"
+        );
+        let sent = made(&mut turn, "read_file", read.clone(), Ok("fn a() {}"));
+        assert_eq!(sent, format!("fn a() {{}}{}", same_as(1)));
+        // The same file read again after an edit may well read the same:
+        // that is news of the edit, not a repeat.
+        made(&mut turn, "edit_file", edit("fn a()"), Ok("Edited a.rs."));
+        assert_eq!(
+            made(&mut turn, "read_file", read.clone(), Ok("fn a() {}")),
+            "fn a() {}"
+        );
+        // An edit that missed, or notes written, changed nothing.
+        made(&mut turn, "edit_file", edit("fn c()"), Err(MISSED));
+        let notes = serde_json::json!({ "path": "NOTES.md", "content": "so far" });
+        made(&mut turn, "write_file", notes, Ok("Wrote NOTES.md"));
+        let sent = made(&mut turn, "read_file", read, Ok("fn a() {}"));
+        assert_eq!(sent, format!("fn a() {{}}{}", same_as(5)));
+    }
+
+    #[test]
+    fn a_call_made_twice_in_one_reply_or_turned_down_twice_is_not_noted() {
+        // Made together, neither read was a retry of the other.
+        let mut turn = turn();
+        let reads = vec![
+            ToolCall {
+                id: "a".into(),
+                ..call("read_file")
+            },
+            ToolCall {
+                id: "b".into(),
+                ..call("read_file")
+            },
+        ];
+        turn.begin(reads);
+        turn.finish_call(Ok("same".into()));
+        turn.finish_call(Ok("same".into()));
+        let sent: Vec<String> = turn.take_results().into_iter().map(|r| r.content).collect();
+        assert_eq!(sent, ["same", "same"]);
+        // A refusal, a decline or a stop is no result of the call.
+        let mut turn = self::turn();
+        let outside = serde_json::json!({ "command": "rm -rf /tmp/x" });
+        for _ in 0..2 {
+            let sent = made(
+                &mut turn,
+                "run_command",
+                outside.clone(),
+                Err(tools::DECLINED),
+            );
+            assert_eq!(sent, tools::DECLINED);
+        }
+    }
+
+    #[test]
+    fn a_result_that_differs_only_in_its_ids_times_and_seeds_is_the_same() {
+        let mut turn = turn();
+        let log = serde_json::json!({ "command": "git log -1" });
+        let first = "commit 2dff3502e9a1\nDate: 2026-10-11 09:12:33\n\n    Fix it\n";
+        let second = "commit 7c0a9b4d2e11\nDate: 2026-10-12 17:40:02\n\n    Fix it\n";
+        made(&mut turn, "run_command", log.clone(), Ok(first));
+        assert_eq!(
+            made(&mut turn, "run_command", log.clone(), Ok(second)),
+            format!("{second}{}", same_as(1))
+        );
+        // One word changed, anywhere, is a different result.
+        let third = "commit 7c0a9b4d2e11\nDate: 2026-10-12 17:40:02\n\n    Fix it now\n";
+        assert_eq!(made(&mut turn, "run_command", log, Ok(third)), third);
+
+        let shaped = |text: &str| result_shape(text);
+        assert_eq!(
+            shaped("12 passed in 0.12s"),
+            shaped("12 passed in 3.4 seconds")
+        );
+        assert_eq!(shaped("seed=1234 ok"), shaped("seed=99 ok"));
+        assert_eq!(
+            shaped("Using --randomly-seed=1234"),
+            shaped("Using --randomly-seed=5")
+        );
+        assert_eq!(shaped("at 0x7f3a2b1c4d60"), shaped("at 0x55d1e0a0b2c0"));
+        assert_eq!(
+            shaped("2026-10-11T09:12:33.123 x"),
+            shaped("2026-01-01T00:00:00.9 x")
+        );
+        assert_eq!(shaped("at 09:12:33"), shaped("at 23:59:59"));
+        assert_eq!(
+            shaped("in /tmp/pytest-of-u/pytest-3/"),
+            "in /tmp/pytest-of-u/pytest-3/"
+        );
+        // Words spelled in a to f, short ids, versions and counts stay.
+        assert_eq!(shaped("defaced facade"), "defaced facade");
+        assert_ne!(shaped("abc123 ok"), shaped("abc124 ok"));
+        assert_ne!(shaped("version 1.2.3"), shaped("version 1.2.4"));
+        assert_ne!(shaped("12 passed"), shaped("13 passed"));
+        assert_ne!(shaped("line 5 seems fine"), shaped("line 6 seems fine"));
+    }
+
+    #[test]
+    fn the_same_result_note_goes_on_its_own_result_and_the_bytes_before_it_do_not_move() {
+        let mut turn = turn();
+        let connection = turn.connection.clone();
+        let mut messages = vec![Message {
+            role: "user".into(),
+            content: "find the bug".into(),
+            ..Default::default()
+        }];
+        let mut bodies = Vec::new();
+        for round in 1..=2 {
+            // Each round reads a.rs again and a file of its own.
+            let calls = vec![
+                ToolCall {
+                    id: format!("a{round}"),
+                    arguments: r#"{"path": "a.rs"}"#.into(),
+                    ..call("read_file")
+                },
+                ToolCall {
+                    id: format!("b{round}"),
+                    arguments: format!(r#"{{"path": "b{round}.rs"}}"#),
+                    ..call("read_file")
+                },
+            ];
+            messages.push(Message {
+                role: "assistant".into(),
+                tool_calls: calls.clone(),
+                ..Default::default()
+            });
+            turn.begin(calls);
+            turn.finish_id(&format!("b{round}"), Ok("b".into()));
+            turn.finish_id(&format!("a{round}"), Ok("a".into()));
+            messages.extend(turn.take_results());
+            bodies.push(crate::chat::body(&connection, &messages, None, None));
+        }
+        let results = &messages[messages.len() - 2..];
+        assert_eq!(results[0].content, format!("a{}", same_as(1)));
+        assert_eq!(results[1].content, "b");
+        // The request with the note carries every message of the one before
+        // it byte for byte, with the new round's after them.
+        let (before, with) = (&bodies[0], &bodies[1]);
+        let earlier = before["messages"].as_array().unwrap();
+        let later = with["messages"].as_array().unwrap();
+        assert_eq!(later.len(), earlier.len() + 3);
+        for (i, message) in earlier.iter().enumerate().skip(1) {
+            assert_eq!(message.to_string(), later[i].to_string(), "message {i}");
+        }
     }
 
     /// What `edit_file` says when its `old` is not in the file.
@@ -2645,7 +3046,7 @@ mod tests {
         made(&mut turn, "read_file", other, Ok("fn b() {}"));
         made(&mut turn, "read_file", missing.clone(), gone);
         let sent = made(&mut turn, "read_file", missing, gone);
-        assert!(sent.contains("made this exact call 3 times"), "{sent}");
+        assert!(sent.contains("made this call 3 times"), "{sent}");
         assert!(!sent.contains("in a row"), "{sent}");
     }
 }

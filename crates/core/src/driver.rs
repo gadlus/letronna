@@ -4411,7 +4411,7 @@ pub(crate) mod tests {
         // The model was told before it was stopped.
         let told = results(&sent[3]);
         assert!(!told[1].contains("Change your approach"));
-        assert!(told[2].contains("made this exact call 3 times"));
+        assert!(told[2].contains("made this call 3 times"));
     }
 
     #[test]
