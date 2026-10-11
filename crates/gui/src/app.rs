@@ -2350,18 +2350,50 @@ impl Chat {
         turn.live = agent::Live::default();
         cx.notify();
         let generation = self.generation;
+        // The reply's text is paced onto the screen, a piece a frame, rather
+        // than shown in the bursts it arrives in; with motion reduced it is
+        // shown as it comes.
+        let paced = !cx.reduce_motion();
         self.reading = Some(cx.spawn(async move |this, cx| {
-            while let Ok(event) = receiver.recv().await {
-                let finished = matches!(event, Event::Finished(_));
-                let current = this.update(cx, |this, cx| {
-                    let current = this.generation == generation;
-                    if current {
-                        this.on_event(event, cx);
+            let mut pacer = crate::ui::pace::Pacer::default();
+            let mut open = true;
+            loop {
+                if pacer.is_empty() {
+                    if !open {
+                        break;
                     }
-                    current
-                });
-                if !matches!(current, Ok(true)) || finished {
+                    match receiver.recv().await {
+                        Ok(event) => pacer.push(event),
+                        Err(_) => {
+                            open = false;
+                            continue;
+                        }
+                    }
+                }
+                while let Ok(event) = receiver.try_recv() {
+                    pacer.push(event);
+                }
+                let batch = if paced { pacer.next() } else { pacer.all() };
+                let mut ended = false;
+                for event in batch {
+                    let finished = matches!(event, Event::Finished(_));
+                    let current = this.update(cx, |this, cx| {
+                        let current = this.generation == generation;
+                        if current {
+                            this.on_event(event, cx);
+                        }
+                        current
+                    });
+                    if !matches!(current, Ok(true)) || finished {
+                        ended = true;
+                        break;
+                    }
+                }
+                if ended {
                     break;
+                }
+                if !pacer.is_empty() {
+                    cx.background_executor().timer(crate::ui::pace::FRAME).await;
                 }
             }
         }));
