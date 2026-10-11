@@ -694,6 +694,10 @@ pub struct Bar {
     /// The permission mode, shown at the front of the footer, which
     /// shift-tab steps through; `None` where no mode applies.
     mode: Option<Mode>,
+    /// Whether shift-tab may land on bypass: only once the session has been
+    /// in it by choice (`--mode bypass` or `/mode bypass`), so a key pressed
+    /// once too often never turns every check off.
+    bypass: bool,
     line: Line,
     picked: usize,
     /// The first of the menu's rows on show, when there are more than fit.
@@ -780,6 +784,7 @@ impl Bar {
     pub fn new(footer: String) -> Self {
         Self {
             mode: None,
+            bypass: false,
             line: Line::default(),
             picked: 0,
             menu_top: 0,
@@ -899,6 +904,7 @@ impl Bar {
     /// Show `mode`, and let shift-tab step on from it.
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = Some(mode);
+        self.bypass |= mode == Mode::Bypass;
         self.settle();
     }
 
@@ -2516,8 +2522,11 @@ const MODE_HINT: &str = "shift+tab to switch";
 impl Bar {
     fn step_mode(&mut self) {
         let Some(now) = self.mode else { return };
-        let at = Mode::OFFERED.iter().position(|m| *m == now).unwrap_or(0);
-        let next = Mode::OFFERED[(at + 1) % Mode::OFFERED.len()];
+        let offered: Vec<Mode> = (Mode::OFFERED.into_iter())
+            .filter(|m| *m != Mode::Bypass || self.bypass)
+            .collect();
+        let at = offered.iter().position(|m| *m == now).unwrap_or(0);
+        let next = offered[(at + 1) % offered.len()];
         self.mode = Some(next);
         // Plan mode also keeps the agents from writing, as `/plan` does.
         letronna_core::agents::set_plan(next == Mode::Plan);
@@ -2643,7 +2652,16 @@ mod tests {
         bar.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(bar.mode(), None, "no mode shown, nothing to step");
         bar.set_mode(Mode::Default);
-        for want in Mode::OFFERED.iter().skip(1).chain(Mode::OFFERED.first()) {
+        // Bypass is left out until the session has chosen it once.
+        let safe: Vec<Mode> = (Mode::OFFERED.into_iter())
+            .filter(|m| *m != Mode::Bypass)
+            .collect();
+        for want in safe.iter().skip(1).chain(safe.first()) {
+            bar.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+            assert_eq!(bar.mode(), Some(*want));
+        }
+        bar.set_mode(Mode::Bypass);
+        for want in &Mode::OFFERED {
             bar.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
             assert_eq!(bar.mode(), Some(*want));
         }
