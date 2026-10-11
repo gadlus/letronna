@@ -450,7 +450,9 @@ impl Chat {
             )
     }
 
-    /// A phrase in a box the user dismisses.
+    /// A phrase in a box the user dismisses. It has no Copy: the clipboard's
+    /// history, on Windows and in clipboard apps, keeps what is copied long
+    /// after, and a phrase is to be written down anyway.
     fn phrase_box(
         &self,
         id: &'static str,
@@ -460,7 +462,6 @@ impl Chat {
         done: &'static str,
         cx: &mut Context<Self>,
     ) -> Div {
-        let copy = secret.clone();
         v_flex()
             .gap_2()
             .px_3()
@@ -477,31 +478,19 @@ impl Chat {
             )
             .child(div().font_family(MONO_FONT).text_sm().child(secret))
             .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new((id, 0usize))
-                            .plain(cx)
-                            .xsmall()
-                            .label("Copy")
-                            .on_click(move |_, window, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
-                                window.push_notification(Notification::success("Copied."), cx);
-                            }),
-                    )
-                    .child(
-                        Button::new((id, 1usize))
-                            .primary()
-                            .xsmall()
-                            .label(done)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                match id {
-                                    "fresh" => this.wallet.fresh = None,
-                                    _ => this.wallet.shown = None,
-                                }
-                                cx.notify();
-                            })),
-                    ),
+                h_flex().gap_2().child(
+                    Button::new((id, 1usize))
+                        .primary()
+                        .xsmall()
+                        .label(done)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            match id {
+                                "fresh" => this.wallet.fresh = None,
+                                _ => this.wallet.shown = None,
+                            }
+                            cx.notify();
+                        })),
+                ),
             )
     }
 
