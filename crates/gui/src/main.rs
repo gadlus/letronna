@@ -756,6 +756,8 @@ fn main() {
         // MCP servers can take seconds to start; started with the window,
         // their tools are there by the first message.
         letronna_core::mcp::start();
+        // Off unless Settings turned it on.
+        let _ = letronna_core::providers::local::apply(&letronna_core::store::current_settings());
         cx.bind_keys(
             keys(cx.keyboard_mapper().as_ref())
                 .into_iter()
