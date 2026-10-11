@@ -154,6 +154,6 @@ Never paste an API key.
 ## Keeping disk use down
 
 Run builds and tests through `scripts/x.sh` (for example `scripts/x.sh test` or
-`scripts/x.sh build --release`). It runs the cargo command, then clears the
-build cache and keeps only the finished binaries and app. Set `KEEP_CACHE=1`
-when you want fast incremental rebuilds instead.
+`scripts/x.sh build --release`). The build cache is kept for fast rebuilds
+until `target/` passes `CACHE_LIMIT_GB` (default 10); then it is cleared,
+keeping only the finished binaries and app. `KEEP_CACHE=1` never clears.
