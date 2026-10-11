@@ -21,7 +21,72 @@ impl Chat {
     /// The (gateway, model) pairs the picker shows for what is typed in its
     /// search box.
     pub(crate) fn model_matches(&self, cx: &App) -> Vec<(String, String)> {
-        self.models_named(&self.model_search.read(cx).value())
+        let mut matches = self.models_named(&self.model_search.read(cx).value());
+        if let Some(provider) = &self.model_provider {
+            matches.retain(|(gateway, _)| gateway == provider);
+        }
+        // Each provider's models together, the session's own first, so one
+        // just added is a heading to find and not a scroll.
+        let on = self.store.model(self.store.active).0;
+        let order = self.providers();
+        matches
+            .sort_by_key(|(gateway, _)| (gateway != on, order.iter().position(|p| p == gateway)));
+        matches
+    }
+
+    /// The providers with models in the picker, in the order they first
+    /// come.
+    pub(crate) fn providers(&self) -> Vec<String> {
+        let mut providers: Vec<String> = Vec::new();
+        for (gateway, _) in &self.models {
+            if !providers.contains(gateway) {
+                providers.push(gateway.clone());
+            }
+        }
+        providers
+    }
+
+    /// A chip for each provider over the model list, and All, to narrow it
+    /// to one; only when there is more than one.
+    fn provider_chips(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let providers = self.providers();
+        if providers.len() < 2 {
+            return None;
+        }
+        let count = |provider: &str| self.models.iter().filter(|(g, _)| g == provider).count();
+        let mut chips = h_flex()
+            .p_1()
+            .gap_0p5()
+            .flex_wrap()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                Button::new("provider-all")
+                    .plain(cx)
+                    .xsmall()
+                    .label("All")
+                    .selected(self.model_provider.is_none())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.model_provider = None;
+                        cx.notify();
+                    })),
+            );
+        for (i, provider) in providers.into_iter().enumerate() {
+            let label = format!("{provider} {}", count(&provider));
+            let selected = self.model_provider.as_deref() == Some(provider.as_str());
+            chips = chips.child(
+                Button::new(("provider", i))
+                    .plain(cx)
+                    .xsmall()
+                    .label(label)
+                    .selected(selected)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.model_provider = (!selected).then(|| provider.clone());
+                        cx.notify();
+                    })),
+            );
+        }
+        Some(chips)
     }
 
     /// The pairs whose gateway or id contains `query`, the model in use
@@ -44,6 +109,19 @@ impl Chat {
         ids
     }
 
+    /// The provider `model` comes through: the session's when it is the
+    /// session's model, else the first that offers it, else the session's.
+    pub(crate) fn provider_of(&self, model: &str) -> String {
+        let (on, current) = self.store.model(self.store.active);
+        if model == current {
+            return on.to_owned();
+        }
+        (self.models.iter())
+            .find(|(_, id)| id == model)
+            .map_or(on, |(gateway, _)| gateway)
+            .to_owned()
+    }
+
     pub(crate) fn model_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (on, current) = self.store.model(self.store.active);
         let (on, current) = (on.to_owned(), current.to_owned());
@@ -60,6 +138,10 @@ impl Chat {
         let mut list = v_flex()
             .id("model-list")
             .max_h(px(320.))
+            // As tall as a long list, so narrowing it to a provider or a
+            // search does not pull the chips out from under the pointer: the
+            // menu grows up from the composer.
+            .when(self.models.len() > 12, |this| this.min_h(px(320.)))
             .overflow_y_scroll()
             .p_1()
             .gap_0p5();
@@ -89,7 +171,21 @@ impl Chat {
                     }),
             );
         }
+        let mut heading: Option<String> = None;
         for (i, (gw, id)) in matches.into_iter().enumerate() {
+            if heading.as_ref() != Some(&gw) {
+                heading = Some(gw.clone());
+                list = list.child(
+                    div()
+                        .px_2()
+                        .pt_1p5()
+                        .pb_0p5()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(cx.theme().muted_foreground)
+                        .child(gw.clone()),
+                );
+            }
             let active = making.is_none() && gw == on && id == current;
             let (pick_gw, pick) = (gw.clone(), id.clone());
             list = list.child(
@@ -99,22 +195,12 @@ impl Chat {
                     .w_full()
                     .justify_start()
                     .child(
-                        h_flex()
-                            .w_full()
-                            .gap_2()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .when(active, |d| d.text_color(cx.theme().link))
-                                    .child(id),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(gw),
-                            ),
+                        h_flex().w_full().gap_2().justify_between().child(
+                            div()
+                                .truncate()
+                                .when(active, |d| d.text_color(cx.theme().link))
+                                .child(id),
+                        ),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.choose_model(pick_gw.clone(), pick.clone(), window, cx)
@@ -139,6 +225,15 @@ impl Chat {
                             .items_center()
                             // A long model name gives way before the text does.
                             .child(div().max_w(px(160.)).truncate().child(short))
+                            .when(making.is_none() && !on.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .max_w(px(100.))
+                                        .truncate()
+                                        .text_color(cx.theme().muted_foreground.opacity(0.7))
+                                        .child(format!("· {on}")),
+                                )
+                            })
                             .child(Icon::new(IconName::ChevronDown).size_3()),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -193,6 +288,9 @@ impl Chat {
                                                 )
                                                 .when(!self.media_models.is_empty(), |this| {
                                                     this.child(self.kind_tabs(cx))
+                                                })
+                                                .when(chat, |this| {
+                                                    this.children(self.provider_chips(cx))
                                                 })
                                                 .child(list),
                                         )
