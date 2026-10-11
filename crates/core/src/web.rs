@@ -407,6 +407,10 @@ struct Unreachable {
     host: String,
     why: String,
     session: u64,
+    /// Whether this says the network is out of reach. A name that could not
+    /// be looked up may only be mistyped, so it says so only once a second
+    /// name fails too, or the network failed otherwise.
+    sure: bool,
 }
 
 impl Unreachable {
@@ -415,6 +419,11 @@ impl Unreachable {
     /// gets through elsewhere: nobody is there to say the connection is
     /// back, and each try would cost it a round.
     fn stops(&self, asker: &Asker, now: Instant) -> bool {
+        self.sure && self.stops_unsure(asker, now)
+    }
+
+    /// Whether this would stop a request `asker` makes at `now` if it were sure.
+    fn stops_unsure(&self, asker: &Asker, now: Instant) -> bool {
         now.saturating_duration_since(self.at) < UNREACHABLE_TIME
             || (asker.unwatched && asker.session == self.session)
     }
@@ -503,22 +512,32 @@ pub(crate) fn note_reach(
     if moved {
         return;
     }
-    if let Some(why) = unconnected(e) {
-        let last = Unreachable {
-            at: Instant::now(),
-            host: url.host_str().unwrap_or_default().to_owned(),
-            why,
-            session: asker.session,
-        };
-        with_unreachable(|unreachable| *unreachable = Some(last));
+    if let Some((why, looked_up)) = unconnected(e) {
+        let host = url.host_str().unwrap_or_default().to_owned();
+        let now = Instant::now();
+        with_unreachable(|unreachable| {
+            // One name that could not be looked up stops nothing; a second,
+            // different one lately says the lookups themselves fail.
+            let sure = !looked_up
+                || unreachable.as_ref().is_some_and(|last| {
+                    last.stops_unsure(asker, now) && (last.sure || last.host != host)
+                });
+            *unreachable = Some(Unreachable {
+                at: now,
+                host,
+                why,
+                session: asker.session,
+                sure,
+            });
+        });
     }
 }
 
 /// Why `e` never reached its server when that is the network's doing rather
-/// than the server's: its name could not be looked up, or nothing on the way
-/// to its address would take a connection. Not a timeout, which a slow page
+/// than the server's, and whether it was its name that could not be looked
+/// up rather than nothing on the way to its address taking a connection. Not a timeout, which a slow page
 /// gives too, nor a failed handshake, which is one server's certificate.
-fn unconnected(e: &reqwest::Error) -> Option<String> {
+fn unconnected(e: &reqwest::Error) -> Option<(String, bool)> {
     if !e.is_connect() || e.is_timeout() || handshake_failure(e).is_some() {
         return None;
     }
@@ -536,7 +555,7 @@ fn unconnected(e: &reqwest::Error) -> Option<String> {
         kind,
         ConnectionRefused | NetworkUnreachable | HostUnreachable | NetworkDown | AddrNotAvailable
     );
-    (looked_up || network).then(|| cause.to_string())
+    (looked_up || network).then(|| (cause.to_string(), looked_up))
 }
 
 /// Whether `error` is web_fetch's or search_web's word that they are stopped,
@@ -2069,8 +2088,14 @@ or <a data-href="/x" href=/top#part>the top</a>.</p>
             }
         });
         let why = fetch(&format!("https://{at}/"), &[], false).unwrap_err();
-        assert!(fenced(&why), "{why}");
-        assert!(why.contains("the secure connection failed: "), "{why}");
+        // Windows ends the connection before rustls reads the answer, so the
+        // error there is the OS's own words and nothing of the server's.
+        if cfg!(windows) && !why.contains("the secure connection failed: ") {
+            assert!(!why.contains("Bad Request"), "{why}");
+        } else {
+            assert!(fenced(&why), "{why}");
+            assert!(why.contains("the secure connection failed: "), "{why}");
+        }
 
         let ctx = ToolContext::of(&crate::chat::Connection {
             conversation: 731_081,
@@ -2131,6 +2156,24 @@ or <a data-href="/x" href=/top#part>the top</a>.</p>
             with_unreachable(|last| last.is_some()),
             "a local page cleared it"
         );
+    }
+
+    #[test]
+    fn one_name_that_could_not_be_looked_up_stops_nothing_but_two_do() {
+        stand_in_for_the_web();
+        let (base, asked) = serve(site);
+        // Names under .invalid are never given to any host.
+        fetch("http://mistyped.invalid/", &[], false).unwrap_err();
+        fetch(&format!("{base}/end"), &[], false).unwrap();
+        assert_eq!(*asked.lock().unwrap(), ["/end"]);
+        fetch("http://mistyped.invalid/", &[], false).unwrap_err();
+        fetch("http://mistyped.invalid/", &[], false).unwrap_err();
+        fetch(&format!("{base}/end"), &[], false).unwrap();
+        fetch("http://mistyped.invalid/", &[], false).unwrap_err();
+        fetch("http://another.invalid/", &[], false).unwrap_err();
+        let stop = fetch(&format!("{base}/end"), &[], false).unwrap_err();
+        assert!(says_unavailable(&stop), "{stop}");
+        assert_eq!(asked.lock().unwrap().len(), 2, "it tried the page");
     }
 
     #[test]

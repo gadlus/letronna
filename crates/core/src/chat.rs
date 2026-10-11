@@ -10650,7 +10650,12 @@ mod tests {
         // moves on whole chunks rather than with every result.
         let budget = sized(Some(128_000), None, CAP_TOKENS, 0);
         let turn = reads(40, 24_000);
-        let requests = requests_by_round(&connection(), &turn, &budget);
+        // Its own conversation, as the stubs read what is saved for it.
+        let c = Connection {
+            conversation: 10_657,
+            ..connection()
+        };
+        let requests = requests_by_round(&c, &turn, &budget);
         let breaks = prefix_breaks(&requests);
         let total = token_sums(&turn, budget.tool_chars, None)[turn.len()];
         assert!(!breaks.is_empty());
