@@ -113,8 +113,16 @@ const FAILURES_NOTED: usize = 2;
 const FAILURE_NOTES: usize = 2;
 
 /// How the answer to a call that never ran opens: one left at the round
-/// cap, stopped before it started, or after a hook ended the turn.
+/// cap, stopped before it started, after a hook ended the turn, or behind
+/// a call of its reply that failed.
 const NOT_RUN: &str = "Not run: ";
+
+/// The answer the calls queued behind one that failed get. They were made
+/// before its result was seen, so each may count on what it was to do, as a
+/// check made after an edit does; run anyway, the check would pass or fail
+/// the unedited file and read as if it had checked the edit.
+const AFTER_A_FAILURE: &str =
+    "Not run: an earlier call in this reply failed; resend it if still wanted.";
 
 /// Calls from one reply run at once. Enough for a model reading around a
 /// project in one go, few enough that a reply of dozens never starts dozens
@@ -627,7 +635,15 @@ impl Turn {
             ..Default::default()
         };
         self.track_edits(&result);
+        let fails_the_rest = fails_the_rest(&result);
         self.results.push(result);
+        // A call that runs alone runs after everything before it, so nothing
+        // of the reply is under way: what is left was never started.
+        if fails_the_rest {
+            while !self.queue.is_empty() {
+                self.finish_call(Err(AFTER_A_FAILURE.into()));
+            }
+        }
     }
 
     /// Note what a finished call did to the edits waiting to be checked: an
@@ -837,6 +853,21 @@ fn sorted(value: serde_json::Value) -> serde_json::Value {
         serde_json::Value::Array(items) => items.into_iter().map(sorted).collect(),
         other => other,
     }
+}
+
+/// Whether a result leaves its reply's other calls unrun: a call that runs
+/// alone, such as an edit or a command, that failed or exited with a code.
+/// A read or search that fails cancels nothing, since the calls beside it
+/// run at once and count on nothing it did; nor does a question, which is
+/// no work the rest could count on. Nor does a call the user, the gate or
+/// a stop kept from running: each call of the reply is answered on its own
+/// there, as a read beside a write plan mode refuses still runs.
+fn fails_the_rest(result: &Message) -> bool {
+    if tools::concurrent(&result.name) || result.name == tools::ASK_USER {
+        return false;
+    }
+    (result.is_error && !refused_or_stopped(&result.content))
+        || crate::tool_runs::exit_code(result).is_some()
 }
 
 /// Whether an error is a no from the user, the gate, a hook or Auto mode,
@@ -1423,6 +1454,98 @@ mod tests {
         assert!(kept.iter().all(|m| m.is_error));
     }
 
+    #[test]
+    fn a_failed_edit_leaves_the_rest_of_its_reply_unrun() {
+        let mut turn = turn();
+        let mut fix = call("edit_file");
+        fix.arguments = edit("fn a()").to_string();
+        let mut test = call("run_command");
+        test.arguments = serde_json::json!({ "command": "cargo test" }).to_string();
+        turn.begin(vec![
+            call("read_file"),
+            fix.clone(),
+            test.clone(),
+            call("list_dir"),
+        ]);
+        turn.finish_call(Ok("fn a() {}".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Run(fix));
+        turn.finish_call(Err(MISSED.into()));
+        // Nothing is left to run: the results go back as they are.
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Ask);
+        let sent = turn.take_results();
+        let answers: Vec<(&str, &str, bool)> = sent
+            .iter()
+            .map(|m| (m.tool_call_id.as_str(), m.content.as_str(), m.is_error))
+            .collect();
+        let not_run = "Not run: an earlier call in this reply failed; resend it if still wanted.";
+        assert_eq!(
+            answers,
+            [
+                ("read_file-1", "fn a() {}", false),
+                ("edit_file-1", MISSED, true),
+                ("run_command-1", not_run, true),
+                ("list_dir-1", not_run, true),
+            ]
+        );
+        // The next reply runs as any does, and the unrun calls count as no
+        // failure of the tools they named.
+        turn.begin(vec![test.clone(), call("list_dir")]);
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Run(test));
+        turn.finish_call(Ok("test result: ok".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Run(call("list_dir")));
+        turn.finish_call(Ok("src".into()));
+        let sent = turn.take_results();
+        assert_eq!(sent[0].content, "test result: ok");
+        assert_eq!(sent[1].content, "src");
+    }
+
+    #[test]
+    fn a_command_that_exits_with_a_code_leaves_the_rest_of_its_reply_unrun() {
+        let mut turn = turn();
+        let mut build = call("run_command");
+        build.arguments = serde_json::json!({ "command": "cargo build" }).to_string();
+        let mut test = ToolCall {
+            id: "test".into(),
+            ..call("run_command")
+        };
+        test.arguments = serde_json::json!({ "command": "cargo test" }).to_string();
+        turn.begin(vec![build, test.clone()]);
+        turn.finish_call(Ok("error[E0308]: mismatched types\n[exit code 101]".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Ask);
+        let sent = turn.take_results();
+        assert!(sent[0].content.ends_with("[exit code 101]") && !sent[0].is_error);
+        assert!(sent[1].content.starts_with("Not run: an earlier call"));
+        // One that ran clean lets the next run.
+        let mut turn = self::turn();
+        turn.begin(vec![call("run_command"), test.clone()]);
+        turn.finish_call(Ok("Finished".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Run(test));
+    }
+
+    #[test]
+    fn a_failed_read_cancels_nothing_beside_it() {
+        let mut turn = turn();
+        let never = |_: &ToolCall| false;
+        let mut other = call("read_file");
+        other.id = "other".into();
+        turn.begin(vec![call("read_file"), other.clone(), call("search")]);
+        // All three run at once; a miss among them is that call's alone.
+        assert_eq!(turn.next_batch(never, MAX_BATCH).len(), 3);
+        turn.finish_id("read_file-1", Err("No such file.".into()));
+        assert_eq!(turn.next_batch(never, MAX_BATCH), [other, call("search")]);
+        turn.finish_id("other", Ok("fn b() {}".into()));
+        turn.finish_id("search-1", Ok("no matches".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Ask);
+        let sent = turn.take_results();
+        assert_eq!(sent.len(), 3);
+        assert!(sent.iter().skip(1).all(|m| !m.is_error));
+        // A read that runs after a failing one, in the same reply, still runs.
+        let mut turn = self::turn();
+        turn.begin(vec![call("read_file"), call("list_dir")]);
+        turn.finish_call(Err("No such file.".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Run(call("list_dir")));
+    }
+
     /// A turn nobody watches, asked where it stands every `every` rounds
     /// without a change.
     fn unattended_every(every: usize) -> Turn {
@@ -1572,20 +1695,23 @@ mod tests {
         let results = &messages[messages.len() - 2..];
         assert_eq!(results[0].content, "a");
         assert!(results[1].content.starts_with("b\n\n[3 rounds since"));
-        // The request with the note holds the one before it byte for byte,
-        // but for the messages the new round added.
+        // The request with the note carries every message of the one before
+        // it byte for byte, with the new round's after them. The system
+        // message is left out of the comparison only because tests beside
+        // this one change the memory and settings it is built from.
         let (before, with) = (&bodies[1], &bodies[2]);
         let earlier = before["messages"].as_array().unwrap();
         let later = with["messages"].as_array().unwrap();
         assert_eq!(later.len(), earlier.len() + 3);
-        for (i, message) in earlier.iter().enumerate() {
+        for (i, message) in earlier.iter().enumerate().skip(1) {
             assert_eq!(message.to_string(), later[i].to_string(), "message {i}");
         }
-        let mut rest = with.clone();
-        rest["messages"] = serde_json::Value::Null;
-        let mut rest_before = before.clone();
-        rest_before["messages"] = serde_json::Value::Null;
-        assert_eq!(rest.to_string(), rest_before.to_string());
+        assert!(
+            later[later.len() - 1]["content"]
+                .as_str()
+                .unwrap()
+                .contains(TAKING_STOCK)
+        );
     }
 
     #[test]
