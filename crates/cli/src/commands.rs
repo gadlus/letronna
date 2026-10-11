@@ -129,8 +129,8 @@ pub fn command(
             fallback(runner, rest);
             Flow::Handled
         }
-        "/gateways" => {
-            gateways(runner);
+        "/connect" | "/gateways" => {
+            connect(runner);
             Flow::Handled
         }
         "/team" => {
@@ -142,27 +142,7 @@ pub fn command(
             Flow::Handled
         }
         "/logout" => {
-            let who = letronna_core::auth::account();
-            let out = runner
-                .bar
-                .busy("signing this computer out", letronna_core::auth::sign_out);
-            render::blank();
-            match (who, out) {
-                (_, Err(why)) => render::line(&render::red(&why)),
-                (Some(account), Ok(note)) => {
-                    render::line(&render::dim(&format!(
-                        "Signed out {}. Your sessions and settings stay where they are.",
-                        account.name
-                    )));
-                    if let Some(note) = note {
-                        render::line(&render::dim(&note));
-                    }
-                }
-                (None, Ok(Some(note))) => {
-                    render::line(&render::dim(&format!("Signed out here. {note}")));
-                }
-                (None, Ok(None)) => render::line(&render::dim("Nobody was signed in.")),
-            }
+            sign_out(runner);
             Flow::Handled
         }
         "/whoami" => {
@@ -1286,6 +1266,107 @@ pub fn sign_in(runner: &mut Runner) {
         }
         // Given up on with escape: what was asked for, not a failure.
         Err(error) if error == "Sign-in cancelled." => render::line(&render::dim(&error)),
+        Err(error) => render::line(&render::red(&error)),
+    }
+}
+
+/// Sign this computer out of Letronna: /logout, and /connect's choice.
+fn sign_out(runner: &mut Runner) {
+    let who = letronna_core::auth::account();
+    let out = runner
+        .bar
+        .busy("signing this computer out", letronna_core::auth::sign_out);
+    render::blank();
+    match (who, out) {
+        (_, Err(why)) => render::line(&render::red(&why)),
+        (Some(account), Ok(note)) => {
+            render::line(&render::dim(&format!(
+                "Signed out {}. Your sessions and settings stay where they are.",
+                account.name
+            )));
+            if let Some(note) = note {
+                render::line(&render::dim(&note));
+            }
+        }
+        (None, Ok(Some(note))) => {
+            render::line(&render::dim(&format!("Signed out here. {note}")));
+        }
+        (None, Ok(None)) => render::line(&render::dim("Nobody was signed in.")),
+    }
+}
+
+/// Sign in to a provider in the browser, or by pasting the address the
+/// browser ended on when it cannot reach this computer.
+fn provider_sign_in(runner: &mut Runner, name: &'static str) {
+    use letronna_core::providers::auth;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    render::blank();
+    if let Some(p) = letronna_core::providers::find(name)
+        && let Some(caveat) = p.caveat()
+    {
+        render::line(&render::dim(p.info().blurb));
+        render::line(&render::dim(caveat));
+    }
+    let flow = match auth::begin(name) {
+        Ok(flow) => flow,
+        Err(error) => return render::line(&render::red(&error)),
+    };
+    render::said(
+        &render::blue("●"),
+        &render::bold(&format!("Sign in to {name}")),
+    );
+    render::line(&render::dim(if flow.open_browser() {
+        "Opening your browser. Come back when it is done."
+    } else {
+        "Open this in your browser:"
+    }));
+    render::line(&render::dim(&flow.url));
+    let waiting = {
+        let flow = flow.clone();
+        std::thread::spawn(move || flow.finish())
+    };
+    let pasted = runner
+        .bar
+        .ask(
+            "Press enter once signed in, or paste the address the browser ended on",
+            false,
+        )
+        .unwrap_or_default();
+    if !pasted.trim().is_empty()
+        && let Err(error) = flow.paste(pasted.trim())
+    {
+        flow.cancel();
+        return render::line(&render::red(&error));
+    }
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let watch = (stop.clone(), flow.clone());
+    let done = runner.bar.busy_cancellable(
+        "waiting for the browser · esc to cancel",
+        stop,
+        move || {
+            while !waiting.is_finished() {
+                if watch.0.load(Ordering::Relaxed) {
+                    watch.1.cancel();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            waiting
+                .join()
+                .unwrap_or_else(|_| Err("The sign-in stopped.".into()))
+        },
+    );
+    match done {
+        Ok(tokens) => {
+            let usage = letronna_core::providers::router::usage(name);
+            let usage = if usage.is_empty() {
+                tokens.email
+            } else {
+                usage
+            };
+            render::line(&render::dim(&format!(
+                "Signed in to {name}: {usage}. /model now lists its models too."
+            )));
+        }
         Err(error) => render::line(&render::red(&error)),
     }
 }
@@ -4137,41 +4218,53 @@ pub fn search_services(runner: &mut Runner) {
     }
 }
 
-/// Every gateway and where it stands, then set one up, change it or remove it.
-/// Everything set up is used at once; `/model` picks among all their models.
-pub fn gateways(runner: &mut Runner) {
+/// Every provider and where it stands, with its plan and usage, then
+/// connect one, change it or disconnect it. Everything connected is used at
+/// once; `/model` picks among all their models.
+pub fn connect(runner: &mut Runner) {
     use letronna_core::gateway::{self, GATEWAYS, LETRONNA};
+    use letronna_core::providers::{self, AuthKind, router};
     let keys = store::load_keys();
     let custom = runner.store.settings.custom_endpoint.clone();
     let (k, c) = (keys.clone(), custom.clone());
     let (models, _) = runner
         .bar
-        .busy("asking every gateway what it has", move || {
+        .busy("asking every provider what it has", move || {
             gateway::all_models(&k, &c)
         });
 
     // The list sits in the box with its choices, not in the conversation.
-    // Letronna is the account, not a gateway to add or remove: /login and
-    // /logout look after it, so it has a status here and no choice.
     let mut rows = Vec::new();
     let mut choices: Vec<(String, &'static str, &'static str)> = Vec::new();
     for g in GATEWAYS.iter() {
         let count = models.iter().filter(|(n, _)| n == g.name).count();
         let (status, good, set_up) = gateway::status(g.name, &keys, &custom, count);
-        let status = if g.name == LETRONNA && !set_up {
-            format!("{status} · /login")
-        } else {
+        let usage = router::usage(g.name);
+        let status = if usage.is_empty() || !set_up {
             status
+        } else {
+            format!("{status} · {usage}")
         };
         rows.push(format!(
             "{} {:<11} {status}",
             if good { "●" } else { "○" },
             g.name
         ));
-        match (g.name, set_up) {
-            (LETRONNA, _) | ("Ollama", _) => {}
-            (_, false) => choices.push((format!("Set up {}", g.name), g.name, "set")),
-            (_, true) => {
+        let provider = providers::find(g.name);
+        if !set_up && let Some(caveat) = provider.and_then(|p| p.caveat()) {
+            rows.push(format!("  {:<11} {}", "", g.blurb));
+            rows.push(format!("  {:<11} {caveat}", ""));
+        }
+        let signs_in = match provider.map(|p| p.auth()) {
+            Some(AuthKind::None) => continue,
+            Some(AuthKind::Account | AuthKind::OAuth(_)) => true,
+            _ => false,
+        };
+        match (signs_in, set_up) {
+            (true, false) => choices.push((format!("Sign in to {}", g.name), g.name, "in")),
+            (true, true) => choices.push((format!("Sign out of {}", g.name), g.name, "out")),
+            (false, false) => choices.push((format!("Set up {}", g.name), g.name, "set")),
+            (false, true) => {
                 choices.push((format!("Change {}", g.name), g.name, "set"));
                 choices.push((format!("Remove {}", g.name), g.name, "remove"));
             }
@@ -4179,7 +4272,7 @@ pub fn gateways(runner: &mut Runner) {
     }
     let mut options: Vec<&str> = choices.iter().map(|c| c.0.as_str()).collect();
     options.push("Done");
-    let Some(picked) = runner.bar.choose("Gateways", rows, &options) else {
+    let Some(picked) = runner.bar.choose("Accounts", rows, &options) else {
         return;
     };
     let Some((_, name, what)) = choices.get(picked).cloned() else {
@@ -4187,6 +4280,18 @@ pub fn gateways(runner: &mut Runner) {
     };
     let mut saved = Ok(keys);
     match what {
+        "in" if name == LETRONNA => sign_in(runner),
+        "out" if name == LETRONNA => sign_out(runner),
+        "in" => provider_sign_in(runner, name),
+        "out" => {
+            render::blank();
+            match providers::auth::sign_out(name) {
+                Ok(()) => render::line(&render::dim(&format!(
+                    "Signed out of {name}. Its models leave /model."
+                ))),
+                Err(error) => render::line(&render::red(&error)),
+            }
+        }
         "remove" => {
             if let Err(error) = store::save_key(gateway::key_slot(name), None) {
                 render::blank();

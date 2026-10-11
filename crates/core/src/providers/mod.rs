@@ -108,6 +108,12 @@ pub trait Provider: Send + Sync {
     fn quota(&self, headers: &reqwest::header::HeaderMap) -> Option<Quota> {
         router::rate_limits(headers, crate::chat::now())
     }
+
+    /// What the user should know before connecting it, shown beside its
+    /// sign-in where there is something.
+    fn caveat(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Every provider, in the order they are offered. Letronna leads: it is what

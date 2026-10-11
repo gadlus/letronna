@@ -217,6 +217,8 @@ pub(crate) struct Chat {
     pub(crate) sign_in_url: Option<String>,
     /// Ends the wait for the browser at once, for the Cancel button.
     pub(crate) sign_in_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// A provider's browser sign-in from the Accounts page, while it waits.
+    pub(crate) provider_sign_in: Option<std::sync::Arc<letronna_core::providers::auth::SignIn>>,
     pub(crate) loading_models: bool,
     pub(crate) gateway_error: Option<String>,
     pub(crate) busy: bool,
@@ -681,7 +683,7 @@ impl Chat {
         let model_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search models…"));
         let gateway_pick = cx.new(|_| store.settings.gateway.clone());
         let presence_pick = cx.new(|_| store.settings.presence.clone());
-        let settings_page = cx.new(|_| "Gateways");
+        let settings_page = cx.new(|_| "Accounts");
         let memory = cx.new(|cx| crate::ui::memory::MemoryPage::new(window, cx));
         let rename = cx.new(|cx| InputState::new(window, cx).placeholder("Session name"));
         let answer = cx.new(|cx| InputState::new(window, cx).placeholder("Your answer…"));
@@ -891,6 +893,7 @@ impl Chat {
             connecting: false,
             sign_in_url: None,
             sign_in_cancel: None,
+            provider_sign_in: None,
             loading_models: false,
             gateway_error: None,
             store,

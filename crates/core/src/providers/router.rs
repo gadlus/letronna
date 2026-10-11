@@ -186,6 +186,49 @@ pub fn quota(name: &str) -> Option<Quota> {
         .cloned()
 }
 
+/// An account's plan and usage in a line, for the Accounts page and
+/// `/connect`: what its last reply said, or the plan it signed in with.
+/// Empty when nothing is known yet.
+pub fn usage(name: &str) -> String {
+    if name == crate::gateway::LETRONNA {
+        return crate::auth::account()
+            .map(|a| match a.plan_name() {
+                "" => format!("{} credit", a.credit()),
+                plan => format!("{plan} · {} credit", a.credit()),
+            })
+            .unwrap_or_default();
+    }
+    let signed = super::auth::tokens(name)
+        .map(|t| t.plan)
+        .filter(|p| !p.is_empty());
+    describe(quota(name), signed, crate::chat::now())
+}
+
+fn describe(quota: Option<Quota>, signed: Option<String>, now: u64) -> String {
+    let plan = quota.as_ref().and_then(|q| q.plan.clone()).or(signed);
+    let mut parts: Vec<String> = plan.into_iter().map(|p| capitalised(&p)).collect();
+    if let Some(q) = quota {
+        parts.push(format!("{:.0}% used", q.used_percent));
+        if let Some(at) = q.resets_at.filter(|&at| at > now) {
+            let mins = (at - now).div_ceil(60);
+            parts.push(match mins {
+                0..60 => format!("resets in {mins}m"),
+                60..1440 => format!("resets in {}h {}m", mins / 60, mins % 60),
+                _ => format!("resets in {}d", mins / 1440),
+            });
+        }
+    }
+    parts.join(" · ")
+}
+
+fn capitalised(word: &str) -> String {
+    let mut chars = word.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
 /// The tightest of the standard rate-limit headers at `now`: OpenAI's
 /// `x-ratelimit-*` and Anthropic's `anthropic-ratelimit-*`, for requests
 /// and for tokens.
@@ -269,6 +312,26 @@ fn reset_at(value: &str, now: u64) -> Option<u64> {
 mod tests {
     use super::*;
     use reqwest::header::{HeaderName, HeaderValue};
+
+    #[test]
+    fn usage_reads_as_plan_then_use_then_reset() {
+        let q = |plan: Option<&str>, at| Quota {
+            plan: plan.map(str::to_owned),
+            used_percent: 42.4,
+            resets_at: at,
+        };
+        assert_eq!(describe(None, None, 0), "");
+        assert_eq!(describe(None, Some("plus".into()), 0), "Plus");
+        assert_eq!(
+            describe(Some(q(Some("pro"), Some(3_900))), Some("plus".into()), 0),
+            "Pro · 42% used · resets in 1h 5m"
+        );
+        assert_eq!(
+            describe(Some(q(None, Some(10))), None, 0),
+            "42% used · resets in 1m"
+        );
+        assert_eq!(describe(Some(q(None, Some(5))), None, 9), "42% used");
+    }
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
         (pairs.iter())
