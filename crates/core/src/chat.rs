@@ -2449,13 +2449,14 @@ fn learn(connection: &Connection, sent: &Value, error: &str) -> bool {
     // A route that reads the turn's older reasoning after all, and was sent
     // none of it: the next request carries every call's, which is another
     // request from the one refused, so it goes once more before the field
-    // itself is given up on. Once: that request carries no empty one of the
-    // turn's, so a refusal of it falls through to the field.
+    // itself is given up on. Learned once per route: a call another model
+    // answered still goes out with an empty one, so the retry can have the
+    // same shape, and a refusal of it falls through to the field rather
+    // than going again.
     if error.contains("reasoningcontent")
         && sends_older_reasoning_empty(sent)
         && learned().lock().is_ok_and(|mut quirks| {
-            quirks.insert((endpoint.clone(), model.clone(), Quirk::KeepOldReasoning));
-            true
+            quirks.insert((endpoint.clone(), model.clone(), Quirk::KeepOldReasoning))
         })
     {
         return true;
@@ -12650,7 +12651,7 @@ mod tests {
     }
 
     #[test]
-    fn a_route_that_refuses_an_empty_reasoning_is_sent_every_calls_once_more() {
+    fn a_route_that_refuses_an_empty_reasoning_is_sent_every_call_whole_once_more() {
         let c = Connection {
             endpoint: "https://strict.example/v1".into(),
             model: "deepseek-reasoner".into(),
@@ -12706,8 +12707,9 @@ mod tests {
         assert!(learn(&c, &sent, refusal));
         assert!(has_quirk(&c, Quirk::KeepOldReasoning));
         assert!(!has_quirk(&c, Quirk::Replay));
-        // The retry carries every call of the model's its own, the earlier
-        // turn's too, which is a request the route has not refused.
+        // The retry carries every call of the model's with its own reasoning,
+        // the earlier turn's too, which is a request the route has not
+        // refused.
         let again = body_with(&c, &window, None, None, &chunked, &[]);
         let every: Vec<Value> = [1, 5, 7, 9, 11, 13, 15].map(own).to_vec();
         assert_eq!(reasoning(&again), every);
@@ -12723,6 +12725,59 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|m| fields.iter().all(|f| m.get(f).is_none()))
+        );
+        assert!(!learn(&c, &third, refusal));
+    }
+
+    #[test]
+    fn a_call_another_model_answered_costs_a_refusing_route_one_retry_not_a_loop() {
+        // Its own endpoint, since the quirks learned are kept by route.
+        let c = Connection {
+            endpoint: "https://strict-fallback.example/v1".into(),
+            model: "deepseek-reasoner".into(),
+            ..connection()
+        };
+        // A round the fallback answered goes out with an empty reasoning
+        // ahead of the model's own calls, cut or no cut: the one shape of
+        // request the route refuses, and one the retry has just the same.
+        let window = vec![
+            Message {
+                role: "user".into(),
+                content: "Read a.rs and b.rs".into(),
+                ..Default::default()
+            },
+            thought_then_called("a", "fallback-model"),
+            result_of("a"),
+            thought_then_called("b", &c.model),
+            result_of("b"),
+            thought_then_called("c", &c.model),
+            result_of("c"),
+        ];
+        let refusal = r#"{"error":{"message":"Invalid request: the reasoning_content of an assistant message with tool_calls in the current turn must be provided","type":"invalid_request_error"}}"#;
+        let reasoning = |sent: &Value| -> Vec<Value> {
+            [2, 4, 6]
+                .map(|i| sent["messages"][i]["reasoning_content"].clone())
+                .to_vec()
+        };
+        let sent = body(&c, &window, None, None);
+        assert_eq!(reasoning(&sent)[0], "");
+        assert!(sends_older_reasoning_empty(&sent));
+        assert!(learn(&c, &sent, refusal));
+        assert!(has_quirk(&c, Quirk::KeepOldReasoning));
+        assert!(!has_quirk(&c, Quirk::Replay));
+        // The retry has the shape still: a second refusal is of the field,
+        // not another retry of the same request.
+        let again = body(&c, &window, None, None);
+        assert_eq!(reasoning(&again), reasoning(&sent));
+        assert!(learn(&c, &again, refusal));
+        assert!(has_quirk(&c, Quirk::Replay));
+        let third = body(&c, &window, None, None);
+        assert!(
+            third["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m.get("reasoning_content").is_none())
         );
         assert!(!learn(&c, &third, refusal));
     }
