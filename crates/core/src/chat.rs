@@ -11330,12 +11330,21 @@ mod tests {
             markers_suspected(c, sent, status, &failure)
         };
         let bad = r#"{"error":{"message":"Invalid request."}}"#;
-        // An overflow, a key or a model turned down as a bad request, and
-        // what passes by itself.
+        // An overflow, also one only its numbers tell from a bad request, a
+        // key or a model turned down as a bad request, and what passes by
+        // itself.
         for (status, error) in [
             (
                 400,
                 r#"{"error":{"message":"prompt is too long: 230000 tokens"}}"#,
+            ),
+            (
+                400,
+                r#"{"error":{"type":"invalid_request_error","message":"max_tokens: 64000 > 32000, which is the maximum allowed number of output tokens for claude-x"}}"#,
+            ),
+            (
+                400,
+                r#"{"error":{"type":"invalid_request_error","message":"input length and `max_tokens` exceed context limit: 188240 + 21333 > 200000, decrease input length or `max_tokens` and try again"}}"#,
             ),
             (400, r#"{"error":{"message":"Invalid API key"}}"#),
             (422, r#"{"error":{"message":"The model does not exist"}}"#),
@@ -11364,6 +11373,37 @@ mod tests {
         assert!(suspected(&c, &sent, 422, bad));
         // Only the resend it goes again as decides, so the requests beside
         // it are still marked.
+        assert!(marks_cache(&c));
+    }
+
+    #[test]
+    fn a_field_a_refusal_names_is_learned_and_the_markers_stay() {
+        // What a server that validates its input strictly says to the field.
+        let refusal = r#"{"error":{"message":"[{'type': 'extra_forbidden', 'loc': ('body', 'stream_options'), 'msg': 'Extra inputs are not permitted', 'input': {'include_usage': True}}]","type":"BadRequestError","param":null,"code":400}}"#;
+        let (endpoint, worker) = serve(vec![
+            ("400 Bad Request", "application/json", refusal),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
+        let c = Connection {
+            endpoint,
+            model: "claude-strict-about-stream-options".into(),
+            ..connection()
+        };
+        let (result, text) = finish(&c, hello());
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(text, "Hello");
+        // Sent again once, without the field and still marked: the field is
+        // learned before the markers are suspected.
+        let bodies = worker.join().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].contains("cache_control"));
+        assert!(bodies[0].contains("stream_options"));
+        assert!(bodies[1].contains("cache_control"));
+        assert!(!bodies[1].contains("stream_options"));
         assert!(marks_cache(&c));
     }
 
