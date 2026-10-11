@@ -165,6 +165,34 @@ fn known() -> &'static Mutex<Known> {
     KNOWN.get_or_init(Default::default)
 }
 
+/// Where the window `facts_or` gives a model comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// Its gateway's list, under the id it was asked for by.
+    Listed,
+    /// Its gateway's list, under an id that differs only by its vendor's path.
+    ListedAlias,
+    /// `FAMILIES`.
+    Family,
+    /// The window the settings or `LETRONNA_CONTEXT_WINDOW` assume.
+    Setting,
+    /// A provider's error, lower than any of those.
+    Learned,
+}
+
+impl Source {
+    /// What it is called where a run reports it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Source::Listed => "listed",
+            Source::ListedAlias => "listed-alias",
+            Source::Family => "family",
+            Source::Setting => "setting",
+            Source::Learned => "learned",
+        }
+    }
+}
+
 /// What is known about `model` at `endpoint`, put together from memory.
 pub fn facts(endpoint: &str, model: &str) -> Facts {
     facts_or(endpoint, model, None, None)
@@ -179,31 +207,88 @@ pub(crate) fn facts_or(
     window: Option<u64>,
     output: Option<u64>,
 ) -> Facts {
-    let key = (host(endpoint), model.to_owned());
-    let (listed, learned) = known()
+    put_together(endpoint, model, window, output).0
+}
+
+/// The window `facts_or` gives `model` at `endpoint` with `window` standing
+/// in, and where it comes from; None when nothing gives one.
+pub(crate) fn window_or(endpoint: &str, model: &str, window: Option<u64>) -> Option<(u64, Source)> {
+    let (facts, source) = put_together(endpoint, model, window, None);
+    facts.context.zip(source)
+}
+
+/// `facts_or`, with where its window comes from.
+fn put_together(
+    endpoint: &str,
+    model: &str,
+    window: Option<u64>,
+    output: Option<u64>,
+) -> (Facts, Option<Source>) {
+    let host = host(endpoint);
+    let key = (host.clone(), model.to_owned());
+    let (listed, alias, learned) = known()
         .lock()
         .map(|known| {
+            let listed = known.listed.get(&key).cloned();
+            // Only when the list has no entry under this id, so one it has
+            // keeps what it says even where that is nothing.
+            let alias = match listed {
+                Some(_) => Facts::default(),
+                None => listed_alias(&known, &host, model),
+            };
             (
-                known.listed.get(&key).cloned().unwrap_or_default(),
+                listed.unwrap_or_default(),
+                alias,
                 known.learned.get(&key).cloned().unwrap_or_default(),
             )
         })
         .unwrap_or_default();
     let family = family(model);
-    Facts {
-        context: lowest(
-            listed.context.or(family.context).or(window),
-            learned.context,
-        ),
+    let given = [
+        (listed.context, Source::Listed),
+        (alias.context, Source::ListedAlias),
+        (family.context, Source::Family),
+        (window, Source::Setting),
+    ]
+    .into_iter()
+    .find_map(|(context, source)| Some((context?, source)));
+    let context = match (given, learned.context) {
+        (Some((given, _)), Some(learned)) if learned < given => Some((learned, Source::Learned)),
+        (None, Some(learned)) => Some((learned, Source::Learned)),
+        (given, _) => given,
+    };
+    let facts = Facts {
+        context: context.map(|(tokens, _)| tokens),
         max_output: lowest(
-            listed.max_output.or(family.max_output).or(output),
+            (listed.max_output)
+                .or(alias.max_output)
+                .or(family.max_output)
+                .or(output),
             learned.max_output,
         ),
         inputs: listed.inputs,
         parameters: listed.parameters,
         efforts: listed.efforts,
         price: listed.price,
+    };
+    (facts, context.map(|(_, source)| source))
+}
+
+/// The window and output limit `host`'s list gives under ids that name
+/// `model` with another vendor's path, as a router lists one model under
+/// each route it reaches it by: the lowest of each, since those routes may
+/// serve it differently. Nothing else is taken, because which parameters and
+/// levels a route accepts, and what it charges, are that route's own.
+fn listed_alias(known: &Known, host: &str, model: &str) -> Facts {
+    let name = plain(model);
+    let mut alias = Facts::default();
+    for ((listed_host, id), facts) in &known.listed {
+        if listed_host == host && plain(id) == name {
+            alias.context = lowest(alias.context, facts.context);
+            alias.max_output = lowest(alias.max_output, facts.max_output);
+        }
     }
+    alias
 }
 
 /// The effort levels `model` at `endpoint` offers, least first: those its
@@ -728,6 +813,94 @@ mod tests {
 
         let elsewhere = facts("https://elsewhere.test/v1", "gpt-4o");
         assert_eq!(elsewhere.context, Some(128_000));
+    }
+
+    #[test]
+    fn a_model_listed_under_another_vendors_path_takes_the_lowest_window() {
+        let endpoint = "http://router.test:8080/v1";
+        let list = json!([
+            {"id": "opencode-go/deepseek-v4.1-flash", "context_length": 1_000_000,
+                "max_output_tokens": 384_000,
+                "pricing": {"prompt": "0.0000001", "completion": "0.0000002"},
+                "reasoning_efforts": [{"effort": "high", "label": "High"}],
+                "supported_parameters": ["tools"]},
+            {"id": "openrouter/deepseek/deepseek-v4.1-flash", "context_length": 1_048_576,
+                "top_provider": {"max_completion_tokens": 65_536}}
+        ]);
+        remember(endpoint, list.as_array().unwrap());
+
+        let alias = facts(endpoint, "deepseek/deepseek-v4.1-flash");
+        assert_eq!(
+            (alias.context, alias.max_output),
+            (Some(1_000_000), Some(65_536))
+        );
+        // What a route accepts and charges stays that route's own.
+        assert_eq!(
+            (alias.price, alias.efforts, alias.parameters, alias.inputs),
+            (None, None, None, None)
+        );
+        assert_eq!(
+            window_or(endpoint, "deepseek/deepseek-v4.1-flash", Some(8_000)),
+            Some((1_000_000, Source::ListedAlias))
+        );
+        // Another host's list says nothing about this one's routes.
+        assert_eq!(
+            facts(
+                "http://elsewhere.test:8080/v1",
+                "deepseek/deepseek-v4.1-flash"
+            )
+            .context,
+            None
+        );
+        // Nor does it name a model whose id only starts the same.
+        assert_eq!(facts(endpoint, "deepseek/deepseek-v4.1").context, None);
+    }
+
+    #[test]
+    fn a_model_listed_under_its_own_id_keeps_its_own_entry() {
+        let endpoint = "https://exact.test/v1";
+        let list = json!([
+            {"id": "vendor/some-model", "context_length": 32_000},
+            {"id": "other/some-model", "context_length": 16_000, "max_output_tokens": 4_096},
+            {"id": "says-nothing"},
+            {"id": "other/says-nothing", "context_length": 16_000}
+        ]);
+        remember(endpoint, list.as_array().unwrap());
+        let exact = facts(endpoint, "vendor/some-model");
+        assert_eq!((exact.context, exact.max_output), (Some(32_000), None));
+        assert_eq!(
+            window_or(endpoint, "vendor/some-model", None),
+            Some((32_000, Source::Listed))
+        );
+        // An entry that gives no window is still the model's own word.
+        assert_eq!(facts(endpoint, "says-nothing").context, None);
+        assert_eq!(window_or(endpoint, "says-nothing", None), None);
+    }
+
+    #[test]
+    fn a_window_says_where_it_comes_from() {
+        let endpoint = "https://sources.test/v1";
+        assert_eq!(
+            window_or(endpoint, "gpt-4o", Some(50_000)),
+            Some((128_000, Source::Family))
+        );
+        assert_eq!(
+            window_or(endpoint, "unlisted-model", Some(50_000)),
+            Some((50_000, Source::Setting))
+        );
+        assert_eq!(window_or(endpoint, "unlisted-model", None), None);
+        learn(endpoint, "gpt-4o", Limit::Context(100_000));
+        assert_eq!(
+            window_or(endpoint, "gpt-4o", None),
+            Some((100_000, Source::Learned))
+        );
+        // A learned limit higher than the set window does not take its place.
+        learn(endpoint, "unlisted-model", Limit::Context(60_000));
+        assert_eq!(
+            window_or(endpoint, "unlisted-model", Some(50_000)),
+            Some((50_000, Source::Setting))
+        );
+        assert_eq!(Source::ListedAlias.name(), "listed-alias");
     }
 
     #[test]

@@ -44,10 +44,10 @@ index 90ea89e..37a4c7c 100644
  ]
 diff --git a/src/harnessbench/adapters/letronna.py b/src/harnessbench/adapters/letronna.py
 new file mode 100644
-index 0000000..b7a677c
+index 0000000..30b8cde
 --- /dev/null
 +++ b/src/harnessbench/adapters/letronna.py
-@@ -0,0 +1,288 @@
+@@ -0,0 +1,313 @@
 +"""Harness-Bench adapter for Letronna's terminal agent, `letronna -p`.
 +
 +Each call is one benchmark round. The task's sandbox gets a Letronna data
@@ -58,11 +58,13 @@ index 0000000..b7a677c
 +the conversation on: with no session yet, `-c` starts one, so it is passed
 +every time.
 +
-+Letronna has no wall-clock limit of its own, so the adapter owns the task's
-+timeout. It interrupts Letronna as Ctrl-C would, which is how Letronna ends
-+its commands, browser and MCP servers, and kills everything left in its
-+session if that takes too long. A round that ran out of time still returns,
-+so the oracle scores what reached out/.
++The adapter owns the task's timeout. Letronna is given a deadline
++TURN_MARGIN_SEC short of it, so it is told to write its outputs and ends
++itself with its result line in time; past the timeout, the adapter
++interrupts it as Ctrl-C would, which is how Letronna ends its commands,
++browser and MCP servers, and kills everything left in its session if that
++takes too long. A round that ran out of time still returns, so the oracle
++scores what reached out/.
 +
 +This file lives in Letronna's repo as scripts/harnessbench/letronna.py, and
 +fork.patch there puts a copy in Harness-Bench as
@@ -90,6 +92,18 @@ index 0000000..b7a677c
 +# Tool rounds a message gets. Letronna's own default of 25 stops long tasks
 +# well short of their timeouts, which are 180 to 3600 seconds.
 +MAX_ROUNDS = 150
++
++# Seconds of the task's timeout kept back from Letronna's own deadline, as
++# OpenHuman's benchmark rig keeps them from a harness's turn: at the
++# deadline Letronna stops with its result line, before the interrupt. A
++# timeout barely over this keeps at least half of itself.
++TURN_MARGIN_SEC = 120
++
++# Seconds a reply may stay quiet before Letronna gives up on it. The usage
++# proxy passes a reply on only once it is whole, so a reply reads as silent
++# until then, and Letronna's own 300 fails any that takes longer; this is
++# how long the proxy itself waits on its upstream.
++READ_TIMEOUT_SEC = 1200
 +
 +# Seconds Letronna has after the interrupt before its group is killed. It
 +# gives its commands two seconds to end (END_WAIT in crates/cli/src/main.rs),
@@ -165,14 +179,20 @@ index 0000000..b7a677c
 +                # Nothing may open a sign-in page or any other in a browser.
 +                "BROWSER": "/usr/bin/false",
 +                "NO_COLOR": "1",
++                "LETRONNA_DEADLINE": str(deadline(ctx.timeout_sec)),
 +            }
 +        )
++        env.setdefault("LETRONNA_READ_TIMEOUT", str(READ_TIMEOUT_SEC))
 +        # A debug build files keys in the Keychain under this name.
 +        env.pop("LETRONNA_VAULT_SERVICE", None)
 +
 +        log = ctx.sandbox / "usage-proxy" / "requests.jsonl"
 +        answered_before = answered_calls(log)
 +        returncode, stdout, stderr, timed_out = run_owned(cmd, ctx.workspace, env, ctx.timeout_sec)
++        result = last_json(stdout)
++        # Stopped at its deadline ("deadline"; "stopped" before #594), the round
++        # ran out of time, and the harness runs no round after it either.
++        timed_out = timed_out or (result or {}).get("status") in ("deadline", "stopped")
 +        answered = answered_calls(log) - answered_before
 +        if answered == 0:
 +            time.sleep(LOG_SETTLE_SEC)
@@ -180,7 +200,7 @@ index 0000000..b7a677c
 +        metadata: dict[str, Any] = {
 +            "returncode": returncode,
 +            "timed_out": timed_out,
-+            "result": last_json(stdout),
++            "result": result,
 +            "model_calls": answered,
 +            "invalid_run": answered == 0,
 +        }
@@ -193,6 +213,11 @@ index 0000000..b7a677c
 +            stderr=stderr,
 +            metadata=metadata,
 +        )
++
++
++def deadline(timeout: float) -> int:
++    """The whole seconds a round of `timeout` gives Letronna: TURN_MARGIN_SEC fewer, but at least half, and at least 1."""
++    return max(1, int(max(timeout - TURN_MARGIN_SEC, timeout / 2)))
 +
 +
 +def seed(data: Path, endpoint: str, model: str, key: str) -> None:
@@ -336,6 +361,109 @@ index 0000000..b7a677c
 +        if str(row.get("path", "")).endswith("/chat/completions") and isinstance(status, int) and 200 <= status < 300:
 +            count += 1
 +    return count
+diff --git a/src/harnessbench/grading/rubric_llm.py b/src/harnessbench/grading/rubric_llm.py
+index 73f500e..6d9e50f 100644
+--- a/src/harnessbench/grading/rubric_llm.py
++++ b/src/harnessbench/grading/rubric_llm.py
+@@ -5,6 +5,7 @@ import base64
+ import json
+ import os
+ import re
++import time
+ import urllib.error
+ import urllib.request
+ from pathlib import Path
+@@ -220,6 +221,25 @@ def _parse_json_object(text: str) -> dict[str, Any] | None:
+     return None
+ 
+ 
++# A busy gateway answers 429 or 5xx, or drops the connection, and one such
++# answer used to leave the run ungraded. Seconds to wait before each new try.
++_RETRY_WAITS_SEC = (10, 30, 60)
++
++
++def _post_with_retries(req: urllib.request.Request, timeout: int) -> Any:
++    for wait in (*_RETRY_WAITS_SEC, None):
++        try:
++            with urllib.request.urlopen(req, timeout=timeout) as resp:
++                return json.loads(resp.read().decode("utf-8"))
++        except urllib.error.HTTPError as e:
++            if wait is None or not (e.code == 429 or e.code >= 500):
++                raise
++        except (urllib.error.URLError, TimeoutError, ConnectionError):
++            if wait is None:
++                raise
++        time.sleep(wait)
++
++
+ def run_llm_rubric(
+     *,
+     system: str,
+@@ -289,33 +309,38 @@ def run_llm_rubric(
+             timeout_sec,
+             int(os.environ.get("HARNESSBENCH_RUBRIC_VISION_TIMEOUT_SEC", "300")),
+         )
+-    try:
+-        with urllib.request.urlopen(req, timeout=effective_timeout) as resp:
+-            data = json.loads(resp.read().decode("utf-8"))
+-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+-        return {
+-            "skipped": True,
+-            "reason": str(e),
+-            "scores": {},
+-            "total": None,
+-            "notes": "",
+-            "rubric_model": mdl,
+-        }
+-
+-    try:
+-        content = data["choices"][0]["message"]["content"]
+-    except (KeyError, IndexError, TypeError):
+-        return {
+-            "skipped": True,
+-            "reason": "unexpected API response shape",
+-            "raw": data,
+-            "scores": {},
+-            "total": None,
+-            "notes": "",
+-            "rubric_model": mdl,
+-        }
++    # A reply with no JSON object in it, or one without scores, is asked for
++    # once more: on a long trace the judge sometimes carries on writing the
++    # trace instead of grading it, and that can parse as an object too.
++    for _ in range(2):
++        try:
++            data = _post_with_retries(req, effective_timeout)
++        except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as e:
++            return {
++                "skipped": True,
++                "reason": str(e),
++                "scores": {},
++                "total": None,
++                "notes": "",
++                "rubric_model": mdl,
++            }
+ 
+-    parsed = _parse_json_object(content) if isinstance(content, str) else None
++        try:
++            content = data["choices"][0]["message"]["content"]
++        except (KeyError, IndexError, TypeError):
++            return {
++                "skipped": True,
++                "reason": "unexpected API response shape",
++                "raw": data,
++                "scores": {},
++                "total": None,
++                "notes": "",
++                "rubric_model": mdl,
++            }
++
++        parsed = _parse_json_object(content) if isinstance(content, str) else None
++        if parsed and isinstance(parsed.get("scores"), dict) and parsed["scores"]:
++            break
+     if not parsed:
+         return {
+             "skipped": False,
 diff --git a/src/harnessbench/registry.py b/src/harnessbench/registry.py
 index 8632100..89100e9 100644
 --- a/src/harnessbench/registry.py
@@ -357,3 +485,33 @@ index 8632100..89100e9 100644
      if adapter_name == "generic_cli":
          return GenericCliAdapter()
      raise ValueError(f"unknown adapter: {adapter_name}")
+diff --git a/src/harnessbench/usage_proxy.py b/src/harnessbench/usage_proxy.py
+index 75a31e3..82e4c30 100644
+--- a/src/harnessbench/usage_proxy.py
++++ b/src/harnessbench/usage_proxy.py
+@@ -23,6 +23,16 @@ def _read_json(path: Path) -> dict[str, Any]:
+         return {}
+ 
+ 
++# Request headers that carry a credential. The raw record keeps the header but
++# not its value, so a run's responses can be kept (and graded again) without
++# keeping the provider key on disk.
++_SECRET_HEADERS = {"authorization", "proxy-authorization", "x-api-key", "api-key", "cookie"}
++
++
++def _redacted_headers(items: Any) -> dict[str, str]:
++    return {k: ("[redacted]" if k.lower() in _SECRET_HEADERS else v) for k, v in items}
++
++
+ def register_routes(routes_file: Path, routes: dict[str, dict[str, Any]]) -> None:
+     existing = _read_json(routes_file)
+     existing.update(routes)
+@@ -261,7 +271,7 @@ class _UsageProxyHandler(BaseHTTPRequestHandler):
+             "path": remainder,
+             "method": self.command,
+             "status": status,
+-            "request_headers": dict(self.headers.items()),
++            "request_headers": _redacted_headers(self.headers.items()),
+             "request_body": body.decode("utf-8", errors="replace"),
+             "response_headers": dict(response_headers),
+             "response_text": decoded_text,

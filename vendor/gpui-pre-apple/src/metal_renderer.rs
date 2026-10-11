@@ -64,7 +64,8 @@ static READ_BACK: Mutex<Vec<(usize, Option<ReadFrame>)>> = Mutex::new(Vec::new()
 /// which cannot be read, unless its layer says otherwise; the layer says so
 /// from now until that one frame is read, as leaving it so would cost every
 /// frame its presentation. An app may always read its own drawable, so
-/// nothing asks the user for anything.
+/// nothing asks the user for anything. Frames drawn while the ask stands are
+/// not shown, so what is read can be the window without what covers it.
 pub fn read_next_frame(layer: *mut c_void) {
     if layer.is_null() {
         return;
@@ -569,12 +570,16 @@ impl MetalRenderer {
 
         // Letronna: read this frame back if it was asked for, unless the
         // drawable came framebuffer-only all the same; the next one is read
-        // then.
+        // then. Either way it is not shown: it is the window without what is
+        // about to be drawn over it, so the screen keeps the frame before.
         let key = layer.as_ptr() as usize;
-        let read_back = (read_asked(key) && !drawable.texture().framebuffer_only())
+        let asked = read_asked(key);
+        let read_back = (asked && !drawable.texture().framebuffer_only())
             .then(|| self.encode_read_back(&command_buffer, drawable.texture()));
 
-        if self.presents_with_transaction {
+        if asked {
+            command_buffer.commit();
+        } else if self.presents_with_transaction {
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
             drawable.present();

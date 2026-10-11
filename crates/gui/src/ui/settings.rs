@@ -1,6 +1,15 @@
 use crate::prelude::*;
+use letronna_core::jev::KEY_SLOT;
 
-actions!(settings, [PreviousSettingsPage, NextSettingsPage]);
+actions!(
+    settings,
+    [
+        PreviousSettingsPage,
+        NextSettingsPage,
+        SettingsTab,
+        SettingsTabBack
+    ]
+);
 
 type ApplyMode = std::rc::Rc<dyn Fn(plugins::PresenceMode, &mut App)>;
 
@@ -18,6 +27,11 @@ pub(crate) const PAGES: &[(&str, AppIcon)] = &[
     ("Plugins", AppIcon::Puzzle),
     ("About", AppIcon::Info),
 ];
+
+/// How far down the window toasts start: below settings' close button and
+/// its focus ring, past settings' 44px margin and the button's row, 12px
+/// in and 20px tall. At gpui-component's 50px an error covered both.
+pub(crate) const TOASTS_TOP: Pixels = px(88.);
 
 impl Chat {
     /// Open a gateway's row to set it up, or close it if it is already open.
@@ -204,6 +218,83 @@ impl Chat {
         cx.notify();
     }
 
+    /// Open Jev's row to give it a key or an address, or close it if open.
+    /// It shares the gateways' fields: one row is open at a time.
+    pub(crate) fn select_jev(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let open = *self.gateway_pick.read(cx) == JEV_ROW;
+        self.gateway_pick.update(cx, |g, cx| {
+            *g = if open { String::new() } else { JEV_ROW.into() };
+            cx.notify();
+        });
+        if open {
+            return;
+        }
+        let address = self.store.settings.jev_endpoint.clone();
+        self.endpoint
+            .update(cx, |input, cx| input.set_value(address, window, cx));
+        let key = self.keys.get(KEY_SLOT).cloned().unwrap_or_default();
+        self.key
+            .update(cx, |input, cx| input.set_value(key, window, cx));
+        cx.notify();
+    }
+
+    /// Save Jev's open row: its key in the key store, its address in the
+    /// settings, unless the address is one a key must not go to.
+    pub(crate) fn save_jev(&mut self, cx: &mut Context<Self>) {
+        let address = self.endpoint.read(cx).value().trim().to_string();
+        let here = ["http://localhost", "http://127.0.0.1", "http://[::1]"];
+        if !address.is_empty()
+            && !address.starts_with("https://")
+            && !here.iter().any(|h| address.starts_with(h))
+        {
+            self.error = Some(
+                "Jev's address must start with https://, or be on this computer, as its key \
+                 goes with every search."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let key = self.key.read(cx).value().trim().to_string();
+        if key.is_empty() {
+            self.keys.remove(KEY_SLOT);
+        } else {
+            self.keys.insert(KEY_SLOT.to_owned(), key);
+        }
+        self.write_keys(KEY_SLOT);
+        self.store.settings.jev_endpoint = address;
+        self.save();
+        self.gateway_pick.update(cx, |g, cx| {
+            g.clear();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Forget Jev's key and address, so it is asked through the account.
+    pub(crate) fn remove_jev(&mut self, cx: &mut Context<Self>) {
+        self.keys.remove(KEY_SLOT);
+        self.write_keys(KEY_SLOT);
+        self.store.settings.jev_endpoint.clear();
+        self.save();
+        self.gateway_pick.update(cx, |g, cx| {
+            g.clear();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Where Jev is asked, as its row says it.
+    pub(crate) fn jev_status(&self) -> String {
+        let address = self.store.settings.jev_endpoint.trim();
+        let own_key = self.keys.get(KEY_SLOT).is_some_and(|key| !key.is_empty());
+        match (address, own_key) {
+            ("", true) => "Your key, at TypeSafe".into(),
+            ("", false) => "Your Letronna account".into(),
+            (address, _) => address.to_owned(),
+        }
+    }
+
     /// Put the open search row's address back to the service's official one.
     pub(crate) fn reset_search_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let open = self.gateway_pick.read(cx).clone();
@@ -310,14 +401,18 @@ impl Chat {
         // Snapshot the window before the overlay covers it. Platforms that
         // cannot sample it return None, which falls back to the plain scrim.
         self.drop_backdrop(cx);
-        // macOS 26 reads it from the next frame drawn, which the overlay
-        // waits out so that frame is the window without it.
+        // macOS 26 reads it from the next frame drawn, which the overlay is
+        // see-through for, so that frame is the window without it.
         self.settings_reading = crate::platform::backdrop::ask(window);
         if self.settings_reading {
             window.refresh();
             self.read_backdrop(0, window, cx);
         } else {
             self.settings_backdrop = crate::platform::backdrop::capture(window);
+        }
+        // Only as it opens: opened again on another page, the keys are in it.
+        if !self.settings_open {
+            self.settings_before = window.focused(cx);
         }
         self.settings_open = true;
         self.gateway_pick.update(cx, |g, _| g.clear());
@@ -347,18 +442,42 @@ impl Chat {
             if !this.settings_reading {
                 return;
             }
-            this.settings_backdrop = crate::platform::backdrop::capture(window);
-            if this.settings_backdrop.is_none() && tries < 3 {
+            let read = crate::platform::backdrop::capture(window);
+            if read.is_none() && tries < 3 {
                 // Drawn again, so there is a frame to read.
                 window.refresh();
                 return this.read_backdrop(tries + 1, window, cx);
             }
-            if this.settings_backdrop.is_none() {
+            if read.is_none() {
                 crate::platform::backdrop::forget(window);
             }
+            // A blur from before wears the window as it was.
+            this.drop_backdrop(cx);
+            this.settings_backdrop = read;
             this.settings_reading = false;
             cx.notify();
         });
+    }
+
+    /// Blur the window behind settings again, as it now looks: once the
+    /// theme changes, the snapshot taken on opening wears the old colours.
+    /// Settings stays open meanwhile, drawn see-through for the frame read,
+    /// and the old blur stays until the new one is in.
+    pub(crate) fn retake_backdrop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Only where one was taken: anywhere else settings is over the plain
+        // scrim.
+        if !self.settings_open || self.settings_closing || self.settings_backdrop.is_none() {
+            return;
+        }
+        self.settings_reading = true;
+        window.refresh();
+        if crate::platform::backdrop::ask(window) {
+            self.read_backdrop(0, window, cx);
+        } else {
+            // Read off the screen, so once the frame without settings is on
+            // it: drawn next frame, and shown by the one after.
+            cx.on_next_frame(window, |this, window, cx| this.read_backdrop(0, window, cx));
+        }
     }
 
     pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -373,7 +492,10 @@ impl Chat {
         if self.page == Page::Capabilities {
             self.reload_tools();
         }
-        self.focus_composer(window, cx);
+        match keys_back(self.settings_before.take(), window) {
+            Some(before) => window.focus(&before, cx),
+            None => self.focus_composer(window, cx),
+        }
         cx.notify();
         // With motion off there is nothing to watch go.
         if cx.reduce_motion() {
@@ -412,9 +534,7 @@ impl Chat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        // Not while the frame behind it is read: that frame is the window
-        // without it.
-        if !self.settings_open || self.settings_reading {
+        if !self.settings_open {
             return None;
         }
         let closing = self.settings_closing;
@@ -479,6 +599,10 @@ impl Chat {
                 .flex()
                 .items_center()
                 .justify_center()
+                // See-through while the frame behind it is read, as that
+                // frame is the window without it; still laid out, so it
+                // keeps its focus and its animations do not start over.
+                .when(self.settings_reading, |overlay| overlay.opacity(0.))
                 .children(blur)
                 .child(scrim)
                 .children(self.grain(&self.grains.settings))
@@ -500,6 +624,7 @@ impl Chat {
         let gap = px(44.);
         let height = vp.height - gap * 2.;
         let current_page = *page.read(cx);
+        let body_scroll = super::scroll_of(&"settings-body".into(), window, cx);
         // A tab stop a row, so Tab reaches the pages, and Up and Down step
         // through them from the one with the keys.
         let handles: std::rc::Rc<[FocusHandle]> = PAGES
@@ -622,6 +747,15 @@ impl Chat {
                 &chat,
                 cx,
             )
+            .child(tool_search_section(
+                &self.store.settings.tool_search,
+                self.jev_status(),
+                &pick,
+                &endpoint,
+                &key,
+                &chat,
+                cx,
+            ))
             .into_any_element(),
             _ => gateway_page(
                 self.gateway_rows(),
@@ -634,8 +768,7 @@ impl Chat {
             )
             .into_any_element(),
         };
-        div()
-            .track_focus(&self.settings_focus)
+        keeps_keys(div(), &self.settings_focus)
             .w(vp.width - gap * 2.)
             .bg(cx.theme().background)
             .border_1()
@@ -656,7 +789,9 @@ impl Chat {
                             .h_full()
                             .child(
                                 div()
+                                    .on_children_prepainted(super::follow_keys(&body_scroll))
                                     .id("settings-body")
+                                    .track_scroll(&body_scroll)
                                     .size_full()
                                     .overflow_y_scroll()
                                     .px_8()
@@ -681,6 +816,56 @@ impl Chat {
                     ),
             )
     }
+}
+
+/// `panel`'s own focus on `el`, with Tab and Shift-Tab going round the
+/// controls inside it: settings is modal, so the keys never reach the
+/// window behind it.
+fn keeps_keys(el: Div, panel: &FocusHandle) -> Div {
+    let (next, back) = (panel.clone(), panel.clone());
+    el.track_focus(panel)
+        .key_context("Settings")
+        .on_action(move |_: &SettingsTab, window, cx| tab_within(&next, false, window, cx))
+        .on_action(move |_: &SettingsTabBack, window, cx| tab_within(&back, true, window, cx))
+}
+
+/// Move the keys to the next control inside `panel`, or with `back` the one
+/// before, from its last round to its first and from its first to its last.
+/// Not gpui-component's focus trap, which steps through the whole window
+/// behind to come round and gives up after a hundred stops.
+fn tab_within(panel: &FocusHandle, back: bool, window: &mut Window, cx: &mut App) {
+    if back {
+        window.focus_prev(cx);
+    } else {
+        window.focus_next(cx);
+    }
+    if panel.contains_focused(window, cx) {
+        return;
+    }
+    // Past one end, so to the other: the panel's own focus comes just before
+    // its first control, and its last is the one the next after is outside.
+    panel.focus(window, cx);
+    window.focus_next(cx);
+    let Some(first) = window.focused(cx).filter(|_| back) else {
+        return;
+    };
+    let mut last = first.clone();
+    loop {
+        window.focus_next(cx);
+        match window.focused(cx) {
+            Some(at) if at != first && panel.contains_focused(window, cx) => last = at,
+            _ => break,
+        }
+    }
+    window.focus(&last, cx);
+}
+
+/// Where the keys go as settings closes: back to `before`, where they were
+/// as it opened, while that is still drawn in the chat. A menu or the
+/// palette it was opened from has gone by then.
+fn keys_back(before: Option<FocusHandle>, window: &Window) -> Option<FocusHandle> {
+    // Escape is the chat's own, so it is there for anything drawn in it.
+    before.filter(|before| window.is_action_available_in(&Dismiss, before))
 }
 
 /// Show settings page `name`, reading usage afresh for its page.
@@ -1348,10 +1533,10 @@ fn appearance_page(
                     chat.update(cx, |this, cx| {
                         this.store.settings.appearance = value.to_string();
                         this.save();
-                        // The blurred snapshot behind settings still wears
-                        // the old colours; the live window shows through.
-                        this.drop_backdrop(cx);
                         crate::theme::apply(value, window, cx);
+                        // The blurred snapshot behind settings still wears
+                        // the old colours.
+                        this.retake_backdrop(window, cx);
                         cx.notify();
                     })
                 }),
@@ -1696,6 +1881,7 @@ impl RenderOnce for KeyedSwitch {
             )
             .read(cx)
             .clone();
+        let shown = SharedString::from(format!("{}-shown", self.id));
         let (checked, turn) = (self.checked, self.on_click);
         let mut switch = gpui_component::switch::Switch::new(self.id.clone())
             .checked(checked)
@@ -1705,9 +1891,8 @@ impl RenderOnce for KeyedSwitch {
         }
         // Ringed as the Capabilities page's switches are, the edge always
         // there so the ring the keys bring moves nothing.
-        div()
-            .id(self.id)
-            .track_focus(&focus.tab_stop(true))
+        let row = div().id(self.id).track_focus(&focus.clone().tab_stop(true));
+        super::shown_on_focus(row, shown, &focus, window, cx)
             .flex_shrink_0()
             .p_0p5()
             .rounded(cx.theme().radius)
@@ -1737,7 +1922,7 @@ pub(crate) struct GatewayRow {
     good: bool,
     /// The row's button: "Add key", "Add URL", "Edit", "Sign in", or none.
     action: Option<&'static str>,
-    set_up: bool,
+    pub(crate) set_up: bool,
 }
 
 impl Chat {
@@ -2006,6 +2191,159 @@ fn search_page(
         ))
 }
 
+/// The row of the shared fields that Jev's address and key open in.
+const JEV_ROW: &str = "jev";
+
+/// How find_tools ranks the tools a request leaves out, by `mode`, and
+/// Jev's row, saying where it is asked (`status`), with its key and address
+/// in the shared fields when open.
+fn tool_search_section(
+    mode: &str,
+    status: String,
+    pick: &Entity<String>,
+    endpoint: &Entity<InputState>,
+    key: &Entity<InputState>,
+    chat: &Entity<Chat>,
+    cx: &App,
+) -> Div {
+    let choices = [
+        (
+            "auto",
+            "Jev while the chat is on a hosted model; by name for a model on this computer",
+        ),
+        ("jev", "Jev always, a model on this computer included"),
+        ("names", "By their names only, and nothing is sent"),
+    ];
+    let mode = match mode {
+        "jev" | "names" => mode,
+        _ => "auto",
+    };
+    let mut ways = v_flex().gap_2();
+    for (at, (value, text)) in choices.into_iter().enumerate() {
+        let active = mode == value;
+        let chat = chat.clone();
+        ways = ways.child(
+            h_flex()
+                .id(("tool-search", at))
+                .cursor_pointer()
+                .items_center()
+                .gap_2p5()
+                .p_2p5()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(if active {
+                    cx.theme().primary
+                } else {
+                    cx.theme().border
+                })
+                .child(div().text_sm().child(text))
+                .on_click(move |_, _, cx| {
+                    chat.update(cx, |this, cx| {
+                        this.store.settings.tool_search = value.to_owned();
+                        this.save();
+                        cx.notify();
+                    })
+                }),
+        );
+    }
+    let editing = pick.read(cx).as_str() == JEV_ROW;
+    let open = chat.clone();
+    let head = h_flex()
+        .px_4()
+        .py_3()
+        .gap_4()
+        .items_center()
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_family(HEADING_FONT)
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("Jev"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(status),
+                ),
+        )
+        .child(
+            Button::new("jev-edit")
+                .small()
+                .plain(cx)
+                .label(if editing { "Close" } else { "Edit" })
+                .on_click(move |_, window, cx| {
+                    open.update(cx, |this, cx| this.select_jev(window, cx))
+                }),
+        );
+    let mut row = v_flex()
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(cx.theme().radius)
+        .child(head);
+    if editing {
+        let (save, remove) = (chat.clone(), chat.clone());
+        row = row.child(
+            v_flex()
+                .px_4()
+                .pb_4()
+                .gap_3()
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(label("API key, blank for your Letronna account", cx))
+                        .child(Input::new(key)),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(label(
+                            "Address, blank for your Letronna account or, with a key, TypeSafe",
+                            cx,
+                        ))
+                        .child(Input::new(endpoint)),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("jev-remove")
+                                .plain(cx)
+                                .small()
+                                .label("Remove")
+                                .on_click(move |_, _, cx| {
+                                    remove.update(cx, |this, cx| this.remove_jev(cx))
+                                }),
+                        )
+                        .child(
+                            Button::new("jev-save")
+                                .primary()
+                                .small()
+                                .label("Save")
+                                .on_click(move |_, _, cx| {
+                                    save.update(cx, |this, cx| this.save_jev(cx))
+                                }),
+                        ),
+                ),
+        );
+    }
+    v_flex()
+        .gap_3()
+        .child(heading(
+            "Finding tools",
+            "A request can leave tools out -- the less used ones in a run nobody watches, an MCP server's when there are many -- and find_tools looks them up. Jev, a small decision model, ranks them by what they do. It is sent the search's words and the tools' names and descriptions, nothing of the chat.",
+            cx,
+        ))
+        .child(ways)
+        .child(row)
+}
+
 fn shortcuts_page(hotkey: &Entity<InputState>, chat: &Entity<Chat>, cx: &App) -> Div {
     let save = chat.clone();
     v_flex()
@@ -2214,4 +2552,122 @@ fn gateway_page(
             cx,
         ))
         .child(gateway_list(rows, pick, endpoint, key, page, chat, cx))
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
+    // would shadow the built-in attribute.
+    use super::{KeyedSwitch, keeps_keys, keys_back};
+    use crate::app::Dismiss;
+    use gpui::{
+        AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
+        ParentElement as _, Render, Styled as _, TestAppContext, VisualTestContext, Window, div,
+        px,
+    };
+    use gpui_component::{Root, button::Button};
+
+    /// A chat with a status bar of two stops, and settings over it: a page
+    /// in its list, a switch and its close button.
+    struct Over {
+        behind: [FocusHandle; 2],
+        panel: FocusHandle,
+        page: FocusHandle,
+    }
+
+    impl Render for Over {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let stop = |focus: &FocusHandle| div().track_focus(focus).w(px(40.)).h(px(20.));
+            div()
+                .size_full()
+                .key_context("Chat")
+                .on_action(|_: &Dismiss, _, _| {})
+                .child(stop(&self.behind[0]))
+                .child(stop(&self.behind[1]))
+                .child(
+                    keeps_keys(div(), &self.panel)
+                        .child(stop(&self.page))
+                        .child(KeyedSwitch::new("grain"))
+                        .child(Button::new("close-settings").label("Close")),
+                )
+        }
+    }
+
+    /// The window with settings open, its keys bound as the app binds them.
+    fn open(cx: &mut TestAppContext) -> (Entity<Over>, &mut VisualTestContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.bind_keys(
+                crate::keys(&gpui::DummyKeyboardMapper)
+                    .into_iter()
+                    .map(|(binding, _)| binding),
+            );
+        });
+        let over = cx.new(|cx| Over {
+            behind: [
+                cx.focus_handle().tab_stop(true),
+                cx.focus_handle().tab_stop(true),
+            ],
+            panel: cx.focus_handle(),
+            page: cx.focus_handle().tab_stop(true),
+        });
+        let chat = over.clone();
+        let (_, cx) = cx.add_window_view(|window, cx| Root::new(chat, window, cx));
+        (over, cx)
+    }
+
+    fn focused(cx: &mut VisualTestContext) -> Option<FocusHandle> {
+        cx.update(|window, cx| window.focused(cx))
+    }
+
+    #[gpui::test]
+    fn tab_goes_round_the_controls_in_settings_and_never_behind(cx: &mut TestAppContext) {
+        let (over, cx) = open(cx);
+        let (panel, page) = cx.read(|cx| (over.read(cx).panel.clone(), over.read(cx).page.clone()));
+        // As settings opens: the panel itself holds the keys.
+        cx.update(|window, cx| panel.focus(window, cx));
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            cx.simulate_keystrokes("tab");
+            let at = focused(cx).unwrap();
+            assert!(cx.update(|window, cx| panel.contains_focused(window, cx)));
+            assert!(!seen.contains(&at));
+            seen.push(at);
+        }
+        // The page in the list, the switch, the close button, then round.
+        assert_eq!(seen[0], page);
+        cx.simulate_keystrokes("tab");
+        assert_eq!(focused(cx), Some(page.clone()));
+        // Back from the first goes round to the close button, and on back.
+        cx.simulate_keystrokes("shift-tab");
+        assert_eq!(focused(cx).as_ref(), Some(&seen[2]));
+        cx.simulate_keystrokes("shift-tab");
+        assert_eq!(focused(cx).as_ref(), Some(&seen[1]));
+        // From the panel itself, as it opens, back goes to the last too.
+        cx.update(|window, cx| panel.focus(window, cx));
+        cx.simulate_keystrokes("shift-tab");
+        assert_eq!(focused(cx).as_ref(), Some(&seen[2]));
+    }
+
+    #[gpui::test]
+    fn the_keys_go_back_where_they_were_when_settings_closes(cx: &mut TestAppContext) {
+        let (over, cx) = open(cx);
+        let (panel, behind) =
+            cx.read(|cx| (over.read(cx).panel.clone(), over.read(cx).behind[1].clone()));
+        // The status bar had them as settings opened.
+        cx.update(|window, cx| behind.focus(window, cx));
+        let before = focused(cx);
+        cx.update(|window, cx| panel.focus(window, cx));
+        cx.simulate_keystrokes("tab tab");
+        // As it closes.
+        cx.update(|window, cx| {
+            if let Some(back) = keys_back(before, window) {
+                window.focus(&back, cx);
+            }
+        });
+        assert_eq!(focused(cx), Some(behind));
+        // A menu it was opened from is gone by then, so it gets nothing back.
+        let menu = cx.update(|_, cx| cx.focus_handle().tab_stop(true));
+        cx.update(|window, _| assert_eq!(keys_back(Some(menu), window), None));
+    }
 }

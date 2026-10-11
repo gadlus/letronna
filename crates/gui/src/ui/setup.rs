@@ -1,9 +1,8 @@
-//! First-run setup: how to reach a model, a project folder, and the model to
-//! start with. One page, not a wizard, because signing in is already a
-//! browser round trip and keys already have their rows in Gateways -- so
-//! this only points at what already exists and reads live from it. Nothing
-//! is tracked here: reopening it from the account menu shows exactly what
-//! is set up by now, and Begin leaves however much of it was done.
+//! First-run setup, over the whole window: a welcome, then one step at a
+//! time -- how to reach a model, the model to start with, a project folder.
+//! Each step points at what already exists (sign-in, the Gateways rows, the
+//! model list) and reads live from it, so nothing is tracked here but which
+//! step is open, and every step can be skipped.
 
 use crate::prelude::*;
 
@@ -25,8 +24,10 @@ impl Chat {
         cx.notify();
     }
 
-    /// Leave the page: Begin, or asking anything at all.
+    /// Leave the page: Begin, or asking anything at all. The app fades in
+    /// under the page's colour rather than appearing all at once.
     pub(crate) fn close_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        crate::ui::motion::veil(cx.theme().background, cx);
         self.show_setup = None;
         self.focus_composer(window, cx);
         cx.notify();
@@ -38,6 +39,22 @@ impl Chat {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let chat = cx.entity();
+        let step = window.use_keyed_state("setup-step", cx, |_, _| 0usize);
+        let way = window.use_keyed_state("setup-way", cx, |_, _| 0usize);
+        let now = (*step.read(cx)).min(STEPS - 1);
+        let go = |to: usize| {
+            let (step, chat) = (step.clone(), chat.clone());
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                step.update(cx, |s, _| *s = to);
+                chat.update(cx, |_, cx| cx.notify());
+            }
+        };
+        let page = match now {
+            0 => self.welcome_step(go(1), cx).into_any_element(),
+            1 => (self.reach_step(&chat, &way, go(0), go(2), cx)).into_any_element(),
+            2 => (self.model_step(&chat, go(1), go(3), cx)).into_any_element(),
+            _ => self.folder_step(&chat, go(2), cx).into_any_element(),
+        };
         let scroll = window
             .use_keyed_state("setup-scroll", cx, |_, _| ScrollHandle::default())
             .read(cx)
@@ -51,63 +68,183 @@ impl Chat {
             .overflow_y_scroll()
             .track_scroll(&scroll)
             .child(
-                h_flex().w_full().justify_center().child(
-                    v_flex()
-                        .w(COLUMN)
-                        .flex_shrink_0()
-                        .px_6()
-                        .py_8()
-                        .gap_8()
-                        .child(
-                            v_flex()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .font_family(HEADING_FONT)
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_size(px(26.))
-                                        .child("Set up Letronna"),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(
-                                            "A few questions, then you are talking to it. All \
-                                             of it can be changed later.",
-                                        ),
-                                ),
-                        )
-                        .child(self.reach_step(&chat, cx))
-                        .child(self.folder_step(&chat, cx))
-                        .child(self.model_step(&chat, cx)),
-                ),
+                v_flex()
+                    .min_h_full()
+                    .w_full()
+                    .items_center()
+                    .justify_center()
+                    .py_10()
+                    .child(
+                        v_flex()
+                            .w(px(460.))
+                            .max_w_full()
+                            .px_6()
+                            .gap_8()
+                            .child(progress(now, cx))
+                            .child(arrive(page, now, cx)),
+                    ),
             )
             .vertical_scrollbar(&scroll)
     }
 
-    /// Step 01: sign in, add a key, or point at a local model. Any one of
-    /// the three is enough, and none of them is required to move on.
-    fn reach_step(&self, chat: &Entity<Chat>, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Who it is and one way on: nothing to read or choose yet.
+    fn welcome_step(
+        &self,
+        next: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         v_flex()
-            .gap_3()
-            .child(step_head(1, "How to reach models", cx))
-            .child(self.sign_in_row(chat, cx))
+            .gap_6()
+            .child(img("images/letronna.png").size(px(64.)).rounded(px(14.)))
+            .child(heading(
+                "Welcome to Letronna",
+                "An agent that works on your computer: it reads, writes, runs and \
+                 browses for you. Connect a model and it is ready.",
+                cx,
+            ))
             .child(
-                v_flex()
-                    .gap_2()
-                    .child(super::settings::label("Use my own key", cx))
-                    .child(super::settings::gateway_list(
-                        self.key_gateway_rows(),
-                        &self.gateway_pick,
-                        &self.endpoint,
-                        &self.key,
-                        &self.settings_page,
-                        chat,
-                        cx,
-                    )),
+                h_flex().child(
+                    Button::new("setup-start")
+                        .primary()
+                        .label("Get started")
+                        .on_click(next),
+                ),
             )
-            .child(self.local_model_row(cx))
+    }
+
+    /// Sign in, add a key, or point at a local model: one picked, its
+    /// details under it. Any one is enough to go on.
+    fn reach_step(
+        &self,
+        chat: &Entity<Chat>,
+        way: &Entity<usize>,
+        back: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        next: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let picked = *way.read(cx);
+        let ollama = self.models.iter().filter(|(g, _)| g == "Ollama").count();
+        let ways = [
+            (
+                "Letronna account",
+                "Hosted models with free starter credit. Recommended.",
+                self.account.is_some(),
+            ),
+            (
+                "My own API key",
+                "OpenAI, Anthropic, OpenRouter, or any compatible server.",
+                self.key_gateway_rows().iter().any(|r| r.set_up),
+            ),
+            (
+                "On this computer",
+                "Ollama: works offline, no key.",
+                ollama > 0,
+            ),
+        ];
+        let mut options = v_flex().gap_2();
+        for (i, (title, blurb, done)) in ways.into_iter().enumerate() {
+            let (way, chat) = (way.clone(), chat.clone());
+            let on = i == picked;
+            let ring = if on {
+                cx.theme().primary
+            } else {
+                cx.theme().muted_foreground.opacity(0.6)
+            };
+            options = options.child(
+                h_flex()
+                    .id(("setup-way", i))
+                    .gap_3()
+                    .items_center()
+                    .px_4()
+                    .py_3()
+                    .rounded(cx.theme().radius)
+                    .border_1()
+                    .border_color(if on {
+                        cx.theme().primary
+                    } else {
+                        cx.theme().border
+                    })
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .size(px(14.))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .border_1()
+                            .border_color(ring)
+                            .when(on, |d| {
+                                d.child(
+                                    div()
+                                        .m(px(3.))
+                                        .size(px(6.))
+                                        .rounded_full()
+                                        .bg(cx.theme().primary),
+                                )
+                            }),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .font_family(HEADING_FONT)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(blurb),
+                            ),
+                    )
+                    .when(done, |d| {
+                        d.child(
+                            Icon::new(IconName::Check)
+                                .size_4()
+                                .text_color(cx.theme().green),
+                        )
+                    })
+                    .on_click(move |_, _, cx| {
+                        way.update(cx, |w, _| *w = i);
+                        chat.update(cx, |_, cx| cx.notify());
+                    }),
+            );
+        }
+        let detail = match picked {
+            0 => self.sign_in_row(chat, cx).into_any_element(),
+            1 => super::settings::gateway_list(
+                self.key_gateway_rows(),
+                &self.gateway_pick,
+                &self.endpoint,
+                &self.key,
+                &self.settings_page,
+                chat,
+                cx,
+            )
+            .into_any_element(),
+            _ => self.local_model_row(cx).into_any_element(),
+        };
+        let ready = self.account.is_some() || !self.models.is_empty();
+        v_flex()
+            .gap_6()
+            .child(heading(
+                "Connect a model",
+                "Pick one way in. The others stay in Settings for later.",
+                cx,
+            ))
+            .child(options)
+            .child(detail)
+            .child(footer(
+                "setup-reach",
+                back,
+                next,
+                if ready { "Continue" } else { "Skip for now" },
+                ready,
+                cx,
+            ))
     }
 
     /// Already signed in, waiting on the browser, or not started: the same
@@ -158,10 +295,7 @@ impl Chat {
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(
-                                    "Recommended: free starter credit and hosted models. Your \
-                                     own key does not need this.",
-                                ),
+                                .child("Opens your browser, then comes back here."),
                         ),
                 )
                 .child(
@@ -238,8 +372,13 @@ impl Chat {
         )
     }
 
-    /// Step 02: the folder the agent's tools read and write in this session.
-    fn folder_step(&self, chat: &Entity<Chat>, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Last: the folder its tools work in, which can be skipped.
+    fn folder_step(
+        &self,
+        chat: &Entity<Chat>,
+        back: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let workspace = self.store.conversations[self.store.active]
             .workspace
             .clone();
@@ -250,12 +389,20 @@ impl Chat {
                     .unwrap_or_else(|| p.display().to_string()),
                 p.display().to_string(),
             ),
-            None => ("No folder chosen".to_owned(), String::new()),
+            None => (
+                "No folder yet".to_owned(),
+                "Until you pick one it works in Letronna, in your home folder.".to_owned(),
+            ),
         };
         let go = chat.clone();
+        let done = chat.clone();
         v_flex()
-            .gap_3()
-            .child(step_head(2, "Project folder", cx))
+            .gap_6()
+            .child(heading(
+                "Where should it work?",
+                "Pick a project folder for its files and commands. You can change it any time.",
+                cx,
+            ))
             .child(
                 row_card(cx).child(
                     h_flex()
@@ -268,17 +415,16 @@ impl Chat {
                                 .gap_0p5()
                                 .child(
                                     div()
-                                        .text_sm()
                                         .font_family(HEADING_FONT)
                                         .font_weight(FontWeight::MEDIUM)
                                         .child(name),
                                 )
-                                .children((!path.is_empty()).then(|| {
+                                .child(
                                     div()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child(path)
-                                })),
+                                        .child(path),
+                                ),
                         )
                         .child(
                             Button::new("setup-folder")
@@ -288,7 +434,7 @@ impl Chat {
                                 .label(if workspace.is_some() {
                                     "Change"
                                 } else {
-                                    "Choose a folder"
+                                    "Choose"
                                 })
                                 .on_click(move |_, window, cx| {
                                     go.update(cx, |this, cx| this.attach_workspace(window, cx))
@@ -296,12 +442,25 @@ impl Chat {
                         ),
                 ),
             )
+            .child(footer(
+                "setup-folder-nav",
+                back,
+                move |_, window, cx| done.update(cx, |this, cx| this.close_setup(window, cx)),
+                "Start using Letronna",
+                true,
+                cx,
+            ))
     }
 
-    /// Step 03: the model new sessions start on. Every set-up gateway's
-    /// models are here, cheapest and priciest alike, with what each costs;
-    /// Begin leaves however much of this was picked.
-    fn model_step(&self, chat: &Entity<Chat>, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The model new sessions start on. Every set-up gateway's models are
+    /// here, cheapest and priciest alike, with what each costs.
+    fn model_step(
+        &self,
+        chat: &Entity<Chat>,
+        back: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        next: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let (on, current) = self.store.model(self.store.active);
         let (on, current) = (on.to_owned(), current.to_owned());
         let custom = self.store.settings.custom_endpoint.clone();
@@ -313,7 +472,7 @@ impl Chat {
         matches.truncate(SETUP_MODELS);
         let mut list = v_flex()
             .id("setup-models")
-            .max_h(px(260.))
+            .max_h(px(320.))
             .overflow_y_scroll()
             .border_1()
             .border_color(cx.theme().border)
@@ -328,7 +487,7 @@ impl Chat {
                     .child(if self.loading_models {
                         "Loading models…"
                     } else {
-                        "No models yet. Reach one in the step above first."
+                        "No models yet: go back and connect one, or skip and do it later."
                     }),
             );
         }
@@ -389,48 +548,101 @@ impl Chat {
                     .child(format!("{more} more in the model picker.")),
             );
         }
-        let begin = chat.clone();
         v_flex()
-            .gap_3()
-            .child(step_head(3, "Default model", cx))
+            .gap_6()
+            .child(heading(
+                "Pick a model",
+                "New sessions start on it. You can switch in any chat.",
+                cx,
+            ))
             .child(list)
-            .child(
-                h_flex().justify_end().child(
-                    Button::new("setup-begin")
-                        .primary()
-                        .small()
-                        .label("Begin")
-                        .on_click(move |_, window, cx| {
-                            begin.update(cx, |this, cx| this.close_setup(window, cx))
-                        }),
-                ),
-            )
+            .child(footer(
+                "setup-model",
+                back,
+                next,
+                if self.models.is_empty() {
+                    "Skip for now"
+                } else {
+                    "Continue"
+                },
+                !self.models.is_empty(),
+                cx,
+            ))
     }
 }
 
-/// "01", "02", "03", set apart from a step's title, with a hairline under
-/// both, as the site's `.cap-n` marks a numbered step.
-fn step_head(n: u8, title: &'static str, cx: &App) -> Div {
-    h_flex()
-        .gap_3()
-        .items_baseline()
-        .pb_2()
-        .border_b_1()
-        .border_color(cx.theme().border)
-        .child(
-            div()
-                .font_family(HEADING_FONT)
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(cx.theme().muted_foreground)
-                .child(format!("{n:02}")),
+/// How many steps: welcome, connect, model, folder.
+const STEPS: usize = 4;
+
+/// A step coming in: it rises into place as it fades in, afresh on every
+/// change of step, back or on. Still while motion is reduced.
+fn arrive(page: AnyElement, step: usize, cx: &App) -> AnyElement {
+    use crate::ui::motion;
+    if cx.reduce_motion() {
+        return page;
+    }
+    div()
+        .relative()
+        .child(page)
+        .with_animation(
+            ("setup-step", step),
+            motion::enter(motion::GENTLE),
+            motion::rise,
         )
+        .into_any_element()
+}
+
+/// A thin bar per step, the ones done and the one open filled in.
+fn progress(now: usize, cx: &App) -> Div {
+    h_flex().gap_1p5().children((0..STEPS).map(|i| {
+        div().h(px(3.)).flex_1().rounded_full().bg(if i <= now {
+            cx.theme().primary
+        } else {
+            cx.theme().border
+        })
+    }))
+}
+
+/// A step's title and what it is for.
+fn heading(title: &'static str, blurb: &'static str, cx: &App) -> Div {
+    v_flex()
+        .gap_2()
         .child(
             div()
-                .text_base()
                 .font_family(HEADING_FONT)
                 .font_weight(FontWeight::SEMIBOLD)
+                .text_size(px(24.))
                 .child(title),
         )
+        .child(
+            div()
+                .text_color(cx.theme().muted_foreground)
+                .line_height(relative(1.5))
+                .child(blurb),
+        )
+}
+
+/// Back on the left, on to the next step on the right.
+fn footer(
+    id: &'static str,
+    back: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    next: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    label: &'static str,
+    ready: bool,
+    cx: &App,
+) -> Div {
+    // Skipping is quieter than going on with something set up.
+    let on = Button::new((id, 1usize)).label(label).on_click(next);
+    h_flex()
+        .justify_between()
+        .items_center()
+        .child(
+            Button::new((id, 0usize))
+                .plain(cx)
+                .label("Back")
+                .on_click(back),
+        )
+        .child(if ready { on.primary() } else { on.framed(cx) })
 }
 
 /// A step's own row: a hairline around it, on the page colour, rather than

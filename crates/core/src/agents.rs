@@ -68,6 +68,7 @@ use crate::tools::{self, Caller, Tool, ToolContext};
 use crate::worktree::{self, Worktree};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -404,6 +405,16 @@ impl Tool for Agent {
     fn description(&self) -> &'static str {
         "Hand a task to a helper agent that works with its own context and reports back. Use it to explore or check many files without filling your own context, not for a few reads you can do yourself. Helpers editing at the same time need separate files, or isolation worktree. Its report is all you get back, and it is the helper's own account: look at what it says it changed or ran before you tell the user it is done. In the window and the terminal it runs in the background by default: carry on or end your turn, and a notice comes when it finishes; do not poll or wait for it. Elsewhere you wait, and its report is this call's result."
     }
+    // A lean run is `-p`, where nothing listens for a helper's notice, so
+    // every helper is waited for (`in_background`): what it would say of the
+    // background, and the arguments for it, only cost such a run's requests.
+    fn description_for(&self, connection: &Connection, _: &[&str]) -> Cow<'static, str> {
+        let said = self.description();
+        match said.strip_suffix(IN_BACKGROUND) {
+            Some(rest) if connection.lean_tools => format!("{rest}{WAITED_FOR}").into(),
+            _ => said.into(),
+        }
+    }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
             "description": {"type": "string", "description": "Three to five words, shown to the user."},
@@ -417,10 +428,26 @@ impl Tool for Agent {
             "isolation": {"type": "string", "enum": ["worktree"], "description": "A new git worktree on a branch of its own from HEAD, without your uncommitted edits. Its file tools stay inside it; its commands are not confined. Removed if nothing changed, else the report names its path and branch."}
         }, "required": ["description", "prompt"]})
     }
+    fn parameters_for(&self, connection: &Connection) -> Value {
+        let mut parameters = self.parameters();
+        if connection.lean_tools
+            && let Some(properties) = parameters["properties"].as_object_mut()
+        {
+            properties.remove("background");
+            properties.remove("keep");
+        }
+        parameters
+    }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         start(args, ctx, &Limits::read(ctx.caller.root))
     }
 }
+
+/// How `agent`'s description ends, on helpers in the background.
+const IN_BACKGROUND: &str = " In the window and the terminal it runs in the background by default: carry on or end your turn, and a notice comes when it finishes; do not poll or wait for it. Elsewhere you wait, and its report is this call's result.";
+
+/// How it ends instead where no helper runs in the background.
+const WAITED_FOR: &str = " You wait for it, and its report is this call's result.";
 
 /// The `agents` tool, for helpers already started, which asks for no approval
 /// and is offered where others read the replies, since none can be started there.
@@ -1477,7 +1504,7 @@ fn helper_session_model(parent: &Connection, model: &str, fork: bool) -> String 
 /// comes last.
 fn usable(connection: &Connection, def: &AgentDef) -> Vec<String> {
     let every = tools::all();
-    let mut usable: Vec<String> = tools::specs_of(&every, connection, false)
+    let mut usable: Vec<String> = tools::specs_of(&every, connection, Default::default())
         .iter()
         .filter_map(|spec| spec["function"]["name"].as_str())
         .filter(|name| {
@@ -1485,7 +1512,8 @@ fn usable(connection: &Connection, def: &AgentDef) -> Vec<String> {
         })
         .map(str::to_owned)
         .collect();
-    if mcp_find::on_demand(&every) && usable.iter().any(|name| mcp_find::is_mcp(name)) {
+    let on_demand = mcp_find::OnDemand::of(connection, &every);
+    if usable.iter().any(|name| on_demand.leaves_out(name)) {
         usable.extend([mcp_find::FIND_TOOLS, mcp_find::CALL_MCP_TOOL].map(String::from));
     }
     usable
@@ -5383,6 +5411,29 @@ mod tests {
             ..attached
         };
         assert!(!types(&fallback).unwrap().contains("mender"));
+    }
+
+    #[test]
+    fn a_lean_run_is_told_nothing_of_helpers_in_the_background() {
+        let lean = Connection {
+            tools: true,
+            lean_tools: true,
+            ..Connection::default()
+        };
+        let said = Agent.description_for(&lean, &[]);
+        assert!(!said.contains("background"), "{said}");
+        assert!(said.ends_with(" You wait for it, and its report is this call's result."));
+        let properties = Agent.parameters_for(&lean)["properties"].clone();
+        assert!(properties.get("background").is_none() && properties.get("keep").is_none());
+        assert!(properties.get("prompt").is_some());
+        // Anywhere else the tool reads as it always has.
+        let window = Connection {
+            tools: true,
+            human: true,
+            ..Connection::default()
+        };
+        assert_eq!(Agent.description_for(&window, &[]), Agent.description());
+        assert_eq!(Agent.parameters_for(&window), Agent.parameters());
     }
 
     /// Whether `done` comes true within a few seconds.

@@ -16,7 +16,7 @@ use crate::session::Runner;
 
 /// Steps, for the heading over each one. Knowing how far there is to go is
 /// most of what makes a setup feel short.
-const STEPS: usize = 4;
+const STEPS: usize = 3;
 
 /// Walk through it. True when a model is ready to talk to at the end.
 /// `installer` is true for `letronna setup`, which ends here rather than
@@ -31,15 +31,13 @@ pub fn run(runner: &mut Runner, installer: bool) -> bool {
     render::blank();
     render::said(&render::blue("●"), &render::bold("Welcome"));
     render::line(&render::dim(
-        "A few questions, then you are talking to it. All of it can be changed later.",
+        "Three questions, then you are talking to it. All of it can be changed later.",
     ));
 
-    sign_in(runner);
-    if !choose_provider(runner) {
-        return false;
+    if connect(runner) {
+        choose_model(runner);
     }
-    choose_model(runner);
-    crate::install::offer(runner, 4, STEPS);
+    crate::install::offer(runner, 3, STEPS);
 
     let ready = !runner.store.settings.model.is_empty();
     render::blank();
@@ -53,7 +51,7 @@ pub fn run(runner: &mut Runner, installer: bool) -> bool {
     } else {
         render::said(&render::blue("●"), &render::bold("Nearly"));
         render::line(&render::dim(
-            "No model is chosen yet. /model picks one once the provider answers.",
+            "No model yet. /login or `letronna setup` connects one, /model picks it.",
         ));
     }
     ready
@@ -71,47 +69,52 @@ fn step(number: usize, title: &str) {
     );
 }
 
-fn sign_in(runner: &mut Runner) {
-    step(1, "Sign in");
-    if let Some(account) = auth::account() {
-        render::line(&render::dim(&format!(
-            "Already signed in as {}.",
-            account.name
-        )));
-        return;
-    }
+/// One question for how to reach a model: the account, a key, this
+/// computer, or another server. False when it was skipped.
+fn connect(runner: &mut Runner) -> bool {
+    step(1, "Connect a model");
+    let signed_in = auth::account();
+    let account = match &signed_in {
+        Some(a) => format!("Letronna account  —  signed in as {}", a.name),
+        None => "Letronna account  —  hosted models, free starter credit. Recommended.".into(),
+    };
     // Asked before anything is opened: a browser appearing unbidden is the
     // sort of thing that makes people close an installer.
     let picked = runner.bar.choose(
-        "Sign in to a Letronna account?",
-        vec!["Hosted models and cloud runs need one. Your own keys do not.".into()],
-        &["Sign in in the browser", "Skip"],
+        "How should Letronna reach a model?",
+        Vec::new(),
+        &[
+            account.as_str(),
+            "My own API key  —  OpenAI, Anthropic or OpenRouter.",
+            "On this computer  —  Ollama. Works offline, no key.",
+            "Another server  —  anything OpenAI-compatible, by its URL.",
+            "Skip for now",
+        ],
     );
-    match picked {
-        Some(0) => crate::commands::sign_in(runner),
-        _ => render::line(&render::dim("Skipped. /login whenever you like.")),
-    }
-}
-
-/// Pick where messages go, and the key for it if it wants one.
-fn choose_provider(runner: &mut Runner) -> bool {
-    step(2, "Who should answer?");
-    let labels: Vec<String> = GATEWAYS
-        .iter()
-        .map(|g| format!("{}  —  {}", g.name, g.blurb))
-        .collect();
-    let options: Vec<&str> = labels.iter().map(String::as_str).collect();
-    let Some(index) = runner.bar.choose("Pick a provider", Vec::new(), &options) else {
-        render::line(&render::dim("Left it. Run `letronna setup` to come back."));
-        return false;
+    let name = match picked {
+        Some(0) => gateway::LETRONNA,
+        Some(1) => {
+            let keyed: Vec<_> = GATEWAYS.iter().filter(|g| g.needs_key).collect();
+            let labels: Vec<String> = keyed
+                .iter()
+                .map(|g| format!("{}  —  {}", g.name, g.blurb))
+                .collect();
+            let options: Vec<&str> = labels.iter().map(String::as_str).collect();
+            match runner.bar.choose("Which provider?", Vec::new(), &options) {
+                Some(i) => keyed[i].name,
+                None => return skipped(),
+            }
+        }
+        Some(2) => "Ollama",
+        Some(3) => "Custom",
+        _ => return skipped(),
     };
-    let chosen = &GATEWAYS[index];
+    let Some(chosen) = GATEWAYS.iter().find(|g| g.name == name) else {
+        return skipped();
+    };
 
     let mut base = chosen.base.to_owned();
     if base.is_empty() {
-        render::line(&render::dim(
-            "Any OpenAI-compatible server: paste its base URL.",
-        ));
         base = runner
             .bar
             .ask("base URL, like http://localhost:8000/v1", false)
@@ -124,17 +127,10 @@ fn choose_provider(runner: &mut Runner) -> bool {
     if chosen.base.is_empty() {
         runner.store.settings.custom_endpoint = runner.store.settings.endpoint.clone();
     }
-    render::line(&format!(
-        "{} {}",
-        render::dim("provider"),
-        render::bold(chosen.name)
-    ));
 
     // The hosted pool is paid for by the account, so it needs one.
-    if chosen.name == gateway::LETRONNA && auth::account().is_none() {
-        render::line(&render::dim(
-            "Letronna's models run on your account. Sign in to use them.",
-        ));
+    if chosen.name == gateway::LETRONNA && signed_in.is_none() {
+        render::line(&render::dim("Opening your browser to sign in."));
         crate::commands::sign_in(runner);
     }
 
@@ -162,12 +158,22 @@ fn choose_provider(runner: &mut Runner) -> bool {
         }
     }
     runner.persist();
+    render::line(&format!(
+        "{} {}",
+        render::dim("connected through"),
+        render::bold(chosen.name)
+    ));
     true
 }
 
+fn skipped() -> bool {
+    render::line(&render::dim("Skipped. `letronna setup` asks again."));
+    false
+}
+
 fn choose_model(runner: &mut Runner) {
-    step(3, "Which model?");
-    crate::commands::switch_model(runner, None, "");
+    step(2, "Pick a model");
+    crate::commands::pick_model(runner, None, "", true);
     // A provider that would not list its models -- a local server, or a key
     // it did not like -- still needs something to talk to.
     if runner.store.settings.model.is_empty() {

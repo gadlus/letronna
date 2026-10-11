@@ -5,9 +5,11 @@ use crate::prelude::*;
 /// sized from.
 pub(crate) const SIDEBAR_WIDTH: Pixels = px(250.);
 
-/// The pages folded under the sidebar's More row, in the order it lists
-/// them; Workflows only while there is a run to show.
-const MORE: [Page; 5] = [
+/// The sidebar's pages after New session, in the order it lists them, every
+/// one a row of its own; Workflows only while there is a run to show.
+const PAGES: [Page; 7] = [
+    Page::Capabilities,
+    Page::Activity,
     Page::Plugins,
     Page::Messaging,
     Page::Artifacts,
@@ -20,7 +22,6 @@ const MORE: [Page; 5] = [
 enum Nav {
     New,
     Page(Page),
-    More,
 }
 
 impl Nav {
@@ -28,8 +29,7 @@ impl Nav {
     fn slot(self) -> usize {
         match self {
             Nav::New => 0,
-            Nav::More => 1,
-            Nav::Page(page) => 2 + page as usize,
+            Nav::Page(page) => 1 + page as usize,
         }
     }
 }
@@ -48,27 +48,16 @@ fn page_icon(page: Page) -> AppIcon {
     }
 }
 
-/// The sidebar's page rows, top to bottom: New session, the two pages used
-/// most, then More, with the rest under it once it is `open`. Folded, the
-/// page on screen still shows, above More, so the row marking it is there.
-fn nav_rows(open: bool, on_screen: Page, workflows: bool) -> Vec<Nav> {
-    let under: Vec<Page> = MORE
-        .into_iter()
-        .filter(|&page| page != Page::Workflows || workflows)
-        .collect();
-    let mut rows = vec![
-        Nav::New,
-        Nav::Page(Page::Capabilities),
-        Nav::Page(Page::Activity),
-    ];
-    if !open && under.contains(&on_screen) {
-        rows.push(Nav::Page(on_screen));
-    }
-    rows.push(Nav::More);
-    if open {
-        rows.extend(under.into_iter().map(Nav::Page));
-    }
-    rows
+/// The sidebar's page rows, top to bottom: New session, then every page.
+fn nav_rows(workflows: bool) -> Vec<Nav> {
+    std::iter::once(Nav::New)
+        .chain(
+            PAGES
+                .into_iter()
+                .filter(|&page| page != Page::Workflows || workflows)
+                .map(Nav::Page),
+        )
+        .collect()
 }
 
 impl Chat {
@@ -80,7 +69,6 @@ impl Chat {
         nav: Nav,
         at: usize,
         handles: &std::rc::Rc<[FocusHandle]>,
-        folded: &[Page],
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let active = matches!(nav, Nav::Page(page) if page == self.page);
@@ -89,18 +77,9 @@ impl Chat {
         let (icon, label) = match nav {
             Nav::New => (Icon::new(AppIcon::SquarePen), "New session"),
             Nav::Page(page) => (Icon::new(page_icon(page)), page.title()),
-            Nav::More => (Icon::new(IconName::Ellipsis), "More"),
         };
         let up = at.checked_sub(1).and_then(|up| handles.get(up)).cloned();
         let down = handles.get(at + 1).cloned();
-        // Folded, More says what is under it.
-        let under = (nav == Nav::More && !folded.is_empty()).then(|| {
-            folded
-                .iter()
-                .map(|page| page.title())
-                .collect::<Vec<_>>()
-                .join(", ")
-        });
         h_flex()
             .id(("nav", nav.slot()))
             .track_focus(&handles[at])
@@ -120,37 +99,10 @@ impl Chat {
             .focus(|s| s.border_color(ring))
             .active(|s| s.bg(accent.opacity(0.6)))
             .child(icon.size_4().text_color(muted))
-            .child(
-                div()
-                    .when(nav != Nav::More, |this| this.flex_1())
-                    .min_w_0()
-                    .truncate()
-                    .child(label),
-            )
+            .child(div().flex_1().min_w_0().truncate().child(label))
             .when(nav == Nav::New, |this| {
                 this.children(
                     crate::ui::keys::bound_key(&NewSession, cx).map(|key| Kbd::new(key).text_xs()),
-                )
-            })
-            .when(nav == Nav::More, |this| {
-                this.child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .font_weight(FontWeight::NORMAL)
-                        .text_color(muted)
-                        .children(under),
-                )
-                .child(
-                    Icon::new(if self.nav_more {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .size_3()
-                    .text_color(muted),
                 )
             })
             // As on a session row, a press leaves the keys where they were;
@@ -159,10 +111,6 @@ impl Chat {
             .on_click(cx.listener(move |this, _, window, cx| match nav {
                 Nav::New => this.new_chat(window, cx),
                 Nav::Page(page) => this.open_page(page, window, cx),
-                Nav::More => {
-                    this.nav_more ^= true;
-                    cx.notify();
-                }
             }))
             .on_action(
                 cx.listener(move |_, _: &sessions::PreviousSession, window, cx| {
@@ -355,6 +303,8 @@ impl Chat {
         let filter = self.session_filter();
         (0..self.store.conversations.len())
             .rev()
+            // A new session is listed once something is said in it.
+            .filter(|&i| !untouched(&self.store.conversations[i]))
             .filter(|&i| {
                 query.is_empty()
                     || self.store.conversations[i]
@@ -441,7 +391,7 @@ impl Chat {
         let session = self.store.conversations[self.store.active].id;
         let workflows =
             self.page == Page::Workflows || !letronna_core::workflow::runs(session).is_empty();
-        let rows = nav_rows(self.nav_more, self.page, workflows);
+        let rows = nav_rows(workflows);
         let handles: std::rc::Rc<[FocusHandle]> = rows
             .iter()
             .map(|nav| {
@@ -453,14 +403,9 @@ impl Chat {
                     .clone()
             })
             .collect();
-        let folded: Vec<Page> = MORE
-            .into_iter()
-            .filter(|&page| page != Page::Workflows || workflows)
-            .filter(|page| !rows.contains(&Nav::Page(*page)))
-            .collect();
         let mut nav = v_flex().px_2().pt_2().gap_0p5();
         for (at, &row) in rows.iter().enumerate() {
-            nav = nav.child(self.nav_item(row, at, &handles, &folded, cx));
+            nav = nav.child(self.nav_item(row, at, &handles, cx));
         }
         let visible = self.visible_sessions(cx);
         let keyed = self
@@ -518,13 +463,19 @@ impl Chat {
             }
         }
         if visible.is_empty() {
+            // Only a new session nothing was said in: there is none to match.
+            let none_yet = self.store.conversations.iter().all(untouched);
             sessions = sessions.child(
                 div()
                     .px_2()
                     .py_1()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("No sessions match"),
+                    .child(if none_yet {
+                        "No sessions yet"
+                    } else {
+                        "No sessions match"
+                    }),
             );
         }
 
@@ -679,56 +630,30 @@ mod tests {
         rows.iter()
             .map(|row| match row {
                 Nav::New => "New session",
-                Nav::More => "More",
                 Nav::Page(page) => page.title(),
             })
             .collect()
     }
 
     #[test]
-    fn folded_only_the_pages_used_most_show_above_more() {
-        assert_eq!(
-            names(&nav_rows(false, Page::Chat, true)),
-            ["New session", "Capabilities", "Activity", "More"]
-        );
-    }
-
-    #[test]
-    fn a_folded_page_on_screen_still_shows_above_more() {
-        assert_eq!(
-            names(&nav_rows(false, Page::Artifacts, false)),
-            [
-                "New session",
-                "Capabilities",
-                "Activity",
-                "Artifacts",
-                "More"
-            ]
-        );
-        // One of the two kept out of More is not shown twice.
-        assert_eq!(nav_rows(false, Page::Activity, false).len(), 4);
-    }
-
-    #[test]
-    fn open_more_lists_the_rest_with_workflows_only_while_runs_show() {
-        let mut open = vec![
+    fn every_page_has_a_row_with_workflows_only_while_runs_show() {
+        let mut all = vec![
             "New session",
             "Capabilities",
             "Activity",
-            "More",
             "Plugins",
             "Messaging",
             "Artifacts",
             "Scheduled jobs",
         ];
-        assert_eq!(names(&nav_rows(true, Page::Chat, false)), open);
-        open.push("Workflows");
-        assert_eq!(names(&nav_rows(true, Page::Workflows, true)), open);
+        assert_eq!(names(&nav_rows(false)), all);
+        all.push("Workflows");
+        assert_eq!(names(&nav_rows(true)), all);
     }
 
     #[test]
     fn every_page_row_has_a_focus_of_its_own() {
-        let rows = nav_rows(true, Page::Chat, true);
+        let rows = nav_rows(true);
         let mut slots: Vec<usize> = rows.iter().map(|row| row.slot()).collect();
         slots.sort_unstable();
         slots.dedup();

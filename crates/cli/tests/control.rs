@@ -257,7 +257,22 @@ fn messages_run_as_turns_in_the_order_sent() {
         .iter()
         .map(|(_, content)| content.as_str())
         .collect();
-    assert_eq!(tail, ["one", "First.", "two"]);
+    assert_eq!(after_note(tail[0]), "one");
+    assert_eq!(tail[1..], ["First.", "two"]);
+}
+
+/// What follows the run's surroundings in `content`, the first message from
+/// the user in a request's window: a run nobody watches, as every one here
+/// is, is told them there rather than in its system prompt, on the wire only.
+fn after_note(content: &str) -> &str {
+    let (note, message) = content
+        .split_once(")\n\n")
+        .unwrap_or_else(|| panic!("no surroundings note before {content:?}"));
+    assert!(
+        note.starts_with("(From Letronna, not part of the message below: Commands on PATH:"),
+        "{note}"
+    );
+    message
 }
 
 #[test]
@@ -552,7 +567,10 @@ fn the_json_result_names_the_session_and_its_model() {
         .iter()
         .map(|(_, content)| content.as_str())
         .collect();
-    assert_eq!(tail, ["hello", "Hello.", "again"]);
+    // The resumed run's window opens at the earlier prompt, which is the
+    // one told the surroundings.
+    assert_eq!(after_note(tail[0]), "hello");
+    assert_eq!(tail[1..], ["Hello.", "again"]);
 }
 
 #[test]
@@ -628,7 +646,9 @@ fn a_print_run_past_its_deadline_stops_with_its_result() {
         &flags,
         &[("LETRONNA_DEADLINE", "2")],
     );
-    assert_eq!(run.next()["status"], "stopped");
+    // Said as its own status, so a harness can tell its time limit from a
+    // stop it made.
+    assert_eq!(run.next()["status"], "deadline");
     // Out of time is not a Ctrl-C, so a harness counts the run as having ended.
     assert_eq!(run.close(), 0);
 }

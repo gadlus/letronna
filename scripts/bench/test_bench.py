@@ -240,6 +240,42 @@ class RunnerTests(unittest.TestCase):
         self.assertAlmostEqual(summary["completion"], 1.25 / 3)
         self.assertAlmostEqual(summary["completion_of_ceiling"], 1.5 / 3)
 
+    def test_efficiency_counts_calls_cache_hits_and_the_first_requests_static_prompt(self) -> None:
+        responses = self.tmp / "usage-proxy" / "responses"
+        responses.mkdir(parents=True)
+        listing = {"path": "/models", "request_body": ""}
+        system = [{"type": "text", "text": "You are Letronna."}, {"type": "text", "text": "Brief."}]
+        tools = [{"type": "function", "function": {"name": "read_file"}}]
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": "Go."}]
+        opening = {"messages": messages, "tools": tools}
+        later = {"messages": [{"role": "system", "content": "a much longer prompt"}]}
+        for name, record in [
+            ("0001.json", listing),
+            ("0002.json", {"path": "/chat/completions", "request_body": json.dumps(opening)}),
+            ("0003.json", {"path": "/chat/completions", "request_body": json.dumps(later)}),
+        ]:
+            (responses / name).write_text(json.dumps(record), encoding="utf-8")
+        usage = {"available": True, "input_tokens": 300, "cache_read_tokens": 100}
+        rounds = [{"metadata": {"model_calls": 3}}, {"metadata": {"model_calls": 2}}]
+        kept = made_up_result("001-file") | {
+            "sandbox": str(self.tmp),
+            "usage_summary": usage,
+            "adapter_results": rounds,
+        }
+        deleted = made_up_result("002-exec") | {
+            "sandbox": str(self.tmp / "deleted"),
+            "usage_summary": {"available": True, "input_tokens": 100, "cache_read_tokens": 0},
+            "adapter_results": [{"metadata": {"model_calls": 1}}],
+        }
+        one_run = {"001-file": kept, "002-exec": deleted, "003-browser": None}
+        spent = report.efficiency(list(one_run), [one_run], len)
+        self.assertEqual(spent["calls"], 3.0, "five calls and one, over the runs with a result")
+        self.assertAlmostEqual(spent["cache_hit"], 100 / 500)
+        schemas = '[{"type":"function","function":{"name":"read_file"}}]'
+        self.assertEqual(spent["static_prompt"], len("You are Letronna.\nBrief.") + len(schemas))
+        nothing = report.efficiency(["001-file"], [{"001-file": made_up_result()}], len)
+        self.assertEqual(nothing, {"calls": None, "cache_hit": None, "static_prompt": None})
+
     def test_the_runner_refuses_a_fork_on_a_different_commit(self) -> None:
         bench = self.tmp / "bench"
         (bench / "src" / "harnessbench").mkdir(parents=True)
@@ -339,6 +375,8 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("| score, mean of 2 runs | 0.500 | 0.750 |", text)
         self.assertIn("| completion over each task's ceiling | 0.000 | 1.000 |", text)
         self.assertIn("| pass^2 | 0.000 | 1.000 |", text)
+        self.assertIn("| prompt cache hit, cached of input tokens | n/a | n/a |", text)
+        self.assertIn("time to first token and call latency are not given", text)
         self.assertIn("**win**", text)
         self.assertIn("| artifact commitment | 2 | 0 |", text)
         self.assertIn("| oracle defect | 2 | 0 |", text)
