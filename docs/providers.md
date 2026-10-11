@@ -11,7 +11,7 @@ A provider implements the `Provider` trait in `providers/mod.rs`:
 | Method | What it gives |
 |---|---|
 | `info()` | Its name, base URL, one-line blurb, docs link and tier |
-| `auth()` | What it needs: `ApiKey`, `None` (runs locally), `Account` (Letronna sign-in) or `Url` (the user gives the base URL) |
+| `auth()` | What it needs: `ApiKey`, `None` (runs locally), `Account` (Letronna sign-in), `Url` (the user gives the base URL) or `OAuth(&SPEC)` (a sign-in in the browser) |
 | `wire()` | The format its base URL speaks. Defaults to OpenAI chat completions. |
 | `models()` | The model ids it serves. Defaults to `GET <base>/models`. |
 
@@ -23,7 +23,7 @@ The **tier** says what using it costs: `Subscription`, `ApiKey`, `Credit` or `Fr
 
 1. **Copy the template.** Copy `providers/_template/` to a new folder named for the provider in lowercase, for example `providers/mistral/`. Rename the struct.
 2. **Fill in `info()`.** Use the base URL of its OpenAI-shaped API, ending in the version (`https://api.example.com/v1`, no trailing slash). Link `docs` to the page where people get a key.
-3. **Pick `auth()` and `wire()`.** Most providers take an API key and speak OpenAI chat completions, and then there is nothing to change. If it speaks Anthropic's Messages format, return `Wire::Anthropic`.
+3. **Pick `auth()` and `wire()`.** Most providers take an API key and speak OpenAI chat completions, and then there is nothing to change. If it speaks Anthropic's Messages format, return `Wire::Anthropic`; if only OpenAI's Responses API, `Wire::OpenAiResponses`.
 4. **Register it.** In `providers/mod.rs`, add `mod mistral;` and one line to `PROVIDERS`, in the place it should appear in the gateway list.
 5. **Run the suite.** `scripts/x.sh test -p letronna-core --lib providers::`
 
@@ -45,3 +45,7 @@ Say in the PR which models you tried it with, and how (a real key, or the record
 ## Keys and tokens
 
 Keys are saved in the system's vault: macOS Keychain or Windows Credential Manager. A provider never reads or writes a key itself; the gateway hands it the one saved under its name. Never log a key, put one in a fixture, or write one to a file.
+
+## Browser sign-in
+
+A provider signed in to in the browser describes its OAuth sign-in as data, a `static` `OAuthSpec` (`providers/auth/`): its authorize and token URLs, client id, scopes, the loopback port and path the browser comes back to, any extra authorize parameters, whether the token endpoint takes JSON or a form, PKCE, and where the account id and plan are in the id token. Return `AuthKind::OAuth(&SPEC)` and nothing else is needed: `providers::auth` opens the browser, waits on the loopback (or takes the address or `code#state` pasted back), trades the code for tokens, keeps them in the vault under `provider:<name>`, and refreshes the access token shortly before it ends or once when it is refused. `providers/chatgpt/` is the example.

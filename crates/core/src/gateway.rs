@@ -108,6 +108,11 @@ pub fn resolve(name: &str, custom: &str, key: &str) -> (String, String) {
         let token = crate::auth::account().map(|a| a.token).unwrap_or_default();
         return (base_url(name, custom), token);
     }
+    // A browser sign-in sends its access token, refreshed when near its end.
+    if let Some(AuthKind::OAuth(_)) = auth_of(name) {
+        let token = crate::providers::auth::access(name).unwrap_or_default();
+        return (base_url(name, custom), token);
+    }
     if let Some(added) = added_as(name) {
         return (added.base, added.key);
     }
@@ -129,7 +134,7 @@ pub fn base_url(name: &str, custom: &str) -> String {
 }
 
 /// Every gateway set up on this computer, as (name, base URL, key): Letronna
-/// once signed in, a keyed gateway once its key is saved, Custom once it has
+/// and those signed in to in the browser once signed in, a keyed gateway once its key is saved, Custom once it has
 /// a URL, Ollama always (on this machine, a closed port answers at once),
 /// and those plugins added.
 pub fn ready(keys: &HashMap<String, String>, custom: &str) -> Vec<(&'static str, String, String)> {
@@ -141,6 +146,7 @@ pub fn ready(keys: &HashMap<String, String>, custom: &str) -> Vec<(&'static str,
             let key = keys.get(key_slot(g.name)).cloned().unwrap_or_default();
             let on = match auth_of(g.name) {
                 Some(AuthKind::Account) => crate::auth::account().is_some(),
+                Some(AuthKind::OAuth(_)) => crate::providers::auth::signed_in(g.name),
                 Some(AuthKind::Url) => !custom.trim().is_empty(),
                 Some(AuthKind::None) => true,
                 _ => !key.trim().is_empty(),
@@ -179,6 +185,16 @@ pub fn status(
             true,
         ),
         Some(AuthKind::Account) => ("Not signed in".into(), false, false),
+        Some(AuthKind::OAuth(_)) if crate::providers::auth::signed_in(name) => (
+            if models > 0 {
+                format!("Signed in · {}", count(models))
+            } else {
+                "Signed in".into()
+            },
+            true,
+            true,
+        ),
+        Some(AuthKind::OAuth(_)) => ("Not signed in".into(), false, false),
         Some(AuthKind::None) if models > 0 => (format!("Running · {}", count(models)), true, true),
         Some(AuthKind::None) => ("Not running".into(), false, false),
         Some(AuthKind::Url) if custom.trim().is_empty() => ("Not set up".into(), false, false),
@@ -314,5 +330,29 @@ mod tests {
             status("Custom", &none, "http://x/v1", 2).0,
             "Connected · 2 models"
         );
+    }
+
+    #[test]
+    fn a_browser_sign_in_is_set_up_once_signed_in() {
+        let none = HashMap::new();
+        assert_eq!(
+            status("ChatGPT", &none, "", 0),
+            ("Not signed in".into(), false, false)
+        );
+        assert!(!ready(&none, "").iter().any(|g| g.0 == "ChatGPT"));
+        let _vault = crate::providers::auth::tests::vault("gateway-sign-in");
+        crate::providers::auth::tests::keep("ChatGPT", "access-1");
+        assert_eq!(
+            status("ChatGPT", &none, "", 2),
+            ("Signed in · 2 models".into(), true, true)
+        );
+        let listed = ready(&none, "");
+        let chatgpt = listed.iter().find(|g| g.0 == "ChatGPT").unwrap();
+        assert_eq!(
+            (chatgpt.1.as_str(), chatgpt.2.as_str()),
+            ("https://chatgpt.com/backend-api/codex", "access-1")
+        );
+        crate::providers::auth::sign_out("ChatGPT").unwrap();
+        assert!(!ready(&none, "").iter().any(|g| g.0 == "ChatGPT"));
     }
 }

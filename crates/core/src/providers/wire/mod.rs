@@ -13,4 +13,6 @@ pub enum Wire {
     OpenAiChat,
     /// Anthropic's Messages API.
     Anthropic,
+    /// OpenAI's Responses API, which alone some backends speak.
+    OpenAiResponses,
 }
