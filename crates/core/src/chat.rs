@@ -6552,6 +6552,46 @@ mod tests {
         );
     }
 
+    /// About what a run nobody watches sends before its first message, as
+    /// `tokens` counts it: the system message, as its golden copy has it,
+    /// and the tools array, which every request of every run repeats and a
+    /// provider caches after the first. Held here so a prompt or description
+    /// edit shows its cost in the failure, with the bytes themselves in the
+    /// golden copies.
+    const STATIC_TOKENS: usize = 6_545;
+
+    #[test]
+    #[cfg_attr(
+        any(windows, not(feature = "workflows")),
+        ignore = "The count is of a default build outside Windows, where run_command describes bash"
+    )]
+    fn the_system_message_and_tools_of_a_print_run_cost_what_is_recorded() {
+        let system = golden_prompt(false);
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::store::tests::Scratch::new("chat-static-tokens");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        // As `-p` without `--tools` sends it: the less used tools on demand.
+        let c = Connection {
+            tools: true,
+            lean_tools: true,
+            workspace: Some("/w".into()),
+            ..connection()
+        };
+        let tools = body(&c, &[], None, None)["tools"].to_string();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        let now = tokens(&system) + tokens(&tools);
+        assert_eq!(
+            now,
+            STATIC_TOKENS,
+            "the system message ({} tokens) and tools ({} tokens) of a print run now cost {now}, {:+} against the {STATIC_TOKENS} recorded; if the change is meant, record the new count",
+            tokens(&system),
+            tokens(&tools),
+            now as isize - STATIC_TOKENS as isize
+        );
+    }
+
     /// The messages a request over `c` sends with tools for `window`.
     fn sent_with_tools(c: &Connection, window: &[Message]) -> Vec<Value> {
         let with_tools = Connection {
