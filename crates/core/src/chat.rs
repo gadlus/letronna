@@ -6839,7 +6839,9 @@ mod tests {
         unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
         // As `-p` without `--tools` sends it on a fresh install: the less
         // used tools on demand, and no MCP tool, since one another test
-        // serves would put call_mcp_tool in the array too.
+        // serves would put call_mcp_tool in the array too. Nor wake_me: it
+        // is offered once the process listens on its inbox, which a print
+        // run never does but another test in this process may.
         let c = Connection {
             tools: true,
             lean_tools: true,
@@ -6848,7 +6850,7 @@ mod tests {
         };
         let every: Vec<_> = crate::tools::all()
             .into_iter()
-            .filter(|tool| !crate::mcp::is_tool(tool.name()))
+            .filter(|tool| !crate::mcp::is_tool(tool.name()) && tool.name() != "wake_me")
             .collect();
         let on_demand = crate::mcp_find::OnDemand::of(&c, &every);
         let sent = Value::Array(offered(&c, &every, on_demand));
