@@ -7,7 +7,7 @@
 //! added at the edge, in `wire::openai_responses`.
 
 use super::auth::OAuthSpec;
-use super::{AuthKind, Provider, ProviderInfo, Tier, Wire};
+use super::{AuthKind, Provider, ProviderInfo, Quota, Tier, Wire};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -71,6 +71,13 @@ impl Provider for ChatGpt {
 
     fn wire(&self) -> Wire {
         Wire::OpenAiResponses
+    }
+
+    /// The plan's own limits, which its backend sends on every reply: the
+    /// share of each window used and when it starts again. The tighter is
+    /// the quota.
+    fn quota(&self, headers: &reqwest::header::HeaderMap) -> Option<Quota> {
+        plan_usage(headers, crate::chat::now())
     }
 
     fn models(&self, base: &str, key: &str) -> Result<Vec<String>, String> {
@@ -139,9 +146,46 @@ fn listing(catalog: &Value) -> Vec<Value> {
         .collect()
 }
 
+/// The tighter of the plan's two windows at `now`, as its headers give them.
+fn plan_usage(headers: &reqwest::header::HeaderMap, now: u64) -> Option<Quota> {
+    let number = |name: String| headers.get(name)?.to_str().ok()?.trim().parse::<f64>().ok();
+    let (used_percent, reset) = (["primary", "secondary"].into_iter())
+        .filter_map(|window| {
+            let used = number(format!("x-codex-{window}-used-percent"))?;
+            Some((
+                used,
+                number(format!("x-codex-{window}-reset-after-seconds")),
+            ))
+        })
+        .max_by(|a, b| a.0.total_cmp(&b.0))?;
+    Some(Quota {
+        plan: super::auth::tokens(NAME)
+            .map(|t| t.plan)
+            .filter(|plan| !plan.is_empty()),
+        used_percent,
+        resets_at: reset.map(|after| now + after.max(0.0) as u64),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_plans_tighter_window_is_its_quota() {
+        let headers: reqwest::header::HeaderMap = [
+            ("x-codex-primary-used-percent", "12.5"),
+            ("x-codex-primary-reset-after-seconds", "600"),
+            ("x-codex-secondary-used-percent", "40"),
+            ("x-codex-secondary-reset-after-seconds", "86400"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.parse().unwrap(), v.parse().unwrap()))
+        .collect();
+        let quota = plan_usage(&headers, 100).unwrap();
+        assert_eq!((quota.used_percent, quota.resets_at), (40.0, Some(86_500)));
+        assert_eq!(plan_usage(&Default::default(), 0), None);
+    }
 
     #[test]
     fn only_the_models_the_plan_lists_are_offered_with_the_efforts_the_api_takes() {
