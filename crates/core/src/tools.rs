@@ -6855,16 +6855,23 @@ mod tests {
     fn write_file_makes_new_scratch_files_in_the_temp_folder_and_changes_only_its_own_there() {
         let temp = std::env::temp_dir();
         let at = |what: &str| temp.join(format!("letronna-scratch-{what}-{}", std::process::id()));
-        let (project, theirs, folder, link) =
-            (at("project"), at("theirs"), at("folder"), at("link"));
+        let (project, theirs, folder, link, nowhere) = (
+            at("project"),
+            at("theirs"),
+            at("folder"),
+            at("link"),
+            at("nowhere"),
+        );
         let repro = at("repro.py");
-        for path in [&project, &folder] {
+        for path in [&project, &folder, &nowhere] {
             let _ = std::fs::remove_dir_all(path);
         }
         for path in [&repro, &theirs, &link] {
             let _ = std::fs::remove_file(path);
         }
         std::fs::create_dir_all(&project).unwrap();
+        // A folder the session did not make: made here, not by its tools.
+        std::fs::create_dir_all(&nowhere).unwrap();
         std::fs::write(&theirs, "theirs").unwrap();
         let ctx = ToolContext {
             workspace: Some(project.clone()),
@@ -6889,7 +6896,7 @@ mod tests {
         // link on the way stay out of reach.
         let elsewhere = [
             theirs.clone(),
-            project.with_file_name("letronna-nowhere").join("new.txt"),
+            nowhere.join("new.txt"),
             link.join("new.txt"),
         ];
         for path in &elsewhere[..1] {
@@ -6900,6 +6907,7 @@ mod tests {
             write(path, "mine").unwrap_err();
         }
         assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "theirs");
+        assert!(!nowhere.join("new.txt").exists());
         assert!(!folder.join("new.txt").exists());
         // Another session did not make the file.
         let other = ToolContext {
@@ -6917,7 +6925,7 @@ mod tests {
         let me = std::env::current_exe().ok();
         let refused = resolve_write_in(&new, &ctx, &theirs, me.as_deref(), false).unwrap_err();
         assert_eq!(refused, format!("`{new}` is outside the project folder."));
-        for path in [project, folder] {
+        for path in [project, folder, nowhere] {
             std::fs::remove_dir_all(path).unwrap();
         }
         for path in [repro, theirs, link] {
