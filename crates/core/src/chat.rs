@@ -601,8 +601,21 @@ fn message_tokens(m: &Message, tool_chars: usize, echoed: bool) -> usize {
 /// is counted where a request over `route` sends it back, as one over
 /// `messages` would; with no route, none is.
 fn token_sums(messages: &[Message], tool_chars: usize, route: Option<&Connection>) -> Vec<usize> {
-    let pictures = pictures(messages);
     let turn = messages.iter().rposition(opens_turn);
+    token_sums_from(messages, tool_chars, route, turn)
+}
+
+/// `token_sums` where the turn in progress, whose calls a request over
+/// `route` sends the reasoning of, opens at `turn`: with none, every call's
+/// counts, as if no turn had ended, which `old_before` needs so that the
+/// cost it places the boundary by never falls when one does.
+fn token_sums_from(
+    messages: &[Message],
+    tool_chars: usize,
+    route: Option<&Connection>,
+    turn: Option<usize>,
+) -> Vec<usize> {
+    let pictures = pictures(messages);
     let mut sums = Vec::with_capacity(messages.len() + 1);
     let mut total = 0;
     sums.push(total);
@@ -2839,7 +2852,10 @@ const KEEP_RESULTS: usize = 5;
 const KEEP_TOKENS: usize = 4_000;
 
 /// Where the old part of `window` ends, for a request over `route`, whose
-/// reasoning sent back counts. Nothing is old until the window, with every
+/// reasoning sent back counts: that of every call the route's model made in
+/// the window, whether or not the request still sends it, since a turn's
+/// goes out only while the turn runs and a cost that fell when one ended
+/// would move the boundary back. Nothing is old until the window, with every
 /// result whole, costs more than four fifths of the budget: each move of the
 /// boundary changes messages already sent, so the prompt cache misses from
 /// the first of them on, and on a provider that caches, sending a few more
@@ -2875,7 +2891,7 @@ fn old_before(window: &[Message], budget: &Budget, route: Option<&Connection>) -
     if budget.squeezed {
         return newest;
     }
-    let sums = token_sums(window, budget.tool_chars, route);
+    let sums = token_sums_from(window, budget.tool_chars, route, None);
     let total = sums[window.len()];
     if total <= budget.tokens / 5 * 4 {
         return 0;
@@ -10646,6 +10662,54 @@ mod tests {
             .map(|m| m["content"].as_str().unwrap().to_owned())
             .collect();
         assert_eq!(cleared(&sent[35..]), 0);
+    }
+
+    #[test]
+    fn the_boundary_does_not_move_back_when_a_turn_ends_on_a_reasoning_route() {
+        // A DeepSeek turn whose reasoning, sent back with every call while
+        // the turn runs, takes the window past four fifths of the budget,
+        // though the results alone would not.
+        let c = Connection {
+            model: "deepseek-reasoner".into(),
+            ..connection()
+        };
+        let budget = Budget::SMALL;
+        let mut messages = reads(12, 1_200);
+        for m in messages.iter_mut().filter(|m| m.role == "assistant") {
+            m.model = c.model.clone();
+            m.reasoning = "Hmm. ".repeat(220);
+        }
+        messages.push(said("assistant", "All read."));
+        let cost = |route: Option<&Connection>| {
+            token_sums(&messages, budget.tool_chars, route)[messages.len()]
+        };
+        assert!(cost(Some(&c)) > budget.tokens / 5 * 4, "{}", cost(Some(&c)));
+        assert!(cost(None) <= budget.tokens / 5 * 4, "{}", cost(None));
+        let old = old_before(&messages, &budget, Some(&c));
+        assert!(old > 0);
+        let request = |messages: &[Message]| {
+            body_with(&c, messages, None, None, &budget, &[])["messages"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        let before = request(&messages);
+        // The user's next prompt ends the turn: the calls' reasoning no
+        // longer goes back, and the window, now lighter, stays where it is.
+        messages.push(said("user", "Now sum them up."));
+        assert_eq!(window_from(&messages, &budget, 0, Some(&c)), 0);
+        assert!(old_before(&messages, &budget, Some(&c)) >= old);
+        // On the wire the results cleared stay cleared: of the messages sent
+        // before, only the calls change, losing their reasoning.
+        let after = request(&messages);
+        for (i, (was, is)) in before.iter().zip(&after).enumerate() {
+            let mut was = was.clone();
+            if was.get("reasoning_content").is_some() {
+                was["reasoning_content"] = "".into();
+            }
+            assert_eq!(was, *is, "{i}");
+        }
+        assert_eq!(after.len(), before.len() + 1);
     }
 
     #[test]
