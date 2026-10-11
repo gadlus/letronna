@@ -2750,10 +2750,12 @@ fn markers_refused(connection: &Connection, sent: &Value, status: u16, error: &s
 /// is answered, the route goes without them for the rest of the run; if it
 /// is turned down the same way, the request was bad for something else and
 /// the markers stay. Only the resend decides: requests beside it keep their
-/// markers meanwhile, and what they get says nothing of them. So each
-/// refusal costs one more request at most, and one that is bad for another
-/// reason neither goes round again nor loses the cache for good. An
-/// overflow is never theirs.
+/// markers meanwhile, and what they get says nothing of them. One of those
+/// marked before another's resend kept them off the route, and turned down
+/// after, goes again without them too, as the route's requests now do. So
+/// each refusal costs one more request at most, and one that is bad for
+/// another reason neither goes round again nor loses the cache for good.
+/// An overflow is never theirs.
 fn markers_suspected(
     connection: &Connection,
     sent: &Value,
@@ -2766,11 +2768,7 @@ fn markers_suspected(
     // Anthropic's own API takes them, so a refusal there that does not name
     // them is the request's own.
     let direct = crate::providers::wire::anthropic::speaks(&connection.endpoint);
-    bad && carries_markers(sent)
-        && !direct
-        && unmarked()
-            .lock()
-            .is_ok_and(|routes| !routes.contains(&route(connection)))
+    bad && carries_markers(sent) && !direct
 }
 
 /// Keep the cache markers off `connection`'s route for the rest of the run
@@ -11491,6 +11489,63 @@ mod tests {
         assert!(beside_body.contains("cache_control"));
         // The resend was turned down too, so the markers were not at fault.
         assert!(marks_cache(&c));
+    }
+
+    #[test]
+    fn a_turn_marked_before_its_route_went_unmarked_and_refused_after_goes_again_too() {
+        let refusal = r#"{"error":{"message":"Invalid request."}}"#;
+        let hello_back =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n";
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let c = Connection {
+            endpoint: format!("http://{}/v1", server.local_addr().unwrap()),
+            model: "anthropic/claude-settled-meanwhile".into(),
+            ..connection()
+        };
+        let (first_over, go_on) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let next = || {
+                let (mut socket, _) = server.accept().unwrap();
+                let body = request_body(&mut socket);
+                (socket, body)
+            };
+            // Both turns' requests are out, marked, before either is answered.
+            let (one, two) = (next(), next());
+            let ((mut first, first_body), (mut second, second_body)) =
+                if one.1.contains("Another turn") {
+                    (two, one)
+                } else {
+                    (one, two)
+                };
+            answer(&mut first, "400 Bad Request", "application/json", refusal);
+            let (mut resend, resend_body) = next();
+            answer(&mut resend, "200 OK", "text/event-stream", hello_back);
+            go_on.recv().unwrap();
+            // The second is turned down only once the first's resend kept
+            // the markers off the route.
+            answer(&mut second, "400 Bad Request", "application/json", refusal);
+            let (mut again, again_body) = next();
+            answer(&mut again, "200 OK", "text/event-stream", hello_back);
+            [first_body, second_body, resend_body, again_body]
+        });
+        let over = |turn: async_channel::Receiver<Event>| loop {
+            if let Event::Finished(result) = turn.recv_blocking().unwrap() {
+                break result;
+            }
+        };
+        let first = start(c.clone(), hello());
+        let second = start(c.clone(), vec![said("user", "Another turn")]);
+        let result = over(first);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!marks_cache(&c));
+        first_over.send(()).unwrap();
+        let result = over(second);
+        assert!(result.is_ok(), "{result:?}");
+        let [first_body, second_body, resend_body, again_body] = worker.join().unwrap();
+        assert!(first_body.contains("cache_control"));
+        assert!(second_body.contains("cache_control"));
+        assert!(!resend_body.contains("cache_control"));
+        assert!(!again_body.contains("cache_control"));
     }
 
     #[test]
