@@ -21,6 +21,7 @@ pub(crate) mod memory;
 pub(crate) mod messages;
 pub(crate) mod messaging;
 pub(crate) mod motion;
+pub(crate) mod pace;
 pub(crate) mod palette;
 pub(crate) mod panel;
 pub(crate) mod pictures;
