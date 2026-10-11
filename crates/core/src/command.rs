@@ -1522,6 +1522,11 @@ fn classify(
         "set-executionpolicy" => Risk::Dangerous("changes which scripts PowerShell will run"),
         "runas" => ADMIN,
         "start" if has("runas") || has("-verb:runas") => ADMIN,
+        // The user's own: answers piped into its prompts could send money,
+        // show a key or loosen the rules the agent pays by.
+        "letronna" if lower.first().is_some_and(|a| a == "wallet") => {
+            Risk::Dangerous("runs the wallet's own commands, which can send money or show its keys")
+        }
         // It starts whatever it names, with arguments this does not read.
         "start" => Risk::Opaque,
         _ if inline => Risk::Opaque,
@@ -3141,6 +3146,17 @@ mod tests {
             Dialect::PowerShell,
             &["echo x >> $env:LOCALAPPDATA\\Letronna\\SOUL.md"],
         );
+        // The wallet's commands are the user's, however they are reached.
+        dangerous(
+            Dialect::Sh,
+            &[
+                "printf '1\\n' | letronna wallet send 100 usdc to 0x1 on base",
+                "echo Main | ~/.local/bin/letronna wallet reveal Main",
+                "letronna wallet limits --per-day 1000",
+            ],
+        );
+        dangerous(Dialect::PowerShell, &["letronna.exe wallet x402 auto"]);
+        assert_eq!(risk(Dialect::Sh, "letronna --version"), Risk::Plain);
     }
 
     #[test]

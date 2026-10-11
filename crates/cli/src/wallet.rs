@@ -8,6 +8,7 @@
 
 use crate::render;
 use letronna_core::wallet::{self, Kind, X402};
+use std::io::IsTerminal;
 
 const HELP: &str = "\
 Your wallet: pay sites that ask to be paid (x402) and send money, within limits you set
@@ -52,7 +53,9 @@ Options
       --dollar             tokens add: the token is worth one US dollar
 
 Keys stay in the system's vault; the agent never sees them. The caps hold
-even when you say yes to a payment; what you send yourself is not counted.";
+even when you say yes to a payment; what you send yourself is not counted.
+A command that sends, shows a key or changes the rules runs only when typed
+at a terminal.";
 
 /// What a verb needs from whoever is at the keyboard.
 pub trait Keyboard {
@@ -114,6 +117,18 @@ pub fn run(words: &[String]) -> i32 {
     ) {
         println!("{HELP}");
         return 0;
+    }
+    // The agent's own shell can run this, with answers piped into the
+    // prompts; so can a script a page talked it into. Only someone at a
+    // terminal sends, shows a key or loosens the rules.
+    if !std::io::stdin().is_terminal() && !reads_only(words) {
+        eprintln!(
+            "{}",
+            render::red(
+                "This wallet command sends money, shows a key or changes the wallet's rules, so it runs only when typed at a terminal. Nothing was done."
+            )
+        );
+        return 1;
     }
     match verb(words, &mut Plain) {
         Ok(text) => {
@@ -308,6 +323,26 @@ pub fn verb(words: &[String], keys: &mut dyn Keyboard) -> Result<String, String>
         other => Err(format!(
             "No wallet command `{other}`. See letronna wallet --help."
         )),
+    }
+}
+
+/// Whether `words` only read the wallet: what it holds, its rules and what
+/// was spent, with nothing asked. Any other verb, a new one included, waits
+/// for a terminal.
+fn reads_only(words: &[String]) -> bool {
+    let Ok((words, flags)) = split_flags(words) else {
+        // Refused by `verb` before it does anything.
+        return true;
+    };
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    match words.as_slice() {
+        ["balance" | "balances", ..] => true,
+        []
+        | ["summary" | "help" | "list" | "history" | "sites" | "chains" | "networks" | "prefer"] => {
+            true
+        }
+        ["limits"] => flags.is_empty(),
+        _ => false,
     }
 }
 
@@ -767,6 +802,53 @@ mod tests {
                 .unwrap_err()
                 .contains("Unknown option")
         );
+    }
+
+    #[test]
+    fn only_reading_runs_without_a_terminal() {
+        for read in [
+            "",
+            "list",
+            "balance Main --chain base",
+            "history",
+            "limits",
+            "sites",
+            "chains",
+            "prefer",
+        ] {
+            assert!(
+                reads_only(&words(
+                    &read
+                        .split(' ')
+                        .filter(|w| !w.is_empty())
+                        .collect::<Vec<_>>()
+                )),
+                "{read}"
+            );
+        }
+        for change in [
+            "send 1 usdc to 0x209693Bc6afc0C5328bA36FaF03C514EF312287C on base",
+            "reveal Main",
+            "import Main",
+            "new",
+            "remove Main",
+            "limits --per-day 100",
+            "x402 auto",
+            "x402",
+            "resume",
+            "pause",
+            "sites allow example.com",
+            "only-saved off",
+            "chains rpc base https://rpc.example",
+            "save shop 0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+            "default Main",
+            "something-new",
+        ] {
+            assert!(
+                !reads_only(&words(&change.split(' ').collect::<Vec<_>>())),
+                "{change}"
+            );
+        }
     }
 
     #[test]
