@@ -488,8 +488,8 @@ pub(crate) fn note_reach(
     asker: &Asker,
 ) {
     // A redirect reqwest followed may have failed somewhere else.
-    let failed_at = failure.and_then(reqwest::Error::url).unwrap_or(url);
-    if !over_the_web(failed_at) {
+    let url = failure.and_then(reqwest::Error::url).unwrap_or(url);
+    if !over_the_web(url) {
         return;
     }
     let Some(e) = failure else {
@@ -500,7 +500,7 @@ pub(crate) fn note_reach(
     // answers says nothing of this computer's network, and its host, named
     // in the stop every session would then be told, would be the server's
     // words outside a fence.
-    if moved || failed_at != url {
+    if moved {
         return;
     }
     if let Some(why) = unconnected(e) {
@@ -2134,23 +2134,23 @@ or <a data-href="/x" href=/top#part>the top</a>.</p>
     }
 
     #[test]
-    fn a_redirect_to_where_nothing_answers_stops_nothing() {
+    fn a_redirect_to_where_nothing_answers_stops_nothing_and_is_named_only_fenced() {
         stand_in_for_the_web();
         let (base, _) = serve(no_page);
         // Followed here, as web_fetch does.
         let why = fetch(&format!("{base}/away"), &[], false).unwrap_err();
         assert!(crate::untrusted::holds_fence(&why), "{why}");
-        assert!(with_unreachable(|last| last.is_none()), "web_fetch's stopped them");
-        // Followed by reqwest, as a search service's are.
+        assert!(with_unreachable(|last| last.is_none()), "it stopped them");
+        // Followed by reqwest, as a search service's are, the failure names
+        // only the address asked for.
         let asked = reqwest::Url::parse(&format!("{base}/away")).unwrap();
-        let following = reqwest::blocking::Client::builder().no_proxy().build().unwrap();
-        let failure = following.get(asked.clone()).send().unwrap_err();
-        note_reach(&asked, Some(&failure), false, &Asker::default());
-        assert!(with_unreachable(|last| last.is_none()), "a search's stopped them");
-        // The same failure at the address asked for does.
-        let asked = failure.url().unwrap().clone();
-        note_reach(&asked, Some(&failure), false, &Asker::default());
-        assert!(with_unreachable(|last| last.is_some()));
+        let following = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let failure = following.get(asked).send().unwrap_err();
+        let why = unanswered("Could not reach it:", &failure, false);
+        assert!(!why.contains("obey-this"), "{why}");
     }
 
     #[test]
