@@ -974,8 +974,9 @@ fn piped_to_head_or_tail(command: &str) -> Option<&str> {
 
 /// `content` with what changes between two runs of the same thing taken
 /// out: dates, clock times, timings, seeds, and ids of seven or more hex
-/// digits, as commits, objects and addresses have. What is left is hashed
-/// whole, so two results that differ anywhere else never count as one.
+/// digits with a letter among them, as commits, objects and addresses have.
+/// What is left is hashed whole, so two results that differ anywhere else
+/// never count as one.
 fn result_shape(content: &str) -> String {
     static CHANGEABLE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         // Spaces are written `\x20`: the verbose mode drops them, in a
@@ -986,7 +987,7 @@ fn result_shape(content: &str) -> String {
             | \b\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\b                                # a clock time
             | \b\d+(?:\.\d+)?\x20?(?:ms|us|µs|ns|secs?|seconds?|mins?|minutes?|s)\b  # a timing
             | (?i:\bseed)[\x20=:]{1,3}\d+\b                                    # a seed
-            | \b(?:0x)?[0-9a-f]{7,}\b                                           # a hex id, with a digit in it
+            | \b(?:0x)?[0-9a-f]{7,}\b                                           # a hex id, with a digit and a letter in it
             ",
         )
         .expect("the pattern is fixed")
@@ -994,8 +995,12 @@ fn result_shape(content: &str) -> String {
     CHANGEABLE
         .replace_all(content, |found: &regex::Captures| {
             let found = &found[0];
-            // A word that happens to be spelled in a to f, as "defaced", is no id.
-            if found.bytes().any(|b| b.is_ascii_digit()) {
+            // A word that happens to be spelled in a to f, as "defaced", is
+            // no id, and nor is a count of seven digits, as a file size or
+            // a line total: only the id's run holds both. Every other kind
+            // matched carries a letter or a sign of its own.
+            let digits = found.bytes().filter(|b| b.is_ascii_digit()).count();
+            if digits > 0 && digits < found.len() {
                 "#".to_owned()
             } else {
                 found.to_owned()
@@ -1694,7 +1699,10 @@ mod tests {
             ("memory", crate::memory::UNASKED.to_owned()),
             ("memory", crate::memory::NOBODY_TO_SAY_YES.to_owned()),
             ("letronna_info", crate::info::WITHHELD.to_owned()),
-            ("wake_me", "`wake_me` is not available in a scheduled run.".into()),
+            (
+                "wake_me",
+                "`wake_me` is not available in a scheduled run.".into(),
+            ),
         ];
         for (name, why) in refusals {
             let mut turn = turn();
@@ -2855,6 +2863,13 @@ mod tests {
             shaped("Using --randomly-seed=5")
         );
         assert_eq!(shaped("at 0x7f3a2b1c4d60"), shaped("at 0x55d1e0a0b2c0"));
+        assert_eq!(shaped("at 0x00001234"), shaped("at 0x00005678"));
+        assert_eq!(shaped("commit 9fceb02"), shaped("commit a1b2c3d"));
+        // A count of seven digits, as a file size, is no id.
+        assert_ne!(
+            shaped("-rw-r--r-- 1 u u 1234567 Oct 11 app.js"),
+            shaped("-rw-r--r-- 1 u u 1381220 Oct 11 app.js")
+        );
         assert_eq!(
             shaped("2026-10-11T09:12:33.123 x"),
             shaped("2026-01-01T00:00:00.9 x")
