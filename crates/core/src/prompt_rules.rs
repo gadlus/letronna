@@ -260,13 +260,15 @@ pub(crate) const TOOLS: [Rule; 26] = [
         text: "After changing code, run the check nearest the change first: the reproduction, if the task gave or you wrote one, and the one existing test file that covers the changed code. One clean run of those is enough unless it fails or the change alters behaviour other modules import; do not re-run a check that already passed unchanged, and once the edit and the check passed do not re-read, diff or re-test what you changed unless asked. Name failures your change did not cause rather than proving them pre-existing; a baseline run or stash is not needed for that. Say done, fixed or passing only when a result you got shows it. A test your change breaks is yours to fix; edit a test only when the task changes what it checks. If a check fails or cannot run here, say so; never invent output or results.",
     },
     // One example in a report is rarely the only way to the bug; and a
-    // report that does not reproduce as given sends a run through the
-    // project's history and guesses at how it was made, where one look for
-    // another way to the same operation settles it.
+    // report that does not reproduce as given sends a run guessing at how
+    // it was made, where one look for another way to the same operation
+    // settles it. The project's history is for a change the report names,
+    // as a regression's does: a ban on it would keep a run from git log
+    // and blame where they are the answer.
     Rule {
         id: "shared-cause",
         to: To::Every,
-        text: "A bug reported through one example usually sits behind other inputs, types or entry points that share the code: fix it at the shared cause. If the behaviour a task reports does not reproduce as described, say so, check once whether the same operation is reached by another path in the project and behaves differently there, and decide from what you find; do not search history or guess at how the report was produced.",
+        text: "A bug reported through one example usually sits behind other inputs, types or entry points that share the code: fix it at the shared cause. If the behaviour a task reports does not reproduce as described, say so, check once whether the same operation is reached by another path in the project and behaves differently there, and decide from what you find rather than guessing at how the report was produced; go through the project's history only for a change the report names.",
     },
     // Left out when calls run one at a time, so the prompt never asks for
     // what the run will not do. Commands and checks by name, as "such as
