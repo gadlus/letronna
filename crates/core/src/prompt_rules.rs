@@ -165,14 +165,14 @@ pub(crate) const TOOLS: [Rule; 26] = [
         to: To::Unwatched,
         text: "Nobody is watching this run and nobody will answer questions: decide for yourself and state any assumption in your answer, not in a deliverable unless the task asks for it there.",
     },
-    // Only where the task came from, what checks it and its answer: a
-    // package installed elsewhere or a config in the home folder is still
-    // read. A run with nobody to ask otherwise hunts the computer and the
-    // network for them, and finds nothing.
+    // Only for what was meant: a package installed elsewhere, a config in
+    // the home folder or a sibling folder's tests are still read. A run
+    // with nobody to ask otherwise hunts the computer and the network for
+    // whoever set the task, and finds nothing.
     Rule {
         id: "scope-of-task",
         to: To::Unwatched,
-        text: "The task text and the project folder are all the task gives: do not search the rest of the computer or the network for where the task came from, what will check it, or its expected answer; decide from the project.",
+        text: "With nobody to ask, the task text and the project folder are what you have: decide from them rather than searching the rest of the computer or the network for what was meant.",
     },
     Rule {
         id: "paths",
@@ -620,10 +620,10 @@ mod tests {
         assert!(tells(&headless(), "scope-of-task"));
         assert!(!tells(&window(), "scope-of-task"));
         // A run that is told the scope row keeps reading packages and its
-        // own config: only the task's origin, checker and answer are out.
+        // own config: only a hunt for what was meant is out.
         let told = told_without(&headless(), &TOOLS, &[]);
         let scope = told
-            .find("The task text and the project folder are all the task gives")
+            .find("With nobody to ask, the task text and the project folder are what you have")
             .unwrap();
         assert!(
             told[..scope].ends_with("unless the task asks for it there. "),
@@ -640,7 +640,7 @@ mod tests {
             Ok(vec!["scope-of-task", "done", "shared-cause", "batch"])
         );
         let without = told_without(&headless(), &TOOLS, &["scope-of-task", "shared-cause"]);
-        assert!(!without.contains("all the task gives"), "{without}");
+        assert!(!without.contains("are what you have"), "{without}");
         assert!(!without.contains("shared cause"), "{without}");
         assert!(
             without.contains("run the check nearest the change first"),
