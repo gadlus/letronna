@@ -229,6 +229,11 @@ fn main() {
         plain_terminal: !args.once(),
     };
     letronna_core::diag::mark("listed");
+    // At the prompt the mode leads the footer, where shift-tab changes it.
+    if runner.plain_terminal {
+        let mode = runner.mode;
+        runner.bar.set_mode(mode);
+    }
     runner.match_voice();
     letronna_core::browser::share_browser(runner.store.settings.browser_shared);
     std::thread::spawn(letronna_core::browser::close_left_over);
