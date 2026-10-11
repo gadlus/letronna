@@ -87,6 +87,23 @@ const REPEATS_STOPPED: usize = 5;
 /// that nothing has happened yet.
 const POLLING: [&str; 4] = ["wait", "read_job", crate::messaging::READ_CHAT, "agents"];
 
+/// The variable setting how many rounds a run nobody watches may go without
+/// changing the project before it is asked where it stands; 0 never asks.
+pub const PROGRESS_NOTE_ROUNDS: &str = "LETRONNA_PROGRESS_NOTE_ROUNDS";
+
+/// Rounds without a change to the project before that note, unless the
+/// variable says otherwise: room for a real investigation, well under what
+/// a model that has lost its thread spends before it edits.
+const PROGRESS_EVERY: usize = 12;
+
+/// Notes a turn gets asking where it stands: by a third the model has heard
+/// it, and the third says to finish if it cannot name a next step.
+const PROGRESS_NOTES: usize = 3;
+
+/// How that note opens, after the rounds it counts; the rest asks for the
+/// state of play in a line and never says to make a change.
+const TAKING_STOCK: &str = "rounds since the last change to the project.";
+
 /// Rounds in a row one tool fails, whatever its arguments, before the model
 /// is told to change approach: one miss can be a slip, a second is a habit.
 const FAILURES_NOTED: usize = 2;
@@ -207,6 +224,17 @@ pub struct Turn {
     unattended: bool,
     /// Why an unattended turn stopped going round in circles.
     looped: Option<String>,
+    /// Rounds an unattended turn has gone since a call last changed the
+    /// project: only an edit that went through starts it again, never a
+    /// command, since an experiment a round is what a lost thread looks like.
+    rounds_since_edit: usize,
+    /// Rounds without a change before the turn is asked where it stands.
+    progress_every: usize,
+    /// Notes sent this turn asking that.
+    progress_notes: usize,
+    /// The round the last of them went in, so a round that begins nothing,
+    /// as the one at the cap does, is not asked again.
+    noted_round: usize,
     /// The settings turn parallel tool calls off, so no batch holds more
     /// than one.
     one_at_a_time: bool,
@@ -236,6 +264,10 @@ impl Turn {
             failures: HashMap::new(),
             failure_notes: 0,
             looped: None,
+            rounds_since_edit: 0,
+            progress_every: progress_every(std::env::var(PROGRESS_NOTE_ROUNDS).ok().as_deref()),
+            progress_notes: 0,
+            noted_round: 0,
             one_at_a_time: !crate::store::parallel_tool_calls(),
         }
     }
@@ -490,6 +522,9 @@ impl Turn {
             return true;
         }
         self.rounds += 1;
+        if self.unattended {
+            self.rounds_since_edit += 1;
+        }
         self.asked_again = false;
         true
     }
@@ -608,7 +643,42 @@ impl Turn {
             }
         } else if changes_code(result) {
             self.edited = true;
+            self.rounds_since_edit = 0;
         }
+    }
+
+    /// The note asking an unattended turn where it stands, due once it has
+    /// gone `progress_every` rounds, or a multiple, without changing the
+    /// project; `PROGRESS_NOTES` a turn at most, and the last says to finish
+    /// if no next step can be named. It goes on the end of the round's last
+    /// result, so every byte sent before it is as the provider cached it.
+    fn progress_note(&mut self) -> Option<String> {
+        let since = self.rounds_since_edit;
+        let due = self.progress_every > 0 && since > 0 && since.is_multiple_of(self.progress_every);
+        if !due || self.progress_notes >= PROGRESS_NOTES || self.noted_round == self.rounds {
+            return None;
+        }
+        self.progress_notes += 1;
+        self.noted_round = self.rounds;
+        let mut note = format!(
+            "\n\n[{since} {TAKING_STOCK} In one line: what you have established, your current \
+             hypothesis, and the next concrete step. 'Keep reading X because Y' is a fine \
+             answer; if no change is needed, finish with what you found."
+        );
+        if self.progress_notes == PROGRESS_NOTES {
+            note.push_str(
+                " If you cannot name a next step, finish now with what you found and what \
+                 blocks it.",
+            );
+        }
+        // As the batching rule says, and so left out where calls run one at a time.
+        if !self.one_at_a_time {
+            note.push_str(
+                " If you have several independent checks to run, send them in one reply.",
+            );
+        }
+        note.push(']');
+        Some(note)
     }
 
     /// How many times this turn the call has now come back with this result;
@@ -693,6 +763,16 @@ impl Turn {
                 .position(|id| *id == result.tool_call_id)
                 .unwrap_or(usize::MAX)
         });
+        // On the last result, after the order is settled, so the earlier
+        // ones go out as they would have without it.
+        if let Some(last) = results
+            .iter_mut()
+            .rev()
+            .find(|result| result.role == "tool")
+            && let Some(note) = self.progress_note()
+        {
+            last.content.push_str(&note);
+        }
         results
     }
 
@@ -799,10 +879,65 @@ fn checks(result: &Message, workspace: Option<&std::path::Path>) -> bool {
     crate::command::assess(line, dialect, workspace).risk != crate::command::Risk::ReadOnly
 }
 
+/// Rounds without a change to the project before a turn is asked where it
+/// stands, as `setting`, the variable's value, gives it: a number, 0 for
+/// never; unset or not a number, `PROGRESS_EVERY`.
+fn progress_every(setting: Option<&str>) -> usize {
+    setting
+        .and_then(|given| given.trim().parse().ok())
+        .unwrap_or(PROGRESS_EVERY)
+}
+
 /// Whether a tool's result is an edit that went through to more than notes,
 /// the kind a build or test would check.
 pub(crate) fn changes_code(result: &Message) -> bool {
     !result.is_error && EDITS.contains(&result.name.as_str()) && !only_notes(result)
+}
+
+/// What a run's own messages show of how it went: the round its first
+/// change to the project came in, how many rounds followed its last, and
+/// the notes it was sent asking where it stood.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Progress {
+    pub first_edit_round: Option<usize>,
+    pub rounds_after_last_edit: Option<usize>,
+    pub notes: usize,
+}
+
+/// The progress `messages`, a run's own, show: a round is a reply that
+/// made calls, and a change is a result `changes_code` says went through.
+pub fn progress(messages: &[Message]) -> Progress {
+    let mut rounds = 0;
+    let mut progress = Progress::default();
+    let mut last_edit = None;
+    for message in messages {
+        if message.role == "assistant" && !message.tool_calls.is_empty() {
+            rounds += 1;
+        }
+        if message.role != "tool" {
+            continue;
+        }
+        if changes_code(message) {
+            progress.first_edit_round.get_or_insert(rounds);
+            last_edit = Some(rounds);
+        }
+        if carries_progress_note(&message.content) {
+            progress.notes += 1;
+        }
+    }
+    progress.rounds_after_last_edit = last_edit.map(|at| rounds - at);
+    progress
+}
+
+/// Whether a result ends with the note asking where the turn stands: a
+/// bracketed note after it, opening with the rounds it counted.
+fn carries_progress_note(content: &str) -> bool {
+    let Some(at) = content.rfind("\n\n[") else {
+        return false;
+    };
+    let note = &content[at + 3..];
+    let counted = note.trim_start_matches(|c: char| c.is_ascii_digit());
+    counted.len() < note.len() && counted.starts_with(&format!(" {TAKING_STOCK}"))
 }
 
 /// Whether every file an edit names is a note, such as a report, rather
@@ -1286,6 +1421,257 @@ mod tests {
         let not_run = "Not run: stopped before it started.";
         assert_eq!(answers, [not_run, not_run]);
         assert!(kept.iter().all(|m| m.is_error));
+    }
+
+    /// A turn nobody watches, asked where it stands every `every` rounds
+    /// without a change.
+    fn unattended_every(every: usize) -> Turn {
+        Turn {
+            progress_every: every,
+            ..Turn::with_limit(turn().connection, 100).unattended()
+        }
+    }
+
+    /// A round of one read, of a file not read before so that it is no
+    /// repeat, giving what the model was sent back.
+    fn read_round(turn: &mut Turn) -> String {
+        let mut read = call("read_file");
+        read.arguments = format!(r#"{{"path": "f{}.rs"}}"#, turn.rounds + 1);
+        repeat(turn, &read, "contents", 1).remove(0)
+    }
+
+    /// The rounds, of `rounds` reads in a row, whose result carried the note
+    /// asking where the turn stands.
+    fn noted_rounds(turn: &mut Turn, rounds: usize) -> Vec<usize> {
+        (1..=rounds)
+            .filter(|_| read_round(turn).contains(TAKING_STOCK))
+            .collect()
+    }
+
+    #[test]
+    fn a_run_that_reads_for_twelve_rounds_is_asked_where_it_stands_three_times() {
+        let mut turn = unattended_every(12);
+        let mut sent = Vec::new();
+        for _ in 0..48 {
+            sent.push(read_round(&mut turn));
+        }
+        let noted: Vec<usize> = (1..=48).filter(|r| sent[r - 1] != "contents").collect();
+        assert_eq!(noted, [12, 24, 36]);
+        assert_eq!(
+            sent[11],
+            "contents\n\n[12 rounds since the last change to the project. In one line: what \
+             you have established, your current hypothesis, and the next concrete step. \
+             'Keep reading X because Y' is a fine answer; if no change is needed, finish \
+             with what you found. If you have several independent checks to run, send \
+             them in one reply.]"
+        );
+        assert!(sent[23].starts_with("contents\n\n[24 rounds since"));
+        assert!(!sent[23].contains("finish now"));
+        // The third says to finish when no step can be named, and is the last.
+        assert!(sent[35].starts_with("contents\n\n[36 rounds since"));
+        assert!(sent[35].contains(
+            "If you cannot name a next step, finish now with what you found and what blocks it."
+        ));
+        // Where calls run one at a time nothing asks for several in one reply.
+        let mut one_at_a_time = Turn {
+            one_at_a_time: true,
+            ..unattended_every(1)
+        };
+        let sent = read_round(&mut one_at_a_time);
+        assert!(sent.ends_with("finish with what you found.]"), "{sent}");
+    }
+
+    #[test]
+    fn an_edit_starts_the_count_again_and_a_command_does_not() {
+        let mut turn = unattended_every(12);
+        assert!(noted_rounds(&mut turn, 7).is_empty());
+        made(&mut turn, "edit_file", edit("fn a()"), Ok("Edited a.rs."));
+        // Round 8 changed the project: 12 more rounds pass before a note.
+        let noted: Vec<usize> = noted_rounds(&mut turn, 13)
+            .into_iter()
+            .map(|r| r + 8)
+            .collect();
+        assert_eq!(noted, [20]);
+
+        // An experiment that ran clean is no change to the project, nor is a
+        // write of notes or an edit that failed.
+        let mut turn = unattended_every(12);
+        assert!(noted_rounds(&mut turn, 5).is_empty());
+        let experiment = serde_json::json!({ "command": "python -c 'import m; print(m.f())'" });
+        made(&mut turn, "run_command", experiment, Ok("3"));
+        let report = serde_json::json!({ "path": "NOTES.md", "content": "# So far" });
+        made(&mut turn, "write_file", report, Ok("Wrote NOTES.md"));
+        made(&mut turn, "edit_file", edit("fn b()"), Err(MISSED));
+        let noted: Vec<usize> = noted_rounds(&mut turn, 5)
+            .into_iter()
+            .map(|r| r + 8)
+            .collect();
+        assert_eq!(noted, [12]);
+        // A later edit starts the count again, not the three notes.
+        let mut turn = unattended_every(2);
+        assert_eq!(noted_rounds(&mut turn, 4), [2, 4]);
+        made(&mut turn, "edit_file", edit("fn c()"), Ok("Edited a.rs."));
+        let noted: Vec<usize> = noted_rounds(&mut turn, 6)
+            .into_iter()
+            .map(|r| r + 5)
+            .collect();
+        assert_eq!(noted, [7]);
+    }
+
+    #[test]
+    fn a_watched_turn_or_a_setting_of_zero_is_never_asked_where_it_stands() {
+        let mut watched = Turn {
+            progress_every: 2,
+            ..turn()
+        };
+        assert!(noted_rounds(&mut watched, 10).is_empty());
+        let mut off = unattended_every(0);
+        assert!(noted_rounds(&mut off, 10).is_empty());
+        // The variable sets it; what is not a number leaves the default.
+        assert_eq!(progress_every(None), 12);
+        assert_eq!(progress_every(Some(" 15 ")), 15);
+        assert_eq!(progress_every(Some("0")), 0);
+        assert_eq!(progress_every(Some("many")), 12);
+    }
+
+    #[test]
+    fn the_note_goes_on_the_last_result_and_the_bytes_before_it_do_not_move() {
+        let mut turn = unattended_every(3);
+        let connection = turn.connection.clone();
+        let mut messages = vec![Message {
+            role: "user".into(),
+            content: "find the bug".into(),
+            ..Default::default()
+        }];
+        let mut bodies = Vec::new();
+        for round in 1..=3 {
+            let calls = vec![
+                ToolCall {
+                    id: format!("a{round}"),
+                    arguments: format!(r#"{{"path": "a{round}.rs"}}"#),
+                    ..call("read_file")
+                },
+                ToolCall {
+                    id: format!("b{round}"),
+                    arguments: format!(r#"{{"path": "b{round}.rs"}}"#),
+                    ..call("read_file")
+                },
+            ];
+            messages.push(Message {
+                role: "assistant".into(),
+                tool_calls: calls.clone(),
+                ..Default::default()
+            });
+            turn.begin(calls);
+            // Finished out of order, as threads do.
+            turn.finish_id(&format!("b{round}"), Ok("b".into()));
+            turn.finish_id(&format!("a{round}"), Ok("a".into()));
+            messages.extend(turn.take_results());
+            bodies.push(crate::chat::body(&connection, &messages, None, None));
+        }
+        let results = &messages[messages.len() - 2..];
+        assert_eq!(results[0].content, "a");
+        assert!(results[1].content.starts_with("b\n\n[3 rounds since"));
+        // The request with the note holds the one before it byte for byte,
+        // but for the messages the new round added.
+        let (before, with) = (&bodies[1], &bodies[2]);
+        let earlier = before["messages"].as_array().unwrap();
+        let later = with["messages"].as_array().unwrap();
+        assert_eq!(later.len(), earlier.len() + 3);
+        for (i, message) in earlier.iter().enumerate() {
+            assert_eq!(message.to_string(), later[i].to_string(), "message {i}");
+        }
+        let mut rest = with.clone();
+        rest["messages"] = serde_json::Value::Null;
+        let mut rest_before = before.clone();
+        rest_before["messages"] = serde_json::Value::Null;
+        assert_eq!(rest.to_string(), rest_before.to_string());
+    }
+
+    #[test]
+    fn a_rounds_messages_say_when_it_first_edited_and_how_it_went_on() {
+        let round = |i: usize, name: &str, args: &str, is_error: bool, content: &str| {
+            [
+                Message {
+                    role: "assistant".into(),
+                    tool_calls: vec![ToolCall {
+                        id: format!("c{i}"),
+                        name: name.into(),
+                        arguments: args.into(),
+                    }],
+                    ..Default::default()
+                },
+                Message {
+                    role: "tool".into(),
+                    tool_call_id: format!("c{i}"),
+                    name: name.into(),
+                    args: args.into(),
+                    content: content.into(),
+                    is_error,
+                    ..Default::default()
+                },
+            ]
+        };
+        let edit = r#"{"path": "a.rs", "old": "a", "new": "b"}"#;
+        let notes = r#"{"path": "NOTES.md", "content": "so far"}"#;
+        let mut run = vec![Message {
+            role: "user".into(),
+            content: "fix it".into(),
+            ..Default::default()
+        }];
+        run.extend(round(1, "read_file", "{}", false, "fn a() {}"));
+        run.extend(round(2, "edit_file", edit, true, MISSED));
+        run.extend(round(3, "write_file", notes, false, "Wrote NOTES.md"));
+        assert_eq!(
+            progress(&run),
+            Progress {
+                first_edit_round: None,
+                rounds_after_last_edit: None,
+                notes: 0,
+            }
+        );
+        let noted = format!("contents\n\n[12 {TAKING_STOCK} In one line: ...]");
+        run.extend(round(4, "read_file", "{}", false, &noted));
+        run.extend(round(5, "edit_file", edit, false, "Edited a.rs."));
+        run.extend(round(
+            6,
+            "run_command",
+            r#"{"command": "cargo test"}"#,
+            false,
+            "ok",
+        ));
+        run.extend(round(7, "edit_file", edit, false, "Edited a.rs."));
+        run.extend(round(
+            8,
+            "run_command",
+            r#"{"command": "cargo test"}"#,
+            false,
+            "ok",
+        ));
+        run.extend(round(9, "read_file", "{}", false, "fn b() {}"));
+        run.push(Message {
+            role: "assistant".into(),
+            content: "Done.".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            progress(&run),
+            Progress {
+                first_edit_round: Some(5),
+                rounds_after_last_edit: Some(2),
+                notes: 1,
+            }
+        );
+        // A result that happens to hold the words is not a note.
+        assert!(!carries_progress_note(
+            "12 rounds since the last change to the project."
+        ));
+        assert!(!carries_progress_note(
+            "x\n\n[rounds since the last change to the project.]"
+        ));
+        assert!(carries_progress_note(
+            "x\n\n[You made this call 3 times.]\n\n[24 rounds since the last change to the project. In one line.]"
+        ));
     }
 
     #[test]

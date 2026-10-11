@@ -45,7 +45,7 @@ use letronna_core::driver::{self, Allow, Outcome, Report, Spec, Status};
 use letronna_core::gate::Mode;
 use letronna_core::store::Transcript;
 use letronna_core::{
-    crew, hooks, inbox, prompt_rules, store, structured, tools, update, usage, worktree,
+    agent, crew, hooks, inbox, prompt_rules, store, structured, tools, update, usage, worktree,
 };
 use serde_json::{Value, json};
 use session::Runner;
@@ -1134,6 +1134,9 @@ fn as_json(report: &Report, extras: Option<&Extras>) -> Value {
         out["cost_usd"] = extras.cost.into();
         out["refused"] = extras.refused.into();
         out["prompt"] = extras.prompt.clone();
+        out["progress_notes"] = extras.progress.notes.into();
+        out["first_edit_round"] = extras.progress.first_edit_round.into();
+        out["rounds_after_last_edit"] = extras.progress.rounds_after_last_edit.into();
     }
     if let Some(value) = &report.value {
         out["value"] = value.clone();
@@ -1157,6 +1160,9 @@ struct Extras {
     refused: usize,
     /// The prompt rules left out of the run and a hash of those told.
     prompt: Value,
+    /// When the run first changed the project, how long it went on after
+    /// its last change, and how often it was asked where it stood.
+    progress: agent::Progress,
 }
 
 impl Extras {
@@ -1180,6 +1186,7 @@ impl Extras {
             cost: cost(own),
             refused: own.iter().filter(|message| refused(message)).count(),
             prompt,
+            progress: agent::progress(own),
         }
     }
 }
@@ -1601,6 +1608,11 @@ mod tests {
             cost: Some(0.25),
             refused: 2,
             prompt: json!({"dropped": ["compute"], "rules_sha": "0123456789ab"}),
+            progress: agent::Progress {
+                first_edit_round: Some(4),
+                rounds_after_last_edit: Some(3),
+                notes: 1,
+            },
         };
         let out = as_json(&report(Outcome::Done), Some(&extras));
         assert_eq!(
@@ -1637,6 +1649,27 @@ mod tests {
         extras.cost = None;
         let out = as_json(&report(Outcome::Done), Some(&extras));
         assert_eq!(out.get("cost_usd"), Some(&Value::Null));
+        // How the run went: when it first changed the project, how long it
+        // went on after its last change, and the notes asking where it stood.
+        assert_eq!(
+            (
+                &out["progress_notes"],
+                &out["first_edit_round"],
+                &out["rounds_after_last_edit"]
+            ),
+            (&json!(1), &json!(4), &json!(3))
+        );
+        // A run that changed nothing says so, rather than leaving them out.
+        extras.progress = agent::Progress::default();
+        let out = as_json(&report(Outcome::Done), Some(&extras));
+        assert_eq!(out["first_edit_round"], Value::Null);
+        assert_eq!(out["rounds_after_last_edit"], Value::Null);
+        assert_eq!(out["progress_notes"], 0);
+        assert!(
+            as_json(&report(Outcome::Done), None)
+                .get("progress_notes")
+                .is_none()
+        );
     }
 
     #[test]
