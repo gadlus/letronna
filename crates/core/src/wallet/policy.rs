@@ -6,7 +6,8 @@
 //! rounded up to a cent, which would let a day's cap run out ten times too
 //! soon. A token worth a dollar counts as it is; a native coin at a spot
 //! price fetched from Coinbase and kept five minutes; anything else has no
-//! known value, and nothing without one is paid automatically.
+//! known value, and nothing without one is paid or sent by the agent, as
+//! it could not be held to the caps.
 //!
 //! Every payment the agent makes is written to the ledger as pending before
 //! anything is signed, under the file's lock, after the caps are checked
@@ -225,17 +226,16 @@ pub(crate) fn reserve(policy: &Policy, entry: Entry) -> Result<(), String> {
     crate::state::update::<Vec<Entry>>(&path, |disk| {
         let mut entries: Vec<Entry> = serde_json::from_value(disk.clone()).unwrap_or_default();
         if entry.kind != Kind::Own {
-            let usd = match (entry.usd, entry.kind) {
-                (Some(usd), _) => usd,
-                // A send's worth unknown, the user saw its amount on the card.
-                (None, Kind::Send) => 0,
-                (None, _) => {
-                    refused = Some(format!(
-                        "What {} {} is worth in dollars is not known, so it cannot be held to the limits.",
-                        entry.amount, entry.token
-                    ));
-                    return;
-                }
+            let Some(usd) = entry.usd else {
+                let yourself = match entry.kind {
+                    Kind::Send => " The user can send it themselves with `letronna wallet send`.",
+                    _ => "",
+                };
+                refused = Some(format!(
+                    "What {} {} is worth in dollars is not known, so it cannot be held to the limits.{yourself}",
+                    entry.amount, entry.token
+                ));
+                return;
             };
             if let Err(why) = room(policy, spent(&entries, entry.at), usd) {
                 refused = Some(why);
@@ -485,6 +485,9 @@ mod tests {
         // A payment of no known worth is refused, the user's own goes through.
         let unknown = reserve(&policy, entry("u", now, None, Kind::X402)).unwrap_err();
         assert!(unknown.contains("not known"));
+        // Nor is a send counted as nothing when its worth is unknown.
+        let unknown = reserve(&policy, entry("v", now, None, Kind::Send)).unwrap_err();
+        assert!(unknown.contains("send it themselves"), "{unknown}");
         assert!(reserve(&policy, entry("own", now, Some(9 * DOLLAR), Kind::Own)).is_ok());
         // A failed one stops counting: whichever ten got in, the first.
         let first = ledger()[0].id.clone();

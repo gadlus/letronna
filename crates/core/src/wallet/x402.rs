@@ -33,6 +33,9 @@ const QUOTE_TIME: Duration = Duration::from_secs(10 * 60);
 const CLOCK_SLACK: u64 = 600;
 /// The shortest an authorization is valid for, whatever the site asked.
 const MIN_VALID: u64 = 60;
+/// The longest: a site settles a payment within seconds of getting it, and
+/// one that asked for years could hold a signed payment to spend later.
+const MAX_VALID: u64 = 60 * 60;
 
 /// What a site asked to be paid.
 #[derive(Clone, Debug, PartialEq)]
@@ -234,7 +237,7 @@ pub(crate) fn pay(plan: &Plan) -> Result<(&'static str, String), String> {
                 to: super::keys::evm_bytes(&plan.pay_to)?,
                 value: plan.amount,
                 valid_after: now.saturating_sub(CLOCK_SLACK),
-                valid_before: now + timeout.max(MIN_VALID),
+                valid_before: now + timeout.clamp(MIN_VALID, MAX_VALID),
                 nonce: super::random::<32>()?,
             };
             let signature = super::evm::authorize(
@@ -865,6 +868,28 @@ mod tests {
         );
         assert_eq!(remembered(&dear).unwrap().usd, Some(500_000));
         assert_eq!(policy::ledger().len(), 1);
+        // Said yes to the cent its card showed, the page cannot take fifty
+        // though the model's own most was a dollar.
+        let cent = Quote {
+            version: 2,
+            resource: Value::Null,
+            accepts: vec![offer()],
+            error: String::new(),
+        };
+        let cent = choose(&cent, &super::super::load(), "127.0.0.1", false).unwrap();
+        let dearer = site("500000");
+        remember(&dearer, &cent);
+        let approved = crate::tools::ToolContext {
+            approved: true,
+            ..Default::default()
+        };
+        let args = json!({"url": dearer, "max_usd": "1"});
+        let why = crate::tools::Tool::run(&super::super::PaidFetch, &args, &approved).unwrap_err();
+        assert!(
+            why.contains("more than the $0.01 the user said yes to"),
+            "{why}"
+        );
+        assert_eq!(policy::ledger().len(), 1);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
@@ -896,6 +921,37 @@ mod tests {
             signed_under(&value, "Global Dollar", "1", 4663, usdg),
             Some(made.evm)
         );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_payment_is_signed_good_for_an_hour_at_most_whatever_the_site_asks() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = Scratch::new("wallet-x402-valid");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        super::super::import("Main", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", 0).unwrap();
+        super::super::change(|wallet| {
+            wallet.policy.testnets = true;
+            Ok(())
+        })
+        .unwrap();
+        let mut offer = offer();
+        offer["maxTimeoutSeconds"] = u64::MAX.into();
+        let quote = Quote {
+            version: 2,
+            resource: Value::Null,
+            accepts: vec![offer],
+            error: String::new(),
+        };
+        let plan = choose(&quote, &super::super::load(), "x.dev", false).unwrap();
+        let (_, value) = pay(&plan).unwrap();
+        let body: Value = serde_json::from_slice(&STANDARD.decode(value).unwrap()).unwrap();
+        let before: u64 = body["payload"]["authorization"]["validBefore"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(before <= crate::chat::now() + MAX_VALID);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
