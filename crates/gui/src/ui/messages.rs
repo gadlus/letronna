@@ -1802,21 +1802,6 @@ impl Chat {
         let no_project = self.store.conversations[self.store.active]
             .workspace
             .is_none();
-        // The window's two ways to find the rest, with their keys as this
-        // computer writes them.
-        let hints = [
-            (&crate::ui::palette::OpenPalette as &dyn Action, "commands"),
-            (&ShowKeys, "keys"),
-        ]
-        .map(|(action, what)| {
-            crate::ui::keys::bound_key(action, cx)
-                .map(|key| SharedString::from(format!("{} {what}", Kbd::format(&key))))
-        });
-        let hint = |hints: Vec<SharedString>| {
-            h_flex()
-                .gap_x_4()
-                .children(hints.into_iter().map(|hint| div().child(hint)))
-        };
         let page = v_flex()
             .w_full()
             // At least the pane's height, so it is centred there, and taller
@@ -1855,26 +1840,6 @@ impl Chat {
                 )
             })
             .children(self.recent_places(window, cx))
-            .child(
-                // In two groups, so a narrow pane breaks between them.
-                h_flex()
-                    .mt_6()
-                    .max_w_full()
-                    .px_6()
-                    .flex_wrap()
-                    .justify_center()
-                    .gap_x_4()
-                    .gap_y_1()
-                    .text_xs()
-                    // Plain muted, not faded: faded it read under 4.5:1.
-                    .text_color(cx.theme().muted_foreground)
-                    .child(hint(
-                        ["Enter to send", "Shift+Enter for a new line", "Esc to stop"]
-                            .map(SharedString::from)
-                            .to_vec(),
-                    ))
-                    .child(hint(hints.into_iter().flatten().collect())),
-            )
             // A side question asked before anything else still needs somewhere to show.
             .children(
                 self.aside_row(self.store.conversations[self.store.active].id, window, cx)
@@ -1893,9 +1858,9 @@ impl Chat {
     /// under a new session's greeting, or nothing when there are none. Each
     /// row is a tab stop that Enter opens, as a click does.
     fn recent_places(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
-        // Rows in each list: enough to go back to what was open this week,
-        // few enough that the greeting stays the middle of the page.
-        const RECENT: usize = 4;
+        // Rows in each list: enough to go back to what was open lately, few
+        // enough that the wordmark stays the one thing the page is about.
+        const RECENT: usize = 3;
         let here = &self.store.conversations[self.store.active];
         let now = backend::now();
         let mut by_age: Vec<&Conversation> = (self.store.conversations.iter())
@@ -1961,14 +1926,16 @@ impl Chat {
                         .text_xs()
                         .font_family(HEADING_FONT)
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(cx.theme().muted_foreground)
+                        .text_color(cx.theme().muted_foreground.opacity(0.7))
                         .child(title),
                 )
                 .children(rows)
         };
+        // Quiet, and well below the wordmark: there to go back to, not to
+        // compete with it.
         Some(
             h_flex()
-                .mt_6()
+                .mt_12()
                 .max_w_full()
                 .px_6()
                 .flex_wrap()
@@ -2021,7 +1988,8 @@ impl Chat {
             .border_1()
             .border_color(theme.transparent)
             .cursor_pointer()
-            .text_sm()
+            .text_xs()
+            .text_color(theme.muted_foreground)
             .focus(|s| s.border_color(theme.ring))
             .active(|s| s.bg(theme.secondary.opacity(0.5)))
             .child(
@@ -2041,8 +2009,7 @@ impl Chat {
                 div()
                     .when(wide_detail, |this| this.flex_1().min_w_0().truncate())
                     .flex_shrink_0()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
+                    .text_color(theme.muted_foreground.opacity(0.6))
                     .child(detail),
             )
             .on_click(cx.listener(move |this, _, window, cx| open(this, window, cx)))
