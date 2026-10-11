@@ -49,3 +49,19 @@ Keys are saved in the system's vault: macOS Keychain or Windows Credential Manag
 ## Browser sign-in
 
 A provider signed in to in the browser describes its OAuth sign-in as data, a `static` `OAuthSpec` (`providers/auth/`): its authorize and token URLs, client id, scopes, the loopback port and path the browser comes back to, any extra authorize parameters, whether the token endpoint takes JSON or a form, PKCE, and where the account id and plan are in the id token. Return `AuthKind::OAuth(&SPEC)` and nothing else is needed: `providers::auth` opens the browser, waits on the loopback (or takes the address or `code#state` pasted back), trades the code for tokens, keeps them in the vault under `provider:<name>`, and refreshes the access token shortly before it ends or once when it is refused. `providers/chatgpt/` is the example.
+
+## Local endpoint
+
+Settings › Accounts › Local endpoint serves the connected accounts as an
+OpenAI-compatible API at `http://127.0.0.1:8642/v1` (`local_port` in
+settings.json picks another port). It is off until turned on, listens on
+127.0.0.1 only, and refuses any request without
+`Authorization: Bearer <token>`; the token is made on this machine, kept in
+the system vault, and copied from the same page.
+
+- `GET /v1/models` lists every connected account's models.
+- `POST /v1/chat/completions` takes `model`, `messages` and `stream`, and
+  sends through the router, so a rate-limited account hands the request to
+  the next one as a session's would. Tools are not passed through.
+
+The code is `crates/core/src/providers/local.rs`.

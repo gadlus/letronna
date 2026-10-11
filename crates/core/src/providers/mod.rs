@@ -12,6 +12,7 @@
 //! all refer to it that way, so a name never changes once shipped.
 
 pub mod auth;
+pub mod local;
 pub mod router;
 pub mod wire;
 

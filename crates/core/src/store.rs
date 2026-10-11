@@ -488,6 +488,13 @@ pub struct Settings {
     /// out follow in their usual order; see `providers::router`.
     #[serde(default)]
     pub provider_order: Vec<String>,
+    /// Serve the connected accounts on 127.0.0.1 as an OpenAI-compatible
+    /// endpoint; see `providers::local`. Off unless turned on.
+    #[serde(default)]
+    pub local_endpoint: bool,
+    /// The port it listens on; 0 for `providers::local::DEFAULT_PORT`.
+    #[serde(default)]
+    pub local_port: u16,
     /// The sidebar's list narrowed to one state: "needs_you", "working",
     /// "unseen" or "pinned"; empty for no filter.
     #[serde(default)]
@@ -566,6 +573,8 @@ impl Default for Settings {
             keys_in: String::new(),
             fallbacks: Vec::new(),
             provider_order: Vec::new(),
+            local_endpoint: false,
+            local_port: 0,
             memory_review: false,
             memory_saving: crate::memory::Saving::WhenAsked,
             memory_scope: crate::memory::Scope::Auto,

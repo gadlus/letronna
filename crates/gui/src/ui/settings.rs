@@ -855,6 +855,7 @@ impl Chat {
                 &chat,
                 cx,
             ))
+            .child(local_endpoint(&self.store.settings, &chat, cx))
             .into_any_element(),
         };
         keeps_keys(div(), &self.settings_focus)
@@ -2845,6 +2846,69 @@ fn tier_order(order: Vec<letronna_core::providers::Tier>, chat: &Entity<Chat>, c
         );
     }
     section.child(list)
+}
+
+/// The switch for the endpoint other tools reach these accounts on, and,
+/// while it is on, its address and token to copy.
+fn local_endpoint(settings: &letronna_core::store::Settings, chat: &Entity<Chat>, cx: &App) -> Div {
+    use letronna_core::providers::local;
+    let on = settings.local_endpoint;
+    let port = match settings.local_port {
+        0 => local::DEFAULT_PORT,
+        port => port,
+    };
+    let section = v_flex().gap_2().child(heading(
+        "Local endpoint",
+        "Other tools on this computer can use these accounts through an OpenAI-compatible API. It listens on 127.0.0.1 only and needs the token below.",
+        cx,
+    ));
+    let section = section.child(toggle_row(
+        "local-endpoint",
+        "Serve these accounts on this computer",
+        "Off by default. Set local_port in settings.json to use another port.",
+        on,
+        chat,
+        cx,
+        std::rc::Rc::new(move |this: &mut Chat| this.store.settings.local_endpoint = !on),
+    ));
+    if !on {
+        return section;
+    }
+    let address = format!("http://127.0.0.1:{port}/v1");
+    let row = |id: &'static str, label: &'static str, shown: String, copy: String| {
+        h_flex()
+            .gap_3()
+            .items_center()
+            .child(
+                div()
+                    .w(px(64.))
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(label),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .font_family("monospace")
+                    .child(shown),
+            )
+            .child(Button::new(id).framed(cx).xsmall().label("Copy").on_click(
+                move |_, window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                    window.push_notification(
+                        gpui_component::notification::Notification::success("Copied."),
+                        cx,
+                    );
+                },
+            ))
+    };
+    let token = local::token();
+    let hidden = format!("{}…", &token[..token.len().min(8)]);
+    section
+        .child(row("local-address", "Address", address.clone(), address))
+        .child(row("local-token", "Token", hidden, token))
 }
 
 fn gateway_page(

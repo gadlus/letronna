@@ -1222,6 +1222,9 @@ impl Chat {
     }
 
     pub(crate) fn save(&mut self) {
+        if let Err(error) = letronna_core::providers::local::apply(&self.store.settings) {
+            self.error = Some(error);
+        }
         if let Err(error) = self.store.save() {
             letronna_core::diag::event(
                 "save_failed",
