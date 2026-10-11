@@ -121,9 +121,9 @@ pub(crate) const PROSE: [Rule; 1] = [Rule {
 /// The rules after what the tools are for, in order: what to leave alone;
 /// how calls are approved or, in a run nobody watches, what it is told in
 /// place of approvals and `ask_user`, neither of which it has; then checking
-/// the work, making calls, ending a turn, where facts come from, where to
-/// look first and the steps to ask about first.
-pub(crate) const TOOLS: [Rule; 24] = [
+/// the work, where a reported bug sits, making calls, ending a turn, where
+/// facts come from, where to look first and the steps to ask about first.
+pub(crate) const TOOLS: [Rule; 26] = [
     // Undoing what the user changed is the git rule's. New files and tests
     // are not forbidden, as checks and required outputs need them.
     Rule {
@@ -164,6 +164,15 @@ pub(crate) const TOOLS: [Rule; 24] = [
         id: "assume",
         to: To::Unwatched,
         text: "Nobody is watching this run and nobody will answer questions: decide for yourself and state any assumption in your answer, not in a deliverable unless the task asks for it there.",
+    },
+    // Only where the task came from, what checks it and its answer: a
+    // package installed elsewhere or a config in the home folder is still
+    // read. A run with nobody to ask otherwise hunts the computer and the
+    // network for them, and finds nothing.
+    Rule {
+        id: "scope-of-task",
+        to: To::Unwatched,
+        text: "The task text and the project folder are all the task gives: do not search the rest of the computer or the network for where the task came from, what will check it, or its expected answer; decide from the project.",
     },
     Rule {
         id: "paths",
@@ -239,20 +248,33 @@ pub(crate) const TOOLS: [Rule; 24] = [
         to: To::Unwatched,
         text: "Start each reply that calls a tool with one short line saying what you are doing and why.",
     },
-    // The narrowest check first, as a full suite after every edit costs
-    // minutes; a result in hand, not pasted logs; a test edited to pass is
-    // no check at all.
+    // The nearest check first and once, as a full suite after every edit
+    // costs minutes and "broader when it could break more" was read as
+    // running the whole folder to be safe; a result in hand, not pasted
+    // logs; a test edited to pass is no check at all. Naming a failure is
+    // enough, as proving it pre-existing with a baseline run or a stash
+    // costs as much again and touches the user's tree.
     Rule {
         id: "done",
         to: To::Every,
-        text: "After changing code, run the narrowest check that exercises the change, and broader ones only when it could break more. Say done, fixed or passing only when a result you got shows it. A test your change breaks is yours to fix; name, don't fix, failures it did not cause, and edit a test only when the task changes what it checks. If a check fails or cannot run here, say so; never invent output or results.",
+        text: "After changing code, run the check nearest the change first: the reproduction, if the task gave or you wrote one, and the one existing test file that covers the changed code. One clean run of those is enough unless it fails or the change alters behaviour other modules import; do not re-run a check that already passed unchanged, and once the edit and the check passed do not re-read, diff or re-test what you changed unless asked. Name failures your change did not cause rather than proving them pre-existing; a baseline run or stash is not needed for that. Say done, fixed or passing only when a result you got shows it. A test your change breaks is yours to fix; edit a test only when the task changes what it checks. If a check fails or cannot run here, say so; never invent output or results.",
+    },
+    // One example in a report is rarely the only way to the bug; and a
+    // report that does not reproduce as given sends a run through the
+    // project's history and guesses at how it was made, where one look for
+    // another way to the same operation settles it.
+    Rule {
+        id: "shared-cause",
+        to: To::Every,
+        text: "A bug reported through one example usually sits behind other inputs, types or entry points that share the code: fix it at the shared cause. If the behaviour a task reports does not reproduce as described, say so, check once whether the same operation is reached by another path in the project and behaves differently there, and decide from what you find; do not search history or guess at how the report was produced.",
     },
     // Left out when calls run one at a time, so the prompt never asks for
-    // what the run will not do.
+    // what the run will not do. Commands and checks by name, as "such as
+    // several reads or searches" had only those batched.
     Rule {
         id: "batch",
         to: To::Parallel,
-        text: "Make calls that do not depend on each other, such as several reads or searches, in one reply: reads and searches run at once, other calls in the order given, and each extra round resends the whole conversation.",
+        text: "Make calls that do not depend on each other in one reply, whether reads, searches, commands or checks: reads and searches run at once, the rest one after another in your order, and each extra reply resends the whole conversation. Hold a call back only when it needs an earlier call's result, such as an edit after its read or a check after the edit it checks.",
     },
     // Work already under way, such as a helper in the background, is a fine
     // place to end; a question goes through ask_user, which a run nobody
@@ -582,9 +604,47 @@ mod tests {
         );
         assert!(
             window.contains(
-                " or do something else instead. After changing code, run the narrowest check"
+                " or do something else instead. After changing code, run the check nearest the change first"
             ),
             "{window}"
+        );
+    }
+
+    #[test]
+    fn the_checking_and_shared_cause_rows_reach_every_session_and_the_scope_row_only_a_run_nobody_watches()
+     {
+        for id in ["done", "shared-cause"] {
+            assert!(tells(&headless(), id), "{id}");
+            assert!(tells(&window(), id), "{id}");
+        }
+        assert!(tells(&headless(), "scope-of-task"));
+        assert!(!tells(&window(), "scope-of-task"));
+        // A run that is told the scope row keeps reading packages and its
+        // own config: only the task's origin, checker and answer are out.
+        let told = told_without(&headless(), &TOOLS, &[]);
+        let scope = told
+            .find("The task text and the project folder are all the task gives")
+            .unwrap();
+        assert!(
+            told[..scope].ends_with("unless the task asks for it there. "),
+            "{told}"
+        );
+        assert!(told.contains(" fix it at the shared cause. If the behaviour a task reports does not reproduce as described, say so, check once whether"));
+        assert!(
+            told.contains(" never invent output or results. A bug reported through one example")
+        );
+        assert!(!told.contains("name, don't fix"), "{told}");
+        // Each is a row of its own for the measuring variable.
+        assert_eq!(
+            parse("-done,-shared-cause,-scope-of-task,-batch"),
+            Ok(vec!["scope-of-task", "done", "shared-cause", "batch"])
+        );
+        let without = told_without(&headless(), &TOOLS, &["scope-of-task", "shared-cause"]);
+        assert!(!without.contains("all the task gives"), "{without}");
+        assert!(!without.contains("shared cause"), "{without}");
+        assert!(
+            without.contains("run the check nearest the change first"),
+            "{without}"
         );
     }
 

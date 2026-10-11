@@ -6423,9 +6423,10 @@ mod tests {
     }
 
     /// A distinctive part of each work rule's sentence.
-    const WORK_RULES: [&str; 6] = [
+    const WORK_RULES: [&str; 7] = [
         "Do not refactor, rename or reformat",
         "never invent output or results",
+        "fix it at the shared cause",
         "Make calls that do not depend on each other",
         "A reply with no tool call ends your turn",
         "check that the user asked for that step itself",
