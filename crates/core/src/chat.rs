@@ -1084,20 +1084,19 @@ fn start_before(
     // would change every byte from the first. So under the lift the window
     // starts no earlier than it did at the newest request the cap sized,
     // which the replies' own usage finds again.
-    if most > budget.tokens {
-        if let Some(until) = newest_under_cap(messages, budget) {
-            let last_user = messages[..until].iter().rposition(opens_turn).unwrap_or(0);
-            let before = &messages[..until];
-            start = start.max(start_before(
-                before,
-                &budget.capped(),
-                floor,
-                last_user,
-                0,
-                0,
-                route,
-            ));
-        }
+    let under_cap = newest_under_cap(messages, budget).filter(|_| most > budget.tokens);
+    if let Some(until) = under_cap {
+        let last_user = messages[..until].iter().rposition(opens_turn).unwrap_or(0);
+        let before = &messages[..until];
+        start = start.max(start_before(
+            before,
+            &budget.capped(),
+            floor,
+            last_user,
+            0,
+            0,
+            route,
+        ));
     }
     start
 }
