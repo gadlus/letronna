@@ -2600,32 +2600,53 @@ pub(crate) fn host(url: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Models whose route turned a cache marker down, which are sent none for
-/// the rest of this run.
-fn unmarked() -> &'static Mutex<HashSet<String>> {
-    static UNMARKED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+/// What refusals have shown of a route's cache markers this run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Markers {
+    /// A marked request was turned down as bad without saying why, so the
+    /// route's requests go without them until one is answered or turned
+    /// down the same way; see `markers_suspected`.
+    Suspected,
+    /// The route turns them down: none are sent for the rest of the run.
+    Refused,
+}
+
+/// Routes, by endpoint and model as `route` gives them, whose requests go
+/// without cache markers for now, and why. A route that takes them may serve
+/// the same model as one that does not.
+fn unmarked() -> &'static Mutex<HashMap<(String, String), Markers>> {
+    static UNMARKED: OnceLock<Mutex<HashMap<(String, String), Markers>>> = OnceLock::new();
     UNMARKED.get_or_init(Default::default)
 }
 
 /// Whether requests on this route mark where the prompt cache ends: Claude
-/// models, whose cache holds only what a request marks, reached through
-/// OpenRouter or the hosted gateway, which pass `cache_control` on to
-/// Anthropic, or on Anthropic's own API. OpenAI and the servers people run
-/// cache without being asked.
+/// models, whose cache holds only what a request marks, on Anthropic's own
+/// API or over chat completions through any gateway, since OpenRouter, the
+/// hosted gateway and the others that serve Claude pass `cache_control` on
+/// to Anthropic; one that turns it down is found out by its refusal. Not a
+/// request that goes to the Responses API, which has no place for them, nor
+/// a route that turned them down this run. OpenAI and the servers people
+/// run cache without being asked.
 fn marks_cache(connection: &Connection) -> bool {
-    let model = connection.model.trim();
-    let claude = model
+    let claude = connection
+        .model
+        .trim()
         .rsplit('/')
         .next()
         .is_some_and(|id| id.to_lowercase().starts_with("claude"));
-    let passes_markers = host(&connection.endpoint).is_some_and(|h| {
-        h == "openrouter.ai" || host(&crate::auth::hosted_base()).is_some_and(|hosted| h == hosted)
-    }) || crate::providers::wire::anthropic::speaks(&connection.endpoint);
+    let chat_shaped = crate::providers::wire::anthropic::speaks(&connection.endpoint)
+        || !speaks_responses(connection);
     claude
-        && passes_markers
+        && chat_shaped
         && unmarked()
             .lock()
-            .is_ok_and(|models| !models.contains(model))
+            .is_ok_and(|routes| !routes.contains_key(&route(connection)))
+}
+
+/// Whether `sent` carried cache markers. The system message is marked on
+/// every marked request, and is only then a list.
+fn carries_markers(sent: &Value) -> bool {
+    sent["messages"][0]["content"].is_array()
 }
 
 /// The system message as two text parts cut at `at`, the first marked, so a
@@ -2699,19 +2720,74 @@ fn mark(message: &mut Value) -> bool {
     true
 }
 
-/// Whether a refusal was of the cache markers `sent` carried, which are left
-/// off for this model for the rest of the run: a route that passes them on
-/// for most Claude models may still turn them down for one. The system
-/// message is marked on every marked request, and is only then a list.
+/// Whether a refusal named the cache markers `sent` carried, which are left
+/// off on this route for the rest of the run: a route that passes them on
+/// for most Claude models may still turn them down for one. Some gateways
+/// turn a request down as unprocessable (422) rather than bad (400).
 fn markers_refused(connection: &Connection, sent: &Value, status: u16, error: &str) -> bool {
-    let marked = sent["messages"][0]["content"].is_array();
-    if status != 400 || !marked || !error.contains("cache_control") {
+    if !matches!(status, 400 | 422) || !carries_markers(sent) || !error.contains("cache_control") {
         return false;
     }
-    unmarked().lock().is_ok_and(|mut models| {
-        models.insert(connection.model.trim().to_owned());
+    unmarked().lock().is_ok_and(|mut routes| {
+        routes.insert(route(connection), Markers::Refused);
         true
     })
+}
+
+/// Whether a refusal of `sent` as a bad request, with `status` and as
+/// `failure` reads it, may be the doing of the cache markers it carried
+/// though it does not name them, so it goes again without them. A gateway
+/// may turn them down in words of its own, or turn down the system message
+/// in the parts they need. The route then goes without them until a request
+/// is answered, which keeps them off for the rest of the run, or is turned
+/// down the same way, which was for something else and brings them back.
+/// So each refusal costs one more request at most, and one that is bad for
+/// another reason neither goes round again nor loses the cache for good.
+/// An overflow is never theirs.
+fn markers_suspected(
+    connection: &Connection,
+    sent: &Value,
+    status: u16,
+    failure: &Failure,
+) -> bool {
+    let bad = matches!(status, 400 | 422)
+        && failure.kind == FailureKind::BadRequest
+        && failure.overflow.is_none();
+    if !bad {
+        return false;
+    }
+    let key = route(connection);
+    let Ok(mut routes) = unmarked().lock() else {
+        return false;
+    };
+    if !carries_markers(sent) {
+        if routes.get(&key) == Some(&Markers::Suspected) {
+            routes.remove(&key);
+        }
+        return false;
+    }
+    // Anthropic's own API takes them, so a refusal there that does not name
+    // them is the request's own.
+    let direct = crate::providers::wire::anthropic::speaks(&connection.endpoint);
+    if direct || routes.contains_key(&key) {
+        return false;
+    }
+    routes.insert(key, Markers::Suspected);
+    true
+}
+
+/// Keep the cache markers off `connection`'s route for the rest of the run
+/// when they were suspected of a refusal and `sent`, a request without
+/// them, was answered.
+fn answered_unmarked(connection: &Connection, sent: &Value) {
+    if carries_markers(sent) {
+        return;
+    }
+    if let Ok(mut routes) = unmarked().lock()
+        && let Some(markers) = routes.get_mut(&route(connection))
+    {
+        *markers = Markers::Refused;
+    }
 }
 
 /// Keep both ends of an oversized tool result; the middle is rarely the point.
@@ -3979,6 +4055,7 @@ fn stream(
                 )
             }
             Ok(response) if response.status().is_success() => {
+                answered_unmarked(connection, &sent);
                 // An event stream can end early for a reason that passes, as
                 // when a gateway keeps it open with comments and then gives
                 // up on the model. Any other reply, a web page say, would
@@ -4041,6 +4118,13 @@ fn stream(
                     && status.is_client_error()
                     && !matches!(status.as_u16(), 408 | 429)
                     && learn_responses(connection, &sent, responded, &failure, &error)
+                    && !sender.is_closed()
+                {
+                    return stream(connection, messages, start, budget, extra, lsp, sender);
+                }
+                // Last, so what a refusal names is learned first: a bad
+                // request nothing above explained may be the markers'.
+                if markers_suspected(connection, &sent, status.as_u16(), &failure)
                     && !sender.is_closed()
                 {
                     return stream(connection, messages, start, budget, extra, lsp, sender);
@@ -11049,6 +11133,12 @@ mod tests {
                 "anthropic/claude-sonnet-4.5",
             ),
             (crate::auth::hosted_base().as_str(), "claude-sonnet-5"),
+            // Any other gateway that serves Claude over chat completions.
+            (
+                "https://gateway.example.test/v1",
+                "anthropic/claude-sonnet-5-5",
+            ),
+            ("http://localhost:4000/v1", "claude-sonnet-5"),
         ] {
             let c = Connection {
                 endpoint: endpoint.into(),
@@ -11143,8 +11233,15 @@ mod tests {
         for (endpoint, model) in [
             ("https://api.openai.com/v1", "gpt-5"),
             ("https://openrouter.ai/api/v1", "openai/gpt-4o"),
-            ("http://localhost:11434/v1", "claude-sonnet-5"),
-            ("https://example.test/v1", "claude-sonnet-5"),
+            ("http://localhost:11434/v1", "qwen3-coder"),
+            // Other models on a gateway that serves Claude cache unasked.
+            (
+                "https://gateway.example.test/v1",
+                "deepseek/deepseek-v4.1-flash",
+            ),
+            ("https://gateway.example.test/v1", "gpt-5"),
+            // The Responses API has no place for them.
+            ("https://chatgpt.com/backend-api/codex", "claude-sonnet-5"),
         ] {
             let c = Connection {
                 endpoint: endpoint.into(),
@@ -11206,12 +11303,138 @@ mod tests {
         let retry = body_with(&c, &tool_turn(), None, None, &Budget::SMALL, &[]);
         assert!(!retry.to_string().contains("cache_control"));
         assert!(!markers_refused(&c, &retry, 400, refusal));
-        // Only that model is spared them.
+        // Only that model on that route is spared them.
         let other = Connection {
             model: "anthropic/claude-sonnet-4.5".into(),
+            ..c.clone()
+        };
+        assert!(marks_cache(&other));
+        let elsewhere = Connection {
+            endpoint: "https://gateway.example.test/v1".into(),
+            ..c
+        };
+        assert!(marks_cache(&elsewhere));
+        // A gateway that turns the request down as unprocessable is heard too.
+        let sent = body_with(&elsewhere, &tool_turn(), None, None, &Budget::SMALL, &[]);
+        assert!(markers_refused(&elsewhere, &sent, 422, refusal));
+        assert!(!marks_cache(&elsewhere));
+    }
+
+    #[test]
+    fn a_marked_request_is_suspected_only_of_a_bad_request_nothing_else_explains() {
+        let c = Connection {
+            endpoint: "https://gateway.example.test/v1".into(),
+            model: "anthropic/claude-suspected-alone".into(),
+            ..connection()
+        };
+        let sent = body_with(&c, &tool_turn(), None, None, &Budget::SMALL, &[]);
+        assert!(carries_markers(&sent));
+        let suspected = |c: &Connection, sent: &Value, status: u16, error: &str| {
+            let body = serde_json::from_str::<Value>(error).unwrap_or_default();
+            let failure = classify(Some(status), &reqwest::header::HeaderMap::new(), &body);
+            markers_suspected(c, sent, status, &failure)
+        };
+        let bad = r#"{"error":{"message":"Invalid request."}}"#;
+        // An overflow, a key or a model turned down as a bad request, and
+        // what passes by itself.
+        for (status, error) in [
+            (
+                400,
+                r#"{"error":{"message":"prompt is too long: 230000 tokens"}}"#,
+            ),
+            (400, r#"{"error":{"message":"Invalid API key"}}"#),
+            (422, r#"{"error":{"message":"The model does not exist"}}"#),
+            (429, bad),
+            (500, bad),
+        ] {
+            assert!(!suspected(&c, &sent, status, error), "{status} {error}");
+        }
+        assert!(marks_cache(&c));
+        // Anthropic's own API takes them, so a refusal there is the request's.
+        let direct = Connection {
+            endpoint: "https://api.anthropic.com/v1".into(),
+            model: "claude-suspected-alone".into(),
+            ..connection()
+        };
+        let posted = body_with(&direct, &tool_turn(), None, None, &Budget::SMALL, &[]);
+        assert!(carries_markers(&posted));
+        assert!(!suspected(&direct, &posted, 400, bad));
+        // A request nothing marks, as another model's, is never suspected.
+        let other = Connection {
+            model: "deepseek/deepseek-v4.1-flash".into(),
+            ..c.clone()
+        };
+        let plain = body_with(&other, &tool_turn(), None, None, &Budget::SMALL, &[]);
+        assert!(!suspected(&other, &plain, 400, bad));
+        assert!(suspected(&c, &sent, 422, bad));
+        assert!(!marks_cache(&c));
+    }
+
+    #[test]
+    fn a_bad_request_on_a_gateway_goes_again_unmarked_and_that_route_stays_unmarked() {
+        // Turned down in words that never name the markers.
+        let refusal = r#"{"error":{"message":"Invalid value for 'content': expected a string."}}"#;
+        let hello_back =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n";
+        let (endpoint, worker) = serve(vec![
+            ("400 Bad Request", "application/json", refusal),
+            ("200 OK", "text/event-stream", hello_back),
+            ("200 OK", "text/event-stream", hello_back),
+        ]);
+        let c = Connection {
+            endpoint: endpoint.clone(),
+            model: "anthropic/claude-strict-gateway".into(),
+            ..connection()
+        };
+        assert!(marks_cache(&c));
+        let (result, text) = finish(&c, hello());
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(text, "Hello");
+        // The next turn goes without them from the start.
+        let (result, _) = finish(&c, hello());
+        assert!(result.is_ok(), "{result:?}");
+        let bodies = worker.join().unwrap();
+        assert!(bodies[0].contains("cache_control"));
+        assert!(!bodies[1].contains("cache_control"));
+        assert!(!bodies[2].contains("cache_control"));
+        assert!(!marks_cache(&c));
+        // Remembered for that endpoint and model alone.
+        let elsewhere = Connection {
+            endpoint: "https://gateway.example.test/v1".into(),
+            ..c.clone()
+        };
+        assert!(marks_cache(&elsewhere));
+        let other = Connection {
+            model: "anthropic/claude-sonnet-5-5".into(),
+            endpoint,
             ..c
         };
         assert!(marks_cache(&other));
+    }
+
+    #[test]
+    fn a_refusal_the_unmarked_retry_gets_too_is_not_blamed_on_the_markers() {
+        let refusal = r#"{"error":{"message":"Unprocessable request."}}"#;
+        let (endpoint, worker) = serve(vec![
+            ("422 Unprocessable Entity", "application/json", refusal),
+            ("422 Unprocessable Entity", "application/json", refusal),
+        ]);
+        let c = Connection {
+            endpoint,
+            model: "claude-refused-either-way".into(),
+            ..connection()
+        };
+        let (result, _) = finish(&c, hello());
+        // The server's own words, not a request it never got: two and no more.
+        assert!(
+            result.is_err_and(|e| e.to_string().contains("Unprocessable request")),
+            "a third request was sent"
+        );
+        let bodies = worker.join().unwrap();
+        assert!(bodies[0].contains("cache_control"));
+        assert!(!bodies[1].contains("cache_control"));
+        // The markers were not at fault, so the next request carries them.
+        assert!(marks_cache(&c));
     }
 
     #[test]
