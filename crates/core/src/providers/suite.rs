@@ -24,6 +24,10 @@ fn fixture(wire: Wire) -> (&'static str, &'static [&'static str]) {
             include_str!("fixtures/anthropic_models.json"),
             &["claude-test-opus", "claude-test-haiku"],
         ),
+        Wire::OpenAiResponses => (
+            include_str!("fixtures/chatgpt_models.json"),
+            &["gpt-test-codex", "gpt-test-codex-mini"],
+        ),
     }
 }
 

@@ -458,7 +458,7 @@ fn suggest_of(
     let value: Value = crate::chat::carrying(request, connection, &body)
         .send()
         .and_then(|r| r.error_for_status())
-        .and_then(|r| r.json())
+        .and_then(crate::providers::wire::openai_responses::json)
         .map_err(|e| crate::side::Failed::sending(&e, format!("No message came back: {e}")))?;
     let value =
         crate::providers::wire::openai_responses::reply(crate::chat::as_chat(connection, value));

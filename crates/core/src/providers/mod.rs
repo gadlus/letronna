@@ -11,9 +11,11 @@
 //! A provider is named by its `name`: settings, saved keys and fallbacks
 //! all refer to it that way, so a name never changes once shipped.
 
+pub mod auth;
 pub mod wire;
 
 mod anthropic;
+mod chatgpt;
 mod custom;
 mod letronna;
 mod ollama;
@@ -61,6 +63,8 @@ pub enum AuthKind {
     Account,
     /// A base URL the user gives, and a key if that server wants one.
     Url,
+    /// A sign-in in the browser, as `spec` describes it (`auth/`).
+    OAuth(&'static auth::OAuthSpec),
 }
 
 pub trait Provider: Send + Sync {
@@ -85,6 +89,7 @@ pub trait Provider: Send + Sync {
 pub static PROVIDERS: &[&dyn Provider] = &[
     &letronna::Letronna,
     &openai::OpenAi,
+    &chatgpt::ChatGpt,
     &anthropic::Anthropic,
     &openrouter::OpenRouter,
     &ollama::Ollama,

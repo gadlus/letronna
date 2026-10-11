@@ -2473,6 +2473,9 @@ pub(crate) fn carrying(
         );
     }
     let request = request.json(body);
+    if crate::providers::wire::openai_responses::chatgpt(&connection.endpoint) {
+        return crate::providers::wire::openai_responses::as_chatgpt(request, key);
+    }
     if key.is_empty() {
         request
     } else {
@@ -2503,6 +2506,7 @@ fn speaks_responses(connection: &Connection) -> bool {
 /// codex or pro model, or any on a gateway a plugin added that speaks it alone.
 fn only_responses(connection: &Connection) -> bool {
     crate::providers::wire::openai_responses::only(connection.model.trim())
+        || crate::providers::wire::openai_responses::chatgpt(&connection.endpoint)
         || crate::gateway::responses_at(&connection.endpoint)
 }
 
@@ -2524,9 +2528,11 @@ pub(crate) fn to_responses(
     // Only a streamed reply shows them, and the callers that wait for a
     // whole one never learn that they were refused.
     let summaries = body["stream"] == true && !has_quirk(connection, Quirk::Summary);
+    let mut wired = crate::providers::wire::openai_responses::request(&body, summaries);
+    crate::providers::wire::openai_responses::for_endpoint(endpoint, &mut wired);
     Some((
         crate::providers::wire::openai_responses::url(endpoint),
-        crate::providers::wire::openai_responses::request(&body, summaries),
+        wired,
     ))
 }
 
@@ -4015,6 +4021,14 @@ fn stream(
                     );
                 }
                 let error = response.text().unwrap_or_default();
+                // A ChatGPT sign-in refused is refreshed once, and the request
+                // sent again with the new token `carrying` now finds.
+                if status == reqwest::StatusCode::UNAUTHORIZED
+                    && crate::providers::wire::openai_responses::refreshed(&connection.endpoint)
+                    && !sender.is_closed()
+                {
+                    return stream(connection, messages, start, budget, extra, lsp, sender);
+                }
                 // Send it again without what the refusal named, which requests
                 // to this model leave out from then on -- unless the turn was
                 // stopped while this one was out. A timeout or a rate limit is

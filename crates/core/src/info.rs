@@ -303,6 +303,16 @@ fn models(connection: Option<&Connection>) -> String {
                     Some(at) => format!("address set, key set {at}"),
                     None => "address set, no key".to_owned(),
                 },
+                name if matches!(
+                    crate::providers::find(name).map(|p| p.auth()),
+                    Some(crate::providers::AuthKind::OAuth(_))
+                ) =>
+                {
+                    match crate::providers::auth::signed_in(name) {
+                        true => "signed in".to_owned(),
+                        false => "not signed in".to_owned(),
+                    }
+                }
                 _ if !gateway.needs_key => "needs no key".to_owned(),
                 name => match key(name) {
                     Some(at) => format!("key set {at}"),
@@ -1012,7 +1022,8 @@ mod tests {
             "This session: test/model on OpenRouter.",
             "New sessions: test/model on OpenRouter, effort high.",
             "Fallbacks, in order: OpenAI:gpt-5.",
-            "Providers: Letronna signed in; OpenAI key set in the vault; Anthropic no key; \
+            "Providers: Letronna signed in; OpenAI key set in the vault; ChatGPT not signed in; \
+             Anthropic no key; \
              OpenRouter key set in keys.json; Ollama needs no key; Custom address set, no key.",
             "Web search: Brave in use, key in the vault; Tavily not set up; Exa not set up; \
              SearXNG saved, not in use; DuckDuckGo not in use.",

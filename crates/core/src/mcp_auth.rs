@@ -42,13 +42,14 @@
 //! to an address it checked, directly, as a proxy would look the name up
 //! again.
 
+use crate::providers::auth::{form_encoded, listen, pasted, pkce, random, reply, returned};
 use crate::tools::{Tool, ToolContext};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::io::{BufRead, BufReader, Read};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -767,51 +768,6 @@ fn joined(before: Option<&str>, more: Option<&str>) -> Option<String> {
     (!all.is_empty()).then(|| all.join(" "))
 }
 
-/// `count` bytes from the system's secure generator, as base64url.
-fn random(count: usize) -> Result<String, String> {
-    use ring::rand::SecureRandom;
-    let mut bytes = vec![0u8; count];
-    ring::rand::SystemRandom::new()
-        .fill(&mut bytes)
-        .map_err(|_| "This computer would not give a random number for the sign-in.".to_owned())?;
-    Ok(base64url(&bytes))
-}
-
-/// The PKCE challenge for `verifier`: its SHA-256, as base64url (S256).
-fn pkce(verifier: &str) -> String {
-    base64url(ring::digest::digest(&ring::digest::SHA256, verifier.as_bytes()).as_ref())
-}
-
-/// `bytes` in base64url without padding, as PKCE and states are written.
-fn base64url(bytes: &[u8]) -> String {
-    const LETTERS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0u32, |n, (i, &b)| n | (u32::from(b) << (16 - 8 * i)));
-        for i in 0..=chunk.len() {
-            out.push(char::from(LETTERS[((n >> (18 - 6 * i)) & 63) as usize]));
-        }
-    }
-    out
-}
-
-/// Listen for the browser on 127.0.0.1 at `port`, 0 for any free one, and
-/// on [::1] as well when `both`, as `localhost` may be either; the port.
-fn listen(port: u16, both: bool) -> Result<(Vec<TcpListener>, u16), String> {
-    let first = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
-        .map_err(|e| format!("Cannot listen for the sign-in on 127.0.0.1:{port}: {e}"))?;
-    let port = first.local_addr().map_err(|e| e.to_string())?.port();
-    let mut all = vec![first];
-    // A machine without IPv6 still has 127.0.0.1 to come back to.
-    if both && let Ok(second) = TcpListener::bind((Ipv6Addr::LOCALHOST, port)) {
-        all.push(second);
-    }
-    Ok((all, port))
-}
-
 /// An app Letronna registered with an authorization server, kept beside the
 /// tokens to sign in with again rather than registering anew each time.
 #[derive(Serialize, Deserialize)]
@@ -1036,78 +992,6 @@ impl SignIn {
     }
 }
 
-/// Answer the browser with plain text, which runs nothing and fetches
-/// nothing.
-fn reply(stream: &mut TcpStream, status: &str, words: &str) {
-    let _ = write!(
-        stream,
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\n\
-         Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{words}",
-        words.len()
-    );
-    let _ = stream.flush();
-}
-
-/// What a query the sign-in came back with brought: the code, why it was
-/// refused, or None when its state is not `state`, as a page other than the
-/// one sent would give.
-fn returned(query: &str, state: &str) -> Option<Result<String, String>> {
-    let url = Url::parse(&format!("http://127.0.0.1/?{query}")).ok()?;
-    let pairs: HashMap<String, String> = url.query_pairs().into_owned().collect();
-    if !pairs.get("state").is_some_and(|came| same(came, state)) {
-        return None;
-    }
-    if let Some(error) = pairs.get("error") {
-        // An error code is a word; anything else could be words for the
-        // model, so it is left out.
-        let plain = error.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-        let why = if plain {
-            format!(" ({error})")
-        } else {
-            String::new()
-        };
-        return Some(Err(format!("The sign-in was refused{why}.")));
-    }
-    let code = pairs.get("code").filter(|code| !code.is_empty())?;
-    Some(Ok(code.clone()))
-}
-
-/// Whether `a` and `b` are the same, taking as long wherever they differ,
-/// so the time a knock takes says nothing of the state.
-fn same(a: &str, b: &str) -> bool {
-    a.len() == b.len()
-        && a.bytes()
-            .zip(b.bytes())
-            .fold(0, |diff, (x, y)| diff | (x ^ y))
-            == 0
-}
-
-/// The code in what the user pasted: the whole address the browser ended
-/// on, its query, or the code alone.
-fn pasted(text: &str, state: &str) -> Result<String, String> {
-    let text = text.trim();
-    let query = match text.split_once('?') {
-        Some((_, query)) => Some(query),
-        None if text.contains("code=") => Some(text),
-        None => None,
-    };
-    if let Some(query) = query {
-        let query = query.split('#').next().unwrap_or_default();
-        return returned(query, state).unwrap_or_else(|| {
-            Err("That address is not from the sign-in just started, or has no code on it.".into())
-        });
-    }
-    let code_like = !text.is_empty()
-        && text.len() <= 2048
-        && text
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-._~+/=".contains(c));
-    match code_like {
-        true => Ok(text.to_owned()),
-        false => Err("Paste the whole address the browser ended on, or the code on it.".into()),
-    }
-}
-
 /// What a token endpoint gave.
 struct Granted {
     access: String,
@@ -1131,20 +1015,6 @@ struct Credentials<'a> {
     secret: Option<&'a str>,
     /// The secret goes in a Basic header, not the form.
     basic: bool,
-}
-
-/// `text` form-encoded, as the id and secret in a Basic header are (RFC 6749
-/// 2.3.1).
-fn form_encoded(text: &str) -> String {
-    text.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'*' => {
-                char::from(b).to_string()
-            }
-            b' ' => "+".into(),
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
 }
 
 /// POST `form` from `app` to the token endpoint at `at` and take the token
@@ -1686,6 +1556,8 @@ pub(crate) fn keep_tokens_in(dir: &Path) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::providers::auth::{base64url, same};
+    use std::io::Write;
     use std::sync::atomic::AtomicUsize;
 
     /// A request as the fakes below hear it.
