@@ -164,6 +164,7 @@ impl Chat {
         } else {
             message.model.clone()
         };
+        let provider = self.provider_of(&label);
         let leading = px(24.);
         let cx_muted = cx.theme().muted_foreground;
         let md = self.text_id("md", index);
@@ -412,7 +413,14 @@ impl Chat {
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(cx.theme().link)
                                 .child(label),
-                        ),
+                        )
+                        .when(!provider.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(provider),
+                            )
+                        }),
                 )
             })
             // Thinking is shown when it was asked for, the same switch the
@@ -800,12 +808,19 @@ impl Chat {
             // reads as the same turn going on.
             .when(labeled, |this| {
                 this.child(
-                    div()
+                    h_flex()
+                        .gap_2()
                         .text_xs()
                         .font_family(HEADING_FONT)
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(cx.theme().link)
-                        .child(message.model.clone()),
+                        .child(message.model.clone())
+                        .child(
+                            div()
+                                .font_weight(FontWeight::NORMAL)
+                                .text_color(cx.theme().muted_foreground)
+                                .child(self.provider_of(&message.model)),
+                        ),
                 )
             })
             .child(
