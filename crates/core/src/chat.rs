@@ -310,6 +310,10 @@ pub struct Connection {
     /// every request: set for a `-p` run that did not name its tools. Its
     /// helpers keep it, so their array stays the session's.
     pub lean_tools: bool,
+    /// Letronna's less used tools go out behind `find_tools`, as in a lean
+    /// run, without the rest of what a lean run changes: set by the window
+    /// and the terminal, where most turns never call them.
+    pub rare_on_demand: bool,
 }
 
 impl Connection {

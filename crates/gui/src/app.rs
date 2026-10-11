@@ -2014,6 +2014,7 @@ impl Chat {
             plain_terminal: false,
             // Someone is watching, so every tool goes out in the array.
             lean_tools: false,
+            rare_on_demand: true,
         };
         backend::validate(&connection)?;
         Ok(connection)
