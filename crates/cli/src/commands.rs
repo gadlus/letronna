@@ -3899,6 +3899,12 @@ fn switch_media(runner: &mut Runner, kind: &'static str, label: &str) {
 /// gateway actually offers. `filter` narrows the list (by model or gateway
 /// name), and an exact model name skips the asking entirely.
 pub fn switch_model(runner: &mut Runner, session: Option<usize>, filter: &str) {
+    pick_model(runner, session, filter, false);
+}
+
+/// `/model`, or (`in_setup`) the setup's own model step, which has its own
+/// heading and is already where a provider gets added.
+pub fn pick_model(runner: &mut Runner, session: Option<usize>, filter: &str, in_setup: bool) {
     // `/model image`, `/model video`: what makes those, not the chat model.
     if let Some((kind, label)) = media_kind(filter) {
         switch_media(runner, kind, label);
@@ -3913,8 +3919,10 @@ pub fn switch_model(runner: &mut Runner, session: Option<usize>, filter: &str) {
     };
     let current = format!("{model} · {gateway}");
 
-    render::blank();
-    render::said(&render::blue("●"), &render::bold("Models"));
+    if !in_setup {
+        render::blank();
+        render::said(&render::blue("●"), &render::bold("Models"));
+    }
     // Fetching takes a moment over the network; say so rather than freezing.
     let (mut models, errors) = runner
         .bar
@@ -3926,9 +3934,11 @@ pub fn switch_model(runner: &mut Runner, session: Option<usize>, filter: &str) {
     }
     if models.is_empty() {
         if errors.is_empty() {
-            render::line(&render::dim(
-                "No gateway offered any models. Sign in with /login, or add a provider with `letronna setup`.",
-            ));
+            render::line(&render::dim(if in_setup {
+                "Nothing offered any models yet."
+            } else {
+                "No gateway offered any models. Sign in with /login, or add a provider with `letronna setup`."
+            }));
         }
         return;
     }

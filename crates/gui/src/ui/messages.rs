@@ -1880,18 +1880,13 @@ impl Chat {
                 self.aside_row(self.store.conversations[self.store.active].id, window, cx)
                     .map(|row| div().w_full().max_w(COLUMN).px_6().mt_6().child(row)),
             );
-        v_flex()
-            .relative()
-            .flex_1()
-            .min_h_0()
-            .child(
-                div()
-                    .id("empty-chat")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .child(page),
-            )
-            .children(self.grain(&self.grains.empty_chat))
+        v_flex().relative().flex_1().min_h_0().child(
+            div()
+                .id("empty-chat")
+                .size_full()
+                .overflow_y_scroll()
+                .child(page),
+        )
     }
 
     /// Sessions to go back to and folders worked in lately, side by side

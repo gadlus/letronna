@@ -1922,7 +1922,7 @@ pub(crate) struct GatewayRow {
     good: bool,
     /// The row's button: "Add key", "Add URL", "Edit", "Sign in", or none.
     action: Option<&'static str>,
-    set_up: bool,
+    pub(crate) set_up: bool,
 }
 
 impl Chat {
