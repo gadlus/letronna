@@ -16,7 +16,7 @@ type ApplyMode = std::rc::Rc<dyn Fn(plugins::PresenceMode, &mut App)>;
 pub(crate) const PAGES: &[(&str, AppIcon)] = &[
     ("Account", AppIcon::User),
     ("Usage", AppIcon::Clock),
-    ("Gateways", AppIcon::Plugs),
+    ("Accounts", AppIcon::Plugs),
     ("Search", AppIcon::Search),
     ("Model", AppIcon::Robot),
     ("Appearance", AppIcon::Palette),
@@ -190,6 +190,90 @@ impl Chat {
             cx.notify();
         });
         self.load_models(window, cx);
+    }
+
+    /// Start a provider's browser sign-in. Its row waits, with a field for
+    /// the address the browser ended on when it cannot reach this computer.
+    pub(crate) fn provider_sign_in(
+        &mut self,
+        name: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use letronna_core::providers::auth;
+        let flow = match auth::begin(name) {
+            Ok(flow) => flow,
+            Err(why) => {
+                self.error = Some(why);
+                cx.notify();
+                return;
+            }
+        };
+        cx.open_url(&flow.url);
+        self.provider_sign_in = Some(flow.clone());
+        self.key
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(flow.finish());
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(result) = rx.recv().await {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.provider_sign_in = None;
+                    match result {
+                        Ok(_) => {
+                            this.gateway_pick.update(cx, |g, _| g.clear());
+                            this.load_models(window, cx);
+                        }
+                        Err(why) if why == "Sign-in cancelled." => {}
+                        Err(why) => this.error = Some(why),
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Hand the waiting sign-in the address pasted into the row's field.
+    pub(crate) fn provider_paste(&mut self, cx: &mut Context<Self>) {
+        let text = self.key.read(cx).value().trim().to_string();
+        if let Some(flow) = &self.provider_sign_in
+            && let Err(why) = flow.paste(&text)
+        {
+            self.error = Some(why);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn provider_sign_out(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(why) = letronna_core::providers::auth::sign_out(name) {
+            self.error = Some(why);
+        }
+        self.load_models(window, cx);
+        cx.notify();
+    }
+
+    /// Move the tier at `at` one place earlier, or later, in the order the
+    /// router reaches for accounts.
+    pub(crate) fn move_tier(&mut self, at: usize, up: bool, cx: &mut Context<Self>) {
+        use letronna_core::providers::router;
+        let mut order = router::order(&self.store.settings);
+        let to = if up { at.checked_sub(1) } else { Some(at + 1) };
+        let Some(to) = to.filter(|&to| to < order.len()) else {
+            return;
+        };
+        order.swap(at, to);
+        router::reorder(&mut self.store.settings, &order);
+        self.save();
+        cx.notify();
     }
 
     /// Open a search service's row to set it up, or close it if it is open.
@@ -766,6 +850,11 @@ impl Chat {
                 &chat,
                 cx,
             )
+            .child(tier_order(
+                letronna_core::providers::router::order(&self.store.settings),
+                &chat,
+                cx,
+            ))
             .into_any_element(),
         };
         keeps_keys(div(), &self.settings_focus)
@@ -1920,9 +2009,17 @@ pub(crate) struct GatewayRow {
     blurb: &'static str,
     status: String,
     good: bool,
-    /// The row's button: "Add key", "Add URL", "Edit", "Sign in", or none.
+    /// The row's button: "Add key", "Add URL", "Edit", "Sign in", "Sign
+    /// out", or none.
     action: Option<&'static str>,
     pub(crate) set_up: bool,
+    /// Plan and usage, as `router::usage` reads them; empty when unknown.
+    usage: String,
+    /// Signed in to in the browser, not with a key.
+    browser: bool,
+    caveat: Option<&'static str>,
+    /// Its browser sign-in is waiting now.
+    waiting: bool,
 }
 
 impl Chat {
@@ -1939,9 +2036,15 @@ impl Chat {
                     &self.store.settings.custom_endpoint,
                     count,
                 );
+                let provider = letronna_core::providers::find(g.name);
+                let browser = matches!(
+                    provider.map(|p| p.auth()),
+                    Some(letronna_core::providers::AuthKind::OAuth(_))
+                );
                 let action = match g.name {
-                    LETRONNA if !set_up => Some("Sign in"),
-                    LETRONNA | "Ollama" => None,
+                    _ if (browser || g.name == LETRONNA) && !set_up => Some("Sign in"),
+                    _ if browser || g.name == LETRONNA => Some("Sign out"),
+                    "Ollama" => None,
                     "Custom" if !set_up => Some("Add URL"),
                     _ if !set_up => Some("Add key"),
                     _ => Some("Edit"),
@@ -1958,6 +2061,17 @@ impl Chat {
                     good,
                     action,
                     set_up,
+                    usage: if set_up {
+                        letronna_core::providers::router::usage(g.name)
+                    } else {
+                        String::new()
+                    },
+                    browser,
+                    caveat: provider.and_then(|p| p.caveat()),
+                    waiting: self
+                        .provider_sign_in
+                        .as_ref()
+                        .is_some_and(|f| f.name == g.name),
                 }
             })
             .collect()
@@ -1969,7 +2083,7 @@ impl Chat {
     pub(crate) fn key_gateway_rows(&self) -> Vec<GatewayRow> {
         self.gateway_rows()
             .into_iter()
-            .filter(|row| row.name != LETRONNA && row.name != "Ollama")
+            .filter(|row| row.name != LETRONNA && row.name != "Ollama" && !row.browser)
             .collect()
     }
 }
@@ -2414,15 +2528,19 @@ pub(crate) fn gateway_list(
                 .when(!row.set_up, |b| b.primary())
                 .when(row.set_up, |b| b.plain(cx))
                 .label(if editing { "Close" } else { action })
-                .on_click(move |_, window, cx| {
-                    if action == "Sign in" {
+                .on_click(move |_, window, cx| match (action, name) {
+                    ("Sign in", LETRONNA) => {
+                        chat.update(cx, |this, cx| this.sign_in(cx));
                         page.update(cx, |p, cx| {
                             *p = "Account";
                             cx.notify();
                         });
-                    } else {
-                        chat.update(cx, |this, cx| this.select_gateway(name, window, cx));
                     }
+                    ("Sign out", LETRONNA) => chat.update(cx, |this, cx| this.sign_out(cx)),
+                    ("Sign out", _) => {
+                        chat.update(cx, |this, cx| this.provider_sign_out(name, window, cx))
+                    }
+                    _ => chat.update(cx, |this, cx| this.select_gateway(name, window, cx)),
                 })
         });
         let head = h_flex()
@@ -2456,21 +2574,41 @@ pub(crate) fn gateway_list(
                     .flex_shrink_0()
                     .child(div().size(px(7.)).rounded_full().bg(dot))
                     .child(
-                        div()
+                        v_flex()
+                            .items_end()
                             .text_xs()
-                            .text_color(if row.good {
-                                cx.theme().foreground
-                            } else {
-                                cx.theme().muted_foreground
-                            })
-                            .child(row.status),
+                            .child(
+                                div()
+                                    .text_color(if row.good {
+                                        cx.theme().foreground
+                                    } else {
+                                        cx.theme().muted_foreground
+                                    })
+                                    .child(row.status),
+                            )
+                            .when(!row.usage.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(row.usage),
+                                )
+                            }),
                     ),
             )
             .child(div().w(px(84.)).flex().justify_end().children(button));
         let mut item = v_flex()
             .when(i > 0, |d| d.border_t_1().border_color(cx.theme().border))
             .child(head);
-        if editing {
+        if editing && row.browser {
+            item = item.child(browser_sign_in(
+                name,
+                row.caveat,
+                row.waiting,
+                key,
+                chat,
+                cx,
+            ));
+        } else if editing {
             let custom = gateway(name).base.is_empty();
             let needs_key = gateway(name).needs_key;
             let save = chat.clone();
@@ -2535,6 +2673,180 @@ pub(crate) fn gateway_list(
     list
 }
 
+/// A browser sign-in's open row: what to know first and the button, or,
+/// while the browser has it, a field for the address it ended on.
+fn browser_sign_in(
+    name: &'static str,
+    caveat: Option<&'static str>,
+    waiting: bool,
+    key: &Entity<InputState>,
+    chat: &Entity<Chat>,
+    cx: &App,
+) -> Div {
+    let (go, paste, cancel) = (chat.clone(), chat.clone(), chat.clone());
+    let body = v_flex()
+        .px_4()
+        .pb_4()
+        .gap_3()
+        .children(caveat.map(|caveat| {
+            h_flex()
+                .gap_2()
+                .items_center()
+                .text_xs()
+                .child(
+                    Icon::new(IconName::Info)
+                        .size_3p5()
+                        .text_color(cx.theme().muted_foreground),
+                )
+                .child(caveat)
+        }));
+    if !waiting {
+        return body.child(
+            h_flex().justify_end().child(
+                Button::new("gw-browser")
+                    .primary()
+                    .small()
+                    .label("Sign in with browser")
+                    .on_click(move |_, window, cx| {
+                        go.update(cx, |this, cx| this.provider_sign_in(name, window, cx))
+                    }),
+            ),
+        );
+    }
+    body.child(
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(
+                crate::ui::busy::Spinner::new()
+                    .small()
+                    .color(cx.theme().primary),
+            )
+            .child(div().text_sm().child("Waiting for the browser.")),
+    )
+    .child(
+        v_flex()
+            .gap_1()
+            .child(label(
+                "Browser could not reach Letronna? Paste the address it ended on",
+                cx,
+            ))
+            .child(Input::new(key)),
+    )
+    .child(
+        h_flex()
+            .gap_2()
+            .justify_end()
+            .child(
+                Button::new("gw-cancel")
+                    .plain(cx)
+                    .small()
+                    .label("Cancel")
+                    .on_click(move |_, _, cx| {
+                        cancel.update(cx, |this, _| {
+                            if let Some(flow) = &this.provider_sign_in {
+                                flow.cancel();
+                            }
+                        })
+                    }),
+            )
+            .child(
+                Button::new("gw-paste")
+                    .primary()
+                    .small()
+                    .label("Use address")
+                    .on_click(move |_, _, cx| paste.update(cx, |this, cx| this.provider_paste(cx))),
+            ),
+    )
+}
+
+/// The tiers in the order the router reaches for accounts when one is rate
+/// limited or out of quota, each movable up or down.
+fn tier_order(order: Vec<letronna_core::providers::Tier>, chat: &Entity<Chat>, cx: &App) -> Div {
+    use letronna_core::providers::{PROVIDERS, Tier};
+    let last = order.len().saturating_sub(1);
+    let section = v_flex().gap_2().child(heading(
+        "When one runs out",
+        "A rate-limited or exhausted account hands the request to the next one with the same model, in this order.",
+        cx,
+    ));
+    let mut list = v_flex()
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(cx.theme().radius);
+    for (i, tier) in order.into_iter().enumerate() {
+        let title = match tier {
+            Tier::Subscription => "Plans",
+            Tier::ApiKey => "API keys",
+            Tier::Credit => "Letronna credit",
+            Tier::Free => "Free and local",
+        };
+        let names: Vec<&str> = PROVIDERS
+            .iter()
+            .map(|p| p.info())
+            .filter(|info| info.tier == tier)
+            .map(|info| info.name)
+            .collect();
+        let (up, down) = (chat.clone(), chat.clone());
+        list = list.child(
+            h_flex()
+                .when(i > 0, |d| d.border_t_1().border_color(cx.theme().border))
+                .px_4()
+                .py_2()
+                .gap_3()
+                .items_center()
+                .child(
+                    div()
+                        .w(px(16.))
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("{}", i + 1)),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_family(HEADING_FONT)
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(names.join(", ")),
+                        ),
+                )
+                .child(
+                    Button::new(("tier-up", i))
+                        .plain(cx)
+                        .xsmall()
+                        .icon(Icon::new(IconName::ChevronUp))
+                        .disabled(i == 0)
+                        .tooltip("Earlier")
+                        .on_click(move |_, _, cx| {
+                            up.update(cx, |this, cx| this.move_tier(i, true, cx))
+                        }),
+                )
+                .child(
+                    Button::new(("tier-down", i))
+                        .plain(cx)
+                        .xsmall()
+                        .icon(Icon::new(IconName::ChevronDown))
+                        .disabled(i == last)
+                        .tooltip("Later")
+                        .on_click(move |_, _, cx| {
+                            down.update(cx, |this, cx| this.move_tier(i, false, cx))
+                        }),
+                ),
+        );
+    }
+    section.child(list)
+}
+
 fn gateway_page(
     rows: Vec<GatewayRow>,
     pick: &Entity<String>,
@@ -2547,8 +2859,8 @@ fn gateway_page(
     v_flex()
         .gap_5()
         .child(heading(
-            "Gateways",
-            "Every gateway you set up is used at once: its models join the model list, and each message goes to the gateway of the model you pick. Keys stay in keys.json on this machine.",
+            "Accounts",
+            "Every account you connect is used at once: its models join the model list, and each message goes to the account of the model you pick. Keys stay in keys.json on this machine; sign-ins stay in the system vault.",
             cx,
         ))
         .child(gateway_list(rows, pick, endpoint, key, page, chat, cx))

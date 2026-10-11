@@ -69,6 +69,10 @@ impl Provider for ChatGpt {
         AuthKind::OAuth(&SIGN_IN)
     }
 
+    fn caveat(&self) -> Option<&'static str> {
+        Some("Using your ChatGPT plan here may be subject to OpenAI's terms.")
+    }
+
     fn wire(&self) -> Wire {
         Wire::OpenAiResponses
     }

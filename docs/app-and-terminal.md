@@ -52,7 +52,7 @@ Type `/` to list them all. The common ones:
 |---|---|
 | `/new`, `/resume` | Start a session, or reopen one |
 | `/model`, `/effort`, `/thinking` | Model and reasoning controls |
-| `/gateways`, `/search` | Providers and web search |
+| `/connect`, `/search` | Providers, their plan and usage, and web search |
 | `/plan` | Switch to read-only |
 | `/init` | Have the model write the project's `AGENTS.md` |
 | `/skills`, `/mcp` | Skills and MCP servers |
