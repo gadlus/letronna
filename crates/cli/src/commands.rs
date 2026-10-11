@@ -4155,7 +4155,7 @@ pub fn gateways(runner: &mut Runner) {
     // /logout look after it, so it has a status here and no choice.
     let mut rows = Vec::new();
     let mut choices: Vec<(String, &'static str, &'static str)> = Vec::new();
-    for g in GATEWAYS {
+    for g in GATEWAYS.iter() {
         let count = models.iter().filter(|(n, _)| n == g.name).count();
         let (status, good, set_up) = gateway::status(g.name, &keys, &custom, count);
         let status = if g.name == LETRONNA && !set_up {

@@ -1,5 +1,12 @@
+//! The gateways a session can send to, as the settings, `/gateways` and the
+//! model picker list them: the providers in `providers::PROVIDERS`, and
+//! those plugins add while they are on. What sets each one apart -- its URL,
+//! what it needs, what it speaks -- is its provider's; this keeps the shape
+//! the callers were written against.
+
+use crate::providers::{AuthKind, PROVIDERS};
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 /// The hosted pool on your Letronna account: no key, charged to your credit.
 /// First in the list, and what a new install starts on.
@@ -12,44 +19,25 @@ pub struct Gateway {
     pub blurb: &'static str,
 }
 
-pub const GATEWAYS: &[Gateway] = &[
-    Gateway {
-        name: LETRONNA,
-        base: "https://api.letronna.ai/v1",
-        needs_key: false,
-        blurb: "Your Letronna account. Hosted models, charged to your credit. No key.",
-    },
-    Gateway {
-        name: "OpenAI",
-        base: "https://api.openai.com/v1",
-        needs_key: true,
-        blurb: "OpenAI directly. Needs an OpenAI API key.",
-    },
-    Gateway {
-        name: "Anthropic",
-        base: "https://api.anthropic.com/v1",
-        needs_key: true,
-        blurb: "Claude directly. Needs an Anthropic API key.",
-    },
-    Gateway {
-        name: "OpenRouter",
-        base: "https://openrouter.ai/api/v1",
-        needs_key: true,
-        blurb: "Hundreds of models behind one key.",
-    },
-    Gateway {
-        name: "Ollama",
-        base: "http://localhost:11434/v1",
-        needs_key: false,
-        blurb: "Local models on this machine. Works offline.",
-    },
-    Gateway {
-        name: "Custom",
-        base: "",
-        needs_key: false,
-        blurb: "Any OpenAI-compatible server. Paste the base URL.",
-    },
-];
+pub static GATEWAYS: LazyLock<Vec<Gateway>> = LazyLock::new(|| {
+    PROVIDERS
+        .iter()
+        .map(|p| {
+            let info = p.info();
+            Gateway {
+                name: info.name,
+                base: info.base,
+                needs_key: p.auth() == AuthKind::ApiKey,
+                blurb: info.blurb,
+            }
+        })
+        .collect()
+});
+
+/// What the built-in gateway `name` needs, `None` for one a plugin added.
+fn auth_of(name: &str) -> Option<AuthKind> {
+    crate::providers::find(name).map(|p| p.auth())
+}
 
 /// A gateway a plugin of the window serves while it is on, as the Codex
 /// plugin serves a ChatGPT plan's models: listed and resolved like a
@@ -116,7 +104,7 @@ pub(crate) fn responses_at(endpoint: &str) -> bool {
 /// token this computer was signed in with, so there is nothing to paste and
 /// nothing to go stale.
 pub fn resolve(name: &str, custom: &str, key: &str) -> (String, String) {
-    if name == LETRONNA {
+    if auth_of(name) == Some(AuthKind::Account) {
         let token = crate::auth::account().map(|a| a.token).unwrap_or_default();
         return (base_url(name, custom), token);
     }
@@ -129,7 +117,7 @@ pub fn resolve(name: &str, custom: &str, key: &str) -> (String, String) {
 /// Where `resolve` sends a gateway's requests, without reading the account
 /// file for its token, so a page can ask on every frame.
 pub fn base_url(name: &str, custom: &str) -> String {
-    if name == LETRONNA {
+    if auth_of(name) == Some(AuthKind::Account) {
         return crate::auth::hosted_base();
     }
     if let Some(added) = added_as(name) {
@@ -151,10 +139,10 @@ pub fn ready(keys: &HashMap<String, String>, custom: &str) -> Vec<(&'static str,
         .iter()
         .filter_map(|g| {
             let key = keys.get(key_slot(g.name)).cloned().unwrap_or_default();
-            let on = match g.name {
-                LETRONNA => crate::auth::account().is_some(),
-                "Custom" => !custom.trim().is_empty(),
-                "Ollama" => true,
+            let on = match auth_of(g.name) {
+                Some(AuthKind::Account) => crate::auth::account().is_some(),
+                Some(AuthKind::Url) => !custom.trim().is_empty(),
+                Some(AuthKind::None) => true,
                 _ => !key.trim().is_empty(),
             };
             on.then(|| {
@@ -179,8 +167,9 @@ pub fn status(
     let key = keys
         .get(key_slot(name))
         .is_some_and(|k| !k.trim().is_empty());
-    match name {
-        LETRONNA if crate::auth::account().is_some() => (
+    let signed_in = crate::auth::account().is_some();
+    match auth_of(name) {
+        Some(AuthKind::Account) if signed_in => (
             if models > 0 {
                 format!("Signed in · {}", count(models))
             } else {
@@ -189,10 +178,10 @@ pub fn status(
             true,
             true,
         ),
-        LETRONNA => ("Not signed in".into(), false, false),
-        "Ollama" if models > 0 => (format!("Running · {}", count(models)), true, true),
-        "Ollama" => ("Not running".into(), false, false),
-        "Custom" if custom.trim().is_empty() => ("Not set up".into(), false, false),
+        Some(AuthKind::Account) => ("Not signed in".into(), false, false),
+        Some(AuthKind::None) if models > 0 => (format!("Running · {}", count(models)), true, true),
+        Some(AuthKind::None) => ("Not running".into(), false, false),
+        Some(AuthKind::Url) if custom.trim().is_empty() => ("Not set up".into(), false, false),
         _ if g.needs_key && !key => ("Not set up".into(), false, false),
         _ if models > 0 => (format!("Connected · {}", count(models)), true, true),
         _ => ("Set up · no models answered".into(), false, true),
@@ -211,7 +200,10 @@ pub fn all_models(
         .map(|(name, base, key)| {
             (
                 name,
-                std::thread::spawn(move || crate::chat::list_models(&base, &key)),
+                std::thread::spawn(move || match crate::providers::find(name) {
+                    Some(p) => p.models(&base, &key),
+                    None => crate::chat::list_models(&base, &key),
+                }),
             )
         })
         .collect();
@@ -219,7 +211,8 @@ pub fn all_models(
     for (name, ask) in asks {
         match ask.join().unwrap_or_else(|_| Err("stopped".into())) {
             Ok(list) => models.extend(list.into_iter().map(|m| (name.to_owned(), m))),
-            Err(_) if name == "Ollama" => {}
+            // A local server is only there while it runs.
+            Err(_) if auth_of(name) == Some(AuthKind::None) => {}
             Err(e) => errors.push(format!("{name}: {e}")),
         }
     }

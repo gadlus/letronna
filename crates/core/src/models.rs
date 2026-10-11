@@ -366,7 +366,8 @@ pub fn ask_for_list(endpoint: &str, key: &str) -> Option<mpsc::Receiver<()>> {
     // A request to Anthropic's own API goes to its Messages route instead.
     let base = (endpoint.strip_suffix("/chat/completions"))
         .or_else(|| {
-            (endpoint.strip_suffix("/messages")).filter(|_| crate::wire_anthropic::speaks(endpoint))
+            (endpoint.strip_suffix("/messages"))
+                .filter(|_| crate::providers::wire::anthropic::speaks(endpoint))
         })
         .unwrap_or(endpoint)
         .to_owned();

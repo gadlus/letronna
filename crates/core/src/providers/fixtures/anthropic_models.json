@@ -1,0 +1,1 @@
+{"data":[{"type":"model","id":"claude-test-opus","display_name":"Claude Test Opus","created_at":"2026-01-01T00:00:00Z"},{"type":"model","id":"claude-test-haiku","display_name":"Claude Test Haiku","created_at":"2026-01-01T00:00:00Z"}],"has_more":false,"first_id":"claude-test-opus","last_id":"claude-test-haiku"}

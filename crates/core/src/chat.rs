@@ -499,7 +499,7 @@ pub fn validate(connection: &Connection) -> Result<String, String> {
         );
     }
     let chat = base.strip_suffix("/chat/completions");
-    if crate::wire_anthropic::speaks(base) {
+    if crate::providers::wire::anthropic::speaks(base) {
         let root = chat.or_else(|| base.strip_suffix("/messages"));
         return Ok(format!("{}/messages", root.unwrap_or(base)));
     }
@@ -1822,7 +1822,7 @@ fn body_hashed(
     let marks = marks_cache(connection);
     if marks {
         // Anthropic's own API spends the fourth marker on the tools instead.
-        if !crate::wire_anthropic::speaks(&connection.endpoint) {
+        if !crate::providers::wire::anthropic::speaks(&connection.endpoint) {
             split_system(&mut context[0], system.identity);
         }
         mark_cache(&mut context);
@@ -1865,7 +1865,7 @@ fn body_hashed(
         // connection's own: they stay cached when the date or the summary in
         // the system prompt moves.
         if marks
-            && crate::wire_anthropic::speaks(&connection.endpoint)
+            && crate::providers::wire::anthropic::speaks(&connection.endpoint)
             && let Some(last) = tools
                 .iter_mut()
                 .rfind(|tool| tool.get("function").is_some())
@@ -2225,7 +2225,7 @@ fn has_quirk(connection: &Connection, quirk: Quirk) -> bool {
 fn reasons_on_openai(connection: &Connection) -> bool {
     let on_openai = reqwest::Url::parse(connection.endpoint.trim())
         .is_ok_and(|url| url.host_str() == Some("api.openai.com"));
-    on_openai && crate::wire_responses::reasons(&connection.model)
+    on_openai && crate::providers::wire::openai_responses::reasons(&connection.model)
 }
 
 /// Change `body` as every quirk known for this model asks.
@@ -2402,7 +2402,7 @@ fn learn_messages(connection: &Connection, posted: &Value, error: &str) -> bool 
             Quirk::Thinking => posted.get("thinking").is_some(),
             _ => {
                 posted.pointer("/thinking/block_binding").is_some()
-                    || crate::wire_anthropic::replays(posted)
+                    || crate::providers::wire::anthropic::replays(posted)
             }
         };
         if error.contains(&field.replace('_', ""))
@@ -2450,11 +2450,11 @@ fn as_messages(connection: &Connection, body: &Value) -> Value {
             }
         }
     }
-    let thinking = crate::wire_anthropic::Thinking {
+    let thinking = crate::providers::wire::anthropic::Thinking {
         allowed: !helper && !has_quirk(connection, Quirk::Thinking),
         bound: !has_quirk(connection, Quirk::Replay),
     };
-    crate::wire_anthropic::request(&body, thinking)
+    crate::providers::wire::anthropic::request(&body, thinking)
 }
 
 /// `request` carrying `body`, a chat completion request, and the key, as
@@ -2465,8 +2465,12 @@ pub(crate) fn carrying(
     body: &Value,
 ) -> reqwest::blocking::RequestBuilder {
     let key = connection.key.trim();
-    if crate::wire_anthropic::speaks(&connection.endpoint) {
-        return crate::wire_anthropic::sign(request, key, &as_messages(connection, body));
+    if crate::providers::wire::anthropic::speaks(&connection.endpoint) {
+        return crate::providers::wire::anthropic::sign(
+            request,
+            key,
+            &as_messages(connection, body),
+        );
     }
     let request = request.json(body);
     if key.is_empty() {
@@ -2479,8 +2483,8 @@ pub(crate) fn carrying(
 /// A reply that was not streamed, as a chat completion, whichever wire it
 /// came over.
 pub(crate) fn as_chat(connection: &Connection, reply: Value) -> Value {
-    if crate::wire_anthropic::speaks(&connection.endpoint) {
-        crate::wire_anthropic::reply(&reply)
+    if crate::providers::wire::anthropic::speaks(&connection.endpoint) {
+        crate::providers::wire::anthropic::reply(&reply)
     } else {
         reply
     }
@@ -2491,14 +2495,14 @@ pub(crate) fn as_chat(connection: &Connection, reply: Value) -> Value {
 /// run and they have chat/completions to go to instead.
 fn speaks_responses(connection: &Connection) -> bool {
     let model = connection.model.trim();
-    crate::wire_responses::serves(&connection.endpoint, model)
+    crate::providers::wire::openai_responses::serves(&connection.endpoint, model)
         && (only_responses(connection) || !has_quirk(connection, Quirk::Responses))
 }
 
 /// Whether the Responses API is the only route to `connection`'s model: a
 /// codex or pro model, or any on a gateway a plugin added that speaks it alone.
 fn only_responses(connection: &Connection) -> bool {
-    crate::wire_responses::only(connection.model.trim())
+    crate::providers::wire::openai_responses::only(connection.model.trim())
         || crate::gateway::responses_at(&connection.endpoint)
 }
 
@@ -2521,8 +2525,8 @@ pub(crate) fn to_responses(
     // whole one never learn that they were refused.
     let summaries = body["stream"] == true && !has_quirk(connection, Quirk::Summary);
     Some((
-        crate::wire_responses::url(endpoint),
-        crate::wire_responses::request(&body, summaries),
+        crate::providers::wire::openai_responses::url(endpoint),
+        crate::providers::wire::openai_responses::request(&body, summaries),
     ))
 }
 
@@ -2610,7 +2614,7 @@ fn marks_cache(connection: &Connection) -> bool {
         .is_some_and(|id| id.to_lowercase().starts_with("claude"));
     let passes_markers = host(&connection.endpoint).is_some_and(|h| {
         h == "openrouter.ai" || host(&crate::auth::hosted_base()).is_some_and(|hosted| h == hosted)
-    }) || crate::wire_anthropic::speaks(&connection.endpoint);
+    }) || crate::providers::wire::anthropic::speaks(&connection.endpoint);
     claude
         && passes_markers
         && unmarked()
@@ -3439,7 +3443,7 @@ pub(crate) fn client() -> Result<&'static reqwest::blocking::Client, String> {
 
 pub fn list_models(base: &str, key: &str) -> Result<Vec<String>, String> {
     let base = base.trim().trim_end_matches('/');
-    let anthropic = crate::wire_anthropic::speaks(base);
+    let anthropic = crate::providers::wire::anthropic::speaks(base);
     // Anthropic's list comes twenty models at a time unless asked for up to
     // 1000, the most it gives at once.
     let url = match anthropic {
@@ -3448,7 +3452,7 @@ pub fn list_models(base: &str, key: &str) -> Result<Vec<String>, String> {
     };
     let mut request = client()?.get(url).timeout(Duration::from_secs(20));
     if anthropic {
-        request = crate::wire_anthropic::keyed(request, key);
+        request = crate::providers::wire::anthropic::keyed(request, key);
     } else if !key.trim().is_empty() {
         request = request.bearer_auth(key.trim());
     }
@@ -3940,8 +3944,8 @@ fn stream(
     let ticket = crate::cache_miss::sent(connection.conversation, prefix);
     // What goes out in its place on Anthropic's own API, kept to learn from
     // a refusal of it; an OpenAI reasoning model's goes to the Responses API.
-    let posted =
-        crate::wire_anthropic::speaks(&connection.endpoint).then(|| as_messages(connection, &sent));
+    let posted = crate::providers::wire::anthropic::speaks(&connection.endpoint)
+        .then(|| as_messages(connection, &sent));
     let wired = to_responses(connection, &endpoint, &sent);
     let url = wired
         .as_ref()
@@ -3950,7 +3954,9 @@ fn stream(
         .map_err(|e| Failure::new(FailureKind::Unknown, e))?
         .post(url);
     let request = match (&posted, &wired) {
-        (Some(posted), _) => crate::wire_anthropic::sign(request, &connection.key, posted),
+        (Some(posted), _) => {
+            crate::providers::wire::anthropic::sign(request, &connection.key, posted)
+        }
         (None, Some((_, body))) => carrying(request, connection, body),
         (None, None) => carrying(request, connection, &sent),
     };
@@ -4132,7 +4138,7 @@ fn read(
             .map_err(|_| Failure::new(FailureKind::BadReply, "Invalid model response."))?;
         let value = as_chat(connection, value);
         let value = if responses {
-            crate::wire_responses::reply(value)
+            crate::providers::wire::openai_responses::reply(value)
         } else {
             value
         };
@@ -4146,8 +4152,8 @@ fn read(
     let mut done = false;
     // A Messages stream says in many events what a chat completion says in
     // one chunk, so it is read through what it has said so far.
-    let mut messages = crate::wire_anthropic::speaks(&connection.endpoint)
-        .then(crate::wire_anthropic::Stream::default);
+    let mut messages = crate::providers::wire::anthropic::speaks(&connection.endpoint)
+        .then(crate::providers::wire::anthropic::Stream::default);
     for line in BufReader::new(response).lines() {
         let line = match line {
             Ok(line) => line,
@@ -4175,12 +4181,14 @@ fn read(
             break;
         }
         let chunk = match &mut messages {
-            None if responses => parse_chunk(&crate::wire_responses::chunk(&read_event(data)?))?,
+            None if responses => parse_chunk(&crate::providers::wire::openai_responses::chunk(
+                &read_event(data)?,
+            ))?,
             None => parse_event(data)?,
             Some(messages) => match messages.event(&read_event(data)?) {
-                crate::wire_anthropic::Said::Chunk(chunk) => parse_chunk(&chunk)?,
-                crate::wire_anthropic::Said::Nothing => continue,
-                crate::wire_anthropic::Said::Over => {
+                crate::providers::wire::anthropic::Said::Chunk(chunk) => parse_chunk(&chunk)?,
+                crate::providers::wire::anthropic::Said::Nothing => continue,
+                crate::providers::wire::anthropic::Said::Over => {
                     done = true;
                     break;
                 }
@@ -12264,7 +12272,8 @@ mod tests {
                    "output_index": 1, "delta": delta})
         };
         for event in [part(0), words("Searching."), part(1), words("Found it.")] {
-            let chunk = parse_chunk(&crate::wire_responses::chunk(&event)).unwrap();
+            let chunk =
+                parse_chunk(&crate::providers::wire::openai_responses::chunk(&event)).unwrap();
             reply.absorb(chunk, &mut stands, &sender).unwrap();
         }
         let mut thought = String::new();
@@ -12718,13 +12727,13 @@ mod tests {
         };
         let window = thought_before_reading(&c);
         let posted = as_messages(&c, &body(&c, &window, None, None));
-        assert!(crate::wire_anthropic::replays(&posted));
+        assert!(crate::providers::wire::anthropic::replays(&posted));
         assert!(posted.pointer("/thinking/block_binding").is_some());
         // What a route without the controls says to the header.
         let refusal = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Unexpected value(s) `thinking-binding-controls-2026-08-01` for the `anthropic-beta` header. Please consult our documentation at docs.anthropic.com or try again without the header."}}"#;
         assert!(learn_messages(&c, &posted, refusal));
         let again = as_messages(&c, &body(&c, &window, None, None));
-        assert!(!crate::wire_anthropic::replays(&again));
+        assert!(!crate::providers::wire::anthropic::replays(&again));
         assert!(again.get("thinking").is_none());
         // Refused again, it carried nothing to leave out, so it is not sent again.
         assert!(!learn_messages(&c, &again, refusal));
