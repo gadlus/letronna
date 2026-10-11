@@ -460,7 +460,8 @@ fn suggest_of(
         .and_then(|r| r.error_for_status())
         .and_then(|r| r.json())
         .map_err(|e| crate::side::Failed::sending(&e, format!("No message came back: {e}")))?;
-    let value = crate::wire_responses::reply(crate::chat::as_chat(connection, value));
+    let value =
+        crate::providers::wire::openai_responses::reply(crate::chat::as_chat(connection, value));
     let text = crate::chat::unwrap_response(&value)?
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)

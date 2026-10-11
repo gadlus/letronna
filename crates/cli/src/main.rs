@@ -1201,7 +1201,7 @@ fn refused(result: &Message) -> bool {
 
 /// The gateway `name` means, in any case.
 fn gateway_named(name: &str) -> Result<&'static str, String> {
-    let gateways = letronna_core::gateway::GATEWAYS;
+    let gateways = &letronna_core::gateway::GATEWAYS;
     if let Some(gateway) = gateways
         .iter()
         .find(|g| g.name.eq_ignore_ascii_case(name.trim()))

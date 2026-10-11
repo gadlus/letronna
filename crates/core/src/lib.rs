@@ -82,6 +82,7 @@ mod prefilter;
 pub mod preview;
 pub mod profiles;
 pub mod prompt_rules;
+pub mod providers;
 mod redact;
 pub mod references;
 pub mod remote;
@@ -122,8 +123,6 @@ pub mod vault;
 pub mod wake;
 pub mod watch;
 pub mod web;
-mod wire_anthropic;
-mod wire_responses;
 #[cfg(feature = "workflows")]
 pub mod workflow;
 pub mod worktree;
