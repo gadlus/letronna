@@ -137,6 +137,12 @@ pub(crate) const UNASKED: &str = "Not saved: memory is saved only when the user 
 /// is there to give it, as in a scheduled run or `-p`.
 pub(crate) const NOBODY_TO_SAY_YES: &str = "Not saved: each memory save needs the user's yes, and nobody is here to give it. Say in your answer what you would have kept.";
 
+/// Whether a result is one of those refusals of a save, by which the turn
+/// tells it from a save that ran and failed.
+pub(crate) fn not_saved(result: &str) -> bool {
+    result.starts_with("Not saved: ")
+}
+
 /// Words that ask to keep or drop something in memory, as words of the
 /// user's message, in English and Indonesian; "remember" also begins one,
 /// as in "remembered".

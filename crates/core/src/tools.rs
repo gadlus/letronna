@@ -449,6 +449,15 @@ pub fn find(name: &str) -> Option<Arc<dyn Tool>> {
 /// is nearly always among the first few, and a longer list is read past.
 const NEAREST: usize = 3;
 
+/// How the refusal of a call to a tool there is not begins, by which the
+/// turn tells it from a call that ran and failed.
+const UNKNOWN: &str = "Unknown tool `";
+
+/// Whether a result is the refusal of a call to a tool there is not.
+pub(crate) fn is_unknown(result: &str) -> bool {
+    result.starts_with(UNKNOWN)
+}
+
 /// The refusal of a call to `name`, which is no tool, naming the `NEAREST`
 /// tools fewest edits from it, a shared start counting against the edits.
 pub(crate) fn unknown(name: &str) -> String {
@@ -476,7 +485,7 @@ pub(crate) fn unknown(name: &str) -> String {
         .map(|(_, name)| format!("`{name}`"))
         .collect();
     format!(
-        "Unknown tool `{name}`. The nearest tools by name are {}.",
+        "{UNKNOWN}{name}`. The nearest tools by name are {}.",
         nearest.join(", ")
     )
 }

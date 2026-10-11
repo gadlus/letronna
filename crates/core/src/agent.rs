@@ -1022,11 +1022,16 @@ fn fails_the_rest(result: &Message) -> bool {
 }
 
 /// Whether an error is a no from the user, the gate, a hook or Auto mode,
-/// or a stop, rather than the call itself failing.
+/// or a stop, rather than the call itself failing: a call to a tool there
+/// is not, a save the user did not ask for and a question only they may
+/// read are answered in their own words, and are refusals too.
 fn refused_or_stopped(error: &str) -> bool {
     // Another way round a refusal would only get past it.
     crate::gate::refused(error)
         || tools::is_declined(error)
+        || tools::is_unknown(error)
+        || crate::memory::not_saved(error)
+        || error == crate::info::WITHHELD
         || error == STOPPED_WHILE_RUNNING
         || error.starts_with(NOT_RUN)
 }
@@ -1678,6 +1683,33 @@ mod tests {
         assert_eq!(turn.next(|_| Outcome::Run), Next::Ask);
         let sent = turn.take_results();
         assert!(sent[1].content.starts_with("Not run: an earlier call"));
+    }
+
+    #[test]
+    fn a_refused_call_leaves_the_rest_of_its_reply_to_run() {
+        // Each refusal in the words its tool answers with: none of these
+        // ran, so nothing queued behind them counted on what they did.
+        let refusals = [
+            ("bash", tools::unknown("bash")),
+            ("memory", crate::memory::UNASKED.to_owned()),
+            ("memory", crate::memory::NOBODY_TO_SAY_YES.to_owned()),
+            ("letronna_info", crate::info::WITHHELD.to_owned()),
+            ("wake_me", "`wake_me` is not available in a scheduled run.".into()),
+        ];
+        for (name, why) in refusals {
+            let mut turn = turn();
+            let mut fix = call("edit_file");
+            fix.arguments = edit("fn a()").to_string();
+            turn.begin(vec![call(name), fix.clone(), call("run_command")]);
+            turn.finish_call(Err(why.clone()));
+            assert_eq!(turn.next(|_| Outcome::Run), Next::Run(fix), "{why}");
+            turn.finish_call(Ok("edited".into()));
+            assert_eq!(
+                turn.next(|_| Outcome::Run),
+                Next::Run(call("run_command")),
+                "{why}"
+            );
+        }
     }
 
     #[test]
