@@ -551,7 +551,7 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
                 ..
             } => path
                 .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
+                .map_or(Ok(()), |folder| crate::taint::create_folders(ctx, folder))
                 .map_err(|e| format!("Could not make the folder for `{raw}`: {e}."))
                 .and_then(|()| batch.write(path, after.as_bytes(), *mark, &ctx.files)),
             Step::Remove { path, raw, .. } => batch.remove(path, raw, &ctx.files),
@@ -1231,7 +1231,7 @@ mod tests {
                 model: model.into(),
                 ..Default::default()
             };
-            !crate::tools::specs_of(&tools, &connection, false).is_empty()
+            !crate::tools::specs_of(&tools, &connection, Default::default()).is_empty()
         };
         assert!(offered("gpt-4.1"));
         assert!(!offered("claude-sonnet-4-5"));

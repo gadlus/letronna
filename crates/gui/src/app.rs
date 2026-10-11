@@ -42,6 +42,10 @@ const OWN_COMMANDS: &[&str] = &["btw", "init"];
 /// text, which reads as one measure. A wider window gets wider margins
 /// rather than longer lines.
 pub(crate) const COLUMN: Pixels = px(816.);
+/// How much of the way to the bottom the chat goes each frame as a reply
+/// comes in, and the furthest it glides rather than going at once.
+const EASE_STEP: f32 = 0.35;
+const EASE_REACH: Pixels = px(600.);
 
 /// How far past the top and bottom of the chat turns are measured ahead:
 /// about a screen, so scrolling does not show a turn being sized, while a
@@ -84,7 +88,7 @@ pub(crate) struct Aside {
     asked: std::time::Instant,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Page {
     Chat,
     Capabilities,
@@ -183,6 +187,8 @@ pub(crate) struct Chat {
     pub(crate) settings_open: bool,
     /// Held by the settings panel while it is open, so escape reaches it.
     pub(crate) settings_focus: FocusHandle,
+    /// Where the keys were when settings opened, given back when it closes.
+    pub(crate) settings_before: Option<FocusHandle>,
     /// Held by the pages without a composer, so the window's shortcuts still
     /// reach the chat there.
     pub(crate) page_focus: FocusHandle,
@@ -311,6 +317,8 @@ pub(crate) struct Chat {
     pub(crate) runs: std::collections::BTreeMap<u64, crate::runs::Run>,
     /// Where each held run's thread sends its end.
     pub(crate) run_ends: async_channel::Sender<crate::runs::Finished>,
+    /// Where each held run's thread tells its steps, as they happen.
+    pub(crate) run_steps: async_channel::Sender<(u64, letronna_core::driver::Step)>,
     /// The session each chat app is talking in, and the card each was sent.
     pub(crate) remote: letronna_core::remote::Dispatcher,
     /// Bumped when a turn is stopped. The stream thread of the stopped turn
@@ -457,6 +465,8 @@ pub(crate) struct Chat {
     /// Runs of tool calls shown as their rows rather than one line, by
     /// session id and the place of the run's first call.
     pub(crate) runs_open: std::collections::HashSet<(u64, usize)>,
+    /// How long the calls run here took, for their rows.
+    pub(crate) call_times: crate::ui::messages::CallTimes,
     /// The files the newest finished turn changed, for the card after it,
     /// and the session and length last read for it, read or not yet.
     pub(crate) turn_files: Option<crate::ui::actions::TurnFiles>,
@@ -567,9 +577,6 @@ pub(crate) struct Chat {
     /// Sessions whose plan's list was closed by hand, which then rests as the
     /// strip's one line rather than opening by itself.
     pub(crate) plan_folded: std::collections::HashSet<u64>,
-    /// Whether the sidebar's More row is open on the pages under it, kept
-    /// for the window's life.
-    pub(crate) nav_more: bool,
 }
 
 impl Chat {
@@ -831,10 +838,10 @@ impl Chat {
             // other settings pin the window's own look.
             cx.observe_window_appearance(window, |this, window, cx| {
                 if crate::theme::follows_system(&this.store.settings.appearance) {
+                    crate::theme::apply(&this.store.settings.appearance, window, cx);
                     // As when the theme is picked: the blurred snapshot behind
                     // settings wears the old colours.
-                    this.drop_backdrop(cx);
-                    crate::theme::apply(&this.store.settings.appearance, window, cx);
+                    this.retake_backdrop(window, cx);
                 }
             }),
             // Also on coming to the front, for a change the system did not
@@ -866,6 +873,7 @@ impl Chat {
         };
         let draft_for = store.conversations[store.active].id;
         let (run_ends, ended_runs) = async_channel::unbounded();
+        let (run_steps, run_stepped) = async_channel::unbounded();
         let account = letronna_core::auth::account();
         // Nothing reachable yet: no account, and no key or URL saved for a
         // gateway that needs one. Ollama needs neither, so it is not asked.
@@ -922,6 +930,7 @@ impl Chat {
             memory,
             settings_open: false,
             settings_focus: cx.focus_handle(),
+            settings_before: None,
             page_focus: cx.focus_handle(),
             settings_backdrop: None,
             grains: crate::ui::grain::Grains::new(cx),
@@ -969,6 +978,7 @@ impl Chat {
             slack_state: None,
             runs: Default::default(),
             run_ends,
+            run_steps,
             remote: Default::default(),
             generation: 0,
             reading: None,
@@ -1033,6 +1043,7 @@ impl Chat {
             edit_message,
             thinking_open: std::collections::HashSet::new(),
             runs_open: std::collections::HashSet::new(),
+            call_times: Default::default(),
             turn_files: None,
             turn_files_for: None,
             video: None,
@@ -1082,7 +1093,6 @@ impl Chat {
             strip_area: cx.focus_handle(),
             strip_focus_first: false,
             plan_folded: std::collections::HashSet::new(),
-            nav_more: false,
         };
         let shrink = this.follow_browser_shrink(window, cx);
         this._subscriptions.push(shrink);
@@ -1101,6 +1111,13 @@ impl Chat {
         let focus = this.changes.focus.clone();
         let tab = cx.on_focus_in(&focus, window, |this, _, cx| this.refresh_changes(cx));
         this._subscriptions.push(tab);
+        // A new session nothing was said in gives back the number it held,
+        // as the terminal's does on its way out.
+        let quitting = cx.on_app_quit(|this, _| {
+            this.store.release_unused();
+            async {}
+        });
+        this._subscriptions.push(quitting);
         this.load_models(window, cx);
         // Directly, not through `focus_composer`: the window's root does
         // not exist yet to ask about dialogs, and there can be none.
@@ -1108,6 +1125,7 @@ impl Chat {
             .update(cx, |input, cx| input.focus(window, cx));
         Self::watch_schedules(schedule_events, cx);
         Self::watch_runs(ended_runs, cx);
+        Self::watch_run_steps(run_stepped, cx);
         Self::watch_updates(cx);
         Self::watch_inbox(cx);
         // After the inbox listens, as a wake-up is a notice left in it. Every
@@ -1481,18 +1499,15 @@ impl Chat {
             None => {}
         }
         if self.run_holds_open() && (!prompt.is_empty() || !self.attached().is_empty()) {
-            self.error = Some(
-                "This session is running beside the chat. Wait for its answer, or stop it with \
-                 Escape."
-                    .into(),
-            );
-            cx.notify();
-            return;
+            return self.queue_after_run(prompt, window, cx);
         }
-        if self.busy && !prompt.is_empty() {
+        // A reply in another session leaves this one free: what is sent here
+        // runs beside it rather than waiting for it.
+        let elsewhere = self.busy_elsewhere().is_some();
+        if self.busy && !elsewhere && !prompt.is_empty() {
             return self.queue_follow_up(prompt, window, cx);
         }
-        if self.busy {
+        if self.busy && !elsewhere {
             return;
         }
         let images = self.attached().to_vec();
@@ -1530,7 +1545,12 @@ impl Chat {
             .update(cx, |input, cx| input.set_value("", window, cx));
         // Setting the box raises no change, so the chip is put right here.
         self.crew_reset(cx);
-        if self.dispatch(prompt, images, None, cx).is_err() {
+        let sent = if elsewhere {
+            self.send_beside(prompt, images, cx)
+        } else {
+            self.dispatch(prompt, images, None, cx)
+        };
+        if sent.is_err() {
             self.open_settings(window, cx);
         } else {
             self.attachments.remove(&session);
@@ -1574,27 +1594,35 @@ impl Chat {
                     Some(format!(
                         "{command} was not sent: its answer came after the box or the session changed."
                     ))
-                } else if this.busy && this.streaming_id != Some(session) {
-                    Some(
-                        "Another session is working. Send this when it is done, or stop it first."
-                            .into(),
-                    )
                 } else {
                     None
                 };
+                // Sent as a typed message is: after the run or the reply in
+                // this session, or beside a reply in another.
+                let elsewhere = this.busy_elsewhere().is_some();
                 match (expanded, refused) {
                     (Err(why), _) | (Ok(_), Some(why)) => {
                         this.error = Some(why);
                         cx.notify();
                     }
-                    (Ok(text), None) if this.busy => this.queue_follow_up(text, window, cx),
+                    (Ok(text), None) if this.run_holds_open() => {
+                        this.queue_after_run(text, window, cx)
+                    }
+                    (Ok(text), None) if this.busy && !elsewhere => {
+                        this.queue_follow_up(text, window, cx)
+                    }
                     (Ok(text), None) => {
                         this.composer
                             .update(cx, |input, cx| input.set_value("", window, cx));
                         tell_crew(session, &typed, crew::Source::Composer);
                         // Pictures attached go with it, as with a typed message.
                         let images = this.attached().to_vec();
-                        if this.dispatch(text, images, None, cx).is_err() {
+                        let sent = if elsewhere {
+                            this.send_beside(text, images, cx)
+                        } else {
+                            this.dispatch(text, images, None, cx)
+                        };
+                        if sent.is_err() {
                             this.open_settings(window, cx);
                         } else {
                             this.attachments.remove(&session);
@@ -1757,16 +1785,7 @@ impl Chat {
         }
         let conversation = &mut self.store.conversations[self.store.active];
         goal::interrupted(&mut conversation.goal);
-        // Name an untitled session after its first prompt, but leave a name
-        // that was set deliberately, such as a scheduled job's.
-        if conversation.messages.is_empty()
-            && (conversation.title.is_empty() || conversation.title == "New session")
-        {
-            let saved = letronna_core::workflow::saved::typed(&prompt);
-            let shown = letronna_core::init::typed(&prompt).or(saved.as_deref());
-            let shown = shown.unwrap_or(&prompt);
-            conversation.title = letronna_core::store::name_from(shown);
-        }
+        name_after(conversation, &prompt);
         conversation.updated = backend::now();
         // What came in meanwhile goes first, so the prompt is read last.
         conversation
@@ -1893,13 +1912,21 @@ impl Chat {
     ) -> Result<(), String> {
         // A second turn started over a running one would replace its agent
         // loop; the composer queues a follow-up here, which the bar cannot.
-        if self.busy {
+        // A reply in another session leaves this one free, and a new one is
+        // free whatever runs.
+        let previous = self.store.active;
+        let landing = (!new_session).then(|| self.store.conversations[previous].id);
+        if landing.is_some_and(|id| self.busy && self.streaming_id == Some(id)) {
             return Err("A reply is still running. Send this when it is done.".into());
+        }
+        if landing.is_some_and(|id| self.runs.contains_key(&id)) {
+            return Err(
+                "That session is running beside the chat. Send this when it is done.".into(),
+            );
         }
         if prompt.chars().count() > 12_000 {
             return Err("Please keep each message under 12,000 characters.".into());
         }
-        let previous = self.store.active;
         if new_session {
             let workspace = self.store.conversations[previous].workspace.clone();
             self.store.conversations.push(Conversation {
@@ -1914,6 +1941,7 @@ impl Chat {
         let session = self.store.conversations[self.store.active].id;
         tell_crew(session, &prompt, crew::Source::Composer);
         let sent = match self.prompt_for(prompt, cx) {
+            Some(prompt) if self.busy => self.send_beside(prompt, images, cx).is_ok(),
             Some(prompt) => self.dispatch(prompt, images, None, cx).is_ok(),
             None => false,
         };
@@ -1983,6 +2011,8 @@ impl Chat {
             system: None,
             // The window shows Markdown whole.
             plain_terminal: false,
+            // Someone is watching, so every tool goes out in the array.
+            lean_tools: false,
         };
         backend::validate(&connection)?;
         Ok(connection)
@@ -2229,10 +2259,14 @@ impl Chat {
         }
         if !(self.page == Page::Chat && self.store.active == ix) {
             let title = &self.store.conversations[ix].title;
-            self.error = Some(format!(
-                "Helper {} in \"{title}\" is waiting for your answer.",
-                request.label
-            ));
+            self.error = Some(if self.own_run(&request) {
+                format!("\"{title}\" is waiting for your answer.")
+            } else {
+                format!(
+                    "Helper {} in \"{title}\" is waiting for your answer.",
+                    request.label
+                )
+            });
         }
         let mut ctx = letronna_core::tools::ToolContext::default();
         ctx.conversation = request.root;
@@ -2320,18 +2354,50 @@ impl Chat {
         turn.live = agent::Live::default();
         cx.notify();
         let generation = self.generation;
+        // The reply's text is paced onto the screen, a piece a frame, rather
+        // than shown in the bursts it arrives in; with motion reduced it is
+        // shown as it comes.
+        let paced = !cx.reduce_motion();
         self.reading = Some(cx.spawn(async move |this, cx| {
-            while let Ok(event) = receiver.recv().await {
-                let finished = matches!(event, Event::Finished(_));
-                let current = this.update(cx, |this, cx| {
-                    let current = this.generation == generation;
-                    if current {
-                        this.on_event(event, cx);
+            let mut pacer = crate::ui::pace::Pacer::default();
+            let mut open = true;
+            loop {
+                if pacer.is_empty() {
+                    if !open {
+                        break;
                     }
-                    current
-                });
-                if !matches!(current, Ok(true)) || finished {
+                    match receiver.recv().await {
+                        Ok(event) => pacer.push(event),
+                        Err(_) => {
+                            open = false;
+                            continue;
+                        }
+                    }
+                }
+                while let Ok(event) = receiver.try_recv() {
+                    pacer.push(event);
+                }
+                let batch = if paced { pacer.next() } else { pacer.all() };
+                let mut ended = false;
+                for event in batch {
+                    let finished = matches!(event, Event::Finished(_));
+                    let current = this.update(cx, |this, cx| {
+                        let current = this.generation == generation;
+                        if current {
+                            this.on_event(event, cx);
+                        }
+                        current
+                    });
+                    if !matches!(current, Ok(true)) || finished {
+                        ended = true;
+                        break;
+                    }
+                }
+                if ended {
                     break;
+                }
+                if !pacer.is_empty() {
+                    cx.background_executor().timer(crate::ui::pace::FRAME).await;
                 }
             }
         }));
@@ -2639,8 +2705,10 @@ impl Chat {
                     .unwrap_or_default();
                 if let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) {
                     let conversation = &mut self.store.conversations[ix];
+                    let first = conversation.messages.len();
                     conversation.messages.extend(results);
                     let session = conversation.id;
+                    (self.call_times).keep(session, first, &conversation.messages[first..]);
                     // The files the tools wrote are noted on these results,
                     // which are in the conversation only from here.
                     self.refresh_changes(cx);
@@ -2743,6 +2811,7 @@ impl Chat {
         ctx.cancel = self.turn_stop.clone();
         self.call_running = true;
         let (id, name) = (call.id.clone(), call.name.clone());
+        self.call_times.start(&id);
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let _ = tx.send_blocking(letronna_core::tools::run(&call.name, &call.arguments, &ctx));
@@ -2768,6 +2837,7 @@ impl Chat {
     /// Record the outcome of a call that ran, and move on once the rest of
     /// its batch is back too.
     fn record_ran(&mut self, id: &str, result: Result<String, String>, cx: &mut Context<Self>) {
+        self.call_times.stop(id);
         self.outstanding = self.outstanding.saturating_sub(1);
         self.call_running = self.outstanding > 0;
         if let Some(turn) = self.turn.as_mut() {
@@ -3284,9 +3354,24 @@ impl Chat {
         });
     }
 
+    /// Close part of the way to the bottom: a reply coming in glides the
+    /// chat down rather than jumping it a line at a time. A long way, or
+    /// with motion reduced, it goes at once. True while there is more to go.
+    fn ease_to_bottom(&self, still: bool) -> bool {
+        let at = -self.list.scroll_px_offset_for_scrollbar().y;
+        let gap = self.list.max_offset_for_scrollbar().y - at;
+        if still || gap <= px(1.) || gap > EASE_REACH {
+            self.scroll_to_bottom();
+            return false;
+        }
+        (self.list).set_offset_from_scrollbar(point(px(0.), -(at + gap * EASE_STEP)));
+        true
+    }
+
     /// Group the session on screen into turns, tell the list which of them
     /// changed since the last draw, and keep to the bottom while following.
-    fn lay_out_turns(&mut self) {
+    /// True while the chat is still gliding down to it.
+    fn lay_out_turns(&mut self, still: bool) -> bool {
         let conversation = &self.store.conversations[self.store.active];
         let streaming_here = self.busy && self.streaming_id == Some(conversation.id);
         let turns = crate::ui::actions::turns(&conversation.messages, streaming_here);
@@ -3311,8 +3396,10 @@ impl Chat {
             // on screen is measured again at every draw.
             self.list.splice(kept..before, count - kept);
         }
+        let opened = listed != id;
         self.listed = (id, count);
-        self.keep_following();
+        // A session just opened starts at its end, not gliding to it.
+        self.keep_following(still || opened)
     }
 
     /// Turn `n` of the session on screen, as the list draws it. The turn a
@@ -3329,7 +3416,7 @@ impl Chat {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::ui::actions::shows_bar;
-        use crate::ui::motion::Row;
+        use crate::ui::motion::{Fold, Row};
         let Some(&span) = self.turns.get(n) else {
             return self.under_turns(column, window, cx);
         };
@@ -3387,7 +3474,9 @@ impl Chat {
                 && !(streaming_here && i + 1 == messages.len());
             let bar = (!m.notice && (span.yours || ends)).then(|| {
                 let focused = focus.contains_focused(window, cx) && !in_menu;
-                let shown = shows_bar(span, messages.len(), streaming_here, focused);
+                // A run beside the chat is still answering the last turn too.
+                let answering = streaming_here || self.runs.contains_key(&session);
+                let shown = shows_bar(span, messages.len(), answering, focused);
                 self.turn_bar(span, shown, cx)
             });
             let run = letronna_core::tool_runs::holding(&runs, i);
@@ -3422,6 +3511,14 @@ impl Chat {
                 continue;
             }
             let row = self.message_row(i, m, labeled, false, bar, window, cx);
+            // The calls of a run just opened come in with it.
+            let row = match run.filter(|_| folded.is_none()) {
+                Some(run) => {
+                    let key = (conversation.id, run.first);
+                    (self.motion.opened).ease(Fold::Run, key, row, window, cx)
+                }
+                None => row,
+            };
             let row = if hit.take_if(|&mut (_, at)| i >= at).is_some() {
                 self.mark_hit(row, cx)
             } else {
@@ -3529,6 +3626,7 @@ impl Chat {
     ) -> AnyElement {
         let session = self.store.conversations[self.store.active].id;
         let mut rows: Vec<AnyElement> = Vec::new();
+        rows.extend(self.run_live(session, window, cx));
         rows.extend(self.helper_card(session, window, cx));
         rows.extend(self.aside_row(session, window, cx));
         h_flex()
@@ -3565,14 +3663,14 @@ impl Chat {
     /// the bottom runs ahead of the view on its own. What the user does is
     /// move the view up and away from the bottom. Content that shrinks also
     /// moves it up, but pinned to the bottom, and that must not count.
-    fn keep_following(&mut self) {
+    fn keep_following(&mut self, still: bool) -> bool {
         let offset = self.list.scroll_px_offset_for_scrollbar().y;
         // Held at a search hit, the chat stays put. Where it is still counts,
         // so a scroll by hand after it lets go is told the right way round.
         if self.holding_hit() {
             self.followed_offset = offset;
             self.place_hit();
-            return;
+            return false;
         }
         let near_bottom = self.distance_from_bottom() <= FOLLOW_SLACK;
         // The offset grows towards zero going up.
@@ -3582,9 +3680,7 @@ impl Chat {
             self.following = true;
         }
         self.followed_offset = offset;
-        if self.following {
-            self.scroll_to_bottom();
-        }
+        self.following && self.ease_to_bottom(still)
     }
 
     /// A way back down once the chat has been scrolled up. Following stops
@@ -4183,7 +4279,9 @@ impl Render for Chat {
         // only what comes in while it is rises in.
         let shown = &self.store.conversations[self.store.active];
         (self.motion.rows).note(shown.id, shown.messages.len(), shown.unfilled());
-        self.lay_out_turns();
+        if self.lay_out_turns(cx.reduce_motion()) {
+            window.request_animation_frame();
+        }
         self.watch_turn_files(cx);
         self.keep_files_current(window, cx);
         self.keep_region(window, cx);
@@ -4277,6 +4375,13 @@ impl Render for Chat {
             // Beside the docked panel, less again.
             - self.panel_width(window, cx);
         let column = pane.min(COLUMN).max(px(0.));
+        // The setup takes the whole window, as a first launch should look:
+        // no sidebar, composer or status bar around it, only the title bar
+        // to drag the window by.
+        let welcome = self.page == Page::Chat && self.show_setup == Some(conversation.id);
+        // An empty chat's grain runs behind the composer and the status bar
+        // too, to the window's edge, so the page reads as one surface.
+        let mut empty_chat = false;
 
         let body: AnyElement = if self.page == Page::Jobs {
             self.schedules_page(cx).into_any_element()
@@ -4301,14 +4406,15 @@ impl Render for Chat {
             // place of the conversation as the setup page is: the composer
             // stays under it.
             panel
-        } else if self.show_setup == Some(conversation.id) {
-            self.setup_page(window, cx).into_any_element()
+        } else if welcome {
+            div().into_any_element()
         } else if !self.transcript_shown() {
             if conversation.unfilled() {
                 // Still being read in, which takes a moment: blank rather
                 // than the greeting of a new session.
                 div().flex_1().into_any_element()
             } else {
+                empty_chat = true;
                 self.empty_state(window, cx).into_any_element()
             }
         } else {
@@ -4353,6 +4459,34 @@ impl Render for Chat {
                 .into_any_element()
         };
 
+        // A new page, or another session in the chat, rises into place as it
+        // fades in rather than replacing the last one all at once. Keyed by both, so it plays
+        // afresh on every change and not on every frame.
+        let body = if cx.reduce_motion() {
+            body
+        } else {
+            let shown = if self.page == Page::Chat {
+                conversation.id
+            } else {
+                0
+            };
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .w_full()
+                .relative()
+                .child(body)
+                .with_animation(
+                    SharedString::from(format!("page-{:?}-{shown}", self.page)),
+                    crate::ui::motion::enter(crate::ui::motion::GENTLE),
+                    crate::ui::motion::rise,
+                )
+                .into_any_element()
+        };
+
         // Built only where it shows: another page pays nothing for it.
         let strip = (self.page == Page::Chat)
             .then(|| self.running_strip(window, cx))
@@ -4365,6 +4499,11 @@ impl Render for Chat {
             .when(self.page != Page::Chat, |this| {
                 this.track_focus(&self.page_focus)
             })
+            .children(
+                empty_chat
+                    .then(|| self.grain(&self.grains.empty_chat))
+                    .flatten(),
+            )
             // Around the page's focus, so its tab keys reach whatever in it
             // holds the keys.
             .when(self.page == Page::Capabilities, |this| {
@@ -4570,36 +4709,54 @@ impl Render for Chat {
                     cx.notify();
                 }
             }))
-            .child(
-                div()
-                    .relative()
-                    .flex_shrink_0()
-                    .child(self.title_bar(window, cx))
-                    .children(self.grain(&self.grains.title_bar)),
-            )
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .when(self.sidebar_open, |this| {
-                        let sidebar = self.sidebar(window, cx).into_any_element();
-                        // In from the left edge, in a box only while it moves.
-                        this.child(if sidebar_in < 1. {
-                            let moving = div().h_full().flex_shrink_0().relative();
-                            crate::ui::motion::slide(moving, sidebar_in, -1.)
-                                .child(sidebar)
-                                .into_any_element()
-                        } else {
-                            sidebar
+            .when(welcome, |this| {
+                this.child(
+                    TitleBar::new()
+                        .bg(cx.theme().background)
+                        .border_color(cx.theme().background),
+                )
+                .child(self.setup_page(window, cx))
+            })
+            .when(!welcome, |this| {
+                this.child(
+                    div()
+                        .relative()
+                        .flex_shrink_0()
+                        .child(self.title_bar(window, cx))
+                        .children(self.grain(&self.grains.title_bar)),
+                )
+            })
+            .when(!welcome, |this| {
+                this.child(
+                    h_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .when(self.sidebar_open, |this| {
+                            let sidebar = self.sidebar(window, cx).into_any_element();
+                            // In from the left edge, in a box only while it moves.
+                            this.child(if sidebar_in < 1. {
+                                let moving = div().h_full().flex_shrink_0().relative();
+                                crate::ui::motion::slide(moving, sidebar_in, -1.)
+                                    .child(sidebar)
+                                    .into_any_element()
+                            } else {
+                                sidebar
+                            })
                         })
-                    })
-                    .child(main)
-                    .children(self.right_panel(window, cx)),
-            )
+                        .child(main)
+                        .children(self.right_panel(window, cx)),
+                )
+            })
             .children(self.settings_overlay(window, cx))
             .children(self.switcher(cx))
-            // Last, over everything, as the colours of a new theme come in.
-            .children(crate::ui::motion::veil_layer(window, cx))
+            // Last, over everything, as the colours of a new theme come in;
+            // not in a frame read for the blur behind settings, which is to
+            // show the window in them.
+            .children(
+                (!self.settings_reading)
+                    .then(|| crate::ui::motion::veil_layer(window, cx))
+                    .flatten(),
+            )
     }
 }
 
@@ -4693,8 +4850,22 @@ fn escape_closes_aside(asked: u64, here: u64, replying: Option<u64>) -> bool {
     asked == here && replying != Some(here)
 }
 
-/// Whether a session is a new one nothing was said in yet.
-fn untouched(conversation: &Conversation) -> bool {
+/// Name an untitled session after its first prompt, but leave a name that
+/// was set deliberately, such as a scheduled job's.
+pub(crate) fn name_after(conversation: &mut Conversation, prompt: &str) {
+    if conversation.messages.is_empty()
+        && (conversation.title.is_empty() || conversation.title == "New session")
+    {
+        let saved = letronna_core::workflow::saved::typed(prompt);
+        let shown = letronna_core::init::typed(prompt).or(saved.as_deref());
+        let shown = shown.unwrap_or(prompt);
+        conversation.title = letronna_core::store::name_from(shown);
+    }
+}
+
+/// Whether a session is a new one nothing was said in yet: open in the
+/// window, but listed nowhere and kept off the disk until its first message.
+pub(crate) fn untouched(conversation: &Conversation) -> bool {
     conversation.messages.is_empty()
         && !conversation.unfilled()
         && conversation.title == "New session"
@@ -4738,7 +4909,7 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        card_is_up, cuts_in, escape_closes_aside, front_call, run_ended, running_calls,
+        card_is_up, cuts_in, escape_closes_aside, front_call, name_after, run_ended, running_calls,
         side_question, until_repeated_id, untouched,
     };
     use letronna_core::agent::{MAX_BATCH, Next, Turn};
@@ -4964,6 +5135,31 @@ mod tests {
         assert_eq!(side_question("/btw"), Some(""));
         assert_eq!(side_question("/btwx"), None);
         assert_eq!(side_question("tell me /btw"), None);
+    }
+
+    #[test]
+    fn a_new_session_is_named_after_its_first_prompt_only() {
+        use letronna_core::chat::Message;
+        use letronna_core::store::Conversation;
+        let mut new = Conversation {
+            title: "New session".into(),
+            ..Default::default()
+        };
+        name_after(&mut new, "fix the login page so it remembers me");
+        assert_eq!(new.title, "fix the login page so it remembers me");
+
+        // Once something was said, a later prompt leaves the name.
+        new.messages.push(Message::default());
+        name_after(&mut new, "and the logout");
+        assert_eq!(new.title, "fix the login page so it remembers me");
+
+        // As does a name given on purpose, as a scheduled job's.
+        let mut named = Conversation {
+            title: "Morning digest".into(),
+            ..Default::default()
+        };
+        name_after(&mut named, "what is new");
+        assert_eq!(named.title, "Morning digest");
     }
 
     #[test]

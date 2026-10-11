@@ -1,7 +1,7 @@
 [
   {
     "function": {
-      "description": "Read a text file, a PDF, Word, Excel or PowerPoint file, or look at a PNG, JPEG, GIF, WebP or BMP picture; one too big to send is scaled down. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from. A Jupyter notebook (.ipynb) reads as numbered cells with short outputs, a document as its text with a heading for each page, sheet or slide, and N counts the lines of that view.",
+      "description": "Read a text file, a PDF, Word, Excel, PowerPoint or OpenDocument file, an EPUB book, or look at a PNG, JPEG, GIF, WebP or BMP picture; one too big to send is scaled down. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from. A Jupyter notebook (.ipynb) reads as numbered cells with short outputs, a document as its text with a heading for each page, sheet or slide, and N counts the lines of that view.",
       "name": "read_file",
       "parameters": {
         "properties": {
@@ -43,7 +43,7 @@
   },
   {
     "function": {
-      "description": "Search file contents under a folder with a regex (Rust syntax), matched line by line, leaving out what .gitignore ignores and, outside a Git repository, target, dist and build folders unless the glob names them. Mode content (the default) shows each file's matching lines as `12: text` and context lines as `13- text`; files lists the matching files, newest first; count gives matching lines per file. Mode files with no pattern lists the files a glob or type picks. Ignores case unless case_sensitive is set. Paths come back ready for read_file. PDF, Word, Excel and PowerPoint files are searched as read_file reads them only when type, glob or path names them.",
+      "description": "Search file contents under a folder with a regex (Rust syntax), matched line by line, leaving out what .gitignore ignores and, outside a Git repository, target, dist and build folders unless the glob names them. Mode content (the default) shows each file's matching lines as `12: text` and context lines as `13- text`; files lists the matching files, newest first; count gives matching lines per file. Mode files with no pattern lists the files a glob or type picks. Ignores case unless case_sensitive is set. Paths come back ready for read_file. PDF, Word, Excel, PowerPoint, OpenDocument and EPUB files are searched as read_file reads them only when type, glob or path names them.",
       "name": "search",
       "parameters": {
         "properties": {
@@ -83,7 +83,7 @@
             "type": "string"
           },
           "type": {
-            "description": "Only files of this type: rust, py, ts, js, go, java, cpp, md and so on, or a bare extension.",
+            "description": "Only files of this type, such as rust, py, ts or md, or a bare extension.",
             "type": "string"
           }
         },
@@ -186,12 +186,12 @@
   },
   {
     "function": {
-      "description": "Run a bash command in the project folder, or in the folder inside it that workdir names. Each call is a fresh shell: cd, export and source do not carry over to the next call, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish, for up to 2 minutes or the `timeout` given, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0. Past its timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, with a file for read_file named in the cut, so a build or test run need not be piped through tail, which would also hide its exit code. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead.",
+      "description": "Run a bash command in the project folder. Each call is a fresh shell: cd, export and source do not carry over, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish, up to `timeout`, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0; past the timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, and the cut names a file read_file can page through, so a build or test run need not be piped through tail, which also hides its exit code. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For a dev server, a watcher or anything else meant to keep running, pass background: true.",
       "name": "run_command",
       "parameters": {
         "properties": {
           "background": {
-            "description": "Leave the command running and return a job number straight away. A notice comes when it exits; read its output meanwhile with read_job, and end it with stop_job.",
+            "description": "Leave it running and return a job number at once; a notice comes when it exits. read_job reads its output and stop_job ends it.",
             "type": "boolean"
           },
           "command": {
@@ -199,7 +199,7 @@
             "type": "string"
           },
           "notify_on": {
-            "description": "With background: a notice when an output line contains one of these, such as \"ready\" or \"error\". At most one notice every 15 s; exiting always sends one.",
+            "description": "With background: also a notice when a line of output contains one of these, such as \"ready\" or \"error\"; at most one every 15 s.",
             "items": {
               "type": "string"
             },
@@ -218,7 +218,7 @@
             "type": "boolean"
           },
           "workdir": {
-            "description": "The folder to run it in, inside the project: relative to the project folder, or absolute. Left out, it runs in the project folder.",
+            "description": "A folder inside the project to run it in instead, relative to the project folder or absolute.",
             "type": "string"
           }
         },
@@ -232,7 +232,7 @@
   },
   {
     "function": {
-      "description": "Read what a background job has printed so far, and whether it is still running. Pass offset and limit to read a long log a page of lines at a time.",
+      "description": "Read what a background job has printed so far, and whether it is still running.",
       "name": "read_job",
       "parameters": {
         "properties": {
@@ -288,7 +288,7 @@
   },
   {
     "function": {
-      "description": "Type into a tty job and return what it prints next. keys: enter, tab, esc, up, down, ctrl-c, ctrl-d. Never for passwords.",
+      "description": "Type into a tty job and return what it prints next. Never for passwords.",
       "name": "send_job",
       "parameters": {
         "properties": {
@@ -419,7 +419,7 @@
             "type": "integer"
           },
           "mode": {
-            "description": "For add: what each run may do unasked; with nobody there, what would ask is refused. Defaults to default; pick more only when the user asked for it.",
+            "description": "For add: what each run may do unasked; what would ask is refused. Leave it default unless the user asked for more.",
             "enum": [
               "default",
               "accept-edits",
@@ -430,7 +430,7 @@
             "type": "string"
           },
           "name": {
-            "description": "For add: a few words for the list; defaults to the prompt's start.",
+            "description": "For add: a few words for the list.",
             "type": "string"
           },
           "prompt": {
@@ -448,6 +448,43 @@
         },
         "required": [
           "action"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "The user's setup in Letronna, from its own settings: account, plan and credit, models and provider keys, chat apps, schedules, MCP servers and more. Says whether a key or token is set and where, never its value.",
+      "name": "letronna_info",
+      "parameters": {
+        "properties": {
+          "email": {
+            "description": "With account: add the sign-in email, only when the user asks for it.",
+            "type": "boolean"
+          },
+          "topic": {
+            "description": "all gives a line of each.",
+            "enum": [
+              "all",
+              "account",
+              "models",
+              "chat_apps",
+              "schedules",
+              "mcp",
+              "profiles",
+              "permissions",
+              "settings",
+              "usage",
+              "version",
+              "data"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "topic"
         ],
         "type": "object"
       }
@@ -609,7 +646,7 @@
   },
   {
     "function": {
-      "description": "List the user's earlier Letronna sessions: id, title, when they were last used, how many messages, and which project folder. Use this when asked about past sessions or which one to pick up. It returns no conversation text. The user opens one with the /resume command, or `letronna --resume <id>`.",
+      "description": "List the user's earlier Letronna sessions: id, title, when they were last used, how many messages, and which project folder. It returns no conversation text.",
       "name": "list_sessions",
       "parameters": {
         "properties": {
@@ -691,7 +728,7 @@
   },
   {
     "function": {
-      "description": "Load a skill listed in your instructions: instructions for a kind of task. It comes with the folder it lives in and the files beside it, such as scripts to run and references to read; pass file with one of those paths to read it. Long text comes in pages: pass the offset a page ends with to read on.",
+      "description": "Load a skill listed in your instructions: instructions for a kind of task. It comes with the folder it lives in and the files beside it, such as scripts to run and references to read. Long text comes in pages.",
       "name": "skill",
       "parameters": {
         "properties": {
@@ -807,7 +844,7 @@
   },
   {
     "function": {
-      "description": "Fetch a web page (http or https) and return its text: HTML is reduced to readable markdown with its links as full addresses and its forms' fields (hidden ones too), plain text and JSON come back as they are, and a PDF is saved as a file. A page read in the last 15 minutes is given again from memory unless `fresh` is true. Use it to read a page the user mentions, or one a search turned up. For a fact that may have changed since your training, such as a price, a latest release, a schedule or news, look it up rather than answer from training; if you cannot, say your answer may be out of date.",
+      "description": "Fetch a web page and return its text: HTML is reduced to readable markdown with its links as full addresses and its forms' fields (hidden ones too), plain text and JSON come back as they are, and a PDF is saved as a file. For a fact that may have changed since your training, such as a price, a latest release, a schedule or news, look it up rather than answer from training; if you cannot, say your answer may be out of date.",
       "name": "web_fetch",
       "parameters": {
         "properties": {
@@ -865,7 +902,7 @@
   },
   {
     "function": {
-      "description": "Change pictures as a description says -- edit one, combine several, or redraw only where a mask marks -- and save the result as a file. The pictures are files in the project, or ones already in this conversation by the path their result named. It goes to the chat's own gateway: on Letronna's hosted models it is paid from the user's credit, a few cents an image. Use it only when the user asks for a picture to be changed.",
+      "description": "Change pictures as a description says -- edit one, combine several, or redraw only where a mask marks -- and save the result as a file. It goes to the chat's own gateway: on Letronna's hosted models it is paid from the user's credit, a few cents an image. Use it only when the user asks for a picture to be changed.",
       "name": "edit_image",
       "parameters": {
         "properties": {
@@ -1223,12 +1260,12 @@
   },
   {
     "function": {
-      "description": "Hand a task to a helper agent that works with its own context and reports back. Use it to explore or check many files without filling your own context, not for a few reads you can do yourself. Helpers editing at the same time need separate files, or isolation worktree. The helper has not seen this conversation: brief it fully. Its report is all you get back, and it is the helper's own account: look at what it says it changed or ran before you tell the user it is done. In the window and the terminal it runs in the background by default: carry on or end your turn, and a notice comes when it finishes. Do not poll or wait for it. Otherwise it works while you wait, and its report is this call's result. With keep, it stays after reporting, idle with its context, until a message through the agents tool gives it more work; it ends after 30 idle minutes.",
+      "description": "Hand a task to a helper agent that works with its own context and reports back. Use it to explore or check many files without filling your own context, not for a few reads you can do yourself. Helpers editing at the same time need separate files, or isolation worktree. Its report is all you get back, and it is the helper's own account: look at what it says it changed or ran before you tell the user it is done. In the window and the terminal it runs in the background by default: carry on or end your turn, and a notice comes when it finishes; do not poll or wait for it. Elsewhere you wait, and its report is this call's result.",
       "name": "agent",
       "parameters": {
         "properties": {
           "background": {
-            "description": "Default true in the window and terminal, unless the type says otherwise: return now and get a notice when it finishes. false waits for the report.",
+            "description": "false waits for the report. Default true in the window and terminal, unless the type says otherwise.",
             "type": "boolean"
           },
           "description": {
@@ -1236,18 +1273,18 @@
             "type": "string"
           },
           "fork": {
-            "description": "Start it from a copy of this conversation rather than from nothing: it has seen everything so far, so the prompt only says what to do. It keeps your model and tools, whatever type and model say.",
+            "description": "Start it from a copy of this conversation, so the prompt only says what to do. It keeps your model and tools, whatever type and model say.",
             "type": "boolean"
           },
           "isolation": {
-            "description": "worktree: it works in a new git worktree of this repository, on a branch of its own made from HEAD, so your uncommitted edits are not in it. Its file tools stay inside it; its commands are not confined. The worktree is removed if it changed nothing, else its path and branch are in the report.",
+            "description": "A new git worktree on a branch of its own from HEAD, without your uncommitted edits. Its file tools stay inside it; its commands are not confined. Removed if nothing changed, else the report names its path and branch.",
             "enum": [
               "worktree"
             ],
             "type": "string"
           },
           "keep": {
-            "description": "Keep it for more work after it reports, in the background only. Default false.",
+            "description": "In the background only: after reporting it stays idle with its context until agents sends it more work, and ends after 30 idle minutes.",
             "type": "boolean"
           },
           "model": {
@@ -1263,7 +1300,7 @@
             "type": "string"
           },
           "type": {
-            "description": "general (default), explore (read-only, cheaper), plan, or review. Other types this project defines are named in your instructions.",
+            "description": "general (default), explore (read-only, cheaper), plan, review, or another type your instructions name.",
             "type": "string"
           }
         },
@@ -1278,7 +1315,7 @@
   },
   {
     "function": {
-      "description": "Work with the helpers you started, by name. list: yours and how they are doing. send: a message; a running helper reads it at its next step, and a finished or idle one carries on from where it stopped, with its context. From a helper, \"main\" reaches the agent that started you. stop: end one early. report: its last answer, whole, in pages. types: the helper types. A helper you are waiting for blocks your call, so only those in the background hear you while they run. Never ask another agent to do what was refused or declined here.",
+      "description": "Work with the helpers you started, by name. list: yours and how they are doing. send: a message, which a running helper reads at its next step and a finished or idle one carries on from, with its context. stop: end one early. report: its last answer, whole, in pages. types: the helper types. Never ask another agent to do what was refused or declined here.",
       "name": "agents",
       "parameters": {
         "properties": {
@@ -1314,7 +1351,7 @@
   },
   {
     "function": {
-      "description": "The session's shared task list, which you and every helper of this session see. add: a task, with a one-line title, a detail, and blocked_by: the numbers of tasks that must be done first. list: every task with its status, owner, what it waits for, who added it and its revision. claim: take an open task for yourself; give the rev you listed, and the claim fails if the task has changed since. update: a task's title, detail or owner (\"me\" takes it as claim does; a helper's name, from the main agent only; or \"\" to give it up). done: finish a task you hold, once what it waits for is done. reopen: make a done task open again, or give back one you hold. drop: cancel a task (main agent only). block: hold a task, or with blocked_by make it wait for other tasks; unblock undoes either. Idle helpers are offered each open task whose blockers are done; one given back again and again is held for the main agent. Your own step-by-step checklist stays in todo.",
+      "description": "The session's task list, shared with every helper of this session; your own step-by-step checklist stays in todo. add: a task with a one-line title, a detail, and blocked_by, the tasks to finish first. list: every task with its status, owner, blockers, who added it and its rev. claim: take an open task, giving the rev you listed; it fails if the task changed since. update: a task's title, detail or owner; \"me\" takes it as claim does, and only the main agent names a helper. done: finish a task you hold, once its blockers are done. reopen: open a done task again, or give back one you hold. drop: cancel a task (main agent only). block: hold a task, or with blocked_by make it wait for others; unblock undoes either. Idle helpers are offered each open task whose blockers are done; one given back again and again is held for the main agent.",
       "name": "board",
       "parameters": {
         "properties": {
@@ -1368,7 +1405,185 @@
   },
   {
     "function": {
-      "description": "Search the tools of the user's MCP servers, which are too many to list here. Give a few words for what you need done, or a tool's exact name; the matching tools come back with their descriptions and arguments. Then call one with call_mcp_tool.",
+      "description": "Run a task in Letronna Cloud, on Letronna's servers, and get its answer. Where to build what the user asks for, in order: a page, chart, document or small app that one self-contained file can hold is written here as an .html or .svg file the user previews; anything else is built here, in the project, with the tools on this computer; only when this computer cannot (a tool it needs is not on PATH and cannot be installed, it would take more memory or time than this machine has, or the user asks for the cloud) send it here. It also hosts: a web app it leaves wakes on each visit, and a bot or worker the user wants kept online (a Discord or Telegram bot listening for events, a scheduler) runs 24/7 from their credit; say so in `task` only when the user asked for it to stay up, and put any keys it needs in `task` for /work/.env. cloud_apps shows what is left running and cloud_app_power takes it down or back up. The cloud cannot see this computer's files: give it everything it needs in `task`, or an https `repo` it clones. Say in your reply that it ran in the cloud. It costs the user's credit, so each call is asked about.",
+      "name": "cloud_task",
+      "parameters": {
+        "properties": {
+          "branch": {
+            "type": "string"
+          },
+          "repo": {
+            "description": "An https git address to clone and work in.",
+            "type": "string"
+          },
+          "task": {
+            "description": "What to do, whole: the cloud sees nothing else of this conversation.",
+            "type": "string"
+          },
+          "thread": {
+            "description": "An earlier cloud run's thread, to carry on in its folder and conversation.",
+            "type": "string"
+          },
+          "tier": {
+            "description": "Memory: light 512 MB (default), normal 1 GB, heavy 2 GB for builds.",
+            "enum": [
+              "light",
+              "normal",
+              "heavy"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "task"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "The apps and 24/7 workers (bots and the like) the user's Letronna Cloud runs left running. With no `thread`, lists each with its thread, state and address; with one, shows what it printed last and why it stopped. Use it when the user asks about or checks on something hosted in the cloud; cloud_app_power takes one down or brings it back.",
+      "name": "cloud_apps",
+      "parameters": {
+        "properties": {
+          "thread": {
+            "description": "One app's or worker's thread, to read what it printed.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Take one of the user's Letronna Cloud apps or 24/7 workers down (`up` false), or bring a stopped worker back (`up` true; billed from credit again while it runs). Its thread comes from cloud_apps.",
+      "name": "cloud_app_power",
+      "parameters": {
+        "properties": {
+          "thread": {
+            "type": "string"
+          },
+          "up": {
+            "description": "true to bring it back, false to take it down.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "thread",
+          "up"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "The user's crypto wallet in Letronna: its addresses (EVM chains and Solana), the user's spending rules and caps, what it holds on each network, and what was paid. It never shows a key. Pay a site that asks for payment (HTTP 402, x402) with paid_fetch, and send money with wallet_send.",
+      "name": "wallet",
+      "parameters": {
+        "properties": {
+          "action": {
+            "description": "summary: wallets, rules and caps; balances: what each wallet holds, read from the networks; history: the latest payments.",
+            "enum": [
+              "summary",
+              "balances",
+              "history"
+            ],
+            "type": "string"
+          },
+          "wallet": {
+            "description": "For balances, one wallet by name; all when left out.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Send money from the user's wallet: an amount of a network's native coin or of a token (such as USDC) to an address. The user sees each send on a card and decides, and it must fit the caps they set. A payment to a site that asks for it (HTTP 402) goes through paid_fetch instead.",
+      "name": "wallet_send",
+      "parameters": {
+        "properties": {
+          "amount": {
+            "description": "As a person writes it, such as \"5\" or \"0.25\".",
+            "type": "string"
+          },
+          "from": {
+            "description": "Which wallet pays, by name; the default one when left out.",
+            "type": "string"
+          },
+          "network": {
+            "description": "Base, Ethereum, Arbitrum, Optimism, Polygon, BNB Chain, Avalanche, Solana, a test network, or one the user added; a CAIP-2 id works too.",
+            "type": "string"
+          },
+          "to": {
+            "description": "The address: 0x… on an EVM network, base58 on Solana.",
+            "type": "string"
+          },
+          "token": {
+            "description": "The token's symbol or address, such as USDC; the network's own coin when left out.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "network",
+          "to",
+          "amount"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Read a page or call an API that asks to be paid (HTTP 402 with x402), paying it from the user's wallet in USDC or another token, then return what it gives. Use it when web_fetch reports a price, or for an API known to charge per call. The user's rules decide: a small price may be paid on its own, otherwise the user sees the price on a card; the caps always hold.",
+      "name": "paid_fetch",
+      "parameters": {
+        "properties": {
+          "body": {
+            "description": "For POST, the JSON to send.",
+            "type": "string"
+          },
+          "max_usd": {
+            "description": "The most to pay in dollars, such as \"0.05\"; the price shown on the card, or the per-payment cap, when left out.",
+            "type": "string"
+          },
+          "method": {
+            "description": "GET when left out.",
+            "enum": [
+              "GET",
+              "POST"
+            ],
+            "type": "string"
+          },
+          "url": {
+            "description": "The full address, starting with https://.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Search the tools left out of this list: the user's MCP servers' tools when they are too many to list. Give a few words for what you need done, or a tool's exact name; the matching tools come back with their descriptions and arguments. Then call one with call_mcp_tool.",
       "name": "find_tools",
       "parameters": {
         "properties": {
@@ -1387,7 +1602,7 @@
   },
   {
     "function": {
-      "description": "Call a tool of the user's MCP servers that find_tools found: its exact name in `name`, and in `arguments` the arguments find_tools gave for it.",
+      "description": "Call a tool that find_tools found: its exact name in `name`, and in `arguments` the arguments find_tools gave for it.",
       "name": "call_mcp_tool",
       "parameters": {
         "properties": {
@@ -1396,7 +1611,7 @@
             "type": "object"
           },
           "name": {
-            "description": "The tool's name as find_tools gave it, starting with mcp__.",
+            "description": "The tool's name as find_tools gave it.",
             "type": "string"
           }
         },
@@ -1461,26 +1676,26 @@
   },
   {
     "function": {
-      "description": "Search the web. Returns a numbered list of results, each with its title, address and a snippet. Snippets are cut short and may be stale: before you state a fact from a search, read the page that settles it in full with web_fetch, preferring the primary source (the official site or the project's own docs) over a page summarizing it, and give that page's address beside the fact. allowed_domains keeps only results from those sites and blocked_domains drops them, subdomains included; a site in both is blocked. Some services apply site filters after answering, so fewer results may come back. freshness keeps to pages from the last day, week, month or year. The same search again within 10 minutes gives the earlier answer.",
+      "description": "Search the web. Returns a numbered list of results, each with its title, address and a snippet. Snippets are cut short and may be stale: before you state a fact from a search, read the page that settles it in full with web_fetch, preferring the primary source (the official site or the project's own docs) over a page summarizing it, and give that page's address beside the fact. The same search again within 10 minutes gives the earlier answer.",
       "name": "search_web",
       "parameters": {
         "properties": {
           "allowed_domains": {
-            "description": "Only results from these sites and their subdomains, such as [\"docs.rs\"].",
+            "description": "Only results from these sites and their subdomains, such as [\"docs.rs\"]; some services filter after answering, so fewer may come back.",
             "items": {
               "type": "string"
             },
             "type": "array"
           },
           "blocked_domains": {
-            "description": "No results from these sites or their subdomains.",
+            "description": "No results from these sites or their subdomains, even if allowed.",
             "items": {
               "type": "string"
             },
             "type": "array"
           },
           "count": {
-            "description": "How many results, 1 to 10. Left out, 5.",
+            "description": "1 to 10; 5 if left out.",
             "type": "integer"
           },
           "freshness": {
@@ -1494,7 +1709,7 @@
             "type": "string"
           },
           "query": {
-            "description": "What to search for, as you would type it into a search engine.",
+            "description": "As you would type it into a search engine.",
             "type": "string"
           }
         },

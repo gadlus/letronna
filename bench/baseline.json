@@ -4,6 +4,8 @@
     "listing_500_ms": 1.471,
     "load_10k_ms": 11.782,
     "machine": "Mac mini (Mac16,10): Apple M4, 4 performance and 6 efficiency cores, 16 GB, macOS 26.2",
+    "print_first_call_ms": 5.667,
+    "print_rss_mb": 16.875,
     "search_5000_ms": 101.999,
     "stream_10k_events_ms": 13.209,
     "terminal_rss_mb": 9.516,

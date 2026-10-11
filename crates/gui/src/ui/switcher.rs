@@ -104,6 +104,9 @@ impl Chat {
         let on_screen = self.store.conversations[self.store.active].id;
         self.note_recent(on_screen);
         let sessions: Vec<(u64, u64)> = (self.store.conversations.iter())
+            // A new session is left out unless it is the one on screen, the
+            // first row, which the switch goes away from.
+            .filter(|c| c.id == on_screen || !untouched(c))
             .map(|c| (c.id, c.updated))
             .collect();
         let rows = listed(&self.recent, &sessions);

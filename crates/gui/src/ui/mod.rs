@@ -21,6 +21,7 @@ pub(crate) mod memory;
 pub(crate) mod messages;
 pub(crate) mod messaging;
 pub(crate) mod motion;
+pub(crate) mod pace;
 pub(crate) mod palette;
 pub(crate) mod panel;
 pub(crate) mod pictures;
@@ -235,6 +236,63 @@ fn scroll_of(id: &ElementId, window: &mut Window, cx: &mut App) -> ScrollHandle 
         .use_keyed_state(id.clone(), cx, |_, _| ScrollHandle::default())
         .read(cx)
         .clone()
+}
+
+/// Room kept between a control the keys bring into view and the edge of
+/// the page it came in at: a page's own margin.
+const SHOWN_MARGIN: Pixels = px(24.);
+
+/// `control`, asking the page scrolled around it to bring it into view on
+/// the frame the keys arrive on it (see `follow_keys`). `key` names what
+/// remembers whether it had them the frame before, so a page scrolled away
+/// from it while it keeps them stays where it was put.
+pub(crate) fn shown_on_focus(
+    control: Stateful<Div>,
+    key: SharedString,
+    focus: &FocusHandle,
+    window: &mut Window,
+    cx: &mut App,
+) -> Stateful<Div> {
+    let had = window.use_keyed_state(key, cx, |_, _| false);
+    let has = focus.is_focused(window);
+    let arrived = has && !*had.read(cx);
+    had.update(cx, |had, _| *had = has);
+    control.when(arrived, |control| {
+        control.child(
+            canvas(
+                |bounds, window, _| window.request_autoscroll(bounds),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        )
+    })
+}
+
+/// What a page scrolled by `scroll` does once its controls are laid out:
+/// brings into view the one the keys just arrived on, from the next frame.
+pub(crate) fn follow_keys(
+    scroll: &ScrollHandle,
+) -> impl Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static {
+    let scroll = scroll.clone();
+    move |_, window, _| {
+        let Some(control) = window.take_autoscroll() else {
+            return;
+        };
+        let page = scroll.bounds();
+        let mut offset = scroll.offset();
+        let above = page.top() - (control.top() - SHOWN_MARGIN);
+        let below = control.bottom() + SHOWN_MARGIN - page.bottom();
+        if above > px(0.) {
+            offset.y += above;
+        } else if below > px(0.) {
+            offset.y -= below;
+        } else {
+            return;
+        }
+        scroll.set_offset(offset);
+        window.request_animation_frame();
+    }
 }
 
 /// Characters a row of wrapped code is taken to hold when it is not known
@@ -616,7 +674,14 @@ pub(crate) fn copy_button(
 mod tests {
     // Not `use super::*`: the prelude's gpui `test` macro would shadow the
     // built-in attribute.
-    use super::{Cut, Rest, clamped, earlier_lines, more_lines, rest, rows};
+    use super::{Cut, Rest, clamped, earlier_lines, follow_keys, more_lines, rest, rows};
+    use super::{capabilities, settings::KeyedSwitch};
+    use gpui::{
+        AppContext as _, Context, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+        ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, TestAppContext,
+        VisualTestContext, Window, div, point, px,
+    };
+    use gpui_component::Root;
 
     #[test]
     fn a_long_line_still_counts_as_many_rows() {
@@ -691,5 +756,77 @@ mod tests {
         let head = clamped(&text.join("\n"), Cut::Head);
         assert!(head.starts_with("1\n2\n"));
         assert!(head.ends_with("400\n⋯ 50 more lines"));
+    }
+
+    /// Ten switches, a settings one and a capabilities one in turn, on a
+    /// page that shows two and a bit.
+    struct LongPage {
+        scroll: ScrollHandle,
+    }
+
+    impl Render for LongPage {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let rows: Vec<_> = (0..10)
+                .map(|n| {
+                    let id = SharedString::from(format!("row-{n}"));
+                    let control = if n % 2 == 0 {
+                        KeyedSwitch::new(id).into_any_element()
+                    } else {
+                        capabilities::switch(id, false, window, cx, |_, _, _| {}).into_any_element()
+                    };
+                    div().py_2().child(control)
+                })
+                .collect();
+            div()
+                .on_children_prepainted(follow_keys(&self.scroll))
+                .id("page")
+                .track_scroll(&self.scroll)
+                .h(px(100.))
+                .overflow_y_scroll()
+                .children(rows)
+        }
+    }
+
+    /// Whether row `n` is all in sight, once the frame after this one, where
+    /// the page moves to it, is drawn.
+    fn in_sight(n: usize, scroll: &ScrollHandle, cx: &mut VisualTestContext) -> bool {
+        cx.update(|window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
+        let (page, row, y) = (
+            scroll.bounds(),
+            scroll.bounds_for_item(n).unwrap(),
+            scroll.offset().y,
+        );
+        row.top() + y >= page.top() && row.bottom() + y <= page.bottom()
+    }
+
+    #[gpui::test]
+    fn a_page_scrolls_to_the_switch_the_keys_move_to_and_no_further(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let page = cx.new(|_| LongPage {
+            scroll: ScrollHandle::new(),
+        });
+        let scroll = cx.read(|cx| page.read(cx).scroll.clone());
+        let (_, cx) = cx.add_window_view(|window, cx| Root::new(page.clone(), window, cx));
+        // The first row, then down past the fold to the fourth, a
+        // capabilities switch.
+        cx.update(|window, cx| window.focus_next(cx));
+        assert!(in_sight(0, &scroll, cx));
+        assert_eq!(scroll.offset().y, px(0.));
+        cx.simulate_keystrokes("tab tab tab");
+        assert!(in_sight(3, &scroll, cx));
+        assert!(scroll.offset().y < px(0.));
+        // Scrolled back up by hand, the page stays there while the keys do.
+        scroll.set_offset(point(px(0.), px(0.)));
+        page.update(cx, |_, cx| cx.notify());
+        assert!(!in_sight(3, &scroll, cx));
+        // On to a settings switch, then back up to the top.
+        cx.simulate_keystrokes("tab");
+        assert!(in_sight(4, &scroll, cx));
+        for n in (0..4).rev() {
+            cx.simulate_keystrokes("shift-tab");
+            assert!(in_sight(n, &scroll, cx));
+        }
+        assert_eq!(scroll.offset().y, px(0.));
     }
 }

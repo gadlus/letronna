@@ -150,3 +150,10 @@ repository secrets are set, and builds unsigned (as before) when they are not.
 
 Open an issue with the gateway you used, the model, and what you expected.
 Never paste an API key.
+
+## Keeping disk use down
+
+Run builds and tests through `scripts/x.sh` (for example `scripts/x.sh test` or
+`scripts/x.sh build --release`). The build cache is kept for fast rebuilds
+until `target/` passes `CACHE_LIMIT_GB` (default 10); then it is cleared,
+keeping only the finished binaries and app. `KEEP_CACHE=1` never clears.

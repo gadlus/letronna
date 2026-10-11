@@ -651,7 +651,9 @@ impl Turn {
         // A run with a schema corrects a bad answer itself, twice at most and
         // with only what was wrong.
         let corrected = name == crate::driver::STRUCTURED_OUTPUT;
-        if POLLING.contains(&name) || corrected || refused_or_stopped(content) {
+        // The web tools already said to stop trying them and why.
+        let unavailable = crate::web::says_unavailable(content);
+        if POLLING.contains(&name) || corrected || unavailable || refused_or_stopped(content) {
             return 0;
         }
         let (times, round) = self.failures.entry(name.to_owned()).or_default();
@@ -2089,6 +2091,20 @@ mod tests {
             sent.contains("`read_file` has failed 2 times in a row"),
             "{sent}"
         );
+    }
+
+    #[test]
+    fn the_web_tools_saying_they_are_stopped_get_no_failure_note() {
+        let mut turn = turn();
+        let url = serde_json::json!({ "url": "https://example.com/" });
+        let failed = "Could not fetch the page: error sending request: dns error";
+        made(&mut turn, "web_fetch", url.clone(), Err(failed));
+        let stop = format!(
+            "Could not connect to example.com (dns error); {}",
+            crate::web::UNAVAILABLE
+        );
+        let other = serde_json::json!({ "url": "https://example.org/" });
+        assert_eq!(made(&mut turn, "web_fetch", other, Err(&stop)), stop);
     }
 
     #[test]

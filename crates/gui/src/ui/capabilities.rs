@@ -299,8 +299,14 @@ impl Chat {
             .children(tabs);
         let body = match open {
             CapabilityTab::Skills => self.skills_page(cx).into_any_element(),
-            CapabilityTab::Tools => scrolled("tools-tab", self.tools_tab(window, cx)),
-            CapabilityTab::Mcp => scrolled("mcp-tab", self.mcp_tab(window, cx)),
+            CapabilityTab::Tools => {
+                let tab = self.tools_tab(window, cx);
+                scrolled("tools-tab", tab, window, cx)
+            }
+            CapabilityTab::Mcp => {
+                let tab = self.mcp_tab(window, cx);
+                scrolled("mcp-tab", tab, window, cx)
+            }
         };
         v_flex()
             .flex_1()
@@ -565,9 +571,10 @@ pub(crate) fn switch(
         })
         .read(cx)
         .clone();
-    div()
+    let control = div()
         .id(id.clone())
-        .track_focus(&focus.tab_stop(true))
+        .track_focus(&focus.clone().tab_stop(true));
+    super::shown_on_focus(control, format!("{id}-shown").into(), &focus, window, cx)
         .flex_shrink_0()
         .p_0p5()
         .rounded(cx.theme().radius)
@@ -586,9 +593,12 @@ pub(crate) fn switch(
 
 /// `content` under the tabs, scrolling on its own across the whole width,
 /// margins too, with the content in the column.
-fn scrolled(id: &'static str, content: Div) -> AnyElement {
+fn scrolled(id: &'static str, content: Div, window: &mut Window, cx: &mut App) -> AnyElement {
+    let scroll = super::scroll_of(&id.into(), window, cx);
     div()
+        .on_children_prepainted(super::follow_keys(&scroll))
         .id(id)
+        .track_scroll(&scroll)
         .flex_1()
         .min_h_0()
         .overflow_y_scroll()

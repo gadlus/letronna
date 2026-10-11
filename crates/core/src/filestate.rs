@@ -534,7 +534,7 @@ pub(crate) fn overwrite(conversation: u64, path: &Path, raw: &str) -> Result<Cha
         if seen.whole_since(asked).is_none() {
             return Err(format!(
                 "You have seen only part of `{raw}`, or pages of it you read have \
-                 since been dropped or cleared to save room, so writing the whole \
+                 since been dropped or cleared from history, so writing the whole \
                  file would drop the rest. Nothing was changed. Read what you cannot \
                  see of it with read_file first, or change it with edit_file instead."
             ));
@@ -993,6 +993,28 @@ mod tests {
         asked(115, 11, 2, 2);
         run("write_file", write, &ctx).unwrap();
         assert_eq!(read_to(&dir, "long.txt"), "short\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pages_cleared_by_a_move_of_the_boundary_ask_for_a_read_before_a_rewrite() {
+        let (dir, ctx) = project("chunk-step", 127);
+        std::fs::write(dir.join("long.txt"), lines("line")).unwrap();
+        let second = next(&page(&ctx, "long.txt", 1));
+        reply(&ctx, 3);
+        page(&ctx, "long.txt", second);
+        // Every page sent whole, the file may be written over.
+        asked(127, 9, 0, 0);
+        let write = r#"{"path":"long.txt","content":"short\n"}"#;
+        assert!(overwrite(127, &dir.join("long.txt"), "long.txt").is_ok());
+        // The next request moves the boundary a chunk on, past the first
+        // page: writing all of it over now asks for that page again.
+        asked(127, 11, 0, 2);
+        let refused = run("write_file", write, &ctx).unwrap_err();
+        assert!(refused.contains("Read what you cannot see"), "{refused}");
+        // An edit rests on the page it changes, which still goes out whole.
+        let edit = r#"{"path":"long.txt","old":"line 300","new":"end 300"}"#;
+        run("edit_file", edit, &ctx).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 

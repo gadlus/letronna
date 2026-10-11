@@ -15,7 +15,27 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ### Added
 - **All** — A built-in wallet the agent pays from: make one or bring one in from MetaMask, Phantom or any wallet app, on Base, Ethereum, Solana and any EVM chain. Sites that ask to be paid (x402) are paid in USDC within caps you set, asked each time or on their own below a price you choose; sends always ask. `letronna wallet`, `/wallet`, the Wallet page and Settings › Wallet.
+- **Web** — A terminal in the browser: the Cloud page opens Letronna itself, running in Letronna Cloud on a new thread or one you have, to type into as on your own computer.
+- **Terminal** — On a machine that is thrown away after (`LETRONNA_DISPOSABLE=1`, as in Letronna Cloud), the terminal takes its server, key and model from `AGENT_BASE_URL`, `AGENT_API_KEY` and `AGENT_MODEL`, as `-p` does, and saves none of it.
 - **Web** — Letronna Cloud takes more servers: admins add a VPS from the admin page with one setup command, and runs and 24/7 bots spread across every server.
+- **Web** — letronna.ai shows Letronna Cloud on the home page and has a Cloud page in the docs; phone apps for iPhone and Android are marked coming soon.
+- **All** — A shorter README, and a full guide in `docs/`: install, the app and terminal, gateways, tools, extending, the cloud, configuration, data, architecture, building and benchmarks.
+- **All** — `letronna -p --output json` says which window the run's requests were sized by and where it came from (`"window": {"tokens", "source"}`), and names the model the run used, also when the environment or `--model` chose it.
+- **All** — write_file can make a new file in the system's temp folder, such as a script that reproduces a bug, and write_file and edit_file can change one the session made there, so scratch work stays out of the project; another program's file there, or one in a folder the session did not make, is still refused, and a command that writes a new file there no longer counts as writing outside the project in a session that read a page.
+
+### Changed
+- **All** — A folder write_file or apply_patch created for a file counts as the session's own, so a session that read a page may delete it without asking, like the files it made, as long as nothing in it was there before it or is a link.
+- **All** — A model whose window nothing gives is sized as if it held 64,000 tokens when its server takes a key, as a gateway or a LiteLLM proxy does, instead of the smallest window, so old tool results are cleared far later; a server without a key, such as Ollama, keeps the small window, and `LETRONNA_CONTEXT_WINDOW` sets it for a keyed proxy in front of a small local model.
+- **All** — Old tool results are cleared only once a request comes near its budget, and then in chunks of half the window rather than every eight results, so the provider's prompt cache keeps serving the requests in between; results under 600 characters are never cleared, and a cleared one reads as cleared from history, with the call to repeat, rather than to save room.
+- **All** — `/usage` names a cache miss that cleared results or reasoning no longer sent back caused as "an earlier message changed", and says of one where nothing Letronna sends changed that the provider served it without the cache.
+- **All** — web_fetch and search_web say why a request got no answer, such as a name that could not be looked up or a connection turned down, and once one to the web could not connect, other than one a page redirected to, both answer at once that they are unavailable for now, naming the host and why, rather than each trying and waiting to fail: for two minutes in a session someone watches and for the rest of a run nobody does, unless a request to the web gets through; pages on this computer or the local network are still fetched.
+- **All** — `letronna -p` sends about 600 fewer tokens of tools and prompt with every request: the helpers' and the background jobs' lists are found through find_tools like the other less used tools, and nothing it is sent names what such a run lacks: helpers in the background, wake_me, list_sessions and /resume, or Letronna's own skill on using Letronna, whose index and skill tool go too when no other skill is on.
+- **All** — A run nobody watches, such as `letronna -p`, is told the commands on PATH and what its project folder held at the head of its first message rather than in the system prompt, so runs in folders that hold different things send the same system prompt and tools, and a provider's prompt cache serves them across runs; sessions someone watches are unchanged.
+
+### Fixed
+- **All** — A model its gateway lists only under another vendor's path, such as `deepseek/deepseek-v4.1-flash` listed as `opencode-go/deepseek-v4.1-flash`, is sized by that listed window instead of the smallest one, so old tool results are no longer cleared after a few thousand tokens.
+- **All** — A web fetch or search that never reached its server, as when this computer is offline, no longer counts as having read a page, so a session that carries on from its own files is not asked about, or refused, its later deletes and sends; an error that quotes what a server wrote still counts, and the server's words in a failed secure connection, a redirect's address or a file's kind are now fenced as such.
+- **All** — On DeepSeek and Kimi, the reasoning sent back with the tool calls of the turn in progress counts toward the window, so a long turn clears old results before its requests outgrow the model.
 
 ## [0.1.0-alpha.3] - 2026-10-06
 

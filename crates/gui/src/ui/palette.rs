@@ -453,7 +453,10 @@ impl Chat {
         }));
 
         let now = backend::now();
-        let mut by_age: Vec<&Conversation> = self.store.conversations.iter().collect();
+        // A new session is listed once something is said in it.
+        let mut by_age: Vec<&Conversation> = (self.store.conversations.iter())
+            .filter(|c| !untouched(c))
+            .collect();
         by_age.sort_by_key(|c| std::cmp::Reverse(c.updated));
         let sessions = by_age
             .into_iter()
@@ -543,10 +546,10 @@ impl Chat {
             Pick::Look(value) => {
                 self.store.settings.appearance = value.to_owned();
                 self.save();
+                crate::theme::apply(value, window, cx);
                 // The blurred snapshot behind settings still wears the old
                 // colours, as when it is picked there.
-                self.drop_backdrop(cx);
-                crate::theme::apply(value, window, cx);
+                self.retake_backdrop(window, cx);
             }
             Pick::ChooseFolder => self.attach_workspace(window, cx),
             // On the Account page, where the wait for the browser shows,

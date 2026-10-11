@@ -366,7 +366,7 @@ impl Chat {
                 .into_iter()
                 .map(|call| {
                     let checking = self.judging.as_ref().is_some_and(|(id, _)| *id == call.id);
-                    h_flex()
+                    let line = h_flex()
                         .gap_2()
                         .items_center()
                         .text_xs()
@@ -376,15 +376,22 @@ impl Chat {
                                 .xsmall()
                                 .color(cx.theme().primary),
                         )
-                        .child(call.name.clone())
-                        .child(
-                            div()
-                                .font_family(MONO_FONT)
-                                .child(tools::summary(&call.name, &call.arguments)),
-                        )
-                        .when(checking, |row| row.child("checking…"))
+                        .map(|row| {
+                            let summary = tools::summary(&call.name, &call.arguments);
+                            let (name, summary) =
+                                crate::ui::busy::Shimmer::label(call.name.clone(), summary);
+                            row.child(name)
+                                .child(div().font_family(MONO_FONT).child(summary))
+                        })
+                        .when(checking, |row| row.child("checking…"));
+                    // The sweep under it as wide as what it says.
+                    v_flex()
+                        .gap(px(3.))
+                        .child(line)
+                        .child(crate::ui::busy::Sweep)
                 });
-            return Some(v_flex().gap_1().children(lines).into_any_element());
+            let lines = v_flex().items_start().gap_1().children(lines);
+            return Some(lines.into_any_element());
         }
 
         // Worked out when the card came up; here only if it somehow was not.
@@ -877,7 +884,7 @@ impl Chat {
             .find(|request| request.root == root)?;
         let call = &request.call;
         let summary = tools::summary(&call.name, &call.arguments);
-        let title = wants(&format!("Helper {}", request.label), &call.name, &summary);
+        let title = wants(&self.asker(request), &call.name, &summary);
         let answer = |decision: Decision| {
             let (label, id) = (request.label.clone(), call.id.clone());
             cx.listener(move |this, _, _, cx| {
@@ -1028,10 +1035,18 @@ fn key_hint(key: &str) -> Kbd {
     // In its own colours and size: any text style given to it replaces its
     // own whole, colour and all, which left a blue button's white text on
     // the hint's page-coloured box, blank in Paper.
-    Kbd::new(Keystroke {
+    Kbd::new(hint_key(key))
+}
+
+/// The key `key` as a card's hint shows it. Escape is spelt Esc everywhere,
+/// as Windows and Linux show it: macOS's own sign for it reads as a
+/// circular arrow.
+fn hint_key(key: &str) -> Keystroke {
+    let key = if key == "escape" { "esc" } else { key };
+    Keystroke {
         key: key.to_owned(),
         ..Default::default()
-    })
+    }
 }
 
 /// The place of the card coming up in `reply` after the card `before`, with
@@ -1215,7 +1230,7 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        CardFor, CardKey, Press, asks_for_folder, key_hint, option_letter, options_in,
+        CardFor, CardKey, Press, asks_for_folder, hint_key, key_hint, option_letter, options_in,
         own_folder_note, own_folder_words, place, pressed, stroke_of,
     };
     use letronna_core::tools::ToolContext;
@@ -1304,6 +1319,14 @@ mod tests {
         // and its text would take the button's colour over the hint's box.
         let mut hint = key_hint("enter");
         assert_eq!(gpui::Styled::style(&mut hint).text, Default::default());
+    }
+
+    #[test]
+    fn a_card_writes_esc_for_escape_and_enter_as_before() {
+        use gpui_component::kbd::Kbd;
+        assert_eq!(Kbd::format(&hint_key("escape")), "Esc");
+        let enter = gpui::Keystroke::parse("enter").unwrap();
+        assert_eq!(Kbd::format(&hint_key("enter")), Kbd::format(&enter));
     }
 
     #[test]

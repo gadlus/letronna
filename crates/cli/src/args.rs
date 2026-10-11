@@ -70,7 +70,8 @@ With -p
                            itself can stand in for the file; a new session
                            only, so not with -c, -r or stream-json in
 
-With -p, from the environment, saving none of it
+With -p, and in the terminal with LETRONNA_DISPOSABLE=1, from the
+environment, saving none of it
   AGENT_BASE_URL           ask this OpenAI-compatible server instead of the
                            gateway set up, unless --gateway names one
   AGENT_API_KEY            the key to send it

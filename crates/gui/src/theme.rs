@@ -384,6 +384,8 @@ fn paint(t: &mut Theme, p: &Palette) {
     t.shadow = false;
     t.radius = px(2.);
     t.radius_lg = px(4.);
+    // Lower than gpui-component's, clear of settings' close button.
+    t.notification.margins.top = crate::ui::settings::TOASTS_TOP;
     t.font_family = BODY_FONT.into();
     t.mono_font_family = MONO_FONT.into();
 }

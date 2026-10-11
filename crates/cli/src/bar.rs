@@ -22,6 +22,7 @@ use crossterm::event::{
 use crossterm::terminal;
 use letronna_core::approvals::{self, Request};
 use letronna_core::chat::Message;
+use letronna_core::gate::Mode;
 use letronna_core::store::Todo;
 use std::collections::VecDeque;
 use std::sync::mpsc::Receiver;
@@ -102,6 +103,10 @@ pub const COMMANDS: &[Command<'static>] = &[
     Command {
         name: "/search",
         blurb: "let the model search the web; /search services for your own, /search keyless for DuckDuckGo",
+    },
+    Command {
+        name: "/tool-search",
+        blurb: "how find_tools ranks the tools left out: by Jev or by name, and where Jev is asked",
     },
     Command {
         name: "/notify",
@@ -686,6 +691,13 @@ pub struct Switch {
 }
 
 pub struct Bar {
+    /// The permission mode, shown at the front of the footer, which
+    /// shift-tab steps through; `None` where no mode applies.
+    mode: Option<Mode>,
+    /// Whether shift-tab may land on bypass: only once the session has been
+    /// in it by choice (`--mode bypass` or `/mode bypass`), so a key pressed
+    /// once too often never turns every check off.
+    bypass: bool,
     line: Line,
     picked: usize,
     /// The first of the menu's rows on show, when there are more than fit.
@@ -771,6 +783,8 @@ pub struct Bar {
 impl Bar {
     pub fn new(footer: String) -> Self {
         Self {
+            mode: None,
+            bypass: false,
             line: Line::default(),
             picked: 0,
             menu_top: 0,
@@ -885,6 +899,19 @@ impl Bar {
     /// Paint again, for whoever has just changed what is under the box.
     pub fn redraw(&mut self) {
         self.settle();
+    }
+
+    /// Show `mode`, and let shift-tab step on from it.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = Some(mode);
+        self.bypass |= mode == Mode::Bypass;
+        self.settle();
+    }
+
+    /// The mode on show, which shift-tab may have changed; `None` where the
+    /// bar shows none.
+    pub fn mode(&self) -> Option<Mode> {
+        self.mode
     }
 
     pub fn set_footer(&mut self, footer: String) {
@@ -1626,6 +1653,10 @@ impl Bar {
             // on Windows. Ctrl-s reaches us as itself everywhere, since raw
             // mode turns off the flow control that once took it.
             KeyCode::Char('s') if control => self.send_now(),
+            // Shift-tab steps to the next mode, at the prompt or while it
+            // works; the session reads it before its next call.
+            KeyCode::BackTab if self.mode.is_some() => self.step_mode(),
+            KeyCode::Tab if shift && self.mode.is_some() => self.step_mode(),
             KeyCode::Tab => {
                 if let Some(choice) = options.get(self.picked) {
                     self.line.set(&choice.line());
@@ -2113,12 +2144,26 @@ impl Bar {
         } else if self.working {
             // Said while it applies rather than only after a long silence:
             // a reply going the wrong way is worth stopping early.
+            let width = width.saturating_sub(self.mode_width());
             fitted(&self.footer, &format!("{helpers}  ·  esc to stop"), width)
         } else {
             let reach = reach(self.relay.len(), self.runs.len());
+            let width = width.saturating_sub(self.mode_width());
             fitted(&self.footer, &format!("{helpers}{reach}"), width)
         };
-        lines.push(format!("{}{}", render::PAD, render::dim(&note)));
+        // The mode leads the footer while nothing else has taken it over.
+        let plain = self.note.is_none()
+            && self.slider.is_none()
+            && self.choice.is_none()
+            && self.switches.is_none()
+            && back == 0
+            && !(self.working && self.sendable() > 0);
+        let mode = if plain {
+            self.mode_tag()
+        } else {
+            String::new()
+        };
+        lines.push(format!("{}{mode}{}", render::PAD, render::dim(&note)));
 
         // The plan gets only the rows the rest leaves over: what is being
         // typed or asked comes first, and a screen of chrome would push its
@@ -2458,6 +2503,60 @@ fn at_work(helpers: usize) -> String {
     }
 }
 
+/// How each mode reads at the front of the footer: a mark, then a few words
+/// on what happens when you press enter.
+fn mode_words(mode: Mode) -> (&'static str, &'static str) {
+    match mode {
+        Mode::Default => ("⏵", "asks first"),
+        Mode::AcceptEdits => ("⏵⏵", "edits without asking"),
+        Mode::Plan => ("⏸", "plan only"),
+        Mode::Auto => ("⏵⏵", "auto decides"),
+        Mode::DontAsk => ("⏵⏵", "allowed calls only"),
+        Mode::Bypass => ("⏵⏵", "bypass on"),
+    }
+}
+
+/// What shift-tab is for, after the mode.
+const MODE_HINT: &str = "shift+tab to switch";
+
+impl Bar {
+    fn step_mode(&mut self) {
+        let Some(now) = self.mode else { return };
+        let offered: Vec<Mode> = (Mode::OFFERED.into_iter())
+            .filter(|m| *m != Mode::Bypass || self.bypass)
+            .collect();
+        let at = offered.iter().position(|m| *m == now).unwrap_or(0);
+        let next = offered[(at + 1) % offered.len()];
+        self.mode = Some(next);
+        // Plan mode also keeps the agents from writing, as `/plan` does.
+        letronna_core::agents::set_plan(next == Mode::Plan);
+    }
+
+    /// The mode and the hint, coloured by how much runs unasked, with the
+    /// gap before the rest of the footer.
+    fn mode_tag(&self) -> String {
+        let Some(mode) = self.mode else {
+            return String::new();
+        };
+        let (mark, words) = mode_words(mode);
+        let said = format!("{mark} {words}");
+        let said = match mode {
+            Mode::Bypass => render::red(&said),
+            Mode::Plan => render::blue(&said),
+            Mode::Default => render::dim(&said),
+            _ => render::amber(&said),
+        };
+        format!("{said}{}", render::dim(&format!(" ({MODE_HINT})  ·  ")))
+    }
+
+    fn mode_width(&self) -> usize {
+        self.mode.map_or(0, |mode| {
+            let (mark, words) = mode_words(mode);
+            format!("{mark} {words} ({MODE_HINT})  ·  ").chars().count()
+        })
+    }
+}
+
 /// The footer with `then` after it, in `width` columns. The footer gives way
 /// first, so the model's name loses its end before what the user can do now.
 fn fitted(footer: &str, then: &str, width: usize) -> String {
@@ -2544,6 +2643,29 @@ mod tests {
             .map(String::as_str)
             .map(plain)
             .collect()
+    }
+
+    #[test]
+    fn shift_tab_steps_through_the_modes_and_comes_round() {
+        use letronna_core::gate::Mode;
+        let mut bar = Bar::new(String::new());
+        bar.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(bar.mode(), None, "no mode shown, nothing to step");
+        bar.set_mode(Mode::Default);
+        // Bypass is left out until the session has chosen it once.
+        let safe: Vec<Mode> = (Mode::OFFERED.into_iter())
+            .filter(|m| *m != Mode::Bypass)
+            .collect();
+        for want in safe.iter().skip(1).chain(safe.first()) {
+            bar.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+            assert_eq!(bar.mode(), Some(*want));
+        }
+        bar.set_mode(Mode::Bypass);
+        for want in &Mode::OFFERED {
+            bar.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+            assert_eq!(bar.mode(), Some(*want));
+        }
+        letronna_core::agents::set_plan(false);
     }
 
     fn press(bar: &mut Bar, code: KeyCode) {

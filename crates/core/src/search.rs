@@ -30,6 +30,7 @@
 //! be what is asking for it.
 
 use crate::tools::{Tool, ToolContext};
+use crate::web::Asker;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -392,7 +393,7 @@ impl Tool for SearchWeb {
             "freshness": {"type": "string", "enum": ["day", "week", "month", "year"], "description": "Only pages from this last stretch of time."}
         }, "required": ["query"]})
     }
-    fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let query = args["query"].as_str().unwrap_or_default().trim();
         if query.is_empty() {
             return Err("Say what to search for.".into());
@@ -411,8 +412,9 @@ impl Tool for SearchWeb {
             count,
             options,
         };
+        let asker = Asker::of(ctx);
         searched_once(memo(), asked, Instant::now(), |asked| {
-            search(&reach, query, count, &asked.options)
+            search(&reach, query, count, &asked.options, &asker)
         })
     }
     fn needs_approval(&self) -> bool {
@@ -423,6 +425,9 @@ impl Tool for SearchWeb {
     }
 
     fn untrusted(&self) -> bool {
+        true
+    }
+    fn fences_its_errors(&self) -> bool {
         true
     }
     fn preview(&self, args: &Value, _: &ToolContext) -> String {
@@ -784,15 +789,21 @@ fn searched_once(
     Ok(listing)
 }
 
-/// Ask the service for `query`, and list what it found that the filters keep;
-/// DuckDuckGo one search at a time, and not while it is held off.
-fn search(reach: &Reach, query: &str, count: u64, options: &Options) -> Result<String, String> {
+/// Ask the service for `query` for `asker`, and list what it found that the
+/// filters keep; DuckDuckGo one search at a time, and not while it is held off.
+fn search(
+    reach: &Reach,
+    query: &str,
+    count: u64,
+    options: &Options,
+    asker: &Asker,
+) -> Result<String, String> {
     if !reach.service.keyless {
-        return ask(reach, query, count, options);
+        return ask(reach, query, count, options, asker);
     }
     static LIMITED_AT: Mutex<Option<Instant>> = Mutex::new(None);
     unless_held_off(&LIMITED_AT, Instant::now(), || {
-        ask(reach, query, count, options)
+        ask(reach, query, count, options, asker)
     })
 }
 
@@ -820,8 +831,15 @@ fn unless_held_off(
 }
 
 /// Send the one request a search takes, and list what came back that the
-/// filters keep.
-fn ask(reach: &Reach, query: &str, count: u64, options: &Options) -> Result<String, String> {
+/// filters keep. One that could not connect stops the web tools for a while
+/// in `asker`'s session, as a page that could not does.
+fn ask(
+    reach: &Reach,
+    query: &str,
+    count: u64,
+    options: &Options,
+    asker: &Asker,
+) -> Result<String, String> {
     let Reach {
         service,
         key,
@@ -871,13 +889,23 @@ fn ask(reach: &Reach, query: &str, count: u64, options: &Options) -> Result<Stri
             options,
         )),
     };
-    let reply = request.send().map_err(|e| match e.is_timeout() {
+    let unreached =
+        |e: reqwest::Error| format!("Could not reach {} at {address}: {e}", service.name);
+    let request = request.build().map_err(unreached)?;
+    let asked = request.url().clone();
+    crate::web::stopped(&asked, asker, Instant::now())?;
+    let reply = client.execute(request);
+    crate::web::note_reach(&asked, reply.as_ref().err(), false, asker);
+    let reply = reply.map_err(|e| match e.is_timeout() {
         true => format!(
             "{} did not answer within {} seconds.",
             service.name,
             SEARCH_TIME.as_secs()
         ),
-        false => format!("Could not reach {} at {address}: {e}", service.name),
+        false => {
+            let lead = format!("Could not reach {} at {address}:", service.name);
+            crate::web::unanswered(&lead, &e, e.url() != Some(&asked))
+        }
     })?;
     let status = reply.status();
     // The site a redirect points to, which only DuckDuckGo's are left unfollowed.
@@ -902,21 +930,26 @@ fn ask(reach: &Reach, query: &str, count: u64, options: &Options) -> Result<Stri
         // Sent on rather than answered is the query's doing, not a limit, so
         // it neither reads as one nor holds the next search off.
         if status.is_redirection() {
-            let to = elsewhere
-                .map(|host| format!(" to {host}"))
-                .unwrap_or_default();
             // It may redirect for reasons of its own too, where dropping a
             // bang the query does not have would be no help.
             let next = if sends_on(query) {
-                ", as it does for a word starting with ! or a query starting with \\. It was \
-                 not followed: search again without them."
+                "It does so for a word starting with ! or a query starting with \\. It was not \
+                 followed: search again without them."
             } else {
-                ". It was not followed: read a page you know with web_fetch, or search again \
-                 later."
+                "It was not followed: read a page you know with web_fetch, or search again later."
             };
-            return Err(format!(
-                "DuckDuckGo answered by sending this search on{to} rather than listing results{next}"
-            ));
+            // The site is the redirect's to name, in any words it likes.
+            let sent_on = match elsewhere {
+                Some(host) => {
+                    let lead = "DuckDuckGo answered by sending this search on rather than \
+                                listing results, to:";
+                    crate::untrusted::quoted(lead, &host) + "\n"
+                }
+                None => "DuckDuckGo answered by sending this search on rather than listing \
+                         results. "
+                    .to_owned(),
+            };
+            return Err(format!("{sent_on}{next}"));
         }
         let found = match status.as_u16() {
             202 | 401 | 403 | 429 => None,
@@ -1175,6 +1208,16 @@ fn listing(service: &str, query: &str, hits: &[Hit]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `super::ask` for a session someone watches.
+    fn ask(reach: &Reach, query: &str, count: u64, options: &Options) -> Result<String, String> {
+        super::ask(reach, query, count, options, &Asker::default())
+    }
+
+    /// `super::search` for a session someone watches.
+    fn search(reach: &Reach, query: &str, count: u64, options: &Options) -> Result<String, String> {
+        super::search(reach, query, count, options, &Asker::default())
+    }
 
     #[test]
     fn each_service_answers_in_its_own_shape() {
@@ -1841,7 +1884,11 @@ mod tests {
         .unwrap_err();
         asked.join().unwrap();
         assert!(
-            error.starts_with("DuckDuckGo answered by sending this search on to 127.0.0.1 "),
+            error.starts_with("DuckDuckGo answered by sending this search on rather"),
+            "{error}"
+        );
+        assert!(
+            error.contains("\n127.0.0.1\n</untrusted-content-"),
             "{error}"
         );
         assert!(error.ends_with("search again without them."), "{error}");
@@ -1858,7 +1905,7 @@ mod tests {
         for (status, said) in [
             (
                 "302 Found\r\nLocation: /html/",
-                "search on to 127.0.0.1 rather",
+                "\n127.0.0.1\n</untrusted-content-",
             ),
             ("301 Moved Permanently", "search on rather"),
         ] {
@@ -1873,6 +1920,35 @@ mod tests {
             assert_eq!(*limited_at.lock().unwrap(), None, "held off");
         }
         assert!(sends_on("\\rust book") && sends_on("rust !w") && !sends_on("rust! book"));
+    }
+
+    #[test]
+    fn a_search_that_could_not_connect_says_why_and_stops_the_web_tools() {
+        crate::web::stand_in_for_the_web();
+        // Nothing answers on port 1 of this machine.
+        let why = ask(&duckduckgo_at(1), "rust", 5, &Options::default()).unwrap_err();
+        assert!(why.starts_with("Could not reach DuckDuckGo at "), "{why}");
+        // Under reqwest's "error sending request", which is all it said.
+        assert!(why.to_lowercase().contains("refused"), "{why}");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = ask(&duckduckgo_at(port), "rust", 5, &Options::default()).unwrap_err();
+        assert!(crate::web::says_unavailable(&stop), "{stop}");
+        assert!(
+            stop.starts_with("Could not connect to 127.0.0.1 ("),
+            "{stop}"
+        );
+        // web_fetch is stopped by it too, and neither tried the server.
+        let ctx = ToolContext::default();
+        let call = json!({ "url": format!("http://127.0.0.1:{port}/") }).to_string();
+        let error = crate::tools::run("web_fetch", &call, &ctx).unwrap_err();
+        assert!(crate::web::says_unavailable(&error), "{error}");
+        assert!(
+            listener
+                .accept()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
+        );
     }
 
     #[test]

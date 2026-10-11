@@ -29,7 +29,8 @@ pub const SHOWN: usize = 5;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
-    /// Who Letronna is, its rules, the date or the computer it runs on.
+    /// Who Letronna is, its rules, the date or the computer it runs on,
+    /// which a run nobody watches is told with its first message.
     System,
     Memory,
     Skills,
@@ -38,10 +39,14 @@ pub enum Reason {
     Tools,
     /// The model, or the gateway it is reached through.
     Model,
+    /// A message sent before changed: old results cleared, a written file's
+    /// text cut to its length, or reasoning no longer sent back.
+    History,
     /// Nothing changed, but longer passed than the provider keeps a prefix.
     Expired,
-    /// Nothing changed in time; the provider let it go on its own. A reason
-    /// a later version saved reads as this too.
+    /// Nothing changed in time; the provider served it without the cache,
+    /// most likely from another of its servers. A reason a later version
+    /// saved reads as this too.
     #[serde(other)]
     Unknown,
 }
@@ -56,8 +61,12 @@ impl Reason {
             Self::Summary => "the summary changed",
             Self::Tools => "the tools changed",
             Self::Model => "the model or gateway changed",
+            Self::History => "an earlier message changed",
             Self::Expired => "over 5 minutes idle",
-            Self::Unknown => "nothing changed that Letronna sends",
+            Self::Unknown => {
+                "nothing Letronna sends changed; the provider served it without the cache \
+                 (likely another server)"
+            }
         }
     }
 
@@ -70,6 +79,7 @@ impl Reason {
             Self::Summary => "summary",
             Self::Tools => "tools",
             Self::Model => "model",
+            Self::History => "history",
             Self::Expired => "expired",
             Self::Unknown => "unknown",
         }
@@ -79,14 +89,15 @@ impl Reason {
 /// The parts of a request a cached prefix covers, in the order it holds them,
 /// but for the model, which comes first: each model's cache is its own, and
 /// a switch moves the window and so the summary, which would be named
-/// instead.
-const ORDER: [Reason; 6] = [
+/// instead. The messages come last, after all that comes before them.
+const ORDER: [Reason; 7] = [
     Reason::Model,
     Reason::System,
     Reason::Memory,
     Reason::Skills,
     Reason::Summary,
     Reason::Tools,
+    Reason::History,
 ];
 
 /// A hash of each part of one request's cached prefix, in `ORDER`.
@@ -258,6 +269,21 @@ mod tests {
     }
 
     #[test]
+    fn a_changed_earlier_message_alone_is_named_as_the_history() {
+        let same = prefix_with(None, "");
+        let cleared = prefix_with(Some(Reason::History), "old results cleared");
+        assert_eq!(second(same, cleared, 30, 0), Some(Reason::History));
+        // With nothing changed, a cache that served next to nothing is the
+        // provider's own doing.
+        assert_eq!(second(same, same, 30, LEAST - 1), Some(Reason::Unknown));
+        // A window moved on changes the history too, but the summary is
+        // what moved it.
+        let mut moved = prefix_with(Some(Reason::Summary), "new summary");
+        moved.set(Reason::History, "fewer old results");
+        assert_eq!(second(same, moved, 30, 0), Some(Reason::Summary));
+    }
+
+    #[test]
     fn a_new_model_wins_over_the_summary_its_window_moved() {
         let mut changed = prefix_with(Some(Reason::Summary), "shorter window");
         changed.set(Reason::Model, "other-model");
@@ -331,6 +357,10 @@ mod tests {
     fn a_saved_reason_this_version_does_not_know_reads_as_unknown() {
         let reason: Reason = serde_json::from_str("\"weather\"").unwrap();
         assert_eq!(reason, Reason::Unknown);
+        assert_eq!(
+            serde_json::to_string(&Reason::History).unwrap(),
+            "\"history\""
+        );
         assert_eq!(
             serde_json::to_string(&Reason::Skills).unwrap(),
             "\"skills\""

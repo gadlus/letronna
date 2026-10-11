@@ -141,16 +141,37 @@ fn box_blur(width: u32, height: u32, src: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The `w` by `h` piece at `x`, `y` of a BGRA picture `width` pixels across,
+/// or None where it does not lie wholly inside it.
+// Built for tests everywhere, as the Windows window is cut out with it.
+#[cfg(any(windows, test))]
+fn cut(
+    width: usize,
+    bgra: &[u8],
+    (x, y): (usize, usize),
+    (w, h): (usize, usize),
+) -> Option<Vec<u8>> {
+    if w == 0 || h == 0 || x.checked_add(w)? > width {
+        return None;
+    }
+    let mut out = Vec::with_capacity(w.checked_mul(h)?.checked_mul(4)?);
+    for line in bgra.chunks_exact(width * 4).skip(y).take(h) {
+        out.extend_from_slice(&line[x * 4..(x + w) * 4]);
+    }
+    (out.len() == w * h * 4).then_some(out)
+}
+
 #[cfg(windows)]
 mod windows_impl {
     use crate::prelude::*;
-    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Foundation::{POINT, RECT};
     use windows_sys::Win32::Graphics::Gdi::{
-        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateCompatibleDC,
-        DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC, SelectObject,
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, ClientToScreen, CreateCompatibleBitmap,
+        CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC,
+        SelectObject,
     };
     use windows_sys::Win32::Storage::Xps::PrintWindow;
-    use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect};
 
     /// The window's pixels, or `None` if it cannot be read.
     pub(super) fn read(window: &Window) -> Option<(u32, u32, Vec<u8>)> {
@@ -174,10 +195,23 @@ mod windows_impl {
             if w <= 0 || h <= 0 {
                 return None;
             }
+            // PrintWindow draws the whole window, with the invisible borders
+            // it is resized by, so the client area is cut out from where it
+            // sits in it. Read at the client's size, the left border came out
+            // as a dark band down the blur and the right edge went missing.
+            let mut frame = rect;
+            let mut origin = POINT { x: 0, y: 0 };
+            if GetWindowRect(hwnd, &mut frame) == 0 || ClientToScreen(hwnd, &mut origin) == 0 {
+                return None;
+            }
+            let (fw, fh) = (frame.right - frame.left, frame.bottom - frame.top);
+            if fw <= 0 || fh <= 0 {
+                return None;
+            }
 
             let screen = GetDC(std::ptr::null_mut());
             let dc = CreateCompatibleDC(screen);
-            let bitmap = CreateCompatibleBitmap(screen, w, h);
+            let bitmap = CreateCompatibleBitmap(screen, fw, fh);
             let previous = SelectObject(dc, bitmap);
 
             // PW_RENDERFULLCONTENT (2) is what makes this work for a GPU-drawn window.
@@ -186,21 +220,21 @@ mod windows_impl {
             let mut info: BITMAPINFO = std::mem::zeroed();
             info.bmiHeader = BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w,
+                biWidth: fw,
                 // Negative height asks for a top-down buffer.
-                biHeight: -h,
+                biHeight: -fh,
                 biPlanes: 1,
                 biBitCount: 32,
                 biCompression: BI_RGB,
                 ..std::mem::zeroed()
             };
-            let mut pixels = vec![0u8; (w as usize) * (h as usize) * 4];
+            let mut whole = vec![0u8; (fw as usize) * (fh as usize) * 4];
             let read = GetDIBits(
                 dc,
                 bitmap,
                 0,
-                h as u32,
-                pixels.as_mut_ptr().cast(),
+                fh as u32,
+                whole.as_mut_ptr().cast(),
                 &mut info,
                 DIB_RGB_COLORS,
             );
@@ -213,6 +247,13 @@ mod windows_impl {
             if !drawn || read == 0 {
                 return None;
             }
+            let at = |offset: i32| usize::try_from(offset).ok();
+            let mut pixels = super::cut(
+                fw as usize,
+                &whole,
+                (at(origin.x - frame.left)?, at(origin.y - frame.top)?),
+                (w as usize, h as usize),
+            )?;
             // BitBlt leaves alpha at zero; the backdrop must be opaque.
             for chunk in pixels.as_chunks_mut::<4>().0 {
                 chunk[3] = 255;
@@ -643,6 +684,7 @@ mod x11 {
 
 #[cfg(test)]
 mod tests {
+    use super::cut;
     use super::mac::{self, Layout};
     use super::x11::{self, Format};
 
@@ -789,5 +831,25 @@ mod tests {
             ..layout(1, 1, 8, argb)
         };
         assert_eq!(mac::to_bgra(&[0; 8], &wide), None);
+    }
+
+    #[test]
+    fn the_client_area_is_cut_out_of_the_whole_window_without_its_border() {
+        // A 4x3 window, its pixels numbered, with a border a pixel wide on
+        // the left, the right and the bottom around a 2x2 client area.
+        let whole: Vec<u8> = (0..12).flat_map(|n| [n, n, n, 255]).collect();
+        let client = cut(4, &whole, (1, 0), (2, 2));
+        let numbers = client.map(|bgra| bgra.chunks(4).map(|px| px[0]).collect::<Vec<_>>());
+        assert_eq!(numbers, Some(vec![1, 2, 5, 6]));
+    }
+
+    #[test]
+    fn a_piece_not_wholly_inside_the_picture_gives_none() {
+        let whole = vec![0; 4 * 3 * 4];
+        assert_eq!(cut(4, &whole, (3, 0), (2, 2)), None);
+        assert_eq!(cut(4, &whole, (0, 2), (2, 2)), None);
+        assert_eq!(cut(4, &whole, (0, 0), (0, 2)), None);
+        assert_eq!(cut(4, &whole, (usize::MAX, 0), (2, 2)), None);
+        assert_eq!(cut(0, &[], (0, 0), (1, 1)), None);
     }
 }
