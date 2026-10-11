@@ -13,6 +13,9 @@ use std::time::Duration;
 
 pub(crate) const NAME: &str = "ChatGPT";
 
+/// The window plugin that offers it, by its id in `plugins.json`.
+const PLUGIN: &str = "chatgpt";
+
 static SIGN_IN: OAuthSpec = OAuthSpec {
     authorize: "https://auth.openai.com/oauth/authorize",
     token: "https://auth.openai.com/oauth/token",
@@ -71,6 +74,10 @@ impl Provider for ChatGpt {
 
     fn caveat(&self) -> Option<&'static str> {
         Some("Using your ChatGPT plan here may be subject to OpenAI's terms.")
+    }
+
+    fn plugin(&self) -> Option<&'static str> {
+        Some(PLUGIN)
     }
 
     fn wire(&self) -> Wire {

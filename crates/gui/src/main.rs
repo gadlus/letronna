@@ -751,6 +751,7 @@ fn main() {
                 )),
                 Box::new(plugins::hello::Hello::new()),
                 Box::new(plugins::claude_code::ClaudeCode::new()),
+                Box::new(plugins::chatgpt::ChatGpt::new()),
             ],
         );
         // MCP servers can take seconds to start; started with the window,

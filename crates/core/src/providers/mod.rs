@@ -34,6 +34,9 @@ mod suite;
 pub use router::Quota;
 pub use wire::Wire;
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 /// Who a provider is, as the gateway list and `/gateways` show it.
 pub struct ProviderInfo {
     pub name: &'static str,
@@ -117,6 +120,12 @@ pub trait Provider: Send + Sync {
     fn caveat(&self) -> Option<&'static str> {
         None
     }
+
+    /// The id of the window plugin that offers it, for a provider that is
+    /// there only while that plugin is on; `None` for one always offered.
+    fn plugin(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Every provider, in the order they are offered. Letronna leads: it is what
@@ -136,4 +145,61 @@ pub static PROVIDERS: &[&dyn Provider] = &[
 /// The provider called `name`.
 pub fn find(name: &str) -> Option<&'static dyn Provider> {
     PROVIDERS.iter().copied().find(|p| p.info().name == name)
+}
+
+/// Whether the provider called `name` is offered now: always, unless a
+/// plugin offers it, and then only while that plugin is on.
+pub fn offered(name: &str) -> bool {
+    find(name).and_then(|p| p.plugin()).is_none_or(plugged)
+}
+
+/// What the window said its plugins are, by id, once it has.
+fn switched() -> &'static Mutex<HashMap<&'static str, bool>> {
+    static SWITCHED: OnceLock<Mutex<HashMap<&'static str, bool>>> = OnceLock::new();
+    SWITCHED.get_or_init(Default::default)
+}
+
+/// Turn the plugin `id` on or off for this process, as the window does as
+/// it starts and when its switch is flipped.
+pub fn plug(id: &'static str, on: bool) {
+    if let Ok(mut switched) = switched().lock() {
+        switched.insert(id, on);
+    }
+}
+
+/// Whether the plugin `id` is on: as the window said, or, in a process with
+/// no plugins of its own such as the terminal, as the window saved it in
+/// `plugins.json`. Off until switched on.
+fn plugged(id: &str) -> bool {
+    if let Some(on) = switched().lock().ok().and_then(|s| s.get(id).copied()) {
+        return on;
+    }
+    std::fs::read(crate::chat::data_dir().join("plugins.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<HashMap<String, bool>>(&bytes).ok())
+        .and_then(|saved| saved.get(id).copied())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    /// Switch the plugin `id` on as the window saves it, in the data folder
+    /// the test holds.
+    pub(crate) fn plugged_in(id: &str) {
+        let path = crate::chat::data_dir().join("plugins.json");
+        std::fs::write(path, format!("{{\"{id}\": true}}")).unwrap();
+    }
+
+    #[test]
+    fn a_plugin_is_off_until_switched_on_and_the_window_has_the_last_word() {
+        let _held = super::auth::tests::vault("plugged");
+        assert!(!super::plugged("plugged-test"));
+        plugged_in("plugged-test");
+        assert!(super::plugged("plugged-test"));
+        // What the window says outranks what it saved.
+        super::plug("plugged-test", false);
+        assert!(!super::plugged("plugged-test"));
+        // A provider no plugin offers is always there.
+        assert!(super::offered("OpenAI"));
+    }
 }

@@ -82,10 +82,11 @@ fn added_as(name: &str) -> Option<Added> {
         .cloned()
 }
 
-/// Whether `name` is a gateway on offer now: a built-in one, or one a plugin
-/// added and has not taken back.
+/// Whether `name` is a gateway on offer now: a built-in one whose plugin, if
+/// it has one, is on, or one a plugin added and has not taken back.
 pub fn offered(name: &str) -> bool {
-    GATEWAYS.iter().any(|g| g.name == name) || added_as(name).is_some()
+    (GATEWAYS.iter().any(|g| g.name == name) && crate::providers::offered(name))
+        || added_as(name).is_some()
 }
 
 /// Whether requests to `endpoint` go to the Responses API whatever the model,
@@ -153,12 +154,13 @@ pub fn base_url(name: &str, custom: &str) -> String {
 /// Every gateway set up on this computer, as (name, base URL, key): Letronna
 /// and those signed in to in the browser once signed in, a keyed gateway once its key is saved, Custom once it has
 /// a URL, Ollama always (on this machine, a closed port answers at once),
-/// and those plugins added.
+/// and those plugins added. One a plugin offers is left out while it is off.
 pub fn ready(keys: &HashMap<String, String>, custom: &str) -> Vec<(&'static str, String, String)> {
     let plugins = added().lock().map(|list| list.clone()).unwrap_or_default();
     let plugins = plugins.into_iter().map(|g| (g.name, g.base, g.key));
     GATEWAYS
         .iter()
+        .filter(|g| crate::providers::offered(g.name))
         .filter_map(|g| {
             let key = keys.get(key_slot(g.name)).cloned().unwrap_or_default();
             let on = match auth_of(g.name) {
@@ -350,6 +352,19 @@ mod tests {
     }
 
     #[test]
+    fn a_provider_a_plugin_offers_is_there_only_while_the_plugin_is_on() {
+        let none = HashMap::new();
+        let _vault = crate::providers::auth::tests::vault("gateway-plugin");
+        crate::providers::auth::tests::keep("ChatGPT", "access-1");
+        // Signed in, but its plugin was never switched on.
+        assert!(!offered("ChatGPT"));
+        assert!(!ready(&none, "").iter().any(|g| g.0 == "ChatGPT"));
+        crate::providers::tests::plugged_in("chatgpt");
+        assert!(offered("ChatGPT"));
+        assert!(ready(&none, "").iter().any(|g| g.0 == "ChatGPT"));
+    }
+
+    #[test]
     fn a_browser_sign_in_is_set_up_once_signed_in() {
         let none = HashMap::new();
         assert_eq!(
@@ -358,6 +373,7 @@ mod tests {
         );
         assert!(!ready(&none, "").iter().any(|g| g.0 == "ChatGPT"));
         let _vault = crate::providers::auth::tests::vault("gateway-sign-in");
+        crate::providers::tests::plugged_in("chatgpt");
         crate::providers::auth::tests::keep("ChatGPT", "access-1");
         assert_eq!(
             status("ChatGPT", &none, "", 2),

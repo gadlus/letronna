@@ -4290,7 +4290,8 @@ pub fn connect(runner: &mut Runner) {
     // The list sits in the box with its choices, not in the conversation.
     let mut rows = Vec::new();
     let mut choices: Vec<(String, &'static str, &'static str)> = Vec::new();
-    for g in GATEWAYS.iter() {
+    // One a plugin offers is listed only while the plugin is on.
+    for g in GATEWAYS.iter().filter(|g| providers::offered(g.name)) {
         let count = models.iter().filter(|(n, _)| n == g.name).count();
         let (status, good, set_up) = gateway::status(g.name, &keys, &custom, count);
         let usage = router::usage(g.name);

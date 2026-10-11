@@ -7,6 +7,7 @@
 //! To write one: make a struct in `src/plugins/`, implement [`Plugin`], and add
 //! it to the `vec![...]` in `main`. Nothing else in the app needs to change.
 
+pub(crate) mod chatgpt;
 pub(crate) mod claude_code;
 pub(crate) mod discord;
 pub(crate) mod hello;
@@ -68,6 +69,11 @@ pub(crate) trait Plugin: 'static {
     fn tools(&self) -> Vec<Arc<dyn letronna_core::tools::Tool>> {
         Vec::new()
     }
+    /// The core provider this plugin offers, by name. The Plugins page shows
+    /// its account row under the plugin while the plugin is on.
+    fn provider(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Publish the tools of every enabled plugin so the agent can call them.
@@ -87,6 +93,7 @@ pub(crate) struct PluginInfo {
     pub(crate) description: &'static str,
     pub(crate) enabled: bool,
     pub(crate) builtin: bool,
+    pub(crate) provider: Option<&'static str>,
 }
 
 struct Registry(Vec<Box<dyn Plugin>>);
@@ -147,6 +154,7 @@ pub(crate) fn list(cx: &App) -> Vec<PluginInfo> {
                     description: p.description(),
                     enabled: p.enabled(),
                     builtin: p.builtin(),
+                    provider: p.provider(),
                 })
                 .collect()
         })

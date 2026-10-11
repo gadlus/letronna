@@ -20,6 +20,7 @@ pub(crate) trait Plugin: 'static {
     fn default_enabled(&self) -> bool { true } // on or off before the user chooses
     fn settings(&self, cx: &App) -> Option<AnyElement> { None } // your own UI, shown under the row
     fn tools(&self) -> Vec<Arc<dyn Tool>> { Vec::new() }        // tools you give the agent
+    fn provider(&self) -> Option<&'static str> { None }         // a core provider you offer
 }
 ```
 
@@ -53,7 +54,7 @@ opened, a tool ran, the window focused), not UI details.
 ## Hooks are trait methods
 
 There are no mixins in Rust. A hook is simply a method the app calls on your
-plugin. You get three kinds:
+plugin. You get four kinds:
 
 - **Event hooks** — `handle(&AppEvent)` reacts to what the app is doing.
 - **UI hooks** — `settings(&App) -> Option<AnyElement>` lets you render your own
@@ -61,6 +62,9 @@ plugin. You get three kinds:
 - **Tool hooks** — `tools() -> Vec<Arc<dyn Tool>>` adds tools the model can call.
   They are offered only while your plugin is enabled, and withdrawn the moment
   it is switched off. A plugin cannot take over the name of a built-in tool.
+- **Provider hooks** — `provider()` names a core provider whose `plugin()` is
+  your id. It is offered only while you are on, and the Plugins page shows
+  its account row (sign-in, status, usage) under yours. `chatgpt.rs` is one.
 
 A tool runs on a worker thread with no access to `App`, so everything it holds
 must be `Send + Sync` — share your plugin's state through an `Arc`, as

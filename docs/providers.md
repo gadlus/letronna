@@ -50,6 +50,16 @@ Keys are saved in the system's vault: macOS Keychain or Windows Credential Manag
 
 A provider signed in to in the browser describes its OAuth sign-in as data, a `static` `OAuthSpec` (`providers/auth/`): its authorize and token URLs, client id, scopes, the loopback port and path the browser comes back to, any extra authorize parameters, whether the token endpoint takes JSON or a form, PKCE, and where the account id and plan are in the id token. Return `AuthKind::OAuth(&SPEC)` and nothing else is needed: `providers::auth` opens the browser, waits on the loopback (or takes the address or `code#state` pasted back), trades the code for tokens, keeps them in the vault under `provider:<name>`, and refreshes the access token shortly before it ends or once when it is refused. `providers/chatgpt/` is the example.
 
+## Offered by a plugin
+
+A provider can be one a window plugin switches on, as ChatGPT is: its
+`plugin()` returns the plugin's id, and until that plugin is on it is left
+out of the gateways, the model list, the router, the local endpoint and
+`/connect`. Everything else about it is the same as any provider's. The
+window's plugin calls `providers::plug(id, on)`; the terminal reads the same
+choice from `plugins.json`. Its account row is shown under the plugin in
+Settings › Plugins rather than on the Accounts page.
+
 ## Local endpoint
 
 Settings › Accounts › Local endpoint serves the connected accounts as an
