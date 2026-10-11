@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     any::Any,
+    cell::Cell,
     collections::{BTreeMap, HashMap, HashSet},
     io::{BufRead, BufReader},
     ops::Range,
@@ -2600,23 +2601,29 @@ pub(crate) fn host(url: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// What refusals have shown of a route's cache markers this run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Markers {
-    /// A marked request was turned down as bad without saying why, so the
-    /// route's requests go without them until one is answered or turned
-    /// down the same way; see `markers_suspected`.
-    Suspected,
-    /// The route turns them down: none are sent for the rest of the run.
-    Refused,
+/// Routes, by endpoint and model as `route` gives them, that turned cache
+/// markers down, which are sent none for the rest of this run. A route that
+/// takes them may serve the same model as one that does not.
+fn unmarked() -> &'static Mutex<HashSet<(String, String)>> {
+    static UNMARKED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    UNMARKED.get_or_init(Default::default)
 }
 
-/// Routes, by endpoint and model as `route` gives them, whose requests go
-/// without cache markers for now, and why. A route that takes them may serve
-/// the same model as one that does not.
-fn unmarked() -> &'static Mutex<HashMap<(String, String), Markers>> {
-    static UNMARKED: OnceLock<Mutex<HashMap<(String, String), Markers>>> = OnceLock::new();
-    UNMARKED.get_or_init(Default::default)
+thread_local! {
+    /// Whether this thread is sending a request again without the cache
+    /// markers its refusal is suspected of; see `markers_suspected`.
+    static SUSPECTING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `send` as the resend, without cache markers, of a request whose
+/// refusal they are suspected of: what it sends carries none, and only its
+/// own answer can keep them off the route. Requests on other threads are
+/// marked as before.
+fn without_markers<T>(send: impl FnOnce() -> T) -> T {
+    let before = SUSPECTING.replace(true);
+    let sent = send();
+    SUSPECTING.set(before);
+    sent
 }
 
 /// Whether requests on this route mark where the prompt cache ends: Claude
@@ -2625,8 +2632,8 @@ fn unmarked() -> &'static Mutex<HashMap<(String, String), Markers>> {
 /// hosted gateway and the others that serve Claude pass `cache_control` on
 /// to Anthropic; one that turns it down is found out by its refusal. Not a
 /// request that goes to the Responses API, which has no place for them, nor
-/// a route that turned them down this run. OpenAI and the servers people
-/// run cache without being asked.
+/// a route that turned them down this run, nor a request sent again without
+/// them. OpenAI and the servers people run cache without being asked.
 fn marks_cache(connection: &Connection) -> bool {
     let claude = connection
         .model
@@ -2638,9 +2645,10 @@ fn marks_cache(connection: &Connection) -> bool {
         || !speaks_responses(connection);
     claude
         && chat_shaped
+        && !SUSPECTING.get()
         && unmarked()
             .lock()
-            .is_ok_and(|routes| !routes.contains_key(&route(connection)))
+            .is_ok_and(|routes| !routes.contains(&route(connection)))
 }
 
 /// Whether `sent` carried cache markers. The system message is marked on
@@ -2729,21 +2737,23 @@ fn markers_refused(connection: &Connection, sent: &Value, status: u16, error: &s
         return false;
     }
     unmarked().lock().is_ok_and(|mut routes| {
-        routes.insert(route(connection), Markers::Refused);
+        routes.insert(route(connection));
         true
     })
 }
 
 /// Whether a refusal of `sent` as a bad request, with `status` and as
 /// `failure` reads it, may be the doing of the cache markers it carried
-/// though it does not name them, so it goes again without them. A gateway
-/// may turn them down in words of its own, or turn down the system message
-/// in the parts they need. The route then goes without them until a request
-/// is answered, which keeps them off for the rest of the run, or is turned
-/// down the same way, which was for something else and brings them back.
-/// So each refusal costs one more request at most, and one that is bad for
-/// another reason neither goes round again nor loses the cache for good.
-/// An overflow is never theirs.
+/// though it does not name them, so it goes again without them
+/// (`without_markers`). A gateway may turn them down in words of its own,
+/// or turn down the system message in the parts they need. If that resend
+/// is answered, the route goes without them for the rest of the run; if it
+/// is turned down the same way, the request was bad for something else and
+/// the markers stay. Only the resend decides: requests beside it keep their
+/// markers meanwhile, and what they get says nothing of them. So each
+/// refusal costs one more request at most, and one that is bad for another
+/// reason neither goes round again nor loses the cache for good. An
+/// overflow is never theirs.
 fn markers_suspected(
     connection: &Connection,
     sent: &Value,
@@ -2753,40 +2763,25 @@ fn markers_suspected(
     let bad = matches!(status, 400 | 422)
         && failure.kind == FailureKind::BadRequest
         && failure.overflow.is_none();
-    if !bad {
-        return false;
-    }
-    let key = route(connection);
-    let Ok(mut routes) = unmarked().lock() else {
-        return false;
-    };
-    if !carries_markers(sent) {
-        if routes.get(&key) == Some(&Markers::Suspected) {
-            routes.remove(&key);
-        }
-        return false;
-    }
     // Anthropic's own API takes them, so a refusal there that does not name
     // them is the request's own.
     let direct = crate::providers::wire::anthropic::speaks(&connection.endpoint);
-    if direct || routes.contains_key(&key) {
-        return false;
-    }
-    routes.insert(key, Markers::Suspected);
-    true
+    bad && carries_markers(sent)
+        && !direct
+        && unmarked()
+            .lock()
+            .is_ok_and(|routes| !routes.contains(&route(connection)))
 }
 
 /// Keep the cache markers off `connection`'s route for the rest of the run
-/// when they were suspected of a refusal and `sent`, a request without
-/// them, was answered.
+/// when `sent` went again without them after a refusal they were suspected
+/// of, and was answered.
 fn answered_unmarked(connection: &Connection, sent: &Value) {
-    if carries_markers(sent) {
+    if !SUSPECTING.get() || carries_markers(sent) {
         return;
     }
-    if let Ok(mut routes) = unmarked().lock()
-        && let Some(markers) = routes.get_mut(&route(connection))
-    {
-        *markers = Markers::Refused;
+    if let Ok(mut routes) = unmarked().lock() {
+        routes.insert(route(connection));
     }
 }
 
@@ -4127,7 +4122,9 @@ fn stream(
                 if markers_suspected(connection, &sent, status.as_u16(), &failure)
                     && !sender.is_closed()
                 {
-                    return stream(connection, messages, start, budget, extra, lsp, sender);
+                    return without_markers(|| {
+                        stream(connection, messages, start, budget, extra, lsp, sender)
+                    });
                 }
                 failure
             }
@@ -11367,7 +11364,9 @@ mod tests {
         let plain = body_with(&other, &tool_turn(), None, None, &Budget::SMALL, &[]);
         assert!(!suspected(&other, &plain, 400, bad));
         assert!(suspected(&c, &sent, 422, bad));
-        assert!(!marks_cache(&c));
+        // Only the resend it goes again as decides, so the requests beside
+        // it are still marked.
+        assert!(marks_cache(&c));
     }
 
     #[test]
@@ -11434,6 +11433,107 @@ mod tests {
         assert!(bodies[0].contains("cache_control"));
         assert!(!bodies[1].contains("cache_control"));
         // The markers were not at fault, so the next request carries them.
+        assert!(marks_cache(&c));
+    }
+
+    /// Answer `socket` with `status`, content type `kind` and `body`.
+    fn answer(socket: &mut std::net::TcpStream, status: &str, kind: &str, body: &str) {
+        use std::io::Write;
+        write!(socket, "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    }
+
+    #[test]
+    fn a_turn_beside_a_suspected_request_keeps_its_markers_and_its_answer_decides_nothing() {
+        let refusal = r#"{"error":{"message":"Invalid request."}}"#;
+        let hello_back =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n";
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let c = Connection {
+            endpoint: format!("http://{}/v1", server.local_addr().unwrap()),
+            model: "anthropic/claude-beside-a-suspect".into(),
+            ..connection()
+        };
+        let (held, resend_out) = std::sync::mpsc::channel();
+        let (answered, beside_over) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let next = || {
+                let (mut socket, _) = server.accept().unwrap();
+                let body = request_body(&mut socket);
+                (socket, body)
+            };
+            let (mut first, first_body) = next();
+            answer(&mut first, "400 Bad Request", "application/json", refusal);
+            // Its resend is held while another turn on the route is answered,
+            let (mut resend, resend_body) = next();
+            held.send(()).unwrap();
+            let (mut beside, beside_body) = next();
+            answer(&mut beside, "200 OK", "text/event-stream", hello_back);
+            beside_over.recv().unwrap();
+            // and then turned down the same way.
+            answer(&mut resend, "400 Bad Request", "application/json", refusal);
+            [first_body, resend_body, beside_body]
+        });
+        let first = start(c.clone(), hello());
+        resend_out.recv_timeout(Duration::from_secs(20)).unwrap();
+        let (result, text) = finish(&c, hello());
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(text, "Hello");
+        answered.send(()).unwrap();
+        let result = loop {
+            if let Event::Finished(result) = first.recv_blocking().unwrap() {
+                break result;
+            }
+        };
+        assert!(result.is_err_and(|e| e.to_string().contains("Invalid request")));
+        let [first_body, resend_body, beside_body] = worker.join().unwrap();
+        assert!(first_body.contains("cache_control"));
+        assert!(!resend_body.contains("cache_control"));
+        assert!(beside_body.contains("cache_control"));
+        // The resend was turned down too, so the markers were not at fault.
+        assert!(marks_cache(&c));
+    }
+
+    #[test]
+    fn a_resend_stopped_before_it_went_leaves_the_route_marked() {
+        let refusal = r#"{"error":{"message":"Invalid request."}}"#;
+        let hello_back =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n";
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let c = Connection {
+            endpoint: format!("http://{}/v1", server.local_addr().unwrap()),
+            model: "anthropic/claude-stopped-resend".into(),
+            ..connection()
+        };
+        let cancel = Cancel::default();
+        let stop = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            let (mut first, _) = server.accept().unwrap();
+            let first_body = request_body(&mut first);
+            // Stopped while its first request is out.
+            stop.set();
+            answer(&mut first, "400 Bad Request", "application/json", refusal);
+            let (mut next, _) = server.accept().unwrap();
+            let next_body = request_body(&mut next);
+            answer(&mut next, "200 OK", "text/event-stream", hello_back);
+            [first_body, next_body]
+        });
+        let extra = Extra {
+            cancel,
+            ..Default::default()
+        };
+        let rx = start_with(c.clone(), hello(), extra);
+        let result = loop {
+            if let Event::Finished(result) = rx.recv_blocking().unwrap() {
+                break result;
+            }
+        };
+        assert!(result.is_err_and(|e| e.kind == FailureKind::Stopped));
+        // The next turn is marked, and its answer says nothing of them.
+        let (result, _) = finish(&c, hello());
+        assert!(result.is_ok(), "{result:?}");
+        let [first_body, next_body] = worker.join().unwrap();
+        assert!(first_body.contains("cache_control"));
+        assert!(next_body.contains("cache_control"));
         assert!(marks_cache(&c));
     }
 
