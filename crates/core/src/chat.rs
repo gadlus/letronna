@@ -691,6 +691,15 @@ struct Budget {
 }
 
 impl Budget {
+    /// This budget with no lift: what every request is sized by until the
+    /// provider's cache serves the session.
+    fn capped(&self) -> Self {
+        Self {
+            cached: self.tokens,
+            ..*self
+        }
+    }
+
     /// The window every model had before its own could be known.
     const SMALL: Self = Self {
         tokens: CONTEXT_TOKENS,
@@ -1070,6 +1079,26 @@ fn start_before(
             .find(|i| marks[*i] >= next && messages.get(*i).is_none_or(opens_turn))
             .unwrap_or(last_user);
     }
+    // The lift never moves the window back: the turns a request the cap
+    // sized dropped went out as their summary, and bringing them back
+    // would change every byte from the first. So under the lift the window
+    // starts no earlier than it did at the newest request the cap sized,
+    // which the replies' own usage finds again.
+    if most > budget.tokens {
+        if let Some(until) = newest_under_cap(messages, budget) {
+            let last_user = messages[..until].iter().rposition(opens_turn).unwrap_or(0);
+            let before = &messages[..until];
+            start = start.max(start_before(
+                before,
+                &budget.capped(),
+                floor,
+                last_user,
+                0,
+                0,
+                route,
+            ));
+        }
+    }
     start
 }
 
@@ -1087,8 +1116,8 @@ const SERVED_REPLIES: usize = 3;
 /// so what it decides, where the window starts and where old results end,
 /// moves only as a reply comes in: a run of misses clears results sooner
 /// and moves the window on, as the misses cost that already, and once the
-/// cache serves the session again, the lift comes back, which costs the one
-/// miss a move does.
+/// cache serves the session again, the lift comes back and holds both where
+/// the cap left them, never back.
 fn may_cost(budget: &Budget, messages: &[Message]) -> usize {
     if budget.cached <= budget.tokens || budget.squeezed {
         return budget.tokens;
@@ -1108,6 +1137,17 @@ fn may_cost(budget: &Budget, messages: &[Message]) -> usize {
     } else {
         budget.tokens
     }
+}
+
+/// Where the newest request the cap sized ended: the messages before the
+/// newest reply whose request `may_cost` gave the cap, since a request is
+/// sized by the replies before it. None until a reply reports its usage,
+/// while every request is sized by the cap anyway.
+fn newest_under_cap(messages: &[Message], budget: &Budget) -> Option<usize> {
+    (0..messages.len())
+        .rev()
+        .filter(|&i| messages[i].role == "assistant" && messages[i].prompt_tokens > 0)
+        .find(|&i| may_cost(budget, &messages[..i]) == budget.tokens)
 }
 
 /// Where the window starts over `messages` for a model that reads `context`
@@ -3045,8 +3085,17 @@ fn old_before(window: &[Message], budget: &Budget, route: Option<&Connection>) -
     }
     let sums = token_sums_from(window, budget.tool_chars, route, None);
     let total = sums[window.len()];
-    if total <= may_cost(budget, window) / 5 * 4 {
-        return 0;
+    let most = may_cost(budget, window);
+    if total <= most / 5 * 4 {
+        // Under the lift, what a request the cap sized cleared stays
+        // cleared: sent whole again, the results would change every byte
+        // from the first of them. So the boundary is no earlier than at the
+        // newest request the cap sized, found again from the window's own
+        // replies, which past its first rounds are the ones that decided.
+        return match newest_under_cap(window, budget).filter(|_| most > budget.tokens) {
+            Some(until) => old_before(&window[..until], &budget.capped(), route),
+            None => 0,
+        };
     }
     let keep = (budget.room / 16).max(KEEP_TOKENS);
     let chunk = (budget.room / 3).max(budget.step);
@@ -10504,6 +10553,92 @@ mod tests {
         assert!(places.contains(&moved), "{moved} not in {places:?}");
         let sums = token_sums(&messages, budget.tool_chars, None);
         assert!(sums[messages.len()] - sums[moved] <= budget.cached);
+    }
+
+    #[test]
+    fn the_lift_coming_back_never_moves_the_window_back() {
+        let budget = sized(Some(1_000_000), None, CAP_TOKENS, 0);
+        let plain = budget.capped();
+        let long = |i: usize| {
+            let [mut question, mut answer] = exchange(i);
+            question.content.push_str(&"x".repeat(2_400));
+            answer.content.push_str(&"y".repeat(2_400));
+            [question, answer]
+        };
+        // Served from the first reply but for two in a row past the cap, as
+        // a gateway routing to another of its servers serves them: the
+        // requests sized by those three replies are the cap's.
+        let mut messages = Vec::new();
+        for i in 0..120 {
+            messages.extend(long(i));
+        }
+        served(&mut messages, 90);
+        for i in [70, 71] {
+            messages[2 * i + 1].cached_tokens = 0;
+        }
+        // The request that gets reply n carries n exchanges and its question.
+        let starts: Vec<usize> = (0..120)
+            .map(|n| window_start(&messages[..2 * n + 1], &budget))
+            .collect();
+        let capped = |n: usize| window_start(&messages[..2 * n + 1], &plain);
+        assert!(starts[..72].iter().all(|&start| start == 0), "{starts:?}");
+        assert!(capped(72) > 0);
+        assert_eq!(starts[72], capped(72));
+        assert_eq!(starts[73], capped(73));
+        // Served again, the window stays where the cap moved it rather than
+        // taking the dropped turns back, and steps on from there as before.
+        assert!(starts.windows(2).all(|w| w[0] <= w[1]), "{starts:?}");
+        assert_eq!(starts[74], starts[73]);
+        assert_eq!(starts[119], starts[73]);
+        assert!(capped(119) > starts[119]);
+        // The summary claimed ahead agrees, so it is made for that place.
+        assert!(start_ahead(&messages, &budget, 0, budget.tokens / 4) >= starts[119]);
+    }
+
+    #[test]
+    fn the_lift_coming_back_keeps_the_results_the_cap_cleared_cleared() {
+        let c = connection();
+        let budget = sized(Some(1_000_000), None, CAP_TOKENS, 0);
+        let mut turn = reads(60, 8_000);
+        served(&mut turn, 90);
+        for i in [30, 31] {
+            turn[2 * i + 1].cached_tokens = 0;
+        }
+        // Round by round, where the old results end and the conversation
+        // on the wire.
+        let rounds: Vec<(usize, String)> = (1..=60)
+            .map(|n| {
+                let prefix = &turn[..1 + 2 * n];
+                let sent = body_with(&c, prefix, None, None, &budget, &[])["messages"].clone();
+                let mut sent = sent.as_array().unwrap().clone();
+                sent.remove(0);
+                (
+                    old_before(prefix, &budget, None),
+                    Value::Array(sent).to_string(),
+                )
+            })
+            .collect();
+        let olds: Vec<usize> = rounds.iter().map(|(old, _)| *old).collect();
+        // Under the lift nothing was cleared; the two requests the cap sized
+        // cleared the oldest, and once served again the lift keeps them so.
+        assert!(olds[..31].iter().all(|&old| old == 0), "{olds:?}");
+        assert!(olds[31] > 0, "{olds:?}");
+        assert_eq!(
+            olds[31],
+            old_before(&turn[..1 + 2 * 32], &budget.capped(), None)
+        );
+        assert!(olds.windows(2).all(|w| w[0] <= w[1]), "{olds:?}");
+        assert_eq!(olds[33], olds[32]);
+        assert_eq!(olds[59], olds[32]);
+        // On the wire each request begins with the bytes of the one before,
+        // but for the cap's own moves.
+        let wire: Vec<String> = rounds.into_iter().map(|(_, wire)| wire).collect();
+        let moved: Vec<usize> = (1..olds.len())
+            .filter(|&n| olds[n] != olds[n - 1])
+            .map(|n| n + 1)
+            .collect();
+        assert_eq!(prefix_breaks(&wire), moved);
+        assert!(moved.iter().all(|&round| round <= 33), "{moved:?}");
     }
 
     #[test]
