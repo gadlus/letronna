@@ -42,6 +42,10 @@ const OWN_COMMANDS: &[&str] = &["btw", "init"];
 /// text, which reads as one measure. A wider window gets wider margins
 /// rather than longer lines.
 pub(crate) const COLUMN: Pixels = px(816.);
+/// How much of the way to the bottom the chat goes each frame as a reply
+/// comes in, and the furthest it glides rather than going at once.
+const EASE_STEP: f32 = 0.35;
+const EASE_REACH: Pixels = px(600.);
 
 /// How far past the top and bottom of the chat turns are measured ahead:
 /// about a screen, so scrolling does not show a turn being sized, while a
@@ -84,7 +88,7 @@ pub(crate) struct Aside {
     asked: std::time::Instant,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Page {
     Chat,
     Capabilities,
@@ -3314,9 +3318,24 @@ impl Chat {
         });
     }
 
+    /// Close part of the way to the bottom: a reply coming in glides the
+    /// chat down rather than jumping it a line at a time. A long way, or
+    /// with motion reduced, it goes at once. True while there is more to go.
+    fn ease_to_bottom(&self, still: bool) -> bool {
+        let at = -self.list.scroll_px_offset_for_scrollbar().y;
+        let gap = self.list.max_offset_for_scrollbar().y - at;
+        if still || gap <= px(1.) || gap > EASE_REACH {
+            self.scroll_to_bottom();
+            return false;
+        }
+        (self.list).set_offset_from_scrollbar(point(px(0.), -(at + gap * EASE_STEP)));
+        true
+    }
+
     /// Group the session on screen into turns, tell the list which of them
     /// changed since the last draw, and keep to the bottom while following.
-    fn lay_out_turns(&mut self) {
+    /// True while the chat is still gliding down to it.
+    fn lay_out_turns(&mut self, still: bool) -> bool {
         let conversation = &self.store.conversations[self.store.active];
         let streaming_here = self.busy && self.streaming_id == Some(conversation.id);
         let turns = crate::ui::actions::turns(&conversation.messages, streaming_here);
@@ -3341,8 +3360,10 @@ impl Chat {
             // on screen is measured again at every draw.
             self.list.splice(kept..before, count - kept);
         }
+        let opened = listed != id;
         self.listed = (id, count);
-        self.keep_following();
+        // A session just opened starts at its end, not gliding to it.
+        self.keep_following(still || opened)
     }
 
     /// Turn `n` of the session on screen, as the list draws it. The turn a
@@ -3606,14 +3627,14 @@ impl Chat {
     /// the bottom runs ahead of the view on its own. What the user does is
     /// move the view up and away from the bottom. Content that shrinks also
     /// moves it up, but pinned to the bottom, and that must not count.
-    fn keep_following(&mut self) {
+    fn keep_following(&mut self, still: bool) -> bool {
         let offset = self.list.scroll_px_offset_for_scrollbar().y;
         // Held at a search hit, the chat stays put. Where it is still counts,
         // so a scroll by hand after it lets go is told the right way round.
         if self.holding_hit() {
             self.followed_offset = offset;
             self.place_hit();
-            return;
+            return false;
         }
         let near_bottom = self.distance_from_bottom() <= FOLLOW_SLACK;
         // The offset grows towards zero going up.
@@ -3623,9 +3644,7 @@ impl Chat {
             self.following = true;
         }
         self.followed_offset = offset;
-        if self.following {
-            self.scroll_to_bottom();
-        }
+        self.following && self.ease_to_bottom(still)
     }
 
     /// A way back down once the chat has been scrolled up. Following stops
@@ -4224,7 +4243,9 @@ impl Render for Chat {
         // only what comes in while it is rises in.
         let shown = &self.store.conversations[self.store.active];
         (self.motion.rows).note(shown.id, shown.messages.len(), shown.unfilled());
-        self.lay_out_turns();
+        if self.lay_out_turns(cx.reduce_motion()) {
+            window.request_animation_frame();
+        }
         self.watch_turn_files(cx);
         self.keep_files_current(window, cx);
         self.keep_region(window, cx);
@@ -4397,6 +4418,33 @@ impl Render for Chat {
                 .children(self.jump_to_latest(cx))
                 .children(self.browser_preview(pane, window, cx))
                 .children(self.ring(crate::ui::keys::Region::Transcript, cx))
+                .into_any_element()
+        };
+
+        // A new page, or another session in the chat, fades in rather than
+        // replacing the last one all at once. Keyed by both, so it plays
+        // afresh on every change and not on every frame.
+        let body = if cx.reduce_motion() {
+            body
+        } else {
+            let shown = if self.page == Page::Chat {
+                conversation.id
+            } else {
+                0
+            };
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .w_full()
+                .child(body)
+                .with_animation(
+                    SharedString::from(format!("page-{:?}-{shown}", self.page)),
+                    crate::ui::motion::enter(crate::ui::motion::STANDARD),
+                    |el, t| el.opacity(t),
+                )
                 .into_any_element()
         };
 
