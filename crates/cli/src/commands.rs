@@ -67,16 +67,10 @@ pub fn command(
             Flow::Handled
         }
         "/plan" => {
-            runner.mode = if runner.mode == Mode::Plan {
-                Mode::Default
-            } else {
-                Mode::Plan
-            };
-            letronna_core::agents::set_plan(runner.mode == Mode::Plan);
-            let note = footer(runner);
-            runner.bar.set_footer(note);
+            let plan = runner.current_mode() != Mode::Plan;
+            runner.set_mode(if plan { Mode::Plan } else { Mode::Default });
             render::blank();
-            render::line(&render::dim(if runner.mode == Mode::Plan {
+            render::line(&render::dim(if plan {
                 "Plan mode on: reads, searches and runs read-only commands, never edits your files."
             } else {
                 "Plan mode off."
@@ -93,16 +87,14 @@ pub fn command(
             let rest = picked.unwrap_or(rest);
             if !rest.is_empty() {
                 match Mode::parse(rest) {
-                    Ok(mode) => runner.mode = mode,
+                    Ok(mode) => runner.set_mode(mode),
                     Err(error) => {
                         render::line(&render::red(&error));
                         return Flow::Handled;
                     }
                 }
-                let note = footer(runner);
-                runner.bar.set_footer(note);
             }
-            let mode = runner.mode;
+            let mode = runner.current_mode();
             render::line(&render::dim(&format!(
                 "{}: {}.",
                 mode.label(),
@@ -119,7 +111,7 @@ pub fn command(
         "/decisions" => {
             render::blank();
             let decisions = &runner.store.conversations[*session].decisions;
-            for line in crate::session::decided(decisions, runner.mode) {
+            for line in crate::session::decided(decisions, runner.current_mode()) {
                 render::line(&render::dim(&line));
             }
             Flow::Handled
@@ -2485,7 +2477,7 @@ fn pick_mode(runner: &mut Runner) -> Option<&'static str> {
     let labels: Vec<String> = Mode::OFFERED
         .iter()
         .map(|mode| {
-            let using = if *mode == runner.mode {
+            let using = if *mode == runner.current_mode() {
                 "  (in use)"
             } else {
                 ""
