@@ -11377,6 +11377,7 @@ mod tests {
             ("400 Bad Request", "application/json", refusal),
             ("200 OK", "text/event-stream", hello_back),
             ("200 OK", "text/event-stream", hello_back),
+            ("400 Bad Request", "application/json", refusal),
         ]);
         let c = Connection {
             endpoint: endpoint.clone(),
@@ -11387,13 +11388,21 @@ mod tests {
         let (result, text) = finish(&c, hello());
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(text, "Hello");
+        // The resend's answer settled it.
+        assert!(!marks_cache(&c));
         // The next turn goes without them from the start.
         let (result, _) = finish(&c, hello());
         assert!(result.is_ok(), "{result:?}");
+        // A refusal of a request without them is that request's own, and
+        // brings them back no more than an answer does.
+        let (result, _) = finish(&c, hello());
+        assert!(result.is_err_and(|e| e.to_string().contains("expected a string")));
         let bodies = worker.join().unwrap();
+        assert_eq!(bodies.len(), 4);
         assert!(bodies[0].contains("cache_control"));
         assert!(!bodies[1].contains("cache_control"));
         assert!(!bodies[2].contains("cache_control"));
+        assert!(!bodies[3].contains("cache_control"));
         assert!(!marks_cache(&c));
         // Remembered for that endpoint and model alone.
         let elsewhere = Connection {
