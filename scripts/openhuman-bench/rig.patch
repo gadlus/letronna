@@ -1,0 +1,264 @@
+diff --git a/bundles/Dockerfile b/bundles/Dockerfile
+index 10cfec5..74cf63c 100644
+--- a/bundles/Dockerfile
++++ b/bundles/Dockerfile
+@@ -69,3 +69,16 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+ COPY adapters/deepseek-harness.sh /opt/harness/adapter.sh
+ COPY adapters/deepseek-harness-base.sh /opt/harness/deepseek-harness-base.sh
+ COPY dsh_run.py /opt/harness/dsh_run.py
++
++# Letronna from a prebuilt Linux binary: build.sh stages LETRONNA_LINUX_BIN as the `letronna-bin`
++# build context (not `letronna`, which would name this stage itself) and passes
++# LETRONNA_GIT_SHA, the commit it was built from, as GIT_SHA. Running it here fails the build,
++# not a task, when it cannot start on Ubuntu 22.04.
++FROM base AS letronna
++ARG GIT_SHA=unknown
++COPY --from=letronna-bin letronna /opt/harness/letronna/letronna
++RUN chmod +x /opt/harness/letronna/letronna \
++    && /opt/harness/letronna/letronna --version \
++    && echo "${GIT_SHA}" > /opt/harness/letronna/GIT_SHA
++COPY forward.mjs /opt/harness/forward.mjs
++COPY adapters/letronna.sh /opt/harness/adapter.sh
+diff --git a/bundles/adapters/letronna.sh b/bundles/adapters/letronna.sh
+new file mode 100755
+index 0000000..967d162
+--- /dev/null
++++ b/bundles/adapters/letronna.sh
+@@ -0,0 +1,66 @@
++#!/usr/bin/env bash
++# Letronna's adapter for OpenHuman's benchmark rig, in the contract of its
++# bundles/adapters/*.sh: _common.sh gives PROMPT, a fresh HOME and the task's
++# working directory, and runner/entry.mjs runs this under TASK_TIMEOUT_S with
++# stdout and stderr going to the task's harness.log. rig.patch puts a copy in
++# the rig as bundles/adapters/letronna.sh.
++. "$(dirname "$0")/_common.sh"
++
++# A data folder of its own with nothing set up: the route below is the
++# environment's, saved nowhere, so the key lives in this process alone.
++export AGENT_DATA_DIR="$HOME/letronna-data"
++mkdir -p "$AGENT_DATA_DIR"
++
++# The meter proxy. Under Harbor (Terminal-Bench) it is a unix socket, reached
++# through a loopback forwarder; otherwise the compose service by name, which
++# Letronna sends a key to over plain HTTP only when told the host is on a
++# local network. The key it sends is the rig's dummy one either way.
++if [ -n "${PROXY_SOCKET:-}" ]; then
++  node /opt/harness/forward.mjs 18080 "$PROXY_SOCKET" &
++  fwd=$!
++  trap 'kill $fwd 2>/dev/null || true' EXIT
++  for _ in $(seq 1 50); do (echo > /dev/tcp/127.0.0.1/18080) 2>/dev/null && break; sleep 0.1; done
++  proxy=http://127.0.0.1:18080
++else
++  proxy="$PROXY_URL"
++  export LETRONNA_ALLOW_HTTP=1
++fi
++# BENCH_PROXY_PREFIX tags each call with its trial, so Harbor trials can run
++# side by side.
++export AGENT_BASE_URL="$proxy${BENCH_PROXY_PREFIX:-}/v1"
++export AGENT_API_KEY="$DUMMY_API_KEY"
++export AGENT_MODEL="$BENCH_MODEL"
++
++# The rig's turn budget (runner/turn-budget.mjs): the task's budget less
++# BENCH_TURN_MARGIN_S, 120 s unless set, but at least half of it. At 80% of
++# it Letronna is told to write its outputs, and at the end it stops with its
++# result line, before the runner's kill. A budget of 0, which Harbor gives
++# when the task's own is unclear, sets none; a LETRONNA_DEADLINE given wins.
++budget="${BENCH_TURN_BUDGET_S:-${TASK_TIMEOUT_S:-0}}"
++budget="${budget%%.*}"
++if [ -z "${LETRONNA_DEADLINE:-}" ] && [ "$budget" -gt 0 ] 2>/dev/null; then
++  left=$((budget - ${BENCH_TURN_MARGIN_S:-120}))
++  half=$((budget / 2))
++  deadline=$((left > half ? left : half))
++  export LETRONNA_DEADLINE=$((deadline > 0 ? deadline : 1))
++fi
++
++# Seconds a reply may stay silent: Letronna's own 300 would give up on a
++# call the provider is slow to start under load, which the other harnesses
++# wait out.
++export LETRONNA_READ_TIMEOUT="${LETRONNA_READ_TIMEOUT:-1200}"
++# The task container is thrown away after the task, so an unwatched Bypass
++# run may do what is hard to take back, such as `rm -r` or `git reset
++# --hard`, as the other harnesses' permission bypasses do.
++export LETRONNA_DISPOSABLE=1
++# The agent's PATH and python are the task image's, not a login shell's.
++export LETRONNA_NO_LOGIN_ENV=1
++# Nothing may open a sign-in page or any other in a browser.
++export BROWSER=/usr/bin/false
++export NO_COLOR=1
++
++# 150 tool rounds, as Letronna's Harness-Bench runs get: nobody is there to
++# say "continue". The result line goes to harness.log with the rest, and to
++# letronna.json beside it on its own.
++/opt/harness/letronna/letronna -p "$PROMPT" --output json --mode bypass --max-rounds 150 \
++  | tee "${RESULT_DIR:-/results}/letronna.json"
+diff --git a/bundles/build.sh b/bundles/build.sh
+index 48d131c..764b2ec 100755
+--- a/bundles/build.sh
++++ b/bundles/build.sh
+@@ -1,6 +1,6 @@
+ #!/usr/bin/env bash
+ # Build a harness bundle and extract it to .cache/harness/<name>/.
+-#   ./bundles/build.sh claude-code|codex|opencode|openclaw|hermes|openhuman
++#   ./bundles/build.sh claude-code|codex|opencode|openclaw|hermes|openhuman|letronna
+ set -euo pipefail
+ here="$(cd "$(dirname "$0")/.." && pwd)"
+ # The OpenHuman bundle compiles the vendored checkout (git submodule vendor/openhuman).
+@@ -40,6 +40,17 @@ case "$name" in
+       --build-arg "LOCAL_MODULES=${LOCAL_MODULES:-}" \
+       -t "$image" "$repo"
+     ;;
++  letronna)
++    # Not compiled here: LETRONNA_LINUX_BIN is a Linux letronna for the task images, and
++    # LETRONNA_GIT_SHA the commit it was built from, recorded as the build like OpenHuman's.
++    bin="${LETRONNA_LINUX_BIN:?set LETRONNA_LINUX_BIN to a Linux letronna binary}"
++    sha="${LETRONNA_GIT_SHA:?set LETRONNA_GIT_SHA to the commit the binary was built from}"
++    staged="$here/.cache/letronna-bin"
++    rm -rf "$staged"; mkdir -p "$staged"
++    cp "$bin" "$staged/letronna"
++    docker build -f "$here/bundles/Dockerfile" --platform "$platform" --target letronna "${args[@]}" \
++      --build-context "letronna-bin=$staged" --build-arg "GIT_SHA=$sha" -t "$image" "$here/bundles"
++    ;;
+   deepseek-harness-minimal)
+     # Same install as deepseek-harness; only the adapter (profile) differs.
+     image="bench-bundle-deepseek-harness"
+diff --git a/charts.mjs b/charts.mjs
+index aed791c..05cbcd0 100644
+--- a/charts.mjs
++++ b/charts.mjs
+@@ -21,6 +21,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
+ /** Fixed order and identity: a harness keeps its position and colour in every panel. */
+ export const HARNESSES = [
+   { id: "openhuman", label: ["Open", "Human"], hero: "coral" },
++  { id: "letronna", label: ["Letronna"], hero: "violet" },
+   { id: "claude-code", label: ["Claude", "Code"] },
+   { id: "codex", label: ["Codex"] },
+   { id: "opencode", label: ["Open", "Code"] },
+diff --git a/format.mjs b/format.mjs
+index 73339c8..4d8bc40 100644
+--- a/format.mjs
++++ b/format.mjs
+@@ -54,7 +54,7 @@ export const pct = (v, d = 1) => (has(v) ? `${grouped(Number(v), d)}%` : NONE);
+ 
+ // OpenHuman is the harness under test, so it always leads; the rest follow the lineup order
+ // (the same as the charts), and anything unknown goes last, alphabetically.
+-const LINEUP = ["openhuman", "claude-code", "codex", "opencode", "openclaw", "hermes", "deepseek-harness", "deepseek-harness-minimal"];
++const LINEUP = ["openhuman", "letronna", "claude-code", "codex", "opencode", "openclaw", "hermes", "deepseek-harness", "deepseek-harness-minimal"];
+ const slot = (name) => (LINEUP.includes(name) ? LINEUP.indexOf(name) : LINEUP.length);
+ 
+ /** Sort harness names (or objects, with `key`) into display order. Does not mutate. */
+diff --git a/run-meta.mjs b/run-meta.mjs
+index 496da0c..98f7488 100644
+--- a/run-meta.mjs
++++ b/run-meta.mjs
+@@ -14,10 +14,12 @@ const KNOB = /^(OPENHUMAN_|TASK_TIMEOUT_S$|BENCH_(MODEL|REASONING|TURN_MARGIN_S|
+  */
+ export function runMeta(root, harness, env = process.env) {
+   let version = null;
+-  if (harness.startsWith("openhuman")) {
+-    // Written by bundles/Dockerfile.openhuman from the built tree's HEAD (or OPENHUMAN_SRC's).
++  const stamped = ["openhuman", "letronna"].find((name) => harness.startsWith(name));
++  if (stamped) {
++    // Written by bundles/Dockerfile.openhuman from the built tree's HEAD (or OPENHUMAN_SRC's), and
++    // by the Dockerfile's letronna target from LETRONNA_GIT_SHA.
+     try {
+-      version = fs.readFileSync(path.join(root, ".cache", "harness", harness, "openhuman", "GIT_SHA"), "utf8").trim() || null;
++      version = fs.readFileSync(path.join(root, ".cache", "harness", harness, stamped, "GIT_SHA"), "utf8").trim() || null;
+     } catch {
+       // bundle built before the stamp existed
+     }
+diff --git a/run-meta.test.mjs b/run-meta.test.mjs
+index bee65d2..95b7877 100644
+--- a/run-meta.test.mjs
++++ b/run-meta.test.mjs
+@@ -18,3 +18,10 @@ test("runMeta reads the OpenHuman bundle stamp, lock versions and set knobs", ()
+   assert.equal(runMeta(root, "claude-code", {}).harness_version, "2.1.0");
+   assert.equal(runMeta(root, "hermes", {}).harness_version, null);
+ });
++
++test("runMeta reads the Letronna bundle stamp", () => {
++  const root = fs.mkdtempSync(path.join(os.tmpdir(), "meta-"));
++  fs.mkdirSync(path.join(root, ".cache/harness/letronna/letronna"), { recursive: true });
++  fs.writeFileSync(path.join(root, ".cache/harness/letronna/letronna/GIT_SHA"), "def5678\n");
++  assert.equal(runMeta(root, "letronna", {}).harness_version, "def5678");
++});
+diff --git a/run-tbench.sh b/run-tbench.sh
+index 62aeeaa..b84ce83 100755
+--- a/run-tbench.sh
++++ b/run-tbench.sh
+@@ -4,6 +4,7 @@
+ # see tbench/run.mjs. Needs `uv tool install harbor`.
+ # Usage: ./run-tbench.sh 2|4 [run-id]     INSTANCES=tbench/instances-tb2-5.txt (default: the 5-task sample)
+ #        BUNDLE=<name> runs .cache/harness/<name> (built with BUNDLE_NAME=<name> ./bundles/build.sh openhuman)
++#        HARNESS=letronna runs that harness's bundle through the same agent, filed under its name
+ #        N_CONCURRENT=<n> runs n trials at once (metered per trial; CPU/latency then not comparable)
+ set -uo pipefail
+ cd "$(dirname "$0")"
+@@ -11,6 +12,6 @@ bench="${1:?usage: run-tbench.sh 2|4 [run-id]}"
+ run_id="${2:-tbench${bench}-$(date +%Y%m%d-%H%M)}"
+ export BENCH_UID="$(id -u)" BENCH_GID="$(id -g)"
+ node tbench/run.mjs --bench "$bench" --run-id "$run_id" --instances "${INSTANCES:-tbench/instances-tb${bench}-5.txt}" \
+-  ${BUNDLE:+--bundle "$BUNDLE"} ${N_CONCURRENT:+--n-concurrent "$N_CONCURRENT"} \
++  ${BUNDLE:+--bundle "$BUNDLE"} ${HARNESS:+--harness "$HARNESS"} ${N_CONCURRENT:+--n-concurrent "$N_CONCURRENT"} \
+   || echo "[run-tbench] harbor run failed"
+ node report.mjs --run-id "$run_id"
+diff --git a/tbench/openhuman_agent.py b/tbench/openhuman_agent.py
+index 10d1f4e..f6f41e8 100644
+--- a/tbench/openhuman_agent.py
++++ b/tbench/openhuman_agent.py
+@@ -34,7 +34,9 @@ from harbor.agents.base import BaseAgent
+ from harbor.environments.base import BaseEnvironment
+ from harbor.models.agent.context import AgentContext
+ 
+-HARNESS = "openhuman"
++# Another bench harness run the same way (tbench/run.mjs --harness): its bundle's adapter.sh, with
++# every call tagged and every result filed under its name.
++HARNESS = os.environ.get("BENCH_HARNESS_NAME") or "openhuman"
+ 
+ 
+ def task_key(logs_dir: Path) -> str:
+diff --git a/tbench/run.mjs b/tbench/run.mjs
+index 691ea01..7a87ddf 100644
+--- a/tbench/run.mjs
++++ b/tbench/run.mjs
+@@ -2,7 +2,7 @@
+ // run.mjs — Terminal-Bench through Harbor (the benchmark's own harness), OpenHuman only.
+ //
+ //   node tbench/run.mjs --bench 2|4 --run-id ID [--instances FILE | --task NAME ...] [--n-concurrent 1]
+-//                       [--bundle NAME] [--convert-only] [-- <extra harbor run args>]
++//                       [--bundle NAME] [--harness letronna] [--convert-only] [-- <extra harbor run args>]
+ //
+ // Harbor builds/pulls each task's environment, applies its resources, network and agent timeout,
+ // and runs its verifier exactly as on the Terminal-Bench leaderboard. The bench adds only:
+@@ -17,6 +17,8 @@
+ //     --convert-only redoes just this step for an existing job dir.
+ //   --bundle NAME runs .cache/harness/NAME (a BUNDLE_NAME build) instead of .cache/harness/openhuman;
+ //     results are still filed under openhuman, and the build is recorded per row.
++//   --harness NAME runs another harness's bundle through the same agent and entry (letronna); its
++//     calls are tagged, and its results filed, under NAME.
+ //
+ // Each call is tagged per request (a path prefix the proxy strips), so --n-concurrent > 1 meters
+ // correctly. Trials still run one at a time by default: CPU and latency figures are only
+@@ -31,7 +33,6 @@ import { runMeta } from "../run-meta.mjs";
+ 
+ const here = path.dirname(fileURLToPath(import.meta.url));
+ const root = path.resolve(here, "..");
+-const HARNESS = "openhuman";
+ const DATASETS = {
+   2: "terminal-bench@2.0",
+   4: "terminal-bench/terminal-bench@4.0.0",
+@@ -42,6 +43,7 @@ const dash = argv.indexOf("--");
+ const own = dash === -1 ? argv : argv.slice(0, dash);
+ const extra = dash === -1 ? [] : argv.slice(dash + 1);
+ const opt = (k, d) => (own.includes(k) ? own[own.indexOf(k) + 1] : d);
++const HARNESS = opt("--harness", "openhuman");
+ const bench = opt("--bench");
+ if (!DATASETS[bench]) throw new Error("--bench 2 or --bench 4 is required");
+ const runId = opt("--run-id", `tbench${bench}-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "")}`);
+@@ -149,6 +151,7 @@ services:
+       ...process.env,
+       PYTHONPATH: [root, process.env.PYTHONPATH].filter(Boolean).join(":"),
+       BENCH_RUN_ID: runId,
++      BENCH_HARNESS_NAME: HARNESS,
+       BENCH_METER_LOG: path.join(root, "results", "meter.jsonl"),
+       BENCH_HARNESS_VERSION: meta.harness_version ?? "",
+       // The agent derives OpenHuman's turn timeout from the task's budget, which these scale.

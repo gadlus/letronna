@@ -1,0 +1,86 @@
+{"ask": "open a bug report saying the login page crashes on Safari", "want": ["mcp__github__create_issue", "mcp__github__issue_write"]}
+{"ask": "what changed in the most recent version they shipped", "want": ["mcp__github__get_latest_release", "mcp__github__list_releases"]}
+{"ask": "merge PR 42 now that the checks are green", "want": ["mcp__github__merge_pull_request"]}
+{"ask": "start a new branch called fix-typo from main", "want": ["mcp__github__create_branch"]}
+{"ask": "who last touched line 120 of src/server.ts", "want": ["mcp__github__get_file_blame"]}
+{"ask": "show me the readme of that repo", "want": ["mcp__github__get_file_contents"]}
+{"ask": "copy their repository into my own account", "want": ["mcp__github__fork_repository"]}
+{"ask": "bookmark this project so I can find it later", "want": ["mcp__github__star_repository"]}
+{"ask": "close issue 17 as not planned", "want": ["mcp__github__update_issue_state", "mcp__github__issue_write"]}
+{"ask": "rename issue 8 to something clearer", "want": ["mcp__github__update_issue_title", "mcp__github__issue_write"]}
+{"ask": "tag issue 3 as a bug and a good first issue", "want": ["mcp__github__update_issue_labels", "mcp__github__issue_write"]}
+{"ask": "give issue 55 to the new contributor", "want": ["mcp__github__update_issue_assignees", "mcp__github__issue_write"]}
+{"ask": "put a thumbs up on that issue", "want": ["mcp__github__add_issue_reaction", "mcp__github__add_issue_comment"]}
+{"ask": "reply on issue 12 that a fix is coming", "want": ["mcp__github__add_issue_comment"]}
+{"ask": "why did the last CI run fail? get me the logs", "want": ["mcp__github__get_job_logs"]}
+{"ask": "rerun the failed workflow", "want": ["mcp__github__actions_run_trigger"]}
+{"ask": "which pipelines does this repo have", "want": ["mcp__github__actions_list"]}
+{"ask": "are any of our dependencies flagged as vulnerable", "want": ["mcp__github__list_dependabot_alerts", "mcp__github__get_dependabot_alert"]}
+{"ask": "were any leaked API tokens found in our code", "want": ["mcp__github__list_secret_scanning_alerts", "mcp__github__get_secret_scanning_alert"]}
+{"ask": "find where a function called parse_config is defined in any public repo", "want": ["mcp__github__search_code"]}
+{"ask": "look for projects about rust game engines", "want": ["mcp__github__search_repositories"]}
+{"ask": "find the developer whose handle is octocat", "want": ["mcp__github__search_users"]}
+{"ask": "which commit brought in the retry budget", "want": ["mcp__github__search_commits", "mcp__github__list_commits"]}
+{"ask": "which pull requests are still open", "want": ["mcp__github__list_pull_requests", "mcp__github__search_pull_requests"]}
+{"ask": "what does pull request 88 change", "want": ["mcp__github__pull_request_read"]}
+{"ask": "ask two teammates to look over PR 90", "want": ["mcp__github__request_pull_request_reviewers"]}
+{"ask": "approve pull request 91", "want": ["mcp__github__pull_request_review_write", "mcp__github__create_pull_request_review", "mcp__github__submit_pending_pull_request_review"]}
+{"ask": "PR 93 is not a draft any more, mark it ready", "want": ["mcp__github__update_pull_request_draft_state", "mcp__github__update_pull_request"]}
+{"ask": "bring my PR's branch up to date with main", "want": ["mcp__github__update_pull_request_branch"]}
+{"ask": "propose my changes on feature-x for main", "want": ["mcp__github__create_pull_request"]}
+{"ask": "save this snippet as a public gist", "want": ["mcp__github__create_gist"]}
+{"ask": "commit these three files at once", "want": ["mcp__github__push_files"]}
+{"ask": "change the version line in package.json on GitHub", "want": ["mcp__github__create_or_update_file"]}
+{"ask": "remove the old config file from the repo", "want": ["mcp__github__delete_file"]}
+{"ask": "make a new private repo called notes", "want": ["mcp__github__create_repository"]}
+{"ask": "what is waiting in my GitHub inbox", "want": ["mcp__github__list_notifications"]}
+{"ask": "clear all my unread GitHub alerts", "want": ["mcp__github__mark_all_notifications_read"]}
+{"ask": "stop watching that noisy repository", "want": ["mcp__github__manage_repository_notification_subscription"]}
+{"ask": "who am I signed in as on GitHub", "want": ["mcp__github__get_me"]}
+{"ask": "which teams am I on", "want": ["mcp__github__get_teams"]}
+{"ask": "who can push to this repo", "want": ["mcp__github__list_repository_collaborators"]}
+{"ask": "show the folder layout of the repository", "want": ["mcp__github__get_repository_tree"]}
+{"ask": "list the version tags", "want": ["mcp__github__list_tags"]}
+{"ask": "has this issue been reported before", "want": ["mcp__github__find_duplicate", "mcp__github__search_issues"]}
+{"ask": "find issues about memory leaks in the parser", "want": ["mcp__github__search_issues", "mcp__github__list_issues"]}
+{"ask": "what is issue 101 about", "want": ["mcp__github__issue_read"]}
+{"ask": "make issue 7 a child of issue 2", "want": ["mcp__github__add_sub_issue", "mcp__github__sub_issue_write"]}
+{"ask": "issue 9 cannot start until issue 4 is done, record that", "want": ["mcp__github__issue_dependency_write"]}
+{"ask": "add a card to our roadmap board for the API work", "want": ["mcp__github__projects_write"]}
+{"ask": "what planning boards do we have", "want": ["mcp__github__projects_list"]}
+{"ask": "rewrite the description of PR 77", "want": ["mcp__github__update_pull_request_body", "mcp__github__update_pull_request"]}
+{"ask": "mark that review conversation as settled", "want": ["mcp__github__resolve_review_thread"]}
+{"ask": "collapse that spammy comment", "want": ["mcp__github__hide_issue_comment"]}
+{"ask": "show the community threads in the repo", "want": ["mcp__github__list_discussions"]}
+{"ask": "get an automated AI review of my PR", "want": ["mcp__github__request_copilot_review"]}
+{"ask": "delete the throwaway repository test-123", "want": ["mcp__github__delete_repository"]}
+{"ask": "create a label called needs-triage", "want": ["mcp__github__label_write"]}
+{"ask": "open the shop's website and add the blue mug to the cart", "want": ["browse", "use_page"]}
+{"ask": "fill in the signup form on example.com", "want": ["use_page", "browse"]}
+{"ask": "click the OK button in the installer that is open on my screen", "want": ["computer"]}
+{"ask": "draw a logo of a fox inside a circle", "want": ["make_image"]}
+{"ask": "make the background of this photo white", "want": ["edit_image"]}
+{"ask": "make a short clip of waves at sunset", "want": ["make_video"]}
+{"ask": "what is said in this voice memo", "want": ["transcribe"]}
+{"ask": "read this paragraph out loud", "want": ["speak"]}
+{"ask": "save these steps as something you can reuse next time", "want": ["skill_manage"]}
+{"ask": "what did we decide in an earlier chat about the database", "want": ["search_sessions"]}
+{"ask": "list my previous conversations", "want": ["list_sessions", "search_sessions"]}
+{"ask": "add a task for the crew to write the tests", "want": ["board"]}
+{"ask": "what did people say earlier in this group chat", "want": ["read_chat"]}
+{"ask": "look at my screen and tell me what the dialog says", "want": ["computer"]}
+{"ask": "what does HTTP status 418 mean", "want": []}
+{"ask": "explain the difference between merge and rebase", "want": []}
+{"ask": "thanks, that is all", "want": []}
+{"ask": "how do I write a for loop in Python", "want": []}
+{"ask": "what is 17 times 23", "want": []}
+{"ask": "summarize what you just did", "want": []}
+{"ask": "is it better to indent with tabs or spaces", "want": []}
+{"ask": "translate good morning into French", "want": []}
+{"ask": "what is a mutex", "want": []}
+{"ask": "give me three names for a coffee shop", "want": []}
+{"ask": "what does the -p flag of mkdir do", "want": []}
+{"ask": "rewrite that sentence to sound friendlier", "want": []}
+{"ask": "what is the capital of Australia", "want": []}
+{"ask": "explain big O notation simply", "want": []}
+{"ask": "how are you today", "want": []}

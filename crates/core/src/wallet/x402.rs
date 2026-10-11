@@ -33,6 +33,9 @@ const QUOTE_TIME: Duration = Duration::from_secs(10 * 60);
 const CLOCK_SLACK: u64 = 600;
 /// The shortest an authorization is valid for, whatever the site asked.
 const MIN_VALID: u64 = 60;
+/// The longest: a site settles a payment within seconds of getting it, and
+/// one that asked for years could hold a signed payment to spend later.
+const MAX_VALID: u64 = 60 * 60;
 
 /// What a site asked to be paid.
 #[derive(Clone, Debug, PartialEq)]
@@ -234,7 +237,7 @@ pub(crate) fn pay(plan: &Plan) -> Result<(&'static str, String), String> {
                 to: super::keys::evm_bytes(&plan.pay_to)?,
                 value: plan.amount,
                 valid_after: now.saturating_sub(CLOCK_SLACK),
-                valid_before: now + timeout.max(MIN_VALID),
+                valid_before: now + timeout.clamp(MIN_VALID, MAX_VALID),
                 nonce: super::random::<32>()?,
             };
             let signature = super::evm::authorize(
@@ -627,6 +630,23 @@ mod tests {
     /// The signer of a version 2 EVM payment, checked as a facilitator
     /// would: the signature recovers to `from` over the authorization.
     fn signer(payment: &str) -> Option<String> {
+        signed_under(
+            payment,
+            "USDC",
+            "2",
+            84532,
+            "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+        )
+    }
+
+    /// The signer of an EVM payment signed under a token's EIP-712 domain.
+    fn signed_under(
+        payment: &str,
+        name: &str,
+        version: &str,
+        chain_id: u64,
+        contract: &str,
+    ) -> Option<String> {
         let body: Value = serde_json::from_slice(&STANDARD.decode(payment).ok()?).ok()?;
         let payload = &body["payload"];
         let auth = &payload["authorization"];
@@ -643,13 +663,8 @@ mod tests {
             valid_before: auth["validBefore"].as_str()?.parse().ok()?,
             nonce,
         };
-        let digest = super::super::evm::test_digest(
-            "USDC",
-            "2",
-            84532,
-            "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
-            &authorization,
-        );
+        let digest =
+            super::super::evm::test_digest(name, version, chain_id, contract, &authorization);
         let signature = k256::ecdsa::Signature::from_slice(&bytes[..64]).ok()?;
         let id = k256::ecdsa::RecoveryId::from_byte(bytes[64] - 27)?;
         let key = k256::ecdsa::VerifyingKey::recover_from_prehash(&digest, &signature, id).ok()?;
@@ -853,6 +868,123 @@ mod tests {
         );
         assert_eq!(remembered(&dear).unwrap().usd, Some(500_000));
         assert_eq!(policy::ledger().len(), 1);
+        // Said yes to the cent its card showed, the page cannot take fifty
+        // though the model's own most was a dollar.
+        let cent = Quote {
+            version: 2,
+            resource: Value::Null,
+            accepts: vec![offer()],
+            error: String::new(),
+        };
+        let cent = choose(&cent, &super::super::load(), "127.0.0.1", false).unwrap();
+        let dearer = site("500000");
+        remember(&dearer, &cent);
+        let approved = crate::tools::ToolContext {
+            approved: true,
+            ..Default::default()
+        };
+        let args = json!({"url": dearer, "max_usd": "1"});
+        let why = crate::tools::Tool::run(&super::super::PaidFetch, &args, &approved).unwrap_err();
+        assert!(
+            why.contains("more than the $0.01 the user said yes to"),
+            "{why}"
+        );
+        assert_eq!(policy::ledger().len(), 1);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_usdg_offer_on_robinhood_chain_is_signed_as_global_dollar_unnamed() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = Scratch::new("wallet-usdg");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        let made = super::super::import("Main", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", 0).unwrap();
+        // A version 1 offer that names the network by its old name and does
+        // not say how the token signs.
+        let usdg = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168";
+        let offer = json!({
+            "scheme": "exact", "network": "robinhood", "maxAmountRequired": "10000",
+            "asset": usdg, "payTo": "0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+            "resource": "https://x.dev/a", "description": "", "maxTimeoutSeconds": 60
+        });
+        let quote = Quote {
+            version: 1,
+            resource: Value::Null,
+            accepts: vec![offer],
+            error: String::new(),
+        };
+        let plan = choose(&quote, &super::super::load(), "x.dev", false).unwrap();
+        assert_eq!(plan.price(), "0.01 USDG ($0.01) on Robinhood Chain");
+        let (header, value) = pay(&plan).unwrap();
+        assert_eq!(header, "X-PAYMENT");
+        assert_eq!(
+            signed_under(&value, "Global Dollar", "1", 4663, usdg),
+            Some(made.evm)
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_payment_is_signed_good_for_an_hour_at_most_whatever_the_site_asks() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = Scratch::new("wallet-x402-valid");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        super::super::import("Main", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", 0).unwrap();
+        super::super::change(|wallet| {
+            wallet.policy.testnets = true;
+            Ok(())
+        })
+        .unwrap();
+        let mut offer = offer();
+        offer["maxTimeoutSeconds"] = u64::MAX.into();
+        let quote = Quote {
+            version: 2,
+            resource: Value::Null,
+            accepts: vec![offer],
+            error: String::new(),
+        };
+        let plan = choose(&quote, &super::super::load(), "x.dev", false).unwrap();
+        let (_, value) = pay(&plan).unwrap();
+        let body: Value = serde_json::from_slice(&STANDARD.decode(value).unwrap()).unwrap();
+        let before: u64 = body["payload"]["authorization"]["validBefore"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(before <= crate::chat::now() + MAX_VALID);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn solana_is_tried_before_base_unless_the_user_says_otherwise() {
+        let base = json!({
+            "scheme": "exact", "network": chains::BASE, "amount": "10000",
+            "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "payTo": "0x209693Bc6afc0C5328bA36FaF03C514EF312287C", "maxTimeoutSeconds": 60,
+            "extra": {"name": "USD Coin", "version": "2"}
+        });
+        let solana = json!({
+            "scheme": "exact", "network": chains::SOLANA, "amount": "10000",
+            "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "payTo": "2wKupLR9q6wXYppw8Gr2NvWxKBUqm4PPJKkQfoxHDBg4", "maxTimeoutSeconds": 60,
+            "extra": {"feePayer": "EwWqGE4ZFKLofuestmU4LDdK7XM1N4ALgdZccwYugwGd"}
+        });
+        // Base listed first by the site, Solana chosen all the same.
+        let quote = Quote {
+            version: 2,
+            resource: Value::Null,
+            accepts: vec![base, solana],
+            error: String::new(),
+        };
+        let mut wallet = wallet();
+        assert_eq!(
+            choose(&quote, &wallet, "x.dev", false).unwrap().chain.id,
+            chains::SOLANA
+        );
+        wallet.policy.prefer = vec![chains::BASE.into()];
+        assert_eq!(
+            choose(&quote, &wallet, "x.dev", false).unwrap().chain.id,
+            chains::BASE
+        );
     }
 }

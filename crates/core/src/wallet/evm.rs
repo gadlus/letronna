@@ -23,6 +23,11 @@ const TRANSFER_GAS: u128 = 21_000;
 /// The tip offered when a chain will not suggest one: 0.1 gwei, which L2s
 /// take and L1s still include.
 const FALLBACK_TIP: u128 = 100_000_000;
+/// The most a send's network fee may come to, in micro-dollars. A transfer
+/// costs under a cent on an L2 and a dollar or two on Ethereum in an
+/// ordinary hour, while the fee is whatever the RPC answers: one that
+/// answered wildly could spend the whole balance on gas.
+pub(crate) const FEE_CEILING: u64 = 5 * super::policy::DOLLAR;
 
 /// ERC-20 `balanceOf(address)`.
 const BALANCE_OF: &str = "70a08231";
@@ -176,6 +181,13 @@ pub(crate) fn send(
     )?)?;
     let gas = gas_for(chain, &from, &target, value, &data)?;
     let fees = fees(chain)?;
+    let per_gas = match fees {
+        Fees::Eip1559 { max, .. } => max,
+        Fees::Legacy { price } => price,
+    };
+    within_ceiling(chain, gas, per_gas, |wei| {
+        super::policy::worth(wei, chain.decimals, false, &chain.symbol)
+    })?;
     let call = Call {
         chain_id,
         nonce,
@@ -290,10 +302,41 @@ fn fees(chain: &Chain) -> Result<Fees, String> {
     let tip = rpc(chain, "eth_maxPriorityFeePerGas", json!([]))
         .and_then(|tip| quantity(&tip))
         .unwrap_or(FALLBACK_TIP);
-    Ok(Fees::Eip1559 {
-        tip,
-        max: base * 2 + tip,
-    })
+    let max = (base.checked_mul(2))
+        .and_then(|twice| twice.checked_add(tip))
+        .ok_or_else(|| format!("{} answered an impossible fee.", chain.name))?;
+    Ok(Fees::Eip1559 { tip, max })
+}
+
+/// Refuse a send whose fee, `gas` at `per_gas` at most, could pass
+/// `FEE_CEILING`, at what the chain's coin is `worth`.
+fn within_ceiling(
+    chain: &Chain,
+    gas: u128,
+    per_gas: u128,
+    worth: impl Fn(u128) -> Option<u64>,
+) -> Result<(), String> {
+    let ceiling = super::policy::dollars(FEE_CEILING);
+    let Some(usd) = gas.checked_mul(per_gas).map(worth) else {
+        return Err(format!(
+            "Nothing was sent: {} answered an impossible fee.",
+            chain.name
+        ));
+    };
+    let Some(usd) = usd else {
+        return Err(format!(
+            "Nothing was sent: what {} is worth is not known, so the network's fee cannot be held to its {ceiling} ceiling.",
+            chain.symbol
+        ));
+    };
+    if usd > FEE_CEILING {
+        return Err(format!(
+            "Nothing was sent: the network's fee could come to {}, over the {ceiling} ceiling on one fee. Try again when {} is less busy.",
+            super::policy::dollars(usd),
+            chain.name
+        ));
+    }
+    Ok(())
 }
 
 /// Gas for a call, with a fifth more than the chain's estimate, since a
@@ -315,7 +358,8 @@ fn gas_for(
     if data.is_empty() && estimate == TRANSFER_GAS {
         return Ok(TRANSFER_GAS);
     }
-    Ok(estimate + estimate / 5)
+    // Too large to add to is too large to pay for, which the ceiling says.
+    Ok(estimate.saturating_add(estimate / 5))
 }
 
 /// Wait for `hash` to be mined; one that reverted is the error, and one still
@@ -456,12 +500,18 @@ mod tests {
 
     #[test]
     fn a_token_domain_is_the_one_its_contract_reports() {
-        // DOMAIN_SEPARATOR() as USDC's contracts answer it on Base and Base
-        // Sepolia (read with eth_call on 2026-10-07).
+        // DOMAIN_SEPARATOR() as the contracts answer it (read with eth_call
+        // on 2026-10-07).
         let base = evm_bytes("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").unwrap();
         assert_eq!(
             to_hex(&domain_separator("USD Coin", "2", 8453, &base)),
             "02fa7265e7c5d81118673727957699e4d68f74cd74b7db77da710fe8a2c7834f"
+        );
+        // Paxos's USDG on Robinhood Chain, whose version() reverts.
+        let usdg = evm_bytes("0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168").unwrap();
+        assert_eq!(
+            to_hex(&domain_separator("Global Dollar", "1", 4663, &usdg)),
+            "7a3d7400b27830f4f91c2c16a082486d67c1befecaec2f53b33f1f35d5b62036"
         );
         let sepolia = evm_bytes("0x036CbD53842c5426634e7929541eC2318f3dCF7e").unwrap();
         assert_eq!(
@@ -567,6 +617,23 @@ mod tests {
         let mut expected = vec![0x02];
         expected.extend(rlp_list(&whole));
         assert_eq!(signed(&key, &call).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_fee_over_the_ceiling_or_of_unknown_worth_is_refused() {
+        let chains = super::super::chains::all(&super::super::Wallet::default());
+        let ethereum = super::super::chains::find(&chains, "ethereum").unwrap();
+        // ETH at $4,000, in micro-dollars for so many wei.
+        let at = |wei: u128| u64::try_from((wei * 4_000).div_ceil(10u128.pow(12))).ok();
+        // A token transfer at 2 gwei, about fifty cents.
+        assert!(within_ceiling(ethereum, 65_000, 2_000_000_000, at).is_ok());
+        // At 100 gwei, $26.
+        let why = within_ceiling(ethereum, 65_000, 100_000_000_000, at).unwrap_err();
+        assert!(why.contains("$26.00, over the $5.00 ceiling"), "{why}");
+        let why = within_ceiling(ethereum, 65_000, 2_000_000_000, |_| None).unwrap_err();
+        assert!(why.contains("not known"), "{why}");
+        let why = within_ceiling(ethereum, u128::MAX, 2, at).unwrap_err();
+        assert!(why.contains("impossible"), "{why}");
     }
 
     #[test]

@@ -67,16 +67,10 @@ pub fn command(
             Flow::Handled
         }
         "/plan" => {
-            runner.mode = if runner.mode == Mode::Plan {
-                Mode::Default
-            } else {
-                Mode::Plan
-            };
-            letronna_core::agents::set_plan(runner.mode == Mode::Plan);
-            let note = footer(runner);
-            runner.bar.set_footer(note);
+            let plan = runner.current_mode() != Mode::Plan;
+            runner.set_mode(if plan { Mode::Plan } else { Mode::Default });
             render::blank();
-            render::line(&render::dim(if runner.mode == Mode::Plan {
+            render::line(&render::dim(if plan {
                 "Plan mode on: reads, searches and runs read-only commands, never edits your files."
             } else {
                 "Plan mode off."
@@ -93,16 +87,14 @@ pub fn command(
             let rest = picked.unwrap_or(rest);
             if !rest.is_empty() {
                 match Mode::parse(rest) {
-                    Ok(mode) => runner.mode = mode,
+                    Ok(mode) => runner.set_mode(mode),
                     Err(error) => {
                         render::line(&render::red(&error));
                         return Flow::Handled;
                     }
                 }
-                let note = footer(runner);
-                runner.bar.set_footer(note);
             }
-            let mode = runner.mode;
+            let mode = runner.current_mode();
             render::line(&render::dim(&format!(
                 "{}: {}.",
                 mode.label(),
@@ -119,7 +111,7 @@ pub fn command(
         "/decisions" => {
             render::blank();
             let decisions = &runner.store.conversations[*session].decisions;
-            for line in crate::session::decided(decisions, runner.mode) {
+            for line in crate::session::decided(decisions, runner.current_mode()) {
                 render::line(&render::dim(&line));
             }
             Flow::Handled
@@ -218,6 +210,10 @@ pub fn command(
             } else {
                 "Web search off."
             }));
+            Flow::Handled
+        }
+        "/tool-search" => {
+            tool_search(runner, rest);
             Flow::Handled
         }
         "/notify" => {
@@ -450,6 +446,119 @@ fn send_prompt(runner: &mut Runner, command: &str, rest: &str) -> Flow {
         }
         None => Flow::Handled,
     }
+}
+
+/// What `/tool-search` was asked to do.
+#[derive(Debug, PartialEq)]
+enum ToolSearch {
+    Show,
+    /// Rank by Jev where the chat is hosted, Jev anywhere, or by names.
+    Rank(&'static str),
+    /// Ask Jev at this address; empty for the Letronna account.
+    Address(String),
+    /// Ask this Jev model; empty for the latest.
+    Model(String),
+    /// Ask for a Jev key of the user's own, or remove it.
+    Key {
+        remove: bool,
+    },
+}
+
+/// What `/tool-search` followed by `rest` asks for, or why it cannot be done.
+fn tool_search_asked(rest: &str) -> Result<ToolSearch, String> {
+    let (what, value) = rest
+        .trim()
+        .split_once(char::is_whitespace)
+        .map_or((rest.trim(), ""), |(what, value)| (what, value.trim()));
+    Ok(match what {
+        "" => ToolSearch::Show,
+        "auto" => ToolSearch::Rank("auto"),
+        "jev" => ToolSearch::Rank("jev"),
+        "names" => ToolSearch::Rank("names"),
+        "key" => ToolSearch::Key {
+            remove: value == "remove",
+        },
+        "model" => ToolSearch::Model(value.to_owned()),
+        "address" if value.is_empty() || value == "letronna" => ToolSearch::Address(String::new()),
+        "address" => {
+            let here = ["http://localhost", "http://127.0.0.1", "http://[::1]"];
+            if !value.starts_with("https://") && !here.iter().any(|h| value.starts_with(h)) {
+                return Err(format!(
+                    "{value} is not used: a key goes only to an https address, or to one on this computer."
+                ));
+            }
+            ToolSearch::Address(value.to_owned())
+        }
+        _ => {
+            return Err(
+                "/tool-search auto, jev or names · key (or key remove) · address <url> or letronna · model <name>"
+                    .into(),
+            );
+        }
+    })
+}
+
+/// Show how find_tools ranks what it finds and where Jev is asked, or change
+/// it as `rest` says.
+fn tool_search(runner: &mut Runner, rest: &str) {
+    render::blank();
+    let asked = match tool_search_asked(rest) {
+        Ok(asked) => asked,
+        Err(error) => {
+            render::line(&render::red(&error));
+            return;
+        }
+    };
+    let settings = &mut runner.store.settings;
+    match asked {
+        ToolSearch::Show => {}
+        ToolSearch::Rank(how) => settings.tool_search = how.to_owned(),
+        ToolSearch::Address(url) => settings.jev_endpoint = url,
+        ToolSearch::Model(model) => settings.jev_model = model,
+        ToolSearch::Key { remove } => {
+            let saved = if remove {
+                store::save_key(letronna_core::jev::KEY_SLOT, None)
+            } else {
+                let given = runner.bar.ask("Jev key", true).unwrap_or_default();
+                if given.trim().is_empty() {
+                    return;
+                }
+                store::save_key(letronna_core::jev::KEY_SLOT, Some(given.trim()))
+            };
+            if let Err(error) = saved {
+                render::line(&render::red(&format!(
+                    "Could not save the Jev key: {error}"
+                )));
+                return;
+            }
+        }
+    }
+    runner.persist();
+    let settings = &runner.store.settings;
+    let how = match settings.tool_search.as_str() {
+        "names" => "by the words of their names and descriptions",
+        "jev" => "by Jev wherever it can be reached, else by their names",
+        _ => "by Jev while the chat is on a hosted model, else by their names",
+    };
+    let own_key = store::load_keys()
+        .get(letronna_core::jev::KEY_SLOT)
+        .is_some_and(|key| !key.is_empty());
+    let address = settings.jev_endpoint.trim();
+    let where_asked = match (address, own_key) {
+        ("", true) => "TypeSafe, with your own key".to_owned(),
+        ("", false) => "your Letronna account".to_owned(),
+        (address, _) => address.to_owned(),
+    };
+    let model = Some(settings.jev_model.trim())
+        .filter(|model| !model.is_empty())
+        .unwrap_or("jev-latest");
+    render::line(&render::dim(&format!(
+        "find_tools ranks the tools left out of a request {how}. Jev ({model}) is asked at \
+         {where_asked}, and is sent the search's words and the tools' names and descriptions."
+    )));
+    render::line(&render::dim(
+        "/tool-search auto, jev or names · key · address <url> or letronna · model <name>",
+    ));
 }
 
 /// Show how long sessions are kept, or set it from `rest`.
@@ -2372,7 +2481,7 @@ fn pick_mode(runner: &mut Runner) -> Option<&'static str> {
     let labels: Vec<String> = Mode::OFFERED
         .iter()
         .map(|mode| {
-            let using = if *mode == runner.mode {
+            let using = if *mode == runner.current_mode() {
                 "  (in use)"
             } else {
                 ""
@@ -3823,6 +3932,12 @@ fn switch_media(runner: &mut Runner, kind: &'static str, label: &str) {
 /// gateway actually offers. `filter` narrows the list (by model or gateway
 /// name), and an exact model name skips the asking entirely.
 pub fn switch_model(runner: &mut Runner, session: Option<usize>, filter: &str) {
+    pick_model(runner, session, filter, false);
+}
+
+/// `/model`, or (`in_setup`) the setup's own model step, which has its own
+/// heading and is already where a provider gets added.
+pub fn pick_model(runner: &mut Runner, session: Option<usize>, filter: &str, in_setup: bool) {
     // `/model image`, `/model video`: what makes those, not the chat model.
     if let Some((kind, label)) = media_kind(filter) {
         switch_media(runner, kind, label);
@@ -3837,8 +3952,10 @@ pub fn switch_model(runner: &mut Runner, session: Option<usize>, filter: &str) {
     };
     let current = format!("{model} · {gateway}");
 
-    render::blank();
-    render::said(&render::blue("●"), &render::bold("Models"));
+    if !in_setup {
+        render::blank();
+        render::said(&render::blue("●"), &render::bold("Models"));
+    }
     // Fetching takes a moment over the network; say so rather than freezing.
     let (mut models, errors) = runner
         .bar
@@ -3850,9 +3967,11 @@ pub fn switch_model(runner: &mut Runner, session: Option<usize>, filter: &str) {
     }
     if models.is_empty() {
         if errors.is_empty() {
-            render::line(&render::dim(
-                "No gateway offered any models. Sign in with /login, or add a provider with `letronna setup`.",
-            ));
+            render::line(&render::dim(if in_setup {
+                "Nothing offered any models yet."
+            } else {
+                "No gateway offered any models. Sign in with /login, or add a provider with `letronna setup`."
+            }));
         }
         return;
     }
@@ -4161,9 +4280,9 @@ pub fn gateways(runner: &mut Runner) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Asked, Flow, Run, Stage, agent_lines, agent_rows, asked, choice_label, command,
+        Asked, Flow, Run, Stage, ToolSearch, agent_lines, agent_rows, asked, choice_label, command,
         crew_switch, from_match, keep_days, last_prompt, name_label, run_rows, side_setting,
-        standing, typed_path, with_files,
+        standing, tool_search_asked, typed_path, with_files,
     };
     use crate::session::Runner;
     use letronna_core::agents::Seen;
@@ -4369,6 +4488,35 @@ mod tests {
         assert_eq!(keep_days("0"), Ok(Some(0)));
         assert!(keep_days("a month").is_err());
         assert!(keep_days("-3").is_err());
+    }
+
+    #[test]
+    fn tool_search_takes_a_ranking_a_key_an_address_or_a_model() {
+        assert_eq!(tool_search_asked(""), Ok(ToolSearch::Show));
+        assert_eq!(tool_search_asked(" jev "), Ok(ToolSearch::Rank("jev")));
+        assert_eq!(tool_search_asked("names"), Ok(ToolSearch::Rank("names")));
+        assert_eq!(
+            tool_search_asked("key remove"),
+            Ok(ToolSearch::Key { remove: true })
+        );
+        assert_eq!(
+            tool_search_asked("address https://jev.example/v1/systemone"),
+            Ok(ToolSearch::Address(
+                "https://jev.example/v1/systemone".into()
+            ))
+        );
+        assert_eq!(
+            tool_search_asked("address letronna"),
+            Ok(ToolSearch::Address(String::new()))
+        );
+        assert_eq!(
+            tool_search_asked("model jev-1.13"),
+            Ok(ToolSearch::Model("jev-1.13".into()))
+        );
+        // A key is never sent in the clear to another machine.
+        assert!(tool_search_asked("address http://jev.example/x").is_err());
+        assert!(tool_search_asked("address http://127.0.0.1:9/x").is_ok());
+        assert!(tool_search_asked("sometimes").is_err());
     }
 
     #[test]

@@ -172,6 +172,16 @@ const BUILT_IN: &[Row] = &[
         &["avalanche"],
     ),
     (
+        "eip155:4663",
+        "Robinhood Chain",
+        "https://rpc.mainnet.chain.robinhood.com",
+        "ETH",
+        18,
+        "https://robinhoodchain.blockscout.com/tx/{tx}",
+        false,
+        &["robinhood", "robinhood-chain"],
+    ),
+    (
         SOLANA,
         "Solana",
         "https://api.mainnet-beta.solana.com",
@@ -230,6 +240,16 @@ const BUILT_IN: &[Row] = &[
         "https://solscan.io/tx/{tx}?cluster=devnet",
         true,
         &["solana-devnet"],
+    ),
+    (
+        "eip155:46630",
+        "Robinhood Chain Testnet",
+        "https://rpc.testnet.chain.robinhood.com",
+        "ETH",
+        18,
+        "https://explorer.testnet.chain.robinhood.com/tx/{tx}",
+        true,
+        &["robinhood-testnet"],
     ),
 ];
 
@@ -301,6 +321,16 @@ const TOKENS: &[(&str, &str, &str, u8, &str, &str)] = &[
         "USD Coin",
         "2",
     ),
+    // Paxos's Global Dollar, which signs transfers as "Global Dollar"
+    // version 1 (its version() reverts, so a site's offer may not say).
+    (
+        "eip155:4663",
+        "USDG",
+        "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+        6,
+        "Global Dollar",
+        "1",
+    ),
     (
         SOLANA,
         "USDC",
@@ -356,6 +386,14 @@ const TOKENS: &[(&str, &str, &str, u8, &str, &str)] = &[
         6,
         "",
         "",
+    ),
+    (
+        "eip155:46630",
+        "USDG",
+        "0x7E955252E15c84f5768B83c41a71F9eba181802F",
+        6,
+        "Global Dollar",
+        "1",
     ),
 ];
 
@@ -508,6 +546,13 @@ mod tests {
         assert_eq!(find(&chains, "solana-devnet").unwrap().id, SOLANA_DEVNET);
         assert_eq!(find(&chains, "Base Sepolia").unwrap().id, "eip155:84532");
         assert_eq!(find(&chains, "base-sepolia").unwrap().id, "eip155:84532");
+        assert_eq!(find(&chains, "robinhood").unwrap().id, "eip155:4663");
+        assert!(
+            find(&chains, "4663")
+                .unwrap()
+                .token("usdg")
+                .is_some_and(|t| t.dollar)
+        );
         assert!(find(&chains, "dogechain").is_none());
     }
 

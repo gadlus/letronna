@@ -17,6 +17,13 @@ ledger, the most any output can score there, so a capped task does not read as
 unfinished; a failed check the ledger lists goes in the oracle-defect bucket.
 --band lists the tasks the baseline passed 30-70% of the time, less those the
 ledger keeps from tuning, which is how the dev subset is chosen from a full run.
+
+Each arm's efficiency is given as OpenHuman's benchmark rig gives it: model
+calls per run, the share of input tokens read from the provider's cache, and
+the static prompt (system prompt and tool schemas) of each run's first
+request, counted with o200k_base (four characters a token without tiktoken,
+as the rig's meter falls back to). The bench's usage proxy records no timing,
+so time to first token and call latency, which that rig also gives, are not.
 """
 
 from __future__ import annotations
@@ -27,6 +34,7 @@ import math
 import statistics
 import sys
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
 from buckets import (
@@ -53,6 +61,9 @@ BAND = (0.3, 0.7)
 # When every task moved by exactly the same amount there is no spread to take
 # a standard error from, so the sign test decides instead, at the usual 5%.
 SIGN_P = 0.05
+
+# The roles whose messages OpenHuman's meter counts as the system prompt.
+SYSTEM_ROLES = ("system", "developer")
 
 
 def spoiled(result: dict | None) -> bool:
@@ -105,6 +116,88 @@ def arm_summary(
         "pass_hat_k": statistics.fmean(all(row[i] for row in passes) for i in columns),
         "best_of_k": statistics.fmean(max(row[i] for row in scores) for i in columns),
         "infra": sum(spoiled(run.get(task_id)) for run in runs for task_id in tasks),
+    }
+
+
+def model_calls(result: dict) -> int | None:
+    """Model calls the proxy saw answered over a run's rounds, as the adapter counted them."""
+    rounds = result.get("adapter_results") or []
+    counts = [(item.get("metadata") or {}).get("model_calls") for item in rounds]
+    counts = [count for count in counts if isinstance(count, int)]
+    return sum(counts) if counts else None
+
+
+def first_request(result: dict) -> dict | None:
+    """The body of the first chat completion the proxy kept for a run, if its sandbox is kept."""
+    sandbox = result.get("sandbox")
+    if not sandbox:
+        return None
+    # Numbered as the proxy answered them, so the first is the run's opening call.
+    for record in sorted((Path(sandbox) / "usage-proxy" / "responses").glob("*.json")):
+        try:
+            raw = json.loads(record.read_text(encoding="utf-8"))
+            body = json.loads(raw.get("request_body") or "null")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if str(raw.get("path", "")).endswith("/chat/completions") and isinstance(body, dict):
+            return body
+    return None
+
+
+def text_of(content: object) -> str:
+    """A message's content as text: a string as it is, a list of parts one per line."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(text_of(part) for part in content)
+    if isinstance(content, dict):
+        return str(content.get("text") or content.get("content") or "")
+    return str(content)
+
+
+def static_parts(body: dict) -> tuple[str, str]:
+    """A request's system prompt and tool schemas, as the text OpenHuman's meter sizes."""
+    messages = [message for message in body.get("messages") or [] if isinstance(message, dict)]
+    system = [text_of(m.get("content")) for m in messages if m.get("role") in SYSTEM_ROLES]
+    tools = body.get("tools")
+    # As JSON.stringify writes it, which is what the meter counts.
+    schemas = json.dumps(tools, ensure_ascii=False, separators=(",", ":")) if tools else ""
+    return "\n".join(part for part in system if part), schemas
+
+
+def token_counter() -> tuple[Callable[[str], int], str]:
+    """Counts tokens with o200k_base, as OpenHuman's meter does, or else at four chars each."""
+    try:
+        import tiktoken
+
+        encoding = tiktoken.get_encoding("o200k_base")
+    except Exception:
+        # Not installed, or its encoding file could not be downloaded.
+        return (lambda text: math.ceil(len(text) / 4)), "chars/4, no tiktoken"
+    return (lambda text: len(encoding.encode(text, disallowed_special=()))), "o200k_base"
+
+
+def efficiency(tasks: list[str], runs: list[dict], count: Callable[[str], int]) -> dict:
+    """What one arm's runs spent: model calls a run, cache hits, and the static prompt."""
+    results = [result for run in runs for task_id in tasks if (result := run.get(task_id))]
+    calls = [n for result in results if (n := model_calls(result)) is not None]
+    usage = [u for result in results if (u := result.get("usage_summary") or {}).get("available")]
+    cached = sum(int(u.get("cache_read_tokens") or 0) for u in usage)
+    # The proxy's input_tokens leaves out the ones read from the cache.
+    prompt = cached + sum(int(u.get("input_tokens") or 0) for u in usage)
+    static = []
+    for result in results:
+        body = first_request(result)
+        if body is not None:
+            system, tools = static_parts(body)
+            static.append(count(system) + count(tools))
+    return {
+        "calls": statistics.fmean(calls) if calls else None,
+        "cache_hit": cached / prompt if prompt else None,
+        # The lower middle, as the rig's percentile takes it.
+        "static_prompt": statistics.median_low(static) if static else None,
     }
 
 
@@ -208,6 +301,11 @@ def load(out: Path) -> tuple[dict, dict, dict]:
     return manifest, runs, reruns
 
 
+def shown(value: float | None, spec: str) -> str:
+    """A number in `spec`'s format, or n/a when no run recorded it."""
+    return "n/a" if value is None else spec.format(value)
+
+
 def each_run(summary: dict) -> str:
     """One arm's score in each of its runs, so the single-run swing shows."""
     return " ".join(f"{s:.3f}" for s in summary["per_run"])
@@ -217,6 +315,7 @@ def render(manifest: dict, runs: dict, reruns: dict, known: KnownIssues) -> str:
     """The Markdown report for a loaded run."""
     tasks, k = manifest["tasks"], manifest["k"]
     capped = sum(known.ceilings.get(task_id, 1.0) < 1.0 for task_id in tasks)
+    count, tokenizer = token_counter()
     lines = [
         "# Paired run: candidate against baseline",
         "",
@@ -224,11 +323,13 @@ def render(manifest: dict, runs: dict, reruns: dict, known: KnownIssues) -> str:
         f"{len(tasks)} tasks, {k} runs per task and arm. Every task counts in every "
         f"denominator; infra failures score 0. {capped} of them have an oracle no output "
         "can fully satisfy, so completion is also shown over each task's ceiling, the most "
-        "any output can score there.",
+        "any output can score there. The usage proxy records no timing, so time to first "
+        "token and call latency are not given.",
     ]
     for model in manifest["models"]:
         base, cand = runs[model, "baseline"], runs[model, "candidate"]
         sums = {arm: arm_summary(tasks, runs[model, arm], known.ceilings) for arm in ARMS}
+        spent = {arm: efficiency(tasks, runs[model, arm], count) for arm in ARMS}
         best = f"{sums['baseline']['best_of_k']:.3f}"
         table = [
             (f"score, mean of {k} runs", *(f"{sums[arm]['mean']:.3f}" for arm in ARMS)),
@@ -242,6 +343,19 @@ def render(manifest: dict, runs: dict, reruns: dict, known: KnownIssues) -> str:
             (f"pass^{k}", *(f"{sums[arm]['pass_hat_k']:.3f}" for arm in ARMS)),
             ("runs left at 0 by infra", *(str(sums[arm]["infra"]) for arm in ARMS)),
             ("reruns for infra", *(str(reruns[model, arm]) for arm in ARMS)),
+            (
+                "model calls answered per task run",
+                *(shown(spent[arm]["calls"], "{:.1f}") for arm in ARMS),
+            ),
+            (
+                "prompt cache hit, cached of input tokens",
+                *(shown(spent[arm]["cache_hit"], "{:.1%}") for arm in ARMS),
+            ),
+            (
+                f"static prompt, system + tools of each run's first request ({tokenizer} "
+                "tokens, median)",
+                *(shown(spent[arm]["static_prompt"], "{:,}") for arm in ARMS),
+            ),
             (f"best of {k}, oracle pick (upper bound on self-select)", best, ""),
         ]
         deltas = task_deltas(tasks, base, cand)

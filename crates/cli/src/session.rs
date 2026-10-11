@@ -68,14 +68,38 @@ pub struct Runner {
     pub plain_terminal: bool,
 }
 
+/// The Custom gateway's key when the environment gave it (`AGENT_API_KEY`
+/// on a thrown-away machine, as main's `take_route` says): held by this
+/// process alone, never saved with the keys.
+pub static GIVEN_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 impl Runner {
+    /// The permission mode now: the bar's, where shift-tab can change it.
+    pub fn current_mode(&self) -> Mode {
+        self.bar.mode().unwrap_or(self.mode)
+    }
+
+    /// Change the mode, everywhere it is shown or obeyed.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+        letronna_core::agents::set_plan(mode == Mode::Plan);
+        if self.bar.mode().is_some() {
+            self.bar.set_mode(mode);
+        }
+        let note = crate::banner::footer(self);
+        self.bar.set_footer(note);
+    }
+
     /// Where a session's requests go and the key or sign-in token they carry.
     pub fn route(&self, session: usize) -> (String, String) {
         let (gateway, _) = self.store.model(session);
-        let saved = letronna_core::store::load_keys()
-            .get(letronna_core::gateway::key_slot(gateway))
-            .cloned()
-            .unwrap_or_default();
+        let saved = match GIVEN_KEY.get() {
+            Some(key) if gateway == "Custom" => key.clone(),
+            _ => letronna_core::store::load_keys()
+                .get(letronna_core::gateway::key_slot(gateway))
+                .cloned()
+                .unwrap_or_default(),
+        };
         let custom = &self.store.settings.custom_endpoint;
         letronna_core::gateway::resolve(gateway, custom, &saved)
     }
@@ -90,7 +114,7 @@ impl Runner {
             key,
             tools: true,
             workspace,
-            plan: self.mode == Mode::Plan,
+            plan: self.current_mode() == Mode::Plan,
             remote: None,
             effort: self.store.effort(session).to_owned(),
             search: settings.search,
@@ -99,7 +123,7 @@ impl Runner {
             // a busy provider as a schedule does rather than give up.
             unattended: !self.human,
             wrap_up: false,
-            mode: self.mode,
+            mode: self.current_mode(),
             human: self.human && self.helpers_answered,
             // Filled in by `run`, once the prompt is in.
             typed: Default::default(),
@@ -107,6 +131,8 @@ impl Runner {
             session_model: String::new(),
             system: None,
             plain_terminal: self.plain_terminal,
+            // Set by `-p` alone, once it knows whether its tools were named.
+            lean_tools: false,
         }
     }
 
@@ -701,8 +727,9 @@ impl Runner {
                 }
                 self.trouble = trouble;
             }
-            let gate = Gate::for_terminal(&ctx, &self.allowed, &rules, self.mode, self.human);
-            let auto = self.mode == Mode::Auto;
+            let gate =
+                Gate::for_terminal(&ctx, &self.allowed, &rules, self.current_mode(), self.human);
+            let auto = self.current_mode() == Mode::Auto;
             // Calls that may go together run at once; one the gate would not
             // simply run ends the batch, and is dealt with below on its own.
             // The judge is never asked here: a call it would decide ends the
@@ -1018,7 +1045,7 @@ impl Runner {
         session: usize,
     ) -> Option<(Outcome, Option<Layer>)> {
         let (ctx, rules, grants) = (ctx.clone(), rules.clone(), self.allowed.clone());
-        let (mode, human, typed) = (self.mode, self.human, self.typed(session));
+        let (mode, human, typed) = (self.current_mode(), self.human, self.typed(session));
         let (queued, judge_on) = (call.clone(), connection.clone());
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
@@ -1257,9 +1284,7 @@ impl Runner {
         // Off for the session, not only this turn: the next prompt's
         // connection is built from it, and the footer says so.
         if approved {
-            self.mode = letronna_core::gate::Mode::Default;
-            let note = crate::banner::footer(self);
-            self.bar.set_footer(note);
+            self.set_mode(Mode::Default);
         }
         turn.answer_plan(approved);
         render::blank();

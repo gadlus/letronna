@@ -1216,8 +1216,15 @@ impl Tool for WalletSend {
                     .filter(|_| plan.token.as_ref().is_some_and(|t| t.dollar))
                     .map(|usd| format!(" ({})", dollars(usd)))
                     .unwrap_or_default();
+                let fee = match plan.chain.family {
+                    Family::Evm => format!(
+                        "The network's fee, {} at most, is paid on top.",
+                        dollars(evm::FEE_CEILING)
+                    ),
+                    Family::Solana => "The network's fee is paid on top.".to_owned(),
+                };
                 format!(
-                    "Send {} {}{usd} on {}\nfrom {} ({})\nto {}\nThe network's fee is paid on top.\n{}",
+                    "Send {} {}{usd} on {}\nfrom {} ({})\nto {}\n{fee}\n{}",
                     plan.entry.amount,
                     plan.entry.token,
                     plan.chain.name,
@@ -1383,10 +1390,12 @@ impl Tool for PaidFetch {
             let usd = plan
                 .usd
                 .ok_or_else(|| format!("What {price} is worth in dollars is not known."))?;
-            let most = args["max_usd"]
+            // The card showed the price seen, else the model's most: never
+            // pay more than either.
+            let max = args["max_usd"]
                 .as_str()
-                .and_then(|max| parse_dollars(max).ok())
-                .or(seen.and_then(|seen| seen.usd));
+                .and_then(|max| parse_dollars(max).ok());
+            let most = max.into_iter().chain(seen.and_then(|seen| seen.usd)).min();
             if let Some(most) = most.filter(|most| usd > *most) {
                 return Err(format!(
                     "Nothing was paid: it costs {price} now, more than the {} the user said yes to. Call paid_fetch again so they see the new price.",

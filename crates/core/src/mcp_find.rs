@@ -30,10 +30,17 @@
 //! A helper may use the MCP tools its type allows whether they are sent or
 //! looked up: its tools are listed as if every one were sent, and
 //! `find_tools` finds it only those.
+//!
+//! A lean run -- `-p` that did not name its tools -- also leaves out
+//! Letronna's own less used tools (`RARE`), which took some 3,000 of the
+//! 6,700 tokens its array came to and which such a run seldom needs. They
+//! are found and called through the same pair, and a call that names one
+//! directly still runs it.
 
 use crate::chat::{Connection, ToolCall};
 use crate::tools::{Tool, ToolContext};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -42,6 +49,29 @@ pub(crate) const CALL_MCP_TOOL: &str = "call_mcp_tool";
 
 /// What every MCP tool's name starts with; see `mcp::tool_name`.
 const PREFIX: &str = "mcp__";
+
+/// Letronna's own tools a lean run offers on demand: the largest of those a
+/// run nobody watches seldom needs -- the browser, the computer, pictures,
+/// sound, skills being written, the crew's board, past sessions -- and its
+/// helpers and the list of its background jobs, as such a run waits for
+/// each helper's report and is given each job's number when it starts.
+const RARE: [&str; 15] = [
+    "browse",
+    "use_page",
+    "computer",
+    "edit_image",
+    "make_image",
+    "make_video",
+    "transcribe",
+    "speak",
+    "skill_manage",
+    "board",
+    "search_sessions",
+    "list_sessions",
+    "read_chat",
+    "agents",
+    "list_jobs",
+];
 
 /// Past this many estimated tokens of MCP tool schemas, the MCP tools go out
 /// on demand. It is about what Letronna's own tools take, so MCP tools at
@@ -77,13 +107,47 @@ pub(crate) fn is_mcp(name: &str) -> bool {
     name.starts_with(PREFIX)
 }
 
-/// Whether the tool called `name` goes in the `tools` array: the MCP tools
-/// or the pair that stands in for them, never both.
-pub(crate) fn in_array(name: &str, on_demand: bool) -> bool {
+/// Whether `name` is one of Letronna's own tools a lean run offers on demand.
+pub(crate) fn is_rare(name: &str) -> bool {
+    RARE.contains(&name)
+}
+
+/// Which tools a request leaves out of its array, for `find_tools` to find.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct OnDemand {
+    /// The MCP tools, once their schemas passed the budget.
+    pub(crate) mcp: bool,
+    /// Letronna's own less used tools, in a lean run.
+    pub(crate) rare: bool,
+}
+
+impl OnDemand {
+    /// What a request over `connection`, out of `tools`, leaves out.
+    pub(crate) fn of(connection: &Connection, tools: &[Arc<dyn Tool>]) -> Self {
+        Self {
+            mcp: on_demand(tools),
+            rare: connection.lean_tools,
+        }
+    }
+
+    /// Whether anything is left out, so the pair stands in for it.
+    pub(crate) fn any(self) -> bool {
+        self.mcp || self.rare
+    }
+
+    /// Whether the tool called `name` is left out.
+    pub(crate) fn leaves_out(self, name: &str) -> bool {
+        (self.mcp && is_mcp(name)) || (self.rare && is_rare(name))
+    }
+}
+
+/// Whether the tool called `name` goes in the `tools` array: a tool left out
+/// `on_demand` or the pair that stands in for those, never both.
+pub(crate) fn in_array(name: &str, on_demand: OnDemand) -> bool {
     if name == FIND_TOOLS || name == CALL_MCP_TOOL {
-        on_demand
+        on_demand.any()
     } else {
-        !on_demand || !is_mcp(name)
+        !on_demand.leaves_out(name)
     }
 }
 
@@ -129,7 +193,7 @@ fn schema_tokens(tools: &[Arc<dyn Tool>]) -> usize {
         .sum()
 }
 
-/// Makes each `call_mcp_tool` call the call of the MCP tool it names, before
+/// Makes each `call_mcp_tool` call the call of the tool it names, before
 /// anything decides about it, saying whether it made any. A call that names
 /// none is left as it is, for the tool to say what was wrong.
 pub(crate) fn resolve(calls: &mut [ToolCall]) -> bool {
@@ -147,16 +211,16 @@ pub(crate) fn resolve(calls: &mut [ToolCall]) -> bool {
     resolved
 }
 
-/// The MCP tool a `call_mcp_tool` call names, with its arguments as JSON,
-/// or why it names none.
+/// The tool a `call_mcp_tool` call names, with its arguments as JSON, or
+/// why it names none.
 fn named(args: &Value) -> Result<(String, String), String> {
     let name = args["name"].as_str().map(str::trim).unwrap_or_default();
     if name.is_empty() {
         return Err("Put the tool's name in `name`, as find_tools gave it.".into());
     }
-    if !is_mcp(name) {
+    if !is_mcp(name) && !is_rare(name) {
         return Err(format!(
-            "`{name}` is not a tool of an MCP server, so call_mcp_tool cannot call it; \
+            "`{name}` is not a tool find_tools finds, so call_mcp_tool cannot call it; \
              call it directly."
         ));
     }
@@ -183,17 +247,20 @@ fn beside(args: &Value) -> Value {
     Value::Object(fields)
 }
 
-/// Puts each MCP tool's call in `wired`, a message as a request sends it,
-/// back as a `call_mcp_tool` call, for a request on `connection` that
-/// offers the pair in their place. The same call goes out as the same bytes
-/// every time, so the cached prefix holds, and `resolve` reads it back as it
-/// was saved.
-pub(crate) fn wrap(wired: &mut Value, connection: &Connection) {
+/// Puts each call in `wired`, a message as a request sends it, of a tool
+/// left out `on_demand`, back as a `call_mcp_tool` call, for a request on
+/// `connection` that offers the pair in their place. The same call goes out
+/// as the same bytes every time, so the cached prefix holds, and `resolve`
+/// reads it back as it was saved.
+pub(crate) fn wrap(wired: &mut Value, connection: &Connection, on_demand: OnDemand) {
     let Some(calls) = wired["tool_calls"].as_array_mut() else {
         return;
     };
     for function in calls.iter_mut().map(|call| &mut call["function"]) {
-        let Some(name) = function["name"].as_str().filter(|name| is_mcp(name)) else {
+        let Some(name) = function["name"]
+            .as_str()
+            .filter(|name| on_demand.leaves_out(name))
+        else {
             continue;
         };
         let saved = function["arguments"].as_str().unwrap_or("{}").to_owned();
@@ -227,14 +294,39 @@ pub(crate) fn fit(tools: &mut [Value], connection: &Connection) {
     }
 }
 
-/// Searches the MCP tools, handing back the best matches whole.
+/// Searches the tools left out of the array, handing back the best matches
+/// whole.
 struct FindTools;
 impl Tool for FindTools {
     fn name(&self) -> &'static str {
         FIND_TOOLS
     }
     fn description(&self) -> &'static str {
-        "Search the tools of the user's MCP servers, which are too many to list here. Give a few words for what you need done, or a tool's exact name; the matching tools come back with their descriptions and arguments. Then call one with call_mcp_tool."
+        "Search the tools left out of this list: the user's MCP servers' tools when they are too many to list. Give a few words for what you need done, or a tool's exact name; the matching tools come back with their descriptions and arguments. Then call one with call_mcp_tool."
+    }
+    // A lean run names the less used tools it left out, and only those it
+    // would offer, so none is looked for that is not there. The names are
+    // the array's own, which keep from one request to the next.
+    fn description_for(&self, connection: &Connection, offered: &[&str]) -> Cow<'static, str> {
+        let said = self.description();
+        let rare: Vec<&str> = offered
+            .iter()
+            .copied()
+            .filter(|name| connection.lean_tools && is_rare(name))
+            .collect();
+        let Some((last, rest)) = rare.split_last() else {
+            return said.into();
+        };
+        let named = match rest {
+            [] => last.to_string(),
+            rest => format!("{} and {last}", rest.join(", ")),
+        };
+        said.replacen(
+            " too many to list.",
+            &format!(" too many to list, and Letronna's less used ones: {named}."),
+            1,
+        )
+        .into()
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -251,31 +343,43 @@ impl Tool for FindTools {
                 .is_none_or(|names| names.iter().any(|name| name == tool.name()))
         };
         let tools: Vec<Arc<dyn Tool>> = crate::tools::all().into_iter().filter(allowed).collect();
-        Ok(search(&tools, query, ctx.plan))
+        // Letronna's own tools a lean run left out, as far as it would offer
+        // them at all.
+        let rare: Vec<String> = match ctx.caller.connection.as_deref() {
+            Some(connection) if connection.lean_tools => crate::tools::callable(&tools, connection)
+                .iter()
+                .map(|tool| tool.name())
+                .filter(|name| is_rare(name))
+                .map(str::to_owned)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let connection = ctx.caller.connection.as_deref();
+        Ok(search(&tools, query, ctx.plan, &rare, connection))
     }
     fn concurrent(&self) -> bool {
         true
     }
 }
 
-/// Calls an MCP tool that find_tools found. Only in name: see `resolve`.
+/// Calls a tool that find_tools found. Only in name: see `resolve`.
 struct CallMcpTool;
 impl Tool for CallMcpTool {
     fn name(&self) -> &'static str {
         CALL_MCP_TOOL
     }
     fn description(&self) -> &'static str {
-        "Call a tool of the user's MCP servers that find_tools found: its exact name in `name`, and in `arguments` the arguments find_tools gave for it."
+        "Call a tool that find_tools found: its exact name in `name`, and in `arguments` the arguments find_tools gave for it."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
-            "name": {"type": "string", "description": "The tool's name as find_tools gave it, starting with mcp__."},
+            "name": {"type": "string", "description": "The tool's name as find_tools gave it."},
             "arguments": {"type": "object", "description": "The tool's arguments."}
         }, "required": ["name", "arguments"]})
     }
     fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
-        // A call that names an MCP tool never gets here: it became that
-        // tool's own call as the reply came in. This one only says what was
+        // A call that names a tool it can call never gets here: it became
+        // that tool's own call as the reply came in. This one only says what was
         // wrong, and runs nothing.
         Err(match named(args) {
             Err(why) => why,
@@ -284,10 +388,21 @@ impl Tool for CallMcpTool {
     }
 }
 
-/// What a search for `query` among the MCP tools in `tools` finds; in plan
-/// mode only among those that change nothing, as plan mode would offer.
-fn search(tools: &[Arc<dyn Tool>], query: &str, plan: bool) -> String {
-    let every: Vec<&Arc<dyn Tool>> = tools.iter().filter(|tool| is_mcp(tool.name())).collect();
+/// What a search for `query` among the MCP tools in `tools` and the `rare`
+/// ones left out finds; in plan mode only among those that change nothing,
+/// as plan mode would offer. Ranked by Jev for a search on `connection`
+/// where it is asked, else by the words.
+fn search(
+    tools: &[Arc<dyn Tool>],
+    query: &str,
+    plan: bool,
+    rare: &[String],
+    connection: Option<&Connection>,
+) -> String {
+    let every: Vec<&Arc<dyn Tool>> = tools
+        .iter()
+        .filter(|tool| is_mcp(tool.name()) || rare.iter().any(|name| name == tool.name()))
+        .collect();
     if every.is_empty() {
         return "No MCP server has any tools here: none is set up, or they are still starting."
             .into();
@@ -298,16 +413,42 @@ fn search(tools: &[Arc<dyn Tool>], query: &str, plan: bool) -> String {
         .collect();
     if tools.is_empty() {
         return "In plan mode only tools that change nothing can be found, and none of the \
-                MCP tools qualifies."
+                tools left out qualifies."
             .into();
     }
-    let ranked = ranked(&tools, query);
+    // A search that names a tool exactly finds it without asking anyone.
+    let exact = tools.iter().any(|tool| tool.name() == query.trim());
+    let judged = connection
+        .filter(|_| !exact)
+        .and_then(|connection| crate::jev::rank(connection, query, &options(&tools, query)));
+    let mut out = String::new();
+    let ranked = match judged {
+        Some(crate::jev::Judged::Ranked(names)) => {
+            let chosen: Vec<&Arc<dyn Tool>> = names
+                .iter()
+                .filter_map(|name| tools.iter().find(|tool| tool.name() == name).copied())
+                .collect();
+            if chosen.is_empty() {
+                ranked(&tools, query)
+            } else {
+                chosen
+            }
+        }
+        Some(crate::jev::Judged::Nothing) => {
+            out.push_str("None of these tools seems to do that; the nearest by name are below.\n");
+            ranked(&tools, query)
+        }
+        None => ranked(&tools, query),
+    };
     if ranked.is_empty() {
-        let mut out = format!("No MCP tool matches \"{}\". The tools are:", query.trim());
+        out.push_str(&format!(
+            "No tool matches \"{}\". The tools are:",
+            query.trim()
+        ));
         list(&mut out, &names(&tools), FOUND_BYTES);
         return out;
     }
-    let mut out = String::from(
+    out.push_str(
         "Call one with call_mcp_tool: its name in `name` and its arguments in `arguments`.\n",
     );
     let mut shown = 0;
@@ -331,6 +472,23 @@ fn search(tools: &[Arc<dyn Tool>], query: &str, plan: bool) -> String {
         list(&mut out, &names(rest), crate::chat::MAX_TOOL_CHARS - 100);
     }
     out
+}
+
+/// The names and descriptions of `tools` Jev chooses among for `query`:
+/// those the words rank first go first, so they are among the ones it is
+/// shown when there are more than it takes.
+fn options(tools: &[&Arc<dyn Tool>], query: &str) -> Vec<(&'static str, &'static str)> {
+    let mut order = ranked(tools, query);
+    let rest: Vec<&Arc<dyn Tool>> = tools
+        .iter()
+        .filter(|tool| !order.iter().any(|first| first.name() == tool.name()))
+        .copied()
+        .collect();
+    order.extend(rest);
+    order
+        .iter()
+        .map(|tool| (tool.name(), tool.description()))
+        .collect()
 }
 
 /// How `tool` shows in a search's result, with `schema` for its arguments
@@ -502,6 +660,7 @@ fn words(text: &str) -> Vec<String> {
 pub(crate) mod tests {
     use super::*;
     use crate::chat::Message;
+    use std::time::Duration;
 
     /// An MCP server's tool, as far as the rest of Letronna can tell.
     pub(crate) struct Fake {
@@ -595,13 +754,389 @@ pub(crate) mod tests {
         }
     }
 
+    /// The names of Letronna's own less used tools a request over
+    /// `connection` would send if none were left out.
+    fn rare_offered(connection: &Connection) -> Vec<String> {
+        let every = crate::tools::all();
+        names(&crate::tools::specs_of(
+            &every,
+            connection,
+            OnDemand::default(),
+        ))
+        .into_iter()
+        .filter(|name| is_rare(name))
+        .collect()
+    }
+
+    #[test]
+    fn a_lean_run_leaves_the_less_used_tools_to_find_tools() {
+        let lean = Connection {
+            lean_tools: true,
+            ..connection()
+        };
+        let rare = rare_offered(&lean);
+        assert!(rare.iter().any(|name| name == "browse"), "{rare:?}");
+        let sent = names(&crate::tools::specs(&lean));
+        assert!(!sent.iter().any(|name| is_rare(name)), "{sent:?}");
+        assert!(sent.iter().any(|name| name == FIND_TOOLS));
+        assert!(sent.iter().any(|name| name == CALL_MCP_TOOL));
+        // Every other tool goes out as before.
+        let full = names(&crate::tools::specs(&connection()));
+        let kept: Vec<&String> = full.iter().filter(|name| !is_rare(name)).collect();
+        assert!(kept.iter().all(|name| sent.contains(name)), "{sent:?}");
+        // The helpers and the jobs' list are among them, and find_tools
+        // names each that is left out, and only in a lean run.
+        for name in ["agents", "list_jobs"] {
+            assert!(rare.iter().any(|rare| rare == name), "{rare:?}");
+            assert!(!sent.iter().any(|sent| sent == name), "{sent:?}");
+        }
+        let specs = crate::tools::specs(&lean);
+        let find = specs
+            .iter()
+            .find(|spec| spec["function"]["name"] == FIND_TOOLS)
+            .unwrap();
+        let said = find["function"]["description"].as_str().unwrap();
+        assert!(
+            rare.iter().all(|name| said.contains(name.as_str())),
+            "{said}"
+        );
+        assert!(
+            said.contains(&format!(
+                "{} and {}.",
+                rare[rare.len() - 2],
+                rare[rare.len() - 1]
+            )),
+            "{said}"
+        );
+        assert_eq!(
+            FindTools.description_for(&connection(), &["browse", FIND_TOOLS]),
+            FindTools.description()
+        );
+        assert!(!FindTools.description().contains("browse"));
+        // Each request of the run sends the same bytes.
+        assert_eq!(
+            Value::Array(specs).to_string(),
+            Value::Array(crate::tools::specs(&lean)).to_string()
+        );
+        // Most of the array was those few: what is left is far smaller.
+        let tokens =
+            |c: &Connection| crate::chat::tokens(&Value::Array(crate::tools::specs(c)).to_string());
+        assert!(
+            tokens(&connection()) - tokens(&lean) > 2_000,
+            "{} -> {}",
+            tokens(&connection()),
+            tokens(&lean)
+        );
+    }
+
+    #[test]
+    fn find_tools_finds_a_less_used_tool_only_in_a_lean_run() {
+        let lean = Connection {
+            lean_tools: true,
+            ..connection()
+        };
+        let found = FindTools
+            .run(
+                &json!({"query": "web browser page"}),
+                &ToolContext::of(&lean),
+            )
+            .unwrap();
+        assert!(found.contains("\nbrowse: "), "{found}");
+        // A tool left out is found by its exact name, and a call through
+        // call_mcp_tool becomes its own.
+        for name in ["agents", "list_jobs"] {
+            let found = FindTools
+                .run(&json!({"query": name}), &ToolContext::of(&lean))
+                .unwrap();
+            assert!(found.contains(&format!("\n{name}: ")), "{found}");
+            let mut calls = [wrapped(&format!(
+                r#"{{"name": "{name}", "arguments": {{}}}}"#
+            ))];
+            assert!(resolve(&mut calls));
+            assert_eq!(calls[0].name, name);
+        }
+        // Where they are all sent, a search is only of the MCP tools.
+        let found = FindTools
+            .run(
+                &json!({"query": "web browser page"}),
+                &ToolContext::of(&connection()),
+            )
+            .unwrap();
+        assert!(!found.contains("\nbrowse: "), "{found}");
+    }
+
+    #[test]
+    fn a_less_used_tools_call_goes_out_wrapped_and_reads_back_as_its_own() {
+        let mut calls = [wrapped(
+            r#"{"name": "browse", "arguments": {"url": "https://a.b"}}"#,
+        )];
+        assert!(resolve(&mut calls));
+        assert_eq!(calls[0].name, "browse");
+        assert_eq!(calls[0].arguments, r#"{"url":"https://a.b"}"#);
+        let saved = || {
+            json!({"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+                "function": {"name": "browse", "arguments": r#"{"url":"https://a.b"}"#}}]})
+        };
+        let mut wired = saved();
+        let rare = OnDemand {
+            mcp: false,
+            rare: true,
+        };
+        wrap(&mut wired, &connection(), rare);
+        assert_eq!(wired["tool_calls"][0]["function"]["name"], CALL_MCP_TOOL);
+        // Sent in the array, it goes out as it was made.
+        let mut wired = saved();
+        let mcp = OnDemand {
+            mcp: true,
+            rare: false,
+        };
+        wrap(&mut wired, &connection(), mcp);
+        assert_eq!(wired, saved());
+    }
+
+    /// A Jev on this computer that answers every question with `answer`
+    /// after `wait`, giving its address and the questions it was put.
+    fn jev(answer: Value, wait: Duration) -> (String, std::sync::mpsc::Receiver<Value>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/systemone", server.local_addr().unwrap());
+        let (sent, asked) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for mut stream in server.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let line = line.trim_end().to_ascii_lowercase();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some(n) = line.strip_prefix("content-length:") {
+                        length = n.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let _ = sent.send(serde_json::from_slice(&body).unwrap_or_default());
+                std::thread::sleep(wait);
+                let reply = answer.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        (url, asked)
+    }
+
+    /// Jev's answer choosing `best` and giving `second` a little chance.
+    fn chose(best: &str, second: &str) -> Value {
+        json!({"model": "jev-latest", "answers": {
+            "tool": {"type": "choice", "choice": best, "confidence": 0.8,
+                "probabilities": {best: 0.86, second: 0.1, "speak": 0.01, "none": 0.03}},
+            "needs_tool": {"type": "noul", "noul": 0.97}}})
+    }
+
+    /// What a lean run on a hosted chat finds for `query`, with the settings
+    /// ranking by `mode` and asking Jev at `url`; and the same search ranked
+    /// by the words alone.
+    fn searched(url: &str, mode: &str, query: &str) -> (String, String) {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::store::tests::Scratch::new("mcp-find-jev");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let settings =
+            json!({"endpoint": "", "model": "", "tool_search": mode, "jev_endpoint": url});
+        std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+        let lean = Connection {
+            endpoint: "https://openrouter.ai/api/v1".into(),
+            lean_tools: true,
+            ..connection()
+        };
+        let tools = crate::tools::all();
+        let rare = rare_offered(&lean);
+        let found = search(&tools, query, false, &rare, Some(&lean));
+        let by_words = search(&tools, query, false, &rare, None);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        (found, by_words)
+    }
+
+    /// Where the entry for the tool called `name` starts in `found`.
+    fn at(found: &str, name: &str) -> usize {
+        found
+            .find(&format!("\n{name}: "))
+            .unwrap_or_else(|| panic!("no {name} in {found}"))
+    }
+
+    #[test]
+    fn jev_ranks_the_tools_a_search_finds_by_what_they_do() {
+        let (url, asked) = jev(chose("use_page", "browse"), Duration::ZERO);
+        let query = "sign up on the shop's site for me";
+        let (found, _) = searched(&url, "jev", query);
+        assert!(at(&found, "use_page") < at(&found, "browse"), "{found}");
+        // It was told the search and the tools, and nothing of the chat.
+        let question = asked.try_recv().expect("Jev was not asked");
+        assert_eq!(question["state"], json!({"request": query}));
+        let criteria = question["questions"]["tool"]["criteria"]
+            .as_object()
+            .unwrap();
+        assert!(criteria.contains_key("browse") && criteria.contains_key("none"));
+        assert!(
+            !criteria.keys().any(|name| name == "read_file"),
+            "{criteria:?}"
+        );
+    }
+
+    #[test]
+    fn jev_saying_no_tool_does_it_is_passed_on_with_the_nearest_by_name() {
+        let (url, _asked) = jev(chose("none", "browse"), Duration::ZERO);
+        let (found, by_words) = searched(&url, "jev", "browse the web");
+        assert!(
+            found.starts_with("None of these tools seems to do that"),
+            "{found}"
+        );
+        assert!(found.ends_with(&by_words), "{found}");
+    }
+
+    #[test]
+    fn a_jev_too_slow_or_switched_off_leaves_the_ranking_to_the_words() {
+        let (url, _asked) = jev(chose("use_page", "browse"), Duration::from_secs(4));
+        let (found, by_words) = searched(&url, "jev", "open a web page in a browser");
+        assert_eq!(found, by_words);
+        let (url, asked) = jev(chose("use_page", "browse"), Duration::ZERO);
+        let (found, by_words) = searched(&url, "names", "open a web page in a browser");
+        assert_eq!(found, by_words);
+        assert!(asked.try_recv().is_err(), "Jev was asked with names chosen");
+    }
+
+    /// A request in words of its own, with the tools that do what it asks.
+    type Ask = (String, Vec<String>);
+
+    /// The catalogue the search is measured on -- GitHub's MCP server's tools
+    /// and Letronna's less used ones -- and the requests, each in words of
+    /// its own with the tools that do it, or none where no tool is needed.
+    fn quality_set() -> (Vec<Arc<dyn Tool>>, Vec<Ask>) {
+        let leak = |text: &str| -> &'static str { Box::leak(text.to_owned().into_boxed_str()) };
+        let catalogue: Value =
+            serde_json::from_str(include_str!("bench/tool_search_catalogue.json")).unwrap();
+        let mut tools: Vec<Arc<dyn Tool>> = catalogue["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| {
+                let name = leak(tool["name"].as_str().unwrap());
+                fake(name, leak(tool["description"].as_str().unwrap()), false)
+            })
+            .collect();
+        tools.extend(
+            crate::tools::all()
+                .into_iter()
+                .filter(|t| is_rare(t.name())),
+        );
+        let asks = include_str!("bench/tool_search_asks.jsonl")
+            .lines()
+            .map(|line| {
+                let ask: Value = serde_json::from_str(line).unwrap();
+                let want = ask["want"].as_array().unwrap();
+                let want = want.iter().map(|w| w.as_str().unwrap().to_owned());
+                (ask["ask"].as_str().unwrap().to_owned(), want.collect())
+            })
+            .collect();
+        (tools, asks)
+    }
+
+    /// How `rank` did on `asks`, in percent: of those a tool does, how many
+    /// it put a right tool first for, and among its first three; then of
+    /// the `none` that need no tool, how many it gave one for anyway.
+    fn scored(asks: &[Ask], rank: impl Fn(&str) -> Vec<String>) -> (f64, f64, usize, usize) {
+        let (mut first, mut three, mut needless, mut none) = (0, 0, 0, 0);
+        for (ask, want) in asks {
+            let found = rank(ask);
+            if want.is_empty() {
+                none += 1;
+                needless += usize::from(!found.is_empty());
+                continue;
+            }
+            first += usize::from(found.first().is_some_and(|name| want.contains(name)));
+            three += usize::from(found.iter().take(3).any(|name| want.contains(name)));
+        }
+        let asked = (asks.len() - none) as f64;
+        let share = |n: usize| n as f64 * 100.0 / asked;
+        (share(first), share(three), needless, none)
+    }
+
+    /// What the words alone rank first for `ask` among `tools`.
+    fn by_words(tools: &[Arc<dyn Tool>], ask: &str) -> Vec<String> {
+        let refs: Vec<&Arc<dyn Tool>> = tools.iter().collect();
+        ranked(&refs, ask)
+            .iter()
+            .map(|tool| tool.name().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_word_ranking_is_measured_on_requests_put_in_other_words() {
+        let (tools, asks) = quality_set();
+        let (first, three, needless, none) = scored(&asks, |ask| by_words(&tools, ask));
+        println!(
+            "by words: first {first:.1}%, first three {three:.1}%, a tool for {needless} of {none} needing none"
+        );
+        // Where the ranking stands, so a change that loses ground shows.
+        assert!(three >= 30.0, "{three:.1}% in the first three");
+    }
+
+    #[test]
+    #[ignore = "asks the live Jev: JEV_KEY=<key> [JEV_ENDPOINT=<url>] cargo test -p letronna-core --lib -- --ignored jev_is_measured --nocapture"]
+    fn jev_is_measured_on_the_same_requests() {
+        let key = std::env::var("JEV_KEY").expect("a Jev key in JEV_KEY");
+        let endpoint = std::env::var("JEV_ENDPOINT").unwrap_or_default();
+        let (tools, asks) = quality_set();
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::store::tests::Scratch::new("mcp-find-jev-quality");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let settings =
+            json!({"endpoint": "", "model": "", "tool_search": "jev", "jev_endpoint": endpoint});
+        std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+        crate::store::save_key(crate::jev::KEY_SLOT, Some(&key)).unwrap();
+        let options: Vec<(&str, &str)> =
+            tools.iter().map(|t| (t.name(), t.description())).collect();
+        let hosted = Connection {
+            endpoint: "https://openrouter.ai/api/v1".into(),
+            ..connection()
+        };
+        let started = std::time::Instant::now();
+        let (first, three, needless, none) = scored(&asks, |ask| {
+            match crate::jev::rank(&hosted, ask, &options) {
+                Some(crate::jev::Judged::Ranked(names)) => names,
+                Some(crate::jev::Judged::Nothing) => Vec::new(),
+                None => panic!("Jev gave no answer for {ask:?}"),
+            }
+        });
+        let each = started.elapsed().as_secs_f64() / asks.len() as f64;
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        let (w1, w3, wn, _) = scored(&asks, |ask| by_words(&tools, ask));
+        println!("| ranker | first | first three | a tool where none is needed |");
+        println!("| words | {w1:.1}% | {w3:.1}% | {wn} of {none} |");
+        println!(
+            "| Jev | {first:.1}% | {three:.1}% | {needless} of {none} | ({each:.2} s a search)"
+        );
+    }
+
     #[test]
     fn mcp_tools_under_the_budget_go_out_as_they_always_have() {
         let own = own();
         let tools = with(&own, server(3, 10));
         assert!(!latched(&AtomicBool::new(false), &tools));
-        let sent = names(&crate::tools::specs_of(&tools, &connection(), false));
-        let mut before = names(&crate::tools::specs_of(&own, &connection(), false));
+        let none = OnDemand::default();
+        let sent = names(&crate::tools::specs_of(&tools, &connection(), none));
+        let mut before = names(&crate::tools::specs_of(&own, &connection(), none));
         before.extend((0..3).map(|i| format!("mcp__big__tool_{i}")));
         assert_eq!(sent, before);
         assert!(
@@ -616,7 +1151,11 @@ pub(crate) mod tests {
         let tools = with(&own(), server(40, 30));
         assert!(schema_tokens(&tools) > BUDGET_TOKENS);
         assert!(latched(&AtomicBool::new(false), &tools));
-        let sent = names(&crate::tools::specs_of(&tools, &connection(), true));
+        let mcp = OnDemand {
+            mcp: true,
+            rare: false,
+        };
+        let sent = names(&crate::tools::specs_of(&tools, &connection(), mcp));
         assert!(!sent.iter().any(|name| is_mcp(name)), "{sent:?}");
         assert!(sent.iter().any(|name| name == FIND_TOOLS));
         assert!(sent.iter().any(|name| name == CALL_MCP_TOOL));
@@ -629,7 +1168,10 @@ pub(crate) mod tests {
         let big = with(&own, server(40, 30));
         assert!(latched(&passed, &big));
         let bytes = |tools: &[Arc<dyn Tool>]| {
-            let on_demand = latched(&passed, tools);
+            let on_demand = OnDemand {
+                mcp: latched(&passed, tools),
+                rare: false,
+            };
             Value::Array(crate::tools::specs_of(tools, &connection(), on_demand)).to_string()
         };
         let first = bytes(&big);
@@ -800,16 +1342,16 @@ pub(crate) mod tests {
             fake("read_file", "Letronna's own, never searched.", false),
         ];
         tools.extend(server(8, 2));
-        let found = search(&tools, "create issue", false);
+        let found = search(&tools, "create issue", false, &[], None);
         let at = |name: &str| found.find(&format!("\n{name}: ")).unwrap();
         assert!(at("mcp__gh__create_issue") < at("mcp__gh__list_issues"));
         assert!(at("mcp__gh__list_issues") < at("mcp__gh__get_file"));
         assert!(found.contains(r#""path":{"type":"string"}"#));
         assert!(!found.contains("read_file"));
         // The exact name comes first, whatever else its words match.
-        let exact = search(&tools, "mcp__gh__list_issues", false);
+        let exact = search(&tools, "mcp__gh__list_issues", false, &[], None);
         assert!(exact.find("list_issues") < exact.find("create_issue"));
-        let many = search(&tools, "thing", false);
+        let many = search(&tools, "thing", false, &[], None);
         assert_eq!(many.matches("\nmcp__big__tool_").count(), MAX_FOUND);
         assert!(many.ends_with(
             "Also matched, each shown whole when searched for by name: mcp__big__tool_5, \
@@ -824,10 +1366,12 @@ pub(crate) mod tests {
             fake("mcp__db__query", "Run a query.", false),
         ];
         assert_eq!(
-            search(&tools, "weather", false),
-            "No MCP tool matches \"weather\". The tools are: mcp__gh__create_issue, mcp__db__query."
+            search(&tools, "weather", false, &[], None),
+            "No tool matches \"weather\". The tools are: mcp__gh__create_issue, mcp__db__query."
         );
-        assert!(search(&[], "weather", false).starts_with("No MCP server has any tools"));
+        assert!(
+            search(&[], "weather", false, &[], None).starts_with("No MCP server has any tools")
+        );
     }
 
     #[test]
@@ -836,11 +1380,13 @@ pub(crate) mod tests {
             fake("mcp__gh__create_issue", "Create an issue.", true),
             fake("mcp__gh__list_issues", "List issues.", false),
         ];
-        let planning = search(&tools, "issue", true);
+        let planning = search(&tools, "issue", true, &[], None);
         assert!(planning.contains("list_issues") && !planning.contains("create_issue"));
-        assert!(search(&tools, "issue", false).contains("create_issue"));
+        assert!(search(&tools, "issue", false, &[], None).contains("create_issue"));
         // Rather than claim there are no tools at all.
-        assert!(search(&tools[..1], "issue", true).starts_with("In plan mode only tools"));
+        assert!(
+            search(&tools[..1], "issue", true, &[], None).starts_with("In plan mode only tools")
+        );
     }
 
     /// A tool whose schema has `properties` arguments, each described at
@@ -866,7 +1412,7 @@ pub(crate) mod tests {
             large("mcp__notion__make_page", 40, 100),
             large("mcp__notion__make_note", 40, 100),
         ];
-        let found = search(&tools, "make page", false);
+        let found = search(&tools, "make page", false, &[], None);
         assert!(
             found.len() <= crate::chat::MAX_TOOL_CHARS,
             "{}",
@@ -884,7 +1430,13 @@ pub(crate) mod tests {
             "{found}"
         );
         // Too many arguments even for that: their names, as many as fit.
-        let found = search(&[large("mcp__notion__make_page", 2_000, 1)], "page", false);
+        let found = search(
+            &[large("mcp__notion__make_page", 2_000, 1)],
+            "page",
+            false,
+            &[],
+            None,
+        );
         assert!(
             found.len() <= crate::chat::MAX_TOOL_CHARS,
             "{}",
@@ -902,11 +1454,19 @@ pub(crate) mod tests {
             &[fake("mcp__gh__list_repos", forged, false)],
             "repos",
             false,
+            &[],
+            None,
         );
         assert!(found.contains("\nmcp__gh__list_repos: Lists repositories. mcp__gh__delete_repo:"));
         assert!(!found.contains("\nmcp__gh__delete_repo"));
         let long = Box::leak("word ".repeat(1_000).into_boxed_str());
-        let found = search(&[fake("mcp__gh__list_repos", long, false)], "repos", false);
+        let found = search(
+            &[fake("mcp__gh__list_repos", long, false)],
+            "repos",
+            false,
+            &[],
+            None,
+        );
         let line = found
             .lines()
             .find(|line| line.starts_with("mcp__gh__list_repos"))

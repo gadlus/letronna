@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use crate::ui::motion::{Fold, Row};
 use gpui_component::notification::Notification;
 use letronna_core::failure::{self, Failure, FailureKind, Fix, Kept};
 use letronna_core::tool_runs::Run;
@@ -40,6 +41,47 @@ pub(crate) struct WaitingRetry {
     pub(crate) session: u64,
     /// When, in seconds since 1970.
     pub(crate) at: u64,
+}
+
+/// How long each call the window ran took, for its row to say: timed from
+/// when it started to when its result came back, by the call's id while it
+/// runs, then by the result's place in its session once kept there. Calls
+/// run before the window opened, or by another Letronna, are not timed.
+#[derive(Default)]
+pub(crate) struct CallTimes {
+    started: std::collections::HashMap<String, std::time::Instant>,
+    ran: std::collections::HashMap<String, std::time::Duration>,
+    kept: std::collections::HashMap<(u64, usize), std::time::Duration>,
+}
+
+impl CallTimes {
+    /// Call `id` starts running.
+    pub(crate) fn start(&mut self, id: &str) {
+        let now = std::time::Instant::now();
+        self.started.insert(id.to_owned(), now);
+    }
+
+    /// Call `id`'s result came back.
+    pub(crate) fn stop(&mut self, id: &str) {
+        if let Some(started) = self.started.remove(id) {
+            self.ran.insert(id.to_owned(), started.elapsed());
+        }
+    }
+
+    /// `results` are kept in `session`, from place `first` on.
+    pub(crate) fn keep(&mut self, session: u64, first: usize, results: &[Message]) {
+        for (n, result) in results.iter().enumerate() {
+            if let Some(took) = self.ran.remove(&result.tool_call_id) {
+                self.kept.insert((session, first + n), took);
+            }
+        }
+    }
+
+    /// How long the call whose result is at `key`, a session and a place,
+    /// ran.
+    pub(crate) fn took(&self, key: (u64, usize)) -> Option<std::time::Duration> {
+        self.kept.get(&key).copied()
+    }
 }
 
 impl Chat {
@@ -95,18 +137,6 @@ impl Chat {
         let is_user = message.role == "user";
         let session = self.store.conversations[self.store.active].id;
         let editing = is_user && self.editing_message == Some((session, index));
-        // Where the turn's buttons go: at the end of your prompt's label, in
-        // a reply's copy-and-usage line, or under a reply that has neither.
-        // In the two lines they take no room of their own.
-        let usage_row =
-            !is_user && !message.content.is_empty() && (!streaming || message.tokens > 0);
-        let (on_label, in_usage, under) = match (is_user, usage_row) {
-            (true, _) => (bar.filter(|_| !editing), None, None),
-            (false, true) => (None, bar, None),
-            (false, false) => (None, None, bar),
-        };
-        // A reply that only asked for tools: its tool rows say what happened.
-        let tool_only = !is_user && message.content.is_empty() && !message.tool_calls.is_empty();
         // The call the model is writing now, while this reply streams.
         let writing = self
             .turn
@@ -114,6 +144,21 @@ impl Chat {
             .filter(|_| streaming && !is_user)
             .and_then(|turn| turn.live.drafts.last())
             .map(letronna_core::chat::Draft::label);
+        // A reply coming in ends on a breathing dot, until it stops to write
+        // a call, which then says so instead.
+        let caret = !is_user && streaming && !message.content.is_empty() && writing.is_none();
+        // Where the turn's buttons go: at the end of your prompt's label, in
+        // a reply's copy-and-usage line, or under a reply that has neither.
+        // In the two lines they take no room of their own.
+        let usage_row =
+            !is_user && !message.content.is_empty() && (!streaming || message.tokens > 0 || caret);
+        let (on_label, in_usage, under) = match (is_user, usage_row) {
+            (true, _) => (bar.filter(|_| !editing), None, None),
+            (false, true) => (None, bar, None),
+            (false, false) => (None, None, bar),
+        };
+        // A reply that only asked for tools: its tool rows say what happened.
+        let tool_only = !is_user && message.content.is_empty() && !message.tool_calls.is_empty();
         let label: String = if message.model.is_empty() {
             self.store.model(self.store.active).1.to_owned()
         } else {
@@ -227,28 +272,35 @@ impl Chat {
             // no such reply of its own -- and long done thinking.
             div().into_any_element()
         } else if message.content.is_empty() {
-            h_flex()
-                .gap_2()
-                .items_center()
-                .text_color(cx.theme().muted_foreground)
-                .child(
-                    crate::ui::busy::Spinner::new()
-                        .xsmall()
-                        .color(cx.theme().primary),
-                )
-                .child({
-                    let live = self.turn.as_ref().filter(|_| streaming).map(|t| &t.live);
-                    match (
-                        live.and_then(|l| l.retrying),
-                        live.is_some_and(|l| l.compacting),
-                    ) {
-                        (Some(retry), _) => retry.to_string(),
-                        (None, true) => "Compacting…".to_owned(),
-                        // A long write streams for a while; say so, not Thinking.
-                        (None, false) => writing.clone().unwrap_or("Thinking…".to_owned()),
-                    }
-                })
-                .into_any_element()
+            let live = self.turn.as_ref().filter(|_| streaming).map(|t| &t.live);
+            let doing = match (
+                live.and_then(|l| l.retrying),
+                live.is_some_and(|l| l.compacting),
+            ) {
+                (Some(retry), _) => Some(retry.to_string()),
+                (None, true) => Some("Compacting…".to_owned()),
+                // A long write streams for a while; say so, not Thinking.
+                (None, false) => writing.clone(),
+            };
+            // Thinking shown as it comes in says Thinking above this already.
+            let thinking_shown = !message.reasoning.is_empty() && self.store.settings.thinking;
+            if doing.is_none() && thinking_shown {
+                div().into_any_element()
+            } else {
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        crate::ui::busy::Spinner::new()
+                            .xsmall()
+                            .color(cx.theme().primary),
+                    )
+                    .child(crate::ui::busy::Shimmer::new(
+                        doing.unwrap_or("Thinking…".to_owned()),
+                    ))
+                    .into_any_element()
+            }
         } else {
             // Each fence rests at its first rows; one button beside any long
             // one shows them all, and the reply is drawn again in a view of
@@ -281,6 +333,7 @@ impl Chat {
             gpui_base::TextView::markdown(md, message.content.clone())
                 .selectable(selectable)
                 .line_height(leading)
+                .motion(crate::ui::motion::settling())
                 .style(style)
                 .code_block_actions(move |block, _, cx| {
                     let code = block.code();
@@ -359,16 +412,7 @@ impl Chat {
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(cx.theme().link)
                                 .child(label),
-                        )
-                        .when(streaming, |this| {
-                            this.child(
-                                div()
-                                    .size(px(6.))
-                                    .rounded_full()
-                                    .bg(cx.theme().primary)
-                                    .opacity(crate::ui::busy::breathing(window, cx)),
-                            )
-                        }),
+                        ),
                 )
             })
             // Thinking is shown when it was asked for, the same switch the
@@ -400,7 +444,7 @@ impl Chat {
                                     .xsmall()
                                     .color(cx.theme().primary),
                             )
-                            .child(label),
+                            .child(crate::ui::busy::Shimmer::new(label)),
                     )
                 },
             )
@@ -423,6 +467,19 @@ impl Chat {
                         .items_center()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
+                        // In the copy button's place, so nothing moves as the
+                        // button takes over at the end.
+                        .when(caret, |row| {
+                            row.child(
+                                div().size_5().flex().items_center().justify_center().child(
+                                    div()
+                                        .size(px(6.))
+                                        .rounded_full()
+                                        .bg(cx.theme().primary)
+                                        .opacity(crate::ui::busy::breathing(window, cx)),
+                                ),
+                            )
+                        })
                         // Read when copied, not copied out at every frame.
                         .when(!streaming, |row| {
                             let chat = cx.weak_entity();
@@ -540,7 +597,7 @@ impl Chat {
         let answer = match &aside.answer {
             None => div()
                 .text_color(muted)
-                .child("Thinking…")
+                .child(crate::ui::busy::Shimmer::new("Thinking…"))
                 .into_any_element(),
             Some(Ok(reply)) => v_flex()
                 .gap_1()
@@ -1029,8 +1086,22 @@ impl Chat {
             if !this.thinking_open.remove(&key) {
                 this.thinking_open.insert(key);
             }
+            this.motion.opened.note(Fold::Output, key, cx);
             cx.notify();
         };
+        // How it ended, for a call that ran: done, or failed. A call turned
+        // down or a question answered says so in words.
+        let mark = if failed {
+            Some((IconName::Close, cx.theme().danger))
+        } else if message.is_error || message.name == letronna_core::tools::ASK_USER {
+            None
+        } else {
+            Some((IconName::Check, cx.theme().muted_foreground))
+        };
+        let ended = mark.map(|mark| {
+            let came = self.motion.rows.came(Row::Message, index, cx);
+            outcome(mark, self.call_times.took(key), came, window, cx)
+        });
         let session = key.0;
         let copied = edited.map(|edit| edit.text.clone());
         v_flex()
@@ -1106,6 +1177,7 @@ impl Chat {
                                 .child(from),
                         )
                     })
+                    .children(ended)
                     .when(open || page, |row| row.child(div().flex_1()))
                     // All of it, however little the preview shows; read when
                     // copied, not copied out at every frame.
@@ -1216,16 +1288,16 @@ impl Chat {
                     window,
                     cx,
                 );
-                this.child(
-                    div()
-                        .ml_2()
-                        .pl_3()
-                        .min_w_0()
-                        .border_l_2()
-                        .border_color(cx.theme().border)
-                        .text_color(cx.theme().muted_foreground)
-                        .child(preview),
-                )
+                let output = div()
+                    .ml_2()
+                    .pl_3()
+                    .min_w_0()
+                    .border_l_2()
+                    .border_color(cx.theme().border)
+                    .text_color(cx.theme().muted_foreground)
+                    .child(preview)
+                    .into_any_element();
+                this.child((self.motion.opened).ease(Fold::Output, key, output, window, cx))
             })
     }
 
@@ -1463,26 +1535,40 @@ impl Chat {
                 _ => None,
             }
         });
+        // Done, or with a call that failed, once nothing in it runs. While
+        // one does, the line under the turn that says so has the sweep.
+        let ended = running.is_none().then(|| {
+            let failed = (run.first..=run.last).any(|i| {
+                (conversation.messages.get(i)).is_some_and(letronna_core::tool_runs::failed)
+            });
+            let mark = if failed {
+                (IconName::Close, cx.theme().danger)
+            } else {
+                (IconName::Check, cx.theme().muted_foreground)
+            };
+            let came = self.motion.rows.came(Row::Message, run.last, cx);
+            outcome(mark, None, came, window, cx)
+        });
         let theme = cx.theme();
         let (muted, plain, danger) = (theme.muted_foreground, theme.foreground, theme.danger);
         let line: Vec<AnyElement> = match running {
-            Some(call) => vec![
-                crate::ui::busy::Spinner::new()
-                    .xsmall()
-                    .color(theme.primary)
-                    .into_any_element(),
-                div()
-                    .flex_none()
-                    .text_color(plain)
-                    .child(call.name.clone())
-                    .into_any_element(),
-                div()
-                    .font_family(MONO_FONT)
-                    .min_w_0()
-                    .truncate()
-                    .child(letronna_core::tools::summary(&call.name, &call.arguments))
-                    .into_any_element(),
-            ],
+            Some(call) => {
+                let summary = letronna_core::tools::summary(&call.name, &call.arguments);
+                let (name, summary) = crate::ui::busy::Shimmer::label(call.name.clone(), summary);
+                vec![
+                    crate::ui::busy::Spinner::new()
+                        .xsmall()
+                        .color(theme.primary)
+                        .into_any_element(),
+                    div().flex_none().child(name).into_any_element(),
+                    div()
+                        .font_family(MONO_FONT)
+                        .min_w_0()
+                        .truncate()
+                        .child(summary)
+                        .into_any_element(),
+                ]
+            }
             None => {
                 let told = letronna_core::tool_runs::tell(&conversation.messages, run, tools);
                 let coloured = [(told.did, plain), (told.failed, danger), (told.took, muted)];
@@ -1510,6 +1596,7 @@ impl Chat {
             if !this.runs_open.remove(&key) {
                 this.runs_open.insert(key);
             }
+            this.motion.opened.note(Fold::Run, key, cx);
             cx.notify();
         };
         h_flex()
@@ -1539,6 +1626,7 @@ impl Chat {
                 .size_3(),
             )
             .children(line)
+            .children(ended)
             // As on a tool row, a press leaves the keys in the composer;
             // Tab is what picks the line out.
             .on_any_mouse_down(|_, window, _| window.prevent_default())
@@ -1584,6 +1672,7 @@ impl Chat {
             if !this.thinking_open.remove(&key) {
                 this.thinking_open.insert(key);
             }
+            this.motion.opened.note(Fold::Thought, key, cx);
             cx.notify();
         };
         let label = if live {
@@ -1594,6 +1683,43 @@ impl Chat {
                 None => "Thought".to_owned(),
             }
         };
+        let opened = open.then(|| {
+            let theme = cx.theme();
+            let inset = div()
+                .ml_2()
+                .pl_3()
+                .border_l_2()
+                .border_color(theme.border)
+                .text_color(theme.muted_foreground);
+            let body = if live {
+                // Plain text, not markdown parsed again at every token: the
+                // newest rows, held to the bottom of a box that grows to
+                // eight rows and then stays.
+                let rows = crate::ui::PREVIEW_ROWS;
+                let tail = crate::ui::rest(&message.reasoning, crate::ui::Cut::Tail, 200, rows)
+                    .map_or_else(
+                        || message.reasoning.trim_end().to_owned(),
+                        |rest| rest.shown,
+                    );
+                inset
+                    .flex()
+                    .flex_col()
+                    .justify_end()
+                    .max_h(crate::ui::CODE_LINE * rows as f32)
+                    .overflow_hidden()
+                    .text_xs()
+                    .line_height(crate::ui::CODE_LINE)
+                    .child(tail)
+            } else {
+                inset.text_sm().child(
+                    TextView::markdown(self.text_id("reason", index), message.reasoning.clone())
+                        .selectable(!window.has_active_dialog(cx))
+                        .line_height(px(21.)),
+                )
+            };
+            let body = body.into_any_element();
+            (self.motion.opened).ease(Fold::Thought, key, body, window, cx)
+        });
         let theme = cx.theme();
         v_flex()
             .w_full()
@@ -1622,7 +1748,13 @@ impl Chat {
                         })
                         .size_3(),
                     )
-                    .child(label)
+                    .map(|row| {
+                        if live {
+                            row.child(crate::ui::busy::Shimmer::new(label))
+                        } else {
+                            row.child(label)
+                        }
+                    })
                     .on_any_mouse_down(|_, window, _| window.prevent_default())
                     .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                         if !event.is_keyboard() {
@@ -1631,52 +1763,7 @@ impl Chat {
                     }))
                     .on_action(cx.listener(move |this, _: &ToggleRun, _, cx| toggle(this, cx))),
             )
-            .when(open && live, |this| {
-                // Plain text, not markdown parsed again at every token: the
-                // newest rows, held to the bottom of a box that grows to
-                // eight rows and then stays.
-                let rows = crate::ui::PREVIEW_ROWS;
-                let tail = crate::ui::rest(&message.reasoning, crate::ui::Cut::Tail, 200, rows)
-                    .map_or_else(
-                        || message.reasoning.trim_end().to_owned(),
-                        |rest| rest.shown,
-                    );
-                this.child(
-                    div()
-                        .ml_2()
-                        .pl_3()
-                        .border_l_2()
-                        .border_color(theme.border)
-                        .flex()
-                        .flex_col()
-                        .justify_end()
-                        .max_h(crate::ui::CODE_LINE * rows as f32)
-                        .overflow_hidden()
-                        .text_xs()
-                        .line_height(crate::ui::CODE_LINE)
-                        .text_color(theme.muted_foreground)
-                        .child(tail),
-                )
-            })
-            .when(open && !live, |this| {
-                this.child(
-                    div()
-                        .ml_2()
-                        .pl_3()
-                        .border_l_2()
-                        .border_color(cx.theme().border)
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(
-                            TextView::markdown(
-                                self.text_id("reason", index),
-                                message.reasoning.clone(),
-                            )
-                            .selectable(!window.has_active_dialog(cx))
-                            .line_height(px(21.)),
-                        ),
-                )
-            })
+            .children(opened)
     }
 
     /// Time the thinking of the reply coming in, from its first reasoning
@@ -1715,21 +1802,6 @@ impl Chat {
         let no_project = self.store.conversations[self.store.active]
             .workspace
             .is_none();
-        // The window's two ways to find the rest, with their keys as this
-        // computer writes them.
-        let hints = [
-            (&crate::ui::palette::OpenPalette as &dyn Action, "commands"),
-            (&ShowKeys, "keys"),
-        ]
-        .map(|(action, what)| {
-            crate::ui::keys::bound_key(action, cx)
-                .map(|key| SharedString::from(format!("{} {what}", Kbd::format(&key))))
-        });
-        let hint = |hints: Vec<SharedString>| {
-            h_flex()
-                .gap_x_4()
-                .children(hints.into_iter().map(|hint| div().child(hint)))
-        };
         let page = v_flex()
             .w_full()
             // At least the pane's height, so it is centred there, and taller
@@ -1768,52 +1840,27 @@ impl Chat {
                 )
             })
             .children(self.recent_places(window, cx))
-            .child(
-                // In two groups, so a narrow pane breaks between them.
-                h_flex()
-                    .mt_6()
-                    .max_w_full()
-                    .px_6()
-                    .flex_wrap()
-                    .justify_center()
-                    .gap_x_4()
-                    .gap_y_1()
-                    .text_xs()
-                    // Plain muted, not faded: faded it read under 4.5:1.
-                    .text_color(cx.theme().muted_foreground)
-                    .child(hint(
-                        ["Enter to send", "Shift+Enter for a new line", "Esc to stop"]
-                            .map(SharedString::from)
-                            .to_vec(),
-                    ))
-                    .child(hint(hints.into_iter().flatten().collect())),
-            )
             // A side question asked before anything else still needs somewhere to show.
             .children(
                 self.aside_row(self.store.conversations[self.store.active].id, window, cx)
                     .map(|row| div().w_full().max_w(COLUMN).px_6().mt_6().child(row)),
             );
-        v_flex()
-            .relative()
-            .flex_1()
-            .min_h_0()
-            .child(
-                div()
-                    .id("empty-chat")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .child(page),
-            )
-            .children(self.grain(&self.grains.empty_chat))
+        v_flex().relative().flex_1().min_h_0().child(
+            div()
+                .id("empty-chat")
+                .size_full()
+                .overflow_y_scroll()
+                .child(page),
+        )
     }
 
     /// Sessions to go back to and folders worked in lately, side by side
     /// under a new session's greeting, or nothing when there are none. Each
     /// row is a tab stop that Enter opens, as a click does.
     fn recent_places(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
-        // Rows in each list: enough to go back to what was open this week,
-        // few enough that the greeting stays the middle of the page.
-        const RECENT: usize = 4;
+        // Rows in each list: enough to go back to what was open lately, few
+        // enough that the wordmark stays the one thing the page is about.
+        const RECENT: usize = 3;
         let here = &self.store.conversations[self.store.active];
         let now = backend::now();
         let mut by_age: Vec<&Conversation> = (self.store.conversations.iter())
@@ -1879,14 +1926,16 @@ impl Chat {
                         .text_xs()
                         .font_family(HEADING_FONT)
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(cx.theme().muted_foreground)
+                        .text_color(cx.theme().muted_foreground.opacity(0.7))
                         .child(title),
                 )
                 .children(rows)
         };
+        // Quiet, and well below the wordmark: there to go back to, not to
+        // compete with it.
         Some(
             h_flex()
-                .mt_6()
+                .mt_12()
                 .max_w_full()
                 .px_6()
                 .flex_wrap()
@@ -1939,7 +1988,8 @@ impl Chat {
             .border_1()
             .border_color(theme.transparent)
             .cursor_pointer()
-            .text_sm()
+            .text_xs()
+            .text_color(theme.muted_foreground)
             .focus(|s| s.border_color(theme.ring))
             .active(|s| s.bg(theme.secondary.opacity(0.5)))
             .child(
@@ -1959,8 +2009,7 @@ impl Chat {
                 div()
                     .when(wide_detail, |this| this.flex_1().min_w_0().truncate())
                     .flex_shrink_0()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
+                    .text_color(theme.muted_foreground.opacity(0.6))
                     .child(detail),
             )
             .on_click(cx.listener(move |this, _, window, cx| open(this, window, cx)))
@@ -2123,6 +2172,46 @@ fn without_exit(output: &str) -> &str {
         Some((rest, last)) if last.starts_with("[exit code ") => rest.trim_end(),
         None if output.starts_with("[exit code ") => "",
         _ => output,
+    }
+}
+
+/// How a call ended, as its row's end says it: how long it ran, when the
+/// window timed it, and its mark, both coming in -- the mark growing to its
+/// size -- if the call ended a moment ago, at `came`.
+fn outcome(
+    (mark, color): (IconName, Hsla),
+    took: Option<std::time::Duration>,
+    came: Option<std::time::Instant>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let t = came.map_or(1., |came| {
+        crate::ui::motion::progress_ticked(came, crate::ui::motion::QUICK, window, cx)
+    });
+    let scale = crate::ui::motion::MARK_FROM + (1. - crate::ui::motion::MARK_FROM) * t;
+    h_flex()
+        .flex_none()
+        .gap_1()
+        .items_center()
+        .opacity(t)
+        .children(took.and_then(ran_for))
+        .child(
+            Icon::new(mark)
+                .size_3()
+                .text_color(color)
+                .transform(Transformation::scale(size(scale, scale))),
+        )
+        .into_any_element()
+}
+
+/// How long a call ran: to a tenth of a second under ten seconds, then as
+/// a thought's time; nothing for a call quicker than a tenth, which is no
+/// news.
+fn ran_for(took: std::time::Duration) -> Option<String> {
+    match took.as_millis() {
+        0..100 => None,
+        100..10_000 => Some(format!("{:.1}s", took.as_secs_f32())),
+        _ => Some(took_for(took)),
     }
 }
 
@@ -2425,8 +2514,8 @@ mod tests {
     // Deliberately not `use super::*`: the prelude re-exports gpui, whose own
     // `test` macro would shadow the built-in attribute here.
     use super::{
-        countdown, edited_by, ends_thinking, exit_code, prompt_rest, retry_due, rewind_leaves,
-        took_for, usage_line, without_exit,
+        CallTimes, countdown, edited_by, ends_thinking, exit_code, prompt_rest, ran_for, retry_due,
+        rewind_leaves, took_for, usage_line, without_exit,
     };
     use letronna_core::chat::{Draft, Event, Message};
 
@@ -2589,5 +2678,39 @@ mod tests {
             ..ran(Some(why))
         };
         assert_eq!(rewind_leaves(&wrote), None);
+    }
+
+    #[test]
+    fn a_call_is_timed_from_its_start_to_its_result_and_kept_by_its_place() {
+        let mut times = CallTimes::default();
+        times.start("call_1");
+        times.start("call_2");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        times.stop("call_2");
+        // A result that comes back for a call never started has no time.
+        times.stop("call_9");
+        let result = |id: &str| Message {
+            role: "tool".into(),
+            tool_call_id: id.into(),
+            ..Default::default()
+        };
+        times.keep(7, 4, &[result("call_9"), result("call_2")]);
+        assert_eq!(times.took((7, 4)), None);
+        let took = times.took((7, 5));
+        assert!(took.is_some_and(|took| took.as_millis() >= 20));
+        // Still running, so not kept yet; kept once, never again.
+        times.keep(7, 6, &[result("call_1"), result("call_2")]);
+        assert_eq!(times.took((7, 6)), None);
+        assert_eq!(times.took((7, 7)), None);
+    }
+
+    #[test]
+    fn how_long_a_call_ran_reads_in_tenths_then_whole_seconds_and_a_blink_not_at_all() {
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(ran_for(ms(40)), None);
+        assert_eq!(ran_for(ms(100)).as_deref(), Some("0.1s"));
+        assert_eq!(ran_for(ms(4_260)).as_deref(), Some("4.3s"));
+        assert_eq!(ran_for(ms(12_400)).as_deref(), Some("12s"));
+        assert_eq!(ran_for(ms(125_000)).as_deref(), Some("2m 5s"));
     }
 }

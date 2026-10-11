@@ -1,6 +1,5 @@
 //! The opening screen, and putting a session's conversation back on it.
 
-use letronna_core::gate::Mode;
 use letronna_core::workflow::saved;
 
 use crate::render;
@@ -106,7 +105,11 @@ pub fn banner(runner: &Runner, folder: &str, session: usize) {
         ),
         fact(
             "mode",
-            &format!("{}: {}", runner.mode.label(), runner.mode.about()),
+            &format!(
+                "{}: {}",
+                runner.current_mode().label(),
+                runner.current_mode().about()
+            ),
         ),
         String::new(),
         render::dim("type / for commands"),
@@ -154,9 +157,7 @@ pub fn footer(runner: &Runner) -> String {
     let session = runner.store.active;
     let (gateway, model) = runner.store.model(session);
     let mut parts = vec![model.to_owned(), gateway.to_owned()];
-    if runner.mode != Mode::Default {
-        parts.push(format!("{} mode", runner.mode.label().to_lowercase()));
-    }
+    // The mode is not here: the bar shows it at the front, with its key.
     let crew =
         (runner.store.conversations.get(session)).is_some_and(|c| letronna_core::crew::on(c.id));
     if crew {

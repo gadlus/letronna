@@ -240,6 +240,8 @@ fn with_index(text: Option<String>, dropped: &[Message]) -> Option<String> {
     {
         lines.extend(files_line(dropped));
         lines.extend(jobs_line(dropped));
+        lines.extend(failure_line(dropped));
+        lines.extend(tests_line(dropped));
     }
     let skills = skills_loaded(dropped);
     if !skills.is_empty() {
@@ -906,6 +908,8 @@ fn digest(dropped: &[Message]) -> Option<String> {
     }
     parts.extend(files_line(dropped));
     parts.extend(jobs_line(dropped));
+    parts.extend(failure_line(dropped));
+    parts.extend(tests_line(dropped));
     let todos = crate::store::todos_in(dropped);
     if !todos.is_empty() {
         let items: Vec<String> = todos
@@ -945,6 +949,106 @@ fn jobs_line(messages: &[Message]) -> Option<String> {
             jobs.join(", ")
         )
     })
+}
+
+/// The last command in `messages` that failed, as a summary's index names
+/// it: its first line, its exit code and the first line of its output that
+/// says what went wrong. A summarizer may drop the exact error, and the
+/// model would set out to find it again. None when none failed, or a later
+/// run of the same command passed. Exit 141 is a pipe its reader closed, as
+/// `| head` does, which is no failure.
+fn failure_line(messages: &[Message]) -> Option<String> {
+    let ran = commands_run(messages);
+    let (at, (command, code, output)) = ran
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, (_, code, _))| code.is_some_and(|code| code != 141))?;
+    let code = (*code)?;
+    if ran[at + 1..]
+        .iter()
+        .any(|(again, code, _)| again == command && code.is_none())
+    {
+        return None;
+    }
+    let first = line(command);
+    Some(match output.lines().find(|l| says_what_failed(l)) {
+        Some(why) => format!(
+            "The last command that failed there: `{first}` (exit code {code}): {}",
+            line(why)
+        ),
+        None => format!("The last command that failed there: `{first}` (exit code {code})"),
+    })
+}
+
+/// The test command last run in `messages`, so the summary's reader runs
+/// the same one rather than guessing it.
+fn tests_line(messages: &[Message]) -> Option<String> {
+    let (command, _, _) = commands_run(messages)
+        .into_iter()
+        .rev()
+        .find(|(command, _, _)| runs_tests(command))?;
+    Some(format!("Tests were run with: `{}`", line(&command)))
+}
+
+/// The commands `run_command` ran in `messages`, oldest first: each with
+/// the exit code its result gave when it failed, and that result.
+fn commands_run(messages: &[Message]) -> Vec<(String, Option<i32>, String)> {
+    messages
+        .iter()
+        .enumerate()
+        .flat_map(|(at, m)| m.tool_calls.iter().map(move |call| (at, call)))
+        .filter(|(_, call)| call.name == "run_command")
+        .filter_map(|(at, call)| {
+            let args = crate::tools::parse_args_for(&call.name, &call.arguments).ok()?;
+            let command = args["command"].as_str()?.trim().to_owned();
+            let result = messages[at + 1..]
+                .iter()
+                .find(|m| m.role == "tool" && m.tool_call_id == call.id)?;
+            Some((command, exit_code(&result.content), result.content.clone()))
+        })
+        .collect()
+}
+
+/// The exit code a command's result ends with, which it gives only when
+/// the command failed.
+fn exit_code(result: &str) -> Option<i32> {
+    let at = result.rfind("[exit code ")?;
+    let digits = &result[at + "[exit code ".len()..];
+    let end = digits.find(']')?;
+    digits[..end].trim().parse().ok()
+}
+
+/// Whether `line` of a failed command's output says what went wrong.
+fn says_what_failed(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    !line.starts_with("[exit code ")
+        && ["error", "fail", "panic", "traceback", "exception", "assert"]
+            .iter()
+            .any(|word| lower.contains(word))
+}
+
+/// Whether `command` runs a project's tests.
+fn runs_tests(command: &str) -> bool {
+    const RUNNERS: [&str; 16] = [
+        "cargo test",
+        "cargo nextest",
+        "pytest",
+        "python -m unittest",
+        "npm test",
+        "npm run test",
+        "yarn test",
+        "pnpm test",
+        "go test",
+        "jest",
+        "vitest",
+        "mvn test",
+        "gradle test",
+        "rspec",
+        "dotnet test",
+        "make test",
+    ];
+    RUNNERS.iter().any(|runner| command.contains(runner))
 }
 
 /// The user's newest requests in `messages`, oldest first, whole while they
@@ -1752,6 +1856,56 @@ mod tests {
         let stand_in = with_index(digest(&messages), &messages).unwrap();
         assert_eq!(stand_in.matches("Files read or changed").count(), 1);
         assert_eq!(stand_in.matches("Background jobs started").count(), 1);
+    }
+
+    #[test]
+    fn a_summary_is_followed_by_the_last_failure_and_the_test_command() {
+        let messages = vec![
+            said("user", "fix the failing total test"),
+            calling("a", "run_command", r#"{"command":"cargo test -p ledger"}"#),
+            answering(
+                "a",
+                "run_command",
+                "running 3 tests\ntest total ... FAILED\n\nthread 'total' panicked at src/lib.rs:9:5:\nassertion `left == right` failed\n[exit code 101]",
+            ),
+            calling("b", "run_command", r#"{"command":"git log | head -3"}"#),
+            answering("b", "run_command", "abc fix\n[exit code 141]"),
+        ];
+        remember(&messages, "The total test fails.");
+        let text = summary(
+            &nowhere(),
+            &messages,
+            0,
+            || panic!("the model was asked for the summary again"),
+            |_| panic!("the kept summary was handed over as new"),
+            |_| panic!("asking for the summary again was paid for"),
+        )
+        .unwrap();
+        assert!(
+            text.contains(
+                "The last command that failed there: `cargo test -p ledger` (exit code 101): \
+                 test total ... FAILED"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Tests were run with: `cargo test -p ledger`"),
+            "{text}"
+        );
+        // A later run that passed leaves nothing failing.
+        let mut fixed = messages.clone();
+        fixed.push(calling(
+            "c",
+            "run_command",
+            r#"{"command":"cargo test -p ledger"}"#,
+        ));
+        fixed.push(answering("c", "run_command", "test result: ok. 3 passed"));
+        assert_eq!(failure_line(&fixed), None);
+        assert!(tests_line(&fixed).is_some());
+        // A digest names them itself, once.
+        let stand_in = with_index(digest(&messages), &messages).unwrap();
+        assert_eq!(stand_in.matches("The last command that failed").count(), 1);
+        assert_eq!(stand_in.matches("Tests were run with").count(), 1);
     }
 
     /// A session that starts with `rule` and goes on for `turns` more turns,

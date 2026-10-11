@@ -20,7 +20,7 @@ use crate::prelude::*;
 use letronna_core::approvals;
 use letronna_core::cancel::Cancel;
 use letronna_core::chat::Remote;
-use letronna_core::driver::{self, Allow, Outcome, Spec};
+use letronna_core::driver::{self, Allow, Outcome, Spec, Step};
 use letronna_core::gate::Mode;
 use letronna_core::inbox;
 use letronna_core::messaging::pairing::{self, Attempt};
@@ -42,6 +42,64 @@ pub(crate) struct Run {
     pub(crate) held: bool,
     /// Waiting for a place, not started yet.
     pub(crate) queued: bool,
+    /// What a held run has said and is doing so far, which its session
+    /// shows until the run's messages come in at its end.
+    pub(crate) live: Live,
+    /// Messages typed in its session while it runs, sent there as the next
+    /// prompt once it is done.
+    pub(crate) follow_ups: Vec<String>,
+}
+
+/// A held run as its steps tell it, while its messages are still its own.
+#[derive(Default)]
+pub(crate) struct Live {
+    /// Everything it has said so far, its replies a paragraph apart.
+    pub(crate) said: String,
+    /// The calls it asked for that have not come back, oldest first, each
+    /// with the line that says what it does.
+    calls: Vec<(String, String)>,
+    /// How many of its calls have come back.
+    pub(crate) done: usize,
+    /// Whether a call came since it last said anything, so its next words
+    /// start a reply of their own.
+    after_call: bool,
+}
+
+impl Live {
+    fn step(&mut self, step: &Step) {
+        match step {
+            Step::Said(text) => {
+                if std::mem::take(&mut self.after_call) && !self.said.is_empty() {
+                    self.said.push_str("\n\n");
+                }
+                self.said.push_str(text);
+            }
+            Step::Asked(call) => {
+                self.after_call = true;
+                let summary = letronna_core::tools::summary(&call.name, &call.arguments);
+                let line = match letronna_core::tools::one_line(&summary) {
+                    shown if shown.is_empty() => call.name.clone(),
+                    shown => format!("{} {shown}", call.name),
+                };
+                self.calls.push((call.id.clone(), line));
+            }
+            Step::Finished { id, .. } => {
+                self.after_call = true;
+                self.calls.retain(|(asked, _)| asked != id);
+                self.done += 1;
+            }
+            Step::Thought(_) | Step::Running(_) | Step::Checklist(_) => {}
+        }
+    }
+
+    /// The line under its words: the call it is on or waits on a yes for, or
+    /// that it is thinking before its next words; none while words come in.
+    pub(crate) fn doing(&self) -> Option<String> {
+        if let Some((_, line)) = self.calls.first() {
+            return Some(line.clone());
+        }
+        (self.said.is_empty() || self.after_call).then(|| "Thinking…".to_owned())
+    }
 }
 
 /// A held run's end, sent from its thread.
@@ -237,6 +295,298 @@ impl Chat {
         .detach();
     }
 
+    /// Take each held run's steps as they come, for its session's view.
+    pub(crate) fn watch_run_steps(
+        steps: async_channel::Receiver<(u64, Step)>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            while let Ok((id, step)) = steps.recv().await {
+                if this
+                    .update(cx, |this, cx| this.run_stepped(id, step, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// One step of session `id`'s held run, kept for its view; its checklist
+    /// goes on the session as a turn's does, for the strip over the box.
+    fn run_stepped(&mut self, id: u64, step: Step, cx: &mut Context<Self>) {
+        // One that comes after the run's end is in its messages already.
+        let Some(run) = self.runs.get_mut(&id).filter(|run| run.held) else {
+            return;
+        };
+        run.live.step(&step);
+        let words = matches!(step, Step::Said(_));
+        match step {
+            Step::Checklist(todos) => {
+                if let Some(ix) = self.store.index_of(id) {
+                    self.store.conversations[ix].todos = todos;
+                }
+            }
+            // Nothing it shows.
+            Step::Thought(_) | Step::Running(_) => return,
+            _ => {}
+        }
+        // Words are drawn only where they are said; a call also moves the
+        // sidebar's marks.
+        let on_screen = self.store.conversations[self.store.active].id == id;
+        if on_screen || !words {
+            cx.notify();
+        }
+    }
+
+    /// Send `prompt` in the session on screen as a run beside the chat, for
+    /// while the window's own reply runs in another session. `Err` as
+    /// [`Self::dispatch`] gives it, with the reason shown.
+    pub(crate) fn send_beside(
+        &mut self,
+        prompt: String,
+        images: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), ()> {
+        let ix = self.store.active;
+        // Whether it is new, and so named after this, depends on what was
+        // said before, which a session let go of has to be read back for.
+        self.fill_now(ix);
+        // Checked here, where Settings can open about it, rather than once
+        // the run starts.
+        if let Err(error) = self.connection_for(ix, None) {
+            self.error = Some(error);
+            cx.notify();
+            return Err(());
+        }
+        self.show_setup = None;
+        self.store.pin(ix);
+        let conversation = &mut self.store.conversations[ix];
+        name_after(conversation, &prompt);
+        let content = letronna_core::references::expand(&prompt, conversation.workspace.as_deref());
+        let (id, title) = (conversation.id, conversation.title.clone());
+        let model = self.store.model(ix).1.to_owned();
+        plugins::emit(cx, plugins::AppEvent::ChatStarted { model, title });
+        let message = Message {
+            role: "user".into(),
+            content,
+            images,
+            ..Default::default()
+        };
+        self.error = None;
+        self.run_beside(id, message, None, None, cx);
+        self.follow();
+        Ok(())
+    }
+
+    /// A message typed in a session its own run holds: queued, and sent there
+    /// as the next prompt once the run is done. A chat app's run or a
+    /// scheduled one is the chat's or the job's, and takes none.
+    pub(crate) fn queue_after_run(
+        &mut self,
+        prompt: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let here = self.store.conversations[self.store.active].id;
+        let own = self
+            .runs
+            .get(&here)
+            .is_some_and(|run| run.held && run.source.is_none());
+        let refused = if !own {
+            Some(
+                "This session is running beside the chat. Wait for its answer, or stop it with \
+                 Escape.",
+            )
+        } else if prompt.is_empty() {
+            Some("Pictures go with a message, once this session's run is done.")
+        } else if prompt.chars().count() > 12_000 {
+            Some("Please keep each message under 12,000 characters.")
+        } else if prompt == letronna_core::init::COMMAND {
+            Some("/init starts a turn of its own. Send it when this one is done.")
+        } else {
+            None
+        };
+        if let Some(why) = refused {
+            // Kept as typed, without the line Enter added.
+            self.composer
+                .update(cx, |input, cx| input.set_value(prompt, window, cx));
+            self.error = Some(why.into());
+            cx.notify();
+            return;
+        }
+        if let Some(run) = self.runs.get_mut(&here) {
+            run.follow_ups.push(prompt);
+        }
+        self.composer
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.follow();
+        cx.notify();
+    }
+
+    /// Send what was typed while session `id`'s run went as its next prompt.
+    fn continue_run(&mut self, id: u64, text: String, cx: &mut Context<Self>) {
+        let Some(ix) = self.store.index_of(id) else {
+            return;
+        };
+        let workspace = self.store.conversations[ix].workspace.as_deref();
+        let message = Message {
+            role: "user".into(),
+            content: letronna_core::references::expand(&text, workspace),
+            ..Default::default()
+        };
+        self.run_beside(id, message, None, None, cx);
+    }
+
+    /// Whether `request` comes from its session's own run beside the chat,
+    /// rather than a helper: the helpers it starts join its run, but under
+    /// names of their own.
+    pub(crate) fn own_run(&self, request: &approvals::Request) -> bool {
+        request.run == request.root
+            && self
+                .runs
+                .get(&request.root)
+                .is_some_and(|run| run.held && run.label == request.label)
+    }
+
+    /// Who a card says is asking: Letronna for a session's own run, which
+    /// the user started there, or the helper by name.
+    pub(crate) fn asker(&self, request: &approvals::Request) -> String {
+        if self.own_run(request) {
+            "Letronna".to_owned()
+        } else {
+            format!("Helper {}", request.label)
+        }
+    }
+
+    /// Put `text` back in session `id`'s box, ahead of what is typed there.
+    fn back_to_box(&mut self, id: u64, text: String) {
+        if self.draft_for == id {
+            // The box holds that session's draft, and takes it at its next draw.
+            self.returned_follow_ups = Some(match self.returned_follow_ups.take() {
+                Some(earlier) => format!("{earlier}\n\n{text}"),
+                None => text,
+            });
+            return;
+        }
+        let draft = self.drafts.entry(id).or_default();
+        *draft = if draft.trim().is_empty() {
+            text
+        } else {
+            format!("{text}\n\n{draft}")
+        };
+    }
+
+    /// What the held run in `session` has said and is doing, under the
+    /// session's messages until the run's own come in at its end, and what
+    /// was typed meanwhile under that.
+    pub(crate) fn run_live(
+        &self,
+        session: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let run = self.runs.get(&session).filter(|run| run.held)?;
+        let ix = self.store.index_of(session)?;
+        let live = &run.live;
+        let muted = cx.theme().muted_foreground;
+        let line = if run.queued {
+            Some(format!(
+                "Waiting for a place: {AT_ONCE} sessions are running beside the chat."
+            ))
+        } else if run.cancel.is_set() {
+            Some("Stopping…".to_owned())
+        } else {
+            live.doing()
+        };
+        let label = h_flex()
+            .items_center()
+            .gap_2()
+            .text_xs()
+            .font_family(HEADING_FONT)
+            .child(
+                div()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(cx.theme().link)
+                    .child(self.store.model(ix).1.to_owned()),
+            )
+            .child(
+                div()
+                    .size(px(6.))
+                    .rounded_full()
+                    .bg(cx.theme().primary)
+                    .opacity(crate::ui::busy::breathing(window, cx)),
+            )
+            .when(live.done > 0, |label| {
+                let s = if live.done == 1 { "" } else { "s" };
+                label.child(
+                    div()
+                        .text_color(muted)
+                        .child(format!("{} call{s} done", live.done)),
+                )
+            });
+        let said = (!live.said.is_empty()).then(|| {
+            let id =
+                SharedString::from(format!("run-said-{session}-{}", crate::theme::generation()));
+            div().w_full().overflow_hidden().child(
+                TextView::markdown(id, live.said.clone())
+                    .selectable(!window.has_active_dialog(cx))
+                    .line_height(px(24.)),
+            )
+        });
+        let doing = line.map(|line| {
+            h_flex()
+                .gap_2()
+                .items_center()
+                .text_color(muted)
+                .child(
+                    crate::ui::busy::Spinner::new()
+                        .xsmall()
+                        .color(cx.theme().primary),
+                )
+                .child(div().min_w_0().truncate().child(line))
+        });
+        let queued = run.follow_ups.iter().map(|text| {
+            v_flex()
+                .w_full()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_family(BODY_FONT)
+                        .text_color(muted)
+                        .child("Queued · goes in once this run is done"),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .px_4()
+                        .py_3()
+                        .rounded(cx.theme().radius_lg)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .text_color(muted)
+                        .child(text.clone()),
+                )
+        });
+        Some(
+            v_flex()
+                .w_full()
+                .gap_3()
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_1p5()
+                        .child(label)
+                        .children(said)
+                        .children(doing),
+                )
+                .children(queued)
+                .into_any_element(),
+        )
+    }
+
     /// `/bg <prompt>`: a new session on the open one's project, run beside
     /// the chat while the view stays where it is.
     pub(crate) fn run_in_background(&mut self, prompt: &str, cx: &mut Context<Self>) {
@@ -294,6 +644,8 @@ impl Chat {
             remote,
             held: true,
             queued: true,
+            live: Live::default(),
+            follow_ups: Vec::new(),
         };
         self.runs.insert(id, run);
         self.start_queued(cx);
@@ -362,7 +714,14 @@ impl Chat {
             fork: false,
             from: 0,
             schema: None,
-            watch: None,
+            // Told to its session's view as it goes, which has nothing else
+            // of it until the run's messages come in at its end.
+            watch: Some(std::sync::Arc::new({
+                let steps = self.run_steps.clone();
+                move |step| {
+                    let _ = steps.try_send((id, step));
+                }
+            })),
             // Its own gate, as a helper's: a call that needs a yes gets a
             // card, in the window or in the chat that sent it.
             decide: None,
@@ -420,7 +779,7 @@ impl Chat {
 
     /// What follows a held run's end: its answer to the chat that sent it,
     /// what came too late for it, and a place for the next.
-    fn ended(&mut self, run: Run, id: u64, text: &str, end: End, cx: &mut Context<Self>) {
+    fn ended(&mut self, mut run: Run, id: u64, text: &str, end: End, cx: &mut Context<Self>) {
         match &run.source {
             Some(source) => {
                 let answered = !end.stopped && !end.failed;
@@ -446,6 +805,17 @@ impl Chat {
             .map(|c| c.id);
         if open != Some(id) && self.store.index_of(id).is_some() {
             self.unseen.insert(id);
+        }
+        // What was typed in its session meanwhile goes on as the next prompt
+        // there; after a stop or a failure it goes back in the box instead.
+        let follow_ups = std::mem::take(&mut run.follow_ups);
+        if !follow_ups.is_empty() {
+            let text = follow_ups.join("\n\n");
+            if end.stopped || end.failed {
+                self.back_to_box(id, text);
+            } else {
+                self.continue_run(id, text, cx);
+            }
         }
         // Stop means stop, and after a failure the next would most likely
         // fail too: what came meanwhile waits for the next message.
@@ -502,6 +872,8 @@ impl Chat {
             remote: None,
             held: false,
             queued: false,
+            live: Live::default(),
+            follow_ups: Vec::new(),
         };
         self.runs.insert(started.session, run);
         cx.notify();
@@ -606,9 +978,10 @@ impl Chat {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute here.
-    use super::{Finished, Run, apply, background_prompt};
+    use super::{Finished, Live, Run, apply, background_prompt};
     use letronna_core::cancel::Cancel;
-    use letronna_core::chat::Message;
+    use letronna_core::chat::{Message, ToolCall};
+    use letronna_core::driver::Step;
     use letronna_core::store::Conversation;
     use std::collections::BTreeMap;
 
@@ -628,6 +1001,8 @@ mod tests {
             remote: None,
             held: true,
             queued: false,
+            live: Default::default(),
+            follow_ups: Vec::new(),
         }
     }
 
@@ -654,6 +1029,40 @@ mod tests {
         assert_eq!(background_prompt("/bg   "), None);
         assert_eq!(background_prompt("/bgx run"), None);
         assert_eq!(background_prompt("run /bg later"), None);
+    }
+
+    #[test]
+    fn a_held_runs_steps_say_what_it_said_and_what_it_is_doing() {
+        let mut live = Live::default();
+        assert_eq!(live.doing().as_deref(), Some("Thinking…"));
+
+        live.step(&Step::Said("Looking".into()));
+        live.step(&Step::Thought("hmm".into()));
+        live.step(&Step::Said(" at it.".into()));
+        assert_eq!(live.said, "Looking at it.");
+        assert_eq!(live.doing(), None, "its words say it is working");
+
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "run_command".into(),
+            arguments: r#"{"command": "cargo\n  test"}"#.into(),
+        };
+        live.step(&Step::Asked(call));
+        live.step(&Step::Running("c1".into()));
+        assert_eq!(live.doing().as_deref(), Some("run_command cargo test"));
+
+        live.step(&Step::Finished {
+            id: "c1".into(),
+            output: "ok".into(),
+            failed: false,
+        });
+        assert_eq!(live.done, 1);
+        assert_eq!(live.doing().as_deref(), Some("Thinking…"));
+
+        // Its next reply reads as one of its own.
+        live.step(&Step::Said("All green.".into()));
+        assert_eq!(live.said, "Looking at it.\n\nAll green.");
+        assert_eq!(live.doing(), None);
     }
 
     #[test]

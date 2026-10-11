@@ -30,7 +30,7 @@ use crate::session::Runner;
 use letronna_core::approvals::{self, Decision, Request};
 use letronna_core::budget::Budget;
 use letronna_core::cancel::Cancel;
-use letronna_core::chat::ToolCall;
+use letronna_core::chat::{self, ToolCall};
 use letronna_core::driver::Report;
 use letronna_core::gate::{self, Gate, Grants, Mode};
 use letronna_core::permissions::{self, Rule};
@@ -91,6 +91,8 @@ struct Running {
     cancel: Cancel,
     /// What its result line says of the prompt's rules.
     prompt: Value,
+    /// What it runs over, which its result line names the model and window of.
+    connection: chat::Connection,
 }
 
 /// One line as `next_line` read it.
@@ -154,7 +156,7 @@ pub fn run(runner: &mut Runner, session: usize, args: &Args) -> i32 {
                         running = Some(turn);
                     }
                     Err(error) => {
-                        crate::show(args.output, &crate::failed(error), None);
+                        crate::show(args.output, &crate::failed(error), None, false);
                         failed = true;
                     }
                 }
@@ -255,7 +257,8 @@ pub fn run(runner: &mut Runner, session: usize, args: &Args) -> i32 {
                     (turn.id, turn.before),
                     report,
                     output,
-                    turn.prompt,
+                    (&turn.connection, turn.prompt),
+                    false,
                 );
                 failed |= !ended;
                 // A session deleted or cut short elsewhere meanwhile is not
@@ -353,6 +356,7 @@ fn start(
         before,
         cancel: spec.cancel.clone(),
         prompt: prompt_rules::seen(&spec.connection).unwrap_or_default(),
+        connection: spec.connection.clone(),
     };
     let (events, output) = (events.clone(), args.output);
     std::thread::spawn(move || {

@@ -49,7 +49,7 @@ Then `letronna mcp list`, `get <name>`, `remove <name>`, and `login <name>` or `
 - Long work: /goal (keep working until a goal is met, `--check <command>`), /loop (run a prompt every so often; /loop stop), /heartbeat (look in on this session every so many minutes), /jobs (background commands), /agents (helpers), /workflows, /crew (workflows of helpers for big tasks).
 - Cloud: just ask in chat to run or host something (a bot 24/7), check it or take it down.
 - Wallet: /wallet (the same verbs as `letronna wallet`; `/wallet chains` turns networks on or off). The agent pays a site that asks (HTTP 402, x402) with paid_fetch, or on its own within the user's auto price; wallet_send always shows its card.
-- Keeping and adding: /remember (keep something now, or change when this chat saves), /memory (`/memory edit, log or restore user|memory|project|soul`), /memory-review, /retention (delete old sessions), /init (write AGENTS.md), /skills, /mcp, /plugins.
+- Keeping and adding: /remember (keep something now, or change when this chat saves), /memory (`/memory edit, log or restore user|memory|project|soul`), /memory-review, /retention (delete old sessions), /init (write AGENTS.md), /skills, /mcp, /plugins, /tool-search.
 
 ## The window
 

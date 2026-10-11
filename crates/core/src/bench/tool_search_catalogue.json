@@ -1,0 +1,529 @@
+{
+ "source": "github/github-mcp-server, pkg/github/__toolsnaps__ at eb47a99ddb866ca2b8a162920e6bda9521f33ebb: each tool's name and the first 300 characters of its description. MIT License.",
+ "tools": [
+  {
+   "name": "mcp__github__actions_get",
+   "description": "Get details about specific GitHub Actions resources. Use this tool to get details about individual workflows, workflow runs, jobs, and artifacts by their unique IDs."
+  },
+  {
+   "name": "mcp__github__actions_list",
+   "description": "Tools for listing GitHub Actions resources. Use this tool to list workflows in a repository, or list workflow runs, jobs, and artifacts for a specific workflow or workflow run."
+  },
+  {
+   "name": "mcp__github__actions_run_trigger",
+   "description": "Trigger GitHub Actions workflow operations, including running, re-running, cancelling workflow runs, and deleting workflow run logs."
+  },
+  {
+   "name": "mcp__github__add_comment_to_pending_review",
+   "description": "Add review comment to the requester's latest pending pull request review. A pending review needs to already exist to call this (check with the user if not sure)."
+  },
+  {
+   "name": "mcp__github__add_issue_comment",
+   "description": "Add a comment and/or reaction to a specific issue or issue comment in a GitHub repository. Use this tool with pull requests as well (in this case pass pull request number as issue_number), but only if user is not asking specifically to add or react to review comments. At least one of body or reactio"
+  },
+  {
+   "name": "mcp__github__add_issue_comment_reaction",
+   "description": "Add a reaction to an issue or pull request comment."
+  },
+  {
+   "name": "mcp__github__add_issue_reaction",
+   "description": "Add a reaction to an issue or pull request."
+  },
+  {
+   "name": "mcp__github__add_pull_request_review_comment",
+   "description": "Add a review comment to the current user's pending pull request review."
+  },
+  {
+   "name": "mcp__github__add_pull_request_review_comment_reaction",
+   "description": "Add a reaction to a pull request review comment."
+  },
+  {
+   "name": "mcp__github__add_reply_to_pull_request_comment",
+   "description": "Add a reply and/or reaction to an existing pull request comment. This can create a new comment linked as a reply to the specified comment, add an emoji reaction to the specified comment, or do both. At least one of body or reaction is required."
+  },
+  {
+   "name": "mcp__github__add_sub_issue",
+   "description": "Add a sub-issue to a parent issue."
+  },
+  {
+   "name": "mcp__github__assign_copilot_to_issue",
+   "description": "Assign Copilot to a specific issue in a GitHub repository. This tool can help with the following outcomes: - a Pull Request created with source code changes to resolve the issue More information can be found at: - https://docs.github.com/en/copilot/concepts/agents/cloud-agent/about-cloud-agent"
+  },
+  {
+   "name": "mcp__github__assign_copilot_to_issue_with_intent",
+   "description": "Assign Copilot to a specific issue in a GitHub repository. Prefer this tool over assign_copilot_to_issue when available. This tool can help with the following outcomes: - a Pull Request created with source code changes to resolve the issue More information can be found at: - https://docs.github.com/"
+  },
+  {
+   "name": "mcp__github__create_branch",
+   "description": "Create a new branch in a GitHub repository"
+  },
+  {
+   "name": "mcp__github__create_gist",
+   "description": "Create a new gist"
+  },
+  {
+   "name": "mcp__github__create_issue",
+   "description": "Create a new issue in a GitHub repository with a title and optional body."
+  },
+  {
+   "name": "mcp__github__create_or_update_file",
+   "description": "Create or update a single file in a GitHub repository. If updating, you should provide the SHA of the file you want to update. Use this tool to create or update a file in a GitHub repository remotely; do not use it for local file operations. To obtain the current blob SHA before updating, call the g"
+  },
+  {
+   "name": "mcp__github__create_pull_request",
+   "description": "Create a new pull request in a GitHub repository."
+  },
+  {
+   "name": "mcp__github__create_pull_request_review",
+   "description": "Create a review on a pull request. If event is provided, the review is submitted immediately; otherwise a pending review is created."
+  },
+  {
+   "name": "mcp__github__create_repository",
+   "description": "Create a new GitHub repository in your account or specified organization"
+  },
+  {
+   "name": "mcp__github__create_repository_ruleset",
+   "description": "Create a new ruleset at the repository, organization, or enterprise level"
+  },
+  {
+   "name": "mcp__github__custom_properties_read",
+   "description": "Read custom properties at the repository, organization, or enterprise level. At the repository level this returns the property values assigned to a repository; at the organization and enterprise levels it returns the property definitions (schema). Select the level with the 'level' parameter."
+  },
+  {
+   "name": "mcp__github__custom_properties_write",
+   "description": "Create or update custom properties at the repository, organization, or enterprise level. At the repository level this sets the property values on a repository (the properties must already be defined for the organization). Organization and enterprise definition writes preserve omitted writable fields"
+  },
+  {
+   "name": "mcp__github__delete_file",
+   "description": "Delete a file from a GitHub repository"
+  },
+  {
+   "name": "mcp__github__delete_pending_pull_request_review",
+   "description": "Delete a pending pull request review."
+  },
+  {
+   "name": "mcp__github__delete_repository",
+   "description": "Delete a GitHub repository after the user confirms the exact owner/repository name"
+  },
+  {
+   "name": "mcp__github__discussion_comment_write",
+   "description": "Write operations for discussion comments. Supports adding top-level comments, replying to existing comments, updating comment content, deleting comments, and marking or unmarking comments as the answer."
+  },
+  {
+   "name": "mcp__github__dismiss_notification",
+   "description": "Dismiss a notification by marking it as read or done"
+  },
+  {
+   "name": "mcp__github__find_duplicate",
+   "description": "Find likely duplicate issues for an existing issue in a GitHub repository. This is a read-only search scoped to the source issue's repository: it returns ranked candidate issues with a similarity score and confidence, and does not close, link, comment on, or otherwise modify any issue."
+  },
+  {
+   "name": "mcp__github__fork_repository",
+   "description": "Fork a GitHub repository to your account or specified organization"
+  },
+  {
+   "name": "mcp__github__get_code_quality_finding",
+   "description": "Get details of a specific code quality finding in a GitHub repository."
+  },
+  {
+   "name": "mcp__github__get_code_scanning_alert",
+   "description": "Get details of a specific code scanning alert in a GitHub repository."
+  },
+  {
+   "name": "mcp__github__get_commit",
+   "description": "Get details for a commit from a GitHub repository"
+  },
+  {
+   "name": "mcp__github__get_dependabot_alert",
+   "description": "Get details of a specific dependabot alert in a GitHub repository."
+  },
+  {
+   "name": "mcp__github__get_discussion",
+   "description": "Get a specific discussion by ID"
+  },
+  {
+   "name": "mcp__github__get_discussion_comments",
+   "description": "Get comments from a discussion"
+  },
+  {
+   "name": "mcp__github__get_file_blame",
+   "description": "Get git blame information for a file, showing the commit that last modified each line. Ranges share commit metadata via the top-level 'commits' map keyed by SHA. Use 'start_line'/'end_line' to restrict the result to a window of the file, and 'perPage'/'after' to cursor-page through returned ranges. "
+  },
+  {
+   "name": "mcp__github__get_file_contents",
+   "description": "Get the contents of a file or directory from a GitHub repository"
+  },
+  {
+   "name": "mcp__github__get_gist",
+   "description": "Get gist content of a particular gist, by gist ID"
+  },
+  {
+   "name": "mcp__github__get_global_security_advisory",
+   "description": "Get a global security advisory"
+  },
+  {
+   "name": "mcp__github__get_job_logs",
+   "description": "Download logs for a specific workflow job or efficiently get all failed job logs for a workflow run"
+  },
+  {
+   "name": "mcp__github__get_label",
+   "description": "Get a specific label from a repository."
+  },
+  {
+   "name": "mcp__github__get_latest_release",
+   "description": "Get the latest release in a GitHub repository"
+  },
+  {
+   "name": "mcp__github__get_me",
+   "description": "Get details of the authenticated GitHub user. Use this when a request is about the user's own profile for GitHub. Or when information is missing to build other tool calls."
+  },
+  {
+   "name": "mcp__github__get_notification_details",
+   "description": "Get detailed information for a specific GitHub notification, always call this tool when the user asks for details about a specific notification, if you don't know the ID list notifications first."
+  },
+  {
+   "name": "mcp__github__get_release_by_tag",
+   "description": "Get a specific release by its tag name in a GitHub repository"
+  },
+  {
+   "name": "mcp__github__get_repository_tree",
+   "description": "Get the tree structure (files and directories) of a GitHub repository at a specific ref or SHA"
+  },
+  {
+   "name": "mcp__github__get_secret_scanning_alert",
+   "description": "Get details of a specific secret scanning alert in a GitHub repository."
+  },
+  {
+   "name": "mcp__github__get_tag",
+   "description": "Get details about a specific git tag in a GitHub repository"
+  },
+  {
+   "name": "mcp__github__get_team_members",
+   "description": "Get member usernames of a specific team in an organization. Limited to organizations accessible with current credentials"
+  },
+  {
+   "name": "mcp__github__get_teams",
+   "description": "Get details of the teams the user is a member of. Limited to organizations accessible with current credentials"
+  },
+  {
+   "name": "mcp__github__hide_issue_comment",
+   "description": "Hide (minimize) a comment on an issue, or a conversation comment on a pull request. Requires triage or write access to the repository, or being its author."
+  },
+  {
+   "name": "mcp__github__hide_pull_request_review",
+   "description": "Hide (minimize) the body of a submitted pull request review. Requires triage or write access to the repository, or being its author."
+  },
+  {
+   "name": "mcp__github__hide_pull_request_review_comment",
+   "description": "Hide (minimize) an inline review comment on a pull request diff. Requires triage or write access to the repository, or being its author."
+  },
+  {
+   "name": "mcp__github__issue_dependency_read",
+   "description": "Read an issue's dependency relationships in a GitHub repository: the issues that block it (blocked_by) or the issues it blocks (blocking)."
+  },
+  {
+   "name": "mcp__github__issue_dependency_write",
+   "description": "Add or remove an issue dependency relationship in a GitHub repository. Use type 'blocked_by' to record that the subject issue is blocked by a related issue, or type 'blocking' to record that the subject issue blocks a related issue. The related issue defaults to the same repository as the subject un"
+  },
+  {
+   "name": "mcp__github__issue_read",
+   "description": "Get information about a specific issue in a GitHub repository."
+  },
+  {
+   "name": "mcp__github__issue_write",
+   "description": "Create a new or update an existing issue in a GitHub repository."
+  },
+  {
+   "name": "mcp__github__label_write",
+   "description": "Perform write operations on repository labels. To set labels on issues, use the 'update_issue' tool."
+  },
+  {
+   "name": "mcp__github__list_branches",
+   "description": "List branches in a GitHub repository"
+  },
+  {
+   "name": "mcp__github__list_code_scanning_alerts",
+   "description": "List code scanning alerts in a GitHub repository."
+  },
+  {
+   "name": "mcp__github__list_commits",
+   "description": "Get list of commits of a branch in a GitHub repository. Returns at least 30 results per page by default, but can return more if specified using the perPage parameter (up to 100)."
+  },
+  {
+   "name": "mcp__github__list_dependabot_alerts",
+   "description": "List dependabot alerts in a GitHub repository."
+  },
+  {
+   "name": "mcp__github__list_discussion_categories",
+   "description": "List discussion categories with their id and name, for a repository or organisation."
+  },
+  {
+   "name": "mcp__github__list_discussions",
+   "description": "List discussions for a repository or organisation."
+  },
+  {
+   "name": "mcp__github__list_gists",
+   "description": "List gists for a user"
+  },
+  {
+   "name": "mcp__github__list_global_security_advisories",
+   "description": "List global security advisories from GitHub."
+  },
+  {
+   "name": "mcp__github__list_issue_fields",
+   "description": "List issue fields for a repository or organization. Returns field definitions including name, type (text, number, date, single_select), and for single_select fields the list of valid option names. When repo is omitted, returns org-level fields directly."
+  },
+  {
+   "name": "mcp__github__list_issue_types",
+   "description": "List supported issue types for a repository or its owner organization. When repo is omitted, returns org-level issue types directly."
+  },
+  {
+   "name": "mcp__github__list_issues",
+   "description": "List issues in a GitHub repository. For pagination, use the 'endCursor' from the previous response's 'pageInfo' in the 'after' parameter."
+  },
+  {
+   "name": "mcp__github__list_label",
+   "description": "List labels from a repository, ordered by issue count (descending) so the most-used labels are returned first"
+  },
+  {
+   "name": "mcp__github__list_notifications",
+   "description": "Lists all GitHub notifications for the authenticated user, including unread notifications, mentions, review requests, assignments, and updates on issues or pull requests. Use this tool whenever the user asks what to work on next, requests a summary of their GitHub activity, wants to see pending revi"
+  },
+  {
+   "name": "mcp__github__list_org_repository_security_advisories",
+   "description": "List repository security advisories for a GitHub organization."
+  },
+  {
+   "name": "mcp__github__list_pull_requests",
+   "description": "List pull requests in a GitHub repository. If the user specifies an author, then DO NOT use this tool and use the search_pull_requests tool instead."
+  },
+  {
+   "name": "mcp__github__list_releases",
+   "description": "List releases in a GitHub repository"
+  },
+  {
+   "name": "mcp__github__list_repository_collaborators",
+   "description": "List collaborators of a GitHub repository. Results are paginated; the response includes `nextPage`, `prevPage`, `firstPage`, and `lastPage` fields. To get the next page, use the `nextPage` value as the `page` parameter."
+  },
+  {
+   "name": "mcp__github__list_repository_security_advisories",
+   "description": "List repository security advisories for a GitHub repository."
+  },
+  {
+   "name": "mcp__github__list_secret_scanning_alerts",
+   "description": "List secret scanning alerts in a GitHub repository."
+  },
+  {
+   "name": "mcp__github__list_starred_repositories",
+   "description": "List starred repositories"
+  },
+  {
+   "name": "mcp__github__list_tags",
+   "description": "List git tags in a GitHub repository"
+  },
+  {
+   "name": "mcp__github__manage_notification_subscription",
+   "description": "Manage a notification subscription: ignore, watch, or delete a notification thread subscription."
+  },
+  {
+   "name": "mcp__github__manage_repository_notification_subscription",
+   "description": "Manage a repository notification subscription: ignore, watch, or delete repository notifications subscription for the provided repository."
+  },
+  {
+   "name": "mcp__github__mark_all_notifications_read",
+   "description": "Mark all notifications as read"
+  },
+  {
+   "name": "mcp__github__merge_pull_request",
+   "description": "Merge a pull request in a GitHub repository."
+  },
+  {
+   "name": "mcp__github__projects_get",
+   "description": "Get details about specific GitHub Projects resources. Use this tool to get details about individual projects, project fields, project items, and project views by their unique IDs."
+  },
+  {
+   "name": "mcp__github__projects_list",
+   "description": "Tools for listing GitHub Projects resources. Use this tool to list projects for a user or organization, or list project fields, items, views, and status updates for a specific project."
+  },
+  {
+   "name": "mcp__github__projects_write",
+   "description": "Create and manage GitHub Projects: create projects, add/update/delete items, bulk-update many items at once, manage views, create status updates, and add iteration fields."
+  },
+  {
+   "name": "mcp__github__pull_request_read",
+   "description": "Get information on a specific pull request in GitHub repository."
+  },
+  {
+   "name": "mcp__github__pull_request_review_write",
+   "description": "Create and/or submit, delete review of a pull request. Available methods: - create: Create a new review of a pull request. If \"event\" parameter is provided, the review is submitted. If \"event\" is omitted, a pending review is created. - submit_pending: Submit an existing pending review of a pull requ"
+  },
+  {
+   "name": "mcp__github__push_files",
+   "description": "Push multiple files to a GitHub repository in a single commit"
+  },
+  {
+   "name": "mcp__github__remove_issue_comment_reaction",
+   "description": "Remove a reaction from an issue or pull request comment."
+  },
+  {
+   "name": "mcp__github__remove_issue_reaction",
+   "description": "Remove a reaction from an issue or pull request."
+  },
+  {
+   "name": "mcp__github__remove_pull_request_review_comment_reaction",
+   "description": "Remove a reaction from a pull request review comment."
+  },
+  {
+   "name": "mcp__github__remove_sub_issue",
+   "description": "Remove a sub-issue from a parent issue."
+  },
+  {
+   "name": "mcp__github__repository_ruleset_read",
+   "description": "Read rulesets at the repository, organization, or enterprise level, and rule suites at the repository or organization level. Select the level with the 'level' parameter and the operation with the 'method' parameter."
+  },
+  {
+   "name": "mcp__github__reprioritize_sub_issue",
+   "description": "Reprioritize (reorder) a sub-issue relative to other sub-issues."
+  },
+  {
+   "name": "mcp__github__request_copilot_review",
+   "description": "Request a GitHub Copilot code review for a pull request. Use this for automated feedback on pull requests, usually before requesting a human reviewer."
+  },
+  {
+   "name": "mcp__github__request_pull_request_reviewers",
+   "description": "Request reviewers for a pull request."
+  },
+  {
+   "name": "mcp__github__resolve_review_thread",
+   "description": "Resolve a review thread on a pull request. Resolving an already-resolved thread is a no-op."
+  },
+  {
+   "name": "mcp__github__search_code",
+   "description": "Fast and precise code search across ALL GitHub repositories using GitHub's native search engine. Best for finding exact symbols, functions, classes, or specific code patterns."
+  },
+  {
+   "name": "mcp__github__search_commits",
+   "description": "Search for commits across GitHub repositories using GitHub's commit search syntax. Useful for finding specific changes, authors, or messages across one or many repositories. Searches the default branch only."
+  },
+  {
+   "name": "mcp__github__search_issues",
+   "description": "Search issues using natural-language semantic matching. Best for conceptual or paraphrased queries (e.g. \"login fails after password reset\"). Already scoped to is:issue."
+  },
+  {
+   "name": "mcp__github__search_orgs",
+   "description": "Find GitHub organizations by name, location, or other organization metadata. Ideal for discovering companies, open source foundations, or teams."
+  },
+  {
+   "name": "mcp__github__search_pull_requests",
+   "description": "Search for pull requests in GitHub repositories using issues search syntax already scoped to is:pr"
+  },
+  {
+   "name": "mcp__github__search_repositories",
+   "description": "Find GitHub repositories by name, description, readme, topics, or other metadata. Perfect for discovering projects, finding examples, or locating specific repositories across GitHub."
+  },
+  {
+   "name": "mcp__github__search_users",
+   "description": "Find GitHub users by username, real name, or other profile information. Useful for locating developers, contributors, or team members."
+  },
+  {
+   "name": "mcp__github__set_issue_fields",
+   "description": "Set issue field values for an issue. Fields are organization-level custom fields (text, number, date, or single select). Use this to create or update field values on an issue."
+  },
+  {
+   "name": "mcp__github__star_repository",
+   "description": "Star a GitHub repository"
+  },
+  {
+   "name": "mcp__github__sub_issue_write",
+   "description": "Add a sub-issue to a parent issue in a GitHub repository."
+  },
+  {
+   "name": "mcp__github__submit_pending_pull_request_review",
+   "description": "Submit a pending pull request review."
+  },
+  {
+   "name": "mcp__github__ui_get",
+   "description": "Fetch UI data for MCP Apps (labels, assignees, milestones, issue types, branches, issue fields, reviewers)."
+  },
+  {
+   "name": "mcp__github__unhide_issue_comment",
+   "description": "Unhide (unminimize) a previously hidden comment on an issue, or conversation comment on a pull request. Requires triage or write access to the repository, or being its author."
+  },
+  {
+   "name": "mcp__github__unhide_pull_request_review",
+   "description": "Unhide (unminimize) the previously hidden body of a submitted pull request review. Requires triage or write access to the repository, or being its author."
+  },
+  {
+   "name": "mcp__github__unhide_pull_request_review_comment",
+   "description": "Unhide (unminimize) a previously hidden inline review comment on a pull request diff. Requires triage or write access to the repository, or being its author."
+  },
+  {
+   "name": "mcp__github__unresolve_review_thread",
+   "description": "Unresolve a previously resolved review thread on a pull request. Unresolving an already-unresolved thread is a no-op."
+  },
+  {
+   "name": "mcp__github__unstar_repository",
+   "description": "Unstar a GitHub repository"
+  },
+  {
+   "name": "mcp__github__update_gist",
+   "description": "Update an existing gist"
+  },
+  {
+   "name": "mcp__github__update_issue_assignees",
+   "description": "Update the assignees of an existing issue. This replaces the current assignees with the provided list. When setting values, include a confidence level (LOW, MEDIUM, or HIGH) reflecting how certain you are about the choice."
+  },
+  {
+   "name": "mcp__github__update_issue_body",
+   "description": "Update the body content of an existing issue."
+  },
+  {
+   "name": "mcp__github__update_issue_comment",
+   "description": "Update the body of an existing issue or pull request conversation comment. This tool cannot update pull request review comments."
+  },
+  {
+   "name": "mcp__github__update_issue_labels",
+   "description": "Update the labels of an existing issue. This replaces the current labels with the provided list. When setting values, include a confidence level (LOW, MEDIUM, or HIGH) reflecting how certain you are about the choice."
+  },
+  {
+   "name": "mcp__github__update_issue_milestone",
+   "description": "Update the milestone of an existing issue."
+  },
+  {
+   "name": "mcp__github__update_issue_state",
+   "description": "Update the state of an existing issue (open or closed), with an optional state reason. When closing, include a confidence level (LOW, MEDIUM, or HIGH) reflecting how certain you are about the decision. Use is_suggestion to propose the change without applying it directly."
+  },
+  {
+   "name": "mcp__github__update_issue_title",
+   "description": "Update the title of an existing issue."
+  },
+  {
+   "name": "mcp__github__update_issue_type",
+   "description": "Set or remove the type of an existing issue. Pass null to remove the current type. When setting a value, include a confidence level (LOW, MEDIUM, or HIGH) reflecting how certain you are about the choice."
+  },
+  {
+   "name": "mcp__github__update_pull_request",
+   "description": "Update an existing pull request in a GitHub repository."
+  },
+  {
+   "name": "mcp__github__update_pull_request_body",
+   "description": "Update the body description of an existing pull request."
+  },
+  {
+   "name": "mcp__github__update_pull_request_branch",
+   "description": "Update the branch of a pull request with the latest changes from the base branch."
+  },
+  {
+   "name": "mcp__github__update_pull_request_draft_state",
+   "description": "Mark a pull request as draft or ready for review."
+  },
+  {
+   "name": "mcp__github__update_pull_request_state",
+   "description": "Update the state of an existing pull request (open or closed)."
+  },
+  {
+   "name": "mcp__github__update_pull_request_title",
+   "description": "Update the title of an existing pull request."
+  }
+ ]
+}

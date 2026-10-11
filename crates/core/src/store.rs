@@ -113,8 +113,8 @@ pub struct Conversation {
     /// and kept this copy's over theirs, so the window can say so.
     #[serde(skip)]
     pub diverged: bool,
-    /// Where this session came from, for one imported from Claude Code or
-    /// Codex rather than started here.
+    /// Where this session came from, for one imported from another tool, or
+    /// from a Letronna export, rather than started here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imported_from: Option<crate::import::Source>,
     /// The summaries the user asked for that still hold, oldest first: how
@@ -524,6 +524,18 @@ pub struct Settings {
     /// add a key.
     #[serde(default = "yes")]
     pub keyless_search: bool,
+    /// How find_tools ranks the tools it finds: "auto" or empty for Jev
+    /// where it can be reached and the chat is hosted anyway, "jev" for Jev
+    /// wherever it can be reached, "names" for the words alone (`jev`).
+    #[serde(default)]
+    pub tool_search: String,
+    /// Where Jev is asked: empty for the user's Letronna account, or a
+    /// System One address of their own, with its key in the `Jev` slot.
+    #[serde(default)]
+    pub jev_endpoint: String,
+    /// The Jev model asked; empty for jev-latest.
+    #[serde(default)]
+    pub jev_model: String,
 }
 
 // Written out rather than derived so the film grain, motion, notifications,
@@ -552,6 +564,9 @@ impl Default for Settings {
             memory_saving: crate::memory::Saving::WhenAsked,
             memory_scope: crate::memory::Scope::Auto,
             keyless_search: true,
+            tool_search: String::new(),
+            jev_endpoint: String::new(),
+            jev_model: String::new(),
             gateway: String::new(),
             custom_endpoint: String::new(),
             presence: String::new(),
@@ -878,7 +893,7 @@ impl Store {
     pub fn model(&self, index: usize) -> (&str, &str) {
         let own = self.conversations.get(index).and_then(|c| {
             let (gateway, model) = (c.gateway.as_deref()?, c.model.as_deref()?);
-            let offered = crate::gateway::GATEWAYS.iter().any(|g| g.name == gateway);
+            let offered = crate::gateway::offered(gateway);
             (offered && !model.is_empty()).then_some((gateway, model))
         });
         own.unwrap_or((&self.settings.gateway, &self.settings.model))
@@ -1216,6 +1231,12 @@ impl Conversation {
     /// without what a rewind took back.
     fn flush(&mut self) -> std::io::Result<()> {
         if self.gone {
+            return Ok(());
+        }
+        // A session nothing was said in yet is not one: it gets its file with
+        // its first message, as the terminal's does, rather than being listed
+        // empty everywhere the moment New session is clicked.
+        if self.written.is_none() && self.messages.is_empty() {
             return Ok(());
         }
         self.append_to(&session_path(self.id), true)
@@ -3344,14 +3365,15 @@ fn from_saved(mut saved: serde_json::Value) -> Option<Settings> {
 
 /// A gateway that is no longer offered moves to the Letronna account. Its
 /// model is dropped too, since that id belonged to the old gateway; an empty
-/// model is picked again from the new list.
+/// model is picked again from the new list. One a plugin added stays while
+/// the plugin is on, which in the window is before the settings are read.
 fn retire_gateway(s: &mut Settings) {
     use crate::gateway::{GATEWAYS, LETRONNA};
     // Saves from before Custom had its own field kept its URL in `endpoint`.
     if s.gateway == "Custom" && s.custom_endpoint.is_empty() {
         s.custom_endpoint = s.endpoint.clone();
     }
-    if s.gateway.is_empty() || GATEWAYS.iter().any(|g| g.name == s.gateway) {
+    if s.gateway.is_empty() || crate::gateway::offered(&s.gateway) {
         return;
     }
     s.gateway = LETRONNA.into();
@@ -3383,6 +3405,29 @@ more"
             "Untitled session"
         );
         assert_eq!(name_from(&"x".repeat(50)).len(), 40);
+    }
+
+    #[test]
+    fn a_gateway_a_plugin_added_stays_while_it_is_offered() {
+        crate::gateway::add(crate::gateway::Added {
+            name: "Plugged in",
+            base: "http://127.0.0.1:9/v1".into(),
+            key: String::new(),
+            responses: false,
+        });
+        let mut s = Settings {
+            gateway: "Plugged in".into(),
+            model: "some-model".into(),
+            ..Default::default()
+        };
+        retire_gateway(&mut s);
+        crate::gateway::remove("Plugged in");
+        assert_eq!(
+            (s.gateway.as_str(), s.model.as_str()),
+            ("Plugged in", "some-model")
+        );
+        retire_gateway(&mut s);
+        assert_eq!(s.gateway, "Letronna");
     }
 
     #[test]
@@ -6787,6 +6832,45 @@ pub(crate) mod tests {
         assert_eq!(back.messages.len(), 1);
         // A new session's number counts it as taken.
         assert_eq!(super::load().next_id(), 7);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_new_session_gets_its_file_with_its_first_message() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("first-message");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        let id = store.reserve_id();
+        store.conversations.push(Conversation {
+            id,
+            title: "New session".into(),
+            ..Default::default()
+        });
+        // Saved as anything else changing saves, with nothing said yet.
+        store.save().unwrap();
+        assert!(summaries().iter().all(|s| s.id != id), "listed empty");
+        let reserved = std::fs::metadata(super::session_path(id)).unwrap();
+        assert_eq!(reserved.len(), 0);
+
+        store.conversations[0]
+            .messages
+            .push(said("user", "the first question"));
+        store.save().unwrap();
+        assert!(summaries().iter().any(|s| s.id == id && s.messages == 1));
+
+        // One left unsent still gives its number back on the way out.
+        let unsent = store.reserve_id();
+        store.conversations.push(Conversation {
+            id: unsent,
+            title: "New session".into(),
+            ..Default::default()
+        });
+        store.save().unwrap();
+        store.release_unused();
+        assert!(!super::session_path(unsent).exists());
+        assert!(super::session_path(id).exists());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
