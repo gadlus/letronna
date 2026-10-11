@@ -666,6 +666,10 @@ struct Budget {
     /// Sent again after an overflow: every tool result but the newest few
     /// goes out cleared, and another overflow stands.
     squeezed: bool,
+    /// The turn's older calls go out without their reasoning once it comes
+    /// to a chunk, as `reasoning_before` places the cut; the
+    /// `reasoning_replay` setting turns it on.
+    chunked_reasoning: bool,
 }
 
 impl Budget {
@@ -678,6 +682,7 @@ impl Budget {
         tool_chars: MAX_TOOL_CHARS,
         reply: REPLY_TOKENS,
         squeezed: false,
+        chunked_reasoning: false,
     };
 }
 
@@ -711,7 +716,10 @@ fn budget(connection: &Connection, sizing: crate::store::Sizing) -> Budget {
         + crate::subfolders::reserve(connection)
         + crate::browser::reserve(connection);
     let context = facts.context.or_else(|| assumed_window(connection));
-    sized(context, facts.max_output, cap_tokens(cap), fixed)
+    Budget {
+        chunked_reasoning: sizing.chunked_reasoning,
+        ..sized(context, facts.max_output, cap_tokens(cap), fixed)
+    }
 }
 
 /// The most tokens a request carries besides the reply under a cap of `cap`
@@ -946,6 +954,7 @@ fn sized(context: Option<u64>, output: Option<u64>, cap: usize, fixed: usize) ->
         tool_chars: (room / 2).max(MAX_TOOL_CHARS),
         reply,
         squeezed: false,
+        chunked_reasoning: false,
     }
 }
 
@@ -1677,17 +1686,24 @@ fn body_hashed(
     let stubs = stubs(window, old, budget.squeezed);
     let hints = crate::subfolders::hints(window, connection);
     let turn = window.iter().rposition(opens_turn);
+    let cut = reasoning_before(window, budget, connection, turn, old);
     if let Some(prefix) = prefix.as_deref_mut() {
         // What changes in messages sent before: the results and writes
         // before `old` go out cleared, and on a route that wants reasoning
-        // back, the newest call whose reasoning went back in its own turn
-        // goes out without it once another turn starts.
+        // back, the turn's calls before `cut` go out without theirs, the
+        // newest call whose reasoning went back in its own turn goes
+        // without it once another turn starts, and every call gets its own
+        // once the route turns an empty one down.
         let emptied = turn.and_then(|start| {
             window[..start]
                 .iter()
                 .rposition(|m| echoes_reasoning(m, connection, true) && !m.reasoning.is_empty())
         });
-        prefix.set(crate::cache_miss::Reason::History, (old, emptied));
+        let kept = has_quirk(connection, Quirk::KeepOldReasoning);
+        prefix.set(
+            crate::cache_miss::Reason::History,
+            (old, cut, emptied, kept),
+        );
     }
     // Once, so the calls in the history and the array agree on which tools
     // go out on demand.
@@ -1712,7 +1728,8 @@ fn body_hashed(
             continue;
         }
         let mut wired = wire_message(m, budget.tool_chars);
-        carry_back(&mut wired, m, connection, in_turn(turn, i));
+        let this_turn = in_turn(turn, i);
+        carry_back(&mut wired, m, connection, this_turn, this_turn && i < cut);
         if let Some(stub) = &stubs[i] {
             wired["content"] = stub.as_str().into();
         }
@@ -2156,6 +2173,11 @@ enum Quirk {
     /// Everything `carry_back` adds, which a strict server may not take; on
     /// Anthropic's API, the binding beta too, which is only for what it adds.
     Replay,
+    /// An empty `reasoning_content` on the turn's older calls, which a route
+    /// that reads every call's turned down: from then on each call of the
+    /// model's goes out with its own, across turns, as DeepSeek's own API
+    /// describes, and `reasoning_before` cuts none.
+    KeepOldReasoning,
     /// Anthropic's adaptive thinking, which a model that thinks only on a
     /// budget turns down; the chat body has no field for it.
     Thinking,
@@ -2286,6 +2308,8 @@ fn apply_quirk(body: &mut Value, quirk: Quirk) -> bool {
         Quirk::Thinking => false,
         // Not fields of the chat body: `to_responses` reads them.
         Quirk::Responses | Quirk::Summary => false,
+        // No field either: `echoes_reasoning` and `reasoning_before` read it.
+        Quirk::KeepOldReasoning => false,
     }
 }
 
@@ -2349,6 +2373,21 @@ fn learn(connection: &Connection, sent: &Value, error: &str) -> bool {
     // An HTML error page from a proxy says image in its icons and previews.
     let json = serde_json::from_str::<Value>(error).is_ok();
     let error = error.to_lowercase().replace('_', "");
+    let (endpoint, model) = route(connection);
+    // A route that reads the turn's older reasoning after all, and was sent
+    // none of it: the next request carries every call's, which is another
+    // request from the one refused, so it goes once more before the field
+    // itself is given up on. Once: that request carries no empty one of the
+    // turn's, so a refusal of it falls through to the field.
+    if error.contains("reasoningcontent")
+        && sends_older_reasoning_empty(sent)
+        && learned().lock().is_ok_and(|mut quirks| {
+            quirks.insert((endpoint.clone(), model.clone(), Quirk::KeepOldReasoning));
+            true
+        })
+    {
+        return true;
+    }
     let mut learned_any = false;
     // Not "vision": it is also in "provisioned", as in a throughput limit.
     let about_images = json
@@ -2359,7 +2398,6 @@ fn learn(connection: &Connection, sent: &Value, error: &str) -> bool {
         forget_images(&connection.model);
         learned_any = !sees_images(&connection.model);
     }
-    let (endpoint, model) = route(connection);
     for (quirk, field) in QUIRKS {
         // A request that went out alongside this one may have learned it
         // first; this one still goes again without it.
@@ -2374,6 +2412,32 @@ fn learn(connection: &Connection, sent: &Value, error: &str) -> bool {
         }
     }
     learned_any
+}
+
+/// Whether the request `sent` carried a call of the turn in progress with an
+/// empty `reasoning_content` ahead of one with its reasoning: what
+/// `reasoning_before` makes of a long turn, and the one shape of request a
+/// route that reads every call's reasoning turns down over the field.
+fn sends_older_reasoning_empty(sent: &Value) -> bool {
+    let Some(messages) = sent["messages"].as_array() else {
+        return false;
+    };
+    let turn = messages
+        .iter()
+        .rposition(|m| m["role"] == "user")
+        .unwrap_or(0);
+    let mut emptied = false;
+    for call in messages[turn..]
+        .iter()
+        .filter(|m| m["role"] == "assistant" && m["tool_calls"].is_array())
+    {
+        match call["reasoning_content"].as_str() {
+            Some("") => emptied = true,
+            Some(_) if emptied => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// What a refusal from Anthropic's API names when the field at fault is one
@@ -2799,14 +2863,17 @@ fn wants_reasoning(connection: &Connection) -> bool {
 
 /// Whether `m` goes out over `connection` with its reasoning: a call made
 /// in the turn in progress (`this_turn`) by the model the request goes to,
-/// on a route that wants it back. `carry_back` sends it by this and the
-/// estimate counts it by this, so the window is sized by what is sent.
+/// on a route that wants it back, or in any turn once the route has turned
+/// an empty one down (`Quirk::KeepOldReasoning`). `carry_back` sends it by
+/// this and the estimate counts it by this, so the window is sized by what
+/// is sent; what `reasoning_before` cuts the estimate counts still, so that
+/// a cut never moves the window or the old results.
 fn echoes_reasoning(m: &Message, connection: &Connection, this_turn: bool) -> bool {
-    this_turn
-        && m.role == "assistant"
+    m.role == "assistant"
         && !m.tool_calls.is_empty()
         && m.model.trim() == connection.model.trim()
         && wants_reasoning(connection)
+        && (this_turn || has_quirk(connection, Quirk::KeepOldReasoning))
 }
 
 /// Whether the message at `at` is in the turn that starts at `turn`, the
@@ -2819,8 +2886,10 @@ fn in_turn(turn: Option<usize>, at: usize) -> bool {
 /// reasoning details and thought signatures it sent, to the endpoint and
 /// model that sent them and no other. A route that wants reasoning back
 /// gets it on every call of the turn in progress, and an empty one on older
-/// calls, whose reasoning it no longer reads.
-fn carry_back(wired: &mut Value, m: &Message, connection: &Connection, this_turn: bool) {
+/// calls, whose reasoning it no longer reads; a call of the turn that
+/// `reasoning_before` has `cut` goes out as an older call does, its details
+/// left out too, since on a gateway those are the same reasoning again.
+fn carry_back(wired: &mut Value, m: &Message, connection: &Connection, this_turn: bool, cut: bool) {
     if m.role != "assistant" {
         return;
     }
@@ -2830,7 +2899,7 @@ fn carry_back(wired: &mut Value, m: &Message, connection: &Connection, this_turn
         .as_ref()
         .filter(|r| r.endpoint == endpoint && r.model == model)
     {
-        if !replay.reasoning_details.is_empty() {
+        if !replay.reasoning_details.is_empty() && !cut {
             wired["reasoning_details"] = replay.reasoning_details.clone().into();
         }
         for (at, call) in m.tool_calls.iter().enumerate() {
@@ -2845,7 +2914,7 @@ fn carry_back(wired: &mut Value, m: &Message, connection: &Connection, this_turn
         }
     }
     if !m.tool_calls.is_empty() && wants_reasoning(connection) {
-        let own = echoes_reasoning(m, connection, this_turn);
+        let own = !cut && echoes_reasoning(m, connection, this_turn);
         wired["reasoning_content"] = if own { m.reasoning.as_str() } else { "" }.into();
     }
 }
@@ -2919,6 +2988,70 @@ fn old_before(window: &[Message], budget: &Budget, route: Option<&Connection>) -
     // the old part ends at.
     let crossing = sums.partition_point(|&sum| sum <= target) - 1;
     round(crossing).unwrap_or(0)
+}
+
+/// The newest calls of the turn whose reasoning always goes back whole,
+/// however long the turn has thought: the model carries on from them.
+const KEEP_REASONING: usize = 2;
+/// The least reasoning, in estimated tokens, one move of the reasoning cut
+/// stops sending: a move changes calls already sent, so the prompt cache
+/// misses from the first of them on, and under this much a miss costs more
+/// than the tokens it saves.
+const REASONING_CHUNK: usize = 8_000;
+
+/// Where the calls of the turn in progress that go out without their
+/// reasoning end, for a request over `connection` under `budget`: 0, every
+/// call with its own, unless the budget sends the turn's reasoning in
+/// chunks, as the `reasoning_replay` setting asks, and 0 again once the
+/// route has turned an empty one down (`Quirk::KeepOldReasoning`).
+///
+/// The turn's calls stop carrying their reasoning from the oldest on, once
+/// what the turn has thought, less the newest `KEEP_REASONING` calls', comes
+/// to a chunk of `REASONING_CHUNK` tokens or an eighth of the room, and then
+/// a whole chunk at a time, so the requests between two moves are identical
+/// from the front: the cut is at the first call to take the count past the
+/// last whole chunk, which keeps its own, so that calls arriving never move
+/// it until they make another chunk. It goes no nearer than the
+/// `KEEP_REASONING`-th newest call, which keeps the round the model has not
+/// answered whole, and no earlier than `old`, since the calls before there
+/// have their results cleared and are rewritten with them already, so a
+/// move of the old results and a cut make one rewrite rather than two.
+/// Stateless, as `old_before` is: the estimate counts the reasoning whether
+/// or not it is sent, so a move here never moves `old`.
+fn reasoning_before(
+    window: &[Message],
+    budget: &Budget,
+    connection: &Connection,
+    turn: Option<usize>,
+    old: usize,
+) -> usize {
+    if !budget.chunked_reasoning || has_quirk(connection, Quirk::KeepOldReasoning) {
+        return 0;
+    }
+    let calls: Vec<usize> = (0..window.len())
+        .filter(|&i| in_turn(turn, i) && echoes_reasoning(&window[i], connection, true))
+        .collect();
+    let Some(older) = calls.len().checked_sub(KEEP_REASONING).filter(|&n| n > 0) else {
+        return 0;
+    };
+    let limit = calls[older];
+    let cost = |i: usize| tokens(&window[i].reasoning);
+    let chunk = (budget.room / 8).max(REASONING_CHUNK);
+    let thought: usize = calls[..older].iter().map(|&i| cost(i)).sum();
+    let target = thought / chunk * chunk;
+    let mut counted = 0;
+    let mut crossing = limit;
+    for &i in &calls {
+        counted += cost(i);
+        if counted > target {
+            crossing = i;
+            break;
+        }
+    }
+    let cut = crossing.max(old).min(limit);
+    // A cut at the turn's first call leaves every call its reasoning, and
+    // says so as 0, so that the history is hashed by what the wire carries.
+    if cut > calls[0] { cut } else { 0 }
 }
 
 /// What goes on the wire instead of each tool result in `window`, where
@@ -11975,6 +12108,309 @@ mod tests {
                 .iter()
                 .all(|m| m.get("reasoning_content").is_none())
         );
+        // Sent in chunks of 8,000 tokens, a turn whose calls have thought
+        // 2,000 each carries all of them until the sixth: then the four
+        // oldest, a whole chunk, go out empty and the newest two keep theirs.
+        let full = sized(Some(128_000), None, CAP_TOKENS, 0);
+        let chunked = Budget {
+            chunked_reasoning: true,
+            ..full
+        };
+        let mut window = window[..5].to_vec();
+        for id in ["d", "e", "f", "g", "h", "i"] {
+            window.push(Message {
+                reasoning: "Hmm. ".repeat(1_600),
+                ..thought_then_called(id, "deepseek-reasoner")
+            });
+            window.push(result_of(id));
+        }
+        let sent_with = |budget: &Budget, upto: usize| {
+            let sent = body_with(&c, &window[..upto], None, None, budget, &[]);
+            (0..upto)
+                .map(|i| sent["messages"][i + 1]["reasoning_content"].clone())
+                .collect::<Vec<Value>>()
+        };
+        let own = |i: usize| json!(window[i].reasoning);
+        let two = sent_with(&chunked, 9);
+        assert_eq!((&two[5], &two[7]), (&own(5), &own(7)));
+        let six = sent_with(&chunked, 17);
+        assert_eq!(six[1], "");
+        assert_eq!(
+            six[5..=11],
+            [
+                json!(""),
+                Value::Null,
+                json!(""),
+                Value::Null,
+                json!(""),
+                Value::Null,
+                json!("")
+            ]
+        );
+        assert_eq!((&six[13], &six[15]), (&own(13), &own(15)));
+        assert_eq!(
+            sent_with(&full, 17)[5..],
+            (5..17)
+                .map(|i| if window[i].role == "assistant" {
+                    own(i)
+                } else {
+                    Value::Null
+                })
+                .collect::<Vec<Value>>()[..]
+        );
+        // The estimate counts what the cut leaves out, so it moves nothing.
+        let counted = token_sums(&window, chunked.tool_chars, Some(&c));
+        let without = token_sums(&window, chunked.tool_chars, None);
+        assert_eq!(counted[17] - without[17], tokens(&window[5].reasoning) * 6);
+        assert_eq!(old_before(&window, &chunked, Some(&c)), 0);
+        // A route that is sent no reasoning sees no cut either.
+        for model in ["qwen3:8b", "gpt-5"] {
+            let other = Connection {
+                model: model.into(),
+                ..connection()
+            };
+            let sent = body_with(&other, &window, None, None, &chunked, &[]);
+            let messages = sent["messages"].as_array().unwrap();
+            assert!(
+                messages
+                    .iter()
+                    .all(|m| m.get("reasoning_content").is_none()),
+                "{model}"
+            );
+        }
+    }
+
+    /// `reads`, made by `model` with the reasoning `thought` gives each
+    /// call by its number.
+    fn reasoned_reads(
+        files: usize,
+        chars: usize,
+        model: &str,
+        thought: impl Fn(usize) -> String,
+    ) -> Vec<Message> {
+        let mut turn = reads(files, chars);
+        for (n, m) in turn
+            .iter_mut()
+            .filter(|m| m.role == "assistant")
+            .enumerate()
+        {
+            m.model = model.into();
+            m.reasoning = thought(n);
+        }
+        turn
+    }
+
+    /// The cached prefix a request for `window` over `c` under `budget` is
+    /// hashed by.
+    fn prefix_of(c: &Connection, window: &[Message], budget: &Budget) -> crate::cache_miss::Prefix {
+        let mut prefix = crate::cache_miss::Prefix::default();
+        let extra = Extra::default();
+        body_hashed(
+            c,
+            window,
+            (None, None),
+            None,
+            budget,
+            &extra,
+            Some(&mut prefix),
+        );
+        prefix
+    }
+
+    #[test]
+    fn the_turns_reasoning_is_cut_only_where_a_whole_chunk_is_crossed() {
+        let c = Connection {
+            model: "deepseek-reasoner".into(),
+            ..connection()
+        };
+        // Calls that thought from 625 to 875 tokens each, no two rounds
+        // alike, in a window the results alone never fill.
+        let turn = reasoned_reads(40, 200, &c.model, |n| {
+            format!("Reading {n}. {}", "Hmm. ".repeat(500 + 40 * (n % 7)))
+        });
+        let full = sized(Some(128_000), None, CAP_TOKENS, 0);
+        let chunked = Budget {
+            chunked_reasoning: true,
+            ..full
+        };
+        assert_eq!(old_before(&turn, &chunked, Some(&c)), 0);
+        assert!(prefix_breaks(&requests_by_round(&c, &turn, &full)).is_empty());
+        let requests = requests_by_round(&c, &turn, &chunked);
+        // Where the reasoning of every call but the newest two crosses into
+        // another whole chunk, counted by the round, from 1.
+        let thought: Vec<usize> = (1..turn.len())
+            .step_by(2)
+            .map(|at| tokens(&turn[at].reasoning))
+            .collect();
+        let chunks: Vec<usize> = (1..=thought.len())
+            .map(|k| thought[..k.saturating_sub(2)].iter().sum::<usize>() / REASONING_CHUNK)
+            .collect();
+        let crossed: Vec<usize> = (1..chunks.len())
+            .filter(|&n| chunks[n] != chunks[n - 1])
+            .map(|n| n + 1)
+            .collect();
+        assert!(crossed.len() >= 3, "{crossed:?}");
+        // Between two crossings every request begins with the bytes of the
+        // one before it, and the hash of the history says the same.
+        assert_eq!(prefix_breaks(&requests), crossed);
+        let hashed: Vec<usize> = (1..40)
+            .filter(|&n| {
+                prefix_of(&c, &turn[..2 * n + 3], &chunked)
+                    != prefix_of(&c, &turn[..2 * n + 1], &chunked)
+            })
+            .map(|n| n + 1)
+            .collect();
+        assert_eq!(hashed, crossed);
+        // Each move cuts more, never less, in whole chunks, and the newest
+        // two calls, the round the model has not answered among them, keep
+        // their reasoning every time.
+        let mut cuts = 0;
+        for (n, wire) in requests.iter().enumerate() {
+            let messages: Vec<Value> = serde_json::from_str(wire).unwrap();
+            let sent: Vec<&Value> = messages
+                .iter()
+                .filter(|m| m["role"] == "assistant")
+                .map(|m| &m["reasoning_content"])
+                .collect();
+            let empty = sent.iter().take_while(|r| **r == "").count();
+            assert!(sent[empty..].iter().all(|r| **r != ""), "round {}", n + 1);
+            assert!(sent.len() - empty >= sent.len().min(2), "round {}", n + 1);
+            assert!(empty >= cuts, "round {}", n + 1);
+            assert!(thought[..empty].iter().sum::<usize>() <= chunks[n] * REASONING_CHUNK);
+            cuts = empty;
+        }
+        assert!(cuts > 0);
+    }
+
+    #[test]
+    fn the_cut_follows_the_old_results_in_the_same_rewrite() {
+        let c = Connection {
+            model: "deepseek-reasoner".into(),
+            ..connection()
+        };
+        // A turn whose reasoning never comes to a chunk, in a window the
+        // results fill: the old results move, and the cut goes with them.
+        let turn = reasoned_reads(12, 2_000, &c.model, |n| {
+            format!("Reading {n}. {}", "Hmm. ".repeat(400))
+        });
+        let full = Budget::SMALL;
+        let chunked = Budget {
+            chunked_reasoning: true,
+            ..full
+        };
+        let plain = requests_by_round(&c, &turn, &full);
+        let requests = requests_by_round(&c, &turn, &chunked);
+        let breaks = prefix_breaks(&plain);
+        assert!(!breaks.is_empty());
+        assert_eq!(prefix_breaks(&requests), breaks);
+        let mut moved = false;
+        for (n, (plain, wire)) in plain.iter().zip(&requests).enumerate() {
+            let window = &turn[..2 * n + 3];
+            let old = old_before(window, &chunked, Some(&c));
+            moved |= old > 0;
+            let plain: Vec<Value> = serde_json::from_str(plain).unwrap();
+            let messages: Vec<Value> = serde_json::from_str(wire).unwrap();
+            for (i, m) in window
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.role == "assistant")
+            {
+                // The calls before the old results go without their
+                // reasoning, and only those; sent whole, every call has it.
+                let expected = if i < old { "" } else { m.reasoning.as_str() };
+                assert_eq!(
+                    messages[i + 1]["reasoning_content"],
+                    expected,
+                    "round {} call {i}",
+                    n + 1
+                );
+                assert_eq!(
+                    plain[i + 1]["reasoning_content"],
+                    m.reasoning,
+                    "round {} call {i}",
+                    n + 1
+                );
+            }
+        }
+        assert!(moved);
+    }
+
+    #[test]
+    fn a_route_that_refuses_an_empty_reasoning_is_sent_every_calls_once_more() {
+        let c = Connection {
+            endpoint: "https://strict.example/v1".into(),
+            model: "deepseek-reasoner".into(),
+            ..connection()
+        };
+        let asked = |text: &str| Message {
+            role: "user".into(),
+            content: text.into(),
+            ..Default::default()
+        };
+        let mut first = thought_then_called("a", &c.model);
+        first.replay = Some(Box::new(Replay {
+            endpoint: c.endpoint.clone(),
+            model: c.model.clone(),
+            reasoning_details: vec![json!({"type": "reasoning.text", "text": "t", "index": 0})],
+            extra_content: BTreeMap::new(),
+            reasoning_items: Vec::new(),
+        }));
+        let mut window = vec![
+            asked("Read a.rs"),
+            first,
+            result_of("a"),
+            Message {
+                role: "assistant".into(),
+                content: "Done.".into(),
+                ..Default::default()
+            },
+            asked("Now the rest"),
+        ];
+        for id in ["d", "e", "f", "g", "h", "i"] {
+            window.push(Message {
+                reasoning: "Hmm. ".repeat(1_600),
+                ..thought_then_called(id, &c.model)
+            });
+            window.push(result_of(id));
+        }
+        let chunked = Budget {
+            chunked_reasoning: true,
+            ..sized(Some(128_000), None, CAP_TOKENS, 0)
+        };
+        let sent = body_with(&c, &window, None, None, &chunked, &[]);
+        let reasoning = |sent: &Value| -> Vec<Value> {
+            [1, 5, 7, 9, 11, 13, 15]
+                .map(|i| sent["messages"][i + 1]["reasoning_content"].clone())
+                .to_vec()
+        };
+        let own = |i: usize| json!(window[i].reasoning);
+        assert_eq!(reasoning(&sent)[..5], vec![json!(""); 5][..]);
+        assert_eq!(reasoning(&sent)[5..], [own(13), own(15)]);
+        assert!(sent["messages"][2]["reasoning_details"].is_array());
+        // What DeepSeek's own API says of a call sent without its reasoning.
+        let refusal = r#"{"error":{"message":"Invalid request: the reasoning_content of an assistant message with tool_calls in the current turn must be provided","type":"invalid_request_error"}}"#;
+        assert!(learn(&c, &sent, refusal));
+        assert!(has_quirk(&c, Quirk::KeepOldReasoning));
+        assert!(!has_quirk(&c, Quirk::Replay));
+        // The retry carries every call of the model's its own, the earlier
+        // turn's too, which is a request the route has not refused.
+        let again = body_with(&c, &window, None, None, &chunked, &[]);
+        let every: Vec<Value> = [1, 5, 7, 9, 11, 13, 15].map(own).to_vec();
+        assert_eq!(reasoning(&again), every);
+        assert!(again["messages"][2]["reasoning_details"].is_array());
+        // A refusal of that is of the field, which goes as before.
+        assert!(learn(&c, &again, refusal));
+        assert!(has_quirk(&c, Quirk::Replay));
+        let third = body_with(&c, &window, None, None, &chunked, &[]);
+        let fields = ["reasoning_details", "reasoning_content"];
+        assert!(
+            third["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| fields.iter().all(|f| m.get(f).is_none()))
+        );
+        assert!(!learn(&c, &third, refusal));
     }
 
     #[test]
