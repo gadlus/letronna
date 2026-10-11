@@ -12,6 +12,7 @@
 //! all refer to it that way, so a name never changes once shipped.
 
 pub mod auth;
+pub mod router;
 pub mod wire;
 
 mod anthropic;
@@ -27,6 +28,7 @@ mod _template;
 #[cfg(test)]
 mod suite;
 
+pub use router::Quota;
 pub use wire::Wire;
 
 /// Who a provider is, as the gateway list and `/gateways` show it.
@@ -50,6 +52,24 @@ pub enum Tier {
     ApiKey,
     Credit,
     Free,
+}
+
+impl Tier {
+    pub const ALL: [Tier; 4] = [Tier::Subscription, Tier::ApiKey, Tier::Credit, Tier::Free];
+
+    /// How Settings writes it in `provider_order`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Tier::Subscription => "subscription",
+            Tier::ApiKey => "api_key",
+            Tier::Credit => "credit",
+            Tier::Free => "free",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Tier> {
+        Tier::ALL.into_iter().find(|t| t.name() == name.trim())
+    }
 }
 
 /// What a provider needs before it can be asked.
@@ -81,6 +101,12 @@ pub trait Provider: Send + Sync {
     /// The model ids it serves at `base`, asked with `key`.
     fn models(&self, base: &str, key: &str) -> Result<Vec<String>, String> {
         crate::chat::list_models(base, key)
+    }
+
+    /// How much of its limits the account has used, read off a reply's
+    /// headers: the standard rate-limit ones unless it says otherwise.
+    fn quota(&self, headers: &reqwest::header::HeaderMap) -> Option<Quota> {
+        router::rate_limits(headers, crate::chat::now())
     }
 }
 

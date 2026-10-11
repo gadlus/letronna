@@ -483,6 +483,11 @@ pub struct Settings {
     /// or `Gateway:model`; see `fallback`.
     #[serde(default, deserialize_with = "names")]
     pub fallbacks: Vec<String>,
+    /// The order accounts are reached for when one is rate limited or out of
+    /// quota, by tier: "subscription", "api_key", "credit", "free". Tiers left
+    /// out follow in their usual order; see `providers::router`.
+    #[serde(default)]
+    pub provider_order: Vec<String>,
     /// The sidebar's list narrowed to one state: "needs_you", "working",
     /// "unseen" or "pinned"; empty for no filter.
     #[serde(default)]
@@ -560,6 +565,7 @@ impl Default for Settings {
             script_tool: false,
             keys_in: String::new(),
             fallbacks: Vec::new(),
+            provider_order: Vec::new(),
             memory_review: false,
             memory_saving: crate::memory::Saving::WhenAsked,
             memory_scope: crate::memory::Scope::Auto,

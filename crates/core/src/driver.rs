@@ -1328,6 +1328,8 @@ fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Option<Message>, 
         // A fork's is its parent's, so its requests start as the parent's do.
         floor: spec.transcript.conversation.floor(),
         no_mcp: !reaches_mcp(&spec.allow),
+        #[cfg(test)]
+        route: None,
         // Only a fork of the session's own agent starts from its messages;
         // one a helper made starts from the helper's.
         forked_from: (spec.fork && spec.owner == spec.root).then(|| {

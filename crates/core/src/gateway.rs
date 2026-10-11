@@ -119,6 +119,23 @@ pub fn resolve(name: &str, custom: &str, key: &str) -> (String, String) {
     (base_url(name, custom), key.to_owned())
 }
 
+/// The gateway whose requests go to `endpoint`, if one does; Custom, whose
+/// address is the user's, is never named.
+pub fn named(endpoint: &str) -> Option<&'static str> {
+    let endpoint = endpoint.trim().trim_end_matches('/');
+    let at = |base: &str| !base.is_empty() && base.trim_end_matches('/') == endpoint;
+    let plugin = added()
+        .lock()
+        .ok()
+        .and_then(|list| list.iter().find(|g| at(&g.base)).map(|g| g.name));
+    plugin.or_else(|| {
+        GATEWAYS
+            .iter()
+            .find(|g| at(&base_url(g.name, "")))
+            .map(|g| g.name)
+    })
+}
+
 /// Where `resolve` sends a gateway's requests, without reading the account
 /// file for its token, so a page can ask on every frame.
 pub fn base_url(name: &str, custom: &str) -> String {

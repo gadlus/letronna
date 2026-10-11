@@ -3489,6 +3489,9 @@ pub fn list_models(base: &str, key: &str) -> Result<Vec<String>, String> {
 /// What a caller can add to a model call beyond the connection and messages.
 #[derive(Default)]
 pub struct Extra {
+    /// Where to go on to in place of the router's own route, for a test.
+    #[cfg(test)]
+    pub route: Option<Vec<Connection>>,
     /// Offered after the connection's own tools, and not at all where it offers none.
     pub tools: Vec<Value>,
     /// Names of the connection's own tools to leave out of the request, where
@@ -3561,19 +3564,16 @@ fn begin(
         // Taken once for the call, as each error is told once: a resend
         // after a failure or at a smaller window carries it again.
         let lsp = crate::lsp::note(connection.conversation);
-        let chain = fallbacks(&connection);
-        let result = crate::fallback::run(
-            &chain,
-            |connection| {
-                let budget = budget_for(connection, &chain[0], budget);
-                send_window(
-                    connection,
-                    &messages,
-                    &budget,
-                    &extra,
-                    lsp.as_deref(),
-                    &sender,
-                )
+        #[cfg(test)]
+        let given = extra.route.clone();
+        #[cfg(not(test))]
+        let given = None;
+        let result = crate::providers::router::run(
+            &connection,
+            given,
+            |asked| {
+                let budget = budget_for(asked, &connection, budget);
+                send_window(asked, &messages, &budget, &extra, lsp.as_deref(), &sender)
             },
             |switch| {
                 sender
@@ -3616,23 +3616,6 @@ fn begin(
         }
     });
     receiver
-}
-
-/// The session's connection, then the fallbacks Settings names. The file is
-/// read on each call, as the context cap is, so a change made in the window
-/// counts in the terminal from its next request.
-fn fallbacks(connection: &Connection) -> Vec<Connection> {
-    let settings = crate::store::current_settings();
-    // Entries that do not read are passed over here; the frontends say why
-    // when they are written.
-    let fallbacks: Vec<_> = (settings.fallbacks.iter())
-        .filter_map(|text| crate::fallback::Fallback::parse(text).ok())
-        .collect();
-    if fallbacks.is_empty() {
-        return vec![connection.clone()];
-    }
-    let keys = crate::store::load_keys();
-    crate::fallback::chain(connection, &fallbacks, &keys, &settings.custom_endpoint)
 }
 
 /// The budget for a request to `connection`: the session's own for its model,
@@ -3981,6 +3964,9 @@ fn stream(
             .try_clone()
             .ok_or_else(|| Failure::new(FailureKind::Unknown, "Could not prepare the request."))?
             .send();
+        if let Ok(response) = &send {
+            crate::providers::router::heard(&connection.endpoint, response.headers());
+        }
         let mut stands = false;
         let mut begun = false;
         let mut slow = false;
@@ -7723,6 +7709,67 @@ mod tests {
         };
         assert_eq!(failure.kind, FailureKind::Server);
         assert_eq!(failure.to_string(), "Provider disconnected unexpectedly");
+    }
+
+    #[test]
+    fn a_rate_limited_account_hands_the_request_to_the_next_and_says_so() {
+        use std::io::Write;
+        let listen = || {
+            let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}/v1", server.local_addr().unwrap());
+            (server, base)
+        };
+        let ((limited, a), (answering, b)) = (listen(), listen());
+        let worker_a = std::thread::spawn(move || {
+            let (mut socket, _) = limited.accept().unwrap();
+            request_body(&mut socket);
+            let reply =
+                r#"{"error":{"message":"Rate limit reached.","code":"rate_limit_exceeded"}}"#;
+            // Longer than the retries wait out.
+            write!(socket, "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 120\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+        });
+        let worker_b = std::thread::spawn(move || {
+            let (mut socket, _) = answering.accept().unwrap();
+            request_body(&mut socket);
+            let reply =
+                "data: {\"choices\":[{\"delta\":{\"content\":\"From B\"}}]}\n\ndata: [DONE]\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+        });
+        for (name, base) in [("RouterA", &a), ("RouterB", &b)] {
+            crate::gateway::add(crate::gateway::Added {
+                name,
+                base: base.clone(),
+                key: String::new(),
+                responses: false,
+            });
+        }
+        let on = |endpoint: &str| Connection {
+            endpoint: endpoint.to_owned(),
+            ..connection()
+        };
+        let extra = Extra {
+            route: Some(vec![on(&a), on(&b)]),
+            ..Default::default()
+        };
+        let rx = start_with(on(&a), vec![said("user", "Hi")], extra);
+        let (mut switches, mut text) = (Vec::new(), String::new());
+        while let Ok(event) = rx.recv_blocking() {
+            match event {
+                Event::Switched(switch) => switches.push(switch.to_string()),
+                Event::Delta(delta) => text.push_str(&delta),
+                Event::Finished(done) => assert!(done.is_ok(), "{done:?}"),
+                _ => {}
+            }
+        }
+        worker_a.join().unwrap();
+        worker_b.join().unwrap();
+        crate::gateway::remove("RouterA");
+        crate::gateway::remove("RouterB");
+        assert_eq!(text, "From B");
+        assert_eq!(
+            switches,
+            ["Switched to RouterB: RouterA is rate limited. It is asked again in 5 minutes."]
+        );
     }
 
     #[test]

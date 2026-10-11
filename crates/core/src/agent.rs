@@ -1017,6 +1017,7 @@ mod tests {
         let mut turn = turn();
         turn.absorb(&Event::Switched(crate::fallback::Switch {
             model: "small".into(),
+            label: "small".into(),
             endpoint: "https://fallback.test/v1".into(),
             after: None,
         }));
