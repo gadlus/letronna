@@ -11259,6 +11259,73 @@ mod tests {
     }
 
     #[test]
+    fn a_gateway_counting_the_cache_beside_the_prompt_reads_as_the_whole_input() {
+        // What a gateway serving Claude over chat completions sent back: the
+        // counts under OpenAI's names, but what the cache read and wrote left
+        // out of `prompt_tokens`, as Anthropic counts them.
+        let read = |usage: &str| {
+            let chunk = parse_event(&format!(r#"{{"choices":[],"usage":{usage}}}"#)).unwrap();
+            Message {
+                prompt_tokens: chunk.prompt_tokens.unwrap_or(0),
+                cached_tokens: chunk.cached_tokens.unwrap_or(0),
+                cache_write_tokens: chunk.cache_write_tokens.unwrap_or(0),
+                ..Default::default()
+            }
+        };
+        for (usage, input, cached, written) in [
+            (
+                r#"{"prompt_tokens":11,"completion_tokens":6,"prompt_tokens_details":{"cache_creation_tokens":18012},"cost":0.002256}"#,
+                18_023,
+                0,
+                18_012,
+            ),
+            (
+                r#"{"prompt_tokens":11,"completion_tokens":6,"prompt_tokens_details":{"cached_tokens":18012}}"#,
+                18_023,
+                18_012,
+                0,
+            ),
+            (
+                r#"{"prompt_tokens":11238,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":18012,"cache_creation_tokens":11239}}"#,
+                40_489,
+                18_012,
+                11_239,
+            ),
+            (
+                r#"{"prompt_tokens":4,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":29247,"cache_creation_tokens":11688}}"#,
+                40_939,
+                29_247,
+                11_688,
+            ),
+            // The same gateway's DeepSeek route counts the hits inside.
+            (
+                r#"{"prompt_tokens":9939,"prompt_tokens_details":{"cached_tokens":9856}}"#,
+                9_939,
+                9_856,
+                0,
+            ),
+        ] {
+            let reply = read(usage);
+            assert_eq!(
+                (
+                    reply.input_tokens(),
+                    reply.cached_tokens,
+                    reply.cache_write_tokens
+                ),
+                (input, cached, written),
+                "{usage}"
+            );
+            // A whole reply, as a summary gets, reads the same.
+            let whole = crate::usage::Usage::read(&serde_json::from_str(usage).unwrap());
+            assert_eq!(
+                (whole.input, whole.cached, whole.cache_write),
+                (input, cached, written),
+                "{usage}"
+            );
+        }
+    }
+
+    #[test]
     fn a_reply_brings_its_cache_writes_thinking_and_bill() {
         let events = reply_of(
             "text/event-stream",

@@ -35,6 +35,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — A model its gateway lists only under another vendor's path, such as `deepseek/deepseek-v4.1-flash` listed as `opencode-go/deepseek-v4.1-flash`, is sized by that listed window instead of the smallest one, so old tool results are no longer cleared after a few thousand tokens.
 - **All** — A web fetch or search that never reached its server, as when this computer is offline, no longer counts as having read a page, so a session that carries on from its own files is not asked about, or refused, its later deletes and sends; an error that quotes what a server wrote still counts, and the server's words in a failed secure connection, a redirect's address or a file's kind are now fenced as such.
 - **All** — On DeepSeek and Kimi, the reasoning sent back with the tool calls of the turn in progress counts toward the window, so a long turn clears old results before its requests outgrow the model.
+- **All** — A gateway that reports what its prompt cache wrote as `prompt_tokens_details.cache_creation_tokens`, as some that serve Claude over chat completions do, is read: a reply whose prompt the cache wrote counts it as input, written to the cache, instead of only the few tokens sent fresh, in the usage line, the window's fullness, `/usage` and `letronna -p --output json`.
 
 ## [0.1.0-alpha.3] - 2026-10-06
 
