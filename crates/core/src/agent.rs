@@ -1015,12 +1015,14 @@ fn result_shape(content: &str) -> String {
 /// a test suite's is, and the description promises a command queued behind
 /// it its own. A read or search that fails cancels nothing, since the
 /// calls beside it run at once and count on nothing it did; nor does a
-/// question, which is no work the rest could count on. Nor does a call the
-/// user, the gate or a stop kept from running: each call of the reply is
-/// answered on its own there, as a read beside a write plan mode refuses
-/// still runs.
+/// question, which is no work the rest could count on, nor a memory save,
+/// which no later call counts on and which a full page fails one fact at
+/// a time. Nor does a call the user, the gate or a stop kept from running:
+/// each call of the reply is answered on its own there, as a read beside a
+/// write plan mode refuses still runs.
 fn fails_the_rest(result: &Message) -> bool {
-    if tools::concurrent(&result.name) || result.name == tools::ASK_USER {
+    let on_its_own = [tools::ASK_USER, crate::memory::MEMORY];
+    if tools::concurrent(&result.name) || on_its_own.contains(&result.name.as_str()) {
         return false;
     }
     result.is_error && !refused_or_stopped(&result.content)
@@ -1718,6 +1720,20 @@ mod tests {
                 "{why}"
             );
         }
+    }
+
+    #[test]
+    fn a_memory_save_that_fails_leaves_the_saves_behind_it_to_run() {
+        let mut turn = turn();
+        let mut other = call("memory");
+        other.id = "other".into();
+        // As a memory review saves a turn's facts: a page that is full
+        // loses one fact, not the ones bound for another page.
+        turn.begin(vec![call("memory"), other.clone(), call("run_command")]);
+        turn.finish_call(Err("USER.md is full. Make room on the Memory page.".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Run(other));
+        turn.finish_call(Ok("Saved.".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Run(call("run_command")));
     }
 
     #[test]
