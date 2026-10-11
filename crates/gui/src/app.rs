@@ -165,6 +165,8 @@ pub(crate) struct Chat {
     /// with it rather than asking the chat model about it.
     pub(crate) media_turn: bool,
     pub(crate) model_open: bool,
+    /// The provider the model picker is narrowed to; None shows them all.
+    pub(crate) model_provider: Option<String>,
     pub(crate) model_search: Entity<InputState>,
     pub(crate) keys: std::collections::HashMap<String, String>,
     pub(crate) gateway_pick: Entity<String>,
@@ -915,6 +917,7 @@ impl Chat {
             media_kinds: std::collections::HashMap::new(),
             media_turn: false,
             model_open: false,
+            model_provider: None,
             model_search,
             keys,
             gateway_pick,
@@ -2011,6 +2014,7 @@ impl Chat {
             plain_terminal: false,
             // Someone is watching, so every tool goes out in the array.
             lean_tools: false,
+            rare_on_demand: true,
         };
         backend::validate(&connection)?;
         Ok(connection)

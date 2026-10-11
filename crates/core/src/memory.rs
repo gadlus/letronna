@@ -2111,7 +2111,7 @@ impl Tool for Remember {
         MEMORY
     }
     fn description(&self) -> &'static str {
-        "Keep something for later sessions, or correct what is kept. target \"user\" is what you know about the user (USER.md); target \"memory\" is your own notes (MEMORY.md); target \"project\" is your notes on the project folder attached to this session, for what is true of it alone, such as how to build and test it. They are shown to you at the start of every session (a project's only while it is attached) and have small budgets. action \"add\" keeps content as a new entry; \"replace\" swaps the entry containing old_text for content; \"remove\" deletes the entry containing old_text. To make several changes to one target, pass operations instead, in one call: they are made in order, all or none, and the budget is checked on the result, so a call can make room and add. When one is full, replace or remove before adding."
+        "Keep or correct notes shown at the start of every session. target \"user\": about the user; \"memory\": your own notes; \"project\": facts about the attached project, such as how to build and test it. action \"add\" adds content; \"replace\" and \"remove\" act on the entry containing old_text. Budgets are small: when full, replace or remove before adding. Use operations for several changes in one call."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {

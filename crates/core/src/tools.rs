@@ -2819,11 +2819,11 @@ impl Tool for RunCommand {
     }
     fn description(&self) -> &'static str {
         if cfg!(windows) {
-            "Run a Windows PowerShell 5.1 command in the project folder. `&&` and `||` are syntax errors in 5.1: separate commands with `;`, or write `first; if ($?) { second }` to run the second only when the first succeeded. Each call is a fresh PowerShell: cd and $env: changes do not carry over, so keep steps that depend on each other in one command and pass workdir instead of cd. Waits for it to finish, up to `timeout`, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0; past the timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, and the cut names a file read_file can page through, so a build or test run need not be piped through Select-Object -Last. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For a dev server, a watcher or anything else meant to keep running, pass background: true. Independent commands, such as two test suites, go in one reply as separate calls; they run in your order and each reports its own exit code."
+            "Run a Windows PowerShell 5.1 command in the project folder. `&&` and `||` are syntax errors in 5.1: separate commands with `;`, or write `first; if ($?) { second }` to run the second only when the first succeeded. Each call is a fresh PowerShell: cd and $env: changes do not carry over, so keep steps that depend on each other in one command and pass workdir instead of cd. Returns stdout, then `[stderr]`, then `[exit code N]` unless 0. Long output keeps its start and end and names a file read_file can page, so do not pipe through Select-Object -Last. No keyboard: pass --yes or pipe answers in. For a server or watcher, pass background: true. Independent commands, such as two test suites, go in one reply as separate calls; they run in your order and each reports its own exit code."
         } else if bash() {
-            "Run a bash command in the project folder. Each call is a fresh shell: cd, export and source do not carry over, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish, up to `timeout`, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0; past the timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, and the cut names a file read_file can page through, so a build or test run need not be piped through tail, which also hides its exit code. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For a dev server, a watcher or anything else meant to keep running, pass background: true. Independent commands, such as two test suites, go in one reply as separate calls; they run in your order and each reports its own exit code."
+            "Run a bash command in the project folder. Each call is a fresh shell: chain dependent steps with && and pass workdir instead of cd. Returns stdout, then `[stderr]`, then `[exit code N]` unless 0. Long output keeps its start and end and names a file read_file can page, so do not pipe through tail. No keyboard: pass --yes or pipe answers in. For a server or watcher, pass background: true. Independent commands, such as two test suites, go in one reply as separate calls; they run in your order and each reports its own exit code."
         } else {
-            "Run a shell (sh) command in the project folder. Each call is a fresh shell: cd, export and source do not carry over, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish, up to `timeout`, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0; past the timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, and the cut names a file read_file can page through, so a build or test run need not be piped through tail, which also hides its exit code. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For a dev server, a watcher or anything else meant to keep running, pass background: true. Independent commands, such as two test suites, go in one reply as separate calls; they run in your order and each reports its own exit code."
+            "Run a shell (sh) command in the project folder. Each call is a fresh shell: chain dependent steps with && and pass workdir instead of cd. Returns stdout, then `[stderr]`, then `[exit code N]` unless 0. Long output keeps its start and end and names a file read_file can page, so do not pipe through tail. No keyboard: pass --yes or pipe answers in. For a server or watcher, pass background: true. Independent commands, such as two test suites, go in one reply as separate calls; they run in your order and each reports its own exit code."
         }
     }
     fn description_for(&self, _: &Connection, _: &[&str]) -> Cow<'static, str> {
@@ -4022,7 +4022,7 @@ impl Tool for Todo {
         TODO
     }
     fn description(&self) -> &'static str {
-        "Keep your plan as a checklist, for work of three or more steps or several requests at once; skip it for a quick task. Send the whole list every time. Keep one item doing, and mark one done only once it is done and checked where it can be, never on intent. A blocked item goes back to pending, with one added naming the blocker; drop one no longer needed and say why. When a task covers each file or all N of something, give each its own item, grouping them past about 20. Do not paste the whole list into your reply. Returns how many items are done."
+        "Your plan as a checklist, for work of three or more steps; skip it for quick tasks. Send the whole list each time, keep one item doing, and mark one done only once it is checked, never on intent. Do not paste the list into your reply."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -4641,13 +4641,11 @@ impl Tool for Search {
         true
     }
     fn description(&self) -> &'static str {
-        "Search file contents under a folder with a regex (Rust syntax), matched line by \
-         line, leaving out what .gitignore ignores and, outside a Git repository, target, \
-         dist and build folders unless the glob names them. Mode content (the default) shows \
-         each file's matching lines as `12: text` and context lines as `13- text`; files \
-         lists the matching files, newest first; count gives matching lines per file. Mode \
-         files with no pattern lists the files a glob or type picks. Ignores case unless \
-         case_sensitive is set. Paths come back ready for read_file. Several patterns or \
+        "Regex search (Rust syntax) of file contents under a folder, skipping .gitignore'd \
+         files. Mode content (default) shows `12: text` matches with `13- text` context; \
+         files lists matching files, newest first; count gives matches per file. Mode files \
+         with no pattern lists the files a glob or type picks. Case-insensitive unless \
+         case_sensitive. Several patterns or \
          folders: several search calls in one reply, run at once."
     }
     fn description_for(&self, _: &Connection, _: &[&str]) -> Cow<'static, str> {

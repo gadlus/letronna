@@ -993,7 +993,12 @@ fn aside(runner: &mut Runner, session: usize, question: &str) {
                 render::line(&render::dim(line));
             }
             // What it cost, as under a reply, since the session keeps no trace of it.
-            render::line(&render::dim(&reply_usage(&answer)));
+            let gateway = runner.store.model(session).0;
+            render::line(&render::dim(&format!(
+                "{} · {}",
+                crate::session::answered_by(&answer.model, gateway),
+                reply_usage(&answer)
+            )));
         }
         Err(error) => render::line(&render::red(&error)),
     }
