@@ -4453,8 +4453,8 @@ impl Render for Chat {
                 .into_any_element()
         };
 
-        // A new page, or another session in the chat, fades in rather than
-        // replacing the last one all at once. Keyed by both, so it plays
+        // A new page, or another session in the chat, rises into place as it
+        // fades in rather than replacing the last one all at once. Keyed by both, so it plays
         // afresh on every change and not on every frame.
         let body = if cx.reduce_motion() {
             body
@@ -4471,11 +4471,12 @@ impl Render for Chat {
                 .min_h_0()
                 .min_w_0()
                 .w_full()
+                .relative()
                 .child(body)
                 .with_animation(
                     SharedString::from(format!("page-{:?}-{shown}", self.page)),
-                    crate::ui::motion::enter(crate::ui::motion::STANDARD),
-                    |el, t| el.opacity(t),
+                    crate::ui::motion::enter(crate::ui::motion::GENTLE),
+                    crate::ui::motion::rise,
                 )
                 .into_any_element()
         };
