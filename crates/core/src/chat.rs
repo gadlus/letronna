@@ -6837,22 +6837,37 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = crate::store::tests::Scratch::new("chat-static-tokens");
         unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
-        // As `-p` without `--tools` sends it: the less used tools on demand.
+        // As `-p` without `--tools` sends it on a fresh install: the less
+        // used tools on demand, and no MCP tool, since one another test
+        // serves would put call_mcp_tool in the array too.
         let c = Connection {
             tools: true,
             lean_tools: true,
             workspace: Some("/w".into()),
             ..connection()
         };
-        let tools = body(&c, &[], None, None)["tools"].to_string();
+        let every: Vec<_> = crate::tools::all()
+            .into_iter()
+            .filter(|tool| !crate::mcp::is_tool(tool.name()))
+            .collect();
+        let on_demand = crate::mcp_find::OnDemand::of(&c, &every);
+        let sent = Value::Array(offered(&c, &every, on_demand));
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        let tools = sent.to_string();
+        let names: Vec<&str> = sent
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
         let now = tokens(&system) + tokens(&tools);
         assert_eq!(
             now,
             STATIC_TOKENS,
-            "the system message ({} tokens) and tools ({} tokens) of a print run now cost {now}, {:+} against the {STATIC_TOKENS} recorded; if the change is meant, record the new count",
+            "the system message ({} tokens) and tools ({} tokens: {}) of a print run now cost {now}, {:+} against the {STATIC_TOKENS} recorded; if the change is meant, record the new count",
             tokens(&system),
             tokens(&tools),
+            names.join(", "),
             now as isize - STATIC_TOKENS as isize
         );
     }
