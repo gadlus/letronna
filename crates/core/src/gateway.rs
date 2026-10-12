@@ -172,6 +172,40 @@ pub fn add_own(name: &str, address: &str) -> Result<(&'static str, String), Stri
     Ok((interned(name), base))
 }
 
+/// A name a new gateway called `name` could have instead, when a gateway
+/// has that one: the first of "name 2", "name 3" and on that none has,
+/// within the length a name may have. `None` while `name` is free.
+pub fn free_name(name: &str) -> Option<String> {
+    let name = name.trim();
+    let list = own();
+    let kept = read_kept(&own_path());
+    let used = |name: &str| {
+        taken(name, &list)
+            || kept
+                .iter()
+                .any(|k| k.name.trim().eq_ignore_ascii_case(name))
+    };
+    if name.is_empty() || !used(name) {
+        return None;
+    }
+    (2..1000)
+        .map(|n| {
+            let number = format!(" {n}");
+            let room = NAME_CHARS.saturating_sub(number.chars().count());
+            let stem: String = name.chars().take(room).collect();
+            format!("{}{number}", stem.trim_end())
+        })
+        .find(|candidate| !used(candidate))
+}
+
+/// The gateway that has `name` already, in any case, as the lists spell it.
+pub fn holder(name: &str) -> Option<&'static str> {
+    gateways()
+        .into_iter()
+        .map(|g| g.name)
+        .find(|other| other.eq_ignore_ascii_case(name.trim()))
+}
+
 /// Give the gateway of the user's own called `name` a new address: the
 /// address as it is kept, or why it cannot be.
 pub fn change_own(name: &str, address: &str) -> Result<String, String> {
@@ -231,11 +265,7 @@ fn check_name(name: &str, list: &[Own]) -> Result<(), String> {
 /// What adding a gateway under a name one has already is answered, the
 /// name spelled as that one's is.
 fn already(name: &str) -> String {
-    let spelled = gateways()
-        .into_iter()
-        .map(|g| g.name)
-        .find(|other| other.eq_ignore_ascii_case(name))
-        .unwrap_or(name);
+    let spelled = holder(name).unwrap_or(name);
     format!("There is a gateway called {spelled} already: pick another name, or change that one.")
 }
 
@@ -751,6 +781,17 @@ mod tests {
                 );
             }
             assert_eq!(base_url("Box", ""), "http://localhost:1/v1");
+            // What it could be called instead, and who has the name.
+            assert_eq!(free_name(" box "), Some("box 2".into()));
+            assert_eq!(free_name("OpenAI"), Some("OpenAI 2".into()));
+            assert_eq!(free_name("Elsewhere"), None);
+            assert_eq!(holder("BOX"), Some("Box"));
+            add_own("Box 2", "http://localhost:2/v1").unwrap();
+            assert_eq!(free_name("Box"), Some("Box 3".into()));
+            let long = "y".repeat(40);
+            add_own(&long, "http://localhost:2/v1").unwrap();
+            let instead = free_name(&long).unwrap();
+            assert!(instead.ends_with(" 2") && instead.chars().count() == 40);
             // Changing is its own step, and only for one that is there.
             assert_eq!(
                 change_own("Box", "localhost:3/v1"),
