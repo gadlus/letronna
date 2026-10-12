@@ -1186,9 +1186,10 @@ fn unavailable(
         ));
     }
     // Offered with DuckDuckGo switched off, so the model learns how to search;
-    // nothing would leave, so there is nothing to ask about.
+    // unless the session's gateway sells search, nothing would leave, so
+    // there is nothing to ask about.
     if name == "search_web"
-        && let Some(why) = crate::search::switched_off()
+        && let Some(why) = crate::search::switched_off(ctx.caller.connection.as_deref())
     {
         return Some(why.into());
     }
@@ -2898,6 +2899,19 @@ mod tests {
         )
         .unwrap();
         let off = decide(&search, &gate);
+        // A session on Letronna's own gateway still searches through it.
+        let letronna = ToolContext::of(&crate::chat::Connection {
+            endpoint: crate::auth::hosted_base(),
+            key: "token".into(),
+            ..Default::default()
+        });
+        let through_letronna = decide(
+            &search,
+            &Gate {
+                ctx: &letronna,
+                ..gate
+            },
+        );
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
         assert_eq!(on, Outcome::Ask);
         let Outcome::Refuse(why) = off else {
@@ -2907,6 +2921,7 @@ mod tests {
             why.contains("/search keyless") && why.contains("/search services"),
             "{why}"
         );
+        assert_eq!(through_letronna, Outcome::Ask);
     }
 
     /// A read is judged in the folder `workdir` names, where a link can lead

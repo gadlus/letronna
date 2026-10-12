@@ -419,9 +419,10 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
     tools.push(Arc::new(crate::workflow::tool::Workflow));
     #[cfg(feature = "workflows")]
     tools.push(Arc::new(crate::script::Script));
-    // A search service, DuckDuckGo while the user picks none, unless the one
-    // picked is not set up; with DuckDuckGo switched off too, so a call says
-    // how to search.
+    // A search service, or the gateway's search and DuckDuckGo while the
+    // user picks none, unless the one picked is not set up; with DuckDuckGo
+    // switched off too, so a call searches through a gateway that sells
+    // search or says how to search.
     if crate::search::offered() {
         tools.push(Arc::new(crate::search::SearchWeb));
     }

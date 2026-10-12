@@ -2288,7 +2288,7 @@ fn search_page(
         .gap_5()
         .child(heading(
             "Search",
-            "A search service of your own, which the agent searches the web with, asking you before each search. The one saved last is used, at its official address unless you give another. Keys stay in keys.json on this machine; the Web toggle is the gateway's own search, where it has one.",
+            "A search service of your own, which the agent searches the web with, asking you before each search. The one saved last is used, at its official address unless you give another. With none saved, it searches through the gateway where the gateway sells search, and with DuckDuckGo when that cannot answer. Keys stay in keys.json on this machine; the Web toggle is the gateway's own search inside a reply, where it has one.",
             cx,
         ))
         .child(list)
@@ -2296,7 +2296,7 @@ fn search_page(
             "keyless-search",
             "Search with DuckDuckGo when no search key is set",
             "DuckDuckGo has no official search API. Turned off, the agent searches only with \
-             a service set up above.",
+             a service set up above, or through the gateway where it sells search.",
             keyless_search,
             chat,
             cx,

@@ -4102,13 +4102,14 @@ fn keyless_search(runner: &mut Runner, on: bool) {
     render::line(&render::dim(if on {
         "Search with DuckDuckGo when no search key is set: on. It needs no key, each search is asked first, and a service with a key (/search services) gives steadier results."
     } else {
-        "Search with DuckDuckGo when no search key is set: off. Without a search service of your own (/search services), the model cannot search."
+        "Search with DuckDuckGo when no search key is set: off. Without a search service of your own (/search services), the model searches only through the gateway, where it sells search."
     }));
 }
 
 /// Every search service and where it stands, then set one up to search with,
 /// remove one, or switch DuckDuckGo on or off. The one set up last is used,
-/// and DuckDuckGo while none is.
+/// and while none is, the gateway's search where it sells one, with
+/// DuckDuckGo behind it.
 pub fn search_services(runner: &mut Runner) {
     use letronna_core::search::{self, SERVICES};
     let keys = store::load_keys();

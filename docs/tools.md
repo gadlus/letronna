@@ -14,7 +14,9 @@ The **Web** toggle uses the gateway's own search, where there is one. A search s
 |---|---|
 | Brave, Tavily, Exa | An API key |
 | SearXNG | Your own server, with `json` in its `formats` |
-| DuckDuckGo | Nothing. It is the default; unofficial and may be rate-limited. |
+| DuckDuckGo | Nothing. Unofficial and may be rate-limited. |
+
+With none chosen, `search_web` searches through the gateway where it sells search, such as Letronna's (paid from your credit) or a gateway whose model list has search models, and falls back to DuckDuckGo in the same search when the gateway cannot answer. A chosen service is the only one used.
 
 ## Browser
 
