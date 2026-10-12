@@ -214,7 +214,7 @@ mod tests {
         unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
         let fix = Some(Fix::Search);
         let keyless = Family::Web.readiness();
-        let on = (crate::search::offered(), crate::search::switched_off());
+        let on = (crate::search::offered(), crate::search::switched_off(None));
         std::fs::write(
             dir.join("settings.json"),
             r#"{"endpoint": "", "model": "", "keyless_search": false}"#,
@@ -223,7 +223,7 @@ mod tests {
         let off = Family::Web.readiness();
         // Still offered, so a search can say how to switch it back on.
         let offered = crate::search::offered();
-        let why = crate::search::switched_off();
+        let why = crate::search::switched_off(None);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
         assert_eq!(on, (true, None));
         assert!(offered && why.is_some_and(|why| why.contains("/search keyless")));

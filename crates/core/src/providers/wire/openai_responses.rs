@@ -32,7 +32,85 @@ pub(crate) fn serves(endpoint: &str, model: &str) -> bool {
     let openai = crate::chat::host(endpoint).as_deref() == Some("api.openai.com")
         && reasons(model)
         && !model.to_lowercase().contains("chat");
-    openai || crate::gateway::responses_at(endpoint)
+    openai || chatgpt(endpoint) || crate::gateway::responses_at(endpoint)
+}
+
+/// Whether `endpoint` is ChatGPT's backend, which a ChatGPT plan's sign-in
+/// is sent to: Responses only, streamed only.
+pub(crate) fn chatgpt(endpoint: &str) -> bool {
+    crate::chat::host(endpoint).as_deref() == Some("chatgpt.com")
+}
+
+/// What ChatGPT's backend wants of a Responses request `body` beyond what
+/// OpenAI's API does: always streamed, a whole reply being read off the
+/// stream by `json`.
+pub(crate) fn for_endpoint(endpoint: &str, body: &mut Value) {
+    if chatgpt(endpoint) {
+        body["stream"] = true.into();
+        body["store"] = false.into();
+    }
+}
+
+/// `request` signed as the ChatGPT plan: its access token, fresh, in place
+/// of `key` where there is a sign-in, and the account it is for.
+pub(crate) fn as_chatgpt(
+    request: reqwest::blocking::RequestBuilder,
+    key: &str,
+) -> reqwest::blocking::RequestBuilder {
+    use super::super::{auth, chatgpt::NAME};
+    let token = auth::access(NAME).unwrap_or_else(|_| key.trim().to_owned());
+    let account = auth::tokens(NAME).map(|t| t.account).unwrap_or_default();
+    let request = request.bearer_auth(token).header("originator", "letronna");
+    match account.is_empty() {
+        true => request,
+        false => request.header("chatgpt-account-id", account),
+    }
+}
+
+/// Whether a request ChatGPT's backend at `endpoint` refused can go again:
+/// the sign-in was refreshed, which a refusal right after one never is, so
+/// this sends again at most once.
+pub(crate) fn refreshed(endpoint: &str) -> bool {
+    use super::super::{auth, chatgpt::NAME};
+    chatgpt(endpoint)
+        && auth::tokens(NAME).is_some_and(|held| auth::refused(NAME, &held.access).is_ok())
+}
+
+/// A reply read whole: JSON as it came, or the response a Responses stream
+/// ends with, for a caller that asked ChatGPT's backend, which only
+/// streams, for it whole. A stream that fails says why in the body, as a whole reply does.
+pub(crate) fn json(response: reqwest::blocking::Response) -> reqwest::Result<Value> {
+    let streamed = chatgpt(response.url().as_str())
+        && response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .is_some_and(|h| h.contains("text/event-stream"));
+    if !streamed {
+        return response.json();
+    }
+    Ok(whole(std::io::BufReader::new(response)))
+}
+
+fn whole(reader: impl std::io::BufRead) -> Value {
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(event) = serde_json::from_str::<Value>(data.trim()) else {
+            continue;
+        };
+        match event["type"].as_str().unwrap_or_default() {
+            "response.completed" | "response.incomplete" | "response.failed" => {
+                return event["response"].clone();
+            }
+            "error" if event["error"].is_object() => return json!({"error": event["error"]}),
+            "error" => return json!({"error": event}),
+            _ => {}
+        }
+    }
+    json!({"error": {"message": "The reply ended before it was done."}})
 }
 
 /// Whether `model` is served by the Responses API alone, as OpenAI's codex
@@ -225,6 +303,15 @@ pub(crate) fn chunk(event: &Value) -> Value {
             "index": event["output_index"],
             "function": {"arguments": event["delta"]},
         }]})),
+        // The call whole, arguments and all: what its pieces should have come
+        // to, and all there is of a call in a parallel batch whose pieces
+        // never came.
+        "response.output_item.done" if item["type"] == "function_call" => {
+            delta(json!({"tool_calls_done": [{
+                "id": item["call_id"],
+                "arguments": item["arguments"],
+            }]}))
+        }
         "response.output_item.done" if item["type"] == "reasoning" => {
             delta(json!({"reasoning_items": [item]}))
         }
@@ -538,5 +625,47 @@ mod tests {
             let parted = part(output_index, summary_index);
             assert_eq!(parted["choices"][0]["delta"]["reasoning"], "\n\n");
         }
+    }
+
+    #[test]
+    fn a_reply_wanted_whole_is_read_off_the_stream() {
+        let stream = |events: &[Value]| {
+            let text: String = events
+                .iter()
+                .map(|event| {
+                    format!(
+                        "event: {}
+data: {event}
+
+",
+                        event["type"]
+                    )
+                })
+                .collect();
+            whole(text.as_bytes())
+        };
+        let done = json!({"type": "response.completed", "response": {"object": "response", "status": "completed"}});
+        let delta = json!({"type": "response.output_text.delta", "delta": "Hi"});
+        assert_eq!(stream(&[delta.clone(), done])["status"], "completed");
+        let error =
+            json!({"type": "error", "error": {"message": "limit", "type": "usage_limit_reached"}});
+        assert_eq!(stream(&[error])["error"]["type"], "usage_limit_reached");
+        assert!(stream(&[delta])["error"]["message"].is_string());
+    }
+
+    #[test]
+    fn chatgpts_backend_is_always_streamed_and_keeps_nothing() {
+        let mut body = json!({"stream": false, "store": true});
+        for_endpoint("https://api.openai.com/v1/chat/completions", &mut body);
+        assert_eq!(body["stream"], false);
+        for_endpoint(
+            "https://chatgpt.com/backend-api/codex/chat/completions",
+            &mut body,
+        );
+        assert_eq!(
+            (body["stream"].clone(), body["store"].clone()),
+            (json!(true), json!(false))
+        );
+        assert!(serves("https://chatgpt.com/backend-api/codex", "anything"));
     }
 }

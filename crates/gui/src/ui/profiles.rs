@@ -189,7 +189,7 @@ impl Chat {
         store.assign_ids();
         store.active = store.active.min(store.conversations.len() - 1);
         if store.settings.gateway.is_empty() {
-            store.settings.gateway = GATEWAYS[0].name.into();
+            store.settings.gateway = gateways()[0].name.into();
         }
         if store.settings.endpoint.is_empty() {
             store.settings.endpoint = std::env::var("AGENT_BASE_URL")

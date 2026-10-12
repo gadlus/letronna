@@ -69,8 +69,8 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "models to carry on with when yours is overloaded or out of credit",
     },
     Command {
-        name: "/gateways",
-        blurb: "see, add or remove gateways",
+        name: "/connect",
+        blurb: "connect or sign in to providers, see their plan and usage",
     },
     Command {
         name: "/team",

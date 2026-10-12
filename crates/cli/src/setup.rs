@@ -8,7 +8,7 @@
 //! which is most of the reason a script needs so little in it.
 
 use letronna_core::auth;
-use letronna_core::gateway::{self, GATEWAYS};
+use letronna_core::gateway::{self, gateways};
 use letronna_core::store;
 
 use crate::render;
@@ -94,7 +94,7 @@ fn connect(runner: &mut Runner) -> bool {
     let name = match picked {
         Some(0) => gateway::LETRONNA,
         Some(1) => {
-            let keyed: Vec<_> = GATEWAYS.iter().filter(|g| g.needs_key).collect();
+            let keyed: Vec<_> = gateways().into_iter().filter(|g| g.needs_key).collect();
             let labels: Vec<String> = keyed
                 .iter()
                 .map(|g| format!("{}  —  {}", g.name, g.blurb))
@@ -109,7 +109,7 @@ fn connect(runner: &mut Runner) -> bool {
         Some(3) => "Custom",
         _ => return skipped(),
     };
-    let Some(chosen) = GATEWAYS.iter().find(|g| g.name == name) else {
+    let Some(chosen) = gateways().into_iter().find(|g| g.name == name) else {
         return skipped();
     };
 

@@ -1,7 +1,7 @@
 [
   {
     "function": {
-      "description": "Read a text file, a PDF, Word, Excel, PowerPoint or OpenDocument file, an EPUB book, or look at a PNG, JPEG, GIF, WebP or BMP picture; one too big to send is scaled down. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from. A Jupyter notebook (.ipynb) reads as numbered cells with short outputs, a document as its text with a heading for each page, sheet or slide, and N counts the lines of that view.",
+      "description": "Read a text file, a document (PDF, Office, EPUB) or an image; one too big to send is scaled down. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from. A Jupyter notebook (.ipynb) reads as numbered cells with short outputs, a document as its text with a heading for each page, sheet or slide, and N counts the lines of that view. Leave limit out to get a whole page (about 7k chars). For several files or several regions of one file, make the read_file calls in one reply, they run at once.",
       "name": "read_file",
       "parameters": {
         "properties": {
@@ -43,7 +43,7 @@
   },
   {
     "function": {
-      "description": "Search file contents under a folder with a regex (Rust syntax), matched line by line, leaving out what .gitignore ignores and, outside a Git repository, target, dist and build folders unless the glob names them. Mode content (the default) shows each file's matching lines as `12: text` and context lines as `13- text`; files lists the matching files, newest first; count gives matching lines per file. Mode files with no pattern lists the files a glob or type picks. Ignores case unless case_sensitive is set. Paths come back ready for read_file. PDF, Word, Excel, PowerPoint, OpenDocument and EPUB files are searched as read_file reads them only when type, glob or path names them.",
+      "description": "Regex search (Rust syntax) of file contents under a folder, skipping .gitignore'd files. Mode content (default) shows `12: text` matches with `13- text` context; files lists matching files, newest first; count gives matches per file. Mode files with no pattern lists the files a glob or type picks. Case-insensitive unless case_sensitive. Several patterns or folders: several search calls in one reply, run at once.",
       "name": "search",
       "parameters": {
         "properties": {
@@ -186,7 +186,7 @@
   },
   {
     "function": {
-      "description": "Run a bash command in the project folder. Each call is a fresh shell: cd, export and source do not carry over, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish, up to `timeout`, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0; past the timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, and the cut names a file read_file can page through, so a build or test run need not be piped through tail, which also hides its exit code. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For a dev server, a watcher or anything else meant to keep running, pass background: true.",
+      "description": "Run a bash command in the project folder. Each call is a fresh shell: chain dependent steps with && and pass workdir instead of cd. Returns stdout, then `[stderr]`, then `[exit code N]` unless 0. Long output keeps its start and end and names a file read_file can page, so do not pipe through tail. No keyboard: pass --yes or pipe answers in. For a server or watcher, pass background: true. Independent commands, such as two test suites, go in one reply as separate calls; they run in your order and each reports its own exit code.",
       "name": "run_command",
       "parameters": {
         "properties": {
@@ -538,7 +538,7 @@
   },
   {
     "function": {
-      "description": "Keep your plan as a checklist, for work of three or more steps or several requests at once; skip it for a quick task. Send the whole list every time. Keep one item doing, and mark one done only once it is done and checked where it can be, never on intent. A blocked item goes back to pending, with one added naming the blocker; drop one no longer needed and say why. When a task covers each file or all N of something, give each its own item, grouping them past about 20. Do not paste the whole list into your reply. Returns how many items are done.",
+      "description": "Your plan as a checklist, for work of three or more steps; skip it for quick tasks. Send the whole list each time, keep one item doing, and mark one done only once it is checked, never on intent. Do not paste the list into your reply.",
       "name": "todo",
       "parameters": {
         "properties": {
@@ -662,7 +662,7 @@
   },
   {
     "function": {
-      "description": "Keep something for later sessions, or correct what is kept. target \"user\" is what you know about the user (USER.md); target \"memory\" is your own notes (MEMORY.md); target \"project\" is your notes on the project folder attached to this session, for what is true of it alone, such as how to build and test it. They are shown to you at the start of every session (a project's only while it is attached) and have small budgets. action \"add\" keeps content as a new entry; \"replace\" swaps the entry containing old_text for content; \"remove\" deletes the entry containing old_text. To make several changes to one target, pass operations instead, in one call: they are made in order, all or none, and the budget is checked on the result, so a call can make room and add. When one is full, replace or remove before adding.",
+      "description": "Keep or correct notes shown at the start of every session. target \"user\": about the user; \"memory\": your own notes; \"project\": facts about the attached project, such as how to build and test it. action \"add\" adds content; \"replace\" and \"remove\" act on the entry containing old_text. Budgets are small: when full, replace or remove before adding. Use operations for several changes in one call.",
       "name": "memory",
       "parameters": {
         "properties": {
@@ -1405,15 +1405,19 @@
   },
   {
     "function": {
-      "description": "Run a task in Letronna Cloud, on Letronna's servers, and get its answer. Where to build what the user asks for, in order: a page, chart, document or small app that one self-contained file can hold is written here as an .html or .svg file the user previews; anything else is built here, in the project, with the tools on this computer; only when this computer cannot (a tool it needs is not on PATH and cannot be installed, it would take more memory or time than this machine has, or the user asks for the cloud) send it here. It also hosts: a web app it leaves wakes on each visit, and a bot or worker the user wants kept online (a Discord or Telegram bot listening for events, a scheduler) runs 24/7 from their credit; say so in `task` only when the user asked for it to stay up, and put any keys it needs in `task` for /work/.env. cloud_apps shows what is left running and cloud_app_power takes it down or back up. The cloud cannot see this computer's files: give it everything it needs in `task`, or an https `repo` it clones. Say in your reply that it ran in the cloud. It costs the user's credit, so each call is asked about.",
+      "description": "Run a task in Letronna Cloud, on Letronna's servers, and get its answer. Where to build what the user asks for, in order: a page, chart, document or small app that one self-contained file can hold is written here as an .html or .svg file the user previews; anything else is built here, in the project, with the tools on this computer; only when this computer cannot (a tool it needs is not on PATH and cannot be installed, it would take more memory or time than this machine has, or the user asks for the cloud) send it here. It also hosts: a web app it leaves wakes on each visit, and a bot or worker the user wants kept online (a Discord or Telegram bot listening for events, a scheduler) runs 24/7 from their credit; say so in `task` only when the user asked for it to stay up, and put any keys it needs in `task` for /work/.env. cloud_apps shows what is left running and cloud_app_power takes it down or back up. The cloud cannot see this computer's files: pass folder: true to send it the project folder (what .gitignore keeps, without .git), which works for a private or local-only repository; or an https `repo` it clones, which must be public, as the cloud has no git sign-in. Say in your reply that it ran in the cloud. It costs the user's credit, so each call is asked about.",
       "name": "cloud_task",
       "parameters": {
         "properties": {
           "branch": {
             "type": "string"
           },
+          "folder": {
+            "description": "Send this session's project folder to work in, instead of a repo.",
+            "type": "boolean"
+          },
           "repo": {
-            "description": "An https git address to clone and work in.",
+            "description": "A public https git address to clone and work in.",
             "type": "string"
           },
           "task": {
@@ -1676,7 +1680,7 @@
   },
   {
     "function": {
-      "description": "Search the web. Returns a numbered list of results, each with its title, address and a snippet. Snippets are cut short and may be stale: before you state a fact from a search, read the page that settles it in full with web_fetch, preferring the primary source (the official site or the project's own docs) over a page summarizing it, and give that page's address beside the fact. The same search again within 10 minutes gives the earlier answer.",
+      "description": "Search the web. Returns a numbered list of results, each with its title, address and a snippet. Snippets are cut short and may be stale: read the page that settles a fact with web_fetch, preferring the primary source, and give its address. The same search again within 10 minutes gives the earlier answer.",
       "name": "search_web",
       "parameters": {
         "properties": {

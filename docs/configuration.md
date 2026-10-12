@@ -20,6 +20,7 @@ Most settings are in the window's Settings and in `/` commands. Both are stored 
 | `LETRONNA_ALLOW_HTTP=1` | Allow plain-HTTP gateways on the local network, not just on localhost. The key travels unencrypted. |
 | `LETRONNA_READ_TIMEOUT` | Seconds of silence before a reply is given up on (30–3600; default 300) |
 | `LETRONNA_CONTEXT_WINDOW`, `LETRONNA_MAX_OUTPUT` | Override the model's context window and output limit, in tokens. When nothing gives a model's window, a server that takes a key is assumed to hold 64,000 tokens, and one that takes none, such as Ollama, a small window. Set it for a keyed proxy in front of a small local model, which may cut long prompts short without saying so. |
+| `LETRONNA_REASONING_REPLAY` | `full` (the default) sends DeepSeek and Kimi the reasoning behind every tool call of the turn in progress; `chunked` sends an empty one with the turn's older calls once their reasoning comes to 8,000 tokens, and then a chunk at a time, so the requests in between keep the provider's prompt cache. The `reasoning_replay` setting says the same for every run. |
 
 ### Browser
 
@@ -44,6 +45,7 @@ Most settings are in the window's Settings and in `/` commands. Both are stored 
 | `AGENT_BASE_URL`, `AGENT_API_KEY`, `AGENT_MODEL` | A Custom gateway for this run only (`-p`, or the terminal with `LETRONNA_DISPOSABLE=1`). Nothing is saved. |
 | `LETRONNA_DEADLINE` | Seconds the run may take. Set it a little under the harness's kill time so the run ends with its result line, whose status is then `deadline`. |
 | `LETRONNA_DISPOSABLE=1` | Declares the machine throwaway, as in a benchmark container. Unattended Bypass runs may then use commands that are hard to undo, such as `rm -r` or `git reset --hard`. Never set it on a machine whose files matter. |
+| `LETRONNA_PROGRESS_NOTE_ROUNDS` | Rounds a run nobody watches may go without changing the project before it is asked to say, in one line, what it has established and its next step (default 12; again at twice and three times that; 0 never asks). |
 
 Even without `LETRONNA_DISPOSABLE`, an unattended Bypass run on macOS and Linux may delete folders strictly inside its project. It still refuses:
 
