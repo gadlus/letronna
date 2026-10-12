@@ -303,6 +303,15 @@ pub(crate) fn chunk(event: &Value) -> Value {
             "index": event["output_index"],
             "function": {"arguments": event["delta"]},
         }]})),
+        // The call whole, arguments and all: what its pieces should have come
+        // to, and all there is of a call in a parallel batch whose pieces
+        // never came.
+        "response.output_item.done" if item["type"] == "function_call" => {
+            delta(json!({"tool_calls_done": [{
+                "id": item["call_id"],
+                "arguments": item["arguments"],
+            }]}))
+        }
         "response.output_item.done" if item["type"] == "reasoning" => {
             delta(json!({"reasoning_items": [item]}))
         }
