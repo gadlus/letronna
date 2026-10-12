@@ -66,6 +66,7 @@ tree-sitter-yaml = { version = "0.7", optional = true }
 # parser unpacks it.
 pdf-extract = "0.12.1"
 flate2 = "1"
+tar = "0.4"
 weezl = "0.1"
 # Kimi CLI names each project's folder of sessions by the MD5 of its path,
 # which importing one needs to find the project again. Already built here,
