@@ -715,11 +715,11 @@ fn main() {
         println!("{BRAND} {}", env!("CARGO_PKG_VERSION"));
         return;
     }
-    // Started by Claude Code as its hook, to wait for Letronna's messages:
-    // no window, and before the single-instance check, which would see the
-    // window already open and quit.
-    if let Some(port_file) = plugins::claude_code::hook_arg() {
-        std::process::exit(plugins::claude_code::hook(&port_file));
+    // A Claude Code session the removed Claude Code plugin started still names
+    // this binary as its hook; without an answer Claude Code goes on as it
+    // would, so it gets none rather than a window.
+    if std::env::args().any(|a| a == "--claude-code-hook") {
+        return;
     }
     if std::env::args().any(|a| a == "--uninstall") {
         platform::install::uninstall();
@@ -750,7 +750,6 @@ fn main() {
                     plugins::PresenceMode::Detailed,
                 )),
                 Box::new(plugins::hello::Hello::new()),
-                Box::new(plugins::claude_code::ClaudeCode::new()),
                 Box::new(plugins::chatgpt::ChatGpt::new()),
             ],
         );

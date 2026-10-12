@@ -8,7 +8,6 @@
 //! it to the `vec![...]` in `main`. Nothing else in the app needs to change.
 
 pub(crate) mod chatgpt;
-pub(crate) mod claude_code;
 pub(crate) mod discord;
 pub(crate) mod hello;
 
