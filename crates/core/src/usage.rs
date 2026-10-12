@@ -114,13 +114,17 @@ pub(crate) fn cached(usage: &Value) -> Option<u64> {
         .and_then(Value::as_u64)
 }
 
-/// Input tokens written to the prompt cache, under OpenRouter's name or
-/// Anthropic's.
+/// Input tokens written to the prompt cache, under OpenRouter's name, the
+/// one other gateways give beside `cached_tokens`, or Anthropic's. A name
+/// given as null, as the Responses API's usage can, is passed over.
 pub(crate) fn cache_write(usage: &Value) -> Option<u64> {
-    usage
-        .pointer("/prompt_tokens_details/cache_write_tokens")
-        .or_else(|| usage.get("cache_creation_input_tokens"))
-        .and_then(Value::as_u64)
+    [
+        usage.pointer("/prompt_tokens_details/cache_write_tokens"),
+        usage.pointer("/prompt_tokens_details/cache_creation_tokens"),
+        usage.get("cache_creation_input_tokens"),
+    ]
+    .into_iter()
+    .find_map(|tokens| tokens?.as_u64())
 }
 
 /// Output tokens the model spent thinking.
@@ -459,6 +463,22 @@ mod tests {
             (4_420, 4_100, 300)
         );
         assert_eq!(usage.cost, None);
+    }
+
+    #[test]
+    fn a_cache_write_is_read_under_each_name_a_gateway_uses() {
+        let written = |usage: Value| cache_write(&usage);
+        let openrouter = json!({"prompt_tokens_details": {"cache_write_tokens": 600}});
+        assert_eq!(written(openrouter), Some(600));
+        let gateway = json!({"prompt_tokens_details": {"cache_creation_tokens": 18_012}});
+        assert_eq!(written(gateway), Some(18_012));
+        let anthropic = json!({"cache_creation_input_tokens": 300});
+        assert_eq!(written(anthropic), Some(300));
+        // A name left null, as the Responses API's usage leaves it, is no count.
+        let null = json!({"prompt_tokens_details": {"cache_write_tokens": null},
+            "cache_creation_input_tokens": 300});
+        assert_eq!(written(null), Some(300));
+        assert_eq!(written(json!({"prompt_tokens": 20})), None);
     }
 
     #[test]
