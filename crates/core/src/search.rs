@@ -1516,9 +1516,11 @@ enum Fault {
 
 /// What an answer of HTTP `status` with `body` to a search says of the
 /// gateway; `hosted` for Letronna's own, where a route not found means a
-/// deploy without one. Its API answers its own errors in JSON, among them a
-/// 404 passed on from a provider with nobody to lend a search; a deploy
-/// without the route answers its web framework's plain "404 Not Found".
+/// deploy without one. Its API answers its own errors in JSON: a provider
+/// with nobody to lend a search comes back as a 503 (the route's first
+/// version passed the provider's 404 on), and a 404 in JSON names a model it
+/// does not have; either way it cannot search now. A deploy without the
+/// route answers its web framework's plain "404 Not Found".
 fn fault(status: u16, hosted: bool, body: &[u8]) -> Fault {
     let answered_by_the_api =
         || serde_json::from_slice::<Value>(body).is_ok_and(|json| json["error"].is_object());
@@ -3900,7 +3902,8 @@ pub(crate) mod tests {
 
     #[test]
     fn a_404_from_letronna_means_no_search_route_only_when_its_api_did_not_answer_it() {
-        // The API's own answer when no provider has a search to lend, and a
+        // A 404 the API answers itself, in JSON (a model it does not have, or
+        // a provider's 404 as the route's first version passed it on), and a
         // deploy without the route, as its web framework answers.
         let no_lender = json!({"error": {"message": "The model answered 404.", "type": "upstream_error", "code": 404}});
         assert_eq!(
@@ -3917,7 +3920,7 @@ pub(crate) mod tests {
             models: vec![AUTO.into()],
             ..pool()
         };
-        // With nobody to lend a search, it rests and is still sold.
+        // Answered by the API itself, it rests and is still sold.
         let (base, _) = gateway_at(move |_, _| (404, no_lender.to_string()));
         let gateways = Mutex::new(Gateways::default());
         let why = through(
