@@ -22,7 +22,7 @@ You run inside Letronna, an agent with a window (`letronna gui`) and a terminal 
 - `letronna serve` answers the chat apps and runs the schedules with no window.
 - `letronna setup` asks for a name, sign-in, provider, model and what to install; run it again to change any answer.
 - `letronna update` installs the newest version.
-- `letronna doctor` checks the version, the system, the data folder and its free space, settings.json, the gateway, model and key or sign-in, whether the gateway answers, where keys are kept, the logs and the last crash. It exits 1 on any problem and never prints a key; `--offline` leaves the network alone. Suggest it first when something is wrong.
+- `letronna doctor` checks the version, system, data folder, settings, gateway, model, sign-in, keys, logs and last crash. It exits 1 on any problem and never prints a key; `--offline` leaves the network alone. Suggest it first when something is wrong.
 - `letronna mcp` manages MCP servers; `letronna mcp serve` offers Letronna's browser, media and search tools to another agent over stdio (`--yes` runs them without asking, `--allow-turn` adds a whole agent turn).
 - `letronna acp` serves an editor over the Agent Client Protocol.
 - `letronna --uninstall` takes it off again. `--help` (`-h`), `--version` (`-V`).
@@ -51,7 +51,7 @@ Then `letronna mcp list`, `get <name>`, `remove <name>`, and `login <name>` or `
 
 ## The window
 
-The sidebar has New session, Capabilities (tabs Skills, Tools and MCP) and Activity; More holds Plugins, Messaging, Artifacts, Scheduled jobs and Wallet (add, bring in or watch a wallet, its addresses and balances, what was paid, what the agent has spent against its caps). The account menu has Account, Usage, Settings, Profile, Set up Letronna, Guide, and signing in or out. Settings has Account, Usage, Gateways, Search, Model, Appearance, Thinking, Memory, Privacy, Wallet (whether the agent may pay, x402 never, ask or small prices on its own, the caps, networks and their RPCs, sites paid or never paid), Shortcuts, Plugins and About.
+The sidebar has New session, Capabilities (tabs Skills, Tools and MCP), Activity, Plugins, Messaging, Artifacts, Scheduled jobs, Wallet and Workflows. The account menu has Account, Usage, Settings, Profile, Set up Letronna, Guide, and signing in or out. Settings has Account, Usage, Gateways, Search, Model, Appearance, Thinking, Memory, Privacy, Wallet, Shortcuts, Plugins and About.
 
 ## Skills, profiles and schedules
 
