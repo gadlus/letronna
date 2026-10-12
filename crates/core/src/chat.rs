@@ -3430,6 +3430,9 @@ struct Chunk {
     /// Fragments of `(index, id, name, arguments, extra_content)`; the
     /// stream assembles them.
     tool_calls: Vec<(Option<usize>, String, String, String, Value)>,
+    /// Calls the stream also sent whole, as `(id, arguments)`: their
+    /// arguments stand over whatever the fragments came to.
+    tool_calls_done: Vec<(String, String)>,
     reasoning_details: Vec<Value>,
     /// The Responses API's reasoning items, each whole.
     reasoning_items: Vec<Value>,
@@ -3500,6 +3503,11 @@ impl Assembler {
                 call.name.clone_from(name);
             }
             call.arguments.push_str(arguments);
+        }
+        for (id, arguments) in &chunk.tool_calls_done {
+            if let Some(call) = self.calls.iter_mut().find(|call| call.id == *id) {
+                call.arguments.clone_from(arguments);
+            }
         }
     }
 }
@@ -3617,6 +3625,20 @@ fn parse_chunk(value: &Value) -> Result<Chunk, Failure> {
                 .collect()
         })
         .unwrap_or_default();
+    let tool_calls_done = delta
+        .and_then(|d| d["tool_calls_done"].as_array())
+        .map(|calls| {
+            calls
+                .iter()
+                .filter_map(|c| {
+                    Some((
+                        c["id"].as_str()?.to_owned(),
+                        c["arguments"].as_str()?.to_owned(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let reasoning_details = delta
         .and_then(|d| d["reasoning_details"].as_array())
         .cloned()
@@ -3642,6 +3664,7 @@ fn parse_chunk(value: &Value) -> Result<Chunk, Failure> {
         reasoning_tokens,
         cost,
         tool_calls,
+        tool_calls_done,
         reasoning_details,
         reasoning_items,
         finish,
@@ -5801,6 +5824,33 @@ mod tests {
             name: name.into(),
             arguments: arguments.into(),
         }
+    }
+
+    #[test]
+    fn a_responses_call_sent_whole_keeps_its_arguments_when_no_pieces_came() {
+        // ChatGPT's parallel calls: each added, then done with its arguments,
+        // and the first's pieces sent at no index, which would land on the
+        // last call added.
+        let events = [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_a","name":"list_dir","arguments":""}}"#,
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_b","name":"run_command","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","delta":"{\"path\":\".\"}"}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_a","name":"list_dir","arguments":"{\"path\":\".\"}"}}"#,
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_b","name":"run_command","arguments":"{\"command\":\"ls\"}"}}"#,
+        ];
+        let mut assembler = Assembler::default();
+        for data in events {
+            let event = read_event(data).unwrap();
+            let chunk = crate::providers::wire::openai_responses::chunk(&event);
+            assembler.add(&parse_chunk(&chunk).unwrap());
+        }
+        assert_eq!(
+            assembler.calls,
+            [
+                call("call_a", "list_dir", r#"{"path":"."}"#),
+                call("call_b", "run_command", r#"{"command":"ls"}"#),
+            ]
+        );
     }
 
     #[test]
