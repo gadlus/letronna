@@ -17,6 +17,7 @@ Letronna — a small agent in your terminal
   letronna update          install the newest version
   letronna doctor          check the setup, the disk and the gateway
   letronna cloud           run a task on Letronna's servers (Pro)
+  letronna wallet          the wallet the agent pays from, and its limits
   letronna mcp             add, list, get or remove MCP servers
   letronna mcp serve       offer the browser, media and search tools over MCP
   letronna acp             serve an editor over the Agent Client Protocol
@@ -147,6 +148,8 @@ pub struct Args {
     pub mcp: Option<Vec<String>>,
     /// `letronna cloud ...`: the words after it.
     pub cloud: Option<Vec<String>>,
+    /// `letronna wallet ...`: the words after it.
+    pub wallet: Option<Vec<String>>,
     /// `letronna acp`: speak the Agent Client Protocol on stdin and stdout.
     pub acp: bool,
     /// `--dump-config`: print what a `-p` run with these flags would get
@@ -193,6 +196,7 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         budget: None,
         mcp: None,
         cloud: None,
+        wallet: None,
         acp: false,
         dump_config: false,
         schema: None,
@@ -208,6 +212,10 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
     }
     if raw.next_if(|first| first == "cloud").is_some() {
         args.cloud = Some(raw.collect());
+        return Ok(args);
+    }
+    if raw.next_if(|first| first == "wallet").is_some() {
+        args.wallet = Some(raw.collect());
         return Ok(args);
     }
     // Only as the first word too, since an editor starts it with nothing
