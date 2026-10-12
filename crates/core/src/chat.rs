@@ -3736,6 +3736,7 @@ pub fn list_models(base: &str, key: &str) -> Result<Vec<String>, String> {
         .as_array()
         .ok_or("Invalid model list.")?;
     crate::models::remember(base, list);
+    crate::search::heard_list(base, list);
     let models = list
         .iter()
         .filter_map(|m| m["id"].as_str().or_else(|| m["key"].as_str()))

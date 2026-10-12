@@ -542,8 +542,9 @@ pub struct Settings {
     #[serde(default)]
     pub memory_scope: crate::memory::Scope,
     /// Search with DuckDuckGo, which needs no key, while no search service
-    /// is chosen; switched off, search_web says how to turn it back on or
-    /// add a key.
+    /// is chosen, after the gateway's search where it sells one; switched
+    /// off, search_web searches through that gateway alone, or with none
+    /// says how to turn it back on or add a key.
     #[serde(default = "yes")]
     pub keyless_search: bool,
     /// How find_tools ranks the tools it finds: "auto" or empty for Jev

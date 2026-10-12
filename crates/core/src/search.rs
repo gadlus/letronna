@@ -1,4 +1,5 @@
-//! Searching the web with a search service of the user's own.
+//! Searching the web with a search service of the user's own, or with the
+//! gateway's and DuckDuckGo while none is chosen.
 //!
 //! The gateway's search (the Web toggle) comes with only some gateways, and a
 //! browser searching Google is heavy and runs into its bot checks. A search
@@ -13,33 +14,87 @@
 //! only at the address it is given. Emptied, an address goes back to the
 //! official one.
 //!
-//! While no service is chosen, searches go to DuckDuckGo's page for browsers
-//! without JavaScript, which needs no key, so a fresh install can search from
-//! its first turn. DuckDuckGo has no public search API, so `keyless_search`
-//! in the settings, on unless the user switches it off, says whether it is
-//! used. It is never a stand-in: a chosen service that is not set up gives
-//! its own error, and switched off with no other service chosen, the tool
-//! says how to switch it back on or add a key rather than searching. It is
-//! asked once per search with Letronna's own user agent; when it limits
-//! searches, the model is told so rather than given an empty list, and it is
-//! left alone for a while.
+//! While no service is chosen, a search goes through the session's own
+//! gateway when it sells search -- Letronna's, paid from the account's
+//! credit, or one that lists search models in its `/models`, the cheapest
+//! tried first -- and on to DuckDuckGo's page for browsers without JavaScript
+//! in the same call when the gateway cannot answer. A gateway's searches are
+//! lent by providers that at times have none to lend, so one that could not
+//! answer rests for ten minutes, DuckDuckGo going first meanwhile, and is
+//! still asked when DuckDuckGo cannot answer either. The session's key goes
+//! only to its own gateway, and no redirect from it is followed. Choosing
+//! DuckDuckGo by name keeps every search off the gateway's paid search.
 //!
-//! The tool is only offered while a service is usable, or DuckDuckGo is
-//! switched off with nothing else chosen, and asks before each search: the
-//! query leaves for somebody else's server, and a page read a moment ago may
-//! be what is asking for it.
+//! DuckDuckGo needs no key, so a fresh install can search from its first
+//! turn. It has no public search API, so `keyless_search` in the settings, on
+//! unless the user switches it off, says whether it is used. It is never a
+//! stand-in for a chosen service: a chosen service is the only one asked, one
+//! that is not set up gives its own error, and with DuckDuckGo switched off,
+//! no other service chosen and no gateway that sells search, the tool says
+//! how to switch it back on or add a key rather than searching. It is asked
+//! once per search with Letronna's own user agent; when it limits searches,
+//! the model is told so rather than given an empty list, and it is left alone
+//! for a while.
+//!
+//! The tool is only offered while a service is usable, or none but
+//! DuckDuckGo is chosen, so that a call can say how to search, and asks
+//! before each search, naming every place the query may go and who pays for
+//! a search through the gateway: it leaves for somebody else's server, and a
+//! page read a moment ago may be what is asking for it.
 
+use crate::chat::Connection;
 use crate::tools::{Tool, ToolContext};
 use crate::web::Asker;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 /// How long a search service gets to answer.
 const SEARCH_TIME: Duration = Duration::from_secs(20);
+/// How long a gateway's search gets to answer: less than a service, as
+/// DuckDuckGo is there to go on to. Letronna's own gets as long: its "auto"
+/// waits 5 seconds on each search model and starts no other after the first
+/// 6 (letronna-api's WAIT and TRY_FOR in search.js), so it answers or gives
+/// up within about 11, and an answer it charges for is not thrown away here.
+const GATEWAY_TIME: Duration = Duration::from_secs(15);
+/// How long a gateway's list of models gets to come.
+const LIST_TIME: Duration = Duration::from_secs(8);
+/// The most of a gateway's list of models, or of its answer to a search,
+/// that is read, in bytes: a list of some 500 models is well under this.
+const GATEWAY_BYTES: u64 = 4 * 1024 * 1024;
+/// How many of a gateway's search models one search tries, cheapest first,
+/// before it goes on to DuckDuckGo.
+const MODELS_TRIED: usize = 2;
+/// How long a gateway whose search could not answer is left to rest, and a
+/// search model of it that could not is tried after the others: whoever
+/// lends its searches seldom has one again a minute later.
+const REST: Duration = Duration::from_secs(10 * 60);
+/// How long a gateway found to sell no search, or whose list could not be
+/// read, is taken at that before its list is read again; and how often a
+/// gateway that turned a search down has its list read again for it.
+const UNSOLD_TIME: Duration = Duration::from_secs(5 * 60);
+/// Why a gateway whose list of models could not be read lately is not asked
+/// to search for now.
+const NO_LIST: &str = "its list of models could not be read";
+/// Why Letronna's own, found lately to have no search route, is not asked
+/// to search for now.
+const NO_ROUTE: &str = "it has no search route yet";
+/// How long a gateway's search is not asked once auto mode left a search
+/// over it to the judge, as one that costs nothing: the judge is waited on
+/// for at most 20 seconds, and the search runs once it answers, so it goes
+/// through no gateway found to sell search on its way -- a list or a lapse
+/// that ran out meanwhile, or a list read for the model picker.
+const JUDGED_TIME: Duration = Duration::from_secs(60);
+/// Why a gateway is not asked for a search auto mode let run as free.
+const JUDGED_FREE: &str = "it was not known to sell search when auto mode let a search run as free";
+/// The search model Letronna's own gateway is asked for: whichever it finds
+/// cheapest of those that have not been failing lately.
+const AUTO: &str = "auto";
+/// What the memo calls a search through the session's gateway.
+const GATEWAY: &str = "gateway";
 /// How many results a search returns unless asked for more, and the most.
 const RESULTS: u64 = 5;
 const MOST_RESULTS: u64 = 10;
@@ -187,18 +242,74 @@ pub fn ready() -> bool {
 }
 
 /// Whether the tool is offered: while a service is usable, and while
-/// DuckDuckGo is switched off with no other chosen, so that a call can say
-/// how to search.
+/// DuckDuckGo is switched off with no other chosen, so that a call searches
+/// through a gateway that sells search or says how to search.
 pub fn offered() -> bool {
     let now = standing();
     now.ready || now.keyless
 }
 
 /// Why a search cannot go out though the tool is offered: DuckDuckGo is
-/// switched off and no other service is chosen.
-pub(crate) fn switched_off() -> Option<&'static str> {
+/// switched off, and either it was chosen by name or no other service is
+/// chosen and `connection`'s gateway is not known to sell search. Its list
+/// is not read for this, only what is known of it already.
+pub(crate) fn switched_off(connection: Option<&Connection>) -> Option<&'static str> {
     let now = standing();
-    (now.keyless && !now.ready).then_some(SWITCHED_OFF)
+    if !now.keyless || now.ready {
+        return None;
+    }
+    let gateway = !now.chosen && named_gate(connection, gateways(), Instant::now()).is_some();
+    (!gateway).then_some(SWITCHED_OFF)
+}
+
+/// Whether a search over `connection` would be paid through its gateway,
+/// from the account's credit or to that gateway: no service is chosen and
+/// the gateway sells search now. A list not read lately is read first, as
+/// the search itself would read it, so this may wait on the gateway, once
+/// in a while: it is for deciding a call, never for a card or a lookup. A
+/// gateway whose list named no search models, or could not be read, is sent
+/// no search, so a search over it costs nothing; nor is any for a while
+/// after, whatever is found of it meanwhile, as auto mode's judge then lets
+/// the search run as free.
+pub(crate) fn paid_through_gateway(connection: Option<&Connection>) -> bool {
+    if standing().chosen {
+        return false;
+    }
+    let gateways = gateways();
+    if selling(connection, gateways, Instant::now()).is_some_and(|gate| sells(&gate)) {
+        return true;
+    }
+    if let Some(gate) = session_gateway(connection) {
+        lock(gateways).judged_free(&gate.base, Instant::now());
+    }
+    false
+}
+
+/// Where searches over `connection` go while no service is chosen, as the
+/// model is told of the user's setup: through its gateway, who pays, and
+/// whether DuckDuckGo is asked when it cannot answer; `None` unless the
+/// gateway is known to sell search. Its list is not read for this, only what
+/// is known of it already.
+pub(crate) fn through_note(connection: Option<&Connection>) -> Option<String> {
+    if standing().chosen {
+        return None;
+    }
+    let gate = named_gate(connection, gateways(), Instant::now()).filter(sells)?;
+    let payer = match gate.hosted {
+        true => "from the account's credit",
+        false => "to that gateway",
+    };
+    Some(match crate::store::keyless_search() {
+        true => format!(
+            "With no service chosen, searches go through {}, paid {payer} by the search, \
+             and to DuckDuckGo when it cannot answer.",
+            gate.name
+        ),
+        false => format!(
+            "With no service chosen, searches go through {} alone, paid {payer} by the search.",
+            gate.name
+        ),
+    })
 }
 
 /// Where searching stands, as the files say now.
@@ -209,6 +320,8 @@ struct Standing {
     /// The service searches go to, or would but for the settings, is the
     /// keyless one.
     keyless: bool,
+    /// A service is chosen by name, which is then the only one asked.
+    chosen: bool,
 }
 
 fn standing() -> Standing {
@@ -229,6 +342,7 @@ fn standing() -> Standing {
         Standing {
             ready: usable(&choice, &keys, crate::store::keyless_search()).is_ok(),
             keyless: picked(&choice).is_some_and(|s| s.keyless),
+            chosen: !choice.service.is_empty(),
         }
     })
 }
@@ -371,6 +485,522 @@ fn web_address(pasted: &str, self_hosted: bool) -> String {
     address
 }
 
+/// One way a search may go.
+enum Route {
+    /// A search service: the one the user chose, or DuckDuckGo while none is.
+    Service(Reach),
+    /// The session's own gateway, which sells search.
+    Gateway(Gate),
+}
+
+impl Route {
+    /// Where the card says a search by this route goes.
+    fn place(&self) -> String {
+        match self {
+            Route::Service(reach) if reach.address == reach.service.official => {
+                reach.service.name.to_owned()
+            }
+            Route::Service(reach) => format!("{} at {}", reach.service.name, reach.address),
+            Route::Gateway(gate) => format!("through {}", gate.name),
+        }
+    }
+
+    /// A search by this route as the memo knows it.
+    fn asked(&self, query: &str, count: u64, options: &Options) -> Asked {
+        let (service, address) = match self {
+            Route::Service(reach) => (reach.service.name, reach.address.clone()),
+            Route::Gateway(gate) => (GATEWAY, gate.base.clone()),
+        };
+        Asked {
+            service,
+            address,
+            query: query.to_owned(),
+            count,
+            options: options.clone(),
+        }
+    }
+}
+
+/// The routes a search tries, in turn until one answers. A service the user
+/// chose, DuckDuckGo by name included, is the only one. With none chosen,
+/// `gate`, the session's gateway when it sells search, goes first and
+/// DuckDuckGo after it, unless the settings switch DuckDuckGo off; while the
+/// gateway is `resting`, DuckDuckGo goes first and the gateway after it.
+fn routes(
+    choice: &Choice,
+    keys: &HashMap<String, String>,
+    keyless: bool,
+    gate: Option<Gate>,
+    resting: bool,
+) -> Result<Vec<Route>, String> {
+    if !choice.service.is_empty() {
+        return usable(choice, keys, keyless).map(|reach| vec![Route::Service(reach)]);
+    }
+    let duckduckgo = usable(choice, keys, keyless).ok().map(Route::Service);
+    let gateway = gate.map(Route::Gateway);
+    let order = match resting {
+        true => [duckduckgo, gateway],
+        false => [gateway, duckduckgo],
+    };
+    let routes: Vec<Route> = order.into_iter().flatten().collect();
+    if routes.is_empty() {
+        return Err(SWITCHED_OFF.into());
+    }
+    Ok(routes)
+}
+
+/// What the card says of where a search goes: the first route, then those
+/// it goes on to when one cannot answer.
+fn heading(routes: &[Route], query: &str) -> String {
+    let places: Vec<String> = routes.iter().map(Route::place).collect();
+    match places.split_first() {
+        Some((first, [])) => format!("Search {first} for \"{query}\""),
+        Some((first, rest)) => format!(
+            "Search {first} for \"{query}\", or {} if it cannot",
+            rest.join(", then ")
+        ),
+        None => format!("Search for \"{query}\""),
+    }
+}
+
+/// Who pays for a search through the gateway among `routes`, as the card
+/// says it below the filters, the way the media cards do; nothing when no
+/// gateway is among them, as a service's plan is the user's own.
+fn paid(routes: &[Route]) -> String {
+    let payer = |gate: &Gate| match gate.hosted {
+        true => "from your Letronna credit",
+        false => "to that gateway",
+    };
+    routes
+        .iter()
+        .find_map(|route| match route {
+            Route::Gateway(gate) => Some(format!(
+                "\n\nA search through {} is paid {}.",
+                gate.name,
+                payer(gate)
+            )),
+            Route::Service(_) => None,
+        })
+        .unwrap_or_default()
+}
+
+/// The session's gateway, as its search is reached.
+#[derive(Clone)]
+struct Gate {
+    /// What the card and the results call it: its name among the gateways,
+    /// or its host.
+    name: String,
+    /// Its address, which the search route is under, with no slash on the end.
+    base: String,
+    /// The session's key for it, which goes nowhere else.
+    key: String,
+    /// It is Letronna's own, which sells search whatever its list says.
+    hosted: bool,
+    /// Its search models in the order they are tried; none while its list
+    /// has not been read.
+    models: Vec<String>,
+    /// Why it is not asked to search for now, though it may sell search:
+    /// its list could not be read lately, or Letronna's own had no search
+    /// route. It is still named on the card, after DuckDuckGo, as by the
+    /// time the card is answered it may be asked again.
+    failing: Option<&'static str>,
+}
+
+/// The gateway a session over `connection` talks to, whose search a search
+/// with no service chosen may go through: none with no connection, for
+/// Letronna's own while not signed in, or for Anthropic's API, which sells
+/// no search.
+fn session_gateway(connection: Option<&Connection>) -> Option<Gate> {
+    let connection = connection?;
+    let base = gateway_base(&connection.endpoint);
+    if base.is_empty() || crate::providers::wire::anthropic::speaks(&base) {
+        return None;
+    }
+    let hosted = base == crate::auth::hosted_base();
+    let key = connection.key.trim().to_owned();
+    if hosted && key.is_empty() {
+        return None;
+    }
+    let name = crate::gateway::named(&base)
+        .map(str::to_owned)
+        .or_else(|| crate::chat::host(&base))
+        .unwrap_or_else(|| base.clone());
+    Some(Gate {
+        name,
+        base,
+        key,
+        hosted,
+        models: Vec::new(),
+        failing: None,
+    })
+}
+
+/// A gateway's address as its routes are reached under it: the chat route
+/// and any slash taken off the end.
+fn gateway_base(endpoint: &str) -> String {
+    let base = endpoint.trim().trim_end_matches('/');
+    base.strip_suffix("/chat/completions")
+        .unwrap_or(base)
+        .to_owned()
+}
+
+/// The session's gateway with the search models it sells, as far as is
+/// known at `now` without asking it: `None` only when its list, read lately,
+/// named no search models, and no models yet while its list was not read.
+/// One whose list could not be read, or Letronna's own without a search
+/// route, is still given, as failing: the card names every place a search
+/// approved later may go.
+fn named_gate(
+    connection: Option<&Connection>,
+    gateways: &Mutex<Gateways>,
+    now: Instant,
+) -> Option<Gate> {
+    let mut gate = session_gateway(connection)?;
+    match lock(gateways).known(&gate.base, gate.hosted, now) {
+        Known::SellsNone => return None,
+        Known::Sells(models) => gate.models = models,
+        Known::Failing(why) => gate.failing = Some(why),
+        Known::Unknown => {}
+    }
+    Some(gate)
+}
+
+/// Whether `gate` is known to sell search and may be asked now: Letronna's
+/// own unless it lately had no search route, or another whose list named
+/// search models.
+fn sells(gate: &Gate) -> bool {
+    gate.failing.is_none() && !gate.models.is_empty()
+}
+
+/// Whether `gate` goes after DuckDuckGo at `now`: it could not answer
+/// lately, or cannot be asked for now.
+fn rests(gate: &Gate, gateways: &Mutex<Gateways>, now: Instant) -> bool {
+    gate.failing.is_some() || lock(gateways).resting(&gate.base, now)
+}
+
+/// `gate` for a search that runs at `now`: not asked while a search auto
+/// mode let run as free, its search not known to be sold then, may still be
+/// on its way. The gate decides on what is known, so this is the search's
+/// alone.
+fn as_judged(mut gate: Gate, gateways: &Mutex<Gateways>, now: Instant) -> Gate {
+    if gate.failing.is_none() && lock(gateways).judged_lately(&gate.base, now) {
+        gate.failing = Some(JUDGED_FREE);
+    }
+    gate
+}
+
+/// The session's gateway when it may sell search, with its search models in
+/// the order they are tried; its list is read first when it never was, or
+/// not lately. One that cannot be asked for now is given as failing.
+fn selling(
+    connection: Option<&Connection>,
+    gateways: &Mutex<Gateways>,
+    now: Instant,
+) -> Option<Gate> {
+    let mut gate = named_gate(connection, gateways, now)?;
+    if gate.models.is_empty() && gate.failing.is_none() {
+        // One search at a time reads it, so searches side by side send one
+        // request between them, and the others take what it found.
+        let reader = lock(gateways).reader(&gate.base);
+        let _turn = reader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gate = named_gate(connection, gateways, now)?;
+        if gate.models.is_empty() && gate.failing.is_none() {
+            let listed = ask_for_models(&gate.base, &gate.key);
+            let mut known = lock(gateways);
+            match listed {
+                Some(models) => {
+                    known.listed(&gate.base, models.clone(), now);
+                    gate.models = models;
+                }
+                None => {
+                    known.lapsed(&gate.base, NO_LIST, now);
+                    gate.failing = Some(NO_LIST);
+                }
+            }
+        }
+        if gate.models.is_empty() && gate.failing.is_none() {
+            return None;
+        }
+    }
+    gate.models = lock(gateways).in_turn(&gate.base, &gate.models, now);
+    Some(gate)
+}
+
+/// The search models `base` lists in its `/models`, cheapest first, asked
+/// with `key` as a list for the model picker is; `None` when the list could
+/// not be read.
+fn ask_for_models(base: &str, key: &str) -> Option<Vec<String>> {
+    let deadline = Instant::now() + LIST_TIME;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(LIST_TIME)
+        .user_agent(concat!("Letronna/", env!("CARGO_PKG_VERSION")))
+        // Not followed, as a gateway's search is not: a redirect could carry
+        // the key to wherever it points.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()?;
+    let mut request = client.get(format!("{base}/models"));
+    if !key.is_empty() {
+        request = request.bearer_auth(key);
+    }
+    let reply = request.send().ok()?;
+    if !reply.status().is_success() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    read_by(reply, GATEWAY_BYTES, deadline, &mut bytes).ok()?;
+    let body: Value = serde_json::from_slice(&bytes).ok()?;
+    let list = crate::chat::unwrap_response(&body).ok()?["data"].as_array()?;
+    Some(search_models(list))
+}
+
+/// Read what `reply` sends into `bytes`, up to `most` of them, until
+/// `deadline`, when it fails as timed out. The client's timeout covers each
+/// read alone, so a gateway that sent a byte now and then could otherwise
+/// hold a search for as long as it liked.
+fn read_by(
+    reply: impl std::io::Read,
+    most: u64,
+    deadline: Instant,
+    bytes: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut reply = reply.take(most);
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        if Instant::now() > deadline {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        match reply.read(&mut chunk) {
+            Ok(0) => return Ok(()),
+            Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Note what a gateway's `/models` list, read for the model picker or a
+/// request, says of its search, so a search need not read it again and the
+/// card can name the gateway before any search has gone through it.
+pub(crate) fn heard_list(base: &str, list: &[Value]) {
+    let base = gateway_base(base);
+    // Letronna's own sells search at a route of its own, which its list of
+    // chat models does not name.
+    if base == crate::auth::hosted_base() {
+        return;
+    }
+    lock(gateways()).listed(&base, search_models(list), Instant::now());
+}
+
+/// The search models in the entries of a gateway's `/models` list, cheapest
+/// first: those of type "search", by the most a query may cost, those that
+/// name no price after the rest and those that cost the same by id. An id
+/// not shaped like one is left out, as errors name it unfenced.
+fn search_models(list: &[Value]) -> Vec<String> {
+    let mut found: Vec<(Option<f64>, String)> = list
+        .iter()
+        .filter(|entry| {
+            entry["type"]
+                .as_str()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("search"))
+        })
+        .filter_map(|entry| {
+            let id = entry["id"].as_str().filter(|id| model_id(id))?;
+            let price = &entry["pricing"]["max_usd_per_unit"];
+            let price = price
+                .as_f64()
+                .or_else(|| price.as_str()?.trim().parse().ok())
+                .filter(|price: &f64| price.is_finite() && *price >= 0.0);
+            Some((price, id.to_owned()))
+        })
+        .collect();
+    found.sort_by(|(a, one), (b, other)| {
+        let by_price = match (a, b) {
+            (Some(a), Some(b)) => a.total_cmp(b),
+            (a, b) => b.is_some().cmp(&a.is_some()),
+        };
+        by_price.then_with(|| one.cmp(other))
+    });
+    let mut models: Vec<String> = found.into_iter().map(|(_, id)| id).collect();
+    models.dedup();
+    models
+}
+
+/// Whether `id` is shaped like a model's id: short, and only letters,
+/// digits and `-_./:@`.
+fn model_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 100
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:@".contains(c))
+}
+
+/// What is known of a gateway's search.
+#[derive(Clone, PartialEq, Debug)]
+enum Known {
+    /// It sells search with these models, cheapest first.
+    Sells(Vec<String>),
+    /// Its list, read lately, named no search models.
+    SellsNone,
+    /// It may sell search but is not asked for now, for this reason: its
+    /// list could not be read lately, or, Letronna's own, it had no search
+    /// route.
+    Failing(&'static str),
+    /// Its list has not been read, or not lately.
+    Unknown,
+}
+
+/// What a gateway's list said of its search.
+enum Sold {
+    /// These search models, cheapest first: kept for the rest of the process.
+    Models(Vec<String>),
+    /// None, as its list said at this moment.
+    None(Instant),
+    /// It could not be asked at this moment, for this reason.
+    Lapsed(Instant, &'static str),
+}
+
+/// What is known of each gateway's search, by its address, kept only in
+/// memory: what it sells, and when it and each of its search models last
+/// could not answer.
+#[derive(Default)]
+struct Gateways {
+    sold: HashMap<String, Sold>,
+    failed: HashMap<String, Instant>,
+    failed_models: HashMap<(String, String), Instant>,
+    /// When its list was last forgotten for a search it turned down.
+    forgotten: HashMap<String, Instant>,
+    /// Held while its list is read, so one search reads it at a time.
+    reading: HashMap<String, std::sync::Arc<Mutex<()>>>,
+    /// When auto mode last left a search over it to the judge as free.
+    judged: HashMap<String, Instant>,
+}
+
+impl Gateways {
+    /// What is known at `now` of the search at `base`; Letronna's own,
+    /// `hosted`, sells it with its own pick of model unless it lately had no
+    /// route for it.
+    fn known(&self, base: &str, hosted: bool, now: Instant) -> Known {
+        let lately = |at: &Instant| now.saturating_duration_since(*at) < UNSOLD_TIME;
+        match self.sold.get(base) {
+            Some(Sold::None(at)) if lately(at) => Known::SellsNone,
+            Some(Sold::Lapsed(at, why)) if lately(at) => Known::Failing(why),
+            _ if hosted => Known::Sells(vec![AUTO.to_owned()]),
+            Some(Sold::Models(models)) => Known::Sells(models.clone()),
+            _ => Known::Unknown,
+        }
+    }
+
+    /// Keep the search models the list at `base` named at `now`, cheapest
+    /// first; none is kept only for `UNSOLD_TIME`.
+    fn listed(&mut self, base: &str, models: Vec<String>, now: Instant) {
+        let sold = match models.is_empty() {
+            true => Sold::None(now),
+            false => Sold::Models(models),
+        };
+        self.sold.insert(base.to_owned(), sold);
+    }
+
+    /// `base` could not be asked at `now`, for `why`: its list could not be
+    /// read, or it had no search route. It is not asked for a while, and
+    /// rests, so that once it is again, DuckDuckGo still goes first for a
+    /// time, as the cards meanwhile said.
+    fn lapsed(&mut self, base: &str, why: &'static str, now: Instant) {
+        self.sold.insert(base.to_owned(), Sold::Lapsed(now, why));
+        self.rest(base, now);
+    }
+
+    /// Read the list at `base` again before its next search, as it turned a
+    /// search down at `now` and may no longer have the model it was asked
+    /// for; but not more than once in `UNSOLD_TIME`, as one whose list and
+    /// searches disagree would have it read before every search.
+    fn forget(&mut self, base: &str, now: Instant) {
+        let lately = (self.forgotten.get(base))
+            .is_some_and(|at| now.saturating_duration_since(*at) < UNSOLD_TIME);
+        if !lately {
+            self.sold.remove(base);
+            self.forgotten.insert(base.to_owned(), now);
+        }
+    }
+
+    /// What is held while the list at `base` is read.
+    fn reader(&mut self, base: &str) -> std::sync::Arc<Mutex<()>> {
+        self.reading.entry(base.to_owned()).or_default().clone()
+    }
+
+    /// Auto mode left a search over `base` to the judge at `now` as free:
+    /// its search was not known to be sold.
+    fn judged_free(&mut self, base: &str, now: Instant) {
+        self.judged.insert(base.to_owned(), now);
+    }
+
+    /// Whether a search over `base` that auto mode let run as free may still
+    /// be on its way at `now`: it was left to the judge less than
+    /// `JUDGED_TIME` before.
+    fn judged_lately(&self, base: &str, now: Instant) -> bool {
+        self.judged
+            .get(base)
+            .is_some_and(|at| now.saturating_duration_since(*at) < JUDGED_TIME)
+    }
+
+    /// Whether the search at `base` could not answer less than `REST` before
+    /// `now`.
+    fn resting(&self, base: &str, now: Instant) -> bool {
+        self.failed
+            .get(base)
+            .is_some_and(|at| now.saturating_duration_since(*at) < REST)
+    }
+
+    /// `models` in the order they are tried at `now`: as given, cheapest
+    /// first, but those that could not answer lately after the others.
+    fn in_turn(&self, base: &str, models: &[String], now: Instant) -> Vec<String> {
+        let tired = |model: &String| {
+            self.failed_models
+                .get(&(base.to_owned(), model.clone()))
+                .is_some_and(|at| now.saturating_duration_since(*at) < REST)
+        };
+        let (fresh, tired): (Vec<String>, Vec<String>) =
+            models.iter().cloned().partition(|model| !tired(model));
+        fresh.into_iter().chain(tired).collect()
+    }
+
+    /// `model` at `base` could not answer at `now`.
+    fn model_failed(&mut self, base: &str, model: &str, now: Instant) {
+        self.failed_models
+            .insert((base.to_owned(), model.to_owned()), now);
+    }
+
+    /// None of the search models tried at `base` could answer at `now`, so
+    /// it rests.
+    fn rest(&mut self, base: &str, now: Instant) {
+        self.failed.insert(base.to_owned(), now);
+    }
+
+    /// `model` at `base` answered, so neither rests any longer.
+    fn answered(&mut self, base: &str, model: &str) {
+        self.failed.remove(base);
+        self.failed_models
+            .remove(&(base.to_owned(), model.to_owned()));
+    }
+}
+
+fn gateways() -> &'static Mutex<Gateways> {
+    static GATEWAYS: OnceLock<Mutex<Gateways>> = OnceLock::new();
+    GATEWAYS.get_or_init(Default::default)
+}
+
+/// `gateways`, as it is even when a search panicked while holding it: what
+/// it holds is only ever a hint.
+fn lock(gateways: &Mutex<Gateways>) -> MutexGuard<'_, Gateways> {
+    gateways
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// The model's way to search the web.
 pub struct SearchWeb;
 
@@ -404,17 +1034,32 @@ impl Tool for SearchWeb {
             .clamp(1, MOST_RESULTS);
         let options = options(args)?;
         let keyless = crate::store::keyless_search();
-        let reach = usable(&choice(), &crate::store::load_keys(), keyless)?;
-        let asked = Asked {
-            service: reach.service.name,
-            address: reach.address.clone(),
-            query: query.to_owned(),
-            count,
-            options,
+        let choice = choice();
+        let now = Instant::now();
+        // A chosen service is the only one asked, so the gateway's list is
+        // not read for it.
+        let gate = match choice.service.is_empty() {
+            true => selling(ctx.caller.connection.as_deref(), gateways(), now),
+            false => None,
         };
+        let gate = gate.map(|gate| as_judged(gate, gateways(), now));
+        let resting = (gate.as_ref()).is_some_and(|gate| rests(gate, gateways(), now));
+        let routes = routes(&choice, &crate::store::load_keys(), keyless, gate, resting)?;
+        let asked: Vec<Asked> = routes
+            .iter()
+            .map(|route| route.asked(query, count, &options))
+            .collect();
         let asker = Asker::of(ctx);
-        searched_once(memo(), asked, Instant::now(), |asked| {
-            search(&reach, query, count, &asked.options, &asker)
+        searched_once(memo(), &asked, now, || {
+            search_each(
+                &routes,
+                query,
+                count,
+                &options,
+                &asker,
+                gateways(),
+                held_off(),
+            )
         })
     }
     fn needs_approval(&self) -> bool {
@@ -430,7 +1075,7 @@ impl Tool for SearchWeb {
     fn fences_its_errors(&self) -> bool {
         true
     }
-    fn preview(&self, args: &Value, _: &ToolContext) -> String {
+    fn preview(&self, args: &Value, ctx: &ToolContext) -> String {
         let query = args["query"].as_str().unwrap_or_default();
         // Tavily and Exa are sent the sites too, and DuckDuckGo a single
         // allowed one as site: in the query, so the card and the judge
@@ -440,17 +1085,25 @@ impl Tool for SearchWeb {
             .map(|options| filters(&options))
             .unwrap_or_default();
         let keyless = crate::store::keyless_search();
-        let search = match usable(&choice(), &crate::store::load_keys(), keyless) {
-            Ok(reach) if reach.address == reach.service.official => {
-                format!("Search {} for \"{query}\"", reach.service.name)
-            }
-            Ok(reach) => format!(
-                "Search {} at {} for \"{query}\"",
-                reach.service.name, reach.address
-            ),
-            Err(_) => format!("Search for \"{query}\""),
+        let choice = choice();
+        let now = Instant::now();
+        // No list is read for the card, so a gateway whose list was not read
+        // yet, or could not be lately, is named as one the search may go
+        // through: the card names every place the query may go, also once
+        // what is known of the gateway has changed by the time it is
+        // answered. Only a list read lately that named no search models
+        // leaves it off.
+        let gate = match choice.service.is_empty() {
+            true => named_gate(ctx.caller.connection.as_deref(), gateways(), now),
+            false => None,
         };
-        format!("{search}{filters}")
+        let resting = (gate.as_ref()).is_some_and(|gate| rests(gate, gateways(), now));
+        let (search, paid) =
+            match routes(&choice, &crate::store::load_keys(), keyless, gate, resting) {
+                Ok(routes) => (heading(&routes, query), paid(&routes)),
+                Err(_) => (format!("Search for \"{query}\""), String::new()),
+            };
+        format!("{search}{filters}{paid}")
     }
 }
 
@@ -728,8 +1381,8 @@ fn payload(
     sent
 }
 
-/// A search as the memo knows it: the same service at the same address,
-/// asked the same thing.
+/// A search as the memo knows it: the same service at the same address, or
+/// the same gateway, asked the same thing.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 struct Asked {
     service: &'static str,
@@ -765,46 +1418,346 @@ fn memo() -> &'static Mutex<Memo> {
     MEMO.get_or_init(Default::default)
 }
 
-/// The answer to `asked` from the memo, with a note that it is, or from
-/// `search` when there is none still fresh. A failed search is not kept, so
-/// asking again tries again.
+/// The answer to a search from the memo, with a note that it is, when one of
+/// `routes`, the search as each route it may take would be known, answered it
+/// lately; else from `search`, which says which of them answered, and it is
+/// kept under that one alone. A failed search is not kept, so asking again
+/// tries again.
 fn searched_once(
     memo: &Mutex<Memo>,
-    asked: Asked,
+    routes: &[Asked],
     now: Instant,
-    search: impl FnOnce(&Asked) -> Result<String, String>,
+    search: impl FnOnce() -> Result<(usize, String), String>,
 ) -> Result<String, String> {
     // Not held across the search, so searches running side by side wait
     // only for each other's lookups.
-    let recalled = memo.lock().ok().and_then(|memo| memo.recall(&asked, now));
+    let recalled = memo
+        .lock()
+        .ok()
+        .and_then(|memo| routes.iter().find_map(|asked| memo.recall(asked, now)));
     if let Some(listing) = recalled {
         return Ok(format!(
             "(The same search was made a few minutes ago; this is its answer again.)\n\n{listing}"
         ));
     }
-    let listing = search(&asked)?;
-    if let Ok(mut memo) = memo.lock() {
-        memo.keep(asked, listing.clone(), now);
+    let (by, listing) = search()?;
+    if let (Ok(mut memo), Some(asked)) = (memo.lock(), routes.get(by)) {
+        memo.keep(asked.clone(), listing.clone(), now);
     }
     Ok(listing)
 }
 
+/// Search each of `routes` in turn until one answers, with its listing and
+/// which one it was; when none does, each one's reason, a line each.
+fn search_each(
+    routes: &[Route],
+    query: &str,
+    count: u64,
+    options: &Options,
+    asker: &Asker,
+    gateways: &Mutex<Gateways>,
+    limited_at: &Mutex<Option<Instant>>,
+) -> Result<(usize, String), String> {
+    let mut reasons = Vec::new();
+    for (at, route) in routes.iter().enumerate() {
+        let answer = match route {
+            Route::Service(reach) => search(reach, query, count, options, asker, limited_at),
+            Route::Gateway(gate) => through(gate, query, count, options, gateways),
+        };
+        match answer {
+            Ok(listing) => return Ok((at, listing)),
+            Err(why) => reasons.push(why),
+        }
+    }
+    Err(reasons.join("\n"))
+}
+
+/// When DuckDuckGo last limited a search, for the process.
+fn held_off() -> &'static Mutex<Option<Instant>> {
+    static LIMITED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+    &LIMITED_AT
+}
+
 /// Ask the service for `query` for `asker`, and list what it found that the
-/// filters keep; DuckDuckGo one search at a time, and not while it is held off.
+/// filters keep; DuckDuckGo one search at a time, and not while it is held
+/// off since it last limited one, at `limited_at`.
 fn search(
     reach: &Reach,
     query: &str,
     count: u64,
     options: &Options,
     asker: &Asker,
+    limited_at: &Mutex<Option<Instant>>,
 ) -> Result<String, String> {
     if !reach.service.keyless {
         return ask(reach, query, count, options, asker);
     }
-    static LIMITED_AT: Mutex<Option<Instant>> = Mutex::new(None);
-    unless_held_off(&LIMITED_AT, Instant::now(), || {
+    unless_held_off(limited_at, Instant::now(), || {
         ask(reach, query, count, options, asker)
     })
+}
+
+/// How a search through a gateway failed, which decides what comes next.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Fault {
+    /// It cannot search now: nobody lends it a search at the moment, its
+    /// quota or the account's credit is used up, the key was refused, it did
+    /// not answer, or its answer was no list of results. Its next search
+    /// model is tried, and the gateway rests once none could answer.
+    Unavailable,
+    /// Letronna's own has no search route: an older deploy. It is not asked
+    /// for a while.
+    NoRoute,
+    /// It turned the search itself down, as for a model it no longer has:
+    /// its next search model is tried, it goes last for a while, and the
+    /// list is read again next time.
+    Refused,
+}
+
+/// What an answer of HTTP `status` with `body` to a search says of the
+/// gateway; `hosted` for Letronna's own, where a route not found means a
+/// deploy without one. Its API answers its own errors in JSON: a provider
+/// with nobody to lend a search comes back as a 503 (the route's first
+/// version passed the provider's 404 on), and a 404 in JSON names a model it
+/// does not have; either way it cannot search now. A deploy without the
+/// route answers its web framework's plain "404 Not Found".
+fn fault(status: u16, hosted: bool, body: &[u8]) -> Fault {
+    let answered_by_the_api =
+        || serde_json::from_slice::<Value>(body).is_ok_and(|json| json["error"].is_object());
+    match status {
+        404 if hosted && !answered_by_the_api() => Fault::NoRoute,
+        300..=399 | 401..=404 | 408 | 429 | 500..=599 => Fault::Unavailable,
+        _ => Fault::Refused,
+    }
+}
+
+/// Search through the session's gateway with the first `MODELS_TRIED` of its
+/// search models, going on to the next when one cannot answer. One that could
+/// not is tried after the others for a while, and the gateway rests when none
+/// of them could. Only the models in `gate` are asked for, and `selling`
+/// gives no gateway whose list named none, so nothing is sent to one that
+/// `sells` no search: auto mode leaves a search over it to the judge. Nor is
+/// anything sent for a while after, as `as_judged` gives it as failing.
+// Neither checked against nor noted in what stops web_fetch and search_web
+// after a request that could not connect: that is about reaching the web,
+// and the gateway is the session's own, reached as the model's requests
+// are. One that cannot be reached says nothing of the web, and DuckDuckGo is
+// still worth asking.
+fn through(
+    gate: &Gate,
+    query: &str,
+    count: u64,
+    options: &Options,
+    gateways: &Mutex<Gateways>,
+) -> Result<String, String> {
+    // Named on the card, but not asked for now: what kept it from being
+    // asked is its reason.
+    if let Some(why) = gate.failing {
+        return Err(format!("{} could not search: {why}.", gate.name));
+    }
+    let today = chrono::Utc::now().date_naive();
+    let (mut said, mut unavailable) = (Vec::new(), false);
+    for model in gate.models.iter().take(MODELS_TRIED) {
+        let asked = ask_gateway(gate, model, query, count, options, today, GATEWAY_TIME);
+        let (fault, why) = match asked {
+            Ok(listing) => {
+                lock(gateways).answered(&gate.base, model);
+                return Ok(listing);
+            }
+            Err(failed) => failed,
+        };
+        said.push(why);
+        let (mut known, now) = (lock(gateways), Instant::now());
+        match fault {
+            Fault::Unavailable => {
+                unavailable = true;
+                known.model_failed(&gate.base, model, now);
+            }
+            Fault::NoRoute => {
+                known.lapsed(&gate.base, NO_ROUTE, now);
+                break;
+            }
+            Fault::Refused => {
+                known.model_failed(&gate.base, model, now);
+                known.forget(&gate.base, now);
+            }
+        }
+    }
+    if unavailable {
+        lock(gateways).rest(&gate.base, Instant::now());
+    }
+    Err(format!(
+        "{} could not search: {}.",
+        gate.name,
+        said.join("; ")
+    ))
+}
+
+/// Ask `gate` to search with `model`, given `time` to answer in full, and
+/// list what came back that the filters keep; when it fails, how and why in
+/// a few words.
+fn ask_gateway(
+    gate: &Gate,
+    model: &str,
+    query: &str,
+    count: u64,
+    options: &Options,
+    today: chrono::NaiveDate,
+    time: Duration,
+) -> Result<String, (Fault, String)> {
+    let unavailable = |why: String| (Fault::Unavailable, why);
+    let deadline = Instant::now() + time;
+    let late = || format!("{model} did not answer within {} seconds", time.as_secs());
+    let client = reqwest::blocking::Client::builder()
+        .timeout(time)
+        .user_agent(concat!("Letronna/", env!("CARGO_PKG_VERSION")))
+        // Not followed: a redirect could carry the session's key, and the
+        // query, to wherever it points.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| unavailable(e.to_string()))?;
+    let mut request = client
+        .post(format!("{}/search", gate.base))
+        .header("Accept", "application/json")
+        .json(&gateway_payload(model, query, count, options));
+    if !gate.key.is_empty() {
+        request = request.bearer_auth(&gate.key);
+    }
+    let reply = request.send().map_err(|e| {
+        unavailable(match e.is_timeout() {
+            true => late(),
+            false => crate::web::unanswered(&format!("{model} could not be reached:"), &e, false),
+        })
+    })?;
+    let status = reply.status().as_u16();
+    let mut bytes = Vec::new();
+    // What arrived before the answer stopped still says why it failed.
+    let read = read_by(reply, GATEWAY_BYTES, deadline, &mut bytes);
+    if !(200..300).contains(&status) {
+        let fault = fault(status, gate.hosted, &bytes);
+        return Err((fault, gateway_failure(model, status, fault, &bytes)));
+    }
+    let other = || {
+        unavailable(format!(
+            "{model} answered with something other than search results"
+        ))
+    };
+    read.map_err(|e| match e.kind() {
+        std::io::ErrorKind::TimedOut => unavailable(late()),
+        _ => other(),
+    })?;
+    let body: Value = serde_json::from_slice(&bytes).map_err(|_| other())?;
+    // It narrows by neither site nor date, so for either it was asked for
+    // more, and the list is narrowed here.
+    let wider = match narrowed_here(options) {
+        true => usize::MAX,
+        false => count as usize,
+    };
+    let found = gateway_hits(&body, wider, options.freshness, today).ok_or_else(other)?;
+    // Letronna's own names the model it picked for "auto".
+    let used = body["model"]
+        .as_str()
+        .filter(|id| model_id(id))
+        .unwrap_or(model);
+    let from = format!("{} search ({used})", gate.name);
+    Ok(kept(&from, query, found, count, options))
+}
+
+/// Whether a gateway's results are narrowed here, which it is then asked for
+/// more of: it takes neither sites nor a stretch of time.
+fn narrowed_here(options: &Options) -> bool {
+    options.by_site() || options.freshness.is_some()
+}
+
+/// What a gateway's search route is sent.
+fn gateway_payload(model: &str, query: &str, count: u64, options: &Options) -> Value {
+    let most = match narrowed_here(options) {
+        true => WIDER,
+        false => count,
+    };
+    json!({"model": model, "query": query, "max_results": most})
+}
+
+/// Why a gateway's search with `model` failed with HTTP `status`, in a few
+/// words. What it said is quoted, fenced, only when it turned the search
+/// itself down, where it says why; otherwise the status says enough.
+fn gateway_failure(model: &str, status: u16, fault: Fault, body: &[u8]) -> String {
+    match (fault, status) {
+        (Fault::NoRoute, _) => format!("{NO_ROUTE} (HTTP {status})"),
+        (_, 401 | 403) => format!("{model}: the key was refused (HTTP {status})"),
+        (_, 402) => format!("{model}: no credit is left to pay for it (HTTP {status})"),
+        (_, 300..=399) => {
+            format!("{model} answered with a redirect, which was not followed (HTTP {status})")
+        }
+        (Fault::Unavailable, _) => format!("{model} cannot search now (HTTP {status})"),
+        (Fault::Refused, _) => {
+            let json: Value = serde_json::from_slice(body).unwrap_or_default();
+            let said: String = match json["error"]["message"].as_str() {
+                Some(message) => message.chars().take(200).collect(),
+                None => String::from_utf8_lossy(body).chars().take(200).collect(),
+            };
+            let lead = format!("{model} turned the search down (HTTP {status})");
+            match said.trim() {
+                "" => lead,
+                said => crate::untrusted::quoted(&format!("{lead}:"), said),
+            }
+        }
+    }
+}
+
+/// The results in a gateway's answer, up to `count`, less those `freshness`
+/// rules out; `None` when the answer holds no list of results. One without a
+/// web address is left out, and a snippet is cut to `SNIPPET`.
+fn gateway_hits(
+    body: &Value,
+    count: usize,
+    freshness: Option<Freshness>,
+    today: chrono::NaiveDate,
+) -> Option<Vec<Hit>> {
+    let since = freshness.map(|freshness| freshness.since(today));
+    let hits = body["results"]
+        .as_array()?
+        .iter()
+        .filter(|r| r["url"].as_str().is_some_and(web_page))
+        // The gateway takes no stretch of time, so the one asked for is held
+        // to the day each result says it was published. One that says none,
+        // or in a form not read here, is kept rather than dropped for want
+        // of a date.
+        .filter(|r| match (since, published(&r["published_at"])) {
+            (Some(since), Some(day)) => day >= since,
+            _ => true,
+        })
+        .take(count)
+        .map(|r| Hit {
+            title: text(&r["title"]),
+            url: r["url"].as_str().unwrap_or_default().trim().to_owned(),
+            snippet: cut(&text(&r["snippet"]), SNIPPET),
+        })
+        .collect();
+    Some(hits)
+}
+
+/// Whether `url` is the address of a web page: http or https.
+fn web_page(url: &str) -> bool {
+    reqwest::Url::parse(url.trim()).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+}
+
+/// The day a result says it was published, when it says so in a form read
+/// here: RFC 3339, or anything that starts with the year, month and day.
+fn published(value: &Value) -> Option<chrono::NaiveDate> {
+    let said = value.as_str()?.trim();
+    if let Ok(at) = chrono::DateTime::parse_from_rfc3339(said) {
+        return Some(at.date_naive());
+    }
+    chrono::NaiveDate::parse_from_str(said.get(..10)?, "%Y-%m-%d").ok()
+}
+
+/// `text` cut to `most` characters, with … where it was cut.
+fn cut(text: &str, most: usize) -> String {
+    match text.char_indices().nth(most) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text.to_owned(),
+    }
 }
 
 /// The answer from `ask`, unless DuckDuckGo limited a search less than
@@ -1206,17 +2159,34 @@ fn listing(service: &str, query: &str, hits: &[Hit]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Take the list at `base` as read, and found to name no search models,
+    /// longer ago than that is kept: a gateway that sells none, whose entry
+    /// has run out.
+    pub(crate) fn sold_none_long_ago(base: &str) {
+        let ago = UNSOLD_TIME + Duration::from_secs(1);
+        let at = Instant::now().checked_sub(ago).unwrap();
+        lock(gateways()).listed(base, Vec::new(), at);
+    }
+
+    /// Take the list at `base` as one that could not be read so long ago
+    /// that it is read again in `left`.
+    pub(crate) fn unread_for(base: &str, left: Duration) {
+        let at = Instant::now().checked_sub(UNSOLD_TIME - left).unwrap();
+        lock(gateways()).lapsed(base, NO_LIST, at);
+    }
 
     /// `super::ask` for a session someone watches.
     fn ask(reach: &Reach, query: &str, count: u64, options: &Options) -> Result<String, String> {
         super::ask(reach, query, count, options, &Asker::default())
     }
 
-    /// `super::search` for a session someone watches.
+    /// `super::search` for a session someone watches, with nothing held off.
     fn search(reach: &Reach, query: &str, count: u64, options: &Options) -> Result<String, String> {
-        super::search(reach, query, count, options, &Asker::default())
+        let limited_at = Mutex::new(None);
+        super::search(reach, query, count, options, &Asker::default(), &limited_at)
     }
 
     #[test]
@@ -1654,18 +2624,18 @@ mod tests {
             options: Options::default(),
         };
         let searches = std::cell::Cell::new(0);
-        let search = |_: &Asked| {
+        let search = || {
             searches.set(searches.get() + 1);
-            Ok(format!("listing {}", searches.get()))
+            Ok((0, format!("listing {}", searches.get())))
         };
         let start = Instant::now();
         assert_eq!(
-            searched_once(&memo, asked.clone(), start, search).unwrap(),
+            searched_once(&memo, std::slice::from_ref(&asked), start, search).unwrap(),
             "listing 1"
         );
         let again = searched_once(
             &memo,
-            asked.clone(),
+            std::slice::from_ref(&asked),
             start + Duration::from_secs(60),
             search,
         )
@@ -1682,13 +2652,13 @@ mod tests {
             ..asked.clone()
         };
         assert_eq!(
-            searched_once(&memo, recent, start, search).unwrap(),
+            searched_once(&memo, &[recent], start, search).unwrap(),
             "listing 2"
         );
         // Past its time, it is searched again.
         let later = start + MEMO_TIME + Duration::from_secs(1);
         assert_eq!(
-            searched_once(&memo, asked.clone(), later, search).unwrap(),
+            searched_once(&memo, std::slice::from_ref(&asked), later, search).unwrap(),
             "listing 3"
         );
         // A failure is not kept.
@@ -1696,9 +2666,14 @@ mod tests {
             query: "dogs".into(),
             ..asked
         };
-        assert!(searched_once(&memo, failed.clone(), later, |_| Err("down".into())).is_err());
+        assert!(
+            searched_once(&memo, std::slice::from_ref(&failed), later, || Err(
+                "down".into()
+            ))
+            .is_err()
+        );
         assert_eq!(
-            searched_once(&memo, failed, later, search).unwrap(),
+            searched_once(&memo, &[failed], later, search).unwrap(),
             "listing 4"
         );
     }
@@ -2098,6 +3073,1267 @@ mod tests {
         let limited = Err(LIMITED.to_owned());
         assert_eq!(side_by_side(limited.clone()), vec![limited; 2]);
         assert_eq!(asked.load(SeqCst), 3);
+    }
+
+    /// A gateway that sells search, as a session's is found to.
+    fn pool() -> Gate {
+        Gate {
+            name: "Pool".into(),
+            base: "https://pool.example/v1".into(),
+            key: "key".into(),
+            hosted: false,
+            models: vec!["cheap/search".into()],
+            failing: None,
+        }
+    }
+
+    /// Where `routes` go, as the card names them.
+    fn places(routes: &[Route]) -> Vec<String> {
+        routes.iter().map(Route::place).collect()
+    }
+
+    /// Each request a gateway heard: its method and target, its
+    /// authorization and its body.
+    type Heard = std::sync::Arc<Mutex<Vec<(String, String, Value)>>>;
+
+    /// A gateway on this machine answering each request with the status and
+    /// JSON `answer` makes of its method and target and its body; its base
+    /// address, and what it heard.
+    fn gateway_at(
+        answer: impl Fn(&str, &Value) -> (u16, String) + Send + Sync + 'static,
+    ) -> (String, Heard) {
+        let heard = Heard::default();
+        let kept = heard.clone();
+        let base = crate::mcp_auth::tests::serve(move |request| {
+            let target = format!("{} {}", request.method, request.target);
+            let body: Value = serde_json::from_str(&request.body).unwrap_or_default();
+            let (status, reply) = answer(&target, &body);
+            let key = request.headers.get("authorization").cloned();
+            kept.lock()
+                .unwrap()
+                .push((target, key.unwrap_or_default(), body));
+            let kind = vec![("Content-Type", "application/json".to_owned())];
+            (status, kind, reply)
+        });
+        (format!("{base}/v1"), heard)
+    }
+
+    #[test]
+    fn a_search_tries_the_gateway_then_duckduckgo_unless_a_service_is_chosen() {
+        let keys = HashMap::from([("Brave".to_owned(), "key".to_owned())]);
+        let tried = |service: &str, keyless: bool, gate: Option<Gate>, resting: bool| {
+            let choice = Choice {
+                service: service.into(),
+                ..Choice::default()
+            };
+            routes(&choice, &keys, keyless, gate, resting).map(|routes| places(&routes))
+        };
+        // Nothing chosen: the gateway first, DuckDuckGo if it cannot answer.
+        assert_eq!(
+            tried("", true, Some(pool()), false).unwrap(),
+            ["through Pool", "DuckDuckGo"]
+        );
+        // While the gateway rests, DuckDuckGo first, the gateway if it cannot.
+        assert_eq!(
+            tried("", true, Some(pool()), true).unwrap(),
+            ["DuckDuckGo", "through Pool"]
+        );
+        // DuckDuckGo switched off leaves the gateway, resting or not.
+        for resting in [false, true] {
+            assert_eq!(
+                tried("", false, Some(pool()), resting).unwrap(),
+                ["through Pool"]
+            );
+        }
+        // With no gateway that sells search either, nothing is searched.
+        assert_eq!(tried("", false, None, false).unwrap_err(), SWITCHED_OFF);
+        // With no connection there is no gateway, and DuckDuckGo is alone.
+        assert!(session_gateway(None).is_none());
+        assert_eq!(tried("", true, None, false).unwrap(), ["DuckDuckGo"]);
+        // A chosen service is the only one asked, DuckDuckGo by name too.
+        assert_eq!(
+            tried("Brave", true, Some(pool()), false).unwrap(),
+            ["Brave"]
+        );
+        assert_eq!(
+            tried("DuckDuckGo", true, Some(pool()), true).unwrap(),
+            ["DuckDuckGo"]
+        );
+        assert_eq!(
+            tried("DuckDuckGo", false, Some(pool()), false).unwrap_err(),
+            SWITCHED_OFF
+        );
+        assert_eq!(
+            tried("Tavily", true, Some(pool()), false).unwrap_err(),
+            "Tavily has no key saved."
+        );
+    }
+
+    #[test]
+    fn a_session_searches_through_its_own_gateway_and_letronnas_once_signed_in() {
+        let over = |endpoint: &str, key: &str| Connection {
+            endpoint: endpoint.into(),
+            key: key.into(),
+            ..Connection::default()
+        };
+        assert!(session_gateway(Some(&over("", "key"))).is_none());
+        let hosted = crate::auth::hosted_base();
+        assert!(
+            session_gateway(Some(&over(&hosted, ""))).is_none(),
+            "not signed in"
+        );
+        let letronna =
+            session_gateway(Some(&over(&format!("{hosted}/chat/completions/"), "token"))).unwrap();
+        assert_eq!(
+            (letronna.name.as_str(), letronna.base.as_str()),
+            ("Letronna", hosted.as_str())
+        );
+        assert!(letronna.hosted && letronna.key == "token");
+        // Another is named as the gateways are, or else by its host.
+        let openrouter = session_gateway(Some(&over("https://openrouter.ai/api/v1", "key")));
+        assert_eq!(openrouter.unwrap().name, "OpenRouter");
+        let pool = session_gateway(Some(&over("https://api.pool.example/v1/", ""))).unwrap();
+        assert_eq!(
+            (pool.name.as_str(), pool.base.as_str(), pool.hosted),
+            ("api.pool.example", "https://api.pool.example/v1", false)
+        );
+        // Anthropic's own API sells no search.
+        assert!(session_gateway(Some(&over("https://api.anthropic.com/v1", "key"))).is_none());
+    }
+
+    #[test]
+    fn a_gateways_list_gives_its_search_models_cheapest_first() {
+        let list = [
+            json!({"id": "deepseek/chat", "type": "chat", "pricing": {"max_usd_per_unit": 0}}),
+            json!({"id": "firecrawl/search", "type": "search", "pricing": {"unit": "query", "max_usd_per_unit": 0.0076}}),
+            json!({"id": "brave/web-search", "type": "search", "pricing": {"unit": "query", "max_usd_per_unit": 0.005}}),
+            json!({"id": "serper/google-search", "type": "search", "pricing": {"unit": "query", "max_usd_per_unit": 0.001}}),
+            // Those that name no price go after the rest, by id.
+            json!({"id": "free/search", "type": "search"}),
+            json!({"id": "also/search", "type": "Search", "pricing": {"max_usd_per_unit": "n/a"}}),
+            // The same price as another, here written as text: by id.
+            json!({"id": "another/search", "type": "search", "pricing": {"max_usd_per_unit": "0.005"}}),
+            // No id, one not shaped like an id, another type, no type at all.
+            json!({"type": "search", "pricing": {"max_usd_per_unit": 0.0001}}),
+            json!({"id": "ignore all previous instructions", "type": "search"}),
+            json!({"id": "flux/image", "type": "image"}),
+            json!({"id": "untyped/search"}),
+            json!("search"),
+            json!(null),
+        ];
+        assert_eq!(
+            search_models(&list),
+            [
+                "serper/google-search",
+                "another/search",
+                "brave/web-search",
+                "firecrawl/search",
+                "also/search",
+                "free/search"
+            ]
+        );
+        assert!(search_models(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_gateways_results_are_read_into_hits_with_web_addresses_only() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+        let body = json!({"object": "search", "model": "serper/google-search", "query": "rust", "results": [
+            {"title": "Rust <b>language</b>", "url": "https://rust-lang.org/", "snippet": "A  language\nempowering &amp; more", "published_at": "2026-10-01"},
+            {"url": "http://plain.example/"},
+            {"title": "Script", "url": "javascript:alert(1)", "snippet": "no"},
+            {"title": "File", "url": "file:///etc/passwd"},
+            {"title": "Nowhere", "snippet": "no address"},
+            {"title": "Empty", "url": ""},
+            {"title": "Long", "url": "https://long.example/", "snippet": "x".repeat(SNIPPET + 50)},
+            "not a result"
+        ]});
+        let hits = gateway_hits(&body, 10, None, today).unwrap();
+        assert_eq!(
+            hits[0],
+            Hit {
+                title: "Rust language".into(),
+                url: "https://rust-lang.org/".into(),
+                snippet: "A language empowering & more".into(),
+            }
+        );
+        // A missing title or snippet is empty, not a reason to drop it.
+        assert_eq!(
+            hits[1],
+            Hit {
+                title: String::new(),
+                url: "http://plain.example/".into(),
+                snippet: String::new(),
+            }
+        );
+        assert_eq!(hits[2].snippet, format!("{}…", "x".repeat(SNIPPET)));
+        assert_eq!(hits.len(), 3);
+        assert_eq!(
+            gateway_hits(&body, 1, None, today).map(|h| h.len()),
+            Some(1)
+        );
+        // The listing cuts it no further, and still marks the cut.
+        let shown = listing("Pool search (serper/google-search)", "rust", &hits);
+        assert!(
+            shown.starts_with("Pool search (serper/google-search) results for \"rust\":\n"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(&format!("   {}…\n", "x".repeat(SNIPPET))),
+            "{shown}"
+        );
+        // An answer with no list is not taken for one that found nothing.
+        let error = json!({"error": {"message": "no", "type": "upstream_error"}});
+        assert_eq!(gateway_hits(&error, 10, None, today), None);
+        assert_eq!(
+            gateway_hits(&json!({"results": []}), 10, None, today),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn a_gateway_failure_is_told_apart_by_its_status() {
+        for status in [301, 401, 402, 403, 404, 408, 429, 500, 502, 503, 504] {
+            assert_eq!(fault(status, false, b""), Fault::Unavailable, "{status}");
+        }
+        // Letronna's own without the route is a deploy that has none yet.
+        assert_eq!(fault(404, true, b"404 Not Found"), Fault::NoRoute);
+        assert_eq!(fault(503, true, b""), Fault::Unavailable);
+        for status in [400, 405, 413, 422] {
+            assert_eq!(fault(status, false, b""), Fault::Refused, "{status}");
+        }
+        let failure = |status, fault, body: &[u8]| gateway_failure("a/search", status, fault, body);
+        assert_eq!(
+            failure(503, Fault::Unavailable, b"<html>busy</html>"),
+            "a/search cannot search now (HTTP 503)"
+        );
+        assert_eq!(
+            failure(402, Fault::Unavailable, b""),
+            "a/search: no credit is left to pay for it (HTTP 402)"
+        );
+        assert_eq!(
+            failure(401, Fault::Unavailable, b""),
+            "a/search: the key was refused (HTTP 401)"
+        );
+        assert_eq!(
+            failure(404, Fault::NoRoute, b""),
+            "it has no search route yet (HTTP 404)"
+        );
+        // Why it turned a search down is its words, and fenced as such.
+        let refused = failure(
+            400,
+            Fault::Refused,
+            br#"{"error": {"message": "Unknown model a/search", "type": "invalid_request_error"}}"#,
+        );
+        assert!(
+            refused.starts_with("a/search turned the search down (HTTP 400):\n<untrusted-content-"),
+            "{refused}"
+        );
+        assert!(refused.contains("\nUnknown model a/search\n"), "{refused}");
+        assert_eq!(
+            failure(400, Fault::Refused, b" "),
+            "a/search turned the search down (HTTP 400)"
+        );
+    }
+
+    #[test]
+    fn results_older_than_the_freshness_asked_are_dropped_and_undated_ones_kept() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+        let body = json!({"results": [
+            {"title": "New", "url": "https://new.example/", "published_at": "2026-10-10T08:00:00Z"},
+            {"title": "Old", "url": "https://old.example/", "published_at": "2026-09-01"},
+            {"title": "Undated", "url": "https://undated.example/"},
+            {"title": "Words", "url": "https://words.example/", "published_at": "3 days ago"},
+            {"title": "Edge", "url": "https://edge.example/", "published_at": "2026-10-05T23:00:00+02:00"}
+        ]});
+        let titles = |freshness: Option<Freshness>| -> Vec<String> {
+            let hits = gateway_hits(&body, 10, freshness, today).unwrap();
+            hits.into_iter().map(|hit| hit.title).collect()
+        };
+        assert_eq!(
+            titles(Some(Freshness::Week)),
+            ["New", "Undated", "Words", "Edge"]
+        );
+        assert_eq!(titles(Some(Freshness::Day)), ["Undated", "Words"]);
+        assert_eq!(titles(None).len(), 5);
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 5);
+        assert_eq!(published(&json!("2026-10-05T23:00:00+02:00")), day);
+        assert_eq!(published(&json!("2026-10-05 12:00")), day);
+        assert_eq!(published(&json!("Oct 5, 2026")), None);
+        assert_eq!(published(&json!(20261005)), None);
+        // It takes no stretch of time or sites, so it is asked for more.
+        let week = Options {
+            freshness: Some(Freshness::Week),
+            ..Options::default()
+        };
+        assert_eq!(
+            gateway_payload("auto", "rust", 5, &week),
+            json!({"model": "auto", "query": "rust", "max_results": WIDER})
+        );
+        assert_eq!(
+            gateway_payload("auto", "rust", 5, &Options::default()),
+            json!({"model": "auto", "query": "rust", "max_results": 5})
+        );
+    }
+
+    #[test]
+    fn the_card_names_every_place_the_query_may_go() {
+        let none = HashMap::new();
+        let nothing = Choice::default();
+        let card = |routes: Result<Vec<Route>, String>| heading(&routes.unwrap(), "rust");
+        assert_eq!(
+            card(routes(&nothing, &none, true, Some(pool()), false)),
+            "Search through Pool for \"rust\", or DuckDuckGo if it cannot"
+        );
+        assert_eq!(
+            card(routes(&nothing, &none, true, Some(pool()), true)),
+            "Search DuckDuckGo for \"rust\", or through Pool if it cannot"
+        );
+        assert_eq!(
+            card(routes(&nothing, &none, false, Some(pool()), false)),
+            "Search through Pool for \"rust\""
+        );
+        assert_eq!(
+            card(routes(&nothing, &none, true, None, false)),
+            "Search DuckDuckGo for \"rust\""
+        );
+        // DuckDuckGo at an address of the user's is named with it.
+        let mut elsewhere = Choice::default();
+        elsewhere.set_address(service("DuckDuckGo").unwrap(), "https://ddg.example/html");
+        assert_eq!(
+            card(routes(&elsewhere, &none, true, Some(pool()), false)),
+            "Search through Pool for \"rust\", or DuckDuckGo at https://ddg.example/html if it cannot"
+        );
+        // It says who pays for a search through the gateway, wherever it
+        // goes in turn, and nothing for DuckDuckGo alone.
+        let paid_for = |gate: Option<Gate>, resting: bool| {
+            paid(&routes(&nothing, &none, true, gate, resting).unwrap())
+        };
+        let to_pool = "\n\nA search through Pool is paid to that gateway.";
+        assert_eq!(paid_for(Some(pool()), false), to_pool);
+        assert_eq!(paid_for(Some(pool()), true), to_pool);
+        let letronna = Gate {
+            name: "Letronna".into(),
+            hosted: true,
+            ..pool()
+        };
+        assert_eq!(
+            paid_for(Some(letronna), false),
+            "\n\nA search through Letronna is paid from your Letronna credit."
+        );
+        assert_eq!(paid_for(None, false), "");
+    }
+
+    #[test]
+    fn the_card_of_a_session_on_letronna_names_its_search_and_duckduckgo() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // No search service chosen, as on a fresh install.
+        let dir = crate::store::tests::Scratch::new("search-card-letronna");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        let ctx = ToolContext::of(&Connection {
+            endpoint: crate::auth::hosted_base(),
+            key: "token".into(),
+            ..Connection::default()
+        });
+        let call = json!({"query": "rust", "allowed_domains": ["docs.rs"]});
+        let on = SearchWeb.preview(&call, &ctx);
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"endpoint": "", "model": "", "keyless_search": false}"#,
+        )
+        .unwrap();
+        let off = SearchWeb.preview(&call, &ctx);
+        let unasked = switched_off(ctx.caller.connection.as_deref());
+        let alone = SearchWeb.preview(&call, &ToolContext::default());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        let paid = "\n\nA search through Letronna is paid from your Letronna credit.";
+        assert_eq!(
+            on,
+            format!(
+                "Search through Letronna for \"rust\", or DuckDuckGo if it cannot\nonly from docs.rs{paid}"
+            )
+        );
+        // DuckDuckGo switched off leaves Letronna's search, which goes out.
+        assert_eq!(
+            off,
+            format!("Search through Letronna for \"rust\"\nonly from docs.rs{paid}")
+        );
+        assert_eq!(unasked, None);
+        // With no gateway, nothing is searched.
+        assert_eq!(alone, "Search for \"rust\"\nonly from docs.rs");
+    }
+
+    #[test]
+    fn a_search_is_remembered_by_the_route_that_answered_it() {
+        let memo = Mutex::new(Memo::default());
+        let (none, nothing) = (HashMap::new(), Choice::default());
+        let asked = |keyless: bool, gate: Option<Gate>| -> Vec<Asked> {
+            let routes = routes(&nothing, &none, keyless, gate, false).unwrap();
+            let options = Options::default();
+            routes
+                .iter()
+                .map(|route| route.asked("rust", 5, &options))
+                .collect()
+        };
+        let (both, duckduckgo, gateway) = (
+            asked(true, Some(pool())),
+            asked(true, None),
+            asked(false, Some(pool())),
+        );
+        let now = Instant::now();
+        let answer = |by: usize, listing: &str| {
+            let listing = listing.to_owned();
+            move || Ok((by, listing))
+        };
+        // The gateway failed, and DuckDuckGo answered.
+        assert_eq!(
+            searched_once(&memo, &both, now, answer(1, "from DuckDuckGo")).unwrap(),
+            "from DuckDuckGo"
+        );
+        // So a search only DuckDuckGo may answer is given its answer again,
+        let again = searched_once(&memo, &duckduckgo, now, answer(0, "asked")).unwrap();
+        assert!(again.ends_with("\n\nfrom DuckDuckGo"), "{again}");
+        // and one only the gateway may answer is not.
+        assert_eq!(
+            searched_once(&memo, &gateway, now, answer(0, "from the gateway")).unwrap(),
+            "from the gateway"
+        );
+        // One that may go either way is given the first route's answer.
+        let either = searched_once(&memo, &both, now, answer(0, "asked")).unwrap();
+        assert!(either.ends_with("\n\nfrom the gateway"), "{either}");
+        // A search no route answered is kept under none of them.
+        let dogs: Vec<Asked> = (both.iter())
+            .map(|asked| Asked {
+                query: "dogs".into(),
+                ..asked.clone()
+            })
+            .collect();
+        assert!(searched_once(&memo, &dogs, now, || Err("down".into())).is_err());
+        assert_eq!(
+            searched_once(&memo, &dogs, now, answer(1, "dogs")).unwrap(),
+            "dogs"
+        );
+    }
+
+    #[test]
+    fn what_is_known_of_a_gateways_search_lasts_as_long_as_it_should() {
+        let mut known = Gateways::default();
+        let (pool, letronna) = ("https://pool.example/v1", "https://letronna.example/v1");
+        let start = Instant::now();
+        let a = || vec!["a/search".to_owned()];
+        let auto = || Known::Sells(vec![AUTO.to_owned()]);
+        assert_eq!(known.known(pool, false, start), Known::Unknown);
+        // Letronna's own sells search with its own pick, its list unread.
+        assert_eq!(known.known(letronna, true, start), auto());
+        // Search models found are kept for the rest of the process,
+        known.listed(pool, a(), start);
+        let tomorrow = start + Duration::from_secs(24 * 60 * 60);
+        assert_eq!(known.known(pool, false, tomorrow), Known::Sells(a()));
+        // none found, or a list not read, for a few minutes.
+        known.listed(pool, Vec::new(), start);
+        let soon = start + UNSOLD_TIME - Duration::from_secs(1);
+        assert_eq!(known.known(pool, false, soon), Known::SellsNone);
+        assert_eq!(
+            known.known(pool, false, start + UNSOLD_TIME),
+            Known::Unknown
+        );
+        // A search it turned down has its list read again, but not again
+        // for the next one it turns down a moment later.
+        known.listed(pool, a(), start);
+        known.forget(pool, start);
+        assert_eq!(known.known(pool, false, start), Known::Unknown);
+        known.listed(pool, a(), start);
+        known.forget(pool, soon);
+        assert_eq!(known.known(pool, false, soon), Known::Sells(a()));
+        known.forget(pool, start + UNSOLD_TIME);
+        assert_eq!(
+            known.known(pool, false, start + UNSOLD_TIME),
+            Known::Unknown
+        );
+        // Letronna's own with no search route is not asked for a while, but
+        // still named, and rests meanwhile and a while after.
+        known.lapsed(letronna, NO_ROUTE, start);
+        assert_eq!(known.known(letronna, true, soon), Known::Failing(NO_ROUTE));
+        assert!(known.resting(letronna, soon));
+        assert_eq!(known.known(letronna, true, start + UNSOLD_TIME), auto());
+        assert!(known.resting(letronna, start + UNSOLD_TIME));
+        // As is another whose list could not be read.
+        let unread = "https://unread.example/v1";
+        known.lapsed(unread, NO_LIST, start);
+        assert_eq!(known.known(unread, false, soon), Known::Failing(NO_LIST));
+        assert_eq!(
+            known.known(unread, false, start + UNSOLD_TIME),
+            Known::Unknown
+        );
+        // A list read for the model picker tells as much, but Letronna's own
+        // list of chat models says nothing of its search.
+        let picker = "https://picker.pool.example/v1";
+        heard_list(
+            &format!("{picker}/"),
+            &[json!({"id": "a/search", "type": "search"})],
+        );
+        let now = Instant::now();
+        assert_eq!(
+            lock(gateways()).known(picker, false, now),
+            Known::Sells(a())
+        );
+        let hosted = crate::auth::hosted_base();
+        heard_list(&hosted, &[json!({"id": "chat/model", "type": "chat"})]);
+        assert_eq!(lock(gateways()).known(&hosted, true, now), auto());
+    }
+
+    #[test]
+    fn a_gateway_that_could_not_answer_rests_and_its_tired_model_goes_last() {
+        let mut known = Gateways::default();
+        let pool = "https://pool.example/v1";
+        let models = ["a/search", "b/search", "c/search"].map(str::to_owned);
+        let start = Instant::now();
+        assert!(!known.resting(pool, start));
+        assert_eq!(known.in_turn(pool, &models, start), models);
+        known.model_failed(pool, "a/search", start);
+        known.model_failed(pool, "b/search", start);
+        known.rest(pool, start);
+        let soon = start + REST - Duration::from_secs(1);
+        assert!(known.resting(pool, soon));
+        assert!(!known.resting("https://other.example/v1", soon));
+        assert_eq!(
+            known.in_turn(pool, &models, soon),
+            ["c/search", "a/search", "b/search"]
+        );
+        // Rested long enough, it and its models go in their own order again.
+        let later = start + REST;
+        assert!(!known.resting(pool, later));
+        assert_eq!(known.in_turn(pool, &models, later), models);
+        // And an answer ends the rest at once.
+        known.model_failed(pool, "a/search", later);
+        known.rest(pool, later);
+        known.answered(pool, "a/search");
+        assert!(!known.resting(pool, later));
+        assert_eq!(known.in_turn(pool, &models, later), models);
+    }
+
+    #[test]
+    fn a_gateways_list_is_read_once_and_kept() {
+        let (base, heard) = gateway_at(|target, _| {
+            match target {
+            "GET /v1/models" => (
+                200,
+                json!({"object": "list", "data": [
+                    {"id": "chat/model", "type": "chat"},
+                    {"id": "dear/search", "type": "search", "pricing": {"unit": "query", "max_usd_per_unit": 0.005}},
+                    {"id": "cheap/search", "type": "search", "pricing": {"unit": "query", "max_usd_per_unit": 0.001}}
+                ]})
+                .to_string(),
+            ),
+            _ => (404, String::new()),
+        }
+        });
+        let connection = Connection {
+            endpoint: format!("{base}/chat/completions"),
+            key: "secret".into(),
+            ..Connection::default()
+        };
+        let gateways = Mutex::new(Gateways::default());
+        let now = Instant::now();
+        // Before its list is read, the card names it as a place the search
+        // may go.
+        let named = named_gate(Some(&connection), &gateways, now).unwrap();
+        assert!(named.models.is_empty() && named.name == "127.0.0.1");
+        let gate = selling(Some(&connection), &gateways, now).unwrap();
+        assert_eq!(gate.models, ["cheap/search", "dear/search"]);
+        let tomorrow = now + Duration::from_secs(24 * 60 * 60);
+        let again = selling(Some(&connection), &gateways, tomorrow).unwrap();
+        assert_eq!(again.models, ["cheap/search", "dear/search"]);
+        let heard = heard.lock().unwrap();
+        assert_eq!(heard.len(), 1, "its list was read once");
+        assert_eq!(
+            (heard[0].0.as_str(), heard[0].1.as_str()),
+            ("GET /v1/models", "Bearer secret")
+        );
+    }
+
+    #[test]
+    fn a_gateway_that_sells_no_search_is_asked_again_only_after_a_while() {
+        let (base, heard) = gateway_at(|_, _| {
+            (
+                200,
+                json!({"data": [{"id": "chat/model", "type": "chat"}]}).to_string(),
+            )
+        });
+        let connection = Connection {
+            endpoint: base,
+            key: "key".into(),
+            ..Connection::default()
+        };
+        let gateways = Mutex::new(Gateways::default());
+        let now = Instant::now();
+        assert!(selling(Some(&connection), &gateways, now).is_none());
+        // Nor is it named on the card meanwhile.
+        let minute = now + Duration::from_secs(60);
+        assert!(named_gate(Some(&connection), &gateways, minute).is_none());
+        assert!(selling(Some(&connection), &gateways, minute).is_none());
+        assert_eq!(heard.lock().unwrap().len(), 1);
+        assert!(selling(Some(&connection), &gateways, now + UNSOLD_TIME).is_none());
+        assert_eq!(heard.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_gateway_is_not_asked_for_a_while_after_auto_mode_let_a_search_run_as_free() {
+        let hosted = crate::auth::hosted_base();
+        let connection = Connection {
+            endpoint: hosted.clone(),
+            key: "token".into(),
+            ..Connection::default()
+        };
+        let gateways = Mutex::new(Gateways::default());
+        let start = Instant::now();
+        // Letronna's own, found without a search route, is not asked until a
+        // moment after a search over it is left to the judge as free.
+        lock(&gateways).lapsed(&hosted, NO_ROUTE, start);
+        let decided = start + UNSOLD_TIME - Duration::from_secs(1);
+        let gate = selling(Some(&connection), &gateways, decided).unwrap();
+        assert_eq!(gate.failing, Some(NO_ROUTE));
+        lock(&gateways).judged_free(&hosted, decided);
+        // The judge answers once that has run out: it sells search again,
+        // but is not asked for the search the judge let run.
+        let ran = decided + Duration::from_secs(20);
+        let gate = selling(Some(&connection), &gateways, ran).unwrap();
+        assert!(sells(&gate));
+        assert_eq!(as_judged(gate, &gateways, ran).failing, Some(JUDGED_FREE));
+        // Another gateway's search goes on as it would.
+        assert_eq!(as_judged(pool(), &gateways, ran).failing, None);
+        // Nor is one that was failing given another reason.
+        let failing = Gate {
+            base: hosted.clone(),
+            failing: Some(NO_ROUTE),
+            ..pool()
+        };
+        assert_eq!(as_judged(failing, &gateways, ran).failing, Some(NO_ROUTE));
+        // Once any search the judge let run has run, it is asked again.
+        let later = decided + JUDGED_TIME;
+        let gate = selling(Some(&connection), &gateways, later).unwrap();
+        assert_eq!(as_judged(gate, &gateways, later).failing, None);
+    }
+
+    #[test]
+    fn a_gateway_model_that_cannot_search_gives_way_to_the_next() {
+        let (base, heard) = gateway_at(|_, body| {
+            match body["model"].as_str() {
+            Some("cheap/search") => (
+                503,
+                json!({"error": {"message": "no lender", "type": "upstream_error"}}).to_string(),
+            ),
+            _ => (
+                200,
+                json!({"object": "search", "model": "dear/search", "query": "rust", "results": [
+                    {"title": "Rust", "url": "https://rust-lang.org/", "snippet": "A language", "published_at": "2026-10-01"}
+                ]})
+                .to_string(),
+            ),
+        }
+        });
+        // DuckDuckGo stands by where nothing is sent to it.
+        let duckduckgo = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        duckduckgo.set_nonblocking(true).unwrap();
+        let port = duckduckgo.local_addr().unwrap().port();
+        let gate = Gate {
+            base: base.clone(),
+            key: "secret".into(),
+            models: vec!["cheap/search".into(), "dear/search".into()],
+            ..pool()
+        };
+        let routes = [Route::Gateway(gate), Route::Service(duckduckgo_at(port))];
+        let (gateways, limited_at) = (Mutex::new(Gateways::default()), Mutex::new(None));
+        let options = Options::default();
+        let asker = Asker::default();
+        let (by, found) =
+            search_each(&routes, "rust", 5, &options, &asker, &gateways, &limited_at).unwrap();
+        assert_eq!(by, 0);
+        assert!(
+            found.starts_with("Pool search (dear/search) results for \"rust\":\n"),
+            "{found}"
+        );
+        assert!(
+            found.contains("\n1. Rust\n   https://rust-lang.org/\n   A language\n"),
+            "{found}"
+        );
+        let heard = heard.lock().unwrap();
+        let asked: Vec<(&str, &str, &str)> = (heard.iter())
+            .map(|(target, key, body)| {
+                (
+                    target.as_str(),
+                    key.as_str(),
+                    body["model"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                ("POST /v1/search", "Bearer secret", "cheap/search"),
+                ("POST /v1/search", "Bearer secret", "dear/search")
+            ]
+        );
+        assert_eq!(
+            heard[1].2,
+            json!({"model": "dear/search", "query": "rust", "max_results": 5})
+        );
+        assert!(
+            duckduckgo
+                .accept()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock),
+            "DuckDuckGo was asked"
+        );
+        // It answered, so it does not rest, but the model that could not
+        // goes last for a while.
+        let (known, now) = (lock(&gateways), Instant::now());
+        assert!(!known.resting(&base, now));
+        let models = ["cheap/search", "dear/search"].map(str::to_owned);
+        assert_eq!(
+            known.in_turn(&base, &models, now),
+            ["dear/search", "cheap/search"]
+        );
+    }
+
+    #[test]
+    fn when_the_gateway_and_duckduckgo_both_fail_the_error_gives_each_reason() {
+        // Its cheapest has nobody to lend it a search; the next answers with
+        // something that is no list of results.
+        let (base, heard) = gateway_at(|_, body| match body["model"].as_str() {
+            Some("a/search") => (503, "{}".into()),
+            _ => (200, "<html>Moved</html>".into()),
+        });
+        let (port, asked) = answer_once("202 Accepted", CHALLENGE_PAGE);
+        let gate = Gate {
+            base: base.clone(),
+            models: ["a/search", "b/search", "c/search"]
+                .map(str::to_owned)
+                .to_vec(),
+            ..pool()
+        };
+        let routes = [Route::Gateway(gate), Route::Service(duckduckgo_at(port))];
+        let (gateways, limited_at) = (Mutex::new(Gateways::default()), Mutex::new(None));
+        let asker = Asker::default();
+        let why = search_each(
+            &routes,
+            "rust",
+            5,
+            &Options::default(),
+            &asker,
+            &gateways,
+            &limited_at,
+        )
+        .unwrap_err();
+        asked.join().unwrap();
+        assert_eq!(
+            why,
+            format!(
+                "Pool could not search: a/search cannot search now (HTTP 503); b/search answered \
+                 with something other than search results.\n{LIMITED}"
+            )
+        );
+        // Two of its models were tried, not the third.
+        assert_eq!(heard.lock().unwrap().len(), 2);
+        // DuckDuckGo is held off as ever, and the gateway rests, so the next
+        // search asks DuckDuckGo first.
+        assert!(limited_at.lock().unwrap().is_some());
+        assert!(lock(&gateways).resting(&base, Instant::now()));
+    }
+
+    #[test]
+    fn a_resting_gateway_is_asked_after_all_when_duckduckgo_is_held_off() {
+        let (base, heard) = gateway_at(|_, _| {
+            let results = json!({"results": [{"title": "T", "url": "https://t.example/"}]});
+            (200, results.to_string())
+        });
+        let gateways = Mutex::new(Gateways::default());
+        lock(&gateways).rest(&base, Instant::now());
+        let gate = Gate {
+            base: base.clone(),
+            ..pool()
+        };
+        let routes = routes(&Choice::default(), &HashMap::new(), true, Some(gate), true).unwrap();
+        assert_eq!(places(&routes), ["DuckDuckGo", "through Pool"]);
+        // DuckDuckGo limited a search a moment ago, so it is not asked.
+        let limited_at = Mutex::new(Some(Instant::now()));
+        let asker = Asker::default();
+        let (by, found) = search_each(
+            &routes,
+            "rust",
+            5,
+            &Options::default(),
+            &asker,
+            &gateways,
+            &limited_at,
+        )
+        .unwrap();
+        assert_eq!(by, 1);
+        assert!(
+            found.starts_with("Pool search (cheap/search) results for \"rust\":\n"),
+            "{found}"
+        );
+        assert_eq!(heard.lock().unwrap().len(), 1);
+        // It answered, so it rests no longer.
+        assert!(!lock(&gateways).resting(&base, Instant::now()));
+    }
+
+    #[test]
+    fn a_gateway_that_cannot_be_reached_rests_without_stopping_the_web_tools() {
+        crate::web::stand_in_for_the_web();
+        // Nothing answers on port 1 of this machine.
+        let gate = Gate {
+            base: "http://127.0.0.1:1/v1".into(),
+            ..pool()
+        };
+        let gateways = Mutex::new(Gateways::default());
+        let why = through(&gate, "rust", 5, &Options::default(), &gateways).unwrap_err();
+        assert!(
+            why.starts_with("Pool could not search: cheap/search could not be reached: "),
+            "{why}"
+        );
+        assert!(lock(&gateways).resting(&gate.base, Instant::now()));
+        // The gateway is the session's own, not the web: web_fetch and
+        // DuckDuckGo still go out.
+        let page = reqwest::Url::parse("http://127.0.0.1:1/").unwrap();
+        assert!(crate::web::stopped(&page, &Asker::default(), Instant::now()).is_ok());
+    }
+
+    #[test]
+    fn a_404_from_letronna_means_no_search_route_only_when_its_api_did_not_answer_it() {
+        // A 404 the API answers itself, in JSON (a model it does not have, or
+        // a provider's 404 as the route's first version passed it on), and a
+        // deploy without the route, as its web framework answers.
+        let no_lender = json!({"error": {"message": "The model answered 404.", "type": "upstream_error", "code": 404}});
+        assert_eq!(
+            fault(404, true, no_lender.to_string().as_bytes()),
+            Fault::Unavailable
+        );
+        assert_eq!(fault(404, true, b"404 Not Found"), Fault::NoRoute);
+        assert_eq!(fault(404, true, b""), Fault::NoRoute);
+        assert_eq!(fault(404, false, b"404 Not Found"), Fault::Unavailable);
+        let letronna = |base: String| Gate {
+            name: "Letronna".into(),
+            base,
+            hosted: true,
+            models: vec![AUTO.into()],
+            ..pool()
+        };
+        // Answered by the API itself, it rests and is still sold.
+        let (base, _) = gateway_at(move |_, _| (404, no_lender.to_string()));
+        let gateways = Mutex::new(Gateways::default());
+        let why = through(
+            &letronna(base.clone()),
+            "rust",
+            5,
+            &Options::default(),
+            &gateways,
+        )
+        .unwrap_err();
+        let now = Instant::now();
+        assert_eq!(
+            why,
+            "Letronna could not search: auto cannot search now (HTTP 404)."
+        );
+        assert!(lock(&gateways).resting(&base, now));
+        assert_eq!(
+            lock(&gateways).known(&base, true, now),
+            Known::Sells(vec![AUTO.into()])
+        );
+        // Without the route, it is not asked for a while, and says why.
+        let (base, heard) = gateway_at(|_, _| (404, "404 Not Found".into()));
+        let gateways = Mutex::new(Gateways::default());
+        let gate = letronna(base.clone());
+        let why = through(&gate, "rust", 5, &Options::default(), &gateways).unwrap_err();
+        assert_eq!(
+            why,
+            "Letronna could not search: it has no search route yet (HTTP 404)."
+        );
+        let now = Instant::now();
+        assert_eq!(
+            lock(&gateways).known(&base, true, now),
+            Known::Failing(NO_ROUTE)
+        );
+        let failing = Gate {
+            failing: Some(NO_ROUTE),
+            ..gate
+        };
+        let why = through(&failing, "rust", 5, &Options::default(), &gateways).unwrap_err();
+        assert_eq!(
+            why,
+            "Letronna could not search: it has no search route yet."
+        );
+        assert_eq!(heard.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_gateway_whose_list_could_not_be_read_stays_on_the_card_after_duckduckgo() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        // Its list cannot be read the first time, and can afterwards.
+        let lists = AtomicUsize::new(0);
+        let (base, heard) = gateway_at(move |target, _| match target {
+            "GET /v1/models" if lists.fetch_add(1, SeqCst) == 0 => (500, "{}".into()),
+            "GET /v1/models" => (
+                200,
+                json!({"data": [{"id": "a/search", "type": "search"}]}).to_string(),
+            ),
+            _ => (503, "{}".into()),
+        });
+        let connection = Connection {
+            endpoint: base,
+            key: "key".into(),
+            ..Connection::default()
+        };
+        let gateways = Mutex::new(Gateways::default());
+        let (none, nothing) = (HashMap::new(), Choice::default());
+        // Where a search may go at `now`, as the card or the run finds it.
+        let places_at = |gate: Option<Gate>, now: Instant| -> Vec<String> {
+            let resting = gate.as_ref().is_some_and(|g| rests(g, &gateways, now));
+            places(&routes(&nothing, &none, true, gate, resting).unwrap())
+        };
+        let start = Instant::now();
+        // A search finds its list cannot be read: it is not asked, but is
+        // still a place a search may go, after DuckDuckGo.
+        let gate = selling(Some(&connection), &gateways, start).unwrap();
+        assert_eq!(gate.failing, Some(NO_LIST));
+        let why = through(&gate, "rust", 5, &Options::default(), &gateways).unwrap_err();
+        assert_eq!(
+            why,
+            "127.0.0.1 could not search: its list of models could not be read."
+        );
+        assert_eq!(heard.lock().unwrap().len(), 1, "it was asked to search");
+        // The card a minute later names it so.
+        let minute = start + Duration::from_secs(60);
+        let card = places_at(named_gate(Some(&connection), &gateways, minute), minute);
+        assert_eq!(card, ["DuckDuckGo", "through 127.0.0.1"]);
+        // Approved once its list may be read again, the search goes where
+        // the card said, in the order it said.
+        let later = start + UNSOLD_TIME + Duration::from_secs(1);
+        let gate = selling(Some(&connection), &gateways, later).unwrap();
+        assert_eq!(
+            (gate.models.as_slice(), gate.failing),
+            (["a/search".into()].as_slice(), None)
+        );
+        assert_eq!(places_at(Some(gate), later), card);
+        assert_eq!(heard.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_model_the_gateway_turns_down_goes_last_and_its_list_is_read_again_only_now_and_then() {
+        let (base, heard) = gateway_at(|_, body| match body["model"].as_str() {
+            Some("a/search") => (
+                400,
+                json!({"error": {"message": "Unknown model", "type": "invalid_request_error"}})
+                    .to_string(),
+            ),
+            _ => (200, json!({"results": []}).to_string()),
+        });
+        let models = ["a/search", "b/search"].map(str::to_owned);
+        let gate = Gate {
+            base: base.clone(),
+            models: models.to_vec(),
+            ..pool()
+        };
+        let gateways = Mutex::new(Gateways::default());
+        let start = Instant::now();
+        lock(&gateways).listed(&base, models.to_vec(), start);
+        let found = through(&gate, "rust", 5, &Options::default(), &gateways).unwrap();
+        assert_eq!(found, "Pool search (b/search) found nothing for \"rust\".");
+        let (known, now) = (lock(&gateways), Instant::now());
+        assert_eq!(known.in_turn(&base, &models, now), ["b/search", "a/search"]);
+        assert_eq!(known.known(&base, false, now), Known::Unknown);
+        drop(known);
+        // Read again and turned down again a moment later, the list is kept.
+        lock(&gateways).listed(&base, models.to_vec(), now);
+        through(&gate, "rust", 5, &Options::default(), &gateways).unwrap();
+        let now = Instant::now();
+        assert_eq!(
+            lock(&gateways).known(&base, false, now),
+            Known::Sells(models.to_vec())
+        );
+        assert_eq!(heard.lock().unwrap().len(), 4);
+        assert!(!lock(&gateways).resting(&base, now));
+    }
+
+    #[test]
+    fn searches_side_by_side_read_the_gateways_list_once() {
+        let (base, heard) = gateway_at(|_, _| {
+            // Slow enough that two reads not kept apart would overlap.
+            std::thread::sleep(Duration::from_millis(300));
+            let list = json!({"data": [{"id": "a/search", "type": "search"}]});
+            (200, list.to_string())
+        });
+        let connection = Connection {
+            endpoint: base,
+            key: "key".into(),
+            ..Connection::default()
+        };
+        let gateways = Mutex::new(Gateways::default());
+        let now = Instant::now();
+        let found: Vec<Vec<String>> = std::thread::scope(|scope| {
+            let searches: Vec<_> = (0..3)
+                .map(|_| scope.spawn(|| selling(Some(&connection), &gateways, now).unwrap().models))
+                .collect();
+            searches.into_iter().map(|s| s.join().unwrap()).collect()
+        });
+        assert_eq!(found, vec![vec!["a/search".to_owned()]; 3]);
+        assert_eq!(heard.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_gateways_redirect_is_not_followed_with_the_key_or_the_query() {
+        let elsewhere = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        elsewhere.set_nonblocking(true).unwrap();
+        let to = elsewhere.local_addr().unwrap().port();
+        let base = crate::mcp_auth::tests::serve(move |_| {
+            let location = format!("http://127.0.0.1:{to}/v1/elsewhere");
+            (302, vec![("Location", location)], String::new())
+        });
+        let base = format!("{base}/v1");
+        assert_eq!(ask_for_models(&base, "secret"), None);
+        let gate = Gate {
+            base: base.clone(),
+            ..pool()
+        };
+        let gateways = Mutex::new(Gateways::default());
+        let why = through(&gate, "rust", 5, &Options::default(), &gateways).unwrap_err();
+        assert_eq!(
+            why,
+            "Pool could not search: cheap/search answered with a redirect, which was not \
+             followed (HTTP 302)."
+        );
+        assert!(lock(&gateways).resting(&base, Instant::now()));
+        assert!(
+            elsewhere
+                .accept()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock),
+            "the redirect was followed"
+        );
+    }
+
+    #[test]
+    fn a_gateway_that_sends_its_answer_slowly_is_given_up_on_at_its_deadline() {
+        /// A byte now and then, never the end.
+        struct Trickle;
+        impl std::io::Read for Trickle {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(20));
+                buf[0] = b' ';
+                Ok(1)
+            }
+        }
+        let mut bytes = Vec::new();
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let read = read_by(Trickle, GATEWAY_BYTES, deadline, &mut bytes);
+        assert_eq!(read.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(!bytes.is_empty() && bytes.len() < 50, "{}", bytes.len());
+        // One that ends in time is read whole, up to the most.
+        let later = Instant::now() + Duration::from_secs(60);
+        let mut bytes = Vec::new();
+        read_by(&b"results"[..], 6, later, &mut bytes).unwrap();
+        assert_eq!(bytes, b"result");
+        // A search through Letronna's own that answers so, a space now and
+        // then, is given up on at its deadline as any gateway's is: here a
+        // short one rather than `GATEWAY_TIME`.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.read(&mut [0u8; 4096]);
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n";
+            let mut sent = stream.write_all(head.as_bytes());
+            // Until the search hangs up.
+            while sent.is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+                sent = stream.write_all(b" ");
+            }
+        });
+        let letronna = Gate {
+            name: "Letronna".into(),
+            base: format!("http://127.0.0.1:{port}/v1"),
+            hosted: true,
+            models: vec![AUTO.into()],
+            ..pool()
+        };
+        let today = chrono::Utc::now().date_naive();
+        let time = Duration::from_millis(500);
+        let started = Instant::now();
+        let asked = ask_gateway(&letronna, AUTO, "rust", 5, &Options::default(), today, time);
+        let took = started.elapsed();
+        let (fault, why) = asked.unwrap_err();
+        assert_eq!(fault, Fault::Unavailable);
+        assert!(why.starts_with("auto did not answer within "), "{why}");
+        assert!(took >= time && took < Duration::from_secs(5), "{took:?}");
+    }
+
+    #[test]
+    fn a_search_over_a_gateway_that_sells_no_search_sends_it_none() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // No search service chosen, and DuckDuckGo at a stand-in.
+        let dir = crate::store::tests::Scratch::new("search-unsold");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        let (port, asked) = answer_once("200 OK", RESULTS_PAGE);
+        let duckduckgo = format!("http://127.0.0.1:{port}/html");
+        let mut choice = Choice::default();
+        choice.set_address(service("DuckDuckGo").unwrap(), &duckduckgo);
+        choose(&choice).unwrap();
+        // A server of the user's own, such as Ollama: no key, and a list of
+        // chat models alone. It would answer a search if it were sent one.
+        let (base, heard) = gateway_at(|target, _| match target {
+            "GET /v1/models" => (
+                200,
+                json!({"object": "list", "data": [
+                    {"id": "llama3.2:latest", "object": "model", "owned_by": "library"}
+                ]})
+                .to_string(),
+            ),
+            _ => {
+                let results = json!({"results": [{"title": "T", "url": "https://t.example/"}]});
+                (200, results.to_string())
+            }
+        });
+        let ctx = ToolContext::of(&Connection {
+            endpoint: base,
+            ..Connection::default()
+        });
+        let connection = ctx.caller.connection.as_deref();
+        let call = json!({"query": "ollama glue"});
+        // Its list unread, the card names it as a place the search may go,
+        // and the model is told nothing of it; neither reads the list.
+        let card = SearchWeb.preview(&call, &ctx);
+        let note = through_note(connection);
+        let unread = heard.lock().unwrap().is_empty();
+        // Deciding the call reads it, and finds no search sold.
+        let paid = paid_through_gateway(connection);
+        let card_after = SearchWeb.preview(&call, &ctx);
+        let found = SearchWeb.run(&call, &ctx);
+        asked.join().unwrap();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert!(
+            card.starts_with("Search through 127.0.0.1 for \"ollama glue\", or DuckDuckGo"),
+            "{card}"
+        );
+        assert!(note.is_none() && unread && !paid);
+        assert_eq!(
+            card_after,
+            format!("Search DuckDuckGo at {duckduckgo} for \"ollama glue\"")
+        );
+        let found = found.unwrap();
+        assert!(
+            found.starts_with("DuckDuckGo results for \"ollama glue\":\n"),
+            "{found}"
+        );
+        // Its list was read once, with no key, and it was sent no search.
+        let heard: Vec<(String, String)> = (heard.lock().unwrap().iter())
+            .map(|(target, key, _)| (target.clone(), key.clone()))
+            .collect();
+        assert_eq!(heard, [("GET /v1/models".to_owned(), String::new())]);
+    }
+
+    #[test]
+    fn a_search_reads_the_gateways_list_falls_back_and_is_remembered_by_route() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // No search service chosen, and DuckDuckGo at a stand-in.
+        let dir = crate::store::tests::Scratch::new("search-run");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        let (port, asked) = answer_once("200 OK", RESULTS_PAGE);
+        let duckduckgo = format!("http://127.0.0.1:{port}/html");
+        let mut choice = Choice::default();
+        choice.set_address(service("DuckDuckGo").unwrap(), &duckduckgo);
+        choose(&choice).unwrap();
+        let (base, heard) = gateway_at(|target, _| match target {
+            "GET /v1/models" => (
+                200,
+                json!({"data": [{"id": "a/search", "type": "search"}]}).to_string(),
+            ),
+            _ => (503, json!({"error": {"message": "no lender"}}).to_string()),
+        });
+        let ctx = ToolContext::of(&Connection {
+            endpoint: format!("{base}/chat/completions"),
+            key: "secret".into(),
+            ..Connection::default()
+        });
+        let call = json!({"query": "letronna glue"});
+        let card = SearchWeb.preview(&call, &ctx);
+        let first = SearchWeb.run(&call, &ctx);
+        asked.join().unwrap();
+        let card_after = SearchWeb.preview(&call, &ctx);
+        let again = SearchWeb.run(&call, &ctx);
+        // Another search while it rests goes to DuckDuckGo alone.
+        let (port, asked) = answer_once("200 OK", RESULTS_PAGE);
+        choice.set_address(
+            service("DuckDuckGo").unwrap(),
+            &format!("http://127.0.0.1:{port}/html"),
+        );
+        choose(&choice).unwrap();
+        let other = SearchWeb.run(&json!({"query": "letronna glue again"}), &ctx);
+        asked.join().unwrap();
+        // With DuckDuckGo switched off, a gateway that may sell search is
+        // still searched, and one whose list named none is not.
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"endpoint": "", "model": "", "keyless_search": false}"#,
+        )
+        .unwrap();
+        let over = |endpoint: &str| Connection {
+            endpoint: endpoint.into(),
+            key: "key".into(),
+            ..Connection::default()
+        };
+        let selling = switched_off(ctx.caller.connection.as_deref());
+        let unread = switched_off(Some(&over("https://unread.pool.example/v1")));
+        let chat_only = "https://chat-only.pool.example/v1";
+        heard_list(chat_only, &[json!({"id": "chat/model", "type": "chat"})]);
+        let none_sold = switched_off(Some(&over(chat_only)));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+
+        let paid = "\n\nA search through 127.0.0.1 is paid to that gateway.";
+        assert_eq!(
+            card,
+            format!(
+                "Search through 127.0.0.1 for \"letronna glue\", or DuckDuckGo at {duckduckgo} if it cannot{paid}"
+            )
+        );
+        let first = first.unwrap();
+        assert!(
+            first.starts_with("DuckDuckGo results for \"letronna glue\":\n"),
+            "{first}"
+        );
+        // Its list was read, then its search, with the key, and no more.
+        let heard: Vec<(String, String)> = (heard.lock().unwrap().iter())
+            .map(|(target, key, _)| (target.clone(), key.clone()))
+            .collect();
+        let bearer = "Bearer secret".to_owned();
+        assert_eq!(
+            heard,
+            [
+                ("GET /v1/models".to_owned(), bearer.clone()),
+                ("POST /v1/search".to_owned(), bearer)
+            ]
+        );
+        // It rests now, so DuckDuckGo goes first, and the same search is
+        // answered from what DuckDuckGo found.
+        assert_eq!(
+            card_after,
+            format!(
+                "Search DuckDuckGo at {duckduckgo} for \"letronna glue\", or through 127.0.0.1 if it cannot{paid}"
+            )
+        );
+        let again = again.unwrap();
+        assert!(again.starts_with("(The same search was made"), "{again}");
+        assert!(again.ends_with(&first), "{again}");
+        let other = other.unwrap();
+        assert!(other.starts_with("DuckDuckGo results for"), "{other}");
+        assert_eq!(
+            (selling, unread, none_sold),
+            (None, None, Some(SWITCHED_OFF))
+        );
     }
 
     /// Sends one search to DuckDuckGo from this connection.
