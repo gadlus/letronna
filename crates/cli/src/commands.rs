@@ -720,6 +720,7 @@ fn about(command: &slash::Command) -> String {
     let winner = match winner {
         Origin::BuiltIn => "Letronna's own",
         Origin::User => "yours",
+        Origin::Plugin => "a plugin's",
         Origin::Project => "the project's",
         Origin::Skill => "a skill",
         Origin::Workflow => "a saved workflow",
@@ -733,6 +734,7 @@ fn from(origin: Origin) -> &'static str {
         // Only a name's winner is ever built in; the match must name it.
         Origin::BuiltIn => "built in",
         Origin::User => "yours",
+        Origin::Plugin => "plugin",
         Origin::Project => "project",
         Origin::Skill => "skill",
         Origin::Workflow => "workflow",

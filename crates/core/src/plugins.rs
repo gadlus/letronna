@@ -400,7 +400,12 @@ pub(crate) fn skill_roots_in(data: &Path) -> Vec<PathBuf> {
 
 /// The folders of command files the plugins switched on bring.
 pub fn command_folders() -> Vec<PathBuf> {
-    active(&backend::data_dir())
+    command_folders_in(&backend::data_dir())
+}
+
+/// `command_folders` for the data folder `data`.
+pub(crate) fn command_folders_in(data: &Path) -> Vec<PathBuf> {
+    active(data)
         .iter()
         .flat_map(|(_, folder, manifest, _)| declared(folder, &manifest.commands, "commands"))
         .collect()
