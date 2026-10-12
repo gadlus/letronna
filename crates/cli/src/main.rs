@@ -1273,9 +1273,19 @@ fn take_route(runner: &mut Runner, args: &Args) {
     };
     let _ = session::GIVEN_KEY.set(key);
     let settings = &mut runner.store.settings;
-    settings.gateway = "Custom".into();
+    settings.gateway = route_gateway(&endpoint, letronna_core::auth::signed_in()).into();
     settings.custom_endpoint = endpoint;
     settings.model = model;
+}
+
+/// The gateway the environment's server is: Letronna's own when it is the
+/// account API and someone is signed in (as `LETRONNA_TOKEN` does in a cloud
+/// terminal), so it lists its models and sends the sign-in; Custom otherwise.
+fn route_gateway(endpoint: &str, signed_in: bool) -> &'static str {
+    match letronna_core::gateway::named(endpoint) {
+        Some(letronna_core::gateway::LETRONNA) if signed_in => letronna_core::gateway::LETRONNA,
+        _ => "Custom",
+    }
 }
 
 /// The Custom route, as (endpoint, key, model), that `AGENT_BASE_URL`,
@@ -2180,6 +2190,15 @@ mod tests {
     /// What `letronna` makes of `words`.
     fn parsed(words: &[&str]) -> Args {
         parse(words.iter().map(|word| word.to_string())).unwrap()
+    }
+
+    #[test]
+    fn the_account_api_routes_to_the_letronna_gateway_once_signed_in() {
+        let hosted = letronna_core::auth::hosted_base();
+        assert_eq!(route_gateway(&hosted, true), "Letronna");
+        assert_eq!(route_gateway(&format!("{hosted}/"), true), "Letronna");
+        assert_eq!(route_gateway(&hosted, false), "Custom");
+        assert_eq!(route_gateway("https://proxy.test/v1", true), "Custom");
     }
 
     /// An environment with a server, its key and its model in it.
