@@ -574,6 +574,8 @@ impl Chat {
             "search_web" => "Letronna wants to search the web".to_owned(),
             "memory" => "Letronna wants to change what it remembers".to_owned(),
             "send_job" => "Letronna wants to type into a running job".to_owned(),
+            "wallet_send" => "Letronna wants to send money from your wallet".to_owned(),
+            "paid_fetch" => "Letronna wants to pay for a page from your wallet".to_owned(),
             other => format!("Letronna wants to use {other}"),
         };
         let folder = self.card_folder();
@@ -1182,6 +1184,8 @@ fn wants(who: &str, name: &str, summary: &str) -> String {
         "search_web" => format!("{who} wants to search the web"),
         "memory" => format!("{who} wants to change what it remembers"),
         "send_job" => format!("{who} wants to type into a running job"),
+        "wallet_send" => format!("{who} wants to send money from your wallet"),
+        "paid_fetch" => format!("{who} wants to pay for a page from your wallet"),
         other => format!("{who} wants to use {other}"),
     }
 }

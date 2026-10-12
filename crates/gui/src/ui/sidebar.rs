@@ -7,13 +7,14 @@ pub(crate) const SIDEBAR_WIDTH: Pixels = px(250.);
 
 /// The sidebar's pages after New session, in the order it lists them, every
 /// one a row of its own; Workflows only while there is a run to show.
-const PAGES: [Page; 7] = [
+const PAGES: [Page; 8] = [
     Page::Capabilities,
     Page::Activity,
     Page::Plugins,
     Page::Messaging,
     Page::Artifacts,
     Page::Jobs,
+    Page::Wallet,
     Page::Workflows,
 ];
 
@@ -45,6 +46,7 @@ fn page_icon(page: Page) -> AppIcon {
         Page::Jobs => AppIcon::Clock,
         Page::Activity => AppIcon::Robot,
         Page::Workflows => AppIcon::Workflow,
+        Page::Wallet => AppIcon::Wallet,
     }
 }
 
@@ -136,6 +138,7 @@ impl Chat {
             Page::Activity => return self.open_activity(window, cx),
             Page::Workflows => return self.open_workflows(window, cx),
             Page::Artifacts => self.read_artifacts(cx),
+            Page::Wallet => self.read_wallet(true, cx),
             Page::Plugins => self.reload_plugins(),
             Page::Chat | Page::Messaging => {}
         }
@@ -644,6 +647,7 @@ mod tests {
             "Messaging",
             "Artifacts",
             "Scheduled jobs",
+            "Wallet",
         ];
         assert_eq!(names(&nav_rows(false)), all);
         all.push("Workflows");

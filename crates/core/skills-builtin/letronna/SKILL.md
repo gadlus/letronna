@@ -52,7 +52,7 @@ Then `letronna mcp list`, `get <name>`, `remove <name>`, and `login <name>` or `
 
 ## The window
 
-The sidebar has New session, Capabilities (tabs Skills, Tools and MCP) and Activity; More holds Plugins, Messaging, Artifacts and Scheduled jobs. The account menu has Account, Usage, Settings, Profile, Set up Letronna, Guide, and signing in or out. Settings has Account, Usage, Gateways, Search, Model, Appearance, Thinking, Memory, Privacy, Shortcuts, Plugins and About.
+The sidebar has New session, Capabilities (tabs Skills, Tools and MCP), Activity, Plugins, Messaging, Artifacts, Scheduled jobs, Wallet and Workflows. The account menu has Account, Usage, Settings, Profile, Set up Letronna, Guide, and signing in or out. Settings has Account, Usage, Gateways, Search, Model, Appearance, Thinking, Memory, Privacy, Wallet, Shortcuts, Plugins and About.
 
 ## Skills, profiles and schedules
 

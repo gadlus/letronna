@@ -14,6 +14,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 ## [Unreleased]
 
 ### Added
+- **All** — A built-in wallet the agent pays from: make one or bring one in from MetaMask, Phantom or any wallet app, on Base, Ethereum, Solana and any EVM chain. Sites that ask to be paid (x402) are paid in USDC within caps you set, asked each time or on their own below a price you choose; sends always ask. `letronna wallet`, `/wallet`, the Wallet page and Settings › Wallet.
 - **Web** — A terminal in the browser: the Cloud page opens Letronna itself, running in Letronna Cloud on a new thread or one you have, to type into as on your own computer.
 - **Terminal** — On a machine that is thrown away after (`LETRONNA_DISPOSABLE=1`, as in Letronna Cloud), the terminal takes its server, key and model from `AGENT_BASE_URL`, `AGENT_API_KEY` and `AGENT_MODEL`, as `-p` does, and saves none of it.
 - **Web** — Letronna Cloud takes more servers: admins add a VPS from the admin page with one setup command, and runs and 24/7 bots spread across every server.
