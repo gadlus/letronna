@@ -1252,14 +1252,36 @@ pub fn sign_in(runner: &mut Runner) {
     render::line(&render::dim(
         "Not your usual browser? Paste the link into the one you use.",
     ));
+    // Over SSH the browser cannot reach this machine's port, so the page
+    // offers a code instead.
+    render::line(&render::dim(
+        "On another machine? Press esc, then type the code the page shows.",
+    ));
     open_in_browser(&pending.url);
 
     let stop = pending.cancel();
-    match runner.bar.busy_cancellable(
-        "waiting for the browser · esc to cancel",
+    let state = pending.state();
+    let signed_in = match runner.bar.busy_cancellable(
+        "waiting for the browser · esc for a code or to cancel",
         stop,
         move || pending.finish(),
     ) {
+        Err(error) if error == "Sign-in cancelled." => {
+            match runner
+                .bar
+                .ask("The code from the sign-in page, or esc to cancel", true)
+            {
+                Some(code) if !code.trim().is_empty() => {
+                    runner.bar.busy("checking the code", move || {
+                        letronna_core::auth::redeem(&state, &code)
+                    })
+                }
+                _ => Err(error),
+            }
+        }
+        done => done,
+    };
+    match signed_in {
         Ok(account) => {
             render::said(&render::blue("›"), &render::bold(&account.name));
             let plan = account.plan_name();
