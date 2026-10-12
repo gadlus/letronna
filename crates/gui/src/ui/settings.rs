@@ -136,7 +136,7 @@ impl Chat {
         }
         let address = self.endpoint.read(cx).value().trim().to_string();
         let kept = if is_own(&editing) {
-            keep_own(&editing, &address).map(|_| ())
+            change_own(&editing, &address).map(|_| ())
         } else if gateway(&editing).base.is_empty() && address.is_empty() {
             self.store.settings.custom_endpoint.clear();
             Ok(())
@@ -244,7 +244,7 @@ impl Chat {
     pub(crate) fn add_gateway(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.gateway_name.read(cx).value().trim().to_string();
         let address = self.endpoint.read(cx).value().trim().to_string();
-        let name = match keep_own(&name, &address) {
+        let name = match add_own(&name, &address) {
             Ok((name, _)) => name,
             Err(why) => {
                 self.error = Some(why);
