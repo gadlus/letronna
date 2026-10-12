@@ -636,10 +636,20 @@ fn token_sums_from(
 /// against a long run of tiny messages; a bigger window holds as many more.
 const MAX_MESSAGES: usize = 60;
 /// The most a window holds by default, in estimated tokens, however much the
-/// model could take. Until requests carry cache markers every round of a
-/// turn is billed for the whole window again, so a bigger one costs more on
-/// every round rather than once; the `context_cap` setting changes it.
+/// model could take, on a route whose prompt cache is not serving the
+/// session: there every round of a turn pays for the whole window again, so
+/// a bigger one costs more on every round rather than once. Where the usage
+/// says the cache serves most of each request, a round pays for what is new
+/// and a fraction of the rest, and clearing or dropping history costs more,
+/// a miss on everything after it, than the tokens it saves: the window then
+/// holds up to `LIFT_CAPS` times as much (`Budget::cached`). The
+/// `context_cap` setting sets it, cache or no cache.
 const CAP_TOKENS: usize = 64_000;
+/// How many times the cap a window may hold while the cache serves the
+/// session, on a model with room for it: about 256,000 tokens by default.
+/// Further than that a long run distracts a model more than it informs it,
+/// and the one move of the window it brings is a miss on all of it.
+const LIFT_CAPS: usize = 4;
 /// The reply asked for when the model's output limit is not known: what
 /// every request asked for before any limit was, which the smallest limits
 /// in use, such as deepseek-chat's, still accept.
@@ -656,6 +666,14 @@ const MAX_REPLY_TOKENS: usize = 32_000;
 struct Budget {
     /// What the window's messages may cost together.
     tokens: usize,
+    /// What they may cost instead while the provider's cache has been
+    /// serving the session, as `may_cost` decides: more than `tokens` only
+    /// on a model whose window holds twice the cap, and then the lesser of
+    /// `LIFT_CAPS` caps and what three quarters of the window leaves. Only
+    /// where the window starts and where old results end come from it: the
+    /// step, the message guard and the share of a tool result keep coming
+    /// from the cap, so the places and the chunks do not move with it.
+    cached: usize,
     /// How far apart the places are where the window may start.
     step: usize,
     /// What a request may carry besides the reply, before the system prompt
@@ -670,18 +688,33 @@ struct Budget {
     /// Sent again after an overflow: every tool result but the newest few
     /// goes out cleared, and another overflow stands.
     squeezed: bool,
+    /// The turn's older calls go out without their reasoning once it comes
+    /// to a chunk, as `reasoning_before` places the cut; the
+    /// `reasoning_replay` setting turns it on.
+    chunked_reasoning: bool,
 }
 
 impl Budget {
+    /// This budget with no lift: what every request is sized by until the
+    /// provider's cache serves the session.
+    fn capped(&self) -> Self {
+        Self {
+            cached: self.tokens,
+            ..*self
+        }
+    }
+
     /// The window every model had before its own could be known.
     const SMALL: Self = Self {
         tokens: CONTEXT_TOKENS,
+        cached: CONTEXT_TOKENS,
         step: CONTEXT_TOKENS / 2,
         room: CONTEXT_TOKENS,
         messages: MAX_MESSAGES,
         tool_chars: MAX_TOOL_CHARS,
         reply: REPLY_TOKENS,
         squeezed: false,
+        chunked_reasoning: false,
     };
 }
 
@@ -698,11 +731,11 @@ fn assumed_window(connection: &Connection) -> Option<u64> {
     (!connection.key.trim().is_empty()).then_some(ASSUMED_WINDOW)
 }
 
-/// The budget for the next request over `connection`: its model's window as
-/// far as it is known or `sizing` or `assumed_window` assumes it, the user's
-/// cap (0 for the default), and what the system prompt, the tools,
-/// subfolders' instructions and the web advice take.
-fn budget(connection: &Connection, sizing: crate::store::Sizing) -> Budget {
+/// The budget for the next request over `connection`, carrying `messages`:
+/// its model's window as far as it is known or `sizing` or `assumed_window`
+/// assumes it, the user's cap (0 for the default), and what the system
+/// prompt, the tools, subfolders' instructions and the web advice take.
+fn budget(connection: &Connection, sizing: crate::store::Sizing, messages: &[Message]) -> Budget {
     let facts = crate::models::facts_or(
         &connection.endpoint,
         connection.model.trim(),
@@ -712,10 +745,17 @@ fn budget(connection: &Connection, sizing: crate::store::Sizing) -> Budget {
     let cap = sizing.cap;
     // The instructions ride on results the window counts without them.
     let fixed = fixed_tokens(connection)
-        + crate::subfolders::reserve(connection)
+        + crate::subfolders::reserve(connection, messages)
         + crate::browser::reserve(connection);
     let context = facts.context.or_else(|| assumed_window(connection));
-    sized(context, facts.max_output, cap_tokens(cap), fixed)
+    let sized = sized(context, facts.max_output, cap_tokens(cap), fixed);
+    Budget {
+        // A cap the user set is the most a request carries, cache or no
+        // cache: the lift is for the default, which was sized for no cache.
+        cached: if cap == 0 { sized.cached } else { sized.tokens },
+        chunked_reasoning: sizing.chunked_reasoning,
+        ..sized
+    }
 }
 
 /// The most tokens a request carries besides the reply under a cap of `cap`
@@ -806,7 +846,7 @@ fn context_parts(connection: &Connection, messages: &[Message], floor: usize) ->
     } else {
         (0, 0)
     };
-    let request_budget = budget(connection, crate::store::sizing());
+    let request_budget = budget(connection, crate::store::sizing(), messages);
     let start = window_from(messages, &request_budget, floor, Some(connection));
     let sums = token_sums(
         &messages[start..],
@@ -931,6 +971,16 @@ fn sized(context: Option<u64>, output: Option<u64>, cap: usize, fixed: usize) ->
         .min(cap)
         .max(CONTEXT_TOKENS);
     let tokens = room.saturating_sub(fixed).max(CONTEXT_TOKENS);
+    // A model whose window holds twice the cap has room to lift it while
+    // the cache serves the session; one without, or one whose window was
+    // learned from an overflow, would run into its limit, since the
+    // estimate undercounts some models by a quarter.
+    let lifted = if context as usize >= 2 * cap {
+        ((context as usize).saturating_sub(reply) / 4 * 3).min(LIFT_CAPS * cap)
+    } else {
+        room
+    };
+    let cached = lifted.saturating_sub(fixed).max(tokens);
     // A step longer than what the messages may cost would leave the window
     // nowhere to start but the current turn, on every request, once the
     // history past a place outgrew that before reaching the next one.
@@ -940,6 +990,7 @@ fn sized(context: Option<u64>, output: Option<u64>, cap: usize, fixed: usize) ->
     }
     Budget {
         tokens,
+        cached,
         step,
         room,
         messages: MAX_MESSAGES * room / CONTEXT_TOKENS,
@@ -950,6 +1001,7 @@ fn sized(context: Option<u64>, output: Option<u64>, cap: usize, fixed: usize) ->
         tool_chars: (room / 2).max(MAX_TOOL_CHARS),
         reply,
         squeezed: false,
+        chunked_reasoning: false,
     }
 }
 
@@ -1007,6 +1059,7 @@ fn start_before(
 ) -> usize {
     let sums = token_sums(messages, budget.tool_chars, route);
     let total = sums[messages.len()] + ahead;
+    let most = may_cost(budget, messages);
     // Toward the steps a message counts as at least its share of a window
     // full by the message guard, so a run of short ones, which meets the
     // guard long before the budget, still steps on. Pictures are left out:
@@ -1020,7 +1073,7 @@ fn start_before(
     }
     let mut start = summary_end(messages, floor);
     while start < last_user
-        && (total - sums[start] > budget.tokens || messages.len() + more - start > budget.messages)
+        && (total - sums[start] > most || messages.len() + more - start > budget.messages)
     {
         // On to the first user turn past the next whole step from the
         // beginning, so the window never begins midway through a tool
@@ -1030,7 +1083,74 @@ fn start_before(
             .find(|i| marks[*i] >= next && messages.get(*i).is_none_or(opens_turn))
             .unwrap_or(last_user);
     }
+    // The lift never moves the window back: the turns a request the cap
+    // sized dropped went out as their summary, and bringing them back
+    // would change every byte from the first. So under the lift the window
+    // starts no earlier than it did at the newest request the cap sized,
+    // which the replies' own usage finds again.
+    let under_cap = newest_under_cap(messages, budget).filter(|_| most > budget.tokens);
+    if let Some(until) = under_cap {
+        let last_user = messages[..until].iter().rposition(opens_turn).unwrap_or(0);
+        let before = &messages[..until];
+        start = start.max(start_before(
+            before,
+            &budget.capped(),
+            floor,
+            last_user,
+            0,
+            0,
+            route,
+        ));
+    }
     start
+}
+
+/// How many of the newest replies say together whether the provider's cache
+/// is serving the session: enough that one request it served without the
+/// cache, as one routed to another of its servers is, changes nothing.
+const SERVED_REPLIES: usize = 3;
+
+/// What `messages` may cost together under `budget`: `budget.cached` while
+/// the newest `SERVED_REPLIES` replies that report their usage were served
+/// at least half of their input from the provider's cache, taken together,
+/// and `budget.tokens` otherwise -- before any reply, on a route whose
+/// usage never counts the cache, and after an overflow, when the cache was
+/// missed anyway. The same answer for every request between two replies,
+/// so what it decides, where the window starts and where old results end,
+/// moves only as a reply comes in: a run of misses clears results sooner
+/// and moves the window on, as the misses cost that already, and once the
+/// cache serves the session again, the lift comes back and holds both where
+/// the cap left them, never back.
+fn may_cost(budget: &Budget, messages: &[Message]) -> usize {
+    if budget.cached <= budget.tokens || budget.squeezed {
+        return budget.tokens;
+    }
+    let (mut cached, mut input) = (0, 0);
+    let replies = messages
+        .iter()
+        .rev()
+        .filter(|m| m.role == "assistant" && m.prompt_tokens > 0)
+        .take(SERVED_REPLIES);
+    for reply in replies {
+        cached += reply.cached_tokens;
+        input += reply.input_tokens();
+    }
+    if input > 0 && cached * 2 >= input {
+        budget.cached
+    } else {
+        budget.tokens
+    }
+}
+
+/// Where the newest request the cap sized ended: the messages before the
+/// newest reply whose request `may_cost` gave the cap, since a request is
+/// sized by the replies before it. None until a reply reports its usage,
+/// while every request is sized by the cap anyway.
+fn newest_under_cap(messages: &[Message], budget: &Budget) -> Option<usize> {
+    (0..messages.len())
+        .rev()
+        .filter(|&i| messages[i].role == "assistant" && messages[i].prompt_tokens > 0)
+        .find(|&i| may_cost(budget, &messages[..i]) == budget.tokens)
 }
 
 /// Where the window starts over `messages` for a model that reads `context`
@@ -1681,17 +1801,24 @@ fn body_hashed(
     let stubs = stubs(window, old, budget.squeezed);
     let hints = crate::subfolders::hints(window, connection);
     let turn = window.iter().rposition(opens_turn);
+    let cut = reasoning_before(window, budget, connection, turn, old);
     if let Some(prefix) = prefix.as_deref_mut() {
         // What changes in messages sent before: the results and writes
         // before `old` go out cleared, and on a route that wants reasoning
-        // back, the newest call whose reasoning went back in its own turn
-        // goes out without it once another turn starts.
+        // back, the turn's calls before `cut` go out without theirs, the
+        // newest call whose reasoning went back in its own turn goes
+        // without it once another turn starts, and every call gets its own
+        // once the route turns an empty one down.
         let emptied = turn.and_then(|start| {
             window[..start]
                 .iter()
                 .rposition(|m| echoes_reasoning(m, connection, true) && !m.reasoning.is_empty())
         });
-        prefix.set(crate::cache_miss::Reason::History, (old, emptied));
+        let kept = has_quirk(connection, Quirk::KeepOldReasoning);
+        prefix.set(
+            crate::cache_miss::Reason::History,
+            (old, cut, emptied, kept),
+        );
     }
     // Once, so the calls in the history and the array agree on which tools
     // go out on demand.
@@ -1716,7 +1843,8 @@ fn body_hashed(
             continue;
         }
         let mut wired = wire_message(m, budget.tool_chars);
-        carry_back(&mut wired, m, connection, in_turn(turn, i));
+        let this_turn = in_turn(turn, i);
+        carry_back(&mut wired, m, connection, this_turn, this_turn && i < cut);
         if let Some(stub) = &stubs[i] {
             wired["content"] = stub.as_str().into();
         }
@@ -2160,6 +2288,11 @@ enum Quirk {
     /// Everything `carry_back` adds, which a strict server may not take; on
     /// Anthropic's API, the binding beta too, which is only for what it adds.
     Replay,
+    /// An empty `reasoning_content` on the turn's older calls, which a route
+    /// that reads every call's turned down: from then on each call of the
+    /// model's goes out with its own, across turns, as DeepSeek's own API
+    /// describes, and `reasoning_before` cuts none.
+    KeepOldReasoning,
     /// Anthropic's adaptive thinking, which a model that thinks only on a
     /// budget turns down; the chat body has no field for it.
     Thinking,
@@ -2290,6 +2423,8 @@ fn apply_quirk(body: &mut Value, quirk: Quirk) -> bool {
         Quirk::Thinking => false,
         // Not fields of the chat body: `to_responses` reads them.
         Quirk::Responses | Quirk::Summary => false,
+        // No field either: `echoes_reasoning` and `reasoning_before` read it.
+        Quirk::KeepOldReasoning => false,
     }
 }
 
@@ -2353,6 +2488,22 @@ fn learn(connection: &Connection, sent: &Value, error: &str) -> bool {
     // An HTML error page from a proxy says image in its icons and previews.
     let json = serde_json::from_str::<Value>(error).is_ok();
     let error = error.to_lowercase().replace('_', "");
+    let (endpoint, model) = route(connection);
+    // A route that reads the turn's older reasoning after all, and was sent
+    // none of it: the next request carries every call's, which is another
+    // request from the one refused, so it goes once more before the field
+    // itself is given up on. Learned once per route: a call another model
+    // answered still goes out with an empty one, so the retry can have the
+    // same shape, and a refusal of it falls through to the field rather
+    // than going again.
+    if error.contains("reasoningcontent")
+        && sends_older_reasoning_empty(sent)
+        && learned().lock().is_ok_and(|mut quirks| {
+            quirks.insert((endpoint.clone(), model.clone(), Quirk::KeepOldReasoning))
+        })
+    {
+        return true;
+    }
     let mut learned_any = false;
     // Not "vision": it is also in "provisioned", as in a throughput limit.
     let about_images = json
@@ -2363,7 +2514,6 @@ fn learn(connection: &Connection, sent: &Value, error: &str) -> bool {
         forget_images(&connection.model);
         learned_any = !sees_images(&connection.model);
     }
-    let (endpoint, model) = route(connection);
     for (quirk, field) in QUIRKS {
         // A request that went out alongside this one may have learned it
         // first; this one still goes again without it.
@@ -2378,6 +2528,32 @@ fn learn(connection: &Connection, sent: &Value, error: &str) -> bool {
         }
     }
     learned_any
+}
+
+/// Whether the request `sent` carried a call of the turn in progress with an
+/// empty `reasoning_content` ahead of one with its reasoning: what
+/// `reasoning_before` makes of a long turn, and the one shape of request a
+/// route that reads every call's reasoning turns down over the field.
+fn sends_older_reasoning_empty(sent: &Value) -> bool {
+    let Some(messages) = sent["messages"].as_array() else {
+        return false;
+    };
+    let turn = messages
+        .iter()
+        .rposition(|m| m["role"] == "user")
+        .unwrap_or(0);
+    let mut emptied = false;
+    for call in messages[turn..]
+        .iter()
+        .filter(|m| m["role"] == "assistant" && m["tool_calls"].is_array())
+    {
+        match call["reasoning_content"].as_str() {
+            Some("") => emptied = true,
+            Some(_) if emptied => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// What a refusal from Anthropic's API names when the field at fault is one
@@ -2803,14 +2979,17 @@ fn wants_reasoning(connection: &Connection) -> bool {
 
 /// Whether `m` goes out over `connection` with its reasoning: a call made
 /// in the turn in progress (`this_turn`) by the model the request goes to,
-/// on a route that wants it back. `carry_back` sends it by this and the
-/// estimate counts it by this, so the window is sized by what is sent.
+/// on a route that wants it back, or in any turn once the route has turned
+/// an empty one down (`Quirk::KeepOldReasoning`). `carry_back` sends it by
+/// this and the estimate counts it by this, so the window is sized by what
+/// is sent; what `reasoning_before` cuts the estimate counts still, so that
+/// a cut never moves the window or the old results.
 fn echoes_reasoning(m: &Message, connection: &Connection, this_turn: bool) -> bool {
-    this_turn
-        && m.role == "assistant"
+    m.role == "assistant"
         && !m.tool_calls.is_empty()
         && m.model.trim() == connection.model.trim()
         && wants_reasoning(connection)
+        && (this_turn || has_quirk(connection, Quirk::KeepOldReasoning))
 }
 
 /// Whether the message at `at` is in the turn that starts at `turn`, the
@@ -2823,8 +3002,10 @@ fn in_turn(turn: Option<usize>, at: usize) -> bool {
 /// reasoning details and thought signatures it sent, to the endpoint and
 /// model that sent them and no other. A route that wants reasoning back
 /// gets it on every call of the turn in progress, and an empty one on older
-/// calls, whose reasoning it no longer reads.
-fn carry_back(wired: &mut Value, m: &Message, connection: &Connection, this_turn: bool) {
+/// calls, whose reasoning it no longer reads; a call of the turn that
+/// `reasoning_before` has `cut` goes out as an older call does, its details
+/// left out too, since on a gateway those are the same reasoning again.
+fn carry_back(wired: &mut Value, m: &Message, connection: &Connection, this_turn: bool, cut: bool) {
     if m.role != "assistant" {
         return;
     }
@@ -2834,7 +3015,7 @@ fn carry_back(wired: &mut Value, m: &Message, connection: &Connection, this_turn
         .as_ref()
         .filter(|r| r.endpoint == endpoint && r.model == model)
     {
-        if !replay.reasoning_details.is_empty() {
+        if !replay.reasoning_details.is_empty() && !cut {
             wired["reasoning_details"] = replay.reasoning_details.clone().into();
         }
         for (at, call) in m.tool_calls.iter().enumerate() {
@@ -2849,7 +3030,7 @@ fn carry_back(wired: &mut Value, m: &Message, connection: &Connection, this_turn
         }
     }
     if !m.tool_calls.is_empty() && wants_reasoning(connection) {
-        let own = echoes_reasoning(m, connection, this_turn);
+        let own = !cut && echoes_reasoning(m, connection, this_turn);
         wired["reasoning_content"] = if own { m.reasoning.as_str() } else { "" }.into();
     }
 }
@@ -2870,10 +3051,10 @@ const KEEP_TOKENS: usize = 4_000;
 /// the window, whether or not the request still sends it, since a turn's
 /// goes out only while the turn runs and a cost that fell when one ended
 /// would move the boundary back. Nothing is old until the window, with every
-/// result whole, costs more than four fifths of the budget: each move of the
-/// boundary changes messages already sent, so the prompt cache misses from
-/// the first of them on, and on a provider that caches, sending a few more
-/// thousand tokens again costs less than that miss.
+/// result whole, costs more than four fifths of what it may (`may_cost`):
+/// each move of the boundary changes messages already sent, so the prompt
+/// cache misses from the first of them on, and on a provider that caches,
+/// sending a few more thousand tokens again costs less than that miss.
 ///
 /// Then the boundary moves in chunks of a third of the room, or a step of
 /// the window if that is longer, so that the requests between two moves are
@@ -2907,8 +3088,17 @@ fn old_before(window: &[Message], budget: &Budget, route: Option<&Connection>) -
     }
     let sums = token_sums_from(window, budget.tool_chars, route, None);
     let total = sums[window.len()];
-    if total <= budget.tokens / 5 * 4 {
-        return 0;
+    let most = may_cost(budget, window);
+    if total <= most / 5 * 4 {
+        // Under the lift, what a request the cap sized cleared stays
+        // cleared: sent whole again, the results would change every byte
+        // from the first of them. So the boundary is no earlier than at the
+        // newest request the cap sized, found again from the window's own
+        // replies, which past its first rounds are the ones that decided.
+        return match newest_under_cap(window, budget).filter(|_| most > budget.tokens) {
+            Some(until) => old_before(&window[..until], &budget.capped(), route),
+            None => 0,
+        };
     }
     let keep = (budget.room / 16).max(KEEP_TOKENS);
     let chunk = (budget.room / 3).max(budget.step);
@@ -2923,6 +3113,70 @@ fn old_before(window: &[Message], budget: &Budget, route: Option<&Connection>) -
     // the old part ends at.
     let crossing = sums.partition_point(|&sum| sum <= target) - 1;
     round(crossing).unwrap_or(0)
+}
+
+/// The newest calls of the turn whose reasoning always goes back whole,
+/// however long the turn has thought: the model carries on from them.
+const KEEP_REASONING: usize = 2;
+/// The least reasoning, in estimated tokens, one move of the reasoning cut
+/// stops sending: a move changes calls already sent, so the prompt cache
+/// misses from the first of them on, and under this much a miss costs more
+/// than the tokens it saves.
+const REASONING_CHUNK: usize = 8_000;
+
+/// Where the calls of the turn in progress that go out without their
+/// reasoning end, for a request over `connection` under `budget`: 0, every
+/// call with its own, unless the budget sends the turn's reasoning in
+/// chunks, as the `reasoning_replay` setting asks, and 0 again once the
+/// route has turned an empty one down (`Quirk::KeepOldReasoning`).
+///
+/// The turn's calls stop carrying their reasoning from the oldest on, once
+/// what the turn has thought, less the newest `KEEP_REASONING` calls', comes
+/// to a chunk of `REASONING_CHUNK` tokens or an eighth of the room, and then
+/// a whole chunk at a time, so the requests between two moves are identical
+/// from the front: the cut is at the first call to take the count past the
+/// last whole chunk, which keeps its own, so that calls arriving never move
+/// it until they make another chunk. It goes no nearer than the
+/// `KEEP_REASONING`-th newest call, which keeps the round the model has not
+/// answered whole, and no earlier than `old`, since the calls before there
+/// have their results cleared and are rewritten with them already, so a
+/// move of the old results and a cut make one rewrite rather than two.
+/// Stateless, as `old_before` is: the estimate counts the reasoning whether
+/// or not it is sent, so a move here never moves `old`.
+fn reasoning_before(
+    window: &[Message],
+    budget: &Budget,
+    connection: &Connection,
+    turn: Option<usize>,
+    old: usize,
+) -> usize {
+    if !budget.chunked_reasoning || has_quirk(connection, Quirk::KeepOldReasoning) {
+        return 0;
+    }
+    let calls: Vec<usize> = (0..window.len())
+        .filter(|&i| in_turn(turn, i) && echoes_reasoning(&window[i], connection, true))
+        .collect();
+    let Some(older) = calls.len().checked_sub(KEEP_REASONING).filter(|&n| n > 0) else {
+        return 0;
+    };
+    let limit = calls[older];
+    let cost = |i: usize| tokens(&window[i].reasoning);
+    let chunk = (budget.room / 8).max(REASONING_CHUNK);
+    let thought: usize = calls[..older].iter().map(|&i| cost(i)).sum();
+    let target = thought / chunk * chunk;
+    let mut counted = 0;
+    let mut crossing = limit;
+    for &i in &calls {
+        counted += cost(i);
+        if counted > target {
+            crossing = i;
+            break;
+        }
+    }
+    let cut = crossing.max(old).min(limit);
+    // A cut at the turn's first call leaves every call its reasoning, and
+    // says so as 0, so that the history is hashed by what the wire carries.
+    if cut > calls[0] { cut } else { 0 }
 }
 
 /// What goes on the wire instead of each tool result in `window`, where
@@ -3553,7 +3807,7 @@ fn begin(
     extra: Extra,
     ahead: bool,
 ) -> async_channel::Receiver<Event> {
-    let budget = budget(&connection, crate::store::sizing());
+    let budget = budget(&connection, crate::store::sizing(), &messages);
     // Before the reply exists, so every call it makes is stamped with it.
     let window = window_from(&messages, &budget, extra.floor, Some(&connection));
     let cleared = window + old_before(&messages[window..], &budget, Some(&connection));
@@ -3576,7 +3830,7 @@ fn begin(
             &connection,
             given,
             |asked| {
-                let budget = budget_for(asked, &connection, budget);
+                let budget = budget_for(asked, &connection, budget, &messages);
                 send_window(asked, &messages, &budget, &extra, lsp.as_deref(), &sender)
             },
             |switch| {
@@ -3622,13 +3876,19 @@ fn begin(
     receiver
 }
 
-/// The budget for a request to `connection`: the session's own for its model,
-/// and one of its own for a fallback, whose window may differ.
-fn budget_for(connection: &Connection, primary: &Connection, own: Budget) -> Budget {
+/// The budget for a request to `connection` carrying `messages`: the
+/// session's own for its model, and one of its own for a fallback, whose
+/// window may differ.
+fn budget_for(
+    connection: &Connection,
+    primary: &Connection,
+    own: Budget,
+    messages: &[Message],
+) -> Budget {
     if connection.endpoint == primary.endpoint && connection.model == primary.model {
         return own;
     }
-    budget(connection, crate::store::sizing())
+    budget(connection, crate::store::sizing(), messages)
 }
 
 /// The place claimed for the summary of what the window drops at its next
@@ -3726,7 +3986,7 @@ pub fn compact(
         return Err("Nothing to summarize: no turn comes before it.".into());
     }
     validate(connection)?;
-    let budget = budget(connection, crate::store::sizing());
+    let budget = budget(connection, crate::store::sizing(), messages);
     let start = window_from(messages, &budget, floor, Some(connection));
     if end <= start {
         return Err("Nothing to summarize: the turns before it are summarized already.".into());
@@ -3825,11 +4085,16 @@ fn roomier(connection: &Connection, sent: &Budget) -> Option<Budget> {
     (reply > sent.reply).then_some(Budget { reply, ..*sent })
 }
 
-/// The budget to send again with after `failure`, once, when it is an
-/// overflow a smaller window or a shorter reply can mend. What the error gave
-/// away is learned for the model first, so the requests after it are sized
-/// by it too.
-fn refit(connection: &Connection, failure: &Failure, sent: &Budget) -> Option<Budget> {
+/// The budget to send `messages` again with after `failure`, once, when it
+/// is an overflow a smaller window or a shorter reply can mend. What the
+/// error gave away is learned for the model first, so the requests after it
+/// are sized by it too.
+fn refit(
+    connection: &Connection,
+    failure: &Failure,
+    sent: &Budget,
+    messages: &[Message],
+) -> Option<Budget> {
     let overflow = failure.overflow.filter(|_| !sent.squeezed)?;
     let model = connection.model.trim();
     if let Some(tokens) = overflow.context {
@@ -3840,7 +4105,7 @@ fn refit(connection: &Connection, failure: &Failure, sent: &Budget) -> Option<Bu
     }
     let mut next = Budget {
         squeezed: true,
-        ..budget(connection, crate::store::sizing())
+        ..budget(connection, crate::store::sizing(), messages)
     };
     let left = overflow
         .context
@@ -4067,7 +4332,7 @@ fn stream(
             // An overflow never passes by itself, so it is never waited out:
             // it gets here on the try it came back on. The one request sent
             // again after it has tries of its own for what does pass.
-            if !begun && let Some(budget) = refit(connection, &failure, budget) {
+            if !begun && let Some(budget) = refit(connection, &failure, budget, messages) {
                 return send_window(connection, messages, &budget, extra, lsp, sender);
             }
             // A reply that thought until its limit and wrote nothing goes
@@ -6427,9 +6692,10 @@ mod tests {
     }
 
     /// A distinctive part of each work rule's sentence.
-    const WORK_RULES: [&str; 6] = [
+    const WORK_RULES: [&str; 7] = [
         "Do not refactor, rename or reformat",
         "never invent output or results",
+        "fix it at the shared cause",
         "Make calls that do not depend on each other",
         "A reply with no tool call ends your turn",
         "check that the user asked for that step itself",
@@ -6552,6 +6818,63 @@ mod tests {
         assert!(
             alone.contains("A reply with no tool call ends your turn"),
             "{alone}"
+        );
+    }
+
+    /// About what a run nobody watches sends before its first message, as
+    /// `tokens` counts it: the system message, as its golden copy has it,
+    /// and the tools array, which every request of every run repeats and a
+    /// provider caches after the first. Held here so a prompt or description
+    /// edit shows its cost in the failure, with the bytes themselves in the
+    /// golden copies.
+    const STATIC_TOKENS: usize = 5_015;
+
+    #[test]
+    #[cfg_attr(
+        any(windows, not(feature = "workflows")),
+        ignore = "The count is of a default build outside Windows, where run_command describes bash"
+    )]
+    fn the_system_message_and_tools_of_a_print_run_cost_what_is_recorded() {
+        let system = golden_prompt(false);
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::store::tests::Scratch::new("chat-static-tokens");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        // As `-p` without `--tools` sends it on a fresh install: the less
+        // used tools on demand, and no MCP tool, since one another test
+        // serves would put call_mcp_tool in the array too. Nor wake_me: it
+        // is offered once the process listens on its inbox, which a print
+        // run never does but another test in this process may.
+        let c = Connection {
+            tools: true,
+            lean_tools: true,
+            workspace: Some("/w".into()),
+            ..connection()
+        };
+        let every: Vec<_> = crate::tools::all()
+            .into_iter()
+            .filter(|tool| !crate::mcp::is_tool(tool.name()) && tool.name() != "wake_me")
+            .collect();
+        let on_demand = crate::mcp_find::OnDemand::of(&c, &every);
+        let sent = Value::Array(offered(&c, &every, on_demand));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        let tools = sent.to_string();
+        let names: Vec<&str> = sent
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        let now = tokens(&system) + tokens(&tools);
+        assert_eq!(
+            now,
+            STATIC_TOKENS,
+            "the system message ({} tokens) and tools ({} tokens: {}) of a print run now cost {now}, {:+} against the {STATIC_TOKENS} recorded; if the change is meant, record the new count",
+            tokens(&system),
+            tokens(&tools),
+            names.join(", "),
+            now as isize - STATIC_TOKENS as isize
         );
     }
 
@@ -8687,7 +9010,7 @@ mod tests {
                 model: model.into(),
                 ..connection()
             };
-            let asked = budget(&c, Sizing::default());
+            let asked = budget(&c, Sizing::default(), &[]);
             assert_eq!(asked.reply, reply, "{model}");
             let body = body_with(&c, &[], None, None, &asked, &[]);
             assert_eq!(body["max_completion_tokens"], reply, "{model}");
@@ -9922,7 +10245,7 @@ mod tests {
         );
         assert_eq!(sized(Some(200_000), None, 1_000, 2_000), Budget::SMALL);
         // Ollama's list says nothing and its models are in no table.
-        assert_eq!(budget(&connection(), Sizing::default()), Budget::SMALL);
+        assert_eq!(budget(&connection(), Sizing::default(), &[]), Budget::SMALL);
         assert_eq!(
             window(&connection()),
             Window {
@@ -9937,7 +10260,7 @@ mod tests {
             key: "test-key".into(),
             ..connection()
         };
-        let assumed = budget(&keyed, Sizing::default());
+        let assumed = budget(&keyed, Sizing::default(), &[]);
         assert_eq!(
             assumed,
             sized(Some(ASSUMED_WINDOW), None, CAP_TOKENS, fixed_tokens(&keyed))
@@ -9956,7 +10279,7 @@ mod tests {
             key: "  ".into(),
             ..connection()
         };
-        assert_eq!(budget(&blank, Sizing::default()), Budget::SMALL);
+        assert_eq!(budget(&blank, Sizing::default(), &[]), Budget::SMALL);
         // A list that names the model only under another vendor's path is no
         // help on another host.
         let elsewhere = Connection {
@@ -9966,7 +10289,7 @@ mod tests {
         };
         let entry = serde_json::json!({"id": "router/listed-elsewhere", "context_length": 200_000});
         crate::models::remember("https://listed-there.test/v1", &[entry]);
-        assert_eq!(budget(&elsewhere, Sizing::default()), Budget::SMALL);
+        assert_eq!(budget(&elsewhere, Sizing::default(), &[]), Budget::SMALL);
         assert_eq!(
             window(&elsewhere),
             Window {
@@ -9985,7 +10308,7 @@ mod tests {
         };
         // The family table's output limit, and its window under the default
         // cap less what the prompt takes.
-        let default = budget(&gpt, Sizing::default());
+        let default = budget(&gpt, Sizing::default(), &[]);
         assert_eq!(default.reply, 16_384);
         assert_eq!(default.step, CAP_TOKENS / 2);
         assert!(default.tokens < CAP_TOKENS, "{default:?}");
@@ -9994,7 +10317,7 @@ mod tests {
             cap: 20_000,
             ..Sizing::default()
         };
-        assert_eq!(budget(&gpt, capped).step, 10_000);
+        assert_eq!(budget(&gpt, capped, &[]).step, 10_000);
         assert_eq!(
             window(&gpt),
             Window {
@@ -10013,7 +10336,7 @@ mod tests {
             ..connection()
         };
         let turn = tool_turn();
-        let small = budget(&routed, Sizing::default());
+        let small = budget(&routed, Sizing::default(), &[]);
         assert_eq!(small, Budget::SMALL);
         let before = body_with(&routed, &turn, None, None, &small, &[]);
         let list = serde_json::json!([
@@ -10021,7 +10344,7 @@ mod tests {
             {"id": "openrouter/deepseek/deepseek-v4.1-flash", "context_length": 1_048_576}
         ]);
         crate::models::remember(&routed.endpoint, list.as_array().unwrap());
-        let listed = budget(&routed, Sizing::default());
+        let listed = budget(&routed, Sizing::default(), &[]);
         assert_eq!(listed.step, CAP_TOKENS / 2);
         assert_eq!(listed.reply, REPLY_TOKENS);
         assert!(listed.tool_chars > Budget::SMALL.tool_chars, "{listed:?}");
@@ -10048,14 +10371,14 @@ mod tests {
             ..connection()
         };
         let proxied = model("qwen3.6-plus");
-        assert_eq!(budget(&proxied, Sizing::default()), Budget::SMALL);
+        assert_eq!(budget(&proxied, Sizing::default(), &[]), Budget::SMALL);
         let set = Sizing {
             window: Some(131_072),
             output: Some(32_768),
             ..Sizing::default()
         };
         // Sized as a listed window would be, under the default cap.
-        let sized_up = budget(&proxied, set);
+        let sized_up = budget(&proxied, set, &[]);
         assert_eq!(sized_up.reply, MAX_REPLY_TOKENS);
         assert_eq!(
             sized_up.messages,
@@ -10068,16 +10391,16 @@ mod tests {
             output: Some(32_768),
             ..Sizing::default()
         };
-        assert_eq!(budget(&proxied, output_only), Budget::SMALL);
+        assert_eq!(budget(&proxied, output_only, &[]), Budget::SMALL);
         // A model whose family is known keeps its own limits, and one whose
         // list gives its window alone takes the set output limit.
         let gpt = model("gpt-4o");
-        assert_eq!(budget(&gpt, set), budget(&gpt, Sizing::default()));
+        assert_eq!(budget(&gpt, set, &[]), budget(&gpt, Sizing::default(), &[]));
         let entry = serde_json::json!({"id": "lists-its-window", "context_length": 200_000});
         crate::models::remember(&proxied.endpoint, &[entry]);
         let listed = model("lists-its-window");
-        assert_eq!(budget(&listed, Sizing::default()).reply, REPLY_TOKENS);
-        assert_eq!(budget(&listed, set).reply, MAX_REPLY_TOKENS);
+        assert_eq!(budget(&listed, Sizing::default(), &[]).reply, REPLY_TOKENS);
+        assert_eq!(budget(&listed, set, &[]).reply, MAX_REPLY_TOKENS);
     }
 
     #[test]
@@ -10094,13 +10417,248 @@ mod tests {
             model: name.into(),
             ..connection()
         };
-        assert_eq!(budget(&model("glm-5.1"), set).reply, 10_000);
+        assert_eq!(budget(&model("glm-5.1"), set, &[]).reply, 10_000);
         crate::models::learn(endpoint, "glm-5.1", Limit::Context(20_000));
-        assert_eq!(budget(&model("glm-5.1"), set).reply, 5_000);
+        assert_eq!(budget(&model("glm-5.1"), set, &[]).reply, 5_000);
         // An error that names a bigger window than the one set does not
         // raise it.
         crate::models::learn(endpoint, "kimi-k2.5", Limit::Context(60_000));
-        assert_eq!(budget(&model("kimi-k2.5"), set).reply, 10_000);
+        assert_eq!(budget(&model("kimi-k2.5"), set, &[]).reply, 10_000);
+    }
+
+    /// Every reply of `messages` reporting a request of 10,000 tokens, of
+    /// which the cache served `percent`.
+    fn served(messages: &mut [Message], percent: u64) {
+        for m in messages.iter_mut().filter(|m| m.role == "assistant") {
+            m.prompt_tokens = 10_000;
+            m.cached_tokens = percent * 100;
+        }
+    }
+
+    #[test]
+    fn a_model_with_room_is_lifted_past_the_cap_for_a_served_cache_alone() {
+        // A million-token model: four caps, less what the prompt takes.
+        let big = sized(Some(1_000_000), Some(64_000), CAP_TOKENS, 4_000);
+        assert_eq!(big.cached, LIFT_CAPS * CAP_TOKENS - 4_000);
+        // One of twice the cap: three quarters of what its reply leaves.
+        let twice = sized(Some(128_000), Some(64_000), CAP_TOKENS, 4_000);
+        assert_eq!(twice.reply, MAX_REPLY_TOKENS);
+        assert_eq!(twice.cached, 72_000 - 4_000);
+        // Everything else is sized by the cap, so the places the window can
+        // start, the chunks and the tool results are as without the lift.
+        assert_eq!(
+            (big.tokens, big.step, big.messages, big.tool_chars, big.room),
+            (
+                twice.tokens,
+                twice.step,
+                twice.messages,
+                twice.tool_chars,
+                twice.room
+            )
+        );
+        assert_eq!((big.step, big.tool_chars), (CAP_TOKENS / 2, CAP_TOKENS / 2));
+        assert_eq!(big.tokens, CAP_TOKENS - 4_000);
+        // A model with less than twice the cap has no room for it.
+        let under = sized(Some(100_000), None, CAP_TOKENS, 4_000);
+        assert_eq!(under.cached, under.tokens);
+        assert_eq!(Budget::SMALL.cached, Budget::SMALL.tokens);
+        // Nor does a cap the user set, whatever the model.
+        let gpt = Connection {
+            endpoint: "https://sized.test/v1".into(),
+            model: "gpt-4o".into(),
+            ..connection()
+        };
+        let default = budget(&gpt, Sizing::default(), &[]);
+        assert!(default.cached > default.tokens, "{default:?}");
+        let own = Sizing {
+            cap: 20_000,
+            ..Sizing::default()
+        };
+        let capped = budget(&gpt, own, &[]);
+        assert_eq!(capped.cached, capped.tokens);
+    }
+
+    #[test]
+    fn the_lift_holds_while_the_newest_replies_were_served_from_the_cache() {
+        let budget = sized(Some(1_000_000), None, CAP_TOKENS, 0);
+        let mut messages = reads(20, 2_000);
+        // No reply has reported its usage yet, or the route never counts
+        // what the cache served.
+        assert_eq!(may_cost(&budget, &messages), budget.tokens);
+        served(&mut messages, 90);
+        assert_eq!(may_cost(&budget, &messages), budget.cached);
+        // One request served without the cache among the newest three, as
+        // one routed to another of the provider's servers is, changes
+        // nothing; two fall back, and the lift returns once served again.
+        let replies: Vec<usize> = (0..messages.len())
+            .filter(|&i| messages[i].role == "assistant")
+            .collect();
+        let newest = replies[replies.len() - 1];
+        let older = replies[replies.len() - 2];
+        messages[newest].cached_tokens = 0;
+        assert_eq!(may_cost(&budget, &messages), budget.cached);
+        messages[older].cached_tokens = 0;
+        assert_eq!(may_cost(&budget, &messages), budget.tokens);
+        messages[older].cached_tokens = 9_000;
+        assert_eq!(may_cost(&budget, &messages), budget.cached);
+        // A gateway that counts the cache beside the prompt still shows the
+        // share served; a request under half served does not.
+        messages[newest].prompt_tokens = 1_000;
+        messages[newest].cached_tokens = 9_000;
+        assert_eq!(may_cost(&budget, &messages), budget.cached);
+        served(&mut messages, 40);
+        assert_eq!(may_cost(&budget, &messages), budget.tokens);
+        // After an overflow the cache is missed anyway.
+        served(&mut messages, 90);
+        let squeezed = Budget {
+            squeezed: true,
+            ..budget
+        };
+        assert_eq!(may_cost(&squeezed, &messages), budget.tokens);
+        // And a budget with no lift answers the same whatever was served.
+        let plain = Budget {
+            cached: budget.tokens,
+            ..budget
+        };
+        assert_eq!(may_cost(&plain, &messages), budget.tokens);
+    }
+
+    #[test]
+    fn a_served_session_keeps_its_turns_where_the_cap_would_have_dropped_them() {
+        let budget = sized(Some(1_000_000), None, CAP_TOKENS, 0);
+        let plain = Budget {
+            cached: budget.tokens,
+            ..budget
+        };
+        // Exchanges of about 1,200 tokens: the lift is reached long before
+        // the message guard, which keeps coming from the cap.
+        let long = |i: usize| {
+            let [mut question, mut answer] = exchange(i);
+            question.content.push_str(&"x".repeat(2_400));
+            answer.content.push_str(&"y".repeat(2_400));
+            [question, answer]
+        };
+        let mut messages = Vec::new();
+        let (mut starts, mut places) = (Vec::new(), std::collections::BTreeSet::new());
+        for i in 0..70 {
+            messages.extend(long(i));
+            served(&mut messages, 90);
+            starts.push(window_start(&messages, &budget));
+            places.insert(window_start(&messages, &plain));
+        }
+        // About 85,000 tokens: past the cap, within the lift, so the window
+        // never moved and every request began with the bytes of the one
+        // before, where the cap had moved it on.
+        let sums = token_sums(&messages, budget.tool_chars, None);
+        assert!(
+            sums[messages.len()] > budget.tokens,
+            "{}",
+            sums[messages.len()]
+        );
+        assert!(starts.iter().all(|&start| start == 0), "{starts:?}");
+        assert!(places.len() > 1, "{places:?}");
+        // Grown past the lift, it moves on to a place the cap would have
+        // started at too, so the summary is the same one, and from there on
+        // as before.
+        for i in 70..300 {
+            messages.extend(long(i));
+            served(&mut messages, 90);
+            starts.push(window_start(&messages, &budget));
+            places.insert(window_start(&messages, &plain));
+        }
+        let moved = *starts.last().unwrap();
+        assert!(moved > 0, "{starts:?}");
+        assert!(messages.len() - moved < budget.messages);
+        assert!(starts.windows(2).all(|w| w[0] <= w[1]), "{starts:?}");
+        assert!(places.contains(&moved), "{moved} not in {places:?}");
+        let sums = token_sums(&messages, budget.tool_chars, None);
+        assert!(sums[messages.len()] - sums[moved] <= budget.cached);
+    }
+
+    #[test]
+    fn the_lift_coming_back_never_moves_the_window_back() {
+        let budget = sized(Some(1_000_000), None, CAP_TOKENS, 0);
+        let plain = budget.capped();
+        let long = |i: usize| {
+            let [mut question, mut answer] = exchange(i);
+            question.content.push_str(&"x".repeat(2_400));
+            answer.content.push_str(&"y".repeat(2_400));
+            [question, answer]
+        };
+        // Served from the first reply but for two in a row past the cap, as
+        // a gateway routing to another of its servers serves them: the
+        // requests sized by those three replies are the cap's.
+        let mut messages = Vec::new();
+        for i in 0..120 {
+            messages.extend(long(i));
+        }
+        served(&mut messages, 90);
+        for i in [70, 71] {
+            messages[2 * i + 1].cached_tokens = 0;
+        }
+        // The request that gets reply n carries n exchanges and its question.
+        let starts: Vec<usize> = (0..120)
+            .map(|n| window_start(&messages[..2 * n + 1], &budget))
+            .collect();
+        let capped = |n: usize| window_start(&messages[..2 * n + 1], &plain);
+        assert!(starts[..72].iter().all(|&start| start == 0), "{starts:?}");
+        assert!(capped(72) > 0);
+        assert_eq!(starts[72], capped(72));
+        assert_eq!(starts[73], capped(73));
+        // Served again, the window stays where the cap moved it rather than
+        // taking the dropped turns back, and steps on from there as before.
+        assert!(starts.windows(2).all(|w| w[0] <= w[1]), "{starts:?}");
+        assert_eq!(starts[74], starts[73]);
+        assert_eq!(starts[119], starts[73]);
+        assert!(capped(119) > starts[119]);
+        // The summary claimed ahead agrees, so it is made for that place.
+        assert!(start_ahead(&messages, &budget, 0, budget.tokens / 4) >= starts[119]);
+    }
+
+    #[test]
+    fn the_lift_coming_back_keeps_the_results_the_cap_cleared_cleared() {
+        let c = connection();
+        let budget = sized(Some(1_000_000), None, CAP_TOKENS, 0);
+        let mut turn = reads(60, 8_000);
+        served(&mut turn, 90);
+        for i in [30, 31] {
+            turn[2 * i + 1].cached_tokens = 0;
+        }
+        // Round by round, where the old results end and the conversation
+        // on the wire.
+        let rounds: Vec<(usize, String)> = (1..=60)
+            .map(|n| {
+                let prefix = &turn[..1 + 2 * n];
+                let sent = body_with(&c, prefix, None, None, &budget, &[])["messages"].clone();
+                let mut sent = sent.as_array().unwrap().clone();
+                sent.remove(0);
+                (
+                    old_before(prefix, &budget, None),
+                    Value::Array(sent).to_string(),
+                )
+            })
+            .collect();
+        let olds: Vec<usize> = rounds.iter().map(|(old, _)| *old).collect();
+        // Under the lift nothing was cleared; the two requests the cap sized
+        // cleared the oldest, and once served again the lift keeps them so.
+        assert!(olds[..31].iter().all(|&old| old == 0), "{olds:?}");
+        assert!(olds[31] > 0, "{olds:?}");
+        assert_eq!(
+            olds[31],
+            old_before(&turn[..1 + 2 * 32], &budget.capped(), None)
+        );
+        assert!(olds.windows(2).all(|w| w[0] <= w[1]), "{olds:?}");
+        assert_eq!(olds[33], olds[32]);
+        assert_eq!(olds[59], olds[32]);
+        // On the wire each request begins with the bytes of the one before,
+        // but for the cap's own moves.
+        let wire: Vec<String> = rounds.into_iter().map(|(_, wire)| wire).collect();
+        let moved: Vec<usize> = (1..olds.len())
+            .filter(|&n| olds[n] != olds[n - 1])
+            .map(|n| n + 1)
+            .collect();
+        assert_eq!(prefix_breaks(&wire), moved);
+        assert!(moved.iter().all(|&round| round <= 33), "{moved:?}");
     }
 
     #[test]
@@ -10120,14 +10678,16 @@ mod tests {
                 Sizing {
                     cap: 1_000,
                     ..Sizing::default()
-                }
+                },
+                &[]
             ),
             budget(
                 &gpt,
                 Sizing {
                     cap: CONTEXT_TOKENS as u64,
                     ..Sizing::default()
-                }
+                },
+                &[]
             )
         );
     }
@@ -10238,6 +10798,7 @@ mod tests {
 
     #[test]
     fn the_prefix_changes_with_the_history_only_where_an_earlier_message_did() {
+        let _folder = one_data_folder();
         let hashed = |connection: &Connection, window: &[Message]| {
             let mut prefix = crate::cache_miss::Prefix::default();
             let extra = Extra::default();
@@ -10621,6 +11182,87 @@ mod tests {
     }
 
     #[test]
+    fn old_results_are_cleared_far_later_while_the_cache_serves_the_session() {
+        // A million-token model under the default cap: the chunks and the
+        // results sent whole are the cap's, the lift four times it.
+        let budget = sized(Some(1_000_000), None, CAP_TOKENS, 0);
+        assert_eq!(budget.room, CAP_TOKENS);
+        assert_eq!(budget.cached, LIFT_CAPS * CAP_TOKENS);
+        let plain = Budget {
+            cached: budget.tokens,
+            ..budget
+        };
+        let cost = |window: &[Message]| token_sums(window, budget.tool_chars, None)[window.len()];
+        // Forty results of 8,000 characters: past four fifths of the cap,
+        // well under the lift.
+        let mut heavy = reads(40, 8_000);
+        assert!(cost(&heavy) > budget.tokens / 5 * 4, "{}", cost(&heavy));
+        assert!(cost(&heavy) <= budget.cached / 5 * 4, "{}", cost(&heavy));
+        // Until a reply says the cache serves the session, cleared as under
+        // the cap; then none is.
+        let under_cap = cleared(&results_sent(&heavy, &plain));
+        assert!(under_cap > 0);
+        assert_eq!(cleared(&results_sent(&heavy, &budget)), under_cap);
+        served(&mut heavy, 90);
+        assert_eq!(old_before(&heavy, &budget, None), 0);
+        assert_eq!(cleared(&results_sent(&heavy, &budget)), 0);
+        // Past four fifths of the lift they are cleared again, on the cap's
+        // chunks, leaving the newest whole as ever.
+        let mut huge = reads(110, 8_000);
+        served(&mut huge, 90);
+        assert!(cost(&huge) > budget.cached / 5 * 4, "{}", cost(&huge));
+        let old = old_before(&huge, &budget, None);
+        assert!(old > 0);
+        let sent = results_sent(&huge, &budget);
+        assert!(cleared(&sent) > 80, "{}", cleared(&sent));
+        assert_eq!(cleared(&sent[sent.len() - KEEP_RESULTS..]), 0);
+        // When the newest replies were served little, the cap's rule is
+        // back, and so is the boundary it places.
+        let replies: Vec<usize> = (0..heavy.len())
+            .filter(|&i| heavy[i].role == "assistant")
+            .collect();
+        for &i in &replies[replies.len() - 2..] {
+            heavy[i].cached_tokens = 0;
+        }
+        assert_eq!(
+            old_before(&heavy, &budget, None),
+            old_before(&heavy, &plain, None)
+        );
+        assert_eq!(cleared(&results_sent(&heavy, &budget)), under_cap);
+    }
+
+    #[test]
+    fn a_served_turn_sends_the_same_bytes_from_the_front_where_the_cap_rewrote_them() {
+        let _folder = one_data_folder();
+        let c = connection();
+        let budget = sized(Some(1_000_000), None, CAP_TOKENS, 0);
+        let mut turn = reads(40, 8_000);
+        served(&mut turn, 90);
+        // The conversation alone: the system message, which other tests'
+        // settings change under a long run of requests, says nothing here.
+        let conversation = |budget: &Budget| -> Vec<String> {
+            requests_by_round(&c, &turn, budget)
+                .iter()
+                .map(|wire| {
+                    let mut sent: Vec<Value> = serde_json::from_str(wire).unwrap();
+                    sent.remove(0);
+                    Value::Array(sent).to_string()
+                })
+                .collect()
+        };
+        // Round by round every request begins with the bytes of the one
+        // before: no result is cleared on the way to the lift.
+        assert_eq!(prefix_breaks(&conversation(&budget)), Vec::<usize>::new());
+        assert_eq!(cleared(&results_sent(&turn, &budget)), 0);
+        // The cap alone would have rewritten the turn.
+        let plain = Budget {
+            cached: budget.tokens,
+            ..budget
+        };
+        assert!(!prefix_breaks(&conversation(&plain)).is_empty());
+    }
+
+    #[test]
     fn a_result_shorter_than_the_stub_threshold_is_never_stubbed() {
         let mut messages = reads(20, 2_000);
         // 599 characters, as old as the oldest results cleared around it.
@@ -10634,6 +11276,19 @@ mod tests {
     /// The requests a turn of `turn`'s messages sends over `c` under
     /// `budget`, one a round as each result comes in: the messages of each
     /// as they go on the wire.
+    /// The system prompt carries the SOUL.md, style and USER.md of the data
+    /// folder, which other tests point elsewhere while they hold
+    /// `store::tests::DATA_DIR`. A test that compares requests or their
+    /// prefix hashes round by round holds it throughout, so every round reads
+    /// the one folder, as a session's rounds do.
+    fn one_data_folder() -> std::sync::MutexGuard<'static, ()> {
+        crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Its callers hold `store::tests::DATA_DIR` (`one_data_folder`) for the
+    /// whole test, as they also hash prompts the folder feeds.
     fn requests_by_round(c: &Connection, turn: &[Message], budget: &Budget) -> Vec<String> {
         (1..turn.len())
             .step_by(2)
@@ -10658,6 +11313,7 @@ mod tests {
 
     #[test]
     fn the_history_sent_changes_only_where_a_whole_chunk_is_crossed() {
+        let _folder = one_data_folder();
         // A DeepSeek turn, whose reasoning goes back with every call and
         // counts toward the boundary as it does on the wire.
         let c = Connection {
@@ -10718,6 +11374,7 @@ mod tests {
 
     #[test]
     fn results_bigger_than_what_is_kept_still_move_the_boundary_in_chunks() {
+        let _folder = one_data_folder();
         // The newest five results come to far more than the 4,000 tokens
         // kept, so it is they that hold the boundary back, but it still only
         // moves on whole chunks rather than with every result.
@@ -11389,7 +12046,7 @@ mod tests {
         // are sized by it: a reply of a quarter of the window at most.
         let facts = crate::models::facts(&endpoint, "names-its-limit");
         assert_eq!(facts.context, Some(16_000));
-        assert_eq!(budget(&c, Sizing::default()).reply, 4_000);
+        assert_eq!(budget(&c, Sizing::default(), &[]).reply, 4_000);
         // Sent again sized by it, with all but the newest five results cleared.
         assert_eq!(cleared_and_asked(&bodies[0]), (0, 8_192));
         assert_eq!(cleared_and_asked(&bodies[1]), (7, 4_000));
@@ -11584,15 +12241,15 @@ mod tests {
         let failure = classify(Some(400), &reqwest::header::HeaderMap::new(), &body);
         let sent = Budget {
             reply: 21_333,
-            ..budget(&c, Sizing::default())
+            ..budget(&c, Sizing::default(), &[])
         };
-        let next = refit(&c, &failure, &sent).unwrap();
+        let next = refit(&c, &failure, &sent, &[]).unwrap();
         // The window stays as it was; only the reply is cut.
         assert_eq!(next.reply, 4_000);
-        assert_eq!(next.tokens, budget(&c, Sizing::default()).tokens);
+        assert_eq!(next.tokens, budget(&c, Sizing::default(), &[]).tokens);
         assert!(next.squeezed);
         // Once squeezed, a request is not sent again.
-        assert!(refit(&c, &failure, &next).is_none());
+        assert!(refit(&c, &failure, &next, &[]).is_none());
     }
 
     #[test]
@@ -11739,13 +12396,13 @@ mod tests {
         assert!(failure.to_string().contains("rewind"), "{failure}");
         // Only the first went out; the next is refused before it is sent.
         assert_eq!(worker.join().unwrap().len(), 1);
-        assert!(doomed(&c, &long, &budget(&c, Sizing::default())).is_some());
+        assert!(doomed(&c, &long, &budget(&c, Sizing::default(), &[])).is_some());
         let short = [Message {
             role: "user".into(),
             content: "Hi".into(),
             ..Default::default()
         }];
-        assert!(doomed(&c, &short, &budget(&c, Sizing::default())).is_none());
+        assert!(doomed(&c, &short, &budget(&c, Sizing::default(), &[])).is_none());
     }
 
     /// The reply a turn keeps from `stream`, sent by a provider serving
@@ -11938,6 +12595,365 @@ mod tests {
                 .iter()
                 .all(|m| m.get("reasoning_content").is_none())
         );
+        // Sent in chunks of 8,000 tokens, a turn whose calls have thought
+        // 2,000 each carries all of them until the sixth: then the four
+        // oldest, a whole chunk, go out empty and the newest two keep theirs.
+        let full = sized(Some(128_000), None, CAP_TOKENS, 0);
+        let chunked = Budget {
+            chunked_reasoning: true,
+            ..full
+        };
+        let mut window = window[..5].to_vec();
+        for id in ["d", "e", "f", "g", "h", "i"] {
+            window.push(Message {
+                reasoning: "Hmm. ".repeat(1_600),
+                ..thought_then_called(id, "deepseek-reasoner")
+            });
+            window.push(result_of(id));
+        }
+        let sent_with = |budget: &Budget, upto: usize| {
+            let sent = body_with(&c, &window[..upto], None, None, budget, &[]);
+            (0..upto)
+                .map(|i| sent["messages"][i + 1]["reasoning_content"].clone())
+                .collect::<Vec<Value>>()
+        };
+        let own = |i: usize| json!(window[i].reasoning);
+        let two = sent_with(&chunked, 9);
+        assert_eq!((&two[5], &two[7]), (&own(5), &own(7)));
+        let six = sent_with(&chunked, 17);
+        assert_eq!(six[1], "");
+        assert_eq!(
+            six[5..=11],
+            [
+                json!(""),
+                Value::Null,
+                json!(""),
+                Value::Null,
+                json!(""),
+                Value::Null,
+                json!("")
+            ]
+        );
+        assert_eq!((&six[13], &six[15]), (&own(13), &own(15)));
+        assert_eq!(
+            sent_with(&full, 17)[5..],
+            (5..17)
+                .map(|i| if window[i].role == "assistant" {
+                    own(i)
+                } else {
+                    Value::Null
+                })
+                .collect::<Vec<Value>>()[..]
+        );
+        // The estimate counts what the cut leaves out, so it moves nothing.
+        let counted = token_sums(&window, chunked.tool_chars, Some(&c));
+        let without = token_sums(&window, chunked.tool_chars, None);
+        assert_eq!(counted[17] - without[17], tokens(&window[5].reasoning) * 6);
+        assert_eq!(old_before(&window, &chunked, Some(&c)), 0);
+        // A route that is sent no reasoning sees no cut either.
+        for model in ["qwen3:8b", "gpt-5"] {
+            let other = Connection {
+                model: model.into(),
+                ..connection()
+            };
+            let sent = body_with(&other, &window, None, None, &chunked, &[]);
+            let messages = sent["messages"].as_array().unwrap();
+            assert!(
+                messages
+                    .iter()
+                    .all(|m| m.get("reasoning_content").is_none()),
+                "{model}"
+            );
+        }
+    }
+
+    /// `reads`, made by `model` with the reasoning `thought` gives each
+    /// call by its number.
+    fn reasoned_reads(
+        files: usize,
+        chars: usize,
+        model: &str,
+        thought: impl Fn(usize) -> String,
+    ) -> Vec<Message> {
+        let mut turn = reads(files, chars);
+        for (n, m) in turn
+            .iter_mut()
+            .filter(|m| m.role == "assistant")
+            .enumerate()
+        {
+            m.model = model.into();
+            m.reasoning = thought(n);
+        }
+        turn
+    }
+
+    /// The cached prefix a request for `window` over `c` under `budget` is
+    /// hashed by.
+    fn prefix_of(c: &Connection, window: &[Message], budget: &Budget) -> crate::cache_miss::Prefix {
+        let mut prefix = crate::cache_miss::Prefix::default();
+        let extra = Extra::default();
+        body_hashed(
+            c,
+            window,
+            (None, None),
+            None,
+            budget,
+            &extra,
+            Some(&mut prefix),
+        );
+        prefix
+    }
+
+    #[test]
+    fn the_turns_reasoning_is_cut_only_where_a_whole_chunk_is_crossed() {
+        let _folder = one_data_folder();
+        let c = Connection {
+            model: "deepseek-reasoner".into(),
+            ..connection()
+        };
+        // Calls that thought from 625 to 875 tokens each, no two rounds
+        // alike, in a window the results alone never fill.
+        let turn = reasoned_reads(40, 200, &c.model, |n| {
+            format!("Reading {n}. {}", "Hmm. ".repeat(500 + 40 * (n % 7)))
+        });
+        let full = sized(Some(128_000), None, CAP_TOKENS, 0);
+        let chunked = Budget {
+            chunked_reasoning: true,
+            ..full
+        };
+        assert_eq!(old_before(&turn, &chunked, Some(&c)), 0);
+        assert!(prefix_breaks(&requests_by_round(&c, &turn, &full)).is_empty());
+        let requests = requests_by_round(&c, &turn, &chunked);
+        // Where the reasoning of every call but the newest two crosses into
+        // another whole chunk, counted by the round, from 1.
+        let thought: Vec<usize> = (1..turn.len())
+            .step_by(2)
+            .map(|at| tokens(&turn[at].reasoning))
+            .collect();
+        let chunks: Vec<usize> = (1..=thought.len())
+            .map(|k| thought[..k.saturating_sub(2)].iter().sum::<usize>() / REASONING_CHUNK)
+            .collect();
+        let crossed: Vec<usize> = (1..chunks.len())
+            .filter(|&n| chunks[n] != chunks[n - 1])
+            .map(|n| n + 1)
+            .collect();
+        assert!(crossed.len() >= 3, "{crossed:?}");
+        // Between two crossings every request begins with the bytes of the
+        // one before it, and the hash of the history says the same.
+        assert_eq!(prefix_breaks(&requests), crossed);
+        let hashed: Vec<usize> = (1..40)
+            .filter(|&n| {
+                prefix_of(&c, &turn[..2 * n + 3], &chunked)
+                    != prefix_of(&c, &turn[..2 * n + 1], &chunked)
+            })
+            .map(|n| n + 1)
+            .collect();
+        assert_eq!(hashed, crossed);
+        // Each move cuts more, never less, in whole chunks, and the newest
+        // two calls, the round the model has not answered among them, keep
+        // their reasoning every time.
+        let mut cuts = 0;
+        for (n, wire) in requests.iter().enumerate() {
+            let messages: Vec<Value> = serde_json::from_str(wire).unwrap();
+            let sent: Vec<&Value> = messages
+                .iter()
+                .filter(|m| m["role"] == "assistant")
+                .map(|m| &m["reasoning_content"])
+                .collect();
+            let empty = sent.iter().take_while(|r| **r == "").count();
+            assert!(sent[empty..].iter().all(|r| **r != ""), "round {}", n + 1);
+            assert!(sent.len() - empty >= sent.len().min(2), "round {}", n + 1);
+            assert!(empty >= cuts, "round {}", n + 1);
+            assert!(thought[..empty].iter().sum::<usize>() <= chunks[n] * REASONING_CHUNK);
+            cuts = empty;
+        }
+        assert!(cuts > 0);
+    }
+
+    #[test]
+    fn the_cut_follows_the_old_results_in_the_same_rewrite() {
+        let _folder = one_data_folder();
+        let c = Connection {
+            model: "deepseek-reasoner".into(),
+            ..connection()
+        };
+        // A turn whose reasoning never comes to a chunk, in a window the
+        // results fill: the old results move, and the cut goes with them.
+        let turn = reasoned_reads(12, 2_000, &c.model, |n| {
+            format!("Reading {n}. {}", "Hmm. ".repeat(400))
+        });
+        let full = Budget::SMALL;
+        let chunked = Budget {
+            chunked_reasoning: true,
+            ..full
+        };
+        let plain = requests_by_round(&c, &turn, &full);
+        let requests = requests_by_round(&c, &turn, &chunked);
+        let breaks = prefix_breaks(&plain);
+        assert!(!breaks.is_empty());
+        assert_eq!(prefix_breaks(&requests), breaks);
+        let mut moved = false;
+        for (n, (plain, wire)) in plain.iter().zip(&requests).enumerate() {
+            let window = &turn[..2 * n + 3];
+            let old = old_before(window, &chunked, Some(&c));
+            moved |= old > 0;
+            let plain: Vec<Value> = serde_json::from_str(plain).unwrap();
+            let messages: Vec<Value> = serde_json::from_str(wire).unwrap();
+            for (i, m) in window
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.role == "assistant")
+            {
+                // The calls before the old results go without their
+                // reasoning, and only those; sent whole, every call has it.
+                let expected = if i < old { "" } else { m.reasoning.as_str() };
+                assert_eq!(
+                    messages[i + 1]["reasoning_content"],
+                    expected,
+                    "round {} call {i}",
+                    n + 1
+                );
+                assert_eq!(
+                    plain[i + 1]["reasoning_content"],
+                    m.reasoning,
+                    "round {} call {i}",
+                    n + 1
+                );
+            }
+        }
+        assert!(moved);
+    }
+
+    #[test]
+    fn a_route_that_refuses_an_empty_reasoning_is_sent_every_call_whole_once_more() {
+        let c = Connection {
+            endpoint: "https://strict.example/v1".into(),
+            model: "deepseek-reasoner".into(),
+            ..connection()
+        };
+        let asked = |text: &str| Message {
+            role: "user".into(),
+            content: text.into(),
+            ..Default::default()
+        };
+        let mut first = thought_then_called("a", &c.model);
+        first.replay = Some(Box::new(Replay {
+            endpoint: c.endpoint.clone(),
+            model: c.model.clone(),
+            reasoning_details: vec![json!({"type": "reasoning.text", "text": "t", "index": 0})],
+            extra_content: BTreeMap::new(),
+            reasoning_items: Vec::new(),
+        }));
+        let mut window = vec![
+            asked("Read a.rs"),
+            first,
+            result_of("a"),
+            Message {
+                role: "assistant".into(),
+                content: "Done.".into(),
+                ..Default::default()
+            },
+            asked("Now the rest"),
+        ];
+        for id in ["d", "e", "f", "g", "h", "i"] {
+            window.push(Message {
+                reasoning: "Hmm. ".repeat(1_600),
+                ..thought_then_called(id, &c.model)
+            });
+            window.push(result_of(id));
+        }
+        let chunked = Budget {
+            chunked_reasoning: true,
+            ..sized(Some(128_000), None, CAP_TOKENS, 0)
+        };
+        let sent = body_with(&c, &window, None, None, &chunked, &[]);
+        let reasoning = |sent: &Value| -> Vec<Value> {
+            [1, 5, 7, 9, 11, 13, 15]
+                .map(|i| sent["messages"][i + 1]["reasoning_content"].clone())
+                .to_vec()
+        };
+        let own = |i: usize| json!(window[i].reasoning);
+        assert_eq!(reasoning(&sent)[..5], vec![json!(""); 5][..]);
+        assert_eq!(reasoning(&sent)[5..], [own(13), own(15)]);
+        assert!(sent["messages"][2]["reasoning_details"].is_array());
+        // What DeepSeek's own API says of a call sent without its reasoning.
+        let refusal = r#"{"error":{"message":"Invalid request: the reasoning_content of an assistant message with tool_calls in the current turn must be provided","type":"invalid_request_error"}}"#;
+        assert!(learn(&c, &sent, refusal));
+        assert!(has_quirk(&c, Quirk::KeepOldReasoning));
+        assert!(!has_quirk(&c, Quirk::Replay));
+        // The retry carries every call of the model's with its own reasoning,
+        // the earlier turn's too, which is a request the route has not
+        // refused.
+        let again = body_with(&c, &window, None, None, &chunked, &[]);
+        let every: Vec<Value> = [1, 5, 7, 9, 11, 13, 15].map(own).to_vec();
+        assert_eq!(reasoning(&again), every);
+        assert!(again["messages"][2]["reasoning_details"].is_array());
+        // A refusal of that is of the field, which goes as before.
+        assert!(learn(&c, &again, refusal));
+        assert!(has_quirk(&c, Quirk::Replay));
+        let third = body_with(&c, &window, None, None, &chunked, &[]);
+        let fields = ["reasoning_details", "reasoning_content"];
+        assert!(
+            third["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| fields.iter().all(|f| m.get(f).is_none()))
+        );
+        assert!(!learn(&c, &third, refusal));
+    }
+
+    #[test]
+    fn a_call_another_model_answered_costs_a_refusing_route_one_retry_not_a_loop() {
+        // Its own endpoint, since the quirks learned are kept by route.
+        let c = Connection {
+            endpoint: "https://strict-fallback.example/v1".into(),
+            model: "deepseek-reasoner".into(),
+            ..connection()
+        };
+        // A round the fallback answered goes out with an empty reasoning
+        // ahead of the model's own calls, cut or no cut: the one shape of
+        // request the route refuses, and one the retry has just the same.
+        let window = vec![
+            Message {
+                role: "user".into(),
+                content: "Read a.rs and b.rs".into(),
+                ..Default::default()
+            },
+            thought_then_called("a", "fallback-model"),
+            result_of("a"),
+            thought_then_called("b", &c.model),
+            result_of("b"),
+            thought_then_called("c", &c.model),
+            result_of("c"),
+        ];
+        let refusal = r#"{"error":{"message":"Invalid request: the reasoning_content of an assistant message with tool_calls in the current turn must be provided","type":"invalid_request_error"}}"#;
+        let reasoning = |sent: &Value| -> Vec<Value> {
+            [2, 4, 6]
+                .map(|i| sent["messages"][i]["reasoning_content"].clone())
+                .to_vec()
+        };
+        let sent = body(&c, &window, None, None);
+        assert_eq!(reasoning(&sent)[0], "");
+        assert!(sends_older_reasoning_empty(&sent));
+        assert!(learn(&c, &sent, refusal));
+        assert!(has_quirk(&c, Quirk::KeepOldReasoning));
+        assert!(!has_quirk(&c, Quirk::Replay));
+        // The retry has the shape still: a second refusal is of the field,
+        // not another retry of the same request.
+        let again = body(&c, &window, None, None);
+        assert_eq!(reasoning(&again), reasoning(&sent));
+        assert!(learn(&c, &again, refusal));
+        assert!(has_quirk(&c, Quirk::Replay));
+        let third = body(&c, &window, None, None);
+        assert!(
+            third["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m.get("reasoning_content").is_none())
+        );
+        assert!(!learn(&c, &third, refusal));
     }
 
     #[test]

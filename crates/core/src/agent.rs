@@ -87,6 +87,23 @@ const REPEATS_STOPPED: usize = 5;
 /// that nothing has happened yet.
 const POLLING: [&str; 4] = ["wait", "read_job", crate::messaging::READ_CHAT, "agents"];
 
+/// The variable setting how many rounds a run nobody watches may go without
+/// changing the project before it is asked where it stands; 0 never asks.
+pub const PROGRESS_NOTE_ROUNDS: &str = "LETRONNA_PROGRESS_NOTE_ROUNDS";
+
+/// Rounds without a change to the project before that note, unless the
+/// variable says otherwise: room for a real investigation, well under what
+/// a model that has lost its thread spends before it edits.
+const PROGRESS_EVERY: usize = 12;
+
+/// Notes a turn gets asking where it stands: by a third the model has heard
+/// it, and the third says to finish if it cannot name a next step.
+const PROGRESS_NOTES: usize = 3;
+
+/// How that note opens, after the rounds it counts; the rest asks for the
+/// state of play in a line and never says to make a change.
+const TAKING_STOCK: &str = "rounds since the last change to the project.";
+
 /// Rounds in a row one tool fails, whatever its arguments, before the model
 /// is told to change approach: one miss can be a slip, a second is a habit.
 const FAILURES_NOTED: usize = 2;
@@ -96,8 +113,16 @@ const FAILURES_NOTED: usize = 2;
 const FAILURE_NOTES: usize = 2;
 
 /// How the answer to a call that never ran opens: one left at the round
-/// cap, stopped before it started, or after a hook ended the turn.
+/// cap, stopped before it started, after a hook ended the turn, or behind
+/// a call of its reply that failed.
 const NOT_RUN: &str = "Not run: ";
+
+/// The answer the calls queued behind one that failed get. They were made
+/// before its result was seen, so each may count on what it was to do, as a
+/// check made after an edit does; run anyway, the check would pass or fail
+/// the unedited file and read as if it had checked the edit.
+const AFTER_A_FAILURE: &str =
+    "Not run: an earlier call in this reply failed; resend it if still wanted.";
 
 /// Calls from one reply run at once. Enough for a model reading around a
 /// project in one go, few enough that a reply of dozens never starts dozens
@@ -195,6 +220,12 @@ pub struct Turn {
     /// How often each call, by tool, arguments and result, has come back
     /// the same this turn.
     repeats: HashMap<(String, u64, u64), usize>,
+    /// How often each call, by what it amounts to and what its result
+    /// amounts to once ids, timings and dates are taken out, has come back
+    /// this turn, with the round it last did. Only an edit that went
+    /// through starts these again: a command spelled anew, as an experiment
+    /// a round is, changes nothing about what a read brings back.
+    alike: HashMap<(String, u64, u64), (usize, usize)>,
     /// Each change made this turn, by tool and arguments, so only a new one
     /// starts the counts again.
     changes: HashSet<(String, u64)>,
@@ -207,6 +238,17 @@ pub struct Turn {
     unattended: bool,
     /// Why an unattended turn stopped going round in circles.
     looped: Option<String>,
+    /// Rounds an unattended turn has gone since a call last changed the
+    /// project: only an edit that went through starts it again, never a
+    /// command, since an experiment a round is what a lost thread looks like.
+    rounds_since_edit: usize,
+    /// Rounds without a change before the turn is asked where it stands.
+    progress_every: usize,
+    /// Notes sent this turn asking that.
+    progress_notes: usize,
+    /// The round the last of them went in, so a round that begins nothing,
+    /// as the one at the cap does, is not asked again.
+    noted_round: usize,
     /// The settings turn parallel tool calls off, so no batch holds more
     /// than one.
     one_at_a_time: bool,
@@ -232,10 +274,15 @@ impl Turn {
             edited: false,
             asked_to_verify: false,
             repeats: HashMap::new(),
+            alike: HashMap::new(),
             changes: HashSet::new(),
             failures: HashMap::new(),
             failure_notes: 0,
             looped: None,
+            rounds_since_edit: 0,
+            progress_every: progress_every(std::env::var(PROGRESS_NOTE_ROUNDS).ok().as_deref()),
+            progress_notes: 0,
+            noted_round: 0,
             one_at_a_time: !crate::store::parallel_tool_calls(),
         }
     }
@@ -490,6 +537,9 @@ impl Turn {
             return true;
         }
         self.rounds += 1;
+        if self.unattended {
+            self.rounds_since_edit += 1;
+        }
         self.asked_again = false;
         true
     }
@@ -558,11 +608,15 @@ impl Turn {
             content = tools::answered(&content).to_owned();
         }
         let times = self.repeated(&call, &content, is_error);
+        let (alike, last_round) = self.alike(&call, &content, is_error);
         let failures = self.failed(&call.name, &content, is_error);
-        if times >= REPEATS_NOTED {
+        // The two counts part only where one was cleared or left a call out,
+        // so the larger says how often the call came back the same.
+        let same = times.max(alike);
+        if same >= REPEATS_NOTED {
             content.push_str(&format!(
-                "\n\n[You have made this exact call {times} times this turn and got the same \
-                 result each time. Change your approach instead of repeating it.]"
+                "\n\n[You have made this call {same} times this turn and got the same result \
+                 each time. Change your approach instead of repeating it.]"
             ));
         } else if failures == FAILURES_NOTED && self.failure_notes < FAILURE_NOTES {
             self.failure_notes += 1;
@@ -572,6 +626,11 @@ impl Turn {
                  rather than retrying with small changes.]",
                 call.name
             ));
+        } else if alike == 2 {
+            // Said once, before the count says to change approach: twice can
+            // be a check that something held, and the model may not have
+            // noticed that it had the answer already.
+            content.push_str(&format!("\n\n[Same result as round {last_round}.]"));
         }
         if times >= REPEATS_STOPPED && self.unattended && self.looped.is_none() {
             self.looped = Some(format!(
@@ -592,7 +651,15 @@ impl Turn {
             ..Default::default()
         };
         self.track_edits(&result);
+        let fails_the_rest = fails_the_rest(&result);
         self.results.push(result);
+        // A call that runs alone runs after everything before it, so nothing
+        // of the reply is under way: what is left was never started.
+        if fails_the_rest {
+            while !self.queue.is_empty() {
+                self.finish_call(Err(AFTER_A_FAILURE.into()));
+            }
+        }
     }
 
     /// Note what a finished call did to the edits waiting to be checked: an
@@ -608,7 +675,45 @@ impl Turn {
             }
         } else if changes_code(result) {
             self.edited = true;
+            self.rounds_since_edit = 0;
+            // What the project answers may differ now, so the same answer
+            // as before the change is news, not a repeat.
+            self.alike.clear();
         }
+    }
+
+    /// The note asking an unattended turn where it stands, due once it has
+    /// gone `progress_every` rounds, or a multiple, without changing the
+    /// project; `PROGRESS_NOTES` a turn at most, and the last says to finish
+    /// if no next step can be named. It goes on the end of the round's last
+    /// result, so every byte sent before it is as the provider cached it.
+    fn progress_note(&mut self) -> Option<String> {
+        let since = self.rounds_since_edit;
+        let due = self.progress_every > 0 && since > 0 && since.is_multiple_of(self.progress_every);
+        if !due || self.progress_notes >= PROGRESS_NOTES || self.noted_round == self.rounds {
+            return None;
+        }
+        self.progress_notes += 1;
+        self.noted_round = self.rounds;
+        let mut note = format!(
+            "\n\n[{since} {TAKING_STOCK} In one line: what you have established, your current \
+             hypothesis, and the next concrete step. 'Keep reading X because Y' is a fine \
+             answer; if no change is needed, finish with what you found."
+        );
+        if self.progress_notes == PROGRESS_NOTES {
+            note.push_str(
+                " If you cannot name a next step, finish now with what you found and what \
+                 blocks it.",
+            );
+        }
+        // As the batching rule says, and so left out where calls run one at a time.
+        if !self.one_at_a_time {
+            note.push_str(
+                " If you have several independent checks to run, send them in one reply.",
+            );
+        }
+        note.push(']');
+        Some(note)
     }
 
     /// How many times this turn the call has now come back with this result;
@@ -637,6 +742,36 @@ impl Turn {
         let times = self.repeats.entry(key).or_default();
         *times += 1;
         *times
+    }
+
+    /// How many times this turn a call amounting to this one has now come
+    /// back with a result amounting to this one, and the round the last of
+    /// them came in; 0 for a tool made to be polled. `repeated` counts the
+    /// call spelled and answered exactly as before; this counts it past the
+    /// spellings that change nothing, as `command_shape` and `result_shape`
+    /// take them out, so a read that starts a few lines off, a command with
+    /// `2>&1` added or a test run with its timing changed is still seen to
+    /// bring nothing new.
+    fn alike(&mut self, call: &ToolCall, content: &str, is_error: bool) -> (usize, usize) {
+        // A refusal, a decline or a stop is no result of the call.
+        if POLLING.contains(&call.name.as_str()) || (is_error && refused_or_stopped(content)) {
+            return (0, 0);
+        }
+        let shape = call_shape(call, self.connection.workspace.as_deref());
+        let key = (
+            call.name.clone(),
+            hash(&shape),
+            hash(&(result_shape(content), is_error)),
+        );
+        let (times, round) = self.alike.entry(key).or_default();
+        // Calls made together were all made before any result was seen, so
+        // none of them repeats another.
+        if *round == self.rounds {
+            return (0, 0);
+        }
+        *times += 1;
+        let last = std::mem::replace(round, self.rounds);
+        (*times, last)
     }
 
     /// How many rounds in a row `name` has now failed this turn, or 0 when
@@ -693,6 +828,16 @@ impl Turn {
                 .position(|id| *id == result.tool_call_id)
                 .unwrap_or(usize::MAX)
         });
+        // On the last result, after the order is settled, so the earlier
+        // ones go out as they would have without it.
+        if let Some(last) = results
+            .iter_mut()
+            .rev()
+            .find(|result| result.role == "tool")
+            && let Some(note) = self.progress_note()
+        {
+            last.content.push_str(&note);
+        }
         results
     }
 
@@ -759,12 +904,141 @@ fn sorted(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// What a call amounts to, past the spellings that change nothing about
+/// its answer: a command as `command_shape` reads it; a read by its file
+/// and which fifty lines it starts in, since a read a few lines off brings
+/// the same page; a search by its folder, pattern and glob whatever their
+/// case; any other call by its arguments as `repeated` keys them.
+fn call_shape(call: &ToolCall, workspace: Option<&std::path::Path>) -> String {
+    let Ok(args) = tools::parse_args_for(&call.name, &call.arguments) else {
+        return call.arguments.clone();
+    };
+    let text = |key: &str| args[key].as_str().unwrap_or_default().to_owned();
+    match call.name.as_str() {
+        "run_command" => command_shape(&text("command"), workspace),
+        "read_file" => {
+            let page = args["offset"].as_u64().unwrap_or(1) / 50;
+            format!("{}\n{page}", text("path"))
+        }
+        "search" => {
+            format!("{}\n{}\n{}", text("path"), text("pattern"), text("glob")).to_lowercase()
+        }
+        _ => sorted(args).to_string(),
+    }
+}
+
+/// `command` with what changes nothing about what it runs taken out: its
+/// spacing, a `cd` into the workspace in front, and `2>&1`, `| cat` and a
+/// `| head -N` or `| tail -N` behind, so the same command sent again with
+/// those on or off is seen to be the same.
+fn command_shape(command: &str, workspace: Option<&std::path::Path>) -> String {
+    let mut shape = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some(workspace) = workspace {
+        let workspace = workspace.display().to_string();
+        let into = [
+            format!("cd {workspace} &&"),
+            format!("cd \"{workspace}\" &&"),
+            format!("cd '{workspace}' &&"),
+        ];
+        if let Some(rest) = into.iter().find_map(|cd| shape.strip_prefix(cd.as_str())) {
+            shape = rest.trim_start().to_owned();
+        }
+    }
+    loop {
+        let Some(rest) = shape
+            .strip_suffix("2>&1")
+            .or_else(|| shape.strip_suffix("| cat"))
+            .or_else(|| piped_to_head_or_tail(&shape))
+        else {
+            return shape;
+        };
+        shape = rest.trim_end().to_owned();
+    }
+}
+
+/// `command` up to a `| head -N` or `| tail -N` that ends it, in any of
+/// the spellings `-N`, `-nN` and `-n N`; None when it ends otherwise.
+fn piped_to_head_or_tail(command: &str) -> Option<&str> {
+    let (rest, last) = command.rsplit_once('|')?;
+    let mut words = last.split_whitespace();
+    if !matches!(words.next(), Some("head" | "tail")) {
+        return None;
+    }
+    let count = match words.next()? {
+        "-n" => words.next()?,
+        flag => flag.strip_prefix("-n").or_else(|| flag.strip_prefix('-'))?,
+    };
+    let lines = !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit());
+    (lines && words.next().is_none()).then_some(rest)
+}
+
+/// `content` with what changes between two runs of the same thing taken
+/// out: dates, clock times, timings, seeds, and ids of seven or more hex
+/// digits with a letter among them, as commits, objects and addresses have.
+/// What is left is hashed whole, so two results that differ anywhere else
+/// never count as one.
+fn result_shape(content: &str) -> String {
+    static CHANGEABLE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        // Spaces are written `\x20`: the verbose mode drops them, in a
+        // class too.
+        regex::Regex::new(
+            r"(?x)
+              \b\d{4}-\d{2}-\d{2}(?:[T\x20]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?\b  # a date, with its time or not
+            | \b\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\b                                # a clock time
+            | \b\d+(?:\.\d+)?\x20?(?:ms|us|µs|ns|secs?|seconds?|mins?|minutes?|s)\b  # a timing
+            | (?i:\bseed)[\x20=:]{1,3}\d+\b                                    # a seed
+            | \b(?:0x)?[0-9a-f]{7,}\b                                           # a hex id, with a digit and a letter in it
+            ",
+        )
+        .expect("the pattern is fixed")
+    });
+    CHANGEABLE
+        .replace_all(content, |found: &regex::Captures| {
+            let found = &found[0];
+            // A word that happens to be spelled in a to f, as "defaced", is
+            // no id, and nor is a count of seven digits, as a file size or
+            // a line total: only the id's run holds both. Every other kind
+            // matched carries a letter or a sign of its own.
+            let digits = found.bytes().filter(|b| b.is_ascii_digit()).count();
+            if digits > 0 && digits < found.len() {
+                "#".to_owned()
+            } else {
+                found.to_owned()
+            }
+        })
+        .into_owned()
+}
+
+/// Whether a result leaves its reply's other calls unrun: a call that runs
+/// alone, such as an edit or a command, that failed. A command that ran
+/// and exited with a code is no failure here: the code is its answer, as
+/// a test suite's is, and the description promises a command queued behind
+/// it its own. A read or search that fails cancels nothing, since the
+/// calls beside it run at once and count on nothing it did; nor does a
+/// question, which is no work the rest could count on, nor a memory save,
+/// which no later call counts on and which a full page fails one fact at
+/// a time. Nor does a call the user, the gate or a stop kept from running:
+/// each call of the reply is answered on its own there, as a read beside a
+/// write plan mode refuses still runs.
+fn fails_the_rest(result: &Message) -> bool {
+    let on_its_own = [tools::ASK_USER, crate::memory::MEMORY];
+    if tools::concurrent(&result.name) || on_its_own.contains(&result.name.as_str()) {
+        return false;
+    }
+    result.is_error && !refused_or_stopped(&result.content)
+}
+
 /// Whether an error is a no from the user, the gate, a hook or Auto mode,
-/// or a stop, rather than the call itself failing.
+/// or a stop, rather than the call itself failing: a call to a tool there
+/// is not, a save the user did not ask for and a question only they may
+/// read are answered in their own words, and are refusals too.
 fn refused_or_stopped(error: &str) -> bool {
     // Another way round a refusal would only get past it.
     crate::gate::refused(error)
         || tools::is_declined(error)
+        || tools::is_unknown(error)
+        || crate::memory::not_saved(error)
+        || error == crate::info::WITHHELD
         || error == STOPPED_WHILE_RUNNING
         || error.starts_with(NOT_RUN)
 }
@@ -799,10 +1073,65 @@ fn checks(result: &Message, workspace: Option<&std::path::Path>) -> bool {
     crate::command::assess(line, dialect, workspace).risk != crate::command::Risk::ReadOnly
 }
 
+/// Rounds without a change to the project before a turn is asked where it
+/// stands, as `setting`, the variable's value, gives it: a number, 0 for
+/// never; unset or not a number, `PROGRESS_EVERY`.
+fn progress_every(setting: Option<&str>) -> usize {
+    setting
+        .and_then(|given| given.trim().parse().ok())
+        .unwrap_or(PROGRESS_EVERY)
+}
+
 /// Whether a tool's result is an edit that went through to more than notes,
 /// the kind a build or test would check.
 pub(crate) fn changes_code(result: &Message) -> bool {
     !result.is_error && EDITS.contains(&result.name.as_str()) && !only_notes(result)
+}
+
+/// What a run's own messages show of how it went: the round its first
+/// change to the project came in, how many rounds followed its last, and
+/// the notes it was sent asking where it stood.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Progress {
+    pub first_edit_round: Option<usize>,
+    pub rounds_after_last_edit: Option<usize>,
+    pub notes: usize,
+}
+
+/// The progress `messages`, a run's own, show: a round is a reply that
+/// made calls, and a change is a result `changes_code` says went through.
+pub fn progress(messages: &[Message]) -> Progress {
+    let mut rounds = 0;
+    let mut progress = Progress::default();
+    let mut last_edit = None;
+    for message in messages {
+        if message.role == "assistant" && !message.tool_calls.is_empty() {
+            rounds += 1;
+        }
+        if message.role != "tool" {
+            continue;
+        }
+        if changes_code(message) {
+            progress.first_edit_round.get_or_insert(rounds);
+            last_edit = Some(rounds);
+        }
+        if carries_progress_note(&message.content) {
+            progress.notes += 1;
+        }
+    }
+    progress.rounds_after_last_edit = last_edit.map(|at| rounds - at);
+    progress
+}
+
+/// Whether a result ends with the note asking where the turn stands: a
+/// bracketed note after it, opening with the rounds it counted.
+fn carries_progress_note(content: &str) -> bool {
+    let Some(at) = content.rfind("\n\n[") else {
+        return false;
+    };
+    let note = &content[at + 3..];
+    let counted = note.trim_start_matches(|c: char| c.is_ascii_digit());
+    counted.len() < note.len() && counted.starts_with(&format!(" {TAKING_STOCK}"))
 }
 
 /// Whether every file an edit names is a note, such as a report, rather
@@ -1286,6 +1615,403 @@ mod tests {
         let not_run = "Not run: stopped before it started.";
         assert_eq!(answers, [not_run, not_run]);
         assert!(kept.iter().all(|m| m.is_error));
+    }
+
+    #[test]
+    fn a_failed_edit_leaves_the_rest_of_its_reply_unrun() {
+        let mut turn = turn();
+        let mut fix = call("edit_file");
+        fix.arguments = edit("fn a()").to_string();
+        let mut test = call("run_command");
+        test.arguments = serde_json::json!({ "command": "cargo test" }).to_string();
+        turn.begin(vec![
+            call("read_file"),
+            fix.clone(),
+            test.clone(),
+            call("list_dir"),
+        ]);
+        turn.finish_call(Ok("fn a() {}".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Run(fix));
+        turn.finish_call(Err(MISSED.into()));
+        // Nothing is left to run: the results go back as they are.
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Ask);
+        let sent = turn.take_results();
+        let answers: Vec<(&str, &str, bool)> = sent
+            .iter()
+            .map(|m| (m.tool_call_id.as_str(), m.content.as_str(), m.is_error))
+            .collect();
+        let not_run = "Not run: an earlier call in this reply failed; resend it if still wanted.";
+        assert_eq!(
+            answers,
+            [
+                ("read_file-1", "fn a() {}", false),
+                ("edit_file-1", MISSED, true),
+                ("run_command-1", not_run, true),
+                ("list_dir-1", not_run, true),
+            ]
+        );
+        // The next reply runs as any does, and the unrun calls count as no
+        // failure of the tools they named.
+        turn.begin(vec![test.clone(), call("list_dir")]);
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Run(test));
+        turn.finish_call(Ok("test result: ok".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Run(call("list_dir")));
+        turn.finish_call(Ok("src".into()));
+        let sent = turn.take_results();
+        assert_eq!(sent[0].content, "test result: ok");
+        assert_eq!(sent[1].content, "src");
+    }
+
+    #[test]
+    fn a_command_that_exits_with_a_code_leaves_the_rest_of_its_reply_to_run() {
+        let mut turn = turn();
+        let mut build = call("run_command");
+        build.arguments = serde_json::json!({ "command": "cargo build" }).to_string();
+        let mut test = ToolCall {
+            id: "test".into(),
+            ..call("run_command")
+        };
+        test.arguments = serde_json::json!({ "command": "cargo test" }).to_string();
+        // Two suites sent together each report their own code, as the
+        // description promises, so a failure in the first is no reason to
+        // leave the second unrun.
+        turn.begin(vec![build, test.clone()]);
+        turn.finish_call(Ok("error[E0308]: mismatched types\n[exit code 101]".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Run(test.clone()));
+        turn.finish_call(Ok("test result: FAILED\n[exit code 1]".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Ask);
+        let sent = turn.take_results();
+        assert!(sent[0].content.ends_with("[exit code 101]") && !sent[0].is_error);
+        assert!(sent[1].content.ends_with("[exit code 1]") && !sent[1].is_error);
+        // One that could not run at all does leave the rest unrun.
+        let mut turn = self::turn();
+        turn.begin(vec![call("run_command"), test.clone()]);
+        turn.finish_call(Err("The command timed out.".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Ask);
+        let sent = turn.take_results();
+        assert!(sent[1].content.starts_with("Not run: an earlier call"));
+    }
+
+    #[test]
+    fn a_refused_call_leaves_the_rest_of_its_reply_to_run() {
+        // Each refusal in the words its tool answers with: none of these
+        // ran, so nothing queued behind them counted on what they did.
+        let refusals = [
+            ("bash", tools::unknown("bash")),
+            ("memory", crate::memory::UNASKED.to_owned()),
+            ("memory", crate::memory::NOBODY_TO_SAY_YES.to_owned()),
+            ("letronna_info", crate::info::WITHHELD.to_owned()),
+            (
+                "wake_me",
+                "`wake_me` is not available in a scheduled run.".into(),
+            ),
+        ];
+        for (name, why) in refusals {
+            let mut turn = turn();
+            let mut fix = call("edit_file");
+            fix.arguments = edit("fn a()").to_string();
+            turn.begin(vec![call(name), fix.clone(), call("run_command")]);
+            turn.finish_call(Err(why.clone()));
+            assert_eq!(turn.next(|_| Outcome::Run), Next::Run(fix), "{why}");
+            turn.finish_call(Ok("edited".into()));
+            assert_eq!(
+                turn.next(|_| Outcome::Run),
+                Next::Run(call("run_command")),
+                "{why}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_memory_save_that_fails_leaves_the_saves_behind_it_to_run() {
+        let mut turn = turn();
+        let mut other = call("memory");
+        other.id = "other".into();
+        // As a memory review saves a turn's facts: a page that is full
+        // loses one fact, not the ones bound for another page.
+        turn.begin(vec![call("memory"), other.clone(), call("run_command")]);
+        turn.finish_call(Err("USER.md is full. Make room on the Memory page.".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Run(other));
+        turn.finish_call(Ok("Saved.".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Run(call("run_command")));
+    }
+
+    #[test]
+    fn a_failed_read_cancels_nothing_beside_it() {
+        let mut turn = turn();
+        let never = |_: &ToolCall| false;
+        let mut other = call("read_file");
+        other.id = "other".into();
+        turn.begin(vec![call("read_file"), other.clone(), call("search")]);
+        // All three run at once; a miss among them is that call's alone.
+        assert_eq!(turn.next_batch(never, MAX_BATCH).len(), 3);
+        turn.finish_id("read_file-1", Err("No such file.".into()));
+        assert_eq!(turn.next_batch(never, MAX_BATCH), [other, call("search")]);
+        turn.finish_id("other", Ok("fn b() {}".into()));
+        turn.finish_id("search-1", Ok("no matches".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Ask);
+        let sent = turn.take_results();
+        assert_eq!(sent.len(), 3);
+        assert!(sent.iter().skip(1).all(|m| !m.is_error));
+        // A read that runs after a failing one, in the same reply, still runs.
+        let mut turn = self::turn();
+        turn.begin(vec![call("read_file"), call("list_dir")]);
+        turn.finish_call(Err("No such file.".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Run(call("list_dir")));
+    }
+
+    /// A turn nobody watches, asked where it stands every `every` rounds
+    /// without a change.
+    fn unattended_every(every: usize) -> Turn {
+        Turn {
+            progress_every: every,
+            ..Turn::with_limit(turn().connection, 100).unattended()
+        }
+    }
+
+    /// A round of one read, of a file not read before so that it is no
+    /// repeat, giving what the model was sent back.
+    fn read_round(turn: &mut Turn) -> String {
+        let mut read = call("read_file");
+        read.arguments = format!(r#"{{"path": "f{}.rs"}}"#, turn.rounds + 1);
+        repeat(turn, &read, "contents", 1).remove(0)
+    }
+
+    /// The rounds, of `rounds` reads in a row, whose result carried the note
+    /// asking where the turn stands.
+    fn noted_rounds(turn: &mut Turn, rounds: usize) -> Vec<usize> {
+        (1..=rounds)
+            .filter(|_| read_round(turn).contains(TAKING_STOCK))
+            .collect()
+    }
+
+    #[test]
+    fn a_run_that_reads_for_twelve_rounds_is_asked_where_it_stands_three_times() {
+        let mut turn = unattended_every(12);
+        let mut sent = Vec::new();
+        for _ in 0..48 {
+            sent.push(read_round(&mut turn));
+        }
+        let noted: Vec<usize> = (1..=48).filter(|r| sent[r - 1] != "contents").collect();
+        assert_eq!(noted, [12, 24, 36]);
+        assert_eq!(
+            sent[11],
+            "contents\n\n[12 rounds since the last change to the project. In one line: what \
+             you have established, your current hypothesis, and the next concrete step. \
+             'Keep reading X because Y' is a fine answer; if no change is needed, finish \
+             with what you found. If you have several independent checks to run, send \
+             them in one reply.]"
+        );
+        assert!(sent[23].starts_with("contents\n\n[24 rounds since"));
+        assert!(!sent[23].contains("finish now"));
+        // The third says to finish when no step can be named, and is the last.
+        assert!(sent[35].starts_with("contents\n\n[36 rounds since"));
+        assert!(sent[35].contains(
+            "If you cannot name a next step, finish now with what you found and what blocks it."
+        ));
+        // Where calls run one at a time nothing asks for several in one reply.
+        let mut one_at_a_time = Turn {
+            one_at_a_time: true,
+            ..unattended_every(1)
+        };
+        let sent = read_round(&mut one_at_a_time);
+        assert!(sent.ends_with("finish with what you found.]"), "{sent}");
+    }
+
+    #[test]
+    fn an_edit_starts_the_count_again_and_a_command_does_not() {
+        let mut turn = unattended_every(12);
+        assert!(noted_rounds(&mut turn, 7).is_empty());
+        made(&mut turn, "edit_file", edit("fn a()"), Ok("Edited a.rs."));
+        // Round 8 changed the project: 12 more rounds pass before a note.
+        let noted: Vec<usize> = noted_rounds(&mut turn, 13)
+            .into_iter()
+            .map(|r| r + 8)
+            .collect();
+        assert_eq!(noted, [20]);
+
+        // An experiment that ran clean is no change to the project, nor is a
+        // write of notes or an edit that failed.
+        let mut turn = unattended_every(12);
+        assert!(noted_rounds(&mut turn, 5).is_empty());
+        let experiment = serde_json::json!({ "command": "python -c 'import m; print(m.f())'" });
+        made(&mut turn, "run_command", experiment, Ok("3"));
+        let report = serde_json::json!({ "path": "NOTES.md", "content": "# So far" });
+        made(&mut turn, "write_file", report, Ok("Wrote NOTES.md"));
+        made(&mut turn, "edit_file", edit("fn b()"), Err(MISSED));
+        let noted: Vec<usize> = noted_rounds(&mut turn, 5)
+            .into_iter()
+            .map(|r| r + 8)
+            .collect();
+        assert_eq!(noted, [12]);
+        // A later edit starts the count again, not the three notes.
+        let mut turn = unattended_every(2);
+        assert_eq!(noted_rounds(&mut turn, 4), [2, 4]);
+        made(&mut turn, "edit_file", edit("fn c()"), Ok("Edited a.rs."));
+        let noted: Vec<usize> = noted_rounds(&mut turn, 6)
+            .into_iter()
+            .map(|r| r + 5)
+            .collect();
+        assert_eq!(noted, [7]);
+    }
+
+    #[test]
+    fn a_watched_turn_or_a_setting_of_zero_is_never_asked_where_it_stands() {
+        let mut watched = Turn {
+            progress_every: 2,
+            ..turn()
+        };
+        assert!(noted_rounds(&mut watched, 10).is_empty());
+        let mut off = unattended_every(0);
+        assert!(noted_rounds(&mut off, 10).is_empty());
+        // The variable sets it; what is not a number leaves the default.
+        assert_eq!(progress_every(None), 12);
+        assert_eq!(progress_every(Some(" 15 ")), 15);
+        assert_eq!(progress_every(Some("0")), 0);
+        assert_eq!(progress_every(Some("many")), 12);
+    }
+
+    #[test]
+    fn the_note_goes_on_the_last_result_and_the_bytes_before_it_do_not_move() {
+        let mut turn = unattended_every(3);
+        let connection = turn.connection.clone();
+        let mut messages = vec![Message {
+            role: "user".into(),
+            content: "find the bug".into(),
+            ..Default::default()
+        }];
+        let mut bodies = Vec::new();
+        for round in 1..=3 {
+            let calls = vec![
+                ToolCall {
+                    id: format!("a{round}"),
+                    arguments: format!(r#"{{"path": "a{round}.rs"}}"#),
+                    ..call("read_file")
+                },
+                ToolCall {
+                    id: format!("b{round}"),
+                    arguments: format!(r#"{{"path": "b{round}.rs"}}"#),
+                    ..call("read_file")
+                },
+            ];
+            messages.push(Message {
+                role: "assistant".into(),
+                tool_calls: calls.clone(),
+                ..Default::default()
+            });
+            turn.begin(calls);
+            // Finished out of order, as threads do.
+            turn.finish_id(&format!("b{round}"), Ok("b".into()));
+            turn.finish_id(&format!("a{round}"), Ok("a".into()));
+            messages.extend(turn.take_results());
+            bodies.push(crate::chat::body(&connection, &messages, None, None));
+        }
+        let results = &messages[messages.len() - 2..];
+        assert_eq!(results[0].content, "a");
+        assert!(results[1].content.starts_with("b\n\n[3 rounds since"));
+        // The request with the note carries every message of the one before
+        // it byte for byte, with the new round's after them. The system
+        // message is left out of the comparison only because tests beside
+        // this one change the memory and settings it is built from.
+        let (before, with) = (&bodies[1], &bodies[2]);
+        let earlier = before["messages"].as_array().unwrap();
+        let later = with["messages"].as_array().unwrap();
+        assert_eq!(later.len(), earlier.len() + 3);
+        for (i, message) in earlier.iter().enumerate().skip(1) {
+            assert_eq!(message.to_string(), later[i].to_string(), "message {i}");
+        }
+        assert!(
+            later[later.len() - 1]["content"]
+                .as_str()
+                .unwrap()
+                .contains(TAKING_STOCK)
+        );
+    }
+
+    #[test]
+    fn a_rounds_messages_say_when_it_first_edited_and_how_it_went_on() {
+        let round = |i: usize, name: &str, args: &str, is_error: bool, content: &str| {
+            [
+                Message {
+                    role: "assistant".into(),
+                    tool_calls: vec![ToolCall {
+                        id: format!("c{i}"),
+                        name: name.into(),
+                        arguments: args.into(),
+                    }],
+                    ..Default::default()
+                },
+                Message {
+                    role: "tool".into(),
+                    tool_call_id: format!("c{i}"),
+                    name: name.into(),
+                    args: args.into(),
+                    content: content.into(),
+                    is_error,
+                    ..Default::default()
+                },
+            ]
+        };
+        let edit = r#"{"path": "a.rs", "old": "a", "new": "b"}"#;
+        let notes = r#"{"path": "NOTES.md", "content": "so far"}"#;
+        let mut run = vec![Message {
+            role: "user".into(),
+            content: "fix it".into(),
+            ..Default::default()
+        }];
+        run.extend(round(1, "read_file", "{}", false, "fn a() {}"));
+        run.extend(round(2, "edit_file", edit, true, MISSED));
+        run.extend(round(3, "write_file", notes, false, "Wrote NOTES.md"));
+        assert_eq!(
+            progress(&run),
+            Progress {
+                first_edit_round: None,
+                rounds_after_last_edit: None,
+                notes: 0,
+            }
+        );
+        let noted = format!("contents\n\n[12 {TAKING_STOCK} In one line: ...]");
+        run.extend(round(4, "read_file", "{}", false, &noted));
+        run.extend(round(5, "edit_file", edit, false, "Edited a.rs."));
+        run.extend(round(
+            6,
+            "run_command",
+            r#"{"command": "cargo test"}"#,
+            false,
+            "ok",
+        ));
+        run.extend(round(7, "edit_file", edit, false, "Edited a.rs."));
+        run.extend(round(
+            8,
+            "run_command",
+            r#"{"command": "cargo test"}"#,
+            false,
+            "ok",
+        ));
+        run.extend(round(9, "read_file", "{}", false, "fn b() {}"));
+        run.push(Message {
+            role: "assistant".into(),
+            content: "Done.".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            progress(&run),
+            Progress {
+                first_edit_round: Some(5),
+                rounds_after_last_edit: Some(2),
+                notes: 1,
+            }
+        );
+        // A result that happens to hold the words is not a note.
+        assert!(!carries_progress_note(
+            "12 rounds since the last change to the project."
+        ));
+        assert!(!carries_progress_note(
+            "x\n\n[rounds since the last change to the project.]"
+        ));
+        assert!(carries_progress_note(
+            "x\n\n[You made this call 3 times.]\n\n[24 rounds since the last change to the project. In one line.]"
+        ));
     }
 
     #[test]
@@ -1861,7 +2587,10 @@ mod tests {
         let mut other = call("read_file");
         other.arguments = r#"{"path": "b.rs"}"#.into();
         repeat(&mut turn, &call("read_file"), "same", 2);
-        assert_eq!(repeat(&mut turn, &other, "same", 2), ["same", "same"]);
+        assert_eq!(
+            repeat(&mut turn, &other, "same", 2),
+            ["same", "same\n\n[Same result as round 3.]"]
+        );
         assert_eq!(
             repeat(&mut turn, &call("read_file"), "changed", 1),
             ["changed"]
@@ -1950,13 +2679,14 @@ mod tests {
     fn the_third_identical_result_tells_the_model_to_change_approach() {
         let mut turn = turn();
         let sent = repeat(&mut turn, &call("read_file"), "same", 4);
-        assert_eq!(sent[..2], ["same", "same"]);
+        // The second is only told so, in case it had not noticed.
+        assert_eq!(sent[..2], ["same", "same\n\n[Same result as round 1.]"]);
         assert_eq!(
             sent[2],
-            "same\n\n[You have made this exact call 3 times this turn and got the same \
-             result each time. Change your approach instead of repeating it.]"
+            "same\n\n[You have made this call 3 times this turn and got the same result \
+             each time. Change your approach instead of repeating it.]"
         );
-        assert!(sent[3].contains("made this exact call 4 times"));
+        assert!(sent[3].contains("made this call 4 times"));
         // Someone is watching, so it is told but never stopped.
         repeat(&mut turn, &call("read_file"), "same", 4);
         assert_eq!(turn.looping(), None);
@@ -1965,6 +2695,261 @@ mod tests {
             repeat(&mut self::turn(), &call("read_file"), "same", 1),
             ["same"]
         );
+    }
+
+    /// A turn whose project is `/w`, as a command's `cd` into it names it.
+    fn turn_in_w() -> Turn {
+        Turn::new(Connection {
+            workspace: Some("/w".into()),
+            ..turn().connection
+        })
+    }
+
+    /// The same result noted on the result of round `round`.
+    fn same_as(round: usize) -> String {
+        format!("\n\n[Same result as round {round}.]")
+    }
+
+    #[test]
+    fn a_command_spelled_another_way_with_the_same_result_is_noted_on_the_second() {
+        let mut turn = turn_in_w().unattended();
+        let run = |line: &str| serde_json::json!({ "command": line });
+        let passed = Ok("5 passed in 0.12s");
+        let sent = made(&mut turn, "run_command", run("python -m pytest x"), passed);
+        assert_eq!(sent, "5 passed in 0.12s");
+        // The same run, from the project, with its streams joined and cut
+        // short, and a little slower.
+        let again = run("cd /w &&  python -m pytest x 2>&1 | tail -5");
+        let sent = made(&mut turn, "run_command", again, Ok("5 passed in 0.15s"));
+        assert_eq!(sent, format!("5 passed in 0.15s{}", same_as(1)));
+        let sent = made(
+            &mut turn,
+            "run_command",
+            run("python -m pytest x | cat"),
+            passed,
+        );
+        assert!(
+            sent.ends_with(
+                "[You have made this call 3 times this turn and got the same result each \
+                 time. Change your approach instead of repeating it.]"
+            ),
+            "{sent}"
+        );
+        // Only the call spelled the same each time stops a run nobody watches.
+        made(
+            &mut turn,
+            "run_command",
+            run("python -m pytest x 2>&1"),
+            passed,
+        );
+        made(
+            &mut turn,
+            "run_command",
+            run("python -m pytest x | head -n 20"),
+            passed,
+        );
+        assert_eq!(turn.looping(), None);
+        // A `cd` elsewhere, or a cut by bytes, is part of the command.
+        let w = Some(std::path::Path::new("/w"));
+        let shape = "cd /w &&  python -m pytest x 2>&1 | tail -5";
+        assert_eq!(command_shape(shape, w), "python -m pytest x");
+        assert_eq!(
+            command_shape("cd '/w' && ls 2>&1 | head -n5 | cat", w),
+            "ls"
+        );
+        assert_eq!(
+            command_shape("cd /other && ls | head -3", w),
+            "cd /other && ls"
+        );
+        assert_eq!(command_shape("cd /w && ls | head -3", None), "cd /w && ls");
+        assert_eq!(command_shape("ls | head -c 20", w), "ls | head -c 20");
+        assert_eq!(command_shape("true || false", w), "true || false");
+    }
+
+    #[test]
+    fn reads_of_the_same_page_and_searches_in_another_case_are_the_same_call() {
+        let mut turn = turn();
+        let read = |offset: u64| serde_json::json!({ "path": "a.rs", "offset": offset });
+        assert_eq!(
+            made(&mut turn, "read_file", read(700), Ok("fn a() {}")),
+            "fn a() {}"
+        );
+        // Twenty lines on is the same page; sixty lines on is the next.
+        let sent = made(&mut turn, "read_file", read(720), Ok("fn a() {}"));
+        assert_eq!(sent, format!("fn a() {{}}{}", same_as(1)));
+        assert_eq!(
+            made(&mut turn, "read_file", read(760), Ok("fn a() {}")),
+            "fn a() {}"
+        );
+        // Another file's identical page is its own.
+        let other = serde_json::json!({ "path": "b.rs", "offset": 700 });
+        assert_eq!(
+            made(&mut turn, "read_file", other, Ok("fn a() {}")),
+            "fn a() {}"
+        );
+
+        let find = |pattern: &str| serde_json::json!({ "pattern": pattern, "glob": "*.rs" });
+        made(&mut turn, "search", find("Foo"), Ok("a.rs:1: Foo"));
+        let sent = made(&mut turn, "search", find("foo"), Ok("a.rs:1: Foo"));
+        assert_eq!(sent, format!("a.rs:1: Foo{}", same_as(5)));
+    }
+
+    #[test]
+    fn a_changed_result_or_an_edit_between_two_starts_the_count_again() {
+        let mut turn = turn();
+        let read = serde_json::json!({ "path": "a.rs" });
+        made(&mut turn, "read_file", read.clone(), Ok("fn a() {}"));
+        assert_eq!(
+            made(&mut turn, "read_file", read.clone(), Ok("fn b() {}")),
+            "fn b() {}"
+        );
+        let sent = made(&mut turn, "read_file", read.clone(), Ok("fn a() {}"));
+        assert_eq!(sent, format!("fn a() {{}}{}", same_as(1)));
+        // The same file read again after an edit may well read the same:
+        // that is news of the edit, not a repeat.
+        made(&mut turn, "edit_file", edit("fn a()"), Ok("Edited a.rs."));
+        assert_eq!(
+            made(&mut turn, "read_file", read.clone(), Ok("fn a() {}")),
+            "fn a() {}"
+        );
+        // An edit that missed, or notes written, changed nothing.
+        made(&mut turn, "edit_file", edit("fn c()"), Err(MISSED));
+        let notes = serde_json::json!({ "path": "NOTES.md", "content": "so far" });
+        made(&mut turn, "write_file", notes, Ok("Wrote NOTES.md"));
+        let sent = made(&mut turn, "read_file", read, Ok("fn a() {}"));
+        assert_eq!(sent, format!("fn a() {{}}{}", same_as(5)));
+    }
+
+    #[test]
+    fn a_call_made_twice_in_one_reply_or_turned_down_twice_is_not_noted() {
+        // Made together, neither read was a retry of the other.
+        let mut turn = turn();
+        let reads = vec![
+            ToolCall {
+                id: "a".into(),
+                ..call("read_file")
+            },
+            ToolCall {
+                id: "b".into(),
+                ..call("read_file")
+            },
+        ];
+        turn.begin(reads);
+        turn.finish_call(Ok("same".into()));
+        turn.finish_call(Ok("same".into()));
+        let sent: Vec<String> = turn.take_results().into_iter().map(|r| r.content).collect();
+        assert_eq!(sent, ["same", "same"]);
+        // A refusal, a decline or a stop is no result of the call.
+        let mut turn = self::turn();
+        let outside = serde_json::json!({ "command": "rm -rf /tmp/x" });
+        for _ in 0..2 {
+            let sent = made(
+                &mut turn,
+                "run_command",
+                outside.clone(),
+                Err(tools::DECLINED),
+            );
+            assert_eq!(sent, tools::DECLINED);
+        }
+    }
+
+    #[test]
+    fn a_result_that_differs_only_in_its_ids_times_and_seeds_is_the_same() {
+        let mut turn = turn();
+        let log = serde_json::json!({ "command": "git log -1" });
+        let first = "commit 2dff3502e9a1\nDate: 2026-10-11 09:12:33\n\n    Fix it\n";
+        let second = "commit 7c0a9b4d2e11\nDate: 2026-10-12 17:40:02\n\n    Fix it\n";
+        made(&mut turn, "run_command", log.clone(), Ok(first));
+        assert_eq!(
+            made(&mut turn, "run_command", log.clone(), Ok(second)),
+            format!("{second}{}", same_as(1))
+        );
+        // One word changed, anywhere, is a different result.
+        let third = "commit 7c0a9b4d2e11\nDate: 2026-10-12 17:40:02\n\n    Fix it now\n";
+        assert_eq!(made(&mut turn, "run_command", log, Ok(third)), third);
+
+        let shaped = |text: &str| result_shape(text);
+        assert_eq!(
+            shaped("12 passed in 0.12s"),
+            shaped("12 passed in 3.4 seconds")
+        );
+        assert_eq!(shaped("seed=1234 ok"), shaped("seed=99 ok"));
+        assert_eq!(
+            shaped("Using --randomly-seed=1234"),
+            shaped("Using --randomly-seed=5")
+        );
+        assert_eq!(shaped("at 0x7f3a2b1c4d60"), shaped("at 0x55d1e0a0b2c0"));
+        assert_eq!(shaped("at 0x00001234"), shaped("at 0x00005678"));
+        assert_eq!(shaped("commit 9fceb02"), shaped("commit a1b2c3d"));
+        // A count of seven digits, as a file size, is no id.
+        assert_ne!(
+            shaped("-rw-r--r-- 1 u u 1234567 Oct 11 app.js"),
+            shaped("-rw-r--r-- 1 u u 1381220 Oct 11 app.js")
+        );
+        assert_eq!(
+            shaped("2026-10-11T09:12:33.123 x"),
+            shaped("2026-01-01T00:00:00.9 x")
+        );
+        assert_eq!(shaped("at 09:12:33"), shaped("at 23:59:59"));
+        assert_eq!(
+            shaped("in /tmp/pytest-of-u/pytest-3/"),
+            "in /tmp/pytest-of-u/pytest-3/"
+        );
+        // Words spelled in a to f, short ids, versions and counts stay.
+        assert_eq!(shaped("defaced facade"), "defaced facade");
+        assert_ne!(shaped("abc123 ok"), shaped("abc124 ok"));
+        assert_ne!(shaped("version 1.2.3"), shaped("version 1.2.4"));
+        assert_ne!(shaped("12 passed"), shaped("13 passed"));
+        assert_ne!(shaped("line 5 seems fine"), shaped("line 6 seems fine"));
+    }
+
+    #[test]
+    fn the_same_result_note_goes_on_its_own_result_and_the_bytes_before_it_do_not_move() {
+        let mut turn = turn();
+        let connection = turn.connection.clone();
+        let mut messages = vec![Message {
+            role: "user".into(),
+            content: "find the bug".into(),
+            ..Default::default()
+        }];
+        let mut bodies = Vec::new();
+        for round in 1..=2 {
+            // Each round reads a.rs again and a file of its own.
+            let calls = vec![
+                ToolCall {
+                    id: format!("a{round}"),
+                    arguments: r#"{"path": "a.rs"}"#.into(),
+                    ..call("read_file")
+                },
+                ToolCall {
+                    id: format!("b{round}"),
+                    arguments: format!(r#"{{"path": "b{round}.rs"}}"#),
+                    ..call("read_file")
+                },
+            ];
+            messages.push(Message {
+                role: "assistant".into(),
+                tool_calls: calls.clone(),
+                ..Default::default()
+            });
+            turn.begin(calls);
+            turn.finish_id(&format!("b{round}"), Ok("b".into()));
+            turn.finish_id(&format!("a{round}"), Ok("a".into()));
+            messages.extend(turn.take_results());
+            bodies.push(crate::chat::body(&connection, &messages, None, None));
+        }
+        let results = &messages[messages.len() - 2..];
+        assert_eq!(results[0].content, format!("a{}", same_as(1)));
+        assert_eq!(results[1].content, "b");
+        // The request with the note carries every message of the one before
+        // it byte for byte, with the new round's after them.
+        let (before, with) = (&bodies[0], &bodies[1]);
+        let earlier = before["messages"].as_array().unwrap();
+        let later = with["messages"].as_array().unwrap();
+        assert_eq!(later.len(), earlier.len() + 3);
+        for (i, message) in earlier.iter().enumerate().skip(1) {
+            assert_eq!(message.to_string(), later[i].to_string(), "message {i}");
+        }
     }
 
     /// What `edit_file` says when its `old` is not in the file.
@@ -2133,7 +3118,7 @@ mod tests {
         made(&mut turn, "read_file", other, Ok("fn b() {}"));
         made(&mut turn, "read_file", missing.clone(), gone);
         let sent = made(&mut turn, "read_file", missing, gone);
-        assert!(sent.contains("made this exact call 3 times"), "{sent}");
+        assert!(sent.contains("made this call 3 times"), "{sent}");
         assert!(!sent.contains("in a row"), "{sent}");
     }
 }

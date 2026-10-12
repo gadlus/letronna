@@ -45,7 +45,8 @@ use letronna_core::driver::{self, Allow, Outcome, Report, Spec, Status};
 use letronna_core::gate::Mode;
 use letronna_core::store::Transcript;
 use letronna_core::{
-    crew, hooks, inbox, prompt_rules, store, structured, tools, update, usage, worktree,
+    agent, cache_miss, crew, hooks, inbox, prompt_rules, store, structured, tools, update, usage,
+    worktree,
 };
 use serde_json::{Value, json};
 use session::Runner;
@@ -1134,6 +1135,14 @@ fn as_json(report: &Report, extras: Option<&Extras>) -> Value {
         out["cost_usd"] = extras.cost.into();
         out["refused"] = extras.refused.into();
         out["prompt"] = extras.prompt.clone();
+        out["progress_notes"] = extras.progress.notes.into();
+        out["first_edit_round"] = extras.progress.first_edit_round.into();
+        out["rounds_after_last_edit"] = extras.progress.rounds_after_last_edit.into();
+        out["cache_misses"] = json!({
+            "count": extras.cache_misses.count,
+            "lost_tokens": extras.cache_misses.lost_tokens,
+        });
+        out["history_rewrites"] = extras.history_rewrites.into();
     }
     if let Some(value) = &report.value {
         out["value"] = value.clone();
@@ -1157,6 +1166,15 @@ struct Extras {
     refused: usize,
     /// The prompt rules left out of the run and a hash of those told.
     prompt: Value,
+    /// When the run first changed the project, how long it went on after
+    /// its last change, and how often it was asked where it stood.
+    progress: agent::Progress,
+    /// The provider's own cache drops over the run's requests, with the
+    /// tokens they cost, so its cache figures can be read net of them.
+    cache_misses: cache_miss::Drops,
+    /// The run's replies whose cache miss an earlier message changing
+    /// caused: old results cleared, or reasoning no longer sent back.
+    history_rewrites: usize,
 }
 
 impl Extras {
@@ -1180,8 +1198,20 @@ impl Extras {
             cost: cost(own),
             refused: own.iter().filter(|message| refused(message)).count(),
             prompt,
+            progress: agent::progress(own),
+            cache_misses: cache_miss::drops(conversation.id),
+            history_rewrites: history_rewrites(own),
         }
     }
+}
+
+/// How many of the model calls behind `messages` missed the cache because
+/// an earlier message changed.
+fn history_rewrites(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .filter(|message| message.cache_miss == Some(cache_miss::Reason::History))
+        .count()
 }
 
 /// What the model calls behind `messages` cost in US dollars, over those
@@ -1601,6 +1631,16 @@ mod tests {
             cost: Some(0.25),
             refused: 2,
             prompt: json!({"dropped": ["compute"], "rules_sha": "0123456789ab"}),
+            progress: agent::Progress {
+                first_edit_round: Some(4),
+                rounds_after_last_edit: Some(3),
+                notes: 1,
+            },
+            cache_misses: cache_miss::Drops {
+                count: 2,
+                lost_tokens: 7_100,
+            },
+            history_rewrites: 1,
         };
         let out = as_json(&report(Outcome::Done), Some(&extras));
         assert_eq!(
@@ -1637,6 +1677,56 @@ mod tests {
         extras.cost = None;
         let out = as_json(&report(Outcome::Done), Some(&extras));
         assert_eq!(out.get("cost_usd"), Some(&Value::Null));
+        // How the run went: when it first changed the project, how long it
+        // went on after its last change, and the notes asking where it stood.
+        assert_eq!(
+            (
+                &out["progress_notes"],
+                &out["first_edit_round"],
+                &out["rounds_after_last_edit"]
+            ),
+            (&json!(1), &json!(4), &json!(3))
+        );
+        // A run that changed nothing says so, rather than leaving them out.
+        extras.progress = agent::Progress::default();
+        let out = as_json(&report(Outcome::Done), Some(&extras));
+        assert_eq!(out["first_edit_round"], Value::Null);
+        assert_eq!(out["rounds_after_last_edit"], Value::Null);
+        assert_eq!(out["progress_notes"], 0);
+        assert!(
+            as_json(&report(Outcome::Done), None)
+                .get("progress_notes")
+                .is_none()
+        );
+        // What the cache did: the provider's own drops with the tokens they
+        // cost, and the misses Letronna's own rewrites of history caused.
+        assert_eq!(
+            out["cache_misses"],
+            json!({"count": 2, "lost_tokens": 7_100})
+        );
+        assert_eq!(out["history_rewrites"], 1);
+        assert!(
+            as_json(&report(Outcome::Done), None)
+                .get("cache_misses")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_history_rewrites_are_the_replies_whose_miss_an_earlier_message_caused() {
+        let reply = |miss: Option<cache_miss::Reason>| Message {
+            role: "assistant".into(),
+            cache_miss: miss,
+            ..Default::default()
+        };
+        let run = [
+            reply(None),
+            reply(Some(cache_miss::Reason::History)),
+            reply(Some(cache_miss::Reason::Unknown)),
+            reply(Some(cache_miss::Reason::History)),
+        ];
+        assert_eq!(history_rewrites(&run), 2);
+        assert_eq!(history_rewrites(&[]), 0);
     }
 
     #[test]

@@ -382,7 +382,7 @@ impl Tool for SearchWeb {
         "search_web"
     }
     fn description(&self) -> &'static str {
-        "Search the web. Returns a numbered list of results, each with its title, address and a snippet. Snippets are cut short and may be stale: before you state a fact from a search, read the page that settles it in full with web_fetch, preferring the primary source (the official site or the project's own docs) over a page summarizing it, and give that page's address beside the fact. The same search again within 10 minutes gives the earlier answer."
+        "Search the web. Returns a numbered list of results, each with its title, address and a snippet. Snippets are cut short and may be stale: read the page that settles a fact with web_fetch, preferring the primary source, and give its address. The same search again within 10 minutes gives the earlier answer."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {

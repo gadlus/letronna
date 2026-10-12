@@ -1546,10 +1546,11 @@ const REFUSED: [&str; 4] = [
 ];
 
 /// How the result of a call the run may not make at all goes on after the
-/// tool's name: not among the tools it was given, switched off, or changing
-/// things in plan mode.
-const NOT_OFFERED: [&str; 4] = [
+/// tool's name: not among the tools it was given, not in a scheduled run,
+/// switched off, or changing things in plan mode.
+const NOT_OFFERED: [&str; 5] = [
     " is not available to this",
+    " is not available in a scheduled run",
     " is not available in plan mode",
     " in plan mode only runs",
     " is switched off",
