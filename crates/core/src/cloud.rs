@@ -36,6 +36,59 @@ pub struct Task {
     /// A thread to carry on, from an earlier run.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub thread: String,
+    /// The project folder on this computer, packed by `pack` as a gzipped
+    /// tar in base64, unpacked into the run's folder in place of a clone.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub files: String,
+}
+
+/// The most a packed folder may come to, gzipped: what the cloud takes.
+pub const PACK_MAX: usize = 25 * 1024 * 1024;
+
+/// `folder` as a gzipped tar in base64, for `Task::files`: every file the
+/// project's .gitignore keeps, hidden ones such as .env included, but never
+/// .git, so a private or local-only repository reaches the cloud without
+/// anyone's git sign-in.
+pub fn pack(folder: &std::path::Path) -> Result<String, String> {
+    use base64::Engine;
+    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut tar = tar::Builder::new(gz);
+    tar.follow_symlinks(false);
+    let walk = ignore::WalkBuilder::new(folder)
+        .hidden(false)
+        .require_git(false)
+        .filter_entry(|entry| entry.file_name() != ".git")
+        .build();
+    for entry in walk {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let Ok(inside) = path.strip_prefix(folder) else {
+            continue;
+        };
+        if inside.as_os_str().is_empty() || !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        tar.append_path_with_name(path, inside)
+            .map_err(|e| format!("Could not pack {}: {e}", inside.display()))?;
+        if tar.get_ref().get_ref().len() > PACK_MAX {
+            return Err(too_big());
+        }
+    }
+    let packed = tar
+        .into_inner()
+        .and_then(|gz| gz.finish())
+        .map_err(|e| e.to_string())?;
+    if packed.len() > PACK_MAX {
+        return Err(too_big());
+    }
+    Ok(base64::engine::general_purpose::STANDARD.encode(packed))
+}
+
+fn too_big() -> String {
+    format!(
+        "The project folder is over {} MB packed; push it to a repository the cloud can clone, or leave large files out with .gitignore.",
+        PACK_MAX / 1024 / 1024
+    )
 }
 
 /// A run as the cloud tells it.
@@ -320,12 +373,13 @@ impl crate::tools::Tool for CloudTask {
         "cloud_task"
     }
     fn description(&self) -> &'static str {
-        "Run a task in Letronna Cloud, on Letronna's servers, and get its answer. Where to build what the user asks for, in order: a page, chart, document or small app that one self-contained file can hold is written here as an .html or .svg file the user previews; anything else is built here, in the project, with the tools on this computer; only when this computer cannot (a tool it needs is not on PATH and cannot be installed, it would take more memory or time than this machine has, or the user asks for the cloud) send it here. It also hosts: a web app it leaves wakes on each visit, and a bot or worker the user wants kept online (a Discord or Telegram bot listening for events, a scheduler) runs 24/7 from their credit; say so in `task` only when the user asked for it to stay up, and put any keys it needs in `task` for /work/.env. cloud_apps shows what is left running and cloud_app_power takes it down or back up. The cloud cannot see this computer's files: give it everything it needs in `task`, or an https `repo` it clones. Say in your reply that it ran in the cloud. It costs the user's credit, so each call is asked about."
+        "Run a task in Letronna Cloud, on Letronna's servers, and get its answer. Where to build what the user asks for, in order: a page, chart, document or small app that one self-contained file can hold is written here as an .html or .svg file the user previews; anything else is built here, in the project, with the tools on this computer; only when this computer cannot (a tool it needs is not on PATH and cannot be installed, it would take more memory or time than this machine has, or the user asks for the cloud) send it here. It also hosts: a web app it leaves wakes on each visit, and a bot or worker the user wants kept online (a Discord or Telegram bot listening for events, a scheduler) runs 24/7 from their credit; say so in `task` only when the user asked for it to stay up, and put any keys it needs in `task` for /work/.env. cloud_apps shows what is left running and cloud_app_power takes it down or back up. The cloud cannot see this computer's files: pass folder: true to send it the project folder (what .gitignore keeps, without .git), which works for a private or local-only repository; or an https `repo` it clones, which must be public, as the cloud has no git sign-in. Say in your reply that it ran in the cloud. It costs the user's credit, so each call is asked about."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "required": ["task"], "properties": {
             "task": {"type": "string", "description": "What to do, whole: the cloud sees nothing else of this conversation."},
-            "repo": {"type": "string", "description": "An https git address to clone and work in."},
+            "folder": {"type": "boolean", "description": "Send this session's project folder to work in, instead of a repo."},
+            "repo": {"type": "string", "description": "A public https git address to clone and work in."},
             "branch": {"type": "string"},
             "tier": {"type": "string", "enum": TIERS, "description": "Memory: light 512 MB (default), normal 1 GB, heavy 2 GB for builds."},
             "thread": {"type": "string", "description": "An earlier cloud run's thread, to carry on in its folder and conversation."}
@@ -360,6 +414,9 @@ impl crate::tools::Tool for CloudTask {
         if !field("repo").is_empty() {
             card.push_str(&format!("\nin {}", field("repo")));
         }
+        if args["folder"].as_bool() == Some(true) {
+            card.push_str("\nwith this project folder");
+        }
         card
     }
     fn run(
@@ -375,9 +432,21 @@ impl crate::tools::Tool for CloudTask {
             tier: field("tier"),
             thread: field("thread"),
             model: String::new(),
+            files: String::new(),
         };
         if task.prompt.is_empty() {
             return Err("Say what to do in `task`.".into());
+        }
+        let mut task = task;
+        if args["folder"].as_bool() == Some(true) {
+            if !task.repo.is_empty() {
+                return Err("Pass folder or repo, not both.".into());
+            }
+            let folder = match &ctx.workspace {
+                Some(folder) if !ctx.fallback => folder,
+                _ => return Err("This session has no project folder to send.".into()),
+            };
+            task.files = pack(folder)?;
         }
         let started = start(&task)?;
         let run = follow(&started.id, &mut |_| {}, &|| ctx.cancel.is_set())?;
@@ -608,5 +677,42 @@ mod tests {
             }
             .over()
         );
+    }
+
+    #[test]
+    fn a_packed_folder_keeps_what_gitignore_keeps_and_never_git() {
+        use base64::Engine;
+        let dir = std::env::temp_dir().join(format!("letronna-pack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (path, text) in [
+            ("bot.py", "print(1)"),
+            (".env", "TOKEN=x"),
+            (".gitignore", "build/\n"),
+            ("src/lib.py", "x = 1"),
+            ("build/out.bin", "big"),
+            (".git/config", "[core]"),
+        ] {
+            let file = dir.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        }
+        let packed = base64::engine::general_purpose::STANDARD
+            .decode(pack(&dir).unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&packed[..]));
+        let mut names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| {
+                e.unwrap()
+                    .path()
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, [".env", ".gitignore", "bot.py", "src/lib.py"]);
     }
 }
