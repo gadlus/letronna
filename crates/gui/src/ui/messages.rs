@@ -1570,7 +1570,7 @@ impl Chat {
             Some(call) => {
                 let summary = letronna_core::tools::summary(&call.name, &call.arguments);
                 let (name, summary) = crate::ui::busy::Shimmer::label(call.name.clone(), summary);
-                vec![
+                let mut line = vec![
                     crate::ui::busy::Spinner::new()
                         .xsmall()
                         .color(theme.primary)
@@ -1582,7 +1582,21 @@ impl Chat {
                         .truncate()
                         .child(summary)
                         .into_any_element(),
-                ]
+                ];
+                // What a long call says it is doing now, such as a cloud
+                // run's round and tools.
+                if let Some(now) = letronna_core::tool_progress::of(conversation.id) {
+                    line.push(div().flex_none().child("·").into_any_element());
+                    line.push(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(muted)
+                            .child(now)
+                            .into_any_element(),
+                    );
+                }
+                line
             }
             None => {
                 let told = letronna_core::tool_runs::tell(&conversation.messages, run, tools);

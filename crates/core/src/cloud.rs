@@ -449,7 +449,24 @@ impl crate::tools::Tool for CloudTask {
             task.files = pack(folder)?;
         }
         let started = start(&task)?;
-        let run = follow(&started.id, &mut |_| {}, &|| ctx.cancel.is_set())?;
+        // What the run does, shown under the call while it goes, and kept as
+        // its last steps for the result.
+        let here = ctx.conversation;
+        let mut steps: Vec<String> = Vec::new();
+        crate::tool_progress::say(
+            here,
+            format!("Cloud run {}: {}", started.id, started.status),
+        );
+        let followed = follow(
+            &started.id,
+            &mut |heard| {
+                let line = progress_line(&started.id, heard, &mut steps);
+                crate::tool_progress::say(here, line);
+            },
+            &|| ctx.cancel.is_set(),
+        );
+        crate::tool_progress::clear(here);
+        let run = followed?;
         let mut said = format!(
             "Ran in Letronna Cloud as {} ({}, {} s); to carry on there, pass thread {}.",
             run.id, run.tier, run.seconds, run.thread
@@ -459,12 +476,34 @@ impl crate::tools::Tool for CloudTask {
                 " What it made can be seen at {preview}; give the user that link."
             ));
         }
+        // The last steps it took, so a failure says how far it got.
+        const STEPS: usize = 8;
+        if !steps.is_empty() {
+            let from = steps.len().saturating_sub(STEPS);
+            said.push_str(&format!(" Its last steps: {}.", steps[from..].join("; ")));
+        }
         match run.status.as_str() {
             "done" => Ok(format!("{said}\n\n{}", run.answer.trim())),
             "stopped" => Err(format!("{said} It was stopped.")),
             _ => Err(format!("{said} It failed: {}", run.error.trim())),
         }
     }
+}
+
+/// The line shown under a cloud call for what run `id` says now, noting in
+/// `steps` each new set of tools it turns to.
+fn progress_line(id: &str, heard: Heard, steps: &mut Vec<String>) -> String {
+    let now = match heard {
+        Heard::Status(status) => status,
+        Heard::Doing { rounds, doing } if doing.is_empty() => format!("round {rounds}"),
+        Heard::Doing { rounds, doing } => {
+            if steps.last() != Some(&doing) {
+                steps.push(doing.clone());
+            }
+            format!("round {rounds}: {doing}")
+        }
+    };
+    format!("Cloud run {id}: {now}")
 }
 
 /// `cloud_apps`: what the user's cloud runs left running, and what one
@@ -714,5 +753,32 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, [".env", ".gitignore", "bot.py", "src/lib.py"]);
+    }
+
+    #[test]
+    fn a_runs_progress_reads_as_its_round_and_tools_and_keeps_new_steps() {
+        let mut steps = Vec::new();
+        let doing = |rounds, doing: &str| Heard::Doing {
+            rounds,
+            doing: doing.into(),
+        };
+        let lines = [
+            progress_line("run_1", Heard::Status("running".into()), &mut steps),
+            progress_line("run_1", doing(1, "run_command"), &mut steps),
+            progress_line("run_1", doing(2, "run_command"), &mut steps),
+            progress_line("run_1", doing(3, "write_file, run_command"), &mut steps),
+            progress_line("run_1", doing(4, ""), &mut steps),
+        ];
+        assert_eq!(
+            lines,
+            [
+                "Cloud run run_1: running",
+                "Cloud run run_1: round 1: run_command",
+                "Cloud run run_1: round 2: run_command",
+                "Cloud run run_1: round 3: write_file, run_command",
+                "Cloud run run_1: round 4",
+            ]
+        );
+        assert_eq!(steps, ["run_command", "write_file, run_command"]);
     }
 }
