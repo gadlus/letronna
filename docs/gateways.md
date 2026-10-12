@@ -15,7 +15,7 @@ A gateway is a model provider. You can set up as many as you like. The model men
 - **Streaming** uses SSE chat completions.
 - **Context limits**: Letronna knows each model's context window and output limit. When a conversation outgrows the window, older turns are summarised instead of dropped.
 
-Manage gateways in Settings › Gateways, or with `/gateways`.
+Manage them in Settings › Accounts, or with `/connect`.
 
 ## Hosted models
 

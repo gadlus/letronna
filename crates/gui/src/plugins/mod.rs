@@ -7,6 +7,7 @@
 //! To write one: make a struct in `src/plugins/`, implement [`Plugin`], and add
 //! it to the `vec![...]` in `main`. Nothing else in the app needs to change.
 
+pub(crate) mod chatgpt;
 pub(crate) mod claude_code;
 pub(crate) mod discord;
 pub(crate) mod hello;
@@ -17,7 +18,7 @@ use std::sync::Arc;
 
 /// Stable id of the Discord presence plugin.
 pub(crate) const DISCORD: &str = "discord-presence";
-use std::collections::HashMap;
+use letronna_core::providers;
 
 /// Things the app announces that a plugin may care about. Extend this enum to
 /// give plugins new hooks (new sessions, tool calls, window focus, …).
@@ -68,6 +69,11 @@ pub(crate) trait Plugin: 'static {
     fn tools(&self) -> Vec<Arc<dyn letronna_core::tools::Tool>> {
         Vec::new()
     }
+    /// The core provider this plugin offers, by name. The Plugins page shows
+    /// its account row under the plugin while the plugin is on.
+    fn provider(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Publish the tools of every enabled plugin so the agent can call them.
@@ -87,38 +93,28 @@ pub(crate) struct PluginInfo {
     pub(crate) description: &'static str,
     pub(crate) enabled: bool,
     pub(crate) builtin: bool,
+    pub(crate) provider: Option<&'static str>,
 }
 
 struct Registry(Vec<Box<dyn Plugin>>);
 impl Global for Registry {}
 
-fn config_path() -> PathBuf {
-    backend::data_dir().join("plugins.json")
-}
-
-fn load_enabled() -> HashMap<String, bool> {
-    std::fs::read(config_path())
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
-}
-
-fn save_enabled(map: &HashMap<String, bool>) {
-    let _ = std::fs::create_dir_all(backend::data_dir())
-        .and_then(|_| std::fs::write(config_path(), serde_json::to_vec_pretty(map).unwrap()));
-}
-
 /// Install every plugin, applying the saved enabled state, and keep them for the
-/// life of the app.
+/// life of the app. The switches live in core's own file, apart from the
+/// marketplace's `plugins.json`.
 pub(crate) fn init(cx: &mut App, plugins: Vec<Box<dyn Plugin>>) {
-    let saved = load_enabled();
+    let saved = providers::switches();
     for plugin in &plugins {
-        plugin.set_enabled(
-            saved
-                .get(plugin.id())
-                .copied()
-                .unwrap_or_else(|| plugin.default_enabled()),
-        );
+        let on = match saved.get(plugin.id()) {
+            Some(on) => *on,
+            None => {
+                // Decided once, so a later sign-in or out does not flip it.
+                let on = plugin.default_enabled();
+                providers::save_switch(plugin.id(), on);
+                on
+            }
+        };
+        plugin.set_enabled(on);
         plugin.init(cx);
     }
     refresh_tools(&plugins);
@@ -147,6 +143,7 @@ pub(crate) fn list(cx: &App) -> Vec<PluginInfo> {
                     description: p.description(),
                     enabled: p.enabled(),
                     builtin: p.builtin(),
+                    provider: p.provider(),
                 })
                 .collect()
         })
@@ -166,16 +163,10 @@ pub(crate) fn render_settings(cx: &App, id: &str) -> Option<AnyElement> {
 /// Toggle a plugin and persist the choice.
 pub(crate) fn set_enabled(cx: &App, id: &str, enabled: bool) {
     if let Some(registry) = cx.try_global::<Registry>() {
-        let mut map = load_enabled();
-        for plugin in &registry.0 {
-            if plugin.id() == id {
-                plugin.set_enabled(enabled);
-                map.insert(id.to_string(), enabled);
-            } else {
-                map.insert(plugin.id().to_string(), plugin.enabled());
-            }
+        for plugin in registry.0.iter().filter(|p| p.id() == id) {
+            plugin.set_enabled(enabled);
+            providers::save_switch(id, enabled);
         }
-        save_enabled(&map);
         refresh_tools(&registry.0);
     }
 }

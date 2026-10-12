@@ -1,0 +1,60 @@
+name: Request a provider
+description: Ask for a model provider Letronna doesn't support yet.
+title: "Provider: "
+labels: ["provider"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for asking. If you'd like to add it yourself, docs/providers.md walks through it: one folder and one line.
+  - type: input
+    id: name
+    attributes:
+      label: Provider
+      description: Its name, and a link to its site.
+      placeholder: Example AI, https://example.com
+    validations:
+      required: true
+  - type: input
+    id: api
+    attributes:
+      label: API docs
+      description: A link to its API reference.
+    validations:
+      required: true
+  - type: dropdown
+    id: format
+    attributes:
+      label: Format
+      description: Which format does its API speak?
+      options:
+        - OpenAI chat completions (or compatible)
+        - Anthropic Messages
+        - Something else
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: auth
+    attributes:
+      label: Sign-in
+      description: How do people get access?
+      options:
+        - API key
+        - Signing in through the browser
+        - Runs locally, nothing needed
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: What would you use it for? Which models?
+  - type: checkboxes
+    id: help
+    attributes:
+      label: Helping
+      options:
+        - label: I can write the pull request.
+        - label: I can test it with a real account.

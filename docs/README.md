@@ -7,6 +7,7 @@
 | [Gateways and models](gateways.md) | Providers, hosted models, credit, teams |
 | [Tools](tools.md) | Files, shell, search, browser, media, helpers, memory |
 | [Extending](extending.md) | MCP, language servers, skills, plugins, hooks, ACP, chat apps |
+| [Adding a provider](providers.md) | A new model provider: one folder and one line |
 | [Letronna Cloud](cloud.md) | Remote tasks, services, hosted web apps |
 | [Configuration](configuration.md) | Settings files and environment variables |
 | [Data and privacy](data-and-privacy.md) | What is stored where, and what leaves your machine |

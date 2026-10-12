@@ -474,6 +474,29 @@ pub(crate) fn remembered(url: &str) -> Option<Remembered> {
         .map(|(_, _, remembered)| remembered.clone())
 }
 
+/// The most each paid_fetch card showed, by the call's arguments, until
+/// the call runs.
+static SHOWN: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+
+/// Keep the most a card for `args` showed. A card drawn again for the same
+/// arguments never raises it.
+pub(crate) fn show(args: &str, usd: u64) {
+    let Ok(mut shown) = SHOWN.lock() else {
+        return;
+    };
+    match shown.iter_mut().find(|(known, _)| known == args) {
+        Some((_, most)) => *most = (*most).min(usd),
+        None => shown.push((args.to_owned(), usd)),
+    }
+}
+
+/// The most the card for `args` showed, taken: one yes, one payment.
+pub(crate) fn shown(args: &str) -> Option<u64> {
+    let mut shown = SHOWN.lock().ok()?;
+    let at = shown.iter().position(|(known, _)| known == args)?;
+    Some(shown.remove(at).1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -883,12 +906,38 @@ mod tests {
             approved: true,
             ..Default::default()
         };
+        use crate::tools::Tool;
+        let paid = super::super::PaidFetch;
         let args = json!({"url": dearer, "max_usd": "1"});
-        let why = crate::tools::Tool::run(&super::super::PaidFetch, &args, &approved).unwrap_err();
+        let card = paid.preview(&args, &approved);
+        assert!(card.starts_with("Pay 0.01 USDC"), "{card}");
+        // A parallel call then remembers fifty cents for the same page, and
+        // the remembered price lapses: the yes is still for one cent.
+        let fifty = Quote {
+            version: 2,
+            resource: Value::Null,
+            accepts: vec![{
+                let mut dear = offer();
+                dear["amount"] = "500000".into();
+                dear
+            }],
+            error: String::new(),
+        };
+        remember(
+            &dearer,
+            &choose(&fifty, &super::super::load(), "127.0.0.1", false).unwrap(),
+        );
+        QUOTES.lock().unwrap().clear();
+        let why = paid.run(&args, &approved).unwrap_err();
         assert!(
             why.contains("more than the $0.01 the user said yes to"),
             "{why}"
         );
+        // The yes is spent, and a yes without a card pays nothing.
+        let why = paid
+            .run(&json!({"url": site("500000"), "max_usd": "1"}), &approved)
+            .unwrap_err();
+        assert!(why.contains("card for this payment was not found"), "{why}");
         assert_eq!(policy::ledger().len(), 1);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }

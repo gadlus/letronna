@@ -169,6 +169,8 @@ pub(crate) struct Chat {
     /// with it rather than asking the chat model about it.
     pub(crate) media_turn: bool,
     pub(crate) model_open: bool,
+    /// The provider the model picker is narrowed to; None shows them all.
+    pub(crate) model_provider: Option<String>,
     pub(crate) model_search: Entity<InputState>,
     pub(crate) keys: std::collections::HashMap<String, String>,
     pub(crate) gateway_pick: Entity<String>,
@@ -221,6 +223,8 @@ pub(crate) struct Chat {
     pub(crate) sign_in_url: Option<String>,
     /// Ends the wait for the browser at once, for the Cancel button.
     pub(crate) sign_in_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// A provider's browser sign-in from the Accounts page, while it waits.
+    pub(crate) provider_sign_in: Option<std::sync::Arc<letronna_core::providers::auth::SignIn>>,
     pub(crate) loading_models: bool,
     pub(crate) gateway_error: Option<String>,
     pub(crate) busy: bool,
@@ -615,7 +619,7 @@ impl Chat {
         store.assign_ids();
         store.active = store.active.min(store.conversations.len() - 1);
         if store.settings.gateway.is_empty() {
-            store.settings.gateway = GATEWAYS[0].name.into();
+            store.settings.gateway = gateways()[0].name.into();
         }
         if store.settings.endpoint.is_empty() {
             store.settings.endpoint = std::env::var("AGENT_BASE_URL")
@@ -687,7 +691,7 @@ impl Chat {
         let model_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search models…"));
         let gateway_pick = cx.new(|_| store.settings.gateway.clone());
         let presence_pick = cx.new(|_| store.settings.presence.clone());
-        let settings_page = cx.new(|_| "Gateways");
+        let settings_page = cx.new(|_| "Accounts");
         let memory = cx.new(|cx| crate::ui::memory::MemoryPage::new(window, cx));
         let rename = cx.new(|cx| InputState::new(window, cx).placeholder("Session name"));
         let answer = cx.new(|cx| InputState::new(window, cx).placeholder("Your answer…"));
@@ -898,6 +902,7 @@ impl Chat {
             connecting: false,
             sign_in_url: None,
             sign_in_cancel: None,
+            provider_sign_in: None,
             loading_models: false,
             gateway_error: None,
             store,
@@ -919,6 +924,7 @@ impl Chat {
             media_kinds: std::collections::HashMap::new(),
             media_turn: false,
             model_open: false,
+            model_provider: None,
             model_search,
             keys,
             gateway_pick,
@@ -1227,6 +1233,9 @@ impl Chat {
     }
 
     pub(crate) fn save(&mut self) {
+        if let Err(error) = letronna_core::providers::local::apply(&self.store.settings) {
+            self.error = Some(error);
+        }
         if let Err(error) = self.store.save() {
             letronna_core::diag::event(
                 "save_failed",
@@ -2013,6 +2022,7 @@ impl Chat {
             plain_terminal: false,
             // Someone is watching, so every tool goes out in the array.
             lean_tools: false,
+            rare_on_demand: true,
         };
         backend::validate(&connection)?;
         Ok(connection)
@@ -3550,6 +3560,7 @@ impl Chat {
                 per_second: turn.live.per_second,
                 prompt_tokens: turn.live.prompt_tokens,
                 cached_tokens: turn.live.cached_tokens,
+                cache_write_tokens: turn.live.cache_write_tokens,
                 window: turn.live.window,
                 ..Default::default()
             }) {

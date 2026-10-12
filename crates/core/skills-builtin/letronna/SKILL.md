@@ -40,7 +40,7 @@ Then `letronna mcp list`, `get <name>`, `remove <name>`, and `login <name>` or `
 ## Slash commands in the terminal
 
 - /help lists them all, /new starts a fresh session, /clear clears the screen, /exit leaves.
-- Model: /model (also image, speech or video models, and `/model side` for a cheaper one for summaries), /fallback (models to carry on with when one is overloaded or out of credit), /gateways, /effort, /thinking, /style (reply styles).
+- Model: /model (also image, speech or video models, and `/model side` for a cheaper one for summaries), /fallback (models to carry on with when one is overloaded or out of credit), /connect, /effort, /thinking, /style (reply styles).
 - Asking first: /mode, /plan, /decisions (what auto mode's judge allowed or blocked), /verify (build or test after edits).
 - Account: /login, /logout, /whoami, /team (bill hosted models to a team).
 - Web and voice: /search (lets the model search the web; /search services sets up a search service of the user's own), /voice (read replies aloud), /notify (say when a reply ends or needs the user).

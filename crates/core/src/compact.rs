@@ -1215,9 +1215,10 @@ fn ask_of(
     let value: Value = crate::chat::carrying(post(endpoint)?, connection, &body)
         .send()
         .and_then(|r| r.error_for_status())
-        .and_then(|r| r.json())
+        .and_then(crate::providers::wire::openai_responses::json)
         .map_err(|e| crate::side::Failed::sending(&e, e.to_string()))?;
-    let value = crate::wire_responses::reply(crate::chat::as_chat(connection, value));
+    let value =
+        crate::providers::wire::openai_responses::reply(crate::chat::as_chat(connection, value));
     let reply = crate::chat::unwrap_response(&value)?;
     let text = reply
         .pointer("/choices/0/message/content")

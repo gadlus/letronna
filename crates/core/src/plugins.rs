@@ -90,6 +90,8 @@ pub struct Plugin {
     pub styles: Vec<String>,
     /// Its MCP servers, each with what starts it: the command line or URL.
     pub servers: Vec<(String, String)>,
+    /// The providers it declares, each with the URL its requests go to.
+    pub providers: Vec<(String, String)>,
     /// What it brings that is left out, each with why.
     pub clashes: Vec<String>,
     /// Why its manifest does not read now, when it does not; then it brings
@@ -144,6 +146,9 @@ struct Manifest {
     styles: Vec<String>,
     #[serde(default, rename = "mcpServers")]
     servers: Map<String, Value>,
+    /// OpenAI-compatible APIs it offers as providers: data, never a program.
+    #[serde(default)]
+    providers: Vec<crate::providers::declared::Entry>,
 }
 
 /// A folder given as one path or a list of them.
@@ -238,6 +243,7 @@ fn described(folder: &Path, name: String, record: &Record, taken: &mut Vec<Strin
         commands: Vec::new(),
         styles: Vec::new(),
         servers: Vec::new(),
+        providers: Vec::new(),
         clashes: Vec::new(),
         broken: None,
     };
@@ -250,7 +256,8 @@ fn described(folder: &Path, name: String, record: &Record, taken: &mut Vec<Strin
     };
     plugin.version = skills::printable(&manifest.version);
     plugin.description = skills::printable(&manifest.description);
-    plugin.allowed = manifest.servers.is_empty() || record.allowed == consent_key(&manifest);
+    let consent = consent_key(&manifest);
+    plugin.allowed = consent.is_empty() || record.allowed == consent;
     for root in skill_folders(folder, &manifest) {
         for skill in skills::read_root(&root, Source::Plugin) {
             if taken.iter().any(|name| same(name, &skill.name)) {
@@ -278,6 +285,14 @@ fn described(folder: &Path, name: String, record: &Record, taken: &mut Vec<Strin
         .iter()
         .map(|(server, config)| (format!("{}:{server}", plugin.name), target(config)))
         .collect();
+    for entry in &manifest.providers {
+        match crate::providers::declared::refused(entry) {
+            Some(why) => plugin.clashes.push(why),
+            None => plugin
+                .providers
+                .push((entry.name.trim().to_owned(), entry.base.trim().to_owned())),
+        }
+    }
     plugin
 }
 
@@ -432,13 +447,27 @@ fn servers_in(data: &Path) -> Vec<Server> {
     servers
 }
 
-/// What the user agrees to by allowing a plugin's servers: its version and
-/// a hash of their entries. Empty for a plugin with none.
+/// The providers of the plugins switched on and allowed, in plugin order.
+pub(crate) fn providers() -> Vec<crate::providers::declared::Entry> {
+    active(&backend::data_dir())
+        .into_iter()
+        .filter(|(_, _, manifest, record)| record.allowed == consent_key(manifest))
+        .flat_map(|(_, _, manifest, _)| manifest.providers)
+        .collect()
+}
+
+/// What the user agrees to by allowing a plugin's servers and providers:
+/// its version and a hash of their entries. Empty for a plugin with none.
 fn consent_key(manifest: &Manifest) -> String {
-    if manifest.servers.is_empty() {
+    if manifest.servers.is_empty() && manifest.providers.is_empty() {
         return String::new();
     }
-    let entries = serde_json::to_vec(&manifest.servers).unwrap_or_default();
+    // Servers alone hash as they always did, so their consent still holds.
+    let entries = match manifest.providers.is_empty() {
+        true => serde_json::to_vec(&manifest.servers),
+        false => serde_json::to_vec(&(&manifest.servers, &manifest.providers)),
+    }
+    .unwrap_or_default();
     let hash = ring::digest::digest(&ring::digest::SHA256, &entries);
     let hex: String = hash.as_ref()[..8]
         .iter()
@@ -623,12 +652,12 @@ pub fn allow(name: &str) -> Result<(), String> {
 fn allow_in(data: &Path, name: &str) -> Result<(), String> {
     let folder = installed(data, name)?;
     let manifest = read_manifest(&folder)?;
-    if manifest.servers.is_empty() {
+    let key = consent_key(&manifest);
+    if key.is_empty() {
         return Err(format!(
-            "{name} brings no MCP servers, so there is nothing to allow."
+            "{name} brings no MCP servers or providers, so there is nothing to allow."
         ));
     }
-    let key = consent_key(&manifest);
     change_saved(data, |saved| {
         saved.plugins.entry(name.to_owned()).or_default().allowed = key;
         Ok(())
@@ -637,6 +666,7 @@ fn allow_in(data: &Path, name: &str) -> Result<(), String> {
 
 /// Bring the MCP servers in line after `name` changed.
 fn restart_servers(name: &str) -> Result<(), String> {
+    crate::providers::reload();
     crate::mcp::reload()
         .map(drop)
         .map_err(|why| format!("{name} changed, but its MCP servers did not follow: {why}"))
@@ -1214,6 +1244,63 @@ mod tests {
                 .folder
                 .starts_with(data.join(PLUGINS_DIR).join("tools"))
         );
+    }
+
+    #[test]
+    fn a_plugins_provider_joins_the_registry_once_allowed_and_cannot_take_a_built_in_name() {
+        let _held = crate::providers::auth::tests::vault("plugin-provider");
+        let data = backend::data_dir();
+        let manifest = serde_json::json!({
+            "name": "acme", "version": "1.0.0",
+            "providers": [
+                {"name": "Acme", "base": "https://api.acme.test/v1", "tier": "credit",
+                 "blurb": "Acme's models."},
+                {"name": "openai", "base": "https://elsewhere.test/v1"},
+                {"name": "Loose", "base": "http://example.test/v1"},
+            ],
+        });
+        write(
+            &data.join(PLUGINS_DIR).join("acme").join(MANIFEST),
+            manifest.to_string().as_bytes(),
+        );
+        let plugin = plugin_in(&data, "acme").unwrap();
+        assert_eq!(
+            plugin.providers,
+            [("Acme".to_owned(), "https://api.acme.test/v1".to_owned())]
+        );
+        assert!(
+            plugin
+                .clashes
+                .iter()
+                .any(|why| why.contains("built-in provider"))
+        );
+        assert!(plugin.clashes.iter().any(|why| why.contains("https://")));
+        // It sends messages elsewhere, so it waits to be allowed.
+        assert!(!plugin.allowed);
+        crate::providers::reload();
+        assert!(crate::providers::find("Acme").is_none());
+
+        allow_in(&data, "acme").unwrap();
+        crate::providers::reload();
+        let acme = crate::providers::find("Acme").unwrap();
+        assert_eq!(acme.info().tier, crate::providers::Tier::Credit);
+        assert_eq!(acme.auth(), crate::providers::AuthKind::ApiKey);
+        assert_eq!(
+            crate::providers::find("OpenAI").unwrap().info().base,
+            "https://api.openai.com/v1"
+        );
+        // Routed like any other once its key is saved under its name.
+        let keys = std::collections::HashMap::from([("Acme".to_owned(), "k".to_owned())]);
+        let ready = crate::gateway::ready(&keys, "");
+        assert!(
+            ready
+                .iter()
+                .any(|g| *g == ("Acme", "https://api.acme.test/v1".into(), "k".into()))
+        );
+
+        set_enabled_in(&data, "acme", false).unwrap();
+        crate::providers::reload();
+        assert!(crate::providers::find("Acme").is_none());
     }
 
     #[test]

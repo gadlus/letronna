@@ -1,0 +1,7 @@
+{
+  "models": [
+    {"slug": "gpt-test-codex-mini", "display_name": "GPT Test Codex Mini", "visibility": "list", "priority": 3, "context_window": 272000, "input_modalities": ["text"], "supported_reasoning_levels": [{"effort": "low", "description": ""}, {"effort": "high", "description": ""}]},
+    {"slug": "codex-internal", "visibility": "hide", "priority": 1},
+    {"slug": "gpt-test-codex", "display_name": "GPT Test Codex", "visibility": "list", "priority": 2, "context_window": 272000, "input_modalities": ["text", "image"], "supported_reasoning_levels": [{"effort": "medium", "description": ""}]}
+  ]
+}
