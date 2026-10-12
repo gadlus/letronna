@@ -55,14 +55,11 @@ use std::time::{Duration, Instant, SystemTime};
 /// How long a search service gets to answer.
 const SEARCH_TIME: Duration = Duration::from_secs(20);
 /// How long a gateway's search gets to answer: less than a service, as
-/// DuckDuckGo is there to go on to.
+/// DuckDuckGo is there to go on to. Letronna's own gets as long: its "auto"
+/// waits 5 seconds on each search model and starts no other after the first
+/// 6 (letronna-api's WAIT and TRY_FOR in search.js), so it answers or gives
+/// up within about 11, and an answer it charges for is not thrown away here.
 const GATEWAY_TIME: Duration = Duration::from_secs(15);
-/// How long Letronna's own gets. Its "auto" waits up to 15 seconds on each
-/// search model and goes on to the next for up to 30 (letronna-api's WAIT in
-/// search.js and TRY_FOR in media.js), so its answer can take some 45
-/// seconds: giving up sooner would throw away the answer of the model it
-/// went on to, though that search may still be paid for.
-const HOSTED_TIME: Duration = Duration::from_secs(50);
 /// How long a gateway's list of models gets to come.
 const LIST_TIME: Duration = Duration::from_secs(8);
 /// The most of a gateway's list of models, or of its answer to a search,
@@ -587,16 +584,6 @@ struct Gate {
     /// route. It is still named on the card, after DuckDuckGo, as by the
     /// time the card is answered it may be asked again.
     failing: Option<&'static str>,
-}
-
-impl Gate {
-    /// How long its search gets to answer.
-    fn time(&self) -> Duration {
-        match self.hosted {
-            true => HOSTED_TIME,
-            false => GATEWAY_TIME,
-        }
-    }
 }
 
 /// The gateway a session over `connection` talks to, whose search a search
@@ -1519,7 +1506,8 @@ fn through(
     let today = chrono::Utc::now().date_naive();
     let (mut said, mut unavailable) = (Vec::new(), false);
     for model in gate.models.iter().take(MODELS_TRIED) {
-        let (fault, why) = match ask_gateway(gate, model, query, count, options, today) {
+        let asked = ask_gateway(gate, model, query, count, options, today, GATEWAY_TIME);
+        let (fault, why) = match asked {
             Ok(listing) => {
                 lock(gateways).answered(&gate.base, model);
                 return Ok(listing);
@@ -1553,8 +1541,9 @@ fn through(
     ))
 }
 
-/// Ask `gate` to search with `model`, and list what came back that the
-/// filters keep; when it fails, how and why in a few words.
+/// Ask `gate` to search with `model`, given `time` to answer in full, and
+/// list what came back that the filters keep; when it fails, how and why in
+/// a few words.
 fn ask_gateway(
     gate: &Gate,
     model: &str,
@@ -1562,9 +1551,9 @@ fn ask_gateway(
     count: u64,
     options: &Options,
     today: chrono::NaiveDate,
+    time: Duration,
 ) -> Result<String, (Fault, String)> {
     let unavailable = |why: String| (Fault::Unavailable, why);
-    let time = gate.time();
     let deadline = Instant::now() + time;
     let late = || format!("{model} did not answer within {} seconds", time.as_secs());
     let client = reqwest::blocking::Client::builder()
@@ -4046,12 +4035,39 @@ pub(crate) mod tests {
         let mut bytes = Vec::new();
         read_by(&b"results"[..], 6, later, &mut bytes).unwrap();
         assert_eq!(bytes, b"result");
-        // Letronna's own is waited on longer than its "auto" tries models for.
+        // A search through Letronna's own that answers so, a space now and
+        // then, is given up on at its deadline as any gateway's is: here a
+        // short one rather than `GATEWAY_TIME`.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.read(&mut [0u8; 4096]);
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n";
+            let mut sent = stream.write_all(head.as_bytes());
+            // Until the search hangs up.
+            while sent.is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+                sent = stream.write_all(b" ");
+            }
+        });
         let letronna = Gate {
+            name: "Letronna".into(),
+            base: format!("http://127.0.0.1:{port}/v1"),
             hosted: true,
+            models: vec![AUTO.into()],
             ..pool()
         };
-        assert!(letronna.time() > Duration::from_secs(45) && pool().time() == GATEWAY_TIME);
+        let today = chrono::Utc::now().date_naive();
+        let time = Duration::from_millis(500);
+        let started = Instant::now();
+        let asked = ask_gateway(&letronna, AUTO, "rust", 5, &Options::default(), today, time);
+        let took = started.elapsed();
+        let (fault, why) = asked.unwrap_err();
+        assert_eq!(fault, Fault::Unavailable);
+        assert!(why.starts_with("auto did not answer within "), "{why}");
+        assert!(took >= time && took < Duration::from_secs(5), "{took:?}");
     }
 
     #[test]
