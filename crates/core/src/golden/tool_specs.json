@@ -1487,6 +1487,106 @@
   },
   {
     "function": {
+      "description": "The user's crypto wallet in Letronna: its addresses (EVM chains and Solana), the user's spending rules and caps, what it holds on each network, and what was paid. It never shows a key. Pay a site that asks for payment (HTTP 402, x402) with paid_fetch, and send money with wallet_send.",
+      "name": "wallet",
+      "parameters": {
+        "properties": {
+          "action": {
+            "description": "summary: wallets, rules and caps; balances: what each wallet holds, read from the networks; history: the latest payments.",
+            "enum": [
+              "summary",
+              "balances",
+              "history"
+            ],
+            "type": "string"
+          },
+          "wallet": {
+            "description": "For balances, one wallet by name; all when left out.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Send money from the user's wallet: an amount of a network's native coin or of a token (such as USDC) to an address. The user sees each send on a card and decides, and it must fit the caps they set. A payment to a site that asks for it (HTTP 402) goes through paid_fetch instead.",
+      "name": "wallet_send",
+      "parameters": {
+        "properties": {
+          "amount": {
+            "description": "As a person writes it, such as \"5\" or \"0.25\".",
+            "type": "string"
+          },
+          "from": {
+            "description": "Which wallet pays, by name; the default one when left out.",
+            "type": "string"
+          },
+          "network": {
+            "description": "Base, Ethereum, Arbitrum, Optimism, Polygon, BNB Chain, Avalanche, Solana, a test network, or one the user added; a CAIP-2 id works too.",
+            "type": "string"
+          },
+          "to": {
+            "description": "The address: 0x… on an EVM network, base58 on Solana.",
+            "type": "string"
+          },
+          "token": {
+            "description": "The token's symbol or address, such as USDC; the network's own coin when left out.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "network",
+          "to",
+          "amount"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Read a page or call an API that asks to be paid (HTTP 402 with x402), paying it from the user's wallet in USDC or another token, then return what it gives. Use it when web_fetch reports a price, or for an API known to charge per call. The user's rules decide: a small price may be paid on its own, otherwise the user sees the price on a card; the caps always hold.",
+      "name": "paid_fetch",
+      "parameters": {
+        "properties": {
+          "body": {
+            "description": "For POST, the JSON to send.",
+            "type": "string"
+          },
+          "max_usd": {
+            "description": "The most to pay in dollars, such as \"0.05\"; the price shown on the card, or the per-payment cap, when left out.",
+            "type": "string"
+          },
+          "method": {
+            "description": "GET when left out.",
+            "enum": [
+              "GET",
+              "POST"
+            ],
+            "type": "string"
+          },
+          "url": {
+            "description": "The full address, starting with https://.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
       "description": "Search the tools left out of this list: the user's MCP servers' tools when they are too many to list. Give a few words for what you need done, or a tool's exact name; the matching tools come back with their descriptions and arguments. Then call one with call_mcp_tool.",
       "name": "find_tools",
       "parameters": {

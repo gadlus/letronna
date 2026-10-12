@@ -122,6 +122,7 @@ pub mod update;
 pub mod usage;
 pub mod vault;
 pub mod wake;
+pub mod wallet;
 pub mod watch;
 pub mod web;
 #[cfg(feature = "workflows")]

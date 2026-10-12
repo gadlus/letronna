@@ -56,7 +56,7 @@ use std::time::{Duration, Instant};
 
 /// The most of a page that is read, in bytes. What the model is shown is cut
 /// much shorter than this; the rest is only there to find the text in.
-const MAX_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// The largest PDF saved, in bytes. Papers, manuals and data sheets are a few
 /// megabytes; this leaves room for a long scanned one while a fetch the model
 /// makes cannot fill the disk.
@@ -268,15 +268,29 @@ fn fetch_for(raw: &str, secrets: &[String], fresh: bool, asker: &Asker) -> Resul
         follow(&previous, &next, &secrets)?;
         url = next;
     };
+    // A page that asks to be paid (x402) is paid from the wallet when the
+    // user's rules pay it unasked, and read as it answers then; otherwise
+    // the model is told its price and how to ask the user.
+    let response = match response.status().as_u16() {
+        402 => {
+            let headers = response.headers().clone();
+            let at = response.url().clone();
+            let mut said = Vec::new();
+            let _ = response.take(MAX_BYTES).read_to_end(&mut said);
+            match crate::wallet::on_402(&headers, &said, &at) {
+                Some(paid) => paid?,
+                None => {
+                    let kind = kind_of(&headers);
+                    return Err(error_said(402, &said, &kind, &at));
+                }
+            }
+        }
+        _ => response,
+    };
     let status = response.status();
     let reached = response.url().clone();
     let address = reached.to_string();
-    let kind = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let kind = kind_of(response.headers());
     if !status.is_success() {
         return Err(error_answer(status.as_u16(), response, &kind, &reached));
     }
@@ -294,18 +308,7 @@ fn fetch_for(raw: &str, secrets: &[String], fresh: bool, asker: &Asker) -> Resul
         // the cut is still the end.
         body = crate::redact::scrub_cut(&body, true);
     }
-    let text = if kind.contains("html") {
-        match title_of(&body) {
-            Some(title) => format!("{title}\n\n{}", text_of(&body, &reached)),
-            None => text_of(&body, &reached),
-        }
-    } else if kind.is_empty()
-        || kind.starts_with("text/")
-        || kind.contains("json")
-        || kind.contains("xml")
-    {
-        body
-    } else {
+    let Some(text) = readable(&body, &kind, &reached) else {
         // The kind is the server's to name, in any words it likes.
         return Err(crate::untrusted::quoted(
             "That is not a page of text; the server says it is:",
@@ -317,6 +320,32 @@ fn fetch_for(raw: &str, secrets: &[String], fresh: bool, asker: &Asker) -> Resul
         memo.put([asked, memo_key(&reached)], text.clone(), Instant::now());
     }
     Ok(Page::Text(text))
+}
+
+/// A page's body as the model reads it, from where it was `reached`: HTML
+/// reduced to markdown under its title, text, JSON and XML as they are;
+/// none when it is not text.
+pub(crate) fn readable(body: &str, kind: &str, reached: &reqwest::Url) -> Option<String> {
+    if kind.contains("html") {
+        return Some(match title_of(body) {
+            Some(title) => format!("{title}\n\n{}", text_of(body, reached)),
+            None => text_of(body, reached),
+        });
+    }
+    let text = kind.is_empty()
+        || kind.starts_with("text/")
+        || kind.contains("json")
+        || kind.contains("xml");
+    text.then(|| body.to_owned())
+}
+
+/// The content type `headers` give, lowercased; empty when none.
+fn kind_of(headers: &reqwest::header::HeaderMap) -> String {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
 }
 
 /// `lead` over why a request got no answer, `moved` when a redirect sent it
@@ -572,12 +601,18 @@ fn error_answer(
     kind: &str,
     reached: &reqwest::Url,
 ) -> String {
-    let lead = format!("The page answered HTTP {code}.");
     let mut bytes = Vec::new();
     // What arrived before the body stopped still says why, so a failed read
     // only shortens it.
     let _ = response.take(MAX_BYTES).read_to_end(&mut bytes);
-    let body = String::from_utf8_lossy(&bytes);
+    error_said(code, &bytes, kind, reached)
+}
+
+/// The error `code` over `bytes`, what the page said with it, as
+/// `error_answer` gives it.
+fn error_said(code: u16, bytes: &[u8], kind: &str, reached: &reqwest::Url) -> String {
+    let lead = format!("The page answered HTTP {code}.");
+    let body = String::from_utf8_lossy(bytes);
     let said = if kind.contains("html") {
         text_of(&body, reached)
     } else if kind.is_empty()

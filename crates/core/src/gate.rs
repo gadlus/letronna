@@ -636,6 +636,13 @@ fn ladder(
             false => Outcome::Refuse(notify::UNANSWERED.into()),
         };
     }
+    // Money cannot be taken back, so the wallet's own rules decide, in every
+    // mode: a send is read on its card each time, and a page's price runs
+    // unasked only where the user's x402 rules would pay it on their own.
+    // No grant, rule or judge pays.
+    if let Some(outcome) = crate::wallet::gate(tool.name(), &args, gate.human) {
+        return outcome;
+    }
     // A rules file that cannot be read could deny this call, so no setting,
     // grant or allow answers for it.
     if let Some(why) = gate.broken.or(ruling.broken.as_deref()) {

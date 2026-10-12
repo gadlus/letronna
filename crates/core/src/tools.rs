@@ -411,6 +411,9 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(crate::cloud::CloudTask),
         Arc::new(crate::cloud::CloudApps),
         Arc::new(crate::cloud::CloudAppPower),
+        Arc::new(crate::wallet::WalletInfo),
+        Arc::new(crate::wallet::WalletSend),
+        Arc::new(crate::wallet::PaidFetch),
     ];
     // In place of the MCP tools when those are too many to send; see
     // `specs`. Here, so that no plugin can take their names.
@@ -7687,7 +7690,8 @@ mod tests {
             .collect();
         // read_chat fences other people's lines itself, and not the user's.
         // cloud_task too, as a run in the cloud reads what a repository says,
-        // and cloud_apps, as what a hosted program prints is anyone's.
+        // and cloud_apps, as what a hosted program prints is anyone's; and
+        // paid_fetch, which reads a page as web_fetch does.
         assert_eq!(
             fenced,
             [
@@ -7696,7 +7700,8 @@ mod tests {
                 "use_page",
                 "computer",
                 "cloud_task",
-                "cloud_apps"
+                "cloud_apps",
+                "paid_fetch"
             ]
         );
         assert!(crate::search::SearchWeb.untrusted());

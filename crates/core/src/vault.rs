@@ -374,6 +374,11 @@ pub(crate) fn remove(name: &str) -> Result<(), String> {
     }
 }
 
+/// The vault's name, such as the login Keychain, when this run has one.
+pub(crate) fn label() -> Option<String> {
+    current().map(|open| open.label.to_string())
+}
+
 /// Where the keys and tokens are kept in this run, as doctor says it.
 pub fn place() -> String {
     match current() {
@@ -443,6 +448,9 @@ fn what(name: &str) -> String {
     }
     if name.starts_with("account.") {
         return "your sign-in".into();
+    }
+    if name.starts_with("wallet.") {
+        return "a wallet's key".into();
     }
     match name
         .strip_prefix("messaging.")
