@@ -82,10 +82,47 @@ const DEFANGED: &str = "[Instructions_for";
 /// Whether names match in any case, as they do on Windows and macOS.
 const FOLD: bool = cfg!(any(windows, target_os = "macos"));
 
-/// The tokens the files may add to every request over `connection`, which
-/// the window's budget leaves free for them.
-pub(crate) fn reserve(connection: &Connection) -> usize {
-    project(connection).map_or(0, |_| TOTAL_TOKENS)
+/// The tokens the files may add to a request over `connection` carrying
+/// `messages`, which the window's budget leaves free for them: nothing
+/// until a result has touched a folder that has one, since most projects
+/// have none and the room is the conversation's otherwise, and the cap on
+/// them from then on, which the budget takes off what the messages may
+/// cost, so the window moves on a step sooner at most, never to a new
+/// place. All of `messages`, not the window alone, which the budget places.
+pub(crate) fn reserve(connection: &Connection, messages: &[Message]) -> usize {
+    let Some(workspace) = project(connection) else {
+        return 0;
+    };
+    let (Some(base), Ok(root)) = (workspace.to_str(), std::fs::canonicalize(workspace)) else {
+        return 0;
+    };
+    let request = Request::new(workspace, &root);
+    let mut looked = HashSet::new();
+    let found = messages
+        .iter()
+        .flat_map(|m| folders(m, base, &root))
+        .filter(|rel| looked.insert(key(rel)))
+        .any(|rel| {
+            NAMES
+                .iter()
+                .chain(&LOCAL_NAMES)
+                .any(|name| request.file(&rel, name).is_some())
+        });
+    if found { TOTAL_TOKENS } else { 0 }
+}
+
+/// The folders below the project folder, given as `base` and with its links
+/// followed as `root`, that the result `m` touches, as `below` names them.
+fn folders(m: &Message, base: &str, root: &Path) -> Vec<String> {
+    let Some((raw, folder)) = touched(m) else {
+        return Vec::new();
+    };
+    let rels = below(&raw, base, folder, cfg!(windows), FOLD);
+    // A full path through the project folder's links, as tools print.
+    match root.to_str() {
+        Some(real) if rels.is_empty() => below(&raw, real, folder, cfg!(windows), FOLD),
+        _ => rels,
+    }
 }
 
 /// `text`, a tool result's own, with `MARKER` rewritten wherever it is
@@ -140,17 +177,11 @@ pub(crate) fn hints(window: &[Message], connection: &Connection) -> Vec<Option<S
     };
     let mut request = Request::new(workspace, &root);
     for (i, m) in window.iter().enumerate() {
-        let Some((raw, folder)) = touched(m) else {
+        let Some((raw, _)) = touched(m) else {
             continue;
         };
         request.read(m, &raw);
-        let mut rels = below(&raw, base, folder, cfg!(windows), FOLD);
-        // A full path through the project folder's links, as tools print.
-        if rels.is_empty()
-            && let Some(real) = root.to_str()
-        {
-            rels = below(&raw, real, folder, cfg!(windows), FOLD);
-        }
+        let rels = folders(m, base, &root);
         let kept = rels.iter().take_while(|rel| !request.venv(rel)).count();
         let added: String = rels[..kept].iter().map(|rel| request.hint(rel)).collect();
         if !added.is_empty() {
@@ -729,15 +760,22 @@ mod tests {
     }
 
     #[test]
-    fn the_budget_keeps_room_for_the_files_only_where_they_can_go() {
+    fn the_budget_keeps_room_for_the_files_only_once_one_is_found() {
         let dir = scratch("reserve");
-        assert_eq!(reserve(&connection(&dir)), TOTAL_TOKENS);
+        write(dir.join("web/AGENTS.md"), "Web rules.");
+        let touched = [result("read_file", "web/a.ts")];
+        assert_eq!(reserve(&connection(&dir), &touched), TOTAL_TOKENS);
+        // A project without any, or results that touch no folder with one,
+        // leave the room to the conversation.
+        assert_eq!(reserve(&connection(&dir), &[]), 0);
+        let elsewhere = [result("read_file", "api/a.go"), result("read_file", "a.ts")];
+        assert_eq!(reserve(&connection(&dir), &elsewhere), 0);
         let off = Connection {
             tools: false,
             ..connection(&dir)
         };
-        assert_eq!(reserve(&off), 0);
-        assert_eq!(reserve(&Connection::default()), 0);
+        assert_eq!(reserve(&off, &touched), 0);
+        assert_eq!(reserve(&Connection::default(), &touched), 0);
     }
 
     #[test]

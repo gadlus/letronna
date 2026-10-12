@@ -134,6 +134,18 @@ pub(crate) struct Miss {
     pub cached: u64,
 }
 
+/// The answers a session's requests got from the cache with less than the
+/// answer before, though nothing in what they sent had changed: the
+/// provider's own drops, however small, and the tokens they cost. A drop
+/// too small for `/usage` to name still moves a run's cache figures, so a
+/// run that reports them can be read net of what the provider did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Drops {
+    pub count: usize,
+    /// Cached tokens the dropped answers served short of the one before.
+    pub lost_tokens: u64,
+}
+
 /// A request that was answered, as the next one is compared with.
 #[derive(Clone, Copy)]
 struct Answered {
@@ -152,6 +164,7 @@ struct Session {
     last: Option<Answered>,
     /// Tickets handed out so far.
     tickets: u64,
+    drops: Drops,
 }
 
 impl Session {
@@ -174,6 +187,12 @@ impl Session {
             cached,
         };
         let before = self.last.replace(this)?;
+        // Counted apart from the miss named below: a drop of any size with
+        // the same prefix sent is the provider's, named or not.
+        if prefix == before.prefix && cached.saturating_add(LEAST) < before.cached {
+            self.drops.count += 1;
+            self.drops.lost_tokens += before.cached - cached;
+        }
         // Far fewer means under half: a cache that holds serves at least the
         // prefix it served last time, and a growing conversation only adds.
         if before.cached < LEAST || cached.saturating_mul(2) >= before.cached {
@@ -218,6 +237,18 @@ pub(crate) fn answered(conversation: u64, ticket: u64, cached: u64) -> Option<Mi
     let mut sessions = sessions().lock().ok()?;
     let session = sessions.get_mut(&conversation)?;
     session.answered(ticket, cached, crate::chat::now())
+}
+
+/// The provider's own cache drops over `conversation`'s requests this run:
+/// none for a session that sent nothing from here.
+pub fn drops(conversation: u64) -> Drops {
+    let Ok(sessions) = sessions().lock() else {
+        return Drops::default();
+    };
+    sessions
+        .get(&conversation)
+        .map(|session| session.drops)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -351,6 +382,45 @@ mod tests {
         assert_eq!(session.answered(stopped, 100, 4), None);
         let miss = session.answered(next, 100, 5).map(|miss| miss.reason);
         assert_eq!(miss, Some(Reason::Memory));
+    }
+
+    #[test]
+    fn every_drop_with_nothing_changed_is_counted_with_what_it_lost() {
+        let mut session = Session::default();
+        let same = prefix_with(None, "");
+        let changed = prefix_with(Some(Reason::Memory), "changed");
+        // Cached tokens each answer in turn served, with the prefix it sent.
+        let served = [
+            (same, 8_000),
+            // Fewer, but by less than the least a drop is read as.
+            (same, 7_000),
+            // A drop a `/usage` line would never name, well over half.
+            (same, 5_000),
+            // A growing conversation serving more is no drop.
+            (same, 5_200),
+            // The miss the halving rule names counts here too.
+            (same, 100),
+            (same, 6_000),
+            // Nothing the provider did: an earlier message changed.
+            (changed, 1_000),
+        ];
+        let mut named = Vec::new();
+        for (at, (prefix, cached)) in served.into_iter().enumerate() {
+            let now = 10 * at as u64;
+            let ticket = session.sent(prefix, now);
+            named.extend(session.answered(ticket, cached, now + 1));
+        }
+        assert_eq!(
+            session.drops,
+            Drops {
+                count: 2,
+                lost_tokens: 2_000 + 5_100,
+            }
+        );
+        let reasons: Vec<Reason> = named.iter().map(|miss| miss.reason).collect();
+        assert_eq!(reasons, [Reason::Unknown, Reason::Memory]);
+        // A session nothing was sent from has none.
+        assert_eq!(drops(u64::MAX), Drops::default());
     }
 
     #[test]

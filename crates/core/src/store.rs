@@ -411,6 +411,16 @@ pub struct Settings {
     /// it for one run. Edited by hand with Letronna closed.
     #[serde(default)]
     pub max_output: u64,
+    /// How the reasoning a model such as DeepSeek or Kimi wants back with
+    /// its tool calls goes out: empty or "full" sends every call of the
+    /// turn in progress its own; "chunked" sends an empty one with the
+    /// turn's calls older than the newest two once their reasoning comes to
+    /// 8,000 tokens, and then a chunk of that at a time, so the requests in
+    /// between keep the provider's prompt cache. Off until paired runs show
+    /// what a model loses with its older thoughts; `LETRONNA_REASONING_REPLAY`
+    /// sets it for one run. Edited by hand with Letronna closed.
+    #[serde(default)]
+    pub reasoning_replay: String,
     /// The model helpers use when neither the call nor their type names one;
     /// empty for the model of the agent that starts them.
     #[serde(default)]
@@ -532,8 +542,9 @@ pub struct Settings {
     #[serde(default)]
     pub memory_scope: crate::memory::Scope,
     /// Search with DuckDuckGo, which needs no key, while no search service
-    /// is chosen; switched off, search_web says how to turn it back on or
-    /// add a key.
+    /// is chosen, after the gateway's search where it sells one; switched
+    /// off, search_web searches through that gateway alone, or with none
+    /// says how to turn it back on or add a key.
     #[serde(default = "yes")]
     pub keyless_search: bool,
     /// How find_tools ranks the tools it finds: "auto" or empty for Jev
@@ -561,6 +572,7 @@ impl Default for Settings {
             context_cap: 0,
             context_window: 0,
             max_output: 0,
+            reasoning_replay: String::new(),
             helper_model: String::new(),
             side_model: String::new(),
             helpers_at_once: 0,
@@ -3277,10 +3289,14 @@ pub(crate) struct Sizing {
     pub window: Option<u64>,
     /// The output limit assumed for a model whose own is not known.
     pub output: Option<u64>,
+    /// Whether the turn's older calls go out without their reasoning once
+    /// it comes to a chunk: the `reasoning_replay` setting says "chunked".
+    pub chunked_reasoning: bool,
 }
 
-/// The sizing the settings file sets, with `LETRONNA_CONTEXT_WINDOW` and
-/// `LETRONNA_MAX_OUTPUT` in place of its window and output limit.
+/// The sizing the settings file sets, with `LETRONNA_CONTEXT_WINDOW`,
+/// `LETRONNA_MAX_OUTPUT` and `LETRONNA_REASONING_REPLAY` in place of its
+/// window, output limit and reasoning replay.
 pub(crate) fn sizing() -> Sizing {
     let settings = settings().0;
     let set = |tokens: u64| Some(tokens).filter(|&tokens| tokens > 0);
@@ -3291,6 +3307,10 @@ pub(crate) fn sizing() -> Sizing {
             "LETRONNA_CONTEXT_WINDOW",
         )),
         output: set(overridden(settings.max_output, "LETRONNA_MAX_OUTPUT")),
+        chunked_reasoning: chunks_reasoning(
+            &settings.reasoning_replay,
+            "LETRONNA_REASONING_REPLAY",
+        ),
     }
 }
 
@@ -3301,6 +3321,17 @@ fn overridden(saved: u64, name: &str) -> u64 {
         .ok()
         .and_then(|value| value.trim().parse().ok())
         .unwrap_or(saved)
+}
+
+/// Whether the reasoning replay the environment variable `name` holds, or
+/// `saved` when it holds none, is "chunked"; anything else, "full" or a word
+/// no replay goes by, sends every call of the turn its reasoning.
+fn chunks_reasoning(saved: &str, name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .unwrap_or_else(|| saved.to_owned())
+        .trim()
+        .eq_ignore_ascii_case("chunked")
 }
 
 /// The tools the settings file switches off, read again each time so a hand
@@ -8151,6 +8182,27 @@ pub(crate) mod tests {
         assert_eq!(super::overridden(65_536, name), 0);
         unsafe { std::env::set_var(name, "128k") };
         assert_eq!(super::overridden(65_536, name), 65_536);
+        unsafe { std::env::remove_var(name) };
+    }
+
+    #[test]
+    fn the_reasoning_replay_is_chunked_only_where_a_setting_says_so() {
+        let saved = br#"{"endpoint": "", "model": "", "reasoning_replay": "chunked"}"#;
+        assert_eq!(
+            super::read_settings(saved).unwrap().reasoning_replay,
+            "chunked"
+        );
+        assert_eq!(super::Settings::default().reasoning_replay, "");
+        // A name no other test reads, so setting it races nothing.
+        let name = "LETRONNA_TEST_REPLAY";
+        assert!(!super::chunks_reasoning("", name));
+        assert!(!super::chunks_reasoning("full", name));
+        assert!(super::chunks_reasoning(" Chunked ", name));
+        // The environment stands in for the saved word, either way.
+        unsafe { std::env::set_var(name, "chunked") };
+        assert!(super::chunks_reasoning("", name));
+        unsafe { std::env::set_var(name, "full") };
+        assert!(!super::chunks_reasoning("chunked", name));
         unsafe { std::env::remove_var(name) };
     }
 }

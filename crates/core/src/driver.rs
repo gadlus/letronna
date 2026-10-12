@@ -2322,8 +2322,10 @@ pub(crate) mod tests {
             making.lock().unwrap().push(call.name.clone());
             Ok(format!("made {}", call.name))
         }));
+        // In the gate's words, as a session's gate refuses, which tell a
+        // refusal from a write that ran and failed.
         spec.decide = Some(Arc::new(|call, _| match call.name.as_str() {
-            "write_file" => crate::gate::Outcome::Refuse("Not here.".into()),
+            "write_file" => crate::gate::Outcome::Refuse("Refused: not here.".into()),
             _ => crate::gate::Outcome::Run,
         }));
         let report = finished(spec);
@@ -2335,7 +2337,7 @@ pub(crate) mod tests {
             [
                 "made read_file",
                 "made read_file",
-                "Not here.",
+                "Refused: not here.",
                 "made memory"
             ]
         );
@@ -4409,7 +4411,7 @@ pub(crate) mod tests {
         // The model was told before it was stopped.
         let told = results(&sent[3]);
         assert!(!told[1].contains("Change your approach"));
-        assert!(told[2].contains("made this exact call 3 times"));
+        assert!(told[2].contains("made this call 3 times"));
     }
 
     #[test]

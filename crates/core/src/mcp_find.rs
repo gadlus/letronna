@@ -31,9 +31,10 @@
 //! looked up: its tools are listed as if every one were sent, and
 //! `find_tools` finds it only those.
 //!
-//! A lean run -- `-p` that did not name its tools -- also leaves out
-//! Letronna's own less used tools (`RARE`), which took some 3,000 of the
-//! 6,700 tokens its array came to and which such a run seldom needs. They
+//! A lean run, and the window and the terminal (`rare_on_demand`), also
+//! leave out Letronna's own less used tools (`RARE`), which
+//! took some 4,000 of the 8,500 tokens the array came to and which most
+//! turns never need: a "hi" paid for the browser and the scheduler. They
 //! are found and called through the same pair, and a call that names one
 //! directly still runs it.
 
@@ -50,12 +51,12 @@ pub(crate) const CALL_MCP_TOOL: &str = "call_mcp_tool";
 /// What every MCP tool's name starts with; see `mcp::tool_name`.
 const PREFIX: &str = "mcp__";
 
-/// Letronna's own tools a lean run offers on demand: the largest of those a
-/// run nobody watches seldom needs -- the browser, the computer, pictures,
-/// sound, skills being written, the crew's board, past sessions -- and its
-/// helpers and the list of its background jobs, as such a run waits for
-/// each helper's report and is given each job's number when it starts.
-const RARE: [&str; 15] = [
+/// Letronna's own tools offered on demand: the largest of those most turns
+/// never need -- the browser, the computer, pictures, sound, skills being
+/// written, the crew's board, past sessions, schedules, questions about
+/// Letronna itself -- and the helpers' follow-up and background jobs' tools,
+/// as a helper's notice and a job's start already say how to reach them.
+const RARE: [&str; 21] = [
     "browse",
     "use_page",
     "computer",
@@ -71,6 +72,12 @@ const RARE: [&str; 15] = [
     "read_chat",
     "agents",
     "list_jobs",
+    "schedule",
+    "wait",
+    "read_job",
+    "send_job",
+    "stop_job",
+    "letronna_info",
 ];
 
 /// Past this many estimated tokens of MCP tool schemas, the MCP tools go out
@@ -117,7 +124,8 @@ pub(crate) fn is_rare(name: &str) -> bool {
 pub(crate) struct OnDemand {
     /// The MCP tools, once their schemas passed the budget.
     pub(crate) mcp: bool,
-    /// Letronna's own less used tools, in a lean run.
+    /// Letronna's own less used tools: in a lean run, and in the window and
+    /// the terminal, so a turn pays only for the tools it is likely to call.
     pub(crate) rare: bool,
 }
 
@@ -126,7 +134,7 @@ impl OnDemand {
     pub(crate) fn of(connection: &Connection, tools: &[Arc<dyn Tool>]) -> Self {
         Self {
             mcp: on_demand(tools),
-            rare: connection.lean_tools,
+            rare: connection.lean_tools || connection.rare_on_demand,
         }
     }
 

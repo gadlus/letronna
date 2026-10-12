@@ -336,7 +336,13 @@ fn models(connection: Option<&Connection>) -> String {
             }
         })
         .collect();
-    lines.push(format!("Web search: {}.", services.join("; ")));
+    let mut search = format!("Web search: {}.", services.join("; "));
+    // The gateway's search is paid by the search, which the user may ask
+    // about, and is not among the services.
+    if let Some(note) = crate::search::through_note(connection) {
+        search = format!("{search} {note}");
+    }
+    lines.push(search);
     // Any other slot, such as where a remote browser is reached.
     let mut others: Vec<String> = saved
         .keys()
@@ -991,6 +997,77 @@ mod tests {
     }
 
     #[test]
+    fn with_no_search_service_chosen_the_model_is_told_searches_go_through_the_gateway() {
+        let (_held, dir) = data("info-gateway-search");
+        let letronna = Connection {
+            endpoint: crate::auth::hosted_base(),
+            key: "token".into(),
+            ..window()
+        };
+        let told = || answer("models", false, &ToolContext::of(&letronna), never).unwrap();
+        let on = told();
+        let settings = r#"{"endpoint": "", "model": "", "keyless_search": false}"#;
+        std::fs::write(dir.join("settings.json"), settings).unwrap();
+        let off = told();
+        // Chosen by name, DuckDuckGo keeps every search off the gateway.
+        std::fs::write(dir.join("search.json"), r#"{"service": "DuckDuckGo"}"#).unwrap();
+        let alone = told();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert!(
+            on.contains(
+                "; DuckDuckGo in use. With no service chosen, searches go through Letronna, \
+                 paid from the account's credit by the search, and to DuckDuckGo when it \
+                 cannot answer.\n"
+            ),
+            "{on}"
+        );
+        assert!(
+            off.contains(
+                "; DuckDuckGo switched off. With no service chosen, searches go through \
+                 Letronna alone, paid from the account's credit by the search.\n"
+            ),
+            "{off}"
+        );
+        assert!(!alone.contains("With no service chosen"), "{alone}");
+    }
+
+    #[test]
+    fn the_model_is_told_of_a_gateways_search_only_once_it_is_known_to_sell_one() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let (_held, _dir) = data("info-gateway-unread");
+        // A gateway that lists a search model, should its list be read.
+        let lists = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = lists.clone();
+        let base = crate::mcp_auth::tests::serve(move |_| {
+            counted.fetch_add(1, SeqCst);
+            let list = json!({"data": [{"id": "a/search", "type": "search"}]});
+            let kind = vec![("Content-Type", "application/json".to_owned())];
+            (200, kind, list.to_string())
+        });
+        let base = format!("{base}/v1");
+        let pool = Connection {
+            endpoint: base.clone(),
+            key: "key".into(),
+            ..window()
+        };
+        let told = || answer("models", false, &ToolContext::of(&pool), never).unwrap();
+        let unread = told();
+        // Once its list is read, for the model picker or a search, it is.
+        crate::search::heard_list(&base, &[json!({"id": "a/search", "type": "search"})]);
+        let known = told();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert!(!unread.contains("With no service chosen"), "{unread}");
+        assert_eq!(lists.load(SeqCst), 0, "its list was read for the answer");
+        assert!(
+            known.contains(
+                "; DuckDuckGo in use. With no service chosen, searches go through 127.0.0.1, \
+                 paid to that gateway by the search, and to DuckDuckGo when it cannot answer.\n"
+            ),
+            "{known}"
+        );
+    }
+
+    #[test]
     fn each_topic_answers_from_letronnas_own_files() {
         let (_held, dir) = data("info-topics");
         set_up(&dir);
@@ -1023,7 +1100,7 @@ mod tests {
             "New sessions: test/model on OpenRouter, effort high.",
             "Fallbacks, in order: OpenAI:gpt-5.",
             "Providers: Letronna signed in; OpenAI key set in the vault; ChatGPT not signed in; \
-             Anthropic no key; \
+             Anthropic no key; Gemini no key; xAI no key; \
              OpenRouter key set in keys.json; Ollama needs no key; Custom address set, no key.",
             "Web search: Brave in use, key in the vault; Tavily not set up; Exa not set up; \
              SearXNG saved, not in use; DuckDuckGo not in use.",

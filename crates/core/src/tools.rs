@@ -419,9 +419,10 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
     tools.push(Arc::new(crate::workflow::tool::Workflow));
     #[cfg(feature = "workflows")]
     tools.push(Arc::new(crate::script::Script));
-    // A search service, DuckDuckGo while the user picks none, unless the one
-    // picked is not set up; with DuckDuckGo switched off too, so a call says
-    // how to search.
+    // A search service, or the gateway's search and DuckDuckGo while the
+    // user picks none, unless the one picked is not set up; with DuckDuckGo
+    // switched off too, so a call searches through a gateway that sells
+    // search or says how to search.
     if crate::search::offered() {
         tools.push(Arc::new(crate::search::SearchWeb));
     }
@@ -448,6 +449,15 @@ pub fn find(name: &str) -> Option<Arc<dyn Tool>> {
 /// Tools named in the answer to a call of one there is not: the one meant
 /// is nearly always among the first few, and a longer list is read past.
 const NEAREST: usize = 3;
+
+/// How the refusal of a call to a tool there is not begins, by which the
+/// turn tells it from a call that ran and failed.
+const UNKNOWN: &str = "Unknown tool `";
+
+/// Whether a result is the refusal of a call to a tool there is not.
+pub(crate) fn is_unknown(result: &str) -> bool {
+    result.starts_with(UNKNOWN)
+}
 
 /// The refusal of a call to `name`, which is no tool, naming the `NEAREST`
 /// tools fewest edits from it, a shared start counting against the edits.
@@ -476,7 +486,7 @@ pub(crate) fn unknown(name: &str) -> String {
         .map(|(_, name)| format!("`{name}`"))
         .collect();
     format!(
-        "Unknown tool `{name}`. The nearest tools by name are {}.",
+        "{UNKNOWN}{name}`. The nearest tools by name are {}.",
         nearest.join(", ")
     )
 }
@@ -2810,12 +2820,15 @@ impl Tool for RunCommand {
     }
     fn description(&self) -> &'static str {
         if cfg!(windows) {
-            "Run a Windows PowerShell 5.1 command in the project folder. `&&` and `||` are syntax errors in 5.1: separate commands with `;`, or write `first; if ($?) { second }` to run the second only when the first succeeded. Each call is a fresh PowerShell: cd and $env: changes do not carry over, so keep steps that depend on each other in one command and pass workdir instead of cd. Waits for it to finish, up to `timeout`, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0; past the timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, and the cut names a file read_file can page through, so a build or test run need not be piped through Select-Object -Last. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For a dev server, a watcher or anything else meant to keep running, pass background: true."
+            "Run a Windows PowerShell 5.1 command in the project folder. `&&` and `||` are syntax errors in 5.1: separate commands with `;`, or write `first; if ($?) { second }` to run the second only when the first succeeded. Each call is a fresh PowerShell: cd and $env: changes do not carry over, so keep steps that depend on each other in one command and pass workdir instead of cd. Returns stdout, then `[stderr]`, then `[exit code N]` unless 0. Long output keeps its start and end and names a file read_file can page, so do not pipe through Select-Object -Last. No keyboard: pass --yes or pipe answers in. For a server or watcher, pass background: true. Independent commands, such as two test suites, go in one reply as separate calls; they run in your order and each reports its own exit code."
         } else if bash() {
-            "Run a bash command in the project folder. Each call is a fresh shell: cd, export and source do not carry over, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish, up to `timeout`, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0; past the timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, and the cut names a file read_file can page through, so a build or test run need not be piped through tail, which also hides its exit code. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For a dev server, a watcher or anything else meant to keep running, pass background: true."
+            "Run a bash command in the project folder. Each call is a fresh shell: chain dependent steps with && and pass workdir instead of cd. Returns stdout, then `[stderr]`, then `[exit code N]` unless 0. Long output keeps its start and end and names a file read_file can page, so do not pipe through tail. No keyboard: pass --yes or pipe answers in. For a server or watcher, pass background: true. Independent commands, such as two test suites, go in one reply as separate calls; they run in your order and each reports its own exit code."
         } else {
-            "Run a shell (sh) command in the project folder. Each call is a fresh shell: cd, export and source do not carry over, so chain steps that depend on each other with && in one command, pass workdir instead of cd, and run a virtualenv's tools by path, such as .venv/bin/python. Waits for it to finish, up to `timeout`, and returns its output, then `[stderr]` and what went there, then `[exit code N]` unless it exited 0; past the timeout it carries on as a background job or is stopped, as the result says. Long output keeps its start and end, and the cut names a file read_file can page through, so a build or test run need not be piped through tail, which also hides its exit code. It has no keyboard: pass a flag such as --yes, or pipe the answers in. For a dev server, a watcher or anything else meant to keep running, pass background: true."
+            "Run a shell (sh) command in the project folder. Each call is a fresh shell: chain dependent steps with && and pass workdir instead of cd. Returns stdout, then `[stderr]`, then `[exit code N]` unless 0. Long output keeps its start and end and names a file read_file can page, so do not pipe through tail. No keyboard: pass --yes or pipe answers in. For a server or watcher, pass background: true. Independent commands, such as two test suites, go in one reply as separate calls; they run in your order and each reports its own exit code."
         }
+    }
+    fn description_for(&self, _: &Connection, _: &[&str]) -> Cow<'static, str> {
+        unless_one_at_a_time(self.description(), COMMANDS_IN_ONE_REPLY)
     }
     fn parameters(&self) -> Value {
         let mut parameters = json!({"type": "object", "properties": {
@@ -3711,6 +3724,24 @@ fn past_echo<'a>(output: &'a str, typed: &str, recalled: bool) -> &'a str {
 const WAKE_ME_INSTEAD: &str =
     " If you have wake_me, use it instead of a plain pause over 30 seconds.";
 
+/// How read_file's, search's and run_command's descriptions end: the calls
+/// that go in one reply. Said by the tool as well as by the batching rule,
+/// since a model reads a tool's description when it reaches for the tool.
+const READS_IN_ONE_REPLY: &str = " For several files or several regions of one file, make the read_file calls in one reply, they run at once.";
+const SEARCHES_IN_ONE_REPLY: &str =
+    " Several patterns or folders: several search calls in one reply, run at once.";
+const COMMANDS_IN_ONE_REPLY: &str = " Independent commands, such as two test suites, go in one reply as separate calls; they run in your order and each reports its own exit code.";
+
+/// `said` less its closing `clause` where calls run one at a time, as the
+/// batching rule is left out there: a description never asks for what the
+/// run will not do.
+fn unless_one_at_a_time(said: &'static str, clause: &str) -> Cow<'static, str> {
+    if crate::store::parallel_tool_calls() {
+        return said.into();
+    }
+    said.strip_suffix(clause).unwrap_or(said).into()
+}
+
 struct Wait;
 impl Tool for Wait {
     fn hides_key_shapes(&self) -> bool {
@@ -3992,7 +4023,7 @@ impl Tool for Todo {
         TODO
     }
     fn description(&self) -> &'static str {
-        "Keep your plan as a checklist, for work of three or more steps or several requests at once; skip it for a quick task. Send the whole list every time. Keep one item doing, and mark one done only once it is done and checked where it can be, never on intent. A blocked item goes back to pending, with one added naming the blocker; drop one no longer needed and say why. When a task covers each file or all N of something, give each its own item, grouping them past about 20. Do not paste the whole list into your reply. Returns how many items are done."
+        "Your plan as a checklist, for work of three or more steps; skip it for quick tasks. Send the whole list each time, keep one item doing, and mark one done only once it is checked, never on intent. Do not paste the list into your reply."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -4146,7 +4177,10 @@ impl Tool for ReadFile {
         true
     }
     fn description(&self) -> &'static str {
-        "Read a text file, a PDF, Word, Excel, PowerPoint or OpenDocument file, an EPUB book, or look at a PNG, JPEG, GIF, WebP or BMP picture; one too big to send is scaled down. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from. A Jupyter notebook (.ipynb) reads as numbered cells with short outputs, a document as its text with a heading for each page, sheet or slide, and N counts the lines of that view."
+        "Read a text file, a document (PDF, Office, EPUB) or an image; one too big to send is scaled down. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from. A Jupyter notebook (.ipynb) reads as numbered cells with short outputs, a document as its text with a heading for each page, sheet or slide, and N counts the lines of that view. Leave limit out to get a whole page (about 7k chars). For several files or several regions of one file, make the read_file calls in one reply, they run at once."
+    }
+    fn description_for(&self, _: &Connection, _: &[&str]) -> Cow<'static, str> {
+        unless_one_at_a_time(self.description(), READS_IN_ONE_REPLY)
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -4608,15 +4642,15 @@ impl Tool for Search {
         true
     }
     fn description(&self) -> &'static str {
-        "Search file contents under a folder with a regex (Rust syntax), matched line by \
-         line, leaving out what .gitignore ignores and, outside a Git repository, target, \
-         dist and build folders unless the glob names them. Mode content (the default) shows \
-         each file's matching lines as `12: text` and context lines as `13- text`; files \
-         lists the matching files, newest first; count gives matching lines per file. Mode \
-         files with no pattern lists the files a glob or type picks. Ignores case unless \
-         case_sensitive is set. Paths come back ready for read_file. PDF, Word, Excel, \
-         PowerPoint, OpenDocument and EPUB files are searched as read_file reads them only when \
-         type, glob or path names them."
+        "Regex search (Rust syntax) of file contents under a folder, skipping .gitignore'd \
+         files. Mode content (default) shows `12: text` matches with `13- text` context; \
+         files lists matching files, newest first; count gives matches per file. Mode files \
+         with no pattern lists the files a glob or type picks. Case-insensitive unless \
+         case_sensitive. Several patterns or \
+         folders: several search calls in one reply, run at once."
+    }
+    fn description_for(&self, _: &Connection, _: &[&str]) -> Cow<'static, str> {
+        unless_one_at_a_time(self.description(), SEARCHES_IN_ONE_REPLY)
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -8969,5 +9003,62 @@ mod tests {
         let with = Wait.description_for(&lean, &["wait", "wake_me"]);
         assert_eq!(with, Wait.description());
         assert!(with.ends_with(WAKE_ME_INSTEAD));
+    }
+
+    #[test]
+    fn the_read_search_and_command_descriptions_say_what_goes_in_one_reply() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = Scratch::new("tools-one-reply");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let c = Connection::default();
+        let batched: Vec<String> = [&ReadFile as &dyn Tool, &Search, &RunCommand]
+            .into_iter()
+            .map(|tool| tool.description_for(&c, &[]).into_owned())
+            .collect();
+        let settings = json!({"endpoint": "", "model": "m", "parallel_tool_calls": false});
+        std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+        let alone: Vec<String> = [&ReadFile as &dyn Tool, &Search, &RunCommand]
+            .into_iter()
+            .map(|tool| tool.description_for(&c, &[]).into_owned())
+            .collect();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+
+        let clauses = [
+            READS_IN_ONE_REPLY,
+            SEARCHES_IN_ONE_REPLY,
+            COMMANDS_IN_ONE_REPLY,
+        ];
+        let said = [
+            ReadFile.description(),
+            Search.description(),
+            RunCommand.description(),
+        ];
+        for ((whole, one_at_a_time), (clause, full)) in
+            batched.iter().zip(&alone).zip(clauses.iter().zip(said))
+        {
+            assert_eq!(whole, full);
+            assert!(whole.ends_with(clause), "{whole}");
+            // Where calls run one at a time, the clause goes as the batching
+            // rule does, and nothing else moves.
+            assert_eq!(one_at_a_time, &full[..full.len() - clause.len()]);
+            assert!(one_at_a_time.ends_with('.'), "{one_at_a_time}");
+        }
+        // What a page holds is said in round thousands, as PAGE_BYTES gives
+        // it, so a changed cap changes the words too.
+        let page = format!("about {}k chars", PAGE_BYTES / 1_000);
+        assert!(ReadFile.description().contains(&page), "{page}");
+        assert!(
+            ReadFile
+                .description()
+                .starts_with("Read a text file, a document (PDF, Office, EPUB) or an image;")
+        );
+        // Documents are read as named, so the search tool no longer spends
+        // a sentence on when they are searched.
+        assert!(!Search.description().contains("OpenDocument"));
+        let web = crate::search::SearchWeb.description();
+        assert!(web.contains("read the page that settles a fact with web_fetch, preferring the primary source, and give its address."), "{web}");
+        assert!(!web.contains("official site"), "{web}");
     }
 }
