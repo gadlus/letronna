@@ -2190,11 +2190,11 @@ impl Bar {
         } else if self.working {
             // Said while it applies rather than only after a long silence:
             // a reply going the wrong way is worth stopping early.
-            let width = width.saturating_sub(self.mode_width());
+            let width = width.saturating_sub(self.mode_width(width));
             fitted(&self.footer, &format!("{helpers}  ·  esc to stop"), width)
         } else {
             let reach = reach(self.relay.len(), self.runs.len());
-            let width = width.saturating_sub(self.mode_width());
+            let width = width.saturating_sub(self.mode_width(width));
             fitted(&self.footer, &format!("{helpers}{reach}"), width)
         };
         // The mode leads the footer while nothing else has taken it over.
@@ -2205,7 +2205,7 @@ impl Bar {
             && back == 0
             && !(self.working && self.sendable() > 0);
         let mode = if plain {
-            self.mode_tag()
+            self.mode_tag(width)
         } else {
             String::new()
         };
@@ -2579,28 +2579,47 @@ impl Bar {
     }
 
     /// The mode and the hint, coloured by how much runs unasked, with the
-    /// gap before the rest of the footer.
-    fn mode_tag(&self) -> String {
+    /// gap before the rest of the footer, in `width` columns.
+    fn mode_tag(&self, width: usize) -> String {
         let Some(mode) = self.mode else {
             return String::new();
         };
         let (mark, words) = mode_words(mode);
-        let said = format!("{mark} {words}");
+        let (said, after) = mode_said(mark, words, width);
         let said = match mode {
             Mode::Bypass => render::red(&said),
             Mode::Plan => render::blue(&said),
             Mode::Default => render::dim(&said),
             _ => render::amber(&said),
         };
-        format!("{said}{}", render::dim(&format!(" ({MODE_HINT})  ·  ")))
+        format!("{said}{}", render::dim(&after))
     }
 
-    fn mode_width(&self) -> usize {
+    fn mode_width(&self, width: usize) -> usize {
         self.mode.map_or(0, |mode| {
             let (mark, words) = mode_words(mode);
-            format!("{mark} {words} ({MODE_HINT})  ·  ").chars().count()
+            let (said, after) = mode_said(mark, words, width);
+            said.chars().count() + after.chars().count()
         })
     }
+}
+
+/// Columns the footer keeps for what follows the mode before the hint after
+/// it gives way.
+const MODE_ROOM: usize = 16;
+
+/// The mode as the footer says it in `width` columns, and what follows it:
+/// the hint while it leaves `MODE_ROOM` for the rest, else only the gap, the
+/// words cut to fit, so a narrow window never wraps the footer.
+fn mode_said(mark: &str, words: &str, width: usize) -> (String, String) {
+    let said = format!("{mark} {words}");
+    let hinted = format!(" ({MODE_HINT})  ·  ");
+    if said.chars().count() + hinted.chars().count() + MODE_ROOM <= width {
+        return (said, hinted);
+    }
+    let gap = "  ·  ";
+    let room = width.saturating_sub(gap.chars().count());
+    (render::clip(&said, room), gap.to_owned())
 }
 
 /// The footer with `then` after it, in `width` columns. The footer gives way
@@ -2666,8 +2685,8 @@ mod tests {
     use super::{
         Added, Bar, CHOICE_ROWS, Choice, MENU_LIMIT, NAME_WIDTH, PLAN_ROWS, QUEUED_LIMIT,
         RELAY_LIMIT, Row, STILL, SWITCH_ROWS, Slider, Switch, Switches, Waited, at_work, checklist,
-        closest, fitted, is_command, matches, menu_top, name_width, offered, one_row, reach,
-        relay_line, stops_at, track, unescaped,
+        closest, fitted, is_command, matches, menu_top, mode_said, name_width, offered, one_row,
+        reach, relay_line, stops_at, track, unescaped,
     };
     use crate::render::{MARGIN, plain, visible};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -3298,6 +3317,18 @@ mod tests {
         // Narrower than the hint itself, the hint loses its end too.
         for width in [0, 1, 10, 30] {
             assert!(fitted(footer, &then, width).chars().count() <= width);
+        }
+    }
+
+    #[test]
+    fn a_narrow_footer_drops_the_mode_hint_before_it_wraps() {
+        let width = |(said, after): &(String, String)| said.chars().count() + after.chars().count();
+        let wide = mode_said("⏵", "asks first", 80);
+        assert_eq!(wide.1, " (shift+tab to switch)  ·  ");
+        let narrow = mode_said("⏵", "asks first", 40);
+        assert_eq!(narrow, ("⏵ asks first".to_owned(), "  ·  ".to_owned()));
+        for columns in 0..=80 {
+            assert!(width(&mode_said("⏵⏵", "allowed calls only", columns)) <= columns.max(5));
         }
     }
 

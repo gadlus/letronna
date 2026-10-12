@@ -13,6 +13,7 @@
 //! One lock around the lot. Only the main loop draws, but it draws from
 //! several places, and a half-written escape sequence is a broken window.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -44,7 +45,13 @@ struct Screen {
     to: Option<(usize, usize)>,
     open: bool,
     painted: Instant,
+    /// Lines laid out afresh for each width instead of wrapped, by their
+    /// index in `lines`: the opening screen, whose face a wrap breaks apart.
+    blocks: HashMap<usize, LayOut>,
 }
+
+/// Rows for a window so many columns wide, each fitting it.
+pub type LayOut = Box<dyn Fn(usize) -> Vec<String> + Send>;
 
 fn screen() -> &'static Mutex<Screen> {
     static SCREEN: OnceLock<Mutex<Screen>> = OnceLock::new();
@@ -60,6 +67,7 @@ fn screen() -> &'static Mutex<Screen> {
             to: None,
             open: false,
             painted: Instant::now(),
+            blocks: HashMap::new(),
         })
     })
 }
@@ -129,6 +137,24 @@ pub fn push(text: &str) {
     soon();
 }
 
+/// Add rows that are laid out again for each width the window takes, on
+/// lines of their own.
+pub fn block(lay_out: LayOut) {
+    {
+        let Ok(mut s) = screen().lock() else { return };
+        if s.lines.last().is_some_and(|open| !open.is_empty()) {
+            s.lines.push(String::new());
+        }
+        let at = s.lines.len().saturating_sub(1);
+        s.blocks.insert(at, lay_out);
+        s.lines.push(String::new());
+        s.scroll = 0;
+    }
+    // At once: it comes in one piece, often within a frame of the box, and
+    // a throttled paint would leave it unseen until something else paints.
+    now();
+}
+
 /// Hand over the input box and whatever sits under it.
 pub fn chrome(lines: Vec<String>) {
     if let Ok(mut s) = screen().lock() {
@@ -141,6 +167,7 @@ pub fn chrome(lines: Vec<String>) {
 pub fn wipe() {
     if let Ok(mut s) = screen().lock() {
         s.lines = vec![String::new()];
+        s.blocks.clear();
         s.rows.clear();
         s.wrapped = 0;
         s.scroll = 0;
@@ -290,7 +317,10 @@ impl Screen {
             self.wrapped = 0;
         }
         while self.wrapped + 1 < self.lines.len() {
-            let wrapped = render::fold(&self.lines[self.wrapped], width as usize);
+            let wrapped = match self.blocks.get(&self.wrapped) {
+                Some(lay_out) => lay_out(width as usize),
+                None => render::fold(&self.lines[self.wrapped], width as usize),
+            };
             self.rows.extend(wrapped);
             self.wrapped += 1;
         }
@@ -380,7 +410,28 @@ fn paint(s: &mut Screen) {
 
 #[cfg(test)]
 mod tests {
-    use super::base64;
+    use super::{HashMap, Instant, Screen, base64};
+
+    #[test]
+    fn a_block_is_laid_out_again_for_each_width_rather_than_wrapped() {
+        let mut s = Screen {
+            lines: vec!["ab".into(), String::new(), String::new()],
+            rows: Vec::new(),
+            wrapped: 0,
+            width: 0,
+            scroll: 0,
+            chrome: Vec::new(),
+            from: None,
+            to: None,
+            open: false,
+            painted: Instant::now(),
+            blocks: HashMap::new(),
+        };
+        s.blocks
+            .insert(1, Box::new(|width| vec!["x".repeat(width.min(6))]));
+        assert_eq!(s.view(80)[..2], ["ab", "xxxxxx"]);
+        assert_eq!(s.view(4)[..2], ["ab", "xxxx"]);
+    }
 
     #[test]
     fn base64_is_what_the_terminal_expects() {
