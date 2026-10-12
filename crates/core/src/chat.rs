@@ -4401,7 +4401,7 @@ fn stream(
                 // A shared Codex sign-in is renewed by Codex, never here.
                 if status == reqwest::StatusCode::UNAUTHORIZED
                     && crate::providers::wire::openai_responses::chatgpt(&connection.endpoint)
-                    && crate::providers::chatgpt::shares_codex()
+                    && crate::providers::chatgpt::uses_codex()
                 {
                     failure = crate::failure::Failure::new(
                         failure.kind,

@@ -68,6 +68,13 @@ pub fn shares_codex() -> bool {
     super::switches().get(CODEX_SWITCH) == Some(&true)
 }
 
+/// Whether requests go out on the Codex app's sign-in now: switched on, and
+/// Codex has one. Without it Letronna's own sign-in is used, so turning the
+/// switch on on a computer with no Codex does not sign anyone out.
+pub fn uses_codex() -> bool {
+    shares_codex() && codex_tokens().is_some()
+}
+
 /// Where the Codex app keeps its sign-in.
 fn codex_file() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("CODEX_HOME")
@@ -142,7 +149,7 @@ impl Provider for ChatGpt {
             .send()
             .and_then(|r| r.error_for_status())
             .map_err(|e| match e.status().map(|s| s.as_u16()) {
-                Some(401 | 403) if shares_codex() => RENEW_IN_CODEX.to_owned(),
+                Some(401 | 403) if uses_codex() => RENEW_IN_CODEX.to_owned(),
                 Some(401 | 403) => "ChatGPT refused the sign-in. Sign in again.".to_owned(),
                 _ => "Cannot load the model list from ChatGPT.".to_owned(),
             })?;
@@ -244,6 +251,39 @@ mod tests {
         assert_eq!(held.plan, "plus");
         assert!(held.refresh.is_empty() && held.expires_at == 0 && held.refreshed_at == 500);
         assert!(shared(&json!({}), 0).is_none());
+    }
+
+    #[test]
+    fn with_no_codex_sign_in_the_switch_leaves_letronnas_own_in_use() {
+        let _data = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("letronna-codex-{}", std::process::id()));
+        let codex = dir.join("codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::write(
+            dir.join(super::super::SWITCHES),
+            format!(r#"{{"{CODEX_SWITCH}": true}}"#),
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("AGENT_DATA_DIR", &dir);
+            std::env::set_var("CODEX_HOME", &codex);
+        }
+        let without = (shares_codex(), uses_codex());
+        std::fs::write(
+            codex.join("auth.json"),
+            json!({"tokens": {"access_token": "access-x", "id_token": "x.e30.sig"}}).to_string(),
+        )
+        .unwrap();
+        let with = uses_codex();
+        unsafe {
+            std::env::remove_var("AGENT_DATA_DIR");
+            std::env::remove_var("CODEX_HOME");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(without, (true, false));
+        assert!(with);
     }
 
     #[test]
