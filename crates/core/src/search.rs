@@ -82,6 +82,14 @@ const NO_LIST: &str = "its list of models could not be read";
 /// Why Letronna's own, found lately to have no search route, is not asked
 /// to search for now.
 const NO_ROUTE: &str = "it has no search route yet";
+/// How long a gateway's search is not asked once auto mode left a search
+/// over it to the judge, as one that costs nothing: the judge is waited on
+/// for at most 20 seconds, and the search runs once it answers, so it goes
+/// through no gateway found to sell search on its way -- a list or a lapse
+/// that ran out meanwhile, or a list read for the model picker.
+const JUDGED_TIME: Duration = Duration::from_secs(60);
+/// Why a gateway is not asked for a search auto mode let run as free.
+const JUDGED_FREE: &str = "it was not known to sell search when auto mode let a search run as free";
 /// The search model Letronna's own gateway is asked for: whichever it finds
 /// cheapest of those that have not been failing lately.
 const AUTO: &str = "auto";
@@ -260,9 +268,21 @@ pub(crate) fn switched_off(connection: Option<&Connection>) -> Option<&'static s
 /// the search itself would read it, so this may wait on the gateway, once
 /// in a while: it is for deciding a call, never for a card or a lookup. A
 /// gateway whose list named no search models, or could not be read, is sent
-/// no search, so a search over it costs nothing.
+/// no search, so a search over it costs nothing; nor is any for a while
+/// after, whatever is found of it meanwhile, as auto mode's judge then lets
+/// the search run as free.
 pub(crate) fn paid_through_gateway(connection: Option<&Connection>) -> bool {
-    !standing().chosen && selling(connection, gateways(), Instant::now()).is_some_and(|g| sells(&g))
+    if standing().chosen {
+        return false;
+    }
+    let gateways = gateways();
+    if selling(connection, gateways, Instant::now()).is_some_and(|gate| sells(&gate)) {
+        return true;
+    }
+    if let Some(gate) = session_gateway(connection) {
+        lock(gateways).judged_free(&gate.base, Instant::now());
+    }
+    false
 }
 
 /// Where searches over `connection` go while no service is chosen, as the
@@ -658,6 +678,17 @@ fn rests(gate: &Gate, gateways: &Mutex<Gateways>, now: Instant) -> bool {
     gate.failing.is_some() || lock(gateways).resting(&gate.base, now)
 }
 
+/// `gate` for a search that runs at `now`: not asked while a search auto
+/// mode let run as free, its search not known to be sold then, may still be
+/// on its way. The gate decides on what is known, so this is the search's
+/// alone.
+fn as_judged(mut gate: Gate, gateways: &Mutex<Gateways>, now: Instant) -> Gate {
+    if gate.failing.is_none() && lock(gateways).judged_lately(&gate.base, now) {
+        gate.failing = Some(JUDGED_FREE);
+    }
+    gate
+}
+
 /// The session's gateway when it may sell search, with its search models in
 /// the order they are tried; its list is read first when it never was, or
 /// not lately. One that cannot be asked for now is given as failing.
@@ -845,6 +876,8 @@ struct Gateways {
     forgotten: HashMap<String, Instant>,
     /// Held while its list is read, so one search reads it at a time.
     reading: HashMap<String, std::sync::Arc<Mutex<()>>>,
+    /// When auto mode last left a search over it to the judge as free.
+    judged: HashMap<String, Instant>,
 }
 
 impl Gateways {
@@ -897,6 +930,21 @@ impl Gateways {
     /// What is held while the list at `base` is read.
     fn reader(&mut self, base: &str) -> std::sync::Arc<Mutex<()>> {
         self.reading.entry(base.to_owned()).or_default().clone()
+    }
+
+    /// Auto mode left a search over `base` to the judge at `now` as free:
+    /// its search was not known to be sold.
+    fn judged_free(&mut self, base: &str, now: Instant) {
+        self.judged.insert(base.to_owned(), now);
+    }
+
+    /// Whether a search over `base` that auto mode let run as free may still
+    /// be on its way at `now`: it was left to the judge less than
+    /// `JUDGED_TIME` before.
+    fn judged_lately(&self, base: &str, now: Instant) -> bool {
+        self.judged
+            .get(base)
+            .is_some_and(|at| now.saturating_duration_since(*at) < JUDGED_TIME)
     }
 
     /// Whether the search at `base` could not answer less than `REST` before
@@ -994,6 +1042,7 @@ impl Tool for SearchWeb {
             true => selling(ctx.caller.connection.as_deref(), gateways(), now),
             false => None,
         };
+        let gate = gate.map(|gate| as_judged(gate, gateways(), now));
         let resting = (gate.as_ref()).is_some_and(|gate| rests(gate, gateways(), now));
         let routes = routes(&choice, &crate::store::load_keys(), keyless, gate, resting)?;
         let asked: Vec<Asked> = routes
@@ -1485,7 +1534,8 @@ fn fault(status: u16, hosted: bool, body: &[u8]) -> Fault {
 /// not is tried after the others for a while, and the gateway rests when none
 /// of them could. Only the models in `gate` are asked for, and `selling`
 /// gives no gateway whose list named none, so nothing is sent to one that
-/// `sells` no search: auto mode leaves a search over it to the judge.
+/// `sells` no search: auto mode leaves a search over it to the judge. Nor is
+/// anything sent for a while after, as `as_judged` gives it as failing.
 // Neither checked against nor noted in what stops web_fetch and search_web
 // after a request that could not connect: that is about reaching the web,
 // and the gateway is the session's own, reached as the model's requests
@@ -2117,6 +2167,13 @@ pub(crate) mod tests {
         let ago = UNSOLD_TIME + Duration::from_secs(1);
         let at = Instant::now().checked_sub(ago).unwrap();
         lock(gateways()).listed(base, Vec::new(), at);
+    }
+
+    /// Take the list at `base` as one that could not be read so long ago
+    /// that it is read again in `left`.
+    pub(crate) fn unread_for(base: &str, left: Duration) {
+        let at = Instant::now().checked_sub(UNSOLD_TIME - left).unwrap();
+        lock(gateways()).lapsed(base, NO_LIST, at);
     }
 
     /// `super::ask` for a session someone watches.
@@ -3618,6 +3675,44 @@ pub(crate) mod tests {
         assert_eq!(heard.lock().unwrap().len(), 1);
         assert!(selling(Some(&connection), &gateways, now + UNSOLD_TIME).is_none());
         assert_eq!(heard.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_gateway_is_not_asked_for_a_while_after_auto_mode_let_a_search_run_as_free() {
+        let hosted = crate::auth::hosted_base();
+        let connection = Connection {
+            endpoint: hosted.clone(),
+            key: "token".into(),
+            ..Connection::default()
+        };
+        let gateways = Mutex::new(Gateways::default());
+        let start = Instant::now();
+        // Letronna's own, found without a search route, is not asked until a
+        // moment after a search over it is left to the judge as free.
+        lock(&gateways).lapsed(&hosted, NO_ROUTE, start);
+        let decided = start + UNSOLD_TIME - Duration::from_secs(1);
+        let gate = selling(Some(&connection), &gateways, decided).unwrap();
+        assert_eq!(gate.failing, Some(NO_ROUTE));
+        lock(&gateways).judged_free(&hosted, decided);
+        // The judge answers once that has run out: it sells search again,
+        // but is not asked for the search the judge let run.
+        let ran = decided + Duration::from_secs(20);
+        let gate = selling(Some(&connection), &gateways, ran).unwrap();
+        assert!(sells(&gate));
+        assert_eq!(as_judged(gate, &gateways, ran).failing, Some(JUDGED_FREE));
+        // Another gateway's search goes on as it would.
+        assert_eq!(as_judged(pool(), &gateways, ran).failing, None);
+        // Nor is one that was failing given another reason.
+        let failing = Gate {
+            base: hosted.clone(),
+            failing: Some(NO_ROUTE),
+            ..pool()
+        };
+        assert_eq!(as_judged(failing, &gateways, ran).failing, Some(NO_ROUTE));
+        // Once any search the judge let run has run, it is asked again.
+        let later = decided + JUDGED_TIME;
+        let gate = selling(Some(&connection), &gateways, later).unwrap();
+        assert_eq!(as_judged(gate, &gateways, later).failing, None);
     }
 
     #[test]

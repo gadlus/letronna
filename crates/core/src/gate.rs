@@ -853,7 +853,8 @@ pub fn grants_for_session(name: &str, args: &Value) -> bool {
 /// by the search, sells search. Only asked with a judge, which waits on the
 /// network anyway, so a gateway's list not read lately is read here, as the
 /// search would read it; one that sells none leaves DuckDuckGo, which is
-/// free, to the judge as before.
+/// free, to the judge as before, and the search it lets run is sent to no
+/// gateway found to sell search on its way.
 fn spends(name: &str, ctx: &ToolContext) -> bool {
     match name {
         "make_image" | "edit_image" | "speak" | "transcribe" | "make_video" => true,
@@ -2921,6 +2922,101 @@ mod tests {
             let targets: Vec<&str> = heard.iter().map(|(target, _)| target.as_str()).collect();
             assert_eq!(targets, ["GET /v1/models"]);
         }
+    }
+
+    #[test]
+    fn a_search_the_judge_let_run_as_free_is_sent_to_no_gateway_found_selling_meanwhile() {
+        use crate::tools::Tool;
+        use std::time::Duration;
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // No search service chosen, and DuckDuckGo switched off, so the
+        // gateway is all a search may go through.
+        let dir = crate::store::tests::Scratch::new("gate-judged-search");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"endpoint": "", "model": "", "keyless_search": false}"#,
+        )
+        .unwrap();
+        let sold = serde_json::json!([{"id": "cheap/search", "type": "search"}]);
+        // A gateway whose list could not be read nearly five minutes ago, so
+        // it is not asked for a few seconds more; it lists search models now.
+        let (unread, unread_heard) = gateway_listing(200, sold.clone());
+        crate::search::tests::unread_for(&unread, Duration::from_secs(10));
+        // And one whose list named no search models a moment ago.
+        let (unsold, unsold_heard) = gateway_listing(200, sold.clone());
+        crate::search::heard_list(&unsold, &[]);
+        let none = Grants::new();
+        let unasked = |_: &ToolCall, _: &str| -> Verdict { panic!("the judge was asked") };
+        let args = serde_json::json!({ "query": "rust" });
+        let search = call("search_web", args.clone());
+        // Decided with nobody there, a judge that answers once `meanwhile`
+        // has changed what is known of the gateway, then run; and the next
+        // search decided.
+        let judged_then_run = |ctx: &ToolContext, meanwhile: &dyn Fn()| {
+            let gate = Gate {
+                ctx,
+                mode: Mode::Auto,
+                grants: &none,
+                human: false,
+                rules: &[],
+                broken: None,
+            };
+            let allow = |_: &ToolCall, _: &str| {
+                meanwhile();
+                Verdict::Allow
+            };
+            let decided = decide_with(&search, &gate, Some(&allow), false);
+            let found = crate::search::SearchWeb.run(&args, ctx);
+            let next = decide_with(&search, &gate, Some(&unasked), false);
+            (decided, found, next)
+        };
+        // What was known of the first runs out while the judge decides.
+        let ran_out = judged_then_run(&over(&unread, "key"), &|| {
+            crate::search::tests::unread_for(&unread, Duration::ZERO)
+        });
+        // With DuckDuckGo on, at a stand-in that cannot answer, a search over
+        // the second goes to the judge, and its list is read for the model
+        // picker meanwhile.
+        let duckduckgo = crate::mcp_auth::tests::serve(|_| (500, Vec::new(), String::new()));
+        let choice = serde_json::json!({"addresses": {"DuckDuckGo": format!("{duckduckgo}/html")}});
+        std::fs::write(dir.join("search.json"), choice.to_string()).unwrap();
+        std::fs::remove_file(dir.join("settings.json")).unwrap();
+        let read_again = judged_then_run(&over(&unsold, "key"), &|| {
+            crate::search::heard_list(&unsold, sold.as_array().unwrap())
+        });
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        let refused = Outcome::Refuse(
+            "Refused: `search_web` needs the user's yes, and nobody is here to give it. \
+             Carry on without it and say what was left undone."
+                .into(),
+        );
+        for (decided, found, next) in [ran_out, read_again] {
+            // The judge let each run as free, so each went through no
+            // gateway, though either sold search by then.
+            assert_eq!(decided, Outcome::Run);
+            let found = found.unwrap_err();
+            assert!(
+                found.ends_with(
+                    "127.0.0.1 could not search: it was not known to sell search when auto \
+                     mode let a search run as free."
+                ),
+                "{found}"
+            );
+            // The next is paid, as each is now known to sell search.
+            assert_eq!(next, refused);
+        }
+        // The first's list was read again for the search, and neither was
+        // sent one.
+        let targets = |heard: &Heard| -> Vec<String> {
+            (heard.lock().unwrap().iter())
+                .map(|(target, _)| target.clone())
+                .collect()
+        };
+        assert_eq!(targets(&unread_heard), ["GET /v1/models"]);
+        assert!(targets(&unsold_heard).is_empty());
     }
 
     #[test]
