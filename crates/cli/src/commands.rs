@@ -4537,10 +4537,40 @@ fn add_own_gateway(runner: &mut Runner) {
     if name.trim().is_empty() {
         return;
     }
+    // A name a gateway has already: change that one, or add this one under
+    // the next free name -- never one in place of the other unasked.
+    let name = match gateway::free_name(&name) {
+        None => name.trim().to_owned(),
+        Some(free) => {
+            let holder = gateway::holder(&name);
+            let spelled = holder.unwrap_or(name.trim());
+            // Numbered as the one there is spelled.
+            let free = gateway::free_name(spelled).unwrap_or(free);
+            let mut options = Vec::new();
+            let change = holder
+                .filter(|holder| gateway::is_own(holder))
+                .map(|holder| format!("Change {holder}'s address and key"));
+            options.extend(change.as_deref());
+            let instead = format!("Add this one as {free}");
+            options.extend([instead.as_str(), "Cancel"]);
+            let question = format!("There is a gateway called {spelled} already");
+            let Some(picked) = runner.bar.choose(&question, Vec::new(), &options) else {
+                return;
+            };
+            match (options[picked], holder) {
+                (option, Some(holder)) if change.as_deref() == Some(option) => {
+                    set_up_gateway(runner, holder);
+                    return;
+                }
+                (option, _) if option == instead => free,
+                _ => return,
+            }
+        }
+    };
     let address = runner
         .bar
         .ask(
-            &format!("{} base URL, like http://localhost:1234/v1", name.trim()),
+            &format!("{name} base URL, like http://localhost:1234/v1"),
             false,
         )
         .unwrap_or_default();
