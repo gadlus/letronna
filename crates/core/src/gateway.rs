@@ -106,13 +106,17 @@ pub fn own() -> Vec<Own> {
     list
 }
 
+/// gateways.json as it is, every line of it, those `own` leaves out too.
+fn read_kept(path: &Path) -> Vec<Kept> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
 fn read_own(path: &Path) -> Vec<Own> {
-    let Ok(bytes) = std::fs::read(path) else {
-        return Vec::new();
-    };
-    let kept: Vec<Kept> = serde_json::from_slice(&bytes).unwrap_or_default();
     let mut list: Vec<Own> = Vec::new();
-    for gateway in kept {
+    for gateway in read_kept(path) {
         let name = gateway.name.trim();
         // A file edited by hand can name one twice, or a built-in one.
         if name.is_empty() || taken(name, &list) {
@@ -126,16 +130,12 @@ fn read_own(path: &Path) -> Vec<Own> {
     list
 }
 
-fn write_own(list: &[Own]) -> Result<(), String> {
-    let kept: Vec<Kept> = list
-        .iter()
-        .map(|g| Kept {
-            name: g.name.to_owned(),
-            base: g.base.clone(),
-        })
-        .collect();
+/// Write `kept` to gateways.json. It is always the file as read with one
+/// change made, never `own`'s list: a line that list leaves out -- one a
+/// plugin's gateway of the same name hides while it is on -- stays.
+fn write_kept(kept: &[Kept]) -> Result<(), String> {
     let _ = std::fs::create_dir_all(crate::chat::data_dir());
-    let bytes = serde_json::to_vec_pretty(&kept).map_err(|e| e.to_string())?;
+    let bytes = serde_json::to_vec_pretty(kept).map_err(|e| e.to_string())?;
     std::fs::write(own_path(), bytes).map_err(|e| format!("Cannot save the gateways: {e}"))
 }
 
@@ -148,42 +148,53 @@ pub fn is_own(name: &str) -> bool {
     own_as(name).is_some()
 }
 
-/// Add a gateway of the user's own called `name` at `address`, or give the
-/// one already called that the new address. The name and address as they
-/// are kept, or why they cannot be.
-pub fn keep_own(name: &str, address: &str) -> Result<(&'static str, String), String> {
+/// Add a gateway of the user's own called `name` at `address`. A name any
+/// gateway has already, in any case, is refused, never taken to mean that
+/// one: adding is never a way to change another. The name and address as
+/// they are kept, or why they cannot be.
+pub fn add_own(name: &str, address: &str) -> Result<(&'static str, String), String> {
     let name = name.trim();
     let base = own_base(address)?;
-    let mut list = own();
-    let kept = match list.iter_mut().find(|g| g.name == name) {
-        Some(gateway) => {
-            gateway.base = base.clone();
-            gateway.name
-        }
-        None => {
-            check_name(name, &list)?;
-            let name = interned(name);
-            list.push(Own {
-                name,
-                base: base.clone(),
-            });
-            name
-        }
+    check_name(name, &own())?;
+    let mut kept = read_kept(&own_path());
+    // A line of the file `own` left out still holds its name.
+    if kept
+        .iter()
+        .any(|k| k.name.trim().eq_ignore_ascii_case(name))
+    {
+        return Err(already(name));
+    }
+    kept.push(Kept {
+        name: name.to_owned(),
+        base: base.clone(),
+    });
+    write_kept(&kept)?;
+    Ok((interned(name), base))
+}
+
+/// Give the gateway of the user's own called `name` a new address: the
+/// address as it is kept, or why it cannot be.
+pub fn change_own(name: &str, address: &str) -> Result<String, String> {
+    let base = own_base(address)?;
+    let mut kept = read_kept(&own_path());
+    let Some(gateway) = kept.iter_mut().find(|k| k.name.trim() == name) else {
+        return Err(format!("There is no gateway of your own called {name}."));
     };
-    write_own(&list)?;
-    Ok((kept, base))
+    gateway.base = base.clone();
+    write_kept(&kept)?;
+    Ok(base)
 }
 
 /// Stop offering the gateway of the user's own called `name`, and forget
 /// its key.
 pub fn remove_own(name: &str) -> Result<(), String> {
-    let mut list = own();
-    let Some(gone) = list.iter().position(|g| g.name == name) else {
+    if !is_own(name) {
         return Ok(());
-    };
+    }
     let slot = key_slot(name).to_owned();
-    list.remove(gone);
-    write_own(&list)?;
+    let mut kept = read_kept(&own_path());
+    kept.retain(|k| k.name.trim() != name);
+    write_kept(&kept)?;
     crate::store::save_key(&slot, None)
         .map(|_| ())
         .map_err(|e| format!("The gateway is gone, but its key could not be removed: {e}."))
@@ -212,11 +223,14 @@ fn check_name(name: &str, list: &[Own]) -> Result<(), String> {
         return Err("A gateway's name cannot hold a colon or a dot in the middle (·).".into());
     }
     if taken(name, list) {
-        return Err(format!(
-            "There is a gateway called {name} already: pick another name."
-        ));
+        return Err(already(name));
     }
     Ok(())
+}
+
+/// What adding a gateway under a name one has already is answered.
+fn already(name: &str) -> String {
+    format!("There is a gateway called {name} already: pick another name, or change that one.")
 }
 
 /// Whether a built-in gateway, one a plugin added, or one of `list` is
@@ -666,12 +680,12 @@ mod tests {
     fn gateways_of_your_own_are_listed_resolved_and_kept_apart() {
         in_scratch("own-gateways", |_| {
             assert!(own().is_empty());
-            let (studio, base) = keep_own(" LM Studio ", "localhost:1234/v1/").unwrap();
+            let (studio, base) = add_own(" LM Studio ", "localhost:1234/v1/").unwrap();
             assert_eq!(
                 (studio, base.as_str()),
                 ("LM Studio", "http://localhost:1234/v1")
             );
-            let (vllm, _) = keep_own("vLLM", "https://gpu.example/v1/chat/completions").unwrap();
+            let (vllm, _) = add_own("vLLM", "https://gpu.example/v1/chat/completions").unwrap();
             assert_eq!(base_url(vllm, ""), "https://gpu.example/v1");
             // Listed after the built-in ones, and offered.
             let names: Vec<&str> = gateways().iter().map(|g| g.name).collect();
@@ -699,7 +713,7 @@ mod tests {
                 ("Connected · 4 models".into(), true, true)
             );
             // A new address for one kept, then gone.
-            keep_own("vLLM", "https://gpu2.example/v1").unwrap();
+            change_own("vLLM", "https://gpu2.example/v1").unwrap();
             assert_eq!(base_url("vLLM", ""), "https://gpu2.example/v1");
             // Asked for its models, a server that is not there says so.
             assert!(models_of("LM Studio", &keys, "").is_err());
@@ -711,24 +725,35 @@ mod tests {
     #[test]
     fn a_gateway_of_your_own_needs_a_name_of_its_own_and_an_address_that_works() {
         in_scratch("own-gateway-names", |_| {
-            assert!(keep_own("", "http://localhost:1/v1").is_err());
+            assert!(add_own("", "http://localhost:1/v1").is_err());
             assert!(
-                keep_own("openai", "http://localhost:1/v1")
+                add_own("openai", "http://localhost:1/v1")
                     .unwrap_err()
                     .contains("already")
             );
-            assert!(keep_own("Custom", "http://localhost:1/v1").is_err());
-            assert!(keep_own("a:b", "http://localhost:1/v1").is_err());
-            assert!(keep_own(&"x".repeat(41), "http://localhost:1/v1").is_err());
-            assert!(keep_own("Box", "").is_err());
-            keep_own("Box", "http://localhost:1/v1").unwrap();
-            assert!(
-                keep_own("box", "http://localhost:2/v1")
-                    .unwrap_err()
-                    .contains("already")
+            assert!(add_own("Custom", "http://localhost:1/v1").is_err());
+            assert!(add_own("a:b", "http://localhost:1/v1").is_err());
+            assert!(add_own(&"x".repeat(41), "http://localhost:1/v1").is_err());
+            assert!(add_own("Box", "").is_err());
+            add_own("Box", "http://localhost:1/v1").unwrap();
+            // The same name again, in any case, is refused, and the one
+            // there keeps its address: adding never changes another.
+            for again in ["Box", "box", " BOX "] {
+                assert!(
+                    add_own(again, "http://localhost:2/v1")
+                        .unwrap_err()
+                        .contains("already")
+                );
+            }
+            assert_eq!(base_url("Box", ""), "http://localhost:1/v1");
+            // Changing is its own step, and only for one that is there.
+            assert_eq!(
+                change_own("Box", "localhost:3/v1"),
+                Ok("http://localhost:3/v1".into())
             );
+            assert!(change_own("Nobody", "http://localhost:3/v1").is_err());
             // Plain http goes only to this computer unless the user opts in.
-            assert!(keep_own("Far", "http://gpu.example/v1").is_err());
+            assert!(add_own("Far", "http://gpu.example/v1").is_err());
             assert_eq!(
                 own_base("gpu.example/v1"),
                 Ok("https://gpu.example/v1".into())
@@ -759,6 +784,17 @@ mod tests {
             .unwrap();
             let names: Vec<&str> = own().iter().map(|g| g.name).collect();
             assert_eq!(names, ["Box"]);
+            // What was left out stays in the file as written, as a line a
+            // plugin's gateway hides while it is on must come back after,
+            // and its name is still not free.
+            assert!(add_own("openai", "http://localhost:5/v1").is_err());
+            add_own("Two", "http://localhost:5/v1").unwrap();
+            remove_own("Box").unwrap();
+            let file = std::fs::read_to_string(dir.join("gateways.json")).unwrap();
+            assert!(file.contains("\"OpenAI\"") && file.contains("\"box\""));
+            assert!(!file.contains("\"Box\""));
+            let names: Vec<&str> = own().iter().map(|g| g.name).collect();
+            assert_eq!(names, ["box", "Two"]);
         });
     }
 
