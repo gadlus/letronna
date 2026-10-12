@@ -32,7 +32,7 @@ fn fixture(wire: Wire) -> (&'static str, &'static [&'static str]) {
 }
 
 /// A base URL on this machine that answers `GET /v1/models` once with `body`.
-fn serve(body: &'static str) -> String {
+pub(super) fn serve(body: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}/v1", listener.local_addr().unwrap());
     std::thread::spawn(move || {

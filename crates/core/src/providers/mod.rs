@@ -19,10 +19,12 @@ pub mod wire;
 mod anthropic;
 mod chatgpt;
 mod custom;
+mod gemini;
 mod letronna;
 mod ollama;
 mod openai;
 mod openrouter;
+mod xai;
 
 #[cfg(test)]
 mod _template;
@@ -124,6 +126,8 @@ pub static PROVIDERS: &[&dyn Provider] = &[
     &openai::OpenAi,
     &chatgpt::ChatGpt,
     &anthropic::Anthropic,
+    &gemini::Gemini,
+    &xai::Xai,
     &openrouter::OpenRouter,
     &ollama::Ollama,
     &custom::Custom,
