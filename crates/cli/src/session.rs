@@ -991,14 +991,32 @@ impl Runner {
     ) -> Option<Result<String, String>> {
         let (name, arguments) = (call.name.clone(), call.arguments.clone());
         let stop = ctx.cancel.clone();
+        let conversation = ctx.conversation;
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let _ = sender.send(tools::run(&name, &arguments, &ctx));
         });
 
-        self.bar
-            .wait_line_about(&format!("{}({summary})", call.name));
-        let outcome = match self.wait_on(&receiver) {
+        let about = format!("{}({summary})", call.name);
+        self.bar.wait_line_about(&about);
+        // A long call that says what it is doing now, as a cloud run does,
+        // has the waiting line follow it.
+        let mut shown = None;
+        let patience = self.bar.patience();
+        let waited = wait_on(&receiver, patience, || {
+            let now = letronna_core::tool_progress::of(conversation);
+            if now != shown {
+                match &now {
+                    Some(now) => self.bar.rename_wait(&format!("{about} · {now}")),
+                    None => self.bar.rename_wait(&about),
+                }
+                shown = now;
+            }
+            self.bar.pump();
+            self.answer_helpers(true);
+            self.bar.interrupted()
+        });
+        let outcome = match waited {
             Ok(outcome) => Some(outcome),
             Err(Unheard::Stopped) => {
                 stop.set();
