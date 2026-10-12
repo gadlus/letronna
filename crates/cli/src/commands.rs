@@ -1296,6 +1296,13 @@ pub fn sign_in(runner: &mut Runner) {
             } else {
                 format!("Signed in · {plan} · {} credit", account.credit())
             }));
+            // Signing in changes no model, so say where Letronna's are.
+            let settings = &runner.store.settings;
+            if settings.gateway != letronna_core::gateway::LETRONNA || settings.model.is_empty() {
+                render::line(&render::dim(
+                    "Letronna's models are in /model now, beside any others you set up.",
+                ));
+            }
         }
         // Given up on with escape: what was asked for, not a failure.
         Err(error) if error == "Sign-in cancelled." => render::line(&render::dim(&error)),
@@ -1319,6 +1326,13 @@ fn sign_out(runner: &mut Runner) {
             )));
             if let Some(note) = note {
                 render::line(&render::dim(&note));
+            }
+            // A model on Letronna needs the sign-in, so its next message
+            // would only be refused.
+            if runner.store.settings.gateway == letronna_core::gateway::LETRONNA {
+                render::line(&render::dim(
+                    "New messages were going to Letronna's models: /login again, or pick another with /model.",
+                ));
             }
         }
         (None, Ok(Some(note))) => {
@@ -4066,6 +4080,7 @@ pub fn pick_model(runner: &mut Runner, session: Option<usize>, filter: &str, in_
         None => (settings.gateway.as_str(), settings.model.as_str()),
     };
     let current = format!("{model} · {gateway}");
+    let (gateway, model) = (gateway.to_owned(), model.to_owned());
 
     if !in_setup {
         render::blank();
@@ -4093,20 +4108,35 @@ pub fn pick_model(runner: &mut Runner, session: Option<usize>, filter: &str, in_
     models.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
 
     // An exact name is an instruction, not a search.
-    if let Some(exact) = models.iter().find(|(_, m)| m.eq_ignore_ascii_case(filter)) {
-        let (gateway, model) = exact.clone();
-        set_model(runner, session, gateway, model);
-        return;
-    }
+    let exact = match exactly(&models, filter, &gateway) {
+        Ok((gateway, model)) => {
+            set_model(runner, session, gateway, model);
+            return;
+        }
+        Err(several) => several,
+    };
 
     let needle = filter.to_lowercase();
-    let matching: Vec<(String, String)> = models
+    let mut matching: Vec<(String, String)> = match exact.is_empty() {
+        false => exact,
+        true => models
+            .iter()
+            .filter(|(g, m)| {
+                needle.is_empty()
+                    || m.to_lowercase().contains(&needle)
+                    || g.to_lowercase().contains(&needle)
+            })
+            .cloned()
+            .collect(),
+    };
+    // The one in use leads, so keeping it is one key away.
+    if let Some(at) = matching
         .iter()
-        .filter(|(g, m)| {
-            needle.is_empty() || m.to_lowercase().contains(&needle) || g.to_lowercase() == needle
-        })
-        .cloned()
-        .collect();
+        .position(|(g, m)| *g == gateway && *m == model)
+    {
+        let current = matching.remove(at);
+        matching.insert(0, current);
+    }
     if matching.is_empty() {
         render::line(&render::dim(&format!(
             "Nothing matching \"{filter}\" among {} models.",
@@ -4128,7 +4158,13 @@ pub fn pick_model(runner: &mut Runner, session: Option<usize>, filter: &str, in_
             matching.len()
         )));
     }
-    let labels: Vec<String> = shown.iter().map(|(g, m)| format!("{m} · {g}")).collect();
+    let labels: Vec<String> = shown
+        .iter()
+        .map(|(g, m)| match *g == gateway && *m == model {
+            true => format!("{m} · {g} (in use)"),
+            false => format!("{m} · {g}"),
+        })
+        .collect();
     let mut options: Vec<&str> = labels.iter().map(String::as_str).collect();
     options.push("Keep the one I have");
 
@@ -4140,6 +4176,29 @@ pub fn pick_model(runner: &mut Runner, session: Option<usize>, filter: &str, in_
     match shown.get(picked) {
         Some((gateway, model)) => set_model(runner, session, gateway.clone(), model.clone()),
         None => render::line(&render::dim("Left as it was.")),
+    }
+}
+
+/// The model `filter` names exactly among `models`, as (gateway, model): on
+/// `gateway`, the one in use, when it has it, or on the one gateway that
+/// does. Else each gateway's that does, for a choice -- none when no name
+/// is exact -- as the same id on two gateways is two different routes.
+fn exactly(
+    models: &[(String, String)],
+    filter: &str,
+    gateway: &str,
+) -> Result<(String, String), Vec<(String, String)>> {
+    let exact: Vec<(String, String)> = models
+        .iter()
+        .filter(|(_, m)| m.eq_ignore_ascii_case(filter))
+        .cloned()
+        .collect();
+    if let Some(ours) = exact.iter().find(|(g, _)| g == gateway) {
+        return Ok(ours.clone());
+    }
+    match exact.as_slice() {
+        [only] => Ok(only.clone()),
+        _ => Err(exact),
     }
 }
 
@@ -4321,8 +4380,9 @@ pub fn search_services(runner: &mut Runner) {
 }
 
 /// Every provider and where it stands, with its plan and usage, then
-/// connect one, change it or disconnect it. Everything connected is used at
-/// once; `/model` picks among all their models.
+/// connect one, change it or disconnect it, or add a gateway of your own.
+/// Everything connected is used at once; `/model` picks among all their
+/// models.
 pub fn connect(runner: &mut Runner) {
     use letronna_core::gateway::{self, LETRONNA, gateways};
     use letronna_core::providers::{self, AuthKind, router};
@@ -4347,6 +4407,12 @@ pub fn connect(runner: &mut Runner) {
             status
         } else {
             format!("{status} · {usage}")
+        };
+        let own = gateway::is_own(g.name);
+        // Your own say where they are, as their names are yours.
+        let status = match own {
+            true => format!("{status} · {}", gateway::base_url(g.name, &custom)),
+            false => status,
         };
         rows.push(format!(
             "{} {:<11} {status}",
@@ -4373,6 +4439,11 @@ pub fn connect(runner: &mut Runner) {
             }
         }
     }
+    choices.push((
+        "Add a gateway of your own (LM Studio, vLLM, a proxy…)".to_owned(),
+        "",
+        "add",
+    ));
     let mut options: Vec<&str> = choices.iter().map(|c| c.0.as_str()).collect();
     options.push("Done");
     let Some(picked) = runner.bar.choose("Accounts", rows, &options) else {
@@ -4381,7 +4452,6 @@ pub fn connect(runner: &mut Runner) {
     let Some((_, name, what)) = choices.get(picked).cloned() else {
         return;
     };
-    let mut saved = Ok(keys);
     match what {
         "in" if name == LETRONNA => sign_in(runner),
         "out" if name == LETRONNA => sign_out(runner),
@@ -4396,60 +4466,166 @@ pub fn connect(runner: &mut Runner) {
             }
         }
         "remove" => {
-            if let Err(error) = store::save_key(gateway::key_slot(name), None) {
-                render::blank();
+            let removed = match gateway::is_own(name) {
+                true => gateway::remove_own(name),
+                false => store::save_key(gateway::key_slot(name), None)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+            };
+            render::blank();
+            if let Err(error) = removed {
                 render::line(&render::red(&format!("Could not remove {name}: {error}")));
                 return;
             }
-            if gateway::gateway(name).base.is_empty() {
+            if name == "Custom" {
                 runner.store.settings.custom_endpoint.clear();
             }
-            render::blank();
             render::line(&render::dim(&format!(
                 "{name} removed. Its models leave /model."
             )));
         }
-        _ => {
-            if gateway::gateway(name).base.is_empty() {
-                let url = runner
-                    .bar
-                    .ask(
-                        &format!("{name} base URL, like http://localhost:8000/v1"),
-                        false,
-                    )
-                    .unwrap_or_default();
-                if !url.trim().is_empty() {
-                    runner.store.settings.custom_endpoint =
-                        url.trim().trim_end_matches('/').to_owned();
-                }
-            }
-            let hint = if gateway::gateway(name).needs_key {
-                format!("{name} API key")
-            } else {
-                format!("{name} API key (optional)")
-            };
-            let key = runner.bar.ask(&hint, true).unwrap_or_default();
-            if !key.trim().is_empty() {
-                saved = store::save_key(gateway::key_slot(name), Some(key.trim()));
-            }
-            render::blank();
-            render::line(&render::dim(&format!(
-                "{name} saved. /model now lists its models too."
-            )));
-        }
-    }
-    if let Err(error) = saved {
-        render::line(&render::red(&format!("Could not save the key: {error}")));
+        "add" => add_own_gateway(runner),
+        _ => set_up_gateway(runner, name),
     }
     runner.persist();
+}
+
+/// Ask for a gateway's address where it takes one and its key, save them,
+/// and ask it for its models, so the user knows at once whether it works.
+fn set_up_gateway(runner: &mut Runner, name: &'static str) {
+    use letronna_core::gateway;
+    let own = gateway::is_own(name);
+    if own || name == "Custom" {
+        let now = gateway::base_url(name, &runner.store.settings.custom_endpoint);
+        let hint = match now.is_empty() {
+            true => format!("{name} base URL, like http://localhost:8000/v1"),
+            false => format!("{name} base URL (Enter keeps {now})"),
+        };
+        let given = runner.bar.ask(&hint, false).unwrap_or_default();
+        if !given.trim().is_empty() {
+            let kept = match own {
+                true => gateway::keep_own(name, &given).map(|(_, base)| base),
+                false => gateway::own_base(&given),
+            };
+            match kept {
+                Ok(base) if !own => runner.store.settings.custom_endpoint = base,
+                Ok(_) => {}
+                Err(error) => {
+                    render::blank();
+                    render::line(&render::red(&error));
+                    return;
+                }
+            }
+        } else if now.is_empty() {
+            return;
+        }
+    }
+    if !ask_key(runner, name) {
+        return;
+    }
+    runner.persist();
+    check_gateway(runner, name);
+}
+
+/// Add a gateway of the user's own: its name, address and key, then a check.
+fn add_own_gateway(runner: &mut Runner) {
+    use letronna_core::gateway;
+    let name = runner
+        .bar
+        .ask("A name for it, like LM Studio or Office vLLM", false)
+        .unwrap_or_default();
+    if name.trim().is_empty() {
+        return;
+    }
+    let address = runner
+        .bar
+        .ask(
+            &format!("{} base URL, like http://localhost:1234/v1", name.trim()),
+            false,
+        )
+        .unwrap_or_default();
+    if address.trim().is_empty() {
+        return;
+    }
+    let name = match gateway::keep_own(&name, &address) {
+        Ok((name, _)) => name,
+        Err(error) => {
+            render::blank();
+            render::line(&render::red(&error));
+            return;
+        }
+    };
+    if ask_key(runner, name) {
+        check_gateway(runner, name);
+    }
+}
+
+/// Ask for `name`'s key and save it: Enter keeps the one saved, or none
+/// for a gateway that needs none. Whether the key is as wanted.
+fn ask_key(runner: &mut Runner, name: &str) -> bool {
+    use letronna_core::gateway;
+    let saved = store::load_keys()
+        .get(gateway::key_slot(name))
+        .is_some_and(|key| !key.trim().is_empty());
+    let hint = match (gateway::gateway(name).needs_key, saved) {
+        (_, true) => format!("{name} API key (Enter keeps the one saved)"),
+        (true, false) => format!("{name} API key"),
+        (false, false) => format!("{name} API key, if it takes one (Enter for none)"),
+    };
+    let key = runner.bar.ask(&hint, true).unwrap_or_default();
+    if key.trim().is_empty() {
+        return true;
+    }
+    if let Err(error) = store::save_key(gateway::key_slot(name), Some(key.trim())) {
+        render::blank();
+        render::line(&render::red(&format!("Could not save the key: {error}")));
+        return false;
+    }
+    true
+}
+
+/// Ask `name` for its models and say how that went.
+fn check_gateway(runner: &mut Runner, name: &str) {
+    let keys = store::load_keys();
+    let custom = runner.store.settings.custom_endpoint.clone();
+    let asked = name.to_owned();
+    let models = runner
+        .bar
+        .busy(&format!("asking {name} for its models"), move || {
+            letronna_core::gateway::models_of(&asked, &keys, &custom)
+        });
+    render::blank();
+    match models {
+        Ok(models) if !models.is_empty() => render::line(&format!(
+            "{} {} {}",
+            render::green("●"),
+            render::bold(name),
+            render::dim(&format!(
+                "· {} model{} · /model lists them",
+                models.len(),
+                if models.len() == 1 { "" } else { "s" }
+            ))
+        )),
+        Ok(_) => render::line(&render::amber(&format!(
+            "{name} is saved, but it offered no models. Check its address and key with /connect."
+        ))),
+        Err(error) => {
+            render::line(&render::amber(&format!(
+                "{name} is saved, but it did not answer: {error}"
+            )));
+            render::line(&render::dim(
+                "Change its address or key with /connect, or remove it there.",
+            ));
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         Asked, Flow, Run, Stage, ToolSearch, agent_lines, agent_rows, asked, choice_label, command,
-        crew_switch, from_match, keep_days, last_prompt, name_label, run_rows, side_setting,
-        standing, tool_search_asked, typed_path, with_files,
+        crew_switch, exactly, from_match, keep_days, last_prompt, name_label, run_rows,
+        side_setting, standing, tool_search_asked, typed_path, with_files,
     };
     use crate::session::Runner;
     use letronna_core::agents::Seen;
@@ -4655,6 +4831,28 @@ mod tests {
         assert_eq!(keep_days("0"), Ok(Some(0)));
         assert!(keep_days("a month").is_err());
         assert!(keep_days("-3").is_err());
+    }
+
+    #[test]
+    fn a_model_named_exactly_stays_on_the_gateway_in_use() {
+        let on = |g: &str, m: &str| (g.to_owned(), m.to_owned());
+        let models = [
+            on("Custom", "gpt-x"),
+            on("Letronna", "gpt-x"),
+            on("Letronna", "only-here"),
+        ];
+        // Before, the first gateway by name took it, whichever was in use.
+        assert_eq!(
+            exactly(&models, "GPT-X", "Letronna"),
+            Ok(on("Letronna", "gpt-x"))
+        );
+        assert_eq!(
+            exactly(&models, "only-here", "Custom"),
+            Ok(on("Letronna", "only-here"))
+        );
+        // On two gateways, neither in use: a choice of the two.
+        assert_eq!(exactly(&models, "gpt-x", "OpenAI").unwrap_err().len(), 2);
+        assert_eq!(exactly(&models, "gpt", "Letronna"), Err(Vec::new()));
     }
 
     #[test]
