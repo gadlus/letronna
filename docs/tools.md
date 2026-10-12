@@ -16,7 +16,7 @@ The **Web** toggle uses the gateway's own search, where there is one. A search s
 | SearXNG | Your own server, with `json` in its `formats` |
 | DuckDuckGo | Nothing. Unofficial and may be rate-limited. |
 
-With none chosen, `search_web` searches through the gateway where it sells search, such as Letronna's (paid from your credit) or a gateway whose model list has search models, and falls back to DuckDuckGo in the same search when the gateway cannot answer. A chosen service is the only one used.
+With none chosen, `search_web` searches through the gateway where it sells search, such as Letronna's (paid from your credit) or a gateway whose model list has search models, and falls back to DuckDuckGo in the same search when the gateway cannot answer. The approval card says who pays. A chosen service is the only one used: choose DuckDuckGo alone (Use alone in Settings › Search, or `/search services`) to keep every search off the gateway's paid search.
 
 ## Browser
 

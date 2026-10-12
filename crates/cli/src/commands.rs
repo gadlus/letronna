@@ -4100,16 +4100,16 @@ fn keyless_search(runner: &mut Runner, on: bool) {
     runner.persist();
     render::blank();
     render::line(&render::dim(if on {
-        "Search with DuckDuckGo when no search key is set: on. It needs no key, each search is asked first, and a service with a key (/search services) gives steadier results."
+        "Search with DuckDuckGo when no search key is set: on. With no service chosen, it is asked when the gateway's search cannot answer, or first where the gateway sells none. It needs no key, each search is asked first, and a service with a key (/search services) gives steadier results."
     } else {
         "Search with DuckDuckGo when no search key is set: off. Without a search service of your own (/search services), the model searches only through the gateway, where it sells search."
     }));
 }
 
 /// Every search service and where it stands, then set one up to search with,
-/// remove one, or switch DuckDuckGo on or off. The one set up last is used,
-/// and while none is, the gateway's search where it sells one, with
-/// DuckDuckGo behind it.
+/// remove one, use DuckDuckGo alone, or switch it on or off. The one set up
+/// last is used, and while none is, the gateway's search where it sells one,
+/// with DuckDuckGo behind it.
 pub fn search_services(runner: &mut Runner) {
     use letronna_core::search::{self, SERVICES};
     let keys = store::load_keys();
@@ -4129,15 +4129,24 @@ pub fn search_services(runner: &mut Runner) {
             s.name
         ));
         if s.keyless {
-            // Used while no other is chosen, so going back to it is choosing
-            // none; otherwise its setting is switched.
-            let other = !choice.service.is_empty() && choice.service != s.name;
-            let what = match (other, good) {
-                (true, _) => ("Use", "use"),
-                (false, true) => ("Switch off", "off"),
-                (false, false) => ("Switch on", "on"),
-            };
-            choices.push((format!("{} {}", what.0, s.name), s.name, what.1));
+            // Chosen by name, it is the only one asked, so searches never go
+            // through the gateway's paid search; with none chosen it is asked
+            // after the gateway's, and its setting says whether at all.
+            let alone = choice.service == s.name;
+            if !alone {
+                choices.push((format!("Use {} alone", s.name), s.name, "use"));
+            }
+            if alone || choice.service.is_empty() {
+                let what = match good {
+                    true => ("Switch off", "off"),
+                    false => ("Switch on", "on"),
+                };
+                choices.push((format!("{} {}", what.0, s.name), s.name, what.1));
+            }
+            if !choice.service.is_empty() {
+                let none = "Use the gateway's search, then DuckDuckGo".to_owned();
+                choices.push((none, s.name, "none"));
+            }
             continue;
         }
         let verb = if set_up { "Change" } else { "Set up" };
@@ -4158,15 +4167,32 @@ pub fn search_services(runner: &mut Runner) {
         keyless_search(runner, what == "on");
         return;
     }
-    if what == "use" {
+    if what == "use" || what == "none" {
         // The other services' keys and addresses are kept.
-        choice.service.clear();
+        choice.service = match what {
+            "use" => name.to_owned(),
+            _ => String::new(),
+        };
         if let Err(error) = search::choose(&choice) {
             render::blank();
             render::line(&render::red(&error));
             return;
         }
-        keyless_search(runner, true);
+        if what == "none" {
+            render::blank();
+            render::line(&render::dim(if runner.store.settings.keyless_search {
+                "No search service is chosen: the model searches through the gateway where it sells search, paid by the search, and with DuckDuckGo when that cannot answer. Each search is asked first."
+            } else {
+                "No search service is chosen: the model searches only through the gateway, where it sells search, paid by the search, as DuckDuckGo is switched off (/search keyless)."
+            }));
+            return;
+        }
+        runner.store.settings.keyless_search = true;
+        runner.persist();
+        render::blank();
+        render::line(&render::dim(
+            "The model now searches with DuckDuckGo alone, never through the gateway's paid search. It needs no key, each search is asked first, and a service with a key gives steadier results.",
+        ));
         return;
     }
     let Some(service) = search::service(name) else {

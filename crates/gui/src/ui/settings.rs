@@ -424,6 +424,25 @@ impl Chat {
         cx.notify();
     }
 
+    /// Search with the keyless service alone, switched on, so no search goes
+    /// through the gateway's paid search; or, `alone` false, choose none, so
+    /// the gateway's search goes first where it sells one.
+    pub(crate) fn use_search_alone(&mut self, name: &str, alone: bool, cx: &mut Context<Self>) {
+        let mut choice = letronna_core::search::choice();
+        choice.service = match alone {
+            true => name.to_owned(),
+            false => String::new(),
+        };
+        if let Err(error) = letronna_core::search::choose(&choice) {
+            self.error = Some(error);
+        }
+        if alone {
+            self.store.settings.keyless_search = true;
+            self.save();
+        }
+        cx.notify();
+    }
+
     /// Forget a search service's key and address; if it was the one in use,
     /// the agent no longer searches.
     pub(crate) fn remove_search(&mut self, name: &str, cx: &mut Context<Self>) {
@@ -2100,6 +2119,8 @@ pub(crate) struct SearchRow {
     /// Needs nothing set up, so it has no key or address to edit; its
     /// switch is below the list.
     keyless: bool,
+    /// Chosen by name, so it is the only one asked.
+    chosen: bool,
 }
 
 impl Chat {
@@ -2119,6 +2140,7 @@ impl Chat {
                     set_up,
                     self_hosted: s.self_hosted(),
                     keyless: s.keyless,
+                    chosen: choice.service == s.name,
                 }
             })
             .collect()
@@ -2161,6 +2183,18 @@ fn search_page(
                 .label(if editing { "Close" } else { action })
                 .on_click(move |_, window, cx| {
                     chat.update(cx, |this, cx| this.select_search(name, window, cx))
+                })
+        };
+        // DuckDuckGo has nothing to edit; it can be used alone, which keeps
+        // every search off the gateway's paid search, or go back behind it.
+        let alone = {
+            let (chat, chosen) = (chat.clone(), row.chosen);
+            Button::new(("search-alone", i))
+                .small()
+                .plain(cx)
+                .label(if chosen { "With gateway" } else { "Use alone" })
+                .on_click(move |_, _, cx| {
+                    chat.update(cx, |this, cx| this.use_search_alone(name, !chosen, cx))
                 })
         };
         let head = h_flex()
@@ -2209,7 +2243,8 @@ fn search_page(
                     .w(px(96.))
                     .flex()
                     .justify_end()
-                    .when(!row.keyless, |d| d.child(button)),
+                    .when(!row.keyless, |d| d.child(button))
+                    .when(row.keyless, |d| d.child(alone)),
             );
         let mut item = v_flex()
             .when(i > 0, |d| d.border_t_1().border_color(cx.theme().border))
@@ -2288,7 +2323,7 @@ fn search_page(
         .gap_5()
         .child(heading(
             "Search",
-            "A search service of your own, which the agent searches the web with, asking you before each search. The one saved last is used, at its official address unless you give another. With none saved, it searches through the gateway where the gateway sells search, and with DuckDuckGo when that cannot answer. Keys stay in keys.json on this machine; the Web toggle is the gateway's own search inside a reply, where it has one.",
+            "A search service of your own, which the agent searches the web with, asking you before each search. The one saved last is used, at its official address unless you give another. With none saved, it searches through the gateway where the gateway sells search, paid by the search, and with DuckDuckGo when that cannot answer; DuckDuckGo's Use alone keeps every search off the gateway. Keys stay in keys.json on this machine; the Web toggle is the gateway's own search inside a reply, where it has one.",
             cx,
         ))
         .child(list)
