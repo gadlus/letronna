@@ -1,5 +1,6 @@
 use crate::prelude::*;
 use gpui_component::popover::Popover;
+use std::path::PathBuf;
 
 /// The user guide on the website, opened from the account menu.
 const GUIDE: &str = "https://letronna.ai/docs";
@@ -270,9 +271,10 @@ impl Chat {
     }
 
     /// The session's project folder, with its branch and how many files
-    /// changed when it is in git. Click to see the changes, or to pick a
-    /// folder when there is none.
-    fn workspace_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// changed when it is in git. Click for a menu: open another folder,
+    /// one of the recent ones, or the changes; or to pick a folder when
+    /// there is none.
+    fn workspace_chip(&self, cx: &mut Context<Self>) -> AnyElement {
         let workspace = &self.store.conversations[self.store.active].workspace;
         let Some(folder) = workspace else {
             return Button::new("workspace")
@@ -287,7 +289,8 @@ impl Chat {
                         .child(Icon::new(AppIcon::Folder).size_3())
                         .child("No project"),
                 )
-                .on_click(cx.listener(|this, _, window, cx| this.attach_workspace(window, cx)));
+                .on_click(cx.listener(|this, _, window, cx| this.attach_workspace(window, cx)))
+                .into_any_element();
         };
         let name = folder
             .file_name()
@@ -298,15 +301,20 @@ impl Chat {
             Some(status) => (AppIcon::Branch, format!("{name} · {}", status.describe())),
             None => (AppIcon::Folder, name),
         };
+        // Enough to get back to this week's projects without a long menu.
+        const RECENT: usize = 5;
+        let recent: Vec<PathBuf> =
+            letronna_core::palette::recent_folders(&self.store.conversations)
+                .into_iter()
+                .filter(|recent| recent != folder)
+                .take(RECENT)
+                .collect();
+        let chat = cx.entity();
         Button::new("workspace")
             .plain(cx)
             .xsmall()
             .text_color(cx.theme().muted_foreground)
-            .tooltip_with_action(
-                format!("{}: see the changes", folder.display()),
-                &crate::ui::changes::ChangesTab,
-                Some("Chat"),
-            )
+            .tooltip(folder.display().to_string())
             .child(
                 h_flex()
                     .gap_1()
@@ -314,7 +322,42 @@ impl Chat {
                     .child(Icon::new(icon).size_3())
                     .child(label),
             )
-            .on_click(cx.listener(|this, _, window, cx| this.show_changes(window, cx)))
+            .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, _, _| {
+                let open = chat.clone();
+                let mut menu = menu.min_w(px(220.)).item(
+                    PopupMenuItem::new("Open folder…")
+                        .icon(Icon::new(AppIcon::Folder))
+                        .on_click(move |_, window, cx| {
+                            open.update(cx, |this, cx| this.attach_workspace(window, cx))
+                        }),
+                );
+                if !recent.is_empty() {
+                    menu = menu.separator().label("Recent");
+                    for folder in &recent {
+                        let name = folder
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| folder.display().to_string());
+                        let (chat, folder) = (chat.clone(), folder.clone());
+                        menu =
+                            menu.item(PopupMenuItem::new(name).on_click(move |_, window, cx| {
+                                chat.update(cx, |this, cx| {
+                                    this.open_folder(folder.clone(), window, cx);
+                                    cx.notify();
+                                })
+                            }));
+                    }
+                }
+                let changes = chat.clone();
+                menu.separator().item(
+                    PopupMenuItem::new("See changes")
+                        .icon(Icon::new(AppIcon::Branch))
+                        .on_click(move |_, window, cx| {
+                            changes.update(cx, |this, cx| this.show_changes(window, cx))
+                        }),
+                )
+            })
+            .into_any_element()
     }
 
     /// How many things are working, away from the chat, whose strip over the

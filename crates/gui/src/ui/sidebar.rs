@@ -621,7 +621,6 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{Nav, drawn_order, move_in, nav_rows};
-    use crate::app::Page;
     use letronna_core::store::Conversation;
     use std::path::PathBuf;
 

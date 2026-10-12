@@ -164,6 +164,7 @@ impl Chat {
         } else {
             message.model.clone()
         };
+        let provider = self.provider_of(&label);
         let leading = px(24.);
         let cx_muted = cx.theme().muted_foreground;
         let md = self.text_id("md", index);
@@ -412,7 +413,14 @@ impl Chat {
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(cx.theme().link)
                                 .child(label),
-                        ),
+                        )
+                        .when(!provider.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(provider),
+                            )
+                        }),
                 )
             })
             // Thinking is shown when it was asked for, the same switch the
@@ -800,12 +808,19 @@ impl Chat {
             // reads as the same turn going on.
             .when(labeled, |this| {
                 this.child(
-                    div()
+                    h_flex()
+                        .gap_2()
                         .text_xs()
                         .font_family(HEADING_FONT)
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(cx.theme().link)
-                        .child(message.model.clone()),
+                        .child(message.model.clone())
+                        .child(
+                            div()
+                                .font_weight(FontWeight::NORMAL)
+                                .text_color(cx.theme().muted_foreground)
+                                .child(self.provider_of(&message.model)),
+                        ),
                 )
             })
             .child(
@@ -1555,7 +1570,7 @@ impl Chat {
             Some(call) => {
                 let summary = letronna_core::tools::summary(&call.name, &call.arguments);
                 let (name, summary) = crate::ui::busy::Shimmer::label(call.name.clone(), summary);
-                vec![
+                let mut line = vec![
                     crate::ui::busy::Spinner::new()
                         .xsmall()
                         .color(theme.primary)
@@ -1567,7 +1582,21 @@ impl Chat {
                         .truncate()
                         .child(summary)
                         .into_any_element(),
-                ]
+                ];
+                // What a long call says it is doing now, such as a cloud
+                // run's round and tools.
+                if let Some(now) = letronna_core::tool_progress::of(conversation.id) {
+                    line.push(div().flex_none().child("·").into_any_element());
+                    line.push(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(muted)
+                            .child(now)
+                            .into_any_element(),
+                    );
+                }
+                line
             }
             None => {
                 let told = letronna_core::tool_runs::tell(&conversation.messages, run, tools);
@@ -1839,7 +1868,7 @@ impl Chat {
                         ),
                 )
             })
-            .children(self.recent_places(window, cx))
+            .children(self.continue_last(window, cx))
             // A side question asked before anything else still needs somewhere to show.
             .children(
                 self.aside_row(self.store.conversations[self.store.active].id, window, cx)
@@ -1854,165 +1883,57 @@ impl Chat {
         )
     }
 
-    /// Sessions to go back to and folders worked in lately, side by side
-    /// under a new session's greeting, or nothing when there are none. Each
-    /// row is a tab stop that Enter opens, as a click does.
-    fn recent_places(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
-        // Rows in each list: enough to go back to what was open lately, few
-        // enough that the wordmark stays the one thing the page is about.
-        const RECENT: usize = 3;
-        let here = &self.store.conversations[self.store.active];
-        let now = backend::now();
-        let mut by_age: Vec<&Conversation> = (self.store.conversations.iter())
-            .filter(|c| c.id != here.id && c.length() > 0)
-            .collect();
-        by_age.sort_by_key(|c| std::cmp::Reverse(c.updated));
-        let sessions: Vec<Stateful<Div>> = by_age
-            .into_iter()
-            .take(RECENT)
-            .map(|c| {
-                let id = c.id;
-                self.recent_row(
-                    ("recent-session", id as usize),
-                    AppIcon::MessageSquare,
-                    (c.shown_title().into(), age_label(c.updated, now).into()),
-                    false,
-                    window,
-                    cx,
-                    move |this, window, cx| this.go_to_session(id, window, cx),
-                )
-            })
-            .collect();
-        let folders: Vec<Stateful<Div>> =
-            letronna_core::palette::recent_folders(&self.store.conversations)
-                .into_iter()
-                .filter(|folder| here.workspace.as_ref() != Some(folder))
-                .take(RECENT)
-                .enumerate()
-                .map(|(n, folder)| {
-                    let name = folder
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| folder.display().to_string());
-                    // Where it is, its name being the label already.
-                    let path = (folder.parent())
-                        .map(|parent| parent.display().to_string())
-                        .unwrap_or_default();
-                    self.recent_row(
-                        ("recent-folder", n),
-                        AppIcon::Folder,
-                        (name.into(), path.into()),
-                        true,
-                        window,
-                        cx,
-                        move |this, window, cx| {
-                            this.open_folder(folder.clone(), window, cx);
-                            cx.notify();
-                        },
-                    )
-                })
-                .collect();
-        if sessions.is_empty() && folders.is_empty() {
-            return None;
-        }
-        let column = |title: &'static str, rows: Vec<Stateful<Div>>| {
-            v_flex()
-                .w(px(300.))
-                .gap_0p5()
-                .child(
-                    div()
-                        .px_2()
-                        .pb_1()
-                        .text_xs()
-                        .font_family(HEADING_FONT)
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(cx.theme().muted_foreground.opacity(0.7))
-                        .child(title),
-                )
-                .children(rows)
-        };
-        // Quiet, and well below the wordmark: there to go back to, not to
-        // compete with it.
-        Some(
-            h_flex()
-                .mt_12()
-                .max_w_full()
-                .px_6()
-                .flex_wrap()
-                .justify_center()
-                .items_start()
-                .gap_x_8()
-                .gap_y_4()
-                .when(!sessions.is_empty(), |this| {
-                    this.child(column("Recent sessions", sessions))
-                })
-                .when(!folders.is_empty(), |this| {
-                    this.child(column("Recent folders", folders))
-                }),
-        )
-    }
-
-    /// One of the empty state's rows: `text` is its label and a muted
-    /// detail, which with `wide_detail` takes the room left, as a folder's
-    /// path does, and otherwise sits at the end, as a session's age does.
-    #[allow(clippy::too_many_arguments)]
-    fn recent_row(
-        &self,
-        id: (&'static str, usize),
-        icon: AppIcon,
-        text: (SharedString, SharedString),
-        wide_detail: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        open: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
+    /// One quiet line back to the last session, under a new session's
+    /// greeting, or nothing when there is none. The sidebar keeps the rest,
+    /// and the folder chip the folders. A tab stop that Enter opens.
+    fn continue_last(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let here = self.store.conversations[self.store.active].id;
+        let last = (self.store.conversations.iter())
+            .filter(|c| c.id != here && c.length() > 0)
+            .max_by_key(|c| c.updated)?;
+        let id = last.id;
         let focus = window
-            .use_keyed_state(
-                (SharedString::from(format!("{}-focus", id.0)), id.1),
-                cx,
-                |_, cx| cx.focus_handle().tab_stop(true),
-            )
+            .use_keyed_state("continue-last-focus", cx, |_, cx| {
+                cx.focus_handle().tab_stop(true)
+            })
             .read(cx)
             .clone();
         let theme = cx.theme();
-        let (label, detail) = text;
-        h_flex()
-            .id(id)
-            .track_focus(&focus)
-            .h(px(28.))
-            .px_2()
-            .gap_2()
-            .items_center()
-            .rounded(theme.radius)
-            // Always there, so the ring the keys bring moves nothing.
-            .border_1()
-            .border_color(theme.transparent)
-            .cursor_pointer()
-            .text_xs()
-            .text_color(theme.muted_foreground)
-            .focus(|s| s.border_color(theme.ring))
-            .active(|s| s.bg(theme.secondary.opacity(0.5)))
-            .child(
-                Icon::new(icon)
-                    .size_4()
-                    .flex_shrink_0()
-                    .text_color(theme.muted_foreground),
-            )
-            .child(
-                div()
-                    .when(!wide_detail, |this| this.flex_1())
-                    .min_w_0()
-                    .truncate()
-                    .child(label),
-            )
-            .child(
-                div()
-                    .when(wide_detail, |this| this.flex_1().min_w_0().truncate())
-                    .flex_shrink_0()
-                    .text_color(theme.muted_foreground.opacity(0.6))
-                    .child(detail),
-            )
-            .on_click(cx.listener(move |this, _, window, cx| open(this, window, cx)))
+        Some(
+            h_flex()
+                .id("continue-last")
+                .track_focus(&focus)
+                .mt_8()
+                .max_w(px(420.))
+                .px_2()
+                .py_1()
+                .gap_1p5()
+                .items_center()
+                .rounded(theme.radius)
+                // Always there, so the ring the keys bring moves nothing.
+                .border_1()
+                .border_color(theme.transparent)
+                .cursor_pointer()
+                .text_xs()
+                .text_color(theme.muted_foreground.opacity(0.7))
+                .hover(|s| s.text_color(theme.muted_foreground))
+                .focus(|s| s.border_color(theme.ring))
+                .child("Continue")
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(theme.muted_foreground)
+                        .child(format!("\u{201c}{}\u{201d}", last.shown_title())),
+                )
+                .child(format!(
+                    "\u{b7} {}",
+                    age_label(last.updated, backend::now())
+                ))
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.go_to_session(id, window, cx)),
+                ),
+        )
     }
 
     pub(crate) fn page_view(&self, page: Page, cx: &mut Context<Self>) -> impl IntoElement {

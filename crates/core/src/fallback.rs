@@ -42,8 +42,8 @@ impl Fallback {
     pub fn parse(text: &str) -> Result<Self, String> {
         let text = text.trim();
         let named = text.split_once(':').and_then(|(gateway, model)| {
-            let gateway = crate::gateway::GATEWAYS
-                .iter()
+            let gateway = crate::gateway::gateways()
+                .into_iter()
                 .find(|g| g.name.eq_ignore_ascii_case(gateway.trim()))?;
             Some((gateway.name.to_owned(), model.trim().to_owned()))
         });
@@ -101,6 +101,9 @@ impl fmt::Display for Fallback {
 pub struct Switch {
     /// The model asked instead, as its reply is labelled.
     pub model: String,
+    /// What the notice calls it: the model, or the account it is asked on
+    /// when that is all that changed.
+    pub label: String,
     /// Where it is served, so its reply is priced there.
     pub endpoint: String,
     /// The model given up on and why, when one failed on this request; `None`
@@ -111,7 +114,7 @@ pub struct Switch {
 
 impl fmt::Display for Switch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Switched to {}", self.model)?;
+        write!(f, "Switched to {}", self.label)?;
         let Some((from, kind)) = &self.after else {
             return Ok(());
         };
@@ -133,7 +136,8 @@ impl fmt::Display for Switch {
 
 /// Whether a failure that outlasted its retries is one another model could
 /// mend: an overload or server error, an account out of credit or quota, or
-/// a model the gateway does not serve.
+/// a model the gateway does not serve, or a rate limit longer than the
+/// retries wait out, which another account does not share.
 pub fn mends(failure: &Failure) -> bool {
     // Once the reply is on screen, another model's would follow it rather
     // than stand in its place.
@@ -143,6 +147,7 @@ pub fn mends(failure: &Failure) -> bool {
             FailureKind::Overloaded
                 | FailureKind::Server
                 | FailureKind::Quota
+                | FailureKind::RateLimit
                 | FailureKind::NotFound
         )
 }
@@ -157,7 +162,6 @@ fn own(failure: &Failure) -> bool {
             FailureKind::Auth
                 | FailureKind::Settings
                 | FailureKind::Network
-                | FailureKind::RateLimit
                 | FailureKind::ContextTooLong
         )
 }
@@ -182,11 +186,13 @@ pub fn chain(
 
 /// Send with the first of `chain` not cooling down, going on to the next
 /// after a failure `mends` covers, or one of a fallback's `own`, which cools
-/// that one down; a chosen model that was cooling is asked last. `switched`
-/// hears of each switch before the model is asked; an error from it ends the
-/// call, as nobody is listening any more.
+/// that one down; a chosen model that was cooling is asked last. One that is
+/// not `usable` is passed over quietly. `switched` hears of each switch
+/// before the model is asked; an error from it ends the call, as nobody is
+/// listening any more.
 pub fn run(
     chain: &[Connection],
+    mut usable: impl FnMut(&Connection) -> bool,
     mut send: impl FnMut(&Connection) -> Result<(), Failure>,
     mut switched: impl FnMut(Switch) -> Result<(), Failure>,
 ) -> Result<(), Failure> {
@@ -199,16 +205,30 @@ pub fn run(
     // failed too, or are all cooling: it may be back by now, and without it
     // the task would end on a fallback's failure while it was never asked.
     let order = (ready.into_iter()).chain(resting.into_iter().filter(|c| same(c, primary)));
-    let mut after = None;
+    let mut after: Option<(&Connection, FailureKind)> = None;
     let mut last = None;
     for connection in order {
+        if !same(connection, primary) && !usable(connection) {
+            continue;
+        }
         // Going back to the chosen model after a fallback failed is a
         // switch too, or its reply would carry the fallback's name.
         if after.is_some() || !same(connection, primary) {
+            // The same model on another account is told by the account.
+            let from = after.map_or(primary, |(from, _)| from);
+            let by_account = from.model.trim() == connection.model.trim();
+            let label = |c: &Connection| {
+                let model = c.model.trim().to_owned();
+                match crate::gateway::named(&c.endpoint) {
+                    Some(name) if by_account => name.to_owned(),
+                    _ => model,
+                }
+            };
             switched(Switch {
                 model: connection.model.trim().to_owned(),
+                label: label(connection),
                 endpoint: connection.endpoint.clone(),
-                after: after.take(),
+                after: after.take().map(|(from, kind)| (label(from), kind)),
             })?;
         }
         let failure = match send(connection) {
@@ -220,14 +240,14 @@ pub fn run(
             Err(failure) => return Err(failure),
         };
         cool(connection, Instant::now() + COOLDOWN);
-        after = Some((connection.model.trim().to_owned(), failure.kind));
+        after = Some((connection, failure.kind));
         last = Some(failure);
     }
     Err(last.unwrap_or_else(|| Failure::new(FailureKind::Unknown, "No model answered.")))
 }
 
 /// Whether two connections ask the same model at the same place.
-fn same(a: &Connection, b: &Connection) -> bool {
+pub(crate) fn same(a: &Connection, b: &Connection) -> bool {
     key(a) == key(b)
 }
 
@@ -279,6 +299,7 @@ mod tests {
         let mut switches = Vec::new();
         let result = run(
             chain,
+            |_| true,
             |c| {
                 asked.borrow_mut().push(c.model.clone());
                 answer(&c.model)

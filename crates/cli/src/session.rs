@@ -133,6 +133,7 @@ impl Runner {
             plain_terminal: self.plain_terminal,
             // Set by `-p` alone, once it knows whether its tools were named.
             lean_tools: false,
+            rare_on_demand: true,
         }
     }
 
@@ -708,7 +709,12 @@ impl Runner {
         // A reply that only asked for a tool has nothing to caption; the tool
         // line below speaks for it.
         if reply.tokens > 0 && !reply.content.is_empty() {
-            render::line(&render::dim(&usage(&reply)));
+            let gateway = self.store.model(session).0;
+            render::line(&render::dim(&format!(
+                "{} · {}",
+                answered_by(&reply.model, gateway),
+                usage(&reply)
+            )));
         }
         Ok(Some(reply))
     }
@@ -985,14 +991,32 @@ impl Runner {
     ) -> Option<Result<String, String>> {
         let (name, arguments) = (call.name.clone(), call.arguments.clone());
         let stop = ctx.cancel.clone();
+        let conversation = ctx.conversation;
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let _ = sender.send(tools::run(&name, &arguments, &ctx));
         });
 
-        self.bar
-            .wait_line_about(&format!("{}({summary})", call.name));
-        let outcome = match self.wait_on(&receiver) {
+        let about = format!("{}({summary})", call.name);
+        self.bar.wait_line_about(&about);
+        // A long call that says what it is doing now, as a cloud run does,
+        // has the waiting line follow it.
+        let mut shown = None;
+        let patience = self.bar.patience();
+        let waited = wait_on(&receiver, patience, || {
+            let now = letronna_core::tool_progress::of(conversation);
+            if now != shown {
+                match &now {
+                    Some(now) => self.bar.rename_wait(&format!("{about} · {now}")),
+                    None => self.bar.rename_wait(&about),
+                }
+                shown = now;
+            }
+            self.bar.pump();
+            self.answer_helpers(true);
+            self.bar.interrupted()
+        });
+        let outcome = match waited {
             Ok(outcome) => Some(outcome),
             Err(Unheard::Stopped) => {
                 stop.set();
@@ -1823,6 +1847,16 @@ fn declined(request: &Request) {
     render::tool(&call.name, &summary, &why, true);
 }
 
+/// Who answered: the model and the provider it came through, so a reply
+/// says where it is from and not only what it is called.
+pub(crate) fn answered_by(model: &str, gateway: &str) -> String {
+    match (model.rsplit('/').next().unwrap_or(model), gateway) {
+        (model, "") => model.to_owned(),
+        ("", gateway) => gateway.to_owned(),
+        (model, gateway) => format!("{model} · {gateway}"),
+    }
+}
+
 pub(crate) fn usage(reply: &Message) -> String {
     let mut parts = vec![format!("{} out", reply.tokens)];
     if reply.per_second > 0. {
@@ -1848,6 +1882,16 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_reply_names_its_model_and_provider() {
+        assert_eq!(
+            answered_by("openai/gpt-6-luna", "ChatGPT"),
+            "gpt-6-luna · ChatGPT"
+        );
+        assert_eq!(answered_by("gpt-6-luna", ""), "gpt-6-luna");
+        assert_eq!(answered_by("", "ChatGPT"), "ChatGPT");
+    }
 
     #[test]
     fn a_long_preview_ends_its_card_with_how_many_lines_were_left_out() {

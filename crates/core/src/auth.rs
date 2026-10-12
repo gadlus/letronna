@@ -133,11 +133,27 @@ fn on_disk() -> Option<Account> {
 /// Who is signed in, if anyone. A token the vault would not give reads as
 /// signed out, and `vault::trouble` says why.
 pub fn account() -> Option<Account> {
+    // A cloud terminal is handed its opener's sign-in for that run; what the
+    // API last said of them is still kept in the file, without the token.
+    if let Some(token) = given() {
+        return Some(Account {
+            token,
+            ..on_disk().unwrap_or_default()
+        });
+    }
     let mut account = on_disk()?;
     if account.token.is_empty() {
         account.token = crate::vault::get(TOKEN).ok().flatten().unwrap_or_default();
     }
     (!account.token.trim().is_empty()).then_some(account)
+}
+
+/// The token `LETRONNA_TOKEN` hands in, as letronna-cloud does for the
+/// terminal it opens; never written anywhere.
+fn given() -> Option<String> {
+    std::env::var("LETRONNA_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty())
 }
 
 /// Forget the token here: the vault's copy first, and the file only once
@@ -284,9 +300,14 @@ fn client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
 /// vault that refuses it fails the sign-in rather than leave it in the file.
 fn remember(account: &Account) -> Result<(), String> {
     let _ = std::fs::create_dir_all(backend::data_dir());
-    let in_file = on_disk().map(|account| account.token).unwrap_or_default();
-    let token = crate::vault::save(TOKEN, &account.token, &in_file)
-        .map_err(|why| format!("Could not keep the sign-in: {why}."))?;
+    let token = match given() {
+        Some(_) => String::new(),
+        None => {
+            let in_file = on_disk().map(|account| account.token).unwrap_or_default();
+            crate::vault::save(TOKEN, &account.token, &in_file)
+                .map_err(|why| format!("Could not keep the sign-in: {why}."))?
+        }
+    };
     let kept = Account {
         token,
         ..account.clone()
@@ -346,6 +367,11 @@ impl Pending {
         // The plan and credits, when the API answers; the sign-in stands
         // either way.
         Ok(refresh().unwrap_or(account))
+    }
+
+    /// The state the page was sent, which a sign-in code is good for alone.
+    pub fn state(&self) -> String {
+        self.state.clone()
     }
 
     /// A switch that ends the wait at once, for a Cancel button or escape.
@@ -437,6 +463,48 @@ impl Pending {
             ..Account::default()
         })
     }
+}
+
+/// Sign in with the code the page shows when the browser cannot reach this
+/// machine (over SSH, say): the API takes it once, within ten minutes, and
+/// only with the `state` of the sign-in it was shown for.
+pub fn redeem(state: &str, code: &str) -> Result<Account, String> {
+    let response = client(Duration::from_secs(20))?
+        .post(api("/devices/redeem"))
+        .json(&serde_json::json!({ "state": state, "code": code.trim() }))
+        .send()
+        .map_err(|_| "Could not reach the Letronna account service.".to_owned())?;
+    #[derive(Deserialize)]
+    struct Given {
+        #[serde(default)]
+        token: String,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        email: String,
+        #[serde(default)]
+        error: String,
+    }
+    let ok = response.status().is_success();
+    let given: Given = response
+        .json()
+        .map_err(|_| "The account service sent something unexpected.".to_owned())?;
+    if !ok || given.token.is_empty() {
+        return Err(if given.error.is_empty() {
+            "That code did not work. Start /login again.".into()
+        } else {
+            given.error
+        });
+    }
+    let account = Account {
+        name: given.name,
+        email: given.email,
+        token: given.token,
+        since: now(),
+        ..Account::default()
+    };
+    remember(&account)?;
+    Ok(refresh().unwrap_or(account))
 }
 
 /// The page left in the browser, in the website's look. Nothing on it comes

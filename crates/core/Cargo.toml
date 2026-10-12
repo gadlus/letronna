@@ -66,6 +66,7 @@ tree-sitter-yaml = { version = "0.7", optional = true }
 # parser unpacks it.
 pdf-extract = "0.12.1"
 flate2 = "1"
+tar = "0.4"
 weezl = "0.1"
 # The wallet the agent pays from (wallet.rs). k256 signs for every EVM
 # chain, on the sha2 0.11 already in the lock file; Keccak is tiny-keccak's,
