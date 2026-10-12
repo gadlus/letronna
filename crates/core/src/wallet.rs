@@ -1327,15 +1327,29 @@ impl Tool for PaidFetch {
         let url = args["url"].as_str().unwrap_or_default();
         let method = args["method"].as_str().unwrap_or("GET");
         let wallet = load();
-        let price = match x402::remembered(url) {
-            Some(seen) => format!("Pay {} to {}", seen.price, seen.site),
-            None => {
-                let most = args["max_usd"]
-                    .as_str()
-                    .and_then(|max| parse_dollars(max).ok())
-                    .unwrap_or(wallet.policy.per_payment);
-                format!("Pay up to {} (the price is read as it runs)", dollars(most))
+        let max = args["max_usd"]
+            .as_str()
+            .and_then(|max| parse_dollars(max).ok());
+        let seen = x402::remembered(url);
+        // The most this card lets the call pay, kept for `run`: the yes is
+        // for what the card shows, whatever the page asks later.
+        let most = max
+            .into_iter()
+            .chain(seen.as_ref().and_then(|seen| seen.usd))
+            .min()
+            .unwrap_or(wallet.policy.per_payment);
+        x402::show(&args.to_string(), most);
+        let price = match seen {
+            Some(seen) if seen.usd.is_some_and(|usd| usd <= most) => {
+                format!("Pay {} to {}", seen.price, seen.site)
             }
+            Some(seen) => format!(
+                "Pay up to {} ({} was asked by {})",
+                dollars(most),
+                seen.price,
+                seen.site
+            ),
+            None => format!("Pay up to {} (the price is read as it runs)", dollars(most)),
         };
         format!(
             "{price}\nfor {method} {url}\n{}",
@@ -1349,6 +1363,11 @@ impl Tool for PaidFetch {
             return Err("Only http and https addresses can be paid for.".into());
         }
         crate::browser::address(raw, &crate::redact::secrets())?;
+        // Taken first, so a yes is spent even when the call fails early.
+        let shown = ctx
+            .approved
+            .then(|| x402::shown(&args.to_string()))
+            .flatten();
         let wallet = load();
         if wallet.policy.paused || wallet.policy.x402 == X402::Off {
             return Err("The user has the wallet's x402 payments switched off.".into());
@@ -1383,20 +1402,18 @@ impl Tool for PaidFetch {
         let quote = x402::read(&headers, &said)
             .ok_or("The page answered HTTP 402 but did not say how to pay it (no x402 offer).")?;
         let plan = x402::choose(&quote, &wallet, &site, true)?;
-        let seen = x402::remembered(url.as_str());
         x402::remember(url.as_str(), &plan);
         let price = plan.price();
         if ctx.approved {
+            // Pay no more than the card showed, kept when it was drawn: the
+            // remembered price may have lapsed or changed since.
+            let most = shown.ok_or(
+                "Nothing was paid: the card for this payment was not found. Call paid_fetch again.",
+            )?;
             let usd = plan
                 .usd
                 .ok_or_else(|| format!("What {price} is worth in dollars is not known."))?;
-            // The card showed the price seen, else the model's most: never
-            // pay more than either.
-            let max = args["max_usd"]
-                .as_str()
-                .and_then(|max| parse_dollars(max).ok());
-            let most = max.into_iter().chain(seen.and_then(|seen| seen.usd)).min();
-            if let Some(most) = most.filter(|most| usd > *most) {
+            if usd > most {
                 return Err(format!(
                     "Nothing was paid: it costs {price} now, more than the {} the user said yes to. Call paid_fetch again so they see the new price.",
                     dollars(most)
