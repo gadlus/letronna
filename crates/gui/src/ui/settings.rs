@@ -244,6 +244,23 @@ impl Chat {
     pub(crate) fn add_gateway(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.gateway_name.read(cx).value().trim().to_string();
         let address = self.endpoint.read(cx).value().trim().to_string();
+        // A name a gateway has already: the field gets the next free one,
+        // and Add again takes it. Nothing is replaced or renamed unasked.
+        if let Some(free) = free_name(&name) {
+            let spelled = holder(&name).unwrap_or(&name).to_owned();
+            let free = free_name(&spelled).unwrap_or(free);
+            let change = match holder(&name).is_some_and(is_own) {
+                true => format!(", or close this and Edit {spelled} to change its address"),
+                false => String::new(),
+            };
+            self.error = Some(format!(
+                "There is a gateway called {spelled} already. Press Add gateway again to add this one as {free}{change}."
+            ));
+            self.gateway_name
+                .update(cx, |input, cx| input.set_value(free, window, cx));
+            cx.notify();
+            return;
+        }
         let name = match add_own(&name, &address) {
             Ok((name, _)) => name,
             Err(why) => {
