@@ -1,12 +1,22 @@
 //! The gateways a session can send to, as the settings, `/gateways` and the
-//! model picker list them: the providers in `providers::all()`, and
-//! those plugins add while they are on. What sets each one apart -- its URL,
-//! what it needs, what it speaks -- is its provider's; this keeps the shape
-//! the callers were written against.
+//! model picker list them: the providers in `providers::all()`, those the
+//! user added, and those plugins add while they are on. What sets each
+//! built-in one apart -- its URL, what it needs, what it speaks -- is its
+//! provider's; this keeps the shape the callers were written against.
+//!
+//! Custom takes one address. Someone with several servers of their own -- LM
+//! Studio here, vLLM on another machine, a company proxy -- adds each as a
+//! gateway with a name: any server that answers as OpenAI's API does, at
+//! the address given, its key (if it takes one) kept as a gateway's is,
+//! under `gateway:` and its name, so it never meets a search service's. They
+//! are kept in gateways.json and listed after the built-in ones.
 
 use crate::providers::AuthKind;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 /// The hosted pool on your Letronna account: no key, charged to your credit.
 /// First in the list, and what a new install starts on.
@@ -20,8 +30,10 @@ pub struct Gateway {
     pub blurb: &'static str,
 }
 
-/// Every gateway: the built-in providers', then those plugins declare.
+/// Every gateway: the built-in providers', those plugins declare, then the
+/// user's own.
 pub fn gateways() -> Vec<Gateway> {
+    let own = own().into_iter().map(|g| as_gateway(&g));
     crate::providers::all()
         .into_iter()
         .map(|p| {
@@ -33,7 +45,233 @@ pub fn gateways() -> Vec<Gateway> {
                 blurb: info.blurb,
             }
         })
+        .chain(own)
         .collect()
+}
+
+/// What a gateway of the user's own is said to be.
+const OWN_BLURB: &str = "Your own: any server that answers as OpenAI's API does.";
+
+/// A gateway of the user's own as the lists show it. Its address is its
+/// own, as Custom's is, so `base` is empty.
+fn as_gateway(own: &Own) -> Gateway {
+    Gateway {
+        name: own.name,
+        base: "",
+        needs_key: false,
+        blurb: OWN_BLURB,
+    }
+}
+
+/// A gateway the user added, with the address its requests go to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Own {
+    pub name: &'static str,
+    pub base: String,
+}
+
+/// A gateway of the user's own as gateways.json keeps it.
+#[derive(Serialize, Deserialize)]
+struct Kept {
+    name: String,
+    base: String,
+}
+
+fn own_path() -> PathBuf {
+    crate::chat::data_dir().join("gateways.json")
+}
+
+/// The gateways the user added, as gateways.json has them now.
+pub fn own() -> Vec<Own> {
+    // Asked for every gateway listed, every frame a page shows them, so the
+    // file is read again only once it has changed: the terminal and the
+    // window each save it, and each has to see the other's change.
+    type Seen = (PathBuf, Option<(SystemTime, u64)>, Vec<Own>);
+    static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
+    let path = own_path();
+    let stamp = std::fs::metadata(&path)
+        .ok()
+        .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+    if let Ok(seen) = SEEN.lock()
+        && let Some((at, was, list)) = seen.as_ref()
+        && *at == path
+        && *was == stamp
+    {
+        return list.clone();
+    }
+    let list = read_own(&path);
+    if let Ok(mut seen) = SEEN.lock() {
+        *seen = Some((path, stamp, list.clone()));
+    }
+    list
+}
+
+fn read_own(path: &Path) -> Vec<Own> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let kept: Vec<Kept> = serde_json::from_slice(&bytes).unwrap_or_default();
+    let mut list: Vec<Own> = Vec::new();
+    for gateway in kept {
+        let name = gateway.name.trim();
+        // A file edited by hand can name one twice, or a built-in one.
+        if name.is_empty() || taken(name, &list) {
+            continue;
+        }
+        list.push(Own {
+            name: interned(name),
+            base: gateway.base.trim().to_owned(),
+        });
+    }
+    list
+}
+
+fn write_own(list: &[Own]) -> Result<(), String> {
+    let kept: Vec<Kept> = list
+        .iter()
+        .map(|g| Kept {
+            name: g.name.to_owned(),
+            base: g.base.clone(),
+        })
+        .collect();
+    let _ = std::fs::create_dir_all(crate::chat::data_dir());
+    let bytes = serde_json::to_vec_pretty(&kept).map_err(|e| e.to_string())?;
+    std::fs::write(own_path(), bytes).map_err(|e| format!("Cannot save the gateways: {e}"))
+}
+
+fn own_as(name: &str) -> Option<Own> {
+    own().into_iter().find(|g| g.name == name)
+}
+
+/// Whether `name` is a gateway the user added.
+pub fn is_own(name: &str) -> bool {
+    own_as(name).is_some()
+}
+
+/// Add a gateway of the user's own called `name` at `address`, or give the
+/// one already called that the new address. The name and address as they
+/// are kept, or why they cannot be.
+pub fn keep_own(name: &str, address: &str) -> Result<(&'static str, String), String> {
+    let name = name.trim();
+    let base = own_base(address)?;
+    let mut list = own();
+    let kept = match list.iter_mut().find(|g| g.name == name) {
+        Some(gateway) => {
+            gateway.base = base.clone();
+            gateway.name
+        }
+        None => {
+            check_name(name, &list)?;
+            let name = interned(name);
+            list.push(Own {
+                name,
+                base: base.clone(),
+            });
+            name
+        }
+    };
+    write_own(&list)?;
+    Ok((kept, base))
+}
+
+/// Stop offering the gateway of the user's own called `name`, and forget
+/// its key.
+pub fn remove_own(name: &str) -> Result<(), String> {
+    let mut list = own();
+    let Some(gone) = list.iter().position(|g| g.name == name) else {
+        return Ok(());
+    };
+    let slot = key_slot(name).to_owned();
+    list.remove(gone);
+    write_own(&list)?;
+    crate::store::save_key(&slot, None)
+        .map(|_| ())
+        .map_err(|e| format!("The gateway is gone, but its key could not be removed: {e}."))
+}
+
+/// The most characters a gateway's name may have: enough for "Office vLLM
+/// on the big box", short enough for the lists.
+const NAME_CHARS: usize = 40;
+
+/// Why `name` cannot be a new gateway's, if it cannot: empty, too long,
+/// holding what the lists and fallbacks write between a gateway and its
+/// model, or a gateway's already.
+fn check_name(name: &str, list: &[Own]) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Give the gateway a name, such as LM Studio.".into());
+    }
+    if name.chars().count() > NAME_CHARS {
+        return Err(format!(
+            "A gateway's name is {NAME_CHARS} characters at most."
+        ));
+    }
+    if name
+        .chars()
+        .any(|c| c.is_control() || matches!(c, ':' | '·'))
+    {
+        return Err("A gateway's name cannot hold a colon or a dot in the middle (·).".into());
+    }
+    if taken(name, list) {
+        return Err(format!(
+            "There is a gateway called {name} already: pick another name."
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a built-in gateway, one a plugin added, or one of `list` is
+/// called `name`, in any case.
+fn taken(name: &str, list: &[Own]) -> bool {
+    let same = |other: &str| other.eq_ignore_ascii_case(name);
+    crate::providers::all().iter().any(|p| same(p.info().name))
+        || list.iter().any(|g| same(g.name))
+        || added()
+            .lock()
+            .is_ok_and(|added| added.iter().any(|g| same(g.name)))
+}
+
+/// `pasted` as a gateway's address is kept: no slash or chat route on the
+/// end, and with no scheme, http for this computer and the local network
+/// and https for anywhere else. Checked as a request to it would be.
+pub fn own_base(pasted: &str) -> Result<String, String> {
+    let mut base = pasted.trim().trim_end_matches('/').to_owned();
+    if let Some(cut) = base.strip_suffix("/chat/completions") {
+        base = cut.trim_end_matches('/').to_owned();
+    }
+    if base.is_empty() {
+        return Err("Give the server's base URL, such as http://localhost:1234/v1.".into());
+    }
+    if !base.contains("://") {
+        let near =
+            reqwest::Url::parse(&format!("http://{base}")).is_ok_and(|url| crate::web::local(&url));
+        let scheme = if near { "http" } else { "https" };
+        base = format!("{scheme}://{base}");
+    }
+    let probe = crate::chat::Connection {
+        endpoint: base.clone(),
+        model: "any".into(),
+        key: "any".into(),
+        ..Default::default()
+    };
+    crate::chat::validate(&probe)?;
+    Ok(base)
+}
+
+/// `name` for as long as the process runs. The names of the user's own
+/// gateways are read from a file but go where a built-in one's would, and
+/// each is kept once, however often the file is read.
+fn interned(name: &str) -> &'static str {
+    static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let names = NAMES.get_or_init(Default::default);
+    let Ok(mut names) = names.lock() else {
+        return Box::leak(name.to_owned().into_boxed_str());
+    };
+    if let Some(kept) = names.get(name) {
+        return kept;
+    }
+    let kept: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    names.insert(kept);
+    kept
 }
 
 /// What the built-in gateway `name` needs, `None` for one a plugin added.
@@ -119,11 +357,15 @@ pub fn resolve(name: &str, custom: &str, key: &str) -> (String, String) {
     if let Some(added) = added_as(name) {
         return (added.base, added.key);
     }
+    if let Some(own) = own_as(name) {
+        return (own.base, key.to_owned());
+    }
     (base_url(name, custom), key.to_owned())
 }
 
 /// The gateway whose requests go to `endpoint`, if one does; Custom, whose
-/// address is the user's, is never named.
+/// address is the user's, is never named, but one the user added and named
+/// is.
 pub fn named(endpoint: &str) -> Option<&'static str> {
     let endpoint = endpoint.trim().trim_end_matches('/');
     let at = |base: &str| !base.is_empty() && base.trim_end_matches('/') == endpoint;
@@ -148,15 +390,19 @@ pub fn base_url(name: &str, custom: &str) -> String {
     if let Some(added) = added_as(name) {
         return added.base;
     }
+    if let Some(own) = own_as(name) {
+        return own.base;
+    }
     let base = gateway(name).base;
     let base = if base.is_empty() { custom } else { base };
     base.to_owned()
 }
 
 /// Every gateway set up on this computer, as (name, base URL, key): Letronna
-/// and those signed in to in the browser once signed in, a keyed gateway once its key is saved, Custom once it has
-/// a URL, Ollama always (on this machine, a closed port answers at once),
-/// and those plugins added. One a plugin offers is left out while it is off.
+/// and those signed in to in the browser once signed in, a keyed gateway
+/// once its key is saved, Custom once it has a URL, the user's own, Ollama
+/// always (on this machine, a closed port answers at once), and those
+/// plugins added. One a plugin offers is left out while it is off.
 pub fn ready(keys: &HashMap<String, String>, custom: &str) -> Vec<(&'static str, String, String)> {
     let plugins = added().lock().map(|list| list.clone()).unwrap_or_default();
     let plugins = plugins.into_iter().map(|g| (g.name, g.base, g.key));
@@ -170,6 +416,8 @@ pub fn ready(keys: &HashMap<String, String>, custom: &str) -> Vec<(&'static str,
                 Some(AuthKind::OAuth(_)) => crate::providers::auth::signed_in(g.name),
                 Some(AuthKind::Url) => !base_url(g.name, custom).trim().is_empty(),
                 Some(AuthKind::None) => true,
+                // One of the user's own, at the address it was added with.
+                None => !base_url(g.name, custom).trim().is_empty(),
                 _ => !key.trim().is_empty(),
             };
             on.then(|| {
@@ -221,6 +469,7 @@ pub fn status(
         Some(AuthKind::Url) if base_url(name, custom).trim().is_empty() => {
             ("Not set up".into(), false, false)
         }
+        None if base_url(name, custom).trim().is_empty() => ("Not set up".into(), false, false),
         _ if g.needs_key && !key => ("Not set up".into(), false, false),
         _ if models > 0 => (format!("Connected · {}", count(models)), true, true),
         _ => ("Set up · no models answered".into(), false, true),
@@ -258,11 +507,35 @@ pub fn all_models(
     (models, errors)
 }
 
-/// Where a gateway's key is saved: under its own name.
-pub fn key_slot(name: &str) -> &str {
-    name
+/// The models `name` offers, asked now as `all_models` asks each gateway,
+/// for a check right after it is set up; or what it said instead.
+pub fn models_of(
+    name: &str,
+    keys: &HashMap<String, String>,
+    custom: &str,
+) -> Result<Vec<String>, String> {
+    let key = keys.get(key_slot(name)).cloned().unwrap_or_default();
+    let (base, key) = resolve(name, custom, &key);
+    if base.trim().is_empty() {
+        return Err(format!("{name} has no address yet."));
+    }
+    match crate::providers::find(name) {
+        Some(p) => p.models(&base, &key),
+        None => crate::chat::list_models(&base, &key),
+    }
 }
 
+/// Where a gateway's key is saved: under its own name, or for one of the
+/// user's own under `gateway:` and its name, which no search service or
+/// other key is ever called.
+pub fn key_slot(name: &str) -> &str {
+    match own_as(name) {
+        Some(own) => interned(&format!("gateway:{}", own.name)),
+        None => name,
+    }
+}
+
+/// The gateway called `name`; the first, Letronna, when none is.
 pub fn gateway(name: &str) -> Gateway {
     let mut all = gateways();
     let at = all.iter().position(|g| g.name == name).unwrap_or(0);
@@ -366,6 +639,113 @@ mod tests {
         crate::providers::tests::plugged_in("chatgpt");
         assert!(offered("ChatGPT"));
         assert!(ready(&none, "").iter().any(|g| g.0 == "ChatGPT"));
+    }
+
+    /// A data folder of a test's own while `run` runs, as gateways.json and
+    /// the keys are kept there.
+    fn in_scratch<T>(name: &str, run: impl FnOnce(&std::path::Path) -> T) -> T {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::store::tests::Scratch::new(name);
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        let done = run(&dir);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        done
+    }
+
+    #[test]
+    fn gateways_of_your_own_are_listed_resolved_and_kept_apart() {
+        in_scratch("own-gateways", |_| {
+            assert!(own().is_empty());
+            let (studio, base) = keep_own(" LM Studio ", "localhost:1234/v1/").unwrap();
+            assert_eq!(
+                (studio, base.as_str()),
+                ("LM Studio", "http://localhost:1234/v1")
+            );
+            let (vllm, _) = keep_own("vLLM", "https://gpu.example/v1/chat/completions").unwrap();
+            assert_eq!(base_url(vllm, ""), "https://gpu.example/v1");
+            // Listed after the built-in ones, and offered.
+            let names: Vec<&str> = gateways().iter().map(|g| g.name).collect();
+            assert_eq!(names[names.len() - 2..], ["LM Studio", "vLLM"]);
+            assert!(offered("LM Studio") && is_own("vLLM") && !is_own("OpenAI"));
+            assert_eq!(gateway("vLLM").name, "vLLM");
+            // Its key is kept where no search service's or other key is.
+            assert_eq!(key_slot("vLLM"), "gateway:vLLM");
+            assert_eq!(key_slot("OpenAI"), "OpenAI");
+            let keys = HashMap::from([("gateway:vLLM".to_string(), "k".to_string())]);
+            assert_eq!(
+                resolve("vLLM", "", "k"),
+                ("https://gpu.example/v1".into(), "k".into())
+            );
+            let ready = ready(&keys, "");
+            assert!(ready.contains(&("vLLM", "https://gpu.example/v1".into(), "k".into())));
+            assert!(ready.contains(&(
+                "LM Studio",
+                "http://localhost:1234/v1".into(),
+                String::new()
+            )));
+            assert_eq!(named("https://gpu.example/v1/"), Some("vLLM"));
+            assert_eq!(
+                status("vLLM", &keys, "", 4),
+                ("Connected · 4 models".into(), true, true)
+            );
+            // A new address for one kept, then gone.
+            keep_own("vLLM", "https://gpu2.example/v1").unwrap();
+            assert_eq!(base_url("vLLM", ""), "https://gpu2.example/v1");
+            // Asked for its models, a server that is not there says so.
+            assert!(models_of("LM Studio", &keys, "").is_err());
+            remove_own("vLLM").unwrap();
+            assert!(!offered("vLLM") && own().len() == 1);
+        });
+    }
+
+    #[test]
+    fn a_gateway_of_your_own_needs_a_name_of_its_own_and_an_address_that_works() {
+        in_scratch("own-gateway-names", |_| {
+            assert!(keep_own("", "http://localhost:1/v1").is_err());
+            assert!(
+                keep_own("openai", "http://localhost:1/v1")
+                    .unwrap_err()
+                    .contains("already")
+            );
+            assert!(keep_own("Custom", "http://localhost:1/v1").is_err());
+            assert!(keep_own("a:b", "http://localhost:1/v1").is_err());
+            assert!(keep_own(&"x".repeat(41), "http://localhost:1/v1").is_err());
+            assert!(keep_own("Box", "").is_err());
+            keep_own("Box", "http://localhost:1/v1").unwrap();
+            assert!(
+                keep_own("box", "http://localhost:2/v1")
+                    .unwrap_err()
+                    .contains("already")
+            );
+            // Plain http goes only to this computer unless the user opts in.
+            assert!(keep_own("Far", "http://gpu.example/v1").is_err());
+            assert_eq!(
+                own_base("gpu.example/v1"),
+                Ok("https://gpu.example/v1".into())
+            );
+            assert_eq!(
+                own_base("127.0.0.1:8000/v1"),
+                Ok("http://127.0.0.1:8000/v1".into())
+            );
+        });
+    }
+
+    #[test]
+    fn a_hand_edited_list_of_your_own_gateways_skips_what_it_cannot_use() {
+        in_scratch("own-gateways-edited", |dir| {
+            std::fs::write(
+                dir.join("gateways.json"),
+                r#"[{"name": "Box", "base": "http://localhost:1/v1"},
+                    {"name": "box", "base": "http://localhost:2/v1"},
+                    {"name": "OpenAI", "base": "http://localhost:3/v1"},
+                    {"name": " ", "base": "http://localhost:4/v1"}]"#,
+            )
+            .unwrap();
+            let names: Vec<&str> = own().iter().map(|g| g.name).collect();
+            assert_eq!(names, ["Box"]);
+        });
     }
 
     #[test]
