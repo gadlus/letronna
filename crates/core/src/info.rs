@@ -336,7 +336,13 @@ fn models(connection: Option<&Connection>) -> String {
             }
         })
         .collect();
-    lines.push(format!("Web search: {}.", services.join("; ")));
+    let mut search = format!("Web search: {}.", services.join("; "));
+    // The gateway's search is paid by the search, which the user may ask
+    // about, and is not among the services.
+    if let Some(note) = crate::search::through_note(connection) {
+        search = format!("{search} {note}");
+    }
+    lines.push(search);
     // Any other slot, such as where a remote browser is reached.
     let mut others: Vec<String> = saved
         .keys()
@@ -988,6 +994,41 @@ mod tests {
     fn told(topic: &str) -> String {
         let ctx = ToolContext::of(&window());
         answer(topic, false, &ctx, never).unwrap()
+    }
+
+    #[test]
+    fn with_no_search_service_chosen_the_model_is_told_searches_go_through_the_gateway() {
+        let (_held, dir) = data("info-gateway-search");
+        let letronna = Connection {
+            endpoint: crate::auth::hosted_base(),
+            key: "token".into(),
+            ..window()
+        };
+        let told = || answer("models", false, &ToolContext::of(&letronna), never).unwrap();
+        let on = told();
+        let settings = r#"{"endpoint": "", "model": "", "keyless_search": false}"#;
+        std::fs::write(dir.join("settings.json"), settings).unwrap();
+        let off = told();
+        // Chosen by name, DuckDuckGo keeps every search off the gateway.
+        std::fs::write(dir.join("search.json"), r#"{"service": "DuckDuckGo"}"#).unwrap();
+        let alone = told();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert!(
+            on.contains(
+                "; DuckDuckGo in use. With no service chosen, searches go through Letronna, \
+                 paid from the account's credit by the search, and to DuckDuckGo when it \
+                 cannot answer.\n"
+            ),
+            "{on}"
+        );
+        assert!(
+            off.contains(
+                "; DuckDuckGo switched off. With no service chosen, searches go through \
+                 Letronna alone, paid from the account's credit by the search.\n"
+            ),
+            "{off}"
+        );
+        assert!(!alone.contains("With no service chosen"), "{alone}");
     }
 
     #[test]

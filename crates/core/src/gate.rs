@@ -720,7 +720,7 @@ fn ladder(
     }
     // Then the judge.
     if let Some(judge) = judge
-        && !spends(tool.name())
+        && !spends(tool.name(), gate.ctx)
     {
         let why = if opaque {
             "the command hides what it runs, so no allowance covers it"
@@ -848,12 +848,15 @@ pub fn grants_for_session(name: &str, args: &Value) -> bool {
 }
 
 /// Whether the tool named `name` spends the user's credit, which is theirs
-/// to decide rather than a question of safety for the judge.
-fn spends(name: &str) -> bool {
-    matches!(
-        name,
-        "make_image" | "edit_image" | "speak" | "transcribe" | "make_video"
-    )
+/// to decide rather than a question of safety for the judge: search_web
+/// does while no service is chosen and the session's gateway, which is paid
+/// by the search, may answer it.
+fn spends(name: &str, ctx: &ToolContext) -> bool {
+    match name {
+        "make_image" | "edit_image" | "speak" | "transcribe" | "make_video" => true,
+        "search_web" => crate::search::through_gateway(ctx.caller.connection.as_deref()),
+        _ => false,
+    }
 }
 
 /// What the judge's `verdict` on `tool` means for the call.
@@ -2751,6 +2754,52 @@ mod tests {
             let image = decide_with(&image, &gate, Some(&unasked), false);
             assert_eq!(image == Outcome::Ask, human, "{image:?}");
         }
+    }
+
+    #[test]
+    fn a_search_paid_through_the_gateway_is_the_users_call_not_the_judges() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // No search service chosen, as on a fresh install.
+        let dir = crate::store::tests::Scratch::new("gate-paid-search");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        let letronna = ToolContext::of(&crate::chat::Connection {
+            endpoint: crate::auth::hosted_base(),
+            key: "token".into(),
+            ..Default::default()
+        });
+        let alone = ToolContext::default();
+        let none = Grants::new();
+        let allow = |_: &ToolCall, _: &str| Verdict::Allow;
+        let unasked = |_: &ToolCall, _: &str| -> Verdict { panic!("the judge was asked") };
+        let search = call("search_web", serde_json::json!({ "query": "rust" }));
+        let gate = |ctx, human| Gate {
+            ctx,
+            mode: Mode::Auto,
+            grants: &none,
+            human,
+            rules: &[],
+            broken: None,
+        };
+        let mut paid = Vec::new();
+        for human in [true, false] {
+            paid.push(decide_with(
+                &search,
+                &gate(&letronna, human),
+                Some(&unasked),
+                false,
+            ));
+        }
+        // With no gateway, DuckDuckGo is free, and the judge decides.
+        let free = decide_with(&search, &gate(&alone, false), Some(&allow), false);
+        // DuckDuckGo chosen by name keeps every search off the gateway.
+        std::fs::write(dir.join("search.json"), r#"{"service": "DuckDuckGo"}"#).unwrap();
+        let chosen = decide_with(&search, &gate(&letronna, false), Some(&allow), false);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert_eq!(paid[0], Outcome::Ask);
+        assert!(matches!(paid[1], Outcome::Refuse(_)), "{:?}", paid[1]);
+        assert_eq!((free, chosen), (Outcome::Run, Outcome::Run));
     }
 
     #[test]
