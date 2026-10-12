@@ -257,23 +257,27 @@ pub(crate) fn switched_off(connection: Option<&Connection>) -> Option<&'static s
     (!gateway).then_some(SWITCHED_OFF)
 }
 
-/// Whether a search over `connection` may go through its gateway, and so be
-/// paid from the account's credit or to that gateway: no service is chosen
-/// and the gateway is not known to sell no search, as the card would name
-/// it. Its list is not read for this, only what is known of it already.
-pub(crate) fn through_gateway(connection: Option<&Connection>) -> bool {
-    !standing().chosen && named_gate(connection, gateways(), Instant::now()).is_some()
+/// Whether a search over `connection` would be paid through its gateway,
+/// from the account's credit or to that gateway: no service is chosen and
+/// the gateway sells search now. A list not read lately is read first, as
+/// the search itself would read it, so this may wait on the gateway, once
+/// in a while: it is for deciding a call, never for a card or a lookup. A
+/// gateway whose list named no search models, or could not be read, is sent
+/// no search, so a search over it costs nothing.
+pub(crate) fn paid_through_gateway(connection: Option<&Connection>) -> bool {
+    !standing().chosen && selling(connection, gateways(), Instant::now()).is_some_and(|g| sells(&g))
 }
 
 /// Where searches over `connection` go while no service is chosen, as the
 /// model is told of the user's setup: through its gateway, who pays, and
-/// whether DuckDuckGo is asked when it cannot answer; `None` when no gateway
-/// may answer them.
+/// whether DuckDuckGo is asked when it cannot answer; `None` unless the
+/// gateway is known to sell search. Its list is not read for this, only what
+/// is known of it already.
 pub(crate) fn through_note(connection: Option<&Connection>) -> Option<String> {
-    if !through_gateway(connection) {
+    if standing().chosen {
         return None;
     }
-    let gate = session_gateway(connection)?;
+    let gate = named_gate(connection, gateways(), Instant::now()).filter(sells)?;
     let payer = match gate.hosted {
         true => "from the account's credit",
         false => "to that gateway",
@@ -652,6 +656,13 @@ fn named_gate(
         Known::Unknown => {}
     }
     Some(gate)
+}
+
+/// Whether `gate` is known to sell search and may be asked now: Letronna's
+/// own unless it lately had no search route, or another whose list named
+/// search models.
+fn sells(gate: &Gate) -> bool {
+    gate.failing.is_none() && !gate.models.is_empty()
 }
 
 /// Whether `gate` goes after DuckDuckGo at `now`: it could not answer
@@ -1485,7 +1496,9 @@ fn fault(status: u16, hosted: bool, body: &[u8]) -> Fault {
 /// Search through the session's gateway with the first `MODELS_TRIED` of its
 /// search models, going on to the next when one cannot answer. One that could
 /// not is tried after the others for a while, and the gateway rests when none
-/// of them could.
+/// of them could. Only the models in `gate` are asked for, and `selling`
+/// gives no gateway whose list named none, so nothing is sent to one that
+/// `sells` no search: auto mode leaves a search over it to the judge.
 // Neither checked against nor noted in what stops web_fetch and search_web
 // after a request that could not connect: that is about reaching the web,
 // and the gateway is the session's own, reached as the model's requests
@@ -2105,8 +2118,17 @@ fn listing(service: &str, query: &str, hits: &[Hit]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Take the list at `base` as read, and found to name no search models,
+    /// longer ago than that is kept: a gateway that sells none, whose entry
+    /// has run out.
+    pub(crate) fn sold_none_long_ago(base: &str) {
+        let ago = UNSOLD_TIME + Duration::from_secs(1);
+        let at = Instant::now().checked_sub(ago).unwrap();
+        lock(gateways()).listed(base, Vec::new(), at);
+    }
 
     /// `super::ask` for a session someone watches.
     fn ask(reach: &Reach, query: &str, count: u64, options: &Options) -> Result<String, String> {
@@ -4030,6 +4052,72 @@ mod tests {
             ..pool()
         };
         assert!(letronna.time() > Duration::from_secs(45) && pool().time() == GATEWAY_TIME);
+    }
+
+    #[test]
+    fn a_search_over_a_gateway_that_sells_no_search_sends_it_none() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // No search service chosen, and DuckDuckGo at a stand-in.
+        let dir = crate::store::tests::Scratch::new("search-unsold");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        let (port, asked) = answer_once("200 OK", RESULTS_PAGE);
+        let duckduckgo = format!("http://127.0.0.1:{port}/html");
+        let mut choice = Choice::default();
+        choice.set_address(service("DuckDuckGo").unwrap(), &duckduckgo);
+        choose(&choice).unwrap();
+        // A server of the user's own, such as Ollama: no key, and a list of
+        // chat models alone. It would answer a search if it were sent one.
+        let (base, heard) = gateway_at(|target, _| match target {
+            "GET /v1/models" => (
+                200,
+                json!({"object": "list", "data": [
+                    {"id": "llama3.2:latest", "object": "model", "owned_by": "library"}
+                ]})
+                .to_string(),
+            ),
+            _ => {
+                let results = json!({"results": [{"title": "T", "url": "https://t.example/"}]});
+                (200, results.to_string())
+            }
+        });
+        let ctx = ToolContext::of(&Connection {
+            endpoint: base,
+            ..Connection::default()
+        });
+        let connection = ctx.caller.connection.as_deref();
+        let call = json!({"query": "ollama glue"});
+        // Its list unread, the card names it as a place the search may go,
+        // and the model is told nothing of it; neither reads the list.
+        let card = SearchWeb.preview(&call, &ctx);
+        let note = through_note(connection);
+        let unread = heard.lock().unwrap().is_empty();
+        // Deciding the call reads it, and finds no search sold.
+        let paid = paid_through_gateway(connection);
+        let card_after = SearchWeb.preview(&call, &ctx);
+        let found = SearchWeb.run(&call, &ctx);
+        asked.join().unwrap();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert!(
+            card.starts_with("Search through 127.0.0.1 for \"ollama glue\", or DuckDuckGo"),
+            "{card}"
+        );
+        assert!(note.is_none() && unread && !paid);
+        assert_eq!(
+            card_after,
+            format!("Search DuckDuckGo at {duckduckgo} for \"ollama glue\"")
+        );
+        let found = found.unwrap();
+        assert!(
+            found.starts_with("DuckDuckGo results for \"ollama glue\":\n"),
+            "{found}"
+        );
+        // Its list was read once, with no key, and it was sent no search.
+        let heard: Vec<(String, String)> = (heard.lock().unwrap().iter())
+            .map(|(target, key, _)| (target.clone(), key.clone()))
+            .collect();
+        assert_eq!(heard, [("GET /v1/models".to_owned(), String::new())]);
     }
 
     #[test]

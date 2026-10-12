@@ -1032,6 +1032,42 @@ mod tests {
     }
 
     #[test]
+    fn the_model_is_told_of_a_gateways_search_only_once_it_is_known_to_sell_one() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let (_held, _dir) = data("info-gateway-unread");
+        // A gateway that lists a search model, should its list be read.
+        let lists = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = lists.clone();
+        let base = crate::mcp_auth::tests::serve(move |_| {
+            counted.fetch_add(1, SeqCst);
+            let list = json!({"data": [{"id": "a/search", "type": "search"}]});
+            let kind = vec![("Content-Type", "application/json".to_owned())];
+            (200, kind, list.to_string())
+        });
+        let base = format!("{base}/v1");
+        let pool = Connection {
+            endpoint: base.clone(),
+            key: "key".into(),
+            ..window()
+        };
+        let told = || answer("models", false, &ToolContext::of(&pool), never).unwrap();
+        let unread = told();
+        // Once its list is read, for the model picker or a search, it is.
+        crate::search::heard_list(&base, &[json!({"id": "a/search", "type": "search"})]);
+        let known = told();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert!(!unread.contains("With no service chosen"), "{unread}");
+        assert_eq!(lists.load(SeqCst), 0, "its list was read for the answer");
+        assert!(
+            known.contains(
+                "; DuckDuckGo in use. With no service chosen, searches go through 127.0.0.1, \
+                 paid to that gateway by the search, and to DuckDuckGo when it cannot answer.\n"
+            ),
+            "{known}"
+        );
+    }
+
+    #[test]
     fn each_topic_answers_from_letronnas_own_files() {
         let (_held, dir) = data("info-topics");
         set_up(&dir);

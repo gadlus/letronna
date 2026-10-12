@@ -850,11 +850,14 @@ pub fn grants_for_session(name: &str, args: &Value) -> bool {
 /// Whether the tool named `name` spends the user's credit, which is theirs
 /// to decide rather than a question of safety for the judge: search_web
 /// does while no service is chosen and the session's gateway, which is paid
-/// by the search, may answer it.
+/// by the search, sells search. Only asked with a judge, which waits on the
+/// network anyway, so a gateway's list not read lately is read here, as the
+/// search would read it; one that sells none leaves DuckDuckGo, which is
+/// free, to the judge as before.
 fn spends(name: &str, ctx: &ToolContext) -> bool {
     match name {
         "make_image" | "edit_image" | "speak" | "transcribe" | "make_video" => true,
-        "search_web" => crate::search::through_gateway(ctx.caller.connection.as_deref()),
+        "search_web" => crate::search::paid_through_gateway(ctx.caller.connection.as_deref()),
         _ => false,
     }
 }
@@ -2756,6 +2759,42 @@ mod tests {
         }
     }
 
+    /// Each request a gateway heard: its method and target, and its
+    /// authorization.
+    type Heard = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    /// A gateway on this machine whose `/models` answers `status` with
+    /// `listed` as its list, and anything else a 404; its address, and what
+    /// it heard.
+    fn gateway_listing(status: u16, listed: serde_json::Value) -> (String, Heard) {
+        let heard = Heard::default();
+        let kept = heard.clone();
+        let base = crate::mcp_auth::tests::serve(move |request| {
+            let key = request.headers.get("authorization").cloned();
+            let target = format!("{} {}", request.method, request.target);
+            kept.lock().unwrap().push((target, key.unwrap_or_default()));
+            let kind = vec![("Content-Type", "application/json".to_owned())];
+            match request.target.as_str() {
+                "/v1/models" => (
+                    status,
+                    kind,
+                    serde_json::json!({ "data": listed }).to_string(),
+                ),
+                _ => (404, kind, "{}".into()),
+            }
+        });
+        (format!("{base}/v1"), heard)
+    }
+
+    /// A session over the gateway at `endpoint`, with `key`.
+    fn over(endpoint: &str, key: &str) -> ToolContext {
+        ToolContext::of(&Connection {
+            endpoint: endpoint.into(),
+            key: key.into(),
+            ..Default::default()
+        })
+    }
+
     #[test]
     fn a_search_paid_through_the_gateway_is_the_users_call_not_the_judges() {
         let _turn = crate::store::tests::DATA_DIR
@@ -2764,11 +2803,16 @@ mod tests {
         // No search service chosen, as on a fresh install.
         let dir = crate::store::tests::Scratch::new("gate-paid-search");
         unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
-        let letronna = ToolContext::of(&crate::chat::Connection {
-            endpoint: crate::auth::hosted_base(),
-            key: "token".into(),
-            ..Default::default()
-        });
+        let letronna = over(&crate::auth::hosted_base(), "token");
+        // A gateway that lists search models, its list not read yet.
+        let (base, heard) = gateway_listing(
+            200,
+            serde_json::json!([
+                {"id": "chat/model", "type": "chat"},
+                {"id": "cheap/search", "type": "search", "pricing": {"max_usd_per_unit": 0.001}}
+            ]),
+        );
+        let pool = over(&format!("{base}/chat/completions"), "secret");
         let alone = ToolContext::default();
         let none = Grants::new();
         let allow = |_: &ToolCall, _: &str| Verdict::Allow;
@@ -2783,23 +2827,100 @@ mod tests {
             broken: None,
         };
         let mut paid = Vec::new();
-        for human in [true, false] {
-            paid.push(decide_with(
-                &search,
-                &gate(&letronna, human),
-                Some(&unasked),
-                false,
-            ));
+        for ctx in [&letronna, &pool] {
+            for human in [true, false] {
+                paid.push(decide_with(
+                    &search,
+                    &gate(ctx, human),
+                    Some(&unasked),
+                    false,
+                ));
+            }
         }
         // With no gateway, DuckDuckGo is free, and the judge decides.
         let free = decide_with(&search, &gate(&alone, false), Some(&allow), false);
         // DuckDuckGo chosen by name keeps every search off the gateway.
         std::fs::write(dir.join("search.json"), r#"{"service": "DuckDuckGo"}"#).unwrap();
-        let chosen = decide_with(&search, &gate(&letronna, false), Some(&allow), false);
+        let chosen = [&letronna, &pool]
+            .map(|ctx| decide_with(&search, &gate(ctx, false), Some(&allow), false));
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
-        assert_eq!(paid[0], Outcome::Ask);
-        assert!(matches!(paid[1], Outcome::Refuse(_)), "{:?}", paid[1]);
-        assert_eq!((free, chosen), (Outcome::Run, Outcome::Run));
+        let refused = Outcome::Refuse(
+            "Refused: `search_web` needs the user's yes, and nobody is here to give it. \
+             Carry on without it and say what was left undone."
+                .into(),
+        );
+        assert_eq!(paid, [Outcome::Ask, refused.clone(), Outcome::Ask, refused]);
+        // The gateway's list was read for the first call, with its key, and
+        // kept for the others.
+        assert_eq!(
+            *heard.lock().unwrap(),
+            [("GET /v1/models".to_owned(), "Bearer secret".to_owned())]
+        );
+        assert_eq!(free, Outcome::Run);
+        assert_eq!(chosen, [Outcome::Run, Outcome::Run]);
+    }
+
+    #[test]
+    fn a_search_over_a_gateway_that_sells_no_search_is_the_judges_as_before() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // No search service chosen, as on a fresh install.
+        let dir = crate::store::tests::Scratch::new("gate-unpaid-search");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        // A server of the user's own, such as Ollama: no key, and a list of
+        // chat models alone, which the model picker never reads.
+        let (ollama, ollama_heard) = gateway_listing(
+            200,
+            serde_json::json!([
+                {"id": "llama3.2:latest", "object": "model", "owned_by": "library"}
+            ]),
+        );
+        // A gateway with a key that sells no search, such as OpenAI, found so
+        // longer ago than that is kept.
+        let (openai, openai_heard) = gateway_listing(
+            200,
+            serde_json::json!([{"id": "gpt-6", "object": "model", "owned_by": "openai"}]),
+        );
+        crate::search::tests::sold_none_long_ago(&openai);
+        // And one whose list cannot be read.
+        let (broken, broken_heard) = gateway_listing(500, serde_json::json!([]));
+        let none = Grants::new();
+        let judged = std::cell::Cell::new(0);
+        let allow = |_: &ToolCall, _: &str| {
+            judged.set(judged.get() + 1);
+            Verdict::Allow
+        };
+        let search = call("search_web", serde_json::json!({ "query": "rust" }));
+        let mut decided = Vec::new();
+        for ctx in [
+            over(&ollama, ""),
+            over(&openai, "sk-key"),
+            over(&broken, "key"),
+        ] {
+            for human in [true, false] {
+                let gate = Gate {
+                    ctx: &ctx,
+                    mode: Mode::Auto,
+                    grants: &none,
+                    human,
+                    rules: &[],
+                    broken: None,
+                };
+                decided.push(decide_with(&search, &gate, Some(&allow), false));
+            }
+        }
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        // Nothing would be paid, so the judge decides each, with nobody
+        // there too, as before the gateway's search.
+        assert_eq!(decided, vec![Outcome::Run; 6]);
+        assert_eq!(judged.get(), 6);
+        // Each list was read for the first call and kept for the second.
+        for heard in [ollama_heard, openai_heard, broken_heard] {
+            let heard = heard.lock().unwrap();
+            let targets: Vec<&str> = heard.iter().map(|(target, _)| target.as_str()).collect();
+            assert_eq!(targets, ["GET /v1/models"]);
+        }
     }
 
     #[test]
