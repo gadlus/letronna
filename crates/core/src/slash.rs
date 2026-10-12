@@ -66,6 +66,8 @@ pub enum Origin {
     BuiltIn,
     /// The user's `<data>/commands`.
     User,
+    /// A switched-on plugin's commands folder.
+    Plugin,
     /// The project's `.letronna/commands` or `.claude/commands`.
     Project,
     /// A skill switched on, the user's or the project's.
@@ -137,6 +139,7 @@ fn list_in(
     let ordered = files(Origin::User)
         .chain(skills_of(Source::User))
         .chain(workflows_of(false))
+        .chain(files(Origin::Plugin))
         .chain(files(Origin::Project))
         .chain(skills_of(Source::Project))
         .chain(workflows_of(true));
@@ -227,10 +230,12 @@ fn expand(command: &Command, args: &str) -> String {
 }
 
 /// The folders command files are read from, first one first when names
-/// clash: the user's, then the project's own `.letronna` before its
-/// `.claude`.
+/// clash: the user's, then the plugins' switched on, as their skills come
+/// after the user's, then the project's own `.letronna` before its `.claude`.
 fn roots(data: &Path, workspace: Option<&Path>) -> Vec<(PathBuf, Origin)> {
     let mut roots = vec![(data.join(COMMANDS_DIR), Origin::User)];
+    let plugins = crate::plugins::command_folders_in(data);
+    roots.extend(plugins.into_iter().map(|root| (root, Origin::Plugin)));
     if let Some(workspace) = workspace {
         for hidden in [".letronna", ".claude"] {
             let root = workspace.join(hidden).join(COMMANDS_DIR);
@@ -280,11 +285,13 @@ fn walk(
             return;
         }
         *seen += 1;
-        // A project's links are passed over, so a planted one cannot put
-        // some other file in the composer; the user's may be links they made.
+        // A project's or a plugin's links are passed over, so a planted one
+        // cannot put some other file in the composer; the user's may be links
+        // they made.
         let linked = entry.file_type().is_ok_and(|kind| kind.is_symlink());
         let file_name = entry.file_name().to_string_lossy().into_owned();
-        if (linked && origin == Origin::Project) || file_name.starts_with('.') {
+        let theirs = matches!(origin, Origin::Project | Origin::Plugin);
+        if (linked && theirs) || file_name.starts_with('.') {
             continue;
         }
         let path = entry.path();
@@ -321,6 +328,11 @@ fn read_command(path: &Path, name: String, origin: Origin) -> Option<Command> {
             untrusted::visible(&description),
             untrusted::visible(&hint),
             untrusted::vetted("this project's command", &body),
+        ),
+        Origin::Plugin => (
+            untrusted::visible(&description),
+            untrusted::visible(&hint),
+            untrusted::vetted("a plugin's command", &body),
         ),
         _ => (description, hint, body),
     };
@@ -791,6 +803,53 @@ mod tests {
         );
         assert!(tidy.body.ends_with("]\nTidy up."), "{}", tidy.body);
         assert_eq!(find(&listed, "mine").unwrap().body, "Mine\u{200b}.");
+    }
+
+    #[test]
+    fn a_plugin_s_commands_come_after_the_user_s_and_before_the_project_s() {
+        let root = scratch("plugins");
+        let (data, project) = (root.join("data"), root.join("project"));
+        let plugin = data.join("plugins/claude");
+        write(
+            &plugin.join("plugin.json"),
+            r#"{"name": "claude", "commands": ["commands"]}"#,
+        );
+        write(
+            &plugin.join("commands/claude-login.md"),
+            "---\ndescription: Sign in to Claude\n---\nCall\u{200b} the tool.",
+        );
+        write(&plugin.join("commands/review.md"), "The plugin's review.");
+        write(&data.join("commands/review.md"), "Yours.");
+        write(
+            &project.join(".claude/commands/claude-login.md"),
+            "The project's.",
+        );
+        // A plugin switched off brings none.
+        write(&data.join("plugins/off/plugin.json"), r#"{"name": "off"}"#);
+        write(&data.join("plugins/off/commands/gone.md"), "Not listed.");
+        write(
+            &data.join("plugins.json"),
+            r#"{"plugins": {"off": {"off": true}}}"#,
+        );
+        let listed = list_in(&data, Some(&project), &[], &[], &[]);
+        let seen: Vec<(&str, Origin, Option<Origin>)> = listed
+            .iter()
+            .map(|c| (c.name.as_str(), c.origin, c.hidden_by))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("claude-login", Origin::Plugin, None),
+                ("claude-login", Origin::Project, Some(Origin::Plugin)),
+                ("review", Origin::User, None),
+                ("review", Origin::Plugin, Some(Origin::User)),
+            ]
+        );
+        // Someone else's text, cleaned as a project's is.
+        let login = find(&listed, "claude-login").unwrap();
+        assert_eq!(login.description, "Sign in to Claude");
+        assert!(!login.body.contains('\u{200b}'));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[cfg(unix)]
