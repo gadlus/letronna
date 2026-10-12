@@ -4504,7 +4504,7 @@ fn set_up_gateway(runner: &mut Runner, name: &'static str) {
         let given = runner.bar.ask(&hint, false).unwrap_or_default();
         if !given.trim().is_empty() {
             let kept = match own {
-                true => gateway::keep_own(name, &given).map(|(_, base)| base),
+                true => gateway::change_own(name, &given),
                 false => gateway::own_base(&given),
             };
             match kept {
@@ -4547,7 +4547,7 @@ fn add_own_gateway(runner: &mut Runner) {
     if address.trim().is_empty() {
         return;
     }
-    let name = match gateway::keep_own(&name, &address) {
+    let name = match gateway::add_own(&name, &address) {
         Ok((name, _)) => name,
         Err(error) => {
             render::blank();
