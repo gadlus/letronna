@@ -228,9 +228,15 @@ fn check_name(name: &str, list: &[Own]) -> Result<(), String> {
     Ok(())
 }
 
-/// What adding a gateway under a name one has already is answered.
+/// What adding a gateway under a name one has already is answered, the
+/// name spelled as that one's is.
 fn already(name: &str) -> String {
-    format!("There is a gateway called {name} already: pick another name, or change that one.")
+    let spelled = gateways()
+        .into_iter()
+        .map(|g| g.name)
+        .find(|other| other.eq_ignore_ascii_case(name))
+        .unwrap_or(name);
+    format!("There is a gateway called {spelled} already: pick another name, or change that one.")
 }
 
 /// Whether a built-in gateway, one a plugin added, or one of `list` is
@@ -739,10 +745,9 @@ mod tests {
             // The same name again, in any case, is refused, and the one
             // there keeps its address: adding never changes another.
             for again in ["Box", "box", " BOX "] {
-                assert!(
-                    add_own(again, "http://localhost:2/v1")
-                        .unwrap_err()
-                        .contains("already")
+                assert_eq!(
+                    add_own(again, "http://localhost:2/v1").unwrap_err(),
+                    "There is a gateway called Box already: pick another name, or change that one."
                 );
             }
             assert_eq!(base_url("Box", ""), "http://localhost:1/v1");
