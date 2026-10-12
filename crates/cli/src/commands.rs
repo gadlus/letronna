@@ -3054,13 +3054,16 @@ fn describe_plugin(plugin: &letronna_core::plugins::Plugin) {
     for (name, target) in &plugin.servers {
         render::line(&render::dim(&format!("     MCP server {name}: {target}")));
     }
+    for (name, base) in &plugin.providers {
+        render::line(&render::dim(&format!("     Provider {name}: {base}")));
+    }
     for why in &plugin.clashes {
         render::line(&render::amber(&format!("     {why}")));
     }
     if !plugin.allowed {
         render::line(&render::amber(&format!(
-            "     Its MCP servers run programs on this computer and wait for your say: \
-             /plugins allow {} to start them.",
+            "     Its MCP servers run programs on this computer and its providers are sent \
+             your messages, so they wait for your say: /plugins allow {} to use them.",
             plugin.name
         )));
     }
@@ -4276,7 +4279,7 @@ pub fn search_services(runner: &mut Runner) {
 /// connect one, change it or disconnect it. Everything connected is used at
 /// once; `/model` picks among all their models.
 pub fn connect(runner: &mut Runner) {
-    use letronna_core::gateway::{self, GATEWAYS, LETRONNA};
+    use letronna_core::gateway::{self, LETRONNA, gateways};
     use letronna_core::providers::{self, AuthKind, router};
     let keys = store::load_keys();
     let custom = runner.store.settings.custom_endpoint.clone();
@@ -4291,7 +4294,7 @@ pub fn connect(runner: &mut Runner) {
     let mut rows = Vec::new();
     let mut choices: Vec<(String, &'static str, &'static str)> = Vec::new();
     // One a plugin offers is listed only while the plugin is on.
-    for g in GATEWAYS.iter().filter(|g| providers::offered(g.name)) {
+    for g in gateways().iter().filter(|g| providers::offered(g.name)) {
         let count = models.iter().filter(|(n, _)| n == g.name).count();
         let (status, good, set_up) = gateway::status(g.name, &keys, &custom, count);
         let usage = router::usage(g.name);

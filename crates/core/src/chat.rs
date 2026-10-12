@@ -4397,7 +4397,17 @@ fn stream(
                     return stream(connection, messages, start, budget, extra, lsp, sender);
                 }
                 let body = serde_json::from_str::<Value>(&error).unwrap_or_default();
-                let failure = classify(Some(status.as_u16()), &headers, &body);
+                let mut failure = classify(Some(status.as_u16()), &headers, &body);
+                // A shared Codex sign-in is renewed by Codex, never here.
+                if status == reqwest::StatusCode::UNAUTHORIZED
+                    && crate::providers::wire::openai_responses::chatgpt(&connection.endpoint)
+                    && crate::providers::chatgpt::shares_codex()
+                {
+                    failure = crate::failure::Failure::new(
+                        failure.kind,
+                        crate::providers::chatgpt::RENEW_IN_CODEX,
+                    );
+                }
                 // What only the Responses API is sent, and that API itself,
                 // are learned as a field is: each costs at most one retry.
                 if let Some((_, responded)) = &wired

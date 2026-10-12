@@ -99,8 +99,12 @@ fn spec_of(name: &str) -> Result<&'static OAuthSpec, String> {
     }
 }
 
-/// The sign-in kept for provider `name`.
+/// The sign-in kept for provider `name`: ChatGPT's may be the Codex app's,
+/// read as it is now and never refreshed.
 pub fn tokens(name: &str) -> Option<Tokens> {
+    if name == super::chatgpt::NAME && super::chatgpt::shares_codex() {
+        return super::chatgpt::codex_tokens();
+    }
     let kept = crate::vault::get(&slot(name)).ok()??;
     serde_json::from_str(&kept).ok()
 }
@@ -203,7 +207,11 @@ fn renew(name: &str, spec: &OAuthSpec, kept: Tokens) -> Result<Tokens, String> {
 
 /// The tokens a token endpoint's `reply` stands for, with `before`'s where
 /// it leaves one out, as a refresh may.
-fn from_reply(spec: &OAuthSpec, reply: &Value, before: Option<&Tokens>) -> Result<Tokens, String> {
+pub(crate) fn from_reply(
+    spec: &OAuthSpec,
+    reply: &Value,
+    before: Option<&Tokens>,
+) -> Result<Tokens, String> {
     let text = |key: &str| {
         reply[key]
             .as_str()
@@ -482,7 +490,7 @@ fn pasted_code(text: &str, state: &str) -> Result<String, String> {
     pasted(text, state)
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

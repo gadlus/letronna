@@ -1090,7 +1090,7 @@ fn plugins_page(
         .gap_4()
         .child(heading(
             "Plugins",
-            "Optional integrations. Toggle one off to unload it. Choices are saved in plugins.json.",
+            "Optional integrations. Toggle one off to unload it. Choices are saved in plugin-switches.json.",
             cx,
         ))
         .child(list)
@@ -2079,7 +2079,7 @@ impl Chat {
     /// Every gateway with where it stands now, taken before the dialog is
     /// built so the dialog never has to read this entity.
     pub(crate) fn gateway_rows(&self) -> Vec<GatewayRow> {
-        GATEWAYS
+        gateways()
             .iter()
             .map(|g| {
                 let count = self.models.iter().filter(|(n, _)| n == g.name).count();
@@ -2097,7 +2097,11 @@ impl Chat {
                 let action = match g.name {
                     _ if (browser || g.name == LETRONNA) && !set_up => Some("Sign in"),
                     _ if browser || g.name == LETRONNA => Some("Sign out"),
-                    "Ollama" => None,
+                    _ if provider.map(|p| p.auth())
+                        == Some(letronna_core::providers::AuthKind::None) =>
+                    {
+                        None
+                    }
                     "Custom" if !set_up => Some("Add URL"),
                     _ if !set_up => Some("Add key"),
                     _ => Some("Edit"),
@@ -2833,7 +2837,7 @@ fn browser_sign_in(
 /// The tiers in the order the router reaches for accounts when one is rate
 /// limited or out of quota, each movable up or down.
 fn tier_order(order: Vec<letronna_core::providers::Tier>, chat: &Entity<Chat>, cx: &App) -> Div {
-    use letronna_core::providers::{PROVIDERS, Tier};
+    use letronna_core::providers::Tier;
     let last = order.len().saturating_sub(1);
     let section = v_flex().gap_2().child(heading(
         "When one runs out",
@@ -2851,8 +2855,8 @@ fn tier_order(order: Vec<letronna_core::providers::Tier>, chat: &Entity<Chat>, c
             Tier::Credit => "Letronna credit",
             Tier::Free => "Free and local",
         };
-        let names: Vec<&str> = PROVIDERS
-            .iter()
+        let names: Vec<&str> = letronna_core::providers::all()
+            .into_iter()
             .filter(|p| letronna_core::providers::offered(p.info().name))
             .map(|p| p.info())
             .filter(|info| info.tier == tier)

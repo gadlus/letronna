@@ -13,7 +13,7 @@ use std::time::Duration;
 
 pub(crate) const NAME: &str = "ChatGPT";
 
-/// The window plugin that offers it, by its id in `plugins.json`.
+/// The window plugin that offers it, by its id in `plugin-switches.json`.
 const PLUGIN: &str = "chatgpt";
 
 static SIGN_IN: OAuthSpec = OAuthSpec {
@@ -54,6 +54,48 @@ const EFFORTS: [(&str, &str); 7] = [
     ("xhigh", "Extra high"),
     ("max", "Max"),
 ];
+
+/// The switch, kept beside the plugin's own, that has ChatGPT use the
+/// Codex app's sign-in instead of one of its own.
+pub const CODEX_SWITCH: &str = "chatgpt.codex-sign-in";
+
+/// What a refused shared sign-in says: Letronna never renews it itself.
+pub const RENEW_IN_CODEX: &str =
+    "ChatGPT refused the Codex app's sign-in. Use Codex once so it renews its sign-in.";
+
+/// Whether ChatGPT uses the Codex app's sign-in.
+pub fn shares_codex() -> bool {
+    super::switches().get(CODEX_SWITCH) == Some(&true)
+}
+
+/// Where the Codex app keeps its sign-in.
+fn codex_file() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| crate::tools::home().map(|home| home.join(".codex")))?;
+    Some(home.join("auth.json"))
+}
+
+/// The Codex app's sign-in, read afresh on every request so a renewal there
+/// is picked up at once. Only read: never refreshed and never written, so
+/// Codex's own copy is never changed under it.
+pub(crate) fn codex_tokens() -> Option<super::auth::Tokens> {
+    let saved: Value = serde_json::from_slice(&std::fs::read(codex_file()?).ok()?).ok()?;
+    shared(&saved["tokens"], super::auth::now())
+}
+
+/// `tokens` from Codex's `auth.json` as a sign-in Letronna will not renew:
+/// no refresh token, no end to refresh ahead of, refreshed just now.
+fn shared(tokens: &Value, now: u64) -> Option<super::auth::Tokens> {
+    let mut held = super::auth::from_reply(&SIGN_IN, tokens, None).ok()?;
+    if let Some(account) = tokens["account_id"].as_str().filter(|a| !a.is_empty()) {
+        held.account = account.to_owned();
+    }
+    held.refresh.clear();
+    held.expires_at = 0;
+    held.refreshed_at = now;
+    Some(held)
+}
 
 pub struct ChatGpt;
 
@@ -100,6 +142,7 @@ impl Provider for ChatGpt {
             .send()
             .and_then(|r| r.error_for_status())
             .map_err(|e| match e.status().map(|s| s.as_u16()) {
+                Some(401 | 403) if shares_codex() => RENEW_IN_CODEX.to_owned(),
                 Some(401 | 403) => "ChatGPT refused the sign-in. Sign in again.".to_owned(),
                 _ => "Cannot load the model list from ChatGPT.".to_owned(),
             })?;
@@ -181,6 +224,27 @@ fn plan_usage(headers: &reqwest::header::HeaderMap, now: u64) -> Option<Quota> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_codex_apps_sign_in_is_taken_as_one_never_to_renew() {
+        let claims = json!({"https://api.openai.com/auth": {"chatgpt_plan_type": "plus"}});
+        let jwt = |c: &Value| {
+            let part = |v: &Value| super::super::auth::base64url(v.to_string().as_bytes());
+            format!("{}.{}.sig", part(&json!({"alg": "none"})), part(c))
+        };
+        let saved = json!({
+            "id_token": jwt(&claims), "access_token": "access-x",
+            "refresh_token": "refresh-x", "account_id": "acct-1",
+        });
+        let held = shared(&saved, 500).unwrap();
+        assert_eq!(
+            (held.access.as_str(), held.account.as_str()),
+            ("access-x", "acct-1")
+        );
+        assert_eq!(held.plan, "plus");
+        assert!(held.refresh.is_empty() && held.expires_at == 0 && held.refreshed_at == 500);
+        assert!(shared(&json!({}), 0).is_none());
+    }
 
     #[test]
     fn the_plans_tighter_window_is_its_quota() {

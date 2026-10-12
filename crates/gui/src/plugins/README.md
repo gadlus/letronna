@@ -32,7 +32,7 @@ Rules of the trait:
 - **`set_enabled` must actually stop the work.** When disabled, clear whatever
   you put out into the world (a tray item, a presence, a socket) and ignore
   events until re-enabled.
-- **`id` is forever.** It is the key in `plugins.json`. Renaming it resets every
+- **`id` is forever.** It is the key in `plugin-switches.json`. Renaming it resets every
   user's on/off choice.
 
 ## Events
@@ -85,18 +85,19 @@ nothing, then call it from that spot in the UI. Existing plugins keep compiling.
 ## Lifecycle
 
 1. `main` builds the plugin list: `vec![Box::new(MyPlugin::new()), …]`.
-2. `plugins::init` reads `plugins.json`, calls `set_enabled` with the saved
+2. `plugins::init` reads `plugin-switches.json`, calls `set_enabled` with the saved
    choice (`default_enabled` when there is none), then `init` on each, and
    stores the registry.
 3. During the session the app calls `plugins::emit`; enabled plugins get `handle`.
 4. The Plugins settings page calls `plugins::set_enabled`, which flips the plugin
-   and rewrites `plugins.json`.
+   and rewrites `plugin-switches.json`.
 
 ## State and storage
 
-- The on/off map lives in `plugins.json` under the app data dir
-  (`%LOCALAPPDATA%\Letronna` on Windows). The app owns this file; a plugin never
-  writes it.
+- The on/off map lives in `plugin-switches.json` under the app data dir
+  (`%LOCALAPPDATA%\Letronna` on Windows). The app owns this file
+  (`plugins.json` beside it is the marketplace's); a plugin writes only its
+  own option keys there, through `providers::save_switch`.
 - A plugin that needs its own storage should write its own file in the same data
   dir, keyed by its `id`, and read it in `init`.
 

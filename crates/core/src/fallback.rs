@@ -42,8 +42,8 @@ impl Fallback {
     pub fn parse(text: &str) -> Result<Self, String> {
         let text = text.trim();
         let named = text.split_once(':').and_then(|(gateway, model)| {
-            let gateway = crate::gateway::GATEWAYS
-                .iter()
+            let gateway = crate::gateway::gateways()
+                .into_iter()
                 .find(|g| g.name.eq_ignore_ascii_case(gateway.trim()))?;
             Some((gateway.name.to_owned(), model.trim().to_owned()))
         });

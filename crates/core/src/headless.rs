@@ -397,7 +397,7 @@ fn spec(id: u64, run: &Run) -> Result<Spec, String> {
     let own = (conversation.gateway.as_deref())
         .zip(conversation.model.as_deref())
         .filter(|&(gateway, model)| {
-            !model.is_empty() && gateway::GATEWAYS.iter().any(|g| g.name == gateway)
+            !model.is_empty() && gateway::gateways().iter().any(|g| g.name == gateway)
         });
     let (gateway, model) = own.unwrap_or((&settings.gateway, &settings.model));
     let saved = store::load_keys()
