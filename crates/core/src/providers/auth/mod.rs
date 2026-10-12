@@ -100,10 +100,14 @@ fn spec_of(name: &str) -> Result<&'static OAuthSpec, String> {
 }
 
 /// The sign-in kept for provider `name`: ChatGPT's may be the Codex app's,
-/// read as it is now and never refreshed.
+/// read as it is now and never refreshed, or Letronna's own when Codex has
+/// none.
 pub fn tokens(name: &str) -> Option<Tokens> {
-    if name == super::chatgpt::NAME && super::chatgpt::shares_codex() {
-        return super::chatgpt::codex_tokens();
+    if name == super::chatgpt::NAME
+        && super::chatgpt::shares_codex()
+        && let Some(shared) = super::chatgpt::codex_tokens()
+    {
+        return Some(shared);
     }
     let kept = crate::vault::get(&slot(name)).ok()??;
     serde_json::from_str(&kept).ok()
