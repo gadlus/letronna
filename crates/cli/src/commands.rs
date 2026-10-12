@@ -432,6 +432,8 @@ fn send_prompt(runner: &mut Runner, command: &str, rest: &str) -> Flow {
 #[derive(Debug, PartialEq)]
 enum ToolSearch {
     Show,
+    /// Ask Jev one small question now, and say how it went.
+    Check,
     /// Rank by Jev where the chat is hosted, Jev anywhere, or by names.
     Rank(&'static str),
     /// Ask Jev at this address; empty for the Letronna account.
@@ -452,6 +454,7 @@ fn tool_search_asked(rest: &str) -> Result<ToolSearch, String> {
         .map_or((rest.trim(), ""), |(what, value)| (what, value.trim()));
     Ok(match what {
         "" => ToolSearch::Show,
+        "check" => ToolSearch::Check,
         "auto" => ToolSearch::Rank("auto"),
         "jev" => ToolSearch::Rank("jev"),
         "names" => ToolSearch::Rank("names"),
@@ -471,27 +474,118 @@ fn tool_search_asked(rest: &str) -> Result<ToolSearch, String> {
         }
         _ => {
             return Err(
-                "/tool-search auto, jev or names · key (or key remove) · address <url> or letronna · model <name>"
+                "/tool-search auto, jev or names · check · key (or key remove) · address <url> or letronna · model <name>"
                     .into(),
             );
         }
     })
 }
 
-/// Show how find_tools ranks what it finds and where Jev is asked, or change
-/// it as `rest` says.
+/// The ways find_tools can rank, as `/tool-search` offers them: the setting,
+/// its name and what it means.
+const RANKINGS: [(&str, &str, &str); 3] = [
+    (
+        "auto",
+        "Automatic",
+        "Jev ranks them while the chat is on a hosted model; for a model on this computer, they are ranked here by their words",
+    ),
+    (
+        "jev",
+        "Always Jev",
+        "Jev ranks every search, a model on this computer included",
+    ),
+    (
+        "names",
+        "Words only",
+        "ranked here by their names and descriptions, and nothing is sent",
+    ),
+];
+
+/// How the last search's tools were ranked, in a line.
+fn last_ranking() -> String {
+    use letronna_core::jev::Outcome;
+    match letronna_core::jev::last() {
+        None => "No tools searched for yet.".to_owned(),
+        Some(Outcome::Jev(Some(took))) => {
+            format!("Last search ranked by Jev in {:.1} s.", took.as_secs_f64())
+        }
+        Some(Outcome::Jev(None)) => "Last search ranked by Jev.".to_owned(),
+        Some(Outcome::Words(why)) => format!("Last search ranked by words; Jev: {why}."),
+        Some(Outcome::NotAsked(why)) => format!("Last search ranked by words, as {why}."),
+    }
+}
+
+/// Where Jev is asked, as the settings and keys have it: "at TypeSafe",
+/// "through your Letronna account" and the like.
+fn jev_place(runner: &Runner, own_key: bool) -> String {
+    match (runner.store.settings.jev_endpoint.trim(), own_key) {
+        ("", true) => "at TypeSafe, with your own key".to_owned(),
+        ("", false) if letronna_core::auth::account().is_none() => {
+            "nowhere, as this computer is signed out and no Jev key is set".to_owned()
+        }
+        ("", false) => "through your Letronna account".to_owned(),
+        (address, _) => format!("at {address}"),
+    }
+}
+
+/// Show how find_tools ranks what it finds and where Jev is asked, and
+/// offer to change it; or change it, or check Jev, as `rest` says.
 fn tool_search(runner: &mut Runner, rest: &str) {
     render::blank();
-    let asked = match tool_search_asked(rest) {
+    let mut asked = match tool_search_asked(rest) {
         Ok(asked) => asked,
         Err(error) => {
             render::line(&render::red(&error));
             return;
         }
     };
+    let own_key = || {
+        store::load_keys()
+            .get(letronna_core::jev::KEY_SLOT)
+            .is_some_and(|key| !key.is_empty())
+    };
+    if asked == ToolSearch::Show {
+        let now = runner.store.settings.tool_search.clone();
+        let rows = vec![
+            format!("{} · {}", ranking(&now).1, ranking(&now).2),
+            format!("Jev is asked {}.", jev_place(runner, own_key())),
+            last_ranking(),
+        ];
+        let key = match own_key() {
+            true => "Remove your Jev key",
+            false => "Set a Jev key of your own",
+        };
+        let mut options: Vec<&str> = RANKINGS.iter().map(|(_, name, _)| *name).collect();
+        options.extend(["Check Jev now", key, "Done"]);
+        let Some(picked) = runner.bar.choose("Finding tools", rows, &options) else {
+            return;
+        };
+        asked = match picked {
+            at if at < RANKINGS.len() => ToolSearch::Rank(RANKINGS[at].0),
+            at if at == RANKINGS.len() => ToolSearch::Check,
+            at if at == RANKINGS.len() + 1 => ToolSearch::Key { remove: own_key() },
+            _ => return,
+        };
+    }
     let settings = &mut runner.store.settings;
     match asked {
         ToolSearch::Show => {}
+        ToolSearch::Check => {
+            render::line(&render::dim("Asking Jev one small question…"));
+            match letronna_core::jev::check() {
+                Ok(took) => render::line(&render::green(&format!(
+                    "Jev answered in {:.1} s.",
+                    took.as_secs_f64()
+                ))),
+                Err(why) => {
+                    render::line(&render::amber(&why));
+                    render::line(&render::dim(
+                        "Until it answers, find_tools ranks tools by their words.",
+                    ));
+                }
+            }
+            return;
+        }
         ToolSearch::Rank(how) => settings.tool_search = how.to_owned(),
         ToolSearch::Address(url) => settings.jev_endpoint = url,
         ToolSearch::Model(model) => settings.jev_model = model,
@@ -515,30 +609,28 @@ fn tool_search(runner: &mut Runner, rest: &str) {
     }
     runner.persist();
     let settings = &runner.store.settings;
-    let how = match settings.tool_search.as_str() {
-        "names" => "by the words of their names and descriptions",
-        "jev" => "by Jev wherever it can be reached, else by their names",
-        _ => "by Jev while the chat is on a hosted model, else by their names",
-    };
-    let own_key = store::load_keys()
-        .get(letronna_core::jev::KEY_SLOT)
-        .is_some_and(|key| !key.is_empty());
-    let address = settings.jev_endpoint.trim();
-    let where_asked = match (address, own_key) {
-        ("", true) => "TypeSafe, with your own key".to_owned(),
-        ("", false) => "your Letronna account".to_owned(),
-        (address, _) => address.to_owned(),
-    };
+    let (_, name, means) = ranking(&settings.tool_search);
     let model = Some(settings.jev_model.trim())
         .filter(|model| !model.is_empty())
         .unwrap_or("jev-latest");
     render::line(&render::dim(&format!(
-        "find_tools ranks the tools left out of a request {how}. Jev ({model}) is asked at \
-         {where_asked}, and is sent the search's words and the tools' names and descriptions."
+        "find_tools ranks the tools left out of a request: {name}, {means}. Jev ({model}) \
+         is asked {}, and is sent the search's words and the tools' names and \
+         descriptions.",
+        jev_place(runner, own_key())
     )));
     render::line(&render::dim(
-        "/tool-search auto, jev or names · key · address <url> or letronna · model <name>",
+        "/tool-search for the choices · check · auto, jev or names · key · address <url> or letronna · model <name>",
     ));
+}
+
+/// The ranking `setting` names, Automatic for any it does not.
+fn ranking(setting: &str) -> (&'static str, &'static str, &'static str) {
+    RANKINGS
+        .iter()
+        .copied()
+        .find(|(value, _, _)| *value == setting)
+        .unwrap_or(RANKINGS[0])
 }
 
 /// Show how long sessions are kept, or set it from `rest`.
@@ -4448,8 +4540,8 @@ pub fn connect(runner: &mut Runner) {
 mod tests {
     use super::{
         Asked, Flow, Run, Stage, ToolSearch, agent_lines, agent_rows, asked, choice_label, command,
-        crew_switch, from_match, keep_days, last_prompt, name_label, run_rows, side_setting,
-        standing, tool_search_asked, typed_path, with_files,
+        crew_switch, from_match, keep_days, last_prompt, name_label, ranking, run_rows,
+        side_setting, standing, tool_search_asked, typed_path, with_files,
     };
     use crate::session::Runner;
     use letronna_core::agents::Seen;
@@ -4660,6 +4752,9 @@ mod tests {
     #[test]
     fn tool_search_takes_a_ranking_a_key_an_address_or_a_model() {
         assert_eq!(tool_search_asked(""), Ok(ToolSearch::Show));
+        assert_eq!(tool_search_asked(" check"), Ok(ToolSearch::Check));
+        assert_eq!(ranking("names").1, "Words only");
+        assert_eq!(ranking("").1, "Automatic");
         assert_eq!(tool_search_asked(" jev "), Ok(ToolSearch::Rank("jev")));
         assert_eq!(tool_search_asked("names"), Ok(ToolSearch::Rank("names")));
         assert_eq!(

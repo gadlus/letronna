@@ -106,7 +106,7 @@ pub const COMMANDS: &[Command<'static>] = &[
     },
     Command {
         name: "/tool-search",
-        blurb: "how find_tools ranks the tools left out: by Jev or by name, and where Jev is asked",
+        blurb: "how find_tools ranks the tools left out -- Jev or their words -- and a check of Jev",
     },
     Command {
         name: "/notify",

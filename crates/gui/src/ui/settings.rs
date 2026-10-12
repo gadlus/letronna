@@ -375,9 +375,69 @@ impl Chat {
         let own_key = self.keys.get(KEY_SLOT).is_some_and(|key| !key.is_empty());
         match (address, own_key) {
             ("", true) => "Your key, at TypeSafe".into(),
-            ("", false) => "Your Letronna account".into(),
+            ("", false) if self.account.is_none() => {
+                "Signed out: ranked by words until you sign in or add a key".into()
+            }
+            ("", false) => "Through your Letronna account".into(),
             (address, _) => address.to_owned(),
         }
+    }
+
+    /// What Settings › Search says of Jev now.
+    pub(crate) fn jev_lines(&self) -> JevLines {
+        use letronna_core::jev::Outcome;
+        let (last, good) = match letronna_core::jev::last() {
+            None => ("No tools searched for yet".to_owned(), false),
+            Some(Outcome::Jev(Some(took))) => (
+                format!("Last search ranked by Jev in {:.1} s", took.as_secs_f64()),
+                true,
+            ),
+            Some(Outcome::Jev(None)) => ("Last search ranked by Jev".to_owned(), true),
+            Some(Outcome::Words(why)) => {
+                (format!("Last search ranked by words; Jev: {why}"), false)
+            }
+            Some(Outcome::NotAsked(why)) => {
+                (format!("Last search ranked by words, as {why}"), false)
+            }
+        };
+        let checked = self.jev_checked.as_ref().map(|checked| match checked {
+            Ok(took) => (format!("Jev answered in {:.1} s", took.as_secs_f64()), true),
+            Err(why) => (why.clone(), false),
+        });
+        JevLines {
+            place: self.jev_status(),
+            last,
+            good,
+            checked,
+            checking: self.jev_checking,
+        }
+    }
+
+    /// Ask Jev one small question off the window's thread, and keep what it
+    /// found for the Search page.
+    pub(crate) fn check_jev(&mut self, cx: &mut Context<Self>) {
+        if self.jev_checking {
+            return;
+        }
+        self.jev_checking = true;
+        self.jev_checked = None;
+        cx.notify();
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(letronna_core::jev::check());
+        });
+        cx.spawn(async move |this, cx| {
+            let checked = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| Err("The check stopped before it finished.".into()));
+            let _ = this.update(cx, |this, cx| {
+                this.jev_checking = false;
+                this.jev_checked = Some(checked);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Put the open search row's address back to the service's official one.
@@ -866,7 +926,7 @@ impl Chat {
             )
             .child(tool_search_section(
                 &self.store.settings.tool_search,
-                self.jev_status(),
+                self.jev_lines(),
                 &pick,
                 &endpoint,
                 &key,
@@ -2391,12 +2451,24 @@ fn search_page(
 /// The row of the shared fields that Jev's address and key open in.
 const JEV_ROW: &str = "jev";
 
-/// How find_tools ranks the tools a request leaves out, by `mode`, and
-/// Jev's row, saying where it is asked (`status`), with its key and address
-/// in the shared fields when open.
+/// What Settings › Search says of Jev: where it is asked, how the last
+/// search was ranked, and what a check found.
+pub(crate) struct JevLines {
+    place: String,
+    last: String,
+    /// Jev ranked the last search.
+    good: bool,
+    /// What the last check found, and whether Jev answered.
+    checked: Option<(String, bool)>,
+    checking: bool,
+}
+
+/// How find_tools ranks the tools a request leaves out, by `mode`, how the
+/// last search was ranked with a check of Jev, and Jev's row, saying where
+/// it is asked, with its key and address in the shared fields when open.
 fn tool_search_section(
     mode: &str,
-    status: String,
+    jev: JevLines,
     pick: &Entity<String>,
     endpoint: &Entity<InputState>,
     key: &Entity<InputState>,
@@ -2406,17 +2478,26 @@ fn tool_search_section(
     let choices = [
         (
             "auto",
-            "Jev while the chat is on a hosted model; by name for a model on this computer",
+            "Automatic",
+            "Jev ranks them while the chat is on a hosted model; for a model on this computer, they are ranked here by their words.",
         ),
-        ("jev", "Jev always, a model on this computer included"),
-        ("names", "By their names only, and nothing is sent"),
+        (
+            "jev",
+            "Always Jev",
+            "Jev ranks every search, a model on this computer included.",
+        ),
+        (
+            "names",
+            "Words only",
+            "Ranked here by their names and descriptions; nothing is sent.",
+        ),
     ];
     let mode = match mode {
         "jev" | "names" => mode,
         _ => "auto",
     };
     let mut ways = v_flex().gap_2();
-    for (at, (value, text)) in choices.into_iter().enumerate() {
+    for (at, (value, title, text)) in choices.into_iter().enumerate() {
         let active = mode == value;
         let chat = chat.clone();
         ways = ways.child(
@@ -2433,7 +2514,17 @@ fn tool_search_section(
                 } else {
                     cx.theme().border
                 })
-                .child(div().text_sm().child(text))
+                .child(
+                    v_flex()
+                        .gap_0p5()
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(text),
+                        ),
+                )
                 .on_click(move |_, _, cx| {
                     chat.update(cx, |this, cx| {
                         this.store.settings.tool_search = value.to_owned();
@@ -2443,6 +2534,52 @@ fn tool_search_section(
                 }),
         );
     }
+    let dot = |good: bool| {
+        div().size(px(7.)).rounded_full().bg(if good {
+            cx.theme().green
+        } else {
+            cx.theme().muted_foreground.opacity(0.5)
+        })
+    };
+    let check = chat.clone();
+    let last = h_flex()
+        .gap_2()
+        .items_center()
+        .child(dot(jev.good))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(jev.last),
+        )
+        .child(
+            Button::new("jev-check")
+                .small()
+                .plain(cx)
+                .loading(jev.checking)
+                .disabled(jev.checking)
+                .label(if jev.checking {
+                    "Checking"
+                } else {
+                    "Check Jev"
+                })
+                .on_click(move |_, _, cx| check.update(cx, |this, cx| this.check_jev(cx))),
+        );
+    let checked = jev.checked.map(|(said, good)| {
+        h_flex().gap_2().items_center().child(dot(good)).child(
+            div()
+                .text_xs()
+                .text_color(if good {
+                    cx.theme().foreground
+                } else {
+                    cx.theme().muted_foreground
+                })
+                .child(said),
+        )
+    });
+    let status = jev.place;
     let editing = pick.read(cx).as_str() == JEV_ROW;
     let open = chat.clone();
     let head = h_flex()
@@ -2534,10 +2671,11 @@ fn tool_search_section(
         .gap_3()
         .child(heading(
             "Finding tools",
-            "A request can leave tools out -- the less used ones in a run nobody watches, an MCP server's when there are many -- and find_tools looks them up. Jev, a small decision model, ranks them by what they do. It is sent the search's words and the tools' names and descriptions, nothing of the chat.",
+            "A request can leave tools out -- the less used ones, an MCP server's when there are many -- and find_tools looks them up. Jev, a small decision model, ranks them by what they do; without it they are ranked here by their words, and the model can still pick one by what it does. Jev is sent the search's words and the tools' names and descriptions, nothing of the chat.",
             cx,
         ))
         .child(ways)
+        .child(v_flex().gap_1p5().child(last).children(checked))
         .child(row)
 }
 
