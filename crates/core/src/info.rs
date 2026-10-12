@@ -1023,7 +1023,7 @@ mod tests {
             "New sessions: test/model on OpenRouter, effort high.",
             "Fallbacks, in order: OpenAI:gpt-5.",
             "Providers: Letronna signed in; OpenAI key set in the vault; ChatGPT not signed in; \
-             Anthropic no key; \
+             Anthropic no key; Gemini no key; xAI no key; \
              OpenRouter key set in keys.json; Ollama needs no key; Custom address set, no key.",
             "Web search: Brave in use, key in the vault; Tavily not set up; Exa not set up; \
              SearXNG saved, not in use; DuckDuckGo not in use.",
