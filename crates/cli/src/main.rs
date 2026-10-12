@@ -25,6 +25,7 @@ mod install;
 mod mcp;
 mod memory;
 mod notify;
+mod presence;
 mod render;
 mod screen;
 mod serve;
@@ -33,6 +34,7 @@ mod setup;
 mod spinner;
 mod syntax;
 mod title;
+mod wallet;
 
 use args::{Args, HELP, Output, Start, parse};
 use banner::{banner, folder_name, footer, replay};
@@ -126,6 +128,9 @@ fn main() {
     }
     if let Some(words) = &args.cloud {
         std::process::exit(cloud::run(words));
+    }
+    if let Some(words) = &args.wallet {
+        std::process::exit(wallet::run(words));
     }
     if args.acp {
         std::process::exit(acp::run());

@@ -46,3 +46,19 @@ ring = "0.17"
 # C library can say. Already in the lock file, for other crates.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# The wallet's sends, keys and rules wait for the system to confirm the user
+# is there (presence.rs): Windows Hello, at the version the window uses, and
+# LocalAuthentication through objc2, already in the lock file under gpui.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Foundation",
+    "Security_Credentials_UI",
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_WinRT",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
