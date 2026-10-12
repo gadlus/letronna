@@ -232,7 +232,10 @@ fn taken(name: &str, list: &[Own]) -> bool {
 
 /// `pasted` as a gateway's address is kept: no slash or chat route on the
 /// end, and with no scheme, http for this computer and the local network
-/// and https for anywhere else. Checked as a request to it would be.
+/// and https for anywhere else. Checked as a request to it would be, and
+/// never Letronna's own, which the account reaches with its sign-in: under
+/// another gateway it listed every model twice with a key that is not the
+/// account's.
 pub fn own_base(pasted: &str) -> Result<String, String> {
     let mut base = pasted.trim().trim_end_matches('/').to_owned();
     if let Some(cut) = base.strip_suffix("/chat/completions") {
@@ -254,6 +257,11 @@ pub fn own_base(pasted: &str) -> Result<String, String> {
         ..Default::default()
     };
     crate::chat::validate(&probe)?;
+    if base == crate::auth::hosted_base() {
+        return Err(format!(
+            "That is Letronna's own address: sign in under {LETRONNA} to use its models."
+        ));
+    }
     Ok(base)
 }
 
@@ -728,6 +736,12 @@ mod tests {
             assert_eq!(
                 own_base("127.0.0.1:8000/v1"),
                 Ok("http://127.0.0.1:8000/v1".into())
+            );
+            let hosted = format!("{}/chat/completions", crate::auth::hosted_base());
+            assert!(
+                own_base(&hosted)
+                    .unwrap_err()
+                    .contains("sign in under Letronna")
             );
         });
     }
