@@ -50,6 +50,65 @@ Keys are saved in the system's vault: macOS Keychain or Windows Credential Manag
 
 A provider signed in to in the browser describes its OAuth sign-in as data, a `static` `OAuthSpec` (`providers/auth/`): its authorize and token URLs, client id, scopes, the loopback port and path the browser comes back to, any extra authorize parameters, whether the token endpoint takes JSON or a form, PKCE, and where the account id and plan are in the id token. Return `AuthKind::OAuth(&SPEC)` and nothing else is needed: `providers::auth` opens the browser, waits on the loopback (or takes the address or `code#state` pasted back), trades the code for tokens, keeps them in the vault under `provider:<name>`, and refreshes the access token shortly before it ends or once when it is refused. `providers/chatgpt/` is the example.
 
+## Offered by a plugin
+
+A provider can be one a window plugin switches on, as ChatGPT is: its
+`plugin()` returns the plugin's id, and until that plugin is on it is left
+out of the gateways, the model list, the router, the local endpoint and
+`/connect`. Everything else about it is the same as any provider's. The
+window's plugin calls `providers::plug(id, on)` and saves the switch in
+`plugin-switches.json`, where the terminal reads it; `plugins.json` is the
+marketplace's and is never written by a switch. Its account row is shown
+under the plugin in Settings › Plugins rather than on the Accounts page.
+
+ChatGPT starts on for anyone already signed in to it when it became a
+plugin, and off for everyone else; after that the switch is the user's.
+Its plugin can also use the Codex app's sign-in instead of one of its own:
+`~/.codex/auth.json` (or `$CODEX_HOME/auth.json`) is read on every request
+and never refreshed or written. When ChatGPT refuses that token, the user is
+told to use Codex once so it renews its sign-in.
+
+## From a plugin
+
+A plugin installed with `/plugins` can add providers without any code: an
+OpenAI-compatible API is data in its `plugin.json`.
+
+```json
+{
+  "name": "acme",
+  "version": "1.0.0",
+  "providers": [
+    {
+      "name": "Acme",
+      "base": "https://api.acme.example/v1",
+      "blurb": "Acme's hosted models. Needs an Acme API key.",
+      "docs": "https://acme.example/keys",
+      "tier": "api_key",
+      "auth": "api_key"
+    }
+  ]
+}
+```
+
+- `name`: up to 40 letters, digits, spaces, `-`, `_` and `.`. A name a
+  built-in provider has (any case) is refused, and the plugin's page says
+  so; the first plugin to give a name keeps it.
+- `base`: where its `/models` and `/chat/completions` are, `https://` or
+  `http://127.0.0.1`.
+- `tier`: `subscription`, `api_key` (the default), `credit` or `free`, which
+  places it in the fallback order.
+- `auth`: `api_key` (the default) for a key the user pastes, saved in the
+  vault under the provider's name; `url` for a server whose key is
+  optional; `none` for one that needs nothing, allowed only on
+  `http://127.0.0.1`.
+
+A plugin's providers are offered only while it is installed, switched on and
+allowed: since they are sent your messages, they wait for `/plugins allow`
+(or Allow on its page) as MCP servers do, and an update that changes them
+asks again. Then they appear in Settings › Accounts and `/connect`, list
+their models and are routed like any built-in provider. Nothing is run:
+there is no code in a plugin's provider, only where to send requests.
+
 ## Local endpoint
 
 Settings › Accounts › Local endpoint serves the connected accounts as an

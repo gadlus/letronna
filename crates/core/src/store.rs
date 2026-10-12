@@ -3414,7 +3414,7 @@ fn from_saved(mut saved: serde_json::Value) -> Option<Settings> {
 /// model is picked again from the new list. One a plugin added stays while
 /// the plugin is on, which in the window is before the settings are read.
 fn retire_gateway(s: &mut Settings) {
-    use crate::gateway::{GATEWAYS, LETRONNA};
+    use crate::gateway::{LETRONNA, gateways};
     // Saves from before Custom had its own field kept its URL in `endpoint`.
     if s.gateway == "Custom" && s.custom_endpoint.is_empty() {
         s.custom_endpoint = s.endpoint.clone();
@@ -3423,7 +3423,7 @@ fn retire_gateway(s: &mut Settings) {
         return;
     }
     s.gateway = LETRONNA.into();
-    s.endpoint = GATEWAYS[0].base.into();
+    s.endpoint = gateways()[0].base.into();
     s.model.clear();
 }
 

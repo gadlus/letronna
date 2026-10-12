@@ -829,7 +829,16 @@ impl Chat {
             .into_any_element(),
             "Thinking" => thinking_page(&chat, &self.store, window, cx).into_any_element(),
             "Shortcuts" => shortcuts_page(&hotkey, &chat, cx).into_any_element(),
-            "Plugins" => plugins_page(&chat, cx).into_any_element(),
+            "Plugins" => plugins_page(
+                self.gateway_rows(),
+                &pick,
+                &endpoint,
+                &key,
+                &page,
+                &chat,
+                cx,
+            )
+            .into_any_element(),
             "Memory" => v_flex()
                 .gap_5()
                 .child(heading(
@@ -988,12 +997,21 @@ fn show_page(name: &'static str, page: &Entity<&'static str>, chat: &Entity<Chat
     }
 }
 
-fn plugins_page(chat: &Entity<Chat>, cx: &App) -> Div {
+fn plugins_page(
+    mut rows: Vec<GatewayRow>,
+    pick: &Entity<String>,
+    endpoint: &Entity<InputState>,
+    key: &Entity<InputState>,
+    page: &Entity<&'static str>,
+    chat: &Entity<Chat>,
+    cx: &App,
+) -> Div {
     let mut list = v_flex();
     for info in plugins::list(cx) {
-        let chat = chat.clone();
+        let toggle = chat.clone();
         let id = info.id;
         let enabled = info.enabled;
+        let provider = info.provider;
         let row = h_flex()
             .items_center()
             .justify_between()
@@ -1034,9 +1052,15 @@ fn plugins_page(chat: &Entity<Chat>, cx: &App) -> Div {
                 div().flex_shrink_0().cursor_pointer().child(
                     KeyedSwitch::new(SharedString::from(format!("plugin-{id}")))
                         .checked(enabled)
-                        .on_click(move |_, _, cx| {
+                        .on_click(move |_, window, cx| {
                             plugins::set_enabled(cx, id, !enabled);
-                            chat.update(cx, |_, cx| cx.notify());
+                            toggle.update(cx, |this, cx| {
+                                // Its provider's models join the list or leave it.
+                                if provider.is_some() {
+                                    this.load_models(window, cx);
+                                }
+                                cx.notify()
+                            });
                         }),
                 ),
             );
@@ -1045,6 +1069,12 @@ fn plugins_page(chat: &Entity<Chat>, cx: &App) -> Div {
         } else {
             None
         };
+        // The provider it offers, with the row the Accounts page would give it.
+        let account = provider.filter(|_| enabled).map(|name| {
+            let own = rows.iter().position(|row| row.name == name);
+            let own = own.map(|i| rows.remove(i)).into_iter().collect();
+            gateway_list(own, pick, endpoint, key, page, chat, cx)
+        });
         list = list.child(
             v_flex()
                 .gap_2()
@@ -1052,14 +1082,15 @@ fn plugins_page(chat: &Entity<Chat>, cx: &App) -> Div {
                 .border_b_1()
                 .border_color(cx.theme().border)
                 .child(row)
-                .children(settings),
+                .children(settings)
+                .children(account),
         );
     }
     v_flex()
         .gap_4()
         .child(heading(
             "Plugins",
-            "Optional integrations. Toggle one off to unload it. Choices are saved in plugins.json.",
+            "Optional integrations. Toggle one off to unload it. Choices are saved in plugin-switches.json.",
             cx,
         ))
         .child(list)
@@ -2040,13 +2071,15 @@ pub(crate) struct GatewayRow {
     caveat: Option<&'static str>,
     /// Its browser sign-in is waiting now.
     waiting: bool,
+    /// A plugin offers it, so it is shown under the plugin, not here.
+    plugin: bool,
 }
 
 impl Chat {
     /// Every gateway with where it stands now, taken before the dialog is
     /// built so the dialog never has to read this entity.
     pub(crate) fn gateway_rows(&self) -> Vec<GatewayRow> {
-        GATEWAYS
+        gateways()
             .iter()
             .map(|g| {
                 let count = self.models.iter().filter(|(n, _)| n == g.name).count();
@@ -2064,7 +2097,11 @@ impl Chat {
                 let action = match g.name {
                     _ if (browser || g.name == LETRONNA) && !set_up => Some("Sign in"),
                     _ if browser || g.name == LETRONNA => Some("Sign out"),
-                    "Ollama" => None,
+                    _ if provider.map(|p| p.auth())
+                        == Some(letronna_core::providers::AuthKind::None) =>
+                    {
+                        None
+                    }
                     "Custom" if !set_up => Some("Add URL"),
                     _ if !set_up => Some("Add key"),
                     _ => Some("Edit"),
@@ -2088,6 +2125,7 @@ impl Chat {
                     },
                     browser,
                     caveat: provider.and_then(|p| p.caveat()),
+                    plugin: provider.and_then(|p| p.plugin()).is_some(),
                     waiting: self
                         .provider_sign_in
                         .as_ref()
@@ -2799,7 +2837,7 @@ fn browser_sign_in(
 /// The tiers in the order the router reaches for accounts when one is rate
 /// limited or out of quota, each movable up or down.
 fn tier_order(order: Vec<letronna_core::providers::Tier>, chat: &Entity<Chat>, cx: &App) -> Div {
-    use letronna_core::providers::{PROVIDERS, Tier};
+    use letronna_core::providers::Tier;
     let last = order.len().saturating_sub(1);
     let section = v_flex().gap_2().child(heading(
         "When one runs out",
@@ -2817,8 +2855,9 @@ fn tier_order(order: Vec<letronna_core::providers::Tier>, chat: &Entity<Chat>, c
             Tier::Credit => "Letronna credit",
             Tier::Free => "Free and local",
         };
-        let names: Vec<&str> = PROVIDERS
-            .iter()
+        let names: Vec<&str> = letronna_core::providers::all()
+            .into_iter()
+            .filter(|p| letronna_core::providers::offered(p.info().name))
             .map(|p| p.info())
             .filter(|info| info.tier == tier)
             .map(|info| info.name)
@@ -2962,7 +3001,15 @@ fn gateway_page(
             "Every account you connect is used at once: its models join the model list, and each message goes to the account of the model you pick. Keys stay in keys.json on this machine; sign-ins stay in the system vault.",
             cx,
         ))
-        .child(gateway_list(rows, pick, endpoint, key, page, chat, cx))
+        .child(gateway_list(
+            rows.into_iter().filter(|row| !row.plugin).collect(),
+            pick,
+            endpoint,
+            key,
+            page,
+            chat,
+            cx,
+        ))
 }
 
 #[cfg(test)]

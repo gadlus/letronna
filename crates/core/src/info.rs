@@ -293,7 +293,8 @@ fn models(connection: Option<&Connection>) -> String {
         kept(keys.get(slot).and_then(Value::as_str), "keys.json", &name)
     };
     let signed_in = crate::auth::account().is_some();
-    let providers: Vec<String> = (crate::gateway::GATEWAYS.iter())
+    let providers: Vec<String> = (crate::gateway::gateways().iter())
+        .filter(|gateway| crate::providers::offered(gateway.name))
         .map(|gateway| {
             let state = match gateway.name {
                 crate::gateway::LETRONNA if signed_in => "signed in".to_owned(),
@@ -348,7 +349,7 @@ fn models(connection: Option<&Connection>) -> String {
         .keys()
         .filter(|slot| {
             let named = |name: &str| name == slot.as_str();
-            !(crate::gateway::GATEWAYS.iter()).any(|gateway| named(gateway.name))
+            !(crate::gateway::gateways().iter()).any(|gateway| named(gateway.name))
                 && !(crate::search::SERVICES.iter()).any(|service| named(service.name))
         })
         .filter_map(|slot| Some(format!("{slot} {}", key(slot)?)))
@@ -368,7 +369,7 @@ fn models(connection: Option<&Connection>) -> String {
 /// The gateway whose address `endpoint` is, Custom's being `custom`.
 fn gateway_at(endpoint: &str, custom: &str) -> Option<&'static str> {
     let bare = |url: &str| url.trim().trim_end_matches('/').to_owned();
-    (crate::gateway::GATEWAYS.iter())
+    (crate::gateway::gateways().iter())
         .map(|gateway| gateway.name)
         .find(|name| {
             let base = crate::gateway::base_url(name, custom);
@@ -1099,7 +1100,8 @@ mod tests {
             "This session: test/model on OpenRouter.",
             "New sessions: test/model on OpenRouter, effort high.",
             "Fallbacks, in order: OpenAI:gpt-5.",
-            "Providers: Letronna signed in; OpenAI key set in the vault; ChatGPT not signed in; \
+            // ChatGPT is left out while its plugin is off.
+            "Providers: Letronna signed in; OpenAI key set in the vault; \
              Anthropic no key; Gemini no key; xAI no key; \
              OpenRouter key set in keys.json; Ollama needs no key; Custom address set, no key.",
             "Web search: Brave in use, key in the vault; Tavily not set up; Exa not set up; \

@@ -1,17 +1,18 @@
 //! The gateways a session can send to, as the settings, `/gateways` and the
-//! model picker list them: the providers in `providers::PROVIDERS`, and
+//! model picker list them: the providers in `providers::all()`, and
 //! those plugins add while they are on. What sets each one apart -- its URL,
 //! what it needs, what it speaks -- is its provider's; this keeps the shape
 //! the callers were written against.
 
-use crate::providers::{AuthKind, PROVIDERS};
+use crate::providers::AuthKind;
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 /// The hosted pool on your Letronna account: no key, charged to your credit.
 /// First in the list, and what a new install starts on.
 pub const LETRONNA: &str = "Letronna";
 
+#[derive(Clone)]
 pub struct Gateway {
     pub name: &'static str,
     pub base: &'static str,
@@ -19,9 +20,10 @@ pub struct Gateway {
     pub blurb: &'static str,
 }
 
-pub static GATEWAYS: LazyLock<Vec<Gateway>> = LazyLock::new(|| {
-    PROVIDERS
-        .iter()
+/// Every gateway: the built-in providers', then those plugins declare.
+pub fn gateways() -> Vec<Gateway> {
+    crate::providers::all()
+        .into_iter()
         .map(|p| {
             let info = p.info();
             Gateway {
@@ -32,7 +34,7 @@ pub static GATEWAYS: LazyLock<Vec<Gateway>> = LazyLock::new(|| {
             }
         })
         .collect()
-});
+}
 
 /// What the built-in gateway `name` needs, `None` for one a plugin added.
 fn auth_of(name: &str) -> Option<AuthKind> {
@@ -82,10 +84,11 @@ fn added_as(name: &str) -> Option<Added> {
         .cloned()
 }
 
-/// Whether `name` is a gateway on offer now: a built-in one, or one a plugin
-/// added and has not taken back.
+/// Whether `name` is a gateway on offer now: a built-in one whose plugin, if
+/// it has one, is on, or one a plugin added and has not taken back.
 pub fn offered(name: &str) -> bool {
-    GATEWAYS.iter().any(|g| g.name == name) || added_as(name).is_some()
+    (gateways().iter().any(|g| g.name == name) && crate::providers::offered(name))
+        || added_as(name).is_some()
 }
 
 /// Whether requests to `endpoint` go to the Responses API whatever the model,
@@ -129,7 +132,7 @@ pub fn named(endpoint: &str) -> Option<&'static str> {
         .ok()
         .and_then(|list| list.iter().find(|g| at(&g.base)).map(|g| g.name));
     plugin.or_else(|| {
-        GATEWAYS
+        gateways()
             .iter()
             .find(|g| at(&base_url(g.name, "")))
             .map(|g| g.name)
@@ -153,18 +156,19 @@ pub fn base_url(name: &str, custom: &str) -> String {
 /// Every gateway set up on this computer, as (name, base URL, key): Letronna
 /// and those signed in to in the browser once signed in, a keyed gateway once its key is saved, Custom once it has
 /// a URL, Ollama always (on this machine, a closed port answers at once),
-/// and those plugins added.
+/// and those plugins added. One a plugin offers is left out while it is off.
 pub fn ready(keys: &HashMap<String, String>, custom: &str) -> Vec<(&'static str, String, String)> {
     let plugins = added().lock().map(|list| list.clone()).unwrap_or_default();
     let plugins = plugins.into_iter().map(|g| (g.name, g.base, g.key));
-    GATEWAYS
+    gateways()
         .iter()
+        .filter(|g| crate::providers::offered(g.name))
         .filter_map(|g| {
             let key = keys.get(key_slot(g.name)).cloned().unwrap_or_default();
             let on = match auth_of(g.name) {
                 Some(AuthKind::Account) => crate::auth::account().is_some(),
                 Some(AuthKind::OAuth(_)) => crate::providers::auth::signed_in(g.name),
-                Some(AuthKind::Url) => !custom.trim().is_empty(),
+                Some(AuthKind::Url) => !base_url(g.name, custom).trim().is_empty(),
                 Some(AuthKind::None) => true,
                 _ => !key.trim().is_empty(),
             };
@@ -214,7 +218,9 @@ pub fn status(
         Some(AuthKind::OAuth(_)) => ("Not signed in".into(), false, false),
         Some(AuthKind::None) if models > 0 => (format!("Running · {}", count(models)), true, true),
         Some(AuthKind::None) => ("Not running".into(), false, false),
-        Some(AuthKind::Url) if custom.trim().is_empty() => ("Not set up".into(), false, false),
+        Some(AuthKind::Url) if base_url(name, custom).trim().is_empty() => {
+            ("Not set up".into(), false, false)
+        }
         _ if g.needs_key && !key => ("Not set up".into(), false, false),
         _ if models > 0 => (format!("Connected · {}", count(models)), true, true),
         _ => ("Set up · no models answered".into(), false, true),
@@ -257,11 +263,10 @@ pub fn key_slot(name: &str) -> &str {
     name
 }
 
-pub fn gateway(name: &str) -> &'static Gateway {
-    GATEWAYS
-        .iter()
-        .find(|g| g.name == name)
-        .unwrap_or(&GATEWAYS[0])
+pub fn gateway(name: &str) -> Gateway {
+    let mut all = gateways();
+    let at = all.iter().position(|g| g.name == name).unwrap_or(0);
+    all.swap_remove(at)
 }
 
 #[cfg(test)]
@@ -350,6 +355,20 @@ mod tests {
     }
 
     #[test]
+    fn a_provider_a_plugin_offers_is_there_only_while_the_plugin_is_on() {
+        let none = HashMap::new();
+        let _vault = crate::providers::auth::tests::vault("gateway-plugin");
+        crate::providers::auth::tests::keep("ChatGPT", "access-1");
+        crate::providers::save_switch("chatgpt", false);
+        // Signed in, but its plugin is switched off.
+        assert!(!offered("ChatGPT"));
+        assert!(!ready(&none, "").iter().any(|g| g.0 == "ChatGPT"));
+        crate::providers::tests::plugged_in("chatgpt");
+        assert!(offered("ChatGPT"));
+        assert!(ready(&none, "").iter().any(|g| g.0 == "ChatGPT"));
+    }
+
+    #[test]
     fn a_browser_sign_in_is_set_up_once_signed_in() {
         let none = HashMap::new();
         assert_eq!(
@@ -358,6 +377,7 @@ mod tests {
         );
         assert!(!ready(&none, "").iter().any(|g| g.0 == "ChatGPT"));
         let _vault = crate::providers::auth::tests::vault("gateway-sign-in");
+        crate::providers::tests::plugged_in("chatgpt");
         crate::providers::auth::tests::keep("ChatGPT", "access-1");
         assert_eq!(
             status("ChatGPT", &none, "", 2),

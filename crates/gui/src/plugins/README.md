@@ -20,6 +20,7 @@ pub(crate) trait Plugin: 'static {
     fn default_enabled(&self) -> bool { true } // on or off before the user chooses
     fn settings(&self, cx: &App) -> Option<AnyElement> { None } // your own UI, shown under the row
     fn tools(&self) -> Vec<Arc<dyn Tool>> { Vec::new() }        // tools you give the agent
+    fn provider(&self) -> Option<&'static str> { None }         // a core provider you offer
 }
 ```
 
@@ -31,7 +32,7 @@ Rules of the trait:
 - **`set_enabled` must actually stop the work.** When disabled, clear whatever
   you put out into the world (a tray item, a presence, a socket) and ignore
   events until re-enabled.
-- **`id` is forever.** It is the key in `plugins.json`. Renaming it resets every
+- **`id` is forever.** It is the key in `plugin-switches.json`. Renaming it resets every
   user's on/off choice.
 
 ## Events
@@ -53,7 +54,7 @@ opened, a tool ran, the window focused), not UI details.
 ## Hooks are trait methods
 
 There are no mixins in Rust. A hook is simply a method the app calls on your
-plugin. You get three kinds:
+plugin. You get four kinds:
 
 - **Event hooks** — `handle(&AppEvent)` reacts to what the app is doing.
 - **UI hooks** — `settings(&App) -> Option<AnyElement>` lets you render your own
@@ -61,6 +62,9 @@ plugin. You get three kinds:
 - **Tool hooks** — `tools() -> Vec<Arc<dyn Tool>>` adds tools the model can call.
   They are offered only while your plugin is enabled, and withdrawn the moment
   it is switched off. A plugin cannot take over the name of a built-in tool.
+- **Provider hooks** — `provider()` names a core provider whose `plugin()` is
+  your id. It is offered only while you are on, and the Plugins page shows
+  its account row (sign-in, status, usage) under yours. `chatgpt.rs` is one.
 
 A tool runs on a worker thread with no access to `App`, so everything it holds
 must be `Send + Sync` — share your plugin's state through an `Arc`, as
@@ -81,18 +85,19 @@ nothing, then call it from that spot in the UI. Existing plugins keep compiling.
 ## Lifecycle
 
 1. `main` builds the plugin list: `vec![Box::new(MyPlugin::new()), …]`.
-2. `plugins::init` reads `plugins.json`, calls `set_enabled` with the saved
+2. `plugins::init` reads `plugin-switches.json`, calls `set_enabled` with the saved
    choice (`default_enabled` when there is none), then `init` on each, and
    stores the registry.
 3. During the session the app calls `plugins::emit`; enabled plugins get `handle`.
 4. The Plugins settings page calls `plugins::set_enabled`, which flips the plugin
-   and rewrites `plugins.json`.
+   and rewrites `plugin-switches.json`.
 
 ## State and storage
 
-- The on/off map lives in `plugins.json` under the app data dir
-  (`%LOCALAPPDATA%\Letronna` on Windows). The app owns this file; a plugin never
-  writes it.
+- The on/off map lives in `plugin-switches.json` under the app data dir
+  (`%LOCALAPPDATA%\Letronna` on Windows). The app owns this file
+  (`plugins.json` beside it is the marketplace's); a plugin writes only its
+  own option keys there, through `providers::save_switch`.
 - A plugin that needs its own storage should write its own file in the same data
   dir, keyed by its `id`, and read it in `init`.
 

@@ -293,6 +293,9 @@ impl Chat {
         for (name, target) in &plugin.servers {
             brings.push(small(format!("MCP server {name}: {target}"), muted));
         }
+        for (name, base) in &plugin.providers {
+            brings.push(small(format!("Provider {name}: {base}"), muted));
+        }
         for why in &plugin.clashes {
             brings.push(small(why.clone(), cx.theme().warning));
         }
@@ -397,9 +400,10 @@ impl Chat {
                                 .text_xs()
                                 .text_color(cx.theme().foreground)
                                 .child(
-                                    "Its MCP servers run the programs above on this computer. \
-                                     None of them starts until you allow them; an update that \
-                                     changes them asks again.",
+                                    "Its MCP servers run the programs above on this computer, \
+                                     and its providers are sent your messages. None is used \
+                                     until you allow them; an update that changes them asks \
+                                     again.",
                                 ),
                         )
                         .child(
@@ -407,7 +411,7 @@ impl Chat {
                                 .primary()
                                 .xsmall()
                                 .flex_shrink_0()
-                                .label("Allow servers")
+                                .label("Allow")
                                 .disabled(busy)
                                 .on_click(
                                     cx.listener(move |this, _, _, cx| {
@@ -637,7 +641,7 @@ impl Chat {
 /// Whether the plugin has servers that wait to be allowed. One whose
 /// manifest does not read is not allowed either, but has none to show.
 fn waits_for_consent(plugin: &Plugin) -> bool {
-    !plugin.allowed && !plugin.servers.is_empty()
+    !plugin.allowed && !(plugin.servers.is_empty() && plugin.providers.is_empty())
 }
 
 /// Whether the plugin `shown` is in `now` with the version and servers the
@@ -647,6 +651,7 @@ fn unchanged(shown: &Plugin, now: &[Plugin]) -> bool {
         plugin.name == shown.name
             && plugin.version == shown.version
             && plugin.servers == shown.servers
+            && plugin.providers == shown.providers
     })
 }
 
@@ -686,6 +691,7 @@ mod tests {
                 .iter()
                 .map(|(name, target)| (name.to_string(), target.to_string()))
                 .collect(),
+            providers: Vec::new(),
             clashes: Vec::new(),
             broken: None,
         }
