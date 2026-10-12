@@ -1159,6 +1159,14 @@ impl Chat {
     }
 
     pub(crate) fn load_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = window;
+        self.reload_models(cx);
+    }
+
+    /// Ask every set-up gateway for its models again, off the window's
+    /// thread, as `load_models` does where there is no window to hand: a
+    /// sign-in finishing in the background.
+    pub(crate) fn reload_models(&mut self, cx: &mut Context<Self>) {
         if self.loading_models {
             return;
         }
@@ -1172,7 +1180,6 @@ impl Chat {
             let media = letronna_core::media::catalogue().unwrap_or_default();
             let _ = tx.send_blocking((all_models(&keys, &custom), media));
         });
-        let _ = window;
         cx.spawn(async move |this, cx| {
             if let Ok(((models, errors), media)) = rx.recv().await {
                 let _ = this.update(cx, |this, cx| {
