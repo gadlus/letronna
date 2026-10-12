@@ -10798,6 +10798,7 @@ mod tests {
 
     #[test]
     fn the_prefix_changes_with_the_history_only_where_an_earlier_message_did() {
+        let _folder = one_data_folder();
         let hashed = |connection: &Connection, window: &[Message]| {
             let mut prefix = crate::cache_miss::Prefix::default();
             let extra = Extra::default();
@@ -11232,6 +11233,7 @@ mod tests {
 
     #[test]
     fn a_served_turn_sends_the_same_bytes_from_the_front_where_the_cap_rewrote_them() {
+        let _folder = one_data_folder();
         let c = connection();
         let budget = sized(Some(1_000_000), None, CAP_TOKENS, 0);
         let mut turn = reads(40, 8_000);
@@ -11274,6 +11276,19 @@ mod tests {
     /// The requests a turn of `turn`'s messages sends over `c` under
     /// `budget`, one a round as each result comes in: the messages of each
     /// as they go on the wire.
+    /// The system prompt carries the SOUL.md, style and USER.md of the data
+    /// folder, which other tests point elsewhere while they hold
+    /// `store::tests::DATA_DIR`. A test that compares requests or their
+    /// prefix hashes round by round holds it throughout, so every round reads
+    /// the one folder, as a session's rounds do.
+    fn one_data_folder() -> std::sync::MutexGuard<'static, ()> {
+        crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Its callers hold `store::tests::DATA_DIR` (`one_data_folder`) for the
+    /// whole test, as they also hash prompts the folder feeds.
     fn requests_by_round(c: &Connection, turn: &[Message], budget: &Budget) -> Vec<String> {
         (1..turn.len())
             .step_by(2)
@@ -11298,6 +11313,7 @@ mod tests {
 
     #[test]
     fn the_history_sent_changes_only_where_a_whole_chunk_is_crossed() {
+        let _folder = one_data_folder();
         // A DeepSeek turn, whose reasoning goes back with every call and
         // counts toward the boundary as it does on the wire.
         let c = Connection {
@@ -11358,6 +11374,7 @@ mod tests {
 
     #[test]
     fn results_bigger_than_what_is_kept_still_move_the_boundary_in_chunks() {
+        let _folder = one_data_folder();
         // The newest five results come to far more than the 4,000 tokens
         // kept, so it is they that hold the boundary back, but it still only
         // moves on whole chunks rather than with every result.
@@ -12689,6 +12706,7 @@ mod tests {
 
     #[test]
     fn the_turns_reasoning_is_cut_only_where_a_whole_chunk_is_crossed() {
+        let _folder = one_data_folder();
         let c = Connection {
             model: "deepseek-reasoner".into(),
             ..connection()
@@ -12754,6 +12772,7 @@ mod tests {
 
     #[test]
     fn the_cut_follows_the_old_results_in_the_same_rewrite() {
+        let _folder = one_data_folder();
         let c = Connection {
             model: "deepseek-reasoner".into(),
             ..connection()
