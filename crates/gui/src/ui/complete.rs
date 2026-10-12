@@ -32,6 +32,9 @@ pub(crate) struct Completer {
     dismissed: Option<usize>,
     /// References taken from the list and still in the message.
     accepted: Vec<String>,
+    /// The added commands, as (name, what it does), read when a `/` list
+    /// opens rather than on every key.
+    added: Vec<(String, String)>,
     scroll: ScrollHandle,
 }
 
@@ -89,7 +92,14 @@ impl Chat {
             _gathering: None,
         };
         if typing.trigger == '/' {
-            open.choices = complete::commands(typing.query, COMMANDS, &self.skills);
+            let opening = (self.completer.open.as_ref())
+                .is_none_or(|was| was.trigger != '/' || was.start != typing.start);
+            if opening {
+                self.completer.added = self.added_commands();
+            }
+            let added = (self.completer.added.iter()).map(|(n, d)| (n.as_str(), d.as_str()));
+            let offered: Vec<(&str, &str)> = COMMANDS.iter().copied().chain(added).collect();
+            open.choices = complete::commands(typing.query, &offered, &self.skills);
         } else {
             // What was offered stays up until the new list is ready, rather
             // than the list emptying on every key.
@@ -104,6 +114,22 @@ impl Chat {
         self.completer.open = Some(open);
         self.completer.scroll.scroll_to_item(0);
         cx.notify();
+    }
+
+    /// The commands added beside the window's own -- the user's, a plugin's,
+    /// the project's and saved workflows -- that would run as typed. Skills
+    /// are offered as skills, and a name another has first is left out.
+    fn added_commands(&self) -> Vec<(String, String)> {
+        use letronna_core::slash::{self, Origin};
+        let own: Vec<&str> = COMMANDS.iter().map(|&(name, _)| name).collect();
+        let workspace = self.store.conversations[self.store.active]
+            .workspace
+            .as_deref();
+        slash::list(workspace, &own)
+            .into_iter()
+            .filter(|c| c.hidden_by.is_none() && c.origin != Origin::Skill)
+            .map(|c| (c.name, c.description))
+            .collect()
     }
 
     /// Find what an `@` followed by `query` could mean on the background
