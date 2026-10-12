@@ -130,7 +130,7 @@ pub fn run(words: &[String]) -> i32 {
         );
         return 1;
     }
-    match verb(words, &mut Plain) {
+    match guard(words).and_then(|()| verb(words, &mut Plain)) {
         Ok(text) => {
             println!("{text}");
             0
@@ -140,6 +140,16 @@ pub fn run(words: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// A terminal can be faked, and a session's /wallet typed into by whatever
+/// drives it: before a verb that does more than read, the system itself
+/// asks the user to confirm it is them.
+pub fn guard(words: &[String]) -> Result<(), String> {
+    if reads_only(words) {
+        return Ok(());
+    }
+    crate::presence::confirm(&format!("Letronna: wallet {}", words.join(" ")))
 }
 
 /// Do what `words` ask of the wallet, and say what came of it.

@@ -4365,13 +4365,16 @@ name = "letronna-cli"
 version = "0.1.0-alpha.3"
 dependencies = [
  "async-channel",
+ "block2 0.6.2",
  "chrono",
  "crossterm",
  "embed-resource",
  "letronna-core",
  "libc",
+ "objc2 0.6.4",
  "ring",
  "serde_json",
+ "windows 0.61.3",
 ]
 
 [[package]]

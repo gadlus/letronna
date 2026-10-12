@@ -2945,7 +2945,9 @@ fn wallet(runner: &mut Runner, rest: &str) {
         }
     }
     render::blank();
-    match crate::wallet::verb(&words, &mut runner.bar) {
+    let done =
+        crate::wallet::guard(&words).and_then(|()| crate::wallet::verb(&words, &mut runner.bar));
+    match done {
         Ok(text) => {
             render::said(&render::blue("●"), &render::bold("Wallet"));
             for line in text.lines() {

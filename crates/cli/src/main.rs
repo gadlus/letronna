@@ -25,6 +25,7 @@ mod install;
 mod mcp;
 mod memory;
 mod notify;
+mod presence;
 mod render;
 mod screen;
 mod serve;
