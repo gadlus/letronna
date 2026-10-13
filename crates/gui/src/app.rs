@@ -218,6 +218,11 @@ pub(crate) struct Chat {
     pub(crate) account_note: Option<String>,
     /// The teams the account is in, for the Account page's billing choice.
     pub(crate) teams: Vec<letronna_core::auth::Team>,
+    /// What the last check of Jev from Settings › Search found: how long it
+    /// took to answer, or why it could not be used.
+    pub(crate) jev_checked: Option<Result<std::time::Duration, String>>,
+    /// Jev is being checked.
+    pub(crate) jev_checking: bool,
     pub(crate) signing_in: bool,
     /// A messaging token is being checked with its service.
     pub(crate) connecting: bool,
@@ -904,6 +909,8 @@ impl Chat {
             account,
             account_note: None,
             teams: Vec::new(),
+            jev_checked: None,
+            jev_checking: false,
             signing_in: false,
             connecting: false,
             sign_in_url: None,
