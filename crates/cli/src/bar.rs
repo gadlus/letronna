@@ -1684,6 +1684,8 @@ impl Bar {
                 }
             }
             KeyCode::Char('d') if control && self.line.is_empty() => self.done = true,
+            // Open or fold the latest thinking, as Claude Code's ctrl+o does.
+            KeyCode::Char('o') if control => crate::screen::toggle_last(),
             // A newline on purpose, for writing a paragraph.
             KeyCode::Enter if shift || alt => self.line.insert('\n'),
             // Every enter puts a line ending in. Whether it also ends the
@@ -1828,7 +1830,13 @@ impl Bar {
                 // taking the end from the release is what makes a drag work
                 // at all there.
                 crate::screen::select_to(mouse.column, mouse.row);
-                if let Some(text) = crate::screen::select_done() {
+                let text = crate::screen::select_done();
+                // A bare click on folded thinking opens it, and on opened
+                // thinking folds it.
+                if text.is_none() && crate::screen::toggle_at(mouse.column, mouse.row) {
+                    return;
+                }
+                if let Some(text) = text {
                     let lines = text.lines().count();
                     crate::screen::copy(&text);
                     self.note = Some(format!(

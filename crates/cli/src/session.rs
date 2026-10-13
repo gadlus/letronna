@@ -574,6 +574,9 @@ impl Runner {
         let mut out = Stream::opening_with(render::bullet());
         let mut opened = false;
         let mut thought = false;
+        // The fold the thinking goes into while the window is held, folded
+        // to a line once the answer starts.
+        let mut fold: Option<usize> = None;
         let mut explained = false;
         self.bar.wait_line(true);
         loop {
@@ -611,9 +614,12 @@ impl Runner {
                 && retry.dropped
                 && (opened || thought)
             {
+                if let Some(fold) = fold.take() {
+                    crate::screen::thought(fold);
+                }
                 if opened {
                     out.end();
-                } else {
+                } else if !crate::screen::held() {
                     render::out("", true);
                 }
                 if let Some(voice) = &mut self.voice {
@@ -651,12 +657,20 @@ impl Runner {
                     if !thought {
                         self.bar.wait_line(false);
                         render::blank();
-                        render::said(&render::dim("·"), &render::dim("thinking"));
+                        if crate::screen::held() {
+                            fold = Some(crate::screen::fold_open());
+                        } else {
+                            render::said(&render::dim("·"), &render::dim("thinking"));
+                        }
                         thought = true;
                     }
-                    // Dim, and its own column, so it cannot be mistaken for
-                    // the answer -- it is the model talking to itself.
-                    render::out(&render::dim(&text.replace('\n', " ")), false);
+                    // Dim, and apart from the answer, so it cannot be taken
+                    // for it -- it is the model talking to itself. Held, it
+                    // folds to one line that a click or ctrl+o opens.
+                    match fold {
+                        Some(fold) => crate::screen::think(fold, text),
+                        None => render::out(&render::dim(text), false),
+                    }
                 }
             }
             if let Event::Delta(text) = &event {
@@ -664,7 +678,10 @@ impl Runner {
                     // Nothing more is needed above the answer: the gap was
                     // left when the question was echoed.
                     self.bar.wait_line(false);
-                    if thought {
+                    if let Some(fold) = fold.take() {
+                        crate::screen::thought(fold);
+                        render::blank();
+                    } else if thought {
                         render::out("", true);
                         render::blank();
                     }
@@ -692,6 +709,13 @@ impl Runner {
                 render::said(&render::dim("●"), &render::dim(note));
             }
             turn.absorb(&event);
+            // A reply that only thought and called tools never opened an
+            // answer, so its thinking folds here.
+            if matches!(event, Event::Finished(_) | Event::ToolCalls(_))
+                && let Some(fold) = fold.take()
+            {
+                crate::screen::thought(fold);
+            }
             if let Event::Finished(result) = event {
                 self.bar.wait_line(false);
                 out.end();
