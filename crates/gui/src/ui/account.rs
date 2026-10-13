@@ -123,7 +123,15 @@ impl Chat {
                     this.sign_in_url = None;
                     this.sign_in_cancel = None;
                     // Whatever happened, the file says who is signed in now.
+                    let was = this.account.is_some();
                     this.account = auth::account();
+                    // Letronna's models come with the sign-in and go with
+                    // it, so the list is asked for again when it changed:
+                    // before, they joined it only at the next start, and
+                    // stayed in it after a sign-out, refused when picked.
+                    if this.account.is_some() != was {
+                        this.reload_models(cx);
+                    }
                     this.account_note = match result {
                         Ok(account) if this.account.is_some() => {
                             this.account = Some(account);
