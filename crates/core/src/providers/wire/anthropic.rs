@@ -55,11 +55,22 @@ fn stands_in(_: &str) -> bool {
     false
 }
 
+/// Whether `key` is a subscription token rather than an API key. The two are
+/// different credentials with different expectations, and only this one
+/// carries the client marks: adding them to an API key would be inventing a
+/// client rather than presenting the right one.
+pub(crate) fn subscription(key: &str) -> bool {
+    key.contains("sk-ant-oat")
+}
+
 /// `request` with the key and the API version every call to Anthropic carries.
 pub(crate) fn keyed(request: RequestBuilder, key: &str) -> RequestBuilder {
     let request = request.header("anthropic-version", VERSION);
     match key.trim() {
         "" => request,
+        // A subscription token goes as a bearer, as the client it was issued
+        // to sends it; `x-api-key` is for a key.
+        key if subscription(key) => request.bearer_auth(key),
         key => request.header("x-api-key", key),
     }
 }
@@ -67,6 +78,35 @@ pub(crate) fn keyed(request: RequestBuilder, key: &str) -> RequestBuilder {
 /// `request` carrying `posted`, a Messages request, keyed, and naming the
 /// binding beta when `posted` uses it.
 pub(crate) fn sign(request: RequestBuilder, key: &str, posted: &Value) -> RequestBuilder {
+    // A subscription's token is issued to Anthropic's own client, and a
+    // request carrying one without that client's marks is refused as a rate
+    // limit on an account that is not rate limited -- an error that names
+    // nothing of the cause. So the marks go on, and they replace the beta
+    // header rather than add to it: which betas that client sends is part of
+    // what it is. See `providers::claude::cloak`.
+    if subscription(key) {
+        use crate::providers::claude::cloak;
+        let tokens =
+            crate::providers::auth::tokens(crate::providers::claude::NAME).unwrap_or_default();
+        let has_tools = posted["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty());
+        let has_system = posted.get("system").is_some();
+        let effort = posted.pointer("/output_config/effort").is_some();
+        let mut body = posted.clone();
+        let session = cloak::apply(&mut body, &tokens);
+        let betas = cloak::betas(
+            body["model"].as_str().unwrap_or_default(),
+            has_tools,
+            has_system,
+            effort,
+        );
+        let mut request = keyed(request.json(&body), key).header("anthropic-beta", betas);
+        for (name, value) in cloak::marks(&session) {
+            request = request.header(name, value);
+        }
+        return request;
+    }
     let request = keyed(request.json(posted), key);
     match posted.pointer("/thinking/block_binding") {
         Some(_) => request.header("anthropic-beta", BINDING),

@@ -18,6 +18,7 @@ pub mod wire;
 
 mod anthropic;
 pub mod chatgpt;
+pub mod claude;
 mod custom;
 pub(crate) mod declared;
 mod gemini;
@@ -136,6 +137,7 @@ pub static PROVIDERS: &[&dyn Provider] = &[
     &letronna::Letronna,
     &openai::OpenAi,
     &chatgpt::ChatGpt,
+    &claude::Claude,
     &anthropic::Anthropic,
     &gemini::Gemini,
     &xai::Xai,
