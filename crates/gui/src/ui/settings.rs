@@ -856,6 +856,7 @@ impl Chat {
                 .into_any_element(),
             "About" => about_page(&chat, self, cx).into_any_element(),
             "Search" => search_page(
+                self.account_search(),
                 self.search_rows(),
                 self.store.settings.keyless_search,
                 &pick,
@@ -2170,7 +2171,65 @@ pub(crate) struct SearchRow {
     chosen: bool,
 }
 
+/// Searching through the Letronna account, as the first row of the search
+/// list shows it.
+pub(crate) struct AccountSearch {
+    status: &'static str,
+    blurb: &'static str,
+    /// Searches go through the account now.
+    good: bool,
+    signed_in: bool,
+    /// A service is chosen, which is then the only one asked.
+    chosen: bool,
+    /// The last check with the API found no credit to pay for a search.
+    broke: bool,
+}
+
 impl Chat {
+    /// Where searching through the Letronna account stands now.
+    pub(crate) fn account_search(&self) -> AccountSearch {
+        let chosen = !letronna_core::search::choice().service.is_empty();
+        let Some(account) = &self.account else {
+            return AccountSearch {
+                status: "Signed out",
+                blurb: "Sign in to search through your Letronna account, paid by the search from its credit.",
+                good: false,
+                signed_in: false,
+                chosen,
+                broke: false,
+            };
+        };
+        // An account never checked with the API has no plan yet, and its
+        // credit is not known.
+        let credit = account
+            .team
+            .as_ref()
+            .map_or(account.credits, |team| team.credits);
+        let broke = !account.plan.is_empty() && credit <= 0;
+        let (status, blurb) = match (chosen, broke) {
+            (true, _) => (
+                "Not in use",
+                "Through your account, paid by the search from its credit. The service you chose is used instead.",
+            ),
+            (false, true) => (
+                "No credit",
+                "Through your account, paid by the search. Add credit to use it; DuckDuckGo answers until then.",
+            ),
+            (false, false) => (
+                "In use",
+                "Through your account, paid by the search from its credit, with DuckDuckGo behind it.",
+            ),
+        };
+        AccountSearch {
+            status,
+            blurb,
+            good: !chosen && !broke,
+            signed_in: true,
+            chosen,
+            broke,
+        }
+    }
+
     /// Every search service with where it stands now.
     pub(crate) fn search_rows(&self) -> Vec<SearchRow> {
         let choice = letronna_core::search::choice();
@@ -2194,7 +2253,90 @@ impl Chat {
     }
 }
 
+/// The Letronna row at the head of the search list: where searching through
+/// the account stands, and what would change it.
+fn account_search_row(row: AccountSearch, chat: &Entity<Chat>, cx: &App) -> Div {
+    let dot = if row.good {
+        cx.theme().green
+    } else {
+        cx.theme().muted_foreground.opacity(0.5)
+    };
+    let chat = chat.clone();
+    let action = match (row.signed_in, row.chosen, row.broke) {
+        (false, _, _) => Some(
+            Button::new("search-account")
+                .small()
+                .primary()
+                .label("Sign in")
+                .on_click(move |_, window, cx| {
+                    chat.update(cx, |this, cx| this.open_account(window, cx))
+                }),
+        ),
+        (true, true, _) => Some(
+            Button::new("search-account")
+                .small()
+                .plain(cx)
+                .label("Use")
+                .on_click(move |_, _, cx| {
+                    chat.update(cx, |this, cx| this.use_search_alone("", false, cx))
+                }),
+        ),
+        (true, false, true) => Some(
+            Button::new("search-account")
+                .small()
+                .plain(cx)
+                .label("Add credit")
+                .on_click(|_, _, cx| cx.open_url(&letronna_core::auth::checkout())),
+        ),
+        (true, false, false) => None,
+    };
+    h_flex()
+        .px_4()
+        .py_3()
+        .gap_4()
+        .items_center()
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_family(HEADING_FONT)
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(letronna_core::BRAND),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(row.blurb),
+                ),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .flex_shrink_0()
+                .child(div().size(px(7.)).rounded_full().bg(dot))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(if row.good {
+                            cx.theme().foreground
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .child(row.status),
+                ),
+        )
+        .child(div().w(px(96.)).flex().justify_end().children(action))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn search_page(
+    account: AccountSearch,
     rows: Vec<SearchRow>,
     keyless_search: bool,
     pick: &Entity<String>,
@@ -2204,12 +2346,24 @@ fn search_page(
     cx: &App,
 ) -> Div {
     let open = pick.read(cx).clone();
+    // DuckDuckGo, in use with no service chosen, then answers only when the
+    // account's search cannot.
+    let behind_account = account.signed_in && !account.chosen;
+    let back_to = match account.signed_in {
+        true => "With Letronna",
+        false => "With gateway",
+    };
     let mut list = v_flex()
         .border_1()
         .border_color(cx.theme().border)
-        .rounded(cx.theme().radius);
+        .rounded(cx.theme().radius)
+        .child(account_search_row(account, chat, cx));
     for (i, row) in rows.into_iter().enumerate() {
         let name = row.name;
+        let status = match (row.keyless && behind_account, row.status) {
+            (true, "In use") => "If Letronna cannot",
+            (_, status) => status,
+        };
         let editing = open.strip_prefix("search:") == Some(name);
         let dot = if row.good {
             cx.theme().green
@@ -2239,7 +2393,7 @@ fn search_page(
             Button::new(("search-alone", i))
                 .small()
                 .plain(cx)
-                .label(if chosen { "With gateway" } else { "Use alone" })
+                .label(if chosen { back_to } else { "Use alone" })
                 .on_click(move |_, _, cx| {
                     chat.update(cx, |this, cx| this.use_search_alone(name, !chosen, cx))
                 })
@@ -2282,7 +2436,7 @@ fn search_page(
                             } else {
                                 cx.theme().muted_foreground
                             })
-                            .child(row.status),
+                            .child(status),
                     ),
             )
             .child(
@@ -2294,7 +2448,8 @@ fn search_page(
                     .when(row.keyless, |d| d.child(alone)),
             );
         let mut item = v_flex()
-            .when(i > 0, |d| d.border_t_1().border_color(cx.theme().border))
+            .border_t_1()
+            .border_color(cx.theme().border)
             .child(head);
         if editing {
             let (save, remove, reset) = (chat.clone(), chat.clone(), chat.clone());
@@ -2370,7 +2525,7 @@ fn search_page(
         .gap_5()
         .child(heading(
             "Search",
-            "A search service of your own, which the agent searches the web with, asking you before each search. The one saved last is used, at its official address unless you give another. With none saved, it searches through the gateway where the gateway sells search, paid by the search, and with DuckDuckGo when that cannot answer; DuckDuckGo's Use alone keeps every search off the gateway. Keys stay in keys.json on this machine; the Web toggle is the gateway's own search inside a reply, where it has one.",
+            "Where the agent searches the web, asking you before each search. Signed in, it searches through your Letronna account, paid by the search from its credit, with DuckDuckGo when that cannot answer; signed out, through the gateway where it sells search. A service of your own saved below is used instead, at its official address unless you give another, and DuckDuckGo's Use alone keeps every search off what is paid. Keys stay on this machine; the Web toggle is the gateway's own search inside a reply, where it has one.",
             cx,
         ))
         .child(list)
