@@ -964,6 +964,26 @@ pub fn entry_line(entry: &Entry) -> String {
     )
 }
 
+/// Why `chain` could not be asked, said so a person can act on it. A
+/// network that cannot be connected to at all is most often blocked where
+/// the user is -- some internet providers block a chain's domain and answer
+/// with a block page instead -- so it says to switch it off or read it
+/// through another address rather than only that the request failed.
+fn unreached(chain: &Chain, e: reqwest::Error) -> String {
+    if e.is_timeout() {
+        return format!("{} took too long to answer; try again later.", chain.name);
+    }
+    if e.is_connect() || e.is_request() {
+        return format!(
+            "{} could not be reached from this network; it may be blocked here. \
+             Turn it off, or read it through another address, in Settings › Wallet \
+             or with letronna wallet chains off|rpc.",
+            chain.name
+        );
+    }
+    format!("{} did not answer: {}", chain.name, e.without_url())
+}
+
 /// One JSON-RPC call to `chain`. An RPC address can carry the user's key, so
 /// no error says it.
 pub(crate) fn rpc(chain: &Chain, method: &str, params: Value) -> Result<Value, String> {
@@ -972,7 +992,7 @@ pub(crate) fn rpc(chain: &Chain, method: &str, params: Value) -> Result<Value, S
         .post(&chain.rpc)
         .json(&body)
         .send()
-        .map_err(|e| format!("{} did not answer: {}", chain.name, e.without_url()))?
+        .map_err(|e| unreached(chain, e))?
         .json()
         .map_err(|_| format!("{} answered something that is not JSON-RPC.", chain.name))?;
     if let Some(error) = answer.get("error").filter(|error| !error.is_null()) {
@@ -1722,5 +1742,21 @@ mod tests {
         assert!(text.contains("$1.00 a payment") && text.contains("each price asked about"));
         assert!(!text.contains("abandon"));
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_network_that_cannot_be_reached_says_how_to_get_past_it() {
+        let mut chain = chains::all(&Wallet::default())
+            .into_iter()
+            .find(|chain| chain.name.contains("Base"))
+            .unwrap();
+        // Nothing listens on port 1, as nothing answers where a domain is blocked.
+        chain.rpc = "http://127.0.0.1:1".into();
+        let why = rpc(&chain, "eth_chainId", json!([])).unwrap_err();
+        assert!(
+            why.contains("could not be reached from this network"),
+            "{why}"
+        );
+        assert!(why.contains("Settings › Wallet"), "{why}");
     }
 }
