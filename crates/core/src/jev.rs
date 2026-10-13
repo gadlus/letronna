@@ -32,7 +32,7 @@ use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The key store's slot for a Jev key of the user's own.
 pub const KEY_SLOT: &str = "Jev";
@@ -72,6 +72,67 @@ pub(crate) enum Judged {
     Nothing,
 }
 
+/// How the last search's tools were ranked, as the settings say it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Outcome {
+    /// Jev ranked them, answering in this long, or from what it answered to
+    /// the same search before.
+    Jev(Option<Duration>),
+    /// Jev was asked but gave nothing that could be used, for this reason,
+    /// so they were ranked by their words.
+    Words(&'static str),
+    /// Jev was not asked, for this reason, so they were ranked by their
+    /// words.
+    NotAsked(&'static str),
+}
+
+/// How the last search's tools were ranked since Letronna started, if any
+/// search was made.
+pub fn last() -> Option<Outcome> {
+    latest().lock().ok()?.clone()
+}
+
+fn latest() -> &'static Mutex<Option<Outcome>> {
+    static LAST: Mutex<Option<Outcome>> = Mutex::new(None);
+    &LAST
+}
+
+fn record(outcome: Outcome) {
+    if let Ok(mut last) = latest().lock() {
+        *last = Some(outcome);
+    }
+}
+
+/// Ask Jev one small question the way the settings say it is reached, as
+/// "jev" asks it wherever it can be, for the settings' check: how long it
+/// took to answer, or why it could not be used.
+pub fn check() -> Result<Duration, String> {
+    let (settings, _) = crate::store::settings();
+    let keys = crate::store::load_keys();
+    let account = crate::auth::account().map(|account| account.token);
+    let route = route_of(
+        &Connection::default(),
+        "jev",
+        &settings.jev_endpoint,
+        &settings.jev_model,
+        keys.get(KEY_SLOT).map(String::as_str),
+        account.as_deref(),
+    )
+    .map_err(|why| format!("Jev cannot be asked: {why}."))?;
+    let tools = [
+        (
+            "computer",
+            "See and use the screen: take a screenshot, click and type.",
+        ),
+        ("speak", "Read text out loud."),
+    ];
+    let body = request(&route.model, "take a screenshot of the screen", &tools);
+    let started = Instant::now();
+    let answer = ask(&route, &body).map_err(|why| format!("Jev did not answer: {why}."))?;
+    read(&answer).map_err(|why| format!("Jev's answer could not be used: {why}."))?;
+    Ok(started.elapsed())
+}
+
 /// Where Jev is asked, with what key and under what model name.
 #[derive(Debug, PartialEq)]
 struct Route {
@@ -88,18 +149,27 @@ pub(crate) fn rank(connection: &Connection, query: &str, tools: &[(&str, &str)])
     if query.is_empty() || tools.is_empty() {
         return None;
     }
-    let route = route(connection)?;
+    let route = match route(connection) {
+        Ok(route) => route,
+        Err(why) => {
+            record(Outcome::NotAsked(why));
+            return None;
+        }
+    };
     let body = request(&route.model, query, tools);
     let key = remembered_as(&route, &body);
     if let Some(judged) = answers().lock().ok()?.get(&key) {
+        record(Outcome::Jev(None));
         return Some(judged.clone());
     }
+    let started = Instant::now();
     let judged = match ask(&route, &body) {
         Ok(answer) => read(&answer),
         Err(why) => Err(why),
     };
     match judged {
         Ok(judged) => {
+            record(Outcome::Jev(Some(started.elapsed())));
             if let Ok(mut answers) = answers().lock() {
                 if answers.len() >= REMEMBERED {
                     answers.clear();
@@ -109,15 +179,27 @@ pub(crate) fn rank(connection: &Connection, query: &str, tools: &[(&str, &str)])
             Some(judged)
         }
         Err(why) => {
+            record(Outcome::Words(why));
             noted(why);
             None
         }
     }
 }
 
+/// Why Jev is not asked while the settings rank by words alone.
+const WORDS_ONLY: &str = "the settings rank tools by their words only";
+/// Why Jev is not asked, in auto mode, for a chat with a model nearby.
+const NEARBY: &str = "the chat is on a model on this computer or its network";
+/// Why Jev is not asked with neither an account nor a key of the user's own.
+const NO_WAY: &str = "this computer is signed out, and no Jev key of your own is set";
+/// Why Jev is not asked at an address that cannot be read.
+const BAD_ADDRESS: &str = "its address cannot be read";
+/// Why Jev is not asked at an address a key must not go to.
+const IN_THE_CLEAR: &str = "its address is neither https nor this computer";
+
 /// The way to Jev for a search on `connection`, as the settings and keys
-/// have it, or None where it is not asked.
-fn route(connection: &Connection) -> Option<Route> {
+/// have it, or why it is not asked.
+fn route(connection: &Connection) -> Result<Route, &'static str> {
     let (settings, _) = crate::store::settings();
     let keys = crate::store::load_keys();
     let account = crate::auth::account().map(|account| account.token);
@@ -140,13 +222,13 @@ fn route_of(
     model: &str,
     key: Option<&str>,
     account: Option<&str>,
-) -> Option<Route> {
+) -> Result<Route, &'static str> {
     match mode.trim() {
-        "names" => return None,
+        "names" => return Err(WORDS_ONLY),
         // Asked anywhere it can be reached.
         "jev" => {}
         // Only where the chat goes out to a hosted model anyway.
-        _ if !hosted(&connection.endpoint) => return None,
+        _ if !hosted(&connection.endpoint) => return Err(NEARBY),
         _ => {}
     }
     let key = key.map(str::trim).filter(|key| !key.is_empty());
@@ -155,34 +237,34 @@ fn route_of(
         .unwrap_or(MODEL);
     let endpoint = endpoint.trim();
     if !endpoint.is_empty() {
-        let url = reqwest::Url::parse(endpoint).ok()?;
+        let url = reqwest::Url::parse(endpoint).map_err(|_| BAD_ADDRESS)?;
         // A key goes only over TLS, or to this computer.
         let safe = url.scheme() == "https"
             || (url.scheme() == "http" && url.host_str().is_some_and(loopback));
         if !safe {
-            noted("its address is neither https nor this computer");
-            return None;
+            noted(IN_THE_CLEAR);
+            return Err(IN_THE_CLEAR);
         }
         let model = if url.host_str() == Some("openrouter.ai") {
             openrouter_model(model)
         } else {
             model.to_owned()
         };
-        return Some(Route {
+        return Ok(Route {
             url: endpoint.to_owned(),
             key: key.unwrap_or_default().to_owned(),
             model,
         });
     }
     if let Some(key) = key {
-        return Some(Route {
+        return Ok(Route {
             url: TYPESAFE.into(),
             key: key.to_owned(),
             model: model.to_owned(),
         });
     }
-    let token = account.filter(|token| !token.is_empty())?;
-    Some(Route {
+    let token = account.filter(|token| !token.is_empty()).ok_or(NO_WAY)?;
+    Ok(Route {
         url: format!("{}/systemone", crate::auth::hosted_base()),
         key: token.to_owned(),
         model: model.to_owned(),
@@ -263,9 +345,20 @@ fn ask(route: &Route, body: &Value) -> Result<Value, &'static str> {
         }
     })?;
     if !response.status().is_success() {
-        return Err("it refused the request");
+        return Err(refused(response.status().as_u16()));
     }
     response.json().map_err(|_| "its answer was not JSON")
+}
+
+/// Why Jev answered HTTP `status` rather than a ranking, in a few words.
+fn refused(status: u16) -> &'static str {
+    match status {
+        401 | 403 => "the key or the sign-in was refused",
+        402 => "no credit is left to pay for it",
+        429 => "it is limiting requests for now",
+        500..=599 => "it is not available right now",
+        _ => "it refused the request",
+    }
 }
 
 /// The client Jev is asked with, which gives up at `DEADLINE`.
@@ -360,10 +453,13 @@ mod tests {
         // A model on this computer keeps the search's words on it.
         assert_eq!(
             route_of(&on(LOCAL), "auto", "", "", Some("k"), Some("tok")),
-            None
+            Err(NEARBY)
         );
         // Signed out with no key of its own, there is nowhere to ask.
-        assert_eq!(route_of(&on(HOSTED), "auto", "", "", None, None), None);
+        assert_eq!(
+            route_of(&on(HOSTED), "auto", "", "", None, None),
+            Err(NO_WAY)
+        );
     }
 
     #[test]
@@ -378,16 +474,43 @@ mod tests {
         let pinned = route_of(&on(HOSTED), "", or, "jev-1.13", Some("or-key"), None).unwrap();
         assert_eq!(pinned.model, "typesafe/jev-1.13");
         // "jev" asks even for a local chat; "names" never does.
-        assert!(route_of(&on(LOCAL), "jev", "", "", None, Some("tok")).is_some());
+        assert!(route_of(&on(LOCAL), "jev", "", "", None, Some("tok")).is_ok());
         assert_eq!(
             route_of(&on(HOSTED), "names", "", "", Some("k"), Some("tok")),
-            None
+            Err(WORDS_ONLY)
         );
         // No key goes out in the clear to another machine.
         let clear = "http://jev.example/v1/systemone";
-        assert_eq!(route_of(&on(HOSTED), "", clear, "", Some("k"), None), None);
+        assert_eq!(
+            route_of(&on(HOSTED), "", clear, "", Some("k"), None),
+            Err(IN_THE_CLEAR)
+        );
         let here = "http://127.0.0.1:9/v1/systemone";
-        assert!(route_of(&on(HOSTED), "", here, "", Some("k"), None).is_some());
+        assert!(route_of(&on(HOSTED), "", here, "", Some("k"), None).is_ok());
+        assert_eq!(
+            route_of(&on(HOSTED), "", "not an address", "", Some("k"), None),
+            Err(BAD_ADDRESS)
+        );
+    }
+
+    #[test]
+    fn a_refusal_says_why_in_words_a_person_can_act_on() {
+        assert_eq!(refused(401), "the key or the sign-in was refused");
+        assert_eq!(refused(402), "no credit is left to pay for it");
+        assert_eq!(refused(503), "it is not available right now");
+        assert_eq!(refused(418), "it refused the request");
+    }
+
+    #[test]
+    fn check_says_why_when_there_is_nowhere_to_ask() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::store::tests::Scratch::new("jev-check");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        let checked = check();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        assert_eq!(checked, Err(format!("Jev cannot be asked: {NO_WAY}.")));
     }
 
     #[test]
