@@ -70,7 +70,7 @@ pub const COMMANDS: &[Command<'static>] = &[
     },
     Command {
         name: "/connect",
-        blurb: "connect or sign in to providers, see their plan and usage",
+        blurb: "connect or sign in to providers, add gateways of your own, see plan and usage",
     },
     Command {
         name: "/team",
