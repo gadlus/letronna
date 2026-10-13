@@ -50,9 +50,10 @@ impl Chat {
         if open {
             return;
         }
-        self.endpoint.update(cx, |input, cx| {
-            input.set_value(self.store.settings.custom_endpoint.clone(), window, cx)
-        });
+        // Custom's address, or the one a gateway of the user's own has.
+        let address = base_url(name, &self.store.settings.custom_endpoint);
+        self.endpoint
+            .update(cx, |input, cx| input.set_value(address, window, cx));
         let key = self.keys.get(key_slot(name)).cloned().unwrap_or_default();
         self.key
             .update(cx, |input, cx| input.set_value(key, window, cx));
@@ -125,15 +126,29 @@ impl Chat {
         }
     }
 
-    /// Save the open row's key (and URL, for Custom), close it, and reload
-    /// every gateway's models.
+    /// Save the open row's key (and URL, for Custom or a gateway of the
+    /// user's own), close it, and reload every gateway's models. An address
+    /// that cannot be used is said, and nothing is saved.
     pub(crate) fn save_gateway(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let editing = self.gateway_pick.read(cx).clone();
         if editing.is_empty() {
             return;
         }
-        if gateway(&editing).base.is_empty() {
-            self.store.settings.custom_endpoint = self.endpoint.read(cx).value().trim().to_string();
+        let address = self.endpoint.read(cx).value().trim().to_string();
+        let kept = if is_own(&editing) {
+            change_own(&editing, &address).map(|_| ())
+        } else if gateway(&editing).base.is_empty() && address.is_empty() {
+            self.store.settings.custom_endpoint.clear();
+            Ok(())
+        } else if gateway(&editing).base.is_empty() {
+            own_base(&address).map(|base| self.store.settings.custom_endpoint = base)
+        } else {
+            Ok(())
+        };
+        if let Err(why) = kept {
+            self.error = Some(why);
+            cx.notify();
+            return;
         }
         let key = self.key.read(cx).value().trim().to_string();
         let slot = key_slot(&editing).to_string();
@@ -173,19 +188,92 @@ impl Chat {
         cx.notify();
     }
 
-    /// Forget a gateway's key (and URL, for Custom); its models leave the list.
+    /// Forget a gateway's key (and URL, for Custom), or a gateway of the
+    /// user's own with its key; its models leave the list.
     pub(crate) fn remove_gateway(
         &mut self,
         name: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if is_own(name) {
+            if let Err(why) = remove_own(name) {
+                self.error = Some(why);
+            }
+            self.keys = letronna_core::store::load_keys();
+            self.gateway_pick.update(cx, |g, cx| {
+                g.clear();
+                cx.notify();
+            });
+            self.load_models(window, cx);
+            return;
+        }
         self.keys.remove(key_slot(name));
         if gateway(name).base.is_empty() {
             self.store.settings.custom_endpoint.clear();
         }
         self.write_keys(key_slot(name));
         self.save();
+        self.gateway_pick.update(cx, |g, cx| {
+            g.clear();
+            cx.notify();
+        });
+        self.load_models(window, cx);
+    }
+
+    /// Open the form for adding a gateway of the user's own, its fields
+    /// empty, or close it if it is open. It shares the gateways' fields: one
+    /// row is open at a time.
+    pub(crate) fn open_add_gateway(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let open = *self.gateway_pick.read(cx) == ADD_ROW;
+        self.gateway_pick.update(cx, |g, cx| {
+            *g = if open { String::new() } else { ADD_ROW.into() };
+            cx.notify();
+        });
+        if open {
+            return;
+        }
+        for input in [&self.gateway_name, &self.endpoint, &self.key] {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Add the gateway in the open form, with its key if one was given, and
+    /// reload every gateway's models; or say why it cannot be added.
+    pub(crate) fn add_gateway(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.gateway_name.read(cx).value().trim().to_string();
+        let address = self.endpoint.read(cx).value().trim().to_string();
+        // A name a gateway has already: the field gets the next free one,
+        // and Add again takes it. Nothing is replaced or renamed unasked.
+        if let Some(free) = free_name(&name) {
+            let spelled = holder(&name).unwrap_or(&name).to_owned();
+            let free = free_name(&spelled).unwrap_or(free);
+            let change = match holder(&name).is_some_and(is_own) {
+                true => format!(", or close this and Edit {spelled} to change its address"),
+                false => String::new(),
+            };
+            self.error = Some(format!(
+                "There is a gateway called {spelled} already. Press Add gateway again to add this one as {free}{change}."
+            ));
+            self.gateway_name
+                .update(cx, |input, cx| input.set_value(free, window, cx));
+            cx.notify();
+            return;
+        }
+        let name = match add_own(&name, &address) {
+            Ok((name, _)) => name,
+            Err(why) => {
+                self.error = Some(why);
+                cx.notify();
+                return;
+            }
+        };
+        let key = self.key.read(cx).value().trim().to_string();
+        if !key.is_empty() {
+            self.keys.insert(key_slot(name).to_owned(), key);
+            self.write_keys(key_slot(name));
+        }
         self.gateway_pick.update(cx, |g, cx| {
             g.clear();
             cx.notify();
@@ -884,6 +972,14 @@ impl Chat {
                 &chat,
                 cx,
             )
+            .child(add_gateway_row(
+                &pick,
+                &self.gateway_name,
+                &endpoint,
+                &key,
+                &chat,
+                cx,
+            ))
             .child(tier_order(
                 letronna_core::providers::router::order(&self.store.settings),
                 &chat,
@@ -2067,7 +2163,8 @@ impl RenderOnce for KeyedSwitch {
 /// One gateway as the settings list shows it.
 pub(crate) struct GatewayRow {
     name: &'static str,
-    blurb: &'static str,
+    /// What it is, or for one of the user's own, where it is.
+    blurb: String,
     status: String,
     good: bool,
     /// The row's button: "Add key", "Add URL", "Edit", "Sign in", "Sign
@@ -2123,7 +2220,10 @@ impl Chat {
                 };
                 GatewayRow {
                     name: g.name,
-                    blurb: g.blurb,
+                    blurb: match is_own(g.name) {
+                        true => base_url(g.name, ""),
+                        false => g.blurb.to_owned(),
+                    },
                     status,
                     good,
                     action,
@@ -3147,6 +3247,103 @@ fn local_endpoint(settings: &letronna_core::store::Settings, chat: &Entity<Chat>
     section
         .child(row("local-address", "Address", address.clone(), address))
         .child(row("local-token", "Token", hidden, token))
+}
+
+/// The row the form for adding a gateway of the user's own opens in.
+const ADD_ROW: &str = "add-gateway";
+
+/// Below the gateways: a button to add one of the user's own, which opens
+/// a form for its name, address and key.
+fn add_gateway_row(
+    pick: &Entity<String>,
+    name: &Entity<InputState>,
+    endpoint: &Entity<InputState>,
+    key: &Entity<InputState>,
+    chat: &Entity<Chat>,
+    cx: &App,
+) -> Div {
+    let open = pick.read(cx).as_str() == ADD_ROW;
+    let toggle = chat.clone();
+    let head = h_flex()
+        .px_4()
+        .py_3()
+        .gap_4()
+        .items_center()
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_family(HEADING_FONT)
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("A gateway of your own"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("LM Studio, vLLM, a proxy -- any server that answers as OpenAI's API does. Add as many as you like."),
+                ),
+        )
+        .child(
+            div().w(px(84.)).flex().justify_end().child(
+                Button::new("gw-add-open")
+                    .small()
+                    .when(open, |b| b.plain(cx))
+                    .when(!open, |b| b.primary())
+                    .label(if open { "Close" } else { "Add" })
+                    .on_click(move |_, window, cx| {
+                        toggle.update(cx, |this, cx| this.open_add_gateway(window, cx))
+                    }),
+            ),
+        );
+    let mut row = v_flex()
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(cx.theme().radius)
+        .child(head);
+    if open {
+        let add = chat.clone();
+        row = row.child(
+            v_flex()
+                .px_4()
+                .pb_4()
+                .gap_3()
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(label("Name", cx))
+                        .child(Input::new(name)),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(label("Base URL, like http://localhost:1234/v1", cx))
+                        .child(Input::new(endpoint)),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(label("API key (optional)", cx))
+                        .child(Input::new(key).mask_toggle()),
+                )
+                .child(
+                    h_flex().justify_end().child(
+                        Button::new("gw-add")
+                            .primary()
+                            .small()
+                            .label("Add gateway")
+                            .on_click(move |_, window, cx| {
+                                add.update(cx, |this, cx| this.add_gateway(window, cx))
+                            }),
+                    ),
+                ),
+        );
+    }
+    row
 }
 
 fn gateway_page(
