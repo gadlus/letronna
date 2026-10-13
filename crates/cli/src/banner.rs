@@ -80,72 +80,106 @@ pub fn folder_name(workspace: Option<&std::path::Path>) -> String {
         .unwrap_or_else(|| "no project".into())
 }
 
+/// The least room the details get beside the face; with less they stand
+/// alone, as the face beside a column cut to nothing says less than the
+/// column would.
+const BESIDE: usize = 24;
+
+/// Below this width the two hints are left out: cut to fit, they say
+/// nothing.
+const HINTS: usize = 30;
+
 pub fn banner(runner: &Runner, folder: &str, session: usize) {
     render::blank();
 
     let (gateway, model) = runner.store.model(session);
     let conversation = &runner.store.conversations[session];
-    let mut facts = vec![
-        format!(
-            "{}  {}",
-            render::bold(letronna_core::BRAND),
-            render::dim(env!("CARGO_PKG_VERSION"))
-        ),
-        String::new(),
-        fact("project", folder),
-        fact("model", model),
-        fact("gateway", gateway),
-        fact(
+    let facts = vec![
+        ("project", folder.to_owned()),
+        ("model", model.to_owned()),
+        ("gateway", gateway.to_owned()),
+        (
             "session",
-            &match conversation.messages.len() {
+            match conversation.messages.len() {
                 0 => "new".to_owned(),
                 1 => "carrying on, 1 message".to_owned(),
                 n => format!("carrying on, {n} messages"),
             },
         ),
-        fact(
+        (
             "mode",
-            &format!(
+            format!(
                 "{}: {}",
                 runner.current_mode().label(),
                 runner.current_mode().about()
             ),
         ),
-        String::new(),
-        render::dim("type / for commands"),
-        render::dim("shift+enter for a new line · ↑ for what you said before"),
     ];
+    let colour = render::colour();
+    // Laid out again whenever the window changes width, so shrinking it
+    // never wraps the face into pieces.
+    render::block(move |width| laid_out(&facts, width, colour));
+}
 
-    // Side by side when the face fits; the details alone when it does not, so
-    // a narrow window shows something readable rather than a wrapped mess.
-    if !render::colour() || render::width() < render::FACE_WIDTH + render::FACE_GAP + 40 {
-        for fact in facts.into_iter().filter(|f| !f.is_empty()) {
-            render::line(&fact);
+/// The opening screen for a window `width` columns wide: the face with the
+/// details beside it where both fit, else the details alone, every row cut
+/// to fit rather than wrapped.
+fn laid_out(facts: &[(&str, String)], width: usize, colour: bool) -> Vec<String> {
+    let face = render::MARGIN.len() + render::FACE_WIDTH + render::FACE_GAP;
+    let beside = colour && width >= face + BESIDE;
+    let room = match beside {
+        true => width - face,
+        false => width.saturating_sub(render::PAD.len()),
+    };
+    let mut column = vec![title(room), String::new()];
+    column.extend(facts.iter().map(|(label, value)| fact(label, value, room)));
+    if width >= HINTS {
+        column.push(String::new());
+        for hint in [
+            "type / for commands",
+            "shift+enter for a new line · ↑ for what you said before",
+        ] {
+            column.push(render::dim(&render::clip(hint, room)));
         }
-        return;
+    }
+
+    // A narrow window shows something readable rather than a wrapped mess.
+    if !beside {
+        return column
+            .into_iter()
+            .filter(|row| !row.is_empty())
+            .map(|row| format!("{}{row}", render::PAD))
+            .collect();
     }
 
     // Sit the details against the middle of the face rather than its top.
-    let lead = (render::FACE.len().saturating_sub(facts.len())) / 2;
-    let mut column = vec![String::new(); lead];
-    column.append(&mut facts);
-
-    for row in 0..render::FACE.len().max(column.len()) {
-        let face = render::FACE.get(row).copied().unwrap_or("");
-        let text = column.get(row).cloned().unwrap_or_default();
-        render::out(
-            &format!(
-                "{}{}{}",
+    let lead = (render::FACE.len().saturating_sub(column.len())) / 2;
+    let mut rows = vec![String::new(); lead];
+    rows.append(&mut column);
+    (0..render::FACE.len().max(rows.len()))
+        .map(|row| {
+            let face = render::FACE.get(row).copied().unwrap_or("");
+            let text = rows.get(row).map(String::as_str).unwrap_or_default();
+            format!(
+                "{}{}{text}",
                 render::MARGIN,
                 render::blue(&format!(
                     "{face:width$}",
                     width = render::FACE_WIDTH + render::FACE_GAP
-                )),
-                text
-            ),
-            true,
-        );
+                ))
+            )
+        })
+        .collect()
+}
+
+/// The name and version, or the name alone cut to `room` when both do not
+/// fit.
+fn title(room: usize) -> String {
+    let (brand, version) = (letronna_core::BRAND, env!("CARGO_PKG_VERSION"));
+    if brand.chars().count() + 2 + version.chars().count() <= room {
+        return format!("{}  {}", render::bold(brand), render::dim(version));
     }
+    render::bold(&render::clip(brand, room))
 }
 
 /// The standing note under the input box: who the question is going to, and
@@ -176,7 +210,57 @@ pub fn footer(runner: &Runner) -> String {
     parts.join("  ·  ")
 }
 
-/// One `label  value` line of the startup details.
-fn fact(label: &str, value: &str) -> String {
-    format!("{}  {value}", render::dim(&format!("{label:<8}")))
+/// One `label  value` line of the startup details, cut to `room` columns.
+fn fact(label: &str, value: &str, room: usize) -> String {
+    let label = format!("{label:<8}  ");
+    let value = render::clip(value, room.saturating_sub(label.chars().count()));
+    format!("{}{value}", render::dim(&render::clip(&label, room)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn facts() -> Vec<(&'static str, String)> {
+        vec![
+            ("project", "a-project-folder-with-a-rather-long-name".into()),
+            ("model", "provider/a-model-with-a-long-identifier".into()),
+            ("gateway", "Letronna".into()),
+            ("session", "carrying on, 12 messages".into()),
+            (
+                "mode",
+                "Ask: asks before anything that changes files or runs commands".into(),
+            ),
+        ]
+    }
+
+    /// Whether the face is among `rows`.
+    fn shows_face(rows: &[String]) -> bool {
+        rows.iter().any(|row| row.contains(render::FACE[1]))
+    }
+
+    #[test]
+    fn the_banner_never_runs_past_the_window() {
+        for colour in [true, false] {
+            for width in 10..=160 {
+                for row in laid_out(&facts(), width, colour) {
+                    assert!(render::visible(&row) <= width, "{width}: {row:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_face_shows_only_where_it_fits_beside_the_details() {
+        let least = render::MARGIN.len() + render::FACE_WIDTH + render::FACE_GAP + BESIDE;
+        assert!(shows_face(&laid_out(&facts(), least, true)));
+        assert!(shows_face(&laid_out(&facts(), 160, true)));
+        assert!(!shows_face(&laid_out(&facts(), least - 1, true)));
+        assert!(!shows_face(&laid_out(&facts(), 160, false)));
+        // Alone, the details keep the title, every fact and both hints,
+        // each on a row of its own.
+        let alone = laid_out(&facts(), 40, true);
+        assert_eq!(alone.len(), 1 + facts().len() + 2);
+        assert!(alone.iter().any(|row| row.contains("project")));
+    }
 }

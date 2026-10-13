@@ -920,7 +920,11 @@ impl Store {
     pub fn model(&self, index: usize) -> (&str, &str) {
         let own = self.conversations.get(index).and_then(|c| {
             let (gateway, model) = (c.gateway.as_deref()?, c.model.as_deref()?);
-            let offered = crate::gateway::offered(gateway);
+            // Custom with no address left can send nowhere, as the Claude
+            // Code plugin left it, so a session held to it follows the
+            // settings, as one on a gateway no longer offered does.
+            let nowhere = gateway == "Custom" && self.settings.custom_endpoint.trim().is_empty();
+            let offered = crate::gateway::offered(gateway) && !nowhere;
             (offered && !model.is_empty()).then_some((gateway, model))
         });
         own.unwrap_or((&self.settings.gateway, &self.settings.model))
@@ -3413,18 +3417,61 @@ fn from_saved(mut saved: serde_json::Value) -> Option<Settings> {
 /// model is dropped too, since that id belonged to the old gateway; an empty
 /// model is picked again from the new list. One a plugin added stays while
 /// the plugin is on, which in the window is before the settings are read.
+///
+/// So does Custom with no address left, and Custom left at an address that
+/// was never the user's: Letronna's own, which listed the account's models a
+/// second time under a key that is not the account's, and so took a pick of
+/// them by name; or the server of the Claude Code plugin, gone with it. A
+/// model picked on Letronna's address is Letronna's and is kept.
 fn retire_gateway(s: &mut Settings) {
     use crate::gateway::{LETRONNA, gateways};
     // Saves from before Custom had its own field kept its URL in `endpoint`.
-    if s.gateway == "Custom" && s.custom_endpoint.is_empty() {
+    // But `endpoint` follows whichever gateway was last used, so one that is
+    // a gateway's own -- Letronna's, for anyone signed in -- was never Custom's.
+    if s.gateway == "Custom"
+        && s.custom_endpoint.is_empty()
+        && crate::gateway::named(&s.endpoint).is_none()
+    {
         s.custom_endpoint = s.endpoint.clone();
     }
-    if s.gateway.is_empty() || crate::gateway::offered(&s.gateway) {
+    let at_letronna = same_base(&s.custom_endpoint, &crate::auth::hosted_base());
+    if at_letronna || claude_code_server(&s.custom_endpoint) {
+        s.custom_endpoint.clear();
+    }
+    let no_address = s.gateway == "Custom" && s.custom_endpoint.trim().is_empty();
+    if s.gateway.is_empty() || (crate::gateway::offered(&s.gateway) && !no_address) {
         return;
     }
+    let keep_model = at_letronna && !claude_code_model(&s.model);
     s.gateway = LETRONNA.into();
     s.endpoint = gateways()[0].base.into();
-    s.model.clear();
+    if !keep_model {
+        s.model.clear();
+    }
+}
+
+/// Whether two gateway addresses are the same, a slash or the chat route on
+/// the end aside.
+fn same_base(one: &str, other: &str) -> bool {
+    let bare = |url: &str| {
+        let url = url.trim().trim_end_matches('/');
+        url.strip_suffix("/chat/completions")
+            .unwrap_or(url)
+            .to_owned()
+    };
+    !one.trim().is_empty() && bare(one) == bare(other)
+}
+
+/// Whether `url` is the address the Claude Code plugin served its models at
+/// on this computer, which went with the plugin.
+fn claude_code_server(url: &str) -> bool {
+    let url = url.trim().trim_end_matches('/');
+    url.starts_with("http://127.0.0.1:") && url.ends_with("/claude-code/v1")
+}
+
+/// Whether `model` is one the Claude Code plugin offered.
+fn claude_code_model(model: &str) -> bool {
+    model == "claude-code" || model.starts_with("claude-code-")
 }
 
 #[cfg(test)]
@@ -3474,6 +3521,136 @@ more"
         );
         retire_gateway(&mut s);
         assert_eq!(s.gateway, "Letronna");
+    }
+
+    #[test]
+    fn custom_at_letronnas_own_address_moves_to_the_account() {
+        let hosted = crate::auth::hosted_base();
+        // As a signed-in user's settings were left: Custom with no address of
+        // its own, the last request's address being Letronna's.
+        let mut s = Settings {
+            gateway: "Custom".into(),
+            endpoint: hosted.clone(),
+            model: "claude-code".into(),
+            ..Default::default()
+        };
+        retire_gateway(&mut s);
+        assert_eq!(
+            (
+                s.gateway.as_str(),
+                s.custom_endpoint.as_str(),
+                s.model.as_str()
+            ),
+            ("Letronna", "", "")
+        );
+        // Custom pointed at it by hand: the model is Letronna's, and kept.
+        let mut s = Settings {
+            gateway: "Custom".into(),
+            custom_endpoint: format!("{hosted}/"),
+            model: "deepseek/deepseek-chat".into(),
+            ..Default::default()
+        };
+        retire_gateway(&mut s);
+        assert_eq!(
+            (
+                s.gateway.as_str(),
+                s.custom_endpoint.as_str(),
+                s.model.as_str()
+            ),
+            ("Letronna", "", "deepseek/deepseek-chat")
+        );
+        // As this was found on a Mac: Custom at Letronna's address with the
+        // plugin's model, which Letronna never had.
+        let mut s = Settings {
+            gateway: "Custom".into(),
+            custom_endpoint: hosted.clone(),
+            endpoint: hosted.clone(),
+            model: "claude-code".into(),
+            ..Default::default()
+        };
+        retire_gateway(&mut s);
+        assert_eq!(
+            (
+                s.gateway.as_str(),
+                s.custom_endpoint.as_str(),
+                s.model.as_str()
+            ),
+            ("Letronna", "", "")
+        );
+        // Not in use, it only loses the address.
+        let mut s = Settings {
+            gateway: "OpenAI".into(),
+            custom_endpoint: hosted.clone(),
+            model: "gpt-x".into(),
+            ..Default::default()
+        };
+        retire_gateway(&mut s);
+        assert_eq!(
+            (s.gateway.as_str(), s.custom_endpoint.as_str()),
+            ("OpenAI", "")
+        );
+    }
+
+    #[test]
+    fn the_claude_code_plugins_leftovers_go_with_it() {
+        let mut s = Settings {
+            gateway: "Custom".into(),
+            custom_endpoint: "http://127.0.0.1:47821/claude-code/v1".into(),
+            model: "claude-code-opus".into(),
+            ..Default::default()
+        };
+        retire_gateway(&mut s);
+        assert_eq!(
+            (
+                s.gateway.as_str(),
+                s.custom_endpoint.as_str(),
+                s.model.as_str()
+            ),
+            ("Letronna", "", "")
+        );
+        // A server of the user's own keeps everything, whatever its models.
+        let mut s = Settings {
+            gateway: "Custom".into(),
+            custom_endpoint: "http://localhost:8000/v1".into(),
+            model: "claude-code".into(),
+            ..Default::default()
+        };
+        retire_gateway(&mut s);
+        assert_eq!(
+            (
+                s.gateway.as_str(),
+                s.custom_endpoint.as_str(),
+                s.model.as_str()
+            ),
+            ("Custom", "http://localhost:8000/v1", "claude-code")
+        );
+        // An old save's URL in `endpoint` still becomes Custom's.
+        let mut s = Settings {
+            gateway: "Custom".into(),
+            endpoint: "http://localhost:9000/v1".into(),
+            model: "local".into(),
+            ..Default::default()
+        };
+        retire_gateway(&mut s);
+        assert_eq!(
+            (s.gateway.as_str(), s.custom_endpoint.as_str()),
+            ("Custom", "http://localhost:9000/v1")
+        );
+    }
+
+    #[test]
+    fn a_session_held_to_custom_with_no_address_follows_the_settings() {
+        let mut store = Store::default();
+        store.settings.gateway = "Letronna".into();
+        store.settings.model = "deepseek/deepseek-chat".into();
+        store.conversations.push(Conversation {
+            gateway: Some("Custom".into()),
+            model: Some("claude-code".into()),
+            ..Default::default()
+        });
+        assert_eq!(store.model(0), ("Letronna", "deepseek/deepseek-chat"));
+        store.settings.custom_endpoint = "http://localhost:8000/v1".into();
+        assert_eq!(store.model(0), ("Custom", "claude-code"));
     }
 
     #[test]

@@ -148,6 +148,9 @@ pub(crate) struct Chat {
     /// The models to carry on with, written as a comma-separated list.
     pub(crate) fallbacks: Entity<InputState>,
     pub(crate) key: Entity<InputState>,
+    /// The name of a gateway of the user's own being added on the Accounts
+    /// page; its address and key go in `endpoint` and `key`.
+    pub(crate) gateway_name: Entity<InputState>,
     /// The quick entry shortcut, as typed on the Shortcuts settings page.
     pub(crate) hotkey: Entity<InputState>,
     /// Where the browser is when it is not on this computer.
@@ -215,6 +218,11 @@ pub(crate) struct Chat {
     pub(crate) account_note: Option<String>,
     /// The teams the account is in, for the Account page's billing choice.
     pub(crate) teams: Vec<letronna_core::auth::Team>,
+    /// What the last check of Jev from Settings › Search found: how long it
+    /// took to answer, or why it could not be used.
+    pub(crate) jev_checked: Option<Result<std::time::Duration, String>>,
+    /// Jev is being checked.
+    pub(crate) jev_checking: bool,
     pub(crate) signing_in: bool,
     /// A messaging token is being checked with its service.
     pub(crate) connecting: bool,
@@ -663,6 +671,8 @@ impl Chat {
                 .masked(true)
                 .default_value(saved_key)
         });
+        let gateway_name =
+            cx.new(|cx| InputState::new(window, cx).placeholder("A name, like LM Studio"));
         let hotkey = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(crate::platform::hotkey::DEFAULT)
@@ -885,7 +895,8 @@ impl Chat {
         let show_setup = crate::ui::setup::needed(
             account.is_some(),
             keys.values().any(|k| !k.trim().is_empty()),
-            !store.settings.custom_endpoint.trim().is_empty(),
+            !store.settings.custom_endpoint.trim().is_empty()
+                || !letronna_core::gateway::own().is_empty(),
             active.messages.is_empty(),
         )
         .then_some(active.id);
@@ -898,6 +909,8 @@ impl Chat {
             account,
             account_note: None,
             teams: Vec::new(),
+            jev_checked: None,
+            jev_checking: false,
             signing_in: false,
             connecting: false,
             sign_in_url: None,
@@ -914,6 +927,7 @@ impl Chat {
             model,
             fallbacks,
             key,
+            gateway_name,
             hotkey,
             browser_address,
             keep_days,
@@ -1159,6 +1173,14 @@ impl Chat {
     }
 
     pub(crate) fn load_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = window;
+        self.reload_models(cx);
+    }
+
+    /// Ask every set-up gateway for its models again, off the window's
+    /// thread, as `load_models` does where there is no window to hand: a
+    /// sign-in finishing in the background.
+    pub(crate) fn reload_models(&mut self, cx: &mut Context<Self>) {
         if self.loading_models {
             return;
         }
@@ -1172,7 +1194,6 @@ impl Chat {
             let media = letronna_core::media::catalogue().unwrap_or_default();
             let _ = tx.send_blocking((all_models(&keys, &custom), media));
         });
-        let _ = window;
         cx.spawn(async move |this, cx| {
             if let Ok(((models, errors), media)) = rx.recv().await {
                 let _ = this.update(cx, |this, cx| {

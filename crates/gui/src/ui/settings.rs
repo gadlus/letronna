@@ -50,9 +50,10 @@ impl Chat {
         if open {
             return;
         }
-        self.endpoint.update(cx, |input, cx| {
-            input.set_value(self.store.settings.custom_endpoint.clone(), window, cx)
-        });
+        // Custom's address, or the one a gateway of the user's own has.
+        let address = base_url(name, &self.store.settings.custom_endpoint);
+        self.endpoint
+            .update(cx, |input, cx| input.set_value(address, window, cx));
         let key = self.keys.get(key_slot(name)).cloned().unwrap_or_default();
         self.key
             .update(cx, |input, cx| input.set_value(key, window, cx));
@@ -125,15 +126,29 @@ impl Chat {
         }
     }
 
-    /// Save the open row's key (and URL, for Custom), close it, and reload
-    /// every gateway's models.
+    /// Save the open row's key (and URL, for Custom or a gateway of the
+    /// user's own), close it, and reload every gateway's models. An address
+    /// that cannot be used is said, and nothing is saved.
     pub(crate) fn save_gateway(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let editing = self.gateway_pick.read(cx).clone();
         if editing.is_empty() {
             return;
         }
-        if gateway(&editing).base.is_empty() {
-            self.store.settings.custom_endpoint = self.endpoint.read(cx).value().trim().to_string();
+        let address = self.endpoint.read(cx).value().trim().to_string();
+        let kept = if is_own(&editing) {
+            change_own(&editing, &address).map(|_| ())
+        } else if gateway(&editing).base.is_empty() && address.is_empty() {
+            self.store.settings.custom_endpoint.clear();
+            Ok(())
+        } else if gateway(&editing).base.is_empty() {
+            own_base(&address).map(|base| self.store.settings.custom_endpoint = base)
+        } else {
+            Ok(())
+        };
+        if let Err(why) = kept {
+            self.error = Some(why);
+            cx.notify();
+            return;
         }
         let key = self.key.read(cx).value().trim().to_string();
         let slot = key_slot(&editing).to_string();
@@ -173,19 +188,92 @@ impl Chat {
         cx.notify();
     }
 
-    /// Forget a gateway's key (and URL, for Custom); its models leave the list.
+    /// Forget a gateway's key (and URL, for Custom), or a gateway of the
+    /// user's own with its key; its models leave the list.
     pub(crate) fn remove_gateway(
         &mut self,
         name: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if is_own(name) {
+            if let Err(why) = remove_own(name) {
+                self.error = Some(why);
+            }
+            self.keys = letronna_core::store::load_keys();
+            self.gateway_pick.update(cx, |g, cx| {
+                g.clear();
+                cx.notify();
+            });
+            self.load_models(window, cx);
+            return;
+        }
         self.keys.remove(key_slot(name));
         if gateway(name).base.is_empty() {
             self.store.settings.custom_endpoint.clear();
         }
         self.write_keys(key_slot(name));
         self.save();
+        self.gateway_pick.update(cx, |g, cx| {
+            g.clear();
+            cx.notify();
+        });
+        self.load_models(window, cx);
+    }
+
+    /// Open the form for adding a gateway of the user's own, its fields
+    /// empty, or close it if it is open. It shares the gateways' fields: one
+    /// row is open at a time.
+    pub(crate) fn open_add_gateway(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let open = *self.gateway_pick.read(cx) == ADD_ROW;
+        self.gateway_pick.update(cx, |g, cx| {
+            *g = if open { String::new() } else { ADD_ROW.into() };
+            cx.notify();
+        });
+        if open {
+            return;
+        }
+        for input in [&self.gateway_name, &self.endpoint, &self.key] {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Add the gateway in the open form, with its key if one was given, and
+    /// reload every gateway's models; or say why it cannot be added.
+    pub(crate) fn add_gateway(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.gateway_name.read(cx).value().trim().to_string();
+        let address = self.endpoint.read(cx).value().trim().to_string();
+        // A name a gateway has already: the field gets the next free one,
+        // and Add again takes it. Nothing is replaced or renamed unasked.
+        if let Some(free) = free_name(&name) {
+            let spelled = holder(&name).unwrap_or(&name).to_owned();
+            let free = free_name(&spelled).unwrap_or(free);
+            let change = match holder(&name).is_some_and(is_own) {
+                true => format!(", or close this and Edit {spelled} to change its address"),
+                false => String::new(),
+            };
+            self.error = Some(format!(
+                "There is a gateway called {spelled} already. Press Add gateway again to add this one as {free}{change}."
+            ));
+            self.gateway_name
+                .update(cx, |input, cx| input.set_value(free, window, cx));
+            cx.notify();
+            return;
+        }
+        let name = match add_own(&name, &address) {
+            Ok((name, _)) => name,
+            Err(why) => {
+                self.error = Some(why);
+                cx.notify();
+                return;
+            }
+        };
+        let key = self.key.read(cx).value().trim().to_string();
+        if !key.is_empty() {
+            self.keys.insert(key_slot(name).to_owned(), key);
+            self.write_keys(key_slot(name));
+        }
         self.gateway_pick.update(cx, |g, cx| {
             g.clear();
             cx.notify();
@@ -375,9 +463,69 @@ impl Chat {
         let own_key = self.keys.get(KEY_SLOT).is_some_and(|key| !key.is_empty());
         match (address, own_key) {
             ("", true) => "Your key, at TypeSafe".into(),
-            ("", false) => "Your Letronna account".into(),
+            ("", false) if self.account.is_none() => {
+                "Signed out: ranked by words until you sign in or add a key".into()
+            }
+            ("", false) => "Through your Letronna account".into(),
             (address, _) => address.to_owned(),
         }
+    }
+
+    /// What Settings › Search says of Jev now.
+    pub(crate) fn jev_lines(&self) -> JevLines {
+        use letronna_core::jev::Outcome;
+        let (last, good) = match letronna_core::jev::last() {
+            None => ("No tools searched for yet".to_owned(), false),
+            Some(Outcome::Jev(Some(took))) => (
+                format!("Last search ranked by Jev in {:.1} s", took.as_secs_f64()),
+                true,
+            ),
+            Some(Outcome::Jev(None)) => ("Last search ranked by Jev".to_owned(), true),
+            Some(Outcome::Words(why)) => {
+                (format!("Last search ranked by words; Jev: {why}"), false)
+            }
+            Some(Outcome::NotAsked(why)) => {
+                (format!("Last search ranked by words, as {why}"), false)
+            }
+        };
+        let checked = self.jev_checked.as_ref().map(|checked| match checked {
+            Ok(took) => (format!("Jev answered in {:.1} s", took.as_secs_f64()), true),
+            Err(why) => (why.clone(), false),
+        });
+        JevLines {
+            place: self.jev_status(),
+            last,
+            good,
+            checked,
+            checking: self.jev_checking,
+        }
+    }
+
+    /// Ask Jev one small question off the window's thread, and keep what it
+    /// found for the Search page.
+    pub(crate) fn check_jev(&mut self, cx: &mut Context<Self>) {
+        if self.jev_checking {
+            return;
+        }
+        self.jev_checking = true;
+        self.jev_checked = None;
+        cx.notify();
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(letronna_core::jev::check());
+        });
+        cx.spawn(async move |this, cx| {
+            let checked = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| Err("The check stopped before it finished.".into()));
+            let _ = this.update(cx, |this, cx| {
+                this.jev_checking = false;
+                this.jev_checked = Some(checked);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Put the open search row's address back to the service's official one.
@@ -856,6 +1004,7 @@ impl Chat {
                 .into_any_element(),
             "About" => about_page(&chat, self, cx).into_any_element(),
             "Search" => search_page(
+                self.account_search(),
                 self.search_rows(),
                 self.store.settings.keyless_search,
                 &pick,
@@ -866,7 +1015,7 @@ impl Chat {
             )
             .child(tool_search_section(
                 &self.store.settings.tool_search,
-                self.jev_status(),
+                self.jev_lines(),
                 &pick,
                 &endpoint,
                 &key,
@@ -883,6 +1032,14 @@ impl Chat {
                 &chat,
                 cx,
             )
+            .child(add_gateway_row(
+                &pick,
+                &self.gateway_name,
+                &endpoint,
+                &key,
+                &chat,
+                cx,
+            ))
             .child(tier_order(
                 letronna_core::providers::router::order(&self.store.settings),
                 &chat,
@@ -2066,7 +2223,8 @@ impl RenderOnce for KeyedSwitch {
 /// One gateway as the settings list shows it.
 pub(crate) struct GatewayRow {
     name: &'static str,
-    blurb: &'static str,
+    /// What it is, or for one of the user's own, where it is.
+    blurb: String,
     status: String,
     good: bool,
     /// The row's button: "Add key", "Add URL", "Edit", "Sign in", "Sign
@@ -2122,7 +2280,10 @@ impl Chat {
                 };
                 GatewayRow {
                     name: g.name,
-                    blurb: g.blurb,
+                    blurb: match is_own(g.name) {
+                        true => base_url(g.name, ""),
+                        false => g.blurb.to_owned(),
+                    },
                     status,
                     good,
                     action,
@@ -2170,7 +2331,65 @@ pub(crate) struct SearchRow {
     chosen: bool,
 }
 
+/// Searching through the Letronna account, as the first row of the search
+/// list shows it.
+pub(crate) struct AccountSearch {
+    status: &'static str,
+    blurb: &'static str,
+    /// Searches go through the account now.
+    good: bool,
+    signed_in: bool,
+    /// A service is chosen, which is then the only one asked.
+    chosen: bool,
+    /// The last check with the API found no credit to pay for a search.
+    broke: bool,
+}
+
 impl Chat {
+    /// Where searching through the Letronna account stands now.
+    pub(crate) fn account_search(&self) -> AccountSearch {
+        let chosen = !letronna_core::search::choice().service.is_empty();
+        let Some(account) = &self.account else {
+            return AccountSearch {
+                status: "Signed out",
+                blurb: "Sign in to search through your Letronna account, paid by the search from its credit.",
+                good: false,
+                signed_in: false,
+                chosen,
+                broke: false,
+            };
+        };
+        // An account never checked with the API has no plan yet, and its
+        // credit is not known.
+        let credit = account
+            .team
+            .as_ref()
+            .map_or(account.credits, |team| team.credits);
+        let broke = !account.plan.is_empty() && credit <= 0;
+        let (status, blurb) = match (chosen, broke) {
+            (true, _) => (
+                "Not in use",
+                "Through your account, paid by the search from its credit. The service you chose is used instead.",
+            ),
+            (false, true) => (
+                "No credit",
+                "Through your account, paid by the search. Add credit to use it; DuckDuckGo answers until then.",
+            ),
+            (false, false) => (
+                "In use",
+                "Through your account, paid by the search from its credit, with DuckDuckGo behind it.",
+            ),
+        };
+        AccountSearch {
+            status,
+            blurb,
+            good: !chosen && !broke,
+            signed_in: true,
+            chosen,
+            broke,
+        }
+    }
+
     /// Every search service with where it stands now.
     pub(crate) fn search_rows(&self) -> Vec<SearchRow> {
         let choice = letronna_core::search::choice();
@@ -2194,7 +2413,90 @@ impl Chat {
     }
 }
 
+/// The Letronna row at the head of the search list: where searching through
+/// the account stands, and what would change it.
+fn account_search_row(row: AccountSearch, chat: &Entity<Chat>, cx: &App) -> Div {
+    let dot = if row.good {
+        cx.theme().green
+    } else {
+        cx.theme().muted_foreground.opacity(0.5)
+    };
+    let chat = chat.clone();
+    let action = match (row.signed_in, row.chosen, row.broke) {
+        (false, _, _) => Some(
+            Button::new("search-account")
+                .small()
+                .primary()
+                .label("Sign in")
+                .on_click(move |_, window, cx| {
+                    chat.update(cx, |this, cx| this.open_account(window, cx))
+                }),
+        ),
+        (true, true, _) => Some(
+            Button::new("search-account")
+                .small()
+                .plain(cx)
+                .label("Use")
+                .on_click(move |_, _, cx| {
+                    chat.update(cx, |this, cx| this.use_search_alone("", false, cx))
+                }),
+        ),
+        (true, false, true) => Some(
+            Button::new("search-account")
+                .small()
+                .plain(cx)
+                .label("Add credit")
+                .on_click(|_, _, cx| cx.open_url(&letronna_core::auth::checkout())),
+        ),
+        (true, false, false) => None,
+    };
+    h_flex()
+        .px_4()
+        .py_3()
+        .gap_4()
+        .items_center()
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_family(HEADING_FONT)
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(letronna_core::BRAND),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(row.blurb),
+                ),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .flex_shrink_0()
+                .child(div().size(px(7.)).rounded_full().bg(dot))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(if row.good {
+                            cx.theme().foreground
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .child(row.status),
+                ),
+        )
+        .child(div().w(px(96.)).flex().justify_end().children(action))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn search_page(
+    account: AccountSearch,
     rows: Vec<SearchRow>,
     keyless_search: bool,
     pick: &Entity<String>,
@@ -2204,12 +2506,24 @@ fn search_page(
     cx: &App,
 ) -> Div {
     let open = pick.read(cx).clone();
+    // DuckDuckGo, in use with no service chosen, then answers only when the
+    // account's search cannot.
+    let behind_account = account.signed_in && !account.chosen;
+    let back_to = match account.signed_in {
+        true => "With Letronna",
+        false => "With gateway",
+    };
     let mut list = v_flex()
         .border_1()
         .border_color(cx.theme().border)
-        .rounded(cx.theme().radius);
+        .rounded(cx.theme().radius)
+        .child(account_search_row(account, chat, cx));
     for (i, row) in rows.into_iter().enumerate() {
         let name = row.name;
+        let status = match (row.keyless && behind_account, row.status) {
+            (true, "In use") => "If Letronna cannot",
+            (_, status) => status,
+        };
         let editing = open.strip_prefix("search:") == Some(name);
         let dot = if row.good {
             cx.theme().green
@@ -2239,7 +2553,7 @@ fn search_page(
             Button::new(("search-alone", i))
                 .small()
                 .plain(cx)
-                .label(if chosen { "With gateway" } else { "Use alone" })
+                .label(if chosen { back_to } else { "Use alone" })
                 .on_click(move |_, _, cx| {
                     chat.update(cx, |this, cx| this.use_search_alone(name, !chosen, cx))
                 })
@@ -2282,7 +2596,7 @@ fn search_page(
                             } else {
                                 cx.theme().muted_foreground
                             })
-                            .child(row.status),
+                            .child(status),
                     ),
             )
             .child(
@@ -2294,7 +2608,8 @@ fn search_page(
                     .when(row.keyless, |d| d.child(alone)),
             );
         let mut item = v_flex()
-            .when(i > 0, |d| d.border_t_1().border_color(cx.theme().border))
+            .border_t_1()
+            .border_color(cx.theme().border)
             .child(head);
         if editing {
             let (save, remove, reset) = (chat.clone(), chat.clone(), chat.clone());
@@ -2370,7 +2685,7 @@ fn search_page(
         .gap_5()
         .child(heading(
             "Search",
-            "A search service of your own, which the agent searches the web with, asking you before each search. The one saved last is used, at its official address unless you give another. With none saved, it searches through the gateway where the gateway sells search, paid by the search, and with DuckDuckGo when that cannot answer; DuckDuckGo's Use alone keeps every search off the gateway. Keys stay in keys.json on this machine; the Web toggle is the gateway's own search inside a reply, where it has one.",
+            "Where the agent searches the web, asking you before each search. Signed in, it searches through your Letronna account, paid by the search from its credit, with DuckDuckGo when that cannot answer; signed out, through the gateway where it sells search. A service of your own saved below is used instead, at its official address unless you give another, and DuckDuckGo's Use alone keeps every search off what is paid. Keys stay on this machine; the Web toggle is the gateway's own search inside a reply, where it has one.",
             cx,
         ))
         .child(list)
@@ -2391,12 +2706,24 @@ fn search_page(
 /// The row of the shared fields that Jev's address and key open in.
 const JEV_ROW: &str = "jev";
 
-/// How find_tools ranks the tools a request leaves out, by `mode`, and
-/// Jev's row, saying where it is asked (`status`), with its key and address
-/// in the shared fields when open.
+/// What Settings › Search says of Jev: where it is asked, how the last
+/// search was ranked, and what a check found.
+pub(crate) struct JevLines {
+    place: String,
+    last: String,
+    /// Jev ranked the last search.
+    good: bool,
+    /// What the last check found, and whether Jev answered.
+    checked: Option<(String, bool)>,
+    checking: bool,
+}
+
+/// How find_tools ranks the tools a request leaves out, by `mode`, how the
+/// last search was ranked with a check of Jev, and Jev's row, saying where
+/// it is asked, with its key and address in the shared fields when open.
 fn tool_search_section(
     mode: &str,
-    status: String,
+    jev: JevLines,
     pick: &Entity<String>,
     endpoint: &Entity<InputState>,
     key: &Entity<InputState>,
@@ -2406,17 +2733,26 @@ fn tool_search_section(
     let choices = [
         (
             "auto",
-            "Jev while the chat is on a hosted model; by name for a model on this computer",
+            "Automatic",
+            "Jev ranks them while the chat is on a hosted model; for a model on this computer, they are ranked here by their words.",
         ),
-        ("jev", "Jev always, a model on this computer included"),
-        ("names", "By their names only, and nothing is sent"),
+        (
+            "jev",
+            "Always Jev",
+            "Jev ranks every search, a model on this computer included.",
+        ),
+        (
+            "names",
+            "Words only",
+            "Ranked here by their names and descriptions; nothing is sent.",
+        ),
     ];
     let mode = match mode {
         "jev" | "names" => mode,
         _ => "auto",
     };
     let mut ways = v_flex().gap_2();
-    for (at, (value, text)) in choices.into_iter().enumerate() {
+    for (at, (value, title, text)) in choices.into_iter().enumerate() {
         let active = mode == value;
         let chat = chat.clone();
         ways = ways.child(
@@ -2433,7 +2769,17 @@ fn tool_search_section(
                 } else {
                     cx.theme().border
                 })
-                .child(div().text_sm().child(text))
+                .child(
+                    v_flex()
+                        .gap_0p5()
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(text),
+                        ),
+                )
                 .on_click(move |_, _, cx| {
                     chat.update(cx, |this, cx| {
                         this.store.settings.tool_search = value.to_owned();
@@ -2443,6 +2789,52 @@ fn tool_search_section(
                 }),
         );
     }
+    let dot = |good: bool| {
+        div().size(px(7.)).rounded_full().bg(if good {
+            cx.theme().green
+        } else {
+            cx.theme().muted_foreground.opacity(0.5)
+        })
+    };
+    let check = chat.clone();
+    let last = h_flex()
+        .gap_2()
+        .items_center()
+        .child(dot(jev.good))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(jev.last),
+        )
+        .child(
+            Button::new("jev-check")
+                .small()
+                .plain(cx)
+                .loading(jev.checking)
+                .disabled(jev.checking)
+                .label(if jev.checking {
+                    "Checking"
+                } else {
+                    "Check Jev"
+                })
+                .on_click(move |_, _, cx| check.update(cx, |this, cx| this.check_jev(cx))),
+        );
+    let checked = jev.checked.map(|(said, good)| {
+        h_flex().gap_2().items_center().child(dot(good)).child(
+            div()
+                .text_xs()
+                .text_color(if good {
+                    cx.theme().foreground
+                } else {
+                    cx.theme().muted_foreground
+                })
+                .child(said),
+        )
+    });
+    let status = jev.place;
     let editing = pick.read(cx).as_str() == JEV_ROW;
     let open = chat.clone();
     let head = h_flex()
@@ -2534,10 +2926,11 @@ fn tool_search_section(
         .gap_3()
         .child(heading(
             "Finding tools",
-            "A request can leave tools out -- the less used ones in a run nobody watches, an MCP server's when there are many -- and find_tools looks them up. Jev, a small decision model, ranks them by what they do. It is sent the search's words and the tools' names and descriptions, nothing of the chat.",
+            "A request can leave tools out -- the less used ones, an MCP server's when there are many -- and find_tools looks them up. Jev, a small decision model, ranks them by what they do; without it they are ranked here by their words, and the model can still pick one by what it does. Jev is sent the search's words and the tools' names and descriptions, nothing of the chat.",
             cx,
         ))
         .child(ways)
+        .child(v_flex().gap_1p5().child(last).children(checked))
         .child(row)
 }
 
@@ -2992,6 +3385,103 @@ fn local_endpoint(settings: &letronna_core::store::Settings, chat: &Entity<Chat>
     section
         .child(row("local-address", "Address", address.clone(), address))
         .child(row("local-token", "Token", hidden, token))
+}
+
+/// The row the form for adding a gateway of the user's own opens in.
+const ADD_ROW: &str = "add-gateway";
+
+/// Below the gateways: a button to add one of the user's own, which opens
+/// a form for its name, address and key.
+fn add_gateway_row(
+    pick: &Entity<String>,
+    name: &Entity<InputState>,
+    endpoint: &Entity<InputState>,
+    key: &Entity<InputState>,
+    chat: &Entity<Chat>,
+    cx: &App,
+) -> Div {
+    let open = pick.read(cx).as_str() == ADD_ROW;
+    let toggle = chat.clone();
+    let head = h_flex()
+        .px_4()
+        .py_3()
+        .gap_4()
+        .items_center()
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_family(HEADING_FONT)
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("A gateway of your own"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("LM Studio, vLLM, a proxy -- any server that answers as OpenAI's API does. Add as many as you like."),
+                ),
+        )
+        .child(
+            div().w(px(84.)).flex().justify_end().child(
+                Button::new("gw-add-open")
+                    .small()
+                    .when(open, |b| b.plain(cx))
+                    .when(!open, |b| b.primary())
+                    .label(if open { "Close" } else { "Add" })
+                    .on_click(move |_, window, cx| {
+                        toggle.update(cx, |this, cx| this.open_add_gateway(window, cx))
+                    }),
+            ),
+        );
+    let mut row = v_flex()
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(cx.theme().radius)
+        .child(head);
+    if open {
+        let add = chat.clone();
+        row = row.child(
+            v_flex()
+                .px_4()
+                .pb_4()
+                .gap_3()
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(label("Name", cx))
+                        .child(Input::new(name)),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(label("Base URL, like http://localhost:1234/v1", cx))
+                        .child(Input::new(endpoint)),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(label("API key (optional)", cx))
+                        .child(Input::new(key).mask_toggle()),
+                )
+                .child(
+                    h_flex().justify_end().child(
+                        Button::new("gw-add")
+                            .primary()
+                            .small()
+                            .label("Add gateway")
+                            .on_click(move |_, window, cx| {
+                                add.update(cx, |this, cx| this.add_gateway(window, cx))
+                            }),
+                    ),
+                ),
+        );
+    }
+    row
 }
 
 fn gateway_page(

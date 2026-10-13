@@ -449,11 +449,13 @@ fn search(
         None => ranked(&tools, query),
     };
     if ranked.is_empty() {
+        // Each with what it does, so the model can still pick one by its
+        // meaning where no word was shared.
         out.push_str(&format!(
-            "No tool matches \"{}\". The tools are:",
+            "No tool matches \"{}\" by its words. Pick one by what it does, or search again in other words:",
             query.trim()
         ));
-        list(&mut out, &names(&tools), FOUND_BYTES);
+        gists(&mut out, &tools, FOUND_BYTES);
         return out;
     }
     out.push_str(
@@ -601,6 +603,29 @@ fn names(tools: &[&Arc<dyn Tool>]) -> Vec<&'static str> {
     tools.iter().map(|tool| tool.name()).collect()
 }
 
+/// The most characters of a tool's description a list of every tool shows:
+/// enough to say what it does.
+const GIST_CHARS: usize = 80;
+
+/// Adds a line for each of `tools`, its name and what it does, while `out`
+/// stays within two thirds of `limit` bytes, then the rest by name.
+fn gists(out: &mut String, tools: &[&Arc<dyn Tool>], limit: usize) {
+    for (at, tool) in tools.iter().enumerate() {
+        let about = described(tool.as_ref());
+        let about = match about.char_indices().nth(GIST_CHARS) {
+            Some((cut, _)) => format!("{}…", &about[..cut]),
+            None => about,
+        };
+        let line = format!("\n{}: {about}", tool.name());
+        if out.len() + line.len() > limit * 2 / 3 {
+            out.push_str("\nAnd by name:");
+            list(out, &names(&tools[at..]), limit);
+            return;
+        }
+        out.push_str(&line);
+    }
+}
+
 /// Adds `names` to `out`, as many as keep it within `limit` bytes, then how
 /// many more there are.
 fn list(out: &mut String, names: &[&str], limit: usize) {
@@ -615,44 +640,134 @@ fn list(out: &mut String, names: &[&str], limit: usize) {
     out.push('.');
 }
 
-/// The tools that match `query`, best first. Its exact name comes before
-/// everything; then each word of it scores 10 as a whole part of a tool's
-/// name, 5 inside one, and 2 more when a word of the description starts
-/// with it. Ties go by name, so the same search finds the same order.
+/// How much a word of a tool's name counts against one of its description:
+/// a name says what the tool is for, a description also what it is not.
+const NAME_WEIGHT: f64 = 2.0;
+
+/// How much of `NAME_WEIGHT` a word found only inside a part of the name
+/// gets, as "repo" inside "repository".
+const INSIDE_NAME: f64 = 0.5;
+
+/// BM25's two settings for the description: how soon a word said again
+/// stops counting for more, and how much a long description is held back.
+/// The usual values, a little kinder to long descriptions, as MCP servers'
+/// run long.
+const SATURATION: f64 = 1.2;
+const LENGTH: f64 = 0.5;
+
+/// Words too common in requests to tell one tool from another.
+const STOP_WORDS: [&str; 53] = [
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "does", "for", "from", "has",
+    "have", "how", "if", "in", "into", "is", "it", "its", "me", "my", "of", "on", "or", "our",
+    "so", "that", "the", "their", "them", "then", "there", "these", "they", "this", "to", "up",
+    "us", "was", "we", "what", "when", "where", "which", "who", "why", "will", "with", "would",
+    "you",
+];
+
+/// The tools that match `query`, best first, ranked here with nothing sent
+/// anywhere. Its exact name comes before everything. Then each word it
+/// shares with a tool counts by how few of `tools` use it, so a word every
+/// tool has says little (BM25): double in the tool's name, half that inside
+/// a part of the name, and in the description by how often, less in a long
+/// one. Words are compared with their common endings cut, and words too
+/// common to tell tools apart are left out. Ties go by name, so the same
+/// search finds the same order.
 fn ranked<'a>(tools: &[&'a Arc<dyn Tool>], query: &str) -> Vec<&'a Arc<dyn Tool>> {
     let query = query.trim().to_lowercase();
-    let terms = words(&query);
-    let mut scored: Vec<(usize, &Arc<dyn Tool>)> = tools
+    let mut terms: Vec<String> = Vec::new();
+    for term in terms_of(&query) {
+        if !terms.contains(&term) {
+            terms.push(term);
+        }
+    }
+    let read: Vec<(Vec<String>, Vec<String>)> = tools
         .iter()
-        .map(|tool| (score(tool.as_ref(), &query, &terms), *tool))
-        .filter(|(score, _)| *score > 0)
+        .map(|tool| {
+            let name = tool.name().to_lowercase();
+            (
+                terms_of(name.trim_start_matches(PREFIX)),
+                terms_of(&tool.description().to_lowercase()),
+            )
+        })
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name().cmp(b.1.name())));
+    // How many tools use each word, in the name or the description.
+    let mut used: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (name, described) in &read {
+        let mut once: Vec<&str> = name.iter().chain(described).map(String::as_str).collect();
+        once.sort_unstable();
+        once.dedup();
+        for word in once {
+            *used.entry(word).or_default() += 1;
+        }
+    }
+    let count = read.len() as f64;
+    let rare = |term: &str| {
+        let with = used.get(term).copied().unwrap_or(0) as f64;
+        (1.0 + (count - with + 0.5) / (with + 0.5)).ln()
+    };
+    let average = (read.iter().map(|(_, d)| d.len()).sum::<usize>() as f64 / count).max(1.0);
+    let mut scored: Vec<(f64, &Arc<dyn Tool>)> = tools
+        .iter()
+        .zip(&read)
+        .map(|(tool, (name, described))| {
+            if tool.name().to_lowercase() == query {
+                return (f64::MAX, *tool);
+            }
+            let score = terms
+                .iter()
+                .map(|term| {
+                    let in_name = if name.contains(term) {
+                        NAME_WEIGHT
+                    } else if term.chars().count() > 2
+                        && name.iter().any(|part| part.contains(term.as_str()))
+                    {
+                        NAME_WEIGHT * INSIDE_NAME
+                    } else {
+                        0.0
+                    };
+                    let said = described.iter().filter(|word| *word == term).count() as f64;
+                    let long = described.len() as f64 / average;
+                    let in_description = said * (SATURATION + 1.0)
+                        / (said + SATURATION * (1.0 - LENGTH + LENGTH * long));
+                    rare(term) * (in_name + in_description)
+                })
+                .sum();
+            (score, *tool)
+        })
+        .filter(|(score, _)| *score > 0.0)
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.name().cmp(b.1.name())));
     scored.into_iter().map(|(_, tool)| tool).collect()
 }
 
-/// How well `tool` matches `query`, whose words are `terms`; see `ranked`.
-fn score(tool: &dyn Tool, query: &str, terms: &[String]) -> usize {
-    let name = tool.name().to_lowercase();
-    if name == query {
-        return usize::MAX;
+/// The words of `text` a search compares: those that tell tools apart, each
+/// with its common ending cut.
+fn terms_of(text: &str) -> Vec<String> {
+    words(text)
+        .into_iter()
+        .filter(|word| !STOP_WORDS.contains(&word.as_str()))
+        .map(|word| stem(&word))
+        .collect()
+}
+
+/// `word` with a common ending cut, so "issues", "issued" and "issuing"
+/// are the same word: rough, but cut the same way on both sides.
+fn stem(word: &str) -> String {
+    let mut stem = word;
+    for ending in ["ing", "ed", "es", "s", "er", "ion", "ly"] {
+        if stem.chars().count() > ending.len() + 2
+            && let Some(cut) = stem.strip_suffix(ending)
+        {
+            stem = cut;
+            break;
+        }
     }
-    let parts = words(name.trim_start_matches(PREFIX));
-    let described = words(&tool.description().to_lowercase());
-    terms
-        .iter()
-        .map(|term| {
-            let in_name = if parts.contains(term) {
-                10
-            } else if parts.iter().any(|part| part.contains(term.as_str())) {
-                5
-            } else {
-                0
-            };
-            let in_description = described.iter().any(|word| word.starts_with(term.as_str()));
-            in_name + if in_description { 2 } else { 0 }
-        })
-        .sum()
+    if stem.chars().count() > 3
+        && let Some(cut) = stem.strip_suffix('e')
+    {
+        stem = cut;
+    }
+    stem.to_owned()
 }
 
 /// The words of `text` two letters or longer, split wherever it is not a
@@ -1094,8 +1209,13 @@ pub(crate) mod tests {
         println!(
             "by words: first {first:.1}%, first three {three:.1}%, a tool for {needless} of {none} needing none"
         );
-        // Where the ranking stands, so a change that loses ground shows.
-        assert!(three >= 30.0, "{three:.1}% in the first three");
+        // Where the ranking stands, so a change that loses ground shows:
+        // 31.0% first and 47.9% in the first three, with a tool offered for
+        // 8 of the 15 that need none (plain word matching had 18.3%, 32.4%
+        // and 14).
+        assert!(first >= 29.0, "{first:.1}% first");
+        assert!(three >= 46.0, "{three:.1}% in the first three");
+        assert!(needless <= 9, "a tool for {needless} needing none");
     }
 
     #[test]
@@ -1375,8 +1495,15 @@ pub(crate) mod tests {
         ];
         assert_eq!(
             search(&tools, "weather", false, &[], None),
-            "No tool matches \"weather\". The tools are: mcp__gh__create_issue, mcp__db__query."
+            "No tool matches \"weather\" by its words. Pick one by what it does, or search again \
+             in other words:\nmcp__gh__create_issue: Create an issue.\nmcp__db__query: Run a query."
         );
+        // Past what fits, the rest go by name.
+        let many = server(400, 2);
+        let found = search(&many, "weather", false, &[], None);
+        assert!(found.len() <= FOUND_BYTES, "{}", found.len());
+        assert!(found.contains("\nAnd by name: mcp__big__tool_"));
+        assert!(found.ends_with(" more."));
         assert!(
             search(&[], "weather", false, &[], None).starts_with("No MCP server has any tools")
         );

@@ -207,16 +207,39 @@ pub fn holder(name: &str) -> Option<&'static str> {
 }
 
 /// Give the gateway of the user's own called `name` a new address: the
-/// address as it is kept, or why it cannot be.
+/// address as it is kept, or why it cannot be. A move to another host
+/// forgets its key, which was given for the old one and would otherwise go
+/// to the new one with the next request.
 pub fn change_own(name: &str, address: &str) -> Result<String, String> {
     let base = own_base(address)?;
     let mut kept = read_kept(&own_path());
     let Some(gateway) = kept.iter_mut().find(|k| k.name.trim() == name) else {
         return Err(format!("There is no gateway of your own called {name}."));
     };
+    let moved = !same_host(&gateway.base, &base);
     gateway.base = base.clone();
     write_kept(&kept)?;
+    if moved {
+        crate::store::save_key(key_slot(name), None).map_err(|e| {
+            format!("The address changed, but its old key could not be removed: {e}.")
+        })?;
+    }
     Ok(base)
+}
+
+/// Whether two addresses reach the same server: scheme, host and port, as
+/// a browser decides which site a cookie goes to.
+fn same_host(a: &str, b: &str) -> bool {
+    let site = |address: &str| {
+        reqwest::Url::parse(address).ok().map(|url| {
+            (
+                url.scheme().to_owned(),
+                url.host_str().map(str::to_ascii_lowercase),
+                url.port_or_known_default(),
+            )
+        })
+    };
+    matches!((site(a), site(b)), (Some(a), Some(b)) if a == b)
 }
 
 /// Stop offering the gateway of the user's own called `name`, and forget
@@ -867,5 +890,20 @@ mod tests {
         );
         crate::providers::auth::sign_out("ChatGPT").unwrap();
         assert!(!ready(&none, "").iter().any(|g| g.0 == "ChatGPT"));
+    }
+
+    #[test]
+    fn a_new_path_keeps_the_host_and_a_new_host_does_not() {
+        assert!(same_host(
+            "http://localhost:1234/v1",
+            "http://LOCALHOST:1234/v2"
+        ));
+        assert!(same_host("https://a.example/v1", "https://a.example:443/x"));
+        assert!(!same_host("https://a.example/v1", "https://b.example/v1"));
+        assert!(!same_host(
+            "http://localhost:1234/v1",
+            "http://localhost:8080/v1"
+        ));
+        assert!(!same_host("http://a.example/v1", "https://a.example/v1"));
     }
 }
