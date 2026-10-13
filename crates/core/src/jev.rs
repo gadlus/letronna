@@ -23,8 +23,9 @@
 //! wherever it can be reached, and "names" never asks. Only the search's
 //! own words and the tools' names and descriptions are sent. Whatever goes
 //! wrong -- no way to reach it, a slow or refused answer, one that cannot
-//! be read -- leaves the ranking to the words, as before, and is noted in
-//! the diagnostics log once for each kind of trouble.
+//! be read -- leaves the ranking to `find_tools`' own, by the words a search
+//! shares with each tool, and is noted in the diagnostics log once for each
+//! kind of trouble.
 
 use crate::chat::Connection;
 use serde_json::{Map, Value, json};

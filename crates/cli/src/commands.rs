@@ -4276,10 +4276,21 @@ pub fn search_services(runner: &mut Runner) {
     use letronna_core::search::{self, SERVICES};
     let keys = store::load_keys();
     let mut choice = search::choice();
-    let mut rows = Vec::new();
+    let account = letronna_core::auth::account();
+    // With no service chosen, DuckDuckGo then answers only when the
+    // account's search cannot.
+    let behind_account = account.is_some() && choice.service.is_empty();
+    let mut rows = vec![account_search_line(
+        account.as_ref(),
+        !choice.service.is_empty(),
+    )];
     let mut choices: Vec<(String, &'static str, &'static str)> = Vec::new();
     for s in SERVICES {
         let (status, good, set_up) = search::status(s.name, &choice, &keys);
+        let status = match (s.keyless && behind_account, status) {
+            (true, "In use") => "If Letronna cannot",
+            (_, status) => status,
+        };
         // The keyless one has nothing to set up, so its row says what it is.
         let blurb = match s.keyless {
             true => format!(" · {}", s.blurb),
@@ -4306,8 +4317,11 @@ pub fn search_services(runner: &mut Runner) {
                 choices.push((format!("{} {}", what.0, s.name), s.name, what.1));
             }
             if !choice.service.is_empty() {
-                let none = "Use the gateway's search, then DuckDuckGo".to_owned();
-                choices.push((none, s.name, "none"));
+                let none = match account.is_some() {
+                    true => "Use Letronna's search, then DuckDuckGo",
+                    false => "Use the gateway's search, then DuckDuckGo",
+                };
+                choices.push((none.to_owned(), s.name, "none"));
             }
             continue;
         }
@@ -4342,11 +4356,18 @@ pub fn search_services(runner: &mut Runner) {
         }
         if what == "none" {
             render::blank();
-            render::line(&render::dim(if runner.store.settings.keyless_search {
-                "No search service is chosen: the model searches through the gateway where it sells search, paid by the search, and with DuckDuckGo when that cannot answer. Each search is asked first."
-            } else {
-                "No search service is chosen: the model searches only through the gateway, where it sells search, paid by the search, as DuckDuckGo is switched off (/search keyless)."
-            }));
+            let signed_in = account.is_some();
+            render::line(&render::dim(
+                if signed_in && runner.store.settings.keyless_search {
+                    "No search service is chosen: the model searches through your Letronna account, paid by the search from its credit, and with DuckDuckGo when that cannot answer. Each search is asked first."
+                } else if signed_in {
+                    "No search service is chosen: the model searches only through your Letronna account, paid by the search from its credit, as DuckDuckGo is switched off (/search keyless)."
+                } else if runner.store.settings.keyless_search {
+                    "No search service is chosen: the model searches through the gateway where it sells search, paid by the search, and with DuckDuckGo when that cannot answer. Each search is asked first."
+                } else {
+                    "No search service is chosen: the model searches only through the gateway, where it sells search, paid by the search, as DuckDuckGo is switched off (/search keyless)."
+                },
+            ));
             return;
         }
         runner.store.settings.keyless_search = true;
@@ -4409,6 +4430,33 @@ pub fn search_services(runner: &mut Runner) {
     }
     if let Err(error) = search::choose(&choice) {
         render::line(&render::red(&error));
+    }
+}
+
+/// The Letronna row of `/search services`: where searching through the
+/// account stands, `chosen` saying a service is used instead.
+fn account_search_line(account: Option<&letronna_core::auth::Account>, chosen: bool) -> String {
+    let name = letronna_core::BRAND;
+    let Some(account) = account else {
+        return format!(
+            "○ {name:<10} Signed out · /login to search through your account, paid by the search"
+        );
+    };
+    // An account never checked with the API has no plan yet, and its
+    // credit is not known.
+    let credit = account
+        .team
+        .as_ref()
+        .map_or(account.credits, |team| team.credits);
+    let broke = !account.plan.is_empty() && credit <= 0;
+    match (chosen, broke) {
+        (true, _) => format!("○ {name:<10} Not in use · the service you chose is used instead"),
+        (false, true) => format!(
+            "○ {name:<10} No credit · add some at letronna.ai to search through your account; DuckDuckGo answers until then"
+        ),
+        (false, false) => format!(
+            "● {name:<10} In use · through your account, paid by the search from its credit"
+        ),
     }
 }
 
@@ -4539,9 +4587,9 @@ pub fn connect(runner: &mut Runner) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Asked, Flow, Run, Stage, ToolSearch, agent_lines, agent_rows, asked, choice_label, command,
-        crew_switch, from_match, keep_days, last_prompt, name_label, ranking, run_rows,
-        side_setting, standing, tool_search_asked, typed_path, with_files,
+        Asked, Flow, Run, Stage, ToolSearch, account_search_line, agent_lines, agent_rows, asked,
+        choice_label, command, crew_switch, from_match, keep_days, last_prompt, name_label,
+        ranking, run_rows, side_setting, standing, tool_search_asked, typed_path, with_files,
     };
     use crate::session::Runner;
     use letronna_core::agents::Seen;
@@ -4747,6 +4795,23 @@ mod tests {
         assert_eq!(keep_days("0"), Ok(Some(0)));
         assert!(keep_days("a month").is_err());
         assert!(keep_days("-3").is_err());
+    }
+
+    #[test]
+    fn the_letronna_search_row_says_where_the_account_stands() {
+        use letronna_core::auth::Account;
+        let checked = |credits| Account {
+            plan: "free".into(),
+            credits,
+            ..Account::default()
+        };
+        assert!(account_search_line(None, false).contains("Signed out · /login"));
+        assert!(account_search_line(Some(&checked(500)), false).starts_with("● Letronna   In use"));
+        assert!(account_search_line(Some(&checked(-1)), false).contains("No credit"));
+        assert!(account_search_line(Some(&checked(500)), true).contains("Not in use"));
+        // Not checked with the API yet, its credit is not known to be gone.
+        let unchecked = Account::default();
+        assert!(account_search_line(Some(&unchecked), false).contains("In use"));
     }
 
     #[test]

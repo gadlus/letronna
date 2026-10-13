@@ -14,15 +14,18 @@
 //! only at the address it is given. Emptied, an address goes back to the
 //! official one.
 //!
-//! While no service is chosen, a search goes through the session's own
-//! gateway when it sells search -- Letronna's, paid from the account's
-//! credit, or one that lists search models in its `/models`, the cheapest
-//! tried first -- and on to DuckDuckGo's page for browsers without JavaScript
-//! in the same call when the gateway cannot answer. A gateway's searches are
-//! lent by providers that at times have none to lend, so one that could not
-//! answer rests for ten minutes, DuckDuckGo going first meanwhile, and is
-//! still asked when DuckDuckGo cannot answer either. The session's key goes
-//! only to its own gateway, and no redirect from it is followed. Choosing
+//! While no service is chosen, a search goes through Letronna's own search,
+//! paid from the account's credit, whenever this computer is signed in,
+//! whatever gateway the chat is on, as pictures and speech are made there.
+//! Signed out, it goes through the session's own gateway when that sells
+//! search -- one that lists search models in its `/models`, the cheapest
+//! tried first. Either way it goes on to DuckDuckGo's page for browsers
+//! without JavaScript in the same call when the gateway cannot answer. A
+//! gateway's searches are lent by providers that at times have none to lend,
+//! so one that could not answer rests for ten minutes, DuckDuckGo going
+//! first meanwhile, and is still asked when DuckDuckGo cannot answer either.
+//! The account's token goes only to Letronna and the session's key only to
+//! its own gateway, and no redirect from either is followed. Choosing
 //! DuckDuckGo by name keeps every search off the gateway's paid search.
 //!
 //! DuckDuckGo needs no key, so a fresh install can search from its first
@@ -279,7 +282,7 @@ pub(crate) fn paid_through_gateway(connection: Option<&Connection>) -> bool {
     if selling(connection, gateways, Instant::now()).is_some_and(|gate| sells(&gate)) {
         return true;
     }
-    if let Some(gate) = session_gateway(connection) {
+    if let Some(gate) = search_gate(connection, account_token()) {
         lock(gateways).judged_free(&gate.base, Instant::now());
     }
     false
@@ -606,6 +609,41 @@ struct Gate {
     failing: Option<&'static str>,
 }
 
+/// The gateway a search over `connection` goes through while no service is
+/// chosen: Letronna's own with `account`'s token while this computer is
+/// signed in, whatever gateway the chat is on, as pictures and speech are
+/// made there; else the session's own.
+fn search_gate(connection: Option<&Connection>, account: Option<String>) -> Option<Gate> {
+    account_gate(account).or_else(|| session_gateway(connection))
+}
+
+/// Letronna's own gateway, reached with the signed-in account's `token`;
+/// `None` while signed out.
+fn account_gate(token: Option<String>) -> Option<Gate> {
+    let key = token
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())?;
+    Some(Gate {
+        name: crate::gateway::LETRONNA.to_owned(),
+        base: crate::auth::hosted_base(),
+        key,
+        hosted: true,
+        models: Vec::new(),
+        failing: None,
+    })
+}
+
+/// The signed-in account's token, if anyone is signed in.
+fn account_token() -> Option<String> {
+    crate::auth::account().map(|account| account.token)
+}
+
+/// Whether searches go through the Letronna account while no service is
+/// chosen: this computer is signed in, and none is.
+pub fn through_account() -> bool {
+    !standing().chosen && account_gate(account_token()).is_some()
+}
+
 /// The gateway a session over `connection` talks to, whose search a search
 /// with no service chosen may go through: none with no connection, for
 /// Letronna's own while not signed in, or for Anthropic's API, which sells
@@ -644,8 +682,8 @@ fn gateway_base(endpoint: &str) -> String {
         .to_owned()
 }
 
-/// The session's gateway with the search models it sells, as far as is
-/// known at `now` without asking it: `None` only when its list, read lately,
+/// The gateway a search goes through (`search_gate`) with the search models
+/// it sells, as far as is known at `now` without asking it: `None` only when its list, read lately,
 /// named no search models, and no models yet while its list was not read.
 /// One whose list could not be read, or Letronna's own without a search
 /// route, is still given, as failing: the card names every place a search
@@ -655,7 +693,7 @@ fn named_gate(
     gateways: &Mutex<Gateways>,
     now: Instant,
 ) -> Option<Gate> {
-    let mut gate = session_gateway(connection)?;
+    let mut gate = search_gate(connection, account_token())?;
     match lock(gateways).known(&gate.base, gate.hosted, now) {
         Known::SellsNone => return None,
         Known::Sells(models) => gate.models = models,
@@ -689,8 +727,8 @@ fn as_judged(mut gate: Gate, gateways: &Mutex<Gateways>, now: Instant) -> Gate {
     gate
 }
 
-/// The session's gateway when it may sell search, with its search models in
-/// the order they are tried; its list is read first when it never was, or
+/// The gateway a search goes through when it may sell search, with its
+/// search models in the order they are tried; its list is read first when it never was, or
 /// not lately. One that cannot be asked for now is given as failing.
 fn selling(
     connection: Option<&Connection>,
@@ -3199,6 +3237,57 @@ pub(crate) mod tests {
         );
         // Anthropic's own API sells no search.
         assert!(session_gateway(Some(&over("https://api.anthropic.com/v1", "key"))).is_none());
+    }
+
+    #[test]
+    fn signed_in_a_search_goes_through_the_account_whatever_the_chats_gateway() {
+        let over = |endpoint: &str, key: &str| Connection {
+            endpoint: endpoint.into(),
+            key: key.into(),
+            ..Connection::default()
+        };
+        let hosted = crate::auth::hosted_base();
+        for connection in [
+            None,
+            Some(over("https://openrouter.ai/api/v1", "key")),
+            Some(over("http://127.0.0.1:8080/v1", "")),
+            Some(over("https://api.anthropic.com/v1", "key")),
+            // Letronna's own reached as Custom, with no key of its own.
+            Some(over(&hosted, "")),
+        ] {
+            let gate = search_gate(connection.as_ref(), Some("ltr_token".into())).unwrap();
+            assert_eq!(
+                (gate.name.as_str(), gate.base.as_str(), gate.key.as_str()),
+                ("Letronna", hosted.as_str(), "ltr_token")
+            );
+            assert!(gate.hosted);
+        }
+        // Signed out, the session's own gateway is used as before.
+        let openrouter = search_gate(Some(&over("https://openrouter.ai/api/v1", "key")), None);
+        let openrouter = openrouter.unwrap();
+        assert_eq!(
+            (openrouter.name.as_str(), openrouter.key.as_str()),
+            ("OpenRouter", "key")
+        );
+        assert!(search_gate(Some(&over(&hosted, "")), None).is_none());
+        assert!(search_gate(None, Some("  ".into())).is_none());
+    }
+
+    #[test]
+    fn the_card_names_letronna_and_who_pays_when_signed_in() {
+        let gate = account_gate(Some("ltr_token".into())).map(|gate| Gate {
+            models: vec![AUTO.into()],
+            ..gate
+        });
+        let routes = routes(&Choice::default(), &HashMap::new(), true, gate, false).unwrap();
+        assert_eq!(
+            heading(&routes, "rust"),
+            "Search through Letronna for \"rust\", or DuckDuckGo if it cannot"
+        );
+        assert_eq!(
+            paid(&routes),
+            "\n\nA search through Letronna is paid from your Letronna credit."
+        );
     }
 
     #[test]
