@@ -48,6 +48,67 @@ struct Screen {
     /// Lines laid out afresh for each width instead of wrapped, by their
     /// index in `lines`: the opening screen, whose face a wrap breaks apart.
     blocks: HashMap<usize, LayOut>,
+    /// The model's thinking, by its line in `lines`: one row while folded,
+    /// all of it once opened.
+    folds: HashMap<usize, Fold>,
+    /// The first of `rows` each wrapped line starts at, so a fold that
+    /// changes is laid out again from there on.
+    starts: Vec<usize>,
+}
+
+/// One reply's thinking, folded to a line unless opened.
+struct Fold {
+    text: String,
+    open: bool,
+    /// Still coming in.
+    live: bool,
+    began: Instant,
+    took: Duration,
+}
+
+/// Lines of thinking shown under the heading while it comes in.
+const PREVIEW: usize = 2;
+
+impl Fold {
+    fn rows(&self, width: usize) -> Vec<String> {
+        let indent = "    ";
+        let inner = width.saturating_sub(indent.len()).max(10);
+        let body: Vec<String> = self
+            .text
+            .trim()
+            .lines()
+            .flat_map(|line| render::fold(line.trim_end(), inner))
+            .map(|row| format!("{indent}{}", render::dim(&row)))
+            .collect();
+        let heading = if self.live {
+            render::dim("  ✻ Thinking…")
+        } else {
+            let mark = if self.open { "▾" } else { "▸" };
+            let hint = if self.open {
+                ""
+            } else {
+                "  · click or ctrl+o to show"
+            };
+            render::dim(&format!(
+                "  {mark} Thought for {}s{hint}",
+                self.took.as_secs().max(1)
+            ))
+        };
+        let mut rows = vec![heading];
+        if self.open {
+            rows.extend(body);
+        } else if self.live {
+            // The newest lines with words in them: a paragraph break is no
+            // news of what it is thinking.
+            let said: Vec<String> = body
+                .into_iter()
+                .filter(|row| !render::plain(row).trim().is_empty())
+                .collect();
+            let from = said.len().saturating_sub(PREVIEW);
+            rows.extend(said.into_iter().skip(from));
+        }
+        rows
+    }
 }
 
 /// Rows for a window so many columns wide, each fitting it.
@@ -68,6 +129,8 @@ fn screen() -> &'static Mutex<Screen> {
             open: false,
             painted: Instant::now(),
             blocks: HashMap::new(),
+            folds: HashMap::new(),
+            starts: Vec::new(),
         })
     })
 }
@@ -155,6 +218,107 @@ pub fn block(lay_out: LayOut) {
     now();
 }
 
+/// Begin a reply's thinking, folded, on a line of its own; its id is for
+/// `think` and `thought`.
+pub fn fold_open() -> usize {
+    let at = {
+        let Ok(mut s) = screen().lock() else { return 0 };
+        if s.lines.last().is_some_and(|open| !open.is_empty()) {
+            s.lines.push(String::new());
+        }
+        let at = s.lines.len().saturating_sub(1);
+        s.folds.insert(
+            at,
+            Fold {
+                text: String::new(),
+                open: false,
+                live: true,
+                began: Instant::now(),
+                took: Duration::ZERO,
+            },
+        );
+        s.lines.push(String::new());
+        s.scroll = 0;
+        at
+    };
+    now();
+    at
+}
+
+/// More of the thinking `fold` holds.
+pub fn think(fold: usize, text: &str) {
+    {
+        let Ok(mut s) = screen().lock() else { return };
+        let Some(f) = s.folds.get_mut(&fold) else {
+            return;
+        };
+        f.text.push_str(text);
+        s.again_from(fold);
+    }
+    soon();
+}
+
+/// The thinking `fold` holds is all in: it folds to one line.
+pub fn thought(fold: usize) {
+    {
+        let Ok(mut s) = screen().lock() else { return };
+        let Some(f) = s.folds.get_mut(&fold) else {
+            return;
+        };
+        if !f.live {
+            return;
+        }
+        f.live = false;
+        f.took = f.began.elapsed();
+        s.again_from(fold);
+    }
+    now();
+}
+
+/// Open or fold the latest thinking that has finished, for ctrl+o.
+pub fn toggle_last() {
+    {
+        let Ok(mut s) = screen().lock() else { return };
+        let Some(&at) = s
+            .folds
+            .iter()
+            .filter(|(_, f)| !f.live)
+            .map(|(at, _)| at)
+            .max()
+        else {
+            return;
+        };
+        s.toggle(at);
+    }
+    now();
+}
+
+/// Open or fold the thinking at a place on the screen, saying whether a
+/// click there was on one.
+pub fn toggle_at(column: u16, row: u16) -> bool {
+    let toggled = {
+        let Ok(mut s) = screen().lock() else {
+            return false;
+        };
+        let Some((row, _)) = s.buffer_at(column, row) else {
+            return false;
+        };
+        let line = s
+            .starts
+            .partition_point(|&start| start <= row)
+            .saturating_sub(1);
+        let on_fold = s.folds.get(&line).is_some_and(|f| !f.live);
+        if on_fold {
+            s.toggle(line);
+        }
+        on_fold
+    };
+    if toggled {
+        now();
+    }
+    toggled
+}
+
 /// Hand over the input box and whatever sits under it.
 pub fn chrome(lines: Vec<String>) {
     if let Ok(mut s) = screen().lock() {
@@ -168,6 +332,8 @@ pub fn wipe() {
     if let Ok(mut s) = screen().lock() {
         s.lines = vec![String::new()];
         s.blocks.clear();
+        s.folds.clear();
+        s.starts.clear();
         s.rows.clear();
         s.wrapped = 0;
         s.scroll = 0;
@@ -314,12 +480,18 @@ impl Screen {
         if width != self.width {
             self.width = width;
             self.rows.clear();
+            self.starts.clear();
             self.wrapped = 0;
         }
         while self.wrapped + 1 < self.lines.len() {
-            let wrapped = match self.blocks.get(&self.wrapped) {
-                Some(lay_out) => lay_out(width as usize),
-                None => render::fold(&self.lines[self.wrapped], width as usize),
+            self.starts.push(self.rows.len());
+            let wrapped = match (
+                self.blocks.get(&self.wrapped),
+                self.folds.get(&self.wrapped),
+            ) {
+                (Some(lay_out), _) => lay_out(width as usize),
+                (None, Some(fold)) => fold.rows(width as usize),
+                (None, None) => render::fold(&self.lines[self.wrapped], width as usize),
             };
             self.rows.extend(wrapped);
             self.wrapped += 1;
@@ -329,6 +501,26 @@ impl Screen {
             rows.extend(render::fold(open, width as usize));
         }
         rows
+    }
+
+    /// Lay the conversation out again from line `at` on, as it changed.
+    fn again_from(&mut self, at: usize) {
+        if at < self.wrapped {
+            let row = self.starts.get(at).copied().unwrap_or(0);
+            self.rows.truncate(row);
+            self.starts.truncate(at);
+            self.wrapped = at;
+        }
+        // A selection made over rows that move would mark the wrong text.
+        self.from = None;
+        self.to = None;
+    }
+
+    fn toggle(&mut self, at: usize) {
+        if let Some(fold) = self.folds.get_mut(&at) {
+            fold.open = !fold.open;
+            self.again_from(at);
+        }
     }
 
     /// How many rows of the window the conversation gets.
@@ -410,7 +602,8 @@ fn paint(s: &mut Screen) {
 
 #[cfg(test)]
 mod tests {
-    use super::{HashMap, Instant, Screen, base64};
+    use super::{Duration, Fold, HashMap, Instant, Screen, base64};
+    use crate::render;
 
     #[test]
     fn a_block_is_laid_out_again_for_each_width_rather_than_wrapped() {
@@ -426,11 +619,99 @@ mod tests {
             open: false,
             painted: Instant::now(),
             blocks: HashMap::new(),
+            folds: HashMap::new(),
+            starts: Vec::new(),
         };
         s.blocks
             .insert(1, Box::new(|width| vec!["x".repeat(width.min(6))]));
         assert_eq!(s.view(80)[..2], ["ab", "xxxxxx"]);
         assert_eq!(s.view(4)[..2], ["ab", "xxxx"]);
+    }
+
+    /// The rows above the open line at the foot, plain.
+    fn shown(s: &mut Screen, width: u16) -> Vec<String> {
+        let mut rows: Vec<String> = s.view(width).iter().map(|r| render::plain(r)).collect();
+        rows.pop();
+        rows
+    }
+
+    fn held_with_thinking(text: &str, live: bool) -> Screen {
+        let mut s = Screen {
+            lines: vec!["asked".into(), String::new(), String::new()],
+            rows: Vec::new(),
+            wrapped: 0,
+            width: 0,
+            scroll: 0,
+            chrome: Vec::new(),
+            from: None,
+            to: None,
+            open: false,
+            painted: Instant::now(),
+            blocks: HashMap::new(),
+            folds: HashMap::new(),
+            starts: Vec::new(),
+        };
+        s.folds.insert(
+            1,
+            Fold {
+                text: text.into(),
+                open: false,
+                live,
+                began: Instant::now(),
+                took: Duration::from_secs(12),
+            },
+        );
+        s
+    }
+
+    #[test]
+    fn thinking_folds_to_one_line_and_opens_with_its_line_breaks() {
+        let text = "First, read the file.\nThen check the token.\n\nThen answer.";
+        let mut s = held_with_thinking(text, false);
+        let folded = shown(&mut s, 80);
+        assert_eq!(
+            folded[..2],
+            ["asked", "  ▸ Thought for 12s  · click or ctrl+o to show"]
+        );
+        assert_eq!(folded.len(), 2);
+
+        s.toggle(1);
+        let opened = shown(&mut s, 80);
+        assert_eq!(
+            opened[1..],
+            [
+                "  ▾ Thought for 12s",
+                "    First, read the file.",
+                "    Then check the token.",
+                "    ",
+                "    Then answer."
+            ]
+        );
+        s.toggle(1);
+        assert_eq!(shown(&mut s, 80).len(), 2);
+    }
+
+    #[test]
+    fn thinking_still_coming_in_shows_its_last_lines() {
+        let mut s = held_with_thinking("one\ntwo\nthree", true);
+        assert_eq!(
+            shown(&mut s, 80)[1..],
+            ["  ✻ Thinking…", "    two", "    three"]
+        );
+    }
+
+    #[test]
+    fn a_long_line_of_thinking_wraps_under_its_indent() {
+        let mut s = held_with_thinking(&"word ".repeat(30), false);
+        s.toggle(1);
+        let rows = shown(&mut s, 40);
+        assert!(rows.len() > 4, "{rows:?}");
+        assert!(
+            rows[2..]
+                .iter()
+                .all(|r| r.starts_with("    ") && r.chars().count() <= 40),
+            "{rows:?}"
+        );
     }
 
     #[test]
