@@ -189,6 +189,19 @@ pub fn out(text: &str, newline: bool) {
     flush();
 }
 
+/// Rows laid out for the window's width, and laid out again whenever it
+/// changes while the conversation is held: for the opening screen, which
+/// wrapping would break apart.
+pub fn block(lay_out: impl Fn(usize) -> Vec<String> + Send + 'static) {
+    if crate::screen::held() {
+        crate::screen::block(Box::new(lay_out));
+        return;
+    }
+    for row in lay_out(width()) {
+        out(&row, true);
+    }
+}
+
 /// Terminal width, or a sane guess when it cannot be asked.
 pub fn width() -> usize {
     crossterm::terminal::size()
