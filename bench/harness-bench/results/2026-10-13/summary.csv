@@ -1,0 +1,6 @@
+model,model_id,graded,score,passes,fail_grader_only,real_fails,tokens_per_task,calls_per_task,web_searches,earlier_run,earlier_same_tasks,earlier_score,today_score_same_tasks,earlier_tokens,today_tokens_same_tasks
+DeepSeek V4 Flash,deepseek-v4-flash,105,0.84,48,40,17,112704,9.01,2,"main 0bc18970, 10-07",94,0.8419,0.8389,157777,115283
+Muse Spark 1.3,muse-spark-1.3-contributor,106,0.8359,41,49,16,70125,8.71,0,"main 0eb48ad7, 10-08",106,0.8305,0.8359,109986,70125
+Claude Opus 5.5,claude-opus-5-5,106,0.8344,43,45,18,50066,7.12,0,,,,,,
+Claude Sonnet 5.5,claude-sonnet-5-5,105,0.8336,41,48,16,47322,6.35,0,"main 857311a3, 10-08",100,0.8277,0.8339,76996,46644
+Claude Sonnet 4.6,claude-sonnet-4-6,106,0.8037,35,41,30,86205,11.27,0,"main 0bc18970, 10-06",106,0.8118,0.8037,122196,86205
