@@ -30,7 +30,8 @@ pub struct Task {
     pub branch: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub tier: String,
-    /// A hosted model; the cloud's own default when empty.
+    /// The model to run on: the session's, which the cloud swaps for its
+    /// default when empty or not one it hosts.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub model: String,
     /// A thread to carry on, from an earlier run.
@@ -431,7 +432,11 @@ impl crate::tools::Tool for CloudTask {
             branch: field("branch"),
             tier: field("tier"),
             thread: field("thread"),
-            model: String::new(),
+            // The session's own model, which the cloud swaps for its
+            // default when it hosts no model by that name.
+            model: (ctx.caller.connection.as_deref())
+                .map(|c| c.model.trim().to_owned())
+                .unwrap_or_default(),
             files: String::new(),
         };
         if task.prompt.is_empty() {
