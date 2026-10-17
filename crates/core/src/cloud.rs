@@ -460,7 +460,12 @@ impl crate::tools::Tool for CloudTask {
         let mut steps: Vec<String> = Vec::new();
         crate::tool_progress::say(
             here,
-            format!("Cloud run {}: {}", started.id, started.status),
+            format!(
+                "Cloud run {}: {} · {}",
+                started.id,
+                started.status,
+                run_page(&started.id)
+            ),
         );
         let followed = follow(
             &started.id,
@@ -476,6 +481,10 @@ impl crate::tools::Tool for CloudTask {
             "Ran in Letronna Cloud as {} ({}, {} s); to carry on there, pass thread {}.",
             run.id, run.tier, run.seconds, run.thread
         );
+        said.push_str(&format!(
+            " The user can follow and reread it at {}; give them that link.",
+            run_page(&run.id)
+        ));
         if let Some(preview) = &run.preview {
             said.push_str(&format!(
                 " What it made can be seen at {preview}; give the user that link."
@@ -493,6 +502,12 @@ impl crate::tools::Tool for CloudTask {
             _ => Err(format!("{said} It failed: {}", run.error.trim())),
         }
     }
+}
+
+/// The website's page for run `id`, where its owner watches it and reads
+/// it back later.
+fn run_page(id: &str) -> String {
+    format!("{}/cloud/run/{id}", crate::auth::dashboard())
 }
 
 /// The line shown under a cloud call for what run `id` says now, noting in
@@ -695,6 +710,15 @@ mod tests {
         assert_eq!(
             card,
             "Run in Letronna Cloud (light):\nBuild the site\nin https://x/y"
+        );
+    }
+
+    #[test]
+    fn a_run_links_to_its_page_on_the_website() {
+        let page = run_page("run_a");
+        assert!(
+            page.starts_with("http") && page.ends_with("/dashboard/cloud/run/run_a"),
+            "{page}"
         );
     }
 
