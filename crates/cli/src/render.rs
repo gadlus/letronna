@@ -779,6 +779,17 @@ pub fn tool(name: &str, argument: &str, outcome: &str, failed: bool) {
     out(&format!("{PAD}{} {tail}", dim("⎿")), true);
 }
 
+/// A tool's output under its line: held, its first rows shown and the
+/// rest folded under them for a click or ctrl+o to show; printed, its
+/// first lines.
+pub fn output(text: &str) {
+    if crate::screen::held() {
+        crate::screen::output(text);
+    } else {
+        detail(text, 12);
+    }
+}
+
 /// The indented body of a tool result, clipped so a big file does not bury
 /// the conversation.
 pub fn detail(text: &str, max_lines: usize) {

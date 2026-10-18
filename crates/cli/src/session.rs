@@ -927,6 +927,12 @@ impl Runner {
         ctx.approved = approved;
         ctx.sandboxed = sandboxed;
         ctx.keep_in = keep_in;
+        // An edit that goes ahead without asking shows its diff after, as
+        // one asked about shows it before; read now, while the file is as
+        // it was.
+        let diff = (!approved)
+            .then(|| crate::diff::of(&call.name, &call.arguments, &ctx))
+            .flatten();
         let summary = tools::summary(&call.name, &call.arguments);
         let ran = self.run_off_the_loop(&call, ctx, &summary);
         let stopped = ran.is_none();
@@ -936,6 +942,9 @@ impl Runner {
         let outcome =
             ran.unwrap_or_else(|| Err(letronna_core::agent::STOPPED_WHILE_RUNNING.into()));
         print_call(&call.name, &call.arguments, &outcome, tag.as_deref());
+        if outcome.is_ok() {
+            show_unasked_diff(diff);
+        }
         show_hook_problems();
         turn.finish_call(outcome);
         !stopped
@@ -994,6 +1003,15 @@ impl Runner {
     /// each call run, in the calls' order.
     fn run_batch(&mut self, turn: &mut Turn, calls: Vec<ToolCall>, tags: Vec<Option<String>>) {
         let ctx = turn.tool_context();
+        // The diffs of the edits among them, read before any runs.
+        let mut diffs: std::collections::HashMap<String, Vec<String>> = (calls.iter())
+            .filter_map(|call| {
+                Some((
+                    call.id.clone(),
+                    crate::diff::of(&call.name, &call.arguments, &ctx)?,
+                ))
+            })
+            .collect();
         let tags: std::collections::HashMap<String, String> = calls
             .iter()
             .zip(tags)
@@ -1016,6 +1034,9 @@ impl Runner {
                     &outcome,
                     tags.get(&call.id).map(String::as_str),
                 );
+                if outcome.is_ok() {
+                    show_unasked_diff(diffs.remove(&call.id));
+                }
                 show_hook_problems();
                 turn.finish_id(&call.id, outcome);
             }
@@ -1764,7 +1785,7 @@ fn print_call(name: &str, args: &str, outcome: &Result<String, String>, tag: Opt
                 false,
             );
             if !text.trim().is_empty() {
-                render::detail(&text, DETAIL_LINES);
+                render::output(&text);
             }
         }
         Err(_) => render::tool(
@@ -1773,6 +1794,21 @@ fn print_call(name: &str, args: &str, outcome: &Result<String, String>, tag: Opt
             &tagged(&format!("{}{from}", tools::one_line(&text)), tag),
             true,
         ),
+    }
+}
+
+/// The diff of an edit that went ahead without asking, under its line:
+/// what its card would have shown, cut shorter, since nothing waits on it.
+fn show_unasked_diff(rows: Option<Vec<String>>) {
+    let Some(rows) = rows else {
+        return;
+    };
+    for row in rows.iter().take(DETAIL_LINES) {
+        render::out(row, true);
+    }
+    let hidden = rows.len().saturating_sub(DETAIL_LINES);
+    if hidden > 0 {
+        render::line(&render::dim(&format!("… {hidden} more rows of the change")));
     }
 }
 

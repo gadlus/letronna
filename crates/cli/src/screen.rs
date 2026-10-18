@@ -64,13 +64,21 @@ struct Fold {
     live: bool,
     began: Instant,
     took: Duration,
+    /// A tool's output rather than the model's thinking.
+    output: bool,
 }
+
+/// Rows of a tool's output shown before the rest is folded under them.
+const OUTPUT_ROWS: usize = 12;
 
 /// Lines of thinking shown under the heading while it comes in.
 const PREVIEW: usize = 2;
 
 impl Fold {
     fn rows(&self, width: usize) -> Vec<String> {
+        if self.output {
+            return self.output_rows(width);
+        }
         let indent = "    ";
         let inner = width.saturating_sub(indent.len()).max(10);
         let body: Vec<String> = self
@@ -108,6 +116,46 @@ impl Fold {
             rows.extend(said.into_iter().skip(from));
         }
         rows
+    }
+}
+
+impl Fold {
+    /// A tool's output as rows `width` wide: all of them when open or few
+    /// enough, else the first `OUTPUT_ROWS` -- rows, not lines, so one long
+    /// line cannot fill the window -- and how many more there are.
+    fn output_rows(&self, width: usize) -> Vec<String> {
+        let indent = "      ";
+        let inner = width.saturating_sub(indent.len()).max(10);
+        let body: Vec<String> = (self.text.trim_end().lines())
+            .flat_map(|line| render::fold(line.trim_end(), inner))
+            .map(|row| format!("{indent}{}", render::dim(&row)))
+            .collect();
+        if body.len() <= OUTPUT_ROWS {
+            return body;
+        }
+        if self.open {
+            let mut rows = body;
+            rows.push(format!(
+                "{indent}{}",
+                render::dim("▴ click or ctrl+o to fold")
+            ));
+            return rows;
+        }
+        let hidden = body.len() - OUTPUT_ROWS;
+        let mut rows: Vec<String> = body.into_iter().take(OUTPUT_ROWS).collect();
+        rows.push(format!(
+            "{indent}{}",
+            render::dim(&format!(
+                "… {hidden} more rows · click or ctrl+o to show them"
+            ))
+        ));
+        rows
+    }
+
+    /// Whether opening it shows anything more: thinking always, output only
+    /// when some of it is folded away.
+    fn hides(&self, width: usize) -> bool {
+        !self.output || self.output_rows(width).len() > OUTPUT_ROWS
     }
 }
 
@@ -245,6 +293,7 @@ pub fn fold_open() -> usize {
                 live: true,
                 began: Instant::now(),
                 took: Duration::ZERO,
+                output: false,
             },
         );
         s.lines.push(String::new());
@@ -253,6 +302,31 @@ pub fn fold_open() -> usize {
     };
     now();
     at
+}
+
+/// A tool's output on lines of its own, its first rows shown and the rest
+/// folded under them, which a click or ctrl+o shows.
+pub fn output(text: &str) {
+    {
+        let Ok(mut s) = screen().lock() else { return };
+        if s.lines.last().is_some_and(|open| !open.is_empty()) {
+            s.lines.push(String::new());
+        }
+        let at = s.lines.len().saturating_sub(1);
+        s.folds.insert(
+            at,
+            Fold {
+                text: text.to_owned(),
+                open: false,
+                live: false,
+                began: Instant::now(),
+                took: Duration::ZERO,
+                output: true,
+            },
+        );
+        s.lines.push(String::new());
+    }
+    soon();
 }
 
 /// More of the thinking `fold` holds.
@@ -289,10 +363,11 @@ pub fn thought(fold: usize) {
 pub fn toggle_last() {
     {
         let Ok(mut s) = screen().lock() else { return };
+        let width = (s.width as usize).max(20);
         let Some(&at) = s
             .folds
             .iter()
-            .filter(|(_, f)| !f.live)
+            .filter(|(_, f)| !f.live && (f.open || f.hides(width)))
             .map(|(at, _)| at)
             .max()
         else {
@@ -650,6 +725,34 @@ mod tests {
     }
 
     #[test]
+    fn long_output_shows_its_first_rows_and_opens_in_place() {
+        let mut fold = Fold {
+            text: (1..=30)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            open: false,
+            live: false,
+            began: Instant::now(),
+            took: Duration::ZERO,
+            output: true,
+        };
+        let rows: Vec<String> = fold.rows(80).iter().map(|r| render::plain(r)).collect();
+        assert_eq!(rows.len(), super::OUTPUT_ROWS + 1);
+        assert!(rows.last().unwrap().contains("18 more rows"), "{rows:?}");
+        assert!(fold.hides(80));
+        fold.open = true;
+        assert_eq!(fold.rows(80).len(), 31);
+        // One long line counts by the rows it takes, not as one line.
+        fold.open = false;
+        fold.text = "x".repeat(4000);
+        assert_eq!(fold.rows(80).len(), super::OUTPUT_ROWS + 1);
+        // Short output has nothing folded away.
+        fold.text = "ok".into();
+        assert!(!fold.hides(80));
+    }
+
+    #[test]
     fn a_blank_line_is_known_from_a_fold_on_an_empty_line() {
         let mut s = Screen {
             lines: vec!["› the question".into(), String::new(), String::new()],
@@ -707,6 +810,7 @@ mod tests {
                 live,
                 began: Instant::now(),
                 took: Duration::from_secs(12),
+                output: false,
             },
         );
         s

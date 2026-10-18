@@ -167,27 +167,30 @@ fn paint(rows: &[Row]) -> Vec<String> {
     let mut out: Vec<String> = rows
         .iter()
         .take(shown)
-        .map(|row| {
+        .flat_map(|row| {
             let (mark, text, colour) = match row {
                 Row::Same(text) => (" ", text, None),
                 Row::Gone(text) => ("-", text, Some((52, 210))),
                 Row::New(text) => ("+", text, Some((22, 157))),
             };
-            let body = clip(&format!("{mark} {text}"), width);
-            match colour {
-                Some((back, front)) if render::colour() => {
-                    // The background and the default ink are set first, and
-                    // the code colours itself on top. Anything it leaves
-                    // alone falls back to the ink set here, which is what
-                    // keeps a removed line readable on red.
-                    format!(
-                        "{}\x1b[48;5;{back}m\x1b[38;5;{front}m{}\x1b[0m",
-                        render::PAD,
-                        crate::syntax::paint(&body)
-                    )
-                }
-                _ => format!("{}{}", render::PAD, render::dim(&body)),
-            }
+            // A changed line longer than the block goes on under itself
+            // rather than being cut, which could hide the change itself.
+            pieces(&format!("{mark} {text}"), width)
+                .into_iter()
+                .map(move |body| match colour {
+                    Some((back, front)) if render::colour() => {
+                        // The background and the default ink are set first,
+                        // and the code colours itself on top. Anything it
+                        // leaves alone falls back to the ink set here, which
+                        // is what keeps a removed line readable on red.
+                        format!(
+                            "{}\x1b[48;5;{back}m\x1b[38;5;{front}m{}\x1b[0m",
+                            render::PAD,
+                            crate::syntax::paint(&body)
+                        )
+                    }
+                    _ => format!("{}{}", render::PAD, render::dim(&body)),
+                })
         })
         .collect();
 
@@ -199,6 +202,24 @@ fn paint(rows: &[Row]) -> Vec<String> {
         ));
     }
     out
+}
+
+/// A diff row as rows `width` wide, each padded to it: the first with its
+/// mark, the rest under the text after the mark.
+fn pieces(text: &str, width: usize) -> Vec<String> {
+    let text = text.replace('\t', "    ");
+    let chars: Vec<char> = text.chars().collect();
+    let mut rows = Vec::new();
+    let mut at = 0;
+    while at < chars.len() || rows.is_empty() {
+        let lead = if rows.is_empty() { "" } else { "  " };
+        let room = width.saturating_sub(lead.len()).max(1);
+        let end = (at + room).min(chars.len());
+        let piece: String = chars[at..end].iter().collect();
+        rows.push(clip(&format!("{lead}{piece}"), width));
+        at = end;
+    }
+    rows
 }
 
 /// One line of a git patch as `/diff` shows it, cut to `width`: what goes
@@ -331,5 +352,15 @@ mod tests {
         assert_eq!(plain("+added"), "+added");
         assert_eq!(plain("-a longer removed line"), "-a long…");
         assert_eq!(plain(" \tkept"), "     ke…");
+    }
+
+    #[test]
+    fn a_long_changed_line_goes_on_under_itself() {
+        let long = format!("+ {}", "y".repeat(50));
+        let rows = super::pieces(&long, 20);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.chars().count() == 20), "{rows:?}");
+        assert!(rows[1].starts_with("  y"));
+        assert_eq!(super::pieces("  short", 20).len(), 1);
     }
 }
