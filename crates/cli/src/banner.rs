@@ -37,8 +37,12 @@ pub fn replay(runner: &Runner, session: usize) {
                 };
                 said_over_lines(&render::blue("›"), &text, true)
             }
+            // Drawn as a reply streamed in is, its code and headings too.
             "assistant" if !message.content.trim().is_empty() => {
-                said_over_lines(&render::blue("●"), &message.content, false);
+                render::blank();
+                let mut shown = render::Stream::opening_with(render::bullet());
+                shown.push(message.content.trim_end());
+                shown.end();
                 if message.interrupted {
                     render::line(&render::dim("(stopped)"));
                 }

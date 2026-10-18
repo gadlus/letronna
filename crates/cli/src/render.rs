@@ -266,6 +266,19 @@ pub struct Stream {
     /// One `*` seen, waiting to find out whether it is half of a pair.
     star: bool,
     started: bool,
+    /// Whether the line under way has had anything in it yet; until it has,
+    /// its first characters are held to see whether it opens a fence or is
+    /// a heading.
+    mid_line: bool,
+    /// The characters held at the start of a line.
+    held: String,
+    /// A fence line being read, for the language it names.
+    fence: Option<String>,
+    /// Inside a fenced block, whose lines are drawn whole and highlighted.
+    in_block: bool,
+    block_line: String,
+    /// Inside a heading, drawn bold to the end of its line.
+    heading: bool,
 }
 
 impl Stream {
@@ -279,6 +292,23 @@ impl Stream {
         }
     }
 
+    /// The bullet or the indent a line starts with, before anything on it:
+    /// before a style is switched on too, or the reset the bullet ends in
+    /// would switch it off again.
+    fn open_line(&mut self, out: &mut String) {
+        if !self.started {
+            self.at_line_start = true;
+            self.started = true;
+        }
+        if self.at_line_start {
+            match self.lead.take() {
+                Some(lead) => out.push_str(&lead),
+                None => out.push_str(PAD),
+            }
+            self.at_line_start = false;
+        }
+    }
+
     /// Text is built up and handed over in one piece rather than written a
     /// character at a time: a frame is painted for each piece, and a frame
     /// per character would be an answer spent repainting itself.
@@ -287,12 +317,8 @@ impl Stream {
             self.at_line_start = true;
             self.started = true;
         }
-        if self.at_line_start && ch != '\n' {
-            match self.lead.take() {
-                Some(lead) => out.push_str(&lead),
-                None => out.push_str(PAD),
-            }
-            self.at_line_start = false;
+        if ch != '\n' {
+            self.open_line(out);
         }
         out.push(ch);
         if ch == '\n' {
@@ -302,6 +328,7 @@ impl Stream {
 
     fn toggle(&mut self, out: &mut String, on: bool, code: &str) {
         if colour() {
+            self.open_line(out);
             out.push_str(if on { code } else { "\x1b[0m" });
         }
     }
@@ -309,42 +336,152 @@ impl Stream {
     pub fn push(&mut self, text: &str) {
         let mut buffer = String::with_capacity(text.len() + 8);
         for ch in text.chars() {
-            if self.star {
-                self.star = false;
-                if ch == '*' {
-                    self.bold = !self.bold;
-                    let bold = self.bold;
-                    self.toggle(&mut buffer, bold, "\x1b[1m");
-                    continue;
-                }
-                self.emit(&mut buffer, '*');
-            }
-            match ch {
-                '*' => self.star = true,
-                '`' => {
-                    self.code = !self.code;
-                    let code = self.code;
-                    self.toggle(&mut buffer, code, "\x1b[38;5;180m");
-                }
-                _ => self.emit(&mut buffer, ch),
-            }
+            self.take(&mut buffer, ch);
         }
         out(&buffer, false);
+    }
+
+    /// One character of the reply, where it falls: inside a fenced block,
+    /// on a fence, at the start of a line that may open one or be a heading,
+    /// or in a line of prose.
+    fn take(&mut self, out: &mut String, ch: char) {
+        if self.in_block {
+            if ch != '\n' {
+                self.block_line.push(ch);
+                return;
+            }
+            let line = std::mem::take(&mut self.block_line);
+            // The closing fence is not drawn, as the opening one is not.
+            if line.trim_start().starts_with("```") {
+                self.in_block = false;
+                return;
+            }
+            self.block(out, &line);
+            return;
+        }
+        if let Some(fence) = self.fence.as_mut() {
+            if ch != '\n' {
+                fence.push(ch);
+                return;
+            }
+            let language = self.fence.take().unwrap_or_default();
+            self.in_block = true;
+            // The language, dim, in place of the fence that named it.
+            if !language.trim().is_empty() {
+                for c in dim(language.trim()).chars() {
+                    self.emit(out, c);
+                }
+                self.emit(out, '\n');
+            }
+            return;
+        }
+        if !self.mid_line {
+            self.held.push(ch);
+            if self.held == "```" {
+                self.held.clear();
+                self.fence = Some(String::new());
+                return;
+            }
+            let hashes = self.held.chars().take_while(|c| *c == '#').count();
+            let fencing = "```".starts_with(self.held.as_str());
+            let heading_so_far = hashes == self.held.chars().count() && hashes <= 6;
+            if fencing || heading_so_far {
+                return;
+            }
+            let held = std::mem::take(&mut self.held);
+            if hashes > 0 && hashes <= 6 && held.chars().nth(hashes) == Some(' ') {
+                // A heading: bold to the end of the line, its marks dropped.
+                self.heading = true;
+                self.toggle(out, true, "\x1b[1m");
+                self.mid_line = true;
+                return;
+            }
+            for c in held.chars() {
+                self.inline(out, c);
+            }
+            return;
+        }
+        self.inline(out, ch);
+    }
+
+    /// A line of a fenced block, highlighted as the diffs are, with no
+    /// Markdown read into it: `**` and backticks are code there.
+    fn block(&mut self, out: &mut String, line: &str) {
+        for c in crate::syntax::paint(line).chars() {
+            self.emit(out, c);
+        }
+        if colour() {
+            out.push_str("\x1b[0m");
+        }
+        self.emit(out, '\n');
+    }
+
+    /// A character of prose: `**` for bold and backticks for code.
+    fn inline(&mut self, out: &mut String, ch: char) {
+        if self.star {
+            self.star = false;
+            if ch == '*' {
+                self.bold = !self.bold;
+                let bold = self.bold;
+                self.toggle(out, bold, "\x1b[1m");
+                return;
+            }
+            self.emit(out, '*');
+        }
+        match ch {
+            '*' => self.star = true,
+            '`' => {
+                self.code = !self.code;
+                let code = self.code;
+                self.toggle(out, code, "\x1b[38;5;180m");
+            }
+            '\n' => {
+                if std::mem::take(&mut self.heading) {
+                    self.toggle(out, false, "");
+                }
+                self.emit(out, '\n');
+                self.mid_line = false;
+            }
+            _ => {
+                self.emit(out, ch);
+                self.mid_line = true;
+            }
+        }
     }
 
     /// Finish the current line, if one is open, and drop any formatting still
     /// hanging so what comes after it is not tinted.
     pub fn end(&mut self) {
         let mut buffer = String::new();
+        // What a line start held, a fence line never ended or a block line
+        // never ended goes out as it is.
+        let held = std::mem::take(&mut self.held);
+        for c in held.chars() {
+            self.inline(&mut buffer, c);
+        }
+        if let Some(fence) = self.fence.take() {
+            for c in format!("```{fence}").chars() {
+                self.emit(&mut buffer, c);
+            }
+        }
+        if self.in_block && !self.block_line.is_empty() {
+            let line = std::mem::take(&mut self.block_line);
+            for c in crate::syntax::paint(&line).chars() {
+                self.emit(&mut buffer, c);
+            }
+        }
+        self.in_block = false;
         if self.star {
             self.star = false;
             self.emit(&mut buffer, '*');
         }
-        if (self.bold || self.code) && colour() {
+        if (self.bold || self.code || self.heading) && colour() {
             buffer.push_str("\x1b[0m");
         }
         self.bold = false;
         self.code = false;
+        self.heading = false;
+        self.mid_line = false;
         // A reply that never started, one that only called a tool, has no
         // line to close.
         let close = self.started && !self.at_line_start;
@@ -370,6 +507,10 @@ pub fn fold(line: &str, width: usize) -> Vec<String> {
     let mut rows = Vec::new();
     let mut row = String::new();
     let mut filled = 0usize;
+    // The colour and style switched on so far, which a row broken in the
+    // middle of them starts with again: each row is drawn on its own, ending
+    // in a reset.
+    let mut active = String::new();
 
     for (word, wide) in words(line) {
         // A space at the head of a row is the one left behind by the break;
@@ -380,6 +521,7 @@ pub fn fold(line: &str, width: usize) -> Vec<String> {
         }
         if filled + wide <= width {
             row.push_str(&word);
+            styled(&mut active, &word);
             filled += wide;
             continue;
         }
@@ -392,6 +534,7 @@ pub fn fold(line: &str, width: usize) -> Vec<String> {
             }
             rows.push(done);
             row.push_str(&carry);
+            row.push_str(&active);
             filled = indent;
             if word.trim().is_empty() {
                 continue;
@@ -399,29 +542,54 @@ pub fn fold(line: &str, width: usize) -> Vec<String> {
         }
         // A word too long for any row is cut rather than left to overflow.
         if wide > width {
+            let mut escape = String::new();
             for ch in word.chars() {
-                if ch == '\x1b' {
+                // An escape, or a character inside one, takes no room.
+                if ch == '\x1b' || !escape.is_empty() {
                     row.push(ch);
+                    escape.push(ch);
+                    if ch.is_ascii_alphabetic() {
+                        styled(&mut active, &escape);
+                        escape.clear();
+                    }
                     continue;
                 }
-                // Escapes already in the row do not count towards its width.
                 if filled == width {
                     rows.push(std::mem::take(&mut row));
                     row.push_str(&carry);
+                    row.push_str(&active);
                     filled = indent;
                 }
                 row.push(ch);
-                if !in_escape(&row) {
-                    filled += 1;
-                }
+                filled += 1;
             }
             continue;
         }
         row.push_str(&word);
+        styled(&mut active, &word);
         filled += wide;
     }
     rows.push(row);
     rows
+}
+
+/// Follow, in `active`, the colour and style `text` leaves switched on: a
+/// reset clears it, and every other one is added.
+fn styled(active: &mut String, text: &str) {
+    let mut rest = text;
+    while let Some(at) = rest.find("\x1b[") {
+        let tail = &rest[at + 2..];
+        let Some(end) = tail.find(|c: char| c.is_ascii_alphabetic()) else {
+            break;
+        };
+        if tail.as_bytes()[end] == b'm' {
+            match &tail[..end] {
+                "" | "0" => active.clear(),
+                _ => active.push_str(&rest[at..at + 2 + end + 1]),
+            }
+        }
+        rest = &tail[end + 1..];
+    }
 }
 
 /// The column the rest of a line should hang from: whatever it is indented
@@ -471,15 +639,6 @@ fn printing(text: &str) -> Vec<char> {
         }
     }
     out
-}
-
-/// Whether the tail of `text` is part of an escape sequence, so its
-/// characters are not counted as width.
-fn in_escape(text: &str) -> bool {
-    match text.rfind('\x1b') {
-        Some(at) => !text[at..].chars().skip(1).any(|c| c.is_ascii_alphabetic()),
-        None => false,
-    }
 }
 
 /// Split into words and the runs of spaces between them, each with the width
@@ -710,5 +869,41 @@ mod tests {
         // The escape stays with the first row and costs it no width.
         assert!(rows[0].starts_with('\x1b'));
         assert_eq!(visible(&rows[0]), 7);
+    }
+
+    #[test]
+    fn a_fenced_block_is_drawn_without_its_fences_and_as_code() {
+        let mut stream = super::Stream::default();
+        let mut out = String::new();
+        let reply = "Here it is:\n```rust\nlet x = **y** * `z`;\n```\nDone **now**.\n";
+        for ch in reply.chars() {
+            stream.take(&mut out, ch);
+        }
+        let shown = super::plain(&out);
+        assert!(!shown.contains("```"), "{shown}");
+        assert!(shown.contains("    rust\n"), "{shown}");
+        assert!(shown.contains("let x = **y** * `z`;"), "{shown}");
+        assert!(shown.contains("Done now."), "{shown}");
+    }
+
+    #[test]
+    fn a_heading_loses_its_marks() {
+        let mut stream = super::Stream::default();
+        let mut out = String::new();
+        for ch in "## What changed\n#include <x>\n".chars() {
+            stream.take(&mut out, ch);
+        }
+        let shown = super::plain(&out);
+        assert!(shown.contains("What changed\n"), "{shown}");
+        assert!(!shown.contains("## "), "{shown}");
+        assert!(shown.contains("#include <x>"), "{shown}");
+    }
+
+    #[test]
+    fn a_style_broken_over_rows_starts_each_row_again() {
+        let rows = super::fold("\x1b[1mbold words that wrap around\x1b[0m after", 10);
+        assert!(rows.len() > 2, "{rows:?}");
+        assert!(rows[1].starts_with("\x1b[1m"), "{rows:?}");
+        assert!(!rows.last().unwrap().starts_with("\x1b[1m"), "{rows:?}");
     }
 }
