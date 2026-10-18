@@ -311,15 +311,14 @@ pub fn command(
             import(runner, session, workspace, rest);
             Flow::Handled
         }
-        "/undo" => {
-            match with_files(rest) {
-                Some(files) => undo(runner, *session, workspace, files),
-                None => {
-                    render::blank();
-                    render::line(&render::red(
-                        "Usage: /undo, or /undo --files to put the files back too.",
-                    ));
-                }
+        "/rewind" | "/undo" => {
+            if rewinds(rest) {
+                rewind(runner, session, workspace);
+            } else {
+                render::blank();
+                render::line(&render::red(
+                    "Usage: /rewind, or /undo: either lists your messages to go back to.",
+                ));
             }
             Flow::Handled
         }
@@ -1111,6 +1110,7 @@ const KEYS: &[(&str, &str)] = &[
     ("ctrl+a/e", "go to the start or end of the line"),
     ("ctrl+u/k", "delete to the start or end of the line"),
     ("esc", "stop an answer, or clear the line"),
+    ("esc esc", "go back to an earlier message"),
     ("ctrl+c", "copy what is selected, clear the line, or leave"),
     ("page up/down", "scroll back through the conversation"),
     ("drag", "select and copy"),
@@ -3724,93 +3724,299 @@ fn import_one(
     }
 }
 
-/// Whether /undo's argument asks for the files too; `None` for one it does
-/// not know, which must not run a plain undo that drops the files' history.
-fn with_files(rest: &str) -> Option<bool> {
-    match rest {
-        "" => Some(false),
-        "--files" => Some(true),
-        _ => None,
+/// Whether /rewind or /undo was given what it takes: nothing, or the
+/// `--files` /undo once needed to put files back, which is now a choice.
+fn rewinds(rest: &str) -> bool {
+    matches!(rest, "" | "--files")
+}
+
+/// What going back to a message can do, offered once it is picked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Back {
+    /// The conversation goes back to before it, and the files with it.
+    Both,
+    /// The conversation goes back; the files stay as they are now.
+    Conversation,
+    /// The files go back; the conversation stays.
+    Code,
+    /// What came before it is summarized; nothing goes back.
+    Summary,
+    /// A copy of the session carries on from before it.
+    Branch,
+    /// Back to the list.
+    NeverMind,
+}
+
+impl Back {
+    /// The answer as the question offers it, in Claude Code's words where
+    /// it has them.
+    fn label(self) -> &'static str {
+        match self {
+            Back::Both => "Restore code and conversation",
+            Back::Conversation => "Restore conversation",
+            Back::Code => "Restore code",
+            Back::Summary => "Summarize up to here",
+            Back::Branch => "Branch from here",
+            Back::NeverMind => "Never mind",
+        }
     }
 }
 
-/// Take back the last exchange. With `files`, what its tools wrote goes
-/// back too, once the list of those files is agreed to; without, the files
-/// it wrote are named as staying.
-fn undo(runner: &mut Runner, session: usize, workspace: Option<&std::path::Path>, files: bool) {
-    let conversation = &runner.store.conversations[session];
+/// What going back to a message offers: the code only where a file can go
+/// back, and a summary only where something before it is not summarized.
+fn offered(code: bool, summarizes: bool) -> Vec<Back> {
+    let mut offered = Vec::new();
+    if code {
+        offered.push(Back::Both);
+    }
+    offered.push(Back::Conversation);
+    if code {
+        offered.push(Back::Code);
+    }
+    if summarizes {
+        offered.push(Back::Summary);
+    }
+    offered.extend([Back::Branch, Back::NeverMind]);
+    offered
+}
+
+/// Go back to a message you sent, picked from the newest down. Never mind,
+/// or escape, on what to do there comes back to the list.
+fn rewind(runner: &mut Runner, session: &mut usize, workspace: Option<&std::path::Path>) {
+    loop {
+        let messages = &runner.store.conversations[*session].messages;
+        let points = rewind_points(messages);
+        if points.is_empty() {
+            render::blank();
+            render::line(&render::dim("Nothing to go back to yet."));
+            return;
+        }
+        let room = render::width().saturating_sub(PICKER_EDGES);
+        let rows: Vec<String> = (points.iter())
+            .map(|&at| point_label(messages, at, room))
+            .collect();
+        let options: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let detail = vec!["Your messages, the newest first; type to narrow them.".to_owned()];
+        let picked = runner
+            .bar
+            .pick_from("Go back to before which message?", detail, &options);
+        let Some(picked) = picked else {
+            return;
+        };
+        if go_back(runner, session, workspace, points[picked]) {
+            return;
+        }
+    }
+}
+
+/// Where each message you sent that started a turn sits, the newest first:
+/// the places a rewind goes back to. A notice is Letronna's, not yours.
+fn rewind_points(messages: &[Message]) -> Vec<usize> {
+    turn_starts(messages)
+        .rev()
+        .filter(|&at| !messages[at].notice)
+        .collect()
+}
+
+/// A message as the rewind lists it: what you said, on one row, and how
+/// many files its turn changed, cut to `room` columns with the count kept.
+fn point_label(messages: &[Message], at: usize, room: usize) -> String {
+    let message = &messages[at];
+    let said = match bar::as_typed(&message.content) {
+        said if !said.trim().is_empty() => said,
+        _ if !message.images.is_empty() => "(a picture)".to_owned(),
+        _ => "(nothing)".to_owned(),
+    };
+    let files = match turn_files(messages, at) {
+        0 => String::new(),
+        1 => "  ·  1 file".to_owned(),
+        n => format!("  ·  {n} files"),
+    };
+    // A pasted prompt can hold an escape, which printed raw would restyle
+    // or move about the terminal.
+    let said: String = render::fit(&said, room.saturating_sub(files.chars().count()))
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    format!("{said}{files}")
+}
+
+/// How many files the turn your message at `at` started changed, as its
+/// tools and commands noted them: read from the messages alone, so a long
+/// session lists at once.
+fn turn_files(messages: &[Message], at: usize) -> usize {
+    let end = turn_starts(messages)
+        .find(|&start| start > at && !messages[start].notice)
+        .unwrap_or(messages.len());
+    let mut paths: Vec<&std::path::Path> = Vec::new();
+    let changes = (messages[at..end].iter())
+        .filter(|m| m.role == "tool")
+        .flat_map(|m| &m.files);
+    for change in changes {
+        if !paths.contains(&change.path.as_path()) {
+            paths.push(&change.path);
+        }
+    }
+    paths.len()
+}
+
+/// Characters of your message the question quotes, enough to know it by.
+const QUOTED: usize = 60;
+
+/// Ask what to do at your message `at`, and do it. `false` when the answer
+/// was Never mind, or escape, so another message can be picked.
+fn go_back(
+    runner: &mut Runner,
+    session: &mut usize,
+    workspace: Option<&std::path::Path>,
+    at: usize,
+) -> bool {
+    let conversation = &runner.store.conversations[*session];
     let id = conversation.id;
     // Without a project the tools wrote in the fallback folder, which the
     // rewind finds itself, not in the folder the terminal started in.
     let folder = conversation.workspace.clone();
-    let (plan, commands) = match last_prompt(&conversation.messages) {
-        Some((at, _)) => {
-            let dropped = &conversation.messages[at..];
-            let plan = history::plan(id, dropped, folder.as_deref());
-            // What stays, and why, said after the files.
-            let commands: Vec<String> = match history::ran_commands(dropped) {
-                true => std::iter::once(history::COMMANDS_NOTE.to_owned())
-                    .chain(history::unkept(dropped))
-                    .collect(),
-                false => Vec::new(),
-            };
-            (plan, commands)
-        }
-        None => (Vec::new(), Vec::new()),
+    let messages = conversation.messages.clone();
+    let summarizes = at > conversation.floor();
+    let (dropped, looked) = (messages[at..].to_vec(), folder.clone());
+    // Each file the dropped turns wrote is read and hashed, which a big one
+    // makes slow.
+    let plan = runner.bar.busy("reading what changed since", move || {
+        history::plan(id, &dropped, looked.as_deref())
+    });
+    let dropped = &messages[at..];
+    // What stays, and why, said after the files.
+    let commands: Vec<String> = match history::ran_commands(dropped) {
+        true => std::iter::once(history::COMMANDS_NOTE.to_owned())
+            .chain(history::unkept(dropped))
+            .collect(),
+        false => Vec::new(),
     };
-    if files && !plan.is_empty() {
-        let mut detail = history::listing(&plan, folder.as_deref());
-        detail.extend(commands.iter().cloned());
-        let options = [
-            "Take it back and put the files back",
-            "Leave everything as it is",
-        ];
-        let picked = runner
-            .bar
-            .choose("Put these files back too?", detail, &options);
-        if picked != Some(0) {
+    let code = plan.iter().any(|file| file.fate.touches());
+    let said: String = render::fit(&bar::as_typed(&messages[at].content), QUOTED)
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let mut detail = vec![format!("“{said}”"), leaving(dropped.len())];
+    detail.extend(history::listing(&plan, folder.as_deref()));
+    detail.extend(commands.iter().cloned());
+    let offered = offered(code, summarizes);
+    let labels: Vec<&str> = offered.iter().map(|back| back.label()).collect();
+    let picked = runner
+        .bar
+        .choose("Go back to before this message?", detail, &labels);
+    let Some(back) = picked.map(|picked| offered[picked]) else {
+        return false;
+    };
+    match back {
+        Back::NeverMind => return false,
+        Back::Both | Back::Conversation => {
+            let prompt = take_back_to(runner, *session, workspace, at);
+            runner.bar.say(&prompt);
             render::blank();
-            render::line(&render::dim("Nothing taken back."));
-            return;
-        }
-    }
-    let Some(prompt) = take_back(runner, session, workspace) else {
-        render::blank();
-        render::line(&render::dim("Nothing to take back."));
-        return;
-    };
-    runner.bar.say(&prompt);
-    render::blank();
-    render::line(&render::dim(
-        "Took back the last exchange. Your message is back in the box.",
-    ));
-    if plan.is_empty() {
-        if files {
+            render::line(&render::dim(&format!(
+                "Went back to before “{said}”. Your message is back in the box."
+            )));
+            if back == Back::Conversation {
+                if let Some(stay) = staying(&plan, folder.as_deref()) {
+                    render::line(&render::dim(&stay));
+                }
+                return true;
+            }
+            // The question went with the redraw, so what was left alone is
+            // said again here.
+            for line in history::restore(id, &plan, folder.as_deref()).lines() {
+                render::line(&render::dim(&line));
+            }
             for line in &commands {
                 render::line(&render::dim(line));
             }
         }
-        return;
+        Back::Code => {
+            let restored = history::restore(id, &plan, folder.as_deref());
+            render::blank();
+            for line in restored.lines() {
+                render::line(&render::dim(&line));
+            }
+            for line in &commands {
+                render::line(&render::dim(line));
+            }
+            // The conversation still holds the edits, which the model would
+            // otherwise take for what is on disk.
+            if let Some(notice) = restored.notice() {
+                runner.store.conversations[*session].messages.push(notice);
+                runner.persist();
+            }
+        }
+        Back::Summary => {
+            let keep = turns_from(&messages, at);
+            compact(runner, *session, &keep.to_string());
+        }
+        Back::Branch => {
+            let from = runner.store.conversations[*session].id;
+            branch(runner, session, "");
+            if runner.store.conversations[*session].id == from {
+                return true;
+            }
+            // The copy stops before the message, with its text in the box to
+            // be asked another way; the original keeps what came after.
+            let prompt = take_back_to(runner, *session, workspace, at);
+            runner.bar.say(&prompt);
+            render::blank();
+            render::line(&render::dim(&format!(
+                "Now in {}, from before “{said}”. The original is kept; /resume goes back to it.",
+                runner.store.conversations[*session].title
+            )));
+        }
     }
-    if !files {
-        let names: Vec<String> = plan
-            .iter()
-            .map(|file| history::label(&file.path, folder.as_deref()))
-            .collect();
-        render::line(&render::dim(&format!(
-            "The files it wrote stay as they are: {}.",
-            names.join(", ")
-        )));
-        return;
+    true
+}
+
+/// What restoring the conversation takes out of the chat, `gone` messages
+/// from yours on, and what comes back to the box.
+fn leaving(gone: usize) -> String {
+    match gone {
+        0 | 1 => "Restoring the conversation removes this message from the chat, and its text \
+                  goes back in the box."
+            .to_owned(),
+        2 => "Restoring the conversation removes this message and the 1 message after it from \
+              the chat, and its text goes back in the box."
+            .to_owned(),
+        n => format!(
+            "Restoring the conversation removes this message and the {} messages after it \
+             from the chat, and its text goes back in the box.",
+            n - 1
+        ),
     }
-    // The question above went with the redraw, so what was left alone is
-    // said again here.
-    for line in history::restore(id, &plan, folder.as_deref()).lines() {
-        render::line(&render::dim(&line));
+}
+
+/// The files a rewind of the conversation alone leaves as they are, said
+/// after it; `None` when it would have put none back anyway.
+fn staying(plan: &[history::Restore], folder: Option<&std::path::Path>) -> Option<String> {
+    let names: Vec<String> = (plan.iter())
+        .filter(|file| file.fate.touches())
+        .map(|file| history::label(&file.path, folder))
+        .collect();
+    let shown: Vec<&str> = names.iter().take(STAYING).map(String::as_str).collect();
+    let shown = shown.join(", ");
+    match names.len() {
+        0 => None,
+        n if n > STAYING => Some(format!(
+            "The files it changed stay as they are: {shown} and {} more.",
+            n - STAYING
+        )),
+        _ => Some(format!("The files it changed stay as they are: {shown}.")),
     }
-    for line in &commands {
-        render::line(&render::dim(line));
-    }
+}
+
+/// Files a rewind of the conversation alone names as staying; past this it
+/// says how many more, as the question does.
+const STAYING: usize = 10;
+
+/// How many of the session's turns start at your message `at` or after it:
+/// what `/compact` keeps word for word, so its summary stops just before.
+fn turns_from(messages: &[Message], at: usize) -> usize {
+    turn_starts(messages).filter(|&start| start >= at).count()
 }
 
 /// Summarize the session now, all but its last `rest` turns, the latest one
@@ -3894,7 +4100,23 @@ fn take_back(
     session: usize,
     workspace: Option<&std::path::Path>,
 ) -> Option<String> {
-    let (at, prompt) = last_prompt(&runner.store.conversations[session].messages)?;
+    let (at, _) = last_prompt(&runner.store.conversations[session].messages)?;
+    Some(take_back_to(runner, session, workspace, at))
+}
+
+/// Take the session back to just before your message at `at`, and the
+/// screen with it. Returns what you said, as it was typed: a command as
+/// the command, and a message that began with a slash with the slash
+/// doubled again, so sending it again does not run it.
+fn take_back_to(
+    runner: &mut Runner,
+    session: usize,
+    workspace: Option<&std::path::Path>,
+    at: usize,
+) -> String {
+    let prompt = runner.store.conversations[session].messages[at]
+        .content
+        .clone();
     // A review of what is taken back must not keep any of it.
     letronna_core::review::stop(&runner.review);
     let conversation = &mut runner.store.conversations[session];
@@ -3914,13 +4136,7 @@ fn take_back(
     }
     // After the redraw, so a failure to save is not cleared off the screen.
     runner.persist();
-    let prompt = letronna_core::references::typed(&prompt);
-    let typed = letronna_core::init::typed(prompt).map(str::to_owned);
-    Some(
-        typed
-            .or_else(|| letronna_core::workflow::saved::typed(prompt))
-            .unwrap_or_else(|| prompt.to_owned()),
-    )
+    bar::as_typed(&prompt)
 }
 
 /// Attach the picture at `raw` to the next message, saved as the window
@@ -4793,10 +5009,10 @@ fn check_gateway(runner: &mut Runner, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Asked, Flow, Run, Stage, ToolSearch, account_search_line, agent_lines, agent_rows, asked,
-        choice_label, command, crew_switch, exactly, from_match, keep_days, last_prompt,
-        name_label, ranking, run_rows, side_setting, standing, tool_search_asked, typed_path,
-        with_files,
+        Asked, Back, Flow, Run, Stage, ToolSearch, account_search_line, agent_lines, agent_rows,
+        asked, choice_label, command, crew_switch, exactly, from_match, keep_days, last_prompt,
+        leaving, name_label, offered, point_label, ranking, rewind_points, rewinds, run_rows,
+        side_setting, standing, tool_search_asked, turn_files, turn_starts, turns_from, typed_path,
     };
     use crate::session::Runner;
     use letronna_core::agents::Seen;
@@ -4858,11 +5074,119 @@ mod tests {
     }
 
     #[test]
-    fn undo_refuses_a_flag_it_does_not_know() {
-        assert_eq!(with_files(""), Some(false));
-        assert_eq!(with_files("--files"), Some(true));
-        assert_eq!(with_files("--file"), None);
-        assert_eq!(with_files("files"), None);
+    fn rewind_refuses_a_flag_it_does_not_know() {
+        assert!(rewinds(""));
+        // What /undo once needed for the files, now a choice of its own.
+        assert!(rewinds("--files"));
+        assert!(!rewinds("--file"));
+        assert!(!rewinds("3"));
+    }
+
+    /// A tool's result that changed `paths`.
+    fn wrote(paths: &[&str]) -> Message {
+        Message {
+            files: (paths.iter())
+                .map(|path| letronna_core::history::FileChange {
+                    path: path.into(),
+                    before: None,
+                    after: "f00d".into(),
+                    mode: None,
+                })
+                .collect(),
+            ..said("tool", "done")
+        }
+    }
+
+    #[test]
+    fn rewind_points_are_the_turns_you_started_newest_first() {
+        let messages = [
+            said("user", "first"),
+            said("assistant", "ok"),
+            said("user", "second"),
+            // Typed while the reply ran, so part of the second turn.
+            Message {
+                folded: true,
+                ..said("user", "and the tests")
+            },
+            said("assistant", "both done"),
+            // Letronna's, not yours.
+            Message {
+                notice: true,
+                ..said("user", "[Letronna notice]\n- job #7 exited with code 0")
+            },
+            said("assistant", "they passed"),
+            said("user", "third"),
+        ];
+        assert_eq!(rewind_points(&messages), [7, 2, 0]);
+        assert!(rewind_points(&[said("assistant", "hello")]).is_empty());
+    }
+
+    #[test]
+    fn a_point_counts_the_files_its_turn_changed() {
+        let messages = [
+            said("user", "fix the parser"),
+            said("assistant", ""),
+            wrote(&["/p/src/parse.rs"]),
+            said("assistant", ""),
+            wrote(&["/p/src/parse.rs", "/p/tests/parse.rs"]),
+            said("assistant", "fixed"),
+            said("user", "thanks"),
+            said("assistant", "any time"),
+        ];
+        assert_eq!(turn_files(&messages, 0), 2);
+        assert_eq!(turn_files(&messages, 6), 0);
+        assert_eq!(point_label(&messages, 0, 40), "fix the parser  ·  2 files");
+        assert_eq!(point_label(&messages, 6, 40), "thanks");
+        // Cut to fit, the count stays.
+        assert_eq!(point_label(&messages, 0, 20), "fix the…  ·  2 files");
+        // Words from a pasted escape are shown, the escape is not.
+        let pasted = [said("user", "look at \x1b[31mthis")];
+        assert_eq!(point_label(&pasted, 0, 40), "look at [31mthis");
+    }
+
+    #[test]
+    fn going_back_offers_the_code_only_where_a_file_can_go_back() {
+        let labels = |code, summarizes| -> Vec<&str> {
+            offered(code, summarizes)
+                .into_iter()
+                .map(Back::label)
+                .collect()
+        };
+        assert_eq!(
+            labels(true, true),
+            [
+                "Restore code and conversation",
+                "Restore conversation",
+                "Restore code",
+                "Summarize up to here",
+                "Branch from here",
+                "Never mind"
+            ]
+        );
+        assert_eq!(
+            labels(false, false),
+            ["Restore conversation", "Branch from here", "Never mind"]
+        );
+        assert!(leaving(1).starts_with("Restoring the conversation removes this message from"));
+        assert!(leaving(2).contains("and the 1 message after it"));
+        assert!(leaving(7).contains("and the 6 messages after it"));
+    }
+
+    #[test]
+    fn summarizing_up_to_a_point_keeps_the_turns_from_it() {
+        let messages = [
+            said("user", "first"),
+            said("assistant", "ok"),
+            said("user", "second"),
+            said("assistant", "ok"),
+            said("user", "third"),
+            said("assistant", "ok"),
+        ];
+        // /compact keeps that many last turns, so its summary stops at the
+        // message picked.
+        let keep = turns_from(&messages, 2);
+        assert_eq!(keep, 2);
+        assert_eq!(turn_starts(&messages).nth_back(keep - 1), Some(2));
     }
 
     #[test]

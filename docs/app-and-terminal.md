@@ -59,7 +59,22 @@ Type `/` to list them all. The common ones:
 | `/jobs` | Background commands |
 | `/usage` | Tokens and cost per session, day and model |
 | `/btw` | Ask something aside without derailing the turn |
+| `/rewind`, `/undo` | Go back to any message you sent; see below |
 | `/loop`, `/heartbeat` | Keep a session working toward a goal |
 | `/team`, `/login`, `/logout`, `/whoami` | Account |
 
 `@path` attaches a file, a line range or a folder. Your own prompts and skills also run as slash commands.
+
+## Going back
+
+`/rewind` (or `/undo`, or `Esc` twice on an empty box) lists the messages you sent, newest first; type to narrow them. Pick one, then:
+
+| Choice | Does |
+|---|---|
+| Restore code and conversation | The chat goes back to before the message, its text returns to the box, and the files go back to how they were then |
+| Restore conversation | The chat goes back; the files stay as they are now |
+| Restore code | The files go back; the chat stays, and the model is told which files went back |
+| Summarize up to here | What came before the message is summarized, as `/compact` does |
+| Branch from here | A copy of the session carries on from before the message; the original keeps everything |
+
+What a command changed in the project goes back as well as what the file tools wrote. A file someone changed since, a link, or anything outside the project is left alone and named.

@@ -189,8 +189,12 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "continue a session from Claude Code or Codex",
     },
     Command {
+        name: "/rewind",
+        blurb: "go back to any message: restore the chat, the code, or both",
+    },
+    Command {
         name: "/undo",
-        blurb: "take back the last exchange; --files puts files back too",
+        blurb: "the same as /rewind",
     },
     Command {
         name: "/retry",
@@ -418,6 +422,11 @@ const PLAN_LEAVES: usize = 12;
 /// question takes.
 const STILL: Duration = Duration::from_millis(500);
 
+/// How soon a second escape on an empty box must follow the first to open
+/// the rewind, as it does in Claude Code: a deliberate double press, which
+/// two presses a while apart, to stop and then to clear, are not.
+const TWICE: Duration = Duration::from_millis(500);
+
 /// The menu's rows for what is typed: the command named exactly so first,
 /// then Letronna's own, then the `added` ones. Skills and MCP servers'
 /// prompts join them once a letter is typed after the slash, and are
@@ -586,7 +595,7 @@ pub fn unescaped(line: &str) -> &str {
 /// What was typed to send the prompt `content`, so sending it again sends
 /// the same: `/init` and a saved workflow's command as typed, `@` references
 /// without what they attached, and a slash that stood for one put back.
-fn as_typed(content: &str) -> String {
+pub(crate) fn as_typed(content: &str) -> String {
     let content = letronna_core::references::typed(content);
     if let Some(command) = letronna_core::init::typed(content) {
         return command.to_owned();
@@ -818,6 +827,9 @@ pub struct Bar {
     /// While a question that came up on its own is open, when it came up or
     /// when a letter was last typed under it, whichever is later.
     guard: Option<std::time::Instant>,
+    /// When escape was last pressed on an empty box, so a second press soon
+    /// after opens the rewind.
+    esc_at: Option<std::time::Instant>,
     /// Whether anyone is looking, for notifications.
     focus: crate::notify::Focus,
     /// What the user, the project and skills added, as the menu offers it.
@@ -868,6 +880,7 @@ impl Bar {
             asks: None,
             held: None,
             guard: None,
+            esc_at: None,
             focus: crate::notify::Focus::new(std::time::Instant::now()),
             added: Added::default(),
             folder: None,
@@ -1650,6 +1663,8 @@ impl Bar {
             self.switch(key);
             return;
         }
+        // Only escape after escape counts as a double press.
+        let escaped = self.esc_at.take();
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -1751,6 +1766,13 @@ impl Bar {
                 self.queued.push_back(String::new())
             }
             KeyCode::Esc if self.working && self.line.is_empty() => self.interrupt = true,
+            // A second escape on an empty box opens the rewind. The one that
+            // cleared a line does not count as the first, so clearing never
+            // leads into it.
+            KeyCode::Esc if self.line.is_empty() => match escaped {
+                Some(at) if at.elapsed() < TWICE => self.queued.push_back("/rewind".into()),
+                _ => self.esc_at = Some(std::time::Instant::now()),
+            },
             KeyCode::Esc => {
                 self.line.clear();
                 self.picked = 0;
@@ -2692,9 +2714,9 @@ fn track(stops: &[String], at: usize, room: usize) -> (String, String, usize) {
 mod tests {
     use super::{
         Added, Bar, CHOICE_ROWS, Choice, MENU_LIMIT, NAME_WIDTH, PLAN_ROWS, QUEUED_LIMIT,
-        RELAY_LIMIT, Row, STILL, SWITCH_ROWS, Slider, Switch, Switches, Waited, at_work, checklist,
-        closest, fitted, is_command, matches, menu_top, mode_said, name_width, offered, one_row,
-        reach, relay_line, stops_at, track, unescaped,
+        RELAY_LIMIT, Row, STILL, SWITCH_ROWS, Slider, Switch, Switches, TWICE, Waited, as_typed,
+        at_work, checklist, closest, fitted, is_command, matches, menu_top, mode_said, name_width,
+        offered, one_row, reach, relay_line, stops_at, track, unescaped,
     };
     use crate::render::{MARGIN, plain, visible};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2917,7 +2939,14 @@ mod tests {
         let names: Vec<&str> = matches("/re", &added).iter().map(|c| c.name).collect();
         assert_eq!(
             names,
-            ["/retention", "/remember", "/resume", "/retry", "/review"]
+            [
+                "/retention",
+                "/remember",
+                "/resume",
+                "/rewind",
+                "/retry",
+                "/review"
+            ]
         );
         let long = [("/a-long-command-name".to_owned(), String::new())];
         assert_eq!(name_width(&long), "/a-long-command-name".len());
@@ -3401,6 +3430,52 @@ mod tests {
             "check the docs…"
         );
         assert_eq!(one_row("check the docs\n", 40), "check the docs");
+    }
+
+    #[test]
+    fn a_message_that_began_with_a_slash_is_given_back_escaped() {
+        // Sent as `//tmp is full`, kept as `/tmp is full`: given back
+        // without the second slash, sending it again would run /tmp.
+        assert_eq!(as_typed("/tmp is full"), "//tmp is full");
+        assert_eq!(as_typed("the tmp is full"), "the tmp is full");
+    }
+
+    #[test]
+    fn escape_twice_on_an_empty_box_asks_to_rewind() {
+        let mut bar = Bar::new(String::new());
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(bar.queued.is_empty());
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(bar.queued.pop_front().as_deref(), Some("/rewind"));
+        // A third press starts a pair of its own.
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(bar.queued.is_empty());
+        // Another key between the two breaks the pair.
+        hit(&mut bar, KeyCode::Left, KeyModifiers::NONE);
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(bar.queued.is_empty());
+        // So does waiting.
+        bar.esc_at = Some(Instant::now() - TWICE);
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(bar.queued.is_empty());
+    }
+
+    #[test]
+    fn escape_on_a_typed_line_clears_it_without_arming_a_rewind() {
+        let mut bar = Bar::new(String::new());
+        bar.line.set("half a thought");
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(bar.line.text(), "");
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(bar.queued.is_empty(), "clearing led into the rewind");
+        // Stopping a turn is not the first of a pair either.
+        let mut bar = Bar::new(String::new());
+        bar.working(true);
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(bar.interrupted());
+        bar.working(false);
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(bar.queued.is_empty(), "stopping led into the rewind");
     }
 
     #[test]

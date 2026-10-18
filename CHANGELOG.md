@@ -14,6 +14,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 ## [Unreleased]
 
 ### Added
+- **Terminal** — `/rewind`, `/undo` or Esc twice on an empty box lists every message you sent, newest first and narrowed by typing, and going back to one asks whether to restore the code and the conversation, the conversation alone or the code alone, or to summarize up to it or branch from it there; `/undo` no longer only takes back the last exchange. Putting the code back alone tells the model which files went back, and a rewind further back still puts them back to how they were first.
 - **All** — A Claude subscription is a provider you sign in to, beside the Anthropic API key: the models your plan includes, no key to paste.
 - **All** — A built-in wallet the agent pays from: make one or bring one in from MetaMask, Phantom or any wallet app, on Base, Ethereum, Solana and any EVM chain. Sites that ask to be paid (x402) are paid in USDC within caps you set, asked each time or on their own below a price you choose; sends always ask. `letronna wallet`, `/wallet`, the Wallet page and Settings › Wallet.
 - **Web** — A terminal in the browser: the Cloud page opens Letronna itself, running in Letronna Cloud on a new thread or one you have, to type into as on your own computer.
@@ -44,6 +45,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — read_file says what a page holds (about 7k characters, with `limit` left out) and that reads of several files or regions go in one reply; search says the same of several patterns or folders, and run_command of independent commands, each with its own exit code. Where calls run one at a time, those clauses go as the batching rule does. read_file names its kinds of file in a few words, search no longer spends a sentence on when documents are searched, and search_web's note on snippets is shorter.
 
 ### Fixed
+- **Terminal** — A message typed with `//` to start it with a slash is sent as words again by `/retry`, and comes back to the box that way, rather than being run as a command.
 - **All** — A model its gateway lists only under another vendor's path, such as `deepseek/deepseek-v4.1-flash` listed as `opencode-go/deepseek-v4.1-flash`, is sized by that listed window instead of the smallest one, so old tool results are no longer cleared after a few thousand tokens.
 - **All** — A web fetch or search that never reached its server, as when this computer is offline, no longer counts as having read a page, so a session that carries on from its own files is not asked about, or refused, its later deletes and sends; an error that quotes what a server wrote still counts, and the server's words in a failed secure connection, a redirect's address or a file's kind are now fenced as such.
 - **All** — On DeepSeek and Kimi, the reasoning sent back with the tool calls of the turn in progress counts toward the window, so a long turn clears old results before its requests outgrow the model.
