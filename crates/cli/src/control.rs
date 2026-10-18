@@ -171,7 +171,15 @@ pub fn run(runner: &mut Runner, session: usize, args: &Args, started: Instant) -
                             so this message was not sent."
                             .into());
                     }
-                    start(runner, session, &text, args, budget.clone(), &events)
+                    start(
+                        runner,
+                        session,
+                        &text,
+                        args,
+                        budget.clone(),
+                        &events,
+                        deadline,
+                    )
                 });
                 match begun {
                     Ok(mut turn) => {
@@ -393,8 +401,11 @@ fn start(
     args: &Args,
     budget: Option<Arc<Budget>>,
     events: &Sender<Event>,
+    deadline: Option<Instant>,
 ) -> Result<Running, String> {
     let (mut spec, _, before) = crate::begin(runner, session, text, args, budget)?;
+    // The turn times its replies against the run's deadline, as -p's does.
+    spec.connection.deadline = deadline;
     // What the run's own gate leaves open, the judge's doubts included, goes
     // out to the program when it answers, and is refused when it does not.
     spec.connection.human = args.ask_stdio;
