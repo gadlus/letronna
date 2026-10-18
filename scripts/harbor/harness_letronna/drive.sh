@@ -61,7 +61,11 @@ while IFS= read -r line <&4; do
             exec 3>&-
         fi
         ;;
-    *',"type":"result"}')
+    # The result line, in either key order. Sorted, keys that come after
+    # "type", such as "window", follow it, so it is matched up to its comma
+    # as well as at the line's end. Only a control_request carries input a
+    # model wrote, and those are taken above.
+    '{"type":"result",'* | *',"type":"result",'* | *',"type":"result"}')
         printf '%s\n' "$line"
         break
         ;;

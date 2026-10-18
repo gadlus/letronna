@@ -63,9 +63,10 @@ WRITTEN = (
     '"request_id":"letronna-8"},"tool_use_id":"call_1"}}'
 )
 PROGRESS = '{"cached":0,"input":10,"output":1,"rounds":1,"type":"progress"}'
+# As Letronna writes it, sorted, with "window" after "type".
 RESULT = (
     '{"answer":"Done.","cached":0,"files":[],"input":10,"output":1,"rounds":1,"seconds":0,'
-    '"status":"done","type":"result"}'
+    '"status":"done","type":"result","window":{"source":"listed","tokens":128000}}'
 )
 
 
@@ -124,6 +125,16 @@ class DriveTests(unittest.TestCase):
         self.assertEqual(heard[-1], "EOF")
         self.assertEqual(ran.stdout, RESULT + "\n")
         self.assertEqual(self.log.read_text().splitlines(), [PROGRESS, SORTED, PROGRESS, RESULT])
+
+    def test_the_result_is_found_in_any_key_order(self):
+        last = '{"answer":"Done.","rounds":1,"status":"done","type":"result"}'
+        written = '{"type":"result","status":"done","answer":"Done.","rounds":1}'
+        for result in (RESULT, last, written):
+            with self.subTest(result=result):
+                ran = self.drive([PROGRESS, result])
+                self.assertEqual(ran.returncode, 0, ran.stderr)
+                self.assertEqual(ran.stdout, result + "\n")
+                self.assertEqual(self.heard.read_text().splitlines()[-1], "EOF")
 
     def test_request_ids_are_read_in_either_key_order(self):
         ran = self.drive([SORTED, WRITTEN, RESULT])
