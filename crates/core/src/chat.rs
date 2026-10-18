@@ -3588,8 +3588,25 @@ fn read_event(data: &str) -> Result<Value, Failure> {
 /// Read one stream event, or the whole reply of a server that does not
 /// stream, which has under `message` what an event has under `delta`.
 fn parse_chunk(value: &Value) -> Result<Chunk, Failure> {
-    let inner = unwrap_response(value)
-        .map_err(|_| classify(None, &reqwest::header::HeaderMap::new(), value))?;
+    let inner = unwrap_response(value).map_err(|_| {
+        let mut failure = classify(None, &reqwest::header::HeaderMap::new(), value);
+        // The provider took this request and answered 200, so an error event
+        // it sends after that with nothing to go by is most likely at its
+        // end, as a gateway's relayed upstream failure is: the same request
+        // may yet go through, or a fallback take it. A code the table does
+        // not know, such as a refused prompt's, is the provider's own word
+        // on the request and stands. So does `invalid_request_error`, the
+        // type OpenAI, Anthropic and llama.cpp give a request turned down as
+        // written, often with no code.
+        let unexplained = value.get("error").is_some_and(|error| {
+            error.get("code").is_none_or(Value::is_null)
+                && error.get("type").and_then(Value::as_str) != Some("invalid_request_error")
+        });
+        if failure.kind == FailureKind::Unknown && unexplained {
+            failure.kind = FailureKind::Server;
+        }
+        failure
+    })?;
     let delta = inner
         .pointer("/choices/0/delta")
         .or_else(|| inner.pointer("/choices/0/message"));
@@ -8249,6 +8266,116 @@ mod tests {
         };
         assert_eq!(failure.kind, FailureKind::Server);
         assert_eq!(failure.to_string(), "Provider disconnected unexpectedly");
+    }
+
+    #[test]
+    fn an_error_in_a_stream_that_names_no_kind_is_tried_again() {
+        // A gateway's event after two minutes of keep-alives, its upstream's
+        // status only in the words.
+        let named = r#"{"error":{"message":"every lender we tried refused this request (HTTP 502)","type":"upstream_error","code":null}}"#;
+        let Err(failure) = parse_event(named) else {
+            panic!("an error event was read as a chunk");
+        };
+        assert_eq!(failure.kind, FailureKind::Server);
+        assert!(crate::retry::passes(failure.kind));
+        assert_eq!(
+            failure.to_string(),
+            "every lender we tried refused this request (HTTP 502)"
+        );
+        let Err(bare) = parse_event(r#"{"error":{"message":"Internal error"}}"#) else {
+            panic!("an error event was read as a chunk");
+        };
+        assert_eq!(bare.kind, FailureKind::Server);
+        // The upstream's 401 is not the user's key.
+        let Err(upstream) = parse_event(
+            r#"{"error":{"message":"every lender we tried refused this request (HTTP 401)","type":"upstream_error","code":null}}"#,
+        ) else {
+            panic!("an error event was read as a chunk");
+        };
+        assert_eq!(upstream.kind, FailureKind::Server);
+        // A kind the words do name still stands.
+        let Err(limited) = parse_event(r#"{"error":{"message":"upstream said (HTTP 429)"}}"#)
+        else {
+            panic!("an error event was read as a chunk");
+        };
+        assert_eq!(limited.kind, FailureKind::RateLimit);
+        // So does a code of the provider's own that says what it refused,
+        // or a type that says the request was turned down as written.
+        let Err(refused) =
+            parse_event(r#"{"error":{"message":"Invalid prompt","code":"invalid_prompt"}}"#)
+        else {
+            panic!("an error event was read as a chunk");
+        };
+        assert_eq!(refused.kind, FailureKind::Unknown);
+        let Err(filtered) = parse_event(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"Output blocked by content filtering policy"}}"#,
+        ) else {
+            panic!("an error event was read as a chunk");
+        };
+        assert_eq!(filtered.kind, FailureKind::Unknown);
+        // As does a status the provider gives in a field, as TGI does.
+        let Err(invalid) = parse_event(
+            r#"{"error":{"message":"Input validation error: `max_new_tokens` must be <= 4096","http_status_code":422}}"#,
+        ) else {
+            panic!("an error event was read as a chunk");
+        };
+        assert_eq!(invalid.kind, FailureKind::BadRequest);
+        // Anthropic's own trouble partway through is still its own.
+        let Err(internal) = parse_event(
+            r#"{"type":"error","error":{"type":"api_error","message":"Internal server error"}}"#,
+        ) else {
+            panic!("an error event was read as a chunk");
+        };
+        assert_eq!(internal.kind, FailureKind::Server);
+        // A whole reply that only says it did not succeed names no event the
+        // provider sent after taking the request.
+        let Err(unsuccessful) = parse_chunk(&json!({"success": false, "message": "Denied"})) else {
+            panic!("an unsuccessful reply was read as a chunk");
+        };
+        assert_eq!(unsuccessful.kind, FailureKind::Unknown);
+    }
+
+    #[test]
+    fn a_begun_stream_that_ends_in_an_error_naming_no_kind_is_asked_for_again() {
+        let (endpoint, worker) = serve(vec![
+            (
+                "200 OK",
+                "text/event-stream",
+                ": keep-alive\n\ndata: {\"error\":{\"message\":\"every lender we tried refused this request (HTTP 502)\",\"type\":\"upstream_error\",\"code\":null}}\n\ndata: [DONE]\n\n",
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
+        let rx = ask(endpoint);
+        let Event::Retrying(retry) = rx.recv_blocking().unwrap() else {
+            panic!("an error the provider gave no kind for was not tried again");
+        };
+        assert_eq!(retry.kind, FailureKind::Server);
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "Hello"));
+        assert!(matches!(
+            rx.recv_blocking().unwrap(),
+            Event::Finished(Ok(()))
+        ));
+        let bodies = worker.join().unwrap();
+        assert_eq!(bodies[0], bodies[1], "the second try asked something else");
+    }
+
+    #[test]
+    fn a_begun_stream_that_ends_in_a_request_turned_down_is_not_asked_for_again() {
+        let (endpoint, worker) = serve(vec![(
+            "200 OK",
+            "text/event-stream",
+            "data: {\"error\":{\"message\":\"max_tokens is too large\",\"type\":\"invalid_request_error\",\"code\":null}}\n\ndata: [DONE]\n\n",
+        )]);
+        let rx = ask(endpoint);
+        let Event::Finished(Err(failure)) = rx.recv_blocking().unwrap() else {
+            panic!("a request turned down as written was tried again");
+        };
+        assert_eq!(failure.kind, FailureKind::Unknown);
+        assert_eq!(worker.join().unwrap().len(), 1);
     }
 
     #[test]

@@ -12,7 +12,10 @@
 //! ordered table of phrases. An error that arrives inside a stream that began
 //! with 200 goes through the same steps, with the numeric `error.code`
 //! OpenRouter puts in its envelope standing in for the status it could not
-//! send.
+//! send. Where it has none, a status its words name, as "(HTTP 502)" does, is
+//! read after the provider's code and before the phrases. `chat` puts such an
+//! error that names nothing, and whose code and type do not say the request
+//! was refused, down to the provider, which had taken the request.
 //!
 //! A failed turn is kept in its session as a message of its own under
 //! `ROLE`, so it is there after a restart and goes wherever the session
@@ -239,21 +242,33 @@ pub fn clock(at: u64) -> String {
 /// error came inside a reply that began as a success.
 pub fn classify(status: Option<u16>, headers: &HeaderMap, body: &Value) -> Failure {
     let error = body.get("error");
-    let code = status.or_else(|| u16::try_from(error?.get("code")?.as_u64()?).ok());
+    // TGI gives the status of an error it sends inside a stream it has
+    // already answered 200 under a field of its own.
+    let field = |name: &str| u16::try_from(error?.get(name)?.as_u64()?).ok();
+    let code = (status.or_else(|| field("code"))).or_else(|| field("http_status_code"));
     // The whole envelope, so the copy of the upstream reply OpenRouter keeps
     // in `metadata.raw` is read as well: its own message only says "Provider
     // returned error".
     let text = error.unwrap_or(body).to_string().to_lowercase();
+    // A gateway that relays an upstream failure inside a stream it has
+    // already answered 200 may give the upstream's status only in words, as
+    // in "every lender we tried refused this request (HTTP 502)".
+    let named = code.is_none().then(|| status_named(&text)).flatten();
+    let settled = |code: u16| {
+        by_status(code, error)
+            // Ollama answers an overflow with a 500, as it does a crash, and
+            // waiting would only send the same request again.
+            .filter(|kind| {
+                *kind != FailureKind::Server
+                    || by_phrase(&text) != Some(FailureKind::ContextTooLong)
+            })
+    };
     let kind = code
-        .and_then(|code| by_status(code, error))
-        // Ollama answers an overflow with a 500, as it does a crash, and
-        // waiting would only send the same request again.
-        .filter(|kind| {
-            *kind != FailureKind::Server || by_phrase(&text) != Some(FailureKind::ContextTooLong)
-        })
+        .and_then(settled)
         .or_else(|| by_code(error))
+        .or_else(|| named.and_then(settled))
         .or_else(|| by_phrase(&text))
-        .unwrap_or(match code {
+        .unwrap_or(match code.or(named) {
             // A 404 that names no missing model is more often a wrong base
             // URL, which no other model would mend.
             Some(404) => FailureKind::Settings,
@@ -358,6 +373,35 @@ fn by_phrase(text: &str) -> Option<FailureKind> {
         .map(|(_, kind)| *kind)
 }
 
+/// The first HTTP error status the lowercase `text` names, as "(http 502)",
+/// "status 503" or "status code 429" do, of those that say nothing of the
+/// key, the credit or the base URL. A status in the words of an error from a
+/// provider that had taken the request is its upstream's, so a 401 or a 404
+/// there is not the user's to mend.
+fn status_named(text: &str) -> Option<u16> {
+    [
+        "http ",
+        "status code ",
+        "status code: ",
+        "status ",
+        "status: ",
+    ]
+    .into_iter()
+    .flat_map(|phrase| {
+        text.match_indices(phrase)
+            .map(move |(at, _)| (at, at + phrase.len()))
+    })
+    .filter_map(|(at, start)| {
+        let digits = text.get(start..start + 3)?;
+        let after = text[start + 3..].chars().next();
+        let code: u16 = digits.parse().ok()?;
+        (matches!(code, 400 | 405..=599) && !after.is_some_and(|c| c.is_ascii_digit()))
+            .then_some((at, code))
+    })
+    .min_by_key(|(at, _)| *at)
+    .map(|(_, code)| code)
+}
+
 /// The limits an overflow error names, read from its lowercase `text` and
 /// from the numbers llama.cpp puts beside its words.
 fn limits(text: &str, error: Option<&Value>) -> Overflow {
@@ -451,6 +495,64 @@ mod tests {
     fn kind(status: Option<u16>, body: &str) -> FailureKind {
         let body: Value = serde_json::from_str(body).unwrap();
         classify(status, &HeaderMap::new(), &body).kind
+    }
+
+    #[test]
+    fn a_status_given_only_in_words_is_read() {
+        assert_eq!(
+            kind(
+                None,
+                r#"{"error":{"message":"every lender we tried refused this request (HTTP 502)","type":"upstream_error","code":null}}"#
+            ),
+            FailureKind::Server
+        );
+        assert_eq!(
+            kind(None, r#"{"error":{"message":"Upstream status code 429"}}"#),
+            FailureKind::RateLimit
+        );
+        assert_eq!(
+            kind(None, r#"{"error":{"message":"refused (HTTP 400)"}}"#),
+            FailureKind::BadRequest
+        );
+        assert_eq!(
+            kind(None, r#"{"error":{"message":"refused (HTTP 422)"}}"#),
+            FailureKind::BadRequest
+        );
+        // TGI's, its status in a field of its own.
+        assert_eq!(
+            kind(
+                None,
+                r#"{"error":{"message":"Input validation error: `inputs` tokens + `max_new_tokens` must be <= 4096","http_status_code":422}}"#
+            ),
+            FailureKind::BadRequest
+        );
+        // The upstream's 401 and 404 say nothing of the user's key or base
+        // URL, which the gateway has just accepted.
+        assert_eq!(
+            kind(None, r#"{"error":{"message":"refused (HTTP 401)"}}"#),
+            FailureKind::Unknown
+        );
+        assert_eq!(
+            kind(None, r#"{"error":{"message":"refused (HTTP 404)"}}"#),
+            FailureKind::Unknown
+        );
+        // A status the reply came with, or its code, is not overruled.
+        assert_eq!(
+            kind(Some(400), r#"{"error":{"message":"refused (HTTP 502)"}}"#),
+            FailureKind::BadRequest
+        );
+        assert_eq!(
+            kind(
+                None,
+                r#"{"error":{"message":"refused (HTTP 502)","code":"rate_limit_exceeded"}}"#
+            ),
+            FailureKind::RateLimit
+        );
+        assert_eq!(status_named("http 1.1 at host:5000"), None);
+        assert_eq!(status_named("status 2000, then http 5023"), None);
+        assert_eq!(status_named("status 200 after status code 404"), None);
+        assert_eq!(status_named("status: 503 from port 8080"), Some(503));
+        assert_eq!(status_named("status 400 after http 503"), Some(400));
     }
 
     #[test]
