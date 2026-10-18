@@ -54,6 +54,10 @@ struct Screen {
     /// The first of `rows` each wrapped line starts at, so a fold that
     /// changes is laid out again from there on.
     starts: Vec<usize>,
+    /// What each row of the window held when last painted, and the window's
+    /// size then: only rows that changed are written again.
+    shown: Vec<String>,
+    size: (u16, u16),
 }
 
 /// One reply's thinking, folded to a line unless opened.
@@ -179,6 +183,8 @@ fn screen() -> &'static Mutex<Screen> {
             blocks: HashMap::new(),
             folds: HashMap::new(),
             starts: Vec::new(),
+            shown: Vec::new(),
+            size: (0, 0),
         })
     })
 }
@@ -196,6 +202,7 @@ pub fn open() {
         return;
     }
     s.open = true;
+    s.shown.clear();
     print!("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?2004h");
     // Asking for the mouse has to go through crossterm on Windows. The
     // escape sequence alone tells the terminal to report mouse events, but a
@@ -203,6 +210,10 @@ pub fn open() {
     // handle, which is an API call and not something that can be printed.
     // Without it no mouse event ever arrives and selecting does nothing.
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    // Presses, drags and the wheel, not every move of the pointer over the
+    // window, each of which would otherwise be read and drawn for nothing.
+    #[cfg(unix)]
+    print!("\x1b[?1003l");
     // Whether the window has focus, so a notification goes out only when it
     // has not. A terminal that cannot say ignores the request.
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange);
@@ -424,6 +435,7 @@ pub fn wipe() {
         s.scroll = 0;
         s.from = None;
         s.to = None;
+        s.shown.clear();
     }
     now();
 }
@@ -562,6 +574,17 @@ impl Screen {
     /// Rows of the conversation as they are on screen, the open line
     /// included. Built fresh for the tail only; the rest is cached.
     fn view(&mut self, width: u16) -> Vec<String> {
+        let open = self.lay_out(width);
+        let mut rows = self.rows.clone();
+        rows.extend(open);
+        rows
+    }
+
+    /// Bring the wrapped rows up to date for `width`, handing back those of
+    /// the line still open, which change too often to keep: the rest are
+    /// read where they are, rather than the whole conversation copied for
+    /// each frame.
+    fn lay_out(&mut self, width: u16) -> Vec<String> {
         if width != self.width {
             self.width = width;
             self.rows.clear();
@@ -581,11 +604,10 @@ impl Screen {
             self.rows.extend(wrapped);
             self.wrapped += 1;
         }
-        let mut rows = self.rows.clone();
-        if let Some(open) = self.lines.last() {
-            rows.extend(render::fold(open, width as usize));
+        match self.lines.last() {
+            Some(open) => render::fold(open, width as usize),
+            None => Vec::new(),
         }
-        rows
     }
 
     /// Lay the conversation out again from line `at` on, as it changed.
@@ -627,11 +649,11 @@ impl Screen {
     /// Where a place on the screen falls in the conversation.
     fn buffer_at(&mut self, column: u16, row: u16) -> Option<(usize, usize)> {
         let (width, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let view = self.view(width);
+        let total = self.rows.len() + self.lay_out(width).len();
         let depth = self.depth(rows);
-        let first = view.len().saturating_sub(depth + self.scroll);
+        let first = total.saturating_sub(depth + self.scroll);
         let index = first + row as usize;
-        ((row as usize) < depth && index < view.len()).then_some((index, column as usize))
+        ((row as usize) < depth && index < total).then_some((index, column as usize))
     }
 
     /// The marked text, if any is marked.
@@ -663,34 +685,53 @@ fn paint(s: &mut Screen) {
         return;
     }
     let (columns, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let view = s.view(columns);
+    // A window of another size has every row in another place.
+    if (columns, rows) != s.size {
+        s.size = (columns, rows);
+        s.shown.clear();
+    }
+    let open = s.lay_out(columns);
+    let total = s.rows.len() + open.len();
     let depth = s.depth(rows);
     // Scrolling stops at the top rather than running off into nothing.
-    s.scroll = s.scroll.min(view.len().saturating_sub(depth));
-    let first = view.len().saturating_sub(depth + s.scroll);
+    s.scroll = s.scroll.min(total.saturating_sub(depth));
+    let first = total.saturating_sub(depth + s.scroll);
 
     let marked = s
         .from
         .zip(s.to)
         .map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
 
-    let mut frame = String::from("\x1b[?25l");
+    let mut next: Vec<String> = Vec::with_capacity(depth + s.chrome.len());
     for row in 0..depth {
         let index = first + row;
-        let text = view.get(index).map(String::as_str).unwrap_or("");
-        let text = match marked {
+        let text = match index.checked_sub(s.rows.len()) {
+            Some(at) => open.get(at).map(String::as_str).unwrap_or(""),
+            None => s.rows[index].as_str(),
+        };
+        next.push(match marked {
             Some((start, end)) if index >= start.0 && index <= end.0 => {
                 let from = if index == start.0 { start.1 } else { 0 };
                 let to = if index == end.0 { Some(end.1) } else { None };
                 render::mark(text, from, to)
             }
             _ => text.to_owned(),
-        };
-        frame.push_str(&format!("\x1b[{};1H\x1b[2K{text}\x1b[0m", row + 1));
+        });
     }
-    for (at, line) in (depth + 1..).zip(s.chrome.iter()) {
-        frame.push_str(&format!("\x1b[{at};1H\x1b[2K{line}\x1b[0m"));
+    next.extend(s.chrome.iter().cloned());
+
+    // Only the rows that changed are written, inside a synchronized update
+    // that terminals which know it draw at once and others pass over: the
+    // waiting line turning or one word streaming in no longer sends the
+    // whole window again, which over ssh and on a console was a flicker.
+    let mut frame = String::from("\x1b[?2026h\x1b[?25l");
+    for (at, text) in next.iter().enumerate() {
+        if s.shown.get(at) != Some(text) {
+            frame.push_str(&format!("\x1b[{};1H\x1b[2K{text}\x1b[0m", at + 1));
+        }
     }
+    frame.push_str("\x1b[?2026l");
+    s.shown = next;
     print!("{frame}");
     let _ = std::io::stdout().flush();
     s.painted = Instant::now();
@@ -717,6 +758,8 @@ mod tests {
             blocks: HashMap::new(),
             folds: HashMap::new(),
             starts: Vec::new(),
+            shown: Vec::new(),
+            size: (0, 0),
         };
         s.blocks
             .insert(1, Box::new(|width| vec!["x".repeat(width.min(6))]));
@@ -801,6 +844,8 @@ mod tests {
             blocks: HashMap::new(),
             folds: HashMap::new(),
             starts: Vec::new(),
+            shown: Vec::new(),
+            size: (0, 0),
         };
         s.folds.insert(
             1,

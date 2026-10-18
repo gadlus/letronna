@@ -1587,12 +1587,11 @@ impl Bar {
                 Ok(Event::Resize(_, _)) => resized = true,
                 Ok(Event::FocusGained) => self.focus.report(true),
                 Ok(Event::FocusLost) => self.focus.report(false),
+                // A pointer passing over the window is not someone looking at
+                // it, and changes nothing on it: nothing to read or draw.
+                Ok(Event::Mouse(mouse)) if mouse.kind == MouseEventKind::Moved => continue,
                 Ok(Event::Mouse(mouse)) => {
-                    // A pointer passing over the window is not someone
-                    // looking at it; a click or a scroll is.
-                    if mouse.kind != MouseEventKind::Moved {
-                        self.focus.touch(std::time::Instant::now());
-                    }
+                    self.focus.touch(std::time::Instant::now());
                     self.mouse(mouse);
                     // The footer says how far back the view is and whether
                     // something was just copied, so it has to be rebuilt when
