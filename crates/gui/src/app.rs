@@ -2044,6 +2044,8 @@ impl Chat {
             // Someone is watching, so every tool goes out in the array.
             lean_tools: false,
             rare_on_demand: true,
+            // Only a `-p` run has one.
+            deadline: None,
         };
         backend::validate(&connection)?;
         Ok(connection)

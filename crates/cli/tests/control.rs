@@ -699,6 +699,30 @@ fn a_print_run_near_its_deadline_is_told_to_commit_its_outputs() {
     );
 }
 
+#[test]
+fn a_print_run_with_a_deadline_is_told_its_time_in_its_first_request() {
+    let (data, work) = scratch("deadline-told");
+    let (endpoint, bodies) = provider(vec![reply("Done.", &[])]);
+    let flags = ["-p", "write the report", "--output", "json"];
+    let run = Driven::start(
+        &data,
+        &work,
+        &endpoint,
+        &flags,
+        &[("LETRONNA_DEADLINE", "600")],
+    );
+    assert_eq!(run.next()["status"], "done");
+    assert_eq!(run.close(), 0);
+    let first = said(&bodies.recv_timeout(WAIT).unwrap());
+    let told = "This run has about 10 minutes before it is stopped";
+    assert!(
+        first
+            .iter()
+            .any(|(role, words)| role == "user" && words.contains(told)),
+        "{first:?}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_sigterm_stops_a_print_run_and_prints_its_result() {

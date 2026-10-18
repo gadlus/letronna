@@ -316,6 +316,9 @@ pub struct Connection {
     /// run, without the rest of what a lean run changes: set by the window
     /// and the terminal, where most turns never call them.
     pub rare_on_demand: bool,
+    /// When a `-p` run given a deadline is stopped, which its replies are
+    /// timed against; None everywhere else, and its helpers keep it.
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl Connection {
@@ -4179,6 +4182,21 @@ fn roomier(connection: &Connection, sent: &Budget) -> Option<Budget> {
     (reply > sent.reply).then_some(Budget { reply, ..*sent })
 }
 
+/// Whether a reply of `longer` tokens would be done before `deadline` at
+/// the pace of one of `shorter` that took `took`; true with no deadline.
+fn in_time(
+    deadline: Option<std::time::Instant>,
+    took: Duration,
+    shorter: usize,
+    longer: usize,
+) -> bool {
+    let Some(deadline) = deadline else {
+        return true;
+    };
+    let needs = took.mul_f64(longer as f64 / shorter.max(1) as f64);
+    deadline.saturating_duration_since(std::time::Instant::now()) > needs
+}
+
 /// The budget to send `messages` again with after `failure`, once, when it
 /// is an overflow a smaller window or a shorter reply can mend. What the
 /// error gave away is learned for the model first, so the requests after it
@@ -4323,6 +4341,7 @@ fn stream(
         if extra.cancel.is_set() {
             return Err(Failure::new(FailureKind::Stopped, "Stopped."));
         }
+        let sent_at = std::time::Instant::now();
         let send = request
             .try_clone()
             .ok_or_else(|| Failure::new(FailureKind::Unknown, "Could not prepare the request."))?
@@ -4451,9 +4470,18 @@ fn stream(
             }
             // A reply that thought until its limit and wrote nothing goes
             // again once with the longest reply the model takes. What it
-            // thought is dropped: the next try thinks afresh.
+            // thought is dropped: the next try thinks afresh. On a timed run
+            // only if the time left covers a reply that long at this pace:
+            // one that cannot finish would spend the rest thinking again.
             if failure.out_of_room
-                && let Some(budget) = roomier(connection, budget)
+                && let Some(budget) = roomier(connection, budget).filter(|longer| {
+                    in_time(
+                        connection.deadline,
+                        sent_at.elapsed(),
+                        budget.reply,
+                        longer.reply,
+                    )
+                })
             {
                 let retry = crate::retry::Retry {
                     kind: failure.kind,
@@ -12757,6 +12785,59 @@ mod tests {
         assert!(failure.out_of_room);
         // Sent twice and no more.
         assert_eq!(worker.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_timed_reply_that_thinks_away_its_limit_with_no_time_for_more_stands() {
+        let (endpoint, worker) = serve(vec![("200 OK", "text/event-stream", THOUGHT_OUT)]);
+        let rx = start(
+            Connection {
+                endpoint,
+                model: "thinks-with-no-time-left".into(),
+                // Due already, so no longer reply could be done in time.
+                deadline: Some(std::time::Instant::now()),
+                ..connection()
+            },
+            reads(1, 10),
+        );
+        let failure = loop {
+            if let Event::Finished(result) = rx.recv_blocking().unwrap() {
+                break result.expect_err("a cut-off with no time left went through");
+            }
+        };
+        assert!(failure.out_of_room);
+        // Sent once: the longer reply was not asked for.
+        assert_eq!(worker.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_timed_reply_that_thinks_away_its_limit_with_time_to_spare_gets_more_room() {
+        let (endpoint, worker) = serve(vec![
+            ("200 OK", "text/event-stream", THOUGHT_OUT),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Done\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
+        let rx = start(
+            Connection {
+                endpoint,
+                model: "thinks-with-an-hour-left".into(),
+                deadline: Some(std::time::Instant::now() + Duration::from_secs(60 * 60)),
+                ..connection()
+            },
+            reads(1, 10),
+        );
+        let finished = loop {
+            if let Event::Finished(result) = rx.recv_blocking().unwrap() {
+                break result;
+            }
+        };
+        assert!(finished.is_ok(), "{finished:?}");
+        let bodies = worker.join().unwrap();
+        let asked = |body: &str| serde_json::from_str::<Value>(body).unwrap()["max_tokens"].clone();
+        assert_eq!(asked(&bodies[1]), MAX_REPLY_TOKENS);
     }
 
     #[test]

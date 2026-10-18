@@ -134,6 +134,8 @@ impl Runner {
             // Set by `-p` alone, once it knows whether its tools were named.
             lean_tools: false,
             rare_on_demand: true,
+            // Set by `-p` alone, once it knows its deadline.
+            deadline: None,
         }
     }
 

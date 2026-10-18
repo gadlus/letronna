@@ -80,8 +80,8 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::{Component, Path};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Instant, SystemTime};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Names an agent while it runs: its mailbox, and the conversation its
 /// browser and jobs are kept under.
@@ -211,6 +211,21 @@ const PROJECTS: &[&str] = &[
 /// rarely hold more, so a listing stops here rather than read a folder of
 /// data whole.
 const LISTED: usize = 1_000;
+
+/// The share of the time left as a reply begins that it may spend thinking
+/// before it writes anything, on a run with a deadline: replies that thought
+/// for five minutes each used up a 15-minute task with nothing written, and
+/// 30% still leaves most of the time to write, run and fix.
+const THINKING_SHARE: f64 = 0.3;
+
+/// The least a reply on a run with a deadline may think before it is
+/// stopped, however little time is left: a hard step can take a minute of
+/// thought, and a reply stopped sooner is a reply wasted.
+#[cfg(not(test))]
+const LEAST_THINKING: Duration = Duration::from_secs(60);
+/// A tenth of a second in tests, so one is stopped without a minute's wait.
+#[cfg(test)]
+const LEAST_THINKING: Duration = Duration::from_millis(100);
 
 /// What a run did, told as it happens to a frontend that shows the run live.
 #[derive(Clone)]
@@ -502,6 +517,12 @@ fn steps(
     let began = SystemTime::now();
     let mut put_back = false;
     let mut reworded = false;
+    // From the first request, since a run told of its time only near the
+    // end has often thought most of it away by then.
+    if let Some(deadline) = spec.connection.deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        deadline_notice(spec, time_given(left))?;
+    }
     loop {
         if spec.cancel.is_set() {
             return Ok(Outcome::Stopped);
@@ -513,9 +534,16 @@ fn steps(
         {
             return Ok(Outcome::OverBudget);
         }
-        let Some(mut reply) = ask_in_line(spec, turn)? else {
-            keep_cut_short(spec, turn);
-            return Ok(Outcome::Stopped);
+        let mut reply = match ask_in_line(spec, turn)? {
+            Asked::Reply(reply) => reply,
+            Asked::Stopped => {
+                keep_cut_short(spec, turn);
+                return Ok(Outcome::Stopped);
+            }
+            Asked::ActNow(text) => {
+                deadline_notice(spec, text)?;
+                continue;
+            }
         };
         report.input += reply.input_tokens();
         report.cached += reply.cached_tokens;
@@ -1287,25 +1315,39 @@ fn off_thread(call: &ToolCall, ctx: &ToolContext) -> Option<Result<String, Strin
     }
 }
 
+/// What came of asking the model once.
+// Made one at a time, for the reply just read, so the size of the largest
+// costs nothing.
+#[allow(clippy::large_enum_variant)]
+enum Asked {
+    /// Its reply, whole.
+    Reply(Message),
+    /// A stop ended it first.
+    Stopped,
+    /// On a run with a deadline, it thought too long, or thought its reply
+    /// away, without writing anything; the run goes on with this notice.
+    ActNow(String),
+}
+
 /// Waits for a turn on the provider, then calls the model, asking again after
 /// a 429 once the provider has had its rest.
-fn ask_in_line(spec: &Spec, turn: &mut Turn) -> Result<Option<Message>, String> {
+fn ask_in_line(spec: &Spec, turn: &mut Turn) -> Result<Asked, String> {
     let gate = limits::gate(&spec.connection.endpoint);
     let mut retries = 0;
     loop {
         let Some(permit) = gate.acquire(&spec.cancel) else {
-            return Ok(None);
+            return Ok(Asked::Stopped);
         };
         let throttled = gate.throttled();
         let asked = ask(spec, turn, permit);
         // What streamed is in the reply's own count now, or went with it.
         spec.status.streamed.store(0, Ordering::Relaxed);
         let error = match asked {
-            Ok(Some(reply)) => {
+            Ok(Asked::Reply(reply)) => {
                 gate.answered();
-                return Ok(Some(reply));
+                return Ok(Asked::Reply(reply));
             }
-            Ok(None) => return Ok(None),
+            Ok(asked) => return Ok(asked),
             Err(error) => error,
         };
         // The error does not say which call a 429 was for, so one on this
@@ -1320,13 +1362,15 @@ fn ask_in_line(spec: &Spec, turn: &mut Turn) -> Result<Option<Message>, String> 
 }
 
 /// Calls the model with the conversation so far and reads the reply to its
-/// end, holding `permit` as long as the stream lasts, or gives None when a
-/// stop ended it first.
-fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Option<Message>, String> {
+/// end, holding `permit` as long as the stream lasts, unless a stop or, on a
+/// run with a deadline, too long thinking ends it first.
+fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Asked, String> {
+    // The run's, through a child, so the thinking cap can end this one reply.
+    let cancel = spec.cancel.child();
     let extra = Extra {
         tools: spec.schema.iter().map(answer_tool).collect(),
         hide: hidden(spec),
-        cancel: spec.cancel.clone(),
+        cancel: cancel.clone(),
         guard: Some(Box::new(permit)),
         // A fork's is its parent's, so its requests start as the parent's do.
         floor: spec.transcript.conversation.floor(),
@@ -1340,6 +1384,7 @@ fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Option<Message>, 
             (spec.root, crate::agents::copied(messages, spec.from))
         }),
     };
+    let began = Instant::now();
     // The turn's, as the window and the terminal send, since at the round
     // cap it alone asks for the wrap-up with no calls.
     let events = chat::start_with(
@@ -1350,10 +1395,33 @@ fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Option<Message>, 
     // A read waiting on the provider cannot hear a stop, so the stop closes
     // this end instead of waiting for the next line.
     let closer = events.clone();
-    let _waker = spec.cancel.on_set(move || {
+    let _waker = cancel.on_set(move || {
         closer.close();
     });
+    let capped = Arc::new(AtomicBool::new(false));
+    // Left to ring when the reply ends some other way: it then sets a token
+    // nothing listens to any more.
+    let mut cap = spec.connection.deadline.map(|deadline| {
+        let at = began + thinking_cap(deadline.saturating_duration_since(began));
+        let (cancel, capped) = (cancel.clone(), capped.clone());
+        crate::timers::at(
+            at,
+            Box::new(move || {
+                capped.store(true, Ordering::SeqCst);
+                cancel.set();
+            }),
+        )
+    });
     while let Ok(event) = events.recv_blocking() {
+        // Words or a call begun mean it is writing, which the cap leaves be.
+        let writing = match &event {
+            Event::Delta(text) => !text.trim().is_empty(),
+            Event::Drafting(_) | Event::ToolCalls(_) => true,
+            _ => false,
+        };
+        if writing && let Some(timer) = cap.take() {
+            crate::timers::cancel(timer);
+        }
         // Counted before it is told, so a watcher reads the count with it.
         if let Event::Delta(text) | Event::Reasoning(text) = &event {
             let streamed = &spec.status.streamed;
@@ -1377,17 +1445,78 @@ fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Option<Message>, 
         }
         turn.absorb(&event);
         if let Event::Finished(result) = event {
+            let timed = spec.connection.deadline.is_some();
             return match result {
-                Ok(()) => Ok(Some(turn.take_reply(&spec.connection.model))),
-                Err(_) if spec.cancel.is_set() => Ok(None),
+                Ok(()) => Ok(Asked::Reply(turn.take_reply(&spec.connection.model))),
+                Err(_) if spec.cancel.is_set() => Ok(Asked::Stopped),
+                // A timed run that thought its reply away has no time for a
+                // longer one, which `chat` sends only when there is.
+                Err(failure) if capped.load(Ordering::SeqCst) || (timed && failure.out_of_room) => {
+                    Ok(thought_too_long(spec, turn, began))
+                }
                 Err(error) => Err(error.to_string()),
             };
         }
     }
     if spec.cancel.is_set() {
-        return Ok(None);
+        return Ok(Asked::Stopped);
+    }
+    if capped.load(Ordering::SeqCst) {
+        return Ok(thought_too_long(spec, turn, began));
     }
     Err("The model connection closed unexpectedly.".into())
+}
+
+/// How long a reply that began with `left` to the deadline may think before
+/// it writes anything.
+fn thinking_cap(left: Duration) -> Duration {
+    left.mul_f64(THINKING_SHARE).max(LEAST_THINKING)
+}
+
+/// What a timed run goes on with after the reply begun at `began` thought
+/// without writing anything: the notice to write now.
+fn thought_too_long(spec: &Spec, turn: &mut Turn, began: Instant) -> Asked {
+    // Its thinking is dropped with it, as a stream cut short is: it led to
+    // nothing written, and the next reply starts from what is on disk.
+    turn.take_reply(&spec.connection.model);
+    let left = (spec.connection.deadline).map_or(Duration::ZERO, |deadline| {
+        deadline.saturating_duration_since(Instant::now())
+    });
+    Asked::ActNow(format!(
+        "Your last reply thought for {} s without writing anything, so it was stopped, and about \
+         {} s are left before this run is stopped. Write every output the task asks for now with \
+         what you have, complete and valid, then check them.",
+        began.elapsed().as_secs(),
+        left.as_secs()
+    ))
+}
+
+/// What a run with a deadline is told before its first request, with `left`
+/// to go.
+fn time_given(left: Duration) -> String {
+    let minutes = ((left.as_secs() + 30) / 60).max(1);
+    let unit = if minutes == 1 { "minute" } else { "minutes" };
+    format!(
+        "This run has about {minutes} {unit} before it is stopped, and long thinking spends \
+         them. Save a complete first version of every output the task asks for early, then \
+         improve it in place."
+    )
+}
+
+/// Puts `text` on the run's transcript as a notice from its deadline, folded
+/// so it opens no turn of its own.
+fn deadline_notice(spec: &mut Spec, text: String) -> Result<(), String> {
+    let notice = inbox::fold(&[Notice {
+        from: "deadline".into(),
+        when: When::Next,
+        text,
+    }]);
+    let notice = notice.map(|notice| Message {
+        folded: true,
+        ..notice
+    });
+    spec.transcript.conversation.messages.extend(notice);
+    save(&mut spec.transcript)
 }
 
 /// Keeps the reply a stop cut short, as far as it streamed and marked
@@ -5886,5 +6015,180 @@ pub(crate) mod tests {
             let notes = std::fs::read_to_string(dir.join("notes.txt")).unwrap();
             assert_eq!(notes, "rewritten");
         }
+    }
+
+    /// A provider that answers each request with its events in turn, one
+    /// every `every` as a model streams them, and hands back what each
+    /// request carried; a reply the run stops reading is left where it is.
+    fn streaming(replies: Vec<Vec<Value>>, every: Duration) -> (String, Stub) {
+        let (server, endpoint) = listen();
+        let address = server.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            replies
+                .iter()
+                .map(|events| {
+                    let (mut socket, _) = server.accept().unwrap();
+                    let sent = request(&mut socket);
+                    let mut lines: Vec<String> =
+                        events.iter().map(|event| format!("data: {event}\n\n")).collect();
+                    lines.push("data: [DONE]\n\n".into());
+                    let length: usize = lines.iter().map(String::len).sum();
+                    let _ = socket.set_nodelay(true);
+                    let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n");
+                    for line in &lines {
+                        std::thread::sleep(every);
+                        if socket.write_all(line.as_bytes()).is_err() {
+                            break;
+                        }
+                    }
+                    sent
+                })
+                .collect()
+        });
+        (endpoint, Stub { address, worker })
+    }
+
+    /// `n` pieces of thinking, streamed as DeepSeek streams them.
+    fn thinking(n: usize) -> Vec<Value> {
+        (0..n)
+            .map(|_| json!({"choices": [{"delta": {"reasoning_content": "Let me think. "}}]}))
+            .collect()
+    }
+
+    /// A piece of the reply's words.
+    fn says(text: &str) -> Value {
+        json!({"choices": [{"delta": {"content": text}}]})
+    }
+
+    /// Whether any message a request sent holds `words`.
+    fn carries(body: &Value, words: &str) -> bool {
+        (messages(body).iter()).any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|c| c.contains(words))
+        })
+    }
+
+    /// What the act-now notice says, whatever the times in it.
+    const ACT_NOW: &str = "Write every output the task asks for now with what you have";
+
+    #[test]
+    fn a_timed_reply_that_only_thinks_past_its_cap_is_stopped_and_the_run_goes_on() {
+        let dir = scratch("thinking-cap");
+        // Two seconds of thinking, where the cap is 30% of the two left.
+        let mut endless = thinking(100);
+        endless.push(says("Too late."));
+        let (endpoint, provider) = streaming(
+            vec![endless, vec![says("Done.")]],
+            Duration::from_millis(20),
+        );
+        let mut spec = spec(endpoint, &dir, AGENTS + 1500);
+        spec.connection.deadline = Some(Instant::now() + Duration::from_secs(2));
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "Done.");
+        let sent = provider.sent();
+        assert_eq!(sent.len(), 2);
+        let notice = last_notice(&sent);
+        assert!(notice.contains("Your last reply thought for"), "{notice}");
+        assert!(
+            notice.contains("s are left before this run is stopped"),
+            "{notice}"
+        );
+        assert!(notice.contains(ACT_NOW), "{notice}");
+        // What it thought goes with the reply it was stopped in.
+        assert!(!sent[1].to_string().contains("Let me think"));
+    }
+
+    #[test]
+    fn a_timed_reply_that_starts_writing_before_its_cap_is_not_stopped() {
+        let dir = scratch("writes-in-time");
+        let mut writing = vec![says("Working")];
+        writing.extend((0..50).map(|_| says(".")));
+        let (endpoint, provider) = streaming(vec![writing], Duration::from_millis(20));
+        let mut spec = spec(endpoint, &dir, AGENTS + 1505);
+        spec.connection.deadline = Some(Instant::now() + Duration::from_secs(2));
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, format!("Working{}", ".".repeat(50)));
+        assert_eq!(provider.sent().len(), 1);
+    }
+
+    #[test]
+    fn a_timed_reply_that_starts_a_call_before_its_cap_is_not_stopped() {
+        let dir = scratch("calls-in-time");
+        let mut calling = thinking(1);
+        calling.push(json!({"choices": [{"delta": {"tool_calls": [{"index": 0,
+            "id": "call-0", "function": {"name": "read_file", "arguments": ""}}]}}]}));
+        // The arguments a piece at a time, past the cap.
+        calling.extend(r#"{"path": "notes.txt"}"#.chars().map(|piece| {
+            json!({"choices": [{"delta": {"tool_calls": [{"index": 0,
+                "function": {"arguments": piece.to_string()}}]}}]})
+        }));
+        let (endpoint, provider) = streaming(
+            vec![calling, vec![says("The notes say hello.")]],
+            Duration::from_millis(40),
+        );
+        let mut spec = spec(endpoint, &dir, AGENTS + 1510);
+        spec.connection.deadline = Some(Instant::now() + Duration::from_secs(2));
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+        assert_eq!(results(&sent[1]), ["1|hello from the notes"]);
+        assert!(!carries(&sent[1], ACT_NOW));
+    }
+
+    #[test]
+    fn an_untimed_reply_is_never_stopped_for_thinking() {
+        let dir = scratch("untimed-thinking");
+        let mut long = thinking(50);
+        long.push(says("Done."));
+        let (endpoint, provider) = streaming(vec![long], Duration::from_millis(20));
+        let report = finished(spec(endpoint, &dir, AGENTS + 1515));
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "Done.");
+        assert_eq!(provider.sent().len(), 1);
+    }
+
+    #[test]
+    fn a_timed_reply_that_thinks_away_its_limit_is_told_to_act_rather_than_given_more_room() {
+        let dir = scratch("timed-out-of-room");
+        let event = |event: Value| format!("data: {event}\n\n");
+        let thought_out = [
+            event(json!({"choices": [{"delta": {"reasoning_content": "Let me think"}}]})),
+            event(json!({"choices": [{"delta": {}, "finish_reason": "length"}]})),
+            "data: [DONE]\n\n".into(),
+        ]
+        .concat();
+        let (endpoint, provider) = provider(vec![thought_out, reply("Done.", &[])]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 1520);
+        spec.connection.model = "thinks-out-of-time".into();
+        // Due already, so no longer reply could be done in the time left.
+        spec.connection.deadline = Some(Instant::now());
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "Done.");
+        let sent = provider.sent();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1]["max_tokens"], sent[0]["max_tokens"]);
+        assert!(last_notice(&sent).contains(ACT_NOW));
+    }
+
+    #[test]
+    fn only_a_timed_run_is_told_its_time_from_the_first_request() {
+        let dir = scratch("time-given");
+        let (endpoint, provider) = provider(vec![reply("Done.", &[]), reply("Done.", &[])]);
+        let mut timed = spec(endpoint.clone(), &dir, AGENTS + 1525);
+        timed.connection.deadline = Some(Instant::now() + Duration::from_secs(10 * 60));
+        assert_eq!(finished(timed).status, Outcome::Done);
+        let mut untimed = spec(endpoint, &dir, AGENTS + 1526);
+        untimed.transcript.path = dir.join("untimed.jsonl");
+        assert_eq!(finished(untimed).status, Outcome::Done);
+        let sent = provider.sent();
+        let told = "This run has about 10 minutes before it is stopped, and long thinking \
+                    spends them. Save a complete first version of every output the task asks \
+                    for early, then improve it in place.";
+        assert!(carries(&sent[0], told), "{}", sent[0]);
+        assert!(!carries(&sent[1], "before it is stopped"));
     }
 }

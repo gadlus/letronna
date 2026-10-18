@@ -597,6 +597,8 @@ fn ask_once(
     // A child, so a decline at the keyboard that stops the run does not read
     // as a Ctrl-C.
     spec.cancel = interrupted.child();
+    // The run times its replies against it too, not only stops at it.
+    spec.connection.deadline = deadline;
     let id = spec.id;
     // Stopped through the run's own token, not `interrupted`, so a run out
     // of time exits 0 with what it has rather than as a Ctrl-C does.
