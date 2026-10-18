@@ -174,27 +174,41 @@ pub(crate) const TOOLS: [Rule; 26] = [
         to: To::Unwatched,
         text: "With nobody to ask, the task text and the project folder are what you have: decide from them rather than searching the rest of the computer or the network for what was meant.",
     },
+    // What a run made only to test stays in an output's folder for whoever
+    // uses it next unless the run takes it out, while what the project's own
+    // build leaves there is expected. Method or notes after the answer in an
+    // answer file make it no longer just the answer.
     Rule {
         id: "paths",
         to: To::Unwatched,
-        text: "Write each required output at the exact path the task names; make a first version early and update it in place.",
+        text: "Write each required output at the exact path the task names; make a first version early and update it in place. Before ending, remove binaries, logs and scratch files you made only to test from the folders that hold the outputs, unless the task asks for them or the project's own build normally keeps them there; a file the task asks you to write an answer to holds only the answer, in the form asked.",
     },
     // Inputs may change when the task says so, since a repair has to edit
-    // them.
+    // them. Both limits are on the run's own steps: read as limits on a
+    // program it was asked to write, they had a run restore files elsewhere
+    // rather than replace them in place as asked. Such a program meets more
+    // than the inputs it was built against. The caution on deleting data is
+    // the outward row's, so a measurement run that drops outward alone keeps
+    // a pointer to it.
     Rule {
         id: "inputs",
         to: To::Unwatched,
-        text: "Change input files only when the task says to edit them.",
+        text: "Change input files only when the task says to edit them. This and the caution on deleting data limit your own steps; a program the task asks you to write should do what the task says, including replacing or deleting files in place. That program may also run on inputs other than any sample given: base it on the format's own rules, not on values fitted to a sample.",
     },
+    // The library the task names gives the result it meant; a way around it
+    // after one failed call gives a result of the run's own making.
     Rule {
         id: "given",
         to: To::Unwatched,
-        text: "Use the URL, service, repository or test command the task gives.",
+        text: "Use the URL, service, repository or test command the task gives. When the task names a library or tool to use, get the result through it; if a call fails, read the error or its signature and call it correctly rather than going around it.",
     },
+    // A check that reuses a helper's code agrees with it whatever it does,
+    // and a sample in another form than the data, such as another letter
+    // case, can pass where the data does not.
     Rule {
         id: "compute",
         to: To::Unwatched,
-        text: "Compute numbers with a script, not in your head.",
+        text: "Compute numbers with a script, not in your head. Before building on a helper that transforms data, run it on a tiny input whose answer you know, in the same form as the real data, and check the final output with separate code or another tool, not the helper that made it.",
     },
     Rule {
         id: "stop",
@@ -655,15 +669,42 @@ mod tests {
         let _turn = settings_held();
         let full = told_without(&headless(), &TOOLS, &[]);
         let without = told_without(&headless(), &TOOLS, &["compute", "narrate"]);
+        let compute = all().find(|rule| rule.id == "compute").unwrap().text;
+        assert!(compute.starts_with("Compute numbers with a script, not in your head."));
         assert_eq!(
             without,
-            full.replace(" Compute numbers with a script, not in your head.", "")
+            full.replace(&format!(" {compute}"), "")
                 .replace(
                     " Start each reply that calls a tool with one short line saying what you are doing and why.",
                     ""
                 )
         );
         assert!(without.len() < full.len());
+    }
+
+    #[test]
+    fn a_run_nobody_watches_is_told_to_tidy_its_outputs_and_check_its_helpers() {
+        let _turn = settings_held();
+        let told = told_without(&headless(), &TOOLS, &[]);
+        for words in [
+            " update it in place. Before ending, remove binaries, logs and scratch files you made only to test from the folders that hold the outputs,",
+            " holds only the answer, in the form asked. Change input files only when the task says to edit them. This and the caution on deleting data limit your own steps;",
+            " or test command the task gives. When the task names a library or tool to use, get the result through it;",
+            " not in your head. Before building on a helper that transforms data, run it on a tiny input whose answer you know,",
+        ] {
+            assert!(told.contains(words), "{words}: {told}");
+        }
+        // The caution the inputs row speaks of is there to be qualified.
+        assert!(told.contains("deleting data you did not make"), "{told}");
+        let window = told_without(&window(), &TOOLS, &[]);
+        for words in [
+            "only to test",
+            "limit your own steps",
+            "names a library",
+            "tiny input",
+        ] {
+            assert!(!window.contains(words), "{words}: {window}");
+        }
     }
 
     #[test]
