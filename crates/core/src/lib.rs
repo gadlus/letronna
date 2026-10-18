@@ -87,6 +87,7 @@ pub mod providers;
 mod redact;
 pub mod references;
 pub mod remote;
+mod requirements;
 pub mod retry;
 pub mod review;
 pub mod sandbox;

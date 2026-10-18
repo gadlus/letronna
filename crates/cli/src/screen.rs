@@ -811,6 +811,8 @@ mod tests {
             blocks: HashMap::new(),
             folds: HashMap::new(),
             starts: Vec::new(),
+            shown: Vec::new(),
+            size: (0, 0),
         };
         assert!(s.after_blank());
         s.blocks

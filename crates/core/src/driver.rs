@@ -18,7 +18,9 @@
 //! session's own agent that changed source after its last passing
 //! build or test is sent back once to run one, naming the files. So is one
 //! whose files repeat words of an instruction planted in what it read, to
-//! reword them (`echo`).
+//! reword them (`echo`), and one nobody watches that changed source for a
+//! request stating several requirements, quoted back to it to check each
+//! (`requirements`).
 //!
 //! A frontend that shows the run as it goes, as an editor does over ACP,
 //! gives it a `Watch`, which hears each step as it is made. A run that is a
@@ -517,6 +519,7 @@ fn steps(
     let began = SystemTime::now();
     let mut put_back = false;
     let mut reworded = false;
+    let mut listed = false;
     // From the first request, since a run told of its time only near the
     // end has often thought most of it away by then.
     if let Some(deadline) = spec.connection.deadline {
@@ -708,6 +711,19 @@ fn steps(
                 && let Some(notice) = echoed(spec, turn, &report.files, began)
             {
                 reworded = true;
+                spec.transcript.conversation.messages.push(notice);
+                save(&mut spec.transcript)?;
+                continue;
+            }
+            // Before the edits are checked, so what it fixes for a
+            // requirement is checked too; once, and with a round and budget
+            // left, as above.
+            if !listed
+                && report.rounds < spec.rounds
+                && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
+                && let Some(notice) = requirements(spec, turn, &report.files)
+            {
+                listed = true;
                 spec.transcript.conversation.messages.push(notice);
                 save(&mut spec.transcript)?;
                 continue;
@@ -1766,6 +1782,43 @@ fn echoed(spec: &Spec, turn: &Turn, written: &[String], began: SystemTime) -> Op
     Some(Message {
         role: "user".into(),
         content,
+        notice: true,
+        // Folded into the run, so the window keeps the task it is for.
+        folded: true,
+        ..Default::default()
+    })
+}
+
+/// The notice sending a session's own run nobody watches back once to check
+/// the source it changed, `written` among its files, against each
+/// requirement sentence of its request, when the request states enough.
+fn requirements(spec: &Spec, turn: &Turn, written: &[String]) -> Option<Message> {
+    // A helper's work is its parent's to judge, a person reads a watched
+    // run's end, and past the round cap or in plan mode nothing can be run.
+    if !unwatched(spec) || turn.capped().is_some() || !turn.runs_commands() {
+        return None;
+    }
+    if refused(spec, "run_command").is_some() {
+        return None;
+    }
+    // Only a change to source is checked by running it, so a run that
+    // wrote only reports or data is left alone.
+    if !written.iter().any(|file| code(file)) {
+        return None;
+    }
+    let own = (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
+    let request = own.iter().rfind(|message| chat::opens_turn(message))?;
+    // Mail, such as a job's output, is no request.
+    if request.notice {
+        return None;
+    }
+    let found = crate::requirements::sentences(crate::references::typed(&request.content));
+    if found.len() < crate::requirements::FEWEST {
+        return None;
+    }
+    Some(Message {
+        role: "user".into(),
+        content: crate::requirements::notice(&found),
         notice: true,
         // Folded into the run, so the window keeps the task it is for.
         folded: true,
@@ -5389,6 +5442,148 @@ pub(crate) mod tests {
         provider.sent();
 
         assert_eq!(report.text, "Wrote the report.");
+    }
+
+    /// A request stating five requirements of a range parser between two
+    /// instructions about how to work, which are none of them.
+    const SPECIFIED: &str = "Do not modify or add test files unless the task requires it.\n\n\
+        Add a `parse_range` function to the parser. Ranges must be written as `a..b`. \
+        A range whose start is past its end should be rejected with the error `empty range`. \
+        Open ranges such as `a..` default to the end of the input. \
+        The function returns the bounds in the order written.\n\n\
+        When you are done, stop.";
+
+    /// The requirements `SPECIFIED` states, as the notice quotes them.
+    const STATED: [&str; 5] = [
+        "Add a `parse_range` function to the parser.",
+        "Ranges must be written as `a..b`.",
+        "A range whose start is past its end should be rejected with the error `empty range`.",
+        "Open ranges such as `a..` default to the end of the input.",
+        "The function returns the bounds in the order written.",
+    ];
+
+    /// A session's own run in `dir` nobody watches, asked `request`, that
+    /// answers as `answers` say.
+    fn specified(dir: &Path, id: AgentId, request: &str, answers: Vec<String>) -> (Spec, Stub) {
+        let (endpoint, provider) = provider(answers);
+        let mut spec = spec(endpoint, dir, id);
+        spec.depth = 0;
+        spec.decide = runs_everything();
+        spec.transcript.conversation.messages[0].content = request.into();
+        (spec, provider)
+    }
+
+    #[test]
+    fn an_unwatched_run_that_changed_source_is_sent_back_once_with_the_requirements() {
+        let _data = data("requirements");
+        let dir = scratch("requirements");
+        let answers = vec![
+            reply("", &[write_made()]),
+            reply("Added parse_range.", &[]),
+            reply("Each requirement holds.", &[]),
+        ];
+        let (spec, provider) = specified(&dir, AGENTS + 1_700, SPECIFIED, answers);
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        let asked = messages(&sent[2]).last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            asked,
+            crate::requirements::notice(&STATED.map(String::from))
+        );
+        assert_eq!(report.text, "Each requirement holds.");
+    }
+
+    #[test]
+    fn a_run_sent_back_once_for_the_requirements_is_not_sent_back_again() {
+        let _data = data("requirements-again");
+        let dir = scratch("requirements-again");
+        let fixed = ("write_file", json!({"path": "made.rs", "content": "fixed"}));
+        let answers = vec![
+            reply("", &[write_made()]),
+            reply("Added parse_range.", &[]),
+            reply("", &[fixed]),
+            reply("Fixed the empty range.", &[]),
+        ];
+        let (spec, provider) = specified(&dir, AGENTS + 1_710, SPECIFIED, answers);
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        // Changed again after the notice, it still ends at its next answer.
+        let notices = messages(&sent[3])
+            .iter()
+            .filter(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("check your change"))
+            })
+            .count();
+        assert_eq!(notices, 1);
+        assert_eq!(report.text, "Fixed the empty range.");
+    }
+
+    #[test]
+    fn a_request_stating_few_requirements_sends_no_run_back_for_them() {
+        let _data = data("requirements-few");
+        let dir = scratch("requirements-few");
+        let request = "Add a `parse_range` function. Ranges must be written as `a..b`. Thanks.";
+        let answers = vec![reply("", &[write_made()]), reply("Added parse_range.", &[])];
+        let (spec, provider) = specified(&dir, AGENTS + 1_720, request, answers);
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        provider.sent();
+
+        assert_eq!(report.text, "Added parse_range.");
+    }
+
+    #[test]
+    fn a_run_that_changed_no_source_is_not_sent_back_for_the_requirements() {
+        let _data = data("requirements-read");
+        let dir = scratch("requirements-read");
+        let answers = vec![
+            reply("", &[read_notes()]),
+            reply("The notes say hello.", &[]),
+        ];
+        let (spec, provider) = specified(&dir, AGENTS + 1_730, SPECIFIED, answers);
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        provider.sent();
+
+        assert_eq!(report.text, "The notes say hello.");
+    }
+
+    #[test]
+    fn a_watched_run_is_not_sent_back_for_the_requirements() {
+        let _data = data("requirements-watched");
+        let dir = scratch("requirements-watched");
+        let answers = vec![reply("", &[write_made()]), reply("Added parse_range.", &[])];
+        let (mut spec, provider) = specified(&dir, AGENTS + 1_740, SPECIFIED, answers);
+        spec.connection.human = true;
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        provider.sent();
+
+        assert!(dir.join("made.rs").exists());
+        assert_eq!(report.text, "Added parse_range.");
+    }
+
+    #[test]
+    fn a_helper_is_not_sent_back_for_the_requirements() {
+        let _data = data("requirements-helper");
+        let dir = scratch("requirements-helper");
+        let answers = vec![reply("", &[write_made()]), reply("Added parse_range.", &[])];
+        let (mut spec, provider) = specified(&dir, AGENTS + 1_750, SPECIFIED, answers);
+        spec.depth = 1;
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        provider.sent();
+
+        assert!(dir.join("made.rs").exists());
+        assert_eq!(report.text, "Added parse_range.");
     }
 
     #[test]
