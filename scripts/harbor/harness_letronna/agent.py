@@ -19,6 +19,7 @@ import hashlib
 import json
 import shlex
 import tempfile
+import tomllib
 from pathlib import Path, PurePosixPath
 
 from harbor.agents.capabilities import AgentCapabilities
@@ -36,6 +37,10 @@ DRIVE = Path(__file__).with_name("drive.sh")
 # SWE-bench Pro's leaderboard scaffold gives a task 250 turns; `-p`'s own
 # 25 tool rounds would cut most Terminal-Bench and SWE tasks short.
 ROUNDS = 250
+# Seconds Letronna's deadline is set short of Harbor's agent timeout, so it
+# stops with its result line and its session kept before Harbor kills it, as
+# OpenHuman's rig sets it; never more than half the task's time.
+DEADLINE_MARGIN = 120
 # Images on Debian releases past their end of life have their packages on
 # archive.debian.org only, so apt-get update fails there and curl cannot be
 # installed until the sources point at it. The archive keeps no security or
@@ -68,6 +73,7 @@ class Letronna(BaseInstalledAgent):
         sha256: str | None = None,
         max_rounds: int = ROUNDS,
         tools: str | list[str] | None = None,
+        deadline_margin: int = DEADLINE_MARGIN,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -84,6 +90,7 @@ class Letronna(BaseInstalledAgent):
             )
         self._rounds = int(max_rounds)
         self._tools = ",".join(tools) if isinstance(tools, list) else tools
+        self._margin = int(deadline_margin)
 
     @staticmethod
     def name() -> str:
@@ -201,11 +208,47 @@ class Letronna(BaseInstalledAgent):
             str(REMOTE / "letronna"),
         ]
         command = shlex.join(drive + flags) + f" 2>{shlex.quote(str(logs / 'letronna.stderr'))}"
-        env = {"AGENT_DATA_DIR": str(DATA), "LETRONNA_DISPOSABLE": "1"}
+        # The task image's PATH and variables, not those a login shell's
+        # profile would set over them; and a machine thrown away after it.
+        env = {
+            "AGENT_DATA_DIR": str(DATA),
+            "LETRONNA_NO_LOGIN_ENV": "1",
+            "LETRONNA_DISPOSABLE": "1",
+        }
+        deadline = self._deadline()
+        if deadline is not None:
+            env["LETRONNA_DEADLINE"] = str(deadline)
         try:
             await self.exec_as_agent(environment, command=command, env=env)
         finally:
             await self._keep_sessions(environment, logs)
+
+    def _deadline(self) -> int | None:
+        """Whole seconds for Letronna's deadline: the trial's agent timeout, worked out
+        as Harbor works it out, less the margin but at least half of it. None when the
+        trial has no timeout or its config cannot be read, as for a trial started some
+        other way; Harbor's own timeout still holds."""
+        from harbor.models.trial.config import TrialConfig
+
+        try:
+            config = TrialConfig.model_validate_json(
+                (self.logs_dir.parent / "config.json").read_text()
+            )
+            toml = config.task.get_local_path() / "task.toml"
+            task = tomllib.loads(toml.read_text()).get("agent", {}).get("timeout_sec")
+        except Exception as error:
+            self.logger.warning("The trial's agent timeout could not be read: %s", error)
+            return None
+        base = config.agent.override_timeout_sec or task
+        if not base:
+            return None
+        multiplier = config.agent_timeout_multiplier
+        if multiplier is None:
+            multiplier = config.timeout_multiplier
+        budget = int(min(base, config.agent.max_timeout_sec or float("inf")) * multiplier)
+        if budget <= 0:
+            return None
+        return max(budget - self._margin, budget // 2, 1)
 
     async def _keep_sessions(self, environment: BaseEnvironment, logs: PurePosixPath) -> None:
         """Copies the run's session and helper files into the logs, for

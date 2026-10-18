@@ -35,6 +35,7 @@ container localhost is the container.
 | `sha256` | What the binary's SHA-256 must be; for a release, `platforms["linux-x64"].terminal.sha256` in its `latest.json`. Each trial records the hash in its metadata either way. |
 | `max_rounds` | Tool rounds for the task, 250 by default as SWE-bench Pro's scaffold allows; `-p` alone stops at 25. |
 | `tools` | Only these tools, such as `read_file,list_dir,search,write_file,edit_file,apply_patch,run_command` for SWE tasks. |
+| `deadline_margin` | Seconds Letronna's deadline is set short of the trial's agent timeout, 120 by default; never more than half of it. |
 
 The release's `letronna-linux-x64` is built on Ubuntu 22.04 against glibc
 2.35, so it does not start on images with an older glibc. Install then fails
@@ -55,6 +56,15 @@ run one turn of
 letronna -p --input-format stream-json --output stream-json \
   --yes --max-rounds 250 --model <model>
 ```
+
+`LETRONNA_DEADLINE` is the trial's agent timeout, as Harbor works it out
+from the task's `task.toml` and the job's overrides and multipliers, less
+`deadline_margin`. At 80% of it Letronna is told to write its outputs, and
+at the deadline it stops with its result line, its session kept, before
+Harbor's timeout. A trial whose timeout cannot be read gets no deadline.
+`LETRONNA_NO_LOGIN_ENV=1` keeps the task image's PATH and variables rather
+than laying a login shell's over them, as a Debian or Ubuntu
+`/etc/profile` resets PATH.
 
 It runs as a run nobody watches, as on OpenHuman's rig, so it is given what
 Letronna gives such a run: deciding for itself, keeping to the task and its

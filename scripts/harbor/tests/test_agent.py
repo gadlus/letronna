@@ -162,9 +162,14 @@ class AgentTests(unittest.TestCase):
             {"type": "user", "message": {"role": "user", "content": "Fix the build."}},
         )
         [(command, env)] = environment.ran("drive.sh")
+        # No trial config beside the logs, so no deadline.
         self.assertEqual(
             env,
-            {"AGENT_DATA_DIR": "/installed-agent/letronna/data", "LETRONNA_DISPOSABLE": "1"},
+            {
+                "AGENT_DATA_DIR": "/installed-agent/letronna/data",
+                "LETRONNA_NO_LOGIN_ENV": "1",
+                "LETRONNA_DISPOSABLE": "1",
+            },
         )
         words = shlex.split(command.removeprefix("set -o pipefail; "))
         self.assertEqual(
@@ -191,6 +196,47 @@ class AgentTests(unittest.TestCase):
             ],
         )
         self.assertTrue(environment.ran("cp -R /installed-agent/letronna/data/"))
+
+    def trial(self, timeout_sec, **config):
+        """Writes the trial's config.json beside the logs, as Harbor does, for a task
+        whose agent timeout is `timeout_sec`."""
+        task = self.dir / "tasks" / "some-task"
+        task.mkdir(parents=True, exist_ok=True)
+        agent = "[agent]\n" + (f"timeout_sec = {timeout_sec}\n" if timeout_sec else "")
+        (task / "task.toml").write_text('version = "1.0"\n' + agent)
+        trial = {
+            "task": {"path": str(task)},
+            "trial_name": "some-task__abc",
+            "agent": {"import_path": "harness_letronna.agent:Letronna", **config.pop("agent", {})},
+            **config,
+        }
+        (self.logs.parent / "config.json").write_text(json.dumps(trial))
+
+    def deadline(self, **kwargs):
+        environment = Environment()
+        asyncio.run(self.agent(**kwargs).run("Go.", environment, None))
+        [(_, env)] = environment.ran("drive.sh")
+        return env.get("LETRONNA_DEADLINE")
+
+    def test_the_deadline_is_the_tasks_agent_timeout_less_the_margin(self):
+        self.trial(900.0)
+        self.assertEqual(self.deadline(), "780")
+        self.assertEqual(self.deadline(deadline_margin=300), "600")
+        # Never less than half the task's time.
+        self.trial(180.0)
+        self.assertEqual(self.deadline(), "90")
+
+    def test_the_deadline_follows_harbors_overrides_cap_and_multipliers(self):
+        self.trial(900.0, timeout_multiplier=2.0)
+        self.assertEqual(self.deadline(), str(1800 - 120))
+        self.trial(900.0, timeout_multiplier=2.0, agent_timeout_multiplier=0.5)
+        self.assertEqual(self.deadline(), str(450 - 120))
+        self.trial(900.0, agent={"override_timeout_sec": 3600.0, "max_timeout_sec": 1200.0})
+        self.assertEqual(self.deadline(), str(1200 - 120))
+
+    def test_a_task_with_no_agent_timeout_sets_no_deadline(self):
+        self.trial(None)
+        self.assertIsNone(self.deadline())
 
     def test_a_model_harbor_cannot_place_is_refused_before_the_run(self):
         with self.assertRaisesRegex(ValueError, "provider/model"):
