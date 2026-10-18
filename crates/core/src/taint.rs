@@ -130,8 +130,7 @@ pub(crate) fn create_folders(ctx: &ToolContext, folder: &Path) -> std::io::Resul
         // Without a time of making, what arrives in it later cannot be told
         // from what was moved in, so it stays the user's.
         let real = std::fs::canonicalize(&folder);
-        let born = folder.symlink_metadata().and_then(|meta| meta.created());
-        let (Ok(real), Ok(born)) = (real, born) else {
+        let (Ok(real), Some(born)) = (real, born(&folder)) else {
             continue;
         };
         let mut sessions = sessions();
@@ -173,8 +172,7 @@ pub(crate) fn own(ctx: &ToolContext, path: &Path) -> bool {
 /// into the folder is told from what the session and its programs made
 /// there, such as Python's caches.
 fn made_since(path: &Path, born: SystemTime) -> bool {
-    let made_at = |path: &Path| path.symlink_metadata().and_then(|meta| meta.created()).ok();
-    if made_at(path) != Some(born) {
+    if self::born(path) != Some(born) {
         return false;
     }
     let mut left = WALKED;
@@ -195,7 +193,7 @@ fn made_since(path: &Path, born: SystemTime) -> bool {
             let Ok(meta) = path.symlink_metadata() else {
                 return false;
             };
-            let later = meta.created().is_ok_and(|at| at >= born);
+            let later = self::born(&path).is_some_and(|at| at >= born);
             if meta.file_type().is_symlink() || !later {
                 return false;
             }
@@ -205,6 +203,47 @@ fn made_since(path: &Path, born: SystemTime) -> bool {
         }
     }
     true
+}
+
+/// When the system says `path` itself, not what a link at it leads to, was
+/// made, where the disk keeps that. The standard library reads it on Linux
+/// only through glibc, so a build against musl, as the terminal's release
+/// is, asks the kernel itself.
+pub(crate) fn born(path: &Path) -> Option<SystemTime> {
+    #[cfg(all(target_os = "linux", not(target_env = "gnu")))]
+    return statx_born(path);
+    #[cfg(not(all(target_os = "linux", not(target_env = "gnu"))))]
+    return path.symlink_metadata().and_then(|meta| meta.created()).ok();
+}
+
+/// `born` through Linux's statx call, read where the kernel lays out its
+/// answer: the mask of what it filled at byte 0, and the birth time's
+/// seconds at 80 and nanoseconds at 88.
+#[cfg(all(target_os = "linux", not(target_env = "gnu")))]
+fn statx_born(path: &Path) -> Option<SystemTime> {
+    use std::os::unix::ffi::OsStrExt;
+    const BTIME: libc::c_uint = 0x800;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut answer = [0u8; 256];
+    // SAFETY: the name ends in a nul and the answer holds the 256 bytes
+    // statx writes; a kernel without the call fails it, writing nothing.
+    let failed = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            libc::AT_FDCWD,
+            name.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+            BTIME,
+            answer.as_mut_ptr(),
+        )
+    };
+    let word = |at: usize| answer[at..at + 4].try_into().ok().map(u32::from_ne_bytes);
+    if failed != 0 || word(0)? & BTIME == 0 {
+        return None;
+    }
+    let seconds = u64::try_from(i64::from_ne_bytes(answer[80..88].try_into().ok()?)).ok()?;
+    let since = std::time::Duration::new(seconds, word(88)?);
+    SystemTime::UNIX_EPOCH.checked_add(since)
 }
 
 /// Keeps `pairs`, words of a paragraph that spoke to an AI, as read in
