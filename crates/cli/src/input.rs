@@ -27,7 +27,7 @@ pub fn read(prompt: &str) -> Option<String> {
 
 /// Whether there is a keyboard to steer with.
 fn keyboard() -> bool {
-    std::io::stdin().is_terminal() && render::colour()
+    std::io::stdin().is_terminal() && render::ansi()
 }
 
 /// Read a line that is not shown: a dot for each character. For keys, which
@@ -154,7 +154,7 @@ fn draw(out: &mut impl Write, options: &[&str], at: usize, again: bool) {
 pub fn busy<T: Send + 'static>(label: &str, work: impl FnOnce() -> T + Send + 'static) -> T {
     const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let handle = std::thread::spawn(work);
-    if !render::colour() {
+    if !render::ansi() {
         return handle.join().expect("the work panicked");
     }
     let began = std::time::Instant::now();

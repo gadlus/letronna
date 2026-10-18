@@ -161,9 +161,13 @@ pub fn open() {
     let _ = std::io::stdout().flush();
 }
 
-/// Give the window back exactly as it was found.
+/// Give the window back exactly as it was found -- even after a panic left
+/// the screen's lock poisoned, which leaves what it guards whole enough to
+/// say whether the window is held.
 pub fn close() {
-    let Ok(mut s) = screen().lock() else { return };
+    let mut s = screen()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if !s.open {
         return;
     }

@@ -28,7 +28,7 @@ pub fn nl() -> &'static str {
 /// cannot be parked there: it has to stay where output lands, or a redraw
 /// would pull the conversation out of line.
 pub fn caret_over(text: &str) -> String {
-    if colour() {
+    if ansi() {
         format!("\x1b[7m{text}\x1b[0m",)
     } else {
         text.to_owned()
@@ -38,7 +38,7 @@ pub fn caret_over(text: &str) -> String {
 /// Whether stdin is a terminal, so the line editor can take over keystrokes.
 /// Piped input has to go through the plain reader instead.
 pub fn interactive() -> bool {
-    std::io::stdin().is_terminal() && colour()
+    std::io::stdin().is_terminal() && ansi()
 }
 
 /// Text as one plain line: line breaks and other control characters become
@@ -55,7 +55,7 @@ pub fn one_line(text: &str) -> String {
 /// Name the window, the way a terminal program should; `title::restore`
 /// puts the old name back on the way out.
 pub fn title(text: &str) {
-    if colour() {
+    if ansi() {
         print!("]0;{text}");
         flush();
     }
@@ -68,17 +68,25 @@ pub fn clear() {
         crate::screen::wipe();
         return;
     }
-    if colour() {
+    if ansi() {
         print!("[2J[3J[H");
         flush();
     }
 }
 
-/// ANSI, unless output is being piped or the terminal has opted out.
+/// ANSI colours, unless output is being piped, the terminal cannot take
+/// escapes, or `NO_COLOR` opts out of colour.
 pub fn colour() -> bool {
+    ansi() && std::env::var_os("NO_COLOR").is_none()
+}
+
+/// Whether the terminal takes escape sequences at all: the box, the caret,
+/// a selection and the window's title need them whatever the colours.
+/// `NO_COLOR` asks for no colour, not for no box.
+pub fn ansi() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::io::stdout().is_terminal() || std::env::var_os("NO_COLOR").is_some() {
+        if !std::io::stdout().is_terminal() {
             return false;
         }
         // TERM is a Unix convention and cmd.exe does not set it, so asking for
@@ -545,7 +553,7 @@ pub fn mark(text: &str, from: usize, to: Option<usize>) -> String {
     let before: String = chars[..from].iter().collect();
     let span: String = chars[from..to].iter().collect();
     let after: String = chars[to..].iter().collect();
-    if !colour() {
+    if !ansi() {
         return plain;
     }
     format!("{before}\x1b[7m{span}\x1b[27m{after}")

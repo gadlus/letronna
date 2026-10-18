@@ -372,6 +372,13 @@ fn main() {
     // screen we are about to swap away from.
     let note = footer(&runner);
     runner.bar.set_footer(note);
+    // A SIGTERM or a closing terminal ends the session as leaving does,
+    // with the terminal given back and its jobs and worktrees seen to,
+    // rather than leaving it in raw mode on the conversation's screen; a
+    // second SIGTERM ends it at once.
+    let ended = Cancel::default();
+    end_on_signals(ended.clone());
+    runner.bar.end_on(ended);
     runner.bar.install();
     letronna_core::diag::mark("screen");
     // Before anything can start a turn. Without the box, a terminal on both
@@ -551,11 +558,103 @@ fn main() {
     runner.store.release_unused();
     title::restore();
     render::blank();
+    // On the screen the terminal is given back, where the conversation was
+    // not, which session it was and how to come back to it.
+    if let Some(left) = runner.store.conversations.get(session)
+        && left.length() > 0
+    {
+        render::line(&render::dim(&format!(
+            "Saved \"{}\" · letronna -r {} to come back",
+            plain_name(&left.title),
+            left.id
+        )));
+    }
     let open = (runner.store.conversations.get(session)).map_or(opened, |c| c.id);
     for kept in left_worktrees(&runner, &[opened, open]) {
         render::line(&render::dim(&kept));
     }
     letronna_core::diag::stop();
+}
+
+/// How long a hangup leaves the session to finish leaving before the
+/// process ends without it.
+#[cfg(unix)]
+const HANGUP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Set `ended` at a SIGTERM or a hangup, so the session ends as leaving
+/// does; a second SIGTERM ends the process at once. Not Ctrl-C, which is a
+/// key while the box is up and, while the terminal is lent to an editor or
+/// a sign-in, that program's to hear.
+#[cfg(unix)]
+fn end_on_signals(ended: Cancel) {
+    use std::io::Read;
+    use std::os::fd::IntoRawFd;
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static HEARD: AtomicI32 = AtomicI32::new(-1);
+    // A signal handler may not lock or allocate, so it only wakes the thread
+    // below, which sets the token.
+    extern "C" fn heard(signal: libc::c_int) {
+        let byte = [signal as u8];
+        // SAFETY: write is async-signal-safe, the byte is on this stack, and
+        // the pipe stays open for the life of the process.
+        unsafe { libc::write(HEARD.load(Ordering::Relaxed), byte.as_ptr().cast(), 1) };
+    }
+    let Ok((mut reader, writer)) = std::io::pipe() else {
+        return;
+    };
+    HEARD.store(writer.into_raw_fd(), Ordering::Relaxed);
+    // A closing terminal sends two hangups, one from its shell and one from
+    // the kernel as the shell exits, so a second hangup does not end the
+    // process the way a second SIGTERM does.
+    for (signal, once) in [(libc::SIGTERM, true), (libc::SIGHUP, false)] {
+        // SAFETY: all zeroes is a valid sigaction, for the current one to be
+        // read into and for the new one, whose mask is emptied below.
+        let (mut before, mut action): (libc::sigaction, libc::sigaction) =
+            unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
+        // SAFETY: this only reads the current action.
+        unsafe { libc::sigaction(signal, std::ptr::null(), &mut before) };
+        // Ignored on purpose, as nohup does with a hangup.
+        if before.sa_sigaction == libc::SIG_IGN {
+            continue;
+        }
+        action.sa_sigaction = heard as *const () as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART | if once { libc::SA_RESETHAND } else { 0 };
+        // SAFETY: the mask is the action's own, and the action is whole when
+        // set.
+        unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+        }
+    }
+    std::thread::spawn(move || {
+        let mut signal = [0u8];
+        while reader.read(&mut signal).is_ok_and(|read| read == 1) {
+            ended.set();
+            // A hangup is the terminal gone, and reading a terminal that has
+            // gone never returns, so the box may never see `ended`: it gets
+            // a moment to leave as it would, and then the process ends as a
+            // hangup always ended it, rather than spinning on for good.
+            if i32::from(signal[0]) == libc::SIGHUP {
+                std::thread::sleep(HANGUP_GRACE);
+                std::process::exit(128 + libc::SIGHUP);
+            }
+        }
+    });
+}
+
+/// A console closing ends the process as it always has.
+#[cfg(not(unix))]
+fn end_on_signals(_: Cancel) {}
+
+/// A session's name as one plain line, for saying on the way out.
+fn plain_name(title: &str) -> String {
+    let spaced: String = (title.chars())
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    match letronna_core::tools::one_line(&spaced) {
+        name if name.is_empty() => "untitled".to_owned(),
+        name => name,
+    }
 }
 
 /// Show which session is open: its name on the box's edge and in the
@@ -1428,11 +1527,23 @@ fn scheduled(event: letronna_core::schedule::Event) {
 fn rescue_terminal() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Full scrolling region, focus reports off, cursor back, raw mode off.
-        // Only on a terminal: a program reading JSON lines would get them
-        // glued on.
+        // A thread of a tool or a timer can panic and be caught, with the
+        // box still up and in use: only the main thread's panic, which ends
+        // the program, gives the terminal back.
+        if std::thread::current().name() != Some("main") {
+            previous(info);
+            return;
+        }
+        // Out of the conversation's own screen, mouse and key reports off,
+        // the keys' protocol popped, pastes as typed, focus reports off, the
+        // full scrolling region and the cursor back -- so the message below
+        // lands where it can be read and stays there. Only on a terminal: a
+        // program reading JSON lines would get them glued on.
         if std::io::stdout().is_terminal() {
-            print!("\x1b[r\x1b[?2004l\x1b[?1004l\x1b[?25h");
+            print!(
+                "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[<u\x1b[?1049l\x1b[r\x1b[?2004l\x1b[?1004l\x1b[?25h"
+            );
+            let _ = std::io::stdout().flush();
         }
         let _ = crossterm::terminal::disable_raw_mode();
         render::set_raw(false);
@@ -2289,5 +2400,14 @@ mod tests {
                 "env-model".into()
             )))
         );
+    }
+
+    #[test]
+    fn the_name_said_on_leaving_is_one_plain_line() {
+        assert_eq!(
+            super::plain_name("fix the\nbuild\x1b]0;x\x07 now"),
+            "fix the build ]0;x now"
+        );
+        assert_eq!(super::plain_name("  "), "untitled");
     }
 }

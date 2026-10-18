@@ -844,6 +844,8 @@ pub struct Bar {
     added: Added,
     /// The open session's project folder, where an `@` path is completed.
     folder: Option<std::path::PathBuf>,
+    /// Set by a SIGTERM or a hangup, which ends the session as leaving does.
+    ended: Option<letronna_core::cancel::Cancel>,
     /// When the turn running began, which its clock counts from.
     turn_began: Option<std::time::Instant>,
     /// The second of that clock the footer last showed.
@@ -913,6 +915,7 @@ impl Bar {
             focus: crate::notify::Focus::new(std::time::Instant::now()),
             added: Added::default(),
             folder: None,
+            ended: None,
             turn_began: None,
             clock_shown: 0,
             context: None,
@@ -922,6 +925,11 @@ impl Bar {
             mode_note: None,
             before_plan: Mode::Default,
         }
+    }
+
+    /// End the session, as leaving does, once `ended` is set.
+    pub fn end_on(&mut self, ended: letronna_core::cancel::Cancel) {
+        self.ended = Some(ended);
     }
 
     /// Offer `added` in the `/` menu beside Letronna's own commands.
@@ -1496,6 +1504,14 @@ impl Bar {
     pub fn pump(&mut self) {
         if !self.live {
             return;
+        }
+        if self
+            .ended
+            .as_ref()
+            .is_some_and(letronna_core::cancel::Cancel::is_set)
+        {
+            self.interrupt = self.working;
+            self.done = true;
         }
         // Where the line stood before this drain. A drain that swallows a
         // burst of keys is how a paste looks on a console that has no paste

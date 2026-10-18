@@ -116,7 +116,7 @@ pub struct Busy {
 impl Busy {
     pub fn start() -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        if !render::colour() {
+        if !render::ansi() {
             return Self { stop, handle: None };
         }
         let flag = stop.clone();
