@@ -434,7 +434,23 @@ impl Chat {
                 .gap_2();
             for (i, option) in options_in(args).into_iter().enumerate() {
                 let pick = option.clone();
-                let mut chip = Button::new(("option", i)).framed(cx).small();
+                // Not a Button, which keeps its label on one line: a long
+                // answer wraps inside the card instead of running past it.
+                let mut chip = h_flex()
+                    .id(("option", i))
+                    .max_w_full()
+                    .gap_1p5()
+                    .items_start()
+                    .px_2p5()
+                    .py_1()
+                    .rounded(cx.theme().radius)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().secondary)
+                    .text_sm()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().secondary_hover))
+                    .active(|s| s.bg(cx.theme().secondary_active));
                 // Its letter, while the keys are on the answers to press it.
                 if let Some(letter) =
                     option_letter(i).filter(|_| self.question_focus.is_focused(window))
@@ -447,12 +463,12 @@ impl Chat {
                         .text_xs(),
                     );
                 }
-                chips = chips.child(chip.label(option).on_click(cx.listener(
-                    move |this, event: &ClickEvent, window, cx| {
+                chips = chips.child(chip.child(div().min_w_0().child(option)).on_click(
+                    cx.listener(move |this, event: &ClickEvent, window, cx| {
                         this.keys_back(event.is_keyboard(), window, cx);
                         this.resolve_call(Verdict::Answer(pick.clone()), cx)
-                    },
-                )));
+                    }),
+                ));
             }
             let question = h_flex()
                 .gap_2()
