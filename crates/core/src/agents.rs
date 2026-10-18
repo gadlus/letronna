@@ -1606,13 +1606,17 @@ fn indented(text: &str) -> String {
 }
 
 /// The conversation the calling agent has so far, as its own file holds it:
-/// a session's, which both front ends save before running tools, or a
-/// helper's transcript, which the driver saves before each round. Its
-/// messages, and the summaries the user asked for, where its window starts.
+/// a session's, which both front ends save before running tools, or the
+/// transcript of a run the driver makes, a helper's or a session's own held
+/// beside the chat, -p's, a schedule's or an editor's, which it saves before
+/// each round. Its messages, and the summaries the user asked for, where its
+/// window starts.
 fn parent_conversation(caller: &Caller) -> Result<Conversation, String> {
-    let conversation = match caller.agent {
-        None => crate::store::session(caller.root),
-        Some(id) => {
+    let conversation = match (&caller.transcript, caller.agent) {
+        // The driver's run, a session's or a helper's, as far as it has got.
+        (Some(path), _) => Transcript::at(path.clone()).map(|transcript| transcript.conversation),
+        (None, None) => crate::store::session(caller.root),
+        (None, Some(id)) => {
             let n = registry().helpers.iter().find(|h| h.id == id).map(|h| h.n);
             n.and_then(|n| Transcript::open(caller.root, n))
                 .map(|transcript| transcript.conversation)
@@ -4442,6 +4446,38 @@ mod tests {
         // Its parent's file holds the first three as they are; what the fork
         // added after them is its own.
         assert_eq!(copied(&out, out.len()), 3);
+    }
+
+    #[test]
+    fn a_fork_starts_from_the_run_the_driver_keeps_not_the_session_s_file() {
+        let _session = Session::new("fork-run");
+        let dir = Scratch::new("agents-fork-run");
+        let said = |role: &str, content: &str| Message {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        };
+        let mut run = Transcript {
+            path: dir.join("held.jsonl"),
+            conversation: Conversation {
+                id: 4_242,
+                messages: vec![
+                    said("user", "the held run's task"),
+                    said("assistant", "on it"),
+                ],
+                ..Default::default()
+            },
+        };
+        run.save().unwrap();
+        // A session held beside the chat: its own agent, its run's transcript.
+        let caller = Caller {
+            root: 4_242,
+            transcript: Some(run.path.clone()),
+            ..Default::default()
+        };
+        let parent = parent_conversation(&caller).unwrap();
+        assert_eq!(parent.messages.len(), 2);
+        assert_eq!(parent.messages[0].content, "the held run's task");
     }
 
     #[test]

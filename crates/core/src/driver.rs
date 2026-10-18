@@ -1156,9 +1156,12 @@ fn context(spec: &Spec) -> ToolContext {
     ToolContext {
         cancel: spec.cancel.clone(),
         // A helper this agent starts is one deeper, in the same tree and
-        // spending from the same budget.
+        // spending from the same budget. A run at depth 0, held beside the
+        // chat, -p's, a schedule's or an editor's, is the session's own
+        // agent, not a helper, though the driver runs it.
         caller: Caller {
-            agent: Some(spec.id),
+            agent: (spec.depth > 0).then_some(spec.id),
+            transcript: Some(spec.transcript.path.clone()),
             root: spec.root,
             depth: spec.depth,
             budget: spec.budget.clone(),
@@ -1863,6 +1866,21 @@ pub(crate) mod tests {
             watch: None,
             decide: None,
         }
+    }
+
+    #[test]
+    fn a_run_at_depth_0_calls_as_its_session_and_a_helper_as_itself() {
+        let dir = std::env::temp_dir();
+        let mut held = spec("http://127.0.0.1:9/v1".into(), &dir, 7);
+        held.depth = 0;
+        let caller = context(&held).caller;
+        assert_eq!(caller.agent, None, "a held run is the session's own agent");
+        assert_eq!(
+            caller.transcript.as_deref(),
+            Some(dir.join("helper.jsonl").as_path())
+        );
+        let helper = spec("http://127.0.0.1:9/v1".into(), &dir, 9);
+        assert_eq!(context(&helper).caller.agent, Some(9));
     }
 
     pub(crate) fn listen() -> (TcpListener, String) {

@@ -61,6 +61,9 @@ pub(crate) struct Caller {
     pub connection: Option<Arc<Connection>>,
     /// The helper making the call, or None for a session's own agent.
     pub agent: Option<AgentId>,
+    /// Where the driver keeps the calling run's conversation as it goes,
+    /// which a fork of it starts from; None for a turn in a front end.
+    pub transcript: Option<std::path::PathBuf>,
     /// The session the work is for.
     pub root: u64,
     /// How many helpers deep the calling agent is: 0 for a session's own.
