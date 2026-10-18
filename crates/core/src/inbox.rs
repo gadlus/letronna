@@ -159,6 +159,17 @@ pub(crate) fn unwake(to: u64) {
     drop(wake);
 }
 
+/// Drop what waits for session or helper `to`, and what its next notice
+/// would wake, for one that is gone.
+pub fn forget(to: u64) {
+    let (mailbox, wake) = match inbox().lock() {
+        Ok(mut inbox) => (inbox.mailboxes.remove(&to), inbox.wakes.remove(&to)),
+        Err(_) => return,
+    };
+    // Dropped unlocked, as in `unwake`.
+    drop((mailbox, wake));
+}
+
 /// Take what a session or helper should hear now: only what cannot wait while
 /// its turn runs, and everything once it is idle.
 pub fn take(to: u64, idle: bool) -> Vec<Notice> {

@@ -1119,6 +1119,9 @@ impl Store {
 /// Remove session `id`'s file and what is kept beside it for it. Its lock
 /// file goes only with `lock` held on it.
 fn erase(id: u64, lock: Option<Lock>) {
+    // First, so a helper still at work stops, and what it was writing
+    // is not left behind in the folder that goes next.
+    crate::agents::forget(id);
     let path = session_path(id);
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(crate::prefilter::path_for(&path));

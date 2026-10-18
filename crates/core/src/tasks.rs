@@ -186,6 +186,22 @@ fn started_under(tasks: &BTreeMap<Key, Task>, mut owner: u64, by: u64) -> bool {
     false
 }
 
+/// Drop every piece of work session `root` or its helpers started, for a
+/// session that was deleted: what ends later tells nobody, where a new
+/// session given the same id would otherwise hear it.
+pub fn forget(root: u64) {
+    let Ok(mut tasks) = registry().lock() else {
+        return;
+    };
+    let gone: Vec<Key> = (tasks.values())
+        .filter(|task| started_under(&tasks, task.owner, root))
+        .map(|task| task.key)
+        .collect();
+    for key in gone {
+        tasks.remove(&key);
+    }
+}
+
 /// Hand the running work of a helper that is finishing to whoever it
 /// answered to, and say which work that was.
 pub fn reown(from: u64, to: u64) -> Vec<Key> {
@@ -227,6 +243,21 @@ mod tests {
             when: When::Next,
             text: format!("job #{job} exited with code 1"),
         })
+    }
+
+    #[test]
+    fn a_deleted_session_s_work_is_dropped_and_another_s_kept() {
+        let (gone, kept) = (Key::Job(9_801), Key::Job(9_802));
+        register(Task::new(gone, 9_811, None, "server"));
+        register(Task::new(Key::Agent(9_812), 9_811, None, "helper"));
+        register(Task::new(Key::Job(9_803), 9_812, None, "the helper's job"));
+        register(Task::new(kept, 9_813, None, "elsewhere"));
+        forget(9_811);
+        assert!(list(9_811).is_empty());
+        assert_eq!(list(9_813).len(), 1);
+        // Finishing what was dropped tells nobody.
+        finish(&gone, State::Done("exited".into()), None);
+        forget(9_813);
     }
 
     #[test]

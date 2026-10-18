@@ -1285,6 +1285,48 @@ fn occupy(
     Slot { id, name, together }
 }
 
+/// Forgets session `root`, which was deleted, and whose id the next new
+/// session may be given: its helpers' runs are stopped, its idle kept ones
+/// end, and none of them is kept to be listed, named, picked back up or
+/// heard from there, since a run that ends finds no helper to report for.
+pub fn forget(root: u64) {
+    let (cancels, idle, ids) = {
+        let mut registry = registry();
+        let ids: Vec<AgentId> = (registry.helpers.iter())
+            .filter(|helper| helper.root == root)
+            .map(|helper| helper.id)
+            .collect();
+        let cancels: Vec<Cancel> = (registry.running.iter())
+            .filter(|running| ids.contains(&running.id))
+            .map(|running| running.cancel.clone())
+            .collect();
+        let idle: Vec<TimerId> = (registry.helpers.iter_mut())
+            .filter(|helper| helper.root == root)
+            .filter_map(|helper| helper.idle.take())
+            .map(|idle| idle.timer)
+            .collect();
+        registry.helpers.retain(|helper| helper.root != root);
+        registry.names.remove(&root);
+        (cancels, idle, ids)
+    };
+    // Outside the lock, as `stop` does: a stop runs whatever the helper waits on.
+    for cancel in cancels {
+        cancel.set();
+    }
+    for timer in idle {
+        timers::cancel(timer);
+    }
+    for id in ids {
+        inbox::forget(id);
+    }
+    CURRENT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&root);
+    tasks::forget(root);
+    inbox::forget(root);
+}
+
 /// Stops the running helper `id`, or ends it at once if it is kept and idle,
 /// and says whether there was one. The stop counts as the user's, so nothing
 /// picks the helper back up.
@@ -3855,6 +3897,42 @@ mod tests {
             )),
             "{out}"
         );
+    }
+
+    #[test]
+    fn a_deleted_session_s_helpers_stop_and_nothing_of_them_reaches_its_id() {
+        let session = Session::new("forget");
+        inbox::listen();
+        let (asking, asked) = mpsc::channel();
+        let (going, go) = mpsc::channel::<()>();
+        let (endpoint, provider) =
+            Stub::held(vec![reply("The notes say hello.", None)], move |_| {
+                let _ = asking.send(());
+                // Held until the session is deleted under it.
+                let _ = go.recv_timeout(WAIT);
+            });
+        let args = json!({"description": "Read the notes", "type": "explore", "name": "reader",
+            "prompt": "Read notes.txt."});
+        call(session.context(endpoint), args).unwrap();
+        asked.recv_timeout(WAIT).expect("the helper never asked");
+
+        forget(4_242);
+        going.send(()).unwrap();
+        provider.sent();
+        let started = Instant::now();
+        while !registry().running.is_empty() {
+            assert!(started.elapsed() < WAIT, "the helper never stopped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Nothing waits for a new session given the same id: no report, no
+        // helper to list, no work, and its names are free again.
+        assert!(inbox::take(4_242, true).is_empty());
+        assert!(seen().iter().all(|helper| helper.session != 4_242));
+        assert!(tasks::list(4_242).is_empty());
+        let again = reserve(4_242, 4_242, "reader", cap(AT_ONCE), Cancel::default()).unwrap();
+        assert_eq!(again.name, "reader");
+        drop(again);
+        forget(4_242);
     }
 
     #[test]
