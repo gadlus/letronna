@@ -844,6 +844,10 @@ pub struct Bar {
     added: Added,
     /// The open session's project folder, where an `@` path is completed.
     folder: Option<std::path::PathBuf>,
+    /// When the turn running began, which its clock counts from.
+    turn_began: Option<std::time::Instant>,
+    /// The second of that clock the footer last showed.
+    clock_shown: u64,
     /// What the open session's latest request carried, out of its window,
     /// which the box's foot shows; `None` before there is a reply.
     context: Option<(u64, u64)>,
@@ -909,6 +913,8 @@ impl Bar {
             focus: crate::notify::Focus::new(std::time::Instant::now()),
             added: Added::default(),
             folder: None,
+            turn_began: None,
+            clock_shown: 0,
             context: None,
             session: String::new(),
             place: String::new(),
@@ -1571,6 +1577,13 @@ impl Bar {
         if self.handled > 0 || resized {
             self.settle();
         }
+        // The footer's clock goes on while the answer streams in, a second
+        // at a time.
+        let clock = self.turn_time().map_or(0, |took| took.as_secs());
+        if clock != self.clock_shown {
+            self.clock_shown = clock;
+            self.settle();
+        }
         // The waiting line turns on this loop, which runs every twenty
         // milliseconds whether or not anything was typed.
         if self.waiting.is_some() && self.ticked.elapsed() >= Duration::from_millis(90) {
@@ -1750,11 +1763,20 @@ impl Bar {
     /// done when there is one.
     pub fn wait_line(&mut self, on: bool) {
         let step = self.plan.iter().find(|t| t.status == "doing");
-        self.waiting = on.then(|| match step {
-            Some(step) => crate::spinner::Waiting::during(&step.text),
-            None => crate::spinner::Waiting::new(),
+        let began = self.turn_began.unwrap_or_else(std::time::Instant::now);
+        self.waiting = on.then(|| {
+            match step {
+                Some(step) => crate::spinner::Waiting::during(&step.text),
+                None => crate::spinner::Waiting::new(),
+            }
+            .counted_from(began)
         });
         self.settle();
+    }
+
+    /// How long the turn running has taken so far.
+    pub fn turn_time(&self) -> Option<Duration> {
+        self.turn_began.map(|began| began.elapsed())
     }
 
     /// Show a waiting line that says what is being waited for.
@@ -1771,12 +1793,16 @@ impl Bar {
 
     /// Say whether a turn is running, so escape knows what it means.
     pub fn working(&mut self, on: bool) {
+        if on && !self.working {
+            self.turn_began = Some(std::time::Instant::now());
+        }
         self.working = on;
         if !on {
             self.interrupt = false;
             self.hurry = false;
             // What the turn changed shows on the box's edge.
             self.look_at_place();
+            self.turn_began = None;
         }
         // The footer says whether escape will stop anything, so it is
         // redrawn now rather than at the next key; that also brings out the
@@ -2396,9 +2422,21 @@ impl Bar {
             "ctrl-s to send now  ·  ↑ to take it back  ·  esc to stop".to_owned()
         } else if self.working {
             // Said while it applies rather than only after a long silence:
-            // a reply going the wrong way is worth stopping early.
+            // a reply going the wrong way is worth stopping early. The
+            // turn's clock goes on after it, once the waiting line has given
+            // way to the answer streaming in.
             let width = width.saturating_sub(self.mode_width(width));
-            fitted(&self.footer, &format!("{helpers}  ·  esc to stop"), width)
+            let clock = match self.turn_time().map(|took| took.as_secs()) {
+                Some(seconds) if seconds > 0 && self.waiting.is_none() => {
+                    format!("  ·  {}", crate::spinner::spell(seconds))
+                }
+                _ => String::new(),
+            };
+            fitted(
+                &self.footer,
+                &format!("{helpers}  ·  esc to stop{clock}"),
+                width,
+            )
         } else {
             let reach = reach(self.relay.len(), self.runs.len());
             let width = width.saturating_sub(self.mode_width(width));
@@ -2416,6 +2454,10 @@ impl Bar {
         } else {
             String::new()
         };
+        // Cut to the window whatever it says: a wrapped last row would run
+        // off the foot of the window and scroll everything above it.
+        let room = width.saturating_sub(render::visible(&mode));
+        let note = render::clip(&note, room);
         // A mode just picked says what it does over whatever else the footer
         // had, which comes back after.
         lines.push(match self.mode_note(width) {
@@ -4007,6 +4049,35 @@ mod tests {
         bar.guard = Instant::now().checked_sub(STILL);
         bar.pick(key(KeyCode::Enter));
         assert_eq!(bar.answer, Some(0));
+    }
+
+    #[test]
+    fn the_footer_keeps_the_turns_clock_while_the_answer_streams() {
+        let mut bar = Bar::new("model".into());
+        bar.working(true);
+        bar.turn_began = Instant::now().checked_sub(std::time::Duration::from_secs(72));
+        let footer = plain(bar.lines(40).last().unwrap());
+        assert!(footer.ends_with("esc to stop  ·  1m 12s"), "{footer}");
+        // While the waiting line is up, it carries the clock instead.
+        bar.wait_line(true);
+        let footer = plain(bar.lines(40).last().unwrap());
+        assert!(footer.ends_with("esc to stop"), "{footer}");
+        let waiting = plain(&bar.lines(40)[0]);
+        assert!(waiting.ends_with("1m 12s"), "{waiting}");
+        bar.working(false);
+        assert!(bar.turn_time().is_none());
+    }
+
+    #[test]
+    fn every_footer_is_cut_to_the_window() {
+        let mut bar = Bar::new(String::new());
+        bar.slider = Some(Slider {
+            question: "How hard?".into(),
+            stops: vec!["low".into(), "high".into()],
+            at: 0,
+        });
+        let footer = bar.lines(40).last().unwrap().clone();
+        assert!(visible(&footer) < crate::render::width(), "{footer}");
     }
 
     #[test]

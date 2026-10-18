@@ -757,8 +757,16 @@ impl Runner {
         // line below speaks for it.
         if reply.tokens > 0 && !reply.content.is_empty() {
             let gateway = self.store.model(session).0;
+            // A reply that asks for nothing more ends the turn, and says how
+            // long the whole of it took.
+            let took = match self.bar.turn_time().map(|took| took.as_secs()) {
+                Some(seconds) if seconds > 0 && reply.tool_calls.is_empty() => {
+                    format!(" · {}", crate::spinner::spell(seconds))
+                }
+                _ => String::new(),
+            };
             render::line(&render::dim(&format!(
-                "{} · {}",
+                "{} · {}{took}",
                 answered_by(&reply.model, gateway),
                 usage(&reply)
             )));

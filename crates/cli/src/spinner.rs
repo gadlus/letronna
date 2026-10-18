@@ -82,6 +82,11 @@ fn mood_about(what: &str, seconds: u64) -> (String, fn(&str) -> String) {
 /// One wait, from the moment the question went.
 pub struct Waiting {
     began: Instant,
+    /// Where the clock it shows counts from: the turn's start for a wait on
+    /// the model, so a turn of several steps shows how long it has taken in
+    /// all; the wait's own start otherwise. Whether it is taking long is
+    /// always the wait's own.
+    shown: Instant,
     word: &'static str,
     /// What is being waited for, when it is something nameable. Waiting on
     /// the model is "Thinking"; waiting on a tool says which tool, because
@@ -100,13 +105,27 @@ impl Default for Waiting {
 
 impl Waiting {
     pub fn new() -> Self {
+        let now = Instant::now();
+        // Whichever word the clock lands on; they all mean the same thing,
+        // and the same one every time reads as a frozen screen. The time of
+        // day, since an instant just taken has had no time to pass.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.subsec_nanos());
         Self {
-            began: Instant::now(),
-            // Whichever word the clock lands on; they all mean the same
-            // thing, and the same one every time reads as a frozen screen.
-            word: WORDS[Instant::now().elapsed().subsec_nanos() as usize % WORDS.len()],
+            began: now,
+            shown: now,
+            word: WORDS[nanos as usize % WORDS.len()],
             about: None,
             step: None,
+        }
+    }
+
+    /// The same wait, its clock counting from `from`.
+    pub fn counted_from(self, from: Instant) -> Self {
+        Self {
+            shown: from,
+            ..self
         }
     }
 
@@ -139,13 +158,19 @@ impl Waiting {
         let elapsed = self.began.elapsed();
         let seconds = elapsed.as_secs();
         let frame = FRAMES[(elapsed.as_millis() / FRAME_MS) as usize % FRAMES.len()];
-        let since = if seconds > 0 {
-            format!(" {}", spell(seconds))
-        } else {
-            String::new()
+        let since = match self.shown.elapsed().as_secs() {
+            0 => String::new(),
+            shown => format!(" {}", spell(shown)),
         };
         let (say, paint) = match (&self.about, &self.step) {
-            (Some(what), _) => mood_about(what, seconds),
+            // A long command gives way before the clock and the warning, and
+            // stops short of the edge, as a step does below.
+            (Some(what), _) => {
+                let (bare, _) = mood_about("", seconds);
+                let taken = format!("{}{frame} {bare}{since}{}", render::INSIDE, render::MARGIN);
+                let what = render::fit(what, width.saturating_sub(taken.chars().count()));
+                mood_about(&what, seconds)
+            }
             (None, Some(step)) => {
                 // The step gives way before the word, a warning or the clock,
                 // and stops short of the edge: past it the terminal wraps the
@@ -189,6 +214,26 @@ mod tests {
     #[test]
     fn the_line_says_something_from_the_first_moment() {
         assert!(!Waiting::new().line(80).trim().is_empty());
+    }
+
+    #[test]
+    fn a_long_command_gives_way_before_the_clock() {
+        let command = "cargo test --workspace --all-features -- --nocapture --test-threads=1";
+        let began = std::time::Instant::now() - std::time::Duration::from_secs(5);
+        let line = Waiting::about(command).counted_from(began).line(40);
+        assert!(visible(&line) <= 40, "{line}");
+        assert!(crate::render::plain(&line).ends_with("5s"), "{line}");
+    }
+
+    #[test]
+    fn the_word_is_not_always_the_same() {
+        let words: std::collections::HashSet<&str> = (0..200)
+            .map(|_| {
+                std::thread::sleep(std::time::Duration::from_micros(50));
+                Waiting::new().word
+            })
+            .collect();
+        assert!(words.len() > 1);
     }
 
     #[test]
