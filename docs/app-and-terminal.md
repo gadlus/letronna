@@ -64,6 +64,7 @@ Type `/` to list them all. The common ones:
 | `/skills`, `/mcp` | Skills and MCP servers |
 | `/jobs` | Background commands |
 | `/usage` | Tokens and cost per session, day and model |
+| `/context` | What fills the context, part by part; the box's bottom edge says how full it is |
 | `/btw` | Ask something aside without derailing the turn |
 | `/rewind`, `/undo` | Go back to any message you sent; see below |
 | `/loop`, `/heartbeat` | Keep a session working toward a goal |

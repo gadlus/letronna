@@ -565,6 +565,7 @@ fn show_session(runner: &mut Runner, session: usize) {
     let (name, folder) = (conversation.title.clone(), conversation.workspace.clone());
     runner.bar.set_folder(folder);
     runner.bar.set_session(&name);
+    runner.show_context(session);
 }
 
 /// Finishes the worktrees the sessions `ids` work in, now that nothing this

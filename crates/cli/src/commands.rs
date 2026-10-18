@@ -412,6 +412,10 @@ pub fn command(
             usage(runner.store.conversations[*session].id);
             Flow::Handled
         }
+        "/context" => {
+            context(runner, *session);
+            Flow::Handled
+        }
         "/retention" => {
             retention(runner, rest);
             Flow::Handled
@@ -900,6 +904,69 @@ fn fallback(runner: &mut Runner, rest: &str) {
         "Asked in order once your model's own tries are spent. One that fails is passed over for {} minutes.",
         letronna_core::fallback::COOLDOWN.as_secs() / 60
     )));
+}
+
+/// A row for each part of the context: its name, its tokens, and a bar of
+/// its share of them all, a part that takes any room getting a sliver.
+fn context_rows(parts: letronna_core::chat::ContextParts) -> Vec<String> {
+    let rows = [
+        ("system", parts.system),
+        ("tools", parts.tools),
+        ("MCP", parts.mcp),
+        ("memory", parts.memory),
+        ("skills", parts.skills),
+        ("conversation", parts.conversation),
+    ];
+    let total = parts.total().max(1);
+    (rows.into_iter())
+        .map(|(name, tokens)| {
+            let filled = (tokens * CONTEXT_BAR as u64).div_ceil(total) as usize;
+            let filled = filled.min(CONTEXT_BAR);
+            format!(
+                "{}  {:>7}  {}{}",
+                render::dim(&format!("{name:<12}")),
+                letronna_core::usage::count(tokens),
+                render::blue(&"━".repeat(filled)),
+                render::dim(&"─".repeat(CONTEXT_BAR - filled)),
+            )
+        })
+        .collect()
+}
+
+/// Columns of the bar each part of the context gets, at its fullest.
+const CONTEXT_BAR: usize = 24;
+
+/// What fills the session's context, part by part, each with a bar of its
+/// share, as the window's popover behind its status-bar percentage shows
+/// it: what the next request would carry, and how much of the window that
+/// is.
+fn context(runner: &mut Runner, session: usize) {
+    let connection = runner.connection(session);
+    let conversation = &runner.store.conversations[session];
+    let (messages, floor) = (conversation.messages.clone(), conversation.floor());
+    let report = runner.bar.busy("Adding up the context", move || {
+        letronna_core::chat::context_report(&connection, &messages, floor)
+    });
+    let count = letronna_core::usage::count;
+    render::blank();
+    render::line(&render::bold(&match report.window {
+        0 => format!(
+            "{} in use; the model's window is not known",
+            count(report.used)
+        ),
+        window => format!(
+            "{} of {} in use · {}%",
+            count(report.used),
+            count(window),
+            report.used.saturating_mul(100) / window
+        ),
+    }));
+    for row in context_rows(report.parts) {
+        render::line(&row);
+    }
+    render::line(&render::dim(
+        "/compact summarizes earlier turns to make room; /compact 2 keeps the last two.",
+    ));
 }
 
 /// What the model calls took: this session's, each recent day's and each
@@ -5630,5 +5697,34 @@ mod tests {
         assert_eq!(store.conversations[0].memory_scope, None);
         store.settings.memory_saving = Saving::Ask;
         assert_eq!(store.memory_saving(0), Saving::Ask);
+    }
+
+    #[test]
+    fn context_lists_each_part_with_its_tokens() {
+        let parts = letronna_core::chat::ContextParts {
+            system: 3_200,
+            tools: 9_000,
+            mcp: 0,
+            memory: 400,
+            skills: 1_000,
+            conversation: 10_400,
+        };
+        let rows: Vec<String> = (super::context_rows(parts).iter())
+            .map(|row| crate::render::plain(row))
+            .collect();
+        assert_eq!(rows.len(), 6);
+        assert!(
+            rows[0].starts_with("system") && rows[0].contains("3.2k"),
+            "{}",
+            rows[0]
+        );
+        // Nothing gets no bar; a little gets a sliver; the most the most.
+        assert_eq!(rows[2].matches('━').count(), 0);
+        assert_eq!(rows[3].matches('━').count(), 1);
+        assert_eq!(rows[5].matches('━').count(), 11);
+        assert!(
+            rows.iter()
+                .all(|row| row.chars().count() == rows[0].chars().count())
+        );
     }
 }

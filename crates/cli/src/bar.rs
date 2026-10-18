@@ -237,6 +237,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "tokens and cost: this session, by day and by model",
     },
     Command {
+        name: "/context",
+        blurb: "what fills the context, part by part, and how full it is",
+    },
+    Command {
         name: "/insights",
         blurb: "the last weeks by day and hour, top tools and models: /insights 8",
     },
@@ -840,6 +844,9 @@ pub struct Bar {
     added: Added,
     /// The open session's project folder, where an `@` path is completed.
     folder: Option<std::path::PathBuf>,
+    /// What the open session's latest request carried, out of its window,
+    /// which the box's foot shows; `None` before there is a reply.
+    context: Option<(u64, u64)>,
     /// The open session's name, on one line, which the box's top edge
     /// carries.
     session: String,
@@ -902,6 +909,7 @@ impl Bar {
             focus: crate::notify::Focus::new(std::time::Instant::now()),
             added: Added::default(),
             folder: None,
+            context: None,
             session: String::new(),
             place: String::new(),
             places: None,
@@ -972,6 +980,15 @@ impl Bar {
         let changed = place != self.place;
         self.place = place;
         changed
+    }
+
+    /// Show on the box's foot how full the open session's context is: the
+    /// tokens its latest request carried and its window, or nothing.
+    pub fn set_context(&mut self, filled: Option<(u64, u64)>) {
+        if filled != self.context {
+            self.context = filled;
+            self.settle();
+        }
     }
 
     /// Take the window.
@@ -2301,7 +2318,7 @@ impl Bar {
         lines.push(format!(
             "{}{}",
             render::MARGIN,
-            render::dim(&format!("╰{edge}╯"))
+            bottom_edge(self.context, room + 2)
         ));
 
         if self.choice.is_none() && self.switches.is_none() {
@@ -2704,6 +2721,43 @@ fn checklist(todos: &[Todo], room: usize) -> Vec<String> {
         lines.push(format!("{}{}", render::PAD, render::dim(&more)));
     }
     lines
+}
+
+/// How full the context is, in percent, when the foot turns amber, says
+/// how to make room, and turns red.
+const CONTEXT_FULLER: u64 = 70;
+const CONTEXT_COMPACT: u64 = 85;
+const CONTEXT_FULL: u64 = 90;
+
+/// The box's bottom edge, `width` columns between its corners, ending in how
+/// full the context is: what the latest request carried, out of the window
+/// it was sized by. Quiet while there is room, amber as it fills, with the
+/// command that makes room once it is close, and red when it is all but
+/// full, so a long session is not a surprise.
+fn bottom_edge(filled: Option<(u64, u64)>, width: usize) -> String {
+    let Some((used, window)) = filled.filter(|(_, window)| *window > 0) else {
+        return render::dim(&format!("╰{}╯", "─".repeat(width)));
+    };
+    let share = used.saturating_mul(100) / window;
+    let words = match share {
+        share if share >= CONTEXT_COMPACT => format!("{share}% context · /compact"),
+        share => format!("{share}% context"),
+    };
+    // " words " and a dash after it, at the least.
+    if words.chars().count() + 3 > width {
+        return render::dim(&format!("╰{}╯", "─".repeat(width)));
+    }
+    let said = match share {
+        share if share >= CONTEXT_FULL => render::red(&words),
+        share if share >= CONTEXT_FULLER => render::amber(&words),
+        _ => render::dim(&words),
+    };
+    let rest = width - words.chars().count() - 3;
+    format!(
+        "{}{said}{}",
+        render::dim(&format!("╰{} ", "─".repeat(rest))),
+        render::dim(" ─╯")
+    )
 }
 
 /// Below this many columns the edge carries the name alone.
@@ -3953,6 +4007,25 @@ mod tests {
         bar.guard = Instant::now().checked_sub(STILL);
         bar.pick(key(KeyCode::Enter));
         assert_eq!(bar.answer, Some(0));
+    }
+
+    #[test]
+    fn the_meter_turns_amber_then_red() {
+        let edge = |used, width| plain(&super::bottom_edge(Some((used, 100)), width));
+        assert!(
+            edge(42, 40).ends_with("─ 42% context ─╯"),
+            "{}",
+            edge(42, 40)
+        );
+        assert_eq!(visible(&edge(42, 40)), 42);
+        assert!(edge(86, 40).ends_with("86% context · /compact ─╯"));
+        assert_eq!(visible(&edge(95, 40)), 42);
+        // Before a reply, or with no room for the words, a plain edge.
+        assert_eq!(
+            plain(&super::bottom_edge(None, 6)),
+            format!("╰{}╯", "─".repeat(6))
+        );
+        assert_eq!(edge(42, 8), format!("╰{}╯", "─".repeat(8)));
     }
 
     #[test]

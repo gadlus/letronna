@@ -14,6 +14,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 ## [Unreleased]
 
 ### Added
+- **Terminal** — The box's bottom edge says how full the session's context is once there is a reply, from what the latest request carried, as the window's status bar does: quiet while there is room, amber from 70%, pointing to `/compact` from 85% and red from 90%. `/context` shows what fills it, part by part: the system prompt, tools, MCP, memory, skills and the conversation.
 - **Terminal** — The box's top edge names the session and where its folder stands in git (branch, what is changed, how far from upstream), and the window's title leads with the session's name, turns while it works and says "waiting for you" while a card or question waits; the title the terminal had comes back on leaving where the terminal keeps one. Names taken from a prompt's first lines show on one line there and in `/resume`.
 - **Terminal** — `/rewind`, `/undo` or Esc twice on an empty box lists every message you sent, newest first and narrowed by typing, and going back to one asks whether to restore the code and the conversation, the conversation alone or the code alone, or to summarize up to it or branch from it there; `/undo` no longer only takes back the last exchange. Putting the code back alone tells the model which files went back, and a rewind further back still puts them back to how they were first.
 - **All** — A Claude subscription is a provider you sign in to, beside the Anthropic API key: the models your plan includes, no key to paste.

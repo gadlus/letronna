@@ -81,6 +81,16 @@ impl Runner {
         self.bar.mode().unwrap_or(self.mode)
     }
 
+    /// Show how full the session's context is on the box's foot: what its
+    /// latest reply's request carried, out of the window it was sized by,
+    /// as the window's status bar shows it.
+    pub fn show_context(&mut self, session: usize) {
+        let filled = (self.store.conversations[session].messages.iter().rev())
+            .find(|m| m.role == "assistant" && m.window > 0 && m.input_tokens() > 0)
+            .map(|reply| (reply.input_tokens(), reply.window));
+        self.bar.set_context(filled);
+    }
+
     /// Change the mode, everywhere it is shown or obeyed.
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
@@ -375,6 +385,7 @@ impl Runner {
         }
         self.tell_ended();
         self.bar.working(false);
+        self.show_context(session);
         // The session's loop goes round again from the turn that took its
         // tick, and a stop ends it.
         let id = self.store.conversations[session].id;
