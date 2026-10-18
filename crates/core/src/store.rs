@@ -3094,7 +3094,7 @@ pub(crate) fn session_in(data: &std::path::Path, id: u64) -> PathBuf {
 }
 
 /// Where the helpers of a session keep their conversations.
-fn helpers_dir(session: u64) -> PathBuf {
+pub(crate) fn helpers_dir(session: u64) -> PathBuf {
     // Outside `sessions/`, where every file is taken for a session, and in
     // the data folder, which no tool may read.
     backend::data_dir().join("agents").join(session.to_string())

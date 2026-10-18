@@ -1267,9 +1267,12 @@ fn reserve(
     at_once: Cap,
     cancel: Cancel,
 ) -> Result<Slot, String> {
+    // Read before the lock is taken: the disk is slow, and every helper's
+    // step takes the lock.
+    let earlier = (!registry().names.contains_key(&root)).then(|| earlier_names(root));
     let mut registry = registry();
     full(&registry, at_once)?;
-    let given = registry.names.entry(root).or_default();
+    let given = (registry.names.entry(root)).or_insert_with(|| earlier.unwrap_or_default());
     let mut name = wanted.to_owned();
     let mut n = 1;
     while given.contains(&name) {
@@ -1350,6 +1353,43 @@ pub(crate) fn stop_started_in(root: u64, dropped: &[Message]) {
     for name in &named {
         inbox::withdraw(root, &format!("helper {name}"));
     }
+}
+
+/// The names session `root`'s helpers had before this run of Letronna, or
+/// in the session it was copied from: in its helpers' sidecars, and in what
+/// its starts answered, so that no new helper takes a name its
+/// conversation means for an earlier one.
+fn earlier_names(root: u64) -> Vec<String> {
+    let mut names: Vec<String> = (std::fs::read_dir(crate::store::helpers_dir(root)).into_iter())
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .filter_map(|path| Sidecar::read(&path).ok())
+        .map(|sidecar| sidecar.name)
+        .collect();
+    let messages = crate::store::session(root).map(|session| session.messages);
+    for message in messages.iter().flatten() {
+        let named = (message.role == "tool" && message.name == "agent")
+            .then(|| started_name(&message.content).or_else(|| answered_name(&message.content)))
+            .flatten();
+        if let Some(name) = named.filter(|name| !names.iter().any(|given| given == name)) {
+            names.push(name.to_owned());
+        }
+    }
+    names
+}
+
+/// The name of the helper a call waited for, read back from its answer,
+/// `said`, which opens with it.
+fn answered_name(said: &str) -> Option<&str> {
+    let (name, rest) = said.split_once(' ')?;
+    let answered = ["finished: ", "stopped ", "was stopped", "failed: "];
+    (answered.iter().any(|opens| rest.starts_with(opens)) && check_name(name).is_ok())
+        .then_some(name)
 }
 
 /// The name of the helper a background start, which answered `said`, gave
@@ -2224,10 +2264,21 @@ fn answers_to(helpers: &[Helper], helper: &Helper, of: u64) -> bool {
 }
 
 /// Helper `to` of the caller's, or why there is none.
-fn mine<'a>(helpers: &'a [Helper], caller: &Caller, to: &str) -> Result<&'a Helper, String> {
-    let yours = yours(helpers, caller);
+fn mine<'a>(registry: &'a Registry, caller: &Caller, to: &str) -> Result<&'a Helper, String> {
+    let yours = yours(&registry.helpers, caller);
     if let Some(helper) = yours.iter().find(|helper| helper.name == to) {
         return Ok(helper);
+    }
+    // One the conversation names from before a restart, or from the session
+    // it was copied from: still in the names given, but not running here.
+    let before =
+        (registry.names.get(&caller.root)).is_some_and(|names| names.iter().any(|name| name == to));
+    if before && yours.iter().all(|helper| helper.name != to) {
+        return Err(format!(
+            "\"{to}\" was a helper before Letronna restarted, or in the session this one was \
+             copied from, and cannot be reached now. What it reported is in the conversation; \
+             start a new helper for more."
+        ));
     }
     if yours.is_empty() {
         return Err(format!(
@@ -2348,7 +2399,7 @@ enum Reached {
 /// in its mailbox.
 fn reach(caller: &Caller, to: &str, notice: &Notice) -> Result<Reached, String> {
     let registry = registry();
-    let helper = mine(&registry.helpers, caller, to)?;
+    let helper = mine(&registry, caller, to)?;
     if helper.stopped_by_user {
         return Err(user_stopped(&helper.name));
     }
@@ -2625,7 +2676,7 @@ fn back_to_work(
 /// has goes where its report would have gone.
 fn stop_by_name(caller: &Caller, to: &str) -> Result<String, String> {
     let mut registry = registry();
-    let helper = mine(&registry.helpers, caller, to)?;
+    let helper = mine(&registry, caller, to)?;
     let (id, name, background) = (helper.id, helper.name.clone(), helper.run.background);
     let idle =
         (registry.helpers.iter_mut()).find(|helper| helper.id == id && helper.idle.is_some());
@@ -2667,7 +2718,7 @@ fn stop_by_name(caller: &Caller, to: &str) -> Result<String, String> {
 fn report(caller: &Caller, to: &str, offset: usize) -> Result<String, String> {
     let (name, n, sidecar) = {
         let registry = registry();
-        let helper = mine(&registry.helpers, caller, to)?;
+        let helper = mine(&registry, caller, to)?;
         (helper.name.clone(), helper.n, helper.sidecar.clone())
     };
     let Some(transcript) = Transcript::open(caller.root, n) else {
@@ -4068,6 +4119,66 @@ mod tests {
         let send = json!({"action": "send", "to": "reader", "message": "more"});
         assert_eq!(sent_to(&send.to_string()).as_deref(), Some("reader"));
         assert_eq!(sent_to(&json!({"action": "list"}).to_string()), None);
+    }
+
+    #[test]
+    fn names_from_before_a_restart_or_a_copy_are_not_given_again() {
+        let _session = Session::new("earlier-names");
+        let root = 9_701;
+        // A sidecar of a helper from before Letronna restarted.
+        let folder = crate::store::helpers_dir(root);
+        std::fs::create_dir_all(&folder).unwrap();
+        let sidecar = Sidecar {
+            name: "reader".into(),
+            kind: "explore".into(),
+            model: String::new(),
+            plan: false,
+            workspace: None,
+            worktree: None,
+            parent: root,
+            depth: 1,
+            description: String::new(),
+            stopped_by_user: false,
+            fork: false,
+            from: 0,
+            allow: None,
+        };
+        sidecar.write(&folder.join("1.json")).unwrap();
+        // And starts a session copied from another answered.
+        let answered = |content: &str| Message {
+            role: "tool".into(),
+            name: "agent".into(),
+            content: content.into(),
+            ..Default::default()
+        };
+        let mut copied = Transcript {
+            path: crate::store::session_path(root),
+            conversation: Conversation {
+                id: root,
+                messages: vec![
+                    answered("Started explore (explore) in the background. A notice comes."),
+                    answered("checker finished: 1 round, 2 s, 1k tokens in (0% cached), 9 out."),
+                ],
+                ..Default::default()
+            },
+        };
+        std::fs::create_dir_all(copied.path.parent().unwrap()).unwrap();
+        copied.save().unwrap();
+
+        let names = ["reader", "explore", "checker"]
+            .map(|wanted| reserve(root, root, wanted, cap(AT_ONCE), Cancel::default()).unwrap());
+        let given: Vec<&str> = names.iter().map(|slot| slot.name.as_str()).collect();
+        assert_eq!(given, ["reader-2", "explore-2", "checker-2"]);
+
+        // An old one is said to be out of reach, not never started.
+        let caller = Caller {
+            root,
+            ..Default::default()
+        };
+        let Err(why) = mine(&registry(), &caller, "reader") else {
+            panic!("an earlier helper was found");
+        };
+        assert!(why.contains("before Letronna restarted"), "{why}");
     }
 
     #[test]
