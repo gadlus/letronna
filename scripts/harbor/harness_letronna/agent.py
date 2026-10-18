@@ -4,8 +4,9 @@
 `drive.sh` in the task container, with curl, which the verifiers need. `run`
 sets Letronna up on the Custom gateway at the endpoint of the provider the
 model names, then runs one `letronna -p` turn over stream-json, through
-`drive.sh`, which allows every call Letronna asks about. `--yes` runs the
-rest without asking; Letronna still refuses what it never runs. After the
+`drive.sh`, as a run nobody watches: `--yes` and `LETRONNA_DISPOSABLE=1`
+run every call without asking, hard-to-undo ones included, since the
+container is thrown away; Letronna still refuses what it never runs. After the
 run, the session files are copied into the agent's logs, and
 `populate_context_post_run` turns them into `trajectory.json` and the token
 totals.
@@ -183,9 +184,12 @@ class Letronna(BaseInstalledAgent):
             remote_path=str(logs / "message.json"),
         )
         flags = ["-p", "--input-format", "stream-json", "--output", "stream-json"]
-        # With stdio answers someone counts as present, so what --yes leaves
-        # to a person is asked over stdout rather than refused.
-        flags += ["--permission-prompt-tool", "stdio", "--yes"]
+        # Unwatched, as OpenHuman's rig runs it: answering approvals over
+        # stdio would make a program someone who can answer, which turns off
+        # what Letronna does for a run nobody watches and offers ask_user to
+        # a model nobody will answer. LETRONNA_DISPOSABLE lets --yes run what
+        # is hard to take back, as the container is thrown away.
+        flags += ["--yes"]
         flags += ["--max-rounds", str(self._rounds), "--model", model]
         if self._tools:
             flags += ["--tools", self._tools]
@@ -197,10 +201,9 @@ class Letronna(BaseInstalledAgent):
             str(REMOTE / "letronna"),
         ]
         command = shlex.join(drive + flags) + f" 2>{shlex.quote(str(logs / 'letronna.stderr'))}"
+        env = {"AGENT_DATA_DIR": str(DATA), "LETRONNA_DISPOSABLE": "1"}
         try:
-            await self.exec_as_agent(
-                environment, command=command, env={"AGENT_DATA_DIR": str(DATA)}
-            )
+            await self.exec_as_agent(environment, command=command, env=env)
         finally:
             await self._keep_sessions(environment, logs)
 

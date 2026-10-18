@@ -53,14 +53,20 @@ run one turn of
 
 ```sh
 letronna -p --input-format stream-json --output stream-json \
-  --permission-prompt-tool stdio --yes --max-rounds 250 --model <model>
+  --yes --max-rounds 250 --model <model>
 ```
 
-With `-p` and nobody to ask, Letronna refuses commands that are hard to take
-back, such as `rm -r`, `git reset --hard`, `sudo` or `curl ... | sh`, even
-with `--yes`. In a container thrown away after the trial that would fail
-tasks that need them, so `drive.sh` answers each request for approval with
-allow. What Letronna never runs, it refuses before anyone is asked.
+It runs as a run nobody watches, as on OpenHuman's rig, so it is given what
+Letronna gives such a run: deciding for itself, keeping to the task and its
+folder, the checks before it ends, and no `ask_user`. Approvals are not
+answered over stdio, since a program that answers them counts as someone
+who can be asked, which turns all of that off. With nobody to ask, `-p`
+refuses commands that are hard to take back, such as `rm -r`,
+`git reset --hard`, `sudo` or `curl ... | sh`, even with `--yes`; in a
+container thrown away after the trial that would fail tasks that need them,
+so `LETRONNA_DISPOSABLE=1` says the machine is thrown away and they run.
+What Letronna never runs, it still refuses. `drive.sh` still allows any
+request for approval that does come.
 
 The trial's `agent/` folder then holds:
 

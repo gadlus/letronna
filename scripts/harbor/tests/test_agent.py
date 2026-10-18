@@ -162,7 +162,10 @@ class AgentTests(unittest.TestCase):
             {"type": "user", "message": {"role": "user", "content": "Fix the build."}},
         )
         [(command, env)] = environment.ran("drive.sh")
-        self.assertEqual(env, {"AGENT_DATA_DIR": "/installed-agent/letronna/data"})
+        self.assertEqual(
+            env,
+            {"AGENT_DATA_DIR": "/installed-agent/letronna/data", "LETRONNA_DISPOSABLE": "1"},
+        )
         words = shlex.split(command.removeprefix("set -o pipefail; "))
         self.assertEqual(
             words,
@@ -177,8 +180,6 @@ class AgentTests(unittest.TestCase):
                 "stream-json",
                 "--output",
                 "stream-json",
-                "--permission-prompt-tool",
-                "stdio",
                 "--yes",
                 "--max-rounds",
                 "250",
