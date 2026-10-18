@@ -699,6 +699,10 @@ impl Conversation {
         if len >= self.messages.len() {
             return;
         }
+        // Helpers the turns taken back set going would report into a
+        // conversation that no longer asks for it, and keep changing files
+        // a rewind may just have put back.
+        crate::agents::stop_started_in(self.id, &self.messages[len..]);
         self.messages.truncate(len);
         // Replies from here on take the places of those taken back.
         crate::filestate::forget(self.id);

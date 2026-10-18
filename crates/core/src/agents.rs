@@ -1323,6 +1323,50 @@ fn occupy(
     Slot { id, name, together }
 }
 
+/// Stops the helpers of session `root` that the messages a rewind takes
+/// back, `dropped`, started in the background or sent more work, and takes
+/// back any report of theirs still waiting: either would come into a
+/// conversation that no longer asks for it.
+pub(crate) fn stop_started_in(root: u64, dropped: &[Message]) {
+    let named: Vec<String> = (dropped.iter())
+        .filter(|message| message.role == "tool")
+        .filter_map(|message| match message.name.as_str() {
+            "agent" => started_name(&message.content).map(str::to_owned),
+            "agents" => sent_to(&message.args),
+            _ => None,
+        })
+        .collect();
+    if named.is_empty() {
+        return;
+    }
+    let ids: Vec<AgentId> = (registry().helpers.iter())
+        .filter(|helper| helper.root == root && named.contains(&helper.name))
+        .filter(|helper| helper.ended.is_none() || helper.idle.is_some())
+        .map(|helper| helper.id)
+        .collect();
+    for id in ids {
+        stop(id);
+    }
+    for name in &named {
+        inbox::withdraw(root, &format!("helper {name}"));
+    }
+}
+
+/// The name of the helper a background start, which answered `said`, gave
+/// out.
+fn started_name(said: &str) -> Option<&str> {
+    let (name, _) = said.strip_prefix("Started ")?.split_once(" (")?;
+    check_name(name).is_ok().then_some(name)
+}
+
+/// The helper a call to the agents tool, with arguments `args`, sent work.
+fn sent_to(args: &str) -> Option<String> {
+    let args: Value = serde_json::from_str(args).ok()?;
+    (args["action"] == "send")
+        .then(|| text(&args, "to").map(str::to_owned))
+        .flatten()
+}
+
 /// Forgets session `root`, which was deleted, and whose id the next new
 /// session may be given: its helpers' runs are stopped, its idle kept ones
 /// end, and none of them is kept to be listed, named, picked back up or
@@ -3964,6 +4008,66 @@ mod tests {
             )),
             "{out}"
         );
+    }
+
+    #[test]
+    fn a_rewind_past_a_helper_s_start_stops_it_and_its_report_never_comes() {
+        let session = Session::new("rewound");
+        inbox::listen();
+        let (asking, asked) = mpsc::channel();
+        let (going, go) = mpsc::channel::<()>();
+        let (endpoint, provider) =
+            Stub::held(vec![reply("The notes say hello.", None)], move |_| {
+                let _ = asking.send(());
+                let _ = go.recv_timeout(WAIT);
+            });
+        let args = json!({"description": "Read the notes", "type": "explore", "name": "rewound",
+            "prompt": "Read notes.txt."});
+        let started = call(session.context(endpoint), args.clone()).unwrap();
+        let name = started_name(&started).unwrap().to_owned();
+        asked.recv_timeout(WAIT).expect("the helper never asked");
+        let said = |role: &str, name: &str, content: &str| Message {
+            role: role.into(),
+            name: name.into(),
+            content: content.into(),
+            args: args.to_string(),
+            ..Default::default()
+        };
+        let mut conversation = crate::store::Conversation {
+            id: 4_242,
+            messages: vec![
+                said("user", "", "read the notes"),
+                said("assistant", "", ""),
+                said("tool", "agent", &started),
+            ],
+            ..Default::default()
+        };
+
+        conversation.rewind(0);
+        going.send(()).unwrap();
+        provider.sent();
+        let begun = Instant::now();
+        while !registry().running.is_empty() {
+            assert!(begun.elapsed() < WAIT, "the helper never stopped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(inbox::take(4_242, true).is_empty());
+        let rewound = (seen().into_iter())
+            .find(|helper| helper.session == 4_242 && helper.name == name)
+            .unwrap();
+        assert_eq!(rewound.ended.as_deref(), Some("stopped by the user"));
+    }
+
+    #[test]
+    fn a_start_s_answer_and_a_send_name_their_helper() {
+        let started = "Started explore-2 (explore) in the background. A notice comes when it \
+                       finishes; do not poll or wait for it. Carry on, or end your turn.";
+        assert_eq!(started_name(started), Some("explore-2"));
+        assert_eq!(started_name("reader finished: 2 rounds"), None);
+        assert_eq!(started_name("Started a b (explore)"), None);
+        let send = json!({"action": "send", "to": "reader", "message": "more"});
+        assert_eq!(sent_to(&send.to_string()).as_deref(), Some("reader"));
+        assert_eq!(sent_to(&json!({"action": "list"}).to_string()), None);
     }
 
     #[test]
