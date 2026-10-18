@@ -104,6 +104,9 @@ const KEEP: Duration = Duration::from_secs(30 * 60);
 const KEPT: usize = 8;
 /// The longest name a helper can be given, before a number is put after it.
 const NAME_CHARS: usize = 64;
+/// Characters of a helper's description kept: the three to five words asked
+/// for, with room to spare, and never a paragraph in a one-line row.
+const DESCRIPTION_CHARS: usize = 80;
 /// Names that mean someone other than a helper to an agent talking to one,
 /// or, to the task list, the caller itself and where its notices come from.
 const RESERVED: [&str; 5] = ["main", "user", "system", "me", "tasks"];
@@ -518,7 +521,12 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
     } else {
         text(args, "type").unwrap_or("general")
     };
-    let wanted = text(args, "name").unwrap_or(if forking { "fork" } else { kind });
+    let wanted = match text(args, "name") {
+        Some(name) => name.to_owned(),
+        None if forking => "fork".to_owned(),
+        None => named_after(kind),
+    };
+    let wanted = wanted.as_str();
     check_name(wanted)?;
     let def = agent_defs::find(kind, parent.workspace.as_deref())?;
     // The type's, when the call does not say.
@@ -607,7 +615,7 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
         worktree: worktree.clone(),
         parent: owner,
         depth: caller.depth + 1,
-        description: text(args, "description").unwrap_or_default().to_owned(),
+        description: described(args),
         stopped_by_user: false,
         fork: forking,
         from,
@@ -647,7 +655,7 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
         root: caller.root,
         name: slot.name.clone(),
         kind: label.to_owned(),
-        description: text(args, "description").unwrap_or_default().to_owned(),
+        description: described(args),
         n,
         sidecar,
         run,
@@ -1198,6 +1206,36 @@ fn check(caller: &Caller, cancel: &Cancel, limits: &Limits) -> Result<(), String
 
 /// Refuses a name that is reserved, or that is not a letter or digit followed
 /// by letters, digits, `-` and `_`.
+/// What the call `args` said a helper is for, on one line and cut to
+/// `DESCRIPTION_CHARS`, as every list shows it.
+fn described(args: &Value) -> String {
+    let line = tools::one_line(text(args, "description").unwrap_or_default());
+    match line.char_indices().nth(DESCRIPTION_CHARS) {
+        Some((at, _)) => format!("{}…", &line[..at]),
+        None => line,
+    }
+}
+
+/// A helper's name made from its type `kind`, for a call that gave none: a
+/// type can be called anything, as "Code reviewer" or "main", which names a
+/// helper either not at all or as someone else.
+fn named_after(kind: &str) -> String {
+    let mut name = String::new();
+    for c in kind.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            name.push(c);
+        } else if !name.is_empty() && !name.ends_with('-') {
+            name.push('-');
+        }
+    }
+    let name = name.trim_end_matches('-');
+    let name = name[..name.len().min(NAME_CHARS)].trim_end_matches('-');
+    match check_name(name) {
+        Ok(()) => name.to_owned(),
+        Err(_) => "helper".to_owned(),
+    }
+}
+
 fn check_name(name: &str) -> Result<(), String> {
     if RESERVED
         .iter()
@@ -3137,6 +3175,27 @@ mod tests {
             ("explore-3", "explore")
         );
         assert!(first_id >= FIRST_ID && second.id != third.id);
+    }
+
+    #[test]
+    fn a_helper_with_no_name_is_named_after_its_type_as_a_name_can_be() {
+        assert_eq!(named_after("explore"), "explore");
+        assert_eq!(named_after("Code reviewer"), "Code-reviewer");
+        assert_eq!(named_after("  docs / API  "), "docs-API");
+        // Nothing usable, or a name that means someone else.
+        assert_eq!(named_after("Отзыв"), "helper");
+        assert_eq!(named_after("main"), "helper");
+        assert_eq!(named_after(&"x".repeat(100)).len(), NAME_CHARS);
+    }
+
+    #[test]
+    fn a_description_is_kept_on_one_line_and_cut() {
+        let said = |description: &str| described(&json!({"description": description}));
+        assert_eq!(said("Read the\nnotes  please"), "Read the notes please");
+        let long = said(&"word ".repeat(40));
+        assert_eq!(long.chars().count(), DESCRIPTION_CHARS + 1);
+        assert!(long.ends_with('…'));
+        assert_eq!(described(&json!({})), "");
     }
 
     #[test]
