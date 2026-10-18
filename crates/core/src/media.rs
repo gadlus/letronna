@@ -46,10 +46,9 @@ pub const UPLOAD_BYTES: u64 = 25 * 1024 * 1024;
 /// The largest picture a model is sent: Anthropic refuses one over 5 MB of
 /// base64, which is four thirds of the file.
 pub const PICTURE_BYTES: usize = 5 * 1024 * 1024 / 4 * 3;
-/// The long side a picture is scaled down to when it is attached, or read
-/// and too big to send as it is: the most Anthropic looks at before it
-/// scales one down itself, and more than OpenAI keeps of it (768 on the
-/// short side).
+/// The long side a picture longer than it is scaled down to when it is
+/// attached or read: the most Anthropic looks at before it scales one down
+/// itself, and more than OpenAI keeps of it (768 on the short side).
 const LONG_SIDE: u32 = 1_568;
 
 pub struct MakeImage;

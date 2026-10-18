@@ -2048,6 +2048,11 @@ fn body_hashed(
     if crate::usage::asks_cost(&connection.endpoint) {
         body["usage"] = json!({"include": true});
     }
+    // Last, so the size is the whole request's. Pictures are what a
+    // shorter window cannot shrink.
+    if let Some(limit) = body_limit(connection) {
+        shed_pictures(&mut body, limit);
+    }
     if let Some(prefix) = prefix {
         let tools = body.get("tools").map(Value::to_string);
         prefix.set(crate::cache_miss::Reason::Tools, tools);
@@ -2279,6 +2284,77 @@ fn shows_picture(sent: &Value) -> bool {
                 .is_some_and(|parts| parts.iter().any(|part| part["type"] == "image_url"))
         })
     })
+}
+
+/// What a picture left out of a request to keep it under its gateway's
+/// limit goes as instead. Only on the wire: the session keeps the picture.
+const PICTURE_LEFT_OUT: &str = "(From Letronna: a picture was left out here to keep the request under the gateway's size limit. Reading its file again shows it.)";
+/// What the newest goes as, which reading again would only leave out again.
+const NEWEST_PICTURE_LEFT_OUT: &str = "(From Letronna: a picture was left out here, as the request is over the gateway's size limit even with no other picture in it. A smaller copy of its file may fit.)";
+
+/// The most bytes a request to each gateway, by endpoint as `route` gives
+/// it, may come to, learned from one it turned down as too big. Like
+/// `learned` it lasts for this run, and helpers and forks share it.
+fn body_limits() -> &'static Mutex<HashMap<String, usize>> {
+    static BODY_LIMITS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    BODY_LIMITS.get_or_init(Default::default)
+}
+
+/// The most bytes a request to `connection`'s gateway may come to, once a
+/// refusal has said.
+fn body_limit(connection: &Connection) -> Option<usize> {
+    let (endpoint, _) = route(connection);
+    body_limits().lock().ok()?.get(&endpoint).copied()
+}
+
+/// Learn from a request of `refused` bytes turned down as too big what its
+/// gateway takes: a sixteenth under the limit it `named`, since the request
+/// is measured here before it is put on the wire, or three quarters of what
+/// it turned down when it named none, or named one this request was under
+/// already. Whether the limit is now under `refused`, so the next request
+/// leaves out at least one more picture and sending it is worth a try.
+fn learn_body_limit(connection: &Connection, named: Option<u64>, refused: usize) -> bool {
+    let limit = named
+        .and_then(|named| usize::try_from(named / 16 * 15).ok())
+        .filter(|limit| *limit < refused)
+        .unwrap_or(refused / 4 * 3);
+    let (endpoint, _) = route(connection);
+    let Ok(mut limits) = body_limits().lock() else {
+        return false;
+    };
+    let kept = limits.entry(endpoint).or_insert(limit);
+    *kept = (*kept).min(limit);
+    *kept < refused
+}
+
+/// Leave pictures out of `body`, the oldest first, each with a note in its
+/// place, until it comes to at most `limit` bytes or none is left.
+fn shed_pictures(body: &mut Value, limit: usize) {
+    let mut size = serde_json::to_vec(&*body).map_or(0, |bytes| bytes.len());
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let pictures: Vec<&mut Value> = messages
+        .iter_mut()
+        .filter_map(|m| m.get_mut("content").and_then(Value::as_array_mut))
+        .flatten()
+        .filter(|part| part["type"] == "image_url")
+        .collect();
+    let newest = pictures.len().saturating_sub(1);
+    for (at, part) in pictures.into_iter().enumerate() {
+        if size <= limit {
+            break;
+        }
+        let note = if at == newest {
+            NEWEST_PICTURE_LEFT_OUT
+        } else {
+            PICTURE_LEFT_OUT
+        };
+        let note = json!({"type": "text", "text": note});
+        // A part is written out alone as it is within the whole.
+        size = size.saturating_sub(part.to_string().len()) + note.to_string().len();
+        *part = note;
+    }
 }
 
 /// A field some servers turn a whole request down for, which the request
@@ -4431,6 +4507,27 @@ fn stream(
                 if markers_refused(connection, &sent, status.as_u16(), &error) {
                     return stream(connection, messages, start, budget, extra, lsp, sender);
                 }
+                let body = serde_json::from_str::<Value>(&error).unwrap_or_default();
+                // A request too big for its gateway goes again with its
+                // oldest pictures left out, as each one to that gateway is
+                // from then on. Ahead of `learn`, so a refusal that says
+                // image is not taken for a model that cannot see; one with
+                // no picture left is an overflow like any other.
+                if let Some(named) = crate::failure::oversize(status.as_u16(), &body)
+                    && shows_picture(&sent)
+                    && !sender.is_closed()
+                    && let Ok(refused) = serde_json::to_vec(&sent).map(|bytes| bytes.len())
+                    && learn_body_limit(connection, named, refused)
+                {
+                    crate::diag::event(
+                        "pictures_left_out",
+                        &[
+                            ("refused_bytes", refused.into()),
+                            ("limit_bytes", body_limit(connection).into()),
+                        ],
+                    );
+                    return stream(connection, messages, start, budget, extra, lsp, sender);
+                }
                 if status.is_client_error()
                     && !matches!(status.as_u16(), 408 | 429)
                     && (learn(connection, &sent, &error)
@@ -4441,7 +4538,6 @@ fn stream(
                 {
                     return stream(connection, messages, start, budget, extra, lsp, sender);
                 }
-                let body = serde_json::from_str::<Value>(&error).unwrap_or_default();
                 let mut failure = classify(Some(status.as_u16()), &headers, &body);
                 // A shared Codex sign-in is renewed by Codex, never here.
                 if status == reqwest::StatusCode::UNAUTHORIZED
@@ -12887,6 +12983,152 @@ mod tests {
         let bodies = worker.join().unwrap();
         // Nothing named a limit, so only the results were cleared.
         assert_eq!(cleared_and_asked(&bodies[1]), (7, 8_192));
+    }
+
+    /// A turn that reads four pictures of `bytes` bytes each, one a round,
+    /// saved in `dir`, and each as a request carries it.
+    fn four_pictures_read(dir: &std::path::Path, bytes: usize) -> (Vec<Message>, Vec<String>) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut messages = vec![Message {
+            role: "user".into(),
+            content: "compare the frames".into(),
+            ..Default::default()
+        }];
+        let mut urls = Vec::new();
+        for (i, fill) in (b'a'..b'e').enumerate() {
+            let path = dir.join(format!("frame{i}.jpg"));
+            let mut picture = vec![0xFF, 0xD8, 0xFF];
+            picture.resize(bytes, fill);
+            std::fs::write(&path, picture).unwrap();
+            urls.push(crate::media::data_url(&path).unwrap());
+            messages.extend(round(
+                &format!("p{i}"),
+                "read_file",
+                format!(r#"{{"path":"frame{i}.jpg"}}"#),
+                format!(
+                    "{}{}\nA copy of the picture.",
+                    crate::media::SAVED,
+                    path.display()
+                ),
+            ));
+        }
+        (messages, urls)
+    }
+
+    /// Which of `pictures` the request `sent` shows.
+    fn shows(pictures: &[String], sent: &str) -> [bool; 4] {
+        std::array::from_fn(|i| sent.contains(&pictures[i]))
+    }
+
+    const HELLO: &str =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n";
+
+    #[test]
+    fn a_request_too_big_for_its_gateway_goes_again_without_its_oldest_pictures() {
+        let refusal = r#"{"error":{"message":"Request body exceeds the 1 MB limit.","type":"invalid_request_error","code":"request_too_large"}}"#;
+        let (endpoint, worker) = serve(vec![
+            ("413 Payload Too Large", "application/json", refusal),
+            ("200 OK", "text/event-stream", HELLO),
+            ("200 OK", "text/event-stream", HELLO),
+        ]);
+        let dir = std::env::temp_dir().join(format!("letronna-oversize-{}", std::process::id()));
+        // 400 KB each as base64, 1.6 MB in all.
+        let (messages, pictures) = four_pictures_read(&dir, 300_000);
+        let c = Connection {
+            endpoint,
+            ..connection()
+        };
+        assert_eq!(outcome(start(c.clone(), messages.clone())), Ok(()));
+        // The gateway's limit holds for the requests after, which fit it
+        // the first time.
+        assert_eq!(outcome(start(c.clone(), messages)), Ok(()));
+        let bodies = worker.join().unwrap();
+        // Forgotten, for a later test served from the same port.
+        body_limits().lock().unwrap().remove(&route(&c).0);
+        assert_eq!(shows(&pictures, &bodies[0]), [true; 4]);
+        for sent in &bodies[1..] {
+            assert!(sent.len() <= 1_000_000 / 16 * 15, "{}", sent.len());
+            assert_eq!(shows(&pictures, sent), [false, false, true, true]);
+            assert_eq!(sent.matches(PICTURE_LEFT_OUT).count(), 2);
+            assert!(!sent.contains(NEWEST_PICTURE_LEFT_OUT));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_request_too_big_by_a_limit_not_named_sheds_a_quarter_and_then_is_refitted_once() {
+        // A proxy's page, and a gateway's words that name images, which say
+        // nothing of whether the model can view one.
+        let page = "<html><body><h1>413 Request Entity Too Large</h1><hr>nginx</body></html>";
+        let worded = r#"{"error":{"message":"Request too large: its text and images come to more than this endpoint takes.","type":"request_too_large"}}"#;
+        let (endpoint, worker) = serve(vec![
+            ("413 Payload Too Large", "text/html", page),
+            ("413 Payload Too Large", "application/json", worded),
+            ("413 Payload Too Large", "text/html", page),
+            ("413 Payload Too Large", "text/html", page),
+            ("413 Payload Too Large", "text/html", page),
+        ]);
+        let dir =
+            std::env::temp_dir().join(format!("letronna-oversize-unnamed-{}", std::process::id()));
+        let (messages, pictures) = four_pictures_read(&dir, 300_000);
+        let c = Connection {
+            endpoint,
+            model: "sees-past-a-size-limit".into(),
+            ..connection()
+        };
+        let (finished, _) = finish(&c, messages);
+        let bodies = worker.join().unwrap();
+        body_limits().lock().unwrap().remove(&route(&c).0);
+        let shown: Vec<[bool; 4]> = bodies.iter().map(|sent| shows(&pictures, sent)).collect();
+        // Each resend at most three quarters of the one turned down, until
+        // none is left to leave out.
+        assert_eq!(
+            shown,
+            [
+                [true; 4],
+                [false, false, true, true],
+                [false, false, false, true],
+                [false; 4],
+                [false; 4]
+            ]
+        );
+        for pair in bodies[..4].windows(2) {
+            assert!(pair[1].len() <= pair[0].len() / 4 * 3);
+        }
+        // The newest is not said to show when read again, as it would be
+        // left out again.
+        assert_eq!(bodies[3].matches(PICTURE_LEFT_OUT).count(), 3);
+        assert_eq!(bodies[3].matches(NEWEST_PICTURE_LEFT_OUT).count(), 1);
+        // Then, as an overflow, sent again once squeezed, and no more.
+        assert_eq!(finished.unwrap_err().kind, FailureKind::ContextTooLong);
+        assert!(sees_images("sees-past-a-size-limit"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_rate_limit_sent_as_a_request_too_big_leaves_every_picture_in() {
+        // Groq's, for one request over its tokens a minute.
+        let refusal = r#"{"error":{"message":"Request too large for model `llama-4-scout` on tokens per minute (TPM): Limit 8000, Requested 33000, please reduce your message size and try again.","type":"tokens","code":"rate_limit_exceeded"}}"#;
+        let (endpoint, worker) = serve(vec![
+            ("413 Payload Too Large", "application/json", refusal),
+            ("413 Payload Too Large", "application/json", refusal),
+        ]);
+        let dir =
+            std::env::temp_dir().join(format!("letronna-oversize-rate-{}", std::process::id()));
+        let (messages, pictures) = four_pictures_read(&dir, 300_000);
+        let c = Connection {
+            endpoint,
+            ..connection()
+        };
+        let (finished, _) = finish(&c, messages);
+        let bodies = worker.join().unwrap();
+        // Refitted once as an overflow, as before, with no limit learned
+        // that would leave pictures out of the requests after.
+        assert_eq!(finished.unwrap_err().kind, FailureKind::ContextTooLong);
+        assert_eq!(shows(&pictures, &bodies[0]), [true; 4]);
+        assert!(!bodies[1].contains("(From Letronna: a picture was left out"));
+        assert_eq!(body_limit(&c), None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A reply that only thinks until its limit, as a reasoning model at a

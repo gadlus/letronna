@@ -430,6 +430,75 @@ fn limits(text: &str, error: Option<&Value>) -> Overflow {
     }
 }
 
+/// Whether a refusal with `status` and `body` says the request was more
+/// bytes than the server takes, which a shorter window may not mend when
+/// pictures are most of it; with the most it takes, when it names that.
+/// Some(None) is too big by a limit not named.
+pub fn oversize(status: u16, body: &Value) -> Option<Option<u64>> {
+    let error = body.get("error");
+    let text = error.unwrap_or(body).to_string().to_lowercase();
+    // A request over a limit on tokens a minute, which Groq turns down with
+    // a 413 too, says nothing of how many bytes the gateway takes. OpenRouter
+    // passes Groq's on under a numeric code, with Groq's own only in the copy
+    // it keeps in `metadata.raw`.
+    if by_code(error) == Some(FailureKind::RateLimit) || text.contains("rate_limit_exceeded") {
+        return None;
+    }
+    let named = ["code", "type"]
+        .iter()
+        .any(|field| error.and_then(|e| e.get(field)?.as_str()) == Some("request_too_large"));
+    // What a 413 is called, for a gateway that passes one on under another
+    // status. Not "request too large": OpenAI says that of a rate limit.
+    let said = ["payload too large", "entity too large"]
+        .iter()
+        .any(|phrase| text.contains(phrase));
+    (status == 413 || named || said).then(|| size_named(&text))
+}
+
+/// The first size in bytes the lowercase `text` names, such as the 8 MB of
+/// "exceeds the 8 MB limit". A kB or MB is read as thousands, as it says,
+/// so where a server meant 1024 the limit is read low, never high.
+fn size_named(text: &str) -> Option<u64> {
+    let mut rest = text;
+    while let Some(at) = rest.find(|c: char| c.is_ascii_digit()) {
+        rest = &rest[at..];
+        // Digits grouped by commas too, as in 10,485,760 bytes.
+        let end = rest
+            .char_indices()
+            .find(|&(i, c)| {
+                !(c.is_ascii_digit()
+                    || (matches!(c, '.' | ',')
+                        && rest[i + 1..].starts_with(|c: char| c.is_ascii_digit())))
+            })
+            .map_or(rest.len(), |(i, _)| i);
+        let (number, after) = rest.split_at(end);
+        rest = after;
+        let unit = after.trim_start();
+        let unit = &unit[..unit
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(unit.len())];
+        // Not a bare "b", which is also a model's size, as in llama-3-70b.
+        let scale: u64 = match unit {
+            "byte" | "bytes" => 1,
+            "kb" => 1_000,
+            "kib" => 1 << 10,
+            "mb" => 1_000_000,
+            "mib" => 1 << 20,
+            "gb" => 1_000_000_000,
+            "gib" => 1 << 30,
+            _ => continue,
+        };
+        let Ok(number) = number.replace(',', "").parse::<f64>() else {
+            continue;
+        };
+        let bytes = (number * scale as f64) as u64;
+        if bytes > 0 {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
 /// The numbers in the clause of `text` that `phrase` begins, in order.
 fn numbers(text: &str, phrase: &str) -> Vec<u64> {
     let Some(at) = text.find(phrase) else {
@@ -1084,5 +1153,60 @@ mod tests {
         let failure = classify(Some(400), &HeaderMap::new(), &body);
         assert_eq!(failure.kind, FailureKind::BadRequest);
         assert_eq!(failure.overflow, None);
+    }
+
+    #[test]
+    fn a_body_too_big_is_told_from_too_many_tokens_with_the_limit_it_names() {
+        let oversize = |status, body: &str| {
+            let body = serde_json::from_str(body).unwrap_or_default();
+            super::oversize(status, &body)
+        };
+        // A gateway's, which is still an overflow, in its own words.
+        let gateway = r#"{"error":{"message":"Request body exceeds the 8 MB limit.","type":"invalid_request_error","code":"request_too_large"}}"#;
+        assert_eq!(oversize(413, gateway), Some(Some(8_000_000)));
+        let failure = classify(
+            Some(413),
+            &HeaderMap::new(),
+            &serde_json::from_str(gateway).unwrap(),
+        );
+        assert_eq!(failure.kind, FailureKind::ContextTooLong);
+        assert_eq!(failure.to_string(), "Request body exceeds the 8 MB limit.");
+        // Anthropic's names no limit, nor does a proxy's page.
+        let anthropic = r#"{"type":"error","error":{"type":"request_too_large","message":"Request exceeds the maximum allowed number of bytes."}}"#;
+        assert_eq!(oversize(413, anthropic), Some(None));
+        assert_eq!(
+            oversize(413, "<html>413 Request Entity Too Large</html>"),
+            Some(None)
+        );
+        // One passed on as a bad gateway, in the words of a 413.
+        let passed_on =
+            r#"{"error":{"message":"upstream: 413 Payload Too Large (max 10,485,760 bytes)"}}"#;
+        assert_eq!(oversize(502, passed_on), Some(Some(10_485_760)));
+        // Too many tokens, and a rate limit OpenAI words as a request too large.
+        let tokens = r#"{"error":{"message":"This model's maximum context length is 16000 tokens.","type":"invalid_request_error","code":"context_length_exceeded"}}"#;
+        assert_eq!(oversize(400, tokens), None);
+        let rate = r#"{"error":{"message":"Request too large for gpt-4o on tokens per min (TPM): Limit 30000, Requested 50000.","type":"tokens","code":"rate_limit_exceeded"}}"#;
+        assert_eq!(oversize(429, rate), None);
+        // Groq's for the same, which comes as a 413 and is still refitted.
+        let groq = r#"{"error":{"message":"Request too large for model `llama-4-scout` on tokens per minute (TPM): Limit 8000, Requested 33000, please reduce your message size and try again.","type":"tokens","code":"rate_limit_exceeded"}}"#;
+        assert_eq!(oversize(413, groq), None);
+        let relayed = r#"{"error":{"message":"Provider returned error","code":413,"metadata":{"raw":"{\"error\":{\"message\":\"Request too large for model `llama-4-scout` on tokens per minute (TPM): Limit 8000, Requested 33000.\",\"type\":\"tokens\",\"code\":\"rate_limit_exceeded\"}}","provider_name":"Groq"}}}"#;
+        assert_eq!(oversize(413, relayed), None);
+        let failure = classify(
+            Some(413),
+            &HeaderMap::new(),
+            &serde_json::from_str(groq).unwrap(),
+        );
+        assert_eq!(failure.kind, FailureKind::ContextTooLong);
+    }
+
+    #[test]
+    fn a_size_is_read_in_the_unit_it_is_given_in() {
+        assert_eq!(size_named("at most 10485760 bytes"), Some(10_485_760));
+        assert_eq!(size_named("larger than 8 mib"), Some(8 << 20));
+        assert_eq!(size_named("413: over the 7.5mb limit"), Some(7_500_000));
+        assert_eq!(size_named("max 512 kb, see rfc 9110"), Some(512_000));
+        assert_eq!(size_named("\"code\":413,\"status\":\"too big\""), None);
+        assert_eq!(size_named("too large for llama-3.1-70b"), None);
     }
 }

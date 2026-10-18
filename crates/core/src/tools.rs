@@ -4265,7 +4265,7 @@ impl Tool for ReadFile {
 
 /// A picture read_file was pointed at, copied as it is now into Letronna's
 /// own `media/`, from where the next request shows it to the model, scaled
-/// down as `media::fit` does when it cannot be sent as it is, or only
+/// down as `media::fit` does when it is too big or too long a side, or only
 /// described when the model `sees` none; None for a file that is not a
 /// picture.
 fn open_picture(path: &Path, raw: &str, sees: bool) -> Result<Option<String>, String> {
@@ -4292,18 +4292,21 @@ fn open_picture(path: &Path, raw: &str, sees: bool) -> Result<Option<String>, St
         return Ok(Some(format!("`{raw}` is {}", crate::media::unseen(&bytes))));
     }
     let size = crate::media::size(bytes.len());
-    let (bytes, kind, scaled) = match kind {
-        Some(kind) if bytes.len() <= crate::media::PICTURE_BYTES => (bytes, kind, String::new()),
-        _ => {
-            let Some((fitted, fitted_kind)) = crate::media::fit(&bytes) else {
-                if kind.is_none() {
-                    return Ok(None);
-                }
-                return Err(format!(
-                    "`{raw}` is a picture of {size}, more than the {} a model is sent, and it could not be read to scale it down. A smaller copy of it can be read.",
-                    crate::media::size(crate::media::PICTURE_BYTES)
-                ));
-            };
+    // Through `fit` whatever its size: one small enough to send can still be
+    // wider than a model looks at.
+    let (bytes, kind, scaled) = match (crate::media::fit(&bytes), kind) {
+        // Pixels that cannot be read leave nothing to scale it by.
+        (None, Some(kind)) if bytes.len() <= crate::media::PICTURE_BYTES => {
+            (bytes, kind, String::new())
+        }
+        (None, None) => return Ok(None),
+        (None, Some(_)) => {
+            return Err(format!(
+                "`{raw}` is a picture of {size}, more than the {} a model is sent, and it could not be read to scale it down. A smaller copy of it can be read.",
+                crate::media::size(crate::media::PICTURE_BYTES)
+            ));
+        }
+        (Some((fitted, fitted_kind)), _) => {
             // Both sizes, so a place found on the copy can be found on the
             // picture itself.
             let scaled = match (
@@ -5512,6 +5515,28 @@ mod tests {
         let sent = std::fs::read(&copy).unwrap();
         assert_eq!(crate::media::dimensions(&sent), Some((1_568, 224)));
         assert!(sent.len() <= crate::media::PICTURE_BYTES);
+        // One small enough to send is scaled all the same when it is wider
+        // than a model looks at.
+        let mut sheet = Vec::new();
+        image::DynamicImage::new_rgb8(2_418, 816)
+            .write_to(
+                &mut std::io::Cursor::new(&mut sheet),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        assert!(sheet.len() <= crate::media::PICTURE_BYTES);
+        let size = crate::media::size(sheet.len());
+        std::fs::write(dir.join("sheet.png"), sheet).unwrap();
+        let read = run("read_file", r#"{"path":"sheet.png"}"#, &ctx).unwrap();
+        assert!(
+            read.contains(&format!(
+                "`sheet.png`, {size}, scaled from 2418x816 to 1568x529 to be sent."
+            )),
+            "{read}"
+        );
+        let copy = crate::media::saved_by("read_file", &read).unwrap();
+        let sent = std::fs::read(&copy).unwrap();
+        assert_eq!(crate::media::dimensions(&sent), Some((1_568, 529)));
         // A BMP goes as a PNG of the same size, and text that starts as a
         // BMP does is still text.
         let read = run("read_file", r#"{"path":"scan.bmp"}"#, &ctx).unwrap();
