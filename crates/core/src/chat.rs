@@ -1488,6 +1488,14 @@ fn system_prompt(
             None => offset.to_string(),
         };
         system.push_str(&format!(" This computer runs {os}, set to {zone}."));
+        // Only where commands get fewer CPUs than the machine has, so every
+        // other machine's prompt stays as it was, and only where there are
+        // commands to size.
+        if connection.tools
+            && let Some(cpus) = crate::machine::cpus()
+        {
+            system.push_str(&crate::machine::line(cpus));
+        }
     }
     // Where a scheduled run's answer goes, and what `notify` posts now, so a
     // message wanted every day is one schedule and one wanted now one call,
@@ -6174,6 +6182,42 @@ mod tests {
         });
         assert!(!shared.contains(&offset), "{shared}");
         assert!(!shared.contains(", set to "), "{shared}");
+    }
+
+    #[test]
+    fn fewer_cpus_than_the_machine_has_follow_the_computer_line_where_commands_run() {
+        let cpus = crate::machine::Cpus {
+            usable: 1,
+            online: 4,
+            pools: true,
+        };
+        let _given = crate::machine::give(cpus);
+        let line = crate::machine::line(cpus);
+        let system = |connection: &Connection| system_prompt(connection, None, None).text;
+        let tools = Connection {
+            tools: true,
+            ..connection()
+        };
+        let here = system(&tools);
+        // Its own sentence, right after the computer's, which ends as before.
+        let computer = here.find(" This computer runs ").unwrap();
+        let at = here.find(&line).unwrap_or_else(|| panic!("{here}"));
+        assert!(computer < at && here[..at].ends_with('.'), "{here}");
+        assert!(!here[computer + 1..at].contains(". "), "{here}");
+
+        // Without commands, or in a shared chat, there is nothing to size.
+        let toolless = system(&connection());
+        assert!(toolless.contains(" This computer runs "), "{toolless}");
+        assert!(!toolless.contains(" Commands here get "), "{toolless}");
+        let shared = system(&Connection {
+            remote: Some(Remote {
+                place: "#general in a Discord server".into(),
+                shared: true,
+                history: None,
+            }),
+            ..tools
+        });
+        assert!(!shared.contains(" Commands here get "), "{shared}");
     }
 
     #[test]

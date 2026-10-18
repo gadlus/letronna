@@ -1741,13 +1741,18 @@ fn own_program(path: &Path, me: &Path) -> bool {
 
 /// The platform shell, configured the way every caller needs it.
 pub fn shell(command: &str, cwd: Option<&Path>) -> std::process::Command {
-    shell_over(crate::login_env::vars(), command, cwd)
+    let threads = (crate::machine::cpus())
+        .filter(|cpus| cpus.pools)
+        .map(|cpus| cpus.usable);
+    shell_over(crate::login_env::vars(), threads, command, cwd)
 }
 
 /// `shell` starting from the login shell's variables `login`, which every
-/// variable set here wins over.
+/// variable set here wins over, with thread pools of `threads` where the
+/// CPUs are fewer than the machine has and the user chose no size.
 fn shell_over(
     login: &[(std::ffi::OsString, std::ffi::OsString)],
+    threads: Option<usize>,
     command: &str,
     cwd: Option<&Path>,
 ) -> std::process::Command {
@@ -1777,6 +1782,14 @@ fn shell_over(
     // to mean none, and an editor of `true` keeps the message it was given,
     // so a commit without -m fails at once instead of hanging.
     cmd.envs(SHELL_ENV);
+    // A pool with a thread for every CPU the machine has, on a quota of
+    // fewer, spends it spinning while its threads wait on each other. The
+    // limit as well as the count, as a program that sets its own number of
+    // threads ignores the count; the system prompt names both.
+    if let Some(threads) = threads {
+        let threads = threads.to_string();
+        cmd.envs(crate::machine::THREAD_VARS.map(|name| (name, &threads)));
+    }
     // Letronna is a GUI-subsystem app, so it owns no console. Without this,
     // Windows hands the shell a brand new console window on every call and it
     // flashes up over the chat.
@@ -5900,11 +5913,40 @@ mod tests {
         } else {
             r#"echo "$PAGER $GIT_PAGER $TERM $FROM_PROFILE""#
         };
-        let out = shell_over(&login, print, None).output().unwrap();
+        let out = shell_over(&login, None, print, None).output().unwrap();
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
             "cat cat dumb yes"
         );
+    }
+
+    #[test]
+    fn commands_get_thread_pools_of_the_cpus_they_can_use_unless_one_is_chosen() {
+        let set = |cmd: std::process::Command| {
+            crate::machine::THREAD_VARS.map(|name| {
+                cmd.get_envs()
+                    .find(|(set, _)| *set == name)
+                    .and_then(|(_, value)| value)
+                    .map_or(String::new(), |value| value.to_string_lossy().into())
+            })
+        };
+        assert_eq!(set(shell_over(&[], Some(1), "exit", None)), ["1"; 4]);
+        assert_eq!(set(shell_over(&[], None, "exit", None)), [""; 4]);
+        // As the machine's count has them, which the system prompt tells.
+        let one = crate::machine::Cpus {
+            usable: 1,
+            online: 4,
+            pools: true,
+        };
+        let given = crate::machine::give(one);
+        assert_eq!(set(shell("exit", None)), ["1"; 4]);
+        drop(given);
+        // Where the user chose a size, none is set beside it.
+        let _given = crate::machine::give(crate::machine::Cpus {
+            pools: false,
+            ..one
+        });
+        assert_eq!(set(shell("exit", None)), [""; 4]);
     }
 
     /// Process substitution fails in dash and in the sh of macOS alike, so
