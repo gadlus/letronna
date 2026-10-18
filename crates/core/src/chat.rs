@@ -78,7 +78,8 @@ pub struct Message {
     #[serde(default)]
     pub is_error: bool,
     /// For `role: "tool"`: the files the call wrote, so a rewind can put them
-    /// back. Left out of the saved line when there are none.
+    /// back; for a notice that files were put back, what that did. Left out
+    /// of the saved line when there are none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<crate::history::FileChange>,
     /// For a `run_command` result: what of the command's changes a rewind

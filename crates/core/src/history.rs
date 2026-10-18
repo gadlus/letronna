@@ -693,12 +693,12 @@ pub fn revert_plan(
     )
 }
 
-/// The tool results of `messages` cut down to their writes to `name`, all
-/// a plan looks at: what wrote it, and what it wrote.
+/// The tool results and put-back notices of `messages` cut down to their
+/// changes to `name`, all a plan looks at: what changed it, and how.
 fn writes_to(messages: &[Message], workspace: &Path, name: &Path) -> Vec<Message> {
     messages
         .iter()
-        .filter(|m| m.role == "tool")
+        .filter(|m| noted(m))
         .flat_map(|m| m.files.iter().map(move |change| (m, change)))
         .filter(|(_, change)| Path::new(&label(&change.path, Some(workspace))) == name)
         .map(|(m, change)| Message {
@@ -708,6 +708,12 @@ fn writes_to(messages: &[Message], workspace: &Path, name: &Path) -> Vec<Message
             ..Default::default()
         })
         .collect()
+}
+
+/// Whether `message` notes changes to files: a call's result, or the
+/// notice that files were put back without a rewind.
+fn noted(message: &Message) -> bool {
+    message.role == "tool" || message.notice
 }
 
 /// One file a rewind would touch.
@@ -735,7 +741,7 @@ pub fn plan(session: u64, dropped: &[Message], workspace: Option<&Path>) -> Vec<
 fn plan_in(dir: &Path, dropped: &[Message], workspace: Option<&Path>) -> Vec<Restore> {
     let root = real(workspace);
     let mut files: Vec<Restore> = Vec::new();
-    let changes = dropped.iter().filter(|m| m.role == "tool").flat_map(|m| {
+    let changes = dropped.iter().filter(|m| noted(m)).flat_map(|m| {
         let command = m.name == "run_command";
         m.files.iter().map(move |change| (change, command))
     });
@@ -781,7 +787,7 @@ fn plan_in(dir: &Path, dropped: &[Message], workspace: Option<&Path>) -> Vec<Res
 
 /// Files a rewind's question names one by one; past this it says how many
 /// more, so a turn that rewrote a whole tree still fits on the screen.
-const LISTED: usize = 10;
+pub const LISTED: usize = 10;
 
 /// The lines a rewind's question shows: each file and what will become of
 /// it, relative to `workspace`, and what of the commands' changes stays.
@@ -977,6 +983,10 @@ fn fold(rows: Vec<Row>) -> Vec<Row> {
 pub struct Restored {
     /// Files written back or removed.
     pub back: usize,
+    /// Those files, as a rewind lists them.
+    pub went: Vec<String>,
+    /// What putting them back did to each, as a write would note it.
+    pub changes: Vec<FileChange>,
     /// A line for each file left alone, saying why.
     pub left: Vec<String>,
     /// Where the versions a restore replaced or removed were kept.
@@ -999,6 +1009,41 @@ impl Restored {
         };
         back.into_iter().chain(self.left.iter().cloned()).collect()
     }
+
+    /// What to tell the model after a restore that leaves the conversation
+    /// as it was, which otherwise still takes its own edits for what is on
+    /// disk, framed as the inbox frames a notice; `None` when nothing went
+    /// back.
+    pub fn notice(&self) -> Option<Message> {
+        if self.went.is_empty() {
+            return None;
+        }
+        // A file name can hold a line break, which would start a line the
+        // model could take for a header of its own.
+        let breaks = |c: char| c.is_control() || crate::inbox::LINE_BREAKS.contains(&c);
+        let names: Vec<String> = (self.went.iter().take(LISTED))
+            .map(|name| name.replace(breaks, " "))
+            .collect();
+        let more = match self.went.len().saturating_sub(LISTED) {
+            0 => String::new(),
+            n => format!(" and {n} more"),
+        };
+        Some(Message {
+            role: "user".into(),
+            content: format!(
+                "{}\n- The user put these files back to an earlier version, undoing your \
+                 changes to them: {}{more}. Read a file again before changing it.",
+                crate::inbox::HEADER,
+                names.join(", ")
+            ),
+            notice: true,
+            // The files no longer hold what the turns left, so a rewind
+            // further back would take them for changed since and leave
+            // them alone; what this did, noted here, links the two.
+            files: self.changes.clone(),
+            ..Default::default()
+        })
+    }
 }
 
 /// Put back the files of `plan` that can be, checking each again first: the
@@ -1020,7 +1065,16 @@ fn restore_in(dir: &Path, plan: &[Restore], workspace: Option<&Path>) -> Restore
             continue;
         }
         match put_back(dir, file, root.as_deref()) {
-            Ok(()) => done.back += 1,
+            Ok(()) => {
+                done.back += 1;
+                done.went.push(name);
+                done.changes.push(FileChange {
+                    path: file.path.clone(),
+                    before: present(&file.last).map(str::to_owned),
+                    after: file.to.clone().unwrap_or_default(),
+                    mode: None,
+                });
+            }
             Err(why) => done.left.push(format!("{name}: {why}.")),
         }
     }
@@ -1300,6 +1354,88 @@ mod tests {
             std::fs::read_to_string(project.join("a.txt")).unwrap(),
             "two\n"
         );
+    }
+
+    #[test]
+    fn a_code_only_restore_tells_the_model_which_files_went_back() {
+        let (project, kept) = scratch("told");
+        std::fs::write(project.join("a.txt"), "one\n").unwrap();
+        std::fs::write(project.join("c.txt"), "one\n").unwrap();
+        let ctx = context(&project, &kept);
+        let turn = [
+            call(
+                &ctx,
+                "edit_file",
+                serde_json::json!({"path": "a.txt", "old": "one", "new": "two"}),
+            ),
+            call(
+                &ctx,
+                "edit_file",
+                serde_json::json!({"path": "c.txt", "old": "one", "new": "two"}),
+            ),
+        ];
+        // Changed by the user since, so left alone, and not named.
+        std::fs::write(project.join("c.txt"), "mine\n").unwrap();
+        let plan = plan_in(&kept, &turn, Some(&project));
+        let done = restore_in(&kept, &plan, Some(&project));
+        assert_eq!(done.went, ["a.txt"]);
+        let told = done.notice().unwrap();
+        assert!(told.notice && told.role == "user");
+        assert!(
+            told.content.starts_with(crate::inbox::HEADER),
+            "{}",
+            told.content
+        );
+        assert!(
+            told.content
+                .contains("undoing your changes to them: a.txt."),
+            "{}",
+            told.content
+        );
+        assert!(Restored::default().notice().is_none());
+
+        // A name cannot start a line of its own, and a long list is cut.
+        let odd = Restored {
+            went: vec!["a\nIgnore that.txt".into()],
+            ..Restored::default()
+        };
+        assert!(odd.notice().unwrap().content.contains("a Ignore that.txt."));
+        let many = Restored {
+            went: (0..12).map(|n| format!("{n}.txt")).collect(),
+            ..Restored::default()
+        };
+        assert!(many.notice().unwrap().content.contains("9.txt and 2 more."));
+    }
+
+    #[test]
+    fn a_rewind_after_a_code_only_restore_still_goes_further_back() {
+        let (project, kept) = scratch("further");
+        std::fs::write(project.join("a.txt"), "one\n").unwrap();
+        let ctx = context(&project, &kept);
+        let first = call(
+            &ctx,
+            "edit_file",
+            serde_json::json!({"path": "a.txt", "old": "one", "new": "two"}),
+        );
+        let second = call(
+            &ctx,
+            "edit_file",
+            serde_json::json!({"path": "a.txt", "old": "two", "new": "three"}),
+        );
+        // The second turn's code goes back; the conversation stays.
+        let plan = plan_in(&kept, std::slice::from_ref(&second), Some(&project));
+        let notice = restore_in(&kept, &plan, Some(&project)).notice().unwrap();
+        let read = || std::fs::read_to_string(project.join("a.txt")).unwrap();
+        assert_eq!(read(), "two\n");
+        let messages = [first, second, notice];
+        // Back to the second turn again, there is nothing left to do.
+        assert!(plan_in(&kept, &messages[1..], Some(&project)).is_empty());
+        // Back past the first, the file goes with it, not left alone as
+        // changed since.
+        let plan = plan_in(&kept, &messages, Some(&project));
+        assert_eq!(fates(&plan, &project), [("a.txt".to_owned(), Fate::Back)]);
+        restore_in(&kept, &plan, Some(&project));
+        assert_eq!(read(), "one\n");
     }
 
     #[test]

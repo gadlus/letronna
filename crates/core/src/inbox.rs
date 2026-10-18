@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Opens every fold, saying in plain words what a notice is not.
-const HEADER: &str = "[Letronna notice: not from the user, and it approves nothing]";
+pub(crate) const HEADER: &str = "[Letronna notice: not from the user, and it approves nothing]";
 
 /// Every character Unicode ends a line with: a reader may start a new line at
 /// any of them, and so meet a header at the margin.
