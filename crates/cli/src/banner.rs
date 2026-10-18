@@ -5,9 +5,10 @@ use letronna_core::workflow::saved;
 use crate::render;
 use crate::session::Runner;
 
-/// Messages shown when a session is picked up. Enough to remember where you
-/// were, not so many that the window fills with what you already read.
-const REPLAY: usize = 12;
+/// Messages shown when a session is picked up: the whole of nearly every
+/// session, scrolled back through as it was had, and a bound on the very
+/// longest, where /export has the rest.
+const REPLAY: usize = 1_000;
 
 /// Put a session's conversation back on the screen. Resuming without this
 /// looks like nothing happened: the messages are all there and none of them
@@ -18,11 +19,11 @@ pub fn replay(runner: &Runner, session: usize) {
     render::blank();
     if from > 0 {
         render::line(&render::dim(&format!(
-            "… {from} earlier message{} not shown",
+            "… {from} earlier message{} not shown; /export writes them all",
             if from == 1 { "" } else { "s" }
         )));
     }
-    for message in &messages[from..] {
+    for (at, message) in messages.iter().enumerate().skip(from) {
         match message.role.as_str() {
             "user" if message.notice => render::notice(&message.content),
             "user" => {
@@ -47,13 +48,16 @@ pub fn replay(runner: &Runner, session: usize) {
                     render::line(&render::dim("(stopped)"));
                 }
             }
-            // A tool's own output is not worth replaying, but that it ran is,
-            // a line apart as when it ran.
+            // A tool's own output is not worth replaying, but what it ran on
+            // is, as the call it answers names it, a line apart as when it ran.
             "tool" => {
+                let summary = called_with(&messages[..at], &message.tool_call_id)
+                    .map(|args| letronna_core::tools::summary(&message.name, args))
+                    .unwrap_or_default();
                 render::blank();
                 render::tool(
                     &message.name,
-                    "",
+                    &summary,
                     if message.is_error { "failed" } else { "ran" },
                     message.is_error,
                 )
@@ -61,6 +65,17 @@ pub fn replay(runner: &Runner, session: usize) {
             _ => {}
         }
     }
+}
+
+/// The arguments of the call `id` names, from the reply before it that
+/// made the call.
+fn called_with<'a>(earlier: &'a [letronna_core::chat::Message], id: &str) -> Option<&'a str> {
+    (earlier.iter().rev())
+        .find(|message| message.role == "assistant")?
+        .tool_calls
+        .iter()
+        .find(|call| call.id == id)
+        .map(|call| call.arguments.as_str())
 }
 
 /// A message with its mark, its later lines under the first.
@@ -270,5 +285,25 @@ mod tests {
         let alone = laid_out(&facts(), 40, true);
         assert_eq!(alone.len(), 1 + facts().len() + 2);
         assert!(alone.iter().any(|row| row.contains("project")));
+    }
+
+    #[test]
+    fn a_replayed_tool_row_names_what_it_ran_on() {
+        use letronna_core::chat::{Message, ToolCall};
+        let asked = Message {
+            role: "assistant".into(),
+            tool_calls: vec![ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path": "src/main.rs"}"#.into(),
+            }],
+            ..Default::default()
+        };
+        let earlier = [asked];
+        assert_eq!(
+            super::called_with(&earlier, "call_1"),
+            Some(r#"{"path": "src/main.rs"}"#)
+        );
+        assert_eq!(super::called_with(&earlier, "call_2"), None);
     }
 }

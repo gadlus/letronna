@@ -403,6 +403,10 @@ fn main() {
     } else if runner.store.conversations[session].length() > 0 {
         replay(&runner, session);
     }
+    // Painting is throttled, and nothing else paints until a key: without
+    // this a resumed session's conversation stayed off the screen until
+    // the first one was pressed.
+    screen::settle();
     if let Some(tree) = &runner.store.conversations[session].worktree {
         render::line(&render::dim(&format!(
             "Working in worktree {} on branch {}; your checkout is left as it is.",
