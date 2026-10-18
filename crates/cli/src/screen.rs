@@ -177,6 +177,12 @@ pub fn close() {
     let _ = std::io::stdout().flush();
 }
 
+/// Whether the conversation ends in a blank line with nothing on the line
+/// after it yet, so another blank line would make a gap of two.
+pub fn after_blank() -> bool {
+    screen().lock().is_ok_and(|s| s.after_blank())
+}
+
 /// Add text, which may run over several lines or stop mid-line.
 pub fn push(text: &str) {
     {
@@ -523,6 +529,17 @@ impl Screen {
         }
     }
 
+    /// Whether the open line and the one above it are both empty: a fold
+    /// or a block stands on an empty line too, but is not a blank one.
+    fn after_blank(&self) -> bool {
+        let at = self.lines.len();
+        at >= 2
+            && self.lines[at - 1].is_empty()
+            && self.lines[at - 2].is_empty()
+            && !self.blocks.contains_key(&(at - 2))
+            && !self.folds.contains_key(&(at - 2))
+    }
+
     /// How many rows of the window the conversation gets.
     fn depth(&self, rows: u16) -> usize {
         (rows as usize).saturating_sub(self.chrome.len()).max(1)
@@ -626,6 +643,33 @@ mod tests {
             .insert(1, Box::new(|width| vec!["x".repeat(width.min(6))]));
         assert_eq!(s.view(80)[..2], ["ab", "xxxxxx"]);
         assert_eq!(s.view(4)[..2], ["ab", "xxxx"]);
+    }
+
+    #[test]
+    fn a_blank_line_is_known_from_a_fold_on_an_empty_line() {
+        let mut s = Screen {
+            lines: vec!["› the question".into(), String::new(), String::new()],
+            rows: Vec::new(),
+            wrapped: 0,
+            width: 0,
+            scroll: 0,
+            chrome: Vec::new(),
+            from: None,
+            to: None,
+            open: false,
+            painted: Instant::now(),
+            blocks: HashMap::new(),
+            folds: HashMap::new(),
+            starts: Vec::new(),
+        };
+        assert!(s.after_blank());
+        s.blocks
+            .insert(1, Box::new(|width| vec!["x".repeat(width.min(6))]));
+        assert!(!s.after_blank());
+        s.lines = vec!["text".into(), String::new()];
+        assert!(!s.after_blank());
+        s.lines = vec![String::new()];
+        assert!(!s.after_blank());
     }
 
     /// The rows above the open line at the foot, plain.

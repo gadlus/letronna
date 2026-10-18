@@ -209,7 +209,13 @@ pub fn width() -> usize {
         .unwrap_or(80)
 }
 
+/// A line apart from what came before, and only one: a part of the
+/// conversation that opens with a gap, after one that ended with one, is
+/// still a line away rather than two.
 pub fn blank() {
+    if crate::screen::held() && crate::screen::after_blank() {
+        return;
+    }
     out("", true);
 }
 
@@ -320,7 +326,9 @@ impl Stream {
         }
         self.bold = false;
         self.code = false;
-        let close = !self.at_line_start;
+        // A reply that never started, one that only called a tool, has no
+        // line to close.
+        let close = self.started && !self.at_line_start;
         self.at_line_start = true;
         out(&buffer, close);
     }

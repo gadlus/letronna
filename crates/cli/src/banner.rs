@@ -43,13 +43,17 @@ pub fn replay(runner: &Runner, session: usize) {
                     render::line(&render::dim("(stopped)"));
                 }
             }
-            // A tool's own output is not worth replaying, but that it ran is.
-            "tool" => render::tool(
-                &message.name,
-                "",
-                if message.is_error { "failed" } else { "ran" },
-                message.is_error,
-            ),
+            // A tool's own output is not worth replaying, but that it ran is,
+            // a line apart as when it ran.
+            "tool" => {
+                render::blank();
+                render::tool(
+                    &message.name,
+                    "",
+                    if message.is_error { "failed" } else { "ran" },
+                    message.is_error,
+                )
+            }
             _ => {}
         }
     }

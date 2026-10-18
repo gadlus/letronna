@@ -574,6 +574,9 @@ impl Runner {
         // The model's name lives under the input box, so an answer only needs
         // its bullet here.
         let mut out = Stream::opening_with(render::bullet());
+        // An answer to what a tool brought back has no echoed question
+        // above it to leave a gap.
+        let after_tool = (conversation.messages.last()).is_some_and(|m| m.role == "tool");
         let mut opened = false;
         let mut thought = false;
         // The fold the thinking goes into while the window is held, folded
@@ -677,14 +680,16 @@ impl Runner {
             }
             if let Event::Delta(text) = &event {
                 if !opened {
-                    // Nothing more is needed above the answer: the gap was
-                    // left when the question was echoed.
+                    // The gap above a first answer was left when the question
+                    // was echoed; one after a tool's output needs its own.
                     self.bar.wait_line(false);
                     if let Some(fold) = fold.take() {
                         crate::screen::thought(fold);
                         render::blank();
                     } else if thought {
                         render::out("", true);
+                        render::blank();
+                    } else if after_tool {
                         render::blank();
                     }
                     opened = true;
