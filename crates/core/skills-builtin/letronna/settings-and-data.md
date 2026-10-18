@@ -36,7 +36,7 @@ Most of it is set in the window's Settings or with a slash command (`mode`, `eff
 
 `AGENT_DATA_DIR` (the data folder), `LETRONNA_API` (the Letronna gateway's address), `LETRONNA_READ_TIMEOUT` (seconds a reply may stay silent, 30 to 3600, 300 unless set), `LETRONNA_BROWSER` (the browser's path), `LETRONNA_BROWSER_URL` (a browser elsewhere: a cloud service's `wss://` address, or `http://host:9222`), `LETRONNA_BROWSER_HEADLESS=0` (gives the browser a window).
 
-For a -p run, saving none of it: `LETRONNA_DEADLINE` (the seconds a question may take: at 80% it is told to write its outputs, and at the end it stops), `AGENT_BASE_URL` (an OpenAI-compatible server to ask instead of the gateway set up, unless `--gateway` names one), `AGENT_API_KEY` (the key to send it) and `AGENT_MODEL` (the model to ask, unless `--model` names one).
+For a -p run, saving none of it: `LETRONNA_DEADLINE` (the seconds a question may take, or with `--input-format stream-json` the whole run: at 80% it is told to write its outputs, and at the end it stops), `AGENT_BASE_URL` (an OpenAI-compatible server to ask instead of the gateway set up, unless `--gateway` names one), `AGENT_API_KEY` (the key to send it) and `AGENT_MODEL` (the model to ask, unless `--model` names one).
 
 ## Profiles
 

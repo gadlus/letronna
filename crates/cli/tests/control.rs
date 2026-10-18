@@ -723,6 +723,92 @@ fn a_print_run_with_a_deadline_is_told_its_time_in_its_first_request() {
     );
 }
 
+#[test]
+fn a_stream_json_run_past_its_deadline_stops_with_its_result() {
+    let (data, work) = scratch("deadline-stream");
+    // The model sits on the request, so only the deadline ends the turn.
+    let (endpoint, _bodies) = provider(vec![None]);
+    let flags = [
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output",
+        "stream-json",
+    ];
+    let mut run = Driven::start(
+        &data,
+        &work,
+        &endpoint,
+        &flags,
+        &[("LETRONNA_DEADLINE", "2")],
+    );
+    run.say("take your time");
+    assert_eq!(run.next()["status"], "deadline");
+    // Past it, a message is not sent at all.
+    run.say("and this");
+    let refused = run.next();
+    assert_eq!(refused["status"], "failed");
+    assert!(
+        refused["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("LETRONNA_DEADLINE gives the run are up")),
+        "{refused}"
+    );
+    assert_eq!(run.close(), 1);
+}
+
+#[test]
+fn a_stream_json_run_near_its_deadline_is_told_to_commit_its_outputs() {
+    let (data, work) = scratch("deadline-near-stream");
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+    let (sent, bodies) = mpsc::channel();
+    // As for -p: 8 s from the start, the first answer past the warning at
+    // 6.4 s, and the second request well before 8 s.
+    let replies = [
+        (Duration::from_millis(6_800), "Done."),
+        (Duration::ZERO, "Every output is written."),
+    ];
+    std::thread::spawn(move || {
+        for (held, text) in replies {
+            let (mut socket, _) = server.accept().unwrap();
+            let _ = sent.send(request(&mut socket));
+            std::thread::sleep(held);
+            let reply = reply(text, &[]).unwrap();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+        }
+    });
+    let flags = [
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output",
+        "stream-json",
+    ];
+    let mut run = Driven::start(
+        &data,
+        &work,
+        &endpoint,
+        &flags,
+        &[("LETRONNA_DEADLINE", "8")],
+    );
+    run.say("write the report");
+    let result = run.next();
+    assert_eq!(
+        (&result["status"], &result["answer"]),
+        (&json!("done"), &json!("Every output is written."))
+    );
+    assert_eq!(run.close(), 0);
+    let _ = bodies.recv_timeout(WAIT).unwrap();
+    let later = said(&bodies.recv_timeout(WAIT).unwrap());
+    let (role, told) = later.last().unwrap();
+    assert_eq!(role, "user");
+    assert!(
+        told.contains("s are left before this run is stopped"),
+        "{told}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_sigterm_stops_a_print_run_and_prints_its_result() {

@@ -340,7 +340,7 @@ fn main() {
                 }
                 i32::from(!finished)
             }
-            None => control::run(&mut runner, session, &args),
+            None => control::run(&mut runner, session, &args, started),
         };
         // A command still running, a browser with no window, or a job started
         // in the background, would outlive this run unseen.
@@ -805,25 +805,27 @@ fn hold_to_deadline(
             return;
         }
         let left = deadline.saturating_duration_since(std::time::Instant::now());
-        // A notice, as a finished job's is, so nothing takes it for the
-        // user's words; the run reads it at its next step.
-        inbox::push(
-            id,
-            inbox::Notice {
-                from: "deadline".into(),
-                when: inbox::When::Next,
-                text: format!(
-                    "About {} s are left before this run is stopped: write every output the \
-                     task asks for now, complete and valid, and improve it in place only after that.",
-                    left.as_secs_f64().round()
-                ),
-            },
-        );
+        inbox::push(id, deadline_notice(left));
         if cancel.sleep(left) {
             ran_out.store(true, Ordering::SeqCst);
             cancel.set();
         }
     })
+}
+
+/// What a run is told once most of its time is gone, with `left` to go: a
+/// notice, as a finished job's is, so nothing takes it for the user's words;
+/// the run reads it at its next step.
+fn deadline_notice(left: std::time::Duration) -> inbox::Notice {
+    inbox::Notice {
+        from: "deadline".into(),
+        when: inbox::When::Next,
+        text: format!(
+            "About {} s are left before this run is stopped: write every output the \
+             task asks for now, complete and valid, and improve it in place only after that.",
+            left.as_secs_f64().round()
+        ),
+    }
 }
 
 /// Puts `prompt` on the session and hands the session to a run spending

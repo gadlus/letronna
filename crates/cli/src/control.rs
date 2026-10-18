@@ -42,6 +42,7 @@ use std::io::{BufRead, Read};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::time::Instant;
 
 /// The longest line read from stdin: 8 MiB holds a message with a large file
 /// pasted in, and stops a writer that has gone wrong long before memory runs
@@ -63,6 +64,8 @@ enum Event {
     Asked(Request),
     /// The running turn ended.
     Ended(Report),
+    /// The seconds `LETRONNA_DEADLINE` gives the run are up.
+    Deadline,
 }
 
 /// What one line on stdin says.
@@ -108,10 +111,24 @@ enum Got {
 /// Runs the messages stdin sends, one turn each in the order sent, until
 /// stdin closes, and gives the exit code: 0, 1 when a turn failed or stdout
 /// closed, or 2 for a line that could not be read.
-pub fn run(runner: &mut Runner, session: usize, args: &Args) -> i32 {
+pub fn run(runner: &mut Runner, session: usize, args: &Args, started: Instant) -> i32 {
+    // As for `-p`: counted from the run's start, and a mistake ends it at once.
+    let deadline = match crate::deadline_of(std::env::var(crate::DEADLINE).ok().as_deref(), started)
+    {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            crate::show(args.output, &crate::failed(error), None, false);
+            return 1;
+        }
+    };
     // Before any turn, which takes the session out of the store as it runs.
     crate::emit(&crate::init(runner, session));
     let (events, heard) = mpsc::channel();
+    if let Some(deadline) = deadline {
+        // Every turn is on this one session, so its id is theirs.
+        let id = runner.store.conversations[session].id;
+        keep_to(started, deadline, id, events.clone());
+    }
     let current = Arc::new(AtomicU64::new(0));
     read_stdin(events.clone(), current.clone());
     // Served before any turn starts, since a request with nobody serving is
@@ -136,11 +153,19 @@ pub fn run(runner: &mut Runner, session: usize, args: &Args) -> i32 {
     let mut running: Option<Running> = None;
     let mut asked: HashMap<String, Request> = HashMap::new();
     let (mut open, mut bad, mut failed, mut lost) = (true, false, false, false);
+    // Once the deadline is up, the turn running stops and none starts.
+    let mut ran_out = false;
     let (mut asks, mut turns) = (0u64, 0u64);
     loop {
         if running.is_none() {
             if let Some(message) = waiting.pop_front() {
                 let begun = message.and_then(|text| {
+                    if ran_out {
+                        return Err(format!(
+                            "The seconds {} gives the run are up, so this message was not sent.",
+                            crate::DEADLINE
+                        ));
+                    }
                     if lost {
                         return Err("The session was changed elsewhere while a turn ran, \
                             so this message was not sent."
@@ -244,6 +269,12 @@ pub fn run(runner: &mut Runner, session: usize, args: &Args) -> i32 {
                 waiting.clear();
                 (open, failed) = (false, true);
             }
+            Event::Deadline => {
+                ran_out = true;
+                if let Some(turn) = &running {
+                    turn.cancel.set();
+                }
+            }
             Event::Ended(report) => {
                 asked.clear();
                 current.store(0, Ordering::SeqCst);
@@ -258,7 +289,7 @@ pub fn run(runner: &mut Runner, session: usize, args: &Args) -> i32 {
                     report,
                     output,
                     (&turn.connection, turn.prompt),
-                    false,
+                    ran_out,
                 );
                 failed |= !ended;
                 // A session deleted or cut short elsewhere meanwhile is not
@@ -334,6 +365,23 @@ fn fits(tool: &str, arguments: Option<&Value>) -> Result<(), String> {
         Some(field) => Err(format!("Its changed input for `{tool}` has no `{field}`.")),
         None => Ok(()),
     }
+}
+
+/// Tells session `id` how long it has left once most of the time from
+/// `started` to `deadline` has gone, as `-p` does, then says on `events` that
+/// the deadline is up.
+fn keep_to(started: Instant, deadline: Instant, id: u64, events: Sender<Event>) {
+    let warn = started
+        + deadline
+            .saturating_duration_since(started)
+            .mul_f64(crate::WARN_AT);
+    std::thread::spawn(move || {
+        std::thread::sleep(warn.saturating_duration_since(Instant::now()));
+        let left = deadline.saturating_duration_since(Instant::now());
+        letronna_core::inbox::push(id, crate::deadline_notice(left));
+        std::thread::sleep(left);
+        let _ = events.send(Event::Deadline);
+    });
 }
 
 /// Starts `text` as a turn on a thread of its own, spending from `budget`,

@@ -63,8 +63,9 @@ With -p
                            with stream-json in, ask stdin about each call
                            that needs a yes
   LETRONNA_DEADLINE=<s>    in the environment, the seconds a question may
-                           take: at 80% it is told to write its outputs, and
-                           at the end it stops
+                           take, or with stream-json in the whole run: at 80%
+                           it is told to write its outputs, and at the end it
+                           stops
       --json-schema <file>
                            answer in JSON this schema checks, printed alone,
                            or as \"value\" with --output json; the schema
