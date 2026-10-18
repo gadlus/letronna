@@ -1405,6 +1405,9 @@ pub struct Seen {
     pub n: u32,
     /// How its last run ended, or None while it runs.
     pub ended: Option<String>,
+    /// Whether it is kept and waits for more work, holding its place and its
+    /// budget until it is stopped or its idle time runs out.
+    pub idle: bool,
     /// When its last run started.
     pub started: Instant,
     pub status: Arc<Status>,
@@ -1422,6 +1425,7 @@ pub fn seen() -> Vec<Seen> {
             description: helper.description.clone(),
             n: helper.n,
             ended: helper.ended.clone(),
+            idle: helper.idle.is_some(),
             started: helper.run.started,
             status: helper.run.status.clone(),
         })
@@ -5065,7 +5069,11 @@ mod tests {
             .and_then(|helper| Some(helper.idle.as_ref()?.until))
             .unwrap();
         assert!(until > Instant::now() + KEEP - WAIT && until <= Instant::now() + KEEP);
+        // The front ends see it waiting, not ended, so they can offer to stop it.
+        let listed = || seen().into_iter().find(|helper| helper.id == id).unwrap();
+        assert!(listed().idle);
         assert!(stop(id));
+        assert!(!listed().idle);
     }
 
     #[test]

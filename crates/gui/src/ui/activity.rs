@@ -936,10 +936,12 @@ impl Chat {
             })
     }
 
-    /// Open, while `open` is offered, then Steer and Stop while it works.
+    /// Open, while `open` is offered, then Steer and Stop while it works,
+    /// and Stop while it is kept and waits for more work.
     fn helper_controls(&self, seen: &Seen, open: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let id = seen.id;
         let working = seen.ended.is_none();
+        let idle = seen.idle;
         h_flex()
             .flex_shrink_0()
             .gap_1()
@@ -969,7 +971,9 @@ impl Chat {
                             cx.listener(move |this, _, window, cx| this.open_steer(id, window, cx)),
                         ),
                 )
-                .child(
+            })
+            .when(working || idle, |this| {
+                this.child(
                     Button::new(("helper-stop", id as usize))
                         .plain(cx)
                         .xsmall()
@@ -1184,10 +1188,12 @@ impl Chat {
     }
 }
 
-/// Green while it works, red when it failed, grey once it has otherwise ended.
+/// Green while it works, the accent while it waits for more work, red when
+/// it failed, grey once it has otherwise ended.
 fn state_dot(seen: &Seen, cx: &App) -> impl IntoElement {
     let color = match seen.ended.as_deref() {
         None => cx.theme().green,
+        Some(_) if seen.idle => cx.theme().primary,
         Some("failed") => cx.theme().danger,
         Some(_) => cx.theme().muted_foreground.opacity(0.5),
     };
@@ -1370,8 +1376,12 @@ fn refreshed(before: &[Helper], now: Vec<Seen>) -> Vec<Helper> {
 /// A helper's line of progress, from what it last read as.
 fn progress_of(helper: &Helper) -> String {
     let status = &helper.seen.status;
+    let state = match helper.seen.ended.as_deref() {
+        _ if helper.seen.idle => Some("idle, waiting for more work"),
+        ended => ended,
+    };
     progress(
-        helper.seen.ended.as_deref(),
+        state,
         helper.seconds,
         status.rounds.load(Ordering::Relaxed),
         status.input.load(Ordering::Relaxed),
@@ -1433,7 +1443,9 @@ fn lines(n: usize) -> String {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{Counts, Helper, count, newest_line, progress, refreshed, summary, took};
+    use super::{
+        Counts, Helper, count, newest_line, progress, progress_of, refreshed, summary, took,
+    };
     use letronna_core::agents::Seen;
     use letronna_core::store::Todo;
     use std::time::{Duration, Instant};
@@ -1447,9 +1459,21 @@ mod tests {
             description: String::new(),
             n: 1,
             ended: ended.map(str::to_owned),
+            idle: false,
             started,
             status: Default::default(),
         }
+    }
+
+    #[test]
+    fn a_kept_helper_waiting_for_work_says_so_not_that_it_finished() {
+        let mut kept = seen(1, Instant::now(), Some("finished"));
+        kept.idle = true;
+        let helper = Helper {
+            seen: kept,
+            seconds: Some(5),
+        };
+        assert!(progress_of(&helper).starts_with("idle, waiting for more work"));
     }
 
     #[test]

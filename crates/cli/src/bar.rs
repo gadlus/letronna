@@ -3301,6 +3301,7 @@ mod tests {
             description: "Find where\nwindows start".into(),
             n: 1,
             ended: None,
+            idle: false,
             started,
             status: Default::default(),
         };

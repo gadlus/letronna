@@ -2307,6 +2307,7 @@ fn agent_rows(helpers: &[Seen], now: Instant, width: usize) -> Vec<String> {
     let mut rows = vec![["name", "type", "state", "tokens", "task"].map(String::from)];
     rows.extend(helpers.iter().map(|helper| {
         let state = match &helper.ended {
+            _ if helper.idle => "idle, waiting for more work".to_owned(),
             Some(how) => how.clone(),
             None => {
                 let seconds = now.saturating_duration_since(helper.started).as_secs();
@@ -2365,8 +2366,9 @@ fn stop_helper(helpers: &[Seen], name: &str) {
     let Some(helper) = named(helpers, name) else {
         return;
     };
-    // The stop looks again, since the helper may have ended since the list was read.
-    if helper.ended.is_none() && letronna_core::agents::stop(helper.id) {
+    // The stop looks again, since the helper may have ended since the list
+    // was read. A kept one waiting for more work is stopped too.
+    if (helper.ended.is_none() || helper.idle) && letronna_core::agents::stop(helper.id) {
         // It ends at its next check, not this instant, so the list may still
         // show it running for a moment.
         render::said(
@@ -5221,9 +5223,19 @@ mod tests {
             description: description.into(),
             n: 1,
             ended: ended.map(String::from),
+            idle: false,
             started,
             status: Arc::new(status),
         }
+    }
+
+    #[test]
+    fn a_kept_helper_waiting_for_work_is_listed_as_idle() {
+        let started = Instant::now();
+        let mut kept = helper("keeper", Some("finished"), "Keep watch", started);
+        kept.idle = true;
+        let rows = agent_rows(&[kept], started, 100);
+        assert!(rows[1].contains("idle, waiting for more work"), "{rows:?}");
     }
 
     #[test]
