@@ -44,6 +44,8 @@ For scripted runs, `-p` also takes a deadline and a JSON Schema for the answer.
 | **Plan** | Read and search only |
 | **Bypass** | Nothing asks. Only use it where that is safe. |
 
+In the terminal, a card that asks about a tool while you are typing keeps your typing: letters go on into the box behind it, and an Enter pressed while you are still typing sends your line instead of answering. A line you sent while it worked never answers a question asked after it.
+
 In the terminal, Shift+Tab (or Alt+M) steps through Ask, Accept edits, Plan and Auto, and Bypass once you have chosen it; the footer says what each lets run as you land on it. With no flag, the terminal starts in the mode the window's settings start sessions in.
 
 ## Slash commands

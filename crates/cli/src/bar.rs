@@ -381,6 +381,10 @@ const SWITCH_ROWS: usize = 10;
 /// gateway has, scrolls.
 const CHOICE_ROWS: usize = 10;
 
+/// Rows of the conversation a question in the box leaves showing over it,
+/// however much it has to say.
+const KEPT_ROWS: usize = 2;
+
 /// The most columns a name takes in the menu and `/help`: over twice the
 /// longest of Letronna's own, and an added name longer than that is cut
 /// rather than pushing every description off the row.
@@ -1125,24 +1129,38 @@ impl Bar {
     }
 
     /// Wait for a whole line that answers a question, leaving any ring for
-    /// the prompt: a turn it started now would cut into the question. `None`
-    /// when the user is done.
+    /// the prompt: a turn it started now would cut into the question. Lines
+    /// typed before it was asked were meant for the model, so they stay
+    /// queued for it rather than answer this -- a message typed during a
+    /// reply is never taken for a key asked for after it. `None` when the
+    /// user is done.
     pub fn reply(&mut self) -> Option<String> {
-        if let Some(line) = self.next_line() {
-            return Some(line);
-        }
         if !self.live {
-            return crate::input::read(&format!("{} ", render::blue("›")));
-        }
-        loop {
-            if self.done {
-                return None;
-            }
             if let Some(line) = self.next_line() {
                 return Some(line);
             }
-            self.pump();
+            return crate::input::read(&format!("{} ", render::blue("›")));
         }
+        let earlier = std::mem::take(&mut self.queued);
+        let answer = loop {
+            if self.done {
+                break None;
+            }
+            if let Some(line) = self.next_line() {
+                break Some(line);
+            }
+            self.pump();
+        };
+        self.put_back(earlier);
+        answer
+    }
+
+    /// Put lines set aside while a question was open back ahead of anything
+    /// queued since, in the order they were typed.
+    fn put_back(&mut self, earlier: VecDeque<String>) {
+        let later = std::mem::replace(&mut self.queued, earlier);
+        self.queued.extend(later);
+        self.settle();
     }
 
     /// The first line queued, put into the conversation now that it is taken,
@@ -1263,25 +1281,39 @@ impl Bar {
     }
 
     /// Ask for a line to go with an answer just given, with `hint` at the top
-    /// of the box: enter sends it, escape sends nothing. Lines typed before it
-    /// was asked were meant for the model, so they stay queued for it rather
-    /// than answer this.
+    /// of the box: enter sends it, escape sends nothing.
     pub fn reason(&mut self, hint: &str) -> Option<String> {
         if !self.live {
             render::line(&render::bold(hint));
             return crate::input::read(&format!("{}{} ", render::PAD, render::blue("›")));
         }
-        let earlier = std::mem::take(&mut self.queued);
         self.asking = Some(hint.to_owned());
         self.note = Some("enter to send  ·  esc to skip".to_owned());
         self.settle();
         let answer = self.reply();
         self.asking = None;
         self.note = None;
-        let later = std::mem::replace(&mut self.queued, earlier);
-        self.queued.extend(later);
         self.settle();
         answer
+    }
+
+    /// Ask for the user's own words for a question the model put, its first
+    /// line at the top of the box: enter sends them, and escape turns the
+    /// question down, as it does a question with answers offered. `None`
+    /// when it was turned down or the user left.
+    pub fn answer(&mut self, question: &str) -> Option<String> {
+        if !self.live {
+            let words = crate::input::read(&format!("{}{} ", render::PAD, render::blue("›")));
+            return words.filter(|words| !words.trim().is_empty());
+        }
+        self.asking = Some(one_row(question, self.room()));
+        self.note = Some("enter to answer  ·  esc to stop here".to_owned());
+        self.settle();
+        let answer = self.reply();
+        self.asking = None;
+        self.note = None;
+        self.settle();
+        answer.filter(|words| !words.trim().is_empty())
     }
 
     /// Pick one of `stops` by sliding along a track, starting at `start`.
@@ -1401,7 +1433,10 @@ impl Bar {
                 Ok(Event::Paste(text)) => {
                     self.handled += 1;
                     self.focus.touch(std::time::Instant::now());
-                    if self.choice.is_none() && self.switches.is_none() {
+                    // Behind a question nobody asked for, a paste is typing
+                    // too, and goes into the box as letters do.
+                    let open = self.choice.is_some() && self.guard.is_none();
+                    if !open && self.switches.is_none() {
                         self.line.paste(&text);
                         self.picked = 0;
                     }
@@ -1988,13 +2023,33 @@ impl Bar {
     /// says it does. In a list the user opened, letters and digits narrow it
     /// instead, and escape takes the narrowing off first.
     fn pick(&mut self, key: KeyEvent) {
-        // Letters are typing, not answering, and each one puts an answer off
-        // again; an answer that comes too soon is dropped rather than put off,
-        // so pressing it again a moment later takes.
-        if let Some(since) = self.guard.as_mut() {
+        // A question nobody asked for comes up under someone typing. Letters
+        // are typing, not answering: they go on into the box behind it, where
+        // they were meant to go, and each puts an answer off again. A digit or
+        // an enter that comes too soon is part of that typing too, so the
+        // enter sends what was typed to the queue, as it would have without
+        // the question, and only one pressed a moment later answers.
+        if let Some(since) = self.guard {
+            let typing = since.elapsed() < STILL;
+            let plain = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
             match key.code {
-                KeyCode::Enter | KeyCode::Char('0'..='9') if since.elapsed() < STILL => return,
-                KeyCode::Char(_) | KeyCode::Backspace => *since = std::time::Instant::now(),
+                KeyCode::Enter if typing => {
+                    self.guard = Some(std::time::Instant::now());
+                    self.send();
+                    return;
+                }
+                KeyCode::Char(ch) if plain && (typing || !ch.is_ascii_digit()) => {
+                    self.guard = Some(std::time::Instant::now());
+                    self.line.insert(ch);
+                    return;
+                }
+                KeyCode::Backspace => {
+                    self.guard = Some(std::time::Instant::now());
+                    self.line.backspace();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -2168,7 +2223,7 @@ impl Bar {
         ));
         match (&self.slider, &self.choice, &self.switches) {
             (Some(slider), _, _) => self.sliding(slider, room, &mut lines),
-            (None, Some(choice), _) => self.asking(choice, room, &mut lines),
+            (None, Some(choice), _) => self.asking(choice, room, height, &mut lines),
             (None, None, Some(list)) => self.switching(list, room, &mut lines),
             (None, None, None) => self.typing(room, &mut lines),
         }
@@ -2328,7 +2383,7 @@ impl Bar {
     /// The box while it holds a line being typed.
     fn typing(&self, room: usize, lines: &mut Vec<String>) {
         if let Some(question) = &self.asking {
-            for part in render::fold(question, room) {
+            for part in question.lines().flat_map(|line| render::fold(line, room)) {
                 let width = render::visible(&part);
                 lines.push(self.boxed(&render::bold(&part), width, room));
             }
@@ -2451,29 +2506,48 @@ impl Bar {
     /// The box while it holds a question. The answers are listed inside it
     /// and steered with the arrow keys, so agreeing to something is one key
     /// and never the wrong letter.
-    fn asking(&self, choice: &Choice, room: usize, lines: &mut Vec<String>) {
-        for part in render::fold(&choice.question, room) {
-            let width = render::visible(&part);
-            lines.push(self.boxed(&render::bold(&part), width, room));
-        }
-        for detail in &choice.detail {
-            for part in render::fold(detail, room) {
-                let width = render::visible(&part);
-                lines.push(self.boxed(&render::dim(&part), width, room));
-            }
-        }
+    fn asking(&self, choice: &Choice, room: usize, height: usize, lines: &mut Vec<String>) {
         let shown = choice.shown();
-        if let Some(filter) = choice.filter.as_deref().filter(|f| !f.is_empty()) {
-            let count = format!("{} with \"{filter}\"", shown.len());
-            lines.push(self.boxed(&render::dim(&count), count.chars().count(), room));
-        }
-        lines.push(self.boxed("", 0, room));
         // A list the user narrows keeps its height as it is narrowed, so the
         // box does not jump under the letters being typed.
         let rows = match choice.options.len() {
             all if all > CHOICE_ROWS => CHOICE_ROWS + 2,
             all => all,
         };
+        let filtered = choice.filter.as_deref().filter(|f| !f.is_empty());
+        // The words over the choices get what the window leaves once the
+        // choices, the gap above them, the box's foot, the footer and a few
+        // rows of the conversation have theirs: a long command or question
+        // pushing the choices off the bottom would leave enter taking one
+        // nobody can see.
+        let choices = rows.max(shown.len().min(CHOICE_ROWS) + 2) + usize::from(filtered.is_some());
+        let room_rows = height
+            .saturating_sub(lines.len() + 1 + choices + 2 + KEPT_ROWS)
+            .max(1);
+        let mut words: Vec<String> = (choice.question.lines())
+            .flat_map(|line| render::fold(line, room))
+            .map(|part| render::bold(&part))
+            .collect();
+        words.extend(
+            (choice.detail.iter())
+                .flat_map(|detail| detail.lines())
+                .flat_map(|line| render::fold(line, room))
+                .map(|part| render::dim(&part)),
+        );
+        if words.len() > room_rows {
+            let kept = room_rows.saturating_sub(1).max(1);
+            let hidden = words.len() - kept;
+            words.truncate(kept);
+            words.push(render::dim(&format!("… {hidden} more lines")));
+        }
+        for word in &words {
+            lines.push(self.boxed(word, render::visible(word), room));
+        }
+        if let Some(filter) = filtered {
+            let count = format!("{} with \"{filter}\"", shown.len());
+            lines.push(self.boxed(&render::dim(&count), count.chars().count(), room));
+        }
+        lines.push(self.boxed("", 0, room));
         let start = lines.len();
         if shown.is_empty() {
             let none = "Nothing matches.";
@@ -3776,6 +3850,75 @@ mod tests {
         bar.guard = Instant::now().checked_sub(STILL);
         bar.pick(key(KeyCode::Enter));
         assert_eq!(bar.answer, Some(0));
+    }
+
+    #[test]
+    fn typing_under_a_card_nobody_asked_for_stays_in_the_box() {
+        let mut bar = Bar::new(String::new());
+        bar.line.insert_str("fix issue ");
+        bar.choice = Some(question(&["Yes", "No"], false));
+        bar.guard = Some(Instant::now());
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for code in [
+            KeyCode::Char('4'),
+            KeyCode::Char('2'),
+            KeyCode::Char('x'),
+            KeyCode::Backspace,
+        ] {
+            bar.pick(key(code));
+        }
+        assert_eq!(bar.line.text(), "fix issue 42");
+        assert_eq!(bar.answer, None);
+    }
+
+    #[test]
+    fn an_enter_while_still_typing_sends_the_line_rather_than_a_yes() {
+        let mut bar = Bar::new(String::new());
+        bar.line.insert_str("and run the tests");
+        bar.choice = Some(question(&["Yes", "No"], false));
+        bar.guard = Some(Instant::now());
+        bar.pick(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(bar.answer, None);
+        assert_eq!(bar.queued, ["and run the tests"]);
+        assert!(bar.line.is_empty());
+    }
+
+    #[test]
+    fn a_line_queued_before_a_question_is_set_aside_from_its_answer() {
+        let mut bar = Bar::new(String::new());
+        bar.queued.extend(["hello".to_owned(), "/model".to_owned()]);
+        let earlier = std::mem::take(&mut bar.queued);
+        // Only what is typed once it is asked can answer it.
+        bar.queued.push_back("sk-key".into());
+        assert_eq!(bar.next_line().as_deref(), Some("sk-key"));
+        bar.queued.push_back("typed after".into());
+        bar.put_back(earlier);
+        assert_eq!(bar.queued, ["hello", "/model", "typed after"]);
+    }
+
+    #[test]
+    fn a_tall_card_still_shows_its_choices() {
+        let mut bar = Bar::new(String::new());
+        let mut card = question(&["Yes", "No, tell it why not", "No, and stop here"], false);
+        card.question = "Letronna wants to run a script\nwith a second line".into();
+        card.detail = (1..=60).map(|n| format!("echo step {n}")).collect();
+        bar.choice = Some(card);
+        let lines = bar.lines(24);
+        assert!(lines.len() <= 24, "{} rows", lines.len());
+        let text: Vec<String> = lines.iter().map(|line| plain(line)).collect();
+        assert!(text.iter().any(|row| row.contains("3 No, and stop here")));
+        assert!(text.iter().any(|row| row.contains("with a second line")));
+        assert!(text.iter().any(|row| row.contains("more lines")));
+    }
+
+    #[test]
+    fn escape_at_a_question_turns_it_down_rather_than_stopping_later() {
+        let mut bar = Bar::new(String::new());
+        bar.working = true;
+        bar.asking = Some("Which branch?".into());
+        bar.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(bar.queued, [""]);
+        assert!(!bar.interrupt);
     }
 
     #[test]

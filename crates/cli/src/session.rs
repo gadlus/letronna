@@ -31,6 +31,8 @@ const DETAIL_LINES: usize = 12;
 /// The last answer offered to a question with options, which takes a line
 /// typed instead.
 const OWN_WORDS: &str = "Answer in my own words";
+/// Said when the model's question was turned down, which ends the turn.
+const UNANSWERED: &str = "Left unanswered; the turn stopped.";
 
 pub struct Runner {
     pub store: Store,
@@ -1184,19 +1186,25 @@ impl Runner {
             // An open question wants the line; offered answers are picked,
             // or passed over for one in the user's own words, as the
             // window's card takes one.
+            // It comes up while the model works, under whatever is being
+            // typed, so an enter meant for that does not answer it.
             let reply = if options.is_empty() {
                 render::blank();
                 render::said(&render::blue("●"), &bold_question(&question));
-                self.bar.reply().ok_or("No answer given.")?
+                let Some(words) = self.bar.answer(&question) else {
+                    render::line(&render::dim(UNANSWERED));
+                    return Ok(false);
+                };
+                words
             } else {
                 let mut choices: Vec<&str> = options.iter().map(String::as_str).collect();
                 choices.push(OWN_WORDS);
                 // Escape turns the question down, which ends the turn as it
                 // does when a call is asked about.
-                let Some(picked) = self.bar.choose(&question, Vec::new(), &choices) else {
+                let Some(picked) = self.bar.interject(&question, Vec::new(), &choices) else {
                     render::blank();
                     render::said(&render::blue("●"), &bold_question(&question));
-                    render::line(&render::dim("Left unanswered; the turn stopped."));
+                    render::line(&render::dim(UNANSWERED));
                     return Ok(false);
                 };
                 render::blank();
@@ -1207,7 +1215,13 @@ impl Runner {
                         render::blank();
                         option.clone()
                     }
-                    None => self.bar.reply().ok_or("No answer given.")?,
+                    None => {
+                        let Some(words) = self.bar.answer(&question) else {
+                            render::line(&render::dim(UNANSWERED));
+                            return Ok(false);
+                        };
+                        words
+                    }
                 }
             };
             turn.finish_call(Ok(reply));
@@ -1271,7 +1285,9 @@ impl Runner {
         }
         choices.extend(here.as_deref());
         choices.extend(["No, tell it why not", "No, and stop here"]);
-        let picked = self.bar.choose(&question, detail, &choices);
+        // It comes up while the model works, under whatever is being typed:
+        // an enter or a digit meant for that must not be taken for a yes.
+        let picked = self.bar.interject(&question, detail, &choices);
         let picked = picked.and_then(|at| choices.get(at).copied());
         if let Some(at) = picked.and_then(|choice| kept.iter().position(|&k| k == choice)) {
             let place = places[at];
@@ -1329,7 +1345,7 @@ impl Runner {
         let mut shown = Stream::opening_with(render::bullet());
         shown.push(&plan);
         shown.end();
-        let picked = self.bar.choose(
+        let picked = self.bar.interject(
             "Carry out this plan?",
             Vec::new(),
             &[
