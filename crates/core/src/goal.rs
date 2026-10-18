@@ -204,13 +204,15 @@ pub fn active(goal: &Option<Goal>) -> Option<Goal> {
 
 /// Reads what follows `/goal`. The check command comes after a flag, since
 /// a goal may well start with "check"; `clear` and `resume` count only on
-/// their own.
+/// their own, and so do `stop`, `off` and `cancel`, which end a goal as
+/// `clear` does: a goal of one such word is nothing to work towards, and
+/// was always meant as one of them.
 pub fn parse(args: &str) -> Command {
     let args = args.trim();
     if args.is_empty() {
         return Command::Show;
     }
-    if args == "clear" {
+    if matches!(args, "clear" | "stop" | "off" | "cancel") {
         return Command::Clear;
     }
     if args == "resume" {
@@ -1323,6 +1325,9 @@ mod tests {
     fn goal_commands_set_check_show_and_clear() {
         assert_eq!(parse(""), Command::Show);
         assert_eq!(parse(" clear "), Command::Clear);
+        for ending in ["stop", "off", "cancel"] {
+            assert_eq!(parse(ending), Command::Clear, "{ending}");
+        }
         assert_eq!(
             parse("--check cargo test"),
             Command::Check("cargo test".into())
@@ -1333,6 +1338,7 @@ mod tests {
             "check that every page loads",
             "checkout the branch",
             "clear the cache",
+            "stop the flaky test from failing",
             "resume the upload",
         ] {
             assert_eq!(parse(text), Command::Set(text.into()));
