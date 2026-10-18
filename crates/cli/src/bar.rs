@@ -246,7 +246,15 @@ pub const COMMANDS: &[Command<'static>] = &[
     },
     Command {
         name: "/clear",
-        blurb: "clear the screen",
+        blurb: "start fresh in a new session; the last one stays in /resume",
+    },
+    Command {
+        name: "/status",
+        blurb: "version, session, folder, model, mode, account and context",
+    },
+    Command {
+        name: "/export",
+        blurb: "write the conversation as Markdown: /export [file]",
     },
     Command {
         name: "/exit",
@@ -1926,6 +1934,8 @@ impl Bar {
             KeyCode::Char('d') if control && self.line.is_empty() => self.done = true,
             // Open or fold the latest thinking, as Claude Code's ctrl+o does.
             KeyCode::Char('o') if control => crate::screen::toggle_last(),
+            // A clean screen, the session going on as it was.
+            KeyCode::Char('l') if control => crate::screen::wipe(),
             // A newline on purpose, for writing a paragraph.
             KeyCode::Enter if shift || alt => self.line.insert('\n'),
             // Every enter puts a line ending in. Whether it also ends the

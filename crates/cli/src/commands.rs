@@ -53,10 +53,25 @@ pub fn command(
             help(workspace, rest);
             Flow::Handled
         }
+        // A fresh start, as Claude Code's /clear is: a new session on a
+        // clean screen. The one left stays in /resume; ctrl-l only clears.
         "/clear" => {
+            *session = runner.open(false, workspace.map(|p| p.to_path_buf()));
+            runner.persist();
             render::clear();
             banner(runner, &folder_name(workspace), *session);
             runner.bar.redraw();
+            render::line(&render::dim(
+                "New session; /resume brings back the one before.",
+            ));
+            Flow::Handled
+        }
+        "/status" => {
+            status(runner, *session);
+            Flow::Handled
+        }
+        "/export" => {
+            export(runner, *session, rest);
             Flow::Handled
         }
         "/new" => {
@@ -904,6 +919,144 @@ fn fallback(runner: &mut Runner, rest: &str) {
         "Asked in order once your model's own tries are spent. One that fails is passed over for {} minutes.",
         letronna_core::fallback::COOLDOWN.as_secs() / 60
     )));
+}
+
+/// A path as `/status` shows it, the home folder written `~`: the session
+/// file under the data folder fits beside its label that way, where the
+/// whole path would wrap.
+fn shown_path(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(inside) if inside.as_os_str().is_empty() => "~".to_owned(),
+        Some(inside) => std::path::Path::new("~").join(inside).display().to_string(),
+        None => path.display().to_string(),
+    }
+}
+
+/// Where things stand, on one screen: the version, the session, its
+/// folder and branch, the model, the mode, the account, how full the
+/// context is, and the MCP servers.
+fn status(runner: &mut Runner, session: usize) {
+    let conversation = &runner.store.conversations[session];
+    let (id, title) = (conversation.id, conversation.title.clone());
+    let folder = conversation.workspace.clone();
+    let filled = (conversation.messages.iter().rev())
+        .find(|m| m.role == "assistant" && m.window > 0 && m.input_tokens() > 0)
+        .map(|reply| (reply.input_tokens(), reply.window));
+    let place = (folder.clone()).map(|folder| {
+        runner.bar.busy("looking at the project", move || {
+            letronna_core::git::status(&folder).map(|status| status.describe())
+        })
+    });
+    let (gateway, model) = runner.store.model(session);
+    let (gateway, model) = (gateway.to_owned(), model.to_owned());
+    let effort = runner.store.effort(session).to_owned();
+    let row = |label: &str, value: &str| {
+        render::line(&format!("{}  {value}", render::dim(&format!("{label:<8}"))));
+    };
+    render::blank();
+    row("version", env!("CARGO_PKG_VERSION"));
+    let name = match letronna_core::tools::one_line(&title) {
+        name if name.is_empty() => "untitled".to_owned(),
+        name => name,
+    };
+    row("session", &format!("{name} · {id}"));
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    let file = store::sessions_dir().join(format!("{id}.jsonl"));
+    row("file", &shown_path(&file, home.as_deref()));
+    match (&folder, place) {
+        (Some(folder), Some(Ok(place))) => row(
+            "folder",
+            &format!("{} · {place}", shown_path(folder, home.as_deref())),
+        ),
+        (Some(folder), _) => row("folder", &shown_path(folder, home.as_deref())),
+        (None, _) => row("folder", "none"),
+    }
+    let thinking = match effort.as_str() {
+        "" => String::new(),
+        effort => format!(" · thinking {effort}"),
+    };
+    row("model", &format!("{model} on {gateway}{thinking}"));
+    let mode = runner.current_mode();
+    row("mode", &format!("{}: {}", mode.label(), mode.about()));
+    row(
+        "account",
+        &match letronna_core::auth::account() {
+            Some(account) => format!("signed in as {}", account.email),
+            None => "not signed in · /login".to_owned(),
+        },
+    );
+    if let Some((used, window)) = filled {
+        row(
+            "context",
+            &format!(
+                "{}% of {}",
+                used.saturating_mul(100) / window.max(1),
+                letronna_core::usage::count(window)
+            ),
+        );
+    }
+    let servers = letronna_core::mcp::status();
+    if !servers.is_empty() {
+        let up = (servers.iter())
+            .filter(|server| server.state == letronna_core::mcp::State::Connected)
+            .count();
+        row(
+            "mcp",
+            &format!("{} servers, {up} connected · /mcp", servers.len()),
+        );
+    }
+}
+
+/// The conversation as Markdown, to `rest` or, given nothing, to a file in
+/// the project folder named after the session; never over a file there.
+fn export(runner: &mut Runner, session: usize, rest: &str) {
+    let conversation = &runner.store.conversations[session];
+    render::blank();
+    if conversation.length() == 0 {
+        render::line(&render::dim("Nothing to export yet."));
+        return;
+    }
+    let folder = (conversation.workspace.clone())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+    let path = match rest.trim() {
+        "" => folder.join(format!(
+            "{}.md",
+            file_stem(&conversation.title, conversation.id)
+        )),
+        named => folder.join(named),
+    };
+    if path.exists() {
+        render::line(&render::dim(&format!(
+            "{} is there already; /export <another name> writes elsewhere.",
+            path.display()
+        )));
+        return;
+    }
+    let text = letronna_core::export::markdown(conversation);
+    match std::fs::write(&path, text) {
+        Ok(()) => render::line(&render::dim(&format!("Exported to {}.", path.display()))),
+        Err(error) => render::line(&render::red(&format!(
+            "Could not write {}: {error}.",
+            path.display()
+        ))),
+    }
+}
+
+/// A file name for a session: its name in lower case, words joined by
+/// hyphens, or the session's id when its name has nothing to use.
+fn file_stem(title: &str, id: u64) -> String {
+    let words: Vec<String> = (title.split(|c: char| !c.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .take(8)
+        .map(str::to_lowercase)
+        .collect();
+    match words.is_empty() {
+        true => format!("session-{id}"),
+        false => words.join("-"),
+    }
 }
 
 /// A row for each part of the context: its name, its tokens, and a bar of
@@ -5862,6 +6015,33 @@ mod tests {
         assert_eq!(store.conversations[0].memory_scope, None);
         store.settings.memory_saving = Saving::Ask;
         assert_eq!(store.memory_saving(0), Saving::Ask);
+    }
+
+    #[test]
+    fn an_export_is_named_after_its_session() {
+        assert_eq!(
+            super::file_stem("Fix the login bug!", 7),
+            "fix-the-login-bug"
+        );
+        assert_eq!(super::file_stem("  ", 7), "session-7");
+        assert_eq!(super::file_stem("修复 登录", 7), "修复-登录");
+    }
+
+    #[test]
+    fn status_writes_the_home_folder_as_a_tilde() {
+        let home = std::path::Path::new("/Users/someone");
+        let file = home.join("Library/Application Support/Letronna/sessions/7.jsonl");
+        assert_eq!(
+            super::shown_path(&file, Some(home)),
+            std::path::Path::new("~")
+                .join("Library/Application Support/Letronna/sessions/7.jsonl")
+                .display()
+                .to_string()
+        );
+        assert_eq!(super::shown_path(home, Some(home)), "~");
+        let elsewhere = std::path::Path::new("/srv/app");
+        assert_eq!(super::shown_path(elsewhere, Some(home)), "/srv/app");
+        assert_eq!(super::shown_path(elsewhere, None), "/srv/app");
     }
 
     #[test]

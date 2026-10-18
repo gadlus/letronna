@@ -56,7 +56,8 @@ Type `/` to list them all. The common ones:
 
 | Command | Does |
 |---|---|
-| `/new`, `/resume` | Start a session, or reopen one |
+| `/new`, `/clear`, `/resume` | Start a session, or reopen one; Ctrl+L clears the screen |
+| `/status`, `/export` | Where things stand on one screen; the conversation as Markdown |
 | `/model`, `/effort`, `/thinking` | Model and reasoning controls |
 | `/connect`, `/search` | Providers, their plan and usage, and web search |
 | `/plan` | Switch to read-only |
