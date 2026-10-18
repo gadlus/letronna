@@ -795,9 +795,12 @@ impl Chat {
             None => {}
         }
         self.typing.remove(&id);
-        // Nothing waits on its cards now; dropped, they are declined.
-        self.agent_asks
-            .retain(|request| request.root != id || request.run != id);
+        // Nothing waits on the run's own cards now; dropped, they are
+        // declined. Its helpers' stay, since one in the background outlives
+        // the run that started it.
+        self.agent_asks.retain(|request| {
+            !the_run_asks(request.root, request.run, &request.label, id, &run.label)
+        });
         let open = self
             .store
             .conversations
@@ -974,11 +977,18 @@ impl Chat {
     }
 }
 
+/// Whether a card for session `root` in run `run`, asked as `label`, is
+/// held run `id`'s own, which is labelled `run_label`: the helpers it starts
+/// join its run, but under names of their own.
+fn the_run_asks(root: u64, run: u64, label: &str, id: u64, run_label: &str) -> bool {
+    root == id && run == id && label == run_label
+}
+
 #[cfg(test)]
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute here.
-    use super::{Finished, Live, Run, apply, background_prompt};
+    use super::{Finished, Live, Run, apply, background_prompt, the_run_asks};
     use letronna_core::cancel::Cancel;
     use letronna_core::chat::{Message, ToolCall};
     use letronna_core::driver::Step;
@@ -1016,6 +1026,17 @@ mod tests {
             stopped: false,
             failed: false,
         }
+    }
+
+    #[test]
+    fn a_held_run_s_end_drops_its_own_cards_and_keeps_its_helpers() {
+        // Its own, asked under its label in its own run.
+        assert!(the_run_asks(7, 7, "Fix the build", 7, "Fix the build"));
+        // A helper it started joins its run under a name of its own.
+        assert!(!the_run_asks(7, 7, "explore", 7, "Fix the build"));
+        // Another session's, or another run's.
+        assert!(!the_run_asks(8, 8, "Fix the build", 7, "Fix the build"));
+        assert!(!the_run_asks(7, 12, "Fix the build", 7, "Fix the build"));
     }
 
     #[test]
