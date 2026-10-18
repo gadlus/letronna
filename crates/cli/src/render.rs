@@ -41,8 +41,19 @@ pub fn interactive() -> bool {
     std::io::stdin().is_terminal() && colour()
 }
 
-/// Name the window after the session, the way a terminal program should, and
-/// put the old title back on the way out.
+/// Text as one plain line: line breaks and other control characters become
+/// spaces, which then run together, so a session named from the first lines
+/// of a prompt, or from text holding escape codes, can neither break a row
+/// nor reach the terminal as a command.
+pub fn one_line(text: &str) -> String {
+    let spaced: String = (text.chars())
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    spaced.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Name the window, the way a terminal program should; `title::restore`
+/// puts the old name back on the way out.
 pub fn title(text: &str) {
     if colour() {
         print!("]0;{text}");

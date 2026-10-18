@@ -366,6 +366,7 @@ fn main() {
     }
 
     let folder = folder_name(workspace.as_deref());
+    title::save();
     title::idle();
     // The window has to be ours before the banner, or the banner goes to the
     // screen we are about to swap away from.
@@ -417,10 +418,13 @@ fn main() {
     let (_schedules, events) = letronna_core::schedule::Runner::start();
     runner.bar.hear_schedules(events);
     offer_added(&mut runner, workspace.as_deref());
-    runner
-        .bar
-        .set_folder(runner.store.conversations[session].workspace.clone());
-    while let Some(waited) = runner.bar.wait() {
+    loop {
+        // Before every wait, so a session opened, named or renamed by
+        // whatever ran last shows on the box's edge and in the title.
+        show_session(&mut runner, session);
+        let Some(waited) = runner.bar.wait() else {
+            break;
+        };
         // Helpers that ended ring the doorbell as they do.
         runner.tell_ended();
         if let bar::Waited::Scheduled(event) = waited {
@@ -475,9 +479,7 @@ fn main() {
             // Only the open session's wake-ups: another's would leave a
             // notice that starts nothing here.
             letronna_core::wake::serve([open]);
-            runner
-                .bar
-                .set_folder(runner.store.conversations[session].workspace.clone());
+            show_session(&mut runner, session);
             if let Flow::Unknown = flow {
                 let name = line.split_whitespace().next().unwrap_or(&line);
                 render::line(&render::dim(&match runner.bar.meant(name) {
@@ -547,13 +549,22 @@ fn main() {
     letronna_core::browser::close_hidden();
     letronna_core::schedule::stop();
     runner.store.release_unused();
-    render::title("");
+    title::restore();
     render::blank();
     let open = (runner.store.conversations.get(session)).map_or(opened, |c| c.id);
     for kept in left_worktrees(&runner, &[opened, open]) {
         render::line(&render::dim(&kept));
     }
     letronna_core::diag::stop();
+}
+
+/// Show which session is open: its name on the box's edge and in the
+/// window's title, and its folder for `@` paths and the edge's git state.
+fn show_session(runner: &mut Runner, session: usize) {
+    let conversation = &runner.store.conversations[session];
+    let (name, folder) = (conversation.title.clone(), conversation.workspace.clone());
+    runner.bar.set_folder(folder);
+    runner.bar.set_session(&name);
 }
 
 /// Finishes the worktrees the sessions `ids` work in, now that nothing this
@@ -1424,7 +1435,7 @@ fn rescue_terminal() {
         }
         let _ = crossterm::terminal::disable_raw_mode();
         render::set_raw(false);
-        render::title("");
+        title::restore();
         previous(info);
     }));
 }

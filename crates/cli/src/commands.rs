@@ -3342,9 +3342,10 @@ const SESSION_LIST: usize = 50;
 /// How a session reads in the `/resume` list: its title, project folder and
 /// length.
 fn choice_label(conversation: &store::Conversation) -> String {
-    let title = match conversation.title.trim() {
-        "" => "untitled".to_owned(),
-        title => title.to_owned(),
+    // On one line: a name taken from a prompt's first lines would break the row.
+    let title = match render::one_line(&conversation.title) {
+        title if title.is_empty() => "untitled".to_owned(),
+        title => title,
     };
     let folder = conversation
         .workspace

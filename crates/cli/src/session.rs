@@ -174,6 +174,9 @@ impl Runner {
             conversation.updated = chat::now();
             goal::interrupted(&mut conversation.goal);
         }
+        // Named by its first prompt, which shows while that turn runs.
+        let name = self.store.conversations[session].title.clone();
+        self.bar.set_session(&name);
         // What came meanwhile goes in ahead of the prompt, so the user's
         // words are the last thing the model reads.
         self.take_notices(session, true);

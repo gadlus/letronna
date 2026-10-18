@@ -840,6 +840,15 @@ pub struct Bar {
     added: Added,
     /// The open session's project folder, where an `@` path is completed.
     folder: Option<std::path::PathBuf>,
+    /// The open session's name, on one line, which the box's top edge
+    /// carries.
+    session: String,
+    /// Where the folder stands in git -- its branch, what is changed, and
+    /// how far it is from its upstream -- after the name; empty outside a
+    /// repository.
+    place: String,
+    /// A look at `place` under way, which takes a moment in a big repository.
+    places: Option<Receiver<String>>,
     /// When shift-tab last picked a mode, whose words then take the footer
     /// for a moment.
     mode_note: Option<std::time::Instant>,
@@ -893,6 +902,9 @@ impl Bar {
             focus: crate::notify::Focus::new(std::time::Instant::now()),
             added: Added::default(),
             folder: None,
+            session: String::new(),
+            place: String::new(),
+            places: None,
             mode_note: None,
             before_plan: Mode::Default,
         }
@@ -914,9 +926,52 @@ impl Bar {
         self.line.text()
     }
 
-    /// Complete `@` paths in `folder`, the open session's project folder.
+    /// Complete `@` paths in `folder`, the open session's project folder,
+    /// and look at where it stands in git when it is a new one.
     pub fn set_folder(&mut self, folder: Option<std::path::PathBuf>) {
-        self.folder = folder;
+        if folder != self.folder {
+            self.folder = folder;
+            self.place.clear();
+            self.look_at_place();
+        }
+    }
+
+    /// Name the open session on the box's top edge and in the window's
+    /// title: on one line, so a name taken from the first lines of a prompt
+    /// breaks neither.
+    pub fn set_session(&mut self, name: &str) {
+        let name = render::one_line(name);
+        if name != self.session {
+            crate::title::name(&name);
+            self.session = name;
+            self.settle();
+        }
+    }
+
+    /// Look again at where the folder stands in git, off this thread: a
+    /// turn may have changed files, and git can take a moment to say.
+    fn look_at_place(&mut self) {
+        let Some(folder) = self.folder.clone() else {
+            self.places = None;
+            return;
+        };
+        let (tell, told) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let place = letronna_core::git::status(&folder).map(|status| status.describe());
+            let _ = tell.send(place.unwrap_or_default());
+        });
+        self.places = Some(told);
+    }
+
+    /// Take the look at `place` if it is back, saying whether the box changed.
+    fn take_place(&mut self) -> bool {
+        let Some(place) = self.places.as_ref().and_then(|told| told.try_recv().ok()) else {
+            return false;
+        };
+        self.places = None;
+        let changed = place != self.place;
+        self.place = place;
+        changed
     }
 
     /// Take the window.
@@ -1142,6 +1197,8 @@ impl Bar {
             return crate::input::read(&format!("{} ", render::blue("›")));
         }
         let earlier = std::mem::take(&mut self.queued);
+        let waits = self.working;
+        crate::title::waiting(waits);
         let answer = loop {
             if self.done {
                 break None;
@@ -1151,6 +1208,9 @@ impl Bar {
             }
             self.pump();
         };
+        if waits {
+            crate::title::waiting(false);
+        }
         self.put_back(earlier);
         answer
     }
@@ -1225,19 +1285,25 @@ impl Bar {
         self.answer = None;
         self.declined = false;
         self.settle();
-        loop {
+        // A question asked while it works, or one nobody at the keyboard
+        // asked for, is what the window's title says waits for you.
+        let waits = self.working || self.guard.is_some();
+        crate::title::waiting(waits);
+        let picked = loop {
             if self.done || std::mem::take(&mut self.declined) {
-                self.choice = None;
-                self.settle();
-                return None;
+                break None;
             }
             if let Some(answer) = self.answer.take() {
-                self.choice = None;
-                self.settle();
-                return Some(answer);
+                break Some(answer);
             }
             self.pump();
+        };
+        if waits {
+            crate::title::waiting(false);
         }
+        self.choice = None;
+        self.settle();
+        picked
     }
 
     /// `choose`, for a question nobody at the keyboard asked for. It can come
@@ -1500,6 +1566,9 @@ impl Bar {
                 self.settle();
             }
         }
+        if self.take_place() {
+            self.settle();
+        }
         // The footer goes back once the mode's words have had their moment.
         if self
             .mode_note
@@ -1689,6 +1758,8 @@ impl Bar {
         if !on {
             self.interrupt = false;
             self.hurry = false;
+            // What the turn changed shows on the box's edge.
+            self.look_at_place();
         }
         // The footer says whether escape will stop anything, so it is
         // redrawn now rather than at the next key; that also brings out the
@@ -2219,7 +2290,7 @@ impl Bar {
         lines.push(format!(
             "{}{}",
             render::MARGIN,
-            render::dim(&format!("╭{edge}╮"))
+            top_edge(&self.session, &self.place, room + 2)
         ));
         match (&self.slider, &self.choice, &self.switches) {
             (Some(slider), _, _) => self.sliding(slider, room, &mut lines),
@@ -2633,6 +2704,38 @@ fn checklist(todos: &[Todo], room: usize) -> Vec<String> {
         lines.push(format!("{}{}", render::PAD, render::dim(&more)));
     }
     lines
+}
+
+/// Below this many columns the edge carries the name alone.
+const PLACE_ROOM: usize = 40;
+
+/// The box's top edge, `width` columns between its corners, carrying the
+/// session's name and where its folder stands in git: which session this
+/// is shows without a row of its own. The place goes first when they do
+/// not both fit, and the name is cut before it is dropped.
+fn top_edge(name: &str, place: &str, width: usize) -> String {
+    // "─ " before the words and " ─" after them at the least.
+    let room = width.saturating_sub(4);
+    let place = if width < PLACE_ROOM { "" } else { place };
+    let words = match (name.is_empty(), place.is_empty()) {
+        (true, true) => return render::dim(&format!("╭{}╮", "─".repeat(width))),
+        (false, true) => render::clip(name, room),
+        (true, false) => render::dim(&render::clip(place, room)),
+        (false, false) => {
+            let both = format!("{name} · {place}");
+            if render::visible(&both) <= room {
+                format!("{name}{}", render::dim(&format!(" · {place}")))
+            } else {
+                render::clip(name, room)
+            }
+        }
+    };
+    let rest = width.saturating_sub(3 + render::visible(&words));
+    format!(
+        "{}{words}{}",
+        render::dim("╭─ "),
+        render::dim(&format!(" {}╮", "─".repeat(rest)))
+    )
 }
 
 /// A queued line cut to one row `room` columns wide: its first line, with an
@@ -3850,6 +3953,47 @@ mod tests {
         bar.guard = Instant::now().checked_sub(STILL);
         bar.pick(key(KeyCode::Enter));
         assert_eq!(bar.answer, Some(0));
+    }
+
+    #[test]
+    fn the_box_names_the_session_and_its_branch() {
+        let edge = plain(&super::top_edge(
+            "Fix the login bug",
+            "main · 3 changed",
+            60,
+        ));
+        assert!(
+            edge.starts_with("╭─ Fix the login bug · main · 3 changed ─"),
+            "{edge}"
+        );
+        assert!(edge.ends_with("─╮"));
+        assert_eq!(visible(&edge), 62);
+        // Before there is anything to say, a plain edge.
+        assert_eq!(
+            plain(&super::top_edge("", "", 10)),
+            format!("╭{}╮", "─".repeat(10))
+        );
+    }
+
+    #[test]
+    fn a_narrow_box_keeps_the_name_and_drops_the_branch() {
+        for width in [20, 30, 45] {
+            let edge = plain(&super::top_edge(
+                "Fix the login bug in the sign-in page",
+                "main · 3 changed",
+                width,
+            ));
+            assert_eq!(visible(&edge), width + 2, "{edge}");
+            assert!(edge.contains("Fix the"), "{edge}");
+            assert!(!edge.contains("main"), "{edge}");
+        }
+    }
+
+    #[test]
+    fn a_name_with_line_breaks_shows_on_one_line() {
+        let mut bar = Bar::new(String::new());
+        bar.set_session("why does the\nbuild\tfail\x1b]0;x\x07 here");
+        assert_eq!(bar.session, "why does the build fail ]0;x here");
     }
 
     #[test]

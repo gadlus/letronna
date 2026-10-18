@@ -34,6 +34,8 @@ Flags:
 
 For scripted runs, `-p` also takes a deadline and a JSON Schema for the answer.
 
+In the terminal, the box's top edge names the open session and shows where its folder stands in git, and the window's title leads with the session's name, saying "waiting for you" while a card or a question waits for an answer.
+
 ## Modes
 
 | Mode | Behaviour |
