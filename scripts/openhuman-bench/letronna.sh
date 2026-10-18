@@ -59,8 +59,8 @@ export LETRONNA_NO_LOGIN_ENV=1
 export BROWSER=/usr/bin/false
 export NO_COLOR=1
 
-# 150 tool rounds, as Letronna's Harness-Bench runs get: nobody is there to
-# say "continue". The result line goes to harness.log with the rest, and to
-# letronna.json beside it on its own.
-/opt/harness/letronna/letronna -p "$PROMPT" --output json --mode bypass --max-rounds 150 \
+# 300 tool rounds, as nobody is there to say "continue" and a DeepSWE task
+# can take more than 150. The result line goes to harness.log with the rest,
+# and to letronna.json beside it on its own.
+/opt/harness/letronna/letronna -p "$PROMPT" --output json --mode bypass --max-rounds 300 \
   | tee "${RESULT_DIR:-/results}/letronna.json"

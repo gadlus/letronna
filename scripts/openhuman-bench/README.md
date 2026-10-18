@@ -141,7 +141,7 @@ under `TASK_TIMEOUT_S`, and keeps its output as the task's `harness.log`.
   `AGENT_MODEL`, so nothing is set up or saved. The proxy pins the model
   and reasoning whatever Letronna asks for.
 - It runs `letronna -p "$PROMPT" --output json --mode bypass --max-rounds
-  150`. The result line lands in `harness.log` and alone in
+  300`. The result line lands in `harness.log` and alone in
   `letronna.json` beside it.
 - `LETRONNA_DEADLINE`, in whole seconds from the start, follows the rig's
   turn budget (`runner/turn-budget.mjs`): the task's budget less
