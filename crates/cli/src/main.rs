@@ -235,6 +235,11 @@ fn main() {
         plain_terminal: !args.once(),
     };
     letronna_core::diag::mark("listed");
+    // With no flag picking one, the mode the window starts sessions in, so
+    // the two agree; a `-p` run keeps to its flags alone.
+    if !args.mode_picked && !args.once() {
+        runner.mode = runner.store.settings.mode;
+    }
     // At the prompt the mode leads the footer, where shift-tab changes it.
     if runner.plain_terminal {
         let mode = runner.mode;

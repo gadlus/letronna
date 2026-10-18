@@ -32,7 +32,7 @@ Options
       --mode <mode>        how much runs without asking: default, accept-edits,
                            plan, auto, dont-ask or bypass
       --yes                --mode bypass: run tools without asking, bar risky ones
-      --plan               --mode plan: read and search only; never write or run
+      --plan               --mode plan: read and search only; never change files
       --model <id>         this session's model, leaving the default as it is
       --gateway <name>     the gateway that model is on
       --effort <level>     how hard it thinks in this session, or auto
@@ -122,6 +122,9 @@ pub struct Args {
     /// The mode from `--mode`, `--yes` or `--plan`, or why `--mode` named
     /// none.
     pub mode: Result<Mode, String>,
+    /// Whether one of those flags picked it: without one, the terminal
+    /// starts in the mode the window starts sessions in.
+    pub mode_picked: bool,
     /// The session's own model, gateway and effort, for this run and after.
     pub model: Option<String>,
     pub gateway: Option<String>,
@@ -176,6 +179,7 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         prompt: None,
         start: Start::Fresh,
         mode: Ok(Mode::Default),
+        mode_picked: false,
         model: None,
         gateway: None,
         effort: None,
@@ -340,6 +344,7 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
             }
         }
     }
+    args.mode_picked = mode.is_some() || yes || plan;
     args.mode = picked(mode, yes, plan);
     // A chat carried on keeps what it chose; `/remember` changes that.
     if args.private && args.start != Start::Fresh {
@@ -475,6 +480,14 @@ mod tests {
 
     fn args(words: &[&str]) -> super::Args {
         parse(words.iter().map(|w| w.to_string())).unwrap()
+    }
+
+    #[test]
+    fn only_a_flag_picks_the_mode_the_terminal_starts_in() {
+        assert!(!args(&[]).mode_picked);
+        assert!(args(&["--plan"]).mode_picked);
+        assert!(args(&["--yes"]).mode_picked);
+        assert!(args(&["--mode", "default"]).mode_picked);
     }
 
     #[test]

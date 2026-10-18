@@ -747,6 +747,13 @@ impl Runner {
     /// the user stopped the turn, whose finished results are kept.
     fn work_through(&mut self, turn: &mut Turn, session: usize) -> Result<bool, String> {
         loop {
+            // A mode switched while it works holds from the next call, as
+            // the footer already says: plan mode left lets an edit ask, and
+            // entered refuses one, rather than waiting for the next prompt.
+            let now = self.current_mode();
+            if turn.connection.mode != now {
+                turn.connection.switch_to(now);
+            }
             let ctx = turn.tool_context();
             // Read afresh each time, since the window may have added one.
             let rules = permissions::load(&permissions::user_file());

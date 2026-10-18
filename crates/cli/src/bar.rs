@@ -50,7 +50,7 @@ pub const COMMANDS: &[Command<'static>] = &[
     },
     Command {
         name: "/plan",
-        blurb: "read and search only, never write or run",
+        blurb: "read and search only, never change files; /plan on or off",
     },
     Command {
         name: "/mode",
@@ -836,6 +836,11 @@ pub struct Bar {
     added: Added,
     /// The open session's project folder, where an `@` path is completed.
     folder: Option<std::path::PathBuf>,
+    /// When shift-tab last picked a mode, whose words then take the footer
+    /// for a moment.
+    mode_note: Option<std::time::Instant>,
+    /// The mode in use before plan mode was turned on.
+    before_plan: Mode,
 }
 
 impl Bar {
@@ -884,6 +889,8 @@ impl Bar {
             focus: crate::notify::Focus::new(std::time::Instant::now()),
             added: Added::default(),
             folder: None,
+            mode_note: None,
+            before_plan: Mode::Default,
         }
     }
 
@@ -962,9 +969,26 @@ impl Bar {
 
     /// Show `mode`, and let shift-tab step on from it.
     pub fn set_mode(&mut self, mode: Mode) {
+        self.keep_before_plan(mode);
         self.mode = Some(mode);
         self.bypass |= mode == Mode::Bypass;
         self.settle();
+    }
+
+    /// The mode in use before plan mode was turned on, which turning it off
+    /// goes back to.
+    pub fn before_plan(&self) -> Mode {
+        self.before_plan
+    }
+
+    /// Remember the mode being left when `next` turns plan mode on.
+    fn keep_before_plan(&mut self, next: Mode) {
+        if let Some(now) = self.mode
+            && next == Mode::Plan
+            && now != Mode::Plan
+        {
+            self.before_plan = now;
+        }
     }
 
     /// The mode on show, which shift-tab may have changed; `None` where the
@@ -1441,6 +1465,14 @@ impl Bar {
                 self.settle();
             }
         }
+        // The footer goes back once the mode's words have had their moment.
+        if self
+            .mode_note
+            .is_some_and(|since| since.elapsed() >= MODE_NOTE)
+        {
+            self.mode_note = None;
+            self.settle();
+        }
     }
 
     /// Follow the helpers of `session`, the one now open: a line for each at
@@ -1720,6 +1752,8 @@ impl Bar {
             // works; the session reads it before its next call.
             KeyCode::BackTab if self.mode.is_some() => self.step_mode(),
             KeyCode::Tab if shift && self.mode.is_some() => self.step_mode(),
+            // For a terminal that keeps shift-tab to itself.
+            KeyCode::Char('m') if alt && !control && self.mode.is_some() => self.step_mode(),
             KeyCode::Tab => {
                 if let Some(choice) = options.get(self.picked) {
                     self.line.set(&choice.line());
@@ -2239,7 +2273,12 @@ impl Bar {
         } else {
             String::new()
         };
-        lines.push(format!("{}{mode}{}", render::PAD, render::dim(&note)));
+        // A mode just picked says what it does over whatever else the footer
+        // had, which comes back after.
+        lines.push(match self.mode_note(width) {
+            Some(said) => format!("{}{said}", render::PAD),
+            None => format!("{}{mode}{}", render::PAD, render::dim(&note)),
+        });
 
         // The plan gets only the rows the rest leaves over: what is being
         // typed or asked comes first, and a screen of chrome would push its
@@ -2595,17 +2634,66 @@ fn mode_words(mode: Mode) -> (&'static str, &'static str) {
 /// What shift-tab is for, after the mode.
 const MODE_HINT: &str = "shift+tab to switch";
 
+/// How long the footer says what a mode just picked does.
+const MODE_NOTE: Duration = Duration::from_secs(3);
+
+/// Whether shift-tab steps onto `mode`. "Allowed calls only" refuses
+/// whatever would ask without a word, which a key pressed once too often
+/// should never land on, so only `/mode` picks it; bypass only once the
+/// session has been in it by choice.
+fn cycled(mode: Mode, bypass: bool) -> bool {
+    match mode {
+        Mode::DontAsk => false,
+        Mode::Bypass => bypass,
+        _ => true,
+    }
+}
+
+/// `text` in the mode's colour: by how much runs unasked.
+fn tinted(mode: Mode, text: &str) -> String {
+    match mode {
+        Mode::Bypass => render::red(text),
+        Mode::Plan => render::blue(text),
+        Mode::Default => render::dim(text),
+        _ => render::amber(text),
+    }
+}
+
 impl Bar {
     fn step_mode(&mut self) {
         let Some(now) = self.mode else { return };
         let offered: Vec<Mode> = (Mode::OFFERED.into_iter())
-            .filter(|m| *m != Mode::Bypass || self.bypass)
+            .filter(|m| cycled(*m, self.bypass))
             .collect();
-        let at = offered.iter().position(|m| *m == now).unwrap_or(0);
-        let next = offered[(at + 1) % offered.len()];
+        // From a mode only `/mode` picks, the cycle starts again.
+        let next = match offered.iter().position(|m| *m == now) {
+            Some(at) => offered[(at + 1) % offered.len()],
+            None => offered[0],
+        };
+        self.keep_before_plan(next);
         self.mode = Some(next);
+        // Said as it is picked, for a few seconds: what each mode lets run
+        // is not something anyone should have to remember.
+        self.mode_note = Some(std::time::Instant::now());
         // Plan mode also keeps the agents from writing, as `/plan` does.
         letronna_core::agents::set_plan(next == Mode::Plan);
+    }
+
+    /// The mode just picked and what it does, coloured as the footer colours
+    /// the mode, while the note it took the footer for lasts.
+    fn mode_note(&self, width: usize) -> Option<String> {
+        let mode = self.mode?;
+        let since = self.mode_note?;
+        if since.elapsed() >= MODE_NOTE {
+            return None;
+        }
+        let (mark, words) = mode_words(mode);
+        let said = render::clip(&format!("{mark} {words}"), width);
+        let about = render::clip(
+            &format!("  ·  {}", mode.about()),
+            width.saturating_sub(said.chars().count()),
+        );
+        Some(format!("{}{}", tinted(mode, &said), render::dim(&about)))
     }
 
     /// The mode and the hint, coloured by how much runs unasked, with the
@@ -2616,13 +2704,7 @@ impl Bar {
         };
         let (mark, words) = mode_words(mode);
         let (said, after) = mode_said(mark, words, width);
-        let said = match mode {
-            Mode::Bypass => render::red(&said),
-            Mode::Plan => render::blue(&said),
-            Mode::Default => render::dim(&said),
-            _ => render::amber(&said),
-        };
-        format!("{said}{}", render::dim(&after))
+        format!("{}{}", tinted(mode, &said), render::dim(&after))
     }
 
     fn mode_width(&self, width: usize) -> usize {
@@ -2721,6 +2803,7 @@ mod tests {
     use crate::render::{MARGIN, plain, visible};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use letronna_core::chat::Message;
+    use letronna_core::gate::Mode;
     use letronna_core::store::Todo;
     use std::time::Instant;
 
@@ -2747,19 +2830,25 @@ mod tests {
         bar.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(bar.mode(), None, "no mode shown, nothing to step");
         bar.set_mode(Mode::Default);
-        // Bypass is left out until the session has chosen it once.
-        let safe: Vec<Mode> = (Mode::OFFERED.into_iter())
-            .filter(|m| *m != Mode::Bypass)
-            .collect();
+        // Bypass is left out until the session has chosen it once, and the
+        // mode that refuses whatever would ask is never stepped onto.
+        let safe = [Mode::Default, Mode::AcceptEdits, Mode::Plan, Mode::Auto];
         for want in safe.iter().skip(1).chain(safe.first()) {
             bar.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
             assert_eq!(bar.mode(), Some(*want));
         }
         bar.set_mode(Mode::Bypass);
-        for want in &Mode::OFFERED {
+        for want in safe.iter().chain([Mode::Bypass].iter()) {
             bar.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
             assert_eq!(bar.mode(), Some(*want));
         }
+        // Alt-m steps as shift-tab does, and from a mode only `/mode` picks
+        // the cycle starts again.
+        bar.key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
+        assert_eq!(bar.mode(), Some(Mode::Default));
+        bar.set_mode(Mode::DontAsk);
+        bar.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(bar.mode(), Some(Mode::Default));
         letronna_core::agents::set_plan(false);
     }
 
@@ -3687,6 +3776,35 @@ mod tests {
         bar.guard = Instant::now().checked_sub(STILL);
         bar.pick(key(KeyCode::Enter));
         assert_eq!(bar.answer, Some(0));
+    }
+
+    #[test]
+    fn a_switch_says_what_the_mode_does() {
+        let mut bar = Bar::new("model".into());
+        bar.set_mode(Mode::Default);
+        bar.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        let footer = plain(bar.lines(40).last().unwrap());
+        assert!(footer.contains("edits without asking"), "{footer}");
+        assert!(footer.contains(Mode::AcceptEdits.about()), "{footer}");
+        // Once its moment is over, the footer is the footer again.
+        bar.mode_note = Instant::now().checked_sub(super::MODE_NOTE);
+        let footer = plain(bar.lines(40).last().unwrap());
+        assert!(footer.contains("shift+tab to switch"), "{footer}");
+    }
+
+    #[test]
+    fn plan_mode_off_goes_back_to_the_mode_it_came_from() {
+        let mut bar = Bar::new(String::new());
+        bar.set_mode(Mode::AcceptEdits);
+        bar.set_mode(Mode::Plan);
+        assert_eq!(bar.before_plan(), Mode::AcceptEdits);
+        // Stepping into it remembers the same way.
+        bar.set_mode(Mode::Default);
+        bar.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        bar.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(bar.mode(), Some(Mode::Plan));
+        assert_eq!(bar.before_plan(), Mode::AcceptEdits);
+        letronna_core::agents::set_plan(false);
     }
 
     /// A question with `options`, narrowed by typing when `narrowed`.

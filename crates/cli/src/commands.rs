@@ -67,8 +67,20 @@ pub fn command(
             Flow::Handled
         }
         "/plan" => {
-            let plan = runner.current_mode() != Mode::Plan;
-            runner.set_mode(if plan { Mode::Plan } else { Mode::Default });
+            let plan = match rest {
+                "on" => true,
+                "off" => false,
+                "" => runner.current_mode() != Mode::Plan,
+                _ => {
+                    render::line(&render::dim(
+                        "/plan on or /plan off; /plan alone switches it.",
+                    ));
+                    return Flow::Handled;
+                }
+            };
+            // Off goes back to the mode it was turned on from, not to Ask.
+            let back = runner.bar.before_plan();
+            runner.set_mode(if plan { Mode::Plan } else { back });
             render::blank();
             render::line(&render::dim(if plan {
                 "Plan mode on: reads, searches and runs read-only commands, never edits your files."
