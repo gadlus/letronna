@@ -50,7 +50,7 @@ pub fn command(
     match line {
         "/exit" | "/quit" => Flow::Stop,
         "/help" => {
-            help(workspace);
+            help(workspace, rest);
             Flow::Handled
         }
         "/clear" => {
@@ -1182,25 +1182,39 @@ fn aside(runner: &mut Runner, session: usize, question: &str) {
 
 /// Keys the box answers to. None of them are written down anywhere else but
 /// the opening screen, which has scrolled away by the time anyone wonders.
-const KEYS: &[(&str, &str)] = &[
+pub(crate) const KEYS: &[(&str, &str)] = &[
     ("enter", "send"),
     ("shift+enter", "a new line"),
+    ("tab", "finish a command or an @file name"),
     ("↑ ↓", "step through what you said before"),
-    ("ctrl+a/e", "go to the start or end of the line"),
-    ("ctrl+u/k", "delete to the start or end of the line"),
+    ("shift+tab", "switch mode: asks first, edits, plan, auto"),
     ("esc", "stop an answer, or clear the line"),
     ("esc esc", "go back to an earlier message"),
     ("ctrl+c", "copy what is selected, clear the line, or leave"),
+    ("ctrl+d", "leave, on an empty line"),
+    ("ctrl+s", "while it works: send what is queued now"),
+    ("↑ while it works", "take back the newest queued line"),
+    ("ctrl+o", "open or fold the latest thinking"),
+    ("ctrl+a/e", "go to the start or end of the line"),
+    ("ctrl+u/k", "delete to the start or end of the line"),
+    ("ctrl+w", "delete a word back"),
     ("page up/down", "scroll back through the conversation"),
+    ("end", "follow the conversation again"),
     ("drag", "select and copy"),
+    ("@path", "attach a file, a line range or a folder"),
     ("//", "start a message with one /, as in //tmp is full"),
+    ("?", "these keys, on an empty line"),
 ];
 
 /// The commands, then the added ones, then the keys, each in one column so
 /// it reads straight down. Skills are left to `/skills`: there can be
 /// dozens, and each is a line there already.
-fn help(workspace: Option<&std::path::Path>) {
+fn help(workspace: Option<&std::path::Path>, rest: &str) {
     render::blank();
+    let asked = rest.trim().trim_start_matches('/');
+    if !asked.is_empty() {
+        return help_for(asked);
+    }
     let added: Vec<(String, String)> = listed(workspace)
         .iter()
         .filter(|c| c.origin != Origin::Skill)
@@ -1208,43 +1222,194 @@ fn help(workspace: Option<&std::path::Path>) {
         .collect();
     let width = bar::name_width(&added);
     let row = |name: &str, blurb: &str| {
-        // An added command's description is its writer's and can run long.
-        let room = render::width().saturating_sub(width + 2);
+        // An added command's description is its writer's and can run long;
+        // the room left is after the line's own indent, so no row wraps.
+        let room = render::width().saturating_sub(render::PAD.len() + width + 2);
         render::line(&format!(
             "{}  {}",
             render::bold(&format!("{:<width$}", render::fit(name, width))),
             render::dim(&render::fit(blurb, room))
         ));
     };
-    for entry in bar::COMMANDS {
-        row(entry.name, entry.blurb);
+    for (heading, entries) in help_groups() {
+        render::line(&render::dim(heading));
+        for entry in entries {
+            row(entry.name, entry.blurb);
+        }
+        render::blank();
     }
     if !added.is_empty() {
-        render::blank();
+        render::line(&render::dim("Yours, the project's and plugins'"));
         for (name, about) in &added {
             row(name, about);
         }
+        render::blank();
     }
-    render::blank();
     render::line(&render::dim(
         "Skills are under /skills and MCP servers' prompts under /mcp; \
-         type / and the start of a name to find one.",
+         type / and the start of a name to find one. /help <command> says more.",
     ));
     render::blank();
+    keys();
+    render::blank();
+    render::line(&render::dim("The guide: https://letronna.ai/docs"));
+}
+
+/// The keys, one to a row, as `/help` and `?` list them.
+fn keys() {
     let width = KEYS
         .iter()
-        .map(|(key, _)| key.chars().count())
+        .map(|(key, _)| render::visible(key))
         .max()
         .unwrap_or(0);
+    let room = render::width().saturating_sub(render::PAD.len() + width + 2);
     for (key, what) in KEYS {
         render::line(&format!(
             "{}  {}",
             render::bold(&format!("{key:<width$}")),
-            render::dim(what)
+            render::dim(&render::fit(what, room))
         ));
     }
-    render::blank();
-    render::line(&render::dim("The guide: https://letronna.ai/docs"));
+}
+
+/// One command, with the words it takes where the menu knows them.
+fn help_for(asked: &str) {
+    let name = format!("/{asked}");
+    let Some(entry) = bar::COMMANDS.iter().find(|entry| entry.name == name) else {
+        render::line(&render::dim(&format!(
+            "{name} is not one of Letronna's commands; type / to see them."
+        )));
+        return;
+    };
+    render::said(&render::blue("●"), &render::bold(entry.name));
+    render::line(&render::dim(entry.blurb));
+    let words = bar::words_for(entry.name);
+    if !words.is_empty() {
+        render::blank();
+        let width = words
+            .iter()
+            .map(|(word, _)| render::visible(word))
+            .max()
+            .unwrap_or(0);
+        let room = render::width().saturating_sub(render::PAD.len() + width + 2);
+        for (word, about) in &words {
+            render::line(&format!(
+                "{}  {}",
+                render::bold(&format!("{word:<width$}")),
+                render::dim(&render::fit(about, room))
+            ));
+        }
+    }
+}
+
+/// The headings `/help` puts Letronna's own commands under, in the order it
+/// shows them. A name listed that is not a command here is passed over, and
+/// a command under no heading goes under the last.
+const HELP_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Sessions",
+        &[
+            "/new",
+            "/resume",
+            "/rename",
+            "/branch",
+            "/rewind",
+            "/undo",
+            "/retry",
+            "/compact",
+            "/context",
+            "/btw",
+            "/copy",
+            "/export",
+            "/status",
+            "/diff",
+            "/where",
+            "/import",
+            "/retention",
+            "/clear",
+        ],
+    ),
+    (
+        "Model",
+        &[
+            "/model",
+            "/effort",
+            "/thinking",
+            "/style",
+            "/fallback",
+            "/voice",
+        ],
+    ),
+    ("Modes", &["/mode", "/plan", "/decisions", "/verify"]),
+    (
+        "Tools",
+        &[
+            "/search",
+            "/tool-search",
+            "/skills",
+            "/mcp",
+            "/plugins",
+            "/image",
+            "/preview",
+        ],
+    ),
+    (
+        "Memory",
+        &["/memory", "/remember", "/memory-review", "/init"],
+    ),
+    (
+        "Background work",
+        &[
+            "/goal",
+            "/loop",
+            "/heartbeat",
+            "/jobs",
+            "/agents",
+            "/workflows",
+            "/crew",
+            "/notify",
+        ],
+    ),
+    (
+        "Account",
+        &[
+            "/connect",
+            "/team",
+            "/login",
+            "/logout",
+            "/whoami",
+            "/usage",
+            "/insights",
+            "/wallet",
+        ],
+    ),
+    ("Help", &["/help", "/exit"]),
+];
+
+/// Letronna's own commands under their headings, those under none last.
+fn help_groups() -> Vec<(&'static str, Vec<bar::Command<'static>>)> {
+    let find = |name: &&str| {
+        bar::COMMANDS
+            .iter()
+            .find(|entry| entry.name == *name)
+            .copied()
+    };
+    let mut groups: Vec<(&'static str, Vec<bar::Command<'static>>)> = (HELP_GROUPS.iter())
+        .map(|(heading, names)| (*heading, names.iter().filter_map(find).collect()))
+        .collect();
+    let grouped: Vec<&str> = HELP_GROUPS
+        .iter()
+        .flat_map(|(_, names)| names.iter().copied())
+        .collect();
+    let rest: Vec<bar::Command<'static>> = (bar::COMMANDS.iter())
+        .filter(|entry| !grouped.contains(&entry.name))
+        .copied()
+        .collect();
+    if let Some((_, last)) = groups.last_mut() {
+        last.extend(rest);
+    }
+    groups.retain(|(_, entries)| !entries.is_empty());
+    groups
 }
 
 /// Turn reading replies aloud on or off.
@@ -5697,6 +5862,17 @@ mod tests {
         assert_eq!(store.conversations[0].memory_scope, None);
         store.settings.memory_saving = Saving::Ask;
         assert_eq!(store.memory_saving(0), Saving::Ask);
+    }
+
+    #[test]
+    fn help_puts_every_command_under_one_heading() {
+        let shown: Vec<&str> = (super::help_groups().iter())
+            .flat_map(|(_, entries)| entries.iter().map(|entry| entry.name))
+            .collect();
+        for entry in crate::bar::COMMANDS {
+            let times = shown.iter().filter(|name| **name == entry.name).count();
+            assert_eq!(times, 1, "{}", entry.name);
+        }
     }
 
     #[test]

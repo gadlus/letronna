@@ -394,6 +394,12 @@ const KEPT_ROWS: usize = 2;
 /// rather than pushing every description off the row.
 const NAME_WIDTH: usize = 24;
 
+/// The least room for a key's words that makes a second column of keys
+/// worth it, and the gap between the columns: below it a key or two left
+/// to /help reads better than every key's words cut short.
+const KEY_WORDS: usize = 32;
+const KEY_GAP: usize = 3;
+
 /// Rows the box will grow to before what is inside it starts to scroll.
 /// Enough for a paragraph, not so many that the conversation is squeezed out.
 const MAX_ROWS: usize = 8;
@@ -482,6 +488,16 @@ fn matches<'a>(text: &str, added: &'a Added) -> Vec<Row<'a>> {
     // Enter takes the first, so an added `/u` is not lost to `/undo`.
     found.sort_by_key(|r| r.name != text);
     found
+}
+
+/// The words `command` takes that the menu offers after it, with what each
+/// does, for `/help <command>`: none for a command whose words are free.
+pub fn words_for(command: &str) -> Vec<(String, String)> {
+    let added = Added::default();
+    let rows = under(&format!("{command} "), &added).unwrap_or_default();
+    (rows.iter())
+        .map(|row| (row.line(), format!("{}{}", row.kind, row.blurb)))
+        .collect()
 }
 
 /// The rows under `/skills `, `/mcp ` or `/wallet ` while the one word after
@@ -844,6 +860,9 @@ pub struct Bar {
     added: Added,
     /// The open session's project folder, where an `@` path is completed.
     folder: Option<std::path::PathBuf>,
+    /// Whether the keys are shown over the box, as `?` on an empty line
+    /// asks, until the next key.
+    keys_card: bool,
     /// Set by a SIGTERM or a hangup, which ends the session as leaving does.
     ended: Option<letronna_core::cancel::Cancel>,
     /// When the turn running began, which its clock counts from.
@@ -915,6 +934,7 @@ impl Bar {
             focus: crate::notify::Focus::new(std::time::Instant::now()),
             added: Added::default(),
             folder: None,
+            keys_card: false,
             ended: None,
             turn_began: None,
             clock_shown: 0,
@@ -1862,6 +1882,14 @@ impl Bar {
         }
         // Only escape after escape counts as a double press.
         let escaped = self.esc_at.take();
+        // The keys over the box go with the next key, which then does what
+        // it does; `?` on an empty line puts them there.
+        if std::mem::take(&mut self.keys_card) {
+            self.settle();
+        } else if key.code == KeyCode::Char('?') && self.line.is_empty() && !self.working {
+            self.keys_card = true;
+            return;
+        }
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -2434,6 +2462,10 @@ impl Bar {
             }
         } else if back > 0 {
             format!("scrolled back {back} lines  ·  end to follow again")
+        } else if let Some(blurb) = typing_words_of(self.line.text()) {
+            // What the command being given its words does, while they are
+            // typed, where the menu has gone.
+            blurb.to_owned()
         } else if self.working && self.sendable() > 0 {
             "ctrl-s to send now  ·  ↑ to take it back  ·  esc to stop".to_owned()
         } else if self.working {
@@ -2464,6 +2496,7 @@ impl Bar {
             && self.choice.is_none()
             && self.switches.is_none()
             && back == 0
+            && typing_words_of(self.line.text()).is_none()
             && !(self.working && self.sendable() > 0);
         let mode = if plain {
             self.mode_tag(width)
@@ -2492,6 +2525,12 @@ impl Bar {
         }
         let under = usize::from(self.waiting.is_some());
         lines.splice(under..under, plan);
+        // The keys, asked for with `?`, over everything else above the box,
+        // in the rows the rest leaves, one kept for the conversation.
+        if self.keys_card {
+            let card = keys_card(render::width(), height.saturating_sub(lines.len() + 1));
+            lines.splice(0..0, card);
+        }
         lines
     }
 
@@ -2778,6 +2817,70 @@ fn checklist(todos: &[Todo], room: usize) -> Vec<String> {
         let more = render::fit(&format!("… {rest} more"), room + 2);
         lines.push(format!("{}{}", render::PAD, render::dim(&more)));
     }
+    lines
+}
+
+/// The blurb of the command whose words `text` is typing -- `/model so`
+/// -- once its name is whole and a space follows it.
+fn typing_words_of(text: &str) -> Option<&'static str> {
+    let (name, _) = text.split_once(' ')?;
+    if text.contains('\n') {
+        return None;
+    }
+    COMMANDS
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.blurb)
+}
+
+/// The keys, shown over the box at `?`, in the `rows` a window `width`
+/// columns wide leaves them: one to a row where they all fit, side by side in two columns
+/// where they do not and the window is wide enough, and past that the rest
+/// left to `/help`, which lists every one.
+fn keys_card(width: usize, rows: usize) -> Vec<String> {
+    let keys = crate::commands::KEYS;
+    let width = width.saturating_sub(render::INSIDE.len());
+    let key_width = keys
+        .iter()
+        .map(|(key, _)| render::visible(key))
+        .max()
+        .unwrap_or(0);
+    // The last row says how to put them away.
+    let key_rows = rows.saturating_sub(1);
+    let two = keys.len() > key_rows && width >= 2 * (key_width + 2 + KEY_WORDS) + KEY_GAP;
+    let columns = if two { 2 } else { 1 };
+    let per_column = keys.len().div_ceil(columns);
+    let column_width = width.saturating_sub((columns - 1) * KEY_GAP) / columns;
+    let room = column_width.saturating_sub(key_width + 2);
+    let mut lines = Vec::new();
+    let mut shown = 0;
+    for row in 0..per_column.min(key_rows) {
+        let cells: Vec<String> = (0..columns)
+            .filter_map(|column| keys.get(column * per_column + row))
+            .map(|(key, what)| {
+                let what = render::fit(what, room);
+                let pad = " ".repeat(room.saturating_sub(render::visible(&what)) + KEY_GAP);
+                format!(
+                    "{}  {}{pad}",
+                    render::bold(&format!("{key:<key_width$}")),
+                    render::dim(&what)
+                )
+            })
+            .collect();
+        shown += cells.len();
+        lines.push(format!("{}{}", render::INSIDE, cells.concat().trim_end()));
+    }
+    let hidden = keys.len() - shown;
+    let foot = if hidden > 0 {
+        format!("… {hidden} more in /help  ·  any key to put these away")
+    } else {
+        "any key to put these away".to_owned()
+    };
+    lines.push(format!(
+        "{}{}",
+        render::INSIDE,
+        render::dim(&render::fit(&foot, width))
+    ));
     lines
 }
 
@@ -3086,8 +3189,8 @@ mod tests {
     use super::{
         Added, Bar, CHOICE_ROWS, Choice, MENU_LIMIT, NAME_WIDTH, PLAN_ROWS, QUEUED_LIMIT,
         RELAY_LIMIT, Row, STILL, SWITCH_ROWS, Slider, Switch, Switches, TWICE, Waited, as_typed,
-        at_work, checklist, closest, fitted, is_command, matches, menu_top, mode_said, name_width,
-        offered, one_row, reach, relay_line, stops_at, track, unescaped,
+        at_work, checklist, closest, fitted, is_command, keys_card, matches, menu_top, mode_said,
+        name_width, offered, one_row, reach, relay_line, stops_at, track, unescaped,
     };
     use crate::render::{MARGIN, plain, visible};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -4065,6 +4168,61 @@ mod tests {
         bar.guard = Instant::now().checked_sub(STILL);
         bar.pick(key(KeyCode::Enter));
         assert_eq!(bar.answer, Some(0));
+    }
+
+    #[test]
+    fn a_question_mark_on_an_empty_line_shows_the_keys() {
+        let mut bar = Bar::new(String::new());
+        bar.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(bar.line.is_empty());
+        let shown: Vec<String> = bar.lines(60).iter().map(|row| plain(row)).collect();
+        assert!(
+            shown.iter().any(|row| row.contains("shift+tab")),
+            "{shown:?}"
+        );
+        // A short window gets them side by side, or as many as fit with the
+        // rest left to /help, and the box and footer still fit under them.
+        assert!(bar.lines(24).len() < 24);
+        let card = |width: usize, rows: usize| -> Vec<String> {
+            let card: Vec<String> = keys_card(width, rows)
+                .iter()
+                .map(|row| plain(row))
+                .collect();
+            assert!(card.len() <= rows, "{width}x{rows}: {card:?}");
+            assert!(card.iter().all(|row| visible(row) <= width), "{card:?}");
+            assert!(card[0].contains("enter"), "{card:?}");
+            card
+        };
+        let wide = card(120, 16);
+        assert!(wide.iter().any(|row| row.contains("shift+tab")), "{wide:?}");
+        assert!(!wide.last().unwrap().contains("more"), "{wide:?}");
+        let short = card(80, 8);
+        assert!(short.last().unwrap().contains("more in /help"), "{short:?}");
+        // The next key puts them away and does what it does; a second `?`
+        // is typed.
+        bar.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(!bar.keys_card);
+        assert_eq!(bar.line.text(), "?");
+    }
+
+    #[test]
+    fn the_footer_says_what_a_command_does_while_its_words_are_typed() {
+        let mut bar = Bar::new("model".into());
+        bar.line.set("/compact 2");
+        let footer = plain(bar.lines(40).last().unwrap());
+        assert!(footer.contains("summarize earlier turns"), "{footer}");
+        assert_eq!(super::typing_words_of("/compact"), None);
+        assert_eq!(super::typing_words_of("/nothing here"), None);
+    }
+
+    #[test]
+    fn help_for_a_command_lists_the_words_the_menu_knows() {
+        let words = super::words_for("/skills");
+        assert!(
+            words.iter().any(|(word, _)| word == "/skills add"),
+            "{words:?}"
+        );
+        assert!(super::words_for("/model").is_empty());
     }
 
     #[test]
