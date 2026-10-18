@@ -424,7 +424,8 @@ fn main() {
     // it, and is told at the idle prompt when it ends.
     let (_schedules, events) = letronna_core::schedule::Runner::start();
     runner.bar.hear_schedules(events);
-    offer_added(&mut runner, workspace.as_deref());
+    let here = session_folder(&runner, session, workspace.as_deref());
+    offer_added(&mut runner, here.as_deref());
     loop {
         // Before every wait, so a session opened, named or renamed by
         // whatever ran last shows on the box's edge and in the title.
@@ -477,8 +478,10 @@ fn main() {
         if bar::is_command(&line) {
             let flow = command(&mut runner, &line, &mut session, workspace.as_deref());
             // Read again after each command, so a command file made or
-            // changed meanwhile is offered without a restart.
-            offer_added(&mut runner, workspace.as_deref());
+            // changed meanwhile is offered without a restart; from the open
+            // session's folder, which the command may have changed.
+            let here = session_folder(&runner, session, workspace.as_deref());
+            offer_added(&mut runner, here.as_deref());
             // Every turn follows its own session's helpers; this is for the
             // footer's count once a command has opened another.
             let open = runner.store.conversations[session].id;
@@ -574,6 +577,17 @@ fn main() {
         render::line(&render::dim(&kept));
     }
     letronna_core::diag::stop();
+}
+
+/// The open session's folder, its worktree among them, else `start`, the
+/// folder Letronna started in: where its commands and skills are read from.
+fn session_folder(
+    runner: &Runner,
+    session: usize,
+    start: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    (runner.store.conversations[session].workspace.clone())
+        .or_else(|| start.map(|p| p.to_path_buf()))
 }
 
 /// How long a hangup leaves the session to finish leaving before the

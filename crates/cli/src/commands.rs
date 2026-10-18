@@ -47,10 +47,15 @@ pub fn command(
     // rather than making you scroll it.
     let (line, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
     let rest = rest.trim();
+    // Where the open session works -- its worktree, or the project of one
+    // resumed from elsewhere -- for what a command reads or changes there;
+    // the folder Letronna started in is for what is listed by project.
+    let here_buf = (runner.store.conversations.get(*session)).and_then(|c| c.workspace.clone());
+    let here = here_buf.as_deref().or(workspace);
     match line {
         "/exit" | "/quit" => Flow::Stop,
         "/help" => {
-            help(workspace, rest);
+            help(here, rest);
             Flow::Handled
         }
         // A fresh start, as Claude Code's /clear is: a new session on a
@@ -59,7 +64,7 @@ pub fn command(
             *session = runner.open(false, workspace.map(|p| p.to_path_buf()));
             runner.persist();
             render::clear();
-            banner(runner, &folder_name(workspace), *session);
+            banner(runner, &folder_name(here), *session);
             runner.bar.redraw();
             render::line(&render::dim(
                 "New session; /resume brings back the one before.",
@@ -75,10 +80,33 @@ pub fn command(
             Flow::Handled
         }
         "/new" => {
-            *session = runner.open(false, workspace.map(|p| p.to_path_buf()));
-            runner.persist();
+            // A session in a worktree of its own hands that on: the new one
+            // gets one too, made from the same checkout, rather than working
+            // in the checkout the worktree was there to spare.
+            let tree = runner.store.conversations[*session].worktree.clone();
+            let from = tree.as_ref().and_then(|tree| tree.checkout.clone());
+            let folder = from.or_else(|| workspace.map(|p| p.to_path_buf()));
+            *session = runner.open(false, folder);
             render::blank();
-            render::line(&render::dim("New session."));
+            if tree.is_some() {
+                let conversation = &mut runner.store.conversations[*session];
+                let name = format!("session-{}", conversation.id);
+                match letronna_core::worktree::isolate(conversation, &name) {
+                    Ok(()) => {
+                        let branch = (conversation.worktree.as_ref())
+                            .map_or(String::new(), |tree| tree.branch.clone());
+                        render::line(&render::dim(&format!(
+                            "New session, in a worktree of its own on branch {branch}."
+                        )));
+                    }
+                    Err(error) => render::line(&render::red(&format!(
+                        "New session, in the checkout: {error}"
+                    ))),
+                }
+            } else {
+                render::line(&render::dim("New session."));
+            }
+            runner.persist();
             Flow::Handled
         }
         "/plan" => {
@@ -300,7 +328,7 @@ pub fn command(
             Flow::Handled
         }
         "/skills" => {
-            skills(runner, rest, workspace);
+            skills(runner, rest, here);
             Flow::Handled
         }
         "/mcp" => match rest.split_once(char::is_whitespace).unwrap_or((rest, "")) {
@@ -323,7 +351,7 @@ pub fn command(
             Flow::Handled
         }
         "/memory" => {
-            crate::memory::memory(runner, rest, workspace);
+            crate::memory::memory(runner, rest, here);
             Flow::Handled
         }
         "/resume" => {
@@ -340,7 +368,7 @@ pub fn command(
         }
         "/rewind" | "/undo" => {
             if rewinds(rest) {
-                rewind(runner, session, workspace);
+                rewind(runner, session, here);
             } else {
                 render::blank();
                 render::line(&render::red(
@@ -350,7 +378,7 @@ pub fn command(
             Flow::Handled
         }
         "/retry" => {
-            match take_back(runner, *session, workspace) {
+            match take_back(runner, *session, here) {
                 // Queued rather than asked from here, so it goes the way a
                 // typed line goes: the loop sends it and reports a failure.
                 Some(prompt) => runner.bar.send_first(&prompt),
@@ -399,11 +427,11 @@ pub fn command(
             Flow::Handled
         }
         "/image" => {
-            attach(runner, rest, workspace);
+            attach(runner, rest, here);
             Flow::Handled
         }
         "/preview" => {
-            preview(rest, workspace);
+            preview(rest, here);
             Flow::Handled
         }
         "/where" => {
@@ -411,8 +439,7 @@ pub fn command(
             render::line(&format!(
                 "{}  {}",
                 render::dim("project"),
-                workspace
-                    .map(|p| p.display().to_string())
+                here.map(|p| p.display().to_string())
                     .unwrap_or_else(|| "none".into())
             ));
             let id = runner.store.conversations[*session].id;
@@ -440,7 +467,7 @@ pub fn command(
             Flow::Handled
         }
         name if name.starts_with("/mcp__") => send_prompt(runner, name, rest),
-        _ => added(runner, whole, workspace),
+        _ => added(runner, whole, here),
     }
 }
 
