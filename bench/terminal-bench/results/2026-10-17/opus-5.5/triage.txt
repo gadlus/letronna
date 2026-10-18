@@ -1,0 +1,43 @@
+adaptive-rejection-sampler: reward 0.0; letronna done after 8 rounds, 315 s
+  failed: test_can_generate_standard_distribution_samples
+  said: The sampler is in `/app/ars.R`, and `test()` passes all 23 of its tests. R wasn't installed, so I installed it first. A separate review tried every stated requirement through `ars()` and `test()`, checking the numbers with its own code. Not
+break-filter-js-from-html: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 0 rounds, 5 s
+  failed: test_out_html_bypasses_filter
+  said: The provider's content filter stopped the reply.
+caffe-cifar-10: reward 0.0; letronna done after 15 rounds, 531 s
+  failed: test_caffe_version_and_source, test_cifar10_model_exists, test_cpu_only_training_configured, test_training_completed_500_iterations, test_model_accuracy_verification
+  said: I couldn't finish this. Caffe is cloned and configured but not built, so no training has run. `/app/caffe/training_output.txt` and `cifar10_quick_iter_500.caffemodel` don't exist, and the accuracy check (test ≥ 45% and within 5% of train) h
+configure-git-webserver: reward 0.0; letronna done after 7 rounds, 109 s
+  failed: test_hello_html_exists
+  said: The git server and web server are set up, and the whole workflow works. I tested it end to end over SSH as `user`: clone `user@localhost:/git/server`, commit `hello.html`, `git push origin master`, then `curl http://localhost:8080/hello.htm
+crack-7z-hash: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 0 rounds, 6 s
+  failed: test_solution_file, test_solution_content
+  said: The provider's content filter stopped the reply.
+dna-assembly: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 0 rounds, 4 s
+  failed: test_primers
+  said: The provider's content filter stopped the reply.
+dna-insert: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 1 rounds, 9 s
+  failed: test_primers
+  said: I'll read the input sequences first.
+extract-moves-from-video: reward 0.0; letronna deadline after 13 rounds, 1680 s
+  failed: test_solution_file_exists, test_solution_content_similarity
+  said: The googlevideo URL returned a redirect; following it.
+feal-differential-cryptanalysis: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 1 rounds, 20 s
+  failed: test_feal_differential_cryptanalysis_attack
+  said: Reading feal.py to understand the cipher.
+feal-linear-cryptanalysis: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 1 rounds, 22 s
+  failed: test_attack
+  said: Reading the cipher source and data files.
+filter-js-from-html: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 0 rounds, 64 s
+  failed: test_filter_blocks_xss, test_clean_html_unchanged
+  said: The provider's content filter stopped the reply.
+financial-document-processor: reward 0.0; letronna deadline after 6 rounds, 1080 s
+  failed: test_directories_created, test_invoices_moved_correctly, test_other_documents_moved_correctly, test_summary_csv_exists, test_summary_csv_structure, test_summary_csv_content, test_original_documents_dir_empty
+  said: KrJiw is an invoice (Total $9963, Amount due $7139, no VAT); QOoA and WqWM are memos. The first batch showed only one picture, so I'm re-reading the rest.
+fix-code-vulnerability: reward 0.0; letronna deadline after 0 rounds, 780 s
+  failed: test_report_file_exists_example, test_vul_file, test_cwe_id, test_hkey_error_cases
+fix-git: reward 0.0; letronna deadline after 0 rounds, 779 s
+  failed: test_about_file, test_layout_file
+fix-ocaml-gc: reward None, CancelledError; letronna - after - rounds, - s
+gcode-to-text: reward None, CancelledError; letronna - after - rounds, - s
+git-leak-recovery: reward None, CancelledError; letronna - after - rounds, - s

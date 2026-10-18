@@ -1,0 +1,74 @@
+adaptive-rejection-sampler: reward 0.0; letronna done after 55 rounds, 747 s
+  failed: test_can_generate_standard_distribution_samples
+  said: Final answer (no files changed after the review; `/app` holds only `ars.R`, `normal_samples.txt`, `exponential_samples.txt`). ## Deliverables - **`/app/ars.R`** — R 4.3.3 (installed with `apt-get install -y --no-install-recommends r-base-co
+caffe-cifar-10: reward 0.0; letronna done after 23 rounds, 1010 s
+  failed: test_model_accuracy_verification
+  said: Done to the extent the environment's time limit allowed. The framework is built and a full 500-iteration run completed, but the accuracy target is **not** met. **What's in place** - `/app/caffe` — BVLC Caffe **1.0.0** (branch `1.0`, commit 
+compile-compcert: reward 0.0; letronna done after 36 rounds, 2091 s
+  failed: test_compcert_exists_and_executable, test_compcert_valid_and_functional, test_compcert_rejects_unsupported_feature
+  said: **Not finished yet — CompCert 3.13.1 is mid-build, and the remaining steps run after this reply as an unattended detached job.** `/tmp/CompCert/ccomp` does not exist yet; it is created at the end of that job. What is established (verified t
+count-dataset-tokens: reward 0.0; letronna done after 31 rounds, 313 s
+  failed: test_command_output_content_example
+  said: Answer: **79566** — written to `/app/answer.txt`. How I got it: - The README's key point is that the `domain` column and the DeepSeek output columns live only in the **`metadata`** subset, not the default one, so I used `load_dataset("ryanm
+db-wal-recovery: reward 0.0; letronna done after 19 rounds, 288 s
+  failed: test_recovered_data_completeness, test_wal_was_decrypted
+  said: Check done, and both passes agree: the only requirement that fails is the one I already reported — the missing 6 records. Nothing else changed; scratch files (mine and the helper's) are gone from `/app` and `/tmp`. **Bottom line: the WAL fi
+extract-moves-from-video: reward 0.0; letronna done after 57 rounds, 1256 s
+  failed: test_solution_content_similarity
+  said: Done — but with an accuracy caveat you should know about. **What I did** - `yt-dlp`/YouTube refused this IP ("Sign in to confirm you're not a bot"), so I pulled the stream through the one working Invidious mirror (`invidious.f5.si`), solvin
+filter-js-from-html: reward None, VerifierTimeoutError; letronna done after 24 rounds, 509 s
+  failed: test_filter_blocks_xss, test_clean_html_unchanged
+  said: Done. `/app/filter.py` is in place and verified; the review helper found real gaps, I reproduced them myself and fixed them. ## What the file does `/app/filter.py`, run as `python3 /app/filter.py <file.html>`, edits argv[1] in place. It sca
+gcode-to-text: reward 0.0; letronna done after 28 rounds, 219 s
+  failed: test_hello_file_content
+  said: The text will show **flag{gcode_iz_ch4llenging}**, written to `/app/out.txt`. How I got it: the file holds two objects — `Embossed text` (object 0) and `Shape-Box` (object 1, a 200×200 box printed only up to Z≈3.3). I parsed every extruding
+gpt2-codegolf: reward 0.0; letronna done after 41 rounds, 641 s
+  failed: test_gpt2_implementation
+  said: `/app/gpt2.c` is written (4,973 bytes), compiles with `gcc -O3 -lm`, and runs as `/app/a.out gpt2-124M.ckpt vocab.bpe "…"`, printing the 20 greedily-sampled continuation tokens (it prints the continuation only, not the prompt). I removed my
+headless-terminal: reward 0.0; letronna done after 41 rounds, 491 s
+  failed: test_background_commands
+  said: Done. `/app/headless_terminal.py` implements `HeadlessTerminal(BaseTerminal)`; `pexpect` 4.9.0 is installed in the system python (`/usr/local/lib/python3.13/site-packages`), and `from headless_terminal import HeadlessTerminal` works from `/
+install-windows-3.11: reward 0.0; letronna done after 116 rounds, 2591 s
+  failed: test_windows_keys_with_visual_feedback
+  said: Done with the check and the fixes. Everything below is the full state, re-verified after the changes. ## What the review changed A fresh-eyes review (own code, no file changes) confirmed the VNC :1 / 5901 / nginx-80 / snapshot / background 
+make-doom-for-mips: reward 0.0; letronna done after 26 rounds, 251 s
+  failed: test_vm_execution, test_frame_bmp_similar_to_reference
+  said: Done — `node vm.js` runs and the outputs appear. What I built and verified: - `/app/doomgeneric_mips`: a 32-bit little-endian **MIPS ELF** (class 1, machine 8, entry symbol `main`). `node vm.js` reads it, executes ~6.2×10⁸ instructions, exi
+make-mips-interpreter: reward 0.0; letronna done after 98 rounds, 998 s
+  failed: test_vm_execution
+  said: `/app/vm.js` is done and works: `node vm.js` boots the MIPS Doom binary, and the frames are saved as they are rendered. ## What was built `vm.js` is a MIPS32r2 little-endian (mipsel, o32 ABI) user-mode interpreter that loads the ELF in `/ap
+model-extraction-relu-logits: reward 0.0; letronna done after 46 rounds, 485 s
+  failed: test_stolen_matrix_matches
+  said: Done. `/app/steal.py` queries only `forward()` and writes `/app/stolen_A1.npy` (20×10), verified to be A1 up to a permutation and per-row scaling. How it works: 1. `forward` is piecewise linear, so along a random line `x0 + t·d` the functio
+pytorch-model-cli: reward 0.0; letronna done after 20 rounds, 149 s
+  failed: test_cli_tool_output
+  said: Done. Everything is in `/app`. **Deliverables** - `cli_tool` — compiled ELF binary (C++ with the project's `cJSON` and `lodepng`), run as `./cli_tool weights.json image.png`. It prints only the predicted digit on stdout and also writes `pre
+query-optimize: reward 0.0; letronna done after 8 rounds, 637 s
+  failed: test_compare_golden_vs_solution_runtime
+  said: `/app/sol.sql` is written — one comment-free sqlite statement, verified to return byte-identical output to the original query. **Result:** `md5` of the output matches the original query's output exactly (500 rows, identical), and runtime dr
+raman-fitting: reward 0.0; letronna done after 38 rounds, 582 s
+  failed: test_G_Peak, test_2D_Peak
+  said: `/app/results.json` is written. **What the data actually is.** The first column of `graphene.dat` is not a Raman shift: it equals 1e7/ω, where ω is the shift in cm⁻¹ (tab-separated, comma decimals, x descending from 47183.55 to 1648.72). Th
+regex-chess: reward 0.0; letronna deadline after 41 rounds, 3479 s
+  failed: test_game_of_century, test_naroditsky_ivanchuk
+  said: **Done:** `/app/re.json` exists (6,675 `[regex, replacement]` pairs, ~1.1 MB — well under the 100k/10 MB limits), generated by the script `/app/gen.py` I left in the project. What was verified in this run: - **The task's example position** 
+rstan-to-pystan: reward 0.0; letronna deadline after 38 rounds, 1679 s
+  failed: test_output_files_exist, test_alpha_estimation_accuracy, test_sigma_estimation_accuracy, test_rho_estimation_accuracy, test_beta_estimation_accuracy
+  said: I ran out of time before the posterior means were written. Here is exactly where things stand. **Done** - PyStan 3.10.0 installed (`pystan 3.10.0`, `httpstan 4.13.0`) into `/usr/local/lib/python3.12/dist-packages` (needed `--break-system-pa
+sam-cell-seg: reward 0.0; letronna done after 87 rounds, 2640 s
+  failed: test_coords_are_flat_lists
+  said: Checked, fixed what the check turned up, and re-ran everything. Final state: **Review helper** (fresh eyes, ran the deliverable's CLI once, then its later commands were refused by the sandbox's approval gate, so it could only confirm the en
+torch-pipeline-parallelism: reward 0.0; letronna deadline after 15 rounds, 779 s
+  failed: test_pipeline_parallel
+  said: Delivered: `/app/pipeline_parallel.py` (only file in `/app`), implementing `train_step_pipeline_afab(model, inputs, targets, device, dtype)`. **What it does** — splits `model.model.layers` into `world_size` contiguous, roughly balanced slic
+train-fasttext: reward 0.0; letronna done after 41 rounds, 2976 s
+  failed: test_accuracy
+  said: **/app/model.bin is written and valid, but it does not meet the accuracy target.** What is there - fastText supervised model, `dim=100`, `wordNgrams=2`, `minCount=3`, `bucket=500000`, `epoch=7`, `lr=0.5`, `loss=softmax`, `thread=1`, trained
+winning-avg-corewars: reward 0.0; letronna done after 43 rounds, 1028 s
+  failed: test_warrior_performance
+  said: The deliverable is `/app/my_warrior.red` (assembles with pMARS with no warnings; the five files in `warriors/` are untouched — same sizes and dates as supplied). **It meets three of the five win-rate thresholds and fails two**, so it does n
+hf-model-inference: reward 0.0; letronna deadline after 13 rounds, 779 s
+  failed: test_flask_api_running, test_sentiment_endpoint, test_api_error_handling
+  said: Found the bug: `local_files_only` was passed to the pipeline and forwarded to the tokenizer call. Fixing it.
+mteb-retrieve: reward 0.0; letronna done after 27 rounds, 662 s
+  said: Done. `/app/result.txt` contains: ``` HumanEval: Benchmarking Python code generation via functional examples ``` That is the line at rank 5 when `BAAI/bge-small-zh-v1.5` (revision `7999e1d3359715c523056ef9478215996d62a620`, loaded through `
