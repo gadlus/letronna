@@ -168,11 +168,14 @@ pub(crate) const TOOLS: [Rule; 26] = [
     // Only for what was meant: a package installed elsewhere, a config in
     // the home folder or a sibling folder's tests are still read. A run
     // with nobody to ask otherwise hunts the computer and the network for
-    // whoever set the task, and finds nothing.
+    // whoever set the task, and finds nothing. A task that is published,
+    // as a benchmark's are, it finds: on Terminal-Bench 2.0, 6 of 89 runs
+    // looked their own task up online and 3 ran its published solution or
+    // tests, so the network for a copy of the task is out by name.
     Rule {
         id: "scope-of-task",
         to: To::Unwatched,
-        text: "With nobody to ask, the task text and the project folder are what you have: decide from them rather than searching the rest of the computer or the network for what was meant.",
+        text: "With nobody to ask, the task text and the project folder are what you have: decide from them rather than searching the rest of the computer or the network for what was meant, and never look online for a copy of this task, its tests or its answer.",
     },
     // What a run made only to test stays in an output's folder for whoever
     // uses it next unless the run takes it out, while what the project's own
@@ -636,13 +639,19 @@ mod tests {
         assert!(tells(&headless(), "scope-of-task"));
         assert!(!tells(&window(), "scope-of-task"));
         // A run that is told the scope row keeps reading packages and its
-        // own config: only a hunt for what was meant is out.
+        // own config: only a hunt for what was meant, and a copy of the task
+        // online, are out.
         let told = told_without(&headless(), &TOOLS, &[]);
         let scope = told
             .find("With nobody to ask, the task text and the project folder are what you have")
             .unwrap();
         assert!(
             told[..scope].ends_with("unless the task asks for it there. "),
+            "{told}"
+        );
+        assert!(
+            told[scope..]
+                .contains("never look online for a copy of this task, its tests or its answer."),
             "{told}"
         );
         assert!(told.contains(" fix it at the shared cause. If the behaviour a task reports does not reproduce as described, say so, check once whether"));
