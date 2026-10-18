@@ -614,6 +614,13 @@ pub fn is_command(line: &str) -> bool {
     letronna_core::slash::split(line).is_some()
 }
 
+/// Whether a queued line is run here rather than sent to the model: a
+/// command, or a `!` line for the shell. It waits for the turn to end, as
+/// commands do, rather than going to the model mid-turn as text.
+fn runs_here(line: &str) -> bool {
+    is_command(line) || line.starts_with('!')
+}
+
 /// What a line that is not a command sends: a leading "//" stands for one
 /// slash, so "//tmp is full" says "/tmp is full".
 pub fn unescaped(line: &str) -> &str {
@@ -1730,7 +1737,7 @@ impl Bar {
     fn sendable(&self) -> usize {
         self.queued
             .iter()
-            .take_while(|line| !is_command(line))
+            .take_while(|line| !runs_here(line))
             .count()
     }
 
@@ -1745,7 +1752,7 @@ impl Bar {
     /// since they were never going to the model.
     pub fn hand_back(&mut self) {
         let (commands, lines): (Vec<String>, Vec<String>) =
-            self.queued.drain(..).partition(|line| is_command(line));
+            self.queued.drain(..).partition(|line| runs_here(line));
         self.queued = commands.into();
         if lines.is_empty() {
             return;
@@ -2472,6 +2479,14 @@ impl Bar {
             }
         } else if back > 0 {
             format!("scrolled back {back} lines  ·  end to follow again")
+        } else if self.line.text().starts_with('!') && self.choice.is_none() {
+            // A shell line: where it will run, and that it runs unasked.
+            let folder = (self.folder.as_deref())
+                .and_then(|folder| folder.file_name())
+                .map_or("the session's folder".to_owned(), |name| {
+                    name.to_string_lossy().into_owned()
+                });
+            format!("! runs this in {folder} without asking  ·  the model sees what it prints")
         } else if let Some(blurb) = typing_words_of(self.line.text()) {
             // What the command being given its words does, while they are
             // typed, where the menu has gone.
@@ -2506,6 +2521,7 @@ impl Bar {
             && self.choice.is_none()
             && self.switches.is_none()
             && back == 0
+            && !self.line.text().starts_with('!')
             && typing_words_of(self.line.text()).is_none()
             && !(self.working && self.sendable() > 0);
         let mode = if plain {
@@ -4178,6 +4194,18 @@ mod tests {
         bar.guard = Instant::now().checked_sub(STILL);
         bar.pick(key(KeyCode::Enter));
         assert_eq!(bar.answer, Some(0));
+    }
+
+    #[test]
+    fn a_shell_line_waits_with_the_commands_rather_than_going_to_the_model() {
+        let mut bar = Bar::new("model".into());
+        bar.queued
+            .extend(["hello".to_owned(), "!ls".to_owned(), "more".to_owned()]);
+        assert_eq!(bar.sendable(), 1);
+        bar.queued.clear();
+        bar.line.set("!git status");
+        let footer = plain(bar.lines(40).last().unwrap());
+        assert!(footer.contains("runs this in"), "{footer}");
     }
 
     #[test]

@@ -73,6 +73,8 @@ Type `/` to list them all. The common ones:
 
 `@path` attaches a file, a line range or a folder. Your own prompts and skills also run as slash commands.
 
+In the terminal, a line starting with `!` runs as a command in the session's folder, and the model sees what it printed with your next prompt.
+
 In the terminal, `?` on an empty line shows the keys, and `/help <command>` says more about one command.
 
 ## Going back

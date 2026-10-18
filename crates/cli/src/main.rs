@@ -470,6 +470,12 @@ fn main() {
         if line.is_empty() {
             continue;
         }
+        // A line starting with `!` runs as a command here, as a shell would.
+        if let Some(command) = line.strip_prefix('!') {
+            commands::shell_line(&mut runner, session, command.trim());
+            screen::settle();
+            continue;
+        }
         let mut prompt = bar::unescaped(&line);
         // What an MCP server's prompt or a saved workflow's command came to,
         // when the command was one.

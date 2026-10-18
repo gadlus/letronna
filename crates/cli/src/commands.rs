@@ -948,6 +948,64 @@ fn fallback(runner: &mut Runner, rest: &str) {
     )));
 }
 
+/// Run what was typed after `!` in the session's folder, through the tool
+/// the model runs commands with but without asking, since the user typed
+/// it, and Esc stops it as it stops one of the model's. What it printed is
+/// shown as a tool's output is, and goes to the model with the next prompt,
+/// so it knows what was run and what came of it.
+pub fn shell_line(runner: &mut Runner, session: usize, command: &str) {
+    render::blank();
+    if command.is_empty() {
+        render::line(&render::dim(
+            "! and a command runs it here, as in a shell: !git status",
+        ));
+        return;
+    }
+    let connection = runner.connection(session);
+    let mut ctx = letronna_core::tools::ToolContext::of(&connection);
+    ctx.approved = true;
+    let cancel = ctx.cancel.clone();
+    let args = serde_json::json!({ "command": command }).to_string();
+    let handle = std::thread::spawn(move || letronna_core::tools::run("run_command", &args, &ctx));
+    runner.bar.wait_line_about(&format!("! {command}"));
+    runner.bar.working(true);
+    while !handle.is_finished() {
+        runner.bar.pump();
+        if runner.bar.interrupted() {
+            cancel.set();
+        }
+    }
+    runner.bar.working(false);
+    runner.bar.wait_line(false);
+    let ran =
+        (handle.join()).unwrap_or_else(|_| Err("The command stopped without finishing.".into()));
+    let (output, failed) = match ran {
+        Ok(output) => (output, false),
+        Err(error) => (error, true),
+    };
+    let first = output.lines().next().unwrap_or("done").to_owned();
+    render::tool(
+        "!",
+        command,
+        &letronna_core::tools::one_line(&first),
+        failed,
+    );
+    let rest: Vec<&str> = output.lines().skip(1).collect();
+    if !rest.is_empty() {
+        render::detail(&rest.join("\n"), 12);
+    }
+    // Quiet: it goes in with the next prompt, rather than starting a turn.
+    let id = runner.store.conversations[session].id;
+    letronna_core::inbox::push(
+        id,
+        letronna_core::inbox::Notice {
+            from: "the shell".to_owned(),
+            when: letronna_core::inbox::When::Quiet,
+            text: format!("The user ran `{command}` in the terminal:\n{output}"),
+        },
+    );
+}
+
 /// A path as `/status` shows it, the home folder written `~`: the session
 /// file under the data folder fits beside its label that way, where the
 /// whole path would wrap.
@@ -1383,6 +1441,10 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
     ("drag", "select and copy"),
     ("@path", "attach a file, a line range or a folder"),
     ("//", "start a message with one /, as in //tmp is full"),
+    (
+        "!command",
+        "run a command here; the model sees what it prints",
+    ),
     ("?", "these keys, on an empty line"),
 ];
 
