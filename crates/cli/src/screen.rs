@@ -347,7 +347,8 @@ pub fn think(fold: usize, text: &str) {
         let Some(f) = s.folds.get_mut(&fold) else {
             return;
         };
-        f.text.push_str(text);
+        // From the model, so only colour gets through, as with any reply.
+        f.text.push_str(&render::safe(text));
         s.again_from(fold);
     }
     soon();
@@ -681,8 +682,18 @@ impl Screen {
         for row in start.0..=end.0 {
             let text = render::plain(self.rows.get(row).map(String::as_str).unwrap_or(""));
             let chars: Vec<char> = text.chars().collect::<Vec<char>>();
-            let from = if row == start.0 { start.1 } else { 0 };
-            let to = if row == end.0 { end.1 } else { chars.len() };
+            // The selection's ends are columns, which a wide character takes
+            // two of.
+            let from = if row == start.0 {
+                render::char_at(&text, start.1)
+            } else {
+                0
+            };
+            let to = if row == end.0 {
+                render::char_at(&text, end.1)
+            } else {
+                chars.len()
+            };
             let cut: String = chars
                 .iter()
                 .skip(from)

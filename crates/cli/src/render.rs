@@ -193,6 +193,15 @@ pub fn said(mark: &str, text: &str) {
 /// Everything printed goes through here, so raw mode's need for a carriage
 /// return with every newline is dealt with once.
 pub fn out(text: &str, newline: bool) {
+    // Only Letronna's own colours reach a terminal; what the text carries
+    // from outside goes. Piped, the text is passed on as it is.
+    let cleaned;
+    let text = if crate::screen::held() || std::io::stdout().is_terminal() {
+        cleaned = safe(text);
+        cleaned.as_str()
+    } else {
+        text
+    };
     if crate::screen::held() {
         crate::screen::push(text);
         if newline {
@@ -266,6 +275,9 @@ pub struct Stream {
     /// One `*` seen, waiting to find out whether it is half of a pair.
     star: bool,
     started: bool,
+    /// The start of an escape sequence the last piece ended in, held for the
+    /// next: taken out in two halves, half of one would show as text.
+    half_escape: String,
     /// Whether the line under way has had anything in it yet; until it has,
     /// its first characters are held to see whether it opens a fence or is
     /// a heading.
@@ -335,10 +347,34 @@ impl Stream {
 
     pub fn push(&mut self, text: &str) {
         let mut buffer = String::with_capacity(text.len() + 8);
-        for ch in text.chars() {
-            self.take(&mut buffer, ch);
-        }
+        self.piece(&mut buffer, text);
         out(&buffer, false);
+    }
+
+    /// One piece of the reply into `out`, an escape sequence it ends in the
+    /// middle of held for the next piece to finish.
+    fn piece(&mut self, out: &mut String, text: &str) {
+        let joined = std::mem::take(&mut self.half_escape) + text;
+        let (whole, open) = open_escape(&joined);
+        for ch in whole.chars() {
+            self.take(out, ch);
+        }
+        // One that has gone on past a line's end, or for longer than a title
+        // or a link takes, will not end; held, it would keep back the rest
+        // of the reply for good.
+        if open.len() > HALF_ESCAPE_MOST || open.contains('\n') {
+            self.broken(out, open);
+        } else {
+            self.half_escape = open.to_owned();
+        }
+    }
+
+    /// An escape sequence that will never end, as text: what follows its
+    /// escape shows, rather than all of it being taken out as one.
+    fn broken(&mut self, out: &mut String, open: &str) {
+        for ch in open.chars().skip(1) {
+            self.take(out, ch);
+        }
     }
 
     /// One character of the reply, where it falls: inside a fenced block,
@@ -453,6 +489,10 @@ impl Stream {
     /// hanging so what comes after it is not tinted.
     pub fn end(&mut self) {
         let mut buffer = String::new();
+        // An escape the reply never finished goes out as text, as one that
+        // went on too long does.
+        let half = std::mem::take(&mut self.half_escape);
+        self.broken(&mut buffer, &half);
         // What a line start held, a fence line never ended or a block line
         // never ended goes out as it is.
         let held = std::mem::take(&mut self.held);
@@ -554,14 +594,17 @@ pub fn fold(line: &str, width: usize) -> Vec<String> {
                     }
                     continue;
                 }
-                if filled == width {
+                // A wide character that would straddle the edge goes on the
+                // next row whole.
+                let room = columns(ch);
+                if filled + room > width && filled > indent {
                     rows.push(std::mem::take(&mut row));
                     row.push_str(&carry);
                     row.push_str(&active);
                     filled = indent;
                 }
                 row.push(ch);
-                filled += 1;
+                filled += room;
             }
             continue;
         }
@@ -668,7 +711,7 @@ fn words(line: &str) -> Vec<(String, usize)> {
         }
         space = is_space;
         current.push(ch);
-        wide += 1;
+        wide += columns(ch);
     }
     if !current.is_empty() {
         out.push((current, wide));
@@ -707,8 +750,11 @@ pub fn plain(text: &str) -> String {
 pub fn mark(text: &str, from: usize, to: Option<usize>) -> String {
     let plain = plain(text);
     let chars: Vec<char> = plain.chars().collect();
-    let to = to.unwrap_or(chars.len()).min(chars.len());
-    let from = from.min(to);
+    // `from` and `to` are columns, which a wide character takes two of.
+    let to = to
+        .map_or(chars.len(), |to| char_at(&plain, to))
+        .min(chars.len());
+    let from = char_at(&plain, from).min(to);
     let before: String = chars[..from].iter().collect();
     let span: String = chars[from..to].iter().collect();
     let after: String = chars[to..].iter().collect();
@@ -718,7 +764,8 @@ pub fn mark(text: &str, from: usize, to: Option<usize>) -> String {
     format!("{before}\x1b[7m{span}\x1b[27m{after}")
 }
 
-/// Width of text as printed, ignoring the escapes that colour it.
+/// Width of text as printed, ignoring the escapes that colour it: a wide
+/// character takes two columns.
 pub fn visible(text: &str) -> usize {
     let mut width = 0;
     let mut chars = text.chars();
@@ -730,7 +777,7 @@ pub fn visible(text: &str) -> usize {
                 }
             }
         } else {
-            width += 1;
+            width += columns(ch);
         }
     }
     width
@@ -756,14 +803,116 @@ pub fn char_at(text: &str, column: usize) -> usize {
     text.chars().count()
 }
 
+/// The first `width` columns of plain `text`, a wide character that would
+/// straddle the end left out.
+pub fn take_columns(text: &str, width: usize) -> String {
+    let mut used = 0;
+    let mut cut = String::new();
+    for ch in text.chars() {
+        let wide = columns(ch);
+        if used + wide > width {
+            break;
+        }
+        used += wide;
+        cut.push(ch);
+    }
+    cut
+}
+
+/// The most of an escape sequence a stream holds for its next piece to
+/// finish: more than a title or a link takes, and little enough that a
+/// stray escape holds back no more than a line.
+const HALF_ESCAPE_MOST: usize = 512;
+
+/// `text` split before an escape sequence it ends in the middle of, if it
+/// does: what can be cleaned now, and the start of one that the next piece
+/// of a stream finishes.
+fn open_escape(text: &str) -> (&str, &str) {
+    let Some(at) = text.rfind('\x1b') else {
+        return (text, "");
+    };
+    let tail = &text[at + 1..];
+    let mut chars = tail.chars();
+    let finished = match chars.next() {
+        None => false,
+        Some('[') => chars.any(|c| ('\x40'..='\x7e').contains(&c)),
+        Some(']' | 'P' | 'X' | '^' | '_') => tail.contains('\x07') || tail.contains("\x1b\\"),
+        Some(_) => true,
+    };
+    match finished {
+        true => (text, ""),
+        false => text.split_at(at),
+    }
+}
+
+/// `text` with every escape sequence taken out but those that colour and
+/// style it, and the other control characters with them, bar line breaks.
+/// A reply, a file or a command's output can carry sequences that retitle
+/// the window, write to the clipboard, move the cursor or leave the screen
+/// the conversation is held on; only colour and style, which is all
+/// Letronna writes itself, is let through. Tabs become four spaces, so a
+/// row is as wide as it is counted.
+pub fn safe(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => match chars.next() {
+                // A control sequence: kept only when it sets colour or style.
+                Some('[') => {
+                    let mut body = String::new();
+                    let mut last = None;
+                    for next in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&next) {
+                            last = Some(next);
+                            break;
+                        }
+                        body.push(next);
+                    }
+                    let styling = body
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c == ';' || c == ':');
+                    if last == Some('m') && styling {
+                        out.push_str("\x1b[");
+                        out.push_str(&body);
+                        out.push('m');
+                    }
+                }
+                // A string -- a title, a clipboard, a device's own -- ended
+                // by a bell or by escape and a backslash.
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    while let Some(next) = chars.next() {
+                        if next == '\x07' {
+                            break;
+                        }
+                        if next == '\x1b' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Escape and one character, such as a reset of the terminal.
+                _ => {}
+            },
+            '\n' => out.push('\n'),
+            '\t' => out.push_str("    "),
+            control if control.is_control() => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Plain text on a single row, its line breaks made spaces, cut to `width`
 /// columns with an ellipsis where it was cut.
 pub fn fit(text: &str, width: usize) -> String {
     let text = letronna_core::tools::one_line(text);
-    if text.chars().count() <= width {
+    if visible(&text) <= width {
         return text;
     }
-    let mut cut: String = text.chars().take(width.saturating_sub(1)).collect();
+    let mut cut = take_columns(&text, width.saturating_sub(1));
     if width > 0 {
         cut.push('…');
     }
@@ -773,13 +922,13 @@ pub fn fit(text: &str, width: usize) -> String {
 /// Plain text cut to `width` columns, ending in an ellipsis where it was
 /// cut, for a row that must not wrap.
 pub fn clip(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
+    if visible(text) <= width {
         return text.to_owned();
     }
     let Some(room) = width.checked_sub(1) else {
         return String::new();
     };
-    let mut cut: String = text.chars().take(room).collect();
+    let mut cut = take_columns(text, room);
     cut.push('…');
     cut
 }
@@ -900,6 +1049,67 @@ mod tests {
         // The escape stays with the first row and costs it no width.
         assert!(rows[0].starts_with('\x1b'));
         assert_eq!(visible(&rows[0]), 7);
+    }
+
+    #[test]
+    fn wide_characters_take_two_columns() {
+        assert_eq!(super::visible("日本語"), 6);
+        assert_eq!(super::visible("ok ✅"), 5);
+        assert_eq!(
+            super::fold("日本語のテキスト", 6),
+            ["日本語", "のテキ", "スト"]
+        );
+        assert_eq!(super::clip("日本語テキスト", 7), "日本語…");
+        assert_eq!(super::fit("日本語テキスト", 4), "日…");
+        assert_eq!(super::char_at("日本語", 3), 1);
+        assert_eq!(super::plain(&super::mark("日本語", 2, Some(4))), "日本語");
+    }
+
+    #[test]
+    fn text_from_outside_cannot_drive_the_terminal() {
+        let carried = "a\x1b]0;evil\x07b \x1b[31mred\x1b[0m\x1b[?1049l\x1b[2J c\x1b]52;c;Zm9v\x1b\\\tdone\r\x07";
+        assert_eq!(super::safe(carried), "ab \x1b[31mred\x1b[0m c    done");
+        assert_eq!(super::safe("line one\nline two"), "line one\nline two");
+    }
+
+    #[test]
+    fn an_escape_split_between_pieces_of_a_reply_is_taken_out_whole() {
+        assert_eq!(super::open_escape("text \x1b]0;HI"), ("text ", "\x1b]0;HI"));
+        assert_eq!(super::open_escape("a \x1b[2"), ("a ", "\x1b[2"));
+        assert_eq!(super::open_escape("a \x1b[2Jb"), ("a \x1b[2Jb", ""));
+        let mut stream = super::Stream::default();
+        stream.push("say \x1b]0;HI");
+        assert_eq!(stream.half_escape, "\x1b]0;HI");
+        stream.push("JACKED\x07 done");
+        assert!(stream.half_escape.is_empty());
+    }
+
+    #[test]
+    fn an_escape_that_never_ends_holds_back_no_more_than_a_line() {
+        let shown = |out: &str| super::plain(&super::safe(out));
+        let mut stream = super::Stream::default();
+        let mut out = String::new();
+        stream.piece(&mut out, "say \x1b]0;never");
+        assert_eq!(stream.half_escape, "\x1b]0;never");
+        // The line ends with the escape still open: it was never one.
+        stream.piece(&mut out, " ended\nthe rest");
+        assert!(stream.half_escape.is_empty());
+        assert!(shown(&out).contains("]0;never ended"), "{out:?}");
+        assert!(shown(&out).contains("the rest"), "{out:?}");
+        // Nor does one held without a line's end grow past its cap.
+        let mut stream = super::Stream::default();
+        let mut out = String::new();
+        stream.piece(&mut out, "\x1b]");
+        for _ in 0..200 {
+            stream.piece(&mut out, "word ");
+        }
+        assert!(stream.half_escape.len() <= super::HALF_ESCAPE_MOST);
+        assert!(shown(&out).contains("word word"), "{out:?}");
+        // What is still held when the reply ends is not dropped.
+        let mut stream = super::Stream::default();
+        stream.push("tail \x1b]0;open");
+        stream.end();
+        assert!(stream.half_escape.is_empty());
     }
 
     #[test]

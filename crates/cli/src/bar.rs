@@ -2814,7 +2814,7 @@ impl Bar {
         } else {
             format!("{} with \"{}\" in the name", shown.len(), list.filter)
         };
-        lines.push(self.boxed(&render::dim(&count), count.chars().count(), room));
+        lines.push(self.boxed(&render::dim(&count), render::visible(&count), room));
         lines.push(self.boxed("", 0, room));
         // Room for as many rows as the whole list shows, and for the lines
         // saying more are above and below when it scrolls, so narrowing it
@@ -2837,7 +2837,7 @@ impl Bar {
             .min(NAME_WIDTH);
         let more = |count: usize, arrow: &str| {
             let text = format!("    {arrow} {count} more");
-            self.boxed(&render::dim(&text), text.chars().count(), room)
+            self.boxed(&render::dim(&text), render::visible(&text), room)
         };
         if list.top > 0 {
             lines.push(more(list.top, "↑"));
@@ -2915,7 +2915,7 @@ impl Bar {
         }
         if let Some(filter) = filtered {
             let count = format!("{} with \"{filter}\"", shown.len());
-            lines.push(self.boxed(&render::dim(&count), count.chars().count(), room));
+            lines.push(self.boxed(&render::dim(&count), render::visible(&count), room));
         }
         lines.push(self.boxed("", 0, room));
         let start = lines.len();
@@ -2925,7 +2925,7 @@ impl Bar {
         }
         let more = |count: usize, arrow: &str| {
             let text = format!("    {arrow} {count} more");
-            self.boxed(&render::dim(&text), text.chars().count(), room)
+            self.boxed(&render::dim(&text), render::visible(&text), room)
         };
         let end = (choice.top + CHOICE_ROWS).min(shown.len());
         if choice.top > 0 {
@@ -3223,10 +3223,10 @@ fn draft_file() -> std::path::PathBuf {
 /// ellipsis where anything was left off.
 fn one_row(text: &str, room: usize) -> String {
     let first = text.lines().next().unwrap_or_default();
-    if first.chars().count() <= room && !text.trim_end().contains('\n') {
+    if render::visible(first) <= room && !text.trim_end().contains('\n') {
         return first.to_owned();
     }
-    let mut row: String = first.chars().take(room.saturating_sub(1)).collect();
+    let mut row = render::take_columns(first, room.saturating_sub(1));
     row.push('…');
     row
 }
