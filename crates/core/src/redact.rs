@@ -390,6 +390,11 @@ fn secret_name(name: &str) -> bool {
     let Some(last) = words.last() else {
         return false;
     };
+    // A header such as `Authorization` or `Proxy-Authorization` carries the
+    // key itself, with or without a scheme before it.
+    if last == "authorization" {
+        return true;
+    }
     let about = last.strip_suffix('s').unwrap_or(last);
     if RAISED.iter().any(|raised| last.ends_with(raised)) || ABOUT_A_SECRET.contains(&about) {
         return false;
@@ -765,6 +770,8 @@ mod tests {
             "passWord",
             "userPassWord",
             "PASSWORDs",
+            "Authorization",
+            "Proxy-Authorization",
         ] {
             assert!(secret_name(name), "{name}");
         }
@@ -782,7 +789,6 @@ mod tests {
             "KEY_FILENAME",
             "GIT_AUTHOR_NAME",
             "TOKENIZERS_PARALLELISM",
-            "Authorization",
             "authorization_endpoint",
         ] {
             assert!(!secret_name(name), "{name}");

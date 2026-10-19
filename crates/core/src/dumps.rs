@@ -67,6 +67,33 @@ pub(crate) fn notice(found: &[String]) -> String {
     )
 }
 
+/// Whether the file at `path`, found by its name, really is a dump, so the
+/// run may delete it as its own: a name like `app.core` can be a project's,
+/// and a rewrite by rename gives a project file a new birth time. A kernel's
+/// or Valgrind's dump is an ELF core file; the JVM's names carry a pid,
+/// which no project file has.
+pub(crate) fn surely_dump(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if name.starts_with("hs_err_pid") || name.starts_with("java_pid") {
+        return true;
+    }
+    let mut head = [0u8; 18];
+    let read = std::fs::File::open(path).and_then(|mut f| {
+        use std::io::Read;
+        f.read_exact(&mut head)
+    });
+    // ET_CORE is 4, in the byte order the fifth byte names.
+    let kind = if head[5] == 2 {
+        u16::from_be_bytes([head[16], head[17]])
+    } else {
+        u16::from_le_bytes([head[16], head[17]])
+    };
+    read.is_ok() && head.starts_with(b"\x7fELF") && kind == 4
+}
+
 /// Whether a file named `name` is a crash dump: `core`, `core.<pid>` or
 /// `<program>.core`, Valgrind's `vgcore.<pid>`, or the JVM's
 /// `hs_err_pid<pid>.log` or `java_pid<pid>.hprof`.
@@ -101,6 +128,20 @@ mod tests {
         ] {
             assert!(crash_dump(name), "{name}");
         }
+    }
+
+    #[test]
+    fn only_an_elf_core_or_a_jvm_dump_is_surely_one() {
+        let dir = Scratch::new("dumps-sure");
+        let mut elf = b"\x7fELF\x02\x01\x01".to_vec();
+        elf.resize(16, 0);
+        elf.extend([4, 0]);
+        std::fs::write(dir.join("core"), &elf).unwrap();
+        std::fs::write(dir.join("app.core"), "settings = 1\n").unwrap();
+        std::fs::write(dir.join("hs_err_pid42.log"), "#\n").unwrap();
+        assert!(surely_dump(&dir.join("core")));
+        assert!(!surely_dump(&dir.join("app.core")));
+        assert!(surely_dump(&dir.join("hs_err_pid42.log")));
     }
 
     #[test]

@@ -15,6 +15,10 @@ provider over HTTPS with the host's trust store. So:
     OPENROUTER_API_KEY=... python3 relay.py --meter meter.jsonl \
         --provider DeepSeek --reasoning high
 
+It answers only a caller that sends TB2_RELAY_TOKEN as its bearer key, so
+another machine that can reach the port cannot spend the provider key; run.sh
+gives the same token to Letronna in each trial.
+
 With --stub it needs no key and answers as a canned model: a run_command
 call that prints Letronna's LETRONNA_ variables, then a closing message,
 enough to show a trial's plumbing works end to end.
@@ -130,7 +134,19 @@ def handler(relay: Relay):
             m = re.match(r"^/t/([^/]+)(/.*)$", self.path)
             return (m.group(1), m.group(2)) if m else ("", self.path)
 
+        def admitted(self) -> bool:
+            """Whether the caller holds the run's token; answers 401 when not."""
+            import hmac
+
+            given = self.headers.get("Authorization") or ""
+            if hmac.compare_digest(given.encode(), f"Bearer {relay.token}".encode()):
+                return True
+            self.whole(401, b'{"error":{"message":"the relay takes its own token"}}')
+            return False
+
         def do_GET(self) -> None:
+            if not self.admitted():
+                return
             tag, path = self.route()
             if relay.args.stub:
                 listing = {"data": [{"id": "stub-model", "context_length": 128000}]}
@@ -138,6 +154,8 @@ def handler(relay: Relay):
             self.forward("GET", path, None, tag)
 
         def do_POST(self) -> None:
+            if not self.admitted():
+                return
             tag, path = self.route()
             raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
             try:
@@ -327,6 +345,9 @@ def main() -> None:
     if not args.stub and not key:
         sys.exit(f"relay: {args.key_env} is not set; give it, or --stub")
     relay = Relay(args, key)
+    relay.token = os.environ.get("TB2_RELAY_TOKEN", "")
+    if not relay.token:
+        sys.exit("relay: TB2_RELAY_TOKEN is not set; give the same value to run.sh")
     server = ThreadingHTTPServer((args.host, args.port), handler(relay))
     server.daemon_threads = True
     print(f"relay on {args.host}:{args.port} to {'the stub' if args.stub else args.upstream}", flush=True)

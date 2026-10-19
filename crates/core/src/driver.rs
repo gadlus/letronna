@@ -2034,7 +2034,9 @@ fn crash_dumps(spec: &Spec, turn: &Turn, began: SystemTime) -> Option<Message> {
     let ctx = context(spec);
     for dump in &found {
         let path = workspace.join(dump);
-        if crate::taint::born(&path).is_some_and(|at| at >= began) {
+        if crate::taint::born(&path).is_some_and(|at| at >= began)
+            && crate::dumps::surely_dump(&path)
+        {
             crate::taint::made(&ctx, &path);
         }
     }
@@ -5915,7 +5917,12 @@ pub(crate) mod tests {
         let _data = data("dumps-steered");
         let dir = scratch("dumps-steered");
         let (endpoint, provider) = provider(vec![
-            reply("", &[command("printf dump > core")]),
+            reply(
+                "",
+                &[command(
+                    r"printf '\177ELF\2\1\1\0\0\0\0\0\0\0\0\0\4\0' > core",
+                )],
+            ),
             reply("Fixed the rolling window.", &[]),
             reply("", &[command("rm core")]),
             reply("Fixed the rolling window and deleted the dump.", &[]),
@@ -5935,6 +5942,34 @@ pub(crate) mod tests {
         let deleted = messages(&sent[3]).last().unwrap();
         assert!(!deleted["content"].as_str().unwrap().contains("Refused"));
         assert!(!dir.join("core").exists());
+    }
+
+    #[test]
+    fn a_project_file_named_like_a_dump_stays_the_users_after_it_read_untrusted_words() {
+        let _data = data("dumps-steered-not");
+        let dir = scratch("dumps-steered-not");
+        let (endpoint, provider) = provider(vec![
+            reply("", &[command("printf 'settings = 1' > app.core")]),
+            reply("Fixed the rolling window.", &[]),
+            reply("", &[command("rm app.core")]),
+            reply("Fixed the rolling window.", &[]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 1_606);
+        spec.depth = 0;
+        spec.decide = None;
+        spec.connection.mode = crate::gate::Mode::Bypass;
+        spec.root = spec.id;
+        crate::taint::mark(&context(&spec));
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        let refused = messages(&sent[3]).last().unwrap();
+        assert!(
+            refused["content"].as_str().unwrap().contains("Refused"),
+            "{refused}"
+        );
+        assert!(dir.join("app.core").exists());
     }
 
     #[test]

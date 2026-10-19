@@ -114,7 +114,12 @@ OpenRouter, give `--upstream`, `--key-env` and `--model`; the reasoning
 effort then goes as OpenAI's `reasoning_effort`, and the caller's
 User-Agent is passed on, as some gateways turn away Python's:
 
+The relay answers only callers that send `TB2_RELAY_TOKEN`, so another
+machine that reaches its port cannot spend the key; `run.sh` gives the same
+token to Letronna in each trial:
+
 ```sh
+export TB2_RELAY_TOKEN=$(openssl rand -hex 16)
 OPENROUTER_API_KEY=... python3 scripts/harbor/tb2/relay.py \
   --meter tb2-work/meter.jsonl --provider DeepSeek --reasoning high &
 LETRONNA_BIN=$PWD/target/x86_64-unknown-linux-musl/release/letronna \

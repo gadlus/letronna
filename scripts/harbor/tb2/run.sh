@@ -10,6 +10,7 @@
 #   TB2_N           trials at a time for the smaller tasks (3)
 #   TB2_MODEL       the model, as Harbor names it (openai/deepseek/deepseek-v4.1-flash)
 #   TB2_RELAY_PORT  the relay's port on this host (18080)
+#   TB2_RELAY_TOKEN the token relay.py was started with (required)
 #   TB2_CA          a CA bundle for task containers whose TLS this network
 #                   re-terminates; unset, the containers are left as they are
 #   TB2_ALONE       tasks run one at a time (the four largest images)
@@ -49,7 +50,8 @@ if [ "${TB2_AGENT:-}" = oracle ]; then
   agent=(-a oracle)
 else
   bin=${LETRONNA_BIN:?the static Linux letronna to run, as LETRONNA_BIN}
-  curl -fsS "http://127.0.0.1:$port/v1/models" >/dev/null ||
+  : "${TB2_RELAY_TOKEN:?the token relay.py was started with, as TB2_RELAY_TOKEN}"
+  curl -fsS -H "Authorization: Bearer $TB2_RELAY_TOKEN" "http://127.0.0.1:$port/v1/models" >/dev/null ||
     { echo "Nothing answers on port $port: start relay.py first." >&2; exit 1; }
   agent=(
     -a harness_letronna.agent:Letronna -m "$model" --ak "binary=$bin"
@@ -147,8 +149,8 @@ if [ "${TB2_AGENT:-}" != oracle ]; then
   for m in "${meters[@]}"; do judged+=(--meter "$m"); done
 fi
 
-# The relay holds the key; this one only satisfies Harbor's check for one.
-export OPENAI_API_KEY=held-by-the-relay
+# The relay holds the provider key; Letronna sends the relay's own token.
+export OPENAI_API_KEY=${TB2_RELAY_TOKEN:-held-by-the-relay}
 export PYTHONPATH="$here/..${PYTHONPATH:+:$PYTHONPATH}"
 
 # Whether to start no more Harbor runs, and why.

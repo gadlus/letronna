@@ -3184,7 +3184,8 @@ fn stopped_with_run(ctx: &ToolContext) -> String {
     }
     format!(
         " Background jobs are stopped when this run ends; if it must keep running \
-         after that, start it detached instead, as with `{DETACHED}`, and check \
+         after that, start it detached instead, in a plain run_command and not as a job, \
+         as with `{DETACHED}`, and check \
          that it answers."
     )
 }
