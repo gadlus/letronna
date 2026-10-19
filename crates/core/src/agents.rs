@@ -93,7 +93,7 @@ const AT_ONCE: usize = 8;
 const DEPTH: u8 = 2;
 /// Dozens of rounds of reading files, and a ceiling on what a tree that goes
 /// round in circles can cost.
-const BUDGET: u64 = 500_000;
+pub(crate) const BUDGET: u64 = 500_000;
 /// How long a kept helper waits idle for more work: long enough for the rest
 /// of the turn that kept it, or a build or a review, to bring the next task,
 /// and short enough that a forgotten one ends well before the session does.

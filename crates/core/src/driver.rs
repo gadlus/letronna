@@ -1870,14 +1870,29 @@ fn requirements(spec: &Spec, turn: &Turn, written: &[String]) -> Option<Message>
     if found.len() < crate::requirements::FEWEST {
         return None;
     }
+    // A helper reads the request afresh, where one is allowed and the run
+    // has the time and tokens left for its review and the fix after it.
+    let review = refused(spec, "agent").is_none() && affords_review(spec);
     Some(Message {
         role: "user".into(),
-        content: crate::requirements::notice(&found),
+        content: crate::requirements::notice(&found, review),
         notice: true,
         // Folded into the run, so the window keeps the task it is for.
         folded: true,
         ..Default::default()
     })
+}
+
+/// Whether a run has the time to its deadline and the tokens in its budget
+/// for a review helper and the fix after it: near either end, the review
+/// would spend what the fix needed.
+fn affords_review(spec: &Spec) -> bool {
+    let time = (spec.connection.deadline).is_none_or(|deadline| {
+        deadline.saturating_duration_since(Instant::now()) >= crate::requirements::REVIEW_TIME
+    });
+    let tokens = (spec.budget.as_ref())
+        .is_none_or(|budget| budget.left() >= crate::requirements::REVIEW_TOKENS);
+    time && tokens
 }
 
 /// The source files the tool results in `messages` changed after the last
@@ -5658,28 +5673,69 @@ pub(crate) mod tests {
         (spec, provider)
     }
 
-    #[test]
-    fn an_unwatched_run_that_changed_source_is_sent_back_once_with_the_requirements() {
-        let _data = data("requirements");
-        let dir = scratch("requirements");
+    /// What a run asked `SPECIFIED` in a folder `name`, as `setup` leaves it,
+    /// is sent back with once it has changed source.
+    fn requirements_asked(name: &str, id: AgentId, setup: impl FnOnce(&mut Spec)) -> String {
+        let _data = data(name);
+        let dir = scratch(name);
         let answers = vec![
             reply("", &[write_made()]),
             reply("Added parse_range.", &[]),
             reply("Each requirement holds.", &[]),
         ];
-        let (spec, provider) = specified(&dir, AGENTS + 1_700, SPECIFIED, answers);
+        let (mut spec, provider) = specified(&dir, id, SPECIFIED, answers);
+        setup(&mut spec);
         let report = finished(spec);
         assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "Each requirement holds.");
         let sent = provider.sent();
-
-        let asked = messages(&sent[2]).last().unwrap()["content"]
+        messages(&sent[2]).last().unwrap()["content"]
             .as_str()
-            .unwrap();
+            .unwrap()
+            .into()
+    }
+
+    #[test]
+    fn an_unwatched_run_that_changed_source_is_sent_back_once_with_the_requirements() {
+        let asked = requirements_asked("requirements", AGENTS + 1_700, |_| {});
         assert_eq!(
             asked,
-            crate::requirements::notice(&STATED.map(String::from))
+            crate::requirements::notice(&STATED.map(String::from), true)
         );
-        assert_eq!(report.text, "Each requirement holds.");
+    }
+
+    #[test]
+    fn a_run_that_may_not_start_a_helper_is_not_asked_for_a_review() {
+        let asked = requirements_asked("requirements-no-agent", AGENTS + 1_760, |spec| {
+            spec.allow = Allow::Only(vec!["write_file".into(), "run_command".into()]);
+        });
+        assert_eq!(
+            asked,
+            crate::requirements::notice(&STATED.map(String::from), false)
+        );
+    }
+
+    #[test]
+    fn a_run_short_of_time_or_tokens_for_a_review_is_not_asked_for_one() {
+        let stated = STATED.map(String::from);
+        let (time, tokens) = (
+            crate::requirements::REVIEW_TIME,
+            crate::requirements::REVIEW_TOKENS,
+        );
+        let near = requirements_asked("requirements-near-deadline", AGENTS + 1_770, |spec| {
+            spec.connection.deadline = Some(Instant::now() + time - Duration::from_secs(60));
+        });
+        assert_eq!(near, crate::requirements::notice(&stated, false));
+        let spent = requirements_asked("requirements-low-budget", AGENTS + 1_780, |spec| {
+            spec.budget = Some(Arc::new(Budget::new(tokens - 1, None)));
+        });
+        assert_eq!(spent, crate::requirements::notice(&stated, false));
+        // With both to spare, it is.
+        let ample = requirements_asked("requirements-ample", AGENTS + 1_790, |spec| {
+            spec.connection.deadline = Some(Instant::now() + 2 * time);
+            spec.budget = Some(Arc::new(Budget::new(2 * tokens, None)));
+        });
+        assert_eq!(ample, crate::requirements::notice(&stated, true));
     }
 
     #[test]

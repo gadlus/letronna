@@ -53,6 +53,15 @@ impl Budget {
         }
     }
 
+    /// The fewest tokens left in this budget or any ancestor, none once one
+    /// is spent.
+    pub fn left(&self) -> u64 {
+        std::iter::successors(Some(self), |budget| budget.parent.as_deref())
+            .map(|budget| budget.limit.saturating_sub(budget.spent()))
+            .min()
+            .unwrap_or_default()
+    }
+
     /// Refuses the next call when this budget or any ancestor is spent,
     /// naming the one that is.
     pub fn check(&self) -> Result<(), String> {
@@ -113,6 +122,19 @@ mod tests {
             Err("The helper budget is spent (5k of 5k tokens). Finish the work yourself.".into())
         );
         assert_eq!(root.check(), Ok(()));
+    }
+
+    #[test]
+    fn what_is_left_is_the_least_any_ledger_above_has() {
+        let root = Arc::new(Budget::new(10_000, None));
+        let parent = Arc::new(Budget::new(5_000, Some(root.clone())));
+        let child = Budget::new(8_000, Some(parent.clone()));
+        child.charge(&reply(1_000, 0, 200));
+        assert_eq!(child.left(), 3_800);
+        assert_eq!(root.left(), 8_800);
+
+        child.charge(&reply(4_000, 0, 0));
+        assert_eq!(child.left(), 0);
     }
 
     #[test]

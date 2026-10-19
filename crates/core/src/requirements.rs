@@ -32,8 +32,23 @@ pub(crate) const LISTED: usize = 40;
 /// a build or test covers, while a specification states many.
 pub(crate) const FEWEST: usize = 4;
 
+/// What a run that can start a helper is told first after the sentences: a
+/// helper that has not seen the work reads the request afresh, where the
+/// run itself tends to check only the paths it built.
+const REVIEW: &str = "First ask a helper that hasn't seen your work: with the agent tool, start a review helper and wait for its report. Give it the request word for word and the files you changed, and ask it to try each behaviour the request states against your change and report every one that fails, with the command that shows it, changing no file. Check what it reports along with the list.";
+
+/// The least time a run with a deadline needs left to be asked for the
+/// review: the helper takes a few minutes, and the run about as long again
+/// to fix what it reports, so with less the review would spend the time the
+/// fix needed.
+pub(crate) const REVIEW_TIME: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The least a run's token budget needs left to be asked for the review:
+/// what a helper may spend, so the review cannot use up what the fix needs.
+pub(crate) const REVIEW_TOKENS: u64 = crate::agents::BUDGET;
+
 /// What the run is told after the sentences.
-const CHECK: &str = "These are picked by their wording, so read the request once more for any behaviour it states that the list leaves out. For each, run or write a quick test that shows it holds through the entry point a caller uses, end to end, not only by reading internal state, minding exact messages, strings and orderings. A behaviour tied to an event, such as something being demoted, closed or removed, holds on every call that can cause that event, not only the one the sentence names: find each and test it. Where a sentence names several cases or inputs, try each one in every form it could be written, including any your parser or code might reject before it reaches your new check. Fix any that fail; skip one that only gives background or the old behaviour. Remove any script or test you added only for this check, unless the task asks for tests. Only your last message is passed on as your answer, so end with your whole answer again, not only what changed.";
+const CHECK: &str = "These are picked by their wording, so read the request once more for any behaviour it states that the list leaves out. For each, run or write a quick test that shows it holds through the entry point a caller uses, end to end, not only by reading internal state, minding exact messages, strings and orderings. A behaviour tied to an event, such as something being demoted, closed or removed, holds on every call that can cause that event, not only the one the sentence names: find each and test it. Where a sentence names several cases or inputs, try each one in every form it could be written, including any your parser or code might reject before it reaches your new check. A class, function or file the request names that the project already has is the one to change, unless the request asks for a new one: find it and extend it rather than making a new one of that name beside it. Fix any that fail; skip one that only gives background or the old behaviour. Remove any script or test you added only for this check, unless the task asks for tests. Only your last message is passed on as your answer, so end with your whole answer again, not only what changed.";
 
 /// Words and phrases that make a sentence a requirement, in lower case.
 const MARKERS: &[&str] = &[
@@ -223,8 +238,9 @@ pub(crate) fn sentences(request: &str) -> Vec<String> {
 }
 
 /// What sends a run back to check its change against `sentences`, the
-/// first `LISTED` of them quoted.
-pub(crate) fn notice(sentences: &[String]) -> String {
+/// first `LISTED` of them quoted, asked first for a helper's review when it
+/// can `review`.
+pub(crate) fn notice(sentences: &[String], review: bool) -> String {
     let brand = crate::BRAND;
     let mut text = format!(
         "[{brand} check] Before ending, check your change against each requirement the request states:"
@@ -239,6 +255,10 @@ pub(crate) fn notice(sentences: &[String]) -> String {
         ));
     }
     text.push('\n');
+    if review {
+        text.push_str(REVIEW);
+        text.push(' ');
+    }
     text.push_str(CHECK);
     text
 }
@@ -627,11 +647,12 @@ mod tests {
         let all: Vec<String> = (1..=LISTED + 3)
             .map(|n| format!("Rule {n} must hold."))
             .collect();
-        let text = notice(&all);
+        let text = notice(&all, false);
         assert!(text.starts_with("[Letronna check] Before ending, check your change"));
         assert!(text.contains(&format!("\n- Rule {LISTED} must hold.\n")));
         assert!(!text.contains(&format!("Rule {} must", LISTED + 1)));
         assert!(text.contains("\n- and 3 more in the request; check those too.\n"));
-        assert!(text.ends_with(CHECK));
+        assert!(text.ends_with(CHECK) && !text.contains(REVIEW));
+        assert!(notice(&all, true).ends_with(&format!("\n{REVIEW} {CHECK}")));
     }
 }
