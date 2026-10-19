@@ -2062,8 +2062,23 @@ impl Bar {
     fn send(&mut self) {
         let text = self.line.text().trim_end_matches('\n').to_owned();
         self.line.set(&text);
-        if let Some(choice) = matches(self.line.text(), &self.added).get(self.picked) {
-            self.line.set(&choice.line());
+        let options = matches(self.line.text(), &self.added);
+        if let Some(choice) = options.get(self.picked) {
+            // A name typed only in part, that more than one command starts
+            // with, is filled in, as tab does, rather than the first of them
+            // run at once: `/u` and enter would otherwise undo the last
+            // exchange unasked. Enter again runs it; a name typed whole, or
+            // one only a single command starts with, runs at once.
+            let whole =
+                options.len() == 1 || options.iter().any(|option| option.line() == text.trim());
+            let line = choice.line();
+            if !whole {
+                self.line.set(&line);
+                self.picked = 0;
+                self.settle();
+                return;
+            }
+            self.line.set(&line);
         }
         self.picked = 0;
         let line = self.line.take().trim().to_owned();
@@ -3585,6 +3600,18 @@ mod tests {
         bar.line.set("/us");
         bar.send();
         assert_eq!(bar.queued.pop_front().as_deref(), Some("/usage"));
+    }
+
+    #[test]
+    fn enter_on_a_name_several_commands_start_with_fills_it_in() {
+        let mut bar = Bar::new(String::new());
+        bar.line.set("/u");
+        bar.send();
+        assert!(bar.queued.is_empty());
+        assert_eq!(bar.line.text(), "/undo");
+        // Enter again runs what is now a whole name.
+        bar.send();
+        assert_eq!(bar.queued.pop_front().as_deref(), Some("/undo"));
     }
 
     /// Two skills switched on and one off, as `offer_added` hands them over.

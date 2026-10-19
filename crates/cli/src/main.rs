@@ -503,8 +503,12 @@ fn main() {
             if let Flow::Unknown = flow {
                 let name = line.split_whitespace().next().unwrap_or(&line);
                 render::line(&render::dim(&match runner.bar.meant(name) {
-                    Some(meant) => format!("{name} is not a command. Did you mean {meant}?"),
-                    None => format!("{line} is not a command. Type / to see what is."),
+                    Some(meant) => format!(
+                        "{name} is not a command. Did you mean {meant}? Start it with // to send it as text."
+                    ),
+                    None => format!(
+                        "{line} is not a command. Type / to see what is, or start it with // to send it as text."
+                    ),
                 }));
             }
             // The footer names the open session's Crew switch, which the

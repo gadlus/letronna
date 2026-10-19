@@ -213,7 +213,10 @@ pub fn command(
             Flow::Handled
         }
         "/thinking" => {
-            runner.store.settings.thinking = !runner.store.settings.thinking;
+            let Some(on) = switched("/thinking", rest, runner.store.settings.thinking) else {
+                return Flow::Handled;
+            };
+            runner.store.settings.thinking = on;
             runner.persist();
             let note = footer(runner);
             runner.bar.set_footer(note);
@@ -229,13 +232,19 @@ pub fn command(
             search_services(runner);
             Flow::Handled
         }
-        "/search" if rest == "keyless" => {
-            let on = !runner.store.settings.keyless_search;
-            keyless_search(runner, on);
+        "/search" if rest.split_whitespace().next() == Some("keyless") => {
+            let words = rest["keyless".len()..].trim();
+            let now = runner.store.settings.keyless_search;
+            if let Some(on) = switched("/search keyless", words, now) {
+                keyless_search(runner, on);
+            }
             Flow::Handled
         }
         "/search" => {
-            runner.store.settings.search = !runner.store.settings.search;
+            let Some(on) = switched("/search", rest, runner.store.settings.search) else {
+                return Flow::Handled;
+            };
+            runner.store.settings.search = on;
             runner.persist();
             let note = footer(runner);
             runner.bar.set_footer(note);
@@ -252,9 +261,10 @@ pub fn command(
             Flow::Handled
         }
         "/notify" => {
-            let settings = &mut runner.store.settings;
-            settings.notifications = !settings.notifications;
-            let on = settings.notifications;
+            let Some(on) = switched("/notify", rest, runner.store.settings.notifications) else {
+                return Flow::Handled;
+            };
+            runner.store.settings.notifications = on;
             runner.persist();
             render::blank();
             render::line(&render::dim(if on {
@@ -265,11 +275,16 @@ pub fn command(
             Flow::Handled
         }
         "/voice" => {
-            voice(runner);
+            if let Some(on) = switched("/voice", rest, runner.store.settings.voice) {
+                voice(runner, on);
+            }
             Flow::Handled
         }
         "/verify" => {
-            runner.store.settings.verify_edits = !runner.store.settings.verify_edits;
+            let Some(on) = switched("/verify", rest, runner.store.settings.verify_edits) else {
+                return Flow::Handled;
+            };
+            runner.store.settings.verify_edits = on;
             runner.persist();
             render::blank();
             let settings = &runner.store.settings;
@@ -283,7 +298,10 @@ pub fn command(
             Flow::Handled
         }
         "/memory-review" => {
-            let on = !runner.store.settings.memory_review;
+            let Some(on) = switched("/memory-review", rest, runner.store.settings.memory_review)
+            else {
+                return Flow::Handled;
+            };
             runner.store.settings.memory_review = on;
             runner.persist();
             render::blank();
@@ -1654,10 +1672,26 @@ fn help_groups() -> Vec<(&'static str, Vec<bar::Command<'static>>)> {
     groups
 }
 
+/// The switch `rest` asks `command` for: on or off, or the other way from
+/// `now` when it names neither. `None`, once it has said how, for any
+/// other word, which used to flip the switch whatever it said.
+fn switched(command: &str, rest: &str, now: bool) -> Option<bool> {
+    match rest.trim() {
+        "" => Some(!now),
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => {
+            render::line(&render::dim(&format!(
+                "{command} on or {command} off; {command} alone switches it."
+            )));
+            None
+        }
+    }
+}
+
 /// Turn reading replies aloud on or off.
-fn voice(runner: &mut Runner) {
+fn voice(runner: &mut Runner, on: bool) {
     render::blank();
-    let on = !runner.store.settings.voice;
     // The speech is made on the hosted models only an account can use.
     if on && !letronna_core::auth::signed_in() {
         render::line(&render::red(
@@ -2050,10 +2084,7 @@ fn effort(runner: &mut Runner, session: usize, rest: &str) {
         "" => {
             let start = stops.iter().position(|l| *l == current).unwrap_or(0);
             match runner.bar.slide("How hard should it think?", &stops, start) {
-                // Where it already was: a level saved on a model that goes
-                // further stays saved for when that model is back.
-                Some(index) if stops[index] == current => saved.clone(),
-                Some(index) => stops[index].to_owned(),
+                Some(index) => slid_to(stops[index], current, &saved),
                 None => {
                     render::blank();
                     render::line(&render::dim(&format!("Left at {current}.")));
@@ -2067,6 +2098,15 @@ fn effort(runner: &mut Runner, session: usize, rest: &str) {
     // nearest it has, and as named again on a model that has it. Auto, or a
     // word that is no level, leaves it to the model.
     let sent = letronna_core::models::clamp(&levels, &chosen).map(|level| level.id.clone());
+    // A word that is no level is said so, rather than taken for auto.
+    if sent.is_none() && chosen != "auto" {
+        render::blank();
+        render::line(&render::dim(&format!(
+            "{chosen} is not a level {model} has: {}.",
+            stops.join(", ")
+        )));
+        return;
+    }
     let effort = if sent.is_some() { chosen.as_str() } else { "" };
     runner.store.choose_effort(session, effort);
     runner.persist();
@@ -2078,6 +2118,17 @@ fn effort(runner: &mut Runner, session: usize, rest: &str) {
         Some(level) if level == chosen => format!("Thinking {level}."),
         Some(level) => format!("Thinking {level}, the nearest {model} has to {chosen}."),
     }));
+}
+
+/// What picking `picked` on the effort slider asks for, where it stood at
+/// `current`: where it already was, a level saved on a model that goes
+/// further stays saved for when that model is back, and auto, saved as
+/// nothing, stays auto.
+fn slid_to(picked: &str, current: &str, saved: &str) -> String {
+    match picked == current && current != "auto" {
+        true => saved.to_owned(),
+        false => picked.to_owned(),
+    }
 }
 
 /// The reply styles with the chosen one marked, or `name` chosen.
@@ -2221,7 +2272,15 @@ fn jobs(runner: &mut Runner, rest: &str) {
         return;
     }
 
-    render::said(&render::blue("●"), &render::bold("Running"));
+    let heading = match (
+        running.iter().any(|j| j.running),
+        running.iter().any(|j| !j.running),
+    ) {
+        (true, false) => "Running",
+        (false, true) => "Finished",
+        _ => "Jobs",
+    };
+    render::said(&render::blue("●"), &render::bold(heading));
     for job in &running {
         let state = if job.running { "running" } else { "finished" };
         render::line(&format!(
@@ -2896,6 +2955,17 @@ fn send_to_helper(helpers: &[Seen], rest: &str) {
     }
 }
 
+/// The words `/mcp` takes before a server's name.
+const MCP_VERBS: [&str; 7] = [
+    "reconnect",
+    "enable",
+    "disable",
+    "login",
+    "logout",
+    "log",
+    "reload",
+];
+
 /// The MCP servers and how each is doing, or reconnect, enable, disable,
 /// sign in to or out of or read the log of one, or read mcp.json again.
 fn mcp_servers(runner: &mut Runner, rest: &str) {
@@ -2926,6 +2996,15 @@ fn mcp_servers(runner: &mut Runner, rest: &str) {
         false => name.to_owned(),
     };
     let name = picked.as_str();
+    // A word that is none of them is said so, server names included, rather
+    // than asked which server it is for.
+    if !verb.is_empty() && !MCP_VERBS.contains(&verb) {
+        render::line(&render::red(&format!(
+            "/mcp {verb} is not one of {}; /mcp alone lists the servers.",
+            MCP_VERBS.join(", ")
+        )));
+        return;
+    }
     if !verb.is_empty() && verb != "reload" && name.is_empty() {
         let which = format!("Which server? /mcp {verb} <name>");
         render::said(&render::blue("●"), &render::bold(&which));
@@ -6104,6 +6183,26 @@ mod tests {
         assert_eq!(store.conversations[0].memory_scope, None);
         store.settings.memory_saving = Saving::Ask;
         assert_eq!(store.memory_saving(0), Saving::Ask);
+    }
+
+    #[test]
+    fn the_effort_slider_left_where_it_was_keeps_what_was_saved() {
+        // On auto, saved as nothing, enter without moving stays auto rather
+        // than naming an empty level.
+        assert_eq!(super::slid_to("auto", "auto", ""), "auto");
+        // A level another model went further with stays saved.
+        assert_eq!(super::slid_to("high", "high", "max"), "max");
+        assert_eq!(super::slid_to("low", "high", "max"), "low");
+        assert_eq!(super::slid_to("auto", "high", "max"), "auto");
+    }
+
+    #[test]
+    fn a_switch_reads_on_off_or_flips() {
+        assert_eq!(super::switched("/notify", "", true), Some(false));
+        assert_eq!(super::switched("/notify", "", false), Some(true));
+        assert_eq!(super::switched("/notify", "off", false), Some(false));
+        assert_eq!(super::switched("/notify", " on ", true), Some(true));
+        assert_eq!(super::switched("/notify", "please", true), None);
     }
 
     #[test]

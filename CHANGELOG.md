@@ -69,6 +69,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ### Fixed
 
+- **Terminal** — `/thinking`, `/search`, `/search keyless`, `/notify`, `/voice`, `/verify` and `/memory-review` take on or off, where any word flipped them, so `/notify off` could turn notifications on; alone they still switch. Enter on a name more than one command starts with, such as `/u`, fills in the first of them rather than running it, `/effort` with a word that is no level says which levels there are instead of switching to auto, `/mcp` with a word that is none of its own says so instead of asking which server, an unknown command says how to send it as text, and `/jobs` heads finished jobs as finished.
 - **All** — A value after `Authorization:` or `Proxy-Authorization:` is hidden again in tool output and logs, as it was before names were read word by word.
 - **All** — A run that read untrusted words may delete only a real crash dump it left (an ELF core, or the JVM's pid-named files), not a project file named like one, such as `app.core`.
 - **All** — A job told how to keep a server up past a `-p` run is told to start it in a plain command, not as another job, which the run would stop with it.
