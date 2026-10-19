@@ -33,9 +33,34 @@ const BINDING: &str = "thinking-binding-controls-2026-08-01";
 const REPLY_TOKENS: u64 = 8_192;
 
 /// Whether requests to `endpoint` go out as Messages requests: Anthropic's
-/// own API, whether its gateway or Custom points there.
+/// own API, whether its gateway or Custom points there, or a Custom endpoint
+/// that names the Messages route itself, as a proxy that speaks it is given.
 pub(crate) fn speaks(endpoint: &str) -> bool {
+    own(endpoint) || names_messages(endpoint)
+}
+
+/// Whether `endpoint` is Anthropic's own API, rather than a proxy that
+/// speaks its Messages API: only it is known to take cache markers, and
+/// only it is shown the marks of Anthropic's own client.
+pub(crate) fn own(endpoint: &str) -> bool {
     crate::chat::host(endpoint).is_some_and(|host| host == HOST) || stands_in(endpoint)
+}
+
+/// Whether `endpoint`'s path ends in `/messages`, the Messages route, which
+/// no chat completions endpoint ends in.
+fn names_messages(endpoint: &str) -> bool {
+    reqwest::Url::parse(endpoint.trim())
+        .is_ok_and(|url| url.path().trim_end_matches('/').ends_with("/messages"))
+}
+
+/// The root of the API at `base`, which its other routes hang off: `base`
+/// without the Messages route, or the chat route of Anthropic's copy of
+/// OpenAI's API, that it may name.
+pub(crate) fn root(base: &str) -> &str {
+    let base = base.trim().trim_end_matches('/');
+    (base.strip_suffix("/messages"))
+        .or_else(|| base.strip_suffix("/chat/completions"))
+        .unwrap_or(base)
 }
 
 /// The local servers tests stand in for Anthropic's API with, by base URL.
@@ -75,16 +100,22 @@ pub(crate) fn keyed(request: RequestBuilder, key: &str) -> RequestBuilder {
     }
 }
 
-/// `request` carrying `posted`, a Messages request, keyed, and naming the
-/// binding beta when `posted` uses it.
-pub(crate) fn sign(request: RequestBuilder, key: &str, posted: &Value) -> RequestBuilder {
+/// `request` to `endpoint` carrying `posted`, a Messages request, keyed, and
+/// naming the binding beta when `posted` uses it.
+pub(crate) fn sign(
+    request: RequestBuilder,
+    endpoint: &str,
+    key: &str,
+    posted: &Value,
+) -> RequestBuilder {
     // A subscription's token is issued to Anthropic's own client, and a
     // request carrying one without that client's marks is refused as a rate
     // limit on an account that is not rate limited -- an error that names
     // nothing of the cause. So the marks go on, and they replace the beta
     // header rather than add to it: which betas that client sends is part of
-    // what it is. See `providers::claude::cloak`.
-    if subscription(key) {
+    // what it is. See `providers::claude::cloak`. Only to Anthropic itself:
+    // they carry the signed-in account's ids, which a proxy is not shown.
+    if subscription(key) && own(endpoint) {
         use crate::providers::claude::cloak;
         let tokens =
             crate::providers::auth::tokens(crate::providers::claude::NAME).unwrap_or_default();
@@ -1064,6 +1095,173 @@ mod tests {
             (facts.context, facts.max_output),
             (Some(900_000), Some(64_000))
         );
+    }
+
+    #[test]
+    fn a_custom_endpoint_naming_the_messages_route_is_spoken_to_as_anthropic() {
+        // Not a stand-in: only the route it names says what it speaks.
+        let (endpoint, worker) = server(
+            "/proxy/v1/messages",
+            vec![("200 OK", "text/event-stream", says("Hello"))],
+        );
+        // With no key, as the other tests here: a key would send the model
+        // list's ask to this server too, on a thread of its own.
+        let ask = vec![said("user", "Hi")];
+        let (heard, _) = heard_from(start(on(&endpoint, 0xA407), ask));
+        assert!(heard.contains(&"text Hello".to_owned()), "{heard:?}");
+        assert_eq!(heard.last().unwrap(), "finished Ok(())");
+        let (head, body) = &worker.join().unwrap()[0];
+        assert!(head.starts_with("post /proxy/v1/messages "), "{head}");
+        assert!(head.contains("anthropic-version: 2023-06-01"), "{head}");
+        assert!(!head.contains("authorization"), "{head}");
+        let posted: Value = serde_json::from_str(body).unwrap();
+        assert!(posted["max_tokens"].is_u64(), "{posted}");
+        assert_eq!(posted["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn the_model_list_of_an_endpoint_naming_the_messages_route_is_asked_at_its_root() {
+        let list = json!({"data": [{"type": "model", "id": "claude-proxied-5",
+            "max_input_tokens": 800_000, "max_tokens": 32_000}], "has_more": false});
+        let (endpoint, worker) = server(
+            "/listed/v1/messages",
+            vec![("200 OK", "application/json", list.to_string())],
+        );
+        let models = crate::chat::list_models(&endpoint, "held-by-the-proxy").unwrap();
+        assert_eq!(models, ["claude-proxied-5"]);
+        let (head, _) = &worker.join().unwrap()[0];
+        assert!(
+            head.starts_with("get /listed/v1/models?limit=1000 "),
+            "{head}"
+        );
+        // Known by the endpoint as given, which is what a turn asks by.
+        let facts = crate::models::facts(&endpoint, "claude-proxied-5");
+        assert_eq!(
+            (facts.context, facts.max_output),
+            (Some(800_000), Some(32_000))
+        );
+    }
+
+    #[test]
+    fn only_an_endpoint_ending_in_the_messages_route_is_taken_for_one() {
+        for messages in [
+            "https://proxy.example/v1/messages",
+            "https://proxy.example/v1/messages/",
+            "http://host.docker.internal:18090/anthropic/v1/messages",
+        ] {
+            assert!(speaks(messages), "{messages}");
+        }
+        for chat in [
+            "https://proxy.example/v1",
+            "https://proxy.example/v1/chat/completions",
+            "https://openrouter.ai/api/v1",
+            "https://proxy.example/v1/messages/batches",
+            "https://messages.example/v1",
+        ] {
+            assert!(!speaks(chat), "{chat}");
+        }
+        assert_eq!(
+            root("https://proxy.example/v1/messages/"),
+            "https://proxy.example/v1"
+        );
+        assert_eq!(
+            root("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1"
+        );
+        assert_eq!(
+            root("https://api.anthropic.com/v1/chat/completions"),
+            "https://api.anthropic.com/v1"
+        );
+        // Spoken to as Anthropic, but not taken for Anthropic itself.
+        assert!(!own("https://proxy.example/v1/messages"));
+        assert!(own("https://api.anthropic.com/v1/messages"));
+    }
+
+    #[test]
+    fn a_turns_own_ask_for_anthropics_list_leaves_a_pasted_chat_route_off() {
+        let list = json!({"data": [{"type": "model", "id": "claude-pasted-5"}], "has_more": false});
+        let (endpoint, worker) = stand_in(vec![("200 OK", "application/json", list.to_string())]);
+        // Anthropic's own address pasted as Custom with its chat route.
+        let pasted = format!("{endpoint}/chat/completions");
+        let asked = crate::models::ask_for_list(&pasted, "sk-ant-test").unwrap();
+        crate::models::wait_for_list(asked);
+        let (head, _) = &worker.join().unwrap()[0];
+        assert!(
+            head.starts_with("get /anthropic/v1/models?limit=1000 "),
+            "{head}"
+        );
+    }
+
+    #[test]
+    fn a_subscription_token_goes_to_anthropic_itself_with_its_clients_marks() {
+        let (endpoint, worker) = stand_in(vec![("200 OK", "application/json", "{}".into())]);
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let posted = json!({"model": "claude-sonnet-5-5", "max_tokens": 16, "messages": []});
+        sign(
+            client.post(&endpoint),
+            &endpoint,
+            "sk-ant-oat01-test",
+            &posted,
+        )
+        .send()
+        .unwrap();
+        let (head, _) = &worker.join().unwrap()[0];
+        assert!(
+            head.contains("authorization: bearer sk-ant-oat01-test"),
+            "{head}"
+        );
+        assert!(head.contains("x-claude-code-session-id"), "{head}");
+    }
+
+    #[test]
+    fn a_turns_own_ask_for_the_list_of_a_messages_route_goes_as_messages_takes_it() {
+        let list = json!({"data": [{"type": "model", "id": "claude-asked-5",
+            "max_input_tokens": 700_000, "max_tokens": 16_000}], "has_more": false});
+        let (endpoint, worker) = server(
+            "/asked/v1/messages",
+            vec![("200 OK", "application/json", list.to_string())],
+        );
+        let asked = crate::models::ask_for_list(&endpoint, "sk-ant-api-test").unwrap();
+        crate::models::wait_for_list(asked);
+        let (head, _) = &worker.join().unwrap()[0];
+        assert!(
+            head.starts_with("get /asked/v1/models?limit=1000 "),
+            "{head}"
+        );
+        assert!(head.contains("x-api-key: sk-ant-api-test"), "{head}");
+        assert!(head.contains("anthropic-version: 2023-06-01"), "{head}");
+        assert!(!head.contains("authorization"), "{head}");
+    }
+
+    #[test]
+    fn a_subscription_token_goes_to_a_proxy_without_anthropics_client_marks() {
+        let (endpoint, worker) = server(
+            "/subscribed/v1/messages",
+            vec![("200 OK", "application/json", "{}".into())],
+        );
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let posted = json!({"model": "claude-sonnet-5-5", "max_tokens": 16, "messages": []});
+        sign(
+            client.post(&endpoint),
+            &endpoint,
+            "sk-ant-oat01-test",
+            &posted,
+        )
+        .send()
+        .unwrap();
+        let (head, _) = &worker.join().unwrap()[0];
+        assert!(
+            head.contains("authorization: bearer sk-ant-oat01-test"),
+            "{head}"
+        );
+        assert!(!head.contains("x-claude-code-session-id"), "{head}");
+        assert!(!head.contains("x-stainless"), "{head}");
     }
 
     #[test]

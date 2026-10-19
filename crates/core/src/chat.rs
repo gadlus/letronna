@@ -2813,6 +2813,7 @@ pub(crate) fn carrying(
     if crate::providers::wire::anthropic::speaks(&connection.endpoint) {
         return crate::providers::wire::anthropic::sign(
             request,
+            &connection.endpoint,
             key,
             &as_messages(connection, body),
         );
@@ -3110,8 +3111,8 @@ fn markers_suspected(
         && failure.kind == FailureKind::BadRequest
         && failure.overflow.is_none();
     // Anthropic's own API takes them, so a refusal there that does not name
-    // them is the request's own.
-    let direct = crate::providers::wire::anthropic::speaks(&connection.endpoint);
+    // them is the request's own; a proxy that speaks its API may not.
+    let direct = crate::providers::wire::anthropic::own(&connection.endpoint);
     bad && carries_markers(sent) && !direct
 }
 
@@ -3984,7 +3985,10 @@ pub fn list_models(base: &str, key: &str) -> Result<Vec<String>, String> {
     // Anthropic's list comes twenty models at a time unless asked for up to
     // 1000, the most it gives at once.
     let url = match anthropic {
-        true => format!("{base}/models?limit=1000"),
+        true => format!(
+            "{}/models?limit=1000",
+            crate::providers::wire::anthropic::root(base)
+        ),
         false => format!("{base}/models"),
     };
     let mut request = client()?.get(url).timeout(Duration::from_secs(20));
@@ -4501,9 +4505,12 @@ fn stream(
         .map_err(|e| Failure::new(FailureKind::Unknown, e))?
         .post(url);
     let request = match (&posted, &wired) {
-        (Some(posted), _) => {
-            crate::providers::wire::anthropic::sign(request, &connection.key, posted)
-        }
+        (Some(posted), _) => crate::providers::wire::anthropic::sign(
+            request,
+            &connection.endpoint,
+            &connection.key,
+            posted,
+        ),
         (None, Some((_, body))) => carrying(request, connection, body),
         (None, None) => carrying(request, connection, &sent),
     };
@@ -12562,6 +12569,15 @@ mod tests {
         let posted = body_with(&direct, &tool_turn(), None, None, &Budget::SMALL, &[]);
         assert!(carries_markers(&posted));
         assert!(!suspected(&direct, &posted, 400, bad));
+        // A proxy that speaks Anthropic's API is not Anthropic itself, so a
+        // refusal there may still be the markers'.
+        let proxy = Connection {
+            endpoint: "https://proxy.example.test/v1/messages".into(),
+            ..direct.clone()
+        };
+        let proxied = body_with(&proxy, &tool_turn(), None, None, &Budget::SMALL, &[]);
+        assert!(carries_markers(&proxied));
+        assert!(suspected(&proxy, &proxied, 400, bad));
         // A request nothing marks, as another model's, is never suspected.
         let other = Connection {
             model: "deepseek/deepseek-v4.1-flash".into(),
@@ -14950,9 +14966,18 @@ mod tests {
         // Or with the Messages route itself.
         let pasted = Connection {
             endpoint: "https://api.anthropic.com/v1/messages/".into(),
-            ..c
+            ..c.clone()
         };
         assert_eq!(validate(&pasted).unwrap(), messages);
+        // A proxy that speaks Messages, named by that route, posts there too.
+        let proxy = Connection {
+            endpoint: "https://proxy.example/v1/messages".into(),
+            ..c
+        };
+        assert_eq!(
+            validate(&proxy).unwrap(),
+            "https://proxy.example/v1/messages"
+        );
     }
 
     #[test]

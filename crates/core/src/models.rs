@@ -363,14 +363,15 @@ pub fn ask_for_list(endpoint: &str, key: &str) -> Option<mpsc::Receiver<()>> {
     if key.trim().is_empty() || !due(&host(endpoint)) {
         return None;
     }
-    // A request to Anthropic's own API goes to its Messages route instead.
-    let base = (endpoint.strip_suffix("/chat/completions"))
-        .or_else(|| {
-            (endpoint.strip_suffix("/messages"))
-                .filter(|_| crate::providers::wire::anthropic::speaks(endpoint))
-        })
-        .unwrap_or(endpoint)
-        .to_owned();
+    // A request to a Messages route goes as it is: `list_models` asks such an
+    // endpoint at its API's root, with the key as Messages takes it.
+    let base = match crate::providers::wire::anthropic::speaks(endpoint) {
+        true => endpoint,
+        false => endpoint
+            .strip_suffix("/chat/completions")
+            .unwrap_or(endpoint),
+    }
+    .to_owned();
     let key = key.to_owned();
     let (over, heard) = mpsc::channel();
     // A list that did not come is not asked for again until `ASK_AGAIN_AFTER`
