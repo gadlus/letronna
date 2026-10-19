@@ -2940,12 +2940,18 @@ impl Tool for RunCommand {
         unless_one_at_a_time(self.description(), COMMANDS_IN_ONE_REPLY)
     }
     fn parameters(&self) -> Value {
+        // Only some modes confine commands, and each confined result has a
+        // line starting with sandbox::NOTE, below any of Letronna's own notes
+        // on it, so `unsandboxed` points at that rather than implying every
+        // command is held: runs never confined took installs to be refused
+        // and gave up on them. The errors saying a command cannot be
+        // sandboxed come from no run, so they are named too.
         let mut parameters = json!({"type": "object", "properties": {
             "command": {"type": "string", "description": "The command line; it runs as one script."},
             "workdir": {"type": "string", "description": "A folder inside the project to run it in instead, relative to the project folder or absolute."},
             "background": {"type": "boolean", "description": "Leave it running and return a job number at once; a notice comes when it exits. read_job reads its output and stop_job ends it."},
             "notify_on": {"type": "array", "items": {"type": "string"}, "description": "With background: also a notice when a line of output contains one of these, such as \"ready\" or \"error\"; at most one every 15 s."},
-            "unsandboxed": {"type": "boolean", "description": "Run it outside the sandbox. Only after a sandboxed run of it failed for want of the network or of writing outside the project; it needs the user's approval."},
+            "unsandboxed": {"type": "boolean", "description": "Run it outside the sandbox. A command ran in the sandbox only when its result has a line starting `(ran sandboxed`; use this only after such a run of it failed for want of the network or of writing outside the project, or when an error says it cannot be sandboxed. It needs the user's approval."},
             "timeout": {"type": "number", "description": format!("Seconds to wait for it to finish, 1 to {MAX_COMMAND_SECS}; {} if left out. Give a slow build, install or test suite longer.", COMMAND_TIMEOUT.as_secs())}
         }, "required": ["command"]});
         // Windows has no tty job yet, so it is not offered there.
@@ -5068,6 +5074,50 @@ mod tests {
             std::fs::read_to_string(dir.join("src/sandboxed.txt")).unwrap(),
             "hi\n"
         );
+    }
+
+    /// The `unsandboxed` description names the line a confined result has,
+    /// so a run that is never confined does not take its commands to be.
+    #[test]
+    fn run_command_says_a_command_is_sandboxed_only_when_its_result_says_so() {
+        let parameters = RunCommand.parameters();
+        let said = parameters["properties"]["unsandboxed"]["description"]
+            .as_str()
+            .unwrap();
+        let (opening, _) = crate::sandbox::NOTE.split_once(':').unwrap();
+        assert!(said.contains(&format!("`{opening}`")), "{said}");
+    }
+
+    /// A confined command that changed a file the session had read says so
+    /// first, so the line the `unsandboxed` description names is not always
+    /// the result's first: it must still be one of its lines.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_sandboxed_command_that_changed_a_file_read_has_the_line_the_description_names() {
+        if !crate::sandbox::available() {
+            return;
+        }
+        let dir = Scratch::new("tools-sandboxed-changed");
+        std::fs::create_dir(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.txt"), "one\n").unwrap();
+        crate::filestate::asked(5_061, 1, 0, 0);
+        let ctx = ToolContext {
+            workspace: Some(dir.to_path_buf()),
+            conversation: 5_061,
+            sandboxed: true,
+            ..Default::default()
+        };
+        run("read_file", r#"{"path":"src/a.txt"}"#, &ctx).unwrap();
+        crate::filestate::asked(5_061, 3, 0, 0);
+        let command = r#"{"command":"echo three > src/a.txt"}"#;
+        let out = run("run_command", command, &ctx).unwrap();
+        assert!(out.contains("changed files you had read"), "{out}");
+        let parameters = RunCommand.parameters();
+        let said = parameters["properties"]["unsandboxed"]["description"]
+            .as_str()
+            .unwrap();
+        let named = said.split('`').nth(1).unwrap();
+        assert!(out.lines().any(|line| line.starts_with(named)), "{out}");
     }
 
     #[test]

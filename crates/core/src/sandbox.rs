@@ -111,7 +111,9 @@ pub fn available() -> bool {
 }
 
 /// What a confined command's result starts with, so the model knows why it
-/// could not reach the network or write elsewhere.
+/// could not reach the network or write elsewhere. run_command's
+/// `unsandboxed` text quotes its opening as the sign of a confined run, on a
+/// line of its own, as Letronna's notes on the result may come above it.
 pub const NOTE: &str = "(ran sandboxed: no network, writes only in the project)";
 
 /// What follows `NOTE` when the output looks like the sandbox stopped the

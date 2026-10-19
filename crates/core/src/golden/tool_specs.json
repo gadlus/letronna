@@ -214,7 +214,7 @@
             "type": "boolean"
           },
           "unsandboxed": {
-            "description": "Run it outside the sandbox. Only after a sandboxed run of it failed for want of the network or of writing outside the project; it needs the user's approval.",
+            "description": "Run it outside the sandbox. A command ran in the sandbox only when its result has a line starting `(ran sandboxed`; use this only after such a run of it failed for want of the network or of writing outside the project, or when an error says it cannot be sandboxed. It needs the user's approval.",
             "type": "boolean"
           },
           "workdir": {
