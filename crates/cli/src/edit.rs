@@ -470,6 +470,21 @@ impl Line {
         }
     }
 
+    /// Clear the line, keeping what was typed among the lines sent earlier,
+    /// pastes and all, so up brings it back. Says whether there was anything.
+    pub fn shelve(&mut self) -> bool {
+        let typed = self.expand();
+        self.clear();
+        if typed.trim().is_empty() {
+            return false;
+        }
+        if self.history.last() != Some(&typed) {
+            self.history.push(typed);
+        }
+        self.draft.clear();
+        true
+    }
+
     /// Take the line to send, remembering it, and start a fresh one.
     pub fn take(&mut self) -> String {
         let sent = self.expand();

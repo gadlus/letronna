@@ -444,6 +444,12 @@ const PLAN_LEAVES: usize = 12;
 /// question takes.
 const STILL: Duration = Duration::from_millis(500);
 
+/// How soon a second ctrl-c on an empty box must come to leave.
+const AGAIN: Duration = Duration::from_secs(2);
+
+/// What the footer says after the first.
+const LEAVE_AGAIN: &str = "ctrl+c again to leave";
+
 /// How soon a second escape on an empty box must follow the first to open
 /// the rewind, as it does in Claude Code: a deliberate double press, which
 /// two presses a while apart, to stop and then to clear, are not.
@@ -875,6 +881,9 @@ pub struct Bar {
     added: Added,
     /// The open session's project folder, where an `@` path is completed.
     folder: Option<std::path::PathBuf>,
+    /// When ctrl-c was pressed on an empty box, which leaves if pressed
+    /// again soon after.
+    quit_at: Option<std::time::Instant>,
     /// How far back the view was when the footer last said so.
     back: usize,
     /// Whether the keys are shown over the box, as `?` on an empty line
@@ -951,6 +960,7 @@ impl Bar {
             focus: crate::notify::Focus::new(std::time::Instant::now()),
             added: Added::default(),
             folder: None,
+            quit_at: None,
             back: 0,
             keys_card: false,
             ended: None,
@@ -1596,7 +1606,7 @@ impl Bar {
         // event to send.
         let mark = self.line.at();
         let mut resized = false;
-        let noted = self.note.is_some();
+        let noted = self.note.clone();
         self.handled = 0;
         self.enter_at = None;
         self.enters = 0;
@@ -1664,7 +1674,8 @@ impl Bar {
         // queue filled and threw the rest of the paste away -- which is how
         // words went missing out of the middle of pasted text.
         // Anything the user does takes the footer back from a note.
-        if self.handled > 0 && noted && self.asking.is_none() {
+        // Not one a key set in this drain, such as ctrl-c's word on leaving.
+        if self.handled > 0 && noted.is_some() && self.note == noted && self.asking.is_none() {
             self.note = None;
         }
         if self.handled > 0 || resized {
@@ -1688,6 +1699,15 @@ impl Bar {
             if self.look_at_helpers() {
                 self.settle();
             }
+        }
+        // A first ctrl-c not followed soon enough by a second is forgotten,
+        // and so is the footer's word on it.
+        if self.quit_at.is_some_and(|at| at.elapsed() >= AGAIN) {
+            self.quit_at = None;
+            if self.note.as_deref() == Some(LEAVE_AGAIN) {
+                self.note = None;
+            }
+            self.settle();
         }
         // Scrolled back, the reply growing under the view moves it further
         // from the foot, which the footer counts.
@@ -1958,6 +1978,10 @@ impl Bar {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let options = matches(self.line.text(), &self.added);
+        // Leaving takes two ctrl-c's in a row; anything between starts over.
+        if !(control && key.code == KeyCode::Char('c')) {
+            self.quit_at = None;
+        }
         match key.code {
             // With something marked, this is the copy key, which is what
             // anybody pressing it over a selection meant by it. Leaving is
@@ -1974,17 +1998,27 @@ impl Bar {
                 }
             }
             KeyCode::Char('c') if control => {
-                // While an answer is running this stops it and leaves; the
-                // turn does not have to finish first, which is the whole
-                // reason anyone reaches for it.
-                if self.working {
+                // While an answer is running this stops it, as escape does,
+                // and stays: a runaway command is what anyone reaches for it
+                // over, and leaving would take the conversation off the
+                // screen. With words in the box it clears them; on an empty
+                // one it leaves, but only when pressed again, so a stop
+                // pressed once too often never quits. A question waits for
+                // its answer even during a turn, which stopping would leave
+                // waiting, so on an empty answer it is skipped, as escape
+                // skips it.
+                if self.asking.is_some() && self.line.is_empty() {
+                    self.queued.push_back(String::new());
+                } else if self.working && self.asking.is_none() {
                     self.interrupt = true;
-                    self.done = true;
-                } else if self.line.is_empty() {
-                    self.done = true;
-                } else {
+                } else if !self.line.is_empty() {
                     self.line.clear();
                     self.picked = 0;
+                } else if self.quit_at.is_some_and(|at| at.elapsed() < AGAIN) {
+                    self.done = true;
+                } else {
+                    self.quit_at = Some(std::time::Instant::now());
+                    self.note = Some(LEAVE_AGAIN.to_owned());
                 }
             }
             KeyCode::Char('d') if control && self.line.is_empty() => self.done = true,
@@ -2064,6 +2098,12 @@ impl Bar {
             KeyCode::End => self.line.end(),
             // Escape stops an answer when one is running, and is otherwise
             // the quickest way to drop what you were typing.
+            // While an answer runs, escape stops it even over a selection,
+            // which it drops too: one press, whatever the mouse did last.
+            KeyCode::Esc if crate::screen::selecting() && self.working && self.line.is_empty() => {
+                crate::screen::unselect();
+                self.interrupt = true;
+            }
             KeyCode::Esc if crate::screen::selecting() => crate::screen::unselect(),
             // Escape on an empty answer skips the question, even one asked
             // in the middle of a turn, as the reason for a no is.
@@ -2078,8 +2118,18 @@ impl Bar {
                 Some(at) if at.elapsed() < TWICE => self.queued.push_back("/rewind".into()),
                 _ => self.esc_at = Some(std::time::Instant::now()),
             },
-            KeyCode::Esc => {
+            // An answer to a question, a secret above all, is no message to
+            // find again with up, so it is only cleared.
+            KeyCode::Esc if self.secret || self.asking.is_some() => {
                 self.line.clear();
+                self.picked = 0;
+            }
+            // What was typed goes where up finds it, so a slip of the key
+            // costs nothing.
+            KeyCode::Esc => {
+                if self.line.shelve() {
+                    self.note = Some("cleared  ·  ↑ brings it back".to_owned());
+                }
                 self.picked = 0;
             }
             // Ctrl-Backspace reaches a good many terminals as Ctrl-H.
@@ -2209,8 +2259,10 @@ impl Bar {
             KeyCode::Home => slider.at = 0,
             KeyCode::End => slider.at = last,
             KeyCode::Enter => self.slid = Some(Some(slider.at)),
+            // Ctrl-c puts it down, as escape does, rather than leaving
+            // Letronna from the middle of a choice.
             KeyCode::Esc => self.slid = Some(None),
-            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => self.done = true,
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => self.slid = Some(None),
             KeyCode::Char(digit) if digit.is_ascii_digit() => {
                 if let Some(index) = digit.to_digit(10).and_then(|d| (d as usize).checked_sub(1))
                     && index <= last
@@ -2252,7 +2304,7 @@ impl Bar {
                 list.picked = 0;
             }
             KeyCode::Esc => self.flip = Some(None),
-            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => self.done = true,
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => self.flip = Some(None),
             KeyCode::Backspace => {
                 list.filter.pop();
                 list.picked = 0;
@@ -2301,6 +2353,17 @@ impl Bar {
                     self.line.backspace();
                     return;
                 }
+                // A ctrl-c then clears what was typed, as it would with no
+                // question up, rather than turn down one nobody has read.
+                KeyCode::Char('c')
+                    if typing
+                        && key.modifiers == KeyModifiers::CONTROL
+                        && !self.line.is_empty() =>
+                {
+                    self.guard = Some(std::time::Instant::now());
+                    self.line.clear();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -2338,13 +2401,10 @@ impl Bar {
                 }
                 choice.picked = 0;
             }
-            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
-                // A helper's question can come up while a call runs, and
-                // leaving there stops the turn, as Ctrl-C does anywhere else
-                // in one.
-                self.interrupt = self.working;
-                self.done = true;
-            }
+            // Ctrl-c turns the question down, as escape does: during a turn
+            // that stops it, the way a no to its card does, and Letronna
+            // stays open either way.
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => self.declined = true,
             KeyCode::Char(digit) if digit.is_ascii_digit() => {
                 if let Some(index) = digit.to_digit(10).and_then(|d| (d as usize).checked_sub(1))
                     && index < choice.options.len()
@@ -3467,17 +3527,106 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_during_a_turn_stops_it_and_leaves() {
+    fn ctrl_c_during_a_reply_stops_it_and_stays() {
         let mut bar = Bar::new(String::new());
         bar.working(true);
         bar.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(bar.interrupted(), "the turn was not stopped");
-        assert!(bar.finished(), "the terminal stayed open");
-        // Escape stops the turn too, but stays.
+        assert!(!bar.finished(), "the terminal left");
+        // Escape stops the turn too, and stays.
         let mut bar = Bar::new(String::new());
         bar.working(true);
         bar.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(bar.interrupted() && !bar.finished());
+    }
+
+    #[test]
+    fn ctrl_c_twice_on_an_empty_box_leaves() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let mut bar = Bar::new(String::new());
+        bar.key(ctrl_c);
+        assert!(!bar.finished());
+        assert_eq!(bar.note.as_deref(), Some(super::LEAVE_AGAIN));
+        bar.key(ctrl_c);
+        assert!(bar.finished());
+        // A key between them starts over, and one too late does not leave.
+        let mut bar = Bar::new(String::new());
+        bar.key(ctrl_c);
+        bar.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        bar.key(ctrl_c);
+        assert!(!bar.finished());
+        bar.quit_at = Instant::now().checked_sub(super::AGAIN);
+        bar.key(ctrl_c);
+        assert!(!bar.finished());
+        // With words in the box it clears them first.
+        let mut bar = Bar::new(String::new());
+        bar.line.insert_str("half a thought");
+        bar.key(ctrl_c);
+        assert!(bar.line.is_empty() && !bar.finished());
+    }
+
+    #[test]
+    fn ctrl_c_in_a_card_turns_it_down_and_stays() {
+        let mut bar = Bar::new(String::new());
+        bar.working(true);
+        bar.choice = Some(question(&["Yes", "No"], false));
+        bar.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(bar.declined && !bar.finished());
+    }
+
+    #[test]
+    fn ctrl_c_at_a_question_asked_during_a_turn_skips_it() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let mut bar = Bar::new(String::new());
+        bar.working(true);
+        bar.asking = Some("Why not?".into());
+        bar.key(ctrl_c);
+        assert_eq!(bar.queued.pop_front().as_deref(), Some(""));
+        assert!(!bar.finished());
+        // With an answer half typed it clears that first.
+        bar.line.insert_str("because");
+        bar.key(ctrl_c);
+        assert!(bar.line.is_empty() && bar.queued.is_empty());
+    }
+
+    #[test]
+    fn escape_never_puts_a_secret_where_up_finds_it() {
+        let mut bar = Bar::new(String::new());
+        bar.secret = true;
+        bar.asking = Some("API key".into());
+        bar.line.insert_str("sk-half-a-key");
+        bar.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(bar.line.is_empty());
+        bar.secret = false;
+        bar.asking = None;
+        bar.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(bar.line.text(), "");
+    }
+
+    #[test]
+    fn ctrl_c_while_typing_under_a_card_clears_the_line_rather_than_turning_it_down() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let mut bar = Bar::new(String::new());
+        bar.choice = Some(question(&["Yes", "No"], false));
+        bar.guard = Some(Instant::now());
+        bar.line.insert_str("half a thou");
+        bar.key(ctrl_c);
+        assert!(bar.line.is_empty() && !bar.declined);
+        // Once the typing has stopped, it turns the card down.
+        bar.guard = Instant::now().checked_sub(STILL);
+        bar.key(ctrl_c);
+        assert!(bar.declined);
+    }
+
+    #[test]
+    fn a_cleared_draft_comes_back_with_up() {
+        let mut bar = Bar::new(String::new());
+        bar.line.insert_str("a long thought I did not mean to lose");
+        bar.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(bar.line.is_empty());
+        assert!(bar.note.as_deref().unwrap().contains("brings it back"));
+        bar.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(bar.line.text(), "a long thought I did not mean to lose");
     }
 
     #[test]

@@ -1444,9 +1444,15 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
     ("tab", "finish a command or an @file name"),
     ("↑ ↓", "step through what you said before"),
     ("shift+tab", "switch mode: asks first, edits, plan, auto"),
-    ("esc", "stop an answer, or clear the line"),
+    (
+        "esc",
+        "stop an answer, or clear the line (↑ brings it back)",
+    ),
     ("esc esc", "go back to an earlier message"),
-    ("ctrl+c", "copy what is selected, clear the line, or leave"),
+    (
+        "ctrl+c",
+        "copy, stop an answer, clear the line, or twice to leave",
+    ),
     ("ctrl+d", "leave, on an empty line"),
     ("ctrl+s", "while it works: send what is queued now"),
     ("↑ while it works", "take back the newest queued line"),
