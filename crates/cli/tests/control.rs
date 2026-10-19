@@ -537,6 +537,52 @@ fn a_run_that_never_writes_its_required_file_says_so_in_the_json_result() {
 }
 
 #[test]
+fn a_job_started_in_a_print_run_is_told_the_run_stops_it() {
+    let sleep = if cfg!(windows) {
+        "Start-Sleep 30"
+    } else {
+        "sleep 30"
+    };
+    // Asked as a question and driven over stdin: both stop their jobs on
+    // the way out.
+    for streamed in [false, true] {
+        let start = ("run_command", json!({"command": sleep, "background": true}));
+        let name = if streamed {
+            "job-streamed"
+        } else {
+            "job-asked"
+        };
+        let (data, work) = scratch(name);
+        // A run that ran a command is sent back once to be checked.
+        let (endpoint, bodies) = provider(vec![
+            reply("", &[start]),
+            reply("It is up.", &[]),
+            reply("It is up.", &[]),
+        ]);
+        let run = if streamed {
+            let mut run = Driven::streaming(&data, &work, &endpoint, &["--yes"]);
+            run.say("start it");
+            run
+        } else {
+            let flags = ["-p", "start it", "--yes", "--output", "json"];
+            Driven::start(&data, &work, &endpoint, &flags, &[])
+        };
+        assert_eq!(run.next()["status"], "done", "{name}");
+        assert_eq!(run.close(), 0, "{name}");
+        let _ = bodies.recv_timeout(WAIT).unwrap();
+        let (_, told) = said(&bodies.recv_timeout(WAIT).unwrap())
+            .into_iter()
+            .find(|(role, _)| role == "tool")
+            .unwrap_or_else(|| panic!("{name}: no tool result"));
+        assert!(told.starts_with("Started as job #"), "{name}: {told}");
+        assert!(
+            told.contains("Background jobs are stopped when this run ends;"),
+            "{name}: {told}"
+        );
+    }
+}
+
+#[test]
 fn the_json_result_names_the_session_and_its_model() {
     let (data, work) = scratch("named");
     let (endpoint, bodies) = provider(vec![reply("Hello.", &[]), reply("Again.", &[])]);

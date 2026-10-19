@@ -2046,6 +2046,8 @@ impl Chat {
             rare_on_demand: true,
             // Only a `-p` run has one.
             deadline: None,
+            // The window's jobs run on after its turns.
+            jobs_end_with_run: false,
         };
         backend::validate(&connection)?;
         Ok(connection)

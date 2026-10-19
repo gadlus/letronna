@@ -892,6 +892,9 @@ fn begin(
     // demand, which keeps each request some 3,000 tokens smaller; one that
     // named them gets what it named in the array.
     connection.lean_tools = args.tools.is_none();
+    // It stops its jobs on the way out, so a job's start says so, and how to
+    // start a server that must outlive it.
+    connection.jobs_end_with_run = true;
     let context = tools::ToolContext::of(&connection);
     let spec = Spec {
         connection,

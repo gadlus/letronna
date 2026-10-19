@@ -1982,6 +1982,9 @@ const PIPE_NAMES: [&str; 2] = ["stdout", "stderr"];
 /// What the first line of a command's result says, as `run_shell_into`
 /// words it, when the command carried on in the background at its limit.
 const MOVED: &str = "so it carries on in the background as job #";
+/// Where the result of a command moved to the background turns from what to
+/// do about the job to what the command printed.
+const SO_FAR: &str = " Output so far:\n";
 
 fn run_shell_into(
     mut cmd: std::process::Command,
@@ -2178,8 +2181,8 @@ fn run_shell_into(
         let moved = format!(
             "Still running after {}s, so it carries on in the background as job \
              #{id} instead of being stopped. A notice comes when it exits; call \
-             wait with job {id} to wait for it, or read_job to read what it \
-             prints. Output so far:\n",
+             wait with job {id} to wait for it, read_job to read what it \
+             prints, or stop_job if you no longer need it.{SO_FAR}",
             limit.as_secs()
         );
         text.insert_str(0, &moved);
@@ -2940,9 +2943,10 @@ impl Tool for RunCommand {
                 let cmd = shell(command, Some(&dir));
                 run_shell_saving(cmd, command, &ctx.cancel, save, limit, owner)
             };
+            let first = out.as_ref().ok().and_then(|text| text.lines().next());
+            let moved = first.is_some_and(|line| line.contains(MOVED));
             if let Some(watch) = watch {
-                let first = out.as_ref().ok().and_then(|text| text.lines().next());
-                watch.after(first.is_some_and(|line| line.contains(MOVED)));
+                watch.after(moved);
             }
             let note = crate::filestate::note(ctx.conversation, before, cwd);
             // A note means a file moved while it ran, so nothing is sure.
@@ -2951,6 +2955,11 @@ impl Tool for RunCommand {
             }
             // The note goes first, so cutting long output short cannot drop it.
             return match out {
+                // With what to do about the job, ahead of what it printed.
+                Ok(text) if moved => {
+                    let ends = stopped_with_run(ctx) + SO_FAR;
+                    Ok(note + &text.replacen(SO_FAR, &ends, 1))
+                }
                 Ok(text) => Ok(note + &text),
                 Err(e) => Err(note + &e),
             };
@@ -2972,10 +2981,9 @@ impl Tool for RunCommand {
         settle(id, SETTLE, tty, &ctx.cancel);
         // Read this way, what the reply shows never comes again as a notice.
         let log = crate::jobs::first_output(id).unwrap_or_default();
-        let state = if crate::jobs::running(id).unwrap_or(false) {
-            "running"
-        } else {
-            "already exited"
+        let (state, ends) = match crate::jobs::running(id).unwrap_or(false) {
+            true => ("running", stopped_with_run(ctx)),
+            false => ("already exited", String::new()),
         };
         let watching = if notify_on.is_empty() {
             String::new()
@@ -2992,7 +3000,7 @@ impl Tool for RunCommand {
             ""
         };
         Ok(format!(
-            "Started as job #{id} ({state}){on}. First output:\n{}{watching}",
+            "Started as job #{id} ({state}){on}.{ends} First output:\n{}{watching}",
             if log.trim().is_empty() {
                 "[nothing yet]"
             } else {
@@ -3000,6 +3008,33 @@ impl Tool for RunCommand {
             }
         ))
     }
+}
+
+/// How a program is started so that it outlives the run, in the shell
+/// `run_command` runs. The run ends its jobs' process groups, or on Windows
+/// their Job Objects, as it ends, and no other command's.
+const DETACHED: &str = if cfg!(windows) {
+    "Start-Process"
+} else if cfg!(target_os = "linux") {
+    "setsid nohup CMD > LOG 2>&1 &"
+} else {
+    // macOS has no setsid; run as a command rather than a job, this is enough.
+    "nohup CMD > LOG 2>&1 &"
+};
+
+/// What a job started in `ctx` is told after it is said to run, when the run
+/// stops its jobs as it ends, as `-p` does: a server the task wants left up
+/// would go with them, after the answer had said it was up.
+fn stopped_with_run(ctx: &ToolContext) -> String {
+    let ends = (ctx.caller.connection.as_deref()).is_some_and(|c| c.jobs_end_with_run);
+    if !ends {
+        return String::new();
+    }
+    format!(
+        " Background jobs are stopped when this run ends; if it must keep running \
+         after that, start it detached instead, as with `{DETACHED}`, and check \
+         that it answers."
+    )
 }
 
 /// Whether `run_command` leaves the command `args` asks for running as a
@@ -6528,9 +6563,14 @@ mod tests {
         } else {
             "echo before; sleep 6; echo after"
         };
-        let said = run_for(command, Duration::from_secs(4), Some(7_701));
-        let (id, so_far) = moved_job(&said.unwrap(), "4s");
+        let said = run_for(command, Duration::from_secs(4), Some(7_701)).unwrap();
+        let (id, so_far) = moved_job(&said, "4s");
         assert_eq!(so_far.trim_end(), "before");
+        // Named, as the jobs' tools are offered only on demand.
+        assert!(
+            said.contains("or stop_job if you no longer need it."),
+            "{said}"
+        );
 
         // A cold PowerShell start comes on top of the sleep, so the wait is generous.
         let from = format!("job {id}");
@@ -6565,6 +6605,71 @@ mod tests {
         assert!(
             jobs.iter().all(|job| job.command != command),
             "it became a job"
+        );
+    }
+
+    /// A context in the temporary folder for conversation `conversation`, in
+    /// a run that stops its jobs as it ends when `print`.
+    fn in_run(conversation: u64, print: bool) -> ToolContext {
+        let connection = Connection {
+            workspace: Some(std::env::temp_dir()),
+            conversation,
+            jobs_end_with_run: print,
+            ..Default::default()
+        };
+        ToolContext::of(&connection)
+    }
+
+    /// The job number a result starting "Started as job #" names.
+    fn started_job(said: &str) -> u64 {
+        (said.strip_prefix("Started as job #"))
+            .and_then(|rest| rest.split(' ').next()?.parse().ok())
+            .unwrap_or_else(|| panic!("{said}"))
+    }
+
+    #[test]
+    fn a_job_started_in_a_print_run_says_the_run_stops_it_and_how_to_leave_one_running() {
+        let command = if cfg!(windows) {
+            "Start-Sleep 30"
+        } else {
+            "sleep 30"
+        };
+        let args = json!({"command": command, "background": true}).to_string();
+        let print = run("run_command", &args, &in_run(0, true)).unwrap();
+        crate::jobs::stop(started_job(&print)).unwrap();
+        let (told, output) = print.split_once("First output:").unwrap();
+        assert!(
+            told.contains("Background jobs are stopped when this run ends;"),
+            "{print}"
+        );
+        assert!(told.contains(&format!("`{DETACHED}`")), "{print}");
+        assert_eq!(told.matches("stopped when this run ends").count(), 1);
+        assert!(!output.contains("this run ends"), "{print}");
+
+        // The terminal's and the window's jobs run on after the turn.
+        let watched = run("run_command", &args, &in_run(0, false)).unwrap();
+        crate::jobs::stop(started_job(&watched)).unwrap();
+        assert!(!watched.contains("this run ends"), "{watched}");
+    }
+
+    #[test]
+    fn a_command_moved_to_the_background_in_a_print_run_says_the_run_stops_it() {
+        let command = if cfg!(windows) {
+            "Start-Sleep 30"
+        } else {
+            "sleep 30"
+        };
+        let args = json!({"command": command, "timeout": 1}).to_string();
+        let said = run("run_command", &args, &in_run(7_705, true)).unwrap();
+        crate::jobs::stop(moved_job(&said, "1s").0).unwrap();
+        let (told, _) = said.split_once(SO_FAR).unwrap();
+        assert!(
+            told.ends_with(&format!(
+                "or stop_job if you no longer need it. Background jobs are stopped when this \
+                 run ends; if it must keep running after that, start it detached instead, as with \
+                 `{DETACHED}`, and check that it answers."
+            )),
+            "{said}"
         );
     }
 

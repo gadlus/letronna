@@ -148,6 +148,8 @@ impl Runner {
             rare_on_demand: true,
             // Set by `-p` alone, once it knows its deadline.
             deadline: None,
+            // Set by `-p` alone: the terminal's jobs run on after its turns.
+            jobs_end_with_run: false,
         }
     }
 
