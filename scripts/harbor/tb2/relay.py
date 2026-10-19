@@ -9,7 +9,8 @@ provider over HTTPS with the host's trust store. So:
   roots do not hold, still reaches the provider;
 - like OpenHuman's metering proxy, it can pin the model, the provider and the
   reasoning effort on every call, and it writes one meter line per call with
-  the usage the provider reported.
+  the usage the provider reported, and the charge where the upstream sends
+  one in a response header.
 
     OPENROUTER_API_KEY=... python3 relay.py --meter meter.jsonl \
         --provider DeepSeek --reasoning high
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import ssl
@@ -86,6 +88,19 @@ def usage_of(captured: bytes) -> dict | None:
         except (ValueError, AttributeError):
             pass
     return found
+
+
+def charged(headers) -> float | None:
+    """What the upstream says the call cost: a response header whose name ends in -cost."""
+    for name, value in headers.items():
+        if name.lower().endswith("-cost"):
+            try:
+                cost = float(value.strip().lstrip("$").split()[0])
+            except (ValueError, IndexError):
+                continue
+            if math.isfinite(cost):
+                return cost
+    return None
 
 
 def stub_reply(body: dict, call: str = "") -> dict:
@@ -192,6 +207,7 @@ def handler(relay: Relay):
             started = time.time()
             first = None
             status = 0
+            cost = None
             captured = bytearray()
             cut = None
             try:
@@ -202,6 +218,7 @@ def handler(relay: Relay):
                 except urllib.error.HTTPError as error:
                     response = error
                 status = response.status
+                cost = charged(response.headers)
                 self.send_response(status)
                 self.send_header("Content-Type", response.headers.get("Content-Type", "application/json"))
                 self.send_header("Transfer-Encoding", "chunked")
@@ -266,6 +283,8 @@ def handler(relay: Relay):
                 "s": round(time.time() - started, 3),
                 "usage": usage_of(bytes(captured)) if method == "POST" else None,
             }
+            if cost is not None:
+                row["cost"] = cost
             if status >= 400:
                 row["error"] = bytes(captured[:500]).decode("utf8", "replace")
             if cut:
