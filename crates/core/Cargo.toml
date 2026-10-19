@@ -29,6 +29,9 @@ tungstenite = { version = "0.30", default-features = false, features = ["handsha
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 webpki-roots = "1"
 base64 = "0.22"
+# web_fetch also trusts the system's certificates, from SSL_CERT_FILE and
+# SSL_CERT_DIR where set; already in the lock file under hyper-rustls.
+rustls-native-certs = "0.8"
 # Runs workflow scripts: QuickJS, in C built by cc, which ring already
 # needs. It can be stopped from outside and held to a heap and a stack.
 rquickjs = { version = "0.14", optional = true }

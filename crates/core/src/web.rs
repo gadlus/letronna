@@ -978,19 +978,39 @@ fn memo_key(url: &reqwest::Url) -> String {
 
 /// The one HTTP client every fetch goes through, kept open between fetches.
 /// It follows no redirect itself: `fetch` checks each one first.
+///
+/// It trusts the system's certificates as well as its own, as curl and git
+/// do: a network that re-signs HTTPS with its own authority adds that to the
+/// system, or names it in `SSL_CERT_FILE` or `SSL_CERT_DIR`, and a page curl
+/// reads there should not be refused here. Only this client: the connections
+/// that carry the gateway's key keep to the built-in roots.
 fn client() -> Result<&'static reqwest::blocking::Client, String> {
     static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
     CLIENT
-        .get_or_init(|| {
-            reqwest::blocking::Client::builder()
-                .timeout(FETCH_TIME)
-                .redirect(reqwest::redirect::Policy::none())
-                .user_agent(concat!("Letronna/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .map_err(|e| e.to_string())
-        })
+        .get_or_init(|| trusting(rustls_native_certs::load_native_certs().certs))
         .as_ref()
         .map_err(Clone::clone)
+}
+
+/// A client for fetches that trusts the `system` certificates beside the
+/// built-in roots.
+fn trusting(
+    system: Vec<rustls::pki_types::CertificateDer<'static>>,
+) -> Result<reqwest::blocking::Client, String> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(FETCH_TIME)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("Letronna/", env!("CARGO_PKG_VERSION")));
+    // reqwest refuses to build at all over one certificate rustls cannot
+    // take, and a system store can hold one, so each is tried alone first.
+    for cert in system {
+        if rustls::RootCertStore::empty().add(cert.clone()).is_ok()
+            && let Ok(root) = reqwest::Certificate::from_der(&cert)
+        {
+            builder = builder.add_root_certificate(root);
+        }
+    }
+    builder.build().map_err(|e| e.to_string())
 }
 
 /// Where `response` sends the fetch on to, when it is a redirect reqwest
@@ -2848,6 +2868,44 @@ or <a data-href="/x" href=/top#part>the top</a>.</p>
         let first = client().expect("the client builds");
         let second = client().expect("the client builds");
         assert!(std::ptr::eq(first, second));
+    }
+
+    #[test]
+    fn a_system_certificate_rustls_refuses_never_stops_the_client_building() {
+        // A bundle as SSL_CERT_FILE names one: a real root, then a block that
+        // is PEM but holds no certificate. The client is built once a process,
+        // so the bundle goes through the loader SSL_CERT_FILE is read with.
+        const ROOT: &str = "-----BEGIN CERTIFICATE-----
+MIICGzCCAaGgAwIBAgIQQdKd0XLq7qeAwSxs6S+HUjAKBggqhkjOPQQDAzBPMQsw
+CQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJuZXQgU2VjdXJpdHkgUmVzZWFyY2gg
+R3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBYMjAeFw0yMDA5MDQwMDAwMDBaFw00
+MDA5MTcxNjAwMDBaME8xCzAJBgNVBAYTAlVTMSkwJwYDVQQKEyBJbnRlcm5ldCBT
+ZWN1cml0eSBSZXNlYXJjaCBHcm91cDEVMBMGA1UEAxMMSVNSRyBSb290IFgyMHYw
+EAYHKoZIzj0CAQYFK4EEACIDYgAEzZvVn4CDCuwJSvMWSj5cz3es3mcFDR0HttwW
++1qLFNvicWDEukWVEYmO6gbf9yoWHKS5xcUy4APgHoIYOIvXRdgKam7mAHf7AlF9
+ItgKbppbd9/w+kHsOdx1ymgHDB/qo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0T
+AQH/BAUwAwEB/zAdBgNVHQ4EFgQUfEKWrt5LSDv6kviejM9ti6lyN5UwCgYIKoZI
+zj0EAwMDaAAwZQIwe3lORlCEwkSHRhtFcP9Ymd70/aTSVaYgLXTWNLxBo1BfASdW
+tL4ndQavEi51mI38AjEAi/V3bNTIZargCyzuFJ0nN6T5U6VR5CmD1/iQMVtCnwr1
+/q4AaOeMSQ+2b1tbFfLn
+-----END CERTIFICATE-----
+";
+        let garbage =
+            "-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----\n";
+        let bundle =
+            std::env::temp_dir().join(format!("letronna-web-roots-{}.pem", std::process::id()));
+        std::fs::write(&bundle, format!("{ROOT}{garbage}")).unwrap();
+        let found = rustls_native_certs::load_certs_from_paths(Some(&bundle), None).certs;
+        let _ = std::fs::remove_file(&bundle);
+        assert_eq!(found.len(), 2, "both blocks are read");
+        // Handed to reqwest as they are, the garbage stops the build.
+        let unfiltered = found
+            .iter()
+            .fold(reqwest::blocking::Client::builder(), |b, cert| {
+                b.add_root_certificate(reqwest::Certificate::from_der(cert).unwrap())
+            });
+        assert!(unfiltered.build().is_err());
+        trusting(found).expect("the client builds");
     }
 
     #[test]

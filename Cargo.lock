@@ -4403,6 +4403,7 @@ dependencies = [
  "ring",
  "rquickjs",
  "rustls",
+ "rustls-native-certs",
  "security-framework",
  "semver",
  "serde",
