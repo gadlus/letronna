@@ -53,6 +53,9 @@
 //! names under `in/` is told so once, as a notice, to read it or say why not.
 //! A run someone answers as it ends, an editor's turn over ACP or a chat
 //! app's, is not, as the window's own turns are not.
+//! A session's own run nobody watches that would end with crash dumps new in
+//! its project, as a crashing test leaves, is told once to delete them
+//! (`dumps`).
 //!
 //! Nothing here polls. Each wait -- for the model, for a tool, for an
 //! approval -- is a blocking receive that a stop closes, so a stop is heard at
@@ -519,6 +522,7 @@ fn steps(
     let began = SystemTime::now();
     let mut put_back = false;
     let mut reworded = false;
+    let mut swept = false;
     let mut listed = false;
     // From the first request, since a run told of its time only near the
     // end has often thought most of it away by then.
@@ -731,6 +735,19 @@ fn steps(
             // Before the Stop hooks, so they judge the answer that follows.
             if !verified && let Some(notice) = unchecked_edits(spec, turn, begun) {
                 verified = true;
+                spec.transcript.conversation.messages.push(notice);
+                save(&mut spec.transcript)?;
+                continue;
+            }
+            // After the edits are checked, so a test that check has run and
+            // that crashed is caught too; once, and with a round and budget
+            // left, as above.
+            if !swept
+                && report.rounds < spec.rounds
+                && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
+                && let Some(notice) = crash_dumps(spec, turn, began)
+            {
+                swept = true;
                 spec.transcript.conversation.messages.push(notice);
                 save(&mut spec.transcript)?;
                 continue;
@@ -1782,6 +1799,43 @@ fn echoed(spec: &Spec, turn: &Turn, written: &[String], began: SystemTime) -> Op
     Some(Message {
         role: "user".into(),
         content,
+        notice: true,
+        // Folded into the run, so the window keeps the task it is for.
+        folded: true,
+        ..Default::default()
+    })
+}
+
+/// The notice sending a session's own run nobody watches back once to
+/// delete the crash dumps made in its project since `began`, when it can
+/// run a command.
+fn crash_dumps(spec: &Spec, turn: &Turn, began: SystemTime) -> Option<Message> {
+    // A helper's files are its parent's to tidy, a person watching sees what
+    // is left, and past the round cap or in plan mode nothing can be deleted.
+    if !unwatched(spec) || spec.watch.is_some() || turn.capped().is_some() {
+        return None;
+    }
+    if !turn.runs_commands() || refused(spec, "run_command").is_some() {
+        return None;
+    }
+    let workspace = spec.connection.workspace.as_deref()?;
+    let found = crate::dumps::left(workspace, began);
+    if found.is_empty() {
+        return None;
+    }
+    // A program the run started made each one, so it is the run's to delete
+    // even once it has read untrusted words; one there before and only
+    // written since is not.
+    let ctx = context(spec);
+    for dump in &found {
+        let path = workspace.join(dump);
+        if crate::taint::born(&path).is_some_and(|at| at >= began) {
+            crate::taint::made(&ctx, &path);
+        }
+    }
+    Some(Message {
+        role: "user".into(),
+        content: crate::dumps::notice(&found),
         notice: true,
         // Folded into the run, so the window keeps the task it is for.
         folded: true,
@@ -5442,6 +5496,137 @@ pub(crate) mod tests {
         provider.sent();
 
         assert_eq!(report.text, "Wrote the report.");
+    }
+
+    /// A file at `path` written as a crashing test would leave a dump.
+    fn dump(path: &str) -> (&'static str, Value) {
+        ("write_file", json!({"path": path, "content": "dump"}))
+    }
+
+    /// A session's own run nobody watches in `dir` that leaves `files` and
+    /// then ends saying `ended`.
+    fn crashing(dir: &Path, id: AgentId, files: &[&str], ended: &str) -> (Spec, Stub) {
+        let writes: Vec<(&str, Value)> = files.iter().map(|file| dump(file)).collect();
+        let (endpoint, provider) = provider(vec![reply("", &writes), reply(ended, &[])]);
+        let mut spec = spec(endpoint, dir, id);
+        spec.depth = 0;
+        spec.decide = runs_everything();
+        (spec, provider)
+    }
+
+    #[test]
+    fn crash_dumps_a_run_leaves_send_it_back_once_to_delete_them() {
+        let _data = data("dumps");
+        let dir = scratch("dumps");
+        let (endpoint, provider) = provider(vec![
+            reply("", &[dump("core"), dump("core.1234")]),
+            reply("Fixed the rolling window.", &[]),
+            reply("", &[dump("core.99")]),
+            reply("Fixed the rolling window; the dumps stay.", &[]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 1_600);
+        spec.depth = 0;
+        spec.decide = runs_everything();
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        let asked = messages(&sent[2]).last().unwrap();
+        assert_eq!(
+            asked["content"],
+            "[Letronna check] Before ending: a program that crashed while you worked left \
+             crash dumps in the project: `core`, `core.1234`. They are not part of the task, \
+             and a patch taken of the project would carry them, so delete them unless the task \
+             asks for them. Only your last message is passed on as your answer, so end with \
+             your whole answer again, not only what changed."
+        );
+        // Once: dumps left after it, a new one too, end the run.
+        assert_eq!(report.text, "Fixed the rolling window; the dumps stay.");
+    }
+
+    #[test]
+    fn a_dump_a_program_made_is_the_runs_to_delete_after_it_read_untrusted_words() {
+        let _data = data("dumps-steered");
+        let dir = scratch("dumps-steered");
+        let (endpoint, provider) = provider(vec![
+            reply("", &[command("printf dump > core")]),
+            reply("Fixed the rolling window.", &[]),
+            reply("", &[command("rm core")]),
+            reply("Fixed the rolling window and deleted the dump.", &[]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 1_605);
+        spec.depth = 0;
+        // The gate itself decides, as in a `-p` run in Bypass.
+        spec.decide = None;
+        spec.connection.mode = crate::gate::Mode::Bypass;
+        // Its own session, since the mark stays and other tests share root 7.
+        spec.root = spec.id;
+        crate::taint::mark(&context(&spec));
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        let deleted = messages(&sent[3]).last().unwrap();
+        assert!(!deleted["content"].as_str().unwrap().contains("Refused"));
+        assert!(!dir.join("core").exists());
+    }
+
+    #[test]
+    fn a_project_file_or_folder_named_like_a_dump_sends_no_run_back() {
+        let _data = data("dumps-alike");
+        let dir = scratch("dumps-alike");
+        let files = ["core.py", "core/notes.txt"];
+        let (spec, provider) = crashing(&dir, AGENTS + 1_601, &files, "Done.");
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(provider.sent().len(), 2);
+
+        assert!(dir.join("core").is_dir());
+        assert_eq!(report.text, "Done.");
+    }
+
+    #[test]
+    fn a_dump_there_before_the_run_sends_no_run_back() {
+        let _data = data("dumps-before");
+        let dir = scratch("dumps-before");
+        let before = std::fs::File::create(dir.join("core")).unwrap();
+        before
+            .set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        let (spec, provider) = crashing(&dir, AGENTS + 1_602, &["report.txt"], "Done.");
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(provider.sent().len(), 2);
+
+        assert_eq!(report.text, "Done.");
+    }
+
+    #[test]
+    fn a_watched_run_is_never_sent_back_to_delete_dumps() {
+        let _data = data("dumps-watched");
+        let dir = scratch("dumps-watched");
+        let (mut spec, provider) = crashing(&dir, AGENTS + 1_603, &["core"], "Done.");
+        spec.connection.human = true;
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(provider.sent().len(), 2);
+
+        assert!(dir.join("core").exists());
+        assert_eq!(report.text, "Done.");
+    }
+
+    #[test]
+    fn a_helper_is_never_sent_back_to_delete_dumps() {
+        let _data = data("dumps-helper");
+        let dir = scratch("dumps-helper");
+        let (mut spec, provider) = crashing(&dir, AGENTS + 1_604, &["core"], "Done.");
+        spec.depth = 1;
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(provider.sent().len(), 2);
+
+        assert!(dir.join("core").exists());
+        assert_eq!(report.text, "Done.");
     }
 
     /// A request stating five requirements of a range parser between two

@@ -33,6 +33,7 @@ pub mod diag;
 mod docs;
 mod downloads;
 pub mod driver;
+mod dumps;
 mod echo;
 mod edit;
 pub mod export;
