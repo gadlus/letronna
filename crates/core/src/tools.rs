@@ -526,11 +526,20 @@ pub fn parse_args(args: &str) -> Result<Value, String> {
         return Ok(json!({}));
     }
     serde_json::from_str(args).map_err(|e| {
+        // A call cut at the output limit is cleared and asked for again before
+        // it gets here, so these arguments ended for some other reason, such
+        // as the server taking a special token the model wrote whole for the
+        // end of its output.
         if e.is_eof() {
-            "The arguments were cut off before the call was complete. Send less \
-             content in one call. To write a file in parts, write_file the first \
-             part, then add the rest with edit_file anchored on its last lines, or \
-             with run_command."
+            // The token is never spelled whole here: a server that reads special
+            // tokens in prompt text would take this message's copy for the real one.
+            "The arguments were cut off before the call was complete. A model's \
+             output can end early where it writes one of its special tokens \
+             whole, such as the end-of-text token \"<|\" + \"endoftext|>\": if \
+             the content holds one, make the call again with the token built \
+             from parts joined at run time. Otherwise send less content in one \
+             call: write_file the first part, then add the rest with edit_file \
+             anchored on its last lines, or with run_command."
                 .to_owned()
         } else {
             format!("Invalid arguments: {e}")
@@ -7608,6 +7617,17 @@ mod tests {
             assert!(cut.contains(tool), "{tool}: {cut}");
             assert!(find(tool).is_some(), "{tool}");
         }
+    }
+
+    #[test]
+    fn arguments_that_end_early_name_a_special_token_and_sending_less() {
+        // Ended where the model began writing a special token into the file,
+        // with no output limit reached.
+        let cut = parse_args(r#"{"path":"a.c","content":"add(\""#).unwrap_err();
+        assert!(cut.contains(r#""<|" + "endoftext|>""#), "{cut}");
+        assert!(!cut.contains("<|endoftext|>"), "{cut}");
+        assert!(cut.contains("built from parts"), "{cut}");
+        assert!(cut.contains("send less content"), "{cut}");
     }
 
     #[cfg(windows)]
