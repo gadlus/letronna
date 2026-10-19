@@ -77,7 +77,8 @@ const KEY_CHARS: usize = 16;
 /// a break. Not in tool output, where it would hide every commit hash.
 const TOKEN_CHARS: usize = 40;
 /// The words in a name, as in `AWS_SECRET_ACCESS_KEY=...`, that say its
-/// value is a secret.
+/// value is a secret: ending one of its words, as in `PGPASSWORD`, with or
+/// without an s. One that only starts a word, as in `keyboard`, says nothing.
 const SECRET_WORDS: &[&str] = &[
     "key",
     "token",
@@ -87,6 +88,13 @@ const SECRET_WORDS: &[&str] = &[
     "credential",
     "auth",
 ];
+/// What ends the name of an error or a warning, as in Python's `KeyError:
+/// 'name'`, which heads a message, not a value.
+const RAISED: &[&str] = &["error", "exception", "warning"];
+/// The last word of a name, with or without an s, for where a secret is kept
+/// or what it is called, as in `ssl_key_file=/etc/ssl/private/x.key`, rather
+/// than the secret.
+const ABOUT_A_SECRET: &[&str] = &["file", "filename", "path", "dir", "url", "name", "type"];
 /// A named secret's value is hidden from this length on: shorter ones are
 /// flags, numbers and empty placeholders such as `true` or `3600`.
 const VALUE_CHARS: usize = 8;
@@ -374,11 +382,61 @@ fn named_value(rest: &str) -> Option<Range<usize>> {
     (line[range.clone()].chars().count() >= VALUE_CHARS).then_some(range)
 }
 
-/// Whether `name`, as in `name=value`, says its value is a secret.
+/// Whether `name`, as in `name=value`, says its value is a secret: one of
+/// its words ends with a secret word, and its last word does not make it an
+/// error's name or a name for where a secret is kept.
 fn secret_name(name: &str) -> bool {
-    // An author is a person, not a way in.
-    let name = name.to_ascii_lowercase().replace("author", "");
-    SECRET_WORDS.iter().any(|word| name.contains(word))
+    let words = name_words(name);
+    let Some(last) = words.last() else {
+        return false;
+    };
+    let about = last.strip_suffix('s').unwrap_or(last);
+    if RAISED.iter().any(|raised| last.ends_with(raised)) || ABOUT_A_SECRET.contains(&about) {
+        return false;
+    }
+    // A capital inside a secret word, as in `passWord`, splits it in two, so
+    // the parts between `_`, `.` and `-` are read whole as well.
+    words.iter().any(|word| ends_with_secret_word(word))
+        || name
+            .split(['_', '.', '-'])
+            .any(|part| ends_with_secret_word(&part.to_ascii_lowercase()))
+}
+
+/// Whether `word`, in small letters, ends with a secret word, with or without
+/// an s.
+fn ends_with_secret_word(word: &str) -> bool {
+    let word = word.strip_suffix('s').unwrap_or(word);
+    SECRET_WORDS.iter().any(|secret| word.ends_with(secret))
+}
+
+/// The words of `name`, lowercased: split at `_`, `.` and `-` and where a
+/// capital follows a small letter (`apiKey`). An acronym runs into the word
+/// after it, so a run of capitals ends before its last one when a small
+/// letter follows (`APIKey` is api and key). Letters and digits are split
+/// too, so `KEY2` is still a key.
+fn name_words(name: &str) -> Vec<String> {
+    let chars: Vec<char> = name.chars().collect();
+    let mut spaced = String::with_capacity(name.len() * 2);
+    for (at, &c) in chars.iter().enumerate() {
+        let after = chars.get(at + 1).copied();
+        let starts_word = at
+            .checked_sub(1)
+            .map(|before| chars[before])
+            .is_some_and(|before| {
+                (before.is_ascii_lowercase() && c.is_ascii_uppercase())
+                    || (before.is_ascii_uppercase()
+                        && c.is_ascii_uppercase()
+                        && after.is_some_and(|after| after.is_ascii_lowercase()))
+                    || before.is_ascii_digit() != c.is_ascii_digit()
+            });
+        if starts_word || !c.is_ascii_alphanumeric() {
+            spaced.push(' ');
+        }
+        if c.is_ascii_alphanumeric() {
+            spaced.push(c.to_ascii_lowercase());
+        }
+    }
+    spaced.split_whitespace().map(str::to_owned).collect()
 }
 
 /// The body of the private key block starting `rest`: from the line after
@@ -656,6 +714,79 @@ mod tests {
                     \"keys\": [\"a\", \"b\"],\n\"max_tokens\": 409600000,\n\
                     echo API_KEY=abcdefghijkl\nprimary_key == other_primary_key";
         assert_eq!(vendor(kept), kept);
+    }
+
+    #[test]
+    fn errors_and_names_that_only_hold_a_secret_word_are_kept() {
+        let text = "Traceback (most recent call last):\n\
+                    \x20 File \"/app/load.py\", line 8, in <module>\n\
+                    \x20   settings = table[\"retrieval_settings\"]\n\
+                    KeyError: 'retrieval_settings'\n\
+                    jwt.exceptions.InvalidTokenError: Signature verification failed\n\
+                    keyboard.drv=keyboard.drv\n\
+                    ssh-keygen: generating new host keys\n\
+                    smtpd_tls_key_file=/etc/ssl/private/x.key\n\
+                    \x20 \"authorization_endpoint\": \"https://accounts.example.com/o/oauth2/auth\",\n";
+        assert_eq!(vendor(text), text);
+    }
+
+    #[test]
+    fn secret_words_that_end_a_word_or_come_in_the_plural_are_hidden() {
+        let text = "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n\
+                    PGPASSWORD=hunter2hunter2\n\
+                    API_KEYS=0123abcd0123abcd\n\
+                    password = \"correct horse battery staple\"\n\
+                    \x20 \"passWord\": \"hunter2hunter2\"\n";
+        let hidden = format!(
+            "AWS_SECRET_ACCESS_KEY={MARKER}\nPGPASSWORD={MARKER}\nAPI_KEYS={MARKER}\n\
+             password = \"{MARKER}\"\n  \"passWord\": \"{MARKER}\"\n"
+        );
+        assert_eq!(vendor(text), hidden);
+    }
+
+    #[test]
+    fn a_name_is_read_word_by_word() {
+        assert_eq!(
+            name_words("smtpd_tls_keyFile.APIKey2"),
+            ["smtpd", "tls", "key", "file", "api", "key", "2"]
+        );
+        for name in [
+            "PGPASSWORD",
+            "secretkey",
+            "AUTHTOKEN",
+            "accessToken",
+            "APIKey",
+            "api_keys",
+            "secrets",
+            "API_KEY2",
+            "x-auth-token",
+            "OAuthToken",
+            "credentials",
+            "passWord",
+            "userPassWord",
+            "PASSWORDs",
+        ] {
+            assert!(secret_name(name), "{name}");
+        }
+        for name in [
+            "keyboard",
+            "keygen",
+            "keyring",
+            "KeyError",
+            "TokenWarning",
+            "SecretException",
+            "key_file",
+            "keyfile",
+            "tokenPath",
+            "key_files",
+            "KEY_FILENAME",
+            "GIT_AUTHOR_NAME",
+            "TOKENIZERS_PARALLELISM",
+            "Authorization",
+            "authorization_endpoint",
+        ] {
+            assert!(!secret_name(name), "{name}");
+        }
     }
 
     #[test]
