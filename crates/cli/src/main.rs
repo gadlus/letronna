@@ -1577,9 +1577,9 @@ fn rescue_terminal() {
         // lands where it can be read and stays there. Only on a terminal: a
         // program reading JSON lines would get them glued on.
         if std::io::stdout().is_terminal() {
-            print!(
-                "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[<u\x1b[?1049l\x1b[r\x1b[?2004l\x1b[?1004l\x1b[?25h"
-            );
+            print!("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
+            screen::forget_keyboard();
+            print!("\x1b[?1049l\x1b[r\x1b[?2004l\x1b[?1004l\x1b[?25h");
             let _ = std::io::stdout().flush();
         }
         let _ = crossterm::terminal::disable_raw_mode();

@@ -144,6 +144,17 @@ pub fn banner(runner: &Runner, folder: &str, session: usize) {
     render::block(move |width| laid_out(&facts, width, colour));
 }
 
+/// How to start a new line, as this terminal can: shift-enter only where it
+/// reaches the box as itself, and a backslash before enter everywhere.
+fn new_line_hint() -> String {
+    let keys = if crate::screen::shift_enter() {
+        "shift+enter or \\+enter"
+    } else {
+        "\\+enter or ctrl+j"
+    };
+    format!("{keys} for a new line · ↑ for what you said before")
+}
+
 /// The opening screen for a window `width` columns wide: the face with the
 /// details beside it where both fit, else the details alone, every row cut
 /// to fit rather than wrapped.
@@ -158,10 +169,7 @@ fn laid_out(facts: &[(&str, String)], width: usize, colour: bool) -> Vec<String>
     column.extend(facts.iter().map(|(label, value)| fact(label, value, room)));
     if width >= HINTS {
         column.push(String::new());
-        for hint in [
-            "type / for commands",
-            "shift+enter for a new line · ↑ for what you said before",
-        ] {
+        for hint in ["type / for commands", &new_line_hint()] {
             column.push(render::dim(&render::clip(hint, room)));
         }
     }

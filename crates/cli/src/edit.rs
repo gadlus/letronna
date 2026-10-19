@@ -403,6 +403,21 @@ impl Line {
         self.cursor = from;
     }
 
+    /// When the line ending just put in follows a backslash, take the
+    /// backslash out and keep the line ending, as a shell's backslash at the
+    /// end of a line carries a command on to the next. Says whether it did,
+    /// so the enter that put it in does not send.
+    pub fn continued(&mut self) -> bool {
+        let chars = self.chars();
+        let at = self.cursor;
+        if at < 2 || chars[at - 1] != '\n' || chars[at - 2] != '\\' {
+            return false;
+        }
+        self.cut(at - 2, at - 1);
+        self.cursor = at - 1;
+        true
+    }
+
     /// Where the cursor sits as a row and column within the wrapped line.
     pub fn line_of_cursor(&self) -> (usize, usize) {
         let before: String = self.chars()[..self.cursor].iter().collect();
@@ -559,6 +574,20 @@ mod tests {
         let mut line = Line::default();
         line.insert_str(text);
         line
+    }
+
+    #[test]
+    fn backslash_enter_starts_a_new_line() {
+        let mut line = typed("ls \\");
+        line.insert('\n');
+        assert!(line.continued());
+        line.insert_str("-la");
+        assert_eq!(line.text(), "ls \n-la");
+        // Without the backslash, the enter is left to send.
+        let mut plain = typed("ls");
+        plain.insert('\n');
+        assert!(!plain.continued());
+        assert_eq!(plain.text(), "ls\n");
     }
 
     #[test]

@@ -1080,7 +1080,13 @@ impl Bar {
 
     /// Take the window.
     pub fn install(&mut self) {
-        if !render::interactive() || terminal::enable_raw_mode().is_err() {
+        if !render::interactive() {
+            return;
+        }
+        // Before raw mode, which would hand their enters over as ctrl-j: a
+        // line typed while Letronna was starting goes in as it was meant to.
+        self.queued.extend(typed_ahead());
+        if terminal::enable_raw_mode().is_err() {
             return;
         }
         render::set_raw(true);
@@ -1758,7 +1764,10 @@ impl Bar {
         // several, is a line ending inside text that was pasted.
         self.take_search();
         if self.enters == 1 && self.enter_at == Some(self.handled) {
-            self.send();
+            // After a backslash it carries the line on, as in a shell.
+            if !self.line.continued() {
+                self.send();
+            }
         } else if self.handled > 8 && self.choice.is_none() && self.switches.is_none() {
             self.line.fold_burst(mark);
         }
@@ -2060,6 +2069,7 @@ impl Bar {
         }
         // Only escape after escape counts as a double press.
         let escaped = self.esc_at.take();
+        let key = readline(key);
         // The keys over the box go with the next key, which then does what
         // it does; `?` on an empty line puts them there.
         if std::mem::take(&mut self.keys_card) {
@@ -2130,8 +2140,10 @@ impl Bar {
             KeyCode::Char('y') if control => self.line.yank(),
             // A clean screen, the session going on as it was.
             KeyCode::Char('l') if control => crate::screen::wipe(),
-            // A newline on purpose, for writing a paragraph.
+            // A newline on purpose, for writing a paragraph. Ctrl-j is the
+            // one every terminal sends as itself.
             KeyCode::Enter if shift || alt => self.line.insert('\n'),
+            KeyCode::Char('j') if control && !alt => self.line.insert('\n'),
             // Every enter puts a line ending in. Whether it also ends the
             // message is decided once the drain is done, by where it fell
             // among everything else that arrived.
@@ -2240,7 +2252,10 @@ impl Bar {
                 self.picked = 0;
             }
             KeyCode::Delete => self.line.delete(),
-            KeyCode::Char(ch) if !control => {
+            // Alt and a letter is a key, never the letter, where the terminal
+            // sends Option as Escape; ctrl and alt together is AltGr on
+            // Windows, which types a character.
+            KeyCode::Char(ch) if control == alt => {
                 self.line.insert(ch);
                 self.picked = 0;
             }
@@ -3105,6 +3120,80 @@ fn checklist(todos: &[Todo], room: usize) -> Vec<String> {
         lines.push(format!("{}{}", render::PAD, render::dim(&more)));
     }
     lines
+}
+
+/// Readline's keys as the ones they stand for: ctrl-p and ctrl-n step like
+/// the arrows, and alt with b, f, d, backspace or an arrow works on a word
+/// as ctrl does -- Option and an arrow reach the terminal as alt-b and alt-f
+/// in Terminal and iTerm2.
+fn readline(key: KeyEvent) -> KeyEvent {
+    let as_key = |code, modifiers| KeyEvent::new(code, modifiers);
+    let word = KeyModifiers::CONTROL;
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('p'), KeyModifiers::CONTROL) => as_key(KeyCode::Up, KeyModifiers::NONE),
+        (KeyCode::Char('n'), KeyModifiers::CONTROL) => as_key(KeyCode::Down, KeyModifiers::NONE),
+        (KeyCode::Char('b'), KeyModifiers::ALT) => as_key(KeyCode::Left, word),
+        (KeyCode::Char('f'), KeyModifiers::ALT) => as_key(KeyCode::Right, word),
+        (KeyCode::Char('d'), KeyModifiers::ALT) => as_key(KeyCode::Delete, word),
+        (KeyCode::Backspace, KeyModifiers::ALT) => as_key(KeyCode::Backspace, word),
+        (KeyCode::Left, KeyModifiers::ALT) => as_key(KeyCode::Left, word),
+        (KeyCode::Right, KeyModifiers::ALT) => as_key(KeyCode::Right, word),
+        _ => key,
+    }
+}
+
+/// Whole lines typed before the box was up, while the terminal still held
+/// input a line at a time: taken now, before raw mode would hand their
+/// enters over as ctrl-j and run them into whatever is typed next. What is
+/// left of a line not yet ended arrives as keys once raw mode is on.
+#[cfg(unix)]
+fn typed_ahead() -> Vec<String> {
+    use std::os::fd::AsRawFd;
+    lines_waiting(std::io::stdin().as_raw_fd())
+}
+
+#[cfg(not(unix))]
+fn typed_ahead() -> Vec<String> {
+    // A console hands over key events, enters included, whenever they are
+    // read, so nothing typed early is lost there.
+    Vec::new()
+}
+
+/// The lines waiting to be read from terminal `fd`, which reads a line at a
+/// time: only what is there is asked for, so this never waits.
+#[cfg(unix)]
+fn lines_waiting(fd: std::os::fd::RawFd) -> Vec<String> {
+    // A terminal already reading key by key holds keys rather than lines,
+    // and its last one may not be ended yet: those are left to be read as
+    // keys.
+    // SAFETY: `termios` is plain data, which tcgetattr fills in or leaves.
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: as above; `fd` is only asked about.
+    if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 || termios.c_lflag & libc::ICANON == 0 {
+        return Vec::new();
+    }
+    let mut bytes = Vec::new();
+    loop {
+        let mut ready: libc::c_int = 0;
+        // SAFETY: FIONREAD only writes how many bytes are ready into `ready`.
+        let asked = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut ready) };
+        if asked != 0 || ready <= 0 || bytes.len() > 1 << 16 {
+            break;
+        }
+        let mut chunk = vec![0u8; ready as usize];
+        // SAFETY: `chunk` holds `ready` bytes, and that many are waiting, so
+        // the read neither overruns it nor blocks.
+        let read = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if read <= 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read as usize]);
+    }
+    String::from_utf8_lossy(&bytes)
+        .split('\n')
+        .map(|line| line.trim_end_matches('\r').to_owned())
+        .filter(|line| !line.trim().is_empty())
+        .collect()
 }
 
 /// What the footer says of a copy: copied, where the system's clipboard
@@ -4648,6 +4737,94 @@ mod tests {
         bar.guard = Instant::now().checked_sub(STILL);
         bar.pick(key(KeyCode::Enter));
         assert_eq!(bar.answer, Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_line_typed_before_the_box_opens_is_sent() {
+        use std::io::Write;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let (mut master, mut slave) = (0, 0);
+        // SAFETY: both descriptors are this frame's own, and the name,
+        // settings and size may be left out.
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: openpty has just opened both, and nothing else holds them.
+        let (master, slave) =
+            unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        let mut typing = std::fs::File::from(master);
+        typing.write_all(b"fix the build\nand then\nwor").unwrap();
+        // The terminal sorts the bytes into lines as they come; give it a
+        // moment rather than a guess of how long that takes.
+        let mut waiting = Vec::new();
+        for _ in 0..100 {
+            waiting = super::lines_waiting(slave.as_raw_fd());
+            if !waiting.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut more = super::lines_waiting(slave.as_raw_fd());
+        waiting.append(&mut more);
+        // The line not yet ended is left for the keys to bring.
+        assert_eq!(waiting, ["fix the build", "and then"]);
+    }
+
+    #[test]
+    fn ctrl_j_starts_a_new_line() {
+        let mut bar = Bar::new(String::new());
+        bar.line.insert_str("first");
+        bar.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        bar.line.insert_str("second");
+        assert_eq!(bar.line.text(), "first\nsecond");
+        assert!(bar.queued.is_empty());
+    }
+
+    #[test]
+    fn option_arrows_move_by_word_and_type_nothing() {
+        let mut bar = Bar::new(String::new());
+        bar.line.insert_str("one two three");
+        let alt = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::ALT);
+        bar.key(alt('b'));
+        assert_eq!(bar.line.cursor(), 8);
+        bar.key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        assert_eq!(bar.line.cursor(), 4);
+        bar.key(alt('f'));
+        assert_eq!(bar.line.cursor(), 7);
+        bar.key(alt('x'));
+        bar.key(alt('d'));
+        assert_eq!(bar.line.text(), "one two");
+        bar.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(bar.line.text(), "one ");
+    }
+
+    #[test]
+    fn altgr_types_its_character() {
+        let mut bar = Bar::new(String::new());
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        bar.key(KeyEvent::new(KeyCode::Char('@'), altgr));
+        assert_eq!(bar.line.text(), "@");
+    }
+
+    #[test]
+    fn ctrl_p_and_ctrl_n_step_through_what_was_said() {
+        let mut bar = Bar::new(String::new());
+        bar.line
+            .set_history(["first".to_owned(), "second".to_owned()]);
+        let ctrl = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
+        bar.key(ctrl('p'));
+        bar.key(ctrl('p'));
+        assert_eq!(bar.line.text(), "first");
+        bar.key(ctrl('n'));
+        assert_eq!(bar.line.text(), "second");
     }
 
     #[test]

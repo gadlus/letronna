@@ -1481,9 +1481,12 @@ fn aside(runner: &mut Runner, session: usize, question: &str) {
 /// the opening screen, which has scrolled away by the time anyone wonders.
 pub(crate) const KEYS: &[(&str, &str)] = &[
     ("enter", "send"),
-    ("shift+enter", "a new line"),
+    (
+        "\\+enter, ctrl+j",
+        "a new line (or shift+enter, where it works)",
+    ),
     ("tab", "finish a command or an @file name"),
-    ("↑ ↓", "step through what you said before"),
+    ("↑ ↓, ctrl+p/n", "step through what you said before"),
     ("shift+tab", "switch mode: asks first, edits, plan, auto"),
     (
         "esc",
@@ -1504,6 +1507,7 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
         "delete to the start or end of the line; ctrl+y puts it back",
     ),
     ("ctrl+w", "delete a word back"),
+    ("alt+← →", "move a word, as alt+b/f do; alt+d deletes one"),
     ("ctrl+_", "undo the last change to the line"),
     (
         "ctrl+g",

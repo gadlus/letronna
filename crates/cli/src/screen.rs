@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -221,7 +222,42 @@ pub fn open() {
     // Whether the window has focus, so a notification goes out only when it
     // has not. A terminal that cannot say ignores the request.
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange);
+    // Shift and enter reach a terminal program as a plain enter unless the
+    // terminal is asked to say which keys were held, and only some can.
+    // Those that say they can are asked; the rest are left as they are, so
+    // nothing else changes there.
+    #[cfg(unix)]
+    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        let flags = crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
+        let pushed = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PushKeyboardEnhancementFlags(flags)
+        );
+        SHIFT_TOLD.store(pushed.is_ok(), Ordering::Relaxed);
+    }
     let _ = std::io::stdout().flush();
+}
+
+/// Whether the terminal was asked to tell shift-enter from enter.
+static SHIFT_TOLD: AtomicBool = AtomicBool::new(false);
+
+/// Whether shift-enter reaches the box as itself: a console says which keys
+/// are held of its own accord, and a terminal only once asked.
+pub fn shift_enter() -> bool {
+    cfg!(windows) || SHIFT_TOLD.load(Ordering::Relaxed)
+}
+
+/// Stop telling shift-enter from enter, if the terminal was asked to. It
+/// takes no lock, so a panic can call it whatever state the screen is in,
+/// and it goes before leaving the conversation's own screen, which kitty
+/// keeps a stack of these flags for apart from the shell's.
+pub fn forget_keyboard() {
+    if SHIFT_TOLD.swap(false, Ordering::Relaxed) {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PopKeyboardEnhancementFlags
+        );
+    }
 }
 
 /// Give the window back exactly as it was found -- even after a panic left
@@ -235,6 +271,7 @@ pub fn close() {
         return;
     }
     s.open = false;
+    forget_keyboard();
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::DisableFocusChange,
