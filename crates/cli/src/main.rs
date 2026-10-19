@@ -732,14 +732,16 @@ fn ask_once(
     // A child, so a decline at the keyboard that stops the run does not read
     // as a Ctrl-C.
     spec.cancel = interrupted.child();
-    // The run times its replies against it too, not only stops at it.
+    // The run times its replies against it too, not only stops at it, and
+    // is warned before it.
     spec.connection.deadline = deadline;
+    spec.connection.warn_at = deadline.map(|deadline| warning(started, deadline));
     let id = spec.id;
     // Stopped through the run's own token, not `interrupted`, so a run out
     // of time exits 0 with what it has rather than as a Ctrl-C does.
     let ran_out = Arc::new(AtomicBool::new(false));
     if let Some(deadline) = deadline {
-        hold_to_deadline(started, deadline, id, spec.cancel.clone(), ran_out.clone());
+        hold_to_deadline(deadline, spec.cancel.clone(), ran_out.clone());
     }
     // Served before the run starts, since a request with nobody serving is
     // declined at once.
@@ -789,43 +791,26 @@ fn deadline_of(
     }
 }
 
-/// Tells run `id` how long it has left once most of the time from `started`
-/// to `deadline` has gone, then stops it through `cancel` at the deadline,
-/// unless `cancel` is set first, setting `ran_out` when it does.
+/// When a run started at `started` is warned that most of its time to
+/// `deadline` has gone, which the run tells its model itself, so the time
+/// left is counted as the model reads it.
+fn warning(started: std::time::Instant, deadline: std::time::Instant) -> std::time::Instant {
+    started + deadline.saturating_duration_since(started).mul_f64(WARN_AT)
+}
+
+/// Stops a run through `cancel` at `deadline`, unless `cancel` is set
+/// first, setting `ran_out` when it does.
 fn hold_to_deadline(
-    started: std::time::Instant,
     deadline: std::time::Instant,
-    id: u64,
     cancel: Cancel,
     ran_out: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
-    let warn = started + deadline.saturating_duration_since(started).mul_f64(WARN_AT);
     std::thread::spawn(move || {
-        if !cancel.sleep(warn.saturating_duration_since(std::time::Instant::now())) {
-            return;
-        }
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        inbox::push(id, deadline_notice(left));
-        if cancel.sleep(left) {
+        if cancel.sleep(deadline.saturating_duration_since(std::time::Instant::now())) {
             ran_out.store(true, Ordering::SeqCst);
             cancel.set();
         }
     })
-}
-
-/// What a run is told once most of its time is gone, with `left` to go: a
-/// notice, as a finished job's is, so nothing takes it for the user's words;
-/// the run reads it at its next step.
-fn deadline_notice(left: std::time::Duration) -> inbox::Notice {
-    inbox::Notice {
-        from: "deadline".into(),
-        when: inbox::When::Next,
-        text: format!(
-            "About {} s are left before this run is stopped: write every output the \
-             task asks for now, complete and valid, and improve it in place only after that.",
-            left.as_secs_f64().round()
-        ),
-    }
 }
 
 /// Puts `prompt` on the session and hands the session to a run spending
@@ -2275,42 +2260,24 @@ mod tests {
         }
     }
 
-    /// Waits up to ten seconds for what run `id` has been sent.
-    fn told(id: u64) -> Vec<inbox::Notice> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let notices = inbox::take(id, false);
-            if !notices.is_empty() || std::time::Instant::now() > deadline {
-                return notices;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+    #[test]
+    fn a_run_is_warned_once_most_of_its_time_is_gone() {
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(100);
+        assert_eq!(
+            warning(started, deadline),
+            started + std::time::Duration::from_secs(80)
+        );
     }
 
     #[test]
-    fn a_run_near_its_deadline_is_told_to_commit_its_outputs() {
-        // 85 of its 100 s gone: past the warning, short of the deadline.
-        let started = std::time::Instant::now() - std::time::Duration::from_secs(85);
-        let (id, cancel) = (9_250_001, Cancel::default());
-        let ran_out = Arc::new(AtomicBool::new(false));
-        let timer = hold_to_deadline(
-            started,
-            started + std::time::Duration::from_secs(100),
-            id,
-            cancel.clone(),
-            ran_out.clone(),
-        );
-        let notices = told(id);
-        let texts: Vec<&str> = notices.iter().map(|n| n.text.as_str()).collect();
-        assert_eq!(texts.len(), 1, "{texts:?}");
-        assert!(texts[0].starts_with("About 15 s are left"), "{texts:?}");
-        assert!(texts[0].contains("write every output"), "{texts:?}");
-        assert!(!cancel.is_set(), "stopped before its deadline");
-        // A run stopped meanwhile is told nothing more, and the timer goes
-        // without counting the stop as its own.
+    fn a_run_stopped_before_its_deadline_did_not_run_out() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let (cancel, ran_out) = (Cancel::default(), Arc::new(AtomicBool::new(false)));
+        let timer = hold_to_deadline(deadline, cancel.clone(), ran_out.clone());
+        // The timer goes without counting the stop as its own.
         cancel.set();
         timer.join().unwrap();
-        assert!(inbox::take(id, true).is_empty());
         assert!(!ran_out.load(Ordering::SeqCst));
     }
 
@@ -2336,19 +2303,12 @@ mod tests {
         let started = std::time::Instant::now();
         let deadline = started + std::time::Duration::from_millis(300);
         let (cancel, ran_out) = (Cancel::default(), Arc::new(AtomicBool::new(false)));
-        hold_to_deadline(
-            started,
-            deadline,
-            9_250_002,
-            cancel.clone(),
-            ran_out.clone(),
-        )
-        .join()
-        .unwrap();
+        hold_to_deadline(deadline, cancel.clone(), ran_out.clone())
+            .join()
+            .unwrap();
         assert!(cancel.is_set());
         assert!(ran_out.load(Ordering::SeqCst));
         assert!(std::time::Instant::now() >= deadline, "stopped early");
-        assert_eq!(inbox::take(9_250_002, true).len(), 1);
     }
 
     /// What `letronna` makes of `words`.

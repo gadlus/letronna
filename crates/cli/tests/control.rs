@@ -746,30 +746,6 @@ fn a_print_run_near_its_deadline_is_told_to_commit_its_outputs() {
 }
 
 #[test]
-fn a_print_run_with_a_deadline_is_told_its_time_in_its_first_request() {
-    let (data, work) = scratch("deadline-told");
-    let (endpoint, bodies) = provider(vec![reply("Done.", &[])]);
-    let flags = ["-p", "write the report", "--output", "json"];
-    let run = Driven::start(
-        &data,
-        &work,
-        &endpoint,
-        &flags,
-        &[("LETRONNA_DEADLINE", "600")],
-    );
-    assert_eq!(run.next()["status"], "done");
-    assert_eq!(run.close(), 0);
-    let first = said(&bodies.recv_timeout(WAIT).unwrap());
-    let told = "This run has about 10 minutes before it is stopped";
-    assert!(
-        first
-            .iter()
-            .any(|(role, words)| role == "user" && words.contains(told)),
-        "{first:?}"
-    );
-}
-
-#[test]
 fn a_stream_json_run_past_its_deadline_stops_with_its_result() {
     let (data, work) = scratch("deadline-stream");
     // The model sits on the request, so only the deadline ends the turn.
@@ -852,6 +828,82 @@ fn a_stream_json_run_near_its_deadline_is_told_to_commit_its_outputs() {
     assert!(
         told.contains("s are left before this run is stopped"),
         "{told}"
+    );
+}
+
+#[test]
+fn a_stream_json_turn_held_in_a_command_hears_its_warning_with_what_the_command_printed() {
+    let (data, work) = scratch("deadline-command-stream");
+    // 12 s from the start: the command runs from the first request past the
+    // warning at 9.6 s, and the turn is answered well before 12 s.
+    let slow = (
+        "run_command",
+        json!({"command": "echo before; sleep 60", "timeout": 600}),
+    );
+    let (endpoint, bodies) = provider(vec![
+        reply("", &[slow]),
+        reply("Every output is written.", &[]),
+    ]);
+    let flags = [
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output",
+        "stream-json",
+        "--mode",
+        "bypass",
+    ];
+    let mut run = Driven::start(
+        &data,
+        &work,
+        &endpoint,
+        &flags,
+        &[("LETRONNA_DEADLINE", "12")],
+    );
+    run.say("build it and write the report");
+    let result = run.next();
+    assert_eq!(
+        (&result["status"], &result["answer"]),
+        (&json!("done"), &json!("Every output is written."))
+    );
+    assert_eq!(run.close(), 0);
+    let _ = bodies.recv_timeout(WAIT).unwrap();
+    let later = said(&bodies.recv_timeout(WAIT).unwrap());
+    let (_, moved) = later.iter().find(|(role, _)| role == "tool").unwrap();
+    assert!(
+        moved.contains("at this run's time warning, so it carries on in the background as job #"),
+        "{moved}"
+    );
+    assert!(moved.contains("Output so far:\nbefore"), "{moved}");
+    let (role, told) = later.last().unwrap();
+    assert_eq!(role, "user");
+    assert!(
+        told.contains("s are left before this run is stopped"),
+        "{told}"
+    );
+}
+
+#[test]
+fn a_print_run_with_a_deadline_is_told_its_time_in_its_first_request() {
+    let (data, work) = scratch("deadline-told");
+    let (endpoint, bodies) = provider(vec![reply("Done.", &[])]);
+    let flags = ["-p", "write the report", "--output", "json"];
+    let run = Driven::start(
+        &data,
+        &work,
+        &endpoint,
+        &flags,
+        &[("LETRONNA_DEADLINE", "600")],
+    );
+    assert_eq!(run.next()["status"], "done");
+    assert_eq!(run.close(), 0);
+    let first = said(&bodies.recv_timeout(WAIT).unwrap());
+    let told = "This run has about 10 minutes before it is stopped";
+    assert!(
+        first
+            .iter()
+            .any(|(role, words)| role == "user" && words.contains(told)),
+        "{first:?}"
     );
 }
 

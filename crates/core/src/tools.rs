@@ -278,6 +278,10 @@ const WAIT_SECS: u64 = 10;
 /// The longest one `wait` call pauses; a longer one asked for is cut to
 /// this, as the `seconds` parameter says.
 const MAX_WAIT_SECS: u64 = 120;
+/// How long before a run's deadline a foreground call stops waiting, so the
+/// model reads what came of it while it can still act on it; never more
+/// than half the time left, so a call made later still gets its share.
+const BEFORE_DEADLINE: Duration = Duration::from_secs(30);
 /// How much of a file one read shows, in bytes, which is never more
 /// characters: under the chat's cap on a tool result with room for the
 /// footer, so a page reaches the model whole instead of losing its middle.
@@ -1899,6 +1903,7 @@ fn run_shell(command: &str, cwd: Option<&Path>, cancel: &Cancel) -> Result<Strin
         None,
         COMMAND_TIMEOUT,
         None,
+        None,
     )
 }
 
@@ -1912,7 +1917,8 @@ pub(crate) fn run_shell_in(
     limit: Duration,
 ) -> Result<String, String> {
     let cmd = shell(command, Some(cwd));
-    run_shell_saving(cmd, command, &ctx.cancel, None, limit, owner_at_limit(ctx))
+    let (owner, sooner) = (owner_at_limit(ctx), sooner(limit, ctx));
+    run_shell_saving(cmd, command, &ctx.cancel, None, limit, owner, sooner)
 }
 
 /// The conversation a foreground command run in `ctx` becomes a job of when
@@ -1925,6 +1931,55 @@ fn owner_at_limit(ctx: &ToolContext) -> Option<u64> {
     // jobs' notices between steps as the window's does.
     let own = ctx.caller.depth == 0 && ctx.conversation != 0;
     own.then_some(ctx.conversation)
+}
+
+/// Why a foreground call on a run with a deadline stops waiting before the
+/// time it asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cut {
+    /// The run's time warning came, which the model hears only once the
+    /// call is over.
+    Warning,
+    /// The run is stopped at this instant, which would end the call before
+    /// the model saw what came of it.
+    Deadline(Instant),
+}
+
+impl Cut {
+    /// When the call stopped waiting, as its result says it.
+    fn when(self) -> String {
+        match self {
+            Cut::Warning => "at this run's time warning".to_owned(),
+            Cut::Deadline(at) => format!(
+                "with about {} s of this run left",
+                at.saturating_duration_since(Instant::now()).as_secs()
+            ),
+        }
+    }
+}
+
+/// When, sooner than `asked`, a foreground call in `ctx` stops waiting, and
+/// why, or None when it waits as asked: a session's own agent on a run with
+/// a deadline is not kept in one call past its time warning, or past the
+/// moment just before the deadline once the warning has come.
+fn sooner(asked: Duration, ctx: &ToolContext) -> Option<(Duration, Cut)> {
+    // Only that agent is told of the warning, and only its commands can go
+    // on in the background rather than be stopped.
+    owner_at_limit(ctx)?;
+    let connection = ctx.caller.connection.as_deref()?;
+    let (deadline, warn_at) = (connection.deadline?, connection.warn_at?);
+    let now = Instant::now();
+    let (limit, cut) = match warn_at.checked_duration_since(now) {
+        Some(until) => (until, Cut::Warning),
+        None => {
+            let left = deadline.saturating_duration_since(now);
+            (
+                left - BEFORE_DEADLINE.min(left / 2),
+                Cut::Deadline(deadline),
+            )
+        }
+    };
+    (limit < asked).then_some((limit, cut))
 }
 
 /// Where a command's output is saved whole when it is too long to keep, and
@@ -1948,7 +2003,7 @@ fn run_sandboxed(
 ) -> Result<String, String> {
     let (policy, _scratch) = crate::sandbox::Policy::for_project(cwd)?;
     let wrapped = crate::sandbox::here().wrap(&shell(command, Some(dir)), &policy)?;
-    match run_shell_saving(wrapped, command, cancel, save, limit, None) {
+    match run_shell_saving(wrapped, command, cancel, save, limit, None, None) {
         Ok(text) => Ok(crate::sandbox::noted(&text)),
         Err(e) => Err(crate::sandbox::noted(&e)),
     }
@@ -1957,7 +2012,8 @@ fn run_sandboxed(
 /// Runs the shell `cmd`, which runs `command`, until it exits, is stopped or
 /// times out, with output cut while it was read saved whole to `save`, up to
 /// its cap, and the cut saying where. One still running at `limit` is moved
-/// to the background as a job told to `owner`, or stopped if it has none.
+/// to the background as a job told to `owner`, or stopped if it has none;
+/// one with an owner moves at the `sooner` limit instead, if it has one.
 fn run_shell_saving(
     cmd: std::process::Command,
     command: &str,
@@ -1965,8 +2021,9 @@ fn run_shell_saving(
     save: Option<SaveTo>,
     limit: Duration,
     owner: Option<u64>,
+    sooner: Option<(Duration, Cut)>,
 ) -> Result<String, String> {
-    let result = run_shell_into(cmd, command, cancel, save.as_ref(), limit, owner);
+    let result = run_shell_into(cmd, command, cancel, save.as_ref(), limit, owner, sooner);
     // What the pipes were streamed to only goes into the saved file.
     if let Some(save) = &save {
         for pipe in PIPE_NAMES {
@@ -1993,6 +2050,7 @@ fn run_shell_into(
     save: Option<&SaveTo>,
     limit: Duration,
     owner: Option<u64>,
+    sooner: Option<(Duration, Cut)>,
 ) -> Result<String, String> {
     use std::process::Stdio;
     let _running = Running::start();
@@ -2009,6 +2067,12 @@ fn run_shell_into(
     // At once, as for a job, so nothing it starts escapes the tree. Without
     // one it can still run; it just cannot move to the background.
     let tree = crate::jobs::Tree::leaving(&child).ok();
+    // Only where it would move to the background: one that could only be
+    // stopped there waits as long as it was given.
+    let (limit, cut) = match sooner {
+        Some((sooner, cut)) if owner.is_some() && tree.is_some() => (sooner, Some(cut)),
+        _ => (limit, None),
+    };
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         let _ = child.kill();
         return Err("Cannot read the command's output.".into());
@@ -2178,13 +2242,27 @@ fn run_shell_into(
         }
         // First, where no cut can drop it: what to do about it comes before
         // the output.
-        let moved = format!(
-            "Still running after {}s, so it carries on in the background as job \
-             #{id} instead of being stopped. A notice comes when it exits; call \
-             wait with job {id} to wait for it, read_job to read what it \
-             prints, or stop_job if you no longer need it.{SO_FAR}",
-            limit.as_secs()
-        );
+        let moved = match cut {
+            None => format!(
+                "Still running after {}s, so it carries on in the background as job \
+                 #{id} instead of being stopped. A notice comes when it exits; call \
+                 wait with job {id} to wait for it, read_job to read what it \
+                 prints, or stop_job if you no longer need it.{SO_FAR}",
+                limit.as_secs()
+            ),
+            // Near the end a job left running holds the CPU the next steps
+            // need and is stopped with the run anyway, so it is the model's
+            // to decide on now; that the run stops it, `run_command` adds
+            // for every job of a run that does. Its seconds are counted as
+            // it ran, since a limit the clock set is not whole.
+            Some(cut) => format!(
+                "Still running after {:.0}s, {}, so it carries on in the background as \
+                 job #{id} instead of being stopped. Call wait with job {id} if you need \
+                 what it makes, or stop_job {id} if not.{SO_FAR}",
+                started.elapsed().as_secs_f64(),
+                cut.when()
+            ),
+        };
         text.insert_str(0, &moved);
         for gap in &mut gaps {
             gap.at += moved.len();
@@ -2939,9 +3017,9 @@ impl Tool for RunCommand {
             let out = if ctx.sandboxed {
                 run_sandboxed(command, cwd, &dir, &ctx.cancel, save, limit)
             } else {
-                let owner = owner_at_limit(ctx);
+                let (owner, sooner) = (owner_at_limit(ctx), sooner(limit, ctx));
                 let cmd = shell(command, Some(&dir));
-                run_shell_saving(cmd, command, &ctx.cancel, save, limit, owner)
+                run_shell_saving(cmd, command, &ctx.cancel, save, limit, owner, sooner)
             };
             let first = out.as_ref().ok().and_then(|text| text.lines().next());
             let moved = first.is_some_and(|line| line.contains(MOVED));
@@ -3828,12 +3906,22 @@ impl Tool for Wait {
             .as_f64()
             .unwrap_or(WAIT_SECS as f64)
             .clamp(0., MAX_WAIT_SECS as f64);
-        let limit = std::time::Duration::from_secs_f64(seconds);
+        let asked = std::time::Duration::from_secs_f64(seconds);
+        // Cut short near the run's time as a command is, so the model hears
+        // of it at once rather than after the pause.
+        let (limit, cut) = match sooner(asked, ctx) {
+            Some((sooner, cut)) => (sooner, Some(cut)),
+            None => (asked, None),
+        };
+        let seconds = limit.as_secs_f64();
         let Some(id) = args["job"].as_u64() else {
             if !ctx.cancel.sleep(limit) {
                 return Err("Stopped before the wait was over.".into());
             }
-            return Ok(format!("Waited {seconds:.0}s."));
+            return Ok(match cut {
+                Some(cut) => format!("Waited {seconds:.0}s, cut short {}.", cut.when()),
+                None => format!("Waited {seconds:.0}s."),
+            });
         };
         let id = own_job(id, ctx)?;
         let until = args["until"].as_str().unwrap_or_default();
@@ -3872,8 +3960,15 @@ impl Tool for Wait {
                 ));
             }
             if started.elapsed() >= limit {
+                let cut = cut.map_or(String::new(), |cut| {
+                    format!(
+                        "; the wait was cut short {}, so wait again if you need what it \
+                         makes, or stop_job {id} if not",
+                        cut.when()
+                    )
+                });
                 return Ok(format!(
-                    "Job #{id} is still running after {seconds:.0}s{without}.{earlier} Output since the wait began:\n{new}"
+                    "Job #{id} is still running after {seconds:.0}s{without}{cut}.{earlier} Output since the wait began:\n{new}"
                 ));
             }
             if !ctx.cancel.sleep(std::time::Duration::from_millis(250)) {
@@ -6532,7 +6627,7 @@ mod tests {
     fn run_for(command: &str, limit: Duration, owner: Option<u64>) -> Result<String, String> {
         let dir = std::env::temp_dir();
         let cmd = shell(command, Some(&dir));
-        run_shell_saving(cmd, command, &Cancel::default(), None, limit, owner)
+        run_shell_saving(cmd, command, &Cancel::default(), None, limit, owner, None)
     }
 
     /// The job a command moved to the background became, from what the
@@ -6673,6 +6768,220 @@ mod tests {
         );
     }
 
+    /// A call by the own agent of session `conversation` on a run warned at
+    /// `warn_at` and stopped at `deadline`.
+    fn timed(conversation: u64, warn_at: Instant, deadline: Instant) -> ToolContext {
+        ToolContext::of(&Connection {
+            workspace: Some(std::env::temp_dir()),
+            conversation,
+            deadline: Some(deadline),
+            warn_at: Some(warn_at),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_session_s_own_call_on_a_timed_run_waits_no_later_than_it_should_hear_of_its_time() {
+        let (now, asked) = (Instant::now(), Duration::from_secs(600));
+        let near = |limit: Duration, to: u64| limit.abs_diff(Duration::from_secs(to)).as_secs() < 2;
+        // Before the warning, until it.
+        let early = timed(
+            7_705,
+            now + Duration::from_secs(100),
+            now + Duration::from_secs(500),
+        );
+        let (limit, cut) = sooner(asked, &early).unwrap();
+        assert!(near(limit, 100) && cut == Cut::Warning, "{limit:?} {cut:?}");
+        // Past it, until shortly before the deadline, or half of what is
+        // left once that is short.
+        let deadline = now + Duration::from_secs(100);
+        let late = timed(7_705, now - Duration::from_secs(1), deadline);
+        let (limit, cut) = sooner(asked, &late).unwrap();
+        assert!(
+            near(limit, 70) && cut == Cut::Deadline(deadline),
+            "{limit:?}"
+        );
+        let last = timed(
+            7_705,
+            now - Duration::from_secs(1),
+            now + Duration::from_secs(10),
+        );
+        assert!(near(sooner(asked, &last).unwrap().0, 5));
+        // One that asked for less waits as it asked.
+        assert_eq!(sooner(Duration::from_secs(60), &early), None);
+        // A helper's call, a call for no session in particular and one on a
+        // run with no deadline are never cut short.
+        let helper = ToolContext {
+            caller: Caller {
+                depth: 1,
+                ..early.caller.clone()
+            },
+            ..early.clone()
+        };
+        assert_eq!(sooner(asked, &helper), None);
+        let nobody = ToolContext {
+            conversation: 0,
+            ..early.clone()
+        };
+        assert_eq!(sooner(asked, &nobody), None);
+        let untimed = ToolContext::of(&Connection {
+            conversation: 7_705,
+            workspace: Some(std::env::temp_dir()),
+            ..Default::default()
+        });
+        assert_eq!(sooner(asked, &untimed), None);
+    }
+
+    #[test]
+    fn a_command_running_at_the_time_warning_becomes_a_job_then_with_what_it_printed() {
+        let _turn = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let command = if cfg!(windows) {
+            "Write-Output before; Start-Sleep 30; Write-Output after"
+        } else {
+            "echo before; sleep 30; echo after"
+        };
+        let now = Instant::now();
+        let ctx = timed(
+            7_706,
+            now + Duration::from_secs(2),
+            now + Duration::from_secs(60),
+        );
+        let args = json!({"command": command, "timeout": 600}).to_string();
+        let said = run("run_command", &args, &ctx).unwrap();
+        assert!(Instant::now() - now < Duration::from_secs(20), "{said}");
+        let (note, so_far) = said.split_once("Output so far:\n").unwrap();
+        let id: u64 = note
+            .split_once(
+                "s, at this run's time warning, so it carries on in the background as job #",
+            )
+            .and_then(|(_, rest)| rest.split_once(' '))
+            .and_then(|(id, _)| id.parse().ok())
+            .unwrap_or_else(|| panic!("{said}"));
+        crate::jobs::stop(id).unwrap();
+        assert!(note.starts_with("Still running after "), "{note}");
+        assert!(
+            note.contains(&format!(
+                "Call wait with job {id} if you need what it makes, or stop_job {id} if not"
+            )),
+            "{note}"
+        );
+        assert_eq!(so_far.trim_end(), "before");
+    }
+
+    #[test]
+    fn a_command_on_a_run_past_its_warning_becomes_a_job_before_the_deadline() {
+        let _turn = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let command = if cfg!(windows) {
+            "Write-Output before; Start-Sleep 30"
+        } else {
+            "echo before; sleep 30"
+        };
+        // Six seconds left, so it moves at three, with three to go.
+        let now = Instant::now();
+        let ctx = timed(
+            7_707,
+            now - Duration::from_secs(1),
+            now + Duration::from_secs(6),
+        );
+        let args = json!({"command": command, "timeout": 600}).to_string();
+        let said = run("run_command", &args, &ctx).unwrap();
+        let (note, _) = said.split_once("Output so far:\n").unwrap();
+        let id: u64 = note
+            .split_once(" s of this run left, so it carries on in the background as job #")
+            .and_then(|(_, rest)| rest.split_once(' '))
+            .and_then(|(id, _)| id.parse().ok())
+            .unwrap_or_else(|| panic!("{said}"));
+        crate::jobs::stop(id).unwrap();
+        assert!(Instant::now() < now + Duration::from_secs(6), "{note}");
+        assert!(note.contains(&format!("or stop_job {id} if not")), "{note}");
+    }
+
+    #[test]
+    fn a_command_cut_at_the_warning_of_a_print_run_says_what_to_do_and_how_to_leave_it_up_once() {
+        let _turn = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let command = if cfg!(windows) {
+            "Write-Output before; Start-Sleep 30"
+        } else {
+            "echo before; sleep 30"
+        };
+        // A timed -p run is one whose jobs end with it, so both are told.
+        let now = Instant::now();
+        let ctx = ToolContext::of(&Connection {
+            workspace: Some(std::env::temp_dir()),
+            conversation: 7_710,
+            deadline: Some(now + Duration::from_secs(60)),
+            warn_at: Some(now + Duration::from_secs(1)),
+            jobs_end_with_run: true,
+            ..Default::default()
+        });
+        let args = json!({"command": command, "timeout": 600}).to_string();
+        let said = run("run_command", &args, &ctx).unwrap();
+        let (told, so_far) = said.split_once(SO_FAR).unwrap();
+        let id: u64 = told
+            .split_once("at this run's time warning, so it carries on in the background as job #")
+            .and_then(|(_, rest)| rest.split_once(' '))
+            .and_then(|(id, _)| id.parse().ok())
+            .unwrap_or_else(|| panic!("{said}"));
+        crate::jobs::stop(id).unwrap();
+        let what_to_do =
+            format!("Call wait with job {id} if you need what it makes, or stop_job {id} if not.");
+        assert_eq!(told.matches(&what_to_do).count(), 1, "{said}");
+        assert_eq!(
+            told.matches("stopped when this run ends").count(),
+            1,
+            "{said}"
+        );
+        assert!(
+            told.ends_with(&format!(
+                "{what_to_do} Background jobs are stopped when this run ends; if it must keep \
+                 running after that, start it detached instead, as with `{DETACHED}`, and check \
+                 that it answers."
+            )),
+            "{said}"
+        );
+        assert_eq!(so_far.trim_end(), "before");
+    }
+
+    #[test]
+    fn a_wait_on_a_timed_run_ends_at_the_time_warning() {
+        let now = Instant::now();
+        let ctx = timed(
+            7_708,
+            now + Duration::from_secs(1),
+            now + Duration::from_secs(60),
+        );
+        let out = Wait.run(&json!({"seconds": 60}), &ctx).unwrap();
+        assert!(Instant::now() - now < Duration::from_secs(20), "{out}");
+        assert_eq!(out, "Waited 1s, cut short at this run's time warning.");
+
+        // A job waited for is still running, and the model is to say what of it.
+        let sleeper = if cfg!(windows) {
+            "Start-Sleep 30"
+        } else {
+            "sleep 30"
+        };
+        let job = crate::jobs::start_for(sleeper, &std::env::temp_dir(), 7_708).unwrap();
+        let now = Instant::now();
+        let ctx = timed(
+            7_708,
+            now - Duration::from_secs(1),
+            now + Duration::from_secs(4),
+        );
+        let out = Wait.run(&json!({"job": job, "seconds": 60}), &ctx);
+        crate::jobs::stop(job).unwrap();
+        let out = out.unwrap();
+        let still =
+            format!("Job #{job} is still running after 2s; the wait was cut short with about ");
+        assert!(out.starts_with(&still), "{out}");
+        assert!(out.contains(&format!("or stop_job {job} if not.")), "{out}");
+    }
+
     #[test]
     fn a_command_is_stopped_at_the_timeout_it_was_given() {
         // No conversation to tell of a job, so it is stopped rather than moved.
@@ -6795,6 +7104,7 @@ mod tests {
             None,
             COMMAND_TIMEOUT,
             Some(7_703),
+            None,
         );
         assert!(out.unwrap_err().contains("Stopped"));
         let pid = stopper.join().unwrap();
@@ -6828,6 +7138,7 @@ mod tests {
             None,
             Duration::from_secs(20),
             Some(7_704),
+            None,
         );
         let out = out.unwrap_err();
         assert!(
@@ -7703,6 +8014,7 @@ mod tests {
             &Cancel::default(),
             save,
             COMMAND_TIMEOUT,
+            None,
             None,
         )
         .unwrap();

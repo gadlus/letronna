@@ -125,10 +125,10 @@ pub fn run(runner: &mut Runner, session: usize, args: &Args, started: Instant) -
     crate::emit(&crate::init(runner, session));
     let (events, heard) = mpsc::channel();
     if let Some(deadline) = deadline {
-        // Every turn is on this one session, so its id is theirs.
-        let id = runner.store.conversations[session].id;
-        keep_to(started, deadline, id, events.clone());
+        keep_to(deadline, events.clone());
     }
+    // The run's one warning, which every turn is timed against.
+    let timed = deadline.map(|deadline| (crate::warning(started, deadline), deadline));
     let current = Arc::new(AtomicU64::new(0));
     read_stdin(events.clone(), current.clone());
     // Served before any turn starts, since a request with nobody serving is
@@ -171,15 +171,7 @@ pub fn run(runner: &mut Runner, session: usize, args: &Args, started: Instant) -
                             so this message was not sent."
                             .into());
                     }
-                    start(
-                        runner,
-                        session,
-                        &text,
-                        args,
-                        budget.clone(),
-                        &events,
-                        deadline,
-                    )
+                    start(runner, session, &text, args, budget.clone(), &events, timed)
                 });
                 match begun {
                     Ok(mut turn) => {
@@ -375,25 +367,17 @@ fn fits(tool: &str, arguments: Option<&Value>) -> Result<(), String> {
     }
 }
 
-/// Tells session `id` how long it has left once most of the time from
-/// `started` to `deadline` has gone, as `-p` does, then says on `events` that
-/// the deadline is up.
-fn keep_to(started: Instant, deadline: Instant, id: u64, events: Sender<Event>) {
-    let warn = started
-        + deadline
-            .saturating_duration_since(started)
-            .mul_f64(crate::WARN_AT);
+/// Says on `events` that the deadline is up once it is.
+fn keep_to(deadline: Instant, events: Sender<Event>) {
     std::thread::spawn(move || {
-        std::thread::sleep(warn.saturating_duration_since(Instant::now()));
-        let left = deadline.saturating_duration_since(Instant::now());
-        letronna_core::inbox::push(id, crate::deadline_notice(left));
-        std::thread::sleep(left);
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
         let _ = events.send(Event::Deadline);
     });
 }
 
 /// Starts `text` as a turn on a thread of its own, spending from `budget`,
-/// which says on `events` when it has ended.
+/// which says on `events` when it has ended; `timed` is when the run is
+/// warned and when it is stopped, if it has a deadline.
 fn start(
     runner: &mut Runner,
     session: usize,
@@ -401,11 +385,13 @@ fn start(
     args: &Args,
     budget: Option<Arc<Budget>>,
     events: &Sender<Event>,
-    deadline: Option<Instant>,
+    timed: Option<(Instant, Instant)>,
 ) -> Result<Running, String> {
     let (mut spec, _, before) = crate::begin(runner, session, text, args, budget)?;
-    // The turn times its replies against the run's deadline, as -p's does.
-    spec.connection.deadline = deadline;
+    // The turn times its replies against the run's deadline and is warned
+    // before it, as -p's is.
+    spec.connection.warn_at = timed.map(|(warn_at, _)| warn_at);
+    spec.connection.deadline = timed.map(|(_, deadline)| deadline);
     // What the run's own gate leaves open, the judge's doubts included, goes
     // out to the program when it answers, and is refused when it does not.
     spec.connection.human = args.ask_stdio;

@@ -528,8 +528,17 @@ fn steps(
     // end has often thought most of it away by then.
     if let Some(deadline) = spec.connection.deadline {
         let left = deadline.saturating_duration_since(Instant::now());
-        deadline_notice(spec, time_given(left))?;
+        let mut text = time_given(left);
+        // One begun past its warning never hears it, so it is told here
+        // what the warning says to tidy up.
+        if warning_due(spec, false) {
+            text.push_str(&format!(" Before it is stopped, {TIDY}."));
+        }
+        deadline_notice(spec, text)?;
     }
+    // One begun past its warning, as a later turn over stdin can be, has
+    // just been told how little time it has.
+    let mut warned = past_warning(spec);
     loop {
         if spec.cancel.is_set() {
             return Ok(Outcome::Stopped);
@@ -541,13 +550,23 @@ fn steps(
         {
             return Ok(Outcome::OverBudget);
         }
+        if let Some(text) = time_warning(spec, &mut warned) {
+            deadline_notice(spec, text)?;
+        }
         let mut reply = match ask_in_line(spec, turn)? {
             Asked::Reply(reply) => reply,
             Asked::Stopped => {
                 keep_cut_short(spec, turn);
                 return Ok(Outcome::Stopped);
             }
-            Asked::ActNow(text) => {
+            Asked::ActNow(mut text) => {
+                // Which says what the warning would but for tidying up, so
+                // past it the two do not come one after the other: one
+                // standing in for a warning not yet heard says that too.
+                if warning_due(spec, warned) {
+                    text.push_str(&format!(" Also {TIDY}."));
+                }
+                warned |= past_warning(spec);
                 deadline_notice(spec, text)?;
                 continue;
             }
@@ -599,8 +618,18 @@ fn steps(
                 return Ok(Outcome::RoundLimit);
             }
             // Mail that came while it worked may change the answer, so it
-            // carries the run on rather than going unread.
+            // carries the run on rather than going unread, as the warning
+            // does for one that ends past it without having heard it.
             let mut mail = inbox::fold(&inbox::take(spec.id, true));
+            if mail.is_none()
+                && let Some(text) = time_warning(spec, &mut warned)
+            {
+                mail = inbox::fold(&[Notice {
+                    from: "deadline".into(),
+                    when: When::Next,
+                    text,
+                }]);
+            }
             if mail.is_none() && spec.schema.is_some() {
                 if reminded {
                     return Ok(Outcome::Failed(
@@ -1520,6 +1549,46 @@ fn thought_too_long(spec: &Spec, turn: &mut Turn, began: Instant) -> Asked {
          {} s are left before this run is stopped. Write every output the task asks for now with \
          what you have, complete and valid, then check them.",
         began.elapsed().as_secs(),
+        left.as_secs()
+    ))
+}
+
+/// Whether the run's time warning, if it has one, has come.
+fn past_warning(spec: &Spec) -> bool {
+    (spec.connection.warn_at).is_some_and(|at| Instant::now() >= at)
+}
+
+/// What a run near its deadline is told to take out, in the words of the
+/// time warning. A run the deadline stops never reaches its own end, where
+/// it would take out what it made only to test. A run someone watches is
+/// told this too, without the rule that qualifies it, so it names only
+/// scratch files, logs and binaries, not a test added to the project, and
+/// spares what the project's build keeps.
+const TIDY: &str = "remove scratch files, logs and binaries you made only to test from the \
+                    outputs' folders, unless the project's build keeps them there";
+
+/// Whether a session's own run, told of its warning by now if `warned`, is
+/// yet to hear it.
+fn warning_due(spec: &Spec, warned: bool) -> bool {
+    // A helper's task is its parent's to finish in time.
+    !warned && spec.depth == 0 && past_warning(spec)
+}
+
+/// What a session's own run is told once most of its time is gone, when it
+/// has not been told yet: worded as it is read, since a long call or reply
+/// can take it well past the warning.
+fn time_warning(spec: &Spec, warned: &mut bool) -> Option<String> {
+    if !warning_due(spec, *warned) {
+        return None;
+    }
+    *warned = true;
+    let left = spec
+        .connection
+        .deadline?
+        .saturating_duration_since(Instant::now());
+    Some(format!(
+        "About {} s are left before this run is stopped: write every output the task asks \
+         for now, complete and valid, and {TIDY}; improve the outputs in place only after that.",
         left.as_secs()
     ))
 }
@@ -6731,5 +6800,146 @@ pub(crate) mod tests {
                     for early, then improve it in place.";
         assert!(carries(&sent[0], told), "{}", sent[0]);
         assert!(!carries(&sent[1], "before it is stopped"));
+    }
+
+    /// What the time warning says, whatever the seconds in it.
+    const WARNING: &str = "s are left before this run is stopped: write every output the task \
+                           asks for now";
+
+    #[test]
+    fn a_command_running_at_the_time_warning_comes_back_with_the_warning() {
+        let _bell = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("time-warning");
+        let id = AGENTS + 1530;
+        let command = if cfg!(windows) {
+            "Write-Output before; Start-Sleep 30; Write-Output after"
+        } else {
+            "echo before; sleep 30; echo after"
+        };
+        let slow = ("run_command", json!({"command": command, "timeout": 600}));
+        let (endpoint, provider) = provider(vec![reply("", &[slow]), reply("Done.", &[])]);
+        let mut spec = own(endpoint, &dir, id);
+        let now = Instant::now();
+        spec.connection.deadline = Some(now + Duration::from_secs(60));
+        spec.connection.warn_at = Some(now + Duration::from_secs(2));
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert!(
+            Instant::now() - now < Duration::from_secs(20),
+            "held to the end"
+        );
+        let sent = provider.sent();
+        // Told once, with the result of the call it came during.
+        assert_eq!(sent.len(), 2);
+        let moved = results(&sent[1])[0];
+        let job: u64 = moved
+            .split_once("at this run's time warning, so it carries on in the background as job #")
+            .and_then(|(_, rest)| rest.split_once(' '))
+            .and_then(|(job, _)| job.parse().ok())
+            .unwrap_or_else(|| panic!("{moved}"));
+        crate::jobs::stop(job).unwrap();
+        assert!(moved.contains("Output so far:\nbefore"), "{moved}");
+        let notice = last_notice(&sent);
+        let left: u64 = (notice.split_once("About "))
+            .and_then(|(_, rest)| rest.split_once(' '))
+            .and_then(|(left, _)| left.parse().ok())
+            .unwrap_or_else(|| panic!("{notice}"));
+        assert!(notice.contains(WARNING) && left <= 58, "{notice}");
+        assert!(
+            notice.contains(
+                "remove scratch files, logs and binaries you made only to test from the \
+                 outputs' folders, unless the project's build keeps them there; improve the \
+                 outputs"
+            ),
+            "{notice}"
+        );
+        assert!(!carries(&sent[0], WARNING));
+    }
+
+    #[test]
+    fn a_run_that_ends_past_its_warning_unwarned_is_warned_once() {
+        let dir = scratch("warned-at-the-end");
+        // Its first reply streams on past the warning.
+        let mut slow = vec![says("Done")];
+        slow.extend((0..20).map(|_| says(".")));
+        let (endpoint, provider) = streaming(
+            vec![slow, vec![says("Still done.")]],
+            Duration::from_millis(40),
+        );
+        let mut spec = own(endpoint, &dir, AGENTS + 1535);
+        spec.transcript.conversation.messages[0].content = "Say that you are done.".into();
+        let now = Instant::now();
+        spec.connection.deadline = Some(now + Duration::from_secs(60));
+        spec.connection.warn_at = Some(now + Duration::from_millis(300));
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "Still done.");
+        let sent = provider.sent();
+        assert_eq!(sent.len(), 2);
+        assert!(last_notice(&sent).contains(WARNING));
+    }
+
+    #[test]
+    fn a_reply_stopped_for_thinking_past_the_warning_says_to_tidy_up_in_its_place() {
+        let dir = scratch("thought-past-warning");
+        // Begun before the warning, stopped for thinking after it.
+        let mut endless = thinking(100);
+        endless.push(says("Too late."));
+        let (endpoint, provider) = streaming(
+            vec![endless, vec![says("Done.")]],
+            Duration::from_millis(20),
+        );
+        let mut spec = own(endpoint, &dir, AGENTS + 1545);
+        spec.transcript.conversation.messages[0].content = "Say that you are done.".into();
+        let now = Instant::now();
+        spec.connection.deadline = Some(now + Duration::from_secs(2));
+        spec.connection.warn_at = Some(now + Duration::from_millis(300));
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "Done.");
+        let sent = provider.sent();
+        // The warning does not follow it at the end.
+        assert_eq!(sent.len(), 2);
+        let notice = last_notice(&sent);
+        assert!(notice.contains(ACT_NOW), "{notice}");
+        assert!(
+            notice.contains(
+                "Also remove scratch files, logs and binaries you made only to test from the \
+                 outputs' folders, unless the project's build keeps them there."
+            ),
+            "{notice}"
+        );
+        assert!(!sent.iter().any(|body| carries(body, WARNING)));
+    }
+
+    #[test]
+    fn neither_a_helper_nor_a_run_begun_past_its_warning_is_warned() {
+        let dir = scratch("not-warned");
+        let (endpoint, provider) = provider(vec![reply("Done.", &[]), reply("Done.", &[])]);
+        let past = Instant::now() - Duration::from_secs(1);
+        let mut helper = spec(endpoint.clone(), &dir, AGENTS + 1540);
+        helper.connection.deadline = Some(Instant::now() + Duration::from_secs(60));
+        helper.connection.warn_at = Some(past);
+        assert_eq!(finished(helper).status, Outcome::Done);
+        // As a later turn over stdin is, told its time by the first notice.
+        let mut late = own(endpoint, &dir, AGENTS + 1541);
+        late.transcript.path = dir.join("late.jsonl");
+        late.transcript.conversation.messages[0].content = "Say that you are done.".into();
+        late.connection.deadline = Some(Instant::now() + Duration::from_secs(60));
+        late.connection.warn_at = Some(past);
+        assert_eq!(finished(late).status, Outcome::Done);
+        let sent = provider.sent();
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|body| !carries(body, WARNING)));
+        assert!(carries(
+            &sent[1],
+            "This run has about 1 minute before it is stopped"
+        ));
+        // The one that will not be warned still hears what to tidy up.
+        let tidy = "Before it is stopped, remove scratch files, logs and binaries";
+        assert!(carries(&sent[1], tidy));
+        assert!(!carries(&sent[0], tidy));
     }
 }

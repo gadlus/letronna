@@ -319,6 +319,9 @@ pub struct Connection {
     /// When a `-p` run given a deadline is stopped, which its replies are
     /// timed against; None everywhere else, and its helpers keep it.
     pub deadline: Option<std::time::Instant>,
+    /// When such a run is warned that most of its time is gone, which its
+    /// own calls are timed against; set with `deadline`.
+    pub warn_at: Option<std::time::Instant>,
     /// Letronna stops the jobs started in this run once the run is over, as
     /// `-p` and the control protocol do on their way out: set by them
     /// alone, and its helpers keep it.
