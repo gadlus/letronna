@@ -20,6 +20,7 @@ mod control;
 mod diff;
 mod doctor;
 mod edit;
+mod history;
 mod input;
 mod install;
 mod mcp;
@@ -235,6 +236,9 @@ fn main() {
         plain_terminal: !args.once(),
     };
     letronna_core::diag::mark("listed");
+    // At the prompt, what is sent goes into the folder's history, which
+    // up and ctrl-r reach from later sessions too.
+    runner.bar.keep_history(!args.once());
     // With no flag picking one, the mode the window starts sessions in, so
     // the two agree; a `-p` run keeps to its flags alone.
     if !args.mode_picked && !args.once() {
@@ -697,7 +701,17 @@ fn show_session(runner: &mut Runner, session: usize) {
     let (name, folder) = (conversation.title.clone(), conversation.workspace.clone());
     runner.bar.set_folder(folder);
     runner.bar.set_session(&name);
+    // Read again each time, as `/remember`'s list can make the chat private
+    // and `/resume` or `/branch` can open one.
+    runner.bar.set_private(is_private(&runner.store, session));
     runner.show_context(session);
+}
+
+/// Whether the session is a private chat, as the window names one: it
+/// saves to memory only when asked and keeps only its own notes.
+fn is_private(store: &store::Store, session: usize) -> bool {
+    use letronna_core::memory::{Saving, Scope};
+    store.memory_saving(session) == Saving::WhenAsked && store.memory_scope(session) == Scope::Chat
 }
 
 /// Finishes the worktrees the sessions `ids` work in, now that nothing this
@@ -2407,5 +2421,31 @@ mod tests {
             "fix the build ]0;x now"
         );
         assert_eq!(super::plain_name("  "), "untitled");
+    }
+
+    #[test]
+    fn a_chat_is_private_however_it_was_made_so() {
+        use letronna_core::memory::Saving;
+        let mut store = store::Store::default();
+        store.conversations.push(store::Conversation {
+            id: 68_701,
+            ..Default::default()
+        });
+        assert!(!super::is_private(&store, 0));
+        // `/remember`'s Private chat row and `--private` both do this.
+        store.make_private(0);
+        assert!(super::is_private(&store, 0));
+        // A `/branch` copies both choices, and a `/resume` reads them back.
+        let copy = store::Conversation {
+            id: 68_702,
+            memory_saving: store.conversations[0].memory_saving,
+            memory_scope: store.conversations[0].memory_scope,
+            ..Default::default()
+        };
+        store.conversations.push(copy);
+        assert!(super::is_private(&store, 1));
+        // Saving on its own again, it is no longer a private chat.
+        store.choose_memory_saving(0, Some(Saving::Auto));
+        assert!(!super::is_private(&store, 0));
     }
 }

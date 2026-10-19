@@ -22,6 +22,7 @@ Everything Letronna keeps lives in one folder:
 | `skills/`, `plugins/` | Installed skills and plugins |
 | `media/` | Media made with no project attached, and browser screenshots |
 | `browser/` | The shared browser profile. Delete it to sign out of everything. |
+| `prompt-history.jsonl` | What you sent at the terminal's prompt, with its project folder, for ↑ and Ctrl+R in later sessions: the newest 1,000 for each folder, readable by you alone. Answers to questions, keys among them, are never kept, nor is anything typed in a private chat, whether `--private` or `/remember`'s list made it one, a `/branch` of one and one opened again with `/resume` included. Delete it to forget them. |
 | `drafts/` | What is in the terminal's box while Ctrl+G has it open in your editor, readable by you alone; removed when the editor closes |
 
 ## Keys

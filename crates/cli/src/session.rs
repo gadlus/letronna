@@ -1521,7 +1521,8 @@ impl Runner {
         if let Some(conversation) = self.store.conversations.get_mut(index) {
             letronna_core::store::fill(conversation);
             self.bar.set_plan(&conversation.todos);
-            self.bar.set_history(&conversation.messages);
+            self.bar
+                .set_history(&conversation.messages, conversation.workspace.as_deref());
         }
         self.show_goal();
         // Each session has its own model, and the footer names it.
@@ -1540,6 +1541,9 @@ impl Runner {
     /// A session of its own.
     pub fn start(&mut self, workspace: Option<std::path::PathBuf>) -> usize {
         review::stop(&self.review);
+        // A new session has said nothing yet; up reaches what was sent in its
+        // folder before.
+        self.bar.set_history(&[], workspace.as_deref());
         self.store.conversations.push(Conversation {
             id: self.store.reserve_id(),
             title: String::new(),

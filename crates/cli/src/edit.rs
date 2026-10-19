@@ -13,6 +13,12 @@ pub struct Paste {
     pub text: String,
 }
 
+/// Prompts put back under up when a session opens, the newest of them: the
+/// folder's own from earlier sessions, then the session's. More than anyone
+/// steps back through a key at a time, and few enough that a session of
+/// thousands of messages is not copied whole into the box.
+const HISTORY: usize = 1_000;
+
 /// What the last change to the line was, so a run of typing, or of
 /// deleting, is undone as one.
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -25,11 +31,6 @@ enum Edit {
 
 /// The most changes undo goes back through.
 const UNDO: usize = 100;
-
-/// Prompts an opened session puts back under up, the newest of them: more
-/// than anyone steps back through a key at a time, and few enough that a
-/// session of thousands of messages is not copied whole into the box.
-const HISTORY: usize = 100;
 
 #[derive(Default)]
 pub struct Line {
@@ -44,6 +45,9 @@ pub struct Line {
     recalled: Option<usize>,
     /// What was being written before the first recall, so it can come back.
     draft: String,
+    /// Changes made to recalled lines, by their place among them, kept while
+    /// stepping to other lines and back, until the next line is sent.
+    edited: std::collections::HashMap<usize, String>,
     /// The line as it was before each change, for undo: its text, cursor
     /// and pastes.
     undone: Vec<(String, usize, Vec<Paste>)>,
@@ -457,10 +461,17 @@ impl Line {
             (Some(at), _) if at >= newest => None,
             (Some(at), _) => Some(at + 1),
         };
+        // A recalled line changed and then stepped away from keeps the
+        // change, as a shell's history does, until the next line is sent.
+        if let Some(at) = self.recalled
+            && self.text != self.history[at]
+        {
+            self.edited.insert(at, self.text.clone());
+        }
         self.recalled = next;
         match next {
             Some(at) => {
-                let line = self.history[at].clone();
+                let line = (self.edited.get(&at)).unwrap_or(&self.history[at]).clone();
                 self.put(&line);
             }
             None => {
@@ -485,21 +496,41 @@ impl Line {
         true
     }
 
-    /// Take the line to send, remembering it, and start a fresh one.
+    /// Take the line to send, remembering it, and start a fresh one. What is
+    /// remembered is what was sent, pastes and all: a placeholder brought
+    /// back without the paste behind it would send its own words.
     pub fn take(&mut self) -> String {
-        let sent = self.expand();
-        let typed = std::mem::take(&mut self.text);
-        if !typed.trim().is_empty() && self.history.last() != Some(&typed) {
-            self.history.push(typed);
+        let sent = self.take_unkept();
+        if !sent.trim().is_empty() && self.history.last() != Some(&sent) {
+            self.history.push(sent.clone());
         }
+        sent
+    }
+
+    /// Take the line to send without remembering it, for an answer to a
+    /// question -- a key among them -- that up should never bring back.
+    pub fn take_unkept(&mut self) -> String {
+        let sent = self.expand();
+        self.text.clear();
         self.cursor = 0;
         self.pastes.clear();
         self.recalled = None;
         self.draft.clear();
+        self.edited.clear();
         // A line sent is no longer there to undo changes to.
         self.undone.clear();
         self.last = Edit::Other;
         sent
+    }
+
+    /// Whether the line is one brought back from those sent earlier.
+    pub fn recalling(&self) -> bool {
+        self.recalled.is_some()
+    }
+
+    /// The lines sent earlier, newest first.
+    pub fn sent_newest_first(&self) -> Vec<String> {
+        self.history.iter().rev().cloned().collect()
     }
 
     /// Start the lines sent earlier over from `sent`, oldest first, keeping
@@ -516,6 +547,7 @@ impl Line {
         // A place among the old lines means nothing among these.
         self.recalled = None;
         self.draft.clear();
+        self.edited.clear();
     }
 }
 
@@ -527,6 +559,24 @@ mod tests {
         let mut line = Line::default();
         line.insert_str(text);
         line
+    }
+
+    #[test]
+    fn edits_to_a_recalled_line_survive_moving_on() {
+        let mut line = Line::default();
+        line.set_history(["first".to_owned(), "second".to_owned()]);
+        line.up();
+        line.insert_str(" changed");
+        line.up();
+        assert_eq!(line.text(), "first");
+        line.down();
+        assert_eq!(line.text(), "second changed");
+        // Sending lets the changes go.
+        let sent = line.take();
+        assert_eq!(sent, "second changed");
+        line.up();
+        line.up();
+        assert_eq!(line.text(), "second");
     }
 
     #[test]

@@ -444,6 +444,15 @@ const PLAN_LEAVES: usize = 12;
 /// question takes.
 const STILL: Duration = Duration::from_millis(500);
 
+/// The commands the menu offers for what is in the box: none for a line
+/// brought back from those sent before, where up and down go on stepping
+/// through them rather than into a menu.
+fn menu_for<'a>(line: &Line, added: &'a Added) -> Vec<Row<'a>> {
+    match line.recalling() {
+        true => Vec::new(),
+        false => matches(line.text(), added),
+    }
+}
 /// How soon a second ctrl-c on an empty box must come to leave.
 const AGAIN: Duration = Duration::from_secs(2);
 
@@ -881,6 +890,15 @@ pub struct Bar {
     added: Added,
     /// The open session's project folder, where an `@` path is completed.
     folder: Option<std::path::PathBuf>,
+    /// Whether what is sent at the prompt goes into the folder's history:
+    /// only once the terminal at the prompt says so, so a box made for
+    /// anything else -- a test among them -- writes none.
+    keep_history: bool,
+    /// Whether the open chat is a private one, whose prompts go into no
+    /// history however it became private.
+    private: bool,
+    /// What was sent before, newest first, while ctrl-r's list of it is up.
+    searched: Option<Vec<String>>,
     /// When ctrl-c was pressed on an empty box, which leaves if pressed
     /// again soon after.
     quit_at: Option<std::time::Instant>,
@@ -960,6 +978,9 @@ impl Bar {
             focus: crate::notify::Focus::new(std::time::Instant::now()),
             added: Added::default(),
             folder: None,
+            keep_history: false,
+            private: false,
+            searched: None,
             quit_at: None,
             back: 0,
             keys_card: false,
@@ -1192,18 +1213,84 @@ impl Bar {
         self.settle();
     }
 
-    /// Put what was typed into an opened session under up, so a restart or a
-    /// /resume does not leave up with nothing to bring back.
-    pub fn set_history(&mut self, messages: &[Message]) {
+    /// Put under up what was sent at the prompt in `folder`, in any session,
+    /// and then what was typed into the session opened, so a new session, a
+    /// restart or a /resume does not leave up with nothing to bring back.
+    pub fn set_history(&mut self, messages: &[Message], folder: Option<&std::path::Path>) {
+        let earlier = match self.keep_history {
+            true => crate::history::load(folder),
+            false => Vec::new(),
+        };
         self.line.set_history(
-            messages
-                .iter()
-                // A notice, a chat app's message, and a follow-up folded into
-                // a turn -- which is also how a Stop hook's word goes in, so
-                // the two cannot be told apart -- were not typed here.
-                .filter(|m| m.role == "user" && !m.notice && !m.remote && !m.folded)
-                .map(|m| as_typed(&m.content)),
+            earlier.into_iter().chain(
+                messages
+                    .iter()
+                    // A notice, a chat app's message, and a follow-up folded
+                    // into a turn -- which is also how a Stop hook's word goes
+                    // in, so the two cannot be told apart -- were not typed
+                    // here.
+                    .filter(|m| m.role == "user" && !m.notice && !m.remote && !m.folded)
+                    .map(|m| as_typed(&m.content)),
+            ),
         );
+    }
+
+    /// Keep what is sent at the prompt in the folder's history, for later
+    /// sessions, or not, for a private chat.
+    pub fn keep_history(&mut self, keep: bool) {
+        self.keep_history = keep;
+    }
+
+    /// Say whether the open chat is private, which keeps what is sent in it
+    /// out of the folder's history.
+    pub fn set_private(&mut self, private: bool) {
+        self.private = private;
+    }
+
+    /// Whether a line sent now goes into the folder's history.
+    fn keeps_sent(&self) -> bool {
+        self.keep_history && !self.private
+    }
+
+    /// Open what was sent before in a list narrowed by typing, newest first,
+    /// as ctrl-r does in a shell: enter puts the one picked in the box.
+    fn search_history(&mut self) {
+        let sent = self.line.sent_newest_first();
+        if sent.is_empty() {
+            self.note = Some("nothing sent here yet".to_owned());
+            return;
+        }
+        let room = self.room();
+        self.choice = Some(Choice {
+            question: "What you sent before".to_owned(),
+            detail: Vec::new(),
+            options: sent.iter().map(|said| one_row(said, room)).collect(),
+            picked: 0,
+            top: 0,
+            filter: Some(String::new()),
+        });
+        self.answer = None;
+        self.declined = false;
+        self.searched = Some(sent);
+    }
+
+    /// The search of what was sent before, once it has been answered: the
+    /// line picked goes in the box, where it can be changed before it goes.
+    fn take_search(&mut self) {
+        let Some(sent) = &self.searched else {
+            return;
+        };
+        let picked = match self.answer.take() {
+            Some(at) => sent.get(at).cloned(),
+            None if std::mem::take(&mut self.declined) => None,
+            None => return,
+        };
+        self.searched = None;
+        self.choice = None;
+        if let Some(text) = picked {
+            self.line.set(&text);
+        }
+        self.settle();
     }
 
     /// Let the inbox's doorbell end a wait at the prompt, only with the box
@@ -1393,6 +1480,8 @@ impl Bar {
             return crate::input::menu(options, 0);
         }
 
+        // A question takes the box from a search of what was sent before.
+        self.searched = None;
         self.choice = Some(Choice {
             question: question.to_owned(),
             detail,
@@ -1663,6 +1752,7 @@ impl Bar {
         // An enter that was the last thing to arrive, and the only one, ended
         // a line someone was typing. An enter with more behind it, or one of
         // several, is a line ending inside text that was pasted.
+        self.take_search();
         if self.enters == 1 && self.enter_at == Some(self.handled) {
             self.send();
         } else if self.handled > 8 && self.choice.is_none() && self.switches.is_none() {
@@ -1977,12 +2067,14 @@ impl Bar {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let options = matches(self.line.text(), &self.added);
+        let options = menu_for(&self.line, &self.added);
         // Leaving takes two ctrl-c's in a row; anything between starts over.
         if !(control && key.code == KeyCode::Char('c')) {
             self.quit_at = None;
         }
         match key.code {
+            // What was sent before, searched for, as a shell's ctrl-r is.
+            KeyCode::Char('r') if control => self.search_history(),
             // With something marked, this is the copy key, which is what
             // anybody pressing it over a selection meant by it. Leaving is
             // what it does when there is nothing to copy.
@@ -2154,7 +2246,7 @@ impl Bar {
             }
             _ => {}
         }
-        let shown = matches(self.line.text(), &self.added).len();
+        let shown = menu_for(&self.line, &self.added).len();
         self.menu_top = menu_top(self.menu_top, self.picked, shown, MENU_LIMIT);
     }
 
@@ -2163,9 +2255,12 @@ impl Bar {
     /// the queue, going into the conversation once it is taken from there.
     fn send(&mut self) {
         let text = self.line.text().trim_end_matches('\n').to_owned();
+        let recalled = self.line.recalling();
         self.line.set(&text);
         let options = matches(self.line.text(), &self.added);
-        if let Some(choice) = options.get(self.picked) {
+        if let Some(choice) = options.get(self.picked)
+            && !recalled
+        {
             // A name typed only in part, that more than one command starts
             // with, is filled in, as tab does, rather than the first of them
             // run at once: `/u` and enter would otherwise undo the last
@@ -2183,10 +2278,21 @@ impl Bar {
             self.line.set(&line);
         }
         self.picked = 0;
-        let line = self.line.take().trim().to_owned();
+        // An answer to a question -- a key among them -- is nothing to step
+        // back to; what was sent at the prompt is, here and in the folder's
+        // history, which later sessions read.
+        let answering = self.secret || self.asking.is_some();
+        let line = match answering {
+            true => self.line.take_unkept(),
+            false => self.line.take(),
+        };
+        let line = line.trim().to_owned();
         if line.is_empty() {
             self.settle();
             return;
+        }
+        if !answering && self.keeps_sent() {
+            crate::history::add(self.folder.as_deref(), &line);
         }
         self.queued.push_back(line);
         self.settle();
@@ -2569,7 +2675,7 @@ impl Bar {
         ));
 
         if self.choice.is_none() && self.switches.is_none() {
-            let options = matches(self.line.text(), &self.added);
+            let options = menu_for(&self.line, &self.added);
             let top = menu_top(self.menu_top, self.picked, options.len(), MENU_LIMIT);
             let end = (top + MENU_LIMIT).min(options.len());
             // The longest name in this list rather than of all there are:
@@ -4371,7 +4477,7 @@ mod tests {
             said("user", "last prompt"),
         ];
         let mut bar = Bar::new(String::new());
-        bar.set_history(&messages);
+        bar.set_history(&messages, None);
 
         // What has not gone in yet still comes back first.
         bar.queued.push_back("queued".into());
@@ -4535,6 +4641,78 @@ mod tests {
         bar.guard = Instant::now().checked_sub(STILL);
         bar.pick(key(KeyCode::Enter));
         assert_eq!(bar.answer, Some(0));
+    }
+
+    #[test]
+    fn ctrl_r_finds_an_old_prompt() {
+        let mut bar = Bar::new(String::new());
+        bar.keep_history(false);
+        bar.line
+            .set_history(["fix the login bug".to_owned(), "write the docs".to_owned()]);
+        bar.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        for ch in "login".chars() {
+            bar.key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        bar.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        bar.take_search();
+        assert_eq!(bar.line.text(), "fix the login bug");
+        assert!(bar.choice.is_none() && bar.searched.is_none());
+        // Escape puts the list down and leaves the box as it was.
+        bar.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        bar.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        bar.take_search();
+        assert_eq!(bar.line.text(), "fix the login bug");
+        assert!(bar.choice.is_none());
+    }
+
+    #[test]
+    fn a_recalled_paste_sends_its_text() {
+        let mut bar = Bar::new(String::new());
+        bar.keep_history(false);
+        bar.line.paste("one\ntwo\nthree");
+        bar.send();
+        assert_eq!(bar.queued.pop_front().as_deref(), Some("one\ntwo\nthree"));
+        bar.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(bar.line.text(), "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn a_recalled_command_does_not_trap_up_in_the_menu() {
+        let mut bar = Bar::new(String::new());
+        bar.line
+            .set_history(["older".to_owned(), "/clear".to_owned()]);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        bar.key(up);
+        assert_eq!(bar.line.text(), "/clear");
+        bar.key(up);
+        assert_eq!(bar.line.text(), "older");
+    }
+
+    #[test]
+    fn an_answer_to_a_question_is_never_brought_back() {
+        let mut bar = Bar::new(String::new());
+        bar.keep_history(false);
+        bar.secret = true;
+        bar.asking = Some("Your API key".into());
+        bar.line.insert_str("sk-secret");
+        bar.send();
+        assert_eq!(bar.queued.pop_front().as_deref(), Some("sk-secret"));
+        bar.secret = false;
+        bar.asking = None;
+        bar.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(bar.line.text(), "");
+    }
+
+    #[test]
+    fn a_private_chat_keeps_nothing_in_the_folders_history() {
+        let mut bar = Bar::new(String::new());
+        bar.keep_history(true);
+        assert!(bar.keeps_sent());
+        bar.set_private(true);
+        assert!(!bar.keeps_sent());
+        // Back in a chat that is not private, prompts are kept again.
+        bar.set_private(false);
+        assert!(bar.keeps_sent());
     }
 
     #[test]
