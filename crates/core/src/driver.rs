@@ -40,8 +40,9 @@
 //! why.
 //!
 //! A session's own run that would end with items open on the checklist it set
-//! is sent back once, to finish them or say why not, and to end with its whole
-//! answer again, since only its last message is printed or sent. A list an
+//! is sent back, to finish them or say why not, and to end with its whole
+//! answer again, since only its last message is printed or sent; again when it
+//! has changed them since, but never twice for the same list. A list an
 //! earlier turn left is not counted, since the new prompt may be about
 //! something else, nor is a `todo` call the run was refused, which set
 //! nothing. So is one that would end with a file changed or gone that its
@@ -511,7 +512,9 @@ fn steps(
     // A session's transcript holds its earlier turns too, and a checklist
     // one of them left is not this run's to finish.
     let begun = spec.transcript.conversation.messages.len();
-    let mut nudged = false;
+    // Every checklist notice sent, so a list goes back once at most, even
+    // one the run changed and then changed back.
+    let mut nudged: Vec<String> = Vec::new();
     let mut checked = false;
     // Found as the run starts, so a file it makes under `in/` is no input.
     let inputs = asked_to_read(spec);
@@ -649,27 +652,32 @@ fn steps(
             // dropped, so a session's own run goes on once more for it; a
             // helper's answer is its parent's to judge, and a turn someone
             // watches live, as an editor's over ACP, or a chat app's is a
-            // person's to answer, as the window's is. Past once, what is
-            // still open was left on purpose. With no round or budget left,
-            // going on could only end an answered run at its limit.
+            // person's to answer, as the window's is. Past once for the same
+            // list, what is still open was left on purpose; one changed since
+            // to a list not sent before goes back too, which takes a `todo`
+            // call, and so a round, each time. One changed back to a list sent
+            // before does not, or a run flipping an item between pending and
+            // doing could be sent back until its rounds ran out. With no round
+            // or budget left, going on could only end an answered run at its
+            // limit.
             if mail.is_none()
                 && spec.depth == 0
                 && spec.connection.remote.is_none()
                 && spec.watch.is_none()
-                && !nudged
                 && report.rounds < spec.rounds
                 && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
                 && let Some(open) = open_checklist(
                     (spec.transcript.conversation.messages.get(begun..)).unwrap_or_default(),
                     &spec.transcript.conversation.todos,
                 )
+                && !nudged.contains(&open)
             {
-                nudged = true;
                 mail = inbox::fold(&[Notice {
                     from: "Letronna".into(),
                     when: When::Next,
-                    text: open,
+                    text: open.clone(),
                 }]);
+                nudged.push(open);
             }
             // An input never opened is likely part of the task dropped, so the
             // run goes on once more to read it or say why not; past once, what
@@ -3349,7 +3357,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_run_sent_back_once_for_its_checklist_may_then_end_with_items_open() {
+    fn a_run_sent_back_for_its_checklist_may_then_end_with_it_left_as_it_was() {
         let dir = scratch("waiting-items");
         let (endpoint, provider) = provider(vec![
             reply(
@@ -3375,6 +3383,70 @@ pub(crate) mod tests {
         );
         assert_eq!(sent.len(), 3);
         assert_eq!(checklist_notices(&sent[2]).len(), 1);
+    }
+
+    #[test]
+    fn a_checklist_changed_since_it_was_sent_back_sends_the_run_back_again() {
+        let dir = scratch("changed-items");
+        let (endpoint, provider) = provider(vec![
+            reply(
+                "",
+                &[checklist_of(&[
+                    ("item a", "done"),
+                    ("item b", "pending"),
+                    ("item c", "pending"),
+                ])],
+            ),
+            reply("A is done.", &[]),
+            reply(
+                "",
+                &[checklist_of(&[
+                    ("item a", "done"),
+                    ("item b", "done"),
+                    ("item c", "pending"),
+                ])],
+            ),
+            reply("B is done.", &[]),
+            reply("C waits for the user.", &[]),
+        ]);
+        let report = finished(own_run(endpoint, &dir, AGENTS + 505));
+        let sent = provider.sent();
+
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "C waits for the user.");
+        assert_eq!(sent.len(), 5);
+        assert_eq!(checklist_notices(&sent[2]).len(), 1);
+        assert_eq!(checklist_notices(&sent[4]).len(), 2);
+        let again = messages(&sent[4]).last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(again.contains("- item c (pending)"), "{again}");
+        assert!(!again.contains("item b (pending)"), "{again}");
+    }
+
+    #[test]
+    fn a_checklist_changed_back_to_one_sent_before_lets_the_run_end() {
+        let dir = scratch("flipped-items");
+        let (endpoint, provider) = provider(vec![
+            reply("", &[checklist_of(&[("item c", "pending")])]),
+            reply("C waits.", &[]),
+            reply("", &[checklist_of(&[("item c", "doing")])]),
+            reply("C needs a key.", &[]),
+            reply("", &[checklist_of(&[("item c", "pending")])]),
+            reply("C waits for the user.", &[]),
+        ]);
+        let report = finished(own_run(endpoint, &dir, AGENTS + 515));
+        let sent = provider.sent();
+
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "C waits for the user.");
+        assert_eq!(sent.len(), 6);
+        assert_eq!(checklist_notices(&sent[2]).len(), 1);
+        assert_eq!(checklist_notices(&sent[4]).len(), 2);
+        let again = messages(&sent[4]).last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(again.contains("- item c (doing)"), "{again}");
     }
 
     #[test]
