@@ -71,6 +71,7 @@ pub mod mcp_serve;
 pub mod media;
 pub mod memory;
 pub mod messaging;
+mod missing;
 pub mod models;
 mod notebook;
 pub mod notify;

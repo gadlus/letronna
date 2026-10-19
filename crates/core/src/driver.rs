@@ -79,6 +79,7 @@ use crate::inputs;
 use crate::judge;
 use crate::limits::{self, Permit};
 use crate::messaging::notify;
+use crate::missing::{self, Missing};
 use crate::permissions::{self, Rule};
 use crate::store::{Todo, Transcript};
 use crate::structured;
@@ -531,8 +532,11 @@ fn steps(
     let mut verified = false;
     // Before the first call, so a change any call makes shows.
     let kept = left_alone(spec);
+    // Before the first call too, so a file any call makes counts as made.
+    let noted = to_make(spec, contract);
     let began = SystemTime::now();
     let mut put_back = false;
+    let mut missed = false;
     let mut reworded = false;
     let mut swept = false;
     let mut listed = false;
@@ -751,6 +755,11 @@ fn steps(
                     let changed = unchanged::changed(&kept);
                     put_back = !changed.is_empty();
                     problems.extend(changed);
+                }
+                if !missed {
+                    let left = missing::unmade(&noted);
+                    missed = !left.is_empty();
+                    problems.extend(left);
                 }
                 if !problems.is_empty() {
                     // A notice, so nothing takes it for the user's words.
@@ -1326,6 +1335,33 @@ fn required(spec: &Spec) -> Contract {
         return Contract::default();
     }
     contract::from_request(&request.content, workspace)
+}
+
+/// The paths the request of a session's own run nobody watches names that
+/// are not there as it starts, leaving those `contract` asks for to it; none
+/// for a helper, a watched run, one that can make no file, or one mail
+/// started.
+fn to_make(spec: &Spec, contract: &Contract) -> Missing {
+    let Some(workspace) = &spec.connection.workspace else {
+        return Missing::default();
+    };
+    // A person reads a watched run's end, and sent back, a run in Plan mode
+    // or with no tool that makes a file could only be pointed at calls it
+    // may not make.
+    let makes = ["write_file", crate::patch::APPLY_PATCH, "run_command"];
+    let makes = || makes.iter().any(|name| refused(spec, name).is_none());
+    if !unwatched(spec) || spec.connection.plan || !spec.connection.tools || !makes() {
+        return Missing::default();
+    }
+    let messages = &spec.transcript.conversation.messages;
+    let own = messages.get(spec.from..).unwrap_or_default();
+    match own.iter().rfind(|message| chat::opens_turn(message)) {
+        // Mail, such as a job's output or a helper's report, is no request.
+        Some(request) if !request.notice => {
+            missing::from_request(&request.content, workspace, contract)
+        }
+        _ => Missing::default(),
+    }
 }
 
 /// The input files a session's own run is asked to read, as the request it
@@ -6296,6 +6332,109 @@ pub(crate) mod tests {
         let report = finished(spec);
         assert_eq!(report.status, Outcome::Done);
         assert_eq!(spent.sent().len(), 2);
+    }
+
+    /// A session's own run in `dir`, as `-p` runs it, asked for a program
+    /// that is not there yet.
+    fn asked_for_a_program(endpoint: String, dir: &Path, id: AgentId) -> Spec {
+        let mut spec = spec(endpoint, dir, id);
+        spec.depth = 0;
+        spec.decide = runs_everything();
+        spec.transcript.conversation.messages[0].content =
+            "Write a C program at src/greet.c that prints what notes.txt says.".into();
+        spec
+    }
+
+    /// The call that writes the program `asked_for_a_program` asks for.
+    fn write_greeting() -> (&'static str, Value) {
+        (
+            "write_file",
+            json!({"path": "src/greet.c", "content": "main"}),
+        )
+    }
+
+    #[test]
+    fn an_unwatched_run_that_ends_without_a_file_its_request_names_is_sent_back_once() {
+        let dir = scratch("unmade-named");
+        let (endpoint, provider) = provider(vec![
+            reply("Found the strings.", &[]),
+            reply("", &[write_greeting()]),
+            reply("Wrote src/greet.c.", &[]),
+        ]);
+        let report = finished(asked_for_a_program(endpoint, &dir, AGENTS + 1_600));
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "Wrote src/greet.c.");
+        let sent = provider.sent();
+
+        let notice =
+            contract::notice(
+                &["`src/greet.c` does not exist, though the request names it.".into()],
+            );
+        let last = messages(&sent[1]).last().unwrap();
+        assert_eq!(
+            (&last["role"], &last["content"]),
+            (&json!("user"), &json!(notice))
+        );
+        // Folded in as a notice, as the contract's own check is.
+        let saved = written(&dir.join("helper.jsonl"));
+        let check = saved
+            .iter()
+            .find(|record| record["content"].as_str() == Some(&notice))
+            .unwrap();
+        assert_eq!(
+            (&check["notice"], &check["folded"]),
+            (&json!(true), &json!(true))
+        );
+        assert!(dir.join("src/greet.c").exists());
+    }
+
+    #[test]
+    fn a_file_a_command_made_sends_no_run_back() {
+        let dir = scratch("unmade-made");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let (endpoint, provider) = provider(vec![
+            reply("", &[command("echo main > src/greet.c")]),
+            reply("Wrote src/greet.c.", &[]),
+        ]);
+        let report = finished(asked_for_a_program(endpoint, &dir, AGENTS + 1_610));
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(provider.sent().len(), 2);
+        assert_eq!(report.text, "Wrote src/greet.c.");
+    }
+
+    #[test]
+    fn a_run_sent_back_for_a_missing_file_is_not_sent_back_again() {
+        let dir = scratch("unmade-again");
+        let (endpoint, provider) = provider(vec![
+            reply("Found the strings.", &[]),
+            reply("The strings are all there is.", &[]),
+        ]);
+        let report = finished(asked_for_a_program(endpoint, &dir, AGENTS + 1_620));
+        // A third request would find no provider and fail the run.
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(provider.sent().len(), 2);
+        assert_eq!(report.text, "The strings are all there is.");
+    }
+
+    #[test]
+    fn a_watched_run_a_helper_or_one_that_can_make_no_file_is_not_sent_back_for_a_missing_file() {
+        for (id, change) in [
+            (
+                AGENTS + 1_630,
+                (|spec: &mut Spec| spec.connection.human = true) as fn(&mut Spec),
+            ),
+            (AGENTS + 1_640, |spec: &mut Spec| spec.depth = 1),
+            (AGENTS + 1_650, |spec: &mut Spec| {
+                spec.allow = Allow::Only(vec!["read_file".into(), "edit_file".into()]);
+            }),
+        ] {
+            let dir = scratch(&format!("unmade-untold-{id}"));
+            let (endpoint, provider) = provider(vec![reply("Found the strings.", &[])]);
+            let mut spec = asked_for_a_program(endpoint, &dir, id);
+            change(&mut spec);
+            assert_eq!(finished(spec).status, Outcome::Done, "{id}");
+            assert_eq!(provider.sent().len(), 1, "{id}");
+        }
     }
 
     /// A session's own run in `dir`, asked to read `in/brief.md` and

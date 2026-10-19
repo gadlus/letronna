@@ -392,6 +392,14 @@ pub(crate) struct Contract {
     outputs: Vec<Output>,
 }
 
+impl Contract {
+    /// Whether `word` names a file this asks for, as the request may write
+    /// it: from `workspace`, in full by any spelling of it, or by name.
+    pub(crate) fn covers(&self, word: &str, workspace: &Path) -> bool {
+        named(word, &self.outputs, workspace).is_some()
+    }
+}
+
 /// One file a request asks for, and what it spells out about the content.
 #[derive(Debug, PartialEq)]
 struct Output {
@@ -1178,6 +1186,81 @@ pub(crate) fn notice(problems: &[String]) -> String {
     text
 }
 
+/// The words of `text` with a folder in them that could name a file a run
+/// is to make: none inside code, a page quoted in or a diff pasted with no
+/// fence, under a heading such as "Read:" or an item such as "- Later:",
+/// after "e.g." in its sentence or straight after "not" or "no", or in a
+/// sentence that keeps its files out of the contract, or says they are
+/// optional or not needed. Line by line, so a caller with enough stops:
+/// a log pasted in may hold paths on every line, and reading a sentence for
+/// what keeps its files out takes a thousand looks.
+pub(crate) fn named_words(text: &str) -> impl Iterator<Item = &str> {
+    // Only here: leaving out more than the contract does costs no more than
+    // a check that never ran, while "Write out/a.json, optionally sorted"
+    // still asks the contract for its file.
+    const UNASKED: [&str; 2] = ["optionally", "no need for"];
+    let folder = |word: &str| word.contains(['/', '\\']);
+    // Whether the list going on is under a heading that keeps its files out.
+    let mut held = false;
+    // An item heading a list of its own that keeps it out: how far in it is.
+    let mut held_item: Option<usize> = None;
+    // Whether the lines going on are a hunk of a diff.
+    let mut hunk = false;
+    typed(text).into_iter().flat_map(move |line| {
+        let mut named = Vec::new();
+        // A diff's headers name the files it changes, and its hunks what
+        // they hold, which may be anything but a file to make.
+        let header = ["diff --git ", "--- ", "+++ "]
+            .iter()
+            .any(|mark| line.starts_with(mark));
+        let in_hunk = line.is_empty() || line.starts_with(['+', '-', ' ', '\\']);
+        hunk = line.starts_with("@@ ") || (hunk && in_hunk);
+        if header || hunk {
+            return named;
+        }
+        let trimmed = line.trim();
+        let indent = line.len() - line.trim_start().len();
+        // A line no further in than that item is past its list.
+        if held_item.is_some_and(|at| !trimmed.is_empty() && indent <= at) {
+            held_item = None;
+        }
+        let item = listed(line);
+        let nested = line.starts_with(char::is_whitespace);
+        let sentences = sentences(line);
+        // In bold or not, as "**Not yet:**" is.
+        let heading = trimmed.trim_end_matches(['*', '_']).ends_with(':');
+        let holding = heading
+            && sentences
+                .last()
+                .is_some_and(|&last| holds(last) || says(last, &UNASKED));
+        if !item && !nested && !trimmed.is_empty() {
+            held = holding;
+        } else if held || held_item.is_some() {
+            return named;
+        }
+        if item && holding {
+            held_item = Some(indent);
+        }
+        for sentence in sentences {
+            // Most sentences name no path, and need not be read.
+            if !words(sentence).any(folder) || left_out(sentence) || says(sentence, &UNASKED) {
+                continue;
+            }
+            let lower = sentence.to_ascii_lowercase();
+            let example = EXAMPLES.iter().filter_map(|words| lower.find(words)).min();
+            let before = &sentence[..example.unwrap_or(sentence.len())];
+            // As in "out/a.json but not out/b.json" or "no out/b.json".
+            let not = |previous: &str| ["not", "no"].contains(&previous.to_lowercase().as_str());
+            let lead = std::iter::once("").chain(words(before));
+            let kept = lead
+                .zip(words(before))
+                .filter(|&(previous, word)| folder(word) && !not(previous));
+            named.extend(kept.map(|(_, word)| word));
+        }
+        named
+    })
+}
+
 /// The records of CSV `text` as Python's csv module reads them, or the line
 /// a quote that is never closed opened on.
 fn records(text: &str) -> Result<Vec<Record>, usize> {
@@ -1407,7 +1490,7 @@ fn path_like(word: &str) -> bool {
 
 /// The words of `line` that could be paths or file names, with the
 /// markdown and punctuation around them taken off.
-fn words(line: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn words(line: &str) -> impl Iterator<Item = &str> {
     line.split(|c: char| c.is_whitespace() || "`\"'()[],;".contains(c))
         .map(|word| {
             word.trim_start_matches('*')
@@ -4610,6 +4693,101 @@ mod tests {
                 checked_reading(&HAZARDS, &request, &FINDINGS),
                 Vec::<String>::new()
             );
+        }
+    }
+
+    #[test]
+    fn named_words_leave_out_what_a_request_names_but_does_not_ask_for() {
+        let request = "Build the importer in src/importer.py and write its summary \
+                       to reports/summary.md, not reports/old.md.\n\
+                       Do not create reports/draft.md yet. reports/extra.md is optional.\n\
+                       Optionally, add a test in tests/test_importer.py. \
+                       There is no need for docs/usage.md.\n\
+                       Write each reply to replies/ (e.g. replies/002.txt).\n\
+                       Delete cache/old.db once the import works.\n\
+                       Read:\n- data/input.csv\n\n\
+                       Outputs:\n- reports/totals.csv\n- Later:\n  - reports/later.md\n\n\
+                       ```\nTraceback (most recent call last):\n  \
+                       File \"/usr/lib/python3/dist-packages/x.py\", line 3\n```\n\
+                       diff --git a/src/importer.py b/src/importer.py\n\
+                       --- a/src/importer.py\n\
+                       +++ b/src/importer.py\n\
+                       @@ -1,2 +1,3 @@\n \
+                       import csv\n\
+                       +rows = open(\"fixtures/sample.csv\")\n\n\
+                       Then save the log to logs/run.log.";
+        assert_eq!(
+            named_words(request).collect::<Vec<_>>(),
+            [
+                "src/importer.py",
+                "reports/summary.md",
+                "replies/",
+                "reports/totals.csv",
+                "logs/run.log",
+            ]
+        );
+    }
+
+    #[test]
+    fn named_words_keep_under_out_only_what_the_contract_asks_for() {
+        // The contract's own requests on files not to make, or to make later,
+        // each sentence asking for some; named_words may leave out more.
+        let requests = [
+            "Create out/state.json now.\n\n\
+             Do not create these yet:\n- out/final.json\n- out/ledger.csv\n\n\
+             Never write these files:\n- out/secret.json\n\n\
+             Don't create the following yet:\n1. out/later.json\n\n\
+             Outputs (create later, not now):\n- out/final2.json\n\n\
+             Create these in round 2, not now:\n- out/round2.json\n\n\
+             Outputs:\n- out/report.md",
+            "Create out/a.json. Don't make out/b.json yet.\n\
+             Do not generate out/c.md in this round. Never produce out/d.csv.\n\
+             Do not save anything to out/e.json, and do not overwrite out/f.json.\n\
+             Finish the run without creating out/g.json.\n\
+             Write out/x.csv without a BOM.\n\n\
+             Do not produce these files:\n- out/h.json\n- out/i.csv\n\n\
+             Outputs:\n- out/y.json\n\n\
+             **Do not create these yet:**\n- out/j.json\n\n\
+             Create:\n- out/z.json\n1. Do not create these yet:\n   - out/k.json\n\
+             - **Not yet** (round 2):\n  - out/l.json\n- out/w.json",
+            "Create out/a.json but not out/b.json, and out/c.json, not out/d.json.\n\
+             Write out/e.json only; no out/f.json.\n\
+             It is forbidden to write out/g.json. Dont create out/h.json.\n\
+             Do not, under any circumstances, write out/i.json.\n\
+             Do not ever write out/j.json. Do not try to create out/k.json.\n\
+             Finish while avoiding writing out/l.json. No need to create out/m.json.\n\
+             Do not forget to write out/n.json.\n\n\
+             Create:\n- out/o.json\n- Later:\n  - out/p.json\n- out/q.json\n\n\
+             Create these later:\n- out/r.json\n\n\
+             Write out/s.md, explaining:\n~~~\nWrite out/t.json\n~~~",
+            "Write out/a.json. Optionally, write out/b.json too.\n\
+             The report must not be written to out/c.txt; print it.\n\
+             The log must never be written to out/d.txt.\n\
+             Generate out/e.json but skip out/f.json.\n\
+             There is no need to write a out/g.md. There is no need for out/h.md.\n\
+             Write out/i.json.\n\n\
+             Optionally:\n- out/j.json\n\nOutputs:\n- out/k.json",
+        ];
+        for request in requests {
+            let contract = from_request(request, Path::new("/workspace"));
+            let asked = paths(&contract);
+            let unasked: Vec<&str> = named_words(request)
+                .filter(|word| word.starts_with("out/") && !asked.contains(word))
+                .collect();
+            assert_eq!(unasked, Vec::<&str>::new(), "{request}");
+        }
+    }
+
+    #[test]
+    fn a_contract_covers_each_spelling_of_a_file_it_asks_for() {
+        let dir = Scratch::new("contract-covers");
+        let contract = from_request("Write out/a.json and out/b.csv.", &dir);
+        let whole = format!("{}/out/a.json", dir.display()).replace('\\', "/");
+        for word in ["out/a.json", "./out/a.json", whole.as_str()] {
+            assert!(contract.covers(word, &dir), "{word}");
+        }
+        for word in ["out/c.json", "notes/a.json"] {
+            assert!(!contract.covers(word, &dir), "{word}");
         }
     }
 }
