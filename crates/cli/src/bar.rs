@@ -233,6 +233,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "show the project folder and session file",
     },
     Command {
+        name: "/copy",
+        blurb: "copy the last reply as written; /copy 2 the one before it",
+    },
+    Command {
         name: "/usage",
         blurb: "tokens and cost: this session, by day and by model",
     },
@@ -2080,13 +2084,9 @@ impl Bar {
             // what it does when there is nothing to copy.
             KeyCode::Char('c') if control && crate::screen::selecting() => {
                 if let Some(text) = crate::screen::selected() {
-                    let lines = text.lines().count();
-                    crate::screen::copy(&text);
+                    let took = crate::screen::copy(&text);
                     crate::screen::unselect();
-                    self.note = Some(format!(
-                        "copied {lines} line{}",
-                        if lines == 1 { "" } else { "s" }
-                    ));
+                    self.note = Some(copied(&text, took));
                 }
             }
             KeyCode::Char('c') if control => {
@@ -2335,12 +2335,8 @@ impl Bar {
                     return;
                 }
                 if let Some(text) = text {
-                    let lines = text.lines().count();
-                    crate::screen::copy(&text);
-                    self.note = Some(format!(
-                        "copied {lines} line{}  ·  ctrl-c copies again",
-                        if lines == 1 { "" } else { "s" }
-                    ));
+                    let took = crate::screen::copy(&text);
+                    self.note = Some(format!("{}  ·  ctrl-c copies again", copied(&text, took)));
                     self.settle();
                 }
             }
@@ -3109,6 +3105,17 @@ fn checklist(todos: &[Todo], room: usize) -> Vec<String> {
         lines.push(format!("{}{}", render::PAD, render::dim(&more)));
     }
     lines
+}
+
+/// What the footer says of a copy: copied, where the system's clipboard
+/// took it, and only handed to the terminal where nothing could say it did.
+pub fn copied(text: &str, took: bool) -> String {
+    let lines = text.lines().count().max(1);
+    let lines = format!("{lines} line{}", if lines == 1 { "" } else { "s" });
+    match took {
+        true => format!("copied {lines}"),
+        false => format!("{lines} sent to the terminal's clipboard"),
+    }
 }
 
 /// Typed text as the box draws it.

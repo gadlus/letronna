@@ -525,9 +525,70 @@ pub fn unselect() {
 
 /// Put text on the clipboard through the terminal, which works over ssh and
 /// through a multiplexer because the terminal at the far end does the work.
-pub fn copy(text: &str) {
+pub fn copy(text: &str) -> bool {
     print!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
     let _ = std::io::stdout().flush();
+    system_copy(text)
+}
+
+/// Hand `text` to the system's own clipboard command, the first of them
+/// here that takes it: pbcopy on macOS, clip on Windows, and wl-copy, xclip
+/// or xsel on Linux, which need a display to reach. The terminal's own way
+/// above is not taken up by every terminal -- Terminal.app ignores it,
+/// iTerm2 and tmux only with a setting -- and cannot say whether it was, so
+/// this is what says a copy took.
+fn system_copy(text: &str) -> bool {
+    use std::process::{Command, Stdio};
+    if over_ssh(|name| std::env::var_os(name)) {
+        return false;
+    }
+    let commands: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else if cfg!(windows) {
+        &[("clip.exe", &[])]
+    } else {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    };
+    // clip reads UTF-16 when the text says so, and the console's code page
+    // otherwise, which would mangle anything outside it.
+    let bytes: Vec<u8> = if cfg!(windows) {
+        [0xFF, 0xFE]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect()
+    } else {
+        text.as_bytes().to_vec()
+    };
+    for (program, args) in commands {
+        let spawned = Command::new(program)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut child) = spawned else {
+            continue;
+        };
+        let wrote = (child.stdin.take()).is_some_and(|mut stdin| stdin.write_all(&bytes).is_ok());
+        if child.wait().is_ok_and(|status| status.success()) && wrote {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether this runs in a session reached over ssh, as `var` reads the
+/// environment: there the system's clipboard is the far machine's, which
+/// pbcopy or xclip with X forwarding fill without the copy reaching the
+/// one at the keyboard, so only the terminal's own way can say it did.
+fn over_ssh(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    ["SSH_TTY", "SSH_CONNECTION"]
+        .iter()
+        .any(|name| var(name).is_some_and(|value| !value.is_empty()))
 }
 
 fn base64(bytes: &[u8]) -> String {
@@ -678,7 +739,13 @@ impl Screen {
         if start == end {
             return None;
         }
-        let mut out = Vec::new();
+        // What was written rather than how it is drawn: a line wrapped over
+        // several rows is one line again, without the indent the rows after
+        // its first hang from, and the margin or mark in front of a line --
+        // "    ", "  ● ", "  ⎿ " -- is left behind, so a command copied from
+        // an answer pastes as the one line it is.
+        let mut out = String::new();
+        let mut last_full = false;
         for row in start.0..=end.0 {
             let text = render::plain(self.rows.get(row).map(String::as_str).unwrap_or(""));
             let chars: Vec<char> = text.chars().collect::<Vec<char>>();
@@ -699,9 +766,41 @@ impl Screen {
                 .skip(from)
                 .take(to.saturating_sub(from))
                 .collect();
-            out.push(cut.trim_end().to_owned());
+            let starts_line = self.starts.binary_search(&row).is_ok() || row == 0;
+            let cut = match (starts_line, from) {
+                (true, 0) => unmarked(&cut).to_owned(),
+                (true, _) => cut,
+                (false, _) => cut.trim_start().to_owned(),
+            };
+            if row > start.0 {
+                // A row broken mid-word ran to the edge; any other broke at
+                // a space, which the break took.
+                match (starts_line, last_full) {
+                    (true, _) => out.push('\n'),
+                    (false, false) => out.push(' '),
+                    (false, true) => {}
+                }
+            }
+            last_full = chars.len() >= self.width as usize
+                && chars.last().is_some_and(|c| !c.is_whitespace());
+            out.push_str(cut.trim_end());
         }
-        Some(out.join("\n")).filter(|t| !t.trim().is_empty())
+        Some(out).filter(|t| !t.trim().is_empty())
+    }
+}
+
+/// A line as written, without the margin or the mark the conversation
+/// puts in front of it: four spaces, or two and a mark and a space.
+fn unmarked(row: &str) -> &str {
+    if let Some(rest) = row.strip_prefix(render::PAD) {
+        return rest;
+    }
+    let mut chars = row.char_indices();
+    match (chars.next(), chars.next(), chars.next(), chars.next()) {
+        (Some((_, ' ')), Some((_, ' ')), Some((_, mark)), Some((at, ' '))) if mark != ' ' => {
+            &row[at + 1..]
+        }
+        _ => row,
     }
 }
 
@@ -792,6 +891,57 @@ mod tests {
             .insert(1, Box::new(|width| vec!["x".repeat(width.min(6))]));
         assert_eq!(s.view(80)[..2], ["ab", "xxxxxx"]);
         assert_eq!(s.view(4)[..2], ["ab", "xxxx"]);
+    }
+
+    #[test]
+    fn copied_text_joins_wrapped_rows_without_marks() {
+        let mut s = Screen {
+            lines: vec![
+                "  ● the reply text that wraps across rows here".into(),
+                "    cargo build --release".into(),
+                "    fn main() {".into(),
+                "        run();".into(),
+                String::new(),
+            ],
+            rows: Vec::new(),
+            wrapped: 0,
+            width: 0,
+            scroll: 0,
+            painted_rows: 0,
+            chrome: Vec::new(),
+            from: None,
+            to: None,
+            open: false,
+            painted: Instant::now(),
+            blocks: HashMap::new(),
+            folds: HashMap::new(),
+            starts: Vec::new(),
+            shown: Vec::new(),
+            size: (0, 0),
+        };
+        let rows = s.view(20);
+        let last = rows.len() - 2;
+        s.from = Some((0, 0));
+        s.to = Some((last, rows[last].chars().count()));
+        assert_eq!(
+            s.selected().unwrap(),
+            "the reply text that wraps across rows here\ncargo build --release\nfn main() {\n    run();"
+        );
+    }
+
+    #[test]
+    fn a_copy_over_ssh_is_left_to_the_terminal() {
+        let given = |names: &'static [&'static str]| {
+            move |name: &str| {
+                names
+                    .contains(&name)
+                    .then(|| "10.0.0.2 51234 10.0.0.9 22".into())
+            }
+        };
+        assert!(super::over_ssh(given(&["SSH_CONNECTION"])));
+        assert!(super::over_ssh(given(&["SSH_TTY"])));
+        assert!(!super::over_ssh(given(&["TERM"])));
+        assert!(!super::over_ssh(|_| Some(std::ffi::OsString::new())));
     }
 
     #[test]

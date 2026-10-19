@@ -468,6 +468,10 @@ pub fn command(
             ));
             Flow::Handled
         }
+        "/copy" => {
+            copy_reply(runner, *session, rest);
+            Flow::Handled
+        }
         "/usage" => {
             usage(runner.store.conversations[*session].id);
             Flow::Handled
@@ -964,6 +968,43 @@ fn fallback(runner: &mut Runner, rest: &str) {
         "Asked in order once your model's own tries are spent. One that fails is passed over for {} minutes.",
         letronna_core::fallback::COOLDOWN.as_secs() / 60
     )));
+}
+
+/// Copy a reply as it was written, Markdown and all: the latest, or with a
+/// number the one that many back, as `/copy 2` takes the one before last.
+fn copy_reply(runner: &mut Runner, session: usize, rest: &str) {
+    let back = match rest.trim() {
+        "" => 1,
+        number => match number.parse::<usize>() {
+            Ok(back) if back > 0 => back,
+            _ => {
+                render::line(&render::dim(
+                    "/copy copies the last reply; /copy 2 the one before it.",
+                ));
+                return;
+            }
+        },
+    };
+    let messages = &runner.store.conversations[session].messages;
+    let Some(reply) = nth_reply(messages, back) else {
+        render::line(&render::dim(match back {
+            1 => "There is no reply to copy yet.",
+            _ => "There are not that many replies yet.",
+        }));
+        return;
+    };
+    let took = crate::screen::copy(reply);
+    render::blank();
+    render::line(&render::dim(&crate::bar::copied(reply, took)));
+}
+
+/// The text of the reply `back` from the latest, the latest being 1: what
+/// the model wrote for the user to read, not a step that only called tools.
+fn nth_reply(messages: &[Message], back: usize) -> Option<&str> {
+    (messages.iter().rev())
+        .filter(|m| m.role == "assistant" && !m.content.trim().is_empty())
+        .nth(back - 1)
+        .map(|m| m.content.as_str())
 }
 
 /// Run what was typed after `!` in the session's folder, through the tool
@@ -6197,6 +6238,26 @@ mod tests {
         assert_eq!(store.conversations[0].memory_scope, None);
         store.settings.memory_saving = Saving::Ask;
         assert_eq!(store.memory_saving(0), Saving::Ask);
+    }
+
+    #[test]
+    fn copy_two_takes_the_reply_before_last() {
+        let said = |role: &str, content: &str| letronna_core::chat::Message {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        };
+        let messages = [
+            said("user", "first"),
+            said("assistant", "the first answer"),
+            said("user", "second"),
+            said("assistant", ""),
+            said("tool", "ran"),
+            said("assistant", "the second answer"),
+        ];
+        assert_eq!(super::nth_reply(&messages, 1), Some("the second answer"));
+        assert_eq!(super::nth_reply(&messages, 2), Some("the first answer"));
+        assert_eq!(super::nth_reply(&messages, 3), None);
     }
 
     #[test]
