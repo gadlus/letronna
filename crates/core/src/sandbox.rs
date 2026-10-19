@@ -31,7 +31,8 @@ pub trait Sandbox: Sync {
     /// Whether commands can be confined here at all.
     fn available(&self) -> bool;
     /// What to spawn in place of `command` so that it runs held to `policy`,
-    /// with the same arguments, variables and folder.
+    /// with the same arguments, variables and folder, and with Ctrl-C and
+    /// Ctrl-\ at their defaults as `tools::shell` starts it.
     fn wrap(&self, command: &Command, policy: &Policy) -> Result<Command, String>;
 }
 
@@ -227,6 +228,10 @@ impl Sandbox for Seatbelt {
         if let Some(dir) = command.get_current_dir() {
             wrapped.current_dir(dir);
         }
+        // What `command` runs between fork and exec is not copied, so Ctrl-C
+        // and Ctrl-\ go back to their defaults here as `tools::shell` sets them.
+        #[cfg(unix)]
+        crate::tools::interruptible(&mut wrapped);
         Ok(wrapped)
     }
 }

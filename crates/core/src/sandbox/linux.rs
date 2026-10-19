@@ -333,6 +333,13 @@ mod kernel {
             Ok(())
         };
         unsafe { wrapped.pre_exec(hold) };
+        // What `command` runs between fork and exec is not copied, so Ctrl-C
+        // and Ctrl-\ go back to their defaults here as `tools::shell` sets them.
+        // Only once `hold` has given it a session of its own: before that it
+        // is briefly in Letronna's group, where a Ctrl-C at Letronna's
+        // terminal would reach it. Neither Landlock nor the filter refuses
+        // the change.
+        crate::tools::interruptible(&mut wrapped);
         Ok(wrapped)
     }
 
@@ -564,6 +571,27 @@ mod kernel {
             assert_eq!(String::from_utf8_lossy(&ran.stdout), "original");
             let ran = run(&dir, "/bin/sh", "ls ..");
             assert!(String::from_utf8_lossy(&ran.stdout).contains("outside.txt"));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn a_confined_command_can_be_interrupted_though_letronna_ignores_ctrl_c() {
+            use crate::cancel::tests::{INTERRUPTS_ITSELF, ignoring_interrupts};
+            use std::os::unix::process::ExitStatusExt;
+            if !usable() {
+                return;
+            }
+            let dir = tree("interrupted");
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", INTERRUPTS_ITSELF])
+                .current_dir(dir.join("project"));
+            let policy = policy(&dir);
+            let mut confined = confine(&command, &policy, &policy.hidden).unwrap();
+            confined.stdin(std::process::Stdio::null());
+            let ran = ignoring_interrupts(|| confined.output()).unwrap();
+            assert_eq!(String::from_utf8_lossy(&ran.stdout), "quit\n", "{ran:?}");
+            assert_eq!(ran.status.signal(), Some(libc::SIGINT), "{ran:?}");
             std::fs::remove_dir_all(dir).unwrap();
         }
 

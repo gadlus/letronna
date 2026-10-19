@@ -242,9 +242,46 @@ pub fn on_interrupt(cancel: Cancel) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// Held by every test that changes what a signal does to this process:
+    /// that is one setting for the whole process, and tests run side by side.
+    #[cfg(unix)]
+    pub(crate) static SIGNALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// What `run` gives with Ctrl-C and Ctrl-\ ignored by this process, as a
+    /// script's `&` starts a program.
+    #[cfg(unix)]
+    pub(crate) fn ignoring_interrupts<T>(run: impl FnOnce() -> T) -> T {
+        /// What the two signals did before, set back when this is dropped,
+        /// so a `run` that panics leaves the other tests as they were.
+        struct Was([(libc::c_int, libc::sighandler_t); 2]);
+        impl Drop for Was {
+            fn drop(&mut self) {
+                for (signal, was) in self.0 {
+                    // SAFETY: as where it was taken.
+                    unsafe { libc::signal(signal, was) };
+                }
+            }
+        }
+        let _signals = SIGNALS.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: these only change what the two signals do to this test
+        // process, and every other test that does so waits for the lock.
+        let _was = Was([libc::SIGINT, libc::SIGQUIT]
+            .map(|signal| (signal, unsafe { libc::signal(signal, libc::SIG_IGN) })));
+        run()
+    }
+
+    /// A shell line that sends itself Ctrl-\ and then Ctrl-C, which prints
+    /// `quit` and ends at the Ctrl-C where both are at their defaults, and
+    /// prints `survived` where they are ignored. A shell cannot trap a signal
+    /// it started with ignored, and bash ignores Ctrl-\ itself, so that one
+    /// is caught to show it was not.
+    #[cfg(unix)]
+    pub(crate) const INTERRUPTS_ITSELF: &str =
+        "trap 'echo quit' QUIT; kill -QUIT $$; kill -INT $$; echo survived";
 
     fn counter(ran: &Arc<AtomicUsize>) -> impl FnOnce() + Send + 'static {
         let ran = ran.clone();
@@ -316,6 +353,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_ctrl_c_sigterm_or_hangup_sets_the_token_unless_it_was_ignored() {
+        let _signals = SIGNALS.lock().unwrap_or_else(|e| e.into_inner());
         let signals = [
             ("Ctrl-C", libc::SIGINT, true),
             ("SIGTERM", libc::SIGTERM, true),

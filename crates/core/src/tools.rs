@@ -1812,6 +1812,13 @@ fn shell_over(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
+    // A script's `&` starts Letronna with Ctrl-C and Ctrl-\ ignored, and an
+    // ignored signal stays ignored through exec, so no command could be
+    // interrupted even on purpose: Python would not raise KeyboardInterrupt.
+    // Each command leads a group or session of its own, so a Ctrl-C at
+    // Letronna's terminal still never reaches it.
+    #[cfg(unix)]
+    interruptible(&mut cmd);
     // A line that only reads runs without asking, so a repository cannot be
     // left to pick a program for its `git status` to run.
     let risk = crate::command::assess(command, crate::command::Dialect::here(), cwd).risk;
@@ -1819,6 +1826,23 @@ fn shell_over(
         cmd.envs(crate::command::GUARDS.iter().copied());
     }
     cmd
+}
+
+/// Starts `cmd` with Ctrl-C and Ctrl-\ at their defaults, whatever Letronna
+/// itself was started with.
+#[cfg(unix)]
+pub(crate) fn interruptible(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: signal is async-signal-safe, and between fork and exec it
+    // changes only the child.
+    unsafe {
+        cmd.pre_exec(|| {
+            for signal in [libc::SIGINT, libc::SIGQUIT] {
+                libc::signal(signal, libc::SIG_DFL);
+            }
+            Ok(())
+        });
+    }
 }
 
 /// Whether commands run in bash rather than sh: on Unix, wherever bash is on
@@ -6161,6 +6185,16 @@ mod tests {
             ..one
         });
         assert_eq!(set(shell("exit", None)), [""; 4]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_can_be_interrupted_though_letronna_was_started_ignoring_ctrl_c() {
+        use crate::cancel::tests::{INTERRUPTS_ITSELF, ignoring_interrupts};
+        use std::os::unix::process::ExitStatusExt;
+        let ran = ignoring_interrupts(|| shell(INTERRUPTS_ITSELF, None).output()).unwrap();
+        assert_eq!(String::from_utf8_lossy(&ran.stdout), "quit\n", "{ran:?}");
+        assert_eq!(ran.status.signal(), Some(libc::SIGINT), "{ran:?}");
     }
 
     /// Process substitution fails in dash and in the sh of macOS alike, so

@@ -82,6 +82,9 @@ mod tests {
 
     #[test]
     fn ctrl_c_passes_by_while_held_and_is_handled_as_before_after() {
+        let _signals = crate::cancel::tests::SIGNALS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let before = unsafe { libc::signal(libc::SIGQUIT, libc::SIG_DFL) };
         {
             let _held = Held::take();

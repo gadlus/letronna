@@ -948,6 +948,10 @@ fn spawn(hook: &Hook, input: &str, ctx: &ToolContext) -> Result<Ran, String> {
                 command.current_dir(dir);
             }
             no_window(&mut command);
+            // Started with no shell, it would keep the ignored Ctrl-C and
+            // Ctrl-\ that `tools::shell` sets back to their defaults.
+            #[cfg(unix)]
+            crate::tools::interruptible(&mut command);
             command
         }
         None => crate::tools::shell(&shell_line(&hook.command, windows), cwd),
@@ -1285,6 +1289,23 @@ mod tests {
             heard.problems.is_empty() && heard.blocks.is_empty(),
             "{heard:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_started_without_a_shell_can_be_interrupted_though_letronna_ignores_ctrl_c() {
+        use crate::cancel::tests::{INTERRUPTS_ITSELF, ignoring_interrupts};
+        let dir = scratch("interrupted");
+        let command = script(&dir, "interrupted", INTERRUPTS_ITSELF);
+        assert!(argv(&command, false).is_some(), "`{command}` needs a shell");
+        let hook = Hook {
+            kind: "command".into(),
+            command,
+            timeout: None,
+        };
+        let ran = ignoring_interrupts(|| spawn(&hook, "{}", &ToolContext::default())).unwrap();
+        assert_eq!(ran.stdout, "quit\n");
+        assert_eq!(ran.code, None, "it was not killed by the Ctrl-C");
     }
 
     #[test]
