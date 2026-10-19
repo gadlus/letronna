@@ -18,9 +18,9 @@
 //! session's own agent that changed source after its last passing
 //! build or test is sent back once to run one, naming the files. So is one
 //! whose files repeat words of an instruction planted in what it read, to
-//! reword them (`echo`), and one nobody watches that changed source for a
-//! request stating several requirements, quoted back to it to check each
-//! (`requirements`).
+//! reword them (`echo`), and one nobody watches that changed source, or a
+//! file its request names, for a request stating several requirements,
+//! quoted back to it to check each (`requirements`).
 //!
 //! A frontend that shows the run as it goes, as an editor does over ACP,
 //! gives it a `Watch`, which hears each step as it is made. A run that is a
@@ -725,7 +725,7 @@ fn steps(
             if !listed
                 && report.rounds < spec.rounds
                 && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
-                && let Some(notice) = requirements(spec, turn, &report.files)
+                && let Some(notice) = requirements(spec, turn, &report.files, began)
             {
                 listed = true;
                 spec.transcript.conversation.messages.push(notice);
@@ -1844,9 +1844,15 @@ fn crash_dumps(spec: &Spec, turn: &Turn, began: SystemTime) -> Option<Message> {
 }
 
 /// The notice sending a session's own run nobody watches back once to check
-/// the source it changed, `written` among its files, against each
-/// requirement sentence of its request, when the request states enough.
-fn requirements(spec: &Spec, turn: &Turn, written: &[String]) -> Option<Message> {
+/// against each requirement sentence of its request, when the request states
+/// enough, the source it changed, `written` among its files, or else the
+/// files the request names that changed since the run began at `began`.
+fn requirements(
+    spec: &Spec,
+    turn: &Turn,
+    written: &[String],
+    began: SystemTime,
+) -> Option<Message> {
     // A helper's work is its parent's to judge, a person reads a watched
     // run's end, and past the round cap or in plan mode nothing can be run.
     if !unwatched(spec) || turn.capped().is_some() || !turn.runs_commands() {
@@ -1855,27 +1861,38 @@ fn requirements(spec: &Spec, turn: &Turn, written: &[String]) -> Option<Message>
     if refused(spec, "run_command").is_some() {
         return None;
     }
-    // Only a change to source is checked by running it, so a run that
-    // wrote only reports or data is left alone.
-    if !written.iter().any(|file| code(file)) {
-        return None;
-    }
     let own = (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
     let request = own.iter().rfind(|message| chat::opens_turn(message))?;
     // Mail, such as a job's output, is no request.
     if request.notice {
         return None;
     }
-    let found = crate::requirements::sentences(crate::references::typed(&request.content));
+    let typed = crate::references::typed(&request.content);
+    let found = crate::requirements::sentences(typed);
     if found.len() < crate::requirements::FEWEST {
         return None;
+    }
+    // A run that changed no source is checked on what it made of the files
+    // its request names, whichever tool or command wrote them; a report or
+    // data it was not asked for is left alone.
+    let mut outputs = Vec::new();
+    if !written.iter().any(|file| code(file)) {
+        let workspace = spec.connection.workspace.as_deref()?;
+        outputs = crate::requirements::outputs(typed, workspace, began);
+        if outputs.is_empty() {
+            return None;
+        }
+        // A script it was asked for is checked by running it, as a change is.
+        if outputs.iter().any(|file| code(file)) {
+            outputs.clear();
+        }
     }
     // A helper reads the request afresh, where one is allowed and the run
     // has the time and tokens left for its review and the fix after it.
     let review = refused(spec, "agent").is_none() && affords_review(spec);
     Some(Message {
         role: "user".into(),
-        content: crate::requirements::notice(&found, review),
+        content: crate::requirements::notice(&found, review, &outputs),
         notice: true,
         // Folded into the run, so the window keeps the task it is for.
         folded: true,
@@ -5700,7 +5717,7 @@ pub(crate) mod tests {
         let asked = requirements_asked("requirements", AGENTS + 1_700, |_| {});
         assert_eq!(
             asked,
-            crate::requirements::notice(&STATED.map(String::from), true)
+            crate::requirements::notice(&STATED.map(String::from), true, &[])
         );
     }
 
@@ -5711,7 +5728,7 @@ pub(crate) mod tests {
         });
         assert_eq!(
             asked,
-            crate::requirements::notice(&STATED.map(String::from), false)
+            crate::requirements::notice(&STATED.map(String::from), false, &[])
         );
     }
 
@@ -5725,17 +5742,17 @@ pub(crate) mod tests {
         let near = requirements_asked("requirements-near-deadline", AGENTS + 1_770, |spec| {
             spec.connection.deadline = Some(Instant::now() + time - Duration::from_secs(60));
         });
-        assert_eq!(near, crate::requirements::notice(&stated, false));
+        assert_eq!(near, crate::requirements::notice(&stated, false, &[]));
         let spent = requirements_asked("requirements-low-budget", AGENTS + 1_780, |spec| {
             spec.budget = Some(Arc::new(Budget::new(tokens - 1, None)));
         });
-        assert_eq!(spent, crate::requirements::notice(&stated, false));
+        assert_eq!(spent, crate::requirements::notice(&stated, false, &[]));
         // With both to spare, it is.
         let ample = requirements_asked("requirements-ample", AGENTS + 1_790, |spec| {
             spec.connection.deadline = Some(Instant::now() + 2 * time);
             spec.budget = Some(Arc::new(Budget::new(2 * tokens, None)));
         });
-        assert_eq!(ample, crate::requirements::notice(&stated, true));
+        assert_eq!(ample, crate::requirements::notice(&stated, true, &[]));
     }
 
     #[test]
@@ -5825,6 +5842,94 @@ pub(crate) mod tests {
 
         assert!(dir.join("made.rs").exists());
         assert_eq!(report.text, "Added parse_range.");
+    }
+
+    /// A request stating four rules of a file the run is to write.
+    const REPORTED: &str = "Write the orders to `report.csv`, one order a row. \
+        Each row must hold the order's id and its amount. \
+        Rows should be sorted by date, oldest first. \
+        Amounts must be written in whole cents.";
+
+    #[test]
+    fn an_unwatched_run_whose_command_wrote_a_named_file_is_sent_back_to_check_it() {
+        let _data = data("requirements-output");
+        let dir = scratch("requirements-output");
+        let answers = vec![
+            reply("", &[command("echo id,cents > report.csv")]),
+            reply("Wrote the report.", &[]),
+            reply("Each rule holds.", &[]),
+        ];
+        let (spec, provider) = specified(&dir, AGENTS + 1_560, REPORTED, answers);
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        let asked = messages(&sent[2]).last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        let rules = crate::requirements::sentences(REPORTED);
+        let made = ["report.csv".to_owned()];
+        assert_eq!(asked, crate::requirements::notice(&rules, true, &made));
+        assert_eq!(report.text, "Each rule holds.");
+    }
+
+    #[test]
+    fn a_file_the_request_names_but_the_run_left_alone_sends_no_run_back() {
+        let _data = data("requirements-output-kept");
+        let dir = scratch("requirements-output-kept");
+        std::fs::write(dir.join("report.csv"), "id,cents\n").unwrap();
+        // A file the request does not name is the run's own scratch.
+        let answers = vec![
+            reply("", &[command("echo draft > scratch.txt")]),
+            reply("The report already holds every order.", &[]),
+        ];
+        let (spec, provider) = specified(&dir, AGENTS + 1_570, REPORTED, answers);
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        provider.sent();
+
+        assert!(dir.join("scratch.txt").exists());
+        assert_eq!(report.text, "The report already holds every order.");
+    }
+
+    #[test]
+    fn a_request_stating_few_requirements_sends_no_run_back_for_a_file_it_names() {
+        let _data = data("requirements-output-few");
+        let dir = scratch("requirements-output-few");
+        let request = "Write the orders to `report.csv`. Amounts must be in whole cents.";
+        let answers = vec![
+            reply("", &[command("echo id,cents > report.csv")]),
+            reply("Wrote the report.", &[]),
+        ];
+        let (spec, provider) = specified(&dir, AGENTS + 1_580, request, answers);
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        provider.sent();
+
+        assert!(dir.join("report.csv").exists());
+        assert_eq!(report.text, "Wrote the report.");
+    }
+
+    #[test]
+    fn a_script_the_request_names_is_checked_as_a_change_whatever_wrote_it() {
+        let _data = data("requirements-script");
+        let dir = scratch("requirements-script");
+        let request = REPORTED.replace("Write the orders to `report.csv`", "Write `orders.py`");
+        let answers = vec![
+            reply("", &[command("echo pass > orders.py")]),
+            reply("Wrote the script.", &[]),
+            reply("Each rule holds.", &[]),
+        ];
+        let (spec, provider) = specified(&dir, AGENTS + 1_590, &request, answers);
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        let asked = messages(&sent[2]).last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        let rules = crate::requirements::sentences(&request);
+        assert_eq!(asked, crate::requirements::notice(&rules, true, &[]));
     }
 
     #[test]

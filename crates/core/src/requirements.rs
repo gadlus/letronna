@@ -22,6 +22,17 @@
 //! a stop outside a code span and not after an abbreviation such as "e.g.".
 //! The bar is a few such sentences, so a short request or a bug report,
 //! which the notice to run a build or test covers, costs nothing.
+//!
+//! A run whose work is a file the request names rather than source, such as
+//! a table a command wrote, is sent back the same way to check that file
+//! with a script written for the check alone, since its own check tends to
+//! reuse the code that made the file, and a mistake there agrees with
+//! itself. Only the words of the request that read as a file's name or path
+//! are looked up, never the folder walked, and only a file changed since the
+//! run began counts.
+
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Requirement sentences a notice quotes: past this many the list is a
 /// second copy of the request, so it says how many more there are instead.
@@ -34,8 +45,8 @@ pub(crate) const FEWEST: usize = 4;
 
 /// What a run that can start a helper is told first after the sentences: a
 /// helper that has not seen the work reads the request afresh, where the
-/// run itself tends to check only the paths it built.
-const REVIEW: &str = "First ask a helper that hasn't seen your work: with the agent tool, start a review helper and wait for its report. Give it the request word for word and the files you changed, and ask it to try each behaviour the request states against your change and report every one that fails, with the command that shows it, changing no file. Check what it reports along with the list.";
+/// run itself tends to check only the paths it built, with its own code.
+const REVIEW: &str = "First ask a helper that hasn't seen your work: with the agent tool, start a review helper and wait for its report. Give it the request word for word and the files you changed or made, and ask it to try each behaviour the request states against your work and report every one that fails, with the command that shows it, changing no file, and to work out each value it checks with code of its own, not your scripts or helpers. Check what it reports along with the list.";
 
 /// The least time a run with a deadline needs left to be asked for the
 /// review: the helper takes a few minutes, and the run about as long again
@@ -49,6 +60,18 @@ pub(crate) const REVIEW_TOKENS: u64 = crate::agents::BUDGET;
 
 /// What the run is told after the sentences.
 const CHECK: &str = "These are picked by their wording, so read the request once more for any behaviour it states that the list leaves out. For each, run or write a quick test that shows it holds through the entry point a caller uses, end to end, not only by reading internal state, minding exact messages, strings and orderings. A behaviour tied to an event, such as something being demoted, closed or removed, holds on every call that can cause that event, not only the one the sentence names: find each and test it. Where a sentence names several cases or inputs, try each one in every form it could be written, including any your parser or code might reject before it reaches your new check. A class, function or file the request names that the project already has is the one to change, unless the request asks for a new one: find it and extend it rather than making a new one of that name beside it. Fix any that fail; skip one that only gives background or the old behaviour. Remove any script or test you added only for this check, unless the task asks for tests. Only your last message is passed on as your answer, so end with your whole answer again, not only what changed.";
+
+/// What a run whose work is files the request names is told after the
+/// sentences, in place of `CHECK`.
+const CHECK_OUTPUT: &str = "These are picked by their wording, so read the request once more for any rule it states that the list leaves out. Check each against what the files named above hold now, with a short new script that reads only those files and the task's inputs and works out every value it compares itself, reusing none of the scripts or helper functions that made them, since a mistake there would agree with itself. Print only what fails, never a large file whole. Fix any that fail, then delete the check script. Only your last message is passed on as your answer, so end with your whole answer again, not only what changed.";
+
+/// Files the notice for outputs names: the first few are enough to find the
+/// rest by.
+const NAMED: usize = 5;
+
+/// Words of a request that read as a file's name or path looked up at most,
+/// so a request listing a whole tree costs a few dozen looks.
+const LOOKED: usize = 64;
 
 /// Words and phrases that make a sentence a requirement, in lower case.
 const MARKERS: &[&str] = &[
@@ -239,11 +262,16 @@ pub(crate) fn sentences(request: &str) -> Vec<String> {
 
 /// What sends a run back to check its change against `sentences`, the
 /// first `LISTED` of them quoted, asked first for a helper's review when it
-/// can `review`.
-pub(crate) fn notice(sentences: &[String], review: bool) -> String {
+/// can `review`; or, where its work is `outputs`, files the request names,
+/// to check those with a script of its own.
+pub(crate) fn notice(sentences: &[String], review: bool, outputs: &[String]) -> String {
     let brand = crate::BRAND;
+    let work = match outputs {
+        [] => "your change".to_owned(),
+        _ => files(outputs),
+    };
     let mut text = format!(
-        "[{brand} check] Before ending, check your change against each requirement the request states:"
+        "[{brand} check] Before ending, check {work} against each requirement the request states:"
     );
     for sentence in sentences.iter().take(LISTED) {
         text.push_str(&format!("\n- {sentence}"));
@@ -259,8 +287,79 @@ pub(crate) fn notice(sentences: &[String], review: bool) -> String {
         text.push_str(REVIEW);
         text.push(' ');
     }
-    text.push_str(CHECK);
+    text.push_str(if outputs.is_empty() {
+        CHECK
+    } else {
+        CHECK_OUTPUT
+    });
     text
+}
+
+/// `outputs` as a notice names them: "`a`", "`a` and `b`", or the first
+/// `NAMED` and how many more.
+fn files(outputs: &[String]) -> String {
+    let shown: Vec<String> = (outputs.iter().take(NAMED))
+        .map(|file| format!("`{file}`"))
+        .collect();
+    match shown.split_last() {
+        Some((last, [])) => last.clone(),
+        Some(_) if outputs.len() > NAMED => {
+            let more = outputs.len() - NAMED;
+            let noun = if more == 1 { "file" } else { "files" };
+            format!("{} and {more} more {noun}", shown.join(", "))
+        }
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
+/// The files `request` names by a path or a file's name that were changed
+/// after `since`, each once and as the request first writes it: a relative
+/// path or a name is looked for in `workspace`, an absolute path where it
+/// points.
+pub(crate) fn outputs(request: &str, workspace: &Path, since: SystemTime) -> Vec<String> {
+    let mut looked: Vec<&str> = Vec::new();
+    let mut found: Vec<(String, PathBuf)> = Vec::new();
+    for word in crate::inputs::words(request).filter(|word| filelike(word)) {
+        if looked.contains(&word) {
+            continue;
+        }
+        if looked.len() == LOOKED {
+            break;
+        }
+        looked.push(word);
+        // Before looking, which on Windows signs in to a share it names.
+        if crate::paths::unsafe_raw(word, Some(workspace)).is_some() {
+            continue;
+        }
+        let path = workspace.join(word);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || !meta.modified().is_ok_and(|at| at > since) {
+            continue;
+        }
+        // `out.csv`, `./out.csv` and its full path are one file.
+        let path = path.canonicalize().unwrap_or(path);
+        if !found.iter().any(|(_, seen)| *seen == path) {
+            found.push((word.to_owned(), path));
+        }
+    }
+    found.into_iter().map(|(word, _)| word).collect()
+}
+
+/// Whether `word` reads as a file's path or name, such as `out/a.csv` or
+/// `report.json`, rather than a plain word, a number or a web address.
+fn filelike(word: &str) -> bool {
+    if word.contains("://") {
+        return false;
+    }
+    let extension = word.rsplit_once('.').map(|(_, extension)| extension);
+    word.contains(['/', '\\'])
+        || extension.is_some_and(|extension| {
+            extension.chars().all(char::is_alphanumeric)
+                && extension.chars().any(char::is_alphabetic)
+        })
 }
 
 /// The blocks of prose in `request`, its lines joined, with code, console
@@ -505,6 +604,7 @@ fn bullet(line: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn sentences_that_state_what_must_hold_are_kept_in_order() {
@@ -647,12 +747,92 @@ mod tests {
         let all: Vec<String> = (1..=LISTED + 3)
             .map(|n| format!("Rule {n} must hold."))
             .collect();
-        let text = notice(&all, false);
+        let text = notice(&all, false, &[]);
         assert!(text.starts_with("[Letronna check] Before ending, check your change"));
         assert!(text.contains(&format!("\n- Rule {LISTED} must hold.\n")));
         assert!(!text.contains(&format!("Rule {} must", LISTED + 1)));
         assert!(text.contains("\n- and 3 more in the request; check those too.\n"));
         assert!(text.ends_with(CHECK) && !text.contains(REVIEW));
-        assert!(notice(&all, true).ends_with(&format!("\n{REVIEW} {CHECK}")));
+        assert!(notice(&all, true, &[]).ends_with(&format!("\n{REVIEW} {CHECK}")));
+    }
+
+    #[test]
+    fn the_notice_for_outputs_names_them_and_says_to_check_them_with_new_code() {
+        let rules = ["Rows must be sorted by date.".to_owned()];
+        let outputs = |count: usize| -> Vec<String> {
+            (1..=count).map(|n| format!("out/part{n}.csv")).collect()
+        };
+        let text = notice(&rules, false, &outputs(1));
+        assert_eq!(
+            text,
+            format!(
+                "[Letronna check] Before ending, check `out/part1.csv` against each requirement \
+                 the request states:\n- Rows must be sorted by date.\n{CHECK_OUTPUT}"
+            )
+        );
+        let two = notice(&rules, true, &outputs(2));
+        assert!(
+            two.contains("check `out/part1.csv` and `out/part2.csv` against"),
+            "{two}"
+        );
+        assert!(
+            two.ends_with(&format!("\n{REVIEW} {CHECK_OUTPUT}")),
+            "{two}"
+        );
+        let many = notice(&rules, false, &outputs(NAMED + 2));
+        let shown = "`out/part1.csv`, `out/part2.csv`, `out/part3.csv`, `out/part4.csv`, \
+                     `out/part5.csv` and 2 more files against";
+        assert!(many.contains(shown), "{many}");
+        let one_more = notice(&rules, false, &outputs(NAMED + 1));
+        assert!(
+            one_more.contains("`out/part5.csv` and 1 more file against"),
+            "{one_more}"
+        );
+    }
+
+    /// Sets when `file` was last changed.
+    fn changed_at(file: &Path, at: SystemTime) {
+        let file = std::fs::File::options().write(true).open(file).unwrap();
+        file.set_modified(at).unwrap();
+    }
+
+    #[test]
+    fn outputs_are_the_files_a_request_names_that_changed_since_the_run_began() {
+        let dir = crate::store::tests::Scratch::new("requirements-outputs");
+        let elsewhere = crate::store::tests::Scratch::new("requirements-outputs-elsewhere");
+        let since = SystemTime::now();
+        let (before, after) = (
+            since - Duration::from_secs(3600),
+            since + Duration::from_secs(5),
+        );
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        for (file, at) in [
+            ("params.txt", after),
+            ("out/table.csv", after),
+            ("input.json", before),
+            ("scratch.txt", after),
+            ("results", after),
+        ] {
+            std::fs::write(dir.join(file), "made").unwrap();
+            changed_at(&dir.join(file), at);
+        }
+        let summary = elsewhere.join("summary.md");
+        std::fs::write(&summary, "made").unwrap();
+        changed_at(&summary, after);
+        let request = format!(
+            "Fit the curve to input.json and save its parameters to **`params.txt`**. Put the \
+             table in out/table.csv, a summary at {}, and the results in results. \
+             Check ./params.txt and {} once more, and see https://example.com/out/table.csv.",
+            summary.display(),
+            dir.join("params.txt").display()
+        );
+        assert_eq!(
+            outputs(&request, &dir, since),
+            [
+                "params.txt".to_owned(),
+                "out/table.csv".to_owned(),
+                summary.display().to_string(),
+            ]
+        );
     }
 }

@@ -34,19 +34,7 @@ pub(crate) fn named(request: &str, workspace: &Path) -> Vec<String> {
         return Vec::new();
     };
     let mut found = Vec::new();
-    for word in request.split(|c: char| c.is_whitespace() || AROUND.contains(&c)) {
-        // `@` put the file into the message already.
-        if word.starts_with('@') {
-            continue;
-        }
-        // Markdown's bold and a sentence's end are no part of the path.
-        let word = word
-            .trim_start_matches('*')
-            .trim_end_matches(['*', '.', ':', '!', '?']);
-        // Which files a wildcard means is the run's to find out.
-        if word.contains(['*', '?']) {
-            continue;
-        }
+    for word in words(request) {
         if let Some(path) = input(word, workspace, &root)
             && !found.contains(&path)
         {
@@ -54,6 +42,22 @@ pub(crate) fn named(request: &str, workspace: &Path) -> Vec<String> {
         }
     }
     found
+}
+
+/// The words of `request` that may be paths, without the markdown or the
+/// sentence's end around them, leaving out wildcards and `@` references.
+pub(crate) fn words(request: &str) -> impl Iterator<Item = &str> {
+    request
+        .split(|c: char| c.is_whitespace() || AROUND.contains(&c))
+        // `@` put the file into the message already.
+        .filter(|word| !word.starts_with('@'))
+        // Markdown's bold and a sentence's end are no part of the path.
+        .map(|word| {
+            word.trim_start_matches('*')
+                .trim_end_matches(['*', '.', ':', '!', '?'])
+        })
+        // Which files a wildcard means is the run's to find out.
+        .filter(|word| !word.contains(['*', '?']))
 }
 
 /// Where `word` lies inside `root`, the canonical `workspace`, when it names
