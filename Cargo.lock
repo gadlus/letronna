@@ -4374,6 +4374,7 @@ dependencies = [
  "objc2 0.6.4",
  "ring",
  "serde_json",
+ "unicode-width",
  "windows 0.61.3",
 ]
 

@@ -875,6 +875,8 @@ pub struct Bar {
     added: Added,
     /// The open session's project folder, where an `@` path is completed.
     folder: Option<std::path::PathBuf>,
+    /// How far back the view was when the footer last said so.
+    back: usize,
     /// Whether the keys are shown over the box, as `?` on an empty line
     /// asks, until the next key.
     keys_card: bool,
@@ -949,6 +951,7 @@ impl Bar {
             focus: crate::notify::Focus::new(std::time::Instant::now()),
             added: Added::default(),
             folder: None,
+            back: 0,
             keys_card: false,
             ended: None,
             turn_began: None,
@@ -1646,6 +1649,13 @@ impl Bar {
                 self.settle();
             }
         }
+        // Scrolled back, the reply growing under the view moves it further
+        // from the foot, which the footer counts.
+        let back = crate::screen::scrolled();
+        if back != self.back {
+            self.back = back;
+            self.settle();
+        }
         if self.take_place() {
             self.settle();
         }
@@ -1987,8 +1997,8 @@ impl Bar {
                     self.line.set(&line);
                 }
             }
-            KeyCode::Up => self.line.up(),
-            KeyCode::Down => self.line.down(),
+            KeyCode::Up => self.vertical(-1),
+            KeyCode::Down => self.vertical(1),
             KeyCode::Left if control => self.line.word_left(),
             KeyCode::Right if control => self.line.word_right(),
             KeyCode::Left => self.line.left(),
@@ -2286,6 +2296,9 @@ impl Bar {
     /// Put the line into the conversation above the box, so your side of it
     /// is in the scrollback where the answers are.
     pub fn echo(&self, line: &str) {
+        // What you send is where the interest is: a view scrolled back goes
+        // to the foot, which output alone no longer pulls it to.
+        crate::screen::follow();
         render::blank();
         let mut parts = line.lines();
         render::said(
@@ -2307,29 +2320,51 @@ impl Bar {
             .max(8)
     }
 
-    /// The typed text, wrapped. Never more than `MAX_ROWS`: past that it
-    /// follows the cursor.
-    fn rows(&self) -> Vec<String> {
-        let room = self.room().saturating_sub(2).max(4);
-        let mut rows: Vec<String> = Vec::new();
+    /// The typed text, wrapped to the box, as no more than `MAX_ROWS` rows
+    /// that follow the cursor, and the row and column the cursor is at
+    /// among them.
+    fn rows(&self) -> (Vec<String>, (usize, usize)) {
         let text: String = if self.secret {
             self.line.text().chars().map(|_| '•').collect()
         } else {
             self.line.text().to_owned()
         };
-        for part in text.split('\n') {
-            rows.extend(render::fold(part, room));
-        }
-        if rows.is_empty() {
-            rows.push(String::new());
-        }
+        let Wrapped {
+            mut rows,
+            at: (mut row, column),
+            ..
+        } = wrapped(&text, self.line.at(), self.text_room());
         if rows.len() > MAX_ROWS {
-            let (row, _) = self.line.line_of_cursor();
             let last = rows.len() - MAX_ROWS;
             let first = row.saturating_sub(MAX_ROWS - 1).min(last);
             rows = rows[first..first + MAX_ROWS].to_vec();
+            row -= first;
         }
-        rows
+        (rows, (row, column))
+    }
+
+    /// Columns a row of typed text may take: the box's room less the arrow.
+    fn text_room(&self) -> usize {
+        self.room().saturating_sub(2).max(4)
+    }
+
+    /// Move a row up or down the box as it is drawn, a wrapped row being a
+    /// row of its own; from the top or the bottom row, on through what was
+    /// sent before, as the line's own up and down do.
+    fn vertical(&mut self, by: isize) {
+        let shown = wrapped(self.line.text(), self.line.at(), self.text_room());
+        let (row, column) = shown.at;
+        let wanted = row as isize + by;
+        if wanted < 0 || wanted as usize >= shown.rows.len() {
+            match by < 0 {
+                true => self.line.up(),
+                false => self.line.down(),
+            }
+            return;
+        }
+        let wanted = wanted as usize;
+        self.line
+            .put_cursor(shown.starts[wanted] + render::char_at(&shown.rows[wanted], column));
     }
 
     /// Build the box and hand it to the screen, which paints it under the
@@ -2597,9 +2632,7 @@ impl Bar {
                 lines.push(self.boxed(&render::bold(&part), width, room));
             }
         }
-        let rows = self.rows();
-        let (cursor_row, cursor_column) = self.line.line_of_cursor();
-        let on = cursor_row.min(rows.len() - 1);
+        let (rows, (on, cursor_column)) = self.rows();
         for (i, text) in rows.iter().enumerate() {
             let lead = if i == 0 {
                 format!("{} ", render::blue("›"))
@@ -2608,8 +2641,9 @@ impl Bar {
             };
             // The caret is drawn rather than parked: the real cursor has to
             // stay where output lands.
+            let columns: usize = text.chars().map(render::columns).sum();
             let (body, width) = if i == on {
-                let at = cursor_column.min(text.chars().count());
+                let at = render::char_at(text, cursor_column);
                 let before: String = text.chars().take(at).collect();
                 let under: String = text.chars().skip(at).take(1).collect();
                 let after: String = text.chars().skip(at + 1).collect();
@@ -2617,10 +2651,10 @@ impl Bar {
                 let under = if blank { " ".to_owned() } else { under };
                 (
                     format!("{before}{}{after}", render::caret_over(&under)),
-                    text.chars().count() + usize::from(blank),
+                    columns + usize::from(blank),
                 )
             } else {
-                (text.clone(), text.chars().count())
+                (text.clone(), columns)
             };
             lines.push(self.boxed(&format!("{lead}{body}"), 2 + width, room));
         }
@@ -2842,6 +2876,80 @@ fn checklist(todos: &[Todo], room: usize) -> Vec<String> {
         lines.push(format!("{}{}", render::PAD, render::dim(&more)));
     }
     lines
+}
+
+/// Typed text as the box draws it.
+struct Wrapped {
+    rows: Vec<String>,
+    /// Where in the text, in characters, each row starts.
+    starts: Vec<usize>,
+    /// The row the cursor is on, and the column it is at, counted on
+    /// screen.
+    at: (usize, usize),
+}
+
+/// `text` broken into rows `room` columns wide -- at its line endings, and
+/// after the last space that fits, or mid-word where none does -- with
+/// where the character at `cursor` lands. The rows hold the text as it is,
+/// so a place in it is a place on the screen: the caret, the rows on show
+/// and the keys that move between rows all follow the rows as drawn. A wide
+/// character, as in Chinese or most emoji, takes two of the columns.
+fn wrapped(text: &str, cursor: usize, room: usize) -> Wrapped {
+    let room = room.max(1);
+    let mut shown = Wrapped {
+        rows: Vec::new(),
+        starts: Vec::new(),
+        at: (0, 0),
+    };
+    let mut offset = 0;
+    for part in text.split('\n') {
+        let chars: Vec<char> = part.chars().collect();
+        let width = |from: usize, to: usize| -> usize {
+            chars[from..to].iter().map(|&ch| render::columns(ch)).sum()
+        };
+        let mut start = 0;
+        loop {
+            // As many characters as `room` columns hold, and one at the least
+            // so a character wider than the box cannot stall it.
+            let mut fits = start;
+            let mut used = 0;
+            while fits < chars.len()
+                && (fits == start || used + render::columns(chars[fits]) <= room)
+            {
+                used += render::columns(chars[fits]);
+                fits += 1;
+            }
+            let end = if fits == chars.len() {
+                chars.len()
+            } else {
+                (chars[start..fits].iter())
+                    .rposition(|c| *c == ' ')
+                    .filter(|&space| space > 0)
+                    .map_or(fits, |space| start + space + 1)
+            };
+            let last = end == chars.len();
+            let here = offset + start <= cursor
+                && (cursor < offset + end || (last && cursor == offset + end));
+            if here {
+                shown.at = (shown.rows.len(), width(start, cursor - offset));
+            }
+            shown.rows.push(chars[start..end].iter().collect());
+            shown.starts.push(offset + start);
+            if last {
+                // A caret at the end of a full row goes to the next, rather
+                // than past the box's edge.
+                if here && cursor == offset + end && width(start, end) >= room {
+                    shown.at = (shown.rows.len(), 0);
+                    shown.rows.push(String::new());
+                    shown.starts.push(offset + end);
+                }
+                break;
+            }
+            start = end;
+        }
+        offset += chars.len() + 1;
+    }
+    shown
 }
 
 /// The blurb of the command whose words `text` is typing -- `/model so`
@@ -4192,6 +4300,81 @@ mod tests {
         bar.guard = Instant::now().checked_sub(STILL);
         bar.pick(key(KeyCode::Enter));
         assert_eq!(bar.answer, Some(0));
+    }
+
+    #[test]
+    fn the_caret_sits_on_the_wrapped_row() {
+        let shown = super::wrapped("hello world foo", 12, 8);
+        assert_eq!(shown.rows, ["hello ", "world ", "foo"]);
+        assert_eq!(shown.starts, [0, 6, 12]);
+        assert_eq!(shown.at, (2, 0));
+        // Line endings start rows of their own, and a word longer than the
+        // row is broken.
+        let shown = super::wrapped("ab\nabcdefghijk", 14, 5);
+        assert_eq!(shown.rows, ["ab", "abcde", "fghij", "k"]);
+        assert_eq!(shown.at, (3, 1));
+        // A caret at the end of a full row goes on to the next.
+        let shown = super::wrapped("abcde", 5, 5);
+        assert_eq!(shown.rows, ["abcde", ""]);
+        assert_eq!(shown.at, (1, 0));
+        // Anywhere else in it, the caret stays where it is.
+        let shown = super::wrapped("abcde", 2, 5);
+        assert_eq!(shown.rows, ["abcde"]);
+        assert_eq!(shown.at, (0, 2));
+    }
+
+    #[test]
+    fn wide_characters_take_two_columns_of_a_row() {
+        // Each of these takes two columns, so three fill a row of six, and
+        // the caret after the fourth is two columns into the second row.
+        let shown = super::wrapped("你好世界朋友", 4, 6);
+        assert_eq!(shown.rows, ["你好世", "界朋友"]);
+        assert_eq!(shown.starts, [0, 3]);
+        assert_eq!(shown.at, (1, 2));
+        // One that would straddle the edge goes to the next row.
+        let shown = super::wrapped("ab🙂🙂", 4, 5);
+        assert_eq!(shown.rows, ["ab🙂", "🙂"]);
+        assert_eq!(shown.at, (1, 2));
+        // The box draws such a row inside its border.
+        let mut bar = Bar::new(String::new());
+        bar.line.insert_str(&"字".repeat(bar.text_room()));
+        let lines: Vec<String> = bar.lines(40).iter().map(|l| plain(l)).collect();
+        let edge = lines.iter().find(|line| line.contains('╭')).unwrap();
+        let typed: Vec<&String> = lines.iter().filter(|line| line.contains('字')).collect();
+        assert_eq!(typed.len(), 2, "{lines:?}");
+        for line in typed {
+            let wide: usize = line.chars().map(crate::render::columns).sum();
+            assert_eq!(wide, visible(edge), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_prompt_shows_where_you_type() {
+        let mut bar = Bar::new(String::new());
+        let words: Vec<String> = (0..400).map(|n| format!("w{n}")).collect();
+        bar.line.insert_str(&words.join(" "));
+        let (rows, (row, column)) = bar.rows();
+        assert_eq!(rows.len(), super::MAX_ROWS);
+        assert_eq!(row, super::MAX_ROWS - 1);
+        assert!(rows[row].trim_end().ends_with("w399"), "{:?}", rows[row]);
+        assert_eq!(column, rows[row].chars().count());
+    }
+
+    #[test]
+    fn up_and_down_move_between_wrapped_rows_before_history() {
+        let mut bar = Bar::new(String::new());
+        bar.line.set_history(["sent before".to_owned()]);
+        let room = bar.text_room();
+        let long = "x".repeat(room * 2 + 3);
+        bar.line.insert_str(&long);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        bar.key(up);
+        assert_eq!(bar.line.at(), room + 3);
+        bar.key(up);
+        assert_eq!(bar.line.at(), 3);
+        assert_eq!(bar.line.text(), long);
+        bar.key(up);
+        assert_eq!(bar.line.text(), "sent before");
     }
 
     #[test]

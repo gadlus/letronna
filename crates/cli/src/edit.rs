@@ -133,6 +133,11 @@ impl Line {
         self.cursor = self.text.chars().count();
     }
 
+    /// Put the cursor at character `at`, as a move between rows does.
+    pub fn put_cursor(&mut self, at: usize) {
+        self.cursor = at.min(self.text.chars().count());
+    }
+
     pub fn left(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
     }

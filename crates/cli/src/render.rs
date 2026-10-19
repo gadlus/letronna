@@ -736,6 +736,26 @@ pub fn visible(text: &str) -> usize {
     width
 }
 
+/// Columns `ch` takes on a terminal: two for the wide characters of
+/// Chinese, Japanese and Korean and for most emoji, none for a mark that
+/// combines with the one before it, one for the rest.
+pub fn columns(ch: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
+}
+
+/// Which character of plain `text` covers `column`, counting wide ones as
+/// two: a place on the screen as a place in the text.
+pub fn char_at(text: &str, column: usize) -> usize {
+    let mut used = 0;
+    for (at, ch) in text.chars().enumerate() {
+        used += columns(ch);
+        if used > column {
+            return at;
+        }
+    }
+    text.chars().count()
+}
+
 /// Plain text on a single row, its line breaks made spaces, cut to `width`
 /// columns with an ellipsis where it was cut.
 pub fn fit(text: &str, width: usize) -> String {

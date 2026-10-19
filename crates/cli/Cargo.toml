@@ -18,6 +18,9 @@ async-channel.workspace = true
 # When an editor's list of sessions says each was last used; already in the
 # build for core.
 chrono.workspace = true
+# How many columns a character takes: two for Chinese, Japanese and Korean
+# and for most emoji. Already in the lock file, for other crates.
+unicode-width = "0.2"
 # Raw keyboard input and cursor control, on both a Windows console and a
 # terminal that speaks ANSI. Doing it by hand means SetConsoleMode on one and
 # termios on the other, plus decoding key sequences.

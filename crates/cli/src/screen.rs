@@ -37,6 +37,9 @@ struct Screen {
     width: u16,
     /// Rows scrolled back from the foot of the conversation. Zero follows.
     scroll: usize,
+    /// Rows the conversation had when last painted: what came since is added
+    /// to `scroll` while it is back, so what is being read stays put.
+    painted_rows: usize,
     /// The input box and anything under it, owned by the caller.
     chrome: Vec<String>,
     /// Anchor and end of a selection being dragged, in wrapped-row and
@@ -175,6 +178,7 @@ fn screen() -> &'static Mutex<Screen> {
             wrapped: 0,
             width: 0,
             scroll: 0,
+            painted_rows: 0,
             chrome: Vec::new(),
             from: None,
             to: None,
@@ -263,8 +267,6 @@ pub fn push(text: &str) {
                 }
             }
         }
-        // Anything arriving means the tail is where the interest is.
-        s.scroll = 0;
     }
     soon();
 }
@@ -280,7 +282,6 @@ pub fn block(lay_out: LayOut) {
         let at = s.lines.len().saturating_sub(1);
         s.blocks.insert(at, lay_out);
         s.lines.push(String::new());
-        s.scroll = 0;
     }
     // At once: it comes in one piece, often within a frame of the box, and
     // a throttled paint would leave it unseen until something else paints.
@@ -308,7 +309,6 @@ pub fn fold_open() -> usize {
             },
         );
         s.lines.push(String::new());
-        s.scroll = 0;
         at
     };
     now();
@@ -631,6 +631,19 @@ impl Screen {
         }
     }
 
+    /// Scrolled back, keep the view on what is being read while the reply
+    /// goes on growing under it, or a fold under its top closes, now the
+    /// conversation is `rows` long; following, it moves with the foot.
+    fn hold(&mut self, rows: usize) {
+        if self.scroll > 0 {
+            self.scroll += rows.saturating_sub(self.painted_rows);
+            self.scroll = self
+                .scroll
+                .saturating_sub(self.painted_rows.saturating_sub(rows));
+        }
+        self.painted_rows = rows;
+    }
+
     /// Whether the open line and the one above it are both empty: a fold
     /// or a block stands on an empty line too, but is not a blank one.
     fn after_blank(&self) -> bool {
@@ -694,6 +707,7 @@ fn paint(s: &mut Screen) {
     let open = s.lay_out(columns);
     let total = s.rows.len() + open.len();
     let depth = s.depth(rows);
+    s.hold(total);
     // Scrolling stops at the top rather than running off into nothing.
     s.scroll = s.scroll.min(total.saturating_sub(depth));
     let first = total.saturating_sub(depth + s.scroll);
@@ -751,6 +765,7 @@ mod tests {
             wrapped: 0,
             width: 0,
             scroll: 0,
+            painted_rows: 0,
             chrome: Vec::new(),
             from: None,
             to: None,
@@ -766,6 +781,40 @@ mod tests {
             .insert(1, Box::new(|width| vec!["x".repeat(width.min(6))]));
         assert_eq!(s.view(80)[..2], ["ab", "xxxxxx"]);
         assert_eq!(s.view(4)[..2], ["ab", "xxxx"]);
+    }
+
+    #[test]
+    fn output_while_scrolled_back_keeps_the_view() {
+        let mut s = Screen {
+            lines: vec![String::new()],
+            rows: Vec::new(),
+            wrapped: 0,
+            width: 0,
+            scroll: 0,
+            painted_rows: 100,
+            chrome: Vec::new(),
+            from: None,
+            to: None,
+            open: false,
+            painted: Instant::now(),
+            blocks: HashMap::new(),
+            folds: HashMap::new(),
+            starts: Vec::new(),
+            shown: Vec::new(),
+            size: (0, 0),
+        };
+        // Following, new rows move the view with them.
+        s.hold(104);
+        assert_eq!(s.scroll, 0);
+        // Scrolled back, the view moves back by what came, staying put.
+        s.scroll = 20;
+        s.hold(110);
+        assert_eq!(s.scroll, 26);
+        s.hold(110);
+        assert_eq!(s.scroll, 26);
+        // Rows going, as a fold under it closes, take the view back as many.
+        s.hold(100);
+        assert_eq!(s.scroll, 16);
     }
 
     #[test]
@@ -804,6 +853,7 @@ mod tests {
             wrapped: 0,
             width: 0,
             scroll: 0,
+            painted_rows: 0,
             chrome: Vec::new(),
             from: None,
             to: None,
@@ -839,6 +889,7 @@ mod tests {
             wrapped: 0,
             width: 0,
             scroll: 0,
+            painted_rows: 0,
             chrome: Vec::new(),
             from: None,
             to: None,
