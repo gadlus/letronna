@@ -192,11 +192,15 @@ pub(crate) const TOOLS: [Rule; 26] = [
     // rather than replace them in place as asked. Such a program meets more
     // than the inputs it was built against. The caution on deleting data is
     // the outward row's, so a measurement run that drops outward alone keeps
-    // a pointer to it.
+    // a pointer to it. Merely opening an input can change it too: on
+    // Terminal-Bench 2.0, three runs on three models lost a database's
+    // write-ahead log, and the data they were to recover, to a program that
+    // opened or checkpointed the database before they copied it; one that
+    // worked on a copy kept it.
     Rule {
         id: "inputs",
         to: To::Unwatched,
-        text: "Change input files only when the task says to edit them. This and the caution on deleting data limit your own steps; a program the task asks you to write should do what the task says, including replacing or deleting files in place. That program may also run on inputs other than any sample given: base it on the format's own rules, not on values fitted to a sample.",
+        text: "Change input files only when the task says to edit them. This and the caution on deleting data limit your own steps; a program the task asks you to write should do what the task says, including replacing or deleting files in place. That program may also run on inputs other than any sample given: base it on the format's own rules, not on values fitted to a sample. Even opening a file with a program can change it, as sqlite3 can fold a database's write-ahead log into it or delete the log on closing: before running such a program on an input you are to recover data from or repair, copy the input with the files that go with it and try the program on the copy first.",
     },
     // The library the task names gives the result it meant; a way around it
     // after one failed call gives a result of the run's own making.
@@ -700,6 +704,8 @@ mod tests {
             " holds only the answer, in the form asked. Change input files only when the task says to edit them. This and the caution on deleting data limit your own steps;",
             " or test command the task gives. When the task names a library or tool to use, get the result through it;",
             " not in your head. Before building on a helper that transforms data, run it on a tiny input whose answer you know,",
+            " not on values fitted to a sample. Even opening a file with a program can change it,",
+            " before running such a program on an input you are to recover data from or repair, copy the input with the files that go with it and try the program on the copy first.",
         ] {
             assert!(told.contains(words), "{words}: {told}");
         }
@@ -711,6 +717,7 @@ mod tests {
             "limit your own steps",
             "names a library",
             "tiny input",
+            "on the copy first",
         ] {
             assert!(!window.contains(words), "{words}: {window}");
         }
