@@ -49,6 +49,17 @@ const VERDICT_TOKENS: u64 = 64;
 /// Added for a model that thinks before it answers, whether or not it can
 /// be told not to, so its thinking does not use up the verdict's tokens.
 const THINKING_TOKENS: u64 = 2_048;
+/// How long the judge is waited for in a session someone may be watching,
+/// who is kept waiting meanwhile.
+const WAIT: Duration = Duration::from_secs(20);
+/// The wait and the thinking tokens where nobody may be watching, and so
+/// nobody may decide a call the judge leaves unanswered: a model that
+/// thinks at length, whatever effort it is asked for, took up to a minute
+/// and more than 2,048 tokens to reach a verdict. With the verdict's they
+/// come to the reply asked for when a model's limit is not known, which
+/// the smallest limits in use still accept.
+const UNATTENDED_WAIT: Duration = Duration::from_secs(60);
+const UNATTENDED_THINKING_TOKENS: u64 = crate::chat::REPLY_TOKENS as u64 - VERDICT_TOKENS;
 /// Denials in a row after which the user decides until they next type.
 const DENIALS_IN_A_ROW: u8 = 3;
 /// Denials in all after which the same happens, so a session that keeps
@@ -56,8 +67,8 @@ const DENIALS_IN_A_ROW: u8 = 3;
 const DENIALS_IN_ALL: u16 = 20;
 /// Judge calls that fail in a row before the judge rests, and how long it
 /// rests: three rules out one dropped request, and ten minutes lets a rate
-/// limit or an outage pass without every call meanwhile waiting up to
-/// twenty seconds on an endpoint that cannot answer.
+/// limit or an outage pass without every call meanwhile waiting out its
+/// timeout on an endpoint that cannot answer.
 const FAILURES_IN_A_ROW: u8 = 3;
 const REST: Duration = Duration::from_secs(10 * 60);
 
@@ -608,6 +619,20 @@ fn quoted(text: &str) -> String {
 /// cap rather than a cost.
 fn ask(connection: &Connection, prompt: &str) -> Result<String, String> {
     let endpoint = crate::chat::validate(connection)?;
+    // As the session's own requests are sized, so a reply the model is
+    // known not to take is not asked for.
+    let sizing = crate::store::sizing();
+    let limits = crate::models::facts_or(
+        &connection.endpoint,
+        connection.model.trim(),
+        sizing.window,
+        sizing.output,
+    );
+    let (wait, tokens) = patience(connection, &limits, Instant::now());
+    // A request given no time is still sent before it gives up.
+    if wait.is_zero() {
+        return Err("The run's time is up.".to_owned());
+    }
     let body = json!({
         "model": connection.model.trim(),
         "messages": [
@@ -615,14 +640,14 @@ fn ask(connection: &Connection, prompt: &str) -> Result<String, String> {
             {"role": "user", "content": prompt},
         ],
         "stream": false,
-        "max_tokens": VERDICT_TOKENS + THINKING_TOKENS,
+        "max_tokens": tokens,
         "reasoning_effort": "low",
     });
     let (endpoint, body) =
         crate::chat::to_responses(connection, &endpoint, &body).unwrap_or((endpoint, body));
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(20))
+        .timeout(wait)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| e.to_string())?;
@@ -638,6 +663,38 @@ fn ask(connection: &Connection, prompt: &str) -> Result<String, String> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| "No verdict came back.".to_owned())
+}
+
+/// How long the judge is waited for over `connection` and how many tokens
+/// it may write, given its model's `limits`: more of both where nobody may
+/// be watching, as a failed request is waited out longer there (see
+/// `retry::after`), and never a wait past the run's deadline, since a run
+/// stopped meanwhile still sits out the wait.
+fn patience(
+    connection: &Connection,
+    limits: &crate::models::Facts,
+    now: Instant,
+) -> (Duration, u64) {
+    let watched = VERDICT_TOKENS + THINKING_TOKENS;
+    let (wait, tokens) = if connection.unattended {
+        // A provider refuses every request asking more than its model
+        // writes, and a reply the prompt does not leave room for: the
+        // window keeps three quarters for the prompt, as `chat::sized`
+        // does. Never fewer than a watched session asks for, which every
+        // model has been asked for all along.
+        let known = limits
+            .max_output
+            .unwrap_or(u64::MAX)
+            .min(limits.context.map_or(u64::MAX, |context| context / 4));
+        let tokens = (VERDICT_TOKENS + UNATTENDED_THINKING_TOKENS).min(known);
+        (UNATTENDED_WAIT, tokens.max(watched))
+    } else {
+        (WAIT, watched)
+    };
+    let left = connection
+        .deadline
+        .map_or(wait, |deadline| deadline.saturating_duration_since(now));
+    (wait.min(left), tokens)
 }
 
 #[cfg(test)]
@@ -964,6 +1021,91 @@ mod tests {
             Err("still down".into())
         });
         assert!(asked.get());
+    }
+
+    #[test]
+    fn a_run_nobody_watches_gives_the_judge_longer_and_more_tokens() {
+        let now = Instant::now();
+        let unknown = crate::models::Facts::default();
+        let watched = Connection::default();
+        assert_eq!(
+            patience(&watched, &unknown, now),
+            (Duration::from_secs(20), 2_112)
+        );
+        let unwatched = Connection {
+            unattended: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            patience(&unwatched, &unknown, now),
+            (Duration::from_secs(60), 8_192)
+        );
+    }
+
+    #[test]
+    fn the_judge_is_never_asked_for_more_than_its_model_takes() {
+        let now = Instant::now();
+        let on = |model: &str, unattended| {
+            let connection = Connection {
+                endpoint: "https://judge-limits.example/v1".into(),
+                model: model.into(),
+                unattended,
+                ..Default::default()
+            };
+            let limits = crate::models::facts(&connection.endpoint, model);
+            patience(&connection, &limits, now).1
+        };
+        assert_eq!(on("deepseek-chat", true), 8_192);
+        assert_eq!(on("gpt-4o-2024-05-13", true), 4_096);
+        assert_eq!(on("gpt-4o-2024-05-13", false), 2_112);
+        let windowed = |context| crate::models::Facts {
+            context: Some(context),
+            max_output: Some(context),
+            ..Default::default()
+        };
+        let unwatched = Connection {
+            unattended: true,
+            ..Default::default()
+        };
+        // A quarter of the window, and no fewer than a watched session gets.
+        assert_eq!(patience(&unwatched, &windowed(16_384), now).1, 4_096);
+        assert_eq!(patience(&unwatched, &windowed(8_192), now).1, 2_112);
+    }
+
+    #[test]
+    fn the_judge_is_not_waited_for_past_the_runs_deadline() {
+        let now = Instant::now();
+        let unknown = crate::models::Facts::default();
+        let timed = |left: u64| Connection {
+            unattended: true,
+            deadline: Some(now + Duration::from_secs(left)),
+            ..Default::default()
+        };
+        assert_eq!(
+            patience(&timed(25), &unknown, now),
+            (Duration::from_secs(25), 8_192)
+        );
+        assert_eq!(
+            patience(&timed(600), &unknown, now).0,
+            Duration::from_secs(60)
+        );
+        assert_eq!(patience(&timed(0), &unknown, now).0, Duration::ZERO);
+    }
+
+    #[test]
+    fn the_judge_is_not_asked_once_the_runs_time_is_up() {
+        // Nothing listens there; a request sent would fail some other way.
+        let late = Connection {
+            endpoint: "http://127.0.0.1:9/v1".into(),
+            model: "some-model".into(),
+            unattended: true,
+            deadline: Some(Instant::now()),
+            ..Default::default()
+        };
+        assert_eq!(
+            ask(&late, "May it run?"),
+            Err("The run's time is up.".to_owned())
+        );
     }
 
     #[test]

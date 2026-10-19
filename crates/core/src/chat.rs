@@ -669,7 +669,7 @@ const LIFT_CAPS: usize = 4;
 /// The reply asked for when the model's output limit is not known: what
 /// every request asked for before any limit was, which the smallest limits
 /// in use, such as deepseek-chat's, still accept.
-const REPLY_TOKENS: usize = 8_192;
+pub(crate) const REPLY_TOKENS: usize = 8_192;
 /// The longest reply asked for, whatever the model could write: room kept
 /// for the reply is room the window cannot use, and some gateways hold
 /// credit against all of it before the reply starts. 32,000 is a long file
