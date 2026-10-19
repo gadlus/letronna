@@ -940,7 +940,7 @@ impl Chat {
                         if this.busy || this.store.conversations[this.store.active].id != session {
                             return;
                         }
-                        this.put_files_back(session, plan.clone(), window, cx);
+                        this.put_files_back(session, plan.clone(), true, window, cx);
                     });
                     true
                 })

@@ -187,7 +187,8 @@ impl Chat {
                                 .text_color(cx.theme().muted_foreground)
                                 .child(
                                     "Typing anywhere outside a text box writes in the \
-                                     composer. ? in an empty composer opens this list too.",
+                                     composer. ? in an empty composer opens this list too, and \
+                                     Escape twice there steps to your last message, to rewind.",
                                 ),
                         ),
                 )

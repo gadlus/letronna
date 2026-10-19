@@ -396,6 +396,9 @@ pub(crate) struct Chat {
     /// into the box; set where there is no window to hand, put there when
     /// the window next draws.
     pub(crate) returned_follow_ups: Option<String>,
+    /// When escape last found nothing to close in an empty composer, so a
+    /// second one soon after steps to your newest message.
+    pub(crate) escaped: Option<std::time::Instant>,
     /// An MCP server's prompt is being fetched for the line in the box, so
     /// Enter does not ask for another meanwhile.
     pub(crate) fetching_prompt: bool,
@@ -483,6 +486,9 @@ pub(crate) struct Chat {
     /// and the session and length last read for it, read or not yet.
     pub(crate) turn_files: Option<crate::ui::actions::TurnFiles>,
     pub(crate) turn_files_for: Option<(u64, usize)>,
+    /// Notices of files put back while a reply or a run beside the chat held
+    /// their session, by session id, for its next step or its end.
+    pub(crate) put_back_waiting: std::collections::HashMap<u64, Vec<Message>>,
     /// The video playing in the chat, if one is, and its newest frame.
     pub(crate) video: Option<crate::platform::video::Playing>,
     pub(crate) video_frame: Option<std::sync::Arc<RenderImage>>,
@@ -1028,6 +1034,7 @@ impl Chat {
             skill_prompt,
             follow_ups: Vec::new(),
             returned_follow_ups: None,
+            escaped: None,
             fetching_prompt: false,
             skill_source,
             adding_skills: false,
@@ -1066,6 +1073,7 @@ impl Chat {
             call_times: Default::default(),
             turn_files: None,
             turn_files_for: None,
+            put_back_waiting: Default::default(),
             video: None,
             video_frame: None,
             panel: Default::default(),
@@ -2782,6 +2790,15 @@ impl Chat {
             folded: true,
             ..notice
         }));
+        // Files put back while it worked, so the model reads them again
+        // before its next edit to one.
+        let put_back = self.put_back_waiting.remove(&conversation.id);
+        conversation
+            .messages
+            .extend(put_back.into_iter().flatten().map(|notice| Message {
+                folded: true,
+                ..notice
+            }));
         // What you sent while it worked goes in now, before the model is
         // asked again, so it reads it before going on, with its `@` paths
         // attached as a message sent on its own has them.
@@ -3851,8 +3868,13 @@ impl Chat {
             // of the sidebar's filter, which a saved choice would leave
             // swallowing the key that stops a running reply.
             self.stop_turn(cx);
-        } else {
-            self.clear_session_filter(cx);
+        } else if self.page == Page::Chat && self.transcript_focus.contains_focused(window, cx) {
+            // On a turn the keys were stepped to, back to the box.
+            self.focus_composer(window, cx);
+        } else if !self.clear_session_filter(cx) {
+            // Nothing else to close: a second escape steps to your newest
+            // message, to go back from, as Claude Code's opens its rewind.
+            self.escape_twice(window, cx);
         }
     }
 
@@ -3906,6 +3928,10 @@ impl Chat {
         plugins::emit(cx, plugins::AppEvent::ChatIdle);
         // The reply may have changed files, or committed them.
         self.refresh_changes(cx);
+        // Files put back after its last step, told before a follow-up is.
+        if let Some(id) = session {
+            self.tell_waiting_put_back(id);
+        }
         self.send_follow_ups(session, cx);
         if stopped && let Some(ix) = session.and_then(|id| self.store.index_of(id)) {
             goal::interrupted(&mut self.store.conversations[ix].goal);
@@ -4712,6 +4738,11 @@ impl Render for Chat {
                 this.focus_composer_anywhere(window, cx)
             }))
             .on_action(cx.listener(|this, _: &ShowKeys, window, cx| this.show_keys(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &crate::ui::actions::GoBack, window, cx| {
+                    this.go_back(window, cx)
+                }),
+            )
             // From outside the turns, to the newest; a turn or the question
             // card steps from itself before this.
             .on_action(

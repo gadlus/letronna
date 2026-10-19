@@ -6,8 +6,10 @@
 //!
 //! Everything works by place in the session. Going back is saved as a
 //! rewind record the store appends (`Conversation::rewind`), so the terminal
-//! sees the shorter session too. It can also put back the files the agent's
-//! tools wrote since, from the copies `history` kept of them.
+//! sees the shorter session too. It can put back the code and the
+//! conversation, the conversation alone, or only the files the agent's tools
+//! and commands changed since, from the copies `history` kept of them; the
+//! files alone leave a notice telling the model which went back.
 //!
 //! The newest finished turn ends with one line of the files it changed and
 //! the lines it added and removed, the Changes tab a key away, and a button
@@ -18,7 +20,6 @@
 
 use crate::app::Given;
 use crate::prelude::*;
-use gpui_component::checkbox::Checkbox;
 use gpui_component::menu::PopupMenu;
 use gpui_component::notification::Notification;
 use gpui_component::{button::ButtonVariant, dialog::DialogButtonProps};
@@ -54,9 +55,66 @@ actions!(
         RetryTurn,
         RewindTurn,
         ForkTurn,
-        TurnMenu
+        TurnMenu,
+        GoBack
     ]
 );
+
+/// What going back to a turn puts back, as Claude Code's rewind offers it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Restoring {
+    /// The conversation, and the files with it.
+    Both,
+    /// The conversation; the files stay as they are now.
+    Conversation,
+    /// The files; the conversation stays.
+    Code,
+}
+
+impl Restoring {
+    /// The choice, as the question offers it.
+    fn label(self) -> &'static str {
+        match self {
+            Restoring::Both => "Code and conversation",
+            Restoring::Conversation => "Conversation",
+            Restoring::Code => "Code",
+        }
+    }
+
+    /// What the button that does it says.
+    fn button(self) -> &'static str {
+        match self {
+            Restoring::Both => "Restore code and conversation",
+            Restoring::Conversation => "Restore conversation",
+            Restoring::Code => "Restore code",
+        }
+    }
+
+    /// Whether the files go back.
+    fn files(self) -> bool {
+        self != Restoring::Conversation
+    }
+}
+
+/// One line under the rewind question: a file with what becomes of it and
+/// the lines the dropped turns changed in it, or a note.
+#[derive(Clone)]
+enum RewindRow {
+    File {
+        name: String,
+        fate: history::Fate,
+        by_command: bool,
+        lines: Option<(usize, usize)>,
+    },
+    /// How many more files there are than the question names.
+    More(usize),
+    /// Said only when the files go back.
+    Note(String),
+}
+
+/// How soon a second escape must follow the first to step to your newest
+/// message, as Claude Code's double escape opens its rewind.
+const TWICE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// A turn's place in its session: your message on its own, or everything
 /// the model did in reply to it.
@@ -329,28 +387,21 @@ impl Chat {
             return;
         }
         let back = span.yours.then(|| self.prompt_text(span.first)).flatten();
+        let images = if span.yours {
+            self.prompt_images(span.first)
+        } else {
+            Vec::new()
+        };
         let open = &self.store.conversations[self.store.active];
         let (session, folder) = (open.id, open.workspace.clone());
         let dropped = open.messages[keep..].to_vec();
         // Each file the dropped turns wrote is read and hashed, which a big
         // one makes slow, so the question waits for it off the UI thread.
         let planned = cx.background_executor().spawn(async move {
-            let files = history::plan(session, &dropped, folder.as_deref());
-            let mut rows = history::listing(&files, folder.as_deref());
-            // That what commands changed goes back too may be news, so it
-            // is said with the files, before the note on what of theirs stays.
-            if let Some(line) = history::undone_commands(&dropped, &files) {
-                let at = (rows.iter())
-                    .position(|row| row == history::COMMAND_FILES_NOTE)
-                    .unwrap_or(rows.len());
-                rows.insert(at, line);
-            }
-            // And what each command leaves, as the terminal's /undo says it.
-            if !files.is_empty() && history::ran_commands(&dropped) {
-                rows.push(history::COMMANDS_NOTE.to_owned());
-                rows.extend(history::unkept(&dropped));
-            }
-            (files, rows)
+            let changed = history::changed(session, &dropped, folder.as_deref());
+            let files: Vec<history::Restore> =
+                changed.iter().map(|file| file.restore.clone()).collect();
+            (files, rewind_rows(&changed, &dropped, folder.as_deref()))
         });
         cx.spawn_in(window, async move |this, cx| {
             let (files, rows) = planned.await;
@@ -358,20 +409,24 @@ impl Chat {
                 if !this.idle() || this.store.conversations[this.store.active].id != session {
                     return;
                 }
-                this.ask_rewind(keep, back, files, rows, window, cx);
+                this.ask_rewind(keep, back, images, files, rows, window, cx);
             });
         })
         .detach();
     }
 
-    /// Ask whether to go back to `keep`, listing `files` as `rows` under the
-    /// box that puts them back too.
+    /// Ask whether to go back to `keep`, and what to put back: the code and
+    /// the conversation, the conversation alone or the code alone, the
+    /// files listed as `rows`. Your message's text and pictures, `back` and
+    /// `images`, return to the box when the conversation goes back.
+    #[allow(clippy::too_many_arguments)]
     fn ask_rewind(
         &mut self,
         keep: usize,
         back: Option<String>,
+        images: Vec<PathBuf>,
         files: Vec<history::Restore>,
-        rows: Vec<String>,
+        rows: Vec<RewindRow>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -379,88 +434,214 @@ impl Chat {
         if gone == 0 {
             return;
         }
-        let body = rewind_says(back.is_some(), gone, !files.is_empty());
         let session = self.store.conversations[self.store.active].id;
-        // Unticked to start with, as the terminal's /undo needs --files:
-        // putting files back replaces what is on disk, so it is asked for.
-        let put_back = Rc::new(Cell::new(false));
+        // The code is offered only when a file can go back; then both go
+        // back unless another choice is made, as Claude Code's rewind
+        // offers first.
+        let restorable = files.iter().any(|file| file.fate.touches());
+        let chosen = Rc::new(Cell::new(match restorable {
+            true => Restoring::Both,
+            false => Restoring::Conversation,
+        }));
         let chat = cx.entity();
         window.open_alert_dialog(cx, move |dialog, window, cx| {
-            let (chat, back) = (chat.clone(), back.clone());
-            let (files, put_back) = (files.clone(), put_back.clone());
-            let ticked = put_back.get();
+            let (chat, back, images) = (chat.clone(), back.clone(), images.clone());
+            let (files, picked) = (files.clone(), chosen.clone());
+            let now = chosen.get();
+            let choice = |n: usize, restoring: Restoring| {
+                let chosen = chosen.clone();
+                Button::new(("rewind-choice", n))
+                    .small()
+                    .when(now == restoring, |b| b.primary())
+                    .when(now != restoring, |b| b.secondary())
+                    .label(restoring.label())
+                    .on_click(move |_, window, _| {
+                        chosen.set(restoring);
+                        window.refresh();
+                    })
+            };
+            let theme = cx.theme();
+            // With no choice to make, what becomes of each file says why.
+            let fates = now.files() || !restorable;
+            let lines = rows
+                .iter()
+                .filter(|row| now.files() || !matches!(row, RewindRow::Note(_)))
+                .map(|row| match row {
+                    RewindRow::File {
+                        name,
+                        fate,
+                        by_command,
+                        lines,
+                    } => h_flex()
+                        .gap_2()
+                        .items_baseline()
+                        .text_sm()
+                        .child(div().min_w_0().child(name.clone()))
+                        .when(fates, |row| {
+                            let by = if *by_command {
+                                " (changed by a command)"
+                            } else {
+                                ""
+                            };
+                            row.child(
+                                div()
+                                    .min_w_0()
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("{}{by}", fate.says())),
+                            )
+                        })
+                        .when_some(*lines, |row, (added, removed)| {
+                            row.child(div().text_color(theme.green).child(format!("+{added}")))
+                                .child(div().text_color(theme.danger).child(format!("−{removed}")))
+                        })
+                        .into_any_element(),
+                    RewindRow::More(more) => div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child(format!("and {more} more"))
+                        .into_any_element(),
+                    RewindRow::Note(note) => div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child(with_code(note, window, cx))
+                        .into_any_element(),
+                })
+                .collect::<Vec<_>>();
             dialog
                 .title(div().font_family(HEADING_FONT).child("Rewind to here"))
-                .width(px(460.))
+                .width(px(480.))
                 .confirm()
                 .button_props(
                     DialogButtonProps::default()
-                        .ok_text("Rewind")
+                        .ok_text(now.button())
                         .ok_variant(ButtonVariant::Danger),
                 )
                 .child(
                     div()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child(body.clone()),
+                        .child(rewind_says(back.is_some(), gone, now, !rows.is_empty())),
                 )
-                .when(!rows.is_empty(), |dialog| {
+                .when(restorable, |dialog| {
                     dialog.child(
-                        v_flex()
+                        h_flex()
                             .mt_3()
-                            .gap_1()
-                            .child(
-                                Checkbox::new("rewind-files")
-                                    .label("Put the files back too")
-                                    .checked(ticked)
-                                    .on_click({
-                                        let put_back = put_back.clone();
-                                        move |checked, window, _| {
-                                            put_back.set(*checked);
-                                            window.refresh();
-                                        }
-                                    }),
-                            )
-                            .children(rows.iter().map(|row| {
-                                div()
-                                    .pl_6()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(with_code(row, window, cx))
-                            })),
+                            .gap_2()
+                            .flex_wrap()
+                            .child(choice(0, Restoring::Both))
+                            .child(choice(1, Restoring::Conversation))
+                            .child(choice(2, Restoring::Code)),
                     )
                 })
+                .when(!lines.is_empty(), |dialog| {
+                    dialog.child(v_flex().mt_3().gap_1().children(lines))
+                })
                 .on_ok(move |_, window, cx| {
+                    let restoring = picked.get();
                     chat.update(cx, |this, cx| {
-                        // A reply or a summary may have started, or the
-                        // session changed, while the question was up.
-                        let open = this.store.conversations[this.store.active].id;
-                        if !this.idle() || this.run_holds_open() || open != session {
+                        // The session changed while the question was up:
+                        // what it asked about is not on screen any more.
+                        if this.store.conversations[this.store.active].id != session {
                             return;
                         }
-                        this.cut_to(keep);
-                        if put_back.get() && !files.is_empty() {
-                            this.put_files_back(session, files.clone(), window, cx);
+                        // A reply, a summary or a run may have started.
+                        if !this.idle() || this.run_holds_open() {
+                            window.push_notification(
+                                Notification::warning(
+                                    "Something is working in this session. Stop it, then rewind.",
+                                ),
+                                cx,
+                            );
+                            return;
                         }
-                        if let Some(text) = back.clone() {
-                            this.composer
-                                .update(cx, |input, cx| input.set_value(text, window, cx));
+                        if restoring != Restoring::Code {
+                            this.cut_to(keep);
                         }
-                        this.focus_composer(window, cx);
+                        if restoring.files() && !files.is_empty() {
+                            // Only the code alone leaves the edits in the
+                            // conversation, which the model must hear of.
+                            let tell = restoring == Restoring::Code;
+                            this.put_files_back(session, files.clone(), tell, window, cx);
+                        }
+                        if restoring != Restoring::Code {
+                            this.give_back(session, back.clone(), images.clone());
+                        }
                         cx.notify();
+                    });
+                    // The box takes the keys once the question has closed;
+                    // while it is up, they cannot go there.
+                    let chat = chat.clone();
+                    window.on_next_frame(move |window, cx| {
+                        chat.update(cx, |this, cx| this.focus_composer(window, cx));
                     });
                     true
                 })
         });
     }
 
+    /// Step to your newest message, whose buttons then show: W rewinds to
+    /// it, Enter opens the rest, and up and down reach the other turns. A
+    /// double escape in an empty composer comes here, as the palette does.
+    pub(crate) fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page != Page::Chat
+            || !self.transcript_shown()
+            || self.panel_covers(window, cx)
+            || self.settings_open
+            || window.has_active_dialog(cx)
+        {
+            return;
+        }
+        let Some(span) = newest_yours(&self.turns) else {
+            return;
+        };
+        self.go_to_stop(Stop::Turn(span.first), true, window, cx);
+        self.region = Some(crate::ui::keys::Region::Transcript);
+        window.push_notification(
+            Notification::info(
+                "↑ ↓ pick a message · W rewinds to it · Enter shows the rest · Esc goes back",
+            ),
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Escape with nothing left to close: a second one soon after the first,
+    /// in an empty composer, steps to your newest message.
+    pub(crate) fn escape_twice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let first = self.escaped.take();
+        if !self.composer.read(cx).value().trim().is_empty() {
+            return;
+        }
+        if first.is_some_and(|at| at.elapsed() < TWICE) {
+            self.go_back(window, cx);
+        } else {
+            self.escaped = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Put your rewound message back in the box, ahead of anything typed
+    /// since rather than over it, and its pictures with it.
+    fn give_back(&mut self, session: u64, text: Option<String>, images: Vec<PathBuf>) {
+        if let Some(text) = text {
+            self.returned_follow_ups = Some(match self.returned_follow_ups.take() {
+                Some(earlier) => format!("{text}\n\n{earlier}"),
+                None => text,
+            });
+        }
+        if !images.is_empty() {
+            self.attachments.entry(session).or_default().extend(images);
+        }
+    }
+
     /// Put back the files a rewind of `session` listed, off the UI thread,
     /// and say how it went: what could not be, and what was left alone, by
-    /// name.
+    /// name. With `tell`, for files put back under a conversation that
+    /// still holds the edits, the model is told which went back.
     pub(crate) fn put_files_back(
         &mut self,
         session: u64,
         files: Vec<history::Restore>,
+        tell: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -474,6 +655,9 @@ impl Chat {
             let done = restored.await;
             let said = done.lines().join("\n");
             let _ = this.update_in(cx, |this, window, cx| {
+                if tell {
+                    this.tell_put_back(session, &done);
+                }
                 // The files are not what the card read any more.
                 this.turn_files_for = None;
                 cx.notify();
@@ -487,6 +671,39 @@ impl Chat {
             });
         })
         .detach();
+    }
+
+    /// Tell `session`'s model which files `done` put back, with a notice
+    /// that also lets a later rewind take them back further. A reply or a
+    /// run that holds the session takes it at its next step or its end.
+    fn tell_put_back(&mut self, session: u64, done: &history::Restored) {
+        let Some(notice) = done.notice() else {
+            return;
+        };
+        self.put_back_waiting
+            .entry(session)
+            .or_default()
+            .push(notice);
+        let replying = self.streaming_id.filter(|_| self.busy);
+        if !put_back_waits(session, replying, self.runs.contains_key(&session)) {
+            self.tell_waiting_put_back(session);
+        }
+    }
+
+    /// Add to `session` the notices of files put back that wait for it.
+    pub(crate) fn tell_waiting_put_back(&mut self, session: u64) {
+        let Some(waiting) = self.put_back_waiting.remove(&session) else {
+            return;
+        };
+        let Some(ix) = self.store.index_of(session) else {
+            return;
+        };
+        // A session listed but not read in has nothing to add it to.
+        if self.store.conversations[ix].messages.is_empty() {
+            return;
+        }
+        self.store.conversations[ix].messages.extend(waiting);
+        self.save();
     }
 
     /// Carry on in a copy of the session up to this turn; the original stays
@@ -961,14 +1178,16 @@ impl Chat {
     }
 
     /// Whether the turn can be asked again, and gone back to. Neither while
-    /// a reply runs, which owns the session until it stops, nor while a
-    /// summary is made.
+    /// a reply or a run owns the session until it stops, nor while a summary
+    /// is made.
     fn can_retry_and_rewind(&self, span: Span) -> (bool, bool) {
-        let retry = self.idle()
+        // A run holding the session takes nothing from here either.
+        let free = self.idle() && !self.run_holds_open();
+        let retry = free
             && span
                 .prompt()
                 .is_some_and(|at| self.prompt_text(at).is_some());
-        let rewind = self.idle() && (span.yours || self.open_messages().len() > span.keep());
+        let rewind = free && (span.yours || self.open_messages().len() > span.keep());
         (retry, rewind)
     }
 
@@ -1224,7 +1443,7 @@ impl Chat {
                     .disabled(self.busy || !undoable)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if !this.busy && this.store.conversations[this.store.active].id == session {
-                            this.put_files_back(session, files.clone(), window, cx);
+                            this.put_files_back(session, files.clone(), true, window, cx);
                         }
                     })),
             );
@@ -1540,9 +1759,10 @@ fn message_count(n: usize) -> String {
 }
 
 /// What the rewind question says: what going back removes, from your
-/// message when `yours`, and that changes to files stay unless `listed`.
-fn rewind_says(yours: bool, gone: usize, listed: bool) -> String {
-    let mut says = match (yours, gone) {
+/// message when `yours`, and what becomes of the files `listed` under it
+/// once `restoring` is chosen, or that changes to files stay when none are.
+fn rewind_says(yours: bool, gone: usize, restoring: Restoring, listed: bool) -> String {
+    let removed = match (yours, gone) {
         (true, 0 | 1) => {
             "This message is removed from the chat, and its text goes back in the box.".to_owned()
         }
@@ -1557,12 +1777,67 @@ fn rewind_says(yours: bool, gone: usize, listed: bool) -> String {
             message_count(n)
         ),
     };
-    // Listed, the files go back only if the box under them is ticked,
-    // which says so itself.
-    if !listed {
-        says.push_str(" Changes to files are not undone.");
+    match (restoring, listed) {
+        (_, false) => format!("{removed} Changes to files are not undone."),
+        (Restoring::Both, true) => {
+            format!("{removed} The files below go back to how they were at this point.")
+        }
+        (Restoring::Conversation, true) => {
+            format!("{removed} The files below stay as they are now.")
+        }
+        (Restoring::Code, true) => "The chat stays as it is, and the files below go back to how \
+                                    they were at this point."
+            .to_owned(),
     }
-    says
+}
+
+/// The lines under the rewind question: each file `changed` since, up to
+/// as many as the terminal names, then how many more, and what of the
+/// `dropped` turns' commands goes back and what stays.
+fn rewind_rows(
+    changed: &[history::Changed],
+    dropped: &[Message],
+    folder: Option<&std::path::Path>,
+) -> Vec<RewindRow> {
+    let mut rows: Vec<RewindRow> = (changed.iter().take(history::LISTED))
+        .map(|file| RewindRow::File {
+            name: history::label(&file.restore.path, folder),
+            fate: file.restore.fate,
+            by_command: file.restore.by_command,
+            lines: (file.lines.as_ref()).map(|lines| (lines.added, lines.removed)),
+        })
+        .collect();
+    if changed.len() > history::LISTED {
+        rows.push(RewindRow::More(changed.len() - history::LISTED));
+    }
+    let files: Vec<history::Restore> = changed.iter().map(|file| file.restore.clone()).collect();
+    // That what commands changed goes back too may be news, so it is said
+    // with the files, before the note on what of theirs stays.
+    if let Some(line) = history::undone_commands(dropped, &files) {
+        rows.push(RewindRow::Note(line));
+    }
+    if files.iter().any(|file| file.by_command) {
+        rows.push(RewindRow::Note(history::COMMAND_FILES_NOTE.to_owned()));
+    }
+    // And what each command leaves, as the terminal says it.
+    if !files.is_empty() && history::ran_commands(dropped) {
+        rows.push(RewindRow::Note(history::COMMANDS_NOTE.to_owned()));
+        rows.extend(history::unkept(dropped).into_iter().map(RewindRow::Note));
+    }
+    rows
+}
+
+/// Your newest message among `turns`, where a double escape steps to.
+fn newest_yours(turns: &[Span]) -> Option<Span> {
+    turns.iter().rev().find(|span| span.yours).copied()
+}
+
+/// Whether a notice of files put back must wait for `session`'s reply or
+/// run: in a reply under way it could land between a call and its result,
+/// and a run beside the chat leaves its work out of a session changed
+/// while it ran.
+fn put_back_waits(session: u64, replying: Option<u64>, run_holds: bool) -> bool {
+    replying == Some(session) || run_holds
 }
 
 #[cfg(test)]
@@ -1570,8 +1845,8 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        Span, Stop, code_spans, line_totals, message_count, rewind_says, scrolls, shows_bar,
-        step_stop, stops, turns,
+        Restoring, Span, Stop, code_spans, line_totals, message_count, newest_yours,
+        put_back_waits, rewind_says, scrolls, shows_bar, step_stop, stops, turns,
     };
     use letronna_core::chat::Message;
     use letronna_core::history::Lines;
@@ -1695,33 +1970,68 @@ mod tests {
     }
 
     #[test]
-    fn the_rewind_question_says_what_goes_and_that_files_are_not_undone() {
+    fn the_rewind_question_says_what_goes_and_what_becomes_of_the_files() {
+        let said = |yours, gone| rewind_says(yours, gone, Restoring::Conversation, false);
         assert_eq!(
-            rewind_says(true, 2, false),
+            said(true, 2),
             "This message and the 1 message after it are removed from the chat, and its text \
              goes back in the box. Changes to files are not undone."
         );
         assert_eq!(
-            rewind_says(true, 1, false),
+            said(true, 1),
             "This message is removed from the chat, and its text goes back in the box. Changes \
              to files are not undone."
         );
         assert_eq!(
-            rewind_says(false, 1, false),
+            said(false, 1),
             "The message after this is removed from the chat. Changes to files are not undone."
         );
         assert_eq!(
-            rewind_says(false, 4, false),
+            said(false, 4),
             "The 4 messages after this are removed from the chat. Changes to files are not \
              undone."
         );
-        // With files to put back, the box under the question says what
-        // becomes of them.
+        // With files listed, each choice says what becomes of them.
         assert_eq!(
-            rewind_says(true, 4, true),
+            rewind_says(true, 4, Restoring::Both, true),
             "This message and the 3 messages after it are removed from the chat, and its text \
-             goes back in the box."
+             goes back in the box. The files below go back to how they were at this point."
         );
+        assert_eq!(
+            rewind_says(true, 4, Restoring::Conversation, true),
+            "This message and the 3 messages after it are removed from the chat, and its text \
+             goes back in the box. The files below stay as they are now."
+        );
+        assert_eq!(
+            rewind_says(false, 4, Restoring::Code, true),
+            "The chat stays as it is, and the files below go back to how they were at this point."
+        );
+    }
+
+    #[test]
+    fn escape_twice_steps_to_your_newest_message_not_a_reply_or_a_notice() {
+        let said = |role: &str, notice| Message {
+            role: role.into(),
+            notice,
+            ..Default::default()
+        };
+        let session = [
+            said("user", false),
+            said("assistant", false),
+            said("user", false),
+            said("assistant", false),
+            said("user", true),
+            said("assistant", false),
+        ];
+        assert_eq!(
+            newest_yours(&turns(&session, false)).map(|s| s.first),
+            Some(2)
+        );
+        assert_eq!(
+            newest_yours(&turns(&session[..2], true)).map(|s| s.first),
+            Some(0)
+        );
+        assert_eq!(newest_yours(&turns(&[], false)), None);
     }
 
     #[test]
@@ -1791,5 +2101,16 @@ mod tests {
         let odd = "`echo `date`: left running in the background, so not undone.";
         assert_eq!(code_spans(odd), [part(odd, false)]);
         assert_eq!(code_spans("No commands."), [part("No commands.", false)]);
+    }
+
+    #[test]
+    fn files_put_back_under_a_reply_or_a_run_are_told_after_it() {
+        // The reply in this session is under way: it hears at its next step.
+        assert!(put_back_waits(7, Some(7), false));
+        // A run beside the chat holds it: it hears when the run ends.
+        assert!(put_back_waits(7, None, true));
+        // A reply elsewhere leaves this session free to hear at once.
+        assert!(!put_back_waits(7, Some(3), false));
+        assert!(!put_back_waits(7, None, false));
     }
 }

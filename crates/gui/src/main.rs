@@ -276,6 +276,14 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             KeyBinding::new("enter", turn::TurnMenu, Some("Turn")),
             Some("On a turn: its menu"),
         ),
+        (
+            KeyBinding::new("up", turn::PreviousTurn, Some("Turn")),
+            Some("On a turn: step to the one before"),
+        ),
+        (
+            KeyBinding::new("down", turn::NextTurn, Some("Turn")),
+            Some("On a turn: step to the one after"),
+        ),
         // The sidebar's own, as its filters below are, and like a turn's
         // they act only while the sidebar itself has the focus.
         (

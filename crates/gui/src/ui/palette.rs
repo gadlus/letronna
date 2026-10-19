@@ -118,6 +118,10 @@ fn commands() -> Vec<(&'static str, Rc<dyn Action>)> {
             Rc::new(super::activity::ShowRunning),
         ),
         ("Show the keys", Rc::new(ShowKeys)),
+        (
+            "Go back to an earlier message",
+            Rc::new(super::actions::GoBack),
+        ),
         ("Send now, into the reply", Rc::new(SendNow)),
         // Escape's action: it stops the reply only once nothing else is
         // open to back out of, such as Settings or an edit.

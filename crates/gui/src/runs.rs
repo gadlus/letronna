@@ -780,6 +780,9 @@ impl Chat {
     /// What follows a held run's end: its answer to the chat that sent it,
     /// what came too late for it, and a place for the next.
     fn ended(&mut self, mut run: Run, id: u64, text: &str, end: End, cx: &mut Context<Self>) {
+        // Files put back while it ran, told now the session is the window's
+        // again and before a follow-up goes on.
+        self.tell_waiting_put_back(id);
         match &run.source {
             Some(source) => {
                 let answered = !end.stopped && !end.failed;

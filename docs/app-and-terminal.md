@@ -8,6 +8,7 @@ Both front ends sit on the same core and share the account, sessions and setting
 - **Model menu**: lists the models of every configured gateway. Effort, thinking and web search can be toggled where the model supports them.
 - **Side panels**: Browser, Files, Changes and Jobs.
 - **Command palette**: `Ctrl+K`. The whole window is reachable from the keyboard.
+- **Going back**: right-click a message and pick Rewind to here, or press `Esc` twice in an empty composer and then `W` on the message. Choose whether the code and the conversation go back, the conversation alone, or the code alone.
 - **Tray**: on Windows and Linux, closing the window keeps Letronna in the tray.
 
 ## Command line
