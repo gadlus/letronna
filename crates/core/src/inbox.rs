@@ -215,6 +215,19 @@ pub(crate) fn holds(to: u64, from: &str) -> bool {
     })
 }
 
+/// Whether a session or helper has a notice waiting that its running turn
+/// takes at its next step.
+pub(crate) fn urgent(to: u64) -> bool {
+    inbox().lock().is_ok_and(|inbox| {
+        inbox.mailboxes.get(&to).is_some_and(|mailbox| {
+            mailbox
+                .waiting
+                .iter()
+                .any(|(_, notice)| notice.when == When::Next)
+        })
+    })
+}
+
 /// Take back what `from` left for a session or helper that nobody has read.
 pub(crate) fn withdraw(to: u64, from: &str) {
     let Ok(mut inbox) = inbox().lock() else {
@@ -403,6 +416,20 @@ pub(crate) mod tests {
         assert!(pending().contains(&13), "what can wait was lost");
         assert_eq!(texts(&take(13, true)), ["the hour is up"]);
         assert!(!pending().contains(&13));
+    }
+
+    #[test]
+    fn only_what_the_next_step_takes_is_urgent() {
+        let _turn = DOORBELL.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!urgent(14));
+        push(14, notice("wake-up", When::Later, "the hour is up"));
+        push(14, notice("wake-up 2", When::Quiet, "a day late"));
+        assert!(!urgent(14));
+        push(14, notice("job 4", When::Next, "job #4 exited"));
+        assert!(urgent(14));
+        take(14, false);
+        assert!(!urgent(14), "what was taken is still urgent");
+        take(14, true);
     }
 
     #[test]

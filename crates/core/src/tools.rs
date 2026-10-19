@@ -282,6 +282,15 @@ const MAX_WAIT_SECS: u64 = 120;
 /// model reads what came of it while it can still act on it; never more
 /// than half the time left, so a call made later still gets its share.
 const BEFORE_DEADLINE: Duration = Duration::from_secs(30);
+/// The least a foreground call on a run with a deadline holds the turn
+/// before half the time left, or a notice waiting for the model, hands it
+/// back: the default limit, so a call that asked for no more waits as it
+/// asked.
+#[cfg(not(test))]
+const LEAST_HELD: Duration = COMMAND_TIMEOUT;
+/// A second in tests, so one hands the turn back without two minutes' wait.
+#[cfg(test)]
+const LEAST_HELD: Duration = Duration::from_secs(1);
 /// How much of a file one read shows, in bytes, which is never more
 /// characters: under the chat's cap on a tool result with room for the
 /// footer, so a page reaches the model whole instead of losing its middle.
@@ -1973,9 +1982,12 @@ enum Cut {
     /// The run's time warning came, which the model hears only once the
     /// call is over.
     Warning,
-    /// The run is stopped at this instant, which would end the call before
-    /// the model saw what came of it.
+    /// The run is stopped at this instant: the call has had half the time
+    /// left, or the rest would end it before the model saw what came of it.
     Deadline(Instant),
+    /// A notice came for the model, such as a job's exit, which it hears
+    /// only once the call is over.
+    Notice,
 }
 
 impl Cut {
@@ -1983,6 +1995,7 @@ impl Cut {
     fn when(self) -> String {
         match self {
             Cut::Warning => "at this run's time warning".to_owned(),
+            Cut::Notice => "with a notice waiting for you".to_owned(),
             Cut::Deadline(at) => format!(
                 "with about {} s of this run left",
                 at.saturating_duration_since(Instant::now()).as_secs()
@@ -1991,11 +2004,13 @@ impl Cut {
     }
 }
 
-/// When, sooner than `asked`, a foreground call in `ctx` stops waiting, and
-/// why, or None when it waits as asked: a session's own agent on a run with
-/// a deadline is not kept in one call past its time warning, or past the
-/// moment just before the deadline once the warning has come.
-fn sooner(asked: Duration, ctx: &ToolContext) -> Option<(Duration, Cut)> {
+/// How long a foreground call in `ctx` waits, and why when that is sooner
+/// than `asked`; None when it waits as asked, being no call of a session's
+/// own agent on a run with a deadline. Such a call is held no longer than
+/// half the time left, or the least it is held if that is more, nor past
+/// the run's time warning, nor past the moment just before the deadline
+/// once the warning has come.
+fn sooner(asked: Duration, ctx: &ToolContext) -> Option<(Duration, Option<Cut>)> {
     // Only that agent is told of the warning, and only its commands can go
     // on in the background rather than be stopped.
     owner_at_limit(ctx)?;
@@ -2003,7 +2018,15 @@ fn sooner(asked: Duration, ctx: &ToolContext) -> Option<(Duration, Cut)> {
     let (deadline, warn_at) = (connection.deadline?, connection.warn_at?);
     let now = Instant::now();
     let (limit, cut) = match warn_at.checked_duration_since(now) {
-        Some(until) => (until, Cut::Warning),
+        // A call given most of the run would leave the rest of it no time
+        // to act on what came of it.
+        Some(until) => {
+            let share = LEAST_HELD.max(deadline.saturating_duration_since(now) / 2);
+            match share < until {
+                true => (share, Cut::Deadline(deadline)),
+                false => (until, Cut::Warning),
+            }
+        }
         None => {
             let left = deadline.saturating_duration_since(now);
             (
@@ -2012,7 +2035,10 @@ fn sooner(asked: Duration, ctx: &ToolContext) -> Option<(Duration, Cut)> {
             )
         }
     };
-    (limit < asked).then_some((limit, cut))
+    Some(match limit < asked {
+        true => (limit, Some(cut)),
+        false => (asked, None),
+    })
 }
 
 /// Where a command's output is saved whole when it is too long to keep, and
@@ -2046,7 +2072,8 @@ fn run_sandboxed(
 /// times out, with output cut while it was read saved whole to `save`, up to
 /// its cap, and the cut saying where. One still running at `limit` is moved
 /// to the background as a job told to `owner`, or stopped if it has none;
-/// one with an owner moves at the `sooner` limit instead, if it has one.
+/// one with an owner on a timed run moves at the `sooner` limit instead, or
+/// once past the least it is held, as soon as a notice waits for the owner.
 fn run_shell_saving(
     cmd: std::process::Command,
     command: &str,
@@ -2054,7 +2081,7 @@ fn run_shell_saving(
     save: Option<SaveTo>,
     limit: Duration,
     owner: Option<u64>,
-    sooner: Option<(Duration, Cut)>,
+    sooner: Option<(Duration, Option<Cut>)>,
 ) -> Result<String, String> {
     let result = run_shell_into(cmd, command, cancel, save.as_ref(), limit, owner, sooner);
     // What the pipes were streamed to only goes into the saved file.
@@ -2083,7 +2110,7 @@ fn run_shell_into(
     save: Option<&SaveTo>,
     limit: Duration,
     owner: Option<u64>,
-    sooner: Option<(Duration, Cut)>,
+    sooner: Option<(Duration, Option<Cut>)>,
 ) -> Result<String, String> {
     use std::process::Stdio;
     let _running = Running::start();
@@ -2102,9 +2129,9 @@ fn run_shell_into(
     let tree = crate::jobs::Tree::leaving(&child).ok();
     // Only where it would move to the background: one that could only be
     // stopped there waits as long as it was given.
-    let (limit, cut) = match sooner {
-        Some((sooner, cut)) if owner.is_some() && tree.is_some() => (sooner, Some(cut)),
-        _ => (limit, None),
+    let (limit, mut cut, timed) = match sooner {
+        Some((sooner, cut)) if owner.is_some() && tree.is_some() => (sooner, cut, true),
+        _ => (limit, None, false),
     };
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         let _ = child.kill();
@@ -2160,6 +2187,14 @@ fn run_shell_into(
                  it again with background: true.",
                 limit.as_secs()
             ));
+        }
+        // The turn takes such a notice only once this call is over, so the
+        // exit of a job it waits on would go unheard until the limit. Only
+        // past the least it is held, so a call given no more than the
+        // default waits as it asked.
+        if timed && started.elapsed() > LEAST_HELD && owner.is_some_and(crate::inbox::urgent) {
+            cut = Some(Cut::Notice);
+            break Ok(None);
         }
         let leaving = LEAVING.load(std::sync::atomic::Ordering::Relaxed);
         if leaving || !cancel.sleep(std::time::Duration::from_millis(50)) {
@@ -2267,7 +2302,7 @@ fn run_shell_into(
             format!(
                 "Timed out after {}s and was stopped, since it could not be moved \
                  to the background: {e}",
-                limit.as_secs()
+                started.elapsed().as_secs()
             )
         })?;
         if text.trim().is_empty() {
@@ -3948,10 +3983,7 @@ impl Tool for Wait {
         let asked = std::time::Duration::from_secs_f64(seconds);
         // Cut short near the run's time as a command is, so the model hears
         // of it at once rather than after the pause.
-        let (limit, cut) = match sooner(asked, ctx) {
-            Some((sooner, cut)) => (sooner, Some(cut)),
-            None => (asked, None),
-        };
+        let (limit, cut) = sooner(asked, ctx).unwrap_or((asked, None));
         let seconds = limit.as_secs_f64();
         let Some(id) = args["job"].as_u64() else {
             if !ctx.cancel.sleep(limit) {
@@ -6884,14 +6916,25 @@ mod tests {
             now + Duration::from_secs(500),
         );
         let (limit, cut) = sooner(asked, &early).unwrap();
-        assert!(near(limit, 100) && cut == Cut::Warning, "{limit:?} {cut:?}");
+        assert!(
+            near(limit, 100) && cut == Some(Cut::Warning),
+            "{limit:?} {cut:?}"
+        );
+        // Before a warning further off, for half of what is left.
+        let deadline = now + Duration::from_secs(500);
+        let far = timed(7_705, now + Duration::from_secs(400), deadline);
+        let (limit, cut) = sooner(asked, &far).unwrap();
+        assert!(
+            near(limit, 250) && cut == Some(Cut::Deadline(deadline)),
+            "{limit:?} {cut:?}"
+        );
         // Past it, until shortly before the deadline, or half of what is
         // left once that is short.
         let deadline = now + Duration::from_secs(100);
         let late = timed(7_705, now - Duration::from_secs(1), deadline);
         let (limit, cut) = sooner(asked, &late).unwrap();
         assert!(
-            near(limit, 70) && cut == Cut::Deadline(deadline),
+            near(limit, 70) && cut == Some(Cut::Deadline(deadline)),
             "{limit:?}"
         );
         let last = timed(
@@ -6900,8 +6943,16 @@ mod tests {
             now + Duration::from_secs(10),
         );
         assert!(near(sooner(asked, &last).unwrap().0, 5));
+        // Never for less than the least it is held, however little is left.
+        let soon = timed(
+            7_705,
+            now + Duration::from_millis(1_800),
+            now + Duration::from_millis(1_900),
+        );
+        assert_eq!(sooner(asked, &soon).unwrap().0, LEAST_HELD);
         // One that asked for less waits as it asked.
-        assert_eq!(sooner(Duration::from_secs(60), &early), None);
+        let less = Duration::from_secs(60);
+        assert_eq!(sooner(less, &early), Some((less, None)));
         // A helper's call, a call for no session in particular and one on a
         // run with no deadline are never cut short.
         let helper = ToolContext {
@@ -6991,6 +7042,83 @@ mod tests {
         crate::jobs::stop(id).unwrap();
         assert!(Instant::now() < now + Duration::from_secs(6), "{note}");
         assert!(note.contains(&format!("or stop_job {id} if not")), "{note}");
+    }
+
+    /// Where the exit notice of a job of `owner`'s comes from, once the job
+    /// has exited and the notice waits for `owner`.
+    fn heard_exit(owner: u64) -> String {
+        let job = crate::jobs::start_for("exit 3", &std::env::temp_dir(), owner).unwrap();
+        let from = format!("job {job}");
+        // A cold PowerShell start comes first, so the wait is generous.
+        let given = Instant::now() + Duration::from_secs(60);
+        while !crate::inbox::holds(owner, &from) && Instant::now() < given {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            crate::inbox::holds(owner, &from),
+            "no exit notice for job #{job}"
+        );
+        from
+    }
+
+    #[test]
+    fn a_command_on_a_timed_run_gives_the_turn_back_when_a_job_s_notice_waits() {
+        let _turn = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let from = heard_exit(7_711);
+        let command = if cfg!(windows) {
+            "Write-Output before; Start-Sleep 30"
+        } else {
+            "echo before; sleep 30"
+        };
+        // Its warning and the half of what is left are both far off.
+        let now = Instant::now();
+        let ctx = timed(
+            7_711,
+            now + Duration::from_secs(600),
+            now + Duration::from_secs(3600),
+        );
+        let args = json!({"command": command, "timeout": 600}).to_string();
+        let said = run("run_command", &args, &ctx).unwrap();
+        assert!(Instant::now() - now < Duration::from_secs(20), "{said}");
+        let (note, so_far) = said.split_once(SO_FAR).unwrap();
+        let id: u64 = note
+            .split_once(
+                "s, with a notice waiting for you, so it carries on in the background as job #",
+            )
+            .and_then(|(_, rest)| rest.split_once(' '))
+            .and_then(|(id, _)| id.parse().ok())
+            .unwrap_or_else(|| panic!("{said}"));
+        crate::jobs::stop(id).unwrap();
+        assert!(note.contains(&format!("or stop_job {id} if not")), "{note}");
+        assert_eq!(so_far.trim_end(), "before");
+        // Left for the turn to take once the call is over.
+        let taken = crate::inbox::take(7_711, true);
+        assert!(taken.iter().any(|notice| notice.from == from), "{taken:?}");
+    }
+
+    #[test]
+    fn a_command_on_a_run_with_no_deadline_waits_as_asked_with_a_notice_waiting() {
+        let _turn = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        heard_exit(7_712);
+        let command = if cfg!(windows) {
+            "Start-Sleep 2; Write-Output after"
+        } else {
+            "sleep 2; echo after"
+        };
+        let untimed = ToolContext::of(&Connection {
+            conversation: 7_712,
+            workspace: Some(std::env::temp_dir()),
+            ..Default::default()
+        });
+        let args = json!({"command": command, "timeout": 600}).to_string();
+        let said = run("run_command", &args, &untimed).unwrap();
+        crate::inbox::take(7_712, true);
+        assert!(!said.contains(MOVED), "{said}");
+        assert_eq!(said.trim_end(), "after");
     }
 
     #[test]
