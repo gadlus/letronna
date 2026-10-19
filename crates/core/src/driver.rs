@@ -14,13 +14,16 @@
 //! browser is used unseen, with no panel to open; and messages sent
 //! meanwhile are read from the inbox after each batch of results and before
 //! the run counts as done. A reply cut off at the output limit, empty, or
-//! stopping at its next step is sent back as the terminal sends it, and a
-//! session's own agent that changed source after its last passing
-//! build or test is sent back once to run one, naming the files. So is one
-//! whose files repeat words of an instruction planted in what it read, to
-//! reword them (`echo`), and one nobody watches that changed source, or a
-//! file its request names, for a request stating several requirements,
-//! quoted back to it to check each (`requirements`).
+//! stopping at its next step is sent back as the terminal sends it; on a
+//! connection nobody watches, one that loops on the same few words or is
+//! still empty after that is dropped and asked for again after a short
+//! rest, three times a round at most. A session's own agent that changed
+//! source after its last passing build or test is sent back once to run
+//! one, naming the files. So is one whose files repeat words of an
+//! instruction planted in what it read, to reword them (`echo`), and one
+//! nobody watches that changed source, or a file its request names, for a
+//! request stating several requirements, quoted back to it to check each
+//! (`requirements`).
 //!
 //! A frontend that shows the run as it goes, as an editor does over ACP,
 //! gives it a `Watch`, which hears each step as it is made. A run that is a
@@ -116,6 +119,12 @@ const NOBODY_TO_ASK: &str = "Nobody is there to answer in a scheduled run. Decid
 
 /// What a helper is told when a call it needed a yes for did not get one.
 const NOT_APPROVED: &str = "This was not approved, so it did not run. Do not try to get the same result another way: leave it, and say in your report what you could not do.";
+
+/// What a watcher, which cannot take back the words it was sent, hears
+/// after a reply that went round on the same few words. Only a run nobody
+/// may be watching asks again, so in practice that is the app showing a
+/// chat app's run; an editor's turns over ACP are watched and never do.
+const REPEATED: &str = "That reply repeated itself, so it is dropped and asked for again.";
 
 /// How many times a round the provider turned away with a 429 is asked
 /// again: rests of 2, 4 and 8 s ride out a burst, and a provider still
@@ -582,6 +591,18 @@ fn steps(
         spec.status.output.store(report.output, Ordering::Relaxed);
         if let Some(budget) = &spec.budget {
             budget.charge(&reply);
+        }
+        // Dropped once counted and charged, and never kept, so the same
+        // request goes again; with no budget left for it, the reply is
+        // kept, as one that might be an answer after all.
+        if (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
+            && let Some(rest) = turn.ask_again(&reply)
+        {
+            if !reply.content.trim().is_empty() {
+                tell(spec, Step::Said(format!("\n\n({REPEATED})\n\n")));
+            }
+            crate::retry::pause(rest, || spec.cancel.is_set());
+            continue;
         }
         // Taken before `continuation`, which drops calls made in the wrap-up
         // at the round cap: they still end the run at its limit.
@@ -5477,6 +5498,71 @@ pub(crate) mod tests {
         assert!(asked.contains("no visible output"), "{asked}");
         // Neither empty reply is kept, since some routes turn one down.
         assert!(messages(&sent[1]).iter().all(|m| m["role"] != "assistant"));
+    }
+
+    #[test]
+    fn a_run_nobody_watches_asks_again_for_a_reply_that_stays_empty() {
+        let dir = scratch("empty-again");
+        let replies = vec![reply("", &[]), reply("", &[]), reply("Done.", &[])];
+        let (endpoint, provider) = provider(replies);
+        let mut spec = spec(endpoint, &dir, AGENTS + 511);
+        spec.connection.unattended = true;
+        let report = finished(spec);
+        let sent = provider.sent();
+
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "Done.");
+        // The same request went again, with the one notice and no reply kept.
+        assert_eq!(sent[2], sent[1]);
+        let notices = messages(&sent[2])
+            .iter()
+            .filter(|m| (m["content"].as_str()).is_some_and(|c| c.contains("no visible output")))
+            .count();
+        assert_eq!(notices, 1);
+        assert!(messages(&sent[2]).iter().all(|m| m["role"] != "assistant"));
+    }
+
+    #[test]
+    fn a_reply_that_repeats_itself_is_dropped_and_asked_for_again() {
+        let dir = scratch("repeats");
+        let filler = "Let \n\n Actually \n\n Hmm \n\n".repeat(200);
+        let (endpoint, provider) = provider(vec![reply(&filler, &[]), reply("Done.", &[])]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 512);
+        spec.connection.unattended = true;
+        let said = Arc::new(std::sync::Mutex::new(String::new()));
+        let heard = said.clone();
+        spec.watch = Some(Arc::new(move |step| {
+            if let Step::Said(text) = step {
+                heard.lock().unwrap().push_str(&text);
+            }
+        }));
+        let report = finished(spec);
+        let sent = provider.sent();
+
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "Done.");
+        assert_eq!(sent[1], sent[0]);
+        // Dropped, but paid for all the same.
+        assert_eq!(report.output, 100);
+        // A watcher cannot take back the words it heard, so it hears why.
+        let said = said.lock().unwrap();
+        assert!(said.contains(&format!("\n\n({REPEATED})\n\n")), "{said}");
+    }
+
+    #[test]
+    fn a_reply_that_repeats_itself_is_kept_with_no_budget_left_to_ask_again() {
+        let dir = scratch("repeats-spent");
+        let filler = "Let \n\n Actually \n\n Hmm \n\n".repeat(200);
+        // Only one answer: asking again would find nobody and fail the run.
+        let (endpoint, provider) = provider(vec![reply(&filler, &[])]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 513);
+        spec.connection.unattended = true;
+        spec.budget = Some(Arc::new(Budget::new(1_000, None)));
+        let report = finished(spec);
+
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, filler);
+        assert_eq!(provider.sent().len(), 1);
     }
 
     #[test]

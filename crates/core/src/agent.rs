@@ -17,6 +17,7 @@ use crate::gate::Outcome;
 use crate::tools;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::time::Duration;
 
 /// Tool rounds per user message. Enough for a real investigation, small
 /// enough that a looping model stops on its own.
@@ -40,6 +41,42 @@ const CALL_AGAIN: &str = "Your last reply was cut off at the output limit in the
 /// words other agents send, which models already answer well.
 const SPEAK_UP: &str = "Your previous response had no visible output. Please continue and \
     produce a user-visible response.";
+
+/// Times a round a reply on a connection nobody watches is dropped and the
+/// same request sent again; one still looping or blank after that is
+/// handled as any reply is.
+const ASK_AGAIN: usize = 3;
+
+/// The rest before such a request goes again, doubled for each later try:
+/// 2, 4 and 8 s, as a round turned away with a 429 rests, so a route that
+/// just sent nothing has a moment to come right.
+#[cfg(not(test))]
+const FIRST_REST: Duration = Duration::from_secs(2);
+/// A thousandth of that in tests, so asking again costs them no wait.
+#[cfg(test)]
+const FIRST_REST: Duration = Duration::from_millis(2);
+
+/// The fewest characters of a reply read as looping: under that, an answer
+/// that says one thing twice may still be a fine answer.
+const LOOP_CHARS: usize = 2000;
+
+/// The most a reply read as looping packs down to, as a share of its size.
+/// One that went round on "Let... Actually... Hmm" for 6,462 characters
+/// packed to 0.085; of 3,674 replies and thoughts of 2,000 characters or
+/// more in five models' runs, the next smallest packed to 0.26, and no
+/// answer in prose of 800 or more below 0.32. But data packs down as far,
+/// a JSON list of like records or a log to between 0.03 and 0.13, so a
+/// loop must also have run out of new sentences (`LOOP_NEW_SENTENCES`).
+const LOOP_SHARE: f64 = 0.15;
+
+/// Of the sentences in the later half of a reply read as looping, the
+/// most that may be new to it, as a share; a line with no sentence ending
+/// in it, as in most data, counts as one. The loop above had fewer than one
+/// in fifty there; JSON records with one field in ten that changes bring
+/// one in eleven, and a log, a table or a list of tests a new one every
+/// line. An answer that says the same paragraph twice has none, but packs
+/// down only to over a quarter of its size.
+const LOOP_NEW_SENTENCES: f64 = 0.05;
 
 /// The notice after a short answer that stops at what it is about to do.
 const CONTINUE_NOW: &str = "Continue now.";
@@ -209,6 +246,8 @@ pub struct Turn {
     order: Vec<String>,
     /// An empty reply was sent back since the last tool round.
     asked_again: bool,
+    /// Replies dropped and asked for again unchanged since the last tool round.
+    asked_unchanged: usize,
     /// An answer that stopped at its next step was sent back this turn.
     pushed_on: bool,
     /// Whether an answer after unchecked edits is sent back to check them.
@@ -269,6 +308,7 @@ impl Turn {
             continued: 0,
             order: Vec::new(),
             asked_again: false,
+            asked_unchanged: 0,
             pushed_on: false,
             verify: false,
             edited: false,
@@ -430,6 +470,34 @@ impl Turn {
         reply
     }
 
+    /// How long to rest before sending the same request again, when the
+    /// reply just finished is dropped rather than kept: on a connection
+    /// nobody watches, one with no call that loops on the same few words, or
+    /// that is still blank after `SPEAK_UP`. Nobody is there to read past
+    /// filler, and a run that ends on it, or carries it in every later
+    /// request, does worse than one that asks again. `ASK_AGAIN` times a
+    /// round at most; past that `continuation` has its say, as for any reply.
+    pub fn ask_again(&mut self, reply: &Message) -> Option<Duration> {
+        // A reply cut off at the limit goes on from where it stopped, and
+        // the wrap-up at the round cap is the last word either way.
+        if !self.connection.unattended
+            || self.connection.wrap_up
+            || self.cut_off.is_some()
+            || !reply.tool_calls.is_empty()
+            || self.asked_unchanged >= ASK_AGAIN
+        {
+            return None;
+        }
+        // A first blank gets `SPEAK_UP`, which mostly does it, and thinking
+        // alone is an answer of sorts.
+        let blank = reply.content.trim().is_empty() && reply.reasoning.trim().is_empty();
+        if !(blank && self.asked_again) && !loops(&reply.content) {
+            return None;
+        }
+        self.asked_unchanged += 1;
+        Some(FIRST_REST * (1 << (self.asked_unchanged - 1)))
+    }
+
     /// The notice sending the model back to work after the reply just
     /// finished, if it needs one: a reply cut off at the output limit, one
     /// with nothing in it, a short answer that stops at "Now let me...", or,
@@ -541,6 +609,7 @@ impl Turn {
             self.rounds_since_edit += 1;
         }
         self.asked_again = false;
+        self.asked_unchanged = 0;
         true
     }
 
@@ -1154,6 +1223,53 @@ fn only_notes(result: &Message) -> bool {
             .any(|note| extension.eq_ignore_ascii_case(note))
     };
     !paths.is_empty() && paths.iter().all(note)
+}
+
+/// Whether `text` goes round on the same few words: long enough that an
+/// answer would not, out of new sentences by its later half, as data that
+/// brings a new line every few lines is not, and packing down far, as a
+/// paragraph said twice does not.
+fn loops(text: &str) -> bool {
+    text.chars().count() >= LOOP_CHARS && says_nothing_new(text) && packs_down(text)
+}
+
+/// Whether hardly a sentence in the later half of `text` is new to it.
+fn says_nothing_new(text: &str) -> bool {
+    let sentences: Vec<&str> = sentences(text).collect();
+    let half = sentences.len() / 2;
+    let mut written = HashSet::new();
+    let mut new = 0;
+    for (n, sentence) in sentences.iter().enumerate() {
+        if written.insert(*sentence) && n >= half {
+            new += 1;
+        }
+    }
+    (new as f64) < (sentences.len() - half) as f64 * LOOP_NEW_SENTENCES
+}
+
+/// The lines of `text`, each cut after a full stop, question or exclamation
+/// mark, trimmed, leaving out blank ones: a loop that never breaks its line
+/// still says the same sentences. Only a mark a space follows ends one, so
+/// the dots in a version or an address do not cut a line of data into
+/// pieces that repeat.
+fn sentences(text: &str) -> impl Iterator<Item = &str> {
+    text.lines()
+        .flat_map(|line| line.split_inclusive(". "))
+        .flat_map(|piece| piece.split_inclusive("? "))
+        .flat_map(|piece| piece.split_inclusive("! "))
+        .map(str::trim)
+        .filter(|sentence| !sentence.is_empty())
+}
+
+/// Whether `text` deflates to under `LOOP_SHARE` of its size.
+fn packs_down(text: &str) -> bool {
+    use std::io::Write;
+    let mut packer = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    let packed = packer
+        .write_all(text.as_bytes())
+        .and_then(|()| packer.finish());
+    // Packing into memory cannot fail, and packing that did would prove nothing.
+    packed.is_ok_and(|packed| (packed.len() as f64) < text.len() as f64 * LOOP_SHARE)
 }
 
 /// Whether `answer` is short and ends by announcing a step it did not take,
@@ -2252,6 +2368,171 @@ mod tests {
         turn.take_results();
         let mut blank = turn.take_reply("some-model");
         assert!(turn.continuation(&mut blank).unwrap().is_some());
+    }
+
+    /// A turn on a connection nobody watches, as a `-p` run's is.
+    fn unwatched() -> Turn {
+        let mut connection = turn().connection;
+        connection.unattended = true;
+        Turn::new(connection)
+    }
+
+    /// Filler going round on the same few words, `times` times over, as a
+    /// model once wrote for 6,000 characters in place of an answer.
+    fn filler(times: usize) -> String {
+        "Let \n\n Actually \n\n Hmm \n\n".repeat(times)
+    }
+
+    /// An answer as a run's last reply gives one.
+    const SUMMARY: &str = "The parser now reads quoted fields that span several lines, so a CSV exported from a spreadsheet with notes in a cell loads as one row per record rather than splitting a record wherever a note had a line break.
+I changed `read_record` in src/csv.rs to keep reading while a quote is open, and added three tests beside it: a field with an embedded newline, one with an escaped quote just before the newline, and a file that ends inside an open quote, which now fails with the line number where the quote began instead of returning a short last row.
+All 214 tests pass, and `cargo clippy` is clean. The sample in data/notes.csv, which had 1,204 lines, now loads as 980 records, matching the count the spreadsheet shows.
+One thing I did not change: a bare carriage return inside a quoted field is still kept as is, since the old code did the same and nothing in the project relies on either behaviour; if you would rather drop it, that is a one-line change in `read_record`, and I can add a test for it too.";
+
+    #[test]
+    fn a_turn_nobody_watches_asks_again_for_a_reply_still_empty_after_speaking_up() {
+        let mut turn = unwatched();
+        let mut blank = turn.take_reply("some-model");
+        // The first hears the notice, which mostly does it.
+        assert_eq!(turn.ask_again(&blank), None);
+        let nudge = turn.continuation(&mut blank).unwrap().expect("a nudge");
+        assert_eq!(nudge.notice.content, SPEAK_UP);
+        for doubled in [1, 2, 4] {
+            let blank = answer(&mut turn, " \n");
+            assert_eq!(turn.ask_again(&blank), Some(FIRST_REST * doubled));
+        }
+        let mut blank = turn.take_reply("some-model");
+        assert_eq!(turn.ask_again(&blank), None);
+        assert_eq!(
+            turn.continuation(&mut blank).err().as_deref(),
+            Some("The model returned no text. Check model compatibility.")
+        );
+    }
+
+    #[test]
+    fn a_watched_turn_never_asks_again_unchanged() {
+        let mut turn = turn();
+        let mut blank = turn.take_reply("some-model");
+        assert!(turn.continuation(&mut blank).unwrap().is_some());
+        let blank = turn.take_reply("some-model");
+        assert_eq!(turn.ask_again(&blank), None);
+        let looping = answer(&mut turn, &filler(200));
+        assert_eq!(turn.ask_again(&looping), None);
+    }
+
+    #[test]
+    fn a_blank_reply_with_thinking_is_not_asked_again() {
+        let mut turn = unwatched();
+        let mut blank = turn.take_reply("some-model");
+        assert!(turn.continuation(&mut blank).unwrap().is_some());
+        turn.absorb(&Event::Reasoning("The answer is 4.".into()));
+        let mut thought = turn.take_reply("some-model");
+        assert_eq!(turn.ask_again(&thought), None);
+        assert!(matches!(turn.continuation(&mut thought), Ok(None)));
+        assert_eq!(thought.content, "The answer is 4.");
+    }
+
+    #[test]
+    fn a_reply_that_loops_is_asked_for_again_and_one_that_does_not_is_kept() {
+        let mut turn = unwatched();
+        let looping = answer(&mut turn, &filler(200));
+        assert_eq!(turn.ask_again(&looping), Some(FIRST_REST));
+        // An answer said twice brings nothing new in its later half, but it
+        // is prose, which packs down only so far.
+        let twice = format!("{SUMMARY}\n\n{SUMMARY}");
+        assert!(twice.chars().count() >= LOOP_CHARS && says_nothing_new(&twice));
+        let kept = answer(&mut turn, &twice);
+        assert_eq!(turn.ask_again(&kept), None);
+        // One that never breaks its line still says the same sentences.
+        let one_line = answer(
+            &mut turn,
+            &"Wait, let me think about this again. ".repeat(80),
+        );
+        assert_eq!(turn.ask_again(&one_line), Some(FIRST_REST * 2));
+        // Too short to tell from an answer that says one thing twice.
+        assert!(loops(&filler(80)));
+        let short = answer(&mut turn, &filler(79));
+        assert_eq!(turn.ask_again(&short), None);
+        // A call is worth running whatever came with it.
+        turn.absorb(&Event::Delta(filler(200)));
+        turn.absorb(&Event::ToolCalls(vec![call("read_file")]));
+        let calling = turn.take_reply("some-model");
+        assert_eq!(turn.ask_again(&calling), None);
+        // One cut off at the limit goes on from where it stopped.
+        turn.absorb(&Event::Delta(filler(200)));
+        turn.absorb(&Event::CutOff { in_call: false });
+        let mut cut = turn.take_reply("some-model");
+        assert_eq!(turn.ask_again(&cut), None);
+        let nudge = turn
+            .continuation(&mut cut)
+            .unwrap()
+            .expect("a continuation");
+        assert_eq!(nudge.notice.content, CONTINUE);
+        // And the wrap-up at the round cap is the last word.
+        turn.connection.wrap_up = true;
+        let looping = answer(&mut turn, &filler(200));
+        assert_eq!(turn.ask_again(&looping), None);
+    }
+
+    #[test]
+    fn data_that_packs_down_as_far_as_a_loop_is_kept() {
+        let mut turn = unwatched();
+        let records: Vec<String> = (1..=60)
+            .map(|n| {
+                format!(
+                    "  {{\n    \"id\": {n},\n    \"name\": \"User {n}\",\n    \
+                     \"email\": \"user{n}@example.com\",\n    \"active\": true\n  }}"
+                )
+            })
+            .collect();
+        let records = format!("[\n{}\n]", records.join(",\n"));
+        // One field in ten changes from record to record.
+        let alike: Vec<String> = (1..=40)
+            .map(|n| {
+                format!(
+                    "  {{\n    \"id\": {n},\n    \"status\": \"ok\",\n    \
+                     \"region\": \"us-east-1\",\n    \"retries\": 0,\n    \
+                     \"enabled\": true,\n    \"tier\": \"free\",\n    \
+                     \"owner\": \"team-a\",\n    \"version\": \"1.0.0\",\n    \
+                     \"kind\": \"worker\",\n    \"zone\": \"a\"\n  }}"
+                )
+            })
+            .collect();
+        let alike = format!("[\n{}\n]", alike.join(",\n"));
+        let log: Vec<String> = (0..120)
+            .map(|n| {
+                format!(
+                    "2026-10-18T12:{:02}:{:02}Z INFO request {} served in {}ms. Cache warm.",
+                    n / 60,
+                    n % 60,
+                    1000 + n,
+                    5 + n % 40
+                )
+            })
+            .collect();
+        for data in [records, alike, log.join("\n")] {
+            assert!(data.chars().count() >= LOOP_CHARS && packs_down(&data));
+            let kept = answer(&mut turn, &data);
+            assert_eq!(turn.ask_again(&kept), None, "{data}");
+        }
+    }
+
+    #[test]
+    fn asking_again_is_counted_per_round() {
+        let mut turn = unwatched();
+        for _ in 0..ASK_AGAIN {
+            let looping = answer(&mut turn, &filler(200));
+            assert!(turn.ask_again(&looping).is_some());
+        }
+        // Past that it is an answer like any other.
+        let mut looping = answer(&mut turn, &filler(200));
+        assert_eq!(turn.ask_again(&looping), None);
+        assert!(matches!(turn.continuation(&mut looping), Ok(None)));
+        turn.begin(vec![call("read_file")]);
+        turn.finish_call(Ok("contents".into()));
+        turn.take_results();
+        let looping = answer(&mut turn, &filler(200));
+        assert_eq!(turn.ask_again(&looping), Some(FIRST_REST));
     }
 
     #[test]
