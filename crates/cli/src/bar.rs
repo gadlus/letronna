@@ -2347,7 +2347,6 @@ impl Bar {
     /// the footer, for a window `height` rows tall.
     fn lines(&self, height: usize) -> Vec<String> {
         let room = self.room();
-        let edge = "─".repeat(room + 2);
         let mut lines = Vec::new();
         // Above the waiting line, which stays next to the box it waits to fill.
         self.relay_lines(&mut lines);

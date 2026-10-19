@@ -573,6 +573,7 @@ pub fn settle() {
 impl Screen {
     /// Rows of the conversation as they are on screen, the open line
     /// included. Built fresh for the tail only; the rest is cached.
+    #[cfg(test)]
     fn view(&mut self, width: u16) -> Vec<String> {
         let open = self.lay_out(width);
         let mut rows = self.rows.clone();
