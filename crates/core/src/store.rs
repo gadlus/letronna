@@ -429,6 +429,15 @@ pub struct Settings {
     /// on, on the session's gateway; empty for the session's own. See `side`.
     #[serde(default)]
     pub side_model: String,
+    /// Whether a model names a session once its first reply is in; off, a
+    /// session keeps the first line of what was asked. See `title`.
+    #[serde(default = "yes")]
+    pub auto_title: bool,
+    /// The model that names sessions: empty to choose one automatically,
+    /// `chat` for the session's own, or a model on the session's gateway.
+    /// See `title`.
+    #[serde(default)]
+    pub title_model: String,
     /// How many helpers may run at once across Letronna; 0 for the usual 8.
     #[serde(default)]
     pub helpers_at_once: usize,
@@ -575,6 +584,8 @@ impl Default for Settings {
             reasoning_replay: String::new(),
             helper_model: String::new(),
             side_model: String::new(),
+            auto_title: true,
+            title_model: String::new(),
             helpers_at_once: 0,
             helper_depth: 0,
             helper_budget: 0,

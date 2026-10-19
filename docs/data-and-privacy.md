@@ -33,6 +33,7 @@ Keys never reach the model. File tools cannot read the data folder, and the brow
 ## What leaves your machine
 
 - **Chat text** goes only to the gateway of the selected model. With the Letronna gateway, that is `api.letronna.ai`, which records each request's model and cost for your usage page.
+- **Session names**: once a session's first reply is in, a model gives it a short name. It reads the first message and the start of the reply, never a tool's output. By default (automatic) that is Letronna's quick model when the chat is on the Letronna gateway, otherwise your side model or the chat's own, on the chat's own gateway: a chat on your own key, a company's gateway or a model on this computer is never sent elsewhere to be named. Settings › Model or `/model names` picks another model, or turns naming off, which keeps the first line of what you asked.
 - **Cloud tasks** carry only what the task itself contains (see [Cloud](cloud.md)).
 - **Search, browsing and media tools** contact their services only when the agent uses them, and they ask first.
 - **Local data**: diagnostic logs and crash files stay local.

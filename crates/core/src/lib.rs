@@ -115,6 +115,7 @@ pub mod tasklist;
 pub mod tasks;
 mod think;
 pub mod timers;
+pub mod title;
 pub mod tool_progress;
 pub mod tool_runs;
 pub mod tools;
