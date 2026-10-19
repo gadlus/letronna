@@ -2781,6 +2781,27 @@ fn as_messages(connection: &Connection, body: &Value) -> Value {
     crate::providers::wire::anthropic::request(&body, thinking)
 }
 
+/// Whether naming an effort in a request over `connection` carrying
+/// `messages` would ask for thinking that naming none does not. On
+/// Anthropic's API an effort asks for it, and so does thinking given back,
+/// of which a model that thinks only when asked has none to give. Nor would
+/// it end with that request: its reply's thinking is given back on every
+/// request after it. A model that turned thinking down is never asked.
+pub(crate) fn effort_starts_thinking(connection: &Connection, messages: &[Message]) -> bool {
+    use crate::providers::wire::anthropic;
+    let (endpoint, model) = route(connection);
+    let thought = |replay: &Replay| {
+        replay.endpoint == endpoint
+            && replay.model == model
+            && replay.reasoning_details.iter().any(anthropic::is_thinking)
+    };
+    anthropic::speaks(&connection.endpoint)
+        && !has_quirk(connection, Quirk::Thinking)
+        && !(messages.iter())
+            .filter_map(|m| m.replay.as_deref())
+            .any(thought)
+}
+
 /// `request` carrying `body`, a chat completion request, and the key, as
 /// the wire the connection's endpoint speaks takes them.
 pub(crate) fn carrying(
@@ -15047,6 +15068,42 @@ mod tests {
         assert!(again.get("thinking").is_none());
         // The effort was not at fault, and still goes.
         assert_eq!(again["output_config"], json!({"effort": "high"}));
+    }
+
+    #[test]
+    fn naming_an_effort_starts_thinking_only_on_anthropic_before_any_is_given_back() {
+        let on = |endpoint: &str, model: &str| Connection {
+            endpoint: endpoint.into(),
+            model: model.into(),
+            ..connection()
+        };
+        let asked = on("https://api.anthropic.com/v1", "claude-thinks-when-asked");
+        assert!(effort_starts_thinking(&asked, &hello()));
+        assert!(!effort_starts_thinking(
+            &asked,
+            &thought_before_reading(&asked)
+        ));
+        // Another model's thinking is not given back to this one.
+        let other = on("https://api.anthropic.com/v1", "claude-thought-before");
+        assert!(effort_starts_thinking(
+            &asked,
+            &thought_before_reading(&other)
+        ));
+        // A chat completion's effort asks for no more than it names.
+        let routed = on("https://api.example.com/v1", "claude-opus-5");
+        assert!(!effort_starts_thinking(&routed, &hello()));
+        // Nor does one to a model that turned thinking down.
+        let refuses = Connection {
+            effort: "high".into(),
+            ..on(
+                "https://api.anthropic.com/v1",
+                "claude-refuses-adaptive-thinking",
+            )
+        };
+        let posted = as_messages(&refuses, &body(&refuses, &hello(), None, None));
+        let refusal = r#"{"type":"error","error":{"type":"invalid_request_error","message":"thinking.type: Input tag 'adaptive' found using 'type' does not match any of the expected tags: 'disabled', 'enabled'"}}"#;
+        assert!(learn_messages(&refuses, &posted, refusal));
+        assert!(!effort_starts_thinking(&refuses, &hello()));
     }
 
     #[test]

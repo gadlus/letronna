@@ -243,6 +243,24 @@ const LEAST_THINKING: Duration = Duration::from_secs(60);
 #[cfg(test)]
 const LEAST_THINKING: Duration = Duration::from_millis(100);
 
+/// What heads a stopped reply's thinking as it is handed to the one in its
+/// place.
+const THOUGHT_SO_FAR: &str = "What your stopped reply had thought, to go on from rather than \
+                              start again:";
+
+/// The effort the reply in place of one stopped for thinking asks for, or the
+/// nearest the model offers: thinking that came to nothing is time better
+/// spent writing.
+const AFTER_STOPPED: &str = "low";
+
+/// The effort to ask for in place of `effort` after a reply stopped for
+/// thinking, if a lower one: never more than a run set to think little asks
+/// for. Automatic counts as more, since the model then thinks at its own
+/// default.
+fn lowered(effort: &str) -> Option<&'static str> {
+    (!matches!(effort, "none" | "minimal" | "low")).then_some(AFTER_STOPPED)
+}
+
 /// What a run did, told as it happens to a frontend that shows the run live.
 #[derive(Clone)]
 pub enum Step {
@@ -555,6 +573,9 @@ fn steps(
     // One begun past its warning, as a later turn over stdin can be, has
     // just been told how little time it has.
     let mut warned = past_warning(spec);
+    // The run's own effort while the reply after one stopped for thinking
+    // asks for less.
+    let mut lowered_from: Option<String> = None;
     loop {
         if spec.cancel.is_set() {
             return Ok(Outcome::Stopped);
@@ -570,20 +591,45 @@ fn steps(
             deadline_notice(spec, text)?;
         }
         let mut reply = match ask_in_line(spec, turn)? {
-            Asked::Reply(reply) => reply,
+            Asked::Reply(reply) => {
+                // Back before any call runs, so a helper it starts thinks
+                // as the run was set to.
+                if let Some(effort) = lowered_from.take() {
+                    turn.connection.effort = effort;
+                }
+                reply
+            }
             Asked::Stopped => {
                 keep_cut_short(spec, turn);
                 return Ok(Outcome::Stopped);
             }
-            Asked::ActNow(mut text) => {
+            Asked::ActNow {
+                mut notice,
+                thought,
+            } => {
                 // Which says what the warning would but for tidying up, so
                 // past it the two do not come one after the other: one
                 // standing in for a warning not yet heard says that too.
                 if warning_due(spec, warned) {
-                    text.push_str(&format!(" Also {TIDY}."));
+                    notice.push_str(&format!(" Also {TIDY}."));
                 }
                 warned |= past_warning(spec);
-                deadline_notice(spec, text)?;
+                // Where an effort is what asks for thinking, an automatic
+                // run that was not thinking would start to, and go on.
+                let not_thinking = turn.connection.effort.is_empty()
+                    && thought.trim().is_empty()
+                    && chat::effort_starts_thinking(
+                        &turn.connection,
+                        &spec.transcript.conversation.messages,
+                    );
+                if !not_thinking && let Some(low) = lowered(&turn.connection.effort) {
+                    lowered_from = Some(std::mem::replace(&mut turn.connection.effort, low.into()));
+                }
+                let mut texts = vec![notice];
+                if !thought.trim().is_empty() {
+                    texts.push(format!("{THOUGHT_SO_FAR}\n{}", thought.trim()));
+                }
+                deadline_notices(spec, texts)?;
                 continue;
             }
         };
@@ -1451,9 +1497,10 @@ enum Asked {
     Reply(Message),
     /// A stop ended it first.
     Stopped,
-    /// On a run with a deadline, it thought too long, or thought its reply
-    /// away, without writing anything; the run goes on with this notice.
-    ActNow(String),
+    /// On a run with a deadline, it thought until its cap, or its output
+    /// limit, without writing anything; the run goes on with this notice and
+    /// what it had thought.
+    ActNow { notice: String, thought: String },
 }
 
 /// Waits for a turn on the provider, then calls the model, asking again after
@@ -1579,7 +1626,10 @@ fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Asked, String> {
                 // A timed run that thought its reply away has no time for a
                 // longer one, which `chat` sends only when there is.
                 Err(failure) if capped.load(Ordering::SeqCst) || (timed && failure.out_of_room) => {
-                    Ok(thought_too_long(spec, turn, began))
+                    // A reply the cap ends never reads its finish, so one
+                    // that reached its output limit was ended by that, though
+                    // the cap may have rung as it finished.
+                    Ok(thought_too_long(spec, turn, began, failure.out_of_room))
                 }
                 Err(error) => Err(error.to_string()),
             };
@@ -1589,7 +1639,7 @@ fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Asked, String> {
         return Ok(Asked::Stopped);
     }
     if capped.load(Ordering::SeqCst) {
-        return Ok(thought_too_long(spec, turn, began));
+        return Ok(thought_too_long(spec, turn, began, false));
     }
     Err("The model connection closed unexpectedly.".into())
 }
@@ -1601,21 +1651,33 @@ fn thinking_cap(left: Duration) -> Duration {
 }
 
 /// What a timed run goes on with after the reply begun at `began` thought
-/// without writing anything: the notice to write now.
-fn thought_too_long(spec: &Spec, turn: &mut Turn, began: Instant) -> Asked {
-    // Its thinking is dropped with it, as a stream cut short is: it led to
-    // nothing written, and the next reply starts from what is on disk.
-    turn.take_reply(&spec.connection.model);
+/// without writing anything, until its cap or, if `limit`, its output limit:
+/// the notice to write now, and what it had thought.
+fn thought_too_long(spec: &Spec, turn: &mut Turn, began: Instant, limit: bool) -> Asked {
+    // Its words, if any, go with it, but not its thinking: the reply in its
+    // place goes on from that rather than starting over.
+    let cut = turn.take_reply(&spec.connection.model);
     let left = (spec.connection.deadline).map_or(Duration::ZERO, |deadline| {
         deadline.saturating_duration_since(Instant::now())
     });
-    Asked::ActNow(format!(
-        "Your last reply thought for {} s without writing anything, so it was stopped, and about \
-         {} s are left before this run is stopped. Write every output the task asks for now with \
-         what you have, complete and valid, then check them.",
-        began.elapsed().as_secs(),
+    let secs = began.elapsed().as_secs();
+    let why = if limit {
+        format!(
+            "Your last reply reached its output limit while still thinking, after {secs} s, \
+             without writing anything"
+        )
+    } else {
+        format!("Your last reply thought for {secs} s without writing anything, so it was stopped")
+    };
+    let notice = format!(
+        "{why}, and about {} s are left before this run is stopped. Write every output the task \
+         asks for now with what you have, complete and valid, then check them.",
         left.as_secs()
-    ))
+    );
+    Asked::ActNow {
+        notice,
+        thought: cut.reasoning,
+    }
 }
 
 /// Whether the run's time warning, if it has one, has come.
@@ -1673,11 +1735,20 @@ fn time_given(left: Duration) -> String {
 /// Puts `text` on the run's transcript as a notice from its deadline, folded
 /// so it opens no turn of its own.
 fn deadline_notice(spec: &mut Spec, text: String) -> Result<(), String> {
-    let notice = inbox::fold(&[Notice {
-        from: "deadline".into(),
-        when: When::Next,
-        text,
-    }]);
+    deadline_notices(spec, vec![text])
+}
+
+/// Puts `texts` on the run's transcript as notices from its deadline, each
+/// its own item of one fold, which trims a long one to its start and end.
+fn deadline_notices(spec: &mut Spec, texts: Vec<String>) -> Result<(), String> {
+    let notices: Vec<Notice> = (texts.into_iter())
+        .map(|text| Notice {
+            from: "deadline".into(),
+            when: When::Next,
+            text,
+        })
+        .collect();
+    let notice = inbox::fold(&notices);
     let notice = notice.map(|notice| Message {
         folded: true,
         ..notice
@@ -6980,7 +7051,7 @@ pub(crate) mod tests {
     const ACT_NOW: &str = "Write every output the task asks for now with what you have";
 
     #[test]
-    fn a_timed_reply_that_only_thinks_past_its_cap_is_stopped_and_the_run_goes_on() {
+    fn a_timed_reply_that_only_thinks_past_its_cap_is_stopped_and_its_thinking_goes_on() {
         let dir = scratch("thinking-cap");
         // Two seconds of thinking, where the cap is 30% of the two left.
         let mut endless = thinking(100);
@@ -7003,8 +7074,8 @@ pub(crate) mod tests {
             "{notice}"
         );
         assert!(notice.contains(ACT_NOW), "{notice}");
-        // What it thought goes with the reply it was stopped in.
-        assert!(!sent[1].to_string().contains("Let me think"));
+        assert!(notice.contains(THOUGHT_SO_FAR), "{notice}");
+        assert!(notice.contains("Let me think"), "{notice}");
     }
 
     #[test]
@@ -7058,7 +7129,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_timed_reply_that_thinks_away_its_limit_is_told_to_act_rather_than_given_more_room() {
+    fn a_timed_reply_that_thinks_away_its_limit_is_told_so_and_keeps_its_thinking() {
         let dir = scratch("timed-out-of-room");
         let event = |event: Value| format!("data: {event}\n\n");
         let thought_out = [
@@ -7068,17 +7139,212 @@ pub(crate) mod tests {
         ]
         .concat();
         let (endpoint, provider) = provider(vec![thought_out, reply("Done.", &[])]);
+        // A model that takes no longer reply, so none is sent in its place
+        // and the test holds whether there is time for one or not.
+        crate::models::learn(
+            &endpoint,
+            "thinks-out-of-time",
+            crate::models::Limit::Output(4_096),
+        );
         let mut spec = spec(endpoint, &dir, AGENTS + 1520);
         spec.connection.model = "thinks-out-of-time".into();
-        // Due already, so no longer reply could be done in the time left.
-        spec.connection.deadline = Some(Instant::now());
+        // Long enough that its cap never comes first.
+        spec.connection.deadline = Some(Instant::now() + Duration::from_secs(10 * 60));
         let report = finished(spec);
         assert_eq!(report.status, Outcome::Done);
         assert_eq!(report.text, "Done.");
         let sent = provider.sent();
         assert_eq!(sent.len(), 2);
         assert_eq!(sent[1]["max_tokens"], sent[0]["max_tokens"]);
-        assert!(last_notice(&sent).contains(ACT_NOW));
+        let notice = last_notice(&sent);
+        assert!(notice.contains(ACT_NOW), "{notice}");
+        assert!(
+            notice.contains("reached its output limit while still thinking"),
+            "{notice}"
+        );
+        assert!(!notice.contains("thought for"), "{notice}");
+        assert!(notice.contains("Let me think"), "{notice}");
+    }
+
+    #[test]
+    fn the_reply_after_one_stopped_for_thinking_asks_for_low_effort_until_one_comes_back() {
+        let dir = scratch("lowered-effort");
+        let stopped = || {
+            let mut endless = thinking(100);
+            endless.push(says("Too late."));
+            endless
+        };
+        let read = || {
+            let call = json!({"index": 0, "id": "call-0", "function": {
+                "name": "read_file", "arguments": r#"{"path": "notes.txt"}"#}});
+            vec![json!({"choices": [{"delta": {"tool_calls": [call]}}]})]
+        };
+        let (endpoint, provider) = streaming(
+            vec![
+                stopped(),
+                read(),
+                vec![says("Done.")],
+                stopped(),
+                read(),
+                vec![says("Done.")],
+            ],
+            Duration::from_millis(20),
+        );
+        // Automatic, then set high by the user.
+        for (n, effort) in ["", "high"].into_iter().enumerate() {
+            let mut spec = spec(endpoint.clone(), &dir, AGENTS + 1550 + n as u64);
+            spec.transcript.path = dir.join(format!("lowered-{n}.jsonl"));
+            spec.connection.effort = effort.into();
+            spec.connection.deadline = Some(Instant::now() + Duration::from_secs(2));
+            assert_eq!(finished(spec).status, Outcome::Done);
+        }
+        let sent = provider.sent();
+        assert_eq!(sent.len(), 6);
+        let efforts: Vec<_> = (sent.iter())
+            .map(|body| body.get("reasoning_effort").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            efforts,
+            [
+                None,
+                Some("low"),
+                None,
+                Some("high"),
+                Some("low"),
+                Some("high")
+            ]
+        );
+        assert_eq!(results(&sent[2]), ["1|hello from the notes"]);
+    }
+
+    #[test]
+    fn only_effort_above_low_is_lowered_after_a_stopped_reply() {
+        for effort in ["", "medium", "high", "max"] {
+            assert_eq!(lowered(effort), Some("low"), "{effort}");
+        }
+        for effort in ["low", "minimal", "none"] {
+            assert_eq!(lowered(effort), None, "{effort}");
+        }
+    }
+
+    #[test]
+    fn a_reply_stopped_with_no_thinking_streamed_adds_none_to_its_notice() {
+        let dir = scratch("hidden-thinking");
+        // As a model that thinks without streaming it sends nothing to read.
+        let mut hidden: Vec<Value> = (0..100).map(|_| says("")).collect();
+        hidden.push(says("Too late."));
+        let (endpoint, provider) =
+            streaming(vec![hidden, vec![says("Done.")]], Duration::from_millis(20));
+        let mut spec = spec(endpoint, &dir, AGENTS + 1560);
+        spec.connection.deadline = Some(Instant::now() + Duration::from_secs(2));
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+        assert_eq!(sent.len(), 2);
+        let notice = last_notice(&sent);
+        assert!(notice.contains(ACT_NOW), "{notice}");
+        assert!(!notice.contains(THOUGHT_SO_FAR), "{notice}");
+    }
+
+    /// `streaming`, standing in for Anthropic's own API at a path no other
+    /// test's provider has, so one that later gets the same port is not
+    /// taken for it.
+    fn anthropic_streaming(replies: Vec<Vec<Value>>, every: Duration) -> (String, Stub) {
+        let (endpoint, provider) = streaming(replies, every);
+        let endpoint = endpoint.replace("/v1", "/anthropic/v1");
+        let stand_ins = &crate::providers::wire::anthropic::STAND_INS;
+        stand_ins.lock().unwrap().push(endpoint.clone());
+        (endpoint, provider)
+    }
+
+    #[test]
+    fn after_a_stopped_reply_an_automatic_run_thinks_less_only_if_it_was_thinking() {
+        let dir = scratch("messages-effort");
+        let begin = |at: u64, block: Value| {
+            json!({"type": "content_block_start", "index": at,
+                "content_block": block})
+        };
+        let more = |at: u64, delta: Value| {
+            json!({"type": "content_block_delta", "index": at,
+                "delta": delta})
+        };
+        let end = |at: u64| json!({"type": "content_block_stop", "index": at});
+        let message = |blocks: Vec<Value>, stop: &str| {
+            let mut events = vec![json!({"type": "message_start",
+                "message": {"usage": {"input_tokens": 1000, "output_tokens": 1}}})];
+            events.extend(blocks);
+            events.push(
+                json!({"type": "message_delta", "delta": {"stop_reason": stop},
+                "usage": {"output_tokens": 50}}),
+            );
+            events.push(json!({"type": "message_stop"}));
+            events
+        };
+        let text = |words: &str| {
+            vec![
+                begin(1, json!({"type": "text", "text": ""})),
+                more(1, json!({"type": "text_delta", "text": words})),
+                end(1),
+            ]
+        };
+        // Past its cap with nothing written: thinking, or, from a model that
+        // thinks only when asked, nothing at all.
+        let stopped = |thinks: bool| {
+            let mut blocks = Vec::new();
+            if thinks {
+                blocks.push(begin(0, json!({"type": "thinking", "thinking": ""})));
+                blocks.extend((0..100).map(|_| {
+                    more(
+                        0,
+                        json!({"type": "thinking_delta", "thinking": "Let me think. "}),
+                    )
+                }));
+                blocks.push(end(0));
+            } else {
+                blocks.extend((0..100).map(|_| json!({"type": "ping"})));
+            }
+            blocks.extend(text("Too late."));
+            message(blocks, "end_turn")
+        };
+        let read = || {
+            let call = json!({"type": "tool_use", "id": "toolu_01", "name": "read_file",
+                "input": {}});
+            let path =
+                json!({"type": "input_json_delta", "partial_json": r#"{"path": "notes.txt"}"#});
+            message(vec![begin(0, call), more(0, path), end(0)], "tool_use")
+        };
+        let done = || message(text("Done."), "end_turn");
+        let (endpoint, provider) = anthropic_streaming(
+            vec![
+                stopped(false),
+                read(),
+                done(),
+                stopped(true),
+                read(),
+                done(),
+            ],
+            Duration::from_millis(20),
+        );
+        for (n, id) in [AGENTS + 1570, AGENTS + 1571].into_iter().enumerate() {
+            let mut spec = spec(endpoint.clone(), &dir, id);
+            spec.transcript.path = dir.join(format!("messages-{n}.jsonl"));
+            spec.connection.deadline = Some(Instant::now() + Duration::from_secs(3));
+            assert_eq!(finished(spec).status, Outcome::Done);
+        }
+        let sent = provider.sent();
+        assert_eq!(sent.len(), 6);
+        assert!(sent[1].to_string().contains(ACT_NOW));
+        assert!(sent[2].to_string().contains("hello from the notes"));
+        // Not thinking, it is not set to start, which it would go on with.
+        for body in &sent[..3] {
+            assert!(body.get("thinking").is_none(), "{body}");
+            assert!(body.get("output_config").is_none(), "{body}");
+        }
+        // Thinking unasked, it thinks less, then as it would again.
+        assert!(sent[3].get("output_config").is_none());
+        assert_eq!(sent[4]["output_config"], json!({"effort": "low"}));
+        assert_eq!(sent[4]["thinking"]["type"], "adaptive");
+        assert!(sent[5].get("output_config").is_none());
     }
 
     #[test]

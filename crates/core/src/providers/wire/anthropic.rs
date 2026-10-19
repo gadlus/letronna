@@ -207,7 +207,9 @@ pub(crate) fn replays(posted: &Value) -> bool {
         .any(is_thinking)
 }
 
-fn is_thinking(block: &Value) -> bool {
+/// Whether `block`, a content block or a reply's kept reasoning detail, is
+/// thinking.
+pub(crate) fn is_thinking(block: &Value) -> bool {
     matches!(
         block["type"].as_str(),
         Some("thinking" | "redacted_thinking")
