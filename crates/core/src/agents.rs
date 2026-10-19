@@ -279,6 +279,9 @@ struct Running {
     together: Arc<AtomicUsize>,
     /// Its stop, kept here since nothing else reaches one in the background.
     cancel: Cancel,
+    /// Set once the finish of its worktree is spoken for, by the end of its
+    /// run or by Letronna quitting, which may reach it at the same time.
+    tree_claimed: bool,
 }
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
@@ -694,7 +697,9 @@ fn launch(
         return Ok(started);
     }
     let report = driver::run(spec);
-    let left = leave(worktree.as_ref(), &report.jobs, at_top);
+    let left = claim_tree(slot.id)
+        .then(|| leave(worktree.as_ref(), &report.jobs, at_top))
+        .flatten();
     let share = MAX_REPORT / slot.together.load(Ordering::Relaxed).max(1);
     let name = slot.name.clone();
     close(slot, &report, |_, _| ());
@@ -721,6 +726,17 @@ fn leave(worktree: Option<&Worktree>, jobs: &[u64], at_top: Option<String>) -> O
         Some(line) => format!("{line} {kept}"),
         None => kept,
     })
+}
+
+/// Claims the finish of the worktree helper `id`'s run works in, saying
+/// whether this caller has it: whichever of the run's end and Letronna
+/// quitting comes second would find the worktree gone.
+fn claim_tree(id: AgentId) -> bool {
+    let mut registry = registry();
+    let Some(running) = (registry.running.iter_mut()).find(|running| running.id == id) else {
+        return true;
+    };
+    !std::mem::replace(&mut running.tree_claimed, true)
 }
 
 /// Refuses to keep a helper where nothing would wake it, or past session
@@ -801,7 +817,9 @@ fn set_off(
     let started = driver::spawn(spec, move |report| {
         // Each run, a kept one's too: one that changed nothing loses its
         // worktree, and its next wake makes a new one.
-        let left = leave(worktree.as_ref(), &report.jobs, at_top);
+        let left = claim_tree(slot.id)
+            .then(|| leave(worktree.as_ref(), &report.jobs, at_top))
+            .flatten();
         close(slot, report, |by_user, after| {
             let (state, notice) = ended(
                 &name,
@@ -1322,8 +1340,43 @@ fn occupy(
         crew: at_once.crew,
         together: together.clone(),
         cancel,
+        tree_claimed: false,
     });
     Slot { id, name, together }
+}
+
+/// Stops every helper still running, for Letronna quitting, and finishes
+/// the worktree of each that works in one, as the end of its run would
+/// have: removed when it changed nothing, else kept. Gives a line for each
+/// kept, saying where. Run after the jobs are stopped, since a job a helper
+/// started may still be writing there.
+pub fn stop_all() -> Vec<String> {
+    let (cancels, sidecars) = {
+        let mut registry = registry();
+        let cancels: Vec<Cancel> = (registry.running.iter())
+            .map(|running| running.cancel.clone())
+            .collect();
+        // Claimed before the stop, so a run it ends leaves the worktree to
+        // this; one whose end claimed it first finishes it itself. An idle
+        // kept one's worktree was finished when its last run ended.
+        let claimed: Vec<AgentId> = (registry.running.iter_mut())
+            .filter_map(|running| {
+                (!std::mem::replace(&mut running.tree_claimed, true)).then_some(running.id)
+            })
+            .collect();
+        let sidecars: Vec<PathBuf> = (registry.helpers.iter())
+            .filter(|helper| claimed.contains(&helper.id))
+            .map(|helper| helper.sidecar.clone())
+            .collect();
+        (cancels, sidecars)
+    };
+    for cancel in cancels {
+        cancel.set();
+    }
+    (sidecars.iter())
+        .filter_map(|path| Sidecar::read(path).ok()?.worktree)
+        .filter_map(|worktree| worktree.finish(&[]))
+        .collect()
 }
 
 /// Stops the helpers of session `root` that the messages a rewind takes
@@ -4406,6 +4459,42 @@ mod tests {
         assert_eq!(recorded["branch"], "letronna/tree-kept");
         assert_eq!(results(&sent[1]), ["1|from the helper"]);
         assert_eq!(resumed.lines().nth(1), Some(kept.as_str()), "{resumed}");
+    }
+
+    #[test]
+    fn quitting_finishes_the_worktree_a_running_helper_works_in() {
+        let session = Session::new("tree-quit");
+        inbox::listen();
+        crate::worktree::tests::repo(&session.work);
+        let top = crate::worktree::tests::real(&session.work);
+        let tree = top.join(".letronna").join("worktrees").join("tree-quit");
+        let (asking, asked) = mpsc::channel();
+        let (going, go) = mpsc::channel::<()>();
+        let (endpoint, provider) = Stub::held(vec![reply("Looked.", None)], move |_| {
+            let _ = asking.send(());
+            let _ = go.recv_timeout(WAIT);
+        });
+        let args = json!({"description": "Look around", "name": "tree-quit",
+            "isolation": "worktree", "prompt": "Look around."});
+        call(session.context(endpoint), args).unwrap();
+        asked.recv_timeout(WAIT).expect("the helper never asked");
+        assert!(tree.exists());
+
+        // It changed nothing, so its worktree goes, and nothing is said of
+        // it; other tests' helpers may have lines of their own.
+        let kept = stop_all();
+        assert!(
+            kept.iter().all(|line| !line.contains("tree-quit")),
+            "{kept:?}"
+        );
+        assert!(!tree.exists());
+        going.send(()).unwrap();
+        provider.sent();
+        let begun = Instant::now();
+        while !registry().running.is_empty() {
+            assert!(begun.elapsed() < WAIT, "the helper never stopped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

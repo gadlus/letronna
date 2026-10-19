@@ -778,6 +778,9 @@ fn main() {
         // schedules lock goes too, so a terminal can run them at once.
         cx.on_app_quit(|_| {
             letronna_core::jobs::stop_all();
+            // After the jobs, which may have been writing in a helper's
+            // worktree; one kept for its work is left for the user to find.
+            let _ = letronna_core::agents::stop_all();
             letronna_core::mcp::stop_all();
             letronna_core::lsp::stop_all();
             letronna_core::browser::close_hidden();

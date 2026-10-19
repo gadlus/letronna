@@ -568,6 +568,8 @@ fn main() {
     // after a Ctrl-C, is ended and waited for first.
     letronna_core::tools::end_commands(END_WAIT);
     letronna_core::jobs::stop_all();
+    // After the jobs, which may have been writing in a helper's worktree.
+    let helpers_kept = letronna_core::agents::stop_all();
     letronna_core::mcp::stop_all();
     letronna_core::lsp::stop_all();
     letronna_core::browser::close_hidden();
@@ -587,8 +589,11 @@ fn main() {
         )));
     }
     let open = (runner.store.conversations.get(session)).map_or(opened, |c| c.id);
-    for kept in left_worktrees(&runner, &[opened, open]) {
-        render::line(&render::dim(&kept));
+    for kept in left_worktrees(&runner, &[opened, open])
+        .iter()
+        .chain(&helpers_kept)
+    {
+        render::line(&render::dim(kept));
     }
     letronna_core::diag::stop();
 }
