@@ -1090,6 +1090,46 @@ impl Bar {
         work()
     }
 
+    /// Open what is in the box in the user's editor, $VISUAL then $EDITOR,
+    /// and put what is there when it is closed back in the box, ready to
+    /// send: a long prompt written where writing is easy. The draft goes
+    /// to a file in the data folder only its owner can read, removed after.
+    fn edit_draft(&mut self) {
+        let path = draft_file();
+        let draft = self.line.expand();
+        let written = (path.parent().map_or(Ok(()), std::fs::create_dir_all))
+            .and_then(|()| letronna_core::store::write_private(&path, draft.as_bytes()));
+        if let Err(error) = written {
+            self.note = Some(format!("Could not hand the draft over: {error}"));
+            return;
+        }
+        let (program, args) = crate::memory::editor();
+        let program = crate::memory::found(&program);
+        let ran = self.lend(|| {
+            std::process::Command::new(&program)
+                .args(&args)
+                .arg(&path)
+                .status()
+        });
+        let written = std::fs::read_to_string(&path);
+        let _ = std::fs::remove_file(&path);
+        self.note = Some(match (ran, written) {
+            (Ok(status), Ok(text)) if status.success() => {
+                self.line.set_expanded(text.trim_end_matches(['\n', '\r']));
+                "back from the editor  ·  enter sends it  ·  ctrl+_ undoes it".to_owned()
+            }
+            (Ok(status), _) => format!(
+                "{} ended with {status}; the box is as it was",
+                program.display()
+            ),
+            (Err(error), _) => format!(
+                "Could not start {}: {error}. Set VISUAL or EDITOR to the editor you use.",
+                program.display()
+            ),
+        });
+        self.settle();
+    }
+
     /// Paint again, for whoever has just changed what is under the box.
     pub fn redraw(&mut self) {
         self.settle();
@@ -1950,6 +1990,18 @@ impl Bar {
             KeyCode::Char('d') if control && self.line.is_empty() => self.done = true,
             // Open or fold the latest thinking, as Claude Code's ctrl+o does.
             KeyCode::Char('o') if control => crate::screen::toggle_last(),
+            // Write a long prompt where writing is easy.
+            KeyCode::Char('g') if control => self.edit_draft(),
+            // Undo the last change to the line: ctrl-_ reaches us as ctrl-7
+            // from a terminal that sends it the old way, and as ctrl-/ from
+            // some.
+            KeyCode::Char('_' | '7' | '/') if control => {
+                if !self.line.undo() {
+                    self.note = Some("nothing to undo".to_owned());
+                }
+            }
+            // Put back what ctrl-u, ctrl-k or ctrl-w last cut.
+            KeyCode::Char('y') if control => self.line.yank(),
             // A clean screen, the session going on as it was.
             KeyCode::Char('l') if control => crate::screen::wipe(),
             // A newline on purpose, for writing a paragraph.
@@ -3098,6 +3150,13 @@ fn top_edge(name: &str, place: &str, width: usize) -> String {
         render::dim("╭─ "),
         render::dim(&format!(" {}╮", "─".repeat(rest)))
     )
+}
+
+/// Where a draft waits while the editor has it: in the data folder, which
+/// is its owner's, not the shared temp folder, where another user could
+/// leave a file or a link at a name known in advance.
+fn draft_file() -> std::path::PathBuf {
+    (letronna_core::chat::data_dir().join("drafts")).join(format!("{}.md", std::process::id()))
 }
 
 /// A queued line cut to one row `room` columns wide: its first line, with an
@@ -4825,5 +4884,12 @@ mod tests {
         let names: Vec<String> = ["deep/", "lib.rs", "main.rs"].map(String::from).into();
         assert_eq!(offered(&names, 80), "deep/  lib.rs  main.rs");
         assert_eq!(offered(&names, 20), "deep/  lib.rs  …");
+    }
+
+    #[test]
+    fn a_draft_for_the_editor_waits_in_the_data_folder() {
+        // Not the shared temp folder, where the data folder is only in tests.
+        let file = super::draft_file();
+        assert!(file.starts_with(letronna_core::chat::data_dir().join("drafts")));
     }
 }

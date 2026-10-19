@@ -277,7 +277,7 @@ fn report(target: &str, workspace: Option<&Path>) {
 /// The editor to open a file in: $VISUAL, then $EDITOR, as git and crontab
 /// read them, then one every system of the kind has. Split into the program
 /// and its own words, as `code --wait` needs.
-fn editor() -> (String, Vec<String>) {
+pub(crate) fn editor() -> (String, Vec<String>) {
     let chosen = ["VISUAL", "EDITOR"]
         .into_iter()
         .filter_map(|name| std::env::var(name).ok())
@@ -320,7 +320,7 @@ fn words(command: &str) -> (String, Vec<String>) {
 /// each extension in PATHEXT, as Command tries only .exe and the `code`
 /// there is code.cmd; given its full path, Command runs a .cmd safely.
 /// Elsewhere, or when nothing matches, the name as it was given.
-fn found(program: &str) -> PathBuf {
+pub(crate) fn found(program: &str) -> PathBuf {
     if !cfg!(windows) {
         return PathBuf::from(program);
     }

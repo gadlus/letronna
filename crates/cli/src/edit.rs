@@ -7,10 +7,24 @@
 /// A pasted block is not put into the line. A placeholder goes there instead
 /// and the text waits behind it, so pasting sixty lines does not bury the
 /// sentence you were writing around it. The whole thing goes when you send.
+#[derive(Clone)]
 pub struct Paste {
     pub lines: usize,
     pub text: String,
 }
+
+/// What the last change to the line was, so a run of typing, or of
+/// deleting, is undone as one.
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Edit {
+    #[default]
+    Other,
+    Typing,
+    Deleting,
+}
+
+/// The most changes undo goes back through.
+const UNDO: usize = 100;
 
 /// Prompts an opened session puts back under up, the newest of them: more
 /// than anyone steps back through a key at a time, and few enough that a
@@ -30,6 +44,12 @@ pub struct Line {
     recalled: Option<usize>,
     /// What was being written before the first recall, so it can come back.
     draft: String,
+    /// The line as it was before each change, for undo: its text, cursor
+    /// and pastes.
+    undone: Vec<(String, usize, Vec<Paste>)>,
+    last: Edit,
+    /// What ctrl-u, ctrl-k or ctrl-w last cut, which ctrl-y puts back.
+    killed: String,
 }
 
 impl Line {
@@ -58,13 +78,51 @@ impl Line {
             .unwrap_or(self.text.len())
     }
 
+    /// Keep the line as it is for undo before a change of `kind`: a change
+    /// that goes on a run of the same kind is undone with it, and a word
+    /// typed is a run of its own.
+    fn keep(&mut self, kind: Edit, starts_a_word: bool) {
+        if kind == Edit::Other || kind != self.last || starts_a_word {
+            self.undone
+                .push((self.text.clone(), self.cursor, self.pastes.clone()));
+            let over = self.undone.len().saturating_sub(UNDO);
+            self.undone.drain(..over);
+        }
+        self.last = kind;
+    }
+
+    /// Put the line back as it was before the last change, or the run of
+    /// changes it ended. Says whether there was one.
+    pub fn undo(&mut self) -> bool {
+        let Some((text, cursor, pastes)) = self.undone.pop() else {
+            return false;
+        };
+        self.text = text;
+        self.cursor = cursor;
+        self.pastes = pastes;
+        self.last = Edit::Other;
+        true
+    }
+
+    /// Put back what ctrl-u, ctrl-k or ctrl-w last cut, at the cursor.
+    pub fn yank(&mut self) {
+        let killed = self.killed.clone();
+        self.insert_str(&killed);
+    }
+
     pub fn insert(&mut self, ch: char) {
+        self.keep(Edit::Typing, ch == ' ');
         let at = self.byte_at(self.cursor);
         self.text.insert(at, ch);
         self.cursor += 1;
     }
 
     pub fn insert_str(&mut self, text: &str) {
+        self.keep(Edit::Other, false);
+        self.insert_raw(text);
+    }
+
+    fn insert_raw(&mut self, text: &str) {
         let at = self.byte_at(self.cursor);
         self.text.insert_str(at, text);
         self.cursor += text.chars().count();
@@ -122,6 +180,9 @@ impl Line {
     }
 
     pub fn clear(&mut self) {
+        if !self.text.is_empty() {
+            self.keep(Edit::Other, false);
+        }
         self.text.clear();
         self.cursor = 0;
         self.pastes.clear();
@@ -129,8 +190,33 @@ impl Line {
     }
 
     pub fn set(&mut self, text: &str) {
+        if text != self.text {
+            self.keep(Edit::Other, false);
+        }
+        self.put(text);
+    }
+
+    /// The line made `text` with its pastes written out in it, as the editor
+    /// hands a draft back: the pastes behind the old placeholders go, so the
+    /// next paste is numbered from one and a placeholder left in the text
+    /// stays words. An undo brings them back with the line.
+    pub fn set_expanded(&mut self, text: &str) {
+        self.set(text);
+        self.pastes.clear();
+    }
+
+    /// The line made `text`, the cursor at its end, not kept for undo: for
+    /// stepping through what was sent before, which up and down undo.
+    fn put(&mut self, text: &str) {
         self.text = text.to_owned();
-        self.cursor = self.text.chars().count();
+        self.move_to(self.text.chars().count());
+    }
+
+    /// Put the cursor at `at`. A move ends a run of typing or deleting, so
+    /// what is typed after it is undone apart from what came before.
+    fn move_to(&mut self, at: usize) {
+        self.cursor = at;
+        self.last = Edit::Other;
     }
 
     /// Put the cursor at character `at`, as a move between rows does.
@@ -139,25 +225,26 @@ impl Line {
     }
 
     pub fn left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        self.move_to(self.cursor.saturating_sub(1));
     }
 
     pub fn right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.text.chars().count());
+        self.move_to((self.cursor + 1).min(self.text.chars().count()));
     }
 
     pub fn home(&mut self) {
-        self.cursor = 0;
+        self.move_to(0);
     }
 
     pub fn end(&mut self) {
-        self.cursor = self.text.chars().count();
+        self.move_to(self.text.chars().count());
     }
 
     pub fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
         }
+        self.keep(Edit::Deleting, false);
         // A placeholder goes whole: deleting it one character at a time would
         // leave wreckage that still stands for sixty lines.
         if let Some(start) = self.marker_before() {
@@ -170,6 +257,7 @@ impl Line {
     pub fn delete(&mut self) {
         let len = self.text.chars().count();
         if self.cursor < len {
+            self.keep(Edit::Deleting, false);
             self.cut(self.cursor, self.cursor + 1);
         }
     }
@@ -177,47 +265,58 @@ impl Line {
     /// Delete back to the start of the word the cursor is in.
     pub fn backspace_word(&mut self) {
         if let Some(start) = self.marker_before() {
-            self.cut(start, self.cursor);
+            self.cut_kept(start, self.cursor);
             return;
         }
         let start = self.word_start();
-        self.cut(start, self.cursor);
+        self.cut_kept(start, self.cursor);
     }
 
     /// Delete forward to the end of the word ahead of the cursor.
     pub fn delete_word(&mut self) {
         let end = self.word_end();
-        self.cut(self.cursor, end);
+        self.cut_kept(self.cursor, end);
     }
 
     /// Move to the start of the row the cursor is on.
     pub fn row_start(&mut self) {
-        self.cursor = self.row().0;
+        self.move_to(self.row().0);
     }
 
     /// Move to the end of the row the cursor is on.
     pub fn row_end(&mut self) {
-        self.cursor = self.row().1;
+        self.move_to(self.row().1);
     }
 
     /// Delete back to the start of the row the cursor is on.
     pub fn backspace_to_row_start(&mut self) {
         let (start, _) = self.row();
-        self.cut(start, self.cursor);
+        self.cut_kept(start, self.cursor);
     }
 
     /// Delete forward to the end of the row the cursor is on.
     pub fn delete_to_row_end(&mut self) {
         let (_, end) = self.row();
-        self.cut(self.cursor, end);
+        self.cut_kept(self.cursor, end);
+    }
+
+    /// Cut from `from` to `to`, keeping the line for undo and what was cut
+    /// for ctrl-y, as a shell does.
+    fn cut_kept(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        self.keep(Edit::Other, false);
+        self.killed = self.chars()[from..to].iter().collect();
+        self.cut(from, to);
     }
 
     pub fn word_left(&mut self) {
-        self.cursor = self.word_start();
+        self.move_to(self.word_start());
     }
 
     pub fn word_right(&mut self) {
-        self.cursor = self.word_end();
+        self.move_to(self.word_end());
     }
 
     /// What follows the `@` of the reference the cursor ends, if it ends
@@ -230,9 +329,10 @@ impl Line {
 
     /// Put `with` in place of what follows the `@` the cursor's word starts with.
     pub fn replace_reference(&mut self, with: &str) {
+        self.keep(Edit::Other, false);
         let start = self.reference_start() + 1;
         self.cut(start.min(self.cursor), self.cursor);
-        self.insert_str(with);
+        self.insert_raw(with);
     }
 
     fn reference_start(&self) -> usize {
@@ -330,7 +430,7 @@ impl Line {
             if wanted >= 0 && (wanted as usize) < rows.len() {
                 let wanted = wanted as usize;
                 let before: usize = rows[..wanted].iter().map(|r| r.chars().count() + 1).sum();
-                self.cursor = before + column.min(rows[wanted].chars().count());
+                self.move_to(before + column.min(rows[wanted].chars().count()));
                 return;
             }
         }
@@ -361,11 +461,11 @@ impl Line {
         match next {
             Some(at) => {
                 let line = self.history[at].clone();
-                self.set(&line);
+                self.put(&line);
             }
             None => {
                 let draft = std::mem::take(&mut self.draft);
-                self.set(&draft);
+                self.put(&draft);
             }
         }
     }
@@ -381,6 +481,9 @@ impl Line {
         self.pastes.clear();
         self.recalled = None;
         self.draft.clear();
+        // A line sent is no longer there to undo changes to.
+        self.undone.clear();
+        self.last = Edit::Other;
         sent
     }
 
@@ -409,6 +512,65 @@ mod tests {
         let mut line = Line::default();
         line.insert_str(text);
         line
+    }
+
+    #[test]
+    fn undo_goes_back_a_word_or_a_run_of_deletes_at_a_time() {
+        let mut line = Line::default();
+        for ch in "hello world".chars() {
+            line.insert(ch);
+        }
+        assert!(line.undo());
+        assert_eq!(line.text(), "hello");
+        for _ in 0..3 {
+            line.backspace();
+        }
+        assert_eq!(line.text(), "he");
+        assert!(line.undo());
+        assert_eq!(line.text(), "hello");
+        assert!(line.undo());
+        assert_eq!(line.text(), "");
+        assert!(!line.undo());
+    }
+
+    #[test]
+    fn a_move_or_a_recalled_line_ends_a_run_of_typing() {
+        let mut line = Line::default();
+        line.insert('a');
+        line.insert('b');
+        line.left();
+        line.insert('c');
+        assert_eq!(line.text(), "acb");
+        assert!(line.undo());
+        assert_eq!(line.text(), "ab");
+        line.end();
+        line.take();
+        line.insert('x');
+        line.up();
+        line.insert('!');
+        assert_eq!(line.text(), "ab!");
+        assert!(line.undo());
+        assert_eq!(line.text(), "ab");
+    }
+
+    #[test]
+    fn what_a_cut_took_is_put_back_by_yank() {
+        let mut line = typed("one two three");
+        line.backspace_word();
+        assert_eq!(line.text(), "one two ");
+        line.home();
+        line.yank();
+        assert_eq!(line.text(), "threeone two ");
+        assert!(line.undo());
+        assert_eq!(line.text(), "one two ");
+        line.end();
+        line.backspace_to_row_start();
+        assert_eq!(line.text(), "");
+        assert!(line.undo());
+        assert_eq!(line.text(), "one two ");
+        // A line sent leaves nothing to undo.
+        line.take();
+        assert!(!line.undo());
     }
 
     #[test]
@@ -532,6 +694,26 @@ three"
         // Forward past the newest brings the half-written line back.
         line.down();
         assert_eq!(line.text(), "half");
+    }
+
+    #[test]
+    fn a_line_back_from_the_editor_has_no_pastes_behind_it() {
+        let mut line = Line::default();
+        line.paste("one\ntwo\nthree");
+        assert_eq!(line.text(), "[Pasted #1 +3 lines]");
+        let draft = format!("{}\nand [Pasted #1 +3 lines] as words", line.expand());
+        line.set_expanded(&draft);
+        assert_eq!(line.expand(), draft);
+        line.paste("four\nfive");
+        assert!(
+            line.text().ends_with("[Pasted #1 +2 lines]"),
+            "{}",
+            line.text()
+        );
+        // Undone, the line and the paste behind it come back together.
+        assert!(line.undo());
+        assert!(line.undo());
+        assert_eq!(line.expand(), "one\ntwo\nthree");
     }
 
     #[test]

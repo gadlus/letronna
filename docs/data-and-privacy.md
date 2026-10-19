@@ -22,6 +22,7 @@ Everything Letronna keeps lives in one folder:
 | `skills/`, `plugins/` | Installed skills and plugins |
 | `media/` | Media made with no project attached, and browser screenshots |
 | `browser/` | The shared browser profile. Delete it to sign out of everything. |
+| `drafts/` | What is in the terminal's box while Ctrl+G has it open in your editor, readable by you alone; removed when the editor closes |
 
 ## Keys
 

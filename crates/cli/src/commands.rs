@@ -1452,8 +1452,16 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
     ("↑ while it works", "take back the newest queued line"),
     ("ctrl+o", "open or fold the latest thinking"),
     ("ctrl+a/e", "go to the start or end of the line"),
-    ("ctrl+u/k", "delete to the start or end of the line"),
+    (
+        "ctrl+u/k",
+        "delete to the start or end of the line; ctrl+y puts it back",
+    ),
     ("ctrl+w", "delete a word back"),
+    ("ctrl+_", "undo the last change to the line"),
+    (
+        "ctrl+g",
+        "write the line in your editor ($VISUAL or $EDITOR)",
+    ),
     ("page up/down", "scroll back through the conversation"),
     ("end", "follow the conversation again"),
     ("drag", "select and copy"),

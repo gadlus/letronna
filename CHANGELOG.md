@@ -14,6 +14,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 ## [Unreleased]
 
 ### Added
+- **Terminal** — Ctrl+G opens what is in the box in your editor (`$VISUAL`, then `$EDITOR`) and puts what you wrote back in the box when you close it. Ctrl+_ undoes the last change to the line, a word or a run of deletes at a time, and Ctrl+Y puts back what Ctrl+U, Ctrl+K or Ctrl+W last cut.
 - **Terminal** — A line starting with `!` runs as a command in the session's folder, as in a shell, without asking since you typed it; what it prints shows as a tool's output does, Esc stops it, and the model is told what was run and what came of it with the next prompt. Typed while it works, such a line waits for the turn to end, as commands do. The footer says where it will run while you type it.
 - **Terminal** — `?` on an empty line shows the keys over the box until the next key. `/help` lists the commands under headings (sessions, model, modes, tools, memory, background work, account) with every row cut to the window, lists every key, and `/help <command>` says what one does and the words the menu knows for it. While a command's words are typed, the footer keeps what it does.
 - **Terminal** — The box's bottom edge says how full the session's context is once there is a reply, from what the latest request carried, as the window's status bar does: quiet while there is room, amber from 70%, pointing to `/compact` from 85% and red from 90%. `/context` shows what fills it, part by part: the system prompt, tools, MCP, memory, skills and the conversation.
