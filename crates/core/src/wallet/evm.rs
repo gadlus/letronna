@@ -11,7 +11,7 @@
 
 use super::chains::{Chain, Token};
 use super::keys::{evm_bytes, from_hex, keccak, to_hex};
-use super::rpc;
+use super::{Unsent, broadcast, rpc};
 use k256::ecdsa::SigningKey;
 use serde_json::{Value, json};
 
@@ -158,7 +158,7 @@ pub(crate) fn send(
     to: &str,
     amount: u128,
     token: Option<&Token>,
-) -> Result<String, String> {
+) -> Result<String, Unsent> {
     let chain_id = chain
         .evm_id()
         .ok_or_else(|| format!("{} has no EVM chain id.", chain.name))?;
@@ -197,8 +197,10 @@ pub(crate) fn send(
         value,
         data,
     };
-    let raw = format!("0x{}", to_hex(&signed(key, &call)?));
-    let hash = rpc(chain, "eth_sendRawTransaction", json!([raw]))?;
+    let raw = signed(key, &call)?;
+    let hash = format!("0x{}", to_hex(&keccak(&raw)));
+    let raw = format!("0x{}", to_hex(&raw));
+    let hash = broadcast(chain, "eth_sendRawTransaction", json!([raw]), &hash)?;
     let hash = hash
         .as_str()
         .ok_or_else(|| format!("{} did not take the transaction.", chain.name))?

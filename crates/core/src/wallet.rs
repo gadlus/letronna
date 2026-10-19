@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 /// The wallets, networks and rules, in the data folder.
@@ -507,7 +507,8 @@ pub fn payer(wallet: &Wallet, family: Family) -> Option<&Account> {
 }
 
 /// What `account` holds on each network that is on, read from each at once;
-/// the native coin always, a token only when there is some.
+/// the native coin always, a token when there is some or when it could not
+/// be read.
 pub fn balances(wallet: &Wallet, account: &Account) -> Vec<Holding> {
     let networks: Vec<Chain> = chains::all(wallet)
         .into_iter()
@@ -553,13 +554,22 @@ fn held_on(chain: &Chain, account: &Account) -> Vec<Holding> {
         Family::Evm => evm::balance(chain, address),
         Family::Solana => solana::balance(chain, address),
     };
+    // A network out of reach fails every token's read as it failed the
+    // coin's, which the coin's row says once.
+    let reached = native.is_ok();
     let mut held = vec![holding(&chain.symbol, chain.decimals, false, native)];
     for token in &chain.tokens {
         let read = match chain.family {
             Family::Evm => evm::token_balance(chain, token, address),
             Family::Solana => solana::token_balance(chain, address, token),
         };
-        if read.as_ref().is_ok_and(|atomic| *atomic > 0) {
+        // A read the network refused is not a balance of none: left out, it
+        // showed a funded wallet as empty.
+        let shown = match &read {
+            Ok(atomic) => *atomic > 0,
+            Err(_) => reached,
+        };
+        if shown {
             held.push(holding(&token.symbol, token.decimals, token.dollar, read));
         }
     }
@@ -587,10 +597,10 @@ pub fn send(
     } = plan;
     policy::reserve(&wallet.policy, entry.clone())?;
     let sent = match chain.family {
-        Family::Evm => {
-            evm_key(&account).and_then(|key| evm::send(&chain, &key, to, atomic, token.as_ref()))
-        }
-        Family::Solana => solana_key(&account).and_then(|seed| {
+        Family::Evm => evm_key(&account)
+            .map_err(Unsent::No)
+            .and_then(|key| evm::send(&chain, &key, to, atomic, token.as_ref())),
+        Family::Solana => solana_key(&account).map_err(Unsent::No).and_then(|seed| {
             let atomic = u64::try_from(atomic).map_err(|_| "Too large an amount for Solana.")?;
             solana::send(&chain, &seed, to.trim(), atomic, token.as_ref())
         }),
@@ -603,7 +613,22 @@ pub fn send(
             policy::settle(&entry.id, Status::Paid, &entry.tx, &entry.link, "");
             Ok(entry)
         }
-        Err(why) => {
+        Err(Unsent::Maybe { tx, why }) => {
+            let link = chain.link(&tx);
+            let at = match link.is_empty() {
+                true => String::new(),
+                false => format!(" at {link}"),
+            };
+            let why = format!(
+                "{}. The transaction may have gone through all the same: look up {tx}{at} \
+                 before sending this again.",
+                why.trim_end_matches('.')
+            );
+            // It may be on the chain, so it keeps counting.
+            policy::settle(&entry.id, Status::Unsettled, &tx, &link, &why);
+            Err(why)
+        }
+        Err(Unsent::No(why)) => {
             policy::settle(&entry.id, Status::Failed, "", "", &why);
             Err(why)
         }
@@ -984,24 +1009,269 @@ fn unreached(chain: &Chain, e: reqwest::Error) -> String {
     format!("{} did not answer: {}", chain.name, e.without_url())
 }
 
-/// One JSON-RPC call to `chain`. An RPC address can carry the user's key, so
-/// no error says it.
+/// Ask `chain` `method` over JSON-RPC, through each of its addresses in turn
+/// (`chains::rpcs`) until one answers: the one that answered last goes first,
+/// so an RPC that keeps refusing costs one try. An answer is the call's
+/// `result`; an error any other address would give too is the call's. An RPC
+/// address can carry the user's key, so no error says it.
 pub(crate) fn rpc(chain: &Chain, method: &str, params: Value) -> Result<Value, String> {
+    rpc_through(chain, &chains::rpcs(chain), method, params).map_err(Asked::said)
+}
+
+/// `rpc` for a signed transaction whose hash or signature is `tx`, sent with
+/// `method`: one that may have been taken though no RPC said so is
+/// `Unsent::Maybe`, never a plain failure, as it would be paid again.
+pub(crate) fn broadcast(
+    chain: &Chain,
+    method: &str,
+    params: Value,
+    tx: &str,
+) -> Result<Value, Unsent> {
+    rpc_through(chain, &chains::rpcs(chain), method, params).map_err(|asked| match asked {
+        Asked::Unsure(why) => Unsent::Maybe {
+            tx: tx.to_owned(),
+            why,
+        },
+        asked => Unsent::No(asked.said()),
+    })
+}
+
+/// Why a send was not seen through.
+#[derive(Debug)]
+pub(crate) enum Unsent {
+    /// Nothing went out.
+    No(String),
+    /// The transaction `tx` may have gone out all the same.
+    Maybe { tx: String, why: String },
+}
+
+impl From<String> for Unsent {
+    fn from(why: String) -> Self {
+        Unsent::No(why)
+    }
+}
+
+impl From<&str> for Unsent {
+    fn from(why: &str) -> Self {
+        Unsent::No(why.to_owned())
+    }
+}
+
+/// How long one call may take over all of a network's addresses, so a
+/// network that drops every request is given up on in about this rather
+/// than `HTTP_TIME` for each of its fallbacks.
+const RPC_TIME: Duration = Duration::from_secs(30);
+
+/// The address each network answered from last, by its id.
+static ANSWERED: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+
+/// `rpc`, through `addresses`.
+fn rpc_through(
+    chain: &Chain,
+    addresses: &[String],
+    method: &str,
+    params: Value,
+) -> Result<Value, Asked> {
     let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
-    let answer: Value = client()?
-        .post(&chain.rpc)
-        .json(&body)
+    let last = ANSWERED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&chain.id)
+        .cloned();
+    let mut order: Vec<&String> = addresses
+        .iter()
+        .filter(|a| Some(*a) == last.as_ref())
+        .collect();
+    order.extend(addresses.iter().filter(|a| Some(*a) != last.as_ref()));
+    let until = std::time::Instant::now() + RPC_TIME;
+    let mut first = None;
+    let mut tried = 0;
+    for address in &order {
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        tried += 1;
+        match ask(chain, address, method, &body, left.min(HTTP_TIME)) {
+            Ok(result) => {
+                if order.len() > 1 {
+                    ANSWERED
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(chain.id.clone(), address.to_string());
+                }
+                return Ok(result);
+            }
+            // Sent again after an RPC that did no work, a transaction this
+            // one already knows went out through it all the same.
+            Err(Asked::Anywhere(why)) if first.is_some() && sends(method) && known(&why) => {
+                return Err(Asked::Unsure(why));
+            }
+            Err(asked @ (Asked::Anywhere(_) | Asked::Unsure(_))) => return Err(asked),
+            Err(Asked::Here(why)) => {
+                first.get_or_insert(why);
+            }
+        }
+    }
+    let why = first.unwrap_or_else(|| format!("{} has no RPC address.", chain.name));
+    Err(Asked::Here(match tried {
+        0 | 1 => why,
+        2 => format!("{why} Its other public RPC failed too."),
+        tried => format!("{why} Its other {} public RPCs failed too.", tried - 1),
+    }))
+}
+
+/// Why one address did not answer a call.
+#[derive(Debug, PartialEq)]
+enum Asked {
+    /// Its own refusal -- its limits, its plan, its outage -- which another
+    /// address may not share.
+    Here(String),
+    /// The call's, which every address would give.
+    Anywhere(String),
+    /// A send's answer that leaves open whether the transaction was taken:
+    /// it may have gone out, so it goes nowhere else.
+    Unsure(String),
+}
+
+impl Asked {
+    /// What went wrong, said for a person.
+    fn said(self) -> String {
+        match self {
+            Asked::Here(why) | Asked::Anywhere(why) | Asked::Unsure(why) => why,
+        }
+    }
+}
+
+/// Whether `method` hands a signed transaction to the network.
+fn sends(method: &str) -> bool {
+    matches!(method, "sendTransaction" | "eth_sendRawTransaction")
+}
+
+/// Whether a refused send says the network has the transaction already, or
+/// one in its place: a nonce used, or Solana's `AlreadyProcessed`.
+fn known(why: &str) -> bool {
+    let said = why.to_lowercase();
+    [
+        "already known",
+        "known transaction",
+        "nonce too low",
+        "alreadyprocessed",
+        "already processed",
+        "already been processed",
+    ]
+    .iter()
+    .any(|word| said.contains(word))
+}
+
+/// Ask `address`, one of `chain`'s RPCs, the JSON-RPC call `body`, waiting
+/// at most `time` for it.
+fn ask(
+    chain: &Chain,
+    address: &str,
+    method: &str,
+    body: &Value,
+    time: Duration,
+) -> Result<Value, Asked> {
+    // A transaction an RPC may have taken is never sent to another: sent
+    // twice it is refused the second time as known, and a send that went
+    // through would read as failed. Only an RPC that provably did no work
+    // is passed over, and one that may have taken it says so.
+    let sends = sends(method);
+    let response = client()
+        .map_err(Asked::Anywhere)?
+        .post(address)
+        .timeout(time)
+        .json(body)
         .send()
-        .map_err(|e| unreached(chain, e))?
-        .json()
-        .map_err(|_| format!("{} answered something that is not JSON-RPC.", chain.name))?;
+        .map_err(|e| {
+            if e.is_connect() || !sends {
+                Asked::Here(unreached(chain, e))
+            } else if e.is_timeout() {
+                Asked::Unsure(format!("{} took too long to answer.", chain.name))
+            } else {
+                Asked::Anywhere(unreached(chain, e))
+            }
+        })?;
+    let status = response.status();
+    // Before any work: its limits, a key it wants, or what it will not serve.
+    let turned_away = matches!(status.as_u16(), 401 | 403 | 429);
+    let elsewhere = |why: String| match turned_away || !sends {
+        true => Asked::Here(why),
+        false => Asked::Unsure(why),
+    };
+    let answer: Value = response.json().map_err(|_| {
+        elsewhere(match status.is_success() {
+            true => format!("{} answered something that is not JSON-RPC.", chain.name),
+            false => format!("{} answered HTTP {}.", chain.name, status.as_u16()),
+        })
+    })?;
     if let Some(error) = answer.get("error").filter(|error| !error.is_null()) {
         let said = error["message"]
             .as_str()
             .map_or_else(|| error.to_string(), str::to_owned);
-        return Err(format!("{} refused {method}: {said}", chain.name));
+        let why = format!("{} refused {method}: {said}", chain.name);
+        // A gateway can hand a send on and still answer that it is
+        // overloaded, so for a send only its codes say it did no work.
+        return Err(if turned_away || did_no_work(error) {
+            Asked::Here(why)
+        } else if !refused_by_rpc(error) {
+            Asked::Anywhere(why)
+        } else if sends {
+            Asked::Unsure(why)
+        } else {
+            Asked::Here(why)
+        });
+    }
+    if !status.is_success() {
+        return Err(elsewhere(format!(
+            "{} answered HTTP {}.",
+            chain.name,
+            status.as_u16()
+        )));
     }
     Ok(answer["result"].clone())
+}
+
+/// Whether a JSON-RPC `error`'s code says the RPC turned the call away
+/// before doing it: limit exceeded, method not found, and HTTP's own codes
+/// some use.
+fn did_no_work(error: &Value) -> bool {
+    matches!(
+        error["code"].as_i64(),
+        Some(-32005 | -32601 | 401 | 403 | 429)
+    )
+}
+
+/// Whether a JSON-RPC `error` is the RPC's own -- its rate limits, its plan,
+/// a key it wants, a method it does not serve -- rather than the call's,
+/// such as a revert or too little to pay with, which any RPC would give.
+fn refused_by_rpc(error: &Value) -> bool {
+    if did_no_work(error) {
+        return true;
+    }
+    let said = error["message"].as_str().unwrap_or_default().to_lowercase();
+    [
+        "rate limit",
+        "too many",
+        "limit exceeded",
+        "usage limit",
+        "not available",
+        "unauthorized",
+        "not authorized",
+        "forbidden",
+        "personal token",
+        "api key",
+        "authenticate",
+        "not supported",
+        "unsupported",
+        "method not found",
+        "free plan",
+        "overloaded",
+        "capacity",
+    ]
+    .iter()
+    .any(|word| said.contains(word))
 }
 
 /// The HTTP client the wallet's calls go through. It follows no redirect:
@@ -1483,9 +1753,54 @@ fn readable(response: reqwest::blocking::Response, url: &reqwest::Url) -> Result
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::store::tests::{DATA_DIR, Scratch};
+    use std::io::{BufRead, Read, Write};
+
+    /// A network's RPC on this machine: each call is handed to `answer` with
+    /// its method and params, and its reply is what `answer` gives, a
+    /// `result` or an `error`.
+    pub(crate) fn chain_rpc(
+        answer: impl Fn(&str, &Value) -> Value + std::marker::Send + 'static,
+    ) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut request = vec![0; length];
+                let _ = reader.read_exact(&mut request);
+                let request: Value = serde_json::from_slice(&request).unwrap_or_default();
+                let mut reply = answer(
+                    request["method"].as_str().unwrap_or_default(),
+                    &request["params"],
+                );
+                reply["jsonrpc"] = "2.0".into();
+                reply["id"] = request["id"].clone();
+                let body = reply.to_string();
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        address
+    }
 
     const ABANDON: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
@@ -1758,5 +2073,165 @@ mod tests {
             "{why}"
         );
         assert!(why.contains("Settings › Wallet"), "{why}");
+    }
+
+    #[test]
+    fn a_token_that_could_not_be_read_is_listed_with_why_not_as_none() {
+        let refused = |read: &str| {
+            let read = read.to_owned();
+            chain_rpc(move |method, _| match method {
+                // None, so no price is looked up.
+                "getBalance" if read != "all" => json!({"result": {"value": 0}}),
+                _ => json!({"error": {"code": -32602, "message": "rate limited"}}),
+            })
+        };
+        let mut solana = chains::all(&Wallet::default())
+            .into_iter()
+            .find(|chain| chain.id == chains::SOLANA)
+            .unwrap();
+        let account = Account {
+            id: "w1".into(),
+            label: "Main".into(),
+            holds: Holds::Watch,
+            evm: String::new(),
+            solana: "HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk".into(),
+            index: 0,
+        };
+        // The coin read, a token's refused: the token is listed, saying why.
+        solana.rpc = refused("tokens");
+        let held = held_on(&solana, &account);
+        assert_eq!(
+            (held[0].symbol.as_str(), held[0].amount.as_str()),
+            ("SOL", "0")
+        );
+        let usdc = held
+            .iter()
+            .find(|h| h.symbol == "USDC")
+            .expect("USDC left out");
+        assert!(usdc.error.contains("rate limited"), "{usdc:?}");
+        assert!(usdc.amount.is_empty());
+        // Out of reach altogether: the coin's row says so, once.
+        solana.rpc = refused("all");
+        let held = held_on(&solana, &account);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert!(held[0].error.contains("rate limited"));
+    }
+
+    #[test]
+    fn a_refusing_rpc_is_passed_over_and_a_refused_call_is_not() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut chain = chains::all(&Wallet::default())
+            .into_iter()
+            .find(|chain| chain.id == chains::BASE)
+            .unwrap();
+        // Its own id, so what this test remembers is its own.
+        chain.id = "eip155:999001".into();
+        let counted = |answer: Value| {
+            let asked = Arc::new(AtomicUsize::new(0));
+            let count = asked.clone();
+            let address = chain_rpc(move |_, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+                answer.clone()
+            });
+            (address, asked)
+        };
+        let (limited, asked_limited) =
+            counted(json!({"error": {"code": -32005, "message": "rate limited"}}));
+        let (good, asked_good) = counted(json!({"result": "0x1"}));
+        // Nothing listens on port 1: as a blocked RPC would, it never answers.
+        let addresses = ["http://127.0.0.1:1".to_owned(), limited, good];
+
+        let answer = rpc_through(&chain, &addresses, "eth_chainId", json!([]));
+        assert_eq!(answer, Ok(json!("0x1")));
+        assert_eq!(asked_limited.load(Ordering::SeqCst), 1);
+        // The one that answered is asked first from then on.
+        let answer = rpc_through(&chain, &addresses, "eth_chainId", json!([]));
+        assert_eq!(answer, Ok(json!("0x1")));
+        assert_eq!(asked_limited.load(Ordering::SeqCst), 1);
+        assert_eq!(asked_good.load(Ordering::SeqCst), 2);
+
+        // A refusal of the call itself is the answer: another RPC would give it too.
+        chain.id = "eip155:999002".into();
+        let (reverts, _) = counted(json!({"error": {"code": 3, "message": "execution reverted"}}));
+        let (unasked, asked_unasked) = counted(json!({"result": "0x1"}));
+        let why = rpc_through(&chain, &[reverts, unasked], "eth_call", json!([]))
+            .map_err(Asked::said)
+            .unwrap_err();
+        assert!(why.contains("execution reverted"), "{why}");
+        assert_eq!(asked_unasked.load(Ordering::SeqCst), 0);
+
+        // Every one refusing: the first's reason, and how many were tried.
+        chain.id = "eip155:999003".into();
+        let (one, _) = counted(json!({"error": {"code": 429, "message": "Too Many Requests"}}));
+        let (two, _) =
+            counted(json!({"error": {"message": "This method is not available on the free plan"}}));
+        let why = rpc_through(&chain, &[one, two], "eth_getBalance", json!([]))
+            .map_err(Asked::said)
+            .unwrap_err();
+        assert!(why.contains("Too Many Requests"), "{why}");
+        assert!(why.contains("Its other public RPC failed too."), "{why}");
+    }
+
+    #[test]
+    fn a_send_an_rpc_may_have_taken_is_sent_nowhere_else_and_not_called_failed() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut chain = chains::all(&Wallet::default())
+            .into_iter()
+            .find(|chain| chain.id == chains::BASE)
+            .unwrap();
+        let counted = |answer: Value| {
+            let asked = Arc::new(AtomicUsize::new(0));
+            let count = asked.clone();
+            let address = chain_rpc(move |_, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+                answer.clone()
+            });
+            (address, asked)
+        };
+        let send = "eth_sendRawTransaction";
+
+        // A gateway may hand a send on and still say it is overloaded.
+        chain.id = "eip155:999011".into();
+        let overloaded = json!({"error": {"code": -32000, "message": "server overloaded"}});
+        let (busy, _) = counted(overloaded.clone());
+        let (next, asked_next) = counted(json!({"result": "0xabc"}));
+        let answer = rpc_through(&chain, &[busy, next.clone()], send, json!(["0x02"]));
+        assert!(matches!(answer, Err(Asked::Unsure(ref why)) if why.contains("overloaded")));
+        assert_eq!(asked_next.load(Ordering::SeqCst), 0);
+        // The same words to a read still move on to the next RPC.
+        chain.id = "eip155:999012".into();
+        let (busy, _) = counted(overloaded.clone());
+        let answer = rpc_through(&chain, &[busy, next], "eth_getBalance", json!([]));
+        assert_eq!(answer, Ok(json!("0xabc")));
+        assert_eq!(asked_next.load(Ordering::SeqCst), 1);
+
+        // One that did no work is passed over; the next knowing it is unsure too.
+        chain.id = "eip155:999013".into();
+        let (limited, _) = counted(json!({"error": {"code": -32005, "message": "rate limited"}}));
+        let (knows, asked_knows) =
+            counted(json!({"error": {"code": -32000, "message": "already known"}}));
+        let answer = rpc_through(&chain, &[limited, knows], send, json!(["0x02"]));
+        assert!(matches!(answer, Err(Asked::Unsure(ref why)) if why.contains("already known")));
+        assert_eq!(asked_knows.load(Ordering::SeqCst), 1);
+        // Asked first, a nonce already used is the send's own refusal.
+        chain.id = "eip155:999014".into();
+        let (low, _) = counted(json!({"error": {"code": -32000, "message": "nonce too low"}}));
+        let (unasked, asked_unasked) = counted(json!({"result": "0xabc"}));
+        let answer = rpc_through(&chain, &[low, unasked], send, json!(["0x02"]));
+        assert!(matches!(answer, Err(Asked::Anywhere(ref why)) if why.contains("nonce too low")));
+        assert_eq!(asked_unasked.load(Ordering::SeqCst), 0);
+
+        // Whoever sends it is told the transaction to look up, not that it failed.
+        let mut own = chain.clone();
+        own.id = "eip155:999015".into();
+        own.rpc = counted(overloaded).0;
+        let Err(Unsent::Maybe { tx, why }) = broadcast(&own, send, json!(["0x02"]), "0xfeed")
+        else {
+            panic!("a send an RPC may have taken read as refused");
+        };
+        assert_eq!(tx, "0xfeed");
+        assert!(why.contains("overloaded"), "{why}");
     }
 }

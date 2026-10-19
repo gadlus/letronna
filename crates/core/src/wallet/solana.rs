@@ -10,7 +10,7 @@
 //! site's must already exist, as its fee payer would otherwise pay its rent.
 
 use super::chains::{Chain, Token};
-use super::rpc;
+use super::{Unsent, broadcast, rpc};
 use serde_json::{Value, json};
 
 /// The System program, which moves SOL: 32 zero bytes.
@@ -202,6 +202,12 @@ fn transaction(
     Ok(out)
 }
 
+/// The first signature of the whole transaction `signed`, which is its id:
+/// after the count of signatures, one byte while there are fewer than 128.
+fn first_signature(signed: &[u8]) -> String {
+    signed.get(1..65).map(to_base58).unwrap_or_default()
+}
+
 /// `n` as Solana's compact-u16: seven bits a byte, low first.
 fn compact(out: &mut Vec<u8>, n: usize) {
     let mut n = n;
@@ -346,24 +352,45 @@ pub(crate) fn balance(chain: &Chain, owner: &str) -> Result<u128, String> {
         .ok_or_else(|| format!("{} gave no balance.", chain.name))
 }
 
-/// What `owner` holds of `token`, in its smallest unit, across every account
-/// it holds it in.
+/// What `owner` holds of `token`, in its smallest unit: what is in the
+/// account wallets keep it in, under the token program or Token-2022, which
+/// is the account this wallet pays and sends it from. Read as two plain
+/// accounts, which every RPC serves, rather than by searching what the owner
+/// holds, which public RPCs refuse or ration; one never made holds none.
 pub(crate) fn token_balance(chain: &Chain, owner: &str, token: &Token) -> Result<u128, String> {
+    let (owner, mint) = (key(owner)?, key(&token.address)?);
+    let programs = [TOKEN, TOKEN_2022];
+    let accounts = programs
+        .iter()
+        .map(|program| token_account(&owner, &mint, program).map(|at| to_base58(&at)))
+        .collect::<Result<Vec<String>, String>>()?;
     let answer = rpc(
         chain,
-        "getTokenAccountsByOwner",
-        json!([owner, {"mint": token.address}, {"encoding": "jsonParsed", "commitment": "confirmed"}]),
+        "getMultipleAccounts",
+        json!([accounts, {"encoding": "base64", "commitment": "confirmed"}]),
     )?;
-    let accounts = answer["value"].as_array().cloned().unwrap_or_default();
-    Ok(accounts
-        .iter()
-        .filter_map(|account| {
-            account["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"]
-                .as_str()?
-                .parse::<u128>()
-                .ok()
-        })
-        .sum())
+    let found = answer["value"]
+        .as_array()
+        .ok_or_else(|| format!("{} gave no accounts.", chain.name))?;
+    let mut held = 0u128;
+    for (account, program) in found.iter().zip(programs) {
+        if account.is_null() || key(account["owner"].as_str().unwrap_or_default()) != Ok(program) {
+            continue;
+        }
+        let data = account["data"][0].as_str().unwrap_or_default();
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)
+            .map_err(|_| "The token account's data could not be read.".to_string())?;
+        // A token account is its mint (32 bytes), its owner (32), then the
+        // amount.
+        if bytes.get(..32) != Some(&mint[..]) {
+            continue;
+        }
+        let amount: [u8; 8] = (bytes.get(64..72))
+            .and_then(|amount| amount.try_into().ok())
+            .ok_or("The token account's data is too short.")?;
+        held += u128::from(u64::from_le_bytes(amount));
+    }
+    Ok(held)
 }
 
 /// The program a mint lives under and its decimals, read from the chain.
@@ -424,7 +451,7 @@ pub(crate) fn send(
     to: &str,
     amount: u64,
     token: Option<&Token>,
-) -> Result<String, String> {
+) -> Result<String, Unsent> {
     let from: [u8; 32] = super::keys::solana_public(seed)?
         .try_into()
         .map_err(|_| "Not a Solana key.")?;
@@ -451,10 +478,11 @@ pub(crate) fn send(
     let (message, signers) = message(from, &instructions, blockhash(chain)?);
     let signed = transaction(&message, signers, 0, seed)?;
     let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &signed);
-    let answer = rpc(
+    let answer = broadcast(
         chain,
         "sendTransaction",
         json!([encoded, {"encoding": "base64", "preflightCommitment": "confirmed"}]),
+        &first_signature(&signed),
     )?;
     let signature = answer
         .as_str()
@@ -652,6 +680,22 @@ mod tests {
     }
 
     #[test]
+    fn a_sends_id_is_its_one_signature() {
+        let seed = [7u8; 32];
+        let owner: [u8; 32] = super::super::keys::solana_public(&seed)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let (message, signers) = message(owner, &[transfer_sol(owner, [5u8; 32], 1)], [1u8; 32]);
+        let signed = transaction(&message, signers, 0, &seed).unwrap();
+        let pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        assert_eq!(
+            first_signature(&signed),
+            to_base58(pair.sign(&message).as_ref())
+        );
+    }
+
+    #[test]
     #[ignore = "reads Solana devnet; run with --ignored when online"]
     fn devnet_answers_with_a_blockhash_and_a_balance() {
         let chains = super::super::chains::all(&super::super::Wallet::default());
@@ -660,5 +704,46 @@ mod tests {
         balance(devnet, "HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk").unwrap();
         let usdc = devnet.token("usdc").unwrap();
         assert_eq!(mint_of(devnet, &usdc.address).unwrap(), (TOKEN, 6));
+    }
+
+    #[test]
+    fn a_token_is_read_from_the_account_wallets_keep_it_in() {
+        let owner = "HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk";
+        let mut chain = super::super::chains::all(&super::super::Wallet::default())
+            .into_iter()
+            .find(|chain| chain.id == super::super::chains::SOLANA)
+            .unwrap();
+        let usdc = chain.token("usdc").unwrap().clone();
+        let mint = key(&usdc.address).unwrap();
+        // A token account as the chain keeps it: mint, owner, then amount.
+        let mut data = mint.to_vec();
+        data.extend(key(owner).unwrap());
+        data.extend(2_045_225u64.to_le_bytes());
+        data.resize(165, 0);
+        let held = json!({
+            "owner": to_base58(&TOKEN),
+            "data": [base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data), "base64"],
+        });
+        let (asked, heard) = std::sync::mpsc::channel();
+        let answers = std::sync::Mutex::new(vec![json!([null, null]), json!([held, null])]);
+        chain.rpc = super::super::tests::chain_rpc(move |method, params| {
+            let _ = asked.send((method.to_owned(), params.clone()));
+            let value = answers.lock().unwrap().pop().unwrap_or_default();
+            json!({"result": {"context": {"slot": 1}, "value": value}})
+        });
+
+        assert_eq!(token_balance(&chain, owner, &usdc), Ok(2_045_225));
+        // Asked for the two accounts it can be in by name, not by searching
+        // the owner's, which public RPCs refuse.
+        let (method, params) = heard.recv().unwrap();
+        assert_eq!(method, "getMultipleAccounts");
+        let owner_key = key(owner).unwrap();
+        let expected: Vec<String> = [TOKEN, TOKEN_2022]
+            .iter()
+            .map(|program| to_base58(&token_account(&owner_key, &mint, program).unwrap()))
+            .collect();
+        assert_eq!(params[0], json!(expected));
+        // Neither made yet: none, not an error.
+        assert_eq!(token_balance(&chain, owner, &usdc), Ok(0));
     }
 }

@@ -495,7 +495,11 @@ fn balance(keys: &mut dyn Keyboard, name: &str, chain: Option<String>) -> Result
                                 .map(|usd| render::dim(&format!("  {}", wallet::dollars(usd))))
                                 .unwrap_or_default()
                         ),
-                        false => format!("  {:<16} {}", h.chain, render::dim(&h.error)),
+                        false => format!(
+                            "  {:<16} {}",
+                            h.chain,
+                            render::dim(&format!("{}: {}", h.symbol, h.error))
+                        ),
                     });
                 }
                 if !any {

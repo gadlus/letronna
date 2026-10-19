@@ -176,15 +176,26 @@ pub(crate) fn choose(
                     Family::Evm => super::evm::token_balance(chain, &token, &account.evm),
                     Family::Solana => super::solana::token_balance(chain, &account.solana, &token),
                 };
-                if !held.is_ok_and(|held| held >= amount) {
-                    why.push(format!(
-                        "{} {} on {}, more than {} holds",
-                        super::amount_text(amount, token.decimals),
-                        token.symbol,
-                        chain.name,
-                        account.label
-                    ));
-                    continue;
+                let price = format!(
+                    "{} {} on {}",
+                    super::amount_text(amount, token.decimals),
+                    token.symbol,
+                    chain.name
+                );
+                match held {
+                    Ok(held) if held >= amount => {}
+                    Ok(_) => {
+                        why.push(format!("{price}, more than {} holds", account.label));
+                        continue;
+                    }
+                    // Not that it holds too little: what it holds is not known.
+                    Err(error) => {
+                        why.push(format!(
+                            "{price}, but what {} holds there could not be read ({error})",
+                            account.label
+                        ));
+                        continue;
+                    }
                 }
             }
             return Ok(Plan {
@@ -592,6 +603,37 @@ mod tests {
             why.contains("switched off") && why.contains("`upto`"),
             "{why}"
         );
+    }
+
+    #[test]
+    fn a_balance_that_could_not_be_read_is_not_said_to_be_too_little() {
+        let quote = Quote {
+            version: 2,
+            resource: Value::Null,
+            accepts: vec![offer()],
+            error: String::new(),
+        };
+        let on = |answer: Value| {
+            let mut wallet = wallet();
+            let rpc = super::super::tests::chain_rpc(move |_, _| answer.clone());
+            wallet
+                .networks
+                .insert("eip155:84532".into(), chains::Network { on: None, rpc });
+            wallet
+        };
+        let refused = on(json!({"error": {"code": -32005, "message": "rate limited"}}));
+        let why = choose(&quote, &refused, "x.dev", true).unwrap_err();
+        assert!(
+            why.contains("could not be read") && why.contains("rate limited"),
+            "{why}"
+        );
+        assert!(!why.contains("more than"), "{why}");
+        // Read, and short: that is what it says.
+        let empty = on(json!({"result": format!("0x{:064x}", 0)}));
+        let why = choose(&quote, &empty, "x.dev", true).unwrap_err();
+        assert!(why.contains("more than Main holds"), "{why}");
+        let funded = on(json!({"result": format!("0x{:064x}", 1_000_000)}));
+        assert!(choose(&quote, &funded, "x.dev", true).is_ok());
     }
 
     /// A one-request-at-a-time HTTP server on this machine: the first

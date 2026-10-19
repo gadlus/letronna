@@ -927,10 +927,11 @@ fn holding_row(holding: &Holding, muted: Hsla) -> AnyElement {
         )
         .child(match holding.error.is_empty() {
             true => div().child(format!("{} {}{worth}", holding.amount, holding.symbol)),
+            // Named, since a token's read can fail where the coin's did not.
             false => div()
                 .text_color(muted)
                 .truncate()
-                .child(holding.error.clone()),
+                .child(format!("{}: {}", holding.symbol, holding.error)),
         })
         .into_any_element()
 }

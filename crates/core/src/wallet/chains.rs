@@ -253,6 +253,87 @@ const BUILT_IN: &[Row] = &[
     ),
 ];
 
+/// Other public RPCs of each built-in network, tried in this order when its
+/// own refuses, rations or cannot be reached; each answered every call the
+/// wallet makes when it was put here. A network not named has no other free
+/// one that did.
+const FALLBACKS: &[(&str, &[&str])] = &[
+    (
+        BASE,
+        &["https://base-rpc.publicnode.com", "https://base.drpc.org"],
+    ),
+    ("eip155:1", &["https://eth.drpc.org"]),
+    (
+        "eip155:42161",
+        &[
+            "https://arbitrum-one-rpc.publicnode.com",
+            "https://arbitrum.drpc.org",
+        ],
+    ),
+    (
+        "eip155:10",
+        &[
+            "https://optimism-rpc.publicnode.com",
+            "https://optimism.drpc.org",
+        ],
+    ),
+    ("eip155:137", &["https://polygon.drpc.org"]),
+    (
+        "eip155:56",
+        &[
+            "https://bsc-rpc.publicnode.com",
+            "https://bsc-dataseed1.defibit.io",
+            "https://bsc-dataseed1.ninicoin.io",
+        ],
+    ),
+    (
+        "eip155:43114",
+        &[
+            "https://avalanche-c-chain-rpc.publicnode.com",
+            "https://avalanche.drpc.org",
+        ],
+    ),
+    (SOLANA, &["https://solana-rpc.publicnode.com"]),
+    (
+        "eip155:84532",
+        &[
+            "https://base-sepolia-rpc.publicnode.com",
+            "https://base-sepolia.drpc.org",
+        ],
+    ),
+    (
+        "eip155:11155111",
+        &[
+            "https://sepolia.drpc.org",
+            "https://sepolia.gateway.tenderly.co",
+        ],
+    ),
+    ("eip155:80002", &["https://polygon-amoy.drpc.org"]),
+    (
+        "eip155:43113",
+        &[
+            "https://avalanche-fuji-c-chain-rpc.publicnode.com",
+            "https://avalanche-fuji.drpc.org",
+        ],
+    ),
+];
+
+/// The addresses `chain` is read and paid through, in the order they are
+/// tried: its own, then, while its own is the public one Letronna chose, the
+/// other public ones. An address the user set, or a network they added, is
+/// the only one used.
+pub(crate) fn rpcs(chain: &Chain) -> Vec<String> {
+    let built_in = BUILT_IN
+        .iter()
+        .any(|&(id, _, rpc, ..)| id == chain.id && rpc == chain.rpc);
+    let others = FALLBACKS
+        .iter()
+        .filter(|_| built_in)
+        .filter(|(id, _)| *id == chain.id)
+        .flat_map(|(_, rpcs)| rpcs.iter().map(|rpc| rpc.to_string()));
+    std::iter::once(chain.rpc.clone()).chain(others).collect()
+}
+
 /// Each built-in token: network, symbol, address, decimals, and the EIP-712
 /// name and version its transfers are signed under (none where it takes no
 /// signed transfers).
@@ -602,5 +683,38 @@ mod tests {
         );
         assert!(base.is_native("eth") && base.is_native("") && !base.is_native("usdc"));
         assert!(custom_evm("x", 1, "ftp://nope", "").is_err());
+    }
+
+    #[test]
+    fn only_a_built_in_rpc_falls_back_to_other_public_ones() {
+        let mut wallet = Wallet::default();
+        let base = |wallet: &Wallet| find(&all(wallet), "base").unwrap().clone();
+        assert_eq!(
+            rpcs(&base(&wallet)),
+            [
+                "https://mainnet.base.org",
+                "https://base-rpc.publicnode.com",
+                "https://base.drpc.org"
+            ]
+        );
+        // The user's own address is the only one used.
+        wallet.networks.insert(
+            BASE.into(),
+            Network {
+                on: None,
+                rpc: "https://mine.example/rpc".into(),
+            },
+        );
+        assert_eq!(rpcs(&base(&wallet)), ["https://mine.example/rpc"]);
+        // So is a network they added, and one with no other free RPC.
+        let sei = custom_evm("Sei", 1329, "https://evm-rpc.sei-apis.com", "sei").unwrap();
+        assert_eq!(rpcs(&sei), ["https://evm-rpc.sei-apis.com"]);
+        let robinhood = find(&all(&wallet), "robinhood").unwrap().clone();
+        assert_eq!(rpcs(&robinhood), std::slice::from_ref(&robinhood.rpc));
+        // Every fallback is a network's that is built in, and an https one.
+        for (id, rpcs) in FALLBACKS {
+            assert!(BUILT_IN.iter().any(|row| row.0 == *id), "{id}");
+            assert!(rpcs.iter().all(|rpc| rpc.starts_with("https://")), "{id}");
+        }
     }
 }

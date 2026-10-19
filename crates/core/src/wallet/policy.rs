@@ -113,7 +113,8 @@ pub enum Status {
     /// Nothing was signed, or the chain refused it.
     Failed,
     /// Signed and handed over, but not seen settled: the site may still
-    /// settle it until the authorization expires, so it keeps counting.
+    /// settle it until the authorization expires, or a send may be on the
+    /// chain though no RPC said so, so it keeps counting.
     Unsettled,
 }
 
