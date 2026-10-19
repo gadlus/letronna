@@ -639,6 +639,10 @@ fn token_sums_from(
         let echoed = route.is_some_and(|route| echoes_reasoning(m, route, in_turn(turn, i)));
         total += message_tokens(m, tool_chars, echoed);
         total += PICTURE_TOKENS * pictures.iter().filter(|p| p.after == i).count();
+        // A result whose picture is left out says so, counted as a model
+        // that sees is told it. A blind model is told about as much of an
+        // older picture, and of one of the newest, less than it would cost.
+        total += tokens(&unsent_picture(m, true, &pictures));
         sums.push(total);
     }
     sums
@@ -1802,8 +1806,9 @@ fn body_hashed(
     }
     let mut context = vec![json!({"role": "system", "content": system.text})];
     let sees = takes_images(connection);
-    let shown: Vec<(Picture, Value)> = pictures(window)
-        .into_iter()
+    let newest = pictures(window);
+    let shown: Vec<(&Picture, Value)> = newest
+        .iter()
         .filter(|_| sees)
         .filter_map(|picture| {
             let url = crate::media::data_url(&picture.path)?;
@@ -1884,7 +1889,11 @@ fn body_hashed(
             } else {
                 ""
             };
-            wired["content"] = format!("{text}{hint}{advice}").into();
+            let unsent = match &stubs[i] {
+                None => unsent_picture(m, sees, &newest),
+                Some(_) => String::new(),
+            };
+            wired["content"] = format!("{text}{unsent}{hint}{advice}").into();
         }
         if i < old {
             for (at, call) in m.tool_calls.iter().enumerate() {
@@ -2246,6 +2255,45 @@ fn label(tool: &str) -> String {
     } else {
         format!("The picture from {tool}.")
     }
+}
+
+/// What a tool's result whose picture a request no longer carries says
+/// besides, on the wire. Its own words still say the picture follows, and a
+/// model left to wonder reads the picture again, only to push out another.
+fn no_longer_sent() -> String {
+    format!(
+        "(From Letronna: a request carries only the {PICTURES} newest pictures, so this one is no longer sent. Keep what you need from a picture in your reply or a file while it is sent, and read it again only for what you did not keep.)"
+    )
+}
+
+/// What `result` says besides on the wire when it saved a picture this
+/// request does not carry: to a model that `sees` none, what the picture is,
+/// as an attachment is told; to one that does, that it is not among the
+/// `newest`. Browse shows only its newest screenshot by design, the page
+/// having moved on since an older one, so its results say neither.
+fn unsent_picture(result: &Message, sees: bool, newest: &[Picture]) -> String {
+    if result.role != "tool" || result.is_error || result.name == crate::browser::BROWSE {
+        return String::new();
+    }
+    let Some(path) = crate::media::saved_by(&result.name, &result.content)
+        .filter(|path| crate::media::is_picture(path))
+    else {
+        return String::new();
+    };
+    if !sees {
+        let Ok(bytes) = std::fs::read(&path) else {
+            return String::new();
+        };
+        return format!(
+            "\n\n`{}` is {}",
+            path.display(),
+            crate::media::unseen(&bytes)
+        );
+    }
+    if newest.iter().any(|picture| picture.path == path) {
+        return String::new();
+    }
+    format!("\n\n{}", no_longer_sent())
 }
 
 /// Whether the gateway's list says the model takes pictures, or says
@@ -7812,6 +7860,9 @@ mod tests {
             label.contains("A web page drew it, not the user"),
             "{label}"
         );
+        // The older is left out by design, so its result says nothing of it.
+        assert_eq!(context[3]["tool_call_id"], "a");
+        assert!(!context[3]["content"].as_str().unwrap().contains("(From"));
         // What fenced text means is said once, in the system prompt.
         let system = context[0]["content"].as_str().unwrap();
         assert!(system.contains(crate::untrusted::RULE), "{system}");
@@ -7953,9 +8004,95 @@ mod tests {
         );
         let first = told[1]["content"].as_str().unwrap();
         assert_eq!(first.matches("This model cannot view images").count(), 3);
+        // The server's result, whose own words say its picture follows, too.
+        let made = told[3]["content"].as_str().unwrap();
+        let m = dir.join("m.jpg").display().to_string();
+        assert!(
+            made.contains(&format!(
+                "\n\n`{m}` is a JPEG picture, 1 KB. This model cannot view images"
+            )),
+            "{made}"
+        );
         // A model that sees is not told.
         let seen = body(&connection(), &messages, None, None).to_string();
         assert!(!seen.contains("cannot view images"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_result_whose_picture_a_request_no_longer_carries_says_so() {
+        let dir = std::env::temp_dir().join(format!("letronna-unsent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let read = |n: u8| {
+            let path = dir.join(format!("{n}.jpg"));
+            std::fs::write(&path, [0xFF, 0xD8, 0xFF, n]).unwrap();
+            Message {
+                role: "tool".into(),
+                name: "read_file".into(),
+                tool_call_id: n.to_string(),
+                content: format!(
+                    "Saved to {}\nA copy of the picture `{n}.jpg`, 1 KB. It follows the results when this model takes pictures.",
+                    path.display()
+                ),
+                ..Default::default()
+            }
+        };
+        let conversation = |results: &[Message]| {
+            let calls = (results.iter())
+                .map(|r| ToolCall {
+                    id: r.tool_call_id.clone(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                })
+                .collect();
+            let mut messages = vec![
+                said("user", "what do these show?"),
+                Message {
+                    role: "assistant".into(),
+                    tool_calls: calls,
+                    ..Default::default()
+                },
+            ];
+            messages.extend_from_slice(results);
+            messages
+        };
+        let asked = |results: &[Message]| {
+            body(&connection(), &conversation(results), None, None)["messages"].clone()
+        };
+        let result = |sent: &Value, id: &str| -> String {
+            let all = sent.as_array().unwrap();
+            let found = all.iter().find(|m| m["tool_call_id"] == id).unwrap();
+            found["content"].as_str().unwrap().to_owned()
+        };
+        let five: Vec<Message> = (1..=5).map(read).collect();
+        let sent = asked(&five);
+        // The oldest of five goes without its picture, and says so.
+        assert!(result(&sent, "1").ends_with(&no_longer_sent()));
+        for id in ["2", "3", "4", "5"] {
+            assert!(!result(&sent, id).contains("no longer sent"), "{id}");
+        }
+        // Which the window counts where it goes.
+        let messages = conversation(&five);
+        let sums = token_sums(&messages, MAX_TOOL_CHARS, None);
+        let alone = message_tokens(&messages[2], MAX_TOOL_CHARS, false);
+        let note = tokens(&format!("\n\n{}", no_longer_sent()));
+        assert_eq!(sums[3] - sums[2], alone + note);
+        // Four all go, and none says anything.
+        let sent = asked(&five[1..]);
+        assert!(!sent.to_string().contains("no longer sent"));
+        // Nor does a result that failed, whatever it names.
+        let failed = Message {
+            is_error: true,
+            ..read(1)
+        };
+        let sent = asked(&[
+            failed,
+            five[1].clone(),
+            five[2].clone(),
+            five[3].clone(),
+            five[4].clone(),
+        ]);
+        assert!(!sent.to_string().contains("no longer sent"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -7988,7 +8125,14 @@ mod tests {
     fn a_request_an_image_spoilt_is_sent_again_without_it() {
         use std::io::Write;
         let dir = std::env::temp_dir().join(format!("letronna-spoilt-{}", std::process::id()));
-        let messages = screenshots(&dir);
+        let mut messages = screenshots(&dir);
+        // A picture read_file saved, whose result says it follows.
+        let read = dir.join("read.jpg");
+        std::fs::write(&read, [0xFF, 0xD8, 0xFF, 3]).unwrap();
+        messages[5].content = format!(
+            "Saved to {}\nA copy of the picture `read.jpg`, 1 KB. It follows the results when this model takes pictures.",
+            read.display()
+        );
         let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
         let worker = std::thread::spawn(move || {
@@ -8028,6 +8172,15 @@ mod tests {
         assert!(bodies[0].contains("image_url"));
         assert!(!bodies[1].contains("image_url"));
         assert!(!sees_images("turns-images-down"));
+        // The read's result says the picture did not go, and what it is;
+        // the screenshots', kept to the newest anyway, say nothing.
+        assert!(!bodies[0].contains("cannot view images"));
+        assert_eq!(bodies[1].matches("cannot view images").count(), 1);
+        assert!(
+            bodies[1].contains("read.jpg` is a JPEG picture"),
+            "{}",
+            bodies[1]
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
