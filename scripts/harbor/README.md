@@ -102,6 +102,48 @@ counted where they were made.
 Not passed to Letronna: a task's MCP servers and skills folder. Windows task
 images are not supported.
 
+## All of Terminal-Bench 2.0 on one host
+
+`tb2/` runs the 89 tasks on one x86_64 Linux host with Docker, `uv` and
+Harbor (`uv tool install harbor`), from the static build in
+`scripts/openhuman-bench/README.md`. The model is reached through
+`tb2/relay.py` on the host, which holds the key and, like OpenHuman's
+metering proxy, can pin the model, the provider and the reasoning effort on
+every call and writes one meter line per call. For a gateway other than
+OpenRouter, give `--upstream`, `--key-env` and `--model`; the reasoning
+effort then goes as OpenAI's `reasoning_effort`, and the caller's
+User-Agent is passed on, as some gateways turn away Python's:
+
+```sh
+OPENROUTER_API_KEY=... python3 scripts/harbor/tb2/relay.py \
+  --meter tb2-work/meter.jsonl --provider DeepSeek --reasoning high &
+LETRONNA_BIN=$PWD/target/x86_64-unknown-linux-musl/release/letronna \
+  scripts/harbor/tb2/run.sh deepseek-v4.1-flash-1
+```
+
+`run.sh` downloads the dataset into `tb2-work/`, runs every task once with
+`openai/deepseek/deepseek-v4.1-flash` (`TB2_MODEL`) three at a time
+(`TB2_N`), and ends with `tb2/report.py`'s table. All 89 images take 49 GB
+compressed, so `tb2/janitor.py` removes each task's image once its trial is
+done, and the four of 6-9 GB run one at a time after the rest. Letronna
+calls the relay at `http://host.docker.internal:18080/v1`, which
+`LETRONNA_ALLOW_HTTP=1` admits as a local name. `TB2_AGENT=oracle` runs
+each task's own solution instead, with no model, to show which tasks this
+host can pass at all: `report.py RUN --oracle ORACLE` then sets those apart.
+A stopped run picks up with `harbor job resume -p tb2-work/jobs/<job>`.
+`tb2/triage.py JOB` says, for each trial that lost points, how Letronna's
+run ended, the tests the verifier failed and the start of its answer.
+
+A network that re-terminates TLS with its own CA, as a Claude Code cloud
+container's does, breaks every verifier, which fetches uv and pytest over
+HTTPS. `TB2_CA=/path/to/ca-bundle.crt` mounts that bundle into each task
+container and points curl, pip, uv, git, Node and the rest at it. Those
+variables are then in the agent's environment too, and Letronna's own
+web_fetch still refuses such a certificate, since its roots are built in.
+In such a container Docker Hub may also turn anonymous pulls away;
+`"registry-mirrors": ["https://mirror.gcr.io"]` in
+`/etc/docker/daemon.json` serves every Terminal-Bench 2.0 image.
+
 ## Tests
 
 ```sh
@@ -109,6 +151,8 @@ cd scripts/harbor && python3 -m unittest discover -s tests
 ```
 
 `test_drive.py` runs `drive.sh` under `sh` against a stand-in for Letronna,
-and `test_atif.py` converts session folders laid out as Letronna writes them.
+`test_atif.py` converts session folders laid out as Letronna writes them,
+and `test_tb2.py` runs the relay against a stand-in provider and checks the
+janitor's bookkeeping and the report.
 `test_agent.py`, and the converter's check against Harbor's own ATIF models,
 run only where `harbor` can be imported.
