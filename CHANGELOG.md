@@ -13,6 +13,8 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.4.1] - 2026-10-20
+
 ### Added
 - **App** — A session's menu (rename, pin, export, delete) opens from a right-click, a two-finger or Control-click on a Mac, a long press, or the "…" that shows on the row under the pointer; on a Mac, Backspace and Cmd+Backspace delete the selected session too.
 
