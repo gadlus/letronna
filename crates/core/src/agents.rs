@@ -674,13 +674,23 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
          wait for it. Carry on, or end your turn.",
         slot.name, label
     );
-    launch(spec, slot, background, label, started, Vec::new(), worktree)
+    launch(
+        spec,
+        slot,
+        background,
+        label,
+        started,
+        Vec::new(),
+        worktree,
+        &ctx.files,
+    )
 }
 
 /// Sets a helper to work in the place `slot` holds, with `next` folded in as
 /// its next turn: in the background, where the call's answer is `started` and
 /// a notice follows, or while the call waits, where the answer is its report.
 /// The `worktree` it works in, if any, is finished as each run of it ends.
+#[allow(clippy::too_many_arguments)]
 fn launch(
     spec: Spec,
     slot: Slot,
@@ -689,6 +699,7 @@ fn launch(
     started: String,
     next: Vec<Notice>,
     worktree: Option<Worktree>,
+    parent: &crate::history::Log,
 ) -> Result<String, String> {
     let rounds = spec.rounds;
     let at_top = at_top(worktree.as_ref(), &spec);
@@ -697,6 +708,12 @@ fn launch(
         return Ok(started);
     }
     let report = driver::run(spec);
+    // On the call that waited for it, so a rewind past that call puts back
+    // what it changed with the rest. Not what it did in a worktree of its
+    // own, which the project's files never held.
+    if worktree.is_none() {
+        parent.add(changed(&report, &next));
+    }
     let left = claim_tree(slot.id)
         .then(|| leave(worktree.as_ref(), &report.jobs, at_top))
         .flatten();
@@ -726,6 +743,18 @@ fn leave(worktree: Option<&Worktree>, jobs: &[u64], at_top: Option<String>) -> O
         Some(line) => format!("{line} {kept}"),
         None => kept,
     })
+}
+
+/// What a helper's run changed in the project, as its `report` says, with
+/// what the helpers whose reports it began with, `read`, changed: its own to
+/// report up now. Not those of a run that never read them, as they go up
+/// with the reports themselves.
+fn changed(report: &Report, read: &[Notice]) -> Vec<crate::history::FileChange> {
+    let read = if report.input > 0 { read } else { &[] };
+    (read.iter())
+        .flat_map(|notice| notice.files.iter().cloned())
+        .chain(report.changes.iter().cloned())
+        .collect()
 }
 
 /// Claims the finish of the worktree helper `id`'s run works in, saying
@@ -830,6 +859,16 @@ fn set_off(
                 left.as_deref(),
                 after,
             );
+            // On its notice, so a rewind past the message that brings it
+            // puts back what it changed; not in a worktree of its own.
+            let changes = match &worktree {
+                None => changed(report, &next),
+                Some(_) => Vec::new(),
+            };
+            let notice = notice.map(|notice| Notice {
+                files: changes,
+                ..notice
+            });
             tasks::finish(&key, state, notice);
         });
         // In its transcript, but unread by a run stopped or failed before its
@@ -976,6 +1015,7 @@ fn hand_up(owner: u64, name: &str, late: Vec<Notice>) {
                 ),
                 from: name.to_owned(),
                 when: notice.when,
+                files: notice.files,
             },
         );
     }
@@ -1581,6 +1621,7 @@ pub fn steer(id: AgentId, message: &str) -> bool {
             from: "user".into(),
             when: When::Next,
             text: format!("message from the user:\n{message}"),
+            files: Vec::new(),
         };
         inbox::push(id, notice);
     }
@@ -2193,6 +2234,7 @@ fn ended(
         from: format!("helper {name}"),
         when: When::Next,
         text,
+        files: Vec::new(),
     };
     let state = if after == After::Idles {
         State::Idle
@@ -2402,6 +2444,7 @@ fn send(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Stri
         from,
         when: When::Next,
         text: format!("message from {who}:\n{message}"),
+        files: Vec::new(),
     };
     let (name, n, sidecar) = match reach(caller, to, &notice)? {
         Reached::Queued(name) => return Ok(queued(&name)),
@@ -2431,6 +2474,7 @@ fn to_main(caller: &Caller, message: &str) -> Result<String, String> {
             from: name.clone(),
             when: When::Next,
             text: format!("message from helper {name}:\n{message}"),
+            files: Vec::new(),
         },
     );
     Ok("Sent to the agent that started you; it reads it at its next step.".into())
@@ -2533,6 +2577,7 @@ fn resume(
         started,
         notices,
         worktree,
+        &ctx.files,
     )
 }
 
@@ -2912,6 +2957,7 @@ mod tests {
             output: 2_100,
             seconds: 38,
             files: vec!["crates/core/src/chat.rs".into()],
+            changes: Vec::new(),
             jobs: Vec::new(),
             contract: Vec::new(),
         }
@@ -4115,6 +4161,77 @@ mod tests {
     }
 
     #[test]
+    fn what_a_helper_waited_for_changed_goes_back_with_a_rewind_past_its_call() {
+        let session = Session::new("helper-edits");
+        let (endpoint, provider) = Stub::start(vec![
+            reply(
+                "",
+                Some((
+                    "write_file",
+                    json!({"path": "made.txt", "content": "by the helper"}),
+                )),
+            ),
+            reply("Made it.", None),
+        ]);
+        // Watched, and letting edits through without asking.
+        let ctx = ToolContext::of(&Connection {
+            human: true,
+            mode: Mode::AcceptEdits,
+            ..(*session.context(endpoint).caller.connection.unwrap()).clone()
+        });
+        let args = json!({"description": "Make a file", "name": "maker", "background": false,
+            "prompt": "Write made.txt."});
+        call(ctx.clone(), args).unwrap();
+        provider.sent();
+        let made = session.work.join("made.txt");
+        assert!(made.exists());
+
+        // What the helper changed rides on the call that waited for it.
+        let result = Message {
+            role: "tool".into(),
+            name: "agent".into(),
+            files: ctx.files.take(),
+            ..Default::default()
+        };
+        assert_eq!(result.files.len(), 1);
+        let plan = crate::history::plan(4_242, &[result], Some(&session.work));
+        crate::history::restore(4_242, &plan, Some(&session.work));
+        assert!(!made.exists(), "the helper's file stayed after the rewind");
+    }
+
+    #[test]
+    fn what_a_helper_in_the_background_changed_rides_on_its_report() {
+        let session = Session::new("helper-edits-later");
+        inbox::listen();
+        let (endpoint, provider) = Stub::start(vec![
+            reply(
+                "",
+                Some((
+                    "write_file",
+                    json!({"path": "later.txt", "content": "later"}),
+                )),
+            ),
+            reply("Wrote it.", None),
+        ]);
+        // Watched, and letting edits through without asking.
+        let ctx = ToolContext::of(&Connection {
+            human: true,
+            mode: Mode::AcceptEdits,
+            ..(*session.context(endpoint).caller.connection.unwrap()).clone()
+        });
+        let args = json!({"description": "Write later", "name": "later",
+            "prompt": "Write later.txt."});
+        call(ctx, args).unwrap();
+        let notices = heard(4_242);
+        provider.sent();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].files.len(), 1);
+        // Folded into the conversation, the message carries them.
+        let folded = inbox::fold(&notices).unwrap();
+        assert_eq!(folded.files.len(), 1);
+    }
+
+    #[test]
     fn a_rewind_past_a_helper_s_start_stops_it_and_its_report_never_comes() {
         let session = Session::new("rewound");
         inbox::listen();
@@ -4268,6 +4385,37 @@ mod tests {
         assert_eq!(again.name, "reader");
         drop(again);
         forget(4_242);
+    }
+
+    #[test]
+    fn what_the_helpers_a_helper_heard_from_changed_goes_up_with_its_own() {
+        let change = |path: &str| crate::history::FileChange {
+            path: path.into(),
+            after: "f00d".into(),
+            ..Default::default()
+        };
+        let woke_it = Notice {
+            from: "helper inner".into(),
+            when: When::Next,
+            text: "helper inner finished:\nwrote a.txt".into(),
+            files: vec![change("/p/a.txt")],
+        };
+        let mut done = report(Outcome::Done, "Done.");
+        done.changes = vec![change("/p/b.txt")];
+        let up: Vec<PathBuf> = (changed(&done, std::slice::from_ref(&woke_it)).into_iter())
+            .map(|change| change.path)
+            .collect();
+        assert_eq!(up, [PathBuf::from("/p/a.txt"), PathBuf::from("/p/b.txt")]);
+        // One that never read it hands the report up, files and all.
+        done.input = 0;
+        assert_eq!(changed(&done, std::slice::from_ref(&woke_it)).len(), 1);
+        let _bell = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        hand_up(9_771, "outer", vec![woke_it]);
+        let handed = inbox::take(9_771, true);
+        assert_eq!(handed.len(), 1);
+        assert_eq!(handed[0].files, [change("/p/a.txt")]);
     }
 
     #[test]
@@ -5316,6 +5464,7 @@ mod tests {
                 from: "tasks".into(),
                 when: When::Next,
                 text: format!("task 1 is yours, {name}: check the tests"),
+                files: Vec::new(),
             })
         });
         let notices = heard(4_242);
@@ -5584,6 +5733,7 @@ mod tests {
             from: "main".into(),
             when: When::Next,
             text: "message from main:\nanyone there?".into(),
+            files: Vec::new(),
         }
     }
 
@@ -5716,6 +5866,7 @@ mod tests {
             from: "tasks".into(),
             when: When::Next,
             text,
+            files: Vec::new(),
         };
         let places: Vec<Slot> = (0..AT_ONCE)
             .map(|_| reserve(9_604, 9_604, "runner", cap(AT_ONCE), Cancel::default()).unwrap())

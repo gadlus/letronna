@@ -204,6 +204,7 @@ pub fn prompt(session: u64, text: &str, source: Source) -> Vec<Notice> {
             from: "Crew".into(),
             when: When::Next,
             text: words(say, &size),
+            files: Vec::new(),
         })
         .collect()
 }
@@ -237,6 +238,7 @@ pub fn resume(run: &LeftOpen) {
         from: "Crew".into(),
         when: When::Next,
         text,
+        files: Vec::new(),
     };
     inbox::push(run.session, notice);
 }
@@ -605,6 +607,7 @@ return await agent("Look");"#;
             from: "workflow wf-1".into(),
             when: When::Next,
             text: ended.into(),
+            files: Vec::new(),
         };
         inbox::push(session, notice);
         assert!(prompt(session, "and now?", Source::Composer).is_empty());

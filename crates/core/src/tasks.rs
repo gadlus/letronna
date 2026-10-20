@@ -242,6 +242,7 @@ mod tests {
             from: format!("job {job}"),
             when: When::Next,
             text: format!("job #{job} exited with code 1"),
+            files: Vec::new(),
         })
     }
 

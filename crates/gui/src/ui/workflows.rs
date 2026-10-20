@@ -181,6 +181,7 @@ fn resume_run(session: u64, name: &str) -> Result<(), String> {
         from: "Crew".into(),
         when: When::Next,
         text,
+        files: Vec::new(),
     };
     inbox::push(session, notice);
     Ok(())

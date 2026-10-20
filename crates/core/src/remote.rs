@@ -622,6 +622,7 @@ fn leave_for_run(id: u64, place: &str, text: &str) {
         from: place.into(),
         when: When::Later,
         text: text.into(),
+        files: Vec::new(),
     };
     inbox::push(id, notice);
 }

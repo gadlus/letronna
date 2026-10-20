@@ -15,7 +15,8 @@
 //! could not keep; its copies are charged to an allowance of their own.
 //!
 //! Going back to a turn looks at the messages it drops: each file they wrote
-//! goes back to the oldest `before` among them, or away if a tool created it.
+//! goes back to the oldest `before` among them, or away if a tool created it,
+//! oldest by when each change was made rather than where it was told.
 //! A file whose hash is no longer the last `after` was changed since -- by
 //! the user or a command -- and is left alone rather than overwritten.
 //!
@@ -28,7 +29,9 @@ use crate::chat::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The largest file whose old bytes are kept. Source files are well under a
 /// megabyte; ten covers a big generated one, a lock file or a bundle, without
@@ -65,6 +68,34 @@ pub struct FileChange {
     /// file keeps the mode it has, as for what the file tools write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<u32>,
+    /// When it was made, as [`stamp`] numbers it, so a rewind goes through a
+    /// file's changes in that order: a background helper's ride on its
+    /// report, which may come after edits made on top of them. 0 for one
+    /// saved before changes were numbered, which keeps its message's place.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub made: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// A number for a change made now: the microseconds since 1970, or one past
+/// the last number given, so no two changes in a run of Letronna share one
+/// and a clock set back cannot put a later change first there.
+pub(crate) fn stamp() -> u64 {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = (SystemTime::now().duration_since(UNIX_EPOCH)).map_or(0, |since| {
+        u64::try_from(since.as_micros()).unwrap_or(u64::MAX)
+    });
+    let mut last = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(last + 1);
+        match LAST.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(seen) => last = seen,
+        }
+    }
 }
 
 /// Where a turn keeps old bytes, and what its calls have written since their
@@ -84,6 +115,14 @@ impl Log {
         Self {
             dir: (session != 0).then(|| folder(session)),
             ..Self::default()
+        }
+    }
+
+    /// Note `changes` made elsewhere, as by a helper the call waited for, on
+    /// the call's result with its own.
+    pub(crate) fn add(&self, changes: Vec<FileChange>) {
+        if let Ok(mut noted) = self.changes.lock() {
+            noted.extend(changes);
         }
     }
 
@@ -165,6 +204,7 @@ impl Log {
                 before,
                 after: hash(bytes),
                 mode: None,
+                made: stamp(),
             });
         }
     }
@@ -181,6 +221,7 @@ impl Log {
                 before,
                 after: String::new(),
                 mode: None,
+                made: stamp(),
             });
         }
     }
@@ -741,10 +782,17 @@ pub fn plan(session: u64, dropped: &[Message], workspace: Option<&Path>) -> Vec<
 fn plan_in(dir: &Path, dropped: &[Message], workspace: Option<&Path>) -> Vec<Restore> {
     let root = real(workspace);
     let mut files: Vec<Restore> = Vec::new();
-    let changes = dropped.iter().filter(|m| noted(m)).flat_map(|m| {
-        let command = m.name == "run_command";
-        m.files.iter().map(move |change| (change, command))
-    });
+    let mut changes: Vec<(&FileChange, bool)> = (dropped.iter())
+        .filter(|m| noted(m))
+        .flat_map(|m| {
+            let command = m.name == "run_command";
+            m.files.iter().map(move |change| (change, command))
+        })
+        .collect();
+    // In the order they were made, not the order they were told in: a
+    // background helper's come with its report, after any edit the session
+    // made on top of them meanwhile. Stable, so unnumbered ones keep theirs.
+    changes.sort_by_key(|(change, _)| change.made);
     for (change, command) in changes {
         match files.iter_mut().find(|file| file.path == change.path) {
             Some(file) => {
@@ -1073,6 +1121,7 @@ fn restore_in(dir: &Path, plan: &[Restore], workspace: Option<&Path>) -> Restore
                     before: present(&file.last).map(str::to_owned),
                     after: file.to.clone().unwrap_or_default(),
                     mode: None,
+                    made: stamp(),
                 });
             }
             Err(why) => done.left.push(format!("{name}: {why}.")),
@@ -1656,6 +1705,45 @@ mod tests {
     }
 
     #[test]
+    fn a_helper_s_change_told_after_an_edit_made_on_top_of_it_goes_back_in_order() {
+        let (project, kept) = scratch("helper-order");
+        std::fs::write(project.join("a.txt"), "O").unwrap();
+        // A helper in the background writes it, keeping its copies in the
+        // session's history; the session then edits what it left, in m1.
+        let helper = context(&project, &kept);
+        let wrote = call(
+            &helper,
+            "write_file",
+            serde_json::json!({"path": "a.txt", "content": "H"}),
+        );
+        let ctx = context(&project, &kept);
+        let m1 = call(
+            &ctx,
+            "write_file",
+            serde_json::json!({"path": "a.txt", "content": "S"}),
+        );
+        // The helper's report, with its change, is folded in after, as m2.
+        let m2 = Message {
+            role: "user".into(),
+            notice: true,
+            files: wrote.files,
+            ..Default::default()
+        };
+
+        // Back to between the two: the file is as m1, which stays, left it.
+        let plan = plan_in(&kept, std::slice::from_ref(&m2), Some(&project));
+        assert!(plan.iter().all(|file| !file.fate.touches()), "{plan:?}");
+        assert_eq!(restore_in(&kept, &plan, Some(&project)).back, 0);
+        assert_eq!(std::fs::read_to_string(project.join("a.txt")).unwrap(), "S");
+
+        // Back to before the helper began: past both, to what it was.
+        let plan = plan_in(&kept, &[m1, m2], Some(&project));
+        assert_eq!(fates(&plan, &project), [("a.txt".to_owned(), Fate::Back)]);
+        assert_eq!(restore_in(&kept, &plan, Some(&project)).back, 1);
+        assert_eq!(std::fs::read_to_string(project.join("a.txt")).unwrap(), "O");
+    }
+
+    #[test]
     fn a_change_made_between_two_writes_is_not_undone_with_them() {
         let (project, kept) = scratch("between");
         std::fs::write(project.join("a.txt"), "one").unwrap();
@@ -1756,6 +1844,7 @@ mod tests {
                 before: None,
                 after: hash(b"precious\n"),
                 mode: None,
+                made: 0,
             }],
             ..Default::default()
         };

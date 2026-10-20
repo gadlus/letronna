@@ -689,6 +689,7 @@ fn ended(id: u64, key: Key, end: End) {
         from: format!("workflow {name}"),
         when: When::Next,
         text,
+        files: Vec::new(),
     });
     let told = notice.is_some();
     tasks::finish(&key, state, notice);

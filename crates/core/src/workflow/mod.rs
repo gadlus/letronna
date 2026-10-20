@@ -742,6 +742,7 @@ impl Run {
                     "workflow {name} paused: {reason}\nWhat finished is kept: resume it with \
                      {resume}."
                 ),
+                files: Vec::new(),
             },
         );
         self.paused = Some(reason);
@@ -1234,6 +1235,7 @@ mod tests {
             output: 50,
             seconds: 0,
             files: Vec::new(),
+            changes: Vec::new(),
             jobs: Vec::new(),
             contract: Vec::new(),
             value: None,

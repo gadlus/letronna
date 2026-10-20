@@ -404,6 +404,7 @@ fn deliver(wake: &Wake, now: u64) {
                     "wake-up \"{}\", due {due}, came more than a day late, so it started no turn{stopped}.",
                     wake.reason
                 ),
+                files: Vec::new(),
             },
         );
         return;
@@ -423,6 +424,7 @@ fn deliver(wake: &Wake, now: u64) {
             from: WAKE_UP.into(),
             when: When::Later,
             text,
+            files: Vec::new(),
         },
     );
 }
@@ -607,6 +609,7 @@ impl Loop {
                 from: TICK.into(),
                 when: When::Later,
                 text,
+                files: Vec::new(),
             },
         );
     }

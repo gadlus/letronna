@@ -60,6 +60,10 @@ pub struct Notice {
     /// What happened, said in its first line, with any detail on the lines
     /// after it.
     pub text: String,
+    /// What the helper whose run it reports changed in the project, carried
+    /// onto the message it is folded into, so a rewind past that message
+    /// puts the files back; empty for any other notice.
+    pub files: Vec<crate::history::FileChange>,
 }
 
 #[derive(Default)]
@@ -68,6 +72,9 @@ struct Mailbox {
     waiting: VecDeque<(u64, Notice)>,
     /// How many a full mailbox has let go since it was last read.
     dropped: usize,
+    /// What those it let go changed, for the notice saying so to carry, so
+    /// a rewind still puts it back.
+    dropped_files: Vec<crate::history::FileChange>,
 }
 
 #[derive(Default)]
@@ -112,11 +119,14 @@ pub fn push(to: u64, notice: Notice) {
         if let Some((_, waiting)) = same {
             // Trimmed as it grows, or a source that never stops would grow it without end.
             waiting.text = trim(&format!("{}\n{}", waiting.text, notice.text), MAX_NOTICE);
+            waiting.files.extend(notice.files);
         } else {
             mailbox.waiting.push_back((arrival, notice));
-            if mailbox.waiting.len() > MAX_WAITING {
-                mailbox.waiting.pop_front();
+            if mailbox.waiting.len() > MAX_WAITING
+                && let Some((_, gone)) = mailbox.waiting.pop_front()
+            {
                 mailbox.dropped += 1;
+                mailbox.dropped_files.extend(gone.files);
             }
         }
         if !quiet {
@@ -189,6 +199,7 @@ pub fn take(to: u64, idle: bool) -> Vec<Notice> {
                 "The mailbox was full, so {} older notice{s} went unread.",
                 mailbox.dropped
             ),
+            files: std::mem::take(&mut mailbox.dropped_files),
         });
         mailbox.dropped = 0;
     }
@@ -272,6 +283,11 @@ pub fn fold(notices: &[Notice]) -> Option<Message> {
         role: "user".into(),
         content,
         notice: true,
+        // Every notice's, the ones that did not fit included: their work is
+        // done whether or not it is said.
+        files: (notices.iter())
+            .flat_map(|notice| notice.files.iter().cloned())
+            .collect(),
         ..Default::default()
     })
 }
@@ -342,6 +358,7 @@ pub(crate) mod tests {
             from: from.into(),
             when,
             text: text.into(),
+            files: Vec::new(),
         }
     }
 
@@ -558,6 +575,33 @@ pub(crate) mod tests {
             taken[MAX_WAITING].text,
             format!("job #{MAX_WAITING} exited")
         );
+    }
+
+    #[test]
+    fn what_a_full_mailbox_lets_go_still_carries_its_files() {
+        let _turn = DOORBELL.lock().unwrap_or_else(|e| e.into_inner());
+        let change = crate::history::FileChange {
+            path: "/p/a.txt".into(),
+            after: "f00d".into(),
+            ..Default::default()
+        };
+        push(
+            33,
+            Notice {
+                files: vec![change.clone()],
+                ..notice("helper first", When::Later, "helper first finished")
+            },
+        );
+        for i in 0..MAX_WAITING {
+            push(33, notice(&format!("job {i}"), When::Later, "exited"));
+        }
+        let taken = take(33, true);
+        assert_eq!(
+            taken[0].text,
+            "The mailbox was full, so 1 older notice went unread."
+        );
+        assert_eq!(taken[0].files, [change]);
+        assert!(taken[1..].iter().all(|notice| notice.files.is_empty()));
     }
 
     #[test]

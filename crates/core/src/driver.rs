@@ -401,6 +401,11 @@ pub struct Report {
     pub seconds: u64,
     /// Files it wrote or edited, as it named them, each once.
     pub files: Vec<String>,
+    /// What a helper's calls changed in the project, by content hash, with
+    /// what the helpers it heard from changed, for the call or notice that
+    /// reports it to carry, so a rewind past that puts them back; empty for
+    /// a run nobody watches.
+    pub changes: Vec<crate::history::FileChange>,
     /// Jobs it left running, which are its owner's now.
     pub jobs: Vec<u64>,
     /// What was still wrong, as the run ended, with the files its request
@@ -464,6 +469,7 @@ pub fn run_keeping(mut spec: Spec) -> (Report, Transcript) {
         output: 0,
         seconds: 0,
         files: Vec::new(),
+        changes: Vec::new(),
         jobs: Vec::new(),
         contract: Vec::new(),
     };
@@ -706,6 +712,7 @@ fn steps(
                     from: "deadline".into(),
                     when: When::Next,
                     text,
+                    files: Vec::new(),
                 }]);
             }
             if mail.is_none() && spec.schema.is_some() {
@@ -721,6 +728,7 @@ fn steps(
                     from: "Letronna".into(),
                     when: When::Next,
                     text: REMINDER.into(),
+                    files: Vec::new(),
                 }]);
             }
             // Ending with its own plan unfinished is how part of a task gets
@@ -751,6 +759,7 @@ fn steps(
                     from: "Letronna".into(),
                     when: When::Next,
                     text: open.clone(),
+                    files: Vec::new(),
                 }]);
                 nudged.push(open);
             }
@@ -773,6 +782,7 @@ fn steps(
                         from: "Letronna".into(),
                         when: When::Next,
                         text,
+                        files: Vec::new(),
                     }]);
                     // Folded, so it opens no turn of its own, as a Stop hook's word does not.
                     mail = notice.map(|notice| Message {
@@ -782,6 +792,7 @@ fn steps(
                 }
             }
             let answered = mail.is_none();
+            heard(report, mail.as_ref());
             spec.transcript.conversation.messages.extend(mail);
             save(&mut spec.transcript)?;
             if !answered {
@@ -993,6 +1004,7 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
                         folded: true,
                         ..mail
                     });
+                    heard(report, mail.as_ref());
                     spec.transcript.conversation.messages.extend(mail);
                 }
                 return save(&mut spec.transcript);
@@ -1151,9 +1163,12 @@ fn dispatch(
         approved,
         sandboxed,
         keep_in,
+        files: kept_by(spec),
         ..context(spec)
     };
-    let outcome = off_thread(call, &ctx)?;
+    let outcome = off_thread(call, &ctx);
+    report.changes.extend(ctx.files.take());
+    let outcome = outcome?;
     if outcome.is_ok() && matches!(call.name.as_str(), "write_file" | "edit_file") {
         let args = tools::parse_args(&call.arguments).unwrap_or_default();
         if let Some(path) = args["path"].as_str()
@@ -1368,6 +1383,25 @@ fn context(spec: &Spec) -> ToolContext {
             ..ctx.caller.clone()
         },
         ..ctx
+    }
+}
+
+/// Adds what the helpers whose reports `mail` brings changed to `report`'s
+/// changes, for the run's own report to carry up past it.
+fn heard(report: &mut Report, mail: Option<&Message>) {
+    report
+        .changes
+        .extend(mail.into_iter().flat_map(|mail| mail.files.iter().cloned()));
+}
+
+/// Where a call of `spec`'s keeps the old bytes of what it changes: its
+/// session's history, for a helper of a session someone watches, so what the
+/// helper changed can go back with a rewind there; nowhere for any other run,
+/// a held or unwatched one's included, as before.
+fn kept_by(spec: &Spec) -> crate::history::Log {
+    match spec.depth > 0 && spec.connection.human {
+        true => crate::history::Log::new(spec.root),
+        false => crate::history::Log::default(),
     }
 }
 
@@ -1764,6 +1798,7 @@ fn deadline_notices(spec: &mut Spec, texts: Vec<String>) -> Result<(), String> {
             from: "deadline".into(),
             when: When::Next,
             text,
+            files: Vec::new(),
         })
         .collect();
     let notice = inbox::fold(&notices);
@@ -1938,6 +1973,7 @@ fn forward_unread(spec: &Spec) {
                 ),
                 from: spec.label.clone(),
                 when: notice.when,
+                files: notice.files,
             },
         );
     }
@@ -2707,6 +2743,7 @@ pub(crate) mod tests {
             from: from.into(),
             when,
             text: text.into(),
+            files: Vec::new(),
         }
     }
 
@@ -3382,6 +3419,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn what_the_helpers_it_hears_from_changed_rides_on_its_report() {
+        let _bell = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("mail-files");
+        let (endpoint, provider) = provider(vec![
+            reply("", &[read_notes()]),
+            reply("The notes say hello.", &[]),
+            reply("The notes say hello, and b is done.", &[]),
+        ]);
+        let id = AGENTS + 45;
+        let spec = spec(endpoint, &dir, id);
+        let from_helper = |name: &str, when| Notice {
+            files: vec![crate::history::FileChange {
+                path: format!("/p/{name}.txt").into(),
+                after: "f00d".into(),
+                ..Default::default()
+            }],
+            ..notice(&format!("helper {name}"), when, "finished")
+        };
+        // One read mid-run, one read as it answers.
+        inbox::push(id, from_helper("a", When::Next));
+        inbox::push(id, from_helper("b", When::Later));
+        let report = finished(spec);
+        provider.sent();
+        let paths: Vec<&Path> = (report.changes.iter())
+            .map(|change| change.path.as_path())
+            .collect();
+        assert_eq!(paths, [Path::new("/p/a.txt"), Path::new("/p/b.txt")]);
+    }
+
+    #[test]
     fn stopping_ends_it_between_steps_with_what_it_had() {
         let _bell = crate::inbox::tests::DOORBELL
             .lock()
@@ -3408,7 +3477,18 @@ pub(crate) mod tests {
             vec![asked, asked_again]
         });
         let provider = Stub { address, worker };
-        inbox::push(id, notice("main", When::Later, "then run the tests"));
+        let change = crate::history::FileChange {
+            path: "/p/b.txt".into(),
+            after: "f00d".into(),
+            ..Default::default()
+        };
+        inbox::push(
+            id,
+            Notice {
+                files: vec![change.clone()],
+                ..notice("main", When::Later, "then run the tests")
+            },
+        );
         let report = finished(spec);
         assert_eq!(report.status, Outcome::Stopped);
         drop(hold);
@@ -3428,6 +3508,8 @@ pub(crate) mod tests {
             texts,
             ["helper ended before it read this, from main:\nthen run the tests"]
         );
+        // With what it says was changed, for a rewind there to put back.
+        assert_eq!(forwarded[0].files, [change]);
     }
 
     #[test]

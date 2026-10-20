@@ -517,6 +517,7 @@ fn tell(id: u64, text: String) {
         from: format!("job {id}"),
         when: When::Next,
         text,
+        files: Vec::new(),
     };
     crate::tasks::tell(&Key::Job(id), notice);
 }
@@ -1002,6 +1003,7 @@ fn report_exit(id: u64, command: &str, code: Option<i32>, log: &Mutex<Log>, tty:
         from: format!("job {id}"),
         when: When::Next,
         text,
+        files: Vec::new(),
     };
     crate::tasks::finish(&Key::Job(id), state, Some(notice));
 }
@@ -1099,6 +1101,7 @@ pub fn start_work(
             from: format!("job {id}"),
             when: When::Next,
             text: format!("job #{id} {how} (`{label}`):\n{}", said.trim_end()),
+            files: Vec::new(),
         };
         // After a stop this tells nobody: whoever stopped it already knows.
         crate::tasks::finish(&Key::Job(id), state, Some(notice));
@@ -1775,6 +1778,7 @@ mod tests {
             from: format!("job {id}"),
             when: When::Next,
             text: "again".into(),
+            files: Vec::new(),
         };
         crate::tasks::finish(&Key::Job(id), State::Failed("again".into()), Some(again));
         assert!(crate::inbox::take(7_101, true).is_empty());

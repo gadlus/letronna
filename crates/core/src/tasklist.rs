@@ -824,6 +824,7 @@ fn handed(task: &Task) -> Notice {
         from: FROM.into(),
         when: When::Next,
         text,
+        files: Vec::new(),
     }
 }
 
@@ -855,6 +856,7 @@ fn tell(root: u64, by: &str, verb: &str, changed: &Changed, tasks: &[Task], here
         from: FROM.into(),
         when: When::Next,
         text,
+        files: Vec::new(),
     };
     let mut text = format!(
         "{who} {verb} task #{}:\n{}",

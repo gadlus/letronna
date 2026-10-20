@@ -77,8 +77,9 @@ pub struct Message {
     pub args: String,
     #[serde(default)]
     pub is_error: bool,
-    /// For `role: "tool"`: the files the call wrote, so a rewind can put them
-    /// back; for a notice that files were put back, what that did. Left out
+    /// For `role: "tool"`: the files the call wrote, a helper's it waited
+    /// for included, so a rewind can put them back; for a notice, what files
+    /// being put back did, or what a helper it reports on changed. Left out
     /// of the saved line when there are none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<crate::history::FileChange>,
@@ -1727,6 +1728,7 @@ fn mode_notice(mode: Mode) -> Value {
         from: "mode".into(),
         when: crate::inbox::When::Next,
         text: mode_note(mode).into(),
+        files: Vec::new(),
     };
     let content = crate::inbox::fold(&[notice]).map(|folded| folded.content);
     json!({"role": "user", "content": content.unwrap_or_default()})

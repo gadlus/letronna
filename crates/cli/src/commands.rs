@@ -1061,6 +1061,7 @@ pub fn shell_line(runner: &mut Runner, session: usize, command: &str) {
             from: "the shell".to_owned(),
             when: letronna_core::inbox::When::Quiet,
             text: format!("The user ran `{command}` in the terminal:\n{output}"),
+            files: Vec::new(),
         },
     );
 }
@@ -2733,6 +2734,7 @@ fn resume_run(id: u64, name: &str) -> bool {
                 from: "Crew".into(),
                 when: When::Next,
                 text,
+                files: Vec::new(),
             };
             inbox::push(id, notice);
         }
@@ -5729,6 +5731,7 @@ mod tests {
                     before: None,
                     after: "f00d".into(),
                     mode: None,
+                    made: 0,
                 })
                 .collect(),
             ..said("tool", "done")

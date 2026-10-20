@@ -564,6 +564,7 @@ impl Noted {
             // Set again only where the rewind would get it wrong: a file it
             // makes anew, or one whose mode the command changed.
             mode: mode.filter(|_| now.is_none() || moded),
+            made: crate::history::stamp(),
         });
     }
 
@@ -597,6 +598,7 @@ impl Noted {
                     before: None,
                     after,
                     mode: None,
+                    made: crate::history::stamp(),
                 }),
                 _ => left.push(name),
             }
