@@ -31,6 +31,9 @@ use super::{AuthKind, Provider, ProviderInfo, Tier, Wire};
 
 pub(crate) const NAME: &str = "Claude";
 
+/// The window plugin that offers it, by its id in `plugin-switches.json`.
+const PLUGIN: &str = "claude";
+
 static SIGN_IN: OAuthSpec = OAuthSpec {
     authorize: "https://claude.ai/oauth/authorize",
     token: "https://api.anthropic.com/v1/oauth/token",
@@ -107,6 +110,10 @@ impl Provider for Claude {
              token was issued for, which is what makes the subscription usable outside \
              that client. Anthropic may change what it expects, or object.",
         )
+    }
+
+    fn plugin(&self) -> Option<&'static str> {
+        Some(PLUGIN)
     }
 }
 

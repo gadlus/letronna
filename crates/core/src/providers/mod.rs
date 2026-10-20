@@ -298,6 +298,14 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_claude_subscription_is_offered_only_while_its_plugin_is_on() {
+        let _held = super::auth::tests::vault("plugged-claude");
+        assert!(!super::offered("Claude"));
+        plugged_in("claude");
+        assert!(super::offered("Claude"));
+    }
+
+    #[test]
     fn the_switches_keep_out_of_the_marketplaces_records() {
         let _held = super::auth::tests::vault("plugged-apart");
         let market = crate::chat::data_dir().join("plugins.json");

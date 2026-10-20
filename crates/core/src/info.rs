@@ -1100,8 +1100,8 @@ mod tests {
             "This session: test/model on OpenRouter.",
             "New sessions: test/model on OpenRouter, effort high.",
             "Fallbacks, in order: OpenAI:gpt-5.",
-            // ChatGPT is left out while its plugin is off.
-            "Providers: Letronna signed in; OpenAI key set in the vault; Claude not signed in; \
+            // ChatGPT and Claude are left out while their plugins are off.
+            "Providers: Letronna signed in; OpenAI key set in the vault; \
              Anthropic no key; Gemini no key; xAI no key; \
              OpenRouter key set in keys.json; Ollama needs no key; Custom address set, no key.",
             "Web search: Brave in use, key in the vault; Tavily not set up; Exa not set up; \
