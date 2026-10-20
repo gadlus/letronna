@@ -13,6 +13,8 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.4] - 2026-10-20
+
 ### Added
 - **Terminal** — Ctrl+V attaches the picture on the clipboard to your next message, read with what the system already has (AppleScript on macOS, PowerShell on Windows, wl-paste or xclip on Linux), and a picture dragged into the terminal is attached rather than pasted as its path, quoted, escaped or as a file:// address; both go through `/image`.
 - **Terminal** — What you send at the prompt is kept for each project folder across sessions (`prompt-history.jsonl` in the data folder), so ↑ in a new session reaches yesterday's prompts, and Ctrl+R opens them in a list narrowed as you type, newest first. A recalled paste comes back whole instead of as its placeholder, a recalled `/command` no longer traps ↑ in the menu, and changes to a recalled line survive stepping past it; an answer to a question, such as a key, is never brought back by ↑.
