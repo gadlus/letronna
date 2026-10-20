@@ -1,0 +1,48 @@
+# GPT-6 Sol: why each failed trial lost its points
+
+26 of the 89 tasks with a valid trial did not pass (a pass after looking up the task counts as a fail).
+
+| Outcome | Tasks |
+|---|---|
+| The model's own work fell short | 20 |
+| Stopped at the deadline with the work unfinished | 1 |
+| Failed, and the oracle cannot pass it here either | 4 |
+| The provider's content filter stopped the reply | 1 |
+
+## The model's own work fell short (20)
+
+- **break-filter-js-from-html** (failed): Stopped going round in circles, and the repeated call was the model's fault: the session shows it emitted read_file with empty arguments (no path) across rounds 1-3 (its one list_dir, which defaults to ".", succeeded), each read answered "`.` is a folder; list it with list_dir". It never supplied a path or wrote /app/out.html, so test_out_html_bypasses_filter failed with "File /app/out.html does not exist".
+- **compile-compcert** (done): test_compcert_valid_and_functional failed: ccomp was built under /tmp/CompCert with make but never installed (no make install), so when the verifier ran ccomp on positive_probe.c the linker gave "/usr/bin/ld: cannot find -lcompcert" and ccomp exited 2. Letronna's safety handler refused the model's own two verification commands (they bundled rm/cleanup of files it had not created), so the model left verification undone, but that refusal did not cause the failure; the loss was the incomplete install leaving libcompcert.a off the link path.
+- **configure-git-webserver** (done): test_hello_html_exists failed: verify.sh curled port 8080 and got HTTP 404 so "TEST PASSED" was absent. The model set up push-to-deploy and confirmed it locally, then deleted its test commit and rm'd hello.html to leave the repo empty, and it configured no SSH password login for the account verify.sh pushes as, so neither a pre-deployed file nor the test's own push served /hello.html at verification time.
+- **constraints-scheduling** (failed): Stopped going round in circles, the model's fault: it emitted read_file with empty arguments (no path) repeatedly across its two rounds, each answered "`.` is a folder". It never read the calendars or wrote /app/meeting_scheduled.ics, so all three scheduling tests failed with FileNotFoundError on /app/meeting_scheduled.ics.
+- **dna-insert** (done): test_primers failed: the forward and reverse primers in /app/primers.fasta have melting temperatures 8.19 C apart (66.27 vs 58.08 C), exceeding the required within-5 C match, so the design was rejected.
+- **extract-elf** (done): test_output_matches_reference failed: /app/extract.js read ELF program headers and emitted 32-bit words but matched 0.00% of the reference memory values (75% required), so its loadable-segment extraction was wrong (test_extract_js_exists passed).
+- **extract-moves-from-video** (done): test_solution_content_similarity scored 0% vs the required 90%: YouTube returned LOGIN_REQUIRED and the invidious mirrors it tried denied access, so it could not view the video and left /app/solution.txt empty rather than extracting the move list.
+- **financial-document-processor** (failed): Stopped going round in circles, the model's fault: after reading one invoice image it emitted read_file with empty arguments sixteen times in one turn, each answered "`.` is a folder". It never created /app/invoices, /app/other or summary.csv, so all seven tests failed (directories not created, documents dir still held all 17 files).
+- **fix-code-vulnerability** (done): test_hkey_basic_cases failed: the model's _hkey hardening was too strict and raised ValueError("Invalid header name: ''") on empty input, where the test expects _hkey("") to return "" (the other 5 tests passed).
+- **install-windows-3.11** (done): test_windows_keys_with_visual_feedback failed: the test's socat to UNIX-CONNECT:/tmp/qemu-monitor.sock got "No such file or directory", so F1 could not be sent. The model launched QEMU with QMP and monitor sockets under /run/win311-*.sock, not the HMP monitor path /tmp/qemu-monitor.sock the test needs (the other 3 subtests passed).
+- **make-mips-interpreter** (done): test_vm_execution failed: /app/vm.js booted the MIPS ELF and printed DOOM startup output but stopped before "I_InitGraphics: DOOM screen size: w x h: 320 x 200", so the interpreter did not run far enough to reach graphics init (2 other tests passed).
+- **modernize-scientific-stack** (failed): Stopped going round in circles, the model's fault: it emitted read_file and run_command with empty arguments repeatedly. It did one proper read of the legacy script but never wrote /app/analyze_climate_modern.py or a requirements.txt/pyproject.toml, so test_modernized_code_runs and test_dependency_file_exists failed on the missing files.
+- **mteb-leaderboard** (done): test_data_matches failed: it wrote Salesforce/SFR-Embedding-2_R to /app/result.txt, where GritLM/GritLM-7B is expected. It read the scores from the live leaderboard's backend, the leaderboard the task names (so this is not counted as a lookup), without taking them as of August 2025. Its web searches listed copies of the task's README, which it did not open.
+- **mteb-retrieve** (done): test_data_matches failed: the model ranked bge-small-zh-v1.5 cosine similarities and wrote its 5th-ranked line (HumanEval) to result.txt, but the expected 5th document is "MTEB: Massive Text Embedding Benchmark", so its ranking was wrong (test_result_file_exists passed).
+- **raman-fitting** (done): test_G_Peak and test_2D_Peak failed: the fitted Lorentzian centers in /app/results.json were far from the targets (G x0=19218.8 vs 1580.3, gamma=400.7 vs 9.06; 2D x0=33113.9 vs 2670.08), because the model fit the raw high-count region of the spectrum instead of the Raman G and 2D bands.
+- **sam-cell-seg** (done): Six tests failed with IsADirectoryError on /app/test_output.csv: the model's /app/convert_masks.py wrote per-cell masks into a directory named test_output.csv instead of a CSV file, so pandas could not read it (3 tests passed).
+- **schemelike-metacircular-eval** (done): test_interp failed (assert failed==0, got 4 failed of 63): running programs through eval.scm, 4 cases (the 05-simple-io and closures programs in both test dirs, which also run through the metacircular layer) produced output that did not match direct execution, so the evaluator was incorrect on IO/closure handling.
+- **torch-pipeline-parallelism** (done): test_pipeline_parallel[1] and [2] failed: the AFAB backward pass did not match the reference ("Rank 0 mismatch at lm_head.bwd, microbatch 0, max diff=0.0357" and "model.layers.1.bwd ... max diff=0.0138"), so gradients were wrong (the exists and no-hooks checks passed).
+- **torch-tensor-parallelism** (done): test_row_parallel_linear failed for world sizes 2 and 4 (size 1 passed): the _ScatterToParallelRegion split used the full tensor size per rank, raising RuntimeError: split_with_sizes expects split_sizes to sum to 32 but got [32,32] (and to 16 but got [16,16,16,16]), so RowParallelLinear sharded the input wrong.
+- **train-fasttext** (done): test_accuracy failed: the trained /app/model.bin scored 0.615725 on the private test set, just below the 0.62 threshold (assert 0.615725 > 0.62), so the classifier finished but was slightly under-accurate.
+
+## Stopped at the deadline with the work unfinished (1)
+
+- **gpt2-codegolf** (deadline): Letronna stopped the run at the task deadline. test_gpt2_implementation failed because /app/gpt2.c was 5231 bytes, over the 5000-byte limit; the model was still trimming with sed/perl passes (its last note was about trimming redundant tokenizer and output code) when the 779 s ran out.
+
+## Failed, and the oracle cannot pass it here either (4)
+
+- **caffe-cifar-10** (done): Flagged oracle_cannot_pass=true. test_caffe_version_and_source (caffe.bin missing at .build_release/tools/), test_cifar10_model_exists, test_training_completed_500_iterations and test_model_accuracy_verification failed (2 other tests passed); the model built CPU Caffe but its 500-iteration training command was refused by the safety handler, and this is one of the tasks the oracle cannot build-and-train in this container.
+- **filter-js-from-html** (done): Flagged oracle_cannot_pass=true. test_filter_blocks_xss failed (one XSS vector still present after filtering, assert 1==0) and test_clean_html_unchanged failed (the filter modified 5 of 12 clean HTML files); the oracle cannot satisfy both constraints in this container.
+- **make-doom-for-mips** (done): Flagged oracle_cannot_pass=true. test_vm_execution failed: the MIPS VM ran DOOM and printed startup output but never reached the required line "I_InitGraphics: DOOM screen size: w x h: 320 x 200" (2 other tests passed); the oracle cannot drive it to that point in this container.
+- **protein-assembly** (done): Flagged oracle_cannot_pass=true. test_gblock failed: the required fusion-protein order flag-donor-dhfr-acceptor-snap was not present (snap segment index -1, so assert 0 < -1), a constraint the oracle cannot satisfy in this container.
+
+## The provider's content filter stopped the reply (1)
+
+- **vulnerable-secret** (deadline): The model completed two rounds of static inspection (strings, readelf, objdump) and then the gateway's cybersecurity content filter turned away every reply it tried to generate for round three - a steady ~45-second retry loop of about ten rejections from ~00:18 to the 00:26 deadline (a concurrent train-fasttext run's calls succeeded in the same window, so the rejections are this trial's). It never wrote /app/results.txt, so all three results-file tests failed on the missing file; Letronna recorded the stop as the deadline, but the cause was the content filter.

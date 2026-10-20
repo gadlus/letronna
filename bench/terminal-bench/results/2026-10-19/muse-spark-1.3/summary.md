@@ -1,0 +1,95 @@
+**89 tasks, 89 trials.** Mean reward 0.539; 48 passed every run.
+Errors: NonZeroAgentExitCodeError 1, VerifierTimeoutError 2.
+Per task: 541K tokens with cache reads, 10.5 min; cost $0.00 in all.
+
+| Task | Runs | Reward | Oracle | Error | Tokens | Minutes |
+|---|---|---|---|---|---|---|
+| adaptive-rejection-sampler | 1 | 0.00 |  |  | 381K | 11.6 |
+| bn-fit-modify | 1 | 1.00 |  |  | 221K | 4.3 |
+| break-filter-js-from-html | 1 | 1.00 |  |  | 296K | 12.8 |
+| build-cython-ext | 1 | 0.00 |  |  | 2460K | 13.0 |
+| build-pmars | 1 | 0.00 |  |  | 452K | 5.8 |
+| build-pov-ray | 1 | 0.00 |  |  | 110K | 2.1 |
+| caffe-cifar-10 | 1 | 0.00 |  |  | 1134K | 16.9 |
+| cancel-async-tasks | 1 | 0.00 |  |  | 113K | 3.9 |
+| chess-best-move | 1 | 1.00 |  |  | 173K | 5.5 |
+| circuit-fibsqrt | 1 | 0.00 |  |  | 409K | 50.6 |
+| cobol-modernization | 1 | 1.00 |  |  | 256K | 13.0 |
+| code-from-image | 1 | 1.00 |  |  | 31K | 0.8 |
+| compile-compcert | 1 | 0.00 |  |  | 938K | 12.8 |
+| configure-git-webserver | 1 | 0.00 |  |  | 294K | 5.0 |
+| constraints-scheduling | 1 | 1.00 |  |  | 209K | 4.1 |
+| count-dataset-tokens | 1 | 1.00 |  |  | 381K | 7.9 |
+| crack-7z-hash | 1 | 0.00 |  |  | 1277K | 13.0 |
+| custom-memory-heap-crash | 1 | 1.00 |  |  | 798K | 13.5 |
+| db-wal-recovery | 1 | 0.00 |  |  | 513K | 13.0 |
+| distribution-search | 1 | 1.00 |  |  | 71K | 1.5 |
+| dna-assembly | 1 | 0.00 |  |  | 442K | 28.0 |
+| dna-insert | 1 | 1.00 |  |  | 1099K | 22.0 |
+| extract-elf | 1 | 1.00 |  |  | 207K | 4.8 |
+| extract-moves-from-video | 1 | 0.00 |  |  | 361K | 8.4 |
+| feal-differential-cryptanalysis | 1 | 1.00 |  |  | 219K | 7.1 |
+| feal-linear-cryptanalysis | 1 | 0.00 |  |  | 330K | 13.0 |
+| filter-js-from-html | 1 | 0.00 |  |  | 699K | 20.8 |
+| financial-document-processor | 1 | 0.00 |  |  | 344K | 2.7 |
+| fix-code-vulnerability | 1 | 1.00 |  |  | 861K | 7.7 |
+| fix-git | 1 | 1.00 |  |  | 105K | 1.6 |
+| fix-ocaml-gc | 1 | 0.00 |  |  | 159K | 1.3 |
+| gcode-to-text | 1 | 1.00 |  |  | 640K | 7.6 |
+| git-leak-recovery | 1 | 1.00 |  |  | 181K | 2.8 |
+| git-multibranch | 1 | 1.00 |  |  | 204K | 4.9 |
+| gpt2-codegolf | 1 | 0.00 |  |  | 270K | 13.0 |
+| headless-terminal | 1 | 1.00 |  |  | 444K | 10.9 |
+| hf-model-inference | 1 | 1.00 |  |  | 227K | 4.8 |
+| install-windows-3.11 | 1 | 0.00 |  |  | 684K | 11.5 |
+| kv-store-grpc | 1 | 1.00 |  |  | 239K | 4.3 |
+| large-scale-text-editing | 1 | 1.00 |  |  | 556K | 12.1 |
+| largest-eigenval | 1 | 1.00 |  |  | 781K | 10.1 |
+| llm-inference-batching-scheduler | 1 | 1.00 |  |  | 707K | 6.9 |
+| log-summary-date-ranges | 1 | 1.00 |  |  | 200K | 3.1 |
+| mailman | 1 | 0.00 |  |  | 1788K | 16.8 |
+| make-doom-for-mips | 1 | 0.00 |  |  | 1170K | 13.0 |
+| make-mips-interpreter | 1 | 0.00 |  |  | 248K | 1.7 |
+| mcmc-sampling-stan | 1 | 0.00 |  |  | 879K | 23.2 |
+| merge-diff-arc-agi-task | 1 | 1.00 |  |  | 800K | 8.7 |
+| model-extraction-relu-logits | 1 | 1.00 |  |  | 141K | 2.8 |
+| modernize-scientific-stack | 1 | 1.00 |  |  | 205K | 3.1 |
+| mteb-leaderboard | 1 | 0.00 |  |  | 1660K | 14.5 |
+| mteb-retrieve | 1 | 0.00 |  |  | 334K | 5.2 |
+| multi-source-data-merger | 1 | 1.00 |  |  | 184K | 3.3 |
+| nginx-request-logging | 1 | 1.00 |  |  | 245K | 4.9 |
+| openssl-selfsigned-cert | 1 | 1.00 |  |  | 213K | 2.9 |
+| overfull-hbox | 1 | 1.00 |  |  | 1073K | 10.2 |
+| password-recovery | 1 | 1.00 |  |  | 604K | 6.7 |
+| path-tracing | 1 | 1.00 |  |  | 3330K | 21.0 |
+| path-tracing-reverse | 1 | 0.00 |  |  | 240K | 1.6 |
+| polyglot-c-py | 1 | 1.00 |  |  | 379K | 13.0 |
+| polyglot-rust-c | 1 | 1.00 |  |  | 71K | 2.5 |
+| portfolio-optimization | 1 | 1.00 |  |  | 605K | 17.6 |
+| protein-assembly | 1 | 0.00 |  |  | 80K | 1.2 |
+| prove-plus-comm | 1 | 1.00 |  |  | 151K | 8.1 |
+| pypi-server | 1 | 1.00 |  |  | 365K | 5.7 |
+| pytorch-model-cli | 1 | 0.00 |  |  | 413K | 5.8 |
+| pytorch-model-recovery | 1 | 1.00 |  |  | 361K | 7.1 |
+| qemu-alpine-ssh | 1 | 0.00 |  |  | 335K | 6.4 |
+| qemu-startup | 1 | 0.00 |  |  | 350K | 5.6 |
+| query-optimize | 1 | 0.00 |  | VerifierTimeoutError | 339K | 7.3 |
+| raman-fitting | 1 | 0.00 |  |  | 885K | 11.3 |
+| regex-chess | 1 | 0.00 |  | NonZeroAgentExitCodeError | 11K | 28.5 |
+| regex-log | 1 | 1.00 |  |  | 65K | 9.6 |
+| reshard-c4-data | 1 | 1.00 |  |  | 1015K | 13.6 |
+| rstan-to-pystan | 1 | 0.00 |  |  | 265K | 28.0 |
+| sam-cell-seg | 1 | 0.00 |  |  | 1005K | 14.5 |
+| sanitize-git-repo | 1 | 1.00 |  |  | 611K | 6.8 |
+| schemelike-metacircular-eval | 1 | 0.00 |  |  | 1044K | 27.8 |
+| sparql-university | 1 | 1.00 |  |  | 175K | 13.0 |
+| sqlite-db-truncate | 1 | 1.00 |  |  | 149K | 2.7 |
+| sqlite-with-gcov | 1 | 1.00 |  |  | 308K | 3.8 |
+| torch-pipeline-parallelism | 1 | 1.00 |  |  | 289K | 11.2 |
+| torch-tensor-parallelism | 1 | 0.00 |  | VerifierTimeoutError | 198K | 6.2 |
+| train-fasttext | 1 | 0.00 |  |  | 392K | 50.5 |
+| tune-mjcf | 1 | 0.00 |  |  | 530K | 13.0 |
+| video-processing | 1 | 0.00 |  |  | 621K | 9.5 |
+| vulnerable-secret | 1 | 1.00 |  |  | 174K | 1.8 |
+| winning-avg-corewars | 1 | 1.00 |  |  | 3254K | 25.0 |
+| write-compressor | 1 | 0.00 |  |  | 166K | 13.0 |

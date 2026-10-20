@@ -1,0 +1,62 @@
+break-filter-js-from-html: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 0 rounds, 1 s
+  failed: test_out_html_bypasses_filter
+  said: The provider's content filter stopped the reply.
+caffe-cifar-10: reward 0.0; letronna done after 24 rounds, 833 s
+  failed: test_cifar10_model_exists, test_training_completed_500_iterations, test_model_accuracy_verification
+  said: Caffe 1.0 is built for CPU only, but the training run fails the accuracy requirement. The test-accuracy check is **not** met, and the 500-iteration run still going will not meet it. **What works** - BVLC Caffe tag `1.0` is cloned to `/app/c
+compile-compcert: reward 0.0; letronna done after 22 rounds, 970 s
+  failed: test_compcert_exists_and_executable, test_compcert_valid_and_functional, test_compcert_rejects_unsupported_feature
+  said: I couldn't finish the build in the time this run had: `/tmp/CompCert/ccomp` does not exist yet, so I haven't tested any compilation. The build is still running in the background without errors. 77 of the 144 CompCert proof files are compile
+configure-git-webserver: reward 0.0; letronna done after 8 rounds, 94 s
+  failed: test_hello_html_exists
+  said: The server is set up and works. I tested your exact steps as `user` over SSH (clone, commit `hello.html`, `git push origin master`), and afterwards `curl http://localhost:8080/hello.html` returned `hello world`. I then reset the repo to emp
+crack-7z-hash: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 0 rounds, 1 s
+  failed: test_solution_file, test_solution_content
+  said: The provider's content filter stopped the reply.
+dna-assembly: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 0 rounds, 1 s
+  failed: test_primers
+  said: The provider's content filter stopped the reply.
+dna-insert: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 1 rounds, 10 s
+  failed: test_primers
+  said: Reading the input sequences first.
+extract-moves-from-video: reward 0.0; letronna done after 26 rounds, 333 s
+  failed: test_solution_file_exists, test_solution_content_similarity
+  said: I couldn't download the video, so I couldn't transcribe the moves, and I didn't create `/app/solution.txt`. I didn't write a list of moves from memory of Zork speedrun routes, because that would be a guess and not a transcription of this vi
+feal-differential-cryptanalysis: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 1 rounds, 11 s
+  failed: test_feal_differential_cryptanalysis_attack
+  said: Reading the cipher implementation first.
+filter-js-from-html: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 0 rounds, 136 s
+  failed: test_filter_blocks_xss, test_clean_html_unchanged
+  said: The provider's content filter stopped the reply.
+password-recovery: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 0 rounds, 2 s
+  failed: test_recovery_file_exists, test_password_match
+  said: The provider's content filter stopped the reply.
+protein-assembly: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 0 rounds, 1 s
+  failed: test_gblock
+  said: The provider's content filter stopped the reply.
+qemu-alpine-ssh: reward 0.0; letronna done after 8 rounds, 631 s
+  failed: test_sshpass
+  said: The VM is running, but SSH is not set up, so `ssh -p 2222 root@localhost` will not work yet. **What's running:** - QEMU is booting `/app/alpine.iso` with `alpine-disk.qcow2` attached. It runs as a detached process (pid 536), so it should ke
+query-optimize: reward None, VerifierTimeoutError; letronna done after 6 rounds, 426 s
+  said: I saved the faster query in `/app/sol.sql`: one SQLite query ending in a semicolon, with no comments. It runs in about 1.6 seconds. On the unchanged database, your original was still running after more than 6 minutes, and I stopped it. **Ho
+raman-fitting: reward 0.0; letronna done after 7 rounds, 74 s
+  failed: test_2D_Peak
+  said: I fitted the G and 2D peaks and wrote the results to `/app/results.json`. | Peak | x0 (cm⁻¹) | gamma (cm⁻¹) | amplitude | offset | |---|---|---|---|---| | G | 1580.32 | 8.44 | 8303.3 | 5766.6 | | 2D | 2670.08 | 16.81 | 12213.6 | 1433.5 | **
+rstan-to-pystan: reward 0.0; letronna done after 24 rounds, 1392 s
+  failed: test_output_files_exist, test_alpha_estimation_accuracy, test_sigma_estimation_accuracy, test_rho_estimation_accuracy, test_beta_estimation_accuracy
+  said: I couldn't finish the posterior sampling before this run was stopped, so the four result files (`alpha_est.csv`, `sigma_est.csv`, `rho_est.csv`, `beta_est.csv`) don't exist. I didn't write placeholder numbers. I also didn't start the review
+sam-cell-seg: reward 0.0; letronna done after 18 rounds, 2062 s
+  failed: test_coords_are_flat_lists
+  said: I wrote `/app/convert_masks.py`. On the demo, all 48 cells now have refined, non-rectangular polylines, each a single connected shape, with no overlaps. It runs in about 36 seconds on CPU. **How it works** - **Model:** MobileSAM (`vit_t`) l
+video-processing: reward 0.0; letronna done after 13 rounds, 725 s
+  failed: test_jump_analyzer_test_video
+  said: I've written `/app/jump_analyzer.py`. On the example video it writes this to `/app/output.toml`: ```toml jump_takeoff_frame_number = 53 jump_land_frame_number = 62 ``` These match what I saw going through the video frame by frame. Frame 53 
+vulnerable-secret: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 0 rounds, 1 s
+  failed: test_results_file_exists, test_results_file_contains_secret_flag, test_results_file_format
+  said: The provider's content filter stopped the reply.
+winning-avg-corewars: reward 0.0; letronna done after 12 rounds, 658 s
+  failed: test_warrior_performance
+  said: `my_warrior.red` still doesn't meet the request: it fails 2 of the 5 win-rate thresholds. The review helper and my own short check script each ran the test command independently and got the same numbers. I deleted the check script afterward
+mteb-leaderboard: reward 0.0; letronna done after 23 rounds, 349 s
+  failed: test_data_matches
+  said: The answer is **GritLM/GritLM-7B**, but `/app/result.txt` still holds my earlier placeholder guess, `Qwen/Qwen3-Embedding-8B`, which is wrong. I saved that guess before checking. When I tried to replace it, the shell overwrite and the file-

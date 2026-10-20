@@ -1,0 +1,49 @@
+# DeepSeek V4.1 Flash: why each failed trial lost its points
+
+27 of the 89 tasks with a valid trial did not pass (a pass after looking up the task counts as a fail).
+
+| Outcome | Tasks |
+|---|---|
+| The model's own work fell short | 19 |
+| Stopped at the deadline with the work unfinished | 2 |
+| Failed, and the oracle cannot pass it here either | 5 |
+| The verifier timed out | 1 |
+
+## The model's own work fell short (19)
+
+- **adaptive-rejection-sampler** (deadline): test_can_generate_standard_distribution_samples failed, the signature problem: the test calls ars(density, c(-5,5), n=1000) but the model's ars() is ars(n, dfun, lower, upper, ...), so with n matched by name the density bound to dfun and the domain c(-5,5) bound to lower, raising "`lower` must be a single numeric value (possibly -Inf)". Its other 8 tests passed; the deadline hit only during a redundant self-review of an otherwise-complete /app/ars.R.
+- **configure-git-webserver** (done): test_hello_html_exists failed: verify.sh curled port 8080 and got HTTP 404. The model's setup.sh (bare repo + post-receive to /var/www/html + nginx) worked when it pushed as the local repo owner, but it then reset the repo to empty for the user's first push (confirmed "curl before first push: 404") and left SSH password login unconfigured for the git@localhost account verify.sh pushes as, so nothing was served at verification time.
+- **crack-7z-hash** (done): test_solution_file and test_solution_content failed because /app/solution.txt was never written: the model analyzed the archive and wrote its own recovery tool but did not recover the password within its time and chose not to write a guess, so no solution file existed.
+- **extract-elf** (done): test_output_matches_reference failed with 0.00% of expected values matched (75% required): /app/extract.js dumped the raw file bytes as 32-bit little-endian words keyed from a fixed 0x400000 base, rather than parsing loadable segments, so /app/out.json matched none of the reference values (test_extract_js_exists passed).
+- **extract-moves-from-video** (done): test_solution_content_similarity scored 70.91%, below the required 90%: every download path failed (YouTube's bot sign-in, 403s from googlevideo and mirrors), so the model never saw the video and wrote a /app/solution.txt that is a best-effort guess rather than a transcription (test_solution_file_exists passed).
+- **financial-document-processor** (done): test_invoices_moved_correctly, test_other_documents_moved_correctly, test_summary_csv_structure and test_summary_csv_content failed: one document was misclassified between the invoices and other sets, and /app/invoices/summary.csv had 10 rows instead of the required 11 (10 invoices plus a total row); test_directories_created, test_summary_csv_exists and test_original_documents_dir_empty passed.
+- **gcode-to-text** (deadline): test_hello_file_content failed: the model rendered the g-code toolpaths to an image and read the flag as 'flag{gc0od3_iz_ch4LLenGinG}' but the answer is 'flag{gc0d3_iz_ch4LLenGiNg}' (misread glyphs: an extra 'o' and the final 'nG'/'Ng' case). It had already written that string to /app/out.txt as final and was deleting its scratch renders when the deadline hit, so the loss is the misread, not time.
+- **install-windows-3.11** (done): test_windows_keys_with_visual_feedback failed: the test's socat to UNIX-CONNECT:/tmp/qemu-monitor.sock got "No such file or directory". The model exposed a QMP socket (and a qmptool.py helper) for key injection rather than the HMP monitor at that path, so F1 could not be sent; the other 3 subtests passed.
+- **make-mips-interpreter** (done): test_vm_execution failed: the expected line "I_InitGraphics: DOOM screen size: w x h: 320 x 200" was absent from the VM output (the output showed garbled bytes), so /app/vm.js did not execute the MIPS DOOM binary correctly; test_frame_bmp_exists and test_frame_bmp_similar_to_reference passed.
+- **mcmc-sampling-stan** (done): All 6 tests failed, rooted in RStan never installing ("there is no package called 'rstan'"); the model's dependency build was still mid-install at the end. The two numbers it wrote were not MCMC output: posterior alpha mean 2.2307 vs required [2.84, 2.91] and beta mean 12.68, both outside the expected ranges.
+- **mteb-retrieve** (done): test_data_matches failed: /app/result.txt contained "HumanEval: Benchmarking Python code generation via functional examples" but the expected value is "MTEB: Massive Text Embedding Benchmark", so the model retrieved the wrong document for the query (test_result_file_exists passed).
+- **overfull-hbox** (done): test_input_file_matches failed: the modified input.tex may only swap words for synonyms listed in synonyms.txt, but the model substituted 'veteran', which is not in the allowed synonym set for the word it replaced, so the diff contained a disallowed substitution (3 other tests passed).
+- **raman-fitting** (done): test_G_Peak and test_2D_Peak failed: the Lorentzian fits in /app/results.json converged on the wrong centers (G x0=6327.28 vs 1580.3; 2D x0=10395.24 vs 2670.08), i.e. the fit latched onto the wrong spectral region rather than the Raman G and 2D bands.
+- **rstan-to-pystan** (done): test_beta_estimation_accuracy failed by a narrow margin: the beta[0] posterior mean -0.07237 is just below the expected range [-0.07, 0]. The other 5 tests passed, so the PyStan port was close but its estimate fell slightly outside tolerance.
+- **sam-cell-seg** (done): test_mask_alignment failed (IoU 0.4418 < 0.5) and test_coords_are_flat_lists failed because coords_x was a tuple rather than a list. The model's /app/convert_masks.py produced under-aligned polygons and the wrong output type (7 other tests passed).
+- **torch-pipeline-parallelism** (deadline): test_pipeline_parallel[1] and [2] failed on backward-pass gradient mismatches (max diff ~0.0357 at lm_head.bwd and ~0.0138 at layers.1.bwd). The model had declared /app/pipeline_parallel.py implemented and was only rerunning a check and dispatching a reviewer when the deadline hit; the deliverable's backward pass was numerically wrong.
+- **torch-tensor-parallelism** (done): test_row_parallel_linear failed for world sizes 2 and 4 (size 1 passed): in RowParallelLinear.forward, F.linear raised RuntimeError "mat1 and mat2 shapes cannot be multiplied (2x16 and 32x48)" because the model sharded the weight on the wrong dimension, so the per-rank input and weight shapes did not line up.
+- **train-fasttext** (done): test_accuracy failed: the trained classifier reached 0.601325 accuracy, below the 0.62 threshold. The model trained a fastText supervised model (dim 50, wordNgrams 2, 5 epochs) and quantized it to 3.67 MB but, as it stated, did not reach the accuracy target.
+- **video-processing** (deadline): test_jump_analyzer_test_video failed: /app/jump_analyzer.py detected takeoff frame 167, outside the required inclusive range [219, 223]. 4 of 5 subtests passed; the model had declared the deliverable done and was running a final review when the deadline hit, so the loss is the wrong takeoff detection, not time.
+
+## Stopped at the deadline with the work unfinished (2)
+
+- **git-multibranch** (deadline): test_multi_branch_https_deploy failed because nothing was built (files=[]). After one reconnaissance round the model spent the whole budget on long thinking blocks (207 s, 145 s, 101 s) that Letronna repeatedly truncated for producing no output, and it never wrote any file before the time deadline.
+- **gpt2-codegolf** (deadline): test_gpt2_implementation failed because /app/gpt2.c does not exist. The model spent all 779 s reverse-engineering the TF .ckpt format with throwaway /tmp/*.c scanners and hit the time deadline at round 10 still exploring, never writing the required deliverable.
+
+## Failed, and the oracle cannot pass it here either (5)
+
+- **caffe-cifar-10** (deadline): Flagged oracle_cannot_pass=true. test_cifar10_model_exists, test_training_completed_500_iterations and test_model_accuracy_verification failed because cifar10_quick_iter_500.caffemodel was never produced: the CPU converter first hit a missing GPU header (cublas_v2.h), then was run with the wrong db backend arg, and training aborted with a Check failure (CONVERT/TRAIN_EXIT=134) before any iteration, with the deadline reached mid-retry.
+- **filter-js-from-html** (done): Flagged oracle_cannot_pass=true. test_filter_blocks_xss failed (4 XSS vectors still present after filtering) and test_clean_html_unchanged failed (the filter modified 5 of 12 clean HTML files); the task is one the oracle cannot pass in this container.
+- **make-doom-for-mips** (deadline): Flagged oracle_cannot_pass=true. test_vm_execution timed out waiting for /tmp/frame.bmp, and test_frame_bmp_exists and test_frame_bmp_similar_to_reference failed because the frame was never produced; the task is one the oracle cannot pass in this container, and the run also hit the deadline.
+- **protein-assembly** (done): Flagged oracle_cannot_pass=true. test_gblock failed because the fusion protein was not in the required order flag-donor-dhfr-acceptor-snap (the search for the ordered segments returned -1, so assert 0 < -1); the task is one the oracle cannot pass in this container.
+- **qemu-alpine-ssh** (deadline): Flagged oracle_cannot_pass=true. test_sshpass failed: sshpass ssh to root@localhost:2222 returned exit status 255. The model reported the Alpine overlay never downloaded because the guest network was down in initramfs, so sshd never came up; the task is one the oracle cannot pass in this container, and the run also hit the deadline.
+
+## The verifier timed out (1)
+
+- **query-optimize** (done): reward is None with VerifierTimeoutError: the verifier timed out after 900 s (it collected 6 tests and then hung before printing any result). The model finished and wrote /app/sol.sql, but no reward was produced.

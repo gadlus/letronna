@@ -1,0 +1,55 @@
+adaptive-rejection-sampler: reward 0.0; letronna done after 15 rounds, 645 s
+  failed: test_can_generate_standard_distribution_samples
+  said: `ars()` and `test()` are in `/app/ars.R`, and `test()` passes all 24 checks. A review helper then found some densities that `ars()` still handles badly, and I fixed only some of its findings. The final edits were three small input checks. I
+break-filter-js-from-html: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 0 rounds, 0 s
+  failed: test_out_html_bypasses_filter
+  said: The provider's content filter stopped the reply.
+caffe-cifar-10: reward 0.0; letronna done after 24 rounds, 876 s
+  failed: test_caffe_version_and_source, test_cifar10_model_exists, test_cpu_only_training_configured, test_training_completed_500_iterations, test_model_accuracy_verification
+  said: Caffe is not built and nothing was trained, so there is no model and no accuracy result. - **Build:** The CPU-only build of BVLC Caffe 1.0 was still compiling when time ran out. It was running with all four jobs sharing one CPU. I wasn't ab
+configure-git-webserver: reward 0.0; letronna done after 6 rounds, 138 s
+  failed: test_hello_html_exists
+  said: The git server and web server are set up and working, but I only tested the push locally. I haven't tested `git clone user@server:/git/server` over SSH, because you're setting up the login. I packed and pushed `hello.html` as the `git` user
+crack-7z-hash: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 0 rounds, 1 s
+  failed: test_solution_file, test_solution_content
+  said: The provider's content filter stopped the reply.
+extract-moves-from-video: reward 0.0; letronna done after 5 rounds, 20 s
+  failed: test_solution_file_exists, test_solution_content_similarity
+  said: I couldn't download the video or transcribe it, so `/app/solution.txt` doesn't exist. I didn't want to fill it with guessed Zork moves. - **YouTube blocked the download:** a plain request to the video page returned "Sign in to confirm you'r
+filter-js-from-html: reward 0.0; letronna done after 10 rounds, 406 s
+  failed: test_clean_html_unchanged
+  said: `/app/filter.py` is fixed for the problems the review found. It takes the HTML file as `argv[1]` and rewrites it in place. It removes JavaScript but leaves everything else byte-for-byte as it was. I did not re-run the review. I checked the 
+financial-document-processor: reward 0.0; letronna done after 47 rounds, 256 s
+  failed: test_directories_created, test_invoices_moved_correctly, test_other_documents_moved_correctly, test_summary_csv_exists, test_summary_csv_structure, test_summary_csv_content, test_original_documents_dir_empty
+  said: Nothing is moved and no `summary.csv` exists yet. The command that created the folders and moved the files was refused. The reason given was that this session had read file content not written by you, and the command overwrites or deletes f
+largest-eigenval: reward 0.0; letronna done after 6 rounds, 53 s
+  failed: test_speedup
+  said: `find_dominant_eigenvalue_and_eigenvector` in `/app/eigen.py` is now faster than the numpy reference at every size in `eval.py`, and it satisfies the `np.allclose(A @ eigenvec, eigenval * eigenvec)` check. It calls LAPACK `dgeev` directly t
+make-doom-for-mips: reward 0.0; letronna done after 37 rounds, 634 s
+  failed: test_vm_execution
+  said: `/app/doomgeneric_mips` is built, and `node vm.js` now runs Doom in the VM. It prints the startup text to stdout and writes `/tmp/frame.bmp`, a 640x400 image with 240 distinct colours. I only checked that the file has a valid size and colou
+make-mips-interpreter: reward 0.0; letronna done after 16 rounds, 177 s
+  failed: test_vm_execution
+  said: I wrote `/app/vm.js`, and `node vm.js` boots Doom from `doomgeneric_mips` and saves frames to `/tmp/frame.bmp`. I checked the first frame: it's a 640×400 32-bit BMP showing the Doom title screen, with correct colours and text. A full `node 
+model-extraction-relu-logits: reward 0.0; letronna done after 7 rounds, 114 s
+  failed: test_stolen_matrix_matches
+  said: `/app/steal.py` is written and run. It saves a 20×10 matrix to `/app/stolen_A1.npy`, and all 20 rows match the true `A1` rows up to scaling and sign. I checked this against `forward.A1` after the run. **How it works:** it only calls `forwar
+qemu-alpine-ssh: reward 0.0; letronna done after 17 rounds, 700 s
+  failed: test_sshpass
+  said: `ssh -p 2222 root@localhost` does not work yet. I never got a successful login, so I can't tell you it will drop you into a shell. **What is in place:** - The `/app/alpine.iso` VM is running under qemu, detached, with host port 2222 forward
+query-optimize: reward None, VerifierTimeoutError; letronna done after 9 rounds, 487 s
+  said: I wrote the optimized query to `/app/sol.sql`. It returns the same 500 rows as your original, and `cmp` found the two outputs byte-identical. The new query runs in about 1.6 s on the unindexed database. Your original ran for more than 7 min
+sam-cell-seg: reward 0.0; letronna done after 13 rounds, 1738 s
+  failed: test_run_script, test_csv_output_exists, test_csv_shape_cols, test_masks_are_no_longer_rect, test_mask_alignment, test_no_polyline_overlaps, test_single_contiguous_mask_per_cell, test_coords_are_flat_lists
+  said: `/app/convert_masks.py` is written and runs end to end on the demo. A review helper tried it on many other inputs and found two failures and a few weak spots. I fixed the two failures and one weak spot, and re-ran the demo and the two faili
+torch-tensor-parallelism: reward None, VerifierTimeoutError; letronna done after 3 rounds, 68 s
+  said: `/app/parallel_linear.py` is written, but I have not run it. Python and torch aren't installed here, so nothing has been tested. The helper review I ran could only read the code for the same reason. I assumed `master_weight` has the `torch.
+train-fasttext: reward 0.0; letronna done after 18 rounds, 2794 s
+  failed: test_accuracy
+  said: `/app/model.bin` is saved: 138.2 MB, under the 150 MB limit. It scores 0.6244 accuracy on the 10,000-row test file in `data/`, just above the 0.62 target. That margin is thin, so a private test set could land slightly below 0.62. - **Settin
+vulnerable-secret: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 1 rounds, 2 s
+  failed: test_results_file_exists, test_results_file_contains_secret_flag, test_results_file_format
+  said: The provider's content filter stopped the reply.
+mteb-leaderboard: reward 1.0; letronna done after 25 rounds, 427 s
+  looked up: web_fetch {"url": "https://mteb-leaderboard.hf.space/?benchmark_name=MTEB%28Scandinavian%2C+v1%29"}
+  said: I wrote `GritLM/GritLM-7B` to `/app/result.txt`. This comes from my own reconstruction of the leaderboard, not from reading the live page, which I couldn't load. I took the MTEB results repository as of 29 Aug 2025 and recomputed Mean (Task

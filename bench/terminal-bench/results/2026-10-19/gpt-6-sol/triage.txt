@@ -1,0 +1,83 @@
+break-filter-js-from-html: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 3 rounds, 49 s
+  failed: test_out_html_bypasses_filter
+  said: The file reader needs explicit paths; I’ll open `/app/filter.py` and `/app/test_outputs.py` directly.
+caffe-cifar-10: reward 0.0; letronna done after 41 rounds, 860 s
+  failed: test_caffe_version_and_source, test_cifar10_model_exists, test_training_completed_500_iterations, test_model_accuracy_verification
+  said: The CPU-only Caffe build now passes, including the changed `compute_image_mean.cpp`. BVLC Caffe 1.0 is cloned at `/app/caffe`, and CIFAR-10 has been converted to LMDB. The solver is configured for 500 training iterations and 100 test iterat
+compile-compcert: reward 0.0; letronna done after 25 rounds, 734 s
+  failed: test_compcert_valid_and_functional
+  said: CompCert 3.13.1 was freshly built from source for x86-64 Linux under `/tmp/CompCert`. The build completed successfully and produced `/tmp/CompCert/ccomp` and its runtime library. **Verification remains pending:** the environment refused the
+configure-git-webserver: reward 0.0; letronna done after 18 rounds, 256 s
+  failed: test_hello_html_exists
+  said: The Git-to-web setup is running here. A push to `master` on `/git/server` deploys the tracked files to Nginx on port 8080. I tested a push as `user` and confirmed that `/hello.html` returned `hello world`, then removed the test commit and f
+constraints-scheduling: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 2 rounds, 11 s
+  failed: test_structure_event_title_attendees_duration_window, test_constraints_conflicts_business_hours, test_earliest_tiebreakers_and_carol_buffer
+  said: The first read missed the file paths. I’ll open the three calendar files directly.
+dna-insert: reward 0.0; letronna done after 14 rounds, 188 s
+  failed: test_primers
+  said: Created `primers.fasta` with one forward/reverse pair—the minimum needed for the single insertion. An independent check found no failures: both annealing arms are 15–45 nucleotides, their `oligotm` temperatures are 61.24 °C and 59.84 °C usi
+extract-elf: reward 0.0; letronna done after 8 rounds, 142 s
+  failed: test_output_matches_reference
+  said: Created `/app/extract.js`. It reads an ELF binary’s loadable segments and outputs 32-bit memory values as JSON, with decimal addresses as keys and integers as values. Run it with `node extract.js /app/a.out > out.json`. On the provided bina
+extract-moves-from-video: reward 0.0; letronna done after 24 rounds, 185 s
+  failed: test_solution_content_similarity
+  said: I couldn’t download or view the video. YouTube required sign-in for playback, and the alternate player request was refused. The page metadata contains no move list, so I couldn’t verify any commands. `/app/solution.txt` is empty rather than
+filter-js-from-html: reward 0.0; letronna done after 16 rounds, 416 s
+  failed: test_filter_blocks_xss, test_clean_html_unchanged
+  said: Updated `/app/filter.py` and checked it through the command-line entry point. It modifies the given HTML file in place, removes the tested script elements, event handlers, executable URLs, and unsafe CSS, and leaves unaffected bytes—includi
+financial-document-processor: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 3 rounds, 25 s
+  failed: test_directories_created, test_invoices_moved_correctly, test_other_documents_moved_correctly, test_summary_csv_exists, test_summary_csv_structure, test_summary_csv_content, test_original_documents_dir_empty
+  said: The first file is an invoice: its Total is 6558, different from its Amount due. I’ll check the remaining files the same way.
+fix-code-vulnerability: reward 0.0; letronna done after 13 rounds, 375 s
+  failed: test_hkey_basic_cases
+  said: Fixed the HTTP header validation vulnerability in `/app/bottle.py` and recorded it as **CWE-93** in `/app/report.jsonl`. Invalid header names and control characters in header values now raise `ValueError` through the public response APIs. T
+gpt2-codegolf: reward 0.0; letronna deadline after 36 rounds, 779 s
+  failed: test_gpt2_implementation
+  said: The file is still 5,336 bytes. I’ll trim redundant tokenizer and output code, then compile and check the exact count.
+install-windows-3.11: reward 0.0; letronna done after 28 rounds, 388 s
+  failed: test_windows_keys_with_visual_feedback
+  said: Windows for Workgroups 3.11 is running in the background at the Program Manager desktop. I checked each requirement through the running services: - QEMU uses the supplied image in **snapshot mode**; the base image’s modification time stayed
+make-doom-for-mips: reward 0.0; letronna done after 34 rounds, 579 s
+  failed: test_vm_execution
+  said: Built `/app/doomgeneric_mips` using the supplied image backend and fixed two VM instruction-handling issues needed to run it. I ran `node vm.js`: Doom printed its startup output and wrote `/tmp/frame.bmp`. I verified the file is a 640×400 B
+make-mips-interpreter: reward 0.0; letronna done after 42 rounds, 733 s
+  failed: test_vm_execution
+  said: Implemented `/app/vm.js`. Running `node vm.js` boots the supplied MIPS ELF, reads `doom.wad`, and saves rendered BMP frames as `frame_000000.bmp`, `frame_000001.bmp`, and so on. It also retains the latest frame as `frame.bmp`. Verified the 
+modernize-scientific-stack: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 4 rounds, 21 s
+  failed: test_modernized_code_runs, test_dependency_file_exists
+  said: I’ll check the CSV columns and config before writing the replacement.
+protein-assembly: reward 0.0; letronna done after 20 rounds, 379 s
+  failed: test_gblock
+  said: `/app/gblock.txt` is present and contains one line of DNA. The independent local check found **one unmet requirement**: the translated Clover and mCherry sequences cannot literally match their PDB FASTA records, because each record uses `X`
+raman-fitting: reward 0.0; letronna done after 10 rounds, 171 s
+  failed: test_G_Peak, test_2D_Peak
+  said: The fitted G and 2D peak parameters are saved in `/app/results.json`. The file was validated against the requested format.
+sam-cell-seg: reward 0.0; letronna done after 17 rounds, 440 s
+  failed: test_csv_shape_cols, test_masks_are_no_longer_rect, test_mask_alignment, test_no_polyline_overlaps, test_single_contiguous_mask_per_cell, test_coords_are_flat_lists
+  said: `/app/convert_masks.py` is in place. It uses MobileSAM’s distilled `vit_t` model on CPU, prompts it for every CSV row, resolves overlapping pixels, and saves one closed, contiguous, non-rectangular polyline per cell in the output folder. It
+schemelike-metacircular-eval: reward 0.0; letronna done after 28 rounds, 969 s
+  failed: test_interp
+  said: `eval.scm` is complete. A fresh check found no failures: all 32 programs in `test/` matched direct execution, and the calculator produced the same output directly, through `eval.scm`, and through two evaluator layers. The check script was r
+torch-pipeline-parallelism: reward 0.0; letronna done after 10 rounds, 223 s
+  failed: test_pipeline_parallel
+  said: Created `/app/pipeline_parallel.py` with the requested function. It partitions decoder layers across ranks, runs all microbatch forwards before any backwards, transfers hidden states and gradients between stages, and scales each microbatch’
+torch-tensor-parallelism: reward 0.0; letronna done after 5 rounds, 126 s
+  failed: test_row_parallel_linear
+  said: Created `/app/parallel_linear.py` with both PyTorch tensor-parallel linear layers. It shards the initialized weight by output features for `ColumnParallelLinear` and by input features for `RowParallelLinear`, initializes the requested biase
+train-fasttext: reward 0.0; letronna done after 21 rounds, 2610 s
+  failed: test_accuracy
+  said: Saved the fastText model to `/app/model.bin`. It is **144,446,261 bytes** (under 150 MB) and achieved **0.6201 accuracy** on the provided 10,000-review test file. Accuracy on the private test set cannot be verified here.
+vulnerable-secret: reward 0.0; letronna deadline after 2 rounds, 779 s
+  failed: test_results_file_exists, test_results_file_contains_secret_flag, test_results_file_format
+  said: I’m checking embedded strings and the program’s behavior with no input.
+mteb-retrieve: reward 0.0; letronna done after 4 rounds, 62 s
+  failed: test_data_matches
+  said: Wrote the fifth-highest-ranked document to `/app/result.txt` and verified that it matches the source line exactly.
+mteb-leaderboard: reward 0.0; letronna done after 27 rounds, 811 s
+  looked up: run_command {"background":false,"command":"python3 - <<'PY'\nimport requests\nu='https://mteb-leaderboard-backend.hf.space/benchmarks/MTEB%28Scandinavian%2C%20v1%29/scores'
+  looked up: run_command {"background":false,"command":"python3 - <<'PY'\nimport requests\nbase='https://mteb-leaderboard-backend.hf.space'\nfor route in ['/benchmarks/menu','/benchmark
+  looked up: run_command {"background":false,"command":"python3 - <<'PY'\nimport requests\nbase='https://mteb-leaderboard-backend.hf.space/v1';s=requests.Session()\nfor route in ['/benc
+  looked up: run_command {"background":false,"command":"python3 - <<'PY'\nimport requests\nu='https://mteb-leaderboard-backend.hf.space/v1/benchmarks/MTEB%28Scandinavian%2C%20v1%29/scor
+  looked up: run_command {"background":false,"command":"python3 - <<'PY'\nfrom pathlib import Path\nimport requests\nu='https://mteb-leaderboard-backend.hf.space/v1/benchmarks/MTEB%28Sc
+  failed: test_data_matches
+  said: `Salesforce/SFR-Embedding-2_R` is written to `/app/result.txt`. It has the highest reported Mean (Task) among models released by August 2025 in the [Scandinavian MTEB scores](https://mteb-leaderboard-backend.hf.space/v1/benchmarks/MTEB%28Sc

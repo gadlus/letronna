@@ -1,0 +1,80 @@
+adaptive-rejection-sampler: reward 0.0; letronna deadline after 19 rounds, 779 s
+  failed: test_can_generate_standard_distribution_samples
+  said: Starting a review helper with the request text and my files, and independently re-checking the requirements myself in parallel.
+caffe-cifar-10: reward 0.0; letronna deadline after 42 rounds, 1079 s
+  failed: test_cifar10_model_exists, test_training_completed_500_iterations, test_model_accuracy_verification
+  said: Backend arg was wrong ("lmdb", not "cifar10"). Rerunning the full pipeline.
+configure-git-webserver: reward 0.0; letronna done after 21 rounds, 267 s
+  failed: test_hello_html_exists
+  said: Configured. The deliverables are in `/app`: - `setup.sh` — idempotent installer: installs `git` + `nginx`, creates the bare repo at `/git/server` with `HEAD` on `master`, installs the hook, writes the nginx site, starts nginx, and opens por
+crack-7z-hash: reward 0.0; letronna done after 22 rounds, 235 s
+  failed: test_solution_file, test_solution_content
+  said: I ran out of time before the archive's data password was recovered, so I won't invent a word. Here is exactly where things stand. **What I established** - `/app/secrets.7z` (215 bytes) is a valid 7z: both its start-header and next-header CR
+extract-elf: reward 0.0; letronna done after 11 rounds, 331 s
+  failed: test_output_matches_reference
+  said: Created `/app/extract.js` and generated `/app/out.json` from it. The extractor maps the binary file contents starting at memory address `0x400000` (4194304), emitting one 32-bit little-endian integer per 4-byte word: ```json {"4194304":1179
+extract-moves-from-video: reward 0.0; letronna done after 47 rounds, 728 s
+  failed: test_solution_content_similarity
+  said: I could not download or transcribe the video, and the file I wrote is not a transcription of it. What happened: - The video is "Zork I: The Great Underground Empire speedrun - 2:53" by swordsmankirby, confirmed via YouTube oEmbed and matchi
+filter-js-from-html: reward 0.0; letronna done after 11 rounds, 708 s
+  failed: test_filter_blocks_xss, test_clean_html_unchanged
+  said: `/app/filter.py` is complete and passes an independent review after fixes. ## What the script does `python3 /app/filter.py file.html` edits the file in place (argv[1], exit 0, nothing on stdout), operating on the raw text so every byte that
+financial-document-processor: reward 0.0; letronna done after 17 rounds, 160 s
+  failed: test_invoices_moved_correctly, test_other_documents_moved_correctly, test_summary_csv_structure, test_summary_csv_content
+  said: Done. All 17 documents are sorted, `/app/documents/` is empty, and `/app/invoices/summary.csv` is written and verified. **Invoices (9)** — amount used is the tax-inclusive total: | file | total_amount | vat_amount | |---|---|---| | F0oZMhSU
+gcode-to-text: reward 0.0; letronna deadline after 51 rounds, 779 s
+  failed: test_hello_file_content
+  said: The top-down projection reads correctly, so I'll record the string and remove my scratch renders.
+git-multibranch: reward 0.0; letronna deadline after 1 rounds, 779 s
+  failed: test_multi_branch_https_deploy
+  said: Time is short. Writing and running the full setup now.
+gpt2-codegolf: reward 0.0; letronna deadline after 10 rounds, 779 s
+  failed: test_gpt2_implementation
+  said: I'll start by inspecting the checkpoint and vocab file formats.
+install-windows-3.11: reward 0.0; letronna done after 112 rounds, 2010 s
+  failed: test_windows_keys_with_visual_feedback
+  said: All requirements verified; the reviewer's one real defect is fixed. Windows 3.11 for Workgroups is running at its desktop, reachable over VNC and the web, and accepting programmatic keystrokes. **What is running** (QEMU daemonized, pid in `
+make-doom-for-mips: reward 0.0; letronna deadline after 43 rounds, 779 s
+  failed: test_vm_execution, test_frame_bmp_exists, test_frame_bmp_similar_to_reference
+  said: One more diagnostic: print `sprtemp` right after `memset` and at the failing check.
+make-mips-interpreter: reward 0.0; letronna done after 35 rounds, 523 s
+  failed: test_vm_execution
+  said: Implemented `/app/vm.js`. - Loads the little-endian MIPS32r2 ELF and runs it in a 4 GiB address space. - Implements the integer and FPU instruction set used by the binary, including branch delay slots, branch-likely instructions, unaligned 
+mcmc-sampling-stan: reward 0.0; letronna done after 34 rounds, 1628 s
+  failed: test_rstan_package_installed, test_hierarchical_model_implemented, test_r_script_created_and_used_rstan, test_posterior_alpha_estimation, test_posterior_beta_estimation, test_stan_model_sampling
+  said: All four deliverables are in `/app`, but requirement 1 is **not** met: RStan is not installed, so the two numbers are **not** MCMC output. **Files** - `/app/hierarchical_model.stan` — `y ~ binomial(n, theta)`, `theta ~ beta(alpha, beta)`, `
+overfull-hbox: reward 0.0; letronna done after 16 rounds, 103 s
+  failed: test_input_file_matches
+  said: `main.tex` compiles successfully with `pdflatex` and no overfull hbox warnings (0 warnings, exit code 0). PDF written to `main.pdf`. Only these synonym substitutions were made in `input.tex`, each from its listed family: - `curious` → `odd`
+protein-assembly: reward 0.0; letronna done after 20 rounds, 703 s
+  failed: test_gblock
+  said: Final file checked end to end again after the codon tweak. `/app/gblock.txt` — 2583 nt, one line, no newlines or extra characters (2583 bytes, alphabet `ACGT` only). **Design (N→C):** FLAG `DYKDDDDK` – GGGGSGGGGS – Clover – GGGGSGGGGS – DHF
+qemu-alpine-ssh: reward 0.0; letronna deadline after 26 rounds, 779 s
+  failed: test_sshpass
+  said: The overlay never downloaded (guest network was down in initramfs), so sshd is not up. Switching to an interactive serial socket driver that configures the VM directly.
+query-optimize: reward None, VerifierTimeoutError; letronna done after 12 rounds, 224 s
+  said: Wrote `/app/sol.sql`: one statement, no comments. What changed: - The two correlated subqueries per output row (each a full scan of `senses`, 212k rows, with a `GROUP BY` and `ORDER BY`) are replaced by one pass that computes sense counts p
+raman-fitting: reward 0.0; letronna done after 20 rounds, 236 s
+  failed: test_G_Peak, test_2D_Peak
+  said: I wrote `/app/results.json` with Lorentzian fits (linear background included, so `gamma` is FWHM, `amplitude` the peak height above that background). One caveat you should know, because it affects how the numbers should be read: the first c
+rstan-to-pystan: reward 0.0; letronna done after 38 rounds, 1400 s
+  failed: test_beta_estimation_accuracy
+  said: Done. All five files are in `/app`, and the script now carries the R script's exact sampling protocol. **`/app/pystan_analysis.py`** — PyStan 3.10.0 (`stan.build(stan_code, data=data, random_seed=1)`): - Stan model copied from `gp_ard_rstan
+sam-cell-seg: reward 0.0; letronna done after 103 rounds, 4617 s
+  failed: test_mask_alignment, test_coords_are_flat_lists
+  said: Final review is in, and its one real finding is fixed. Here is the complete state. ## Deliverable `/app/convert_masks.py` — a CPU-runnable script that converts every mask in the metadata CSV to a refined, non-overlapping polyline using Mobi
+torch-pipeline-parallelism: reward 0.0; letronna deadline after 14 rounds, 779 s
+  failed: test_pipeline_parallel
+  said: I'll rerun the two-rank check with the init-file race fixed, and in parallel have a fresh reviewer try the request's stated behaviours against the file.
+torch-tensor-parallelism: reward 0.0; letronna done after 17 rounds, 582 s
+  failed: test_row_parallel_linear
+  said: Implemented `/app/parallel_linear.py`, and it passes both my end-to-end multiprocess test and an independent review that drove every stated behavior through the public API at world sizes 1, 2, and 4. **Implementation** - `ColumnParallelLine
+train-fasttext: reward 0.0; letronna done after 25 rounds, 3474 s
+  failed: test_accuracy
+  said: Done as far as time allowed, but I did not reach the accuracy target. **What's at `/app/model.bin`** - fastText supervised classifier trained on all 650,000 training reviews, dim 50, `wordNgrams=2`, `bucket=2,000,000`, `minCount=1`, 5 epoch
+video-processing: reward 0.0; letronna deadline after 74 rounds, 3480 s
+  failed: test_jump_analyzer_test_video
+  said: I'll have a review helper check the deliverable against the request word for word, then verify each requirement myself through the script's entry point.
+mteb-retrieve: reward 0.0; letronna done after 34 rounds, 757 s
+  failed: test_data_matches
+  said: Done. `/app/result.txt` contains: ``` HumanEval: Benchmarking Python code generation via functional examples ``` How I got it: loaded `BAAI/bge-small-zh-v1.5` at revision `7999e1d3359715c523056ef9478215996d62a620` through `mteb.get_model`, 
