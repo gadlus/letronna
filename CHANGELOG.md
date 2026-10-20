@@ -15,6 +15,10 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ### Added
 - **App** — A click on the tray icon on Windows, or the menu bar icon on macOS, opens its menu rather than only the window: Open Letronna, a new session, any of the six sessions used last (with "needs you", "working" or "new" beside one that waits), quick entry, Settings, updates, the Activity page while something runs, and Quit. The Windows menu says the account, credit and model at the top, as the Mac's does; a double-click on the Windows icon opens the window.
+- **App** — Select several sessions in the sidebar with Cmd-click (Ctrl-click on Windows and Linux), Shift-click or Select in a session's menu, then pin, unpin, delete, name again or export them as Markdown together, from the bar over the list, its `…`, or a right-click on one of them. Deleting asks once. With the sidebar focused, Space, Shift+↑/↓, Cmd+A, P, Delete and Esc work on the selection.
+
+### Changed
+- **App** — Shift-click on a session selects a range, as in any list, instead of pinning it.
 
 ### Fixed
 - **macOS** — Closing the window keeps Letronna running in the Dock and the menu bar instead of quitting it. Open Letronna in the menu bar menu, the Dock icon or a notification brings the window back out of the Dock and in front, showing at once what was opened from the menu. Quit in the menu bar menu, or Cmd+Q, ends it.

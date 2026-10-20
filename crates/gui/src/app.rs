@@ -497,6 +497,11 @@ pub(crate) struct Chat {
     pub(crate) session_menu: Option<crate::ui::sessions::SessionMenu>,
     /// A press on a session's row, held to open its menu.
     pub(crate) session_press: Option<crate::ui::sessions::Press>,
+    /// The sessions selected in the sidebar to act on together, by id, in
+    /// the order they were picked; empty while it is one at a time.
+    pub(crate) selected: Vec<u64>,
+    /// The session a Shift-click selects from: the last one clicked.
+    pub(crate) select_anchor: Option<u64>,
     /// The turn the keys were sent to, by session and first message. Its
     /// focus lives only while the list draws it, so it is handed over as
     /// the turn is drawn: kept here until the next draw, then `focusing`
@@ -1117,6 +1122,8 @@ impl Chat {
             picked: None,
             session_menu: None,
             session_press: None,
+            selected: Vec::new(),
+            select_anchor: None,
             focus_turn: None,
             focusing: None,
             turn_menu: None,
@@ -4091,7 +4098,7 @@ impl Chat {
         } else if self.page == Page::Chat && self.transcript_focus.contains_focused(window, cx) {
             // On a turn the keys were stepped to, back to the box.
             self.focus_composer(window, cx);
-        } else if !self.clear_session_filter(cx) {
+        } else if !self.clear_selection(window, cx) && !self.clear_session_filter(cx) {
             // Nothing else to close: a second escape steps to your newest
             // message, to go back from, as Claude Code's opens its rewind.
             self.escape_twice(window, cx);

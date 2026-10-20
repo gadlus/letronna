@@ -324,6 +324,28 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             ),
             None,
         ),
+        // Selecting several, as in a file list; P and Delete then act on
+        // all of them.
+        (
+            KeyBinding::new("space", sessions::ToggleSelected, Some("Sessions")),
+            Some("In the sidebar: select it, or no longer, to act on several"),
+        ),
+        (
+            KeyBinding::new("shift-up", sessions::SelectPrevious, Some("Sessions")),
+            Some("In the sidebar: select the row above as well"),
+        ),
+        (
+            KeyBinding::new("shift-down", sessions::SelectNext, Some("Sessions")),
+            Some("In the sidebar: select the row below as well"),
+        ),
+        (
+            KeyBinding::new("secondary-a", sessions::SelectAll, Some("Sessions")),
+            Some("In the sidebar: select every session listed"),
+        ),
+        (
+            KeyBinding::new("escape", sessions::ClearSelection, Some("Sessions")),
+            Some("In the sidebar: select nothing"),
+        ),
         // The sidebar's own filters, so a shortcut typed elsewhere is
         // never swallowed by one narrowing a list it cannot see.
         (

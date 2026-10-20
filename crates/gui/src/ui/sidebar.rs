@@ -184,6 +184,11 @@ impl Chat {
     /// click on a Mac), a long press, or the "…" that shows while the
     /// pointer is over it. Everything on it names the session by id: the
     /// rows move as sessions are started and deleted.
+    ///
+    /// Cmd-click (Ctrl-click off a Mac) and Shift-click select rows, as in
+    /// a file list. While any are, each row shows a box to tick, a click
+    /// ticks it rather than opening the session, and the fill marks the
+    /// selected rather than the one on screen.
     pub(crate) fn session_row(
         &self,
         index: usize,
@@ -193,7 +198,9 @@ impl Chat {
     ) -> impl IntoElement {
         let c = &self.store.conversations[index];
         let id = c.id;
-        let active = index == self.store.active && self.page == Page::Chat;
+        let selecting = self.selecting();
+        let selected = selecting && self.selected.contains(&id);
+        let active = index == self.store.active && self.page == Page::Chat && !selecting;
         let menu_open = self.session_menu.as_ref().is_some_and(|open| open.id == id);
         // The session a reply is running in says so, on screen or not.
         let age = if self.busy && self.streaming_id == Some(id) {
@@ -235,30 +242,36 @@ impl Chat {
             .rounded(cx.theme().radius)
             .cursor_pointer()
             .text_sm()
-            .when(active, |this| this.bg(cx.theme().sidebar_accent))
+            .when(active || selected, |this| {
+                this.bg(cx.theme().sidebar_accent)
+            })
             .active(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
+            .when(selecting, |this| this.child(check_box(selected, cx)))
             // Its marks are in the blue read as text: the fill blue sinks
-            // under 3:1 on the midnight frame.
-            .child(if c.pinned {
-                Icon::new(AppIcon::Pin)
-                    .size_3()
-                    .text_color(if active {
-                        cx.theme().link
-                    } else {
-                        cx.theme().muted_foreground
-                    })
-                    .into_any_element()
-            } else {
-                div()
-                    .size(px(4.))
-                    .rounded_full()
-                    .flex_shrink_0()
-                    .bg(if active {
-                        cx.theme().link
-                    } else {
-                        cx.theme().muted_foreground.opacity(0.5)
-                    })
-                    .into_any_element()
+            // under 3:1 on the midnight frame. Beside the box the dot would
+            // only say what the box says, so it goes; the pin stays.
+            .when(c.pinned || !selecting, |this| {
+                this.child(if c.pinned {
+                    Icon::new(AppIcon::Pin)
+                        .size_3()
+                        .text_color(if active {
+                            cx.theme().link
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .into_any_element()
+                } else {
+                    div()
+                        .size(px(4.))
+                        .rounded_full()
+                        .flex_shrink_0()
+                        .bg(if active {
+                            cx.theme().link
+                        } else {
+                            cx.theme().muted_foreground.opacity(0.5)
+                        })
+                        .into_any_element()
+                })
             })
             .child(div().flex_1().min_w_0().truncate().child(c.shown_title()))
             // A run beside the chat holds it.
@@ -300,10 +313,14 @@ impl Chat {
                     .flex_shrink_0()
                     .min_w(px(20.))
                     .justify_end()
+                    // While selecting, the selection bar and the row's menu
+                    // act on all of them; a "…" per row would read as one.
                     .child(
                         div()
                             .when(menu_open, |this| this.invisible())
-                            .group_hover(SESSION_ROW, |s| s.invisible())
+                            .when(!selecting, |this| {
+                                this.group_hover(SESSION_ROW, |s| s.invisible())
+                            })
                             .child(age),
                     )
                     .child(
@@ -312,7 +329,9 @@ impl Chat {
                             .inset_0()
                             .justify_end()
                             .when(!menu_open, |this| this.invisible())
-                            .group_hover(SESSION_ROW, |s| s.visible())
+                            .when(!selecting, |this| {
+                                this.group_hover(SESSION_ROW, |s| s.visible())
+                            })
                             // Its press is its own, neither a long press
                             // nor a click on the row.
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -365,17 +384,20 @@ impl Chat {
                 let Some(index) = this.store.index_of(id) else {
                     return;
                 };
-                if event.modifiers().shift {
-                    this.store.conversations[index].pinned ^= true;
-                } else {
-                    this.leave_for(index);
-                    this.store.active = index;
-                    this.error = None;
-                    this.page = Page::Chat;
-                    // The handle is shared across sessions; start at the latest message.
-                    this.follow();
-                    this.focus_composer(window, cx);
+                let modifiers = event.modifiers();
+                if modifiers.shift {
+                    return this.select_span(id, window, cx);
                 }
+                if modifiers.secondary() || this.selecting() {
+                    return this.toggle_selected(id, window, cx);
+                }
+                this.leave_for(index);
+                this.store.active = index;
+                this.error = None;
+                this.page = Page::Chat;
+                // The handle is shared across sessions; start at the latest message.
+                this.follow();
+                this.focus_composer(window, cx);
                 this.save();
                 cx.notify();
             }))
@@ -432,6 +454,25 @@ impl Chat {
         let at = self.picked.and_then(|id| self.store.index_of(id));
         self.picked = move_in(&listed, at, down).map(|index| self.store.conversations[index].id);
         cx.notify();
+    }
+
+    /// Move the sidebar's keys up, or with `down` down, selecting every
+    /// session from where they started to where they land, as Shift and an
+    /// arrow do in a list.
+    fn extend_selection(&mut self, down: bool, cx: &mut Context<Self>) {
+        if !self.selecting() {
+            self.select_anchor = self.picked;
+        }
+        self.pick_session(down, cx);
+        let Some(to) = self.picked else {
+            return;
+        };
+        let listed: Vec<u64> = (self.listed_sessions(cx).into_iter())
+            .map(|index| self.store.conversations[index].id)
+            .collect();
+        let from = self.select_anchor.filter(|from| listed.contains(from));
+        self.select_anchor = Some(from.unwrap_or(to));
+        self.selected = sessions::span(&listed, from.unwrap_or(to), to);
     }
 
     /// Open the session the sidebar's keys are on. The keys stay there, as
@@ -611,7 +652,7 @@ impl Chat {
                 cx,
             ))
             .on_action(Self::session_key::<sessions::PinSession>(
-                Chat::toggle_pin,
+                Chat::pin_picked,
                 cx,
             ))
             .on_action(Self::session_key::<sessions::RenameSession>(
@@ -619,9 +660,36 @@ impl Chat {
                 cx,
             ))
             .on_action(Self::session_key::<sessions::DeleteSession>(
-                Chat::delete_session,
+                Chat::delete_picked,
                 cx,
             ))
+            .on_action(Self::session_key::<sessions::ToggleSelected>(
+                Chat::toggle_selected_at,
+                cx,
+            ))
+            .on_action(Self::session_move::<sessions::SelectPrevious>(
+                |this, cx| this.extend_selection(false, cx),
+                cx,
+            ))
+            .on_action(Self::session_move::<sessions::SelectNext>(
+                |this, cx| this.extend_selection(true, cx),
+                cx,
+            ))
+            .on_action(cx.listener(|this, _: &sessions::SelectAll, window, cx| {
+                if !this.sidebar_focus.is_focused(window) {
+                    return cx.propagate();
+                }
+                this.select_all(window, cx);
+            }))
+            // Ahead of the window's own Escape, which would stop a reply
+            // before it got as far as the selection.
+            .on_action(
+                cx.listener(|this, _: &sessions::ClearSelection, window, cx| {
+                    if !this.clear_selection(window, cx) {
+                        cx.propagate();
+                    }
+                }),
+            )
             .on_action(cx.listener(|this, _: &sessions::FilterNeedsYou, _, cx| {
                 this.toggle_session_filter(SessionFilter::NeedsYou, cx);
             }))
@@ -660,7 +728,11 @@ impl Chat {
                         ),
                 ),
             )
-            .child(div().pt_1().child(self.session_filter_row(cx)))
+            .child(div().pt_1().child(if self.selecting() {
+                self.selection_bar(cx).into_any_element()
+            } else {
+                self.session_filter_row(cx).into_any_element()
+            }))
             .child(
                 v_flex()
                     .id("session-list")
@@ -688,6 +760,32 @@ impl Chat {
 
 /// The group a session row's hover is told by, for its "…" button.
 const SESSION_ROW: &str = "session-row";
+
+/// The box a session row shows while sessions are selected, ticked when
+/// it is one of them; in the blue the row's marks use.
+fn check_box(on: bool, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    div()
+        .size(px(12.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(3.))
+        .border_1()
+        .border_color(if on {
+            theme.link
+        } else {
+            theme.muted_foreground.opacity(0.6)
+        })
+        .when(on, |this| {
+            this.bg(theme.link).child(
+                Icon::new(IconName::Check)
+                    .size(px(10.))
+                    .text_color(theme.background),
+            )
+        })
+}
 
 /// The `visible` sessions in the order the sidebar draws them: pinned
 /// first, then by project with `by_project`, else as they come.
