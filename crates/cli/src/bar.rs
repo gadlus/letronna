@@ -1131,6 +1131,31 @@ impl Bar {
         work()
     }
 
+    /// Attach the picture on the clipboard to the next message: taken off it
+    /// now, to wait where pasted pictures do, and handed to /image as one
+    /// named by path is.
+    fn paste_picture(&mut self) {
+        let at = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
+            .map_or(0, |since| since.as_millis());
+        let folder = crate::picture::pasted_folder();
+        let _ = std::fs::create_dir_all(&folder);
+        let path = folder.join(format!("{at}.png"));
+        if crate::picture::from_clipboard(&path) {
+            self.attach_picture(&path);
+        } else {
+            self.note = Some(
+                "no picture on the clipboard  ·  text pastes with your terminal's own paste"
+                    .to_owned(),
+            );
+        }
+    }
+
+    /// Attach the picture at `path` to the next message, as /image does.
+    fn attach_picture(&mut self, path: &std::path::Path) {
+        self.queued.push_back(crate::picture::image_line(path));
+        self.settle();
+    }
+
     /// Open what is in the box in the user's editor, $VISUAL then $EDITOR,
     /// and put what is there when it is closed back in the box, ready to
     /// send: a long prompt written where writing is easy. The draft goes
@@ -1726,9 +1751,14 @@ impl Bar {
                     self.handled += 1;
                     self.focus.touch(std::time::Instant::now());
                     // Behind a question nobody asked for, a paste is typing
-                    // too, and goes into the box as letters do.
-                    let open = self.choice.is_some() && self.guard.is_none();
-                    if !open && self.switches.is_none() {
+                    // too, and goes into the box as letters do. A picture
+                    // dragged in arrives as its path; it is attached rather
+                    // than typed.
+                    let open =
+                        (self.choice.is_some() && self.guard.is_none()) || self.switches.is_some();
+                    if let Some(path) = crate::picture::dropped(&text).filter(|_| !open) {
+                        self.attach_picture(&path);
+                    } else if !open {
                         self.line.paste(&text);
                         self.picked = 0;
                     }
@@ -2126,6 +2156,8 @@ impl Bar {
             KeyCode::Char('d') if control && self.line.is_empty() => self.done = true,
             // Open or fold the latest thinking, as Claude Code's ctrl+o does.
             KeyCode::Char('o') if control => crate::screen::toggle_last(),
+            // A picture on the clipboard goes with the next message.
+            KeyCode::Char('v') if control => self.paste_picture(),
             // Write a long prompt where writing is easy.
             KeyCode::Char('g') if control => self.edit_draft(),
             // Undo the last change to the line: ctrl-_ reaches us as ctrl-7

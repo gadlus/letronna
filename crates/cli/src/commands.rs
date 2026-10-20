@@ -1515,7 +1515,8 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
     ),
     ("page up/down", "scroll back through the conversation"),
     ("end", "follow the conversation again"),
-    ("drag", "select and copy"),
+    ("drag", "select and copy; a picture dragged in is attached"),
+    ("ctrl+v", "attach the picture on the clipboard"),
     ("@path", "attach a file, a line range or a folder"),
     ("//", "start a message with one /, as in //tmp is full"),
     (
@@ -4789,12 +4790,22 @@ fn attach(runner: &mut Runner, raw: &str, workspace: Option<&std::path::Path>) {
     let saved = std::fs::read(&path)
         .map_err(|e| format!("Cannot read {}: {e}", path.display()))
         .and_then(|bytes| letronna_core::media::attach(&name, &bytes));
+    // A picture taken off the clipboard was only waiting for this: the copy
+    // just kept with the media is the one that goes, and one is enough.
+    let pasted = crate::picture::pasted(&path);
     match saved {
         Ok(saved) => {
+            if pasted {
+                let _ = std::fs::remove_file(&path);
+            }
             runner.images.push(saved);
+            let what = if pasted {
+                "the picture from the clipboard".to_owned()
+            } else {
+                path.display().to_string()
+            };
             render::line(&render::dim(&format!(
-                "Attached {}; it goes with your next message.",
-                path.display()
+                "Attached {what}; it goes with your next message."
             )));
         }
         Err(error) => render::line(&render::red(&error)),
@@ -6242,6 +6253,17 @@ mod tests {
         assert_eq!(store.conversations[0].memory_scope, None);
         store.settings.memory_saving = Saving::Ask;
         assert_eq!(store.memory_saving(0), Saving::Ask);
+    }
+
+    #[test]
+    fn a_picture_with_a_quote_in_its_name_is_attached_by_its_whole_path() {
+        for name in ["say \"cheese\".png", "it's here.png", "a\" b.png"] {
+            let path = std::path::Path::new("/Users/someone/shots").join(name);
+            // Split from its command as `command` splits any line.
+            let line = crate::picture::image_line(&path);
+            let (_, rest) = line.split_once(char::is_whitespace).unwrap();
+            assert_eq!(super::typed_path(rest.trim(), None), path);
+        }
     }
 
     #[test]

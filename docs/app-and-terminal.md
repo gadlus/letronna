@@ -83,6 +83,8 @@ In the terminal, a line starting with `!` runs as a command in the session's fol
 
 In the terminal, `?` on an empty line shows the keys, and `/help <command>` says more about one command.
 
+In the terminal, Ctrl+V attaches the picture on the clipboard to your next message, and a picture dragged into the window is attached rather than pasted as its path; both go through `/image`.
+
 ## Going back
 
 `/rewind` (or `/undo`, or `Esc` twice on an empty box) lists the messages you sent, newest first; type to narrow them. Pick one, then:
