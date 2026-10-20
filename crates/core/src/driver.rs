@@ -60,6 +60,9 @@
 //! A session's own run nobody watches that would end with crash dumps new in
 //! its project, as a crashing test leaves, is told once to delete them
 //! (`dumps`).
+//! One that changed TypeScript or JavaScript and has passed no build since,
+//! though its tests may have passed, is told once which script builds it
+//! (`builds`).
 //!
 //! Nothing here polls. Each wait -- for the model, for a tool, for an
 //! approval -- is a blocking receive that a stop closes, so a stop is heard at
@@ -557,6 +560,7 @@ fn steps(
     let mut missed = false;
     let mut reworded = false;
     let mut swept = false;
+    let mut built = false;
     let mut listed = false;
     // From the first request, since a run told of its time only near the
     // end has often thought most of it away by then.
@@ -848,6 +852,20 @@ fn steps(
             // Before the Stop hooks, so they judge the answer that follows.
             if !verified && let Some(notice) = unchecked_edits(spec, turn, begun) {
                 verified = true;
+                spec.transcript.conversation.messages.push(notice);
+                save(&mut spec.transcript)?;
+                continue;
+            }
+            // After the edits are checked, so the build comes after the
+            // tests, and before the dumps are looked for, so a build that
+            // crashes is caught too; once, and with a round and budget left,
+            // as above.
+            if !built
+                && report.rounds < spec.rounds
+                && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
+                && let Some(notice) = unbuilt(spec, turn, begun)
+            {
+                built = true;
                 spec.transcript.conversation.messages.push(notice);
                 save(&mut spec.transcript)?;
                 continue;
@@ -2117,6 +2135,73 @@ fn affords_review(spec: &Spec) -> bool {
     let tokens = (spec.budget.as_ref())
         .is_none_or(|budget| budget.left() >= crate::requirements::REVIEW_TOKENS);
     time && tokens
+}
+
+/// The notice sending a session's own run nobody watches back once to run
+/// the build of the TypeScript or JavaScript it changed since `begun`, when
+/// no build has passed since its last such change.
+fn unbuilt(spec: &Spec, turn: &Turn, begun: usize) -> Option<Message> {
+    // A helper's edits are its parent's to build, a person watching runs
+    // what they like, and past the round cap or in plan mode nothing runs.
+    if !unwatched(spec) || turn.capped().is_some() || !turn.runs_commands() {
+        return None;
+    }
+    if refused(spec, "run_command").is_some() {
+        return None;
+    }
+    let workspace = spec.connection.workspace.as_deref()?;
+    let messages = spec.transcript.conversation.messages.get(begun..)?;
+    let files = unbuilt_files(messages, workspace);
+    if files.is_empty() || !crate::store::current_settings().verifies_edits() {
+        return None;
+    }
+    let commands = crate::builds::commands(workspace, &files);
+    if commands.is_empty() {
+        return None;
+    }
+    Some(Message {
+        role: "user".into(),
+        content: crate::builds::notice(&commands),
+        notice: true,
+        // Folded into the run, so the window keeps the task it is for.
+        folded: true,
+        ..Default::default()
+    })
+}
+
+/// The TypeScript and JavaScript files the tool results in `messages`
+/// changed after the last build that passed, each once and as the model
+/// named them.
+fn unbuilt_files(messages: &[Message], workspace: &Path) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for result in messages.iter().filter(|message| message.role == "tool") {
+        let args = tools::parse_args_for(&result.name, &result.args).unwrap_or_default();
+        if result.name == "run_command" {
+            let line = args["command"].as_str().unwrap_or_default();
+            if crate::builds::builds(line) && passed(result, &args, workspace) {
+                files.clear();
+            }
+            continue;
+        }
+        if result.is_error {
+            continue;
+        }
+        let changed = match result.name.as_str() {
+            "write_file" | "edit_file" => args["path"]
+                .as_str()
+                .map(str::to_owned)
+                .into_iter()
+                .collect(),
+            crate::patch::APPLY_PATCH => crate::patch::paths(&args).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        for path in changed {
+            if crate::builds::source(&path) && !files.contains(&path) {
+                files.push(path);
+            }
+        }
+    }
+    files
 }
 
 /// The source files the tool results in `messages` changed after the last
@@ -6720,6 +6805,83 @@ pub(crate) mod tests {
 
     fn write_to(path: &str) -> (&'static str, Value) {
         ("write_file", json!({"path": path, "content": "x = 1\n"}))
+    }
+
+    /// A project in `dir` whose package.json builds with `tsc`, and a stand-in
+    /// `tsc` that passes.
+    fn typescript_project(dir: &Path) {
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"scripts": {"build": "tsc", "test": "vitest"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("tsc"), "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join("tsc"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_typescript_change_whose_tests_passed_is_sent_back_once_to_build() {
+        let _data = data("unbuilt");
+        let dir = scratch("unbuilt");
+        typescript_project(&dir);
+        let ended = "Built and fixed. Done: a.ts holds the change.";
+        let (endpoint, provider) = provider(vec![
+            reply("", &[write_to("src/a.ts")]),
+            // Its tests pass, so the edits count as checked.
+            reply("", &[command("mkdir out")]),
+            reply("Done.", &[]),
+            reply(ended, &[]),
+        ]);
+        let report = finished(own(endpoint, &dir, AGENTS + 1_800));
+        let sent = provider.sent();
+        assert_eq!(report.status, Outcome::Done);
+
+        let asked = messages(&sent[3]).last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(asked, crate::builds::notice(&["npm run build".to_owned()]));
+        // Once: the answer after it ends the run.
+        assert_eq!(report.text, ended);
+    }
+
+    #[test]
+    fn a_typescript_change_built_since_sends_no_run_back() {
+        let _data = data("built");
+        let dir = scratch("built");
+        typescript_project(&dir);
+        let (endpoint, provider) = provider(vec![
+            reply("", &[write_to("src/a.ts")]),
+            reply("", &[command("./tsc")]),
+            reply("Done.", &[]),
+        ]);
+        let report = finished(own(endpoint, &dir, AGENTS + 1_810));
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(provider.sent().len(), 3);
+        assert_eq!(report.text, "Done.");
+    }
+
+    #[test]
+    fn a_watched_run_is_never_sent_back_to_build() {
+        let _data = data("unbuilt-watched");
+        let dir = scratch("unbuilt-watched");
+        typescript_project(&dir);
+        let (endpoint, provider) = provider(vec![
+            reply("", &[write_to("src/a.ts")]),
+            reply("", &[command("mkdir out")]),
+            reply("Done.", &[]),
+        ]);
+        let mut spec = own(endpoint, &dir, AGENTS + 1_820);
+        spec.connection.human = true;
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(provider.sent().len(), 3);
+        assert_eq!(report.text, "Done.");
     }
 
     #[test]

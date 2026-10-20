@@ -15,6 +15,7 @@ pub mod auth;
 mod bench;
 pub mod browser;
 pub mod budget;
+mod builds;
 pub mod cache_miss;
 pub mod cancel;
 mod cat;
