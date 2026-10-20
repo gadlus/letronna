@@ -4665,7 +4665,9 @@ fn stream(
         if stands || timeouts > 1 {
             return Err(failure);
         }
-        let Some(mut retry) = crate::retry::after(&failure, tried, connection.unattended) else {
+        let Some(mut retry) =
+            crate::retry::after(&failure, tried, connection.unattended, connection.deadline)
+        else {
             // An overflow never passes by itself, so it is never waited out:
             // it gets here on the try it came back on. The one request sent
             // again after it has tries of its own for what does pass.

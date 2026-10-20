@@ -9,6 +9,10 @@
 //! `Retry-After`. Someone watching would rather be told than sit through a
 //! wait of minutes, so a longer one gives up at once; a schedule or a chat
 //! app, which nobody may be watching, gets more tries and a longer wait.
+//! One of those that must end by a deadline, as a benchmark's run does,
+//! keeps trying past them while a wait still ends before it: a gateway down
+//! for longer than eight minutes would otherwise end the run with most of
+//! its time unused, and giving up gains it nothing.
 //! A reply whose stream is cut part way is tried again the same way, and
 //! what it had said so far is dropped, never kept or run as if whole.
 //!
@@ -39,6 +43,9 @@ const PATIENCE: Duration = Duration::from_secs(60);
 /// minutes is a limit for the hour or the day, better reported than slept
 /// through while every other schedule queues behind the run.
 const PATIENCE_UNATTENDED: Duration = Duration::from_secs(10 * 60);
+/// How long before its deadline a run nobody watches stops trying again
+/// past its usual tries, so the wait never runs into the end of the run.
+const DEADLINE_MARGIN: Duration = Duration::from_secs(60);
 /// How often a wait looks to see whether the turn was stopped.
 const SLICE: Duration = Duration::from_millis(100);
 
@@ -103,21 +110,46 @@ pub fn passes(kind: FailureKind) -> bool {
 }
 
 /// The try to make after `tried` of them failed, the last with `failure`, or
-/// `None` when it is not worth making.
-pub fn after(failure: &Failure, tried: u32, unattended: bool) -> Option<Retry> {
+/// `None` when it is not worth making. A run nobody watches that must end
+/// by `deadline` goes on past its usual tries while the wait still ends
+/// `DEADLINE_MARGIN` before it.
+pub fn after(
+    failure: &Failure,
+    tried: u32,
+    unattended: bool,
+    deadline: Option<Instant>,
+) -> Option<Retry> {
     let (of, patience) = if unattended {
         (TRIES_UNATTENDED, PATIENCE_UNATTENDED)
     } else {
         (TRIES, PATIENCE)
     };
-    if !passes(failure.kind) || tried >= of {
+    if !passes(failure.kind) {
         return None;
     }
     let wait = backoff(tried, jitter()).max(failure.retry_after.unwrap_or_default());
-    (wait <= patience).then_some(Retry {
+    if wait > patience {
+        return None;
+    }
+    if tried < of {
+        return Some(Retry {
+            kind: failure.kind,
+            attempt: tried + 1,
+            of,
+            wait,
+            dropped: false,
+        });
+    }
+    let deadline = deadline.filter(|_| unattended)?;
+    let left =
+        (deadline.saturating_duration_since(Instant::now())).checked_sub(wait + DEADLINE_MARGIN)?;
+    // The tries still to come at the longest wait, so the count the
+    // frontends show stays ahead of the try being made.
+    let more = u32::try_from(left.as_secs() / LONGEST_WAIT.as_secs()).unwrap_or(u32::MAX);
+    Some(Retry {
         kind: failure.kind,
         attempt: tried + 1,
-        of,
+        of: (tried + 1).saturating_add(more),
         wait,
         dropped: false,
     })
@@ -212,35 +244,69 @@ mod tests {
             FailureKind::Unknown,
         ];
         for kind in again {
-            assert!(after(&failure(kind, None), 1, false).is_some(), "{kind:?}");
+            assert!(
+                after(&failure(kind, None), 1, false, None).is_some(),
+                "{kind:?}"
+            );
         }
         for kind in never {
-            assert!(after(&failure(kind, None), 1, false).is_none(), "{kind:?}");
-            assert!(after(&failure(kind, None), 1, true).is_none(), "{kind:?}");
+            assert!(
+                after(&failure(kind, None), 1, false, None).is_none(),
+                "{kind:?}"
+            );
+            assert!(
+                after(&failure(kind, None), 1, true, None).is_none(),
+                "{kind:?}"
+            );
         }
     }
 
     #[test]
     fn six_tries_while_watched_and_twenty_when_not() {
         let overloaded = failure(FailureKind::Overloaded, None);
-        let next = after(&overloaded, 5, false).unwrap();
+        let next = after(&overloaded, 5, false, None).unwrap();
         assert_eq!((next.attempt, next.of), (6, 6));
-        assert!(after(&overloaded, 6, false).is_none());
-        let next = after(&overloaded, 19, true).unwrap();
+        assert!(after(&overloaded, 6, false, None).is_none());
+        let next = after(&overloaded, 19, true, None).unwrap();
         assert_eq!((next.attempt, next.of), (20, 20));
-        assert!(after(&overloaded, 20, true).is_none());
+        assert!(after(&overloaded, 20, true, None).is_none());
+    }
+
+    #[test]
+    fn a_run_with_a_deadline_keeps_trying_while_a_wait_ends_before_it() {
+        let overloaded = failure(FailureKind::Overloaded, None);
+        let later = Instant::now() + Duration::from_secs(10 * 60);
+        let next = after(&overloaded, 20, true, Some(later)).unwrap();
+        assert_eq!(next.attempt, 21);
+        assert!(next.of > 21, "{}", next.of);
+        let next = after(&overloaded, 40, true, Some(later)).unwrap();
+        assert!(next.of > 41, "{}", next.of);
+        // Not once the wait would reach the last minute, nor while watched.
+        let soon = Instant::now() + Duration::from_secs(90);
+        assert!(after(&overloaded, 20, true, Some(soon)).is_none());
+        assert!(after(&overloaded, 6, false, Some(later)).is_none());
+        // What never passes is never waited out, deadline or not.
+        let refused = failure(FailureKind::Auth, None);
+        assert!(after(&refused, 1, true, Some(later)).is_none());
     }
 
     #[test]
     fn retry_after_is_the_shortest_wait() {
         let asked = Duration::from_secs(20);
-        let next = after(&failure(FailureKind::RateLimit, Some(asked)), 1, false).unwrap();
+        let next = after(
+            &failure(FailureKind::RateLimit, Some(asked)),
+            1,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(next.wait, asked);
         // A shorter one leaves the doubling as it is.
         let next = after(
             &failure(FailureKind::RateLimit, Some(Duration::ZERO)),
             4,
             false,
+            None,
         )
         .unwrap();
         assert!(next.wait >= Duration::from_secs(4), "{:?}", next.wait);
@@ -249,10 +315,13 @@ mod tests {
     #[test]
     fn a_wait_over_a_minute_gives_up_at_once_unless_nobody_is_watching() {
         let long = failure(FailureKind::RateLimit, Some(Duration::from_secs(61)));
-        assert!(after(&long, 1, false).is_none());
-        assert_eq!(after(&long, 1, true).unwrap().wait, Duration::from_secs(61));
+        assert!(after(&long, 1, false, None).is_none());
+        assert_eq!(
+            after(&long, 1, true, None).unwrap().wait,
+            Duration::from_secs(61)
+        );
         let longer = failure(FailureKind::RateLimit, Some(Duration::from_secs(3_600)));
-        assert!(after(&longer, 1, true).is_none());
+        assert!(after(&longer, 1, true, None).is_none());
     }
 
     #[test]
