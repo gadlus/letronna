@@ -1,4 +1,5 @@
-//! Jev, a small decision model, ranks the tools `find_tools` searches.
+//! Jev, a small decision model, ranks the tools `find_tools` searches, and
+//! checks the names a quick model gives a session (`title`).
 //!
 //! Matching a search's words to tools' names finds a tool only when the
 //! model guesses the words its name and description use: "ping the team"
@@ -183,6 +184,79 @@ pub(crate) fn rank(connection: &Connection, query: &str, tools: &[(&str, &str)])
             noted(why);
             None
         }
+    }
+}
+
+/// Which of `names` says best what a chat is about, from what was `said`
+/// in it, as Jev judges it for a session on `connection`: `Some(Some(n))`
+/// for the `n`th, `Some(None)` when none fits, and `None` when Jev is not
+/// asked or gives nothing that can be read, which leaves the names as they
+/// were given. It goes where a search's question goes, as the settings say,
+/// but to Letronna's own Jev only from a chat already on Letronna's gateway
+/// (`at_letronna`).
+pub(crate) fn best_name(
+    connection: &Connection,
+    said: &str,
+    names: &[String],
+    at_letronna: bool,
+) -> Option<Option<usize>> {
+    if said.trim().is_empty() || names.is_empty() {
+        return None;
+    }
+    let route = route(connection).ok()?;
+    if !may_check_names(&route, at_letronna) {
+        return None;
+    }
+    let body = name_request(&route.model, said, names);
+    let answer = ask(&route, &body).map_err(noted).ok()?;
+    read_name(&answer, names.len()).map_err(noted).ok()
+}
+
+/// Whether a chat's words may go to Jev by `route` to have its names
+/// checked. Unlike a search's words, they are the chat's own text, which
+/// goes only to the chat's gateway: Letronna's Jev hears them only from a
+/// chat on Letronna's (`at_letronna`), and a Jev the user set up as tool
+/// search allows.
+fn may_check_names(route: &Route, at_letronna: bool) -> bool {
+    at_letronna || route.url != format!("{}/systemone", crate::auth::hosted_base())
+}
+
+/// The question put to Jev about a chat's `names`: which says best what
+/// was `said` in it, or none.
+fn name_request(model: &str, said: &str, names: &[String]) -> Value {
+    let mut criteria = Map::new();
+    for (n, name) in names.iter().enumerate() {
+        criteria.insert((n + 1).to_string(), name.as_str().into());
+    }
+    criteria.insert(
+        NONE.into(),
+        "None of these says what the chat is about.".into(),
+    );
+    json!({
+        "model": model,
+        "state": {"chat": said},
+        "questions": {
+            "name": {
+                "type": "choice",
+                "instructions": "Which name says best what the `chat` is about, for finding it again in a list of chats? Pick `none` when none of them does.",
+                "criteria": criteria,
+            },
+        },
+    })
+}
+
+/// The name Jev's `answer` picks among `count`, by its place, `None` when
+/// it picks none, or why it says nothing that can be used.
+fn read_name(answer: &Value, count: usize) -> Result<Option<usize>, &'static str> {
+    let picked = answer["answers"]["name"]["choice"]
+        .as_str()
+        .ok_or("its answer had no choice")?;
+    if picked == NONE {
+        return Ok(None);
+    }
+    match picked.parse::<usize>() {
+        Ok(n) if (1..=count).contains(&n) => Ok(Some(n - 1)),
+        _ => Err("it chose a name it was not offered"),
     }
 }
 
@@ -431,6 +505,40 @@ fn noted(why: &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jev_is_asked_which_name_fits_with_none_as_a_choice() {
+        let names = ["Login redirect loop".to_owned(), "Auth fix".to_owned()];
+        let body = name_request("jev-latest", "The first message:\nfix it", &names);
+        assert_eq!(body["state"]["chat"], "The first message:\nfix it");
+        let criteria = &body["questions"]["name"]["criteria"];
+        assert_eq!(criteria["1"], "Login redirect loop");
+        assert_eq!(criteria["2"], "Auth fix");
+        assert!(criteria[NONE].is_string());
+        assert_eq!(body["questions"]["name"]["type"], "choice");
+    }
+
+    #[test]
+    fn letronna_s_jev_checks_the_names_only_of_a_chat_on_letronna() {
+        // Signed in, on the user's own key: tool search may ask through the
+        // account, but the chat's words are not sent there to check a name.
+        let account = route_of(&on(HOSTED), "", "", "", None, Some("tok")).unwrap();
+        assert!(!may_check_names(&account, false));
+        assert!(may_check_names(&account, true));
+        // A Jev key of the user's own is theirs to send to.
+        let own = route_of(&on(HOSTED), "", "", "", Some("ts-key"), Some("tok")).unwrap();
+        assert!(may_check_names(&own, false));
+    }
+
+    #[test]
+    fn jev_s_pick_of_a_name_is_read_by_its_place() {
+        let answer = |choice: &str| json!({"answers": {"name": {"choice": choice}}});
+        assert_eq!(read_name(&answer("2"), 3), Ok(Some(1)));
+        assert_eq!(read_name(&answer(NONE), 3), Ok(None));
+        assert!(read_name(&answer("4"), 3).is_err());
+        assert!(read_name(&answer("0"), 3).is_err());
+        assert!(read_name(&json!({}), 3).is_err());
+    }
 
     fn on(endpoint: &str) -> Connection {
         Connection {

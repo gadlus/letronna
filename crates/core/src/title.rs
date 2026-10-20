@@ -3,7 +3,12 @@
 //! A session starts out called by the first line of what was asked
 //! (`store::name_from`). Once its first reply is in, the front end asks
 //! `name` for something better: a model reads the first message and the
-//! start of the reply, offers a few short names, and the first is kept.
+//! start of the reply, and offers three short names. A name from the
+//! chat's own model is kept as given; one from a quicker model is checked
+//! by Jev, where it may be asked, which picks the name that fits best, or
+//! finds none fitting and hands on to the next model. Letronna's own Jev
+//! checks only a chat on Letronna's gateway, as the chat's words go nowhere
+//! else.
 //!
 //! Which model is a setting, `title_model`. Left empty it is chosen
 //! automatically: Letronna's own when the chat is already on Letronna's
@@ -79,15 +84,19 @@ pub fn name(chat: &Connection, messages: &[Message]) -> Result<String, String> {
     let Some(said) = said(messages) else {
         return Err("Nothing has been said yet to name the session after.".into());
     };
+    let at_letronna = hosted(&chat.endpoint);
     let namers = order(
         &settings.title_model,
         &settings.side_model,
         &chat.model,
-        hosted(&chat.endpoint),
+        at_letronna,
         crate::auth::signed_in(),
     );
     let mut why = String::from("No model gave a name.");
     for namer in namers {
+        // The chat's own model is taken at its word; a quicker one is
+        // checked.
+        let own = namer == Namer::Chat;
         let connection = match namer {
             Namer::Letronna => on_letronna(chat),
             Namer::Model(model) => Connection {
@@ -96,9 +105,19 @@ pub fn name(chat: &Connection, messages: &[Message]) -> Result<String, String> {
             },
             Namer::Chat => chat.clone(),
         };
-        match names(&connection, &said) {
-            Ok(names) => return Ok(names[0].clone()),
-            Err(failed) => why = failed,
+        let names = match names(&connection, &said) {
+            Ok(names) => names,
+            Err(failed) => {
+                why = failed;
+                continue;
+            }
+        };
+        let judged = (!own)
+            .then(|| crate::jev::best_name(chat, &said, &names, at_letronna))
+            .flatten();
+        match kept(&names, judged) {
+            Some(name) => return Ok(name),
+            None => why = "None of the names a quick model gave fit the chat.".into(),
         }
     }
     Err(why)
@@ -131,6 +150,17 @@ fn order(
             .chain([Namer::Chat])
             .collect(),
         set => other(set).into_iter().chain([Namer::Chat]).collect(),
+    }
+}
+
+/// The name kept from `names`, with what Jev made of them, `judged`:
+/// the one it picked, none when it found none fitting, and the first
+/// when it was not asked or said nothing that could be used.
+fn kept(names: &[String], judged: Option<Option<usize>>) -> Option<String> {
+    match judged {
+        Some(Some(n)) => names.get(n).cloned(),
+        Some(None) => None,
+        None => names.first().cloned(),
     }
 }
 
@@ -310,6 +340,15 @@ mod tests {
         // A name that starts with a number keeps it.
         assert_eq!(candidates("2026 budget review"), ["2026 budget review"]);
         assert!(candidates("\n...\n\"\"").is_empty());
+    }
+
+    #[test]
+    fn a_name_jev_finds_unfitting_is_not_kept_and_one_it_picks_is() {
+        let names: Vec<String> = ["One", "Two", "Three"].map(String::from).into();
+        assert_eq!(kept(&names, Some(Some(2))), Some("Three".into()));
+        assert_eq!(kept(&names, Some(None)), None);
+        // Not asked, or no answer that could be read: the first stands.
+        assert_eq!(kept(&names, None), Some("One".into()));
     }
 
     #[test]
