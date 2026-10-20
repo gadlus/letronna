@@ -13,6 +13,12 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ## [Unreleased]
 
+### Added
+- **App** — A click on the tray icon on Windows, or the menu bar icon on macOS, opens its menu rather than only the window: Open Letronna, a new session, any of the six sessions used last (with "needs you", "working" or "new" beside one that waits), quick entry, Settings, updates, the Activity page while something runs, and Quit. The Windows menu says the account, credit and model at the top, as the Mac's does; a double-click on the Windows icon opens the window.
+
+### Fixed
+- **macOS** — Closing the window keeps Letronna running in the Dock and the menu bar instead of quitting it. Open Letronna in the menu bar menu, the Dock icon or a notification brings the window back out of the Dock and in front, showing at once what was opened from the menu. Quit in the menu bar menu, or Cmd+Q, ends it.
+
 ## [0.1.0-alpha.4.1] - 2026-10-20
 
 ### Added

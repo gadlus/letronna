@@ -11,7 +11,7 @@ Both front ends sit on the same core and share the account, sessions and setting
 - **Command palette**: `Ctrl+K`. The whole window is reachable from the keyboard.
 - **Going back**: right-click a message and pick Rewind to here, or press `Esc` twice in an empty composer and then `W` on the message. Choose whether the code and the conversation go back, the conversation alone, or the code alone.
 - **Session names**: a model names each session once its first reply is in. Settings › Model › Session names turns it off or picks the model; Name it again in a session's menu asks for a new name.
-- **Tray**: on Windows and Linux, closing the window keeps Letronna in the tray.
+- **Tray and menu bar**: closing the window keeps Letronna running. On Windows it goes to the tray, on Linux and macOS to the taskbar or Dock. On Windows and macOS a click on the tray or menu bar icon opens its menu: Open Letronna, a new session, the sessions used last and what each is waiting on, quick entry, Settings, updates, and Quit, which is how Letronna ends (`Cmd+Q` too on a Mac). A double-click on the Windows icon, or a click on the Dock icon on a Mac, opens the window straight away. On Linux the panel's menu for the icon has Open, quick entry, updates and Quit.
 
 ## Command line
 

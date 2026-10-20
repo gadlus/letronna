@@ -7,7 +7,16 @@ use crate::prelude::*;
 pub(crate) fn show(window: &mut Window) {
     #[cfg(windows)]
     win::set_visible(window, true);
+    #[cfg(target_os = "macos")]
+    mac::bring_back(window);
     window.activate_window();
+}
+
+/// Make the app the active one, from the menu bar while the user's click on
+/// it is still being handled. Elsewhere `show` is enough.
+#[cfg(target_os = "macos")]
+pub(crate) fn activate_app() {
+    mac::activate_app();
 }
 
 /// Get the window out of the way when the user closes it while a tray icon is
@@ -18,7 +27,9 @@ pub(crate) fn hide(window: &mut Window) {
     {
         win::set_visible(window, false);
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    mac::minimize_later(window);
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         window.minimize_window();
     }
@@ -44,22 +55,74 @@ pub(crate) use win::{hwnd, make_topmost};
 #[allow(unexpected_cfgs)]
 mod mac {
     use crate::prelude::*;
-    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+    use objc::runtime::{BOOL, NO, Object, Sel, YES};
+    use objc::{class, msg_send, sel, sel_impl};
 
-    pub(crate) fn pin_appearance(window: &Window, dark: Option<bool>) {
+    /// The NSWindow behind a gpui window.
+    fn ns_window(window: &Window) -> Option<*mut Object> {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        let Ok(handle) = HasWindowHandle::window_handle(window) else {
-            return;
-        };
+        let handle = HasWindowHandle::window_handle(window).ok()?;
         let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-            return;
+            return None;
         };
         let view = h.ns_view.as_ptr() as *mut Object;
+        let ns_window: *mut Object = unsafe { msg_send![view, window] };
+        (!ns_window.is_null()).then_some(ns_window)
+    }
+
+    /// Send `selector` to `target` once the run loop is next free. AppKit
+    /// tells gpui about a window that minimises or comes back by calling
+    /// into it there and then, and every caller here is in the middle of a
+    /// gpui update; gpui's own `activate_window` waits for the same reason.
+    unsafe fn later(target: *mut Object, selector: Sel) {
+        let nil: *mut Object = std::ptr::null_mut();
         unsafe {
-            let ns_window: *mut Object = msg_send![view, window];
-            if ns_window.is_null() {
-                return;
+            let _: () = msg_send![target,
+                performSelectorOnMainThread: selector
+                withObject: nil
+                waitUntilDone: NO];
+        }
+    }
+
+    /// Bring the app forward with its window: out of the Dock if it was
+    /// minimised, and out of hiding if the app was hidden. gpui's
+    /// `activate_window` orders the window front but leaves a minimised one
+    /// in the Dock and the app behind whatever had the focus.
+    pub(crate) fn bring_back(window: &Window) {
+        let Some(ns_window) = ns_window(window) else {
+            return;
+        };
+        unsafe {
+            let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+            later(app, sel!(unhide:));
+            let minimized: BOOL = msg_send![ns_window, isMiniaturized];
+            if minimized == YES {
+                later(ns_window, sel!(deminiaturize:));
             }
+        }
+        activate_app();
+    }
+
+    pub(crate) fn activate_app() {
+        unsafe {
+            let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![app, activateIgnoringOtherApps: YES];
+        }
+    }
+
+    /// Minimise the window into the Dock, after the close that asked for it
+    /// has been answered.
+    pub(crate) fn minimize_later(window: &Window) {
+        if let Some(ns_window) = ns_window(window) {
+            unsafe { later(ns_window, sel!(miniaturize:)) };
+        }
+    }
+
+    pub(crate) fn pin_appearance(window: &Window, dark: Option<bool>) {
+        let Some(ns_window) = ns_window(window) else {
+            return;
+        };
+        unsafe {
             // A nil appearance is the system's own.
             let mut appearance: *mut Object = std::ptr::null_mut();
             if let Some(dark) = dark {

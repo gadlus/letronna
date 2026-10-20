@@ -2432,7 +2432,7 @@ impl Chat {
     }
 
     /// Show the window, on session `id` if it is still there.
-    fn open_told(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_told(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         crate::platform::window::show(window);
         let Some(index) = self.store.index_of(id) else {
             return;

@@ -761,7 +761,11 @@ fn main() {
     // still in a file is moved there.
     letronna_core::vault::open();
     letronna_core::diag::init("gui");
-    gpui_platform::application().with_assets(Assets).run(|cx| {
+    let app = gpui_platform::application().with_assets(Assets);
+    // A click on the Dock icon while the window is in the Dock brings it
+    // back, as it does for any Mac app; elsewhere nothing calls it.
+    app.on_reopen(platform::tray::show_main_window);
+    app.run(|cx| {
         letronna_core::diag::mark("app");
         gpui_component::init(cx);
         highlight::register();
@@ -851,7 +855,9 @@ fn main() {
             .clone();
         platform::hotkey::init(&hotkey_spec, cx);
         // With a tray to bring it back, closing the window tucks the app
-        // away; without one that would strand it, so let it close.
+        // away: hidden on Windows, in the Dock elsewhere. Without one that
+        // would strand it, so let it close; the tray's Quit, or Cmd+Q on a
+        // Mac, is what ends it.
         if platform::tray::available() {
             let _ = window.update(cx, |_, window, cx| {
                 window.on_window_should_close(cx, |window, _| {
@@ -860,6 +866,18 @@ fn main() {
                 });
             });
         }
+        // Back from the Dock or the tray, the window showed the frame it
+        // went away with until something else redrew it, so a session
+        // opened from the menu meanwhile waited for the pointer to move.
+        let _ = window.update(cx, |_, window, _| {
+            window
+                .observe_window_visibility(|visibility, window, _| {
+                    if visibility.is_visible() {
+                        window.refresh();
+                    }
+                })
+                .detach();
+        });
         cx.activate(true);
     });
 }
