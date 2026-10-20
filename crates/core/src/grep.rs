@@ -1466,7 +1466,9 @@ mod tests {
             "secrets",
             &[
                 ("app/.ssh/id_rsa", "TOKEN=1"),
-                ("app/.env.local", "TOKEN=2"),
+                // Not `.env.local`: many a global gitignore lists it, and a
+                // file ignored there is never walked to be counted.
+                ("app/.env.production", "TOKEN=2"),
                 (".env", "TOKEN=3"),
                 (".git-credentials", "https://me:TOKEN@host"),
                 (".env.example", "TOKEN="),

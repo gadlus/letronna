@@ -6887,8 +6887,9 @@ mod tests {
         assert!(
             told.ends_with(&format!(
                 "or stop_job if you no longer need it. Background jobs are stopped when this \
-                 run ends; if it must keep running after that, start it detached instead, as with \
-                 `{DETACHED}`, and check that it answers."
+                 run ends; if it must keep running after that, start it detached instead, in a \
+                 plain run_command and not as a job, as with `{DETACHED}`, and check that it \
+                 answers."
             )),
             "{said}"
         );
@@ -7162,8 +7163,8 @@ mod tests {
         assert!(
             told.ends_with(&format!(
                 "{what_to_do} Background jobs are stopped when this run ends; if it must keep \
-                 running after that, start it detached instead, as with `{DETACHED}`, and check \
-                 that it answers."
+                 running after that, start it detached instead, in a plain run_command and not \
+                 as a job, as with `{DETACHED}`, and check that it answers."
             )),
             "{said}"
         );

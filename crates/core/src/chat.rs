@@ -15214,6 +15214,11 @@ mod tests {
 
     #[test]
     fn system_prompt_bytes_are_identical_across_default_edits_auto_dont_ask_and_bypass() {
+        // The prompt reads the data folder, which other tests point elsewhere
+        // between the two times it is built.
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let modes = [
             Mode::Default,
             Mode::AcceptEdits,
@@ -15282,6 +15287,11 @@ mod tests {
 
     #[test]
     fn a_switch_while_tools_run_is_told_after_their_results() {
+        // The prompt reads the data folder, which other tests point elsewhere
+        // between the two times it is built.
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut session = in_mode(Mode::Default);
         let mut window = vec![
             said("user", "fix the build"),
