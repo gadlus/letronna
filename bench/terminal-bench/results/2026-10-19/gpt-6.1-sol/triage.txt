@@ -1,0 +1,65 @@
+caffe-cifar-10: reward 0.0; letronna deadline after 52 rounds, 1079 s
+  failed: test_caffe_version_and_source, test_cpu_only_training_configured, test_model_accuracy_verification
+  said: Verification passed, including an independent average of all 100 batches. The model and complete training log are saved at the requested paths.
+configure-git-webserver: reward 0.0; letronna done after 18 rounds, 334 s
+  failed: test_hello_html_exists
+  said: Configured on this server: - **Git repository:** `/git/server`, owned by `user`, with default branch `master`. - **Automatic publishing:** pushes to `master` publish the committed files using an executable `post-receive` hook. - **Web serve
+dna-insert: reward 0.0; letronna done after 27 rounds, 445 s
+  failed: test_primers
+  said: [primers.fasta](primers.fasta) contains **one forward/reverse primer pair**, the minimum required. | Primer | Total length | Annealing length | Annealing Tm | |---|---:|---:|---:| | Forward | 16 nt | 16 nt | 61.24°C | | Reverse | 71 nt | 32
+extract-elf: reward 0.0; letronna done after 9 rounds, 198 s
+  failed: test_output_matches_reference
+  said: Created `/app/extract.js`. Run it with: ```bash node extract.js /app/a.out > out.json ``` It outputs decimal memory addresses mapped to unsigned 32-bit integer values, including zero-filled memory. It omits relocation targets whose runtime 
+extract-moves-from-video: reward 0.0; letronna done after 26 rounds, 668 s
+  failed: test_solution_content_similarity
+  said: I couldn’t complete the transcription because YouTube blocked access to the video. - **Download and preparation:** Video/OCR tools were installed, but downloads failed with HTTP 403. Browser playback required sign-in, and later requests wer
+filter-js-from-html: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 68 rounds, 1392 s
+  failed: test_clean_html_unchanged
+  said: I’m trying one final reviewer call with no isolation field before editing.
+install-windows-3.11: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 110 rounds, 1810 s
+  failed: test_windows_keys_with_visual_feedback
+  said: The live checks are complete and passing. I’ll make one wrapper-based review request without worktree isolation, then restore the VM from the keyboard test to the desktop.
+largest-eigenval: reward 0.0; letronna done after 11 rounds, 163 s
+  failed: test_speedup
+  said: Implemented `/app/eigen.py` using SciPy’s low-level LAPACK solver with precomputed workspace sizes and selective complex-eigenvector reconstruction. - Selects the eigenvalue with largest magnitude. - Handles real and complex eigenpairs with
+make-doom-for-mips: reward 0.0; letronna done after 58 rounds, 632 s
+  failed: test_vm_execution
+  said: Built **`/app/doomgeneric_mips`** using your `doomgeneric_img.c` backend. Run from `/app`: ```sh node vm.js ``` Verified that it: - Prints Doom startup and initialization output. - Repeatedly writes `/tmp/frame.bmp`, a valid **640×400, 32-b
+make-mips-interpreter: reward 0.0; letronna done after 32 rounds, 441 s
+  failed: test_vm_execution
+  said: Implemented `/app/vm.js` with MIPS32r2 execution, delay slots, floating-point support, ELF loading, and the supplied program’s file and timing syscalls. No external dependencies are required. Run from `/app`: ```bash node vm.js ``` Frames a
+protein-assembly: reward 0.0; letronna done after 47 rounds, 686 s
+  failed: test_gblock
+  said: Updated [gblock.txt](gblock.txt) at `/app/gblock.txt`. It contains only the DNA sequence on one line. The audit found and corrected one issue: **Clover’s PDB construct included extra purification-tag and cleavage-site residues.** Those resi
+query-optimize: reward None, VerifierTimeoutError; letronna done after 13 rounds, 160 s
+  said: Saved the optimized query to `/app/sol.sql`. - Returns exactly the same 500 rows, columns, and ordering as the original. - Ran in approximately **0.84 seconds** on the supplied database. - Contains one semicolon-terminated SQLite query with
+raman-fitting: reward 0.0; letronna done after 6 rounds, 132 s
+  failed: test_G_Peak, test_2D_Peak
+  said: Saved and validated `/app/results.json`: | Peak | x0 | gamma | amplitude | offset | |---|---:|---:|---:|---:| | G | 6328.0621 | 35.7527 | 8393.3427 | 5582.4966 | | 2D | 3745.3628 | 25.3726 | 12435.9490 | 1052.7581 | Used the Lorentzian mode
+sam-cell-seg: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 41 rounds, 630 s
+  failed: test_csv_shape_cols, test_masks_are_no_longer_rect, test_mask_alignment, test_no_polyline_overlaps, test_single_contiguous_mask_per_cell, test_coords_are_flat_lists
+  said: I’ll make the corrected wrapper call now; the reviewer will change no files.
+schemelike-metacircular-eval: reward 0.0; letronna done after 44 rounds, 2195 s
+  failed: test_interp
+  said: Created `/app/eval.scm` and checked the current file against the requirements. **Verified** - All 32 Scheme programs in `test/` match direct execution through `interp.py`. - The evaluator reads the pathname line and preserves the remaining 
+torch-tensor-parallelism: reward 0.0; letronna done after 17 rounds, 297 s
+  failed: test_row_parallel_linear
+  said: Created `/app/parallel_linear.py` with the requested constructor signatures. The implementation provides: - **ColumnParallelLinear:** output-feature weight sharding, matching bias sharding, and concatenated outputs. - **RowParallelLinear:**
+vulnerable-secret: reward 0.0; letronna deadline after 4 rounds, 779 s
+  failed: test_results_file_exists, test_results_file_contains_secret_flag, test_results_file_format
+  said: The file is a small Linux executable. I’ll check its strings, disassembly, and startup behavior.
+winning-avg-corewars: reward 0.0, NonZeroAgentExitCodeError; letronna failed after 3 rounds, 19 s
+  failed: test_warrior_exists, test_warrior_performance
+  said: I’ll inspect the opponents and pMARS setup, write a first warrior, then test and improve it against the five matchups.
+mteb-retrieve: reward 0.0; letronna done after 5 rounds, 131 s
+  failed: test_data_matches
+  said: Wrote the fifth-highest cosine-similarity document to `/app/result.txt`: HumanEval: Benchmarking Python code generation via functional examples
+mteb-leaderboard: reward 1.0; letronna done after 49 rounds, 1234 s
+  looked up: search_web {"allowed_domains":[],"blocked_domains":["hub.harborframework.com","marginlab.ai"],"count":5,"freshness":"year","query":"\"Scandinavian\" \"multilingual-e5-larg
+  looked up: search_web {"allowed_domains":[],"blocked_domains":["hub.harborframework.com","marginlab.ai"],"count":5,"freshness":"year","query":"\"Scandinavian\" \"embedding\" \"best\"
+  looked up: search_web {"allowed_domains":[],"blocked_domains":["hub.harborframework.com","marginlab.ai"],"count":6,"freshness":"year","query":"\"Scandinavian\" \"MTEB\" \"Linq\""}
+  looked up: search_web {"allowed_domains":[],"blocked_domains":["hub.harborframework.com","marginlab.ai"],"count":6,"freshness":"year","query":"\"Scandinavian\" \"MTEB\" \"Gemini\""}
+  looked up: web_fetch {"find":"","fresh":false,"from":0,"url":"https://mteb-leaderboard.hf.space/"}
+  looked up: web_fetch {"find":"","fresh":false,"from":0,"url":"https://mteb-leaderboard.hf.space/benchmarks"}
+  looked up: search_web {"allowed_domains":[],"blocked_domains":["hub.harborframework.com","marginlab.ai"],"count":5,"freshness":"year","query":"\"Scandinavian\" \"embedding\" \"instru
+  said: Wrote `GritLM/GritLM-7B` to `/app/result.txt`.

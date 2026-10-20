@@ -17,6 +17,7 @@ up its own task as a fail.
 | | improved | DeepSeek V4 Pro (partial, 22 tasks) | 13/19 (68.4%) |
 | | improved | Opus 5.5 (partial, 26 tasks) | 14/22 (63.6%) |
 | [19–20 October](results/2026-10-19/README.md) | new | Sonnet 5.5 | 67/81 (82.7%) |
+| | new | GPT-6.1 Sol | 66/81 (81.5%) |
 | | new | Opus 5.5 | 64/81 (79.0%) |
 | | new | GPT-6 Sol | 59/81 (72.8%) |
 | | new | DeepSeek V4.1 Flash | 59/81 (72.8%) |

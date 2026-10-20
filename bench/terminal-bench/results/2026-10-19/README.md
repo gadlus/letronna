@@ -1,15 +1,16 @@
 # Terminal-Bench 2.0, 19–20 October 2026
 
-All 89 tasks, one trial each, on Letronna's new build, with six models:
-Sonnet 5.5, Opus 5.5, Haiku 5.5, GPT-6 Sol, DeepSeek V4.1 Flash and Muse
-Spark 1.3. Same host and Harbor 0.24 setup as
+All 89 tasks, one trial each, on Letronna's new build, with seven models:
+Sonnet 5.5, Opus 5.5, Haiku 5.5, GPT-6 Sol, GPT-6.1 Sol, DeepSeek V4.1 Flash
+and Muse Spark 1.3. Same host and Harbor 0.24 setup as
 [16–18 October](../2026-10-17/README.md), whose full runs are in the charts
 and `tasks.csv` for comparison. The three Claude models were reached through
-the Anthropic API, the other three through the same gateway as before, all at
+the Anthropic API, the other four through the same gateway as before, all at
 high reasoning. Every run has a valid trial for all 89 tasks.
 
-Two more runs on the same build, GPT-6.1 Sol and Grok 4.7, were still going
-when this was written; they will be added when they finish.
+GPT-6.1 Sol finished after the first six were published and was added on
+20 October. One more run on the same build, Grok 4.7, is still going; it will
+be added when it finishes.
 
 ## The build
 
@@ -41,7 +42,7 @@ that came out of reading its failures. Each is now merged:
 Not in it: sending a run back once for a file its request names but it never
 wrote (#740), and a check for a reply that only announces its next step.
 
-The Claude, GPT-6 Sol and Muse runs used the same build with #744 on top (a
+The Claude, GPT-6 Sol, GPT-6.1 Sol and Muse runs used the same build with #744 on top (a
 Custom endpoint that names the Messages route is spoken to as Anthropic),
 which the Claude runs need; it changes nothing for a gateway that speaks the
 Chat Completions format. The kit's metering, budget stop and reruns of trials
@@ -57,18 +58,22 @@ the fifth column leaves them out.
 | Run | Tasks with a valid trial | Passed, as graded | Passed, lookups as fails | On the tasks the oracle passes here | Lookups |
 |---|---|---|---|---|---|
 | **Sonnet 5.5** | 89 | 71 (79.8%) | **71 (79.8%)** | **67/81 (82.7%)** | 0 |
+| GPT-6.1 Sol | 89 | 70 (78.7%) | 70 (78.7%) | 66/81 (81.5%) | 0 |
 | Opus 5.5 | 89 | 68 (76.4%) | 68 (76.4%) | 64/81 (79.0%) | 0 |
 | GPT-6 Sol | 89 | 63 (70.8%) | 63 (70.8%) | 59/81 (72.8%) | 0 |
 | DeepSeek V4.1 Flash | 89 | 62 (69.7%) | 62 (69.7%) | 59/81 (72.8%) | 0 |
 | Haiku 5.5 | 89 | 58 (65.2%) | 58 (65.2%) | 54/81 (66.7%) | 0 |
 | Muse Spark 1.3 | 89 | 48 (53.9%) | 48 (53.9%) | 48/81 (59.3%) | 0 |
 
-No run looked up its own task. The lookup check flagged two trials of
-mteb-leaderboard, Sonnet 5.5's pass and GPT-6 Sol's fail, for reaching
-`mteb-leaderboard.hf.space` and its backend. That is the Scandinavian MTEB
-leaderboard the task's instruction tells the model to use, not a copy of the
-task, so neither counts as a lookup (`triage.txt` still lists the calls).
-Counted the check's way, Sonnet 5.5 would be at 70.
+No run looked up its own task. The lookup check flagged three trials of
+mteb-leaderboard, Sonnet 5.5's and GPT-6.1 Sol's passes and GPT-6 Sol's fail,
+for reaching `mteb-leaderboard.hf.space` and its backend. That is the
+Scandinavian MTEB leaderboard the task's instruction tells the model to use,
+not a copy of the task, so none counts as a lookup (`triage.txt` still lists
+the calls). GPT-6.1 Sol's searches were flagged too, for naming the
+benchmark's hub, but only in their `blocked_domains`, the sites the search
+keeps out. Counted the check's way, Sonnet 5.5 would be at 70 and GPT-6.1 Sol
+at 69.
 
 Opus 5.5 lost nine tasks, Sonnet 5.5 three and Haiku 5.5 one to Anthropic's
 content filter, each on its first reply or two, and GPT-6 Sol one to its
@@ -82,9 +87,9 @@ own task, orange failed, hatched grey no valid trial, white not run):
 
 ![Every task](tasks.png)
 
-Five tasks beat all six models: caffe-cifar-10 and filter-js-from-html (which
-the oracle cannot pass here either), configure-git-webserver,
-extract-moves-from-video and sam-cell-seg. 31 tasks passed on all six.
+Five tasks beat all seven models: caffe-cifar-10 and filter-js-from-html
+(which the oracle cannot pass here either), configure-git-webserver,
+extract-moves-from-video and sam-cell-seg. 31 tasks passed on all seven.
 
 ## DeepSeek V4.1 Flash: the new build against the improved build
 
@@ -160,6 +165,22 @@ Four of the 20 ended when Letronna stopped a run going round in circles: it
 sent `read_file` with no arguments again and again, sixteen times in one turn
 of financial-document-processor. 339K tokens and 6.2 minutes a task.
 
+### GPT-6.1 Sol
+
+70 of 89 passed, the second-best run, with three of the four large tasks (it
+failed mteb-retrieve). Of the 19 failures, 12 were the model's own work, 4 are
+tasks the oracle cannot pass here, 1 was a verifier timeout (query-optimize),
+1 was YouTube (extract-moves-from-video) and 1 was its provider's content
+filter, which turned away every request after the first minute of
+vulnerable-secret, as it had for GPT-6 Sol. Against GPT-6 Sol on the same
+build it gained ten tasks and lost three; the ten include all four that GPT-6
+Sol lost to empty tool calls. It still sent some: winning-avg-corewars ended
+after 19 s on five `read_file` calls with no arguments. Three more runs
+(filter-js-from-html, install-windows-3.11 and sam-cell-seg) were stopped
+going round in circles on review-helper calls that asked for a git worktree
+in `/app`, which is not a git repository ([below](#what-the-failures-say-about-letronna));
+none of those stops decided the task. 533K tokens and 7.9 minutes a task.
+
 ### DeepSeek V4.1 Flash
 
 62 of 89 passed. Of the 27 failures, 19 were the model's own work, 5 are tasks
@@ -192,7 +213,7 @@ two are not the same run on two builds.
 
 ## What the failures say about Letronna
 
-Read across the six runs, the failures point at these changes for the next
+Read across the seven runs, the failures point at these changes for the next
 build. None is in this one.
 
 - **Let the guard tell a task container from a user's files.** Once a run has
@@ -218,9 +239,17 @@ build. None is in this one.
   before it was cut.
 - **Look into GPT-6 Sol's empty tool calls.** It sent calls with no
   arguments in 62 of the 264 replies where it batched several, and four of its
-  runs ended on them. The review found nothing in Letronna's handling of the
+  runs ended on them; GPT-6.1 Sol lost one run the same way. The review found nothing in Letronna's handling of the
   stream that would empty them, but they are worth checking against the
   provider's raw stream before blaming the model.
+- **Let a review helper start where there is no git repository.** GPT-6.1
+  Sol fills in every field of the agent tool, and the isolation field's only
+  value, "worktree", is refused when the folder is not a git repository, as
+  `/app` is in most tasks. It kept asking: Letronna stopped three of its runs
+  going round in circles on those calls, and in dna-insert no review could
+  start. None of this decided a task, but the review Letronna's own check asks
+  for never ran. Outside a repository the helper should run without isolation,
+  or the tool should not offer it.
 - **Send back a run whose required output is missing** (#740, merged after
   this build). In at least ten failed trials the run ended itself without
   writing the file the task asked for, most of them Muse's.
@@ -275,16 +304,21 @@ Terminal-Bench 2.0 board stopped taking entries before these models came out.
   about 21 GB free during the pull, so the other runs paused for them.
   Once an image was removed from under a running trial (Muse Spark 1.3's
   mteb-leaderboard); that trial was set aside and the task run again.
-- **The host's container restarted once**, at about 03:00 UTC on 20 October;
-  the runs were started again from where they stopped.
+- **The host's container restarted twice**, at about 03:00 UTC on 20 October
+  and again at about 21:40, after GPT-6.1 Sol had finished; the runs were
+  started again from where they stopped.
+- **GPT-6.1 Sol started last**, at 09:25 UTC on 20 October, and paused while
+  the other models' mteb images were pulled. Its large tasks ran from 18:34 to
+  20:02, after a first start that lacked a setting had put every task off
+  without running one.
 - Up to about eight trials shared the host's 4 CPUs at once (three a run for
   the Claude models, two or three for the others), more than on 16–18 October.
 - **Spend.** The Claude runs, at list price by the relay's meter: Sonnet 5.5
   $29.07, Opus 5.5 $39.69, Haiku 5.5 $2.29. The gateway's subscription routes
-  charged a few percent of list price per call (about 4% for GPT-6 Sol and 1%
-  for Muse Spark 1.3 and DeepSeek V4.1 Flash, measured per call), and all the
-  gateway runs together, GPT-6.1 Sol and Grok 4.7 included, had come to under
-  $9 by the meter when this was written.
+  charged a few percent of list price per call (about 4% for GPT-6 Sol and
+  GPT-6.1 Sol, 1% for Muse Spark 1.3 and DeepSeek V4.1 Flash, measured per
+  call), and all the gateway runs together, GPT-6.1 Sol and Grok 4.7 included,
+  had come to under $11 by the meter when GPT-6.1 Sol was added.
 
 ## Read with care
 
