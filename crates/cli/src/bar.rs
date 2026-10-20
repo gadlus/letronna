@@ -62,7 +62,7 @@ pub const COMMANDS: &[Command<'static>] = &[
     },
     Command {
         name: "/model",
-        blurb: "show or change the model; add image, speech or video for those, or side for summaries",
+        blurb: "show or change the model; add image, speech or video for those, side for summaries, or names for session names",
     },
     Command {
         name: "/fallback",
@@ -203,6 +203,10 @@ pub const COMMANDS: &[Command<'static>] = &[
     Command {
         name: "/branch",
         blurb: "carry on in a copy of this session",
+    },
+    Command {
+        name: "/rename",
+        blurb: "name this session, or have a model name it",
     },
     Command {
         name: "/compact",
@@ -760,6 +764,9 @@ pub enum Waited {
     Asked,
     /// Work that went on after a turn has something to say, on a line of its own.
     Note(String),
+    /// A model named session `0`, which was called `1` when it was asked,
+    /// `2`.
+    Named(u64, String, String),
 }
 
 /// A setting with a natural order, picked by sliding along a track rather
@@ -877,6 +884,8 @@ pub struct Bar {
     schedules: Option<async_channel::Receiver<letronna_core::schedule::Event>>,
     /// Where a note comes from work that went on after the last turn.
     notes: Option<async_channel::Receiver<String>>,
+    /// Where a session's name comes from, once a model has given one.
+    names: Option<async_channel::Receiver<(u64, String, String)>>,
     /// Helpers' requests for a yes, once the terminal answers them.
     asks: Option<Receiver<Request>>,
     /// A request taken but not yet answered: one that ended a wait at the
@@ -975,6 +984,7 @@ impl Bar {
             bell: None,
             schedules: None,
             notes: None,
+            names: None,
             asks: None,
             held: None,
             guard: None,
@@ -1356,6 +1366,11 @@ impl Bar {
         self.notes = Some(notes);
     }
 
+    /// Let a session's name, given by a model, end a wait at the prompt.
+    pub fn hear_name(&mut self, names: async_channel::Receiver<(u64, String, String)>) {
+        self.names = Some(names);
+    }
+
     /// Take helpers' requests for a yes from now on, to put to the user in the
     /// box. False, taking nothing, when the box is not up.
     pub fn serve(&mut self) -> bool {
@@ -1405,6 +1420,9 @@ impl Bar {
         // only prints, so it holds nothing up.
         if let Some(note) = self.notes.as_ref().and_then(|notes| notes.try_recv().ok()) {
             return Some(Waited::Note(note));
+        }
+        if let Some((id, was, name)) = self.names.as_ref().and_then(|names| names.try_recv().ok()) {
+            return Some(Waited::Named(id, was, name));
         }
         if let Some(line) = self.next_line() {
             return Some(Waited::Line(line));
@@ -4015,6 +4033,7 @@ mod tests {
                 "/resume",
                 "/rewind",
                 "/retry",
+                "/rename",
                 "/review"
             ]
         );
@@ -4369,6 +4388,25 @@ mod tests {
             Some(Waited::Note("Memory review kept a note".into()))
         );
         assert_eq!(bar.waited(), Some(Waited::Line("and the docs".into())));
+        assert_eq!(bar.waited(), None);
+    }
+
+    #[test]
+    fn a_name_a_model_gives_ends_the_wait() {
+        let mut bar = Bar::new(String::new());
+        let (tell, names) = async_channel::bounded(1);
+        bar.hear_name(names);
+        assert_eq!(bar.waited(), None);
+        tell.try_send((7, "fix the login".into(), "Login redirect loop".into()))
+            .unwrap();
+        assert_eq!(
+            bar.waited(),
+            Some(Waited::Named(
+                7,
+                "fix the login".into(),
+                "Login redirect loop".into()
+            ))
+        );
         assert_eq!(bar.waited(), None);
     }
 

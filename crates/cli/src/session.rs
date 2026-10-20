@@ -179,10 +179,7 @@ impl Runner {
         {
             let conversation = &mut self.store.conversations[session];
             if conversation.messages.is_empty() && conversation.title.is_empty() {
-                let saved = letronna_core::workflow::saved::typed(prompt);
-                let shown = letronna_core::init::typed(prompt).or(saved.as_deref());
-                let shown = shown.unwrap_or(prompt);
-                conversation.title = shown.chars().take(40).collect();
+                conversation.title = first_line(prompt);
             }
             conversation.updated = chat::now();
             goal::interrupted(&mut conversation.goal);
@@ -204,7 +201,58 @@ impl Runner {
         self.persist();
 
         let answer = self.run(connection, session);
-        self.pursue(session, answer)
+        let answer = self.pursue(session, answer);
+        if answer.is_ok() {
+            self.name_after_first_reply(session);
+        }
+        answer
+    }
+
+    /// Have a model name the session once its first reply is in, when
+    /// Settings say so and it is still called by its first line. The name
+    /// comes back through the box, so nothing waits for it.
+    fn name_after_first_reply(&mut self, session: usize) {
+        if self.stopped || !self.human || !self.store.settings.auto_title {
+            return;
+        }
+        let conversation = &self.store.conversations[session];
+        let mut asked = (conversation.messages.iter()).filter(|m| chat::opens_turn(m) && !m.notice);
+        let (Some(first), None) = (asked.next(), asked.next()) else {
+            return;
+        };
+        let typed = letronna_core::references::typed(&first.content);
+        if conversation.title != first_line(typed) {
+            return;
+        }
+        let (id, was) = (conversation.id, conversation.title.clone());
+        let messages = conversation.messages.clone();
+        let connection = self.connection(session);
+        let (tell, heard) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            if let Ok(name) = letronna_core::title::name(&connection, &messages) {
+                let _ = tell.send_blocking((id, was, name));
+            }
+        });
+        self.bar.hear_name(heard);
+    }
+
+    /// Give session `id` the `name` a model gave it, unless it was renamed
+    /// since, when it was called `was`; said for the open session.
+    pub fn named(&mut self, id: u64, was: &str, name: &str) {
+        let Some(at) = self.store.index_of(id) else {
+            return;
+        };
+        if self.store.conversations[at].title != was {
+            return;
+        }
+        self.store.conversations[at].title = name.to_owned();
+        self.persist();
+        if at == self.store.active {
+            render::blank();
+            render::line(&render::dim(&format!(
+                "Named this session “{name}”; /rename changes it."
+            )));
+        }
     }
 
     /// Run a turn on the notices waiting for an idle session, with nothing
@@ -1992,9 +2040,26 @@ pub(crate) fn usage(reply: &Message) -> String {
     parts.join(" · ")
 }
 
+/// What a session is called before a model names it: the first line of
+/// the first message, a command as it was typed, as the window calls it.
+pub fn first_line(prompt: &str) -> String {
+    let saved = letronna_core::workflow::saved::typed(prompt);
+    let shown = letronna_core::init::typed(prompt).or(saved.as_deref());
+    letronna_core::store::name_from(shown.unwrap_or(prompt))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_is_first_called_by_the_first_line_of_what_was_asked() {
+        assert_eq!(first_line("fix the login\nand the logout"), "fix the login");
+        assert_eq!(first_line("\n\n  spaced out  "), "spaced out");
+        assert_eq!(first_line(&"long ".repeat(20)).chars().count(), 40);
+        let init = letronna_core::init::PROMPT;
+        assert_eq!(first_line(init), "/init");
+    }
     use super::{Unheard, wait_on, waitable};
     use serde_json::json;
     use std::cell::Cell;

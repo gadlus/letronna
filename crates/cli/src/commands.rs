@@ -171,6 +171,11 @@ pub fn command(
             }
             Flow::Handled
         }
+        // How sessions are named, not the chat model.
+        "/model" if rest.split_whitespace().next() == Some("names") => {
+            name_model(runner, rest.strip_prefix("names").unwrap_or_default());
+            Flow::Handled
+        }
         // What summaries and checks run on, not the chat model.
         "/model" if rest.split_whitespace().next() == Some("side") => {
             side_model(runner, rest.strip_prefix("side").unwrap_or_default());
@@ -409,6 +414,10 @@ pub fn command(
         }
         "/branch" => {
             branch(runner, session, rest);
+            Flow::Handled
+        }
+        "/rename" => {
+            rename(runner, *session, rest);
             Flow::Handled
         }
         "/compact" => {
@@ -751,6 +760,153 @@ fn side_model(runner: &mut Runner, rest: &str) {
             "Summaries, commit messages and goal checks use {model}, on the session's gateway, or the session's model when the gateway turns it away. /model side off puts them back on the session's model."
         ),
     }));
+}
+
+/// Show how sessions are named, or set it from `rest`; from the keyboard
+/// with nothing given, pick it from a list.
+fn name_model(runner: &mut Runner, rest: &str) {
+    render::blank();
+    let given = match rest.trim() {
+        "" if runner.bar.steered() => pick_naming(runner),
+        rest => names_setting(rest),
+    };
+    if let Some((on, model)) = given {
+        let settings = &mut runner.store.settings;
+        settings.auto_title = on;
+        if let Some(model) = model {
+            settings.title_model = model;
+        }
+        runner.persist();
+    }
+    render::line(&render::dim(&naming_said(
+        runner.store.settings.auto_title,
+        &runner.store.settings.title_model,
+    )));
+}
+
+/// What `/model names` was given: None to only show it; else whether a
+/// model names sessions, and which, when one was said.
+fn names_setting(rest: &str) -> Option<(bool, Option<String>)> {
+    match rest.trim() {
+        "" => None,
+        "off" | "none" => Some((false, None)),
+        "on" => Some((true, None)),
+        "auto" => Some((true, Some(String::new()))),
+        model => Some((true, Some(model.to_owned()))),
+    }
+}
+
+/// How sessions are named, asked in a list: automatically, by the chat's
+/// own model, by a model typed in, or not at all.
+fn pick_naming(runner: &mut Runner) -> Option<(bool, Option<String>)> {
+    let settings = &runner.store.settings;
+    let now = match (settings.auto_title, settings.title_model.as_str()) {
+        (false, _) => 3,
+        (true, "") => 0,
+        (true, "chat") => 1,
+        (true, _) => 2,
+    };
+    let options = [
+        "Automatically: Letronna's quick model on Letronna, else the side model or the chat's own",
+        "With the chat's own model",
+        "With a model you name",
+        "Not at all: keep the first line of what was asked",
+    ];
+    let shown: Vec<String> = (options.iter().enumerate())
+        .map(|(n, option)| match n == now {
+            true => format!("{option} (in use)"),
+            false => (*option).to_owned(),
+        })
+        .collect();
+    let shown: Vec<&str> = shown.iter().map(String::as_str).collect();
+    let detail = vec!["A model names a session once its first reply is in.".to_owned()];
+    match runner
+        .bar
+        .choose("How are sessions named?", detail, &shown)?
+    {
+        0 => Some((true, Some(String::new()))),
+        1 => Some((true, Some("chat".into()))),
+        2 => {
+            let model = runner.bar.ask("the model that names sessions", false)?;
+            names_setting(&model).filter(|(on, _)| *on)
+        }
+        _ => Some((false, None)),
+    }
+}
+
+/// How sessions are named, as `/model names` says it: naming `on`, by the
+/// `model` Settings give.
+fn naming_said(on: bool, model: &str) -> String {
+    if !on {
+        return "Sessions keep the first line of what was asked. /model names auto has a model \
+                name them; /rename names one now."
+            .into();
+    }
+    match model.trim() {
+        "" => "A model names each session once its first reply is in: Letronna's quick model \
+               for a chat on Letronna, checked by Jev, else the side model, else the chat's own. \
+               A chat on another gateway is named there. /model names chat, <model> or off \
+               changes that."
+            .into(),
+        "chat" => "The chat's own model names each session once its first reply is in. /model \
+                   names auto, <model> or off changes that."
+            .into(),
+        model => format!(
+            "{model} names each session once its first reply is in, checked by Jev, or the \
+             chat's own model when it does not answer. /model names auto, chat or off changes \
+             that."
+        ),
+    }
+}
+
+/// Name the session `rest`, or with nothing, have a model name it now.
+fn rename(runner: &mut Runner, session: usize, rest: &str) {
+    render::blank();
+    let given = rest.trim();
+    if !given.is_empty() {
+        runner.store.conversations[session].title = given.to_owned();
+        runner.persist();
+        render::line(&render::dim(&format!("Named this session “{given}”.")));
+        return;
+    }
+    let conversation = &runner.store.conversations[session];
+    if conversation.messages.is_empty() {
+        render::line(&render::dim(
+            "Nothing has been said yet to name the session after; /rename <name> names it.",
+        ));
+        return;
+    }
+    let (connection, messages) = (runner.connection(session), conversation.messages.clone());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = stop.clone();
+    let named = runner
+        .bar
+        .busy_cancellable("naming the session · esc to stop", stop, move || {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(letronna_core::title::name(&connection, &messages));
+            });
+            // A request cannot hear a stop, so it is left to end on its own
+            // and what it gives goes unused.
+            loop {
+                match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(named) => return named,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        if !stopped.load(Ordering::Relaxed) => {}
+                    Err(_) => return Err("Stopped; the name stays as it was.".into()),
+                }
+            }
+        });
+    match named {
+        Ok(name) => {
+            runner.store.conversations[session].title = name.clone();
+            runner.persist();
+            render::line(&render::dim(&format!(
+                "Named this session “{name}”; /rename <name> names it yourself."
+            )));
+        }
+        Err(why) => render::line(&render::red(&why)),
+    }
 }
 
 /// The side model `/model side` was given: None to only show it, empty for
@@ -5651,8 +5807,9 @@ mod tests {
     use super::{
         Asked, Back, Flow, Run, Stage, ToolSearch, account_search_line, agent_lines, agent_rows,
         asked, choice_label, command, crew_switch, exactly, from_match, keep_days, last_prompt,
-        leaving, name_label, offered, point_label, ranking, rewind_points, rewinds, run_rows,
-        side_setting, standing, tool_search_asked, turn_files, turn_starts, turns_from, typed_path,
+        leaving, name_label, names_setting, naming_said, offered, point_label, ranking,
+        rewind_points, rewinds, run_rows, side_setting, standing, tool_search_asked, turn_files,
+        turn_starts, turns_from, typed_path,
     };
     use crate::session::Runner;
     use letronna_core::agents::Seen;
@@ -5672,6 +5829,24 @@ mod tests {
             content: content.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn model_names_takes_auto_chat_off_or_a_model() {
+        assert_eq!(names_setting(""), None);
+        assert_eq!(names_setting("auto"), Some((true, Some(String::new()))));
+        assert_eq!(names_setting("chat"), Some((true, Some("chat".into()))));
+        assert_eq!(names_setting(" off "), Some((false, None)));
+        assert_eq!(names_setting("on"), Some((true, None)));
+        assert_eq!(
+            names_setting("small-model"),
+            Some((true, Some("small-model".into())))
+        );
+        assert!(naming_said(false, "chat").starts_with("Sessions keep the first line"));
+        let auto = naming_said(true, "");
+        assert!(auto.contains("Letronna's quick model for a chat on Letronna"));
+        assert!(auto.contains("A chat on another gateway is named there."));
+        assert!(naming_said(true, "small-model").starts_with("small-model names each session"));
     }
 
     #[test]

@@ -384,7 +384,7 @@ fn turn(prompt: &str, yes: bool) -> Result<String, String> {
     let connection = runner.connection(session);
     chat::validate(&connection)?;
     let mut conversation = runner.store.conversations.remove(session);
-    conversation.title = prompt.chars().take(40).collect();
+    conversation.title = letronna_core::store::name_from(prompt);
     conversation.messages.push(Message {
         role: "user".into(),
         content: prompt.to_owned(),

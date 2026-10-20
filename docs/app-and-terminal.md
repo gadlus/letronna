@@ -74,6 +74,8 @@ Type `/` to list them all. The common ones:
 | `/context` | What fills the context, part by part; the box's bottom edge says how full it is |
 | `/btw` | Ask something aside without derailing the turn |
 | `/rewind`, `/undo` | Go back to any message you sent; see below |
+| `/rename` | Name the session, or with no name have a model name it now |
+| `/model names` | How sessions get their names: automatically, by the chat's model, by another, or not at all |
 | `/loop`, `/heartbeat` | Keep a session working toward a goal |
 | `/team`, `/login`, `/logout`, `/whoami` | Account |
 

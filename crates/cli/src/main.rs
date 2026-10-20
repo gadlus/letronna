@@ -459,6 +459,11 @@ fn main() {
             screen::settle();
             continue;
         }
+        if let bar::Waited::Named(id, was, name) = &waited {
+            runner.named(*id, was, name);
+            screen::settle();
+            continue;
+        }
         let bar::Waited::Line(line) = waited else {
             // Notices came for the open session while it sat idle, and it
             // takes them as a turn of its own -- unless the user stopped the
@@ -879,7 +884,7 @@ fn begin(
         );
     }
     if conversation.messages.is_empty() && conversation.title.is_empty() {
-        conversation.title = prompt.chars().take(40).collect();
+        conversation.title = crate::session::first_line(prompt);
     }
     conversation.updated = chat::now();
     let content = letronna_core::references::expand(prompt, conversation.workspace.as_deref());

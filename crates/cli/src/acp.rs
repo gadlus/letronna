@@ -590,7 +590,7 @@ impl Agent {
         memory::choose(session, conversation.memory_saving);
         memory::choose_scope(session, conversation.memory_scope);
         if conversation.messages.is_empty() && conversation.title.is_empty() {
-            conversation.title = text.chars().take(40).collect();
+            conversation.title = letronna_core::store::name_from(&text);
         }
         conversation.updated = chat::now();
         conversation.messages.push(Message {
