@@ -152,6 +152,7 @@ impl Chat {
                 };
             menu.min_w(px(200.))
                 .item(item("Rename", AppIcon::Pencil, Chat::rename_session))
+                .item(item("Name it again", AppIcon::Sparkles, Chat::name_again))
                 .item(item(
                     if pinned { "Unpin" } else { "Pin" },
                     AppIcon::Pin,
@@ -168,6 +169,80 @@ impl Chat {
                 .separator()
                 .item(item("Delete", AppIcon::Trash, Chat::delete_session))
         }
+    }
+
+    /// Have a model name session `id` once its first reply is in, when
+    /// Settings say so and it is still called by its first line.
+    pub(crate) fn name_after_first_reply(&mut self, id: u64, cx: &mut Context<Self>) {
+        if !self.store.settings.auto_title {
+            return;
+        }
+        let Some(ix) = self.store.index_of(id) else {
+            return;
+        };
+        let conversation = &self.store.conversations[ix];
+        let mut asked = (conversation.messages.iter())
+            .filter(|m| letronna_core::chat::opens_turn(m) && !m.notice);
+        let (Some(first), None) = (asked.next(), asked.next()) else {
+            return;
+        };
+        let typed = letronna_core::references::typed(&first.content);
+        if conversation.title != crate::app::first_line(typed) {
+            return;
+        }
+        self.name_session(id, false, cx);
+    }
+
+    /// Have a model name the session at `index` now, from what was said in
+    /// it, as Rename's neighbour in its menu.
+    pub(crate) fn name_again(&mut self, index: usize, _: &mut Window, cx: &mut Context<Self>) {
+        // A session only listed has its messages on the disk.
+        self.fill_now(index);
+        let id = self.store.conversations[index].id;
+        self.name_session(id, true, cx);
+    }
+
+    /// Ask a model for session `id`'s name off the UI thread, and give it
+    /// the name only if nobody renamed it meanwhile; `said` when the user
+    /// asked, who hears how it went.
+    fn name_session(&mut self, id: u64, said: bool, cx: &mut Context<Self>) {
+        let Some(ix) = self.store.index_of(id) else {
+            return;
+        };
+        let connection = match self.connection_for(ix, None) {
+            Ok(connection) => connection,
+            Err(why) => {
+                if said {
+                    self.note = Some(why);
+                    cx.notify();
+                }
+                return;
+            }
+        };
+        let conversation = &self.store.conversations[ix];
+        let (was, messages) = (conversation.title.clone(), conversation.messages.clone());
+        let named = cx
+            .background_executor()
+            .spawn(async move { letronna_core::title::name(&connection, &messages) });
+        cx.spawn(async move |this, cx| {
+            let named = named.await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(ix) = this.store.index_of(id) else {
+                    return;
+                };
+                match named {
+                    Ok(name) if this.store.conversations[ix].title == was => {
+                        this.store.conversations[ix].title = name;
+                        this.save();
+                    }
+                    Ok(_) => {}
+                    Err(why) if said => this.note = Some(why),
+                    Err(_) => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn toggle_pin(&mut self, index: usize, _: &mut Window, cx: &mut Context<Self>) {

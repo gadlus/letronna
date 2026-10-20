@@ -147,6 +147,8 @@ pub(crate) struct Chat {
     pub(crate) model: Entity<InputState>,
     /// The models to carry on with, written as a comma-separated list.
     pub(crate) fallbacks: Entity<InputState>,
+    /// A model of the user's own to name sessions with, on the Model page.
+    pub(crate) naming_model: Entity<InputState>,
     pub(crate) key: Entity<InputState>,
     /// The name of a gateway of the user's own being added on the Accounts
     /// page; its address and key go in `endpoint` and `key`.
@@ -671,6 +673,15 @@ impl Chat {
                 .placeholder("None. Such as gpt-5-mini, OpenRouter:deepseek/deepseek-chat")
                 .default_value(store.settings.fallbacks.join(", "))
         });
+        let naming_model = cx.new(|cx| {
+            let own = match store.settings.title_model.as_str() {
+                "" | "chat" => String::new(),
+                model => model.to_owned(),
+            };
+            InputState::new(window, cx)
+                .placeholder("A model on the chat's gateway, such as gpt-5-mini")
+                .default_value(own)
+        });
         let key = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("API key")
@@ -932,6 +943,7 @@ impl Chat {
             endpoint,
             model,
             fallbacks,
+            naming_model,
             key,
             gateway_name,
             hotkey,
@@ -3932,6 +3944,10 @@ impl Chat {
         if let Some(id) = session {
             self.tell_waiting_put_back(id);
         }
+        // A session's first reply is in: a model may name it now.
+        if let Some(id) = session.filter(|_| !stopped && self.error.is_none()) {
+            self.name_after_first_reply(id, cx);
+        }
         self.send_follow_ups(session, cx);
         if stopped && let Some(ix) = session.and_then(|id| self.store.index_of(id)) {
             goal::interrupted(&mut self.store.conversations[ix].goal);
@@ -4924,11 +4940,16 @@ pub(crate) fn name_after(conversation: &mut Conversation, prompt: &str) {
     if conversation.messages.is_empty()
         && (conversation.title.is_empty() || conversation.title == "New session")
     {
-        let saved = letronna_core::workflow::saved::typed(prompt);
-        let shown = letronna_core::init::typed(prompt).or(saved.as_deref());
-        let shown = shown.unwrap_or(prompt);
-        conversation.title = letronna_core::store::name_from(shown);
+        conversation.title = first_line(prompt);
     }
+}
+
+/// What a session is called before a model names it: the first line of
+/// its first message, a command as it was typed.
+pub(crate) fn first_line(prompt: &str) -> String {
+    let saved = letronna_core::workflow::saved::typed(prompt);
+    let shown = letronna_core::init::typed(prompt).or(saved.as_deref());
+    letronna_core::store::name_from(shown.unwrap_or(prompt))
 }
 
 /// Whether a session is a new one nothing was said in yet: open in the
@@ -4977,8 +4998,8 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        card_is_up, cuts_in, escape_closes_aside, front_call, name_after, run_ended, running_calls,
-        side_question, until_repeated_id, untouched,
+        card_is_up, cuts_in, escape_closes_aside, first_line, front_call, name_after, run_ended,
+        running_calls, side_question, until_repeated_id, untouched,
     };
     use letronna_core::agent::{MAX_BATCH, Next, Turn};
     use letronna_core::chat::{Connection, ToolCall};
@@ -5228,6 +5249,14 @@ mod tests {
         };
         name_after(&mut named, "what is new");
         assert_eq!(named.title, "Morning digest");
+    }
+
+    #[test]
+    fn the_first_line_is_what_a_model_may_name_a_session_from() {
+        // What a model's name replaces, and what tells that nobody renamed it.
+        assert_eq!(first_line("fix the login\nand the logout"), "fix the login");
+        assert_eq!(first_line(letronna_core::init::PROMPT), "/init");
+        assert_eq!(first_line("   "), "Untitled session");
     }
 
     #[test]

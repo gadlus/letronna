@@ -636,6 +636,15 @@ impl Chat {
             }
         };
         self.store.settings.fallbacks = fallbacks.iter().map(ToString::to_string).collect();
+        // A model of the user's own names sessions; cleared, back to the
+        // automatic choice unless a card was picked.
+        let own = self.naming_model.read(cx).value().trim().to_string();
+        let settings = &mut self.store.settings;
+        match (own.as_str(), settings.title_model.as_str()) {
+            ("", "" | "chat") => {}
+            ("", _) => settings.title_model.clear(),
+            (own, _) => settings.title_model = own.to_owned(),
+        }
         let typed = self.model.read(cx).value().to_string();
         if typed != self.store.settings.model {
             let gateway = self.store.settings.gateway.clone();
@@ -959,7 +968,15 @@ impl Chat {
             },
         );
         let body: AnyElement = match current_page {
-            "Model" => model_page(&model, &self.fallbacks, &chat, cx).into_any_element(),
+            "Model" => model_page(
+                &model,
+                &self.fallbacks,
+                &self.naming_model,
+                &self.store.settings,
+                &chat,
+                cx,
+            )
+            .into_any_element(),
             "Appearance" => {
                 appearance_page(&chat, &self.store.settings, window, cx).into_any_element()
             }
@@ -1885,6 +1902,8 @@ fn appearance_page(
 fn model_page(
     model: &Entity<InputState>,
     fallbacks: &Entity<InputState>,
+    naming_model: &Entity<InputState>,
+    settings: &Settings,
     chat: &Entity<Chat>,
     cx: &App,
 ) -> Div {
@@ -1919,6 +1938,7 @@ fn model_page(
                         )),
                 ),
         )
+        .child(naming_section(settings, naming_model, chat, cx))
         .child(
             h_flex().justify_end().child(
                 Button::new("save-model")
@@ -1930,6 +1950,95 @@ fn model_page(
                     }),
             ),
         )
+}
+
+/// Whether a model names each session once its first reply is in, and
+/// which: automatically, the chat's own, or one of the user's own, whose
+/// id the page's Save keeps.
+fn naming_section(
+    settings: &Settings,
+    own: &Entity<InputState>,
+    chat: &Entity<Chat>,
+    cx: &App,
+) -> Div {
+    let on = settings.auto_title;
+    let switch = toggle_row(
+        "auto-title",
+        "Name sessions with a model",
+        "Once a session's first reply is in, a model gives it a short name from what was said. \
+         Off, it keeps the first line of what you asked.",
+        on,
+        chat,
+        cx,
+        std::rc::Rc::new(|this: &mut Chat| this.store.settings.auto_title ^= true),
+    );
+    let mut section = v_flex()
+        .gap_2()
+        .child(label("Session names", cx))
+        .child(switch);
+    if !on {
+        return section;
+    }
+    let choices = [
+        (
+            "",
+            "Automatic",
+            "Letronna's quick model for a chat on Letronna, checked by Jev; otherwise your side \
+             model, or the chat's own. A chat on another gateway is named there.",
+        ),
+        (
+            "chat",
+            "This chat's model",
+            "The model the chat is on names it.",
+        ),
+    ];
+    for (at, (value, title, text)) in choices.into_iter().enumerate() {
+        let active = settings.title_model.trim() == value;
+        let (chat, own) = (chat.clone(), own.clone());
+        section = section.child(
+            v_flex()
+                .id(("naming", at))
+                .cursor_pointer()
+                .gap_0p5()
+                .p_2p5()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(if active {
+                    cx.theme().primary
+                } else {
+                    cx.theme().border
+                })
+                .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(text),
+                )
+                .on_click(move |_, window, cx| {
+                    own.update(cx, |input, cx| input.set_value("", window, cx));
+                    chat.update(cx, |this, cx| {
+                        this.store.settings.title_model = value.to_owned();
+                        this.save();
+                        cx.notify();
+                    })
+                }),
+        );
+    }
+    section.child(
+        v_flex()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "Or a model of your own, kept with Save: it names sessions first, \
+                         checked by Jev, and the chat's own model when it does not answer.",
+                    ),
+            )
+            .child(Input::new(own)),
+    )
 }
 
 /// How hard the model thinks in the session on screen and new ones, whether

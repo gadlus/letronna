@@ -9,6 +9,7 @@ Both front ends sit on the same core and share the account, sessions and setting
 - **Side panels**: Browser, Files, Changes and Jobs.
 - **Command palette**: `Ctrl+K`. The whole window is reachable from the keyboard.
 - **Going back**: right-click a message and pick Rewind to here, or press `Esc` twice in an empty composer and then `W` on the message. Choose whether the code and the conversation go back, the conversation alone, or the code alone.
+- **Session names**: a model names each session once its first reply is in. Settings › Model › Session names turns it off or picks the model; Name it again in a session's menu asks for a new name.
 - **Tray**: on Windows and Linux, closing the window keeps Letronna in the tray.
 
 ## Command line

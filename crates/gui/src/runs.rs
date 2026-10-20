@@ -795,7 +795,9 @@ impl Chat {
                 );
             }
             None if end.failed => self.error = Some(format!("\"{}\": {text}", run.label)),
-            None => {}
+            None if end.stopped => {}
+            // The window's own, sent beside the chat: a chat app names its.
+            None => self.name_after_first_reply(id, cx),
         }
         self.typing.remove(&id);
         // Nothing waits on the run's own cards now; dropped, they are
