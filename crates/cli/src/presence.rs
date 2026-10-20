@@ -86,6 +86,7 @@ mod imp {
 
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 const NOT_CONFIRMED: &str = "The system did not confirm it was you. Nothing was done.";
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 const UNAVAILABLE: &str = "This needs the system to confirm it is you (Windows Hello, or Touch ID or the login password on macOS), which is not set up here. Nothing was done; use the Wallet page in the window (letronna gui) instead.";
 
 #[cfg(test)]

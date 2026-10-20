@@ -428,7 +428,7 @@ impl Render for Viewer {
                         .into_any_element()
                 }))
             })
-            .children(self.sharp.as_ref().map(&picture))
+            .children(self.sharp.as_ref().map(picture))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
                 let delta = event.delta.pixel_delta(window.line_height());
                 if event.modifiers.secondary() {

@@ -2590,7 +2590,7 @@ impl Spill {
             return Ok(());
         };
         let take = |left: usize| Some(left - left.min(bytes.len()));
-        let (Ok(left) | Err(left)) = self.room.fetch_update(Relaxed, Relaxed, take);
+        let (Ok(left) | Err(left)) = self.room.try_update(Relaxed, Relaxed, take);
         let n = left.min(bytes.len());
         self.saved += n;
         file.write_all(&bytes[..n])
