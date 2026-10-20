@@ -60,6 +60,25 @@ const OPEN_SESSIONS: usize = 8;
 /// How long after the system says a session file changed the folder is
 /// looked at: one save is a few writes, and they are taken in together.
 const SESSIONS_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
+/// Likewise for the files that say where models come from: a key saved is
+/// the keys file and the vault's list, written one after the other.
+const ACCOUNTS_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
+/// The files in the data folder whose change can change the models on offer
+/// or whether the hosted ones can be paid for: keys, the vault's list (keys
+/// and browser sign-ins), gateways of your own, the Custom address, the
+/// sign-in, and which plugins' providers are on.
+const ACCOUNT_FILES: &[&str] = &[
+    "keys.json",
+    "vault.json",
+    "gateways.json",
+    "settings.json",
+    "account.json",
+    "plugin-switches.json",
+];
+/// How often coming back to the window asks the API about an account whose
+/// hosted models need a subscription: back from the checkout page, the plan
+/// it bought should show without a restart.
+const UPGRADE_CHECK: std::time::Duration = std::time::Duration::from_secs(20);
 
 pub(crate) enum Verdict {
     Allow {
@@ -236,6 +255,17 @@ pub(crate) struct Chat {
     /// A provider's browser sign-in from the Accounts page, while it waits.
     pub(crate) provider_sign_in: Option<std::sync::Arc<letronna_core::providers::auth::SignIn>>,
     pub(crate) loading_models: bool,
+    /// The last ask for the models, so an answer to an earlier one, which
+    /// came from keys or gateways since changed, is not shown over it.
+    pub(crate) models_asked: u64,
+    /// Where the models in `models` were asked of, as `reach` sums it up.
+    pub(crate) models_reach: u64,
+    /// When the account was last checked because its hosted models need a
+    /// subscription.
+    pub(crate) upgrade_checked: Option<std::time::Instant>,
+    /// What the composer's placeholder was last set to, which it does not
+    /// give back.
+    pub(crate) placeholder: SharedString,
     pub(crate) gateway_error: Option<String>,
     pub(crate) busy: bool,
     /// The sessions a summary the user asked for is being made of.
@@ -463,6 +493,10 @@ pub(crate) struct Chat {
     /// The session the sidebar's keys are on, by id: an index would move
     /// the keys to another session when one before it was deleted.
     pub(crate) picked: Option<u64>,
+    /// A session's menu in the sidebar, while it is open.
+    pub(crate) session_menu: Option<crate::ui::sessions::SessionMenu>,
+    /// A press on a session's row, held to open its menu.
+    pub(crate) session_press: Option<crate::ui::sessions::Press>,
     /// The turn the keys were sent to, by session and first message. Its
     /// focus lives only while the list draws it, so it is handed over as
     /// the turn is drawn: kept here until the next draw, then `focusing`
@@ -794,7 +828,8 @@ impl Chat {
                 // image, speech and video tabs list other models.
                 if matches!(event, InputEvent::PressEnter { .. })
                     && this.model_kind == "chat"
-                    && let Some((gateway, id)) = this.model_matches(cx).into_iter().next()
+                    && let Some((gateway, id)) = (this.model_matches(cx).into_iter())
+                        .find(|(gateway, id)| !this.needs_subscription(gateway, id))
                 {
                     this.choose_model(gateway, id, window, cx);
                 }
@@ -882,6 +917,7 @@ impl Chat {
                 if window.is_window_active() {
                     this.follow_sessions(cx);
                     this.refresh_changes(cx);
+                    this.check_upgrade(cx);
                 }
             }),
             cx.subscribe_in(&steer, window, |this, _, event, window, cx| {
@@ -934,6 +970,10 @@ impl Chat {
             sign_in_cancel: None,
             provider_sign_in: None,
             loading_models: false,
+            models_asked: 0,
+            models_reach: 0,
+            upgrade_checked: None,
+            placeholder: greeting.into(),
             gateway_error: None,
             store,
             composer,
@@ -1075,6 +1115,8 @@ impl Chat {
             question_focus: cx.focus_handle(),
             region: None,
             picked: None,
+            session_menu: None,
+            session_press: None,
             focus_turn: None,
             focusing: None,
             turn_menu: None,
@@ -1173,6 +1215,10 @@ impl Chat {
         // fires its own first.
         letronna_core::wake::serve_every();
         Self::watch_sessions(cx);
+        Self::watch_accounts(cx);
+        // What the file says of the plan is as of the last check, which may
+        // be from before an upgrade on the website.
+        this.check_upgrade(cx);
         Self::serve_approvals(cx);
         Self::watch_ended(cx);
         Self::watch_clicks(window, cx);
@@ -1201,22 +1247,30 @@ impl Chat {
     /// thread, as `load_models` does where there is no window to hand: a
     /// sign-in finishing in the background.
     pub(crate) fn reload_models(&mut self, cx: &mut Context<Self>) {
-        if self.loading_models {
-            return;
-        }
+        // Asked again while an ask is out, as a gateway saved meanwhile is
+        // not in what that one asked: the newest ask's answer is the list.
+        self.models_asked += 1;
+        let asked = self.models_asked;
         self.loading_models = true;
+        self.models_reach = self.reach();
         let keys = self.keys.clone();
         let custom = self.store.settings.custom_endpoint.clone();
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             // The media models come from Letronna whatever the gateway, and
-            // a list that will not load only leaves their tabs out.
-            let media = letronna_core::media::catalogue().unwrap_or_default();
-            let _ = tx.send_blocking((all_models(&keys, &custom), media));
+            // a list that will not load only leaves their tabs out. Asked
+            // beside the gateways, so neither waits on the other.
+            let media = std::thread::spawn(letronna_core::media::catalogue);
+            let models = all_models(&keys, &custom);
+            let media = media.join().ok().and_then(Result::ok).unwrap_or_default();
+            let _ = tx.send_blocking((models, media));
         });
         cx.spawn(async move |this, cx| {
             if let Ok(((models, errors), media)) = rx.recv().await {
                 let _ = this.update(cx, |this, cx| {
+                    if asked != this.models_asked {
+                        return;
+                    }
                     this.loading_models = false;
                     this.models = models;
                     this.media_models = media;
@@ -1241,6 +1295,17 @@ impl Chat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Shown greyed in the picker; the palette and a typed name come here
+        // too, and are told why instead.
+        if self.needs_subscription(&gateway, &id) {
+            let account = self.account.as_ref();
+            let used_up = letronna_core::gateway::used_up_today(&gateway, &id, account);
+            window.push_notification(
+                gpui_component::notification::Notification::info(self.upgrade_note(used_up)),
+                cx,
+            );
+            return;
+        }
         self.model
             .update(cx, |input, cx| input.set_value(id.clone(), window, cx));
         self.store.choose_model(self.store.active, &gateway, &id);
@@ -1537,7 +1602,7 @@ impl Chat {
                 self.composer
                     .update(cx, |input, cx| input.set_value("", window, cx));
                 if self.run_saved(&prompt, asked, cx).is_err() {
-                    self.open_settings(window, cx);
+                    self.not_sent(window, cx);
                 }
                 return;
             }
@@ -1571,6 +1636,16 @@ impl Chat {
             cx.notify();
             return;
         }
+        // Hosted models the account cannot pay for: the message stays in the
+        // box as typed, without the line Enter added, and the picker opens on
+        // the models that can answer it and the way to upgrade, rather than
+        // sending to be refused.
+        if self.upgrade_needed_here() {
+            self.composer
+                .update(cx, |input, cx| input.set_value(prompt, window, cx));
+            self.open_model_picker(window, cx);
+            return;
+        }
         let session = self.store.conversations[self.store.active].id;
         let words = crate::ui::composer::crew_words(&prompt, self.crew_dismissed);
         tell_crew(session, &words, crew::Source::Composer);
@@ -1601,7 +1676,7 @@ impl Chat {
             self.dispatch(prompt, images, None, cx)
         };
         if sent.is_err() {
-            self.open_settings(window, cx);
+            self.not_sent(window, cx);
         } else {
             self.attachments.remove(&session);
         }
@@ -1661,6 +1736,10 @@ impl Chat {
                     (Ok(text), None) if this.busy && !elsewhere => {
                         this.queue_follow_up(text, window, cx)
                     }
+                    // Left in the box, as a typed message is.
+                    (Ok(_), None) if this.upgrade_needed_here() => {
+                        this.open_model_picker(window, cx)
+                    }
                     (Ok(text), None) => {
                         this.composer
                             .update(cx, |input, cx| input.set_value("", window, cx));
@@ -1673,7 +1752,7 @@ impl Chat {
                             this.dispatch(text, images, None, cx)
                         };
                         if sent.is_err() {
-                            this.open_settings(window, cx);
+                            this.not_sent(window, cx);
                         } else {
                             this.attachments.remove(&session);
                         }
@@ -1803,6 +1882,13 @@ impl Chat {
         let making = self.making(&prompt, from_chat_app);
         // Asking anything at all means the setup page has done its job.
         self.show_setup = None;
+        // Sent, it would only be refused for want of a plan or credit. Media
+        // is made on the hosted models whatever the session's gateway.
+        if self.locked_for(making) {
+            self.error = Some(self.upgrade_note_for(making));
+            cx.notify();
+            return Err(());
+        }
         let connection = match self.connection_for(self.store.active, remote) {
             Ok(connection) => connection,
             Err(error) => {
@@ -2174,6 +2260,120 @@ impl Chat {
         .detach();
     }
 
+    /// Follow the keys, gateways, sign-ins and account whenever the system
+    /// says one of their files changed, as the terminal's `/connect`,
+    /// `/login` and `/model` write them, so the model lists and the Accounts
+    /// page follow without a restart.
+    fn watch_accounts(cx: &mut Context<Self>) {
+        use ::notify::Watcher as _;
+        let folder = letronna_core::chat::data_dir();
+        let _ = std::fs::create_dir_all(&folder);
+        let (tx, rx) = async_channel::bounded(1);
+        let watcher =
+            ::notify::recommended_watcher(move |event: ::notify::Result<::notify::Event>| {
+                let ours = event.is_ok_and(|event| {
+                    event.paths.iter().any(|path| {
+                        (path.file_name().and_then(|name| name.to_str()))
+                            .is_some_and(|name| ACCOUNT_FILES.contains(&name))
+                    })
+                });
+                if ours {
+                    let _ = tx.try_send(());
+                }
+            });
+        let Ok(mut watcher) = watcher else {
+            return;
+        };
+        if watcher
+            .watch(&folder, ::notify::RecursiveMode::NonRecursive)
+            .is_err()
+        {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let _watcher = watcher;
+            while rx.recv().await.is_ok() {
+                cx.background_executor().timer(ACCOUNTS_SETTLE).await;
+                let _ = rx.try_recv();
+                if this
+                    .update(cx, |this, cx| this.follow_accounts(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Take in the keys, Custom address and sign-in as the files have them
+    /// now, and ask for the models again when that changes where they come
+    /// from. The window's own saves come through here too, and change
+    /// nothing it did not already know.
+    pub(crate) fn follow_accounts(&mut self, cx: &mut Context<Self>) {
+        self.keys = load_keys();
+        self.store.follow_custom();
+        // Not while a sign-in waits: its own ending says who is signed in.
+        if !self.signing_in {
+            self.account = letronna_core::auth::account();
+        }
+        if self.reach() != self.models_reach {
+            letronna_core::providers::router::forget();
+            self.reload_models(cx);
+        }
+        cx.notify();
+    }
+
+    /// Where the models would be asked of now, summed up: each ready
+    /// gateway's name, address and key, so a change in any of them, here or
+    /// in the terminal, is told apart from a save that changed nothing.
+    pub(crate) fn reach(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::hash::DefaultHasher::new();
+        ready(&self.keys, &self.store.settings.custom_endpoint).hash(&mut hash);
+        hash.finish()
+    }
+
+    /// Ask the API about the account again when its hosted models need a
+    /// subscription, at most every `UPGRADE_CHECK`: it may have been bought
+    /// since the file was written, and a perk's allowance may be back.
+    pub(crate) fn check_upgrade(&mut self, cx: &mut Context<Self>) {
+        if !self.hosted_unpaid(LETRONNA) || self.signing_in || self.sign_in_url.is_some() {
+            return;
+        }
+        if self
+            .upgrade_checked
+            .is_some_and(|at| at.elapsed() < UPGRADE_CHECK)
+        {
+            return;
+        }
+        self.upgrade_checked = Some(std::time::Instant::now());
+        self.refresh_account(cx);
+    }
+
+    /// Ask the API about the account again, off this thread, after the
+    /// hosted pool turned a call down for want of credit or a plan: a perk's
+    /// allowance for the day may have run out, or the plan changed, and the
+    /// picker greys at once what is closed now. Not while a sign-in waits,
+    /// which the answer would end.
+    fn account_again(&mut self, cx: &mut Context<Self>) {
+        if !self.signing_in && self.sign_in_url.is_none() {
+            self.refresh_account(cx);
+        }
+    }
+
+    /// After a message could not be sent: Settings, where a gateway is set
+    /// up, unless it was held back for want of a subscription, which the
+    /// picker and the box say already.
+    pub(crate) fn not_sent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.upgrade_needed_here() {
+            self.error = None;
+            self.open_model_picker(window, cx);
+            return;
+        }
+        self.open_settings(window, cx);
+    }
+
     /// Take helpers' approval requests for as long as the window is open.
     fn serve_approvals(cx: &mut Context<Self>) {
         let served = approvals::serve();
@@ -2478,6 +2678,9 @@ impl Chat {
         match event {
             Event::Finished(Err(error)) => {
                 let kept = self.keep_failure(&error);
+                if letronna_core::failure::ask_account_again(error.gateway, error.kind) {
+                    self.account_again(cx);
+                }
                 let on_screen =
                     self.streaming_id == Some(self.store.conversations[self.store.active].id);
                 // `finish` reports it to a chat app, and holds back what was
@@ -2494,6 +2697,11 @@ impl Chat {
             // Only the switch a failure caused: the requests after it go to
             // the same fallback until the cooldown ends, and say nothing new.
             Event::Switched(switch) if switch.after.is_some() => {
+                if let Some((from, kind)) = &switch.after
+                    && letronna_core::failure::ask_account_again(Some(from), *kind)
+                {
+                    self.account_again(cx);
+                }
                 self.note = Some(switch.to_string());
             }
             // Kept with the session, so a restart need not ask for it again.
@@ -4333,6 +4541,8 @@ impl Render for Chat {
         // And the composer holds its draft, however the session was switched
         // to: a click, or a message from a chat app.
         self.swap_draft(window, cx);
+        // And says, where it is empty, when what it sends cannot be paid for.
+        self.keep_placeholder(window, cx);
         // And whether it is empty is read from it: GPUI Kit sends no change
         // when the text is set rather than typed, as when a send clears it.
         self.composer_empty = self

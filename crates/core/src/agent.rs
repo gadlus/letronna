@@ -410,7 +410,7 @@ impl Turn {
                     self.live.reasoning.clear();
                     self.live.drafts.clear();
                 }
-                self.live.retrying = Some(*retry);
+                self.live.retrying = Some(retry.clone());
             }
             Event::Switched(switch) => self.live.switched = Some(switch.clone()),
             // The front end tells the user.
@@ -1430,8 +1430,9 @@ mod tests {
             of: 6,
             wait: std::time::Duration::from_secs(1),
             dropped: false,
+            error: "Overloaded".into(),
         };
-        turn.absorb(&Event::Retrying(retry));
+        turn.absorb(&Event::Retrying(retry.clone()));
         assert_eq!(turn.live.retrying, Some(retry));
         turn.absorb(&Event::Reasoning("thinking".into()));
         assert_eq!(turn.live.retrying, None);
@@ -1449,6 +1450,7 @@ mod tests {
             of: 6,
             wait: std::time::Duration::from_secs(1),
             dropped: true,
+            error: String::new(),
         }));
         assert!(turn.live.drafts.is_empty());
         turn.absorb(&Event::Delta("The whole answer.".into()));

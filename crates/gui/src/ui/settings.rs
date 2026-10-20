@@ -2555,7 +2555,7 @@ fn account_search_row(row: AccountSearch, chat: &Entity<Chat>, cx: &App) -> Div 
                 .small()
                 .plain(cx)
                 .label("Add credit")
-                .on_click(|_, _, cx| cx.open_url(&letronna_core::auth::checkout())),
+                .on_click(|_, _, cx| cx.open_url(&letronna_core::auth::credit_checkout())),
         ),
         (true, false, false) => None,
     };

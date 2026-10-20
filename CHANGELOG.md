@@ -13,6 +13,22 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ## [Unreleased]
 
+### Added
+- **App** — A session's menu (rename, pin, export, delete) opens from a right-click, a two-finger or Control-click on a Mac, a long press, or the "…" that shows on the row under the pointer; on a Mac, Backspace and Cmd+Backspace delete the selected session too.
+
+### Changed
+- **All** — On a Free plan with no credit, Letronna's hosted models are greyed out and cannot be picked or sent to, under an Upgrade subscription button that opens checkout, rather than a send that failed and opened Settings. The window's picker, palette and first-run step, and the terminal's `/model`, list them last as needing a subscription; the terminal says so at start and in its footer, holds back a message that would be refused, and points to `/model` for a gateway that is ready. A plan bought on the website is seen without a restart.
+- **All** — On a Free plan with no credit, the hosted models Letronna makes free today stay open: listed as usual with "Free today" in the window and "(free today)" in the terminal's `/model`, and sent to as any other. One whose daily allowance is used up is greyed out with the rest until 00:00 UTC, and says so when picked or sent to; a hosted refusal for want of credit or a plan asks the account again, so it greys at once. Add credit opens the credit checkout, and Upgrade subscription the Pro plan's.
+- **All** — A failed hosted reply on a Free plan offers Upgrade subscription, which opens checkout instead of Settings, with Choose a model beside it when another gateway is set up; Sign in is kept for an account that is not on this computer.
+- **All** — Model lists follow a gateway as soon as it is added, changed or removed, in Settings or with `/connect`: the window follows what the terminal saves and the other way round, and which accounts serve a model is asked again rather than kept until a restart.
+
+### Fixed
+- **All** — A request on Letronna falls to a gateway of your own when the account turns it away or is out of credit, even on the Free plan: every ready account is reached, those after the session's tier in "When one runs out" first, then the earlier ones, with gateways of your own counted as API keys, and the default model on another gateway asked last. A gateway that cannot be reached hands on too. When every model fails, the session's own failure is shown, not a fallback's credit error, and the switch notice names both gateways.
+- **All** — A retry says what the provider said, in the terminal, the window and the log (`model_retry`, with the error masked and kept to 500 characters), where it said only "trying again". A failure keeps its cause: a connection that could not be made or broke off says why, a reply that is no JSON adds its words or its page's title, and an error is read wherever its server put the words: the usual `error.message`, a bare string, FastAPI's `detail` and its list of what failed validation, `msg`, OAuth's `error_description`, Cloudflare's `errors`, or, in no field known, the error as it came. The window wraps those words instead of cutting them to one line.
+- **All** — A gateway answering a server error that says its own upstream credit balance is spent, as one relaying Anthropic's refusal of its account did with a 503, is not waited out: it is not tried again for minutes, the request hands on to another account, and its words are shown. It stays the gateway's error, so neither Add credit nor Upgrade subscription is offered for it, as Letronna's own pool relays its spent credit this way too.
+- **Terminal** — `letronna -p` says each retry, with what the provider said, and each switch to another model on stderr, where it was silent until it gave up and never said another gateway answered.
+- **App** — Deleting a session works while another session replies, finds the session by its id rather than its place in the list, and says why when it cannot, as a notice rather than in a chat that may not be on screen.
+
 ## [0.1.0-alpha.4] - 2026-10-20
 
 ### Added

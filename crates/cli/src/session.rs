@@ -68,6 +68,9 @@ pub struct Runner {
     /// Replies print here at the prompt, which shows only bold and code;
     /// false for `-p`, the control protocol and an editor.
     pub plain_terminal: bool,
+    /// The way out of the turn that just failed, said under its error when
+    /// the Letronna account turned it down.
+    pub way_out: Option<String>,
 }
 
 /// The Custom gateway's key when the environment gave it (`AGENT_API_KEY`
@@ -76,6 +79,16 @@ pub struct Runner {
 pub static GIVEN_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 impl Runner {
+    /// Say a turn failed with `error`, and the way out of it when there is
+    /// one to say.
+    pub fn show_failure(&mut self, error: &str) {
+        render::blank();
+        render::line(&render::red(error));
+        if let Some(way_out) = self.way_out.take() {
+            render::line(&render::amber(&way_out));
+        }
+    }
+
     /// The permission mode now: the bar's, where shift-tab can change it.
     pub fn current_mode(&self) -> Mode {
         self.bar.mode().unwrap_or(self.mode)
@@ -410,6 +423,8 @@ impl Runner {
         hooks::new_turn(connection.conversation);
         let mut turn = Turn::new(connection).verifying(self.store.settings.verifies_edits());
         self.stopped = false;
+        // One left from a failure shown nowhere is not this turn's.
+        self.way_out = None;
         // What is still being said of the last answer is not wanted now.
         if let Some(voice) = &mut self.voice {
             voice.hush();
@@ -697,13 +712,23 @@ impl Runner {
                 if let Some(voice) = &mut self.voice {
                     voice.hush();
                 }
+                // What the provider said goes with it, rather than on a
+                // line of its own that would say the stream closed again.
+                let dropped = letronna_core::retry::DROPPED;
+                let said = render::one_line(&format!("{dropped} {}", retry.error));
+                render::blank();
+                render::said(&render::dim("●"), &render::dim(&said));
+                out = Stream::opening_with(render::bullet());
+                (opened, thought) = (false, false);
+            } else if let Event::Retrying(retry) = &event {
+                // The waiting line is cut to the terminal's width and gone
+                // once the next try answers, so the provider's words are
+                // kept above it too.
                 render::blank();
                 render::said(
                     &render::dim("●"),
-                    &render::dim(letronna_core::retry::DROPPED),
+                    &render::dim(&render::one_line(&retry.to_string())),
                 );
-                out = Stream::opening_with(render::bullet());
-                (opened, thought) = (false, false);
             }
             // The waiting line says why while a failed try waits to be made
             // again, earlier turns are summarized or a call is being written,
@@ -777,6 +802,16 @@ impl Runner {
             {
                 render::blank();
                 render::said(&render::dim("●"), &render::dim(&switch.to_string()));
+                // Turned down by the hosted pool for want of credit or a
+                // plan, and answered elsewhere: the account is asked again
+                // beside the reply, so the next message and /model know.
+                if let Some((from, kind)) = &switch.after
+                    && letronna_core::failure::ask_account_again(Some(from), *kind)
+                {
+                    std::thread::spawn(|| {
+                        let _ = letronna_core::auth::refresh_within(ACCOUNT_CHECK);
+                    });
+                }
             }
             if let Event::Note(note) = &event {
                 render::blank();
@@ -798,6 +833,16 @@ impl Runner {
                 }
                 // Catch up on anything a throttled paint skipped.
                 crate::screen::settle();
+                if let Err(failure) = &result {
+                    let custom = self.store.settings.custom_endpoint.as_str();
+                    self.way_out = way_out_of(failure, &turn.connection.model, custom);
+                    // The account was asked again, and the footer says
+                    // whether the session's model is still open.
+                    if letronna_core::failure::ask_account_again(failure.gateway, failure.kind) {
+                        let note = crate::banner::footer(self);
+                        self.bar.set_footer(note);
+                    }
+                }
                 result.map_err(|failure| failure.to_string())?;
                 break;
             }
@@ -2040,6 +2085,103 @@ pub(crate) fn usage(reply: &Message) -> String {
     parts.join(" · ")
 }
 
+/// How long a hosted failure waits on the account service to say where the
+/// account stands now, before its way out is told from what was kept.
+const ACCOUNT_CHECK: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The way out of `failure`, a call to `model`, when the Letronna account
+/// turned it down, as `way_out` says it, knowing who is signed in now and
+/// which gateways are set up besides, Custom at `custom`.
+fn way_out_of(
+    failure: &letronna_core::failure::Failure,
+    model: &str,
+    custom: &str,
+) -> Option<String> {
+    use letronna_core::providers::{self, AuthKind};
+    if !failure.hosted() {
+        return None;
+    }
+    // Turned down for want of credit or a plan, as when a perk's allowance
+    // for the day runs out or the plan changed: the account is asked again,
+    // briefly, so what is said here and what /model greys are as of now.
+    if letronna_core::failure::ask_account_again(failure.gateway, failure.kind) {
+        let _ = letronna_core::auth::refresh_within(ACCOUNT_CHECK);
+    }
+    let keys = letronna_core::store::load_keys();
+    // A local server is listed whether or not it is running, so it is no
+    // promise of a model to pick.
+    let elsewhere = (letronna_core::gateway::ready(&keys, custom).into_iter())
+        .map(|(name, ..)| name)
+        .filter(|name| *name != letronna_core::gateway::LETRONNA)
+        .find(|name| providers::find(name).is_none_or(|p| p.auth() != AuthKind::None));
+    let account = letronna_core::auth::account();
+    let used_up = letronna_core::gateway::used_up_today(
+        letronna_core::gateway::LETRONNA,
+        model,
+        account.as_ref(),
+    );
+    let pages = Pages {
+        upgrade: letronna_core::auth::checkout(),
+        credit: letronna_core::auth::credit_checkout(),
+    };
+    way_out(failure, account.as_ref(), elsewhere, used_up, &pages)
+}
+
+/// Where a subscription and credit are bought, on the website.
+struct Pages {
+    upgrade: String,
+    credit: String,
+}
+
+/// What to do about a hosted `failure`, in a line: a subscription, credit
+/// or a sign-in, as the account signed in here calls for, and before it a
+/// model on `elsewhere`, a gateway of the user's own, which answers at once.
+/// `used_up` says the model is free on a perk whose allowance for the day
+/// is used up. The address comes last, so nothing after it is taken for
+/// part of it.
+fn way_out(
+    failure: &letronna_core::failure::Failure,
+    account: Option<&letronna_core::auth::Account>,
+    elsewhere: Option<&str>,
+    used_up: bool,
+    pages: &Pages,
+) -> Option<String> {
+    use letronna_core::failure::{FailureKind, upgrade};
+    let upgrade = upgrade(failure.kind, account);
+    let (checkout, credit) = (&pages.upgrade, &pages.credit);
+    let (why, then) = match failure.kind {
+        FailureKind::Quota | FailureKind::Auth if upgrade && used_up => (
+            "This model's free allowance is used up today and comes back at 00:00 UTC",
+            format!("upgrade at {checkout}"),
+        ),
+        FailureKind::Quota if upgrade => (
+            "Your Free plan has no credit for hosted models",
+            format!("upgrade at {checkout}"),
+        ),
+        FailureKind::Auth if upgrade => (
+            "Your Free plan does not include this model",
+            format!("upgrade at {checkout}"),
+        ),
+        FailureKind::Quota => (
+            "Your Letronna credit has run out",
+            format!("add credit at {credit}"),
+        ),
+        FailureKind::Auth if account.is_none() => (
+            "Not signed in to Letronna",
+            "sign in with /login".to_owned(),
+        ),
+        FailureKind::Auth => (
+            "Letronna turned this computer's sign-in away",
+            "sign in again with /login".to_owned(),
+        ),
+        _ => return None,
+    };
+    Some(match elsewhere {
+        Some(gateway) => format!("{why}: pick a model on {gateway} with /model, or {then}"),
+        None => format!("{why}: {then}"),
+    })
+}
+
 /// What a session is called before a model names it: the first line of
 /// the first message, a command as it was typed, as the window calls it.
 pub fn first_line(prompt: &str) -> String {
@@ -2066,6 +2208,78 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_free_plan_turned_down_is_told_how_to_go_on() {
+        use letronna_core::auth::Account;
+        use letronna_core::failure::{Failure, FailureKind};
+        let failed = |kind, gateway| {
+            let mut failure = Failure::new(kind, "Refused.");
+            failure.gateway = gateway;
+            failure
+        };
+        let free = Account {
+            plan: "free".into(),
+            ..Default::default()
+        };
+        let hosted = Some(letronna_core::gateway::LETRONNA);
+        let at = Pages {
+            upgrade: "https://letronna.test/checkout".into(),
+            credit: "https://letronna.test/credit".into(),
+        };
+        let said = |kind, account: Option<&Account>, elsewhere| {
+            way_out(&failed(kind, hosted), account, elsewhere, false, &at)
+        };
+        assert_eq!(
+            said(FailureKind::Quota, Some(&free), None).unwrap(),
+            "Your Free plan has no credit for hosted models: upgrade at https://letronna.test/checkout"
+        );
+        assert_eq!(
+            said(FailureKind::Quota, Some(&free), Some("Custom")).unwrap(),
+            "Your Free plan has no credit for hosted models: pick a model on Custom with /model, or upgrade at https://letronna.test/checkout"
+        );
+        assert_eq!(
+            said(FailureKind::Auth, Some(&free), None).unwrap(),
+            "Your Free plan does not include this model: upgrade at https://letronna.test/checkout"
+        );
+        let pro = Account {
+            plan: "pro".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            said(FailureKind::Quota, Some(&pro), None).unwrap(),
+            "Your Letronna credit has run out: add credit at https://letronna.test/credit"
+        );
+        // Free on a perk whose allowance for today is used up.
+        let used_up = |elsewhere| {
+            way_out(
+                &failed(FailureKind::Quota, hosted),
+                Some(&free),
+                elsewhere,
+                true,
+                &at,
+            )
+        };
+        assert_eq!(
+            used_up(None).unwrap(),
+            "This model's free allowance is used up today and comes back at 00:00 UTC: upgrade at https://letronna.test/checkout"
+        );
+        assert_eq!(
+            used_up(Some("Custom")).unwrap(),
+            "This model's free allowance is used up today and comes back at 00:00 UTC: pick a model on Custom with /model, or upgrade at https://letronna.test/checkout"
+        );
+        assert_eq!(
+            said(FailureKind::Auth, None, None).unwrap(),
+            "Not signed in to Letronna: sign in with /login"
+        );
+        // Only the account's own refusals have a way out to tell.
+        assert_eq!(said(FailureKind::Overloaded, Some(&free), None), None);
+        assert_eq!(way_out_of(&failed(FailureKind::Quota, None), "m", ""), None);
+        assert_eq!(
+            way_out_of(&failed(FailureKind::Quota, Some("OpenAI")), "m", ""),
+            None
+        );
+    }
 
     #[test]
     fn a_reply_names_its_model_and_provider() {
@@ -2473,6 +2687,7 @@ mod tests {
             voice: None,
             review: Default::default(),
             plain_terminal: false,
+            way_out: None,
         };
         // Newer sessions in another folder, and one in none, are passed over.
         let opened = runner.open(true, Some("/work/site".into()));
@@ -2523,6 +2738,7 @@ mod tests {
             voice: None,
             review: Default::default(),
             plain_terminal: false,
+            way_out: None,
         };
         runner.store.conversations.push(Conversation::default());
         assert!(runner.connection(0).unattended);

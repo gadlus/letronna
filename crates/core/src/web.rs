@@ -365,7 +365,7 @@ pub(crate) fn unanswered(lead: &str, e: &reqwest::Error, moved: bool) -> String 
 /// `e` and each error under it. reqwest's own words are the same whether a
 /// name was not found, the connection was turned down or the address is
 /// wrong, and each of those calls for a different next step.
-fn with_causes(e: &reqwest::Error) -> String {
+pub(crate) fn with_causes(e: &(dyn std::error::Error + 'static)) -> String {
     let mut said = e.to_string();
     let mut cause = std::error::Error::source(e);
     while let Some(error) = cause {

@@ -274,11 +274,12 @@ impl Chat {
             div().into_any_element()
         } else if message.content.is_empty() {
             let live = self.turn.as_ref().filter(|_| streaming).map(|t| &t.live);
-            let doing = match (
-                live.and_then(|l| l.retrying),
-                live.is_some_and(|l| l.compacting),
-            ) {
-                (Some(retry), _) => Some(retry.to_string()),
+            let retrying = live.and_then(|l| l.retrying.as_ref());
+            // Under the wait, on a line that wraps: cut to one row, a long
+            // error lost the part that says what went wrong.
+            let said = retrying.map(|retry| retry.said()).filter(|s| !s.is_empty());
+            let doing = match (retrying, live.is_some_and(|l| l.compacting)) {
+                (Some(retry), _) => Some(retry.waiting()),
                 (None, true) => Some("Compacting…".to_owned()),
                 // A long write streams for a while; say so, not Thinking.
                 (None, false) => writing.clone(),
@@ -288,18 +289,30 @@ impl Chat {
             if doing.is_none() && thinking_shown {
                 div().into_any_element()
             } else {
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .text_color(cx.theme().muted_foreground)
+                v_flex()
+                    .gap_1()
                     .child(
-                        crate::ui::busy::Spinner::new()
-                            .xsmall()
-                            .color(cx.theme().primary),
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                crate::ui::busy::Spinner::new()
+                                    .xsmall()
+                                    .color(cx.theme().primary),
+                            )
+                            .child(crate::ui::busy::Shimmer::new(
+                                doing.unwrap_or("Thinking…".to_owned()),
+                            )),
                     )
-                    .child(crate::ui::busy::Shimmer::new(
-                        doing.unwrap_or("Thinking…".to_owned()),
-                    ))
+                    .when_some(said, |row, said| {
+                        row.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(said),
+                        )
+                    })
                     .into_any_element()
             }
         } else {
@@ -671,10 +684,18 @@ impl Chat {
         let Some(model) = self.turn.as_ref().map(|turn| turn.connection.model.clone()) else {
             return false;
         };
-        let hosted = self.store.model(ix).0 == LETRONNA;
-        let Some(message) = failure.kept(&model, hosted, backend::now()) else {
+        // The gateway that failed, which after a switch is not the session's.
+        let hosted = failure.hosted();
+        let Some(mut message) = failure.kept(&model, hosted, backend::now()) else {
             return false;
         };
+        // Who is signed in, as the file says now rather than as this window
+        // last read it, decides between a sign-in, credit and a subscription;
+        // a model another gateway listed is a way on without either.
+        let elsewhere = (self.models.iter()).any(|(gateway, _)| gateway != LETRONNA);
+        if let Some(kept) = message.failed.as_deref_mut() {
+            kept.knowing(letronna_core::auth::account().as_ref(), elsewhere);
+        }
         let session = self.store.conversations[ix].id;
         // A wait set for an earlier failure there is for a turn now gone by.
         if self
@@ -758,6 +779,8 @@ impl Chat {
             kind: FailureKind::Unknown,
             until: None,
             hosted: false,
+            upgrade: false,
+            elsewhere: false,
         });
         let now = backend::now();
         // One further up is history: something came after it.
@@ -852,11 +875,11 @@ impl Chat {
                             .min_w_0()
                             .text_xs()
                             .text_color(muted)
-                            // Clipped, not truncated: gpui keeps the first
-                            // width a truncated line was measured at, here
-                            // too narrow, and drew the line as "…".
-                            .overflow_hidden()
-                            .whitespace_nowrap()
+                            // Wrapped, to four lines: cut to one, a long
+                            // error lost the provider's own words at its end,
+                            // which are what says what went wrong. Copy
+                            // details has the rest.
+                            .line_clamp(4)
                             .child(letronna_core::tools::one_line(&message.content)),
                     )
                     .children(actions.map(|actions| div().pt_1().child(actions))),
@@ -883,6 +906,10 @@ impl Chat {
                 Icon::new(AppIcon::Clock),
             ),
             Fix::AddCredit => ("Add credit".to_owned(), Icon::new(AppIcon::PopOut)),
+            Fix::Upgrade => (
+                "Upgrade subscription".to_owned(),
+                Icon::new(AppIcon::PopOut),
+            ),
             Fix::ChooseModel => ("Choose a model".to_owned(), Icon::new(AppIcon::Sparkles)),
             Fix::SignIn => ("Sign in".to_owned(), Icon::new(AppIcon::User)),
             Fix::CopyDetails => ("Copy details".to_owned(), Icon::new(IconName::Copy)),
@@ -904,7 +931,12 @@ impl Chat {
             }
             Fix::RetryAt(at) => button
                 .on_click(cx.listener(move |this, _, _, cx| this.wait_to_retry(session, at, cx))),
+            // On the website, where credit and the plan are paid for;
+            // Settings has nothing a Free plan out of credit can change.
             Fix::AddCredit => {
+                button.on_click(|_, _, cx| cx.open_url(&letronna_core::auth::credit_checkout()))
+            }
+            Fix::Upgrade => {
                 button.on_click(|_, _, cx| cx.open_url(&letronna_core::auth::checkout()))
             }
             Fix::ChooseModel => button.on_click(cx.listener(|this, _, window, cx| {

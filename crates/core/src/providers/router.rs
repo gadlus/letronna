@@ -4,13 +4,16 @@
 //! The session's model is asked on its own account first. When that account
 //! is rate limited past what the retries wait out, out of quota or credit,
 //! or failing in another way `fallback::mends` covers, the same model is
-//! asked on the next account set up, by tier -- a plan already paid for,
+//! asked on the other accounts set up, by tier -- a plan already paid for,
 //! then an API key, then Letronna credit, then a free one, or in the order
-//! `Settings.provider_order` gives -- and after those the models
-//! `Settings.fallbacks` lists. An account is only asked once it lists the
-//! model. `fallback::run` does the asking: each switch is told to the
-//! frontends as one line, and an account that failed is passed over for
-//! `fallback::COOLDOWN`.
+//! `Settings.provider_order` gives. Those at the session's own tier or after
+//! it come first; those before it come after them, rather than not at all,
+//! so a Letronna account out of credit still reaches a key of the user's
+//! own. After those come the models `Settings.fallbacks` lists, and last the
+//! default model, when it is on another gateway. An account is only asked
+//! once it lists the model. `fallback::run` does the asking: each switch is
+//! told to the frontends as one line, and an account that failed is passed
+//! over for `fallback::COOLDOWN`.
 
 use super::Tier;
 use crate::chat::Connection;
@@ -19,7 +22,9 @@ use crate::fallback::{self, Fallback, Switch};
 use crate::store::Settings;
 use reqwest::header::HeaderMap;
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 /// The tiers in the order Settings gives, then any it leaves out in their
 /// usual order.
@@ -44,34 +49,45 @@ pub fn reorder(settings: &mut Settings, order: &[Tier]) {
 
 /// Send to `primary`, then on to the accounts and fallbacks after it, as
 /// `fallback::run` does. `given` stands in for the route worked out here.
+/// Settings are read on each call, so a change made in the window counts in
+/// the terminal from its next request.
 pub(crate) fn run(
     primary: &Connection,
     given: Option<Vec<Connection>>,
     send: impl FnMut(&Connection) -> Result<(), Failure>,
     switched: impl FnMut(Switch) -> Result<(), Failure>,
 ) -> Result<(), Failure> {
-    let (chain, accounts) = match given {
-        Some(chain) => (chain, Vec::new()),
-        None => route(primary),
+    let (chain, accounts, custom) = match given {
+        Some(chain) => (chain, Vec::new(), String::new()),
+        None => {
+            let settings = crate::store::current_settings();
+            let keys = crate::store::load_keys();
+            let ready = ready(&keys, &settings);
+            let (chain, accounts) = route(primary, &settings, &keys, &ready);
+            (chain, accounts, settings.custom_endpoint)
+        }
     };
     let usable = |c: &Connection| !accounts.iter().any(|a| fallback::same(a, c)) || serves(c);
-    fallback::run(&chain, usable, send, switched)
+    fallback::run(&chain, &custom, usable, send, switched)
 }
 
 /// Every place to ask, in turn, and those of them that are accounts the
-/// router added, whose models are checked before one is asked. Settings are
-/// read on each call, so a change made in the window counts in the terminal
-/// from its next request.
-fn route(primary: &Connection) -> (Vec<Connection>, Vec<Connection>) {
-    let settings = crate::store::current_settings();
-    let keys = crate::store::load_keys();
-    let accounts = accounts(primary, &order(&settings), &ready(&keys, &settings));
+/// router added, whose models are checked before one is asked. `ready` is
+/// the gateways set up, as `gateway::ready` gives them.
+fn route(
+    primary: &Connection,
+    settings: &Settings,
+    keys: &HashMap<String, String>,
+    ready: &[(&'static str, String, String)],
+) -> (Vec<Connection>, Vec<Connection>) {
+    let accounts = accounts(primary, &order(settings), ready);
     // Entries that do not read are passed over here; the frontends say why
     // when they are written.
-    let fallbacks: Vec<_> = (settings.fallbacks.iter())
+    let mut fallbacks: Vec<_> = (settings.fallbacks.iter())
         .filter_map(|text| Fallback::parse(text).ok())
         .collect();
-    let listed = fallback::chain(primary, &fallbacks, &keys, &settings.custom_endpoint);
+    fallbacks.extend(default_elsewhere(primary, settings, ready));
+    let listed = fallback::chain(primary, &fallbacks, keys, &settings.custom_endpoint);
     let mut chain = vec![primary.clone()];
     for next in accounts.iter().chain(&listed[1..]) {
         if !chain.iter().any(|c| fallback::same(c, next)) {
@@ -79,6 +95,25 @@ fn route(primary: &Connection) -> (Vec<Connection>, Vec<Connection>) {
         }
     }
     (chain, accounts)
+}
+
+/// The default model, when it is on a gateway set up other than the
+/// session's. An account is only asked for the session's own model id,
+/// which a key of the user's own seldom lists by a hosted model's name, so
+/// without it a session left on Letronna would end at the account's
+/// refusal while the model they chose for new sessions waits on their key.
+fn default_elsewhere(
+    primary: &Connection,
+    settings: &Settings,
+    ready: &[(&'static str, String, String)],
+) -> Option<Fallback> {
+    let address = |text: &str| text.trim().trim_end_matches('/').to_owned();
+    let (gateway, model) = (settings.gateway.trim(), settings.model.trim());
+    let (_, base, _) = ready.iter().find(|(name, ..)| *name == gateway)?;
+    (!model.is_empty() && address(base) != address(&primary.endpoint)).then(|| Fallback {
+        gateway: gateway.to_owned(),
+        model: model.to_owned(),
+    })
 }
 
 #[cfg(not(test))]
@@ -96,30 +131,29 @@ fn ready(_: &HashMap<String, String>, _: &Settings) -> Vec<(&'static str, String
 }
 
 /// The session's model on each of `ready` (name, base, key) but its own
-/// account, at its tier or after it in `order`, in that order; within a tier
-/// in the order the providers are offered.
+/// account, by tier in `order`: those at its tier or after it first, then
+/// those before it; within a tier in the order the providers are offered. A
+/// gateway no provider declares, as the user's own and those plugins add
+/// are, is ranked as Custom is, among the API keys.
 fn accounts(
     primary: &Connection,
     order: &[Tier],
     ready: &[(&'static str, String, String)],
 ) -> Vec<Connection> {
-    let rank = |name: &str| {
-        let tier = super::find(name)?.info().tier;
-        order.iter().position(|t| *t == tier)
+    let rank = |name: Option<&str>| {
+        let tier = (name.and_then(super::find)).map_or(Tier::ApiKey, |p| p.info().tier);
+        order.iter().position(|t| *t == tier).unwrap_or(order.len())
     };
-    let own = crate::gateway::named(&primary.endpoint)
-        .and_then(rank)
-        .unwrap_or(0);
+    let own = rank(crate::gateway::named(&primary.endpoint));
     let mut accounts: Vec<_> = (ready.iter())
-        .filter_map(|(name, base, key)| Some((rank(name)?, base, key)))
-        .filter(|(rank, ..)| *rank >= own)
-        .map(|(rank, base, key)| {
+        .map(|(name, base, key)| {
             let connection = Connection {
                 endpoint: base.clone(),
                 key: key.clone(),
                 ..primary.clone()
             };
-            (rank, connection)
+            let rank = rank(Some(name));
+            ((rank < own, rank), connection)
         })
         .filter(|(_, c)| !fallback::same(c, primary))
         .collect();
@@ -127,28 +161,59 @@ fn accounts(
     accounts.into_iter().map(|(_, c)| c).collect()
 }
 
+/// How long an account's list of models is taken as it was: a model the
+/// server gains later is reached within this, and a new key or address at
+/// once, as they are listed apart.
+const SERVED_FOR: Duration = Duration::from_secs(5 * 60);
+
+/// Each account's models as last listed, by its address and a hash of its
+/// key -- the key itself is not kept twice -- with when.
+type Served = BTreeMap<(String, u64), (Instant, Vec<String>)>;
+static SERVED: Mutex<Served> = Mutex::new(BTreeMap::new());
+
+fn served_as(endpoint: &str, key: &str) -> (String, u64) {
+    let mut hash = std::hash::DefaultHasher::new();
+    key.trim().hash(&mut hash);
+    (
+        endpoint.trim().trim_end_matches('/').to_owned(),
+        hash.finish(),
+    )
+}
+
+/// Take `models` as what the account at `endpoint` with `key` lists, as a
+/// model list just asked of it said, so the router and the model lists
+/// agree without asking twice.
+pub(crate) fn listed(endpoint: &str, key: &str, models: &[String]) {
+    (SERVED.lock().unwrap_or_else(PoisonError::into_inner))
+        .insert(served_as(endpoint, key), (Instant::now(), models.to_vec()));
+}
+
+/// Ask every account for its models again before it is next tried: a
+/// gateway was added, changed or removed, or a key was saved.
+pub fn forget() {
+    (SERVED.lock().unwrap_or_else(PoisonError::into_inner)).clear();
+}
+
 /// Whether `connection`'s account lists its model.
 fn serves(connection: &Connection) -> bool {
-    // ponytail: each account's list is asked once a process; a model added
-    // later is reached after a restart.
-    static SERVED: Mutex<BTreeMap<String, Vec<String>>> = Mutex::new(BTreeMap::new());
-    let endpoint = connection.endpoint.trim().trim_end_matches('/').to_owned();
+    let at = served_as(&connection.endpoint, &connection.key);
     let kept = (SERVED.lock().unwrap_or_else(PoisonError::into_inner))
-        .get(&endpoint)
-        .cloned();
+        .get(&at)
+        .filter(|(when, _)| when.elapsed() < SERVED_FOR)
+        .map(|(_, models)| models.clone());
     let models = match kept {
         Some(models) => models,
         None => {
-            let listed = match crate::gateway::named(&endpoint).and_then(super::find) {
-                Some(provider) => provider.models(&endpoint, &connection.key),
-                None => crate::chat::list_models(&endpoint, &connection.key),
+            let endpoint = &at.0;
+            let listed = match crate::gateway::named(endpoint).and_then(super::find) {
+                Some(provider) => provider.models(endpoint, &connection.key),
+                None => crate::chat::list_models(endpoint, &connection.key),
             };
             // One that does not answer is asked again next time.
             let Ok(models) = listed else {
                 return false;
             };
-            (SERVED.lock().unwrap_or_else(PoisonError::into_inner))
-                .insert(endpoint, models.clone());
+            self::listed(endpoint, &connection.key, &models);
             models
         }
     };
@@ -314,6 +379,30 @@ mod tests {
     use reqwest::header::{HeaderName, HeaderValue};
 
     #[test]
+    fn a_new_key_a_stale_list_or_a_forget_asks_the_account_again() {
+        // Nothing answers on the discard port, so asking it fails at once.
+        let at = "http://127.0.0.1:9/served/v1";
+        let on = |key: &str| Connection {
+            endpoint: format!("{at}/"),
+            key: key.into(),
+            model: "m".into(),
+            ..Default::default()
+        };
+        listed(at, "old", &["m".into()]);
+        assert!(serves(&on("old")));
+        // Another key is another account, whose list is asked for afresh.
+        assert!(!serves(&on("new")));
+        forget();
+        assert!(!serves(&on("old")));
+        // A list kept past its time is asked for again too.
+        if let Some(then) = Instant::now().checked_sub(SERVED_FOR + Duration::from_secs(1)) {
+            (SERVED.lock().unwrap_or_else(PoisonError::into_inner))
+                .insert(served_as(at, "old"), (then, vec!["m".into()]));
+            assert!(!serves(&on("old")));
+        }
+    }
+
+    #[test]
     fn usage_reads_as_plan_then_use_then_reset() {
         let q = |plan: Option<&str>, at| Quota {
             plan: plan.map(str::to_owned),
@@ -414,8 +503,16 @@ mod tests {
             names(&Tier::ALL, "ChatGPT"),
             ["OpenAI", "Letronna", "Ollama"]
         );
-        // From a key, only that tier and those after it.
-        assert_eq!(names(&Tier::ALL, "OpenAI"), ["Letronna", "Ollama"]);
+        // From a key, that tier and those after it, then those before it.
+        assert_eq!(
+            names(&Tier::ALL, "OpenAI"),
+            ["Letronna", "Ollama", "ChatGPT"]
+        );
+        // From Letronna credit, a key comes after a free one rather than never.
+        assert_eq!(
+            names(&Tier::ALL, "Letronna"),
+            ["Ollama", "ChatGPT", "OpenAI"]
+        );
         // The user's order counts.
         let free_first = [Tier::Free, Tier::Subscription, Tier::ApiKey, Tier::Credit];
         assert_eq!(
@@ -428,5 +525,84 @@ mod tests {
             (first.key.as_str(), first.model.as_str()),
             ("key-OpenAI", "gpt-5")
         );
+    }
+
+    /// A gateway set up, as `gateway::ready` gives it.
+    fn set_up(name: &'static str, base: &str) -> (&'static str, String, String) {
+        (name, base.to_owned(), format!("key-{name}"))
+    }
+
+    fn letronna(model: &str) -> Connection {
+        Connection {
+            endpoint: crate::gateway::base_url(crate::gateway::LETRONNA, ""),
+            model: model.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn gateways_no_provider_declares_are_reached_as_keys_are() {
+        let ready = [
+            set_up("Letronna", &crate::auth::hosted_base()),
+            set_up("Ollama", &crate::gateway::base_url("Ollama", "")),
+            set_up("Office", "https://office.router.test/v1"),
+            set_up("Custom", "https://custom.router.test/v1"),
+        ];
+        let endpoints: Vec<_> = (accounts(&letronna("gpt-5"), &Tier::ALL, &ready).iter())
+            .map(|c| c.endpoint.clone())
+            .collect();
+        assert_eq!(
+            endpoints,
+            [
+                crate::gateway::base_url("Ollama", ""),
+                "https://office.router.test/v1".into(),
+                "https://custom.router.test/v1".into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_default_model_on_another_gateway_is_asked_last() {
+        let custom = "https://default.router.test/v1";
+        let ready = [
+            set_up("Letronna", &crate::auth::hosted_base()),
+            set_up("Custom", custom),
+        ];
+        let settings = Settings {
+            gateway: "Custom".into(),
+            model: "qwen3".into(),
+            custom_endpoint: custom.into(),
+            ..Default::default()
+        };
+        let asked = |primary: &Connection, settings: &Settings| -> Vec<_> {
+            (route(primary, settings, &HashMap::new(), &ready).0.iter())
+                .map(|c| (c.endpoint.clone(), c.model.clone()))
+                .collect()
+        };
+        let hosted = letronna("letronna/auto").endpoint;
+        assert_eq!(
+            asked(&letronna("letronna/auto"), &settings),
+            [
+                (hosted.clone(), "letronna/auto".into()),
+                // The account, should it list the session's model.
+                (custom.into(), "letronna/auto".into()),
+                (custom.into(), "qwen3".into()),
+            ]
+        );
+        // On its own gateway it is the session's to choose, not a fallback.
+        let on_custom = Connection {
+            endpoint: custom.into(),
+            ..letronna("other")
+        };
+        assert_eq!(
+            asked(&on_custom, &settings),
+            [(custom.into(), "other".into()), (hosted, "other".into())]
+        );
+        // Nor is it asked on a gateway not set up.
+        let elsewhere = Settings {
+            gateway: "OpenRouter".into(),
+            ..settings
+        };
+        assert_eq!(asked(&letronna("letronna/auto"), &elsewhere).len(), 2);
     }
 }

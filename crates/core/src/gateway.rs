@@ -169,6 +169,7 @@ pub fn add_own(name: &str, address: &str) -> Result<(&'static str, String), Stri
         base: base.clone(),
     });
     write_kept(&kept)?;
+    crate::providers::router::forget();
     Ok((interned(name), base))
 }
 
@@ -219,6 +220,7 @@ pub fn change_own(name: &str, address: &str) -> Result<String, String> {
     let moved = !same_host(&gateway.base, &base);
     gateway.base = base.clone();
     write_kept(&kept)?;
+    crate::providers::router::forget();
     if moved {
         crate::store::save_key(key_slot(name), None).map_err(|e| {
             format!("The address changed, but its old key could not be removed: {e}.")
@@ -252,6 +254,7 @@ pub fn remove_own(name: &str) -> Result<(), String> {
     let mut kept = read_kept(&own_path());
     kept.retain(|k| k.name.trim() != name);
     write_kept(&kept)?;
+    crate::providers::router::forget();
     crate::store::save_key(&slot, None)
         .map(|_| ())
         .map_err(|e| format!("The gateway is gone, but its key could not be removed: {e}."))
@@ -569,9 +572,17 @@ pub fn all_models(
         .map(|(name, base, key)| {
             (
                 name,
-                std::thread::spawn(move || match crate::providers::find(name) {
-                    Some(p) => p.models(&base, &key),
-                    None => crate::chat::list_models(&base, &key),
+                std::thread::spawn(move || {
+                    let listed = match crate::providers::find(name) {
+                        Some(p) => p.models(&base, &key),
+                        None => crate::chat::list_models(&base, &key),
+                    };
+                    // What the lists show is what the router reaches for, so
+                    // a gateway just set up is tried for its models at once.
+                    if let Ok(models) = &listed {
+                        crate::providers::router::listed(&base, &key, models);
+                    }
+                    listed
                 }),
             )
         })
@@ -588,6 +599,73 @@ pub fn all_models(
     (models, errors)
 }
 
+/// Whether `model` on `name` is listed but cannot be picked or sent to: one
+/// of the hosted pool's, while `account` has no plan or credit to pay for it
+/// and no perk makes it free today.
+pub fn needs_subscription(name: &str, model: &str, account: Option<&crate::auth::Account>) -> bool {
+    match account.filter(|_| hosted_unpaid(name, account)) {
+        Some(account) => !account.free_for("chat", maker(name, model, account).as_deref(), model),
+        None => false,
+    }
+}
+
+/// Whether `name` is the hosted pool and `account` has no plan or credit to
+/// pay for its models, so that only those a perk makes free today are open:
+/// what a list of them says over them, with the way to upgrade.
+pub fn hosted_unpaid(name: &str, account: Option<&crate::auth::Account>) -> bool {
+    auth_of(name) == Some(AuthKind::Account)
+        && account.is_some_and(crate::auth::Account::needs_upgrade)
+}
+
+/// Whether a perk makes `model` on `name`, the hosted pool, free today, as
+/// a list says beside it.
+pub fn free_today(name: &str, model: &str, account: Option<&crate::auth::Account>) -> bool {
+    auth_of(name) == Some(AuthKind::Account)
+        && account.is_some_and(|account| {
+            account.free_for("chat", maker(name, model, account).as_deref(), model)
+        })
+}
+
+/// Whether `model` on `name` needs a subscription only because the perk
+/// that makes it free has used up today's allowance, which comes back at
+/// 00:00 UTC.
+pub fn used_up_today(name: &str, model: &str, account: Option<&crate::auth::Account>) -> bool {
+    match account.filter(|_| hosted_unpaid(name, account)) {
+        Some(account) => {
+            account.perk_used_up_for("chat", maker(name, model, account).as_deref(), model)
+        }
+        None => false,
+    }
+}
+
+/// Who made `model` on `name`, as its list said once it was read; asked
+/// only when a perk of `account`'s is for one maker's models, which alone
+/// turn on it.
+fn maker(name: &str, model: &str, account: &crate::auth::Account) -> Option<String> {
+    (account.perks.iter())
+        .any(|perk| perk.maker.is_some())
+        .then(|| crate::models::facts(&base_url(name, ""), model).maker)
+        .flatten()
+}
+
+/// Read the hosted pool's list now when who made `model` is not known yet
+/// and a perk of `account`'s could turn on it, so `needs_subscription` can
+/// tell: a terminal holding a message back may not have listed it.
+pub fn learn_maker(model: &str, account: &crate::auth::Account) {
+    let wanted = (account.perks.iter()).any(|perk| perk.maker.is_some());
+    if wanted && maker(LETRONNA, model, account).is_none() {
+        let _ = models_of(LETRONNA, &HashMap::new(), "");
+    }
+}
+
+/// The first gateway among `models` that is not the hosted pool, to point to
+/// while the hosted models it would be sent to need a subscription.
+pub fn usable_elsewhere(models: &[(String, String)]) -> Option<&str> {
+    (models.iter())
+        .map(|(name, _)| name.as_str())
+        .find(|name| auth_of(name) != Some(AuthKind::Account))
+}
+
 /// The models `name` offers, asked now as `all_models` asks each gateway,
 /// for a check right after it is set up; or what it said instead.
 pub fn models_of(
@@ -600,10 +678,14 @@ pub fn models_of(
     if base.trim().is_empty() {
         return Err(format!("{name} has no address yet."));
     }
-    match crate::providers::find(name) {
+    let listed = match crate::providers::find(name) {
         Some(p) => p.models(&base, &key),
         None => crate::chat::list_models(&base, &key),
+    };
+    if let Ok(models) = &listed {
+        crate::providers::router::listed(&base, &key, models);
     }
+    listed
 }
 
 /// Where a gateway's key is saved: under its own name, or for one of the
@@ -890,6 +972,112 @@ mod tests {
         );
         crate::providers::auth::sign_out("ChatGPT").unwrap();
         assert!(!ready(&none, "").iter().any(|g| g.0 == "ChatGPT"));
+    }
+
+    #[test]
+    fn hosted_models_need_a_subscription_only_on_free_with_no_credit() {
+        use crate::auth::{Account, Team};
+        let free = Account {
+            plan: "free".into(),
+            ..Default::default()
+        };
+        fn locked(name: &str, account: Option<&Account>) -> bool {
+            needs_subscription(name, "hosted", account)
+        }
+        assert!(locked(LETRONNA, Some(&free)));
+        assert!(hosted_unpaid(LETRONNA, Some(&free)));
+        // Only the hosted pool's: a key or a server of your own is yours.
+        assert!(!locked("Custom", Some(&free)));
+        assert!(!locked("OpenAI", Some(&free)));
+        assert!(!hosted_unpaid("OpenAI", Some(&free)));
+        assert!(!locked(LETRONNA, None));
+        let credit = Account {
+            credits: 500,
+            ..free.clone()
+        };
+        assert!(!locked(LETRONNA, Some(&credit)));
+        let pro = Account {
+            plan: "pro".into(),
+            ..Default::default()
+        };
+        assert!(!locked(LETRONNA, Some(&pro)));
+        // Never checked with the API, so no plan is known yet.
+        assert!(!locked(LETRONNA, Some(&Account::default())));
+        // A team's pool pays when the bills go to it, and only then.
+        let team = |credits| Account {
+            credits: 500,
+            team: Some(Team {
+                credits,
+                ..Default::default()
+            }),
+            ..free.clone()
+        };
+        assert!(!locked(LETRONNA, Some(&team(900))));
+        assert!(locked(LETRONNA, Some(&team(0))));
+
+        let models = [
+            (LETRONNA.to_owned(), "hosted".to_owned()),
+            ("Custom".to_owned(), "local".to_owned()),
+        ];
+        assert_eq!(usable_elsewhere(&models), Some("Custom"));
+        assert_eq!(usable_elsewhere(&models[..1]), None);
+    }
+
+    /// A Free plan with no credit, given these perks as `/me` lists them.
+    fn perked(perks: serde_json::Value) -> crate::auth::Account {
+        crate::auth::Account {
+            plan: "free".into(),
+            perks: serde_json::from_value(perks).unwrap(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_model_a_perk_makes_free_today_stays_open_on_a_free_plan() {
+        let account = perked(serde_json::json!([
+            {"id": "f", "name": "Fast", "kind": "chat", "model": "letronna/fast",
+             "share": 100, "available": true},
+            {"id": "s", "name": "Smart", "kind": "chat", "model": "letronna/smart",
+             "share": 100, "available": false},
+            {"id": "h", "name": "Half", "kind": "chat", "model": "letronna/half",
+             "share": 50, "available": true},
+        ]));
+        let account = Some(&account);
+        assert!(!needs_subscription(LETRONNA, "letronna/fast", account));
+        assert!(free_today(LETRONNA, "letronna/fast", account));
+        // Its allowance used up, it is closed until 00:00 UTC, and says why.
+        assert!(needs_subscription(LETRONNA, "letronna/smart", account));
+        assert!(used_up_today(LETRONNA, "letronna/smart", account));
+        assert!(!free_today(LETRONNA, "letronna/smart", account));
+        // Half off still costs something, and there is no credit.
+        assert!(needs_subscription(LETRONNA, "letronna/half", account));
+        assert!(!used_up_today(LETRONNA, "letronna/half", account));
+        assert!(needs_subscription(LETRONNA, "letronna/deep", account));
+        assert!(!used_up_today(LETRONNA, "letronna/deep", account));
+        // The pool is still one to upgrade for, as its heading says.
+        assert!(hosted_unpaid(LETRONNA, account));
+        // A perk is for the hosted pool's models alone.
+        assert!(!free_today("Custom", "letronna/fast", account));
+    }
+
+    #[test]
+    fn a_perk_for_one_makers_models_goes_by_what_the_list_says() {
+        let account = perked(serde_json::json!([
+            {"id": "q", "name": "Qwen", "kind": "chat", "maker": "Qwen", "share": 100,
+             "available": true},
+        ]));
+        let account = Some(&account);
+        // Before the list is read, who made it is not known.
+        assert!(needs_subscription(LETRONNA, "qwen-perk-test", account));
+        crate::models::remember(
+            &base_url(LETRONNA, ""),
+            &[
+                serde_json::json!({"id": "qwen-perk-test", "object": "model", "owned_by": "Qwen"}),
+                serde_json::json!({"id": "other-perk-test", "object": "model", "owned_by": "OpenAI"}),
+            ],
+        );
+        assert!(!needs_subscription(LETRONNA, "qwen-perk-test", account));
+        assert!(needs_subscription(LETRONNA, "other-perk-test", account));
     }
 
     #[test]

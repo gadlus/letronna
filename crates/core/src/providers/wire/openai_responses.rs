@@ -411,9 +411,10 @@ fn usage(usage: &Value) -> Value {
 /// A Responses `error` in the envelope chat/completions puts one in, which
 /// `failure::classify` reads.
 fn failed(error: &Value) -> Value {
-    let message = error["message"]
-        .as_str()
-        .unwrap_or("The provider could not finish this response.");
+    // Read as an envelope is, so a bare string, given here or under `error`,
+    // and an error with no message of its own are said too.
+    let message = crate::chat::error_words(error)
+        .unwrap_or_else(|| "The provider could not finish this response.".to_owned());
     json!({"error": {
         "message": message,
         "code": error["code"],
@@ -581,6 +582,14 @@ mod tests {
             classify(None, &headers, &limited).kind,
             FailureKind::RateLimit
         );
+        // A proxy's, said in a bare string.
+        let proxied = chunk(&json!({"type": "error", "error": "Upstream went away."}));
+        assert_eq!(
+            classify(None, &headers, &proxied).to_string(),
+            "Upstream went away."
+        );
+        let whole = reply(json!({"object": "response", "status": "failed", "error": "No."}));
+        assert_eq!(classify(None, &headers, &whole).to_string(), "No.");
         let cut = chunk(&json!({
             "type": "response.incomplete",
             "response": {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}},

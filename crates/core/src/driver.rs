@@ -360,6 +360,24 @@ pub struct Status {
     pub streamed: AtomicU64,
     /// The calls of the round under way, as the window's rows name them.
     pub doing: std::sync::Mutex<String>,
+    /// What a screen would have said so far of the model calls: each one
+    /// tried again, and each switch to another model. A run nobody watches
+    /// has no screen to say it is waiting out a failing gateway, which can
+    /// take minutes, or that another gateway answered in its place.
+    pub notes: AtomicU64,
+    /// The last of them as a screen says it, with what the provider said.
+    pub note: std::sync::Mutex<String>,
+}
+
+impl Status {
+    /// Keep `said` as the newest note, the words before the count so whoever
+    /// sees the count go up reads them.
+    fn note(&self, said: String) {
+        if let Ok(mut note) = self.note.lock() {
+            *note = said;
+        }
+        self.notes.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// The calls of a round in a line: each tool with what it works on.
@@ -1661,11 +1679,15 @@ fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Asked, String> {
             // The words of a reply the stream cut off were told, so the
             // watcher hears they are dropped, and the count starts again
             // with the try that takes their place.
-            Event::Retrying(retry) if retry.dropped => {
-                spec.status.streamed.store(0, Ordering::Relaxed);
-                // An editor cannot take back what it was sent.
-                let dropped = crate::retry::DROPPED;
-                tell(spec, Step::Said(format!("\n\n({dropped})\n\n")));
+            Event::Switched(switch) => spec.status.note(switch.to_string()),
+            Event::Retrying(retry) => {
+                spec.status.note(retry.to_string());
+                if retry.dropped {
+                    spec.status.streamed.store(0, Ordering::Relaxed);
+                    // An editor cannot take back what it was sent.
+                    let dropped = crate::retry::DROPPED;
+                    tell(spec, Step::Said(format!("\n\n({dropped})\n\n")));
+                }
             }
             _ => {}
         }
@@ -2804,10 +2826,18 @@ pub(crate) mod tests {
                 heard.lock().unwrap().push_str(&text);
             }
         }));
+        let status = spec.status.clone();
         let report = finished(spec);
         let sent = provider.sent();
         assert_eq!(report.status, Outcome::Done);
         assert_eq!(report.text, "The notes say hello.");
+        // Noted for a run with no screen to say it, `-p`'s stderr.
+        assert_eq!(status.notes.load(Ordering::Relaxed), 1);
+        let note = status.note.lock().unwrap().clone();
+        assert!(
+            note.starts_with("The provider closed the stream early"),
+            "{note}"
+        );
         assert_eq!(report.rounds, 1);
         assert!(!dir.join("made.txt").exists(), "the half-written call ran");
         // The first two requests are the same: nothing of the cut reply went back.

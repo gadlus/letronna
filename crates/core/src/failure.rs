@@ -78,6 +78,13 @@ pub struct Failure {
     /// The reply reached its token limit before it wrote anything, all of
     /// it spent thinking, so a longer limit could mend it.
     pub out_of_room: bool,
+    /// The gateway the failed call went to, once `fallback::run` has said:
+    /// the one that failed, which after a switch is not the session's.
+    pub gateway: Option<&'static str>,
+    /// A server error that waiting will not mend, such as a gateway whose own
+    /// upstream account has run out of credit: not tried again, though
+    /// another model may answer it.
+    pub lasting: bool,
     message: String,
 }
 
@@ -102,8 +109,16 @@ impl Failure {
             overflow: None,
             stands: false,
             out_of_room: false,
+            gateway: None,
+            lasting: false,
             message: message.into(),
         }
+    }
+
+    /// Whether the call went to the Letronna account, whose plan and credit
+    /// decide what it serves, unlike a key of the user's own.
+    pub fn hosted(&self) -> bool {
+        self.gateway == Some(crate::gateway::LETRONNA)
     }
 }
 
@@ -131,6 +146,14 @@ pub struct Kept {
     /// be mended from here, unlike another provider's.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hosted: bool,
+    /// A subscription is the way out of this hosted failure, as `upgrade`
+    /// tells, rather than credit or a sign-in.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub upgrade: bool,
+    /// A gateway besides Letronna was set up, so a model there carries on
+    /// at once while the account waits to be paid for.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub elsewhere: bool,
 }
 
 /// A way out of a failed turn, as a button offers it.
@@ -140,9 +163,31 @@ pub enum Fix {
     /// Retry once the provider's wait is over, at this second since 1970.
     RetryAt(u64),
     AddCredit,
+    /// Subscribe on the website, for a Free plan that cannot pay for the model.
+    Upgrade,
     ChooseModel,
     SignIn,
     CopyDetails,
+}
+
+/// Whether a call to `gateway` that failed as `kind` is worth asking the
+/// account service about again: the hosted pool turning it down for want of
+/// credit or a plan, as when a perk's allowance for the day runs out or the
+/// plan changed, after which what is open is not what was kept.
+pub fn ask_account_again(gateway: Option<&str>, kind: FailureKind) -> bool {
+    gateway == Some(crate::gateway::LETRONNA)
+        && matches!(kind, FailureKind::Quota | FailureKind::Auth)
+}
+
+/// Whether a subscription is the way out of a hosted failure of `kind`
+/// with `account` signed in here: a model the Free plan does not include,
+/// or a Free plan with no credit left. Signed out, a sign-in comes first.
+pub fn upgrade(kind: FailureKind, account: Option<&crate::auth::Account>) -> bool {
+    account.is_some_and(|account| match kind {
+        FailureKind::Auth => account.plan_name() == "Free",
+        FailureKind::Quota => account.needs_upgrade(),
+        _ => false,
+    })
 }
 
 impl Failure {
@@ -168,6 +213,8 @@ impl Failure {
                 kind: self.kind,
                 until,
                 hosted,
+                upgrade: false,
+                elsewhere: false,
             })),
             ..Default::default()
         })
@@ -175,9 +222,17 @@ impl Failure {
 }
 
 impl Kept {
+    /// Take in what decides a hosted failure's way out: `account`, the one
+    /// signed in here, and whether a gateway besides Letronna is set up.
+    pub fn knowing(&mut self, account: Option<&crate::auth::Account>, elsewhere: bool) {
+        self.upgrade = self.hosted && upgrade(self.kind, account);
+        self.elsewhere = self.hosted && elsewhere;
+    }
+
     /// The cause in a few plain words, with `clock` saying when `until` is.
     pub fn cause(&self, clock: impl Fn(u64) -> String) -> String {
         match self.kind {
+            FailureKind::Auth if self.hosted && self.upgrade => "Needs a subscription".to_owned(),
             FailureKind::Auth if self.hosted => "Signed out".to_owned(),
             FailureKind::Auth => "The key was not accepted".to_owned(),
             FailureKind::Quota => "Out of credit".to_owned(),
@@ -203,6 +258,11 @@ impl Kept {
     /// left to the words, and copying them is all that is offered.
     pub fn fixes(&self, now: u64) -> Vec<Fix> {
         let first = match self.kind {
+            // Signed in on the Free plan, Settings has nothing to mend: only
+            // a subscription does.
+            FailureKind::Auth | FailureKind::Quota if self.hosted && self.upgrade => {
+                Some(Fix::Upgrade)
+            }
             FailureKind::Auth if self.hosted => Some(Fix::SignIn),
             FailureKind::Quota if self.hosted => Some(Fix::AddCredit),
             // A bigger window is the one way out the window can offer until
@@ -215,7 +275,15 @@ impl Kept {
             FailureKind::BadReply | FailureKind::Unknown => Some(Fix::Retry),
             _ => None,
         };
-        first.into_iter().chain([Fix::CopyDetails]).collect()
+        // Paying takes a trip to the website; a model on a gateway already
+        // set up answers now.
+        let paying = matches!(first, Some(Fix::Upgrade | Fix::AddCredit));
+        let second = if paying && self.elsewhere {
+            Fix::ChooseModel
+        } else {
+            Fix::CopyDetails
+        };
+        first.into_iter().chain([second]).collect()
     }
 }
 
@@ -241,6 +309,13 @@ pub fn clock(at: u64) -> String {
 /// Read a provider's error reply, given its HTTP status or `None` when the
 /// error came inside a reply that began as a success.
 pub fn classify(status: Option<u16>, headers: &HeaderMap, body: &Value) -> Failure {
+    classify_text(status, headers, body, "")
+}
+
+/// `classify` for a reply whose text as it came, `raw`, `body` was read
+/// from. A reply that is no JSON, a gateway's error page say, is judged by
+/// its status alone, and only its own words say what went wrong behind it.
+pub fn classify_text(status: Option<u16>, headers: &HeaderMap, body: &Value, raw: &str) -> Failure {
     let error = body.get("error");
     // TGI gives the status of an error it sends inside a stream it has
     // already answered 200 under a field of its own.
@@ -290,7 +365,16 @@ pub fn classify(status: Option<u16>, headers: &HeaderMap, body: &Value) -> Failu
         overflow,
         stands: false,
         out_of_room: false,
-        message: words(status, body),
+        gateway: None,
+        // A gateway whose upstream account is spent answers 503, as one did
+        // with "every lender we tried was refused by Anthropic on their API
+        // credit balance": waiting only sent the same request again, twenty
+        // times in a run nobody watched, where another gateway could have
+        // answered at once. It stays the server's error, not the caller's
+        // credit: Letronna's API relays its own pool's spent credit this way
+        // on purpose, and a gateway's lenders are not the caller's key.
+        lasting: kind == FailureKind::Server && by_phrase(&text) == Some(FailureKind::Quota),
+        message: words(status, body, raw),
     }
 }
 
@@ -538,22 +622,96 @@ fn wait_asked(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Duratio
     date.signed_duration_since(now).to_std().ok()
 }
 
-/// What the user is told, word for word as before: the provider's own
-/// complaint when it sent one, or else what its status means.
-fn words(status: Option<u16>, body: &Value) -> String {
+/// Characters kept of what a reply that is no JSON said: a plain-text error
+/// fits, a whole page does not.
+const PAGE_CHARS: usize = 300;
+
+/// What the user is told: the provider's own complaint when it sent one, or
+/// else what its status means, then what a reply that is no JSON, `raw`,
+/// said, which is often the one clue to which server failed and why.
+fn words(status: Option<u16>, body: &Value, raw: &str) -> String {
     if let Err(message) = crate::chat::unwrap_response(body) {
         return message;
     }
     let Some(code) = status else {
         return "The provider could not finish this response.".to_owned();
     };
-    if reqwest::StatusCode::from_u16(code).is_ok_and(crate::chat::transient) {
+    let meant = if reqwest::StatusCode::from_u16(code).is_ok_and(crate::chat::transient) {
         format!(
-            "The gateway is having trouble right now (HTTP {code}). This is at                      the provider's end, not your settings. Try again in a moment, or                      switch gateway in Settings."
+            "The gateway is having trouble right now (HTTP {code}). This is at \
+             the provider's end, not your settings. Try again in a moment, or \
+             switch gateway in Settings."
         )
     } else {
         format!("Provider returned HTTP {code}. Check connection settings and quota.")
+    };
+    // A reply in JSON with no `error`, such as FastAPI's `detail`, says it
+    // where its server puts it, which only the status would otherwise be
+    // left of.
+    let said = match body {
+        Value::Null => page_words(raw),
+        body => crate::chat::error_words(body).and_then(|words| page_words(&words)),
+    };
+    match said {
+        Some(said) => format!("{meant} The provider said: {said}"),
+        None => meant,
     }
+}
+
+/// What a reply that is no JSON says, on one line and cut short: an HTML
+/// page's title, since the rest of the page is markup, or else its text.
+/// `None` when it says nothing, and for a page with no title and a style or
+/// a script, whose text would be mostly those.
+fn page_words(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let text = if raw.starts_with('<') {
+        // Lowercased letter for letter, so its places are the page's too.
+        let lower = raw.to_ascii_lowercase();
+        let titled = lower.find("<title").and_then(|at| {
+            let start = at + lower[at..].find('>')? + 1;
+            let end = start + lower[start..].find("</title")?;
+            Some(raw[start..end].to_owned())
+        });
+        match titled {
+            Some(title) => title,
+            None if lower.contains("<script") || lower.contains("<style") => return None,
+            None => untagged(raw),
+        }
+    } else {
+        raw.to_owned()
+    };
+    // A control character could break the row the words are shown in, or
+    // reach a terminal as a command.
+    let flat = (text.chars())
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    match flat.char_indices().nth(PAGE_CHARS) {
+        _ if flat.is_empty() => None,
+        Some((cut, _)) => Some(format!("{}…", &flat[..cut])),
+        None => Some(flat),
+    }
+}
+
+/// The text of `html` with its tags left out.
+fn untagged(html: &str) -> String {
+    let mut text = String::new();
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            // A space for each tag, so the words either side stay apart.
+            '<' => {
+                in_tag = true;
+                text.push(' ');
+            }
+            '>' => in_tag = false,
+            c if !in_tag => text.push(c),
+            _ => {}
+        }
+    }
+    text
 }
 
 #[cfg(test)]
@@ -880,6 +1038,11 @@ mod tests {
             said(Some(429), r#"{"error":{"message":"Slow down."}}"#),
             "Slow down."
         );
+        // So is one that gives it as a bare string.
+        assert_eq!(
+            said(Some(400), r#"{"error":"model 'qwen3' is not loaded"}"#),
+            "model 'qwen3' is not loaded"
+        );
         // A page that is not JSON leaves only the status to go on.
         assert!(
             said(Some(503), "<html>Service Unavailable</html>")
@@ -889,6 +1052,111 @@ mod tests {
             said(Some(418), ""),
             "Provider returned HTTP 418. Check connection settings and quota."
         );
+        assert_eq!(
+            said(Some(502), ""),
+            "The gateway is having trouble right now (HTTP 502). This is at the provider's \
+             end, not your settings. Try again in a moment, or switch gateway in Settings."
+        );
+    }
+
+    #[test]
+    fn a_server_error_that_names_a_spent_credit_balance_is_not_waited_out() {
+        // As a gateway relaying Anthropic's refusal of its own account said it.
+        let body = serde_json::json!({"error": {
+            "message": "every lender we tried was refused by Anthropic on their API credit \
+                        balance (exhausted, or plan-included credits, which do not cover \
+                        requests that identify as Claude Code)",
+            "type": "upstream_error",
+            "code": null,
+        }});
+        let failure = classify(Some(503), &HeaderMap::new(), &body);
+        // The gateway's own credit, not the caller's: no Add credit or
+        // Upgrade is offered for it, hosted or not.
+        assert_eq!(failure.kind, FailureKind::Server);
+        assert!(failure.lasting);
+        assert!(crate::retry::after(&failure, 1, true, None).is_none());
+        assert!(crate::fallback::mends(&failure));
+        assert!(failure.to_string().contains("credit balance (exhausted"));
+        // A 503 that says nothing of credit is waited out as before.
+        let busy = serde_json::json!({"error": {"message": "upstream timed out", "type": "upstream_error"}});
+        let busy = classify(Some(503), &HeaderMap::new(), &busy);
+        assert_eq!(busy.kind, FailureKind::Server);
+        assert!(!busy.lasting && crate::retry::after(&busy, 1, true, None).is_some());
+        // And a 402 that says so is still the caller's.
+        let own = serde_json::json!({"error": {"message": "Your credit balance is too low"}});
+        assert_eq!(
+            classify(Some(402), &HeaderMap::new(), &own).kind,
+            FailureKind::Quota
+        );
+    }
+
+    #[test]
+    fn what_a_reply_that_is_not_json_said_is_kept() {
+        let said = |status, raw: &str| {
+            let body: Value = serde_json::from_str(raw).unwrap_or_default();
+            classify_text(Some(status), &HeaderMap::new(), &body, raw).to_string()
+        };
+        assert_eq!(
+            said(404, "404 page not found\n"),
+            "Provider returned HTTP 404. Check connection settings and quota. \
+             The provider said: 404 page not found"
+        );
+        // Envoy's, over two lines.
+        let envoy = "upstream connect error or disconnect/reset before headers.\r\n  \
+                     reset reason: overflow";
+        assert!(said(502, envoy).ends_with(
+            "switch gateway in Settings. The provider said: upstream connect error or \
+             disconnect/reset before headers. reset reason: overflow"
+        ));
+        // Of a page, its title, or its words when it is no more than those.
+        assert!(
+            said(
+                502,
+                "<!DOCTYPE html><html><head><title>example.com | 502: Bad gateway</title>\
+                 <style>body{margin:0}</style></head><body>...</body></html>"
+            )
+            .ends_with("The provider said: example.com | 502: Bad gateway")
+        );
+        assert!(
+            said(
+                503,
+                "<html><body><h1>Service Unavailable</h1></body></html>"
+            )
+            .ends_with("The provider said: Service Unavailable")
+        );
+        assert!(
+            said(503, "<html><script>var page = 1;</script></html>")
+                .ends_with("switch gateway in Settings.")
+        );
+        // Cut short, and with nothing that could reach a terminal as a command.
+        let long = said(500, &format!("\u{1b}[2Jtrace: {}", "frame ".repeat(100)));
+        let quoted = long.split("The provider said: ").nth(1).unwrap();
+        assert_eq!(quoted.chars().count(), PAGE_CHARS + 1);
+        assert!(quoted.starts_with("[2Jtrace: frame") && quoted.ends_with('…'));
+        // A reply in JSON is read for its words wherever they are, as
+        // `chat::error_words` finds them.
+        assert_eq!(
+            said(422, r#"{"detail":"model is not loaded"}"#),
+            "Provider returned HTTP 422. Check connection settings and quota. \
+             The provider said: model is not loaded"
+        );
+        assert!(said(400, r#"{"message":"bad model"}"#).ends_with("The provider said: bad model"));
+        assert_eq!(
+            said(
+                422,
+                r#"{"detail":[{"loc":["body","model"],"msg":"no such model"}]}"#
+            ),
+            "Provider returned HTTP 422. Check connection settings and quota. \
+             The provider said: body.model: no such model"
+        );
+        assert_eq!(
+            said(418, "{}"),
+            "Provider returned HTTP 418. Check connection settings and quota."
+        );
+        // The kind is the status's, whatever the page says.
+        let body = Value::Null;
+        let page = classify_text(Some(404), &HeaderMap::new(), &body, "404 page not found");
+        assert_eq!(page.kind, FailureKind::Settings);
     }
 
     #[test]
@@ -1034,6 +1302,8 @@ mod tests {
                 kind: FailureKind::RateLimit,
                 until: Some(1_300),
                 hosted: true,
+                upgrade: false,
+                elsewhere: false,
             })
         );
         // A wait asked with a bad key is no promise it will pass.
@@ -1052,16 +1322,20 @@ mod tests {
         );
     }
 
+    /// A failure of `kind` kept as `kept` gives it, hosted or not.
+    fn kept(kind: FailureKind, until: Option<u64>, hosted: bool) -> Kept {
+        Kept {
+            kind,
+            until,
+            hosted,
+            upgrade: false,
+            elsewhere: false,
+        }
+    }
+
     #[test]
     fn the_likely_fix_comes_first_and_there_are_never_more_than_two() {
-        let fixes = |kind, until, hosted| {
-            Kept {
-                kind,
-                until,
-                hosted,
-            }
-            .fixes(1_000)
-        };
+        let fixes = |kind, until, hosted| kept(kind, until, hosted).fixes(1_000);
         use Fix::*;
         assert_eq!(
             fixes(FailureKind::Quota, None, true),
@@ -1098,16 +1372,89 @@ mod tests {
         );
     }
 
+    fn account(plan: &str, credits: i64) -> crate::auth::Account {
+        crate::auth::Account {
+            plan: plan.into(),
+            credits,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_free_plan_out_of_credit_is_offered_a_subscription_not_settings() {
+        use Fix::*;
+        let free = account("free", 0);
+        let fixes = |kind, signed_in: Option<&crate::auth::Account>, elsewhere| {
+            let mut kept = kept(kind, None, true);
+            kept.knowing(signed_in, elsewhere);
+            (kept.fixes(1_000), kept.cause(|at| at.to_string()))
+        };
+        let quota = FailureKind::Quota;
+        assert_eq!(
+            fixes(quota, Some(&free), false),
+            (vec![Upgrade, CopyDetails], "Out of credit".into())
+        );
+        // With a key of their own set up, a model there goes on now.
+        assert_eq!(fixes(quota, Some(&free), true).0, [Upgrade, ChooseModel]);
+        // Credit left, or a paid plan, is topped up rather than upgraded.
+        assert_eq!(
+            fixes(quota, Some(&account("free", 5)), false).0,
+            [AddCredit, CopyDetails]
+        );
+        assert_eq!(
+            fixes(quota, Some(&account("pro", 0)), true).0,
+            [AddCredit, ChooseModel]
+        );
+        // A model the Free plan does not include is one a subscription does.
+        let gated = fixes(FailureKind::Auth, Some(&account("free", 5)), false);
+        assert_eq!(
+            gated,
+            (vec![Upgrade, CopyDetails], "Needs a subscription".into())
+        );
+        // Only with nobody signed in is a sign-in the way out.
+        assert_eq!(
+            fixes(FailureKind::Auth, None, true),
+            (vec![SignIn, CopyDetails], "Signed out".into())
+        );
+        // A failure on a key of the user's own is not the account's.
+        let mut own = kept(quota, None, false);
+        own.knowing(Some(&free), true);
+        assert_eq!((own.upgrade, own.elsewhere), (false, false));
+        assert_eq!(own.fixes(1_000), [CopyDetails]);
+    }
+
+    #[test]
+    fn only_a_free_plan_with_nothing_left_needs_an_upgrade() {
+        assert!(upgrade(FailureKind::Quota, Some(&account("free", 0))));
+        assert!(upgrade(FailureKind::Quota, Some(&account("free", -3))));
+        assert!(!upgrade(FailureKind::Quota, Some(&account("free", 1))));
+        assert!(!upgrade(FailureKind::Quota, Some(&account("pro", 0))));
+        // An account never checked has no plan to go by.
+        assert!(!upgrade(FailureKind::Quota, Some(&account("", 0))));
+        assert!(!upgrade(FailureKind::Quota, None));
+        // Billed to a team, the team's pool is what pays.
+        let mut billed = account("free", 0);
+        billed.team = Some(crate::auth::Team {
+            credits: 500,
+            ..Default::default()
+        });
+        assert!(!upgrade(FailureKind::Quota, Some(&billed)));
+        assert!(!upgrade(FailureKind::Server, Some(&account("free", 0))));
+    }
+
+    #[test]
+    fn the_account_is_asked_again_when_the_hosted_pool_wants_paying() {
+        let hosted = Some(crate::gateway::LETRONNA);
+        assert!(ask_account_again(hosted, FailureKind::Quota));
+        assert!(ask_account_again(hosted, FailureKind::Auth));
+        assert!(!ask_account_again(hosted, FailureKind::Overloaded));
+        assert!(!ask_account_again(Some("OpenAI"), FailureKind::Quota));
+        assert!(!ask_account_again(None, FailureKind::Auth));
+    }
+
     #[test]
     fn the_cause_is_said_in_a_few_plain_words() {
-        let cause = |kind, until, hosted| {
-            Kept {
-                kind,
-                until,
-                hosted,
-            }
-            .cause(|at| format!("at {at}"))
-        };
+        let cause = |kind, until, hosted| kept(kind, until, hosted).cause(|at| format!("at {at}"));
         assert_eq!(cause(FailureKind::Quota, None, true), "Out of credit");
         assert_eq!(
             cause(FailureKind::RateLimit, Some(1_300), false),

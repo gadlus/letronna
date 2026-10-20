@@ -17,6 +17,17 @@ pub(crate) fn kind_label(kind: &str) -> &str {
         .map_or(kind, |(_, label)| label)
 }
 
+/// A text button opening the page a plan or credit is bought on, beside
+/// models that need one.
+pub(crate) fn upgrade_button(id: &'static str, cx: &App) -> Button {
+    Button::new(id)
+        .plain(cx)
+        .xsmall()
+        .text_color(cx.theme().link)
+        .label("Upgrade subscription")
+        .on_click(|_, _, cx| cx.open_url(&letronna_core::auth::checkout()))
+}
+
 impl Chat {
     /// The (gateway, model) pairs the picker shows for what is typed in its
     /// search box.
@@ -26,12 +37,164 @@ impl Chat {
             matches.retain(|(gateway, _)| gateway == provider);
         }
         // Each provider's models together, the session's own first, so one
-        // just added is a heading to find and not a scroll.
+        // just added is a heading to find and not a scroll; a provider with
+        // nothing that can answer last, and in each those that need a
+        // subscription last, so what can answer comes first.
         let on = self.store.model(self.store.active).0;
         let order = self.providers();
-        matches
-            .sort_by_key(|(gateway, _)| (gateway != on, order.iter().position(|p| p == gateway)));
-        matches
+        let mut keyed: Vec<(bool, (String, String))> = (matches.into_iter())
+            .map(|(gateway, id)| (self.needs_subscription(&gateway, &id), (gateway, id)))
+            .collect();
+        let open: std::collections::HashSet<String> = (keyed.iter())
+            .filter(|(locked, _)| !locked)
+            .map(|(_, (gateway, _))| gateway.clone())
+            .collect();
+        keyed.sort_by_key(|(locked, (gateway, _))| {
+            (
+                !open.contains(gateway),
+                gateway != on,
+                order.iter().position(|p| p == gateway),
+                *locked,
+            )
+        });
+        keyed.into_iter().map(|(_, pair)| pair).collect()
+    }
+
+    /// Whether `model` on `gateway` is shown greyed and cannot be picked:
+    /// one of Letronna's, while the account has no plan or credit to pay for
+    /// it and no perk makes it free today.
+    pub(crate) fn needs_subscription(&self, gateway: &str, model: &str) -> bool {
+        letronna_core::gateway::needs_subscription(gateway, model, self.account.as_ref())
+    }
+
+    /// Whether `gateway` is Letronna and the account has no plan or credit to
+    /// pay for its models, so only those free today are open: what its
+    /// heading says, with the way to upgrade.
+    pub(crate) fn hosted_unpaid(&self, gateway: &str) -> bool {
+        letronna_core::gateway::hosted_unpaid(gateway, self.account.as_ref())
+    }
+
+    /// Whether a perk makes `model` on `gateway` free today, as a list says
+    /// beside it.
+    pub(crate) fn free_today(&self, gateway: &str, model: &str) -> bool {
+        letronna_core::gateway::free_today(gateway, model, self.account.as_ref())
+    }
+
+    /// Whether the media model `model` of `kind`, or the cheapest working
+    /// for `None`, cannot be paid for: the account has no plan or credit,
+    /// and no perk makes it free today. The cheapest working is not, as it
+    /// is picked among them all.
+    pub(crate) fn media_locked(&self, kind: &str, model: Option<&str>) -> bool {
+        if !self.hosted_unpaid(LETRONNA) {
+            return false;
+        }
+        let Some(model) = model else {
+            return true;
+        };
+        let maker = (self.media_models.iter())
+            .find(|o| o.kind == kind && o.id == model)
+            .map(|o| o.maker.as_str());
+        !(self.account.as_ref()).is_some_and(|a| a.free_for(kind, maker, model))
+    }
+
+    /// Whether what the session on screen sends next, making `making` or
+    /// chatting for `None`, would go to a hosted model the account cannot
+    /// pay for.
+    pub(crate) fn locked_for(&self, making: Option<&str>) -> bool {
+        match making {
+            Some(kind) => self.media_locked(kind, self.media_choices.get(kind).map(String::as_str)),
+            None => {
+                let (gateway, model) = self.store.model(self.store.active);
+                self.needs_subscription(gateway, model)
+            }
+        }
+    }
+
+    /// Whether that is only for today, its perk's allowance used up.
+    fn used_up_for(&self, making: Option<&str>) -> bool {
+        let account = self.account.as_ref();
+        match making {
+            Some(kind) => (self.media_choices.get(kind)).is_some_and(|model| {
+                let maker = (self.media_models.iter())
+                    .find(|o| o.kind == kind && o.id == *model)
+                    .map(|o| o.maker.as_str());
+                self.hosted_unpaid(LETRONNA)
+                    && account.is_some_and(|a| a.perk_used_up_for(kind, maker, model))
+            }),
+            None => {
+                let (gateway, model) = self.store.model(self.store.active);
+                letronna_core::gateway::used_up_today(gateway, model, account)
+            }
+        }
+    }
+
+    /// Whether what the session on screen sends next would go to a hosted
+    /// model the account cannot pay for: its model, or for a session making
+    /// media, the one picked for it.
+    pub(crate) fn upgrade_needed_here(&self) -> bool {
+        self.locked_for(self.making_here())
+    }
+
+    /// What the session on screen makes its messages into, if not text.
+    fn making_here(&self) -> Option<&'static str> {
+        let here = self.store.conversations[self.store.active].id;
+        self.media_kinds.get(&here).copied()
+    }
+
+    /// What a refused pick or send says while a hosted model needs a
+    /// subscription: that its free allowance comes back when `used_up`, and
+    /// where else a model can be picked, when anywhere.
+    pub(crate) fn upgrade_note(&self, used_up: bool) -> String {
+        let why = match used_up {
+            true => "Its free allowance is used up today; it comes back at 00:00 UTC.",
+            false => "Hosted models need a subscription on the Free plan.",
+        };
+        match usable_elsewhere(&self.models) {
+            Some(other) => format!("{why} Pick a model on {other}, or upgrade."),
+            None => format!("{why} Upgrade, or add a gateway in Settings."),
+        }
+    }
+
+    /// `upgrade_note` for what the session on screen sends next, making
+    /// `making` or chatting for `None`.
+    pub(crate) fn upgrade_note_for(&self, making: Option<&str>) -> String {
+        self.upgrade_note(self.used_up_for(making))
+    }
+
+    /// The composer's placeholder: the greeting, or while the session is on
+    /// a hosted model the account cannot pay for, why nothing will be sent.
+    /// Short, as it is one line beside the controls.
+    pub(crate) fn keep_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let making = self.making_here();
+        let wanted: SharedString = match self.locked_for(making) {
+            true if self.used_up_for(making) => {
+                "Today's free allowance is used up — back at 00:00 UTC".into()
+            }
+            true => match usable_elsewhere(&self.models) {
+                Some(other) => format!("Hosted models need a subscription — try {other}").into(),
+                None => "Hosted models need a subscription — upgrade first".into(),
+            },
+            false => self.greeting.into(),
+        };
+        // Set only on a change: setting it redraws the box.
+        if self.placeholder != wanted {
+            self.placeholder = wanted.clone();
+            self.composer
+                .update(cx, |input, cx| input.set_placeholder(wanted, window, cx));
+        }
+    }
+
+    /// Open the model picker on the tab of what answers now, its search
+    /// empty and holding the keys.
+    pub(crate) fn open_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let here = self.store.conversations[self.store.active].id;
+        self.model_open = true;
+        self.model_kind = self.media_kinds.get(&here).copied().unwrap_or("chat");
+        self.model_search.update(cx, |search, cx| {
+            search.set_value("", window, cx);
+            search.focus(window, cx);
+        });
+        cx.notify();
     }
 
     /// The providers with models in the picker, in the order they first
@@ -173,17 +336,35 @@ impl Chat {
         }
         let mut heading: Option<String> = None;
         for (i, (gw, id)) in matches.into_iter().enumerate() {
+            let unpaid = self.needs_subscription(&gw, &id);
+            let free = !unpaid && self.free_today(&gw, &id);
             if heading.as_ref() != Some(&gw) {
+                // Over all of Letronna's while any need a subscription, as
+                // the way to upgrade is the same for each.
+                let upgrade = self.hosted_unpaid(&gw);
                 heading = Some(gw.clone());
                 list = list.child(
-                    div()
+                    h_flex()
                         .px_2()
                         .pt_1p5()
                         .pb_0p5()
+                        .gap_2()
+                        .justify_between()
                         .text_xs()
-                        .font_weight(FontWeight::MEDIUM)
                         .text_color(cx.theme().muted_foreground)
-                        .child(gw.clone()),
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(match upgrade {
+                                    true => format!("{gw} · Free plan"),
+                                    false => gw.clone(),
+                                }),
+                        )
+                        .when(upgrade, |row| {
+                            row.child(upgrade_button("model-upgrade", cx))
+                        }),
                 );
             }
             let active = making.is_none() && gw == on && id == current;
@@ -194,23 +375,43 @@ impl Chat {
                     .xsmall()
                     .w_full()
                     .justify_start()
+                    // Greyed and inert: picked, it could only be refused.
+                    .disabled(unpaid)
                     .child(
-                        h_flex().w_full().gap_2().justify_between().child(
-                            div()
-                                .truncate()
-                                .when(active, |d| d.text_color(cx.theme().link))
-                                .child(id),
-                        ),
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .when(active && !unpaid, |d| d.text_color(cx.theme().link))
+                                    .child(id),
+                            )
+                            // A perk pays for it today, so the Free plan
+                            // can use it.
+                            .when(free, |row| {
+                                row.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("Free today"),
+                                )
+                            }),
                     )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.choose_model(pick_gw.clone(), pick.clone(), window, cx)
-                    })),
+                    .when(!unpaid, |button| {
+                        button.on_click(cx.listener(move |this, _, window, cx| {
+                            this.choose_model(pick_gw.clone(), pick.clone(), window, cx)
+                        }))
+                    }),
             );
         }
         if self.model_open && !chat {
             let query = self.model_search.read(cx).value().to_lowercase();
             list = self.media_list(list, &query, cx);
         }
+        let unpaid = self.upgrade_needed_here();
         div()
             .relative()
             .flex_shrink_0()
@@ -218,7 +419,13 @@ impl Chat {
                 Button::new("model-trigger")
                     .plain(cx)
                     .xsmall()
-                    .text_color(cx.theme().muted_foreground)
+                    .text_color(match unpaid {
+                        true => cx.theme().muted_foreground.opacity(0.5),
+                        false => cx.theme().muted_foreground,
+                    })
+                    .when(unpaid, |button| {
+                        button.tooltip("Hosted models need a subscription. Pick another model.")
+                    })
                     .child(
                         h_flex()
                             .gap_1()
@@ -237,16 +444,13 @@ impl Chat {
                             .child(Icon::new(IconName::ChevronDown).size_3()),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.model_open = !this.model_open;
                         if this.model_open {
+                            this.model_open = false;
+                            cx.notify();
+                        } else {
                             // On the tab of what answers now.
-                            this.model_kind = making.unwrap_or("chat");
-                            this.model_search.update(cx, |s, cx| {
-                                s.set_value("", window, cx);
-                                s.focus(window, cx);
-                            });
+                            this.open_model_picker(window, cx);
                         }
-                        cx.notify();
                     })),
             )
             .when(self.model_open, |this| {
@@ -348,6 +552,28 @@ impl Chat {
     ) -> Stateful<Div> {
         let kind = self.model_kind;
         let chosen = self.media_choices.get(kind);
+        // Media is made on the hosted models alone, and those a perk makes
+        // free today are the only ones open without a plan or credit.
+        if self.hosted_unpaid(LETRONNA) {
+            list = list.child(
+                h_flex()
+                    .px_2()
+                    .pt_1p5()
+                    .pb_0p5()
+                    .gap_2()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Needs a subscription"),
+                    )
+                    .child(upgrade_button("media-upgrade", cx)),
+            );
+        }
         let auto = std::iter::once((None, "Auto".to_owned(), "the cheapest working".to_owned()));
         let offers = self
             .media_models
@@ -361,35 +587,42 @@ impl Chat {
             .map(|o| (Some(o.id.clone()), o.id.clone(), o.price()));
         for (i, (pick, name, note)) in auto.chain(offers).enumerate() {
             let active = pick.as_ref() == chosen;
-            list =
-                list.child(
-                    Button::new(("media-model", i))
-                        .plain(cx)
-                        .xsmall()
-                        .w_full()
-                        .justify_start()
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .gap_2()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .when(active, |d| d.text_color(cx.theme().link))
-                                        .child(name),
-                                )
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(note),
-                                ),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
+            let unpaid = self.media_locked(kind, pick.as_deref());
+            let note = match self.hosted_unpaid(LETRONNA) && !unpaid {
+                true => "Free today".to_owned(),
+                false => note,
+            };
+            list = list.child(
+                Button::new(("media-model", i))
+                    .plain(cx)
+                    .xsmall()
+                    .w_full()
+                    .justify_start()
+                    .disabled(unpaid)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .when(active && !unpaid, |d| d.text_color(cx.theme().link))
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .when(!unpaid, |d| d.text_color(cx.theme().muted_foreground))
+                                    .child(note),
+                            ),
+                    )
+                    .when(!unpaid, |button| {
+                        button.on_click(cx.listener(move |this, _, _, cx| {
                             this.choose_media(kind, pick.clone(), cx)
-                        })),
-                );
+                        }))
+                    }),
+            );
         }
         list
     }

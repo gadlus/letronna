@@ -1,6 +1,6 @@
 use crate::app::card_is_up;
 use crate::prelude::*;
-use gpui_component::{Selectable, menu::PopupMenu};
+use gpui_component::{Selectable, menu::PopupMenu, notification::Notification};
 
 actions!(
     sessions,
@@ -132,14 +132,98 @@ pub(crate) fn project_label(workspace: Option<&std::path::Path>) -> String {
     }
 }
 
+/// How long a press on a session's row is held still before its menu
+/// opens: the long press of a trackpad or a touch screen, which gpui gives
+/// a mouse no event for.
+const LONG_PRESS: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How far, in pixels, a held press may wander and still open the menu,
+/// so a hand that shakes a little is not taken for a drag.
+const PRESS_SLOP: f64 = 8.;
+
+/// A session's menu in the sidebar, while it is open. It names the session
+/// by id: a row's place moves when a session before it is deleted or a new
+/// one is started, and the menu must act on the one it was opened on.
+pub(crate) struct SessionMenu {
+    pub(crate) id: u64,
+    /// Where it opened, in the window.
+    pub(crate) at: Point<Pixels>,
+    pub(crate) menu: Entity<PopupMenu>,
+    /// What had the keys before it, which Escape gives them back to.
+    back: Option<FocusHandle>,
+    _closes: [Subscription; 2],
+}
+
+/// A left press on a session's row, which opens its menu once held.
+pub(crate) struct Press {
+    id: u64,
+    at: Point<Pixels>,
+    /// Which press it is, so the wait of an earlier one opens nothing.
+    since: std::time::Instant,
+    /// The menu has opened from it, so letting go is not a click as well.
+    held: bool,
+}
+
+/// Whether `to` is still close enough to `from` for a press to be held.
+fn still(from: Point<Pixels>, to: Point<Pixels>) -> bool {
+    (to - from).magnitude() <= PRESS_SLOP
+}
+
+/// Why session `id` cannot be deleted yet, if it cannot. Only what runs in
+/// that session holds it; a reply in another one does not, which once kept
+/// every session from being deleted while any of them answered.
+pub(crate) fn delete_refusal(
+    id: u64,
+    replying_in: Option<u64>,
+    summarizing: bool,
+    running: bool,
+) -> Option<&'static str> {
+    if replying_in == Some(id) {
+        // Its reply would go on writing into a session no longer there.
+        Some("Stop the reply in this session before deleting it.")
+    } else if summarizing {
+        // Its id can be handed out again before the summary lands.
+        Some("Wait for the summary before deleting the session.")
+    } else if running {
+        // Its end would come for a session no longer there.
+        Some("Stop its run before deleting this session.")
+    } else {
+        None
+    }
+}
+
+/// The session listed after the one at `index` in `listed`, or before it
+/// when it is the last, for the sidebar's keys to go on to once it is
+/// deleted.
+fn beside(listed: &[usize], index: usize) -> Option<usize> {
+    let at = listed.iter().position(|&i| i == index)?;
+    let next = listed
+        .get(at + 1)
+        .or(at.checked_sub(1).and_then(|up| listed.get(up)));
+    next.copied()
+}
+
+/// The session to show once the one at `deleted` is gone: the one that was
+/// on screen, `on_screen`, found again by id as the places after it moved
+/// up, or if that was the one deleted, the one listed under it.
+fn active_after(store: &Store, on_screen: u64, deleted: usize) -> usize {
+    match store.index_of(on_screen) {
+        Some(still) => still,
+        None => deleted.saturating_sub(1),
+    }
+}
+
 impl Chat {
-    pub(crate) fn session_menu(
+    /// What session `id`'s menu holds. Each item finds the session again
+    /// when it is picked, as the menu may have been open while it moved.
+    fn session_menu_items(
         &self,
-        index: usize,
+        id: u64,
         cx: &mut Context<Self>,
-    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
-        let chat = cx.entity();
-        let pinned = self.store.conversations[index].pinned;
+    ) -> impl FnOnce(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let chat = cx.entity().downgrade();
+        let pinned =
+            (self.store.index_of(id)).is_some_and(|ix| self.store.conversations[ix].pinned);
         move |menu, _, _| {
             let item =
                 |label: &'static str,
@@ -147,7 +231,13 @@ impl Chat {
                  f: fn(&mut Chat, usize, &mut Window, &mut Context<Chat>)| {
                     let chat = chat.clone();
                     PopupMenuItem::new(label).icon(Icon::new(icon)).on_click(
-                        move |_, window, cx| chat.update(cx, |this, cx| f(this, index, window, cx)),
+                        move |_, window, cx| {
+                            let _ = chat.update(cx, |this, cx| {
+                                if let Some(index) = this.store.index_of(id) {
+                                    f(this, index, window, cx);
+                                }
+                            });
+                        },
                     )
                 };
             menu.min_w(px(200.))
@@ -169,6 +259,137 @@ impl Chat {
                 .separator()
                 .item(item("Delete", AppIcon::Trash, Chat::delete_session))
         }
+    }
+
+    /// Open session `id`'s menu at `at` in the window, in place of any menu
+    /// already open, with the keys in it.
+    pub(crate) fn open_session_menu(
+        &mut self,
+        id: u64,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.store.index_of(id).is_none() {
+            return;
+        }
+        // From one menu straight to another, the keys go back to where
+        // they were before the first.
+        let back = match &self.session_menu {
+            Some(open) if open.menu.focus_handle(cx).contains_focused(window, cx) => {
+                open.back.clone()
+            }
+            _ => window.focused(cx),
+        };
+        let build = self.session_menu_items(id, cx);
+        let menu = PopupMenu::build(window, cx, build);
+        menu.focus_handle(cx).focus(window, cx);
+        let dismissed = cx.subscribe_in(
+            &menu,
+            window,
+            move |this, menu, _: &DismissEvent, window, cx| {
+                // Escape gives the keys back; an item that moved them, to a
+                // dialog, leaves them there.
+                let back = (this.session_menu.as_ref())
+                    .filter(|open| open.menu == *menu)
+                    .and_then(|open| open.back.clone());
+                if let Some(back) = back
+                    && menu.focus_handle(cx).contains_focused(window, cx)
+                {
+                    window.focus(&back, cx);
+                }
+                this.close_session_menu(menu.entity_id(), cx);
+            },
+        );
+        // It closes only on Escape, a click outside or an item otherwise,
+        // and F6 or Ctrl+L would leave it hung open over the sidebar.
+        let shown = menu.entity_id();
+        let left = cx.on_focus_out(&menu.focus_handle(cx), window, move |this, _, _, cx| {
+            this.close_session_menu(shown, cx);
+        });
+        self.session_menu = Some(SessionMenu {
+            id,
+            at,
+            menu,
+            back,
+            _closes: [dismissed, left],
+        });
+        cx.notify();
+    }
+
+    /// Close the menu `shown`, unless another has opened in its place: a
+    /// right-click on the next row closes the first menu as it opens its own.
+    fn close_session_menu(&mut self, shown: EntityId, cx: &mut Context<Self>) {
+        if (self.session_menu.as_ref()).is_some_and(|open| open.menu.entity_id() == shown) {
+            self.session_menu = None;
+            cx.notify();
+        }
+    }
+
+    /// A left press on session `id`'s row at `at` began. Held there, it
+    /// opens the row's menu, as a long press does on a phone.
+    pub(crate) fn press_session(
+        &mut self,
+        id: u64,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let since = std::time::Instant::now();
+        self.session_press = Some(Press {
+            id,
+            at,
+            since,
+            held: false,
+        });
+        // Left to run out rather than kept: a press let go of before then
+        // is simply no longer the one waiting.
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(LONG_PRESS).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let Some(press) = this.session_press.as_mut() else {
+                    return;
+                };
+                if press.since != since || press.held {
+                    return;
+                }
+                // Moved away without a move the row saw, off its edge.
+                if !still(press.at, window.mouse_position()) {
+                    this.session_press = None;
+                    return;
+                }
+                press.held = true;
+                this.open_session_menu(id, at, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// The pointer moved to `to` over session `id`'s row: a press that
+    /// wanders is a drag or a slip, and opens nothing.
+    pub(crate) fn move_press(&mut self, id: u64, to: Point<Pixels>) {
+        if (self.session_press.as_ref())
+            .is_some_and(|press| press.id == id && !press.held && !still(press.at, to))
+        {
+            self.session_press = None;
+        }
+    }
+
+    /// A press on session `id`'s row was let go of: before the menu opened,
+    /// it is a click and nothing more. Over the row, a held one is kept
+    /// for the click that follows, which `held_press` then takes.
+    pub(crate) fn let_go_press(&mut self, id: u64, over: bool) {
+        if (self.session_press.as_ref())
+            .is_some_and(|press| press.id == id && (!press.held || !over))
+        {
+            self.session_press = None;
+        }
+    }
+
+    /// Whether the click on a row ends a press that opened its menu, so
+    /// the click does not also open the session.
+    pub(crate) fn held_press(&mut self) -> bool {
+        self.session_press.take().is_some_and(|press| press.held)
     }
 
     /// Have a model name session `id` once its first reply is in, when
@@ -257,6 +478,7 @@ impl Chat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let id = self.store.conversations[index].id;
         let title = self.store.conversations[index].title.clone();
         self.rename
             .update(cx, |input, cx| input.set_value(title, window, cx));
@@ -273,7 +495,10 @@ impl Chat {
                 .on_ok(move |_, _, cx| {
                     let title = input.read(cx).value().trim().to_string();
                     chat.update(cx, |this, cx| {
-                        if !title.is_empty() {
+                        // Found again: it may have moved while the dialog was up.
+                        if let Some(index) = this.store.index_of(id)
+                            && !title.is_empty()
+                        {
                             this.store.conversations[index].title = title;
                             this.save();
                             cx.notify();
@@ -287,13 +512,30 @@ impl Chat {
         self.rename.update(cx, |input, cx| input.focus(window, cx));
     }
 
+    /// Why session `id` cannot be deleted yet, if it cannot.
+    pub(crate) fn why_not_delete(&self, id: u64) -> Option<&'static str> {
+        delete_refusal(
+            id,
+            self.streaming_id.filter(|_| self.busy),
+            self.compacting.contains(&id),
+            self.runs.contains_key(&id),
+        )
+    }
+
+    /// Ask, then delete the session at `index`. Said in a toast when it
+    /// cannot be, as the chat it would be said in may not be on screen.
     pub(crate) fn delete_session(
         &mut self,
         index: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let title = self.store.conversations[index].title.clone();
+        let id = self.store.conversations[index].id;
+        if let Some(why) = self.why_not_delete(id) {
+            window.push_notification(Notification::warning(why), cx);
+            return;
+        }
+        let title = self.store.conversations[index].shown_title();
         let chat = cx.entity();
         super::confirm_delete(
             "Delete session",
@@ -301,87 +543,90 @@ impl Chat {
             window,
             cx,
             move |window, cx| {
-                chat.update(cx, |this, cx| {
-                    if this.store.conversations.len() <= index {
-                        return;
-                    }
-                    // Said out loud: the dialog closes either way, and closing
-                    // it on nothing looked like the delete had been lost.
-                    if this.busy {
-                        this.error = Some("Stop the reply before deleting a session.".into());
-                        cx.notify();
-                        return;
-                    }
-                    // Its id can be handed out again before the summary lands.
-                    if this
-                        .compacting
-                        .contains(&this.store.conversations[index].id)
-                    {
-                        this.error =
-                            Some("Wait for the summary before deleting the session.".into());
-                        cx.notify();
-                        return;
-                    }
-                    // Its end would come for a session no longer there.
-                    if this.runs.contains_key(&this.store.conversations[index].id) {
-                        this.error = Some("Stop its run before deleting this session.".into());
-                        cx.notify();
-                        return;
-                    }
-                    // Through the store, so the session's file goes too,
-                    // and its private browser and draft with it.
-                    let id = this.store.conversations[index].id;
-                    this.stop_review(id);
-                    letronna_core::browser::forget(id);
-                    this.drafts.remove(&id);
-                    this.open.retain(|&open| open != id);
-                    this.recent.retain(|&recent| recent != id);
-                    this.panel.forget(id);
-                    // The next new session can be given this id again, and
-                    // must not start out with what was allowed here, nor in
-                    // this one's mode.
-                    this.session_allow
-                        .remove(&this.store.conversations[index].id);
-                    letronna_core::approvals::forget_session(this.store.conversations[index].id);
-                    // Nor with this one's loop, whose ticks would go there.
-                    letronna_core::wake::stop(this.store.conversations[index].id);
-                    this.modes.remove(&this.store.conversations[index].id);
-                    // Nor with this one's rows as they were: what was open,
-                    // how long a reply thought, what an edit changed.
-                    this.thinking_open.retain(|&(session, _)| session != id);
-                    this.runs_open.retain(|&(session, _)| session != id);
-                    this.previews_open.retain(|&(session, _)| session != id);
-                    this.thought_for.retain(|&(session, _), _| session != id);
-                    this.edited.retain(|&(session, _), _| session != id);
-                    this.plan_folded.remove(&id);
-                    // Nor show its helpers' cards; dropped, they are declined.
-                    let id = this.store.conversations[index].id;
-                    this.agent_asks.retain(|request| request.root != id);
-                    // Nor the pictures waiting to go with its next message,
-                    // Auto mode's tags or which of its rows were open.
-                    this.attachments.remove(&id);
-                    this.tags.remove(&id);
-                    this.unseen.remove(&id);
-                    this.kept_own.remove(&id);
-                    this.thinking_open.retain(|&(session, _)| session != id);
-                    this.runs_open.retain(|&(session, _)| session != id);
-                    this.store.remove(index);
-                    if this.store.conversations.is_empty() {
-                        this.new_chat(window, cx);
-                        return;
-                    }
-                    if this.store.active >= index && this.store.active > 0 {
-                        this.store.active -= 1;
-                    }
-                    // Its files leave the Artifacts page with it.
-                    if this.page == Page::Artifacts {
-                        this.read_artifacts(cx);
-                    }
-                    this.save();
-                    cx.notify();
-                });
+                chat.update(cx, |this, cx| this.delete_now(id, window, cx));
             },
         );
+    }
+
+    /// Delete session `id` now that the user said so. Found again by id: a
+    /// session deleted or started while the dialog was up moves the others.
+    fn delete_now(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.store.index_of(id) else {
+            return;
+        };
+        // A reply may have begun there while the dialog was up.
+        if let Some(why) = self.why_not_delete(id) {
+            window.push_notification(Notification::warning(why), cx);
+            return;
+        }
+        // The sidebar's keys go on to the session next in its list, so
+        // Delete can be pressed again for it.
+        let next = (self.picked.filter(|&picked| picked == id))
+            .and_then(|_| beside(&self.listed_sessions(cx), index))
+            .map(|i| self.store.conversations[i].id);
+        let on_screen = self.store.conversations[self.store.active].id;
+        self.stop_review(id);
+        letronna_core::browser::forget(id);
+        self.drafts.remove(&id);
+        self.open.retain(|&open| open != id);
+        self.recent.retain(|&recent| recent != id);
+        self.panel.forget(id);
+        // The next new session can be given this id again, and must not
+        // start out with what was allowed here, nor in this one's mode.
+        self.session_allow.remove(&id);
+        letronna_core::approvals::forget_session(id);
+        // Nor with this one's loop, whose ticks would go there.
+        letronna_core::wake::stop(id);
+        self.modes.remove(&id);
+        // Nor with this one's rows as they were: what was open, how long a
+        // reply thought, what an edit changed.
+        self.thinking_open.retain(|&(session, _)| session != id);
+        self.runs_open.retain(|&(session, _)| session != id);
+        self.previews_open.retain(|&(session, _)| session != id);
+        self.thought_for.retain(|&(session, _), _| session != id);
+        self.edited.retain(|&(session, _), _| session != id);
+        self.plan_folded.remove(&id);
+        // Nor show its helpers' cards; dropped, they are declined.
+        self.agent_asks.retain(|request| request.root != id);
+        // Nor the pictures waiting to go with its next message, Auto mode's
+        // tags or whether it was woken while away.
+        self.attachments.remove(&id);
+        self.tags.remove(&id);
+        self.unseen.remove(&id);
+        self.kept_own.remove(&id);
+        if self.session_menu.as_ref().is_some_and(|open| open.id == id) {
+            self.session_menu = None;
+        }
+        if self
+            .session_press
+            .as_ref()
+            .is_some_and(|press| press.id == id)
+        {
+            self.session_press = None;
+        }
+        // Through the store, so the session's file goes too, and what is
+        // kept beside it.
+        self.store.remove(index);
+        if self.store.conversations.is_empty() {
+            self.picked = None;
+            self.new_chat(window, cx);
+            return;
+        }
+        if next.is_some() {
+            self.picked = next;
+        }
+        self.store.active = active_after(&self.store, on_screen, index);
+        if on_screen == id {
+            // Its typing goes with it, and the next one's comes back.
+            self.swap_draft(window, cx);
+            self.follow();
+        }
+        // Its files leave the Artifacts page with it.
+        if self.page == Page::Artifacts {
+            self.read_artifacts(cx);
+        }
+        self.save();
+        cx.notify();
     }
 
     pub(crate) fn export_session(
@@ -543,9 +788,10 @@ impl Chat {
 #[cfg(test)]
 mod tests {
     use super::{
-        Conversation, SessionFilter, SessionState, group_by_project, next_filter, passes,
-        project_label,
+        Conversation, SessionFilter, SessionState, Store, active_after, beside, delete_refusal,
+        group_by_project, next_filter, passes, project_label, still,
     };
+    use gpui::{point, px};
     use std::path::PathBuf;
 
     fn state(needs_you: bool, working: bool, unseen: bool, pinned: bool) -> SessionState {
@@ -623,5 +869,58 @@ mod tests {
             "letronna"
         );
         assert_eq!(project_label(None), "No project");
+    }
+
+    #[test]
+    fn a_session_is_held_only_by_what_runs_in_it() {
+        // A reply in another session no longer keeps this one.
+        assert_eq!(delete_refusal(1, Some(2), false, false), None);
+        assert_eq!(delete_refusal(1, None, false, false), None);
+        assert!(delete_refusal(1, Some(1), false, false).is_some());
+        assert!(delete_refusal(1, None, true, false).is_some());
+        assert!(delete_refusal(1, Some(2), false, true).is_some());
+    }
+
+    /// A store of sessions with these ids, in this order.
+    fn with_ids(ids: &[u64]) -> Store {
+        Store {
+            conversations: (ids.iter())
+                .map(|&id| Conversation {
+                    id,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_session_on_screen_stays_when_another_is_deleted() {
+        // Session 3 sat at 2; 1 was deleted from 0, so it is at 1 now.
+        assert_eq!(active_after(&with_ids(&[2, 3, 4]), 3, 0), 1);
+        // One after it was deleted: it has not moved.
+        assert_eq!(active_after(&with_ids(&[1, 2, 4]), 2, 2), 1);
+        // It was the one deleted: the one listed under it, older, shows.
+        assert_eq!(active_after(&with_ids(&[1, 2, 4]), 3, 2), 1);
+        assert_eq!(active_after(&with_ids(&[2, 4]), 1, 0), 0);
+    }
+
+    #[test]
+    fn the_sidebar_keys_go_on_to_the_next_session_listed() {
+        let listed = [7, 2, 5];
+        assert_eq!(beside(&listed, 7), Some(2));
+        assert_eq!(beside(&listed, 2), Some(5));
+        // The last one goes back up.
+        assert_eq!(beside(&listed, 5), Some(2));
+        assert_eq!(beside(&[7], 7), None);
+        assert_eq!(beside(&listed, 9), None);
+    }
+
+    #[test]
+    fn a_press_held_still_or_nearly_is_a_long_press() {
+        let at = point(px(100.), px(40.));
+        assert!(still(at, at));
+        assert!(still(at, point(px(105.), px(44.))));
+        assert!(!still(at, point(px(100.), px(49.))));
     }
 }

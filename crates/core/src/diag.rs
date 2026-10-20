@@ -5,9 +5,12 @@
 //! work, so a slow or full disk costs events, never a stalled turn. Events
 //! say what happened -- kinds, ids, sizes, durations and error classes --
 //! and never what was said: no messages, prompts or tool output, so a log
-//! can be handed over when asking for help. Known secrets are masked on the
-//! way out all the same, since an id or a panic message can quote one. Each
-//! frontend writes its own `logs/<frontend>.log`, rotated by size, so the
+//! can be handed over when asking for help. A failed model call is logged
+//! with its `ERROR` as the provider worded it all the same: that is what a
+//! log is read for, and a kind alone says a gateway failed but not why. It
+//! is kept longer than other text. Known secrets are masked on the way out,
+//! since an id, an error or a panic message can quote one. Each frontend
+//! writes its own `logs/<frontend>.log`, rotated by size, so the
 //! window and the terminal never interleave their lines; a panic leaves
 //! `crashes/<frontend>-<time>.txt` with its message and a backtrace. That
 //! message is kept as it is, masked, since it is the clue, even though it
@@ -39,6 +42,11 @@ const CRASH_FILES: usize = 20;
 /// Characters kept of a field's text: an id or a class fits, a message does
 /// not.
 const FIELD_CHARS: usize = 64;
+/// The field a failed model call's error goes in, as its provider worded it.
+pub const ERROR: &str = "error";
+/// Characters kept of an `ERROR`: a provider's complaint fits, a whole error
+/// page does not.
+const ERROR_CHARS: usize = 500;
 /// How long a panic or a quit waits for the writer to catch up: enough for
 /// a full queue, short enough that a stuck disk does not hold the exit.
 const FLUSH_WAIT: Duration = Duration::from_secs(1);
@@ -110,7 +118,8 @@ pub fn init(frontend: &'static str) {
 }
 
 /// Queue an event without waiting; when the queue is full it is dropped and
-/// counted. Fields are ids, sizes, durations and classes, never content.
+/// counted. Fields are ids, sizes, durations and classes, never content,
+/// with a model call's `ERROR` the one exception.
 pub fn event(kind: &'static str, fields: &[(&'static str, Value)]) {
     let Some(log) = LOG.get() else {
         return;
@@ -368,8 +377,22 @@ fn line(
     object.insert("frontend".into(), frontend.into());
     object.insert("pid".into(), pid.into());
     for (name, value) in fields {
+        // A field named as one of the line's own would hide what the line
+        // is, as a failure's kind once did its event's.
+        if object.contains_key(*name) {
+            continue;
+        }
         let value = match value {
-            Value::String(text) => clip(&mask(text, secrets)).into(),
+            Value::String(text) => {
+                let chars = if *name == ERROR {
+                    ERROR_CHARS
+                } else {
+                    FIELD_CHARS
+                };
+                // Masked before it is cut, so no key is cut into a part
+                // that no longer looks like one.
+                clip(&mask(text, secrets), chars).into()
+            }
             Value::Number(_) | Value::Bool(_) => value.clone(),
             _ => Value::Null,
         };
@@ -378,8 +401,9 @@ fn line(
     format!("{}\n", Value::Object(object))
 }
 
-fn clip(text: &str) -> String {
-    match text.char_indices().nth(FIELD_CHARS) {
+/// `text` cut to its first `chars` characters.
+fn clip(text: &str, chars: usize) -> String {
+    match text.char_indices().nth(chars) {
         Some((cut, _)) => format!("{}…", &text[..cut]),
         None => text.to_owned(),
     }
@@ -562,6 +586,57 @@ mod tests {
         assert!(value["args"].is_null());
         assert!(value["name"].as_str().unwrap().chars().count() <= FIELD_CHARS + 1);
         assert!(!text.contains("merger") && !text.contains(prompt.trim_end()));
+    }
+
+    #[test]
+    fn a_field_cannot_take_the_name_of_the_line_it_is_on() {
+        let fields = [
+            ("kind", "server".into()),
+            ("pid", 1.into()),
+            ("ms", 3.into()),
+        ];
+        let text = line("2026-10-20T09:00:00", "model_retry", "gui", 7, &fields, &[]);
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["kind"], "model_retry");
+        assert_eq!(value["pid"], 7);
+        assert_eq!(value["ms"], 3);
+    }
+
+    #[test]
+    fn a_model_error_is_kept_in_its_words_with_keys_masked() {
+        let saved = "a-saved-key-of-no-known-shape".to_owned();
+        let said = format!(
+            "Upstream refused key sk-proj-0123456789abcdef (Authorization: Bearer abc.def-123), \
+             saved a-saved-key-of-no-known-shape: {}",
+            "the gateway gave up waiting on the model. ".repeat(20)
+        );
+        let fields = [
+            ("outcome", "server".into()),
+            (ERROR, said.clone().into()),
+            ("model", said.into()),
+        ];
+        let text = line(
+            "2026-09-29T10:00:00",
+            "model_request",
+            "cli",
+            7,
+            &fields,
+            &[saved],
+        );
+        let value: Value = serde_json::from_str(&text).unwrap();
+        let error = value[ERROR].as_str().unwrap();
+        assert!(error.starts_with("Upstream refused key *** "), "{error}");
+        assert!(error.contains("saved ***: the gateway gave up"), "{error}");
+        assert_eq!(error.chars().count(), ERROR_CHARS + 1);
+        assert!(error.ends_with('…'));
+        for secret in ["sk-proj-", "abc.def", "a-saved-key"] {
+            assert!(!text.contains(secret), "{secret} left in {text}");
+        }
+        // Any other field is cut as short as ever.
+        assert_eq!(
+            value["model"].as_str().unwrap().chars().count(),
+            FIELD_CHARS + 1
+        );
     }
 
     #[test]

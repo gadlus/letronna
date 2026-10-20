@@ -495,6 +495,12 @@ impl Chat {
             .into_iter()
             .map(|(gateway, id)| Row {
                 detail: gateway.clone().into(),
+                // Picked, it is refused, and says why.
+                note: match self.needs_subscription(&gateway, &id) {
+                    true => "Needs a subscription".into(),
+                    false if self.free_today(&gateway, &id) => "Free today".into(),
+                    false => SharedString::default(),
+                },
                 current: gateway == on && id == using,
                 ..Row::new(
                     AppIcon::Robot,

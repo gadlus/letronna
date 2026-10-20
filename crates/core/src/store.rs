@@ -671,8 +671,8 @@ pub struct Store {
     pub active: usize,
     pub settings: Settings,
     /// The settings as JSON when last read or written, so a save puts back
-    /// only the fields changed here since; only loading, `save` and
-    /// `choose_style` touch it.
+    /// only the fields changed here since; only loading, `save`,
+    /// `choose_style` and `follow_custom` touch it.
     pub settings_written: serde_json::Value,
 }
 
@@ -1089,6 +1089,25 @@ impl Store {
         .map_err(std::io::Error::other)?;
         self.settings_written = now;
         Ok(())
+    }
+
+    /// Take the Custom address the other process saved since this one last
+    /// read or wrote the settings, unless this one has a new address of its
+    /// own not yet saved. Whether it changed.
+    pub fn follow_custom(&mut self) -> bool {
+        let disk = current_settings().custom_endpoint;
+        let written = (self.settings_written.get("custom_endpoint"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if disk == written || self.settings.custom_endpoint != written {
+            return false;
+        }
+        if let Some(fields) = self.settings_written.as_object_mut() {
+            fields.insert("custom_endpoint".into(), disk.clone().into());
+        }
+        self.settings.custom_endpoint = disk;
+        true
     }
 
     /// Forget a session and remove its file, its helpers' conversations,
@@ -3816,6 +3835,8 @@ pub fn save_key(
         }
     })
     .map_err(std::io::Error::other)?;
+    // A gateway's models are listed with its key, so the router asks again.
+    crate::providers::router::forget();
     match refused {
         Some(why) => Err(std::io::Error::other(why)),
         None => Ok(load_keys()),
@@ -5241,6 +5262,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_custom_url_saved_elsewhere_is_followed_unless_one_is_waiting_here() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("settings-follow-custom");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        std::fs::write(
+            dir.join("settings.json"),
+            "{\"gateway\":\"OpenAI\",\"model\":\"gpt-a\",\"custom_endpoint\":\"http://one/v1\"}",
+        )
+        .unwrap();
+
+        let mut window = load_listing();
+        let mut terminal = load_listing();
+        assert!(!window.follow_custom());
+        terminal.settings.custom_endpoint = "http://two/v1".into();
+        terminal.save().unwrap();
+        assert!(window.follow_custom());
+        assert_eq!(window.settings.custom_endpoint, "http://two/v1");
+        // Taken in, it is not written back as a change of the window's.
+        window.save().unwrap();
+        assert!(!window.follow_custom());
+        // An address typed here and not saved yet stays.
+        terminal.settings.custom_endpoint = "http://three/v1".into();
+        terminal.save().unwrap();
+        window.settings.custom_endpoint = "http://mine/v1".into();
+        assert!(!window.follow_custom());
+        assert_eq!(window.settings.custom_endpoint, "http://mine/v1");
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
     fn a_key_saved_for_one_slot_leaves_every_other_slot_as_the_file_has_it() {
         use std::collections::HashMap;
         let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
@@ -5313,6 +5364,46 @@ pub(crate) mod tests {
             .push(said("user", "anyone?"));
         terminal.save().unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), new);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_deleted_session_is_not_followed_back_into_the_list() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("deleted-followed");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut terminal = Store::default();
+        terminal.conversations.push(numbered(2));
+        terminal.conversations.push(Conversation {
+            id: 2,
+            messages: vec![said("user", "kept")],
+            ..Default::default()
+        });
+        terminal.save().unwrap();
+
+        // The window deletes session 1 and saves, as a delete does.
+        let mut window = load_listing();
+        let at = window.index_of(1).unwrap();
+        window.remove(at);
+        window.save().unwrap();
+
+        // The terminal, which still has it, says more and is renamed there:
+        // what the "the sessions changed" watch would then take in.
+        terminal.conversations[0]
+            .messages
+            .push(said("user", "still here?"));
+        terminal.conversations[0].title = "renamed".into();
+        terminal.save().unwrap();
+        window.follow(|_| false);
+        let listed: Vec<u64> = window.conversations.iter().map(|c| c.id).collect();
+        assert_eq!(listed, [2]);
+        assert!(summaries().iter().all(|s| s.id != 1));
+        // Nor does a listing from scratch, as the next start makes.
+        let again: Vec<u64> = (load_listing().conversations.iter())
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(again, [2]);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 

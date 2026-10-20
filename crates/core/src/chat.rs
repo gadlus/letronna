@@ -1,5 +1,5 @@
 use crate::cancel::Cancel;
-use crate::failure::{Failure, FailureKind, classify};
+use crate::failure::{Failure, FailureKind, classify, classify_text};
 use crate::gate::Mode;
 use crate::models::Limit;
 use serde::{Deserialize, Serialize};
@@ -3573,18 +3573,73 @@ fn explain(message: &str) -> String {
 
 pub(crate) fn unwrap_response(value: &Value) -> Result<&Value, String> {
     if value.get("error").is_some() || value.get("success").is_some_and(|v| v != true) {
-        let message = value
-            .pointer("/error/message")
-            .or_else(|| value.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("The provider could not finish this response.");
-        return Err(explain(message));
+        let message = error_words(value)
+            .unwrap_or_else(|| "The provider could not finish this response.".to_owned());
+        return Err(explain(&message));
     }
     Ok(if value.get("success") == Some(&Value::Bool(true)) {
         &value["data"]
     } else {
         value
     })
+}
+
+/// What an error reply says, wherever its server put the words: the
+/// envelope's message, as OpenAI, Anthropic, Gemini and most gateways write
+/// it, then a bare string, then the fields other servers use -- FastAPI's
+/// `detail`, its list of what failed validation, `msg`, OAuth's
+/// `error_description`, Cloudflare's `errors` -- and else the error itself
+/// as it came, so nothing a provider said is lost for a field not known
+/// here. `None` only for a reply that says nothing at all.
+pub(crate) fn error_words(value: &Value) -> Option<String> {
+    let text = |v: &Value| {
+        let said = v.as_str()?.trim();
+        (!said.is_empty()).then(|| said.to_owned())
+    };
+    let named = [
+        value.pointer("/error/message"),
+        value.get("error"),
+        value.pointer("/error/detail"),
+        value.pointer("/error/msg"),
+        value.get("message"),
+        value.get("detail"),
+        value.get("msg"),
+        value.get("error_msg"),
+        value.get("error_description"),
+        value.pointer("/errors/0/message"),
+        Some(value),
+    ];
+    named
+        .into_iter()
+        .flatten()
+        .find_map(text)
+        .or_else(|| {
+            // FastAPI's validation errors, each where it is and what is wrong.
+            let failed: Vec<String> = (value["detail"].as_array().into_iter().flatten())
+                .filter_map(|item| {
+                    let msg = item["msg"].as_str()?;
+                    let at: Vec<String> = (item["loc"].as_array().into_iter().flatten())
+                        .map(|part| {
+                            part.as_str()
+                                .map_or_else(|| part.to_string(), str::to_owned)
+                        })
+                        .collect();
+                    Some(match at.is_empty() {
+                        true => msg.to_owned(),
+                        false => format!("{}: {msg}", at.join(".")),
+                    })
+                })
+                .collect();
+            (!failed.is_empty()).then(|| failed.join("; "))
+        })
+        .or_else(|| {
+            let error = value
+                .get("error")
+                .filter(|error| !error.is_null())
+                .unwrap_or(value);
+            let empty = error.is_null() || error.as_object().is_some_and(|o| o.is_empty());
+            (!empty).then(|| error.to_string())
+        })
 }
 
 #[derive(Default)]
@@ -4122,21 +4177,22 @@ fn begin(
         // The call is over by now. Letting go before saying so means whoever
         // hears `Finished` never finds the guard still held.
         drop(extra.guard);
-        crate::diag::event(
-            "model_request",
-            &[
-                ("model", connection.model.as_str().into()),
-                // The failure's own kind, known here since #65, not guessed from its words.
-                (
-                    "outcome",
-                    match &result {
-                        Ok(()) => "ok".into(),
-                        Err(failure) => format!("{:?}", failure.kind).to_lowercase().into(),
-                    },
-                ),
-                ("ms", crate::diag::millis(started)),
-            ],
-        );
+        let mut fields = vec![
+            ("model", connection.model.as_str().into()),
+            // The failure's own kind, known here since #65, not guessed from its words.
+            (
+                "outcome",
+                match &result {
+                    Ok(()) => "ok".into(),
+                    Err(failure) => format!("{:?}", failure.kind).to_lowercase().into(),
+                },
+            ),
+            ("ms", crate::diag::millis(started)),
+        ];
+        if let Err(failure) = &result {
+            fields.push((crate::diag::ERROR, failure.to_string().into()));
+        }
+        crate::diag::event("model_request", &fields);
         // Claimed before the reply is said to be over, so a request sent the
         // moment it is finds the summary being made and waits for it rather
         // than asking for another.
@@ -4543,7 +4599,10 @@ fn stream(
                 slow = ran_out(&e);
                 Failure::new(
                     FailureKind::Network,
-                    "Cannot reach the model. Check that your server is running and the endpoint is correct (5-minute wait for the reply to begin).",
+                    format!(
+                        "Cannot reach the model. Check that your server is running and the endpoint is correct (5-minute wait for the reply to begin). Cause: {}",
+                        unreached(e)
+                    ),
                 )
             }
             Ok(response) if response.status().is_success() => {
@@ -4623,7 +4682,7 @@ fn stream(
                 {
                     return stream(connection, messages, start, budget, extra, lsp, sender);
                 }
-                let mut failure = classify(Some(status.as_u16()), &headers, &body);
+                let mut failure = classify_text(Some(status.as_u16()), &headers, &body, &error);
                 // A shared Codex sign-in is renewed by Codex, never here.
                 if status == reqwest::StatusCode::UNAUTHORIZED
                     && crate::providers::wire::openai_responses::chatgpt(&connection.endpoint)
@@ -4697,7 +4756,9 @@ fn stream(
                     of: 2,
                     wait: Duration::ZERO,
                     dropped: begun,
+                    error: failure.to_string(),
                 };
+                log_retry(connection, &retry);
                 sender
                     .send_blocking(Event::Retrying(retry))
                     .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
@@ -4709,12 +4770,53 @@ fn stream(
         // begun were never handed over, so the next try's reply is the one
         // kept and run.
         retry.dropped = begun;
+        log_retry(connection, &retry);
+        let wait = retry.wait;
         sender
             .send_blocking(Event::Retrying(retry))
             .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
-        if !crate::retry::pause(retry.wait, || sender.is_closed() || extra.cancel.is_set()) {
+        if !crate::retry::pause(wait, || sender.is_closed() || extra.cancel.is_set()) {
             return Err(Failure::new(FailureKind::Stopped, "Chat closed."));
         }
+    }
+}
+
+/// Log a failed try of a call to `connection` that is about to be made
+/// again, with what the provider said: the call's own line at the end says
+/// only how the last try went.
+fn log_retry(connection: &Connection, retry: &crate::retry::Retry) {
+    crate::diag::event(
+        "model_retry",
+        &[
+            ("model", connection.model.as_str().into()),
+            // Not "kind": that names the line itself, and would be
+            // written over.
+            ("outcome", format!("{:?}", retry.kind).to_lowercase().into()),
+            ("attempt", retry.attempt.into()),
+            ("of", retry.of.into()),
+            (
+                "wait_ms",
+                u64::try_from(retry.wait.as_millis())
+                    .unwrap_or(u64::MAX)
+                    .into(),
+            ),
+            (crate::diag::ERROR, retry.error.as_str().into()),
+        ],
+    );
+}
+
+/// What `e` and each error under it say, without the address it was sent
+/// to: a custom endpoint can carry its key there, and its owner knows it.
+fn unreached(e: reqwest::Error) -> String {
+    crate::web::with_causes(&e.without_url())
+}
+
+/// Why reading a reply broke off, in the words of each error under `e`,
+/// without the address as `unreached` leaves it out.
+fn broke_off(e: std::io::Error) -> String {
+    match e.downcast::<reqwest::Error>() {
+        Ok(e) => unreached(e),
+        Err(e) => crate::web::with_causes(&e),
     }
 }
 
@@ -4783,7 +4885,10 @@ fn read(
                 *slow = ran_out_reading(&e);
                 return Err(Failure::new(
                     FailureKind::Network,
-                    "Connection interrupted before the response completed.",
+                    format!(
+                        "Connection interrupted before the response completed. Cause: {}",
+                        broke_off(e)
+                    ),
                 ));
             }
         };
@@ -10379,6 +10484,13 @@ mod tests {
         };
         assert_eq!(retry.kind, FailureKind::RateLimit);
         assert_eq!((retry.attempt, retry.of), (2, 6));
+        assert_eq!(retry.error, "Rate limit reached.");
+        assert!(
+            retry
+                .to_string()
+                .ends_with("(try 2 of 6): Rate limit reached."),
+            "{retry}"
+        );
         assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "Hello"));
         assert!(matches!(
             rx.recv_blocking().unwrap(),
@@ -10424,6 +10536,118 @@ mod tests {
         assert!(bodies[1].contains("image_url"));
         assert!(sees_images("sees-through-a-rate-limit"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_refusal_that_is_no_json_is_told_in_its_own_words() {
+        let (endpoint, worker) = serve(vec![(
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "404 page not found",
+        )]);
+        let rx = ask(endpoint);
+        let Event::Finished(Err(failure)) = rx.recv_blocking().unwrap() else {
+            panic!("a page not found was taken for a reply");
+        };
+        assert_eq!(failure.kind, FailureKind::Settings);
+        assert!(
+            failure
+                .to_string()
+                .ends_with("The provider said: 404 page not found"),
+            "{failure}"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_call_that_cannot_connect_says_why_but_not_where() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let url = format!("http://127.0.0.1:{port}/v1/chat/completions?key=SECRET-custom");
+        let e = client().unwrap().get(url).send().unwrap_err();
+        let said = unreached(e);
+        // More than reqwest's own words, which are the same for every cause.
+        assert!(said.starts_with("error sending request: "), "{said}");
+        assert!(!said.contains("SECRET"), "{said}");
+    }
+
+    #[test]
+    fn an_error_in_a_bare_string_is_told() {
+        let said = |reply: Value| unwrap_response(&reply).unwrap_err();
+        assert_eq!(
+            said(json!({"error": "model 'qwen3' is not loaded"})),
+            "model 'qwen3' is not loaded"
+        );
+        // An error with no words of its own is shown as it came.
+        assert_eq!(said(json!({"error": {"code": 500}})), r#"{"code":500}"#);
+        assert_eq!(
+            said(json!({"error": {}})),
+            "The provider could not finish this response."
+        );
+    }
+
+    #[test]
+    fn an_error_is_read_wherever_its_server_put_the_words() {
+        let said = |reply: Value| error_words(&reply).unwrap_or_default();
+        // OpenAI, Anthropic and Gemini.
+        assert_eq!(
+            said(json!({"error": {"message": "Invalid model", "type": "invalid_request_error"}})),
+            "Invalid model"
+        );
+        assert_eq!(
+            said(
+                json!({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}})
+            ),
+            "Overloaded"
+        );
+        assert_eq!(
+            said(
+                json!({"error": {"code": 400, "message": "API key not valid.", "status": "INVALID_ARGUMENT"}})
+            ),
+            "API key not valid."
+        );
+        // A bare string, under `error` or as the whole reply.
+        assert_eq!(said(json!({"error": "Invalid API key"})), "Invalid API key");
+        assert_eq!(said(json!("Internal error")), "Internal error");
+        // FastAPI, its validation errors, and servers that say msg.
+        assert_eq!(
+            said(json!({"detail": "Model is not loaded"})),
+            "Model is not loaded"
+        );
+        assert_eq!(
+            said(json!({"detail": [
+                {"loc": ["body", "messages", 0, "content"], "msg": "field required", "type": "missing"},
+                {"loc": ["body", "model"], "msg": "unknown model", "type": "value_error"},
+            ]})),
+            "body.messages.0.content: field required; body.model: unknown model"
+        );
+        assert_eq!(said(json!({"code": 1001, "msg": "余额不足"})), "余额不足");
+        assert_eq!(said(json!({"error": {"code": "x", "msg": "busy"}})), "busy");
+        // OAuth, Cloudflare and a bare message.
+        assert_eq!(
+            said(json!({"error": "invalid_token", "error_description": "The token expired"})),
+            "invalid_token"
+        );
+        assert_eq!(
+            said(
+                json!({"success": false, "errors": [{"code": 7003, "message": "No route for that URI"}]})
+            ),
+            "No route for that URI"
+        );
+        assert_eq!(
+            said(json!({"message": "Bad temperature"})),
+            "Bad temperature"
+        );
+        // Words in no field known here are kept as they came.
+        assert_eq!(
+            said(json!({"error": {"reason": "quota", "retry": false}})),
+            r#"{"reason":"quota","retry":false}"#
+        );
+        assert_eq!(said(json!({"status": "failed"})), r#"{"status":"failed"}"#);
+        // Nothing said is nothing to show.
+        assert_eq!(error_words(&json!({})), None);
+        assert_eq!(error_words(&Value::Null), None);
     }
 
     #[test]

@@ -468,6 +468,9 @@ impl Chat {
         // leftover query would hide models with nothing to clear it. And a
         // gateway can list hundreds, each a button built every frame.
         let mut matches = self.models_named("");
+        // What can answer first; the hosted models, while they need a
+        // subscription, after it and greyed.
+        matches.sort_by_key(|(gw, id)| self.needs_subscription(gw, id));
         let more = matches.len().saturating_sub(SETUP_MODELS);
         matches.truncate(SETUP_MODELS);
         let mut list = v_flex()
@@ -492,10 +495,15 @@ impl Chat {
             );
         }
         for (i, (gw, id)) in matches.into_iter().enumerate() {
-            let active = gw == on && id == current;
-            let price = letronna_core::models::facts(&base_url(&gw, &custom), &id)
-                .price
-                .map(|p| price_per_million(&p));
+            let unpaid = self.needs_subscription(&gw, &id);
+            let active = gw == on && id == current && !unpaid;
+            let price = match unpaid {
+                true => Some("needs a subscription".to_owned()),
+                false if self.free_today(&gw, &id) => Some("free today".to_owned()),
+                false => letronna_core::models::facts(&base_url(&gw, &custom), &id)
+                    .price
+                    .map(|p| price_per_million(&p)),
+            };
             let (pick_gw, pick) = (gw.clone(), id.clone());
             let pick_chat = chat.clone();
             let row = Button::new(("setup-model", i))
@@ -503,6 +511,7 @@ impl Chat {
                 .small()
                 .w_full()
                 .justify_start()
+                .disabled(unpaid)
                 .child(
                     h_flex()
                         .w_full()
@@ -520,7 +529,7 @@ impl Chat {
                                 .flex_shrink_0()
                                 .gap_2()
                                 .text_xs()
-                                .text_color(cx.theme().muted_foreground)
+                                .when(!unpaid, |d| d.text_color(cx.theme().muted_foreground))
                                 .child(gw)
                                 .children(price),
                         ),

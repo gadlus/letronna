@@ -235,6 +235,7 @@ fn main() {
         review: Default::default(),
         // Only at the prompt: a `-p` answer may be piped where Markdown shows.
         plain_terminal: !args.once(),
+        way_out: None,
     };
     letronna_core::diag::mark("listed");
     // At the prompt, what is sent goes into the folder's history, which
@@ -391,6 +392,24 @@ fn main() {
     runner.serve_helpers(std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
     render::clear();
     banner(&runner, &folder, session);
+    let (on, model) = runner.store.model(session);
+    let keys = store::load_keys();
+    let ready = letronna_core::gateway::ready(&keys, &runner.store.settings.custom_endpoint);
+    let ready: Vec<&str> = ready.iter().map(|(name, ..)| *name).collect();
+    let hint = commands::unpaid_hint(on, model, &ready);
+    // The hint asked the account service again, which may have opened the
+    // model the footer said was closed.
+    let note = footer(&runner);
+    runner.bar.set_footer(note);
+    if let Some(hint) = hint {
+        render::line(&render::dim(&hint));
+        // What the file says of the plan is as of the last check; asked
+        // again in the background, an upgrade since shows from the next
+        // command on.
+        std::thread::spawn(|| {
+            let _ = letronna_core::auth::refresh();
+        });
+    }
     if let Some(version) = update::seen() {
         render::line(&render::dim(&format!(
             "Letronna {version} is out · letronna update"
@@ -439,6 +458,9 @@ fn main() {
         // Before every wait, so a session opened, named or renamed by
         // whatever ran last shows on the box's edge and in the title.
         show_session(&mut runner, session);
+        // And a Custom address the window saved meanwhile is where the next
+        // message goes, as the keys are read when it is sent.
+        runner.store.follow_custom();
         let Some(waited) = runner.bar.wait() else {
             break;
         };
@@ -474,8 +496,7 @@ fn main() {
             if (!runner.stopped || letronna_core::wake::waiting(id))
                 && let Err(error) = runner.resume(session)
             {
-                render::blank();
-                render::line(&render::red(&error));
+                runner.show_failure(&error);
                 screen::settle();
             }
             continue;
@@ -548,6 +569,11 @@ fn main() {
                 _ => continue,
             }
         }
+        // Sent, it would only be refused for want of a plan or credit.
+        if commands::hold_unpaid(&mut runner, session) {
+            screen::settle();
+            continue;
+        }
         let id = runner.store.conversations[session].id;
         for notice in crew::prompt(id, &line, crew::Source::Bar) {
             inbox::push(id, notice);
@@ -559,8 +585,7 @@ fn main() {
         match runner.ask(session, prompt) {
             Ok(_) => keep.now(),
             Err(error) => {
-                render::blank();
-                render::line(&render::red(&error));
+                runner.show_failure(&error);
                 // Nothing is painted after this until the next key, so without
                 // it a failed turn looks like one that ended with no answer.
                 screen::settle();
@@ -1002,16 +1027,14 @@ fn answer_schema(given: &str) -> Result<Value, String> {
 }
 
 /// Runs `spec` to its end on this thread, with progress lines while it runs
-/// when the output is stream-json.
+/// when the output is stream-json, and each retry or switch of model said
+/// on stderr.
 fn run_following(spec: Spec, output: Output) -> Report {
     let (running, ended) = mpsc::channel::<()>();
-    let progress =
-        (output == Output::StreamJson).then(|| show_progress(spec.status.clone(), ended));
+    let progress = show_progress(spec.status.clone(), ended, output == Output::StreamJson);
     let report = driver::run(spec);
     drop(running);
-    if let Some(progress) = progress {
-        let _ = progress.join();
-    }
+    let _ = progress.join();
     report
 }
 
@@ -1195,12 +1218,39 @@ fn consult(request: &Request, context: &tools::ToolContext, cancel: &Cancel) -> 
     }
 }
 
-/// Writes a stream-json progress line whenever the run's rounds or tokens
-/// have moved on, until `ended` hears that the run is over.
-fn show_progress(status: Arc<Status>, ended: mpsc::Receiver<()>) -> std::thread::JoinHandle<()> {
+/// Writes a stream-json progress line, when `json`, whenever the run's
+/// rounds or tokens have moved on, and says each retry or switch of model
+/// on stderr, until `ended` hears that the run is over.
+fn show_progress(
+    status: Arc<Status>,
+    ended: mpsc::Receiver<()>,
+    json: bool,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut shown = progress(&status);
+        let mut notes = status.notes.load(Ordering::Relaxed);
+        let tell = |notes: &mut u64| {
+            // On stderr, apart from the answer, whatever the output: waiting
+            // out a gateway that keeps failing was minutes of silence, the
+            // provider's words say whether waiting can help, and an answer
+            // from another gateway than the one asked is worth knowing.
+            let now = status.notes.load(Ordering::Relaxed);
+            if now != *notes {
+                *notes = now;
+                if let Ok(said) = status.note.lock() {
+                    // Dim only on a screen: stderr kept in a file stays plain.
+                    match std::io::stderr().is_terminal() {
+                        true => eprintln!("{}", render::dim(&said)),
+                        false => eprintln!("{said}"),
+                    }
+                }
+            }
+        };
         while let Err(mpsc::RecvTimeoutError::Timeout) = ended.recv_timeout(PROGRESS_EVERY) {
+            tell(&mut notes);
+            if !json {
+                continue;
+            }
             let now = progress(&status);
             if now != shown {
                 if !emit(&now) {
@@ -1209,6 +1259,8 @@ fn show_progress(status: Arc<Status>, ended: mpsc::Receiver<()>) -> std::thread:
                 shown = now;
             }
         }
+        // A switch made just before the end is said too.
+        tell(&mut notes);
     })
 }
 

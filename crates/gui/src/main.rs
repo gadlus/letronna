@@ -310,6 +310,20 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             KeyBinding::new("delete", sessions::DeleteSession, Some("Sessions")),
             Some("In the sidebar: delete it, once you say so"),
         ),
+        // A Mac's delete key is Backspace, and Cmd+Backspace moves a file to
+        // the Trash in Finder: Delete alone is Fn and the same key there.
+        (
+            KeyBinding::new("backspace", sessions::DeleteSession, Some("Sessions")),
+            None,
+        ),
+        (
+            KeyBinding::new(
+                "secondary-backspace",
+                sessions::DeleteSession,
+                Some("Sessions"),
+            ),
+            None,
+        ),
         // The sidebar's own filters, so a shortcut typed elsewhere is
         // never swallowed by one narrowing a list it cannot see.
         (

@@ -2127,7 +2127,20 @@ pub fn sign_in(runner: &mut Runner) {
             }));
             // Signing in changes no model, so say where Letronna's are.
             let settings = &runner.store.settings;
-            if settings.gateway != letronna_core::gateway::LETRONNA || settings.model.is_empty() {
+            if account.needs_upgrade() {
+                // Those a perk makes free today are open all the same.
+                let free = (account.perks.iter()).any(|p| p.available && p.share >= 100);
+                let but = match free {
+                    true => ", but for those free today",
+                    false => "",
+                };
+                render::line(&render::dim(&format!(
+                    "Its hosted models need a subscription on the Free plan{but}: {}",
+                    letronna_core::auth::checkout()
+                )));
+            } else if settings.gateway != letronna_core::gateway::LETRONNA
+                || settings.model.is_empty()
+            {
                 render::line(&render::dim(
                     "Letronna's models are in /model now, beside any others you set up.",
                 ));
@@ -2239,9 +2252,8 @@ fn provider_sign_in(runner: &mut Runner, name: &'static str) {
             } else {
                 usage
             };
-            render::line(&render::dim(&format!(
-                "Signed in to {name}: {usage}. /model now lists its models too."
-            )));
+            render::line(&render::dim(&format!("Signed in to {name}: {usage}.")));
+            check_gateway(runner, name);
         }
         Err(error) => render::line(&render::red(&error)),
     }
@@ -4335,8 +4347,7 @@ fn pick_up(
     // for this one to stay quiet.
     runner.stopped = false;
     if let Err(error) = runner.resume(index) {
-        render::blank();
-        render::line(&render::red(&error));
+        runner.show_failure(&error);
     }
 }
 
@@ -5177,6 +5188,8 @@ pub fn pick_model(runner: &mut Runner, session: Option<usize>, filter: &str, in_
         return;
     }
     let keys = store::load_keys();
+    // The window may have moved the Custom address since this one read it.
+    runner.store.follow_custom();
     let custom = runner.store.settings.custom_endpoint.clone();
     let settings = &runner.store.settings;
     let (gateway, model) = match session {
@@ -5191,11 +5204,32 @@ pub fn pick_model(runner: &mut Runner, session: Option<usize>, filter: &str, in_
         render::said(&render::blue("●"), &render::bold("Models"));
     }
     // Fetching takes a moment over the network; say so rather than freezing.
-    let (mut models, errors) = runner
-        .bar
-        .busy("asking every gateway what it has", move || {
-            letronna_core::gateway::all_models(&keys, &custom)
-        });
+    // An account whose hosted models need a subscription is checked again
+    // beside it, as it may have been bought since the file was written.
+    let check = letronna_core::auth::account().is_some_and(|a| a.needs_upgrade());
+    let (mut models, errors, account) =
+        runner
+            .bar
+            .busy("asking every gateway what it has", move || {
+                let fresh = check.then(|| std::thread::spawn(letronna_core::auth::refresh));
+                let (models, errors) = letronna_core::gateway::all_models(&keys, &custom);
+                if let Some(fresh) = fresh {
+                    let _ = fresh.join();
+                }
+                (models, errors, letronna_core::auth::account())
+            });
+    let unpaid =
+        |g: &str, m: &str| letronna_core::gateway::needs_subscription(g, m, account.as_ref());
+    let access = |g: &str, m: &str| {
+        use letronna_core::gateway;
+        let account = account.as_ref();
+        match unpaid(g, m) {
+            true if gateway::used_up_today(g, m, account) => Access::UsedUp,
+            true => Access::Unpaid,
+            false if gateway::free_today(g, m, account) => Access::Free,
+            false => Access::Open,
+        }
+    };
     for error in &errors {
         render::line(&render::red(error));
     }
@@ -5209,15 +5243,33 @@ pub fn pick_model(runner: &mut Runner, session: Option<usize>, filter: &str, in_
         }
         return;
     }
-    models.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    // Those that need a subscription last, so what can answer comes first.
+    models.sort_by(|a, b| {
+        (unpaid(&a.0, &a.1).cmp(&unpaid(&b.0, &b.1)))
+            .then(a.1.cmp(&b.1))
+            .then(a.0.cmp(&b.0))
+    });
+    let usable: Vec<(String, String)> = (models.iter())
+        .filter(|(g, m)| !unpaid(g, m))
+        .cloned()
+        .collect();
 
-    // An exact name is an instruction, not a search.
-    let exact = match exactly(&models, filter, &gateway) {
+    // An exact name is an instruction, not a search: on a gateway that can
+    // answer it when one has it, and refused when only the hosted pool has
+    // it and it cannot be paid for.
+    let exact = match exactly(&usable, filter, &gateway) {
         Ok((gateway, model)) => {
             set_model(runner, session, gateway, model);
             return;
         }
-        Err(several) => several,
+        Err(several) if !several.is_empty() => several,
+        Err(_) => match exactly(&models, filter, &gateway) {
+            Ok((g, m)) => {
+                refuse_unpaid(&usable, access(&g, &m) == Access::UsedUp);
+                return;
+            }
+            Err(several) => several,
+        },
     };
 
     let needle = filter.to_lowercase();
@@ -5233,10 +5285,11 @@ pub fn pick_model(runner: &mut Runner, session: Option<usize>, filter: &str, in_
             .cloned()
             .collect(),
     };
-    // The one in use leads, so keeping it is one key away.
+    // The one in use leads, so keeping it is one key away, unless it cannot
+    // be paid for.
     if let Some(at) = matching
         .iter()
-        .position(|(g, m)| *g == gateway && *m == model)
+        .position(|(g, m)| *g == gateway && *m == model && !unpaid(g, m))
     {
         let current = matching.remove(at);
         matching.insert(0, current);
@@ -5264,23 +5317,207 @@ pub fn pick_model(runner: &mut Runner, session: Option<usize>, filter: &str, in_
     }
     let labels: Vec<String> = shown
         .iter()
-        .map(|(g, m)| match *g == gateway && *m == model {
-            true => format!("{m} · {g} (in use)"),
-            false => format!("{m} · {g}"),
-        })
+        .map(|(g, m)| model_label(m, g, *g == gateway && *m == model, access(g, m)))
         .collect();
     let mut options: Vec<&str> = labels.iter().map(String::as_str).collect();
     options.push("Keep the one I have");
 
     let question = format!("In use: {current}");
-    let Some(picked) = runner.bar.pick_from(&question, Vec::new(), &options) else {
+    // Said over the list, so the models marked are not a surprise once picked.
+    let detail = match shown.iter().any(|(g, m)| unpaid(g, m)) {
+        true => vec![format!(
+            "Hosted models need a subscription on the Free plan: {}",
+            letronna_core::auth::checkout()
+        )],
+        false => Vec::new(),
+    };
+    let Some(picked) = runner.bar.pick_from(&question, detail, &options) else {
         render::line(&render::dim("Left as it was."));
         return;
     };
     match shown.get(picked) {
+        Some((gateway, model)) if unpaid(gateway, model) => {
+            refuse_unpaid(&usable, access(gateway, model) == Access::UsedUp)
+        }
         Some((gateway, model)) => set_model(runner, session, gateway.clone(), model.clone()),
         None => render::line(&render::dim("Left as it was.")),
     }
+}
+
+/// Where a model stands with the account signed in, as `/model` marks it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Access {
+    /// Paid for as any other.
+    Open,
+    /// A hosted one a perk makes free today.
+    Free,
+    /// A hosted one the account has no plan or credit for.
+    Unpaid,
+    /// A hosted one free on a perk whose allowance is used up today.
+    UsedUp,
+}
+
+/// A model as `/model` lists it: the one in use said, and one free today or
+/// that the account cannot pay for marked.
+fn model_label(model: &str, gateway: &str, in_use: bool, access: Access) -> String {
+    let marks = [
+        in_use.then_some("in use"),
+        match access {
+            Access::Open => None,
+            Access::Free => Some("free today"),
+            Access::Unpaid => Some("needs a subscription"),
+            Access::UsedUp => Some("free · used up today"),
+        },
+    ];
+    let marks: Vec<&str> = marks.into_iter().flatten().collect();
+    match marks.is_empty() {
+        true => format!("{model} · {gateway}"),
+        false => format!("{model} · {gateway} ({})", marks.join(" · ")),
+    }
+}
+
+/// Say why a hosted model was not switched to, with `usable` the models
+/// that can answer instead; `used_up` when it is free on a perk whose
+/// allowance for the day is used up.
+fn refuse_unpaid(usable: &[(String, String)], used_up: bool) {
+    let pages = [
+        letronna_core::auth::checkout(),
+        letronna_core::auth::credit_checkout(),
+    ];
+    let [why, instead] = unpaid_lines(
+        letronna_core::gateway::usable_elsewhere(usable),
+        used_up,
+        &pages,
+    );
+    render::blank();
+    render::line(&render::amber(&why));
+    render::line(&render::dim(&instead));
+}
+
+/// How long the terminal's start waits on the account service before it
+/// says the session's model is closed from what the file kept.
+const HINT_CHECK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One line for a session on hosted models the account cannot pay for, as
+/// the terminal starts: its next message would only be refused. `ready` is
+/// the gateways set up besides, as `gateway::ready` names them.
+pub fn unpaid_hint(gateway: &str, model: &str, ready: &[&str]) -> Option<String> {
+    use letronna_core::auth;
+    let locked = |account: Option<&auth::Account>| {
+        letronna_core::gateway::needs_subscription(gateway, model, account)
+    };
+    let mut account = auth::account();
+    if !locked(account.as_ref()) {
+        return None;
+    }
+    // What the file says is as of the last check, so the API is asked
+    // again, briefly, before the model is said to be closed: a plan may have
+    // been bought since, or today's perks may make it free.
+    if let Ok(fresh) = auth::refresh_within(HINT_CHECK) {
+        letronna_core::gateway::learn_maker(model, &fresh);
+        account = Some(fresh);
+    }
+    if !locked(account.as_ref()) {
+        return None;
+    }
+    let why = match letronna_core::gateway::used_up_today(gateway, model, account.as_ref()) {
+        true => "This session's model has used up its free allowance for today, back at 00:00 UTC",
+        false => "Letronna's hosted models need a subscription",
+    };
+    Some(format!(
+        "{why}, so this session's messages would be refused. {}",
+        unpaid_instead(ready, &letronna_core::auth::checkout())
+    ))
+}
+
+/// Whether a message to `session` is held back, and said why: its model is
+/// a hosted one the account cannot pay for, even once the API is asked
+/// again, as the plan may have been bought since the file was written, or
+/// a perk's allowance may be back.
+pub fn hold_unpaid(runner: &mut Runner, session: usize) -> bool {
+    use letronna_core::{auth, gateway};
+    let (on, model) = runner.store.model(session);
+    let (on, model) = (on.to_owned(), model.to_owned());
+    if !gateway::needs_subscription(&on, &model, auth::account().as_ref()) {
+        return false;
+    }
+    let asked = model.clone();
+    let fresh = runner.bar.busy("checking your plan", move || {
+        let fresh = auth::refresh();
+        // A perk for one maker's models needs to know who made this one.
+        if let Ok(account) = &fresh {
+            gateway::learn_maker(&asked, account);
+        }
+        fresh
+    });
+    let account = fresh.ok().or_else(auth::account);
+    if !gateway::needs_subscription(&on, &model, account.as_ref()) {
+        return false;
+    }
+    let keys = store::load_keys();
+    let ready = gateway::ready(&keys, &runner.store.settings.custom_endpoint);
+    let ready: Vec<&str> = ready.iter().map(|(name, ..)| *name).collect();
+    let used_up = gateway::used_up_today(&on, &model, account.as_ref());
+    render::blank();
+    render::line(&render::amber(&held_line(
+        used_up,
+        &unpaid_instead(&ready, &auth::checkout()),
+    )));
+    render::line(&render::dim("↑ brings the message back."));
+    true
+}
+
+/// Why a message was held back, then `instead`: the hosted models need a
+/// subscription, or this one's free allowance is used up for the day.
+fn held_line(used_up: bool, instead: &str) -> String {
+    match used_up {
+        true => format!(
+            "Not sent: this model's free allowance is used up today and comes back at 00:00 UTC. {instead}"
+        ),
+        false => format!("Not sent: Letronna's hosted models need a subscription. {instead}"),
+    }
+}
+
+/// Where to go instead of the hosted models: the first gateway in `ready`
+/// that can answer, or the page an upgrade is bought on.
+fn unpaid_instead(ready: &[&str], checkout: &str) -> String {
+    use letronna_core::providers::{self, AuthKind};
+    // Ollama is listed whether or not it runs, so it is not pointed to.
+    let other = (ready.iter()).find(|name| {
+        !matches!(
+            providers::find(name).map(|p| p.auth()),
+            Some(AuthKind::Account | AuthKind::None)
+        )
+    });
+    match other {
+        Some(other) => format!("/model {other} to pick one there, or upgrade at {checkout}"),
+        None => format!("Upgrade at {checkout}, or set up a gateway with /connect."),
+    }
+}
+
+/// What is said when a hosted model is asked for and the account has no
+/// plan or credit for it: where to upgrade, and where else to pick one; and
+/// when `used_up`, that its free allowance comes back at 00:00 UTC, or credit
+/// pays for it till then. `pages` is where a subscription and credit are
+/// bought.
+fn unpaid_lines(elsewhere: Option<&str>, used_up: bool, pages: &[String; 2]) -> [String; 2] {
+    let [checkout, credit] = pages;
+    [
+        match used_up {
+            true => format!(
+                "Left as it was: its free allowance is used up today and comes back at 00:00 UTC. Upgrade at {checkout}, or add credit at {credit}"
+            ),
+            false => format!(
+                "Left as it was: Letronna's hosted models need a subscription. Upgrade at {checkout}"
+            ),
+        },
+        match elsewhere {
+            Some(gateway) => {
+                format!("Or pick a model on {gateway}, which is ready: /model {gateway}")
+            }
+            None => "Or set up a gateway of your own, or a key, with /connect.".to_owned(),
+        },
+    ]
 }
 
 /// The model `filter` names exactly among `models`, as (gateway, model): on
@@ -5539,6 +5776,7 @@ pub fn connect(runner: &mut Runner) {
     use letronna_core::gateway::{self, LETRONNA, gateways};
     use letronna_core::providers::{self, AuthKind, router};
     let keys = store::load_keys();
+    runner.store.follow_custom();
     let custom = runner.store.settings.custom_endpoint.clone();
     let (k, c) = (keys.clone(), custom.clone());
     let (models, _) = runner
@@ -5805,11 +6043,12 @@ fn check_gateway(runner: &mut Runner, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Asked, Back, Flow, Run, Stage, ToolSearch, account_search_line, agent_lines, agent_rows,
-        asked, choice_label, command, crew_switch, exactly, from_match, keep_days, last_prompt,
-        leaving, name_label, names_setting, naming_said, offered, point_label, ranking,
-        rewind_points, rewinds, run_rows, side_setting, standing, tool_search_asked, turn_files,
-        turn_starts, turns_from, typed_path,
+        Access, Asked, Back, Flow, Run, Stage, ToolSearch, account_search_line, agent_lines,
+        agent_rows, asked, choice_label, command, crew_switch, exactly, from_match, held_line,
+        keep_days, last_prompt, leaving, model_label, name_label, names_setting, naming_said,
+        offered, point_label, ranking, rewind_points, rewinds, run_rows, side_setting, standing,
+        tool_search_asked, turn_files, turn_starts, turns_from, typed_path, unpaid_instead,
+        unpaid_lines,
     };
     use crate::session::Runner;
     use letronna_core::agents::Seen;
@@ -6177,6 +6416,75 @@ mod tests {
     }
 
     #[test]
+    fn a_hosted_model_that_needs_a_subscription_is_marked_and_refused_kindly() {
+        assert_eq!(
+            model_label("gpt-x", "Letronna", false, Access::Unpaid),
+            "gpt-x · Letronna (needs a subscription)"
+        );
+        assert_eq!(
+            model_label("gpt-x", "Letronna", true, Access::Unpaid),
+            "gpt-x · Letronna (in use · needs a subscription)"
+        );
+        assert_eq!(
+            model_label("m", "Custom", true, Access::Open),
+            "m · Custom (in use)"
+        );
+        assert_eq!(
+            model_label("m", "Custom", false, Access::Open),
+            "m · Custom"
+        );
+        assert_eq!(
+            model_label("fast", "Letronna", false, Access::Free),
+            "fast · Letronna (free today)"
+        );
+        assert_eq!(
+            model_label("smart", "Letronna", true, Access::UsedUp),
+            "smart · Letronna (in use · free · used up today)"
+        );
+
+        let checkout = "https://letronna.ai/dashboard/checkout";
+        let pages = [checkout.to_owned(), format!("{checkout}?plan=credits")];
+        let [why, instead] = unpaid_lines(Some("Custom"), false, &pages);
+        assert_eq!(
+            why,
+            "Left as it was: Letronna's hosted models need a subscription. Upgrade at https://letronna.ai/dashboard/checkout"
+        );
+        assert_eq!(
+            instead,
+            "Or pick a model on Custom, which is ready: /model Custom"
+        );
+        let [_, nowhere] = unpaid_lines(None, false, &pages);
+        assert!(nowhere.contains("/connect"));
+        // Free on a perk whose allowance is used up: back at midnight UTC,
+        // or paid for till then.
+        let [why, instead] = unpaid_lines(Some("Custom"), true, &pages);
+        assert_eq!(
+            why,
+            "Left as it was: its free allowance is used up today and comes back at 00:00 UTC. Upgrade at https://letronna.ai/dashboard/checkout, or add credit at https://letronna.ai/dashboard/checkout?plan=credits"
+        );
+        assert_eq!(
+            instead,
+            "Or pick a model on Custom, which is ready: /model Custom"
+        );
+        assert_eq!(
+            held_line(true, "Upgrade at x."),
+            "Not sent: this model's free allowance is used up today and comes back at 00:00 UTC. Upgrade at x."
+        );
+        assert_eq!(
+            held_line(false, "Upgrade at x."),
+            "Not sent: Letronna's hosted models need a subscription. Upgrade at x."
+        );
+
+        // Ollama and the hosted pool are not where a message is sent instead.
+        assert_eq!(
+            unpaid_instead(&["Letronna", "Ollama", "OpenAI"], checkout),
+            "/model OpenAI to pick one there, or upgrade at https://letronna.ai/dashboard/checkout"
+        );
+        let alone = unpaid_instead(&["Letronna", "Ollama"], checkout);
+        assert!(alone.contains("/connect") && !alone.contains("/model Ollama"));
+    }
+
+    #[test]
     fn the_letronna_search_row_says_where_the_account_stands() {
         use letronna_core::auth::Account;
         let checked = |credits| Account {
@@ -6366,6 +6674,7 @@ mod tests {
             voice: None,
             review: Default::default(),
             plain_terminal: false,
+            way_out: None,
         };
         let flow = command(&mut runner, "/mode auto", &mut 0, None);
         assert!(matches!(flow, Flow::Handled));
@@ -6391,6 +6700,7 @@ mod tests {
             voice: None,
             review: Default::default(),
             plain_terminal: false,
+            way_out: None,
         };
         runner.store.conversations.push(Default::default());
         let sent = |runner: &mut Runner, line: &str| match command(runner, line, &mut 0, None) {

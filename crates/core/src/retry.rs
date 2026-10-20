@@ -55,7 +55,7 @@ pub const DROPPED: &str =
     "The provider closed the stream early, so that reply is dropped and asked for again.";
 
 /// A failed call about to be made again, as the frontends are told of it.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Retry {
     /// Why the last try failed.
     pub kind: FailureKind,
@@ -68,15 +68,19 @@ pub struct Retry {
     /// The last try broke off part way through its reply, so what it said
     /// is dropped and the next try's reply comes in its place.
     pub dropped: bool,
+    /// What the provider said on the last try, as its failure words it. A
+    /// kind alone leaves whoever reads the line, or the log, to guess why.
+    pub error: String,
 }
 
-impl fmt::Display for Retry {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Retry {
+    /// What is being waited for, without the provider's words: the window
+    /// shows those on a line of their own, where a long one can wrap.
+    pub fn waiting(&self) -> String {
         // Only a reply cut off before it wrote anything is asked for again
         // after a bad reply, at once and with a longer limit.
         if self.kind == FailureKind::BadReply {
-            return write!(
-                f,
+            return format!(
                 "The model spent its whole reply thinking, asking again with more room (try {} of {})",
                 self.attempt, self.of
             );
@@ -89,11 +93,29 @@ impl fmt::Display for Retry {
             _ => "The provider had an error",
         };
         let seconds = self.wait.as_millis().div_ceil(1000);
-        write!(
-            f,
+        format!(
             "{why}, trying again in {seconds}s (try {} of {})",
             self.attempt, self.of
         )
+    }
+
+    /// The provider's words, on one line; empty after a bad reply, whose
+    /// error is Letronna's own and says no more than `waiting` does.
+    pub fn said(&self) -> String {
+        if self.kind == FailureKind::BadReply {
+            return String::new();
+        }
+        crate::tools::one_line(&self.error)
+    }
+}
+
+impl fmt::Display for Retry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.waiting())?;
+        match self.said() {
+            said if said.is_empty() => Ok(()),
+            said => write!(f, ": {said}"),
+        }
     }
 }
 
@@ -124,7 +146,7 @@ pub fn after(
     } else {
         (TRIES, PATIENCE)
     };
-    if !passes(failure.kind) {
+    if !passes(failure.kind) || failure.lasting {
         return None;
     }
     let wait = backoff(tried, jitter()).max(failure.retry_after.unwrap_or_default());
@@ -138,6 +160,7 @@ pub fn after(
             of,
             wait,
             dropped: false,
+            error: failure.to_string(),
         });
     }
     let deadline = deadline.filter(|_| unattended)?;
@@ -152,6 +175,7 @@ pub fn after(
         of: (tried + 1).saturating_add(more),
         wait,
         dropped: false,
+        error: failure.to_string(),
     })
 }
 
@@ -332,6 +356,7 @@ mod tests {
             of: 6,
             wait: Duration::from_millis(1_100),
             dropped: false,
+            error: String::new(),
         };
         assert_eq!(
             retry.to_string(),
@@ -340,12 +365,51 @@ mod tests {
         let cut = Retry {
             kind: FailureKind::Network,
             dropped: true,
-            ..retry
+            ..retry.clone()
         };
         assert_eq!(
             cut.to_string(),
             "The provider closed the stream early, trying again in 2s (try 2 of 6)"
         );
+        let roomier = Retry {
+            kind: FailureKind::BadReply,
+            error: "The model reached its output limit before writing anything.".into(),
+            ..retry
+        };
+        assert_eq!(
+            roomier.to_string(),
+            "The model spent its whole reply thinking, asking again with more room (try 2 of 6)"
+        );
+    }
+
+    #[test]
+    fn the_retry_says_what_the_provider_said() {
+        let refused = failure(FailureKind::Server, Some(Duration::from_secs(9)));
+        let mut retry = after(&refused, 3, false, None).unwrap();
+        assert_eq!(retry.error, "It failed.");
+        assert_eq!(
+            retry.to_string(),
+            "The provider had an error, trying again in 9s (try 4 of 6): It failed."
+        );
+        // Words over several lines still fit the one row they are shown in.
+        retry.error = "upstream connect error\n  reset reason: overflow\n".into();
+        assert_eq!(
+            retry.to_string(),
+            "The provider had an error, trying again in 9s (try 4 of 6): \
+             upstream connect error reset reason: overflow"
+        );
+        // The window shows the two apart, so a long error can wrap.
+        assert_eq!(
+            retry.waiting(),
+            "The provider had an error, trying again in 9s (try 4 of 6)"
+        );
+        assert_eq!(
+            retry.said(),
+            "upstream connect error reset reason: overflow"
+        );
+        // A reply spent thinking is told by the wait alone.
+        retry.kind = FailureKind::BadReply;
+        assert!(retry.said().is_empty() && !retry.to_string().contains("overflow"));
     }
 
     #[test]

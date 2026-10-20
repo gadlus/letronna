@@ -12,7 +12,9 @@
 //! A model that failed is passed over for `COOLDOWN`, remembered in memory
 //! only, so each request after it goes straight to the fallback rather than
 //! sitting through the same retries again. Once that is over the chosen
-//! model is asked first again.
+//! model is asked first again. The chosen model is only passed over once
+//! another has taken the request from it: when they all fail, it is still
+//! the one asked first, and its failure is the one shown.
 
 use crate::chat::Connection;
 use crate::failure::{Failure, FailureKind};
@@ -101,8 +103,8 @@ impl fmt::Display for Fallback {
 pub struct Switch {
     /// The model asked instead, as its reply is labelled.
     pub model: String,
-    /// What the notice calls it: the model, or the account it is asked on
-    /// when that is all that changed.
+    /// What the notice calls it: the model, the account it is asked on when
+    /// that is all that changed, or both when both did.
     pub label: String,
     /// Where it is served, so its reply is priced there.
     pub endpoint: String,
@@ -118,10 +120,14 @@ impl fmt::Display for Switch {
         let Some((from, kind)) = &self.after else {
             return Ok(());
         };
+        // The Letronna account takes no key, and its quota is its credit.
+        let hosted = from == crate::gateway::LETRONNA;
         let why = match kind {
             FailureKind::Overloaded => "is overloaded",
+            FailureKind::Quota if hosted => "is out of credit",
             FailureKind::Quota => "is out of credit or quota",
             FailureKind::NotFound => "was not found",
+            FailureKind::Auth if hosted => "turned the request away",
             FailureKind::Auth => "turned its key away",
             FailureKind::Settings => "is not set up",
             FailureKind::Network => "could not be reached",
@@ -135,34 +141,37 @@ impl fmt::Display for Switch {
 }
 
 /// Whether a failure that outlasted its retries is one another model could
-/// mend: an overload or server error, an account out of credit or quota, or
-/// a model the gateway does not serve, or a rate limit longer than the
-/// retries wait out, which another account does not share.
+/// mend: an overload or server error, an account out of credit or quota, a
+/// model the gateway does not serve, a rate limit longer than the retries
+/// wait out, which another account does not share, or a gateway that cannot
+/// be reached. The Letronna account turning a request away is one too: a
+/// model the Free plan leaves out, or a sign-in gone, is the account's
+/// rather than the request's, and a gateway of the user's own may answer.
+/// A key of their own turned away, or settings that cannot work, are not.
 pub fn mends(failure: &Failure) -> bool {
     // Once the reply is on screen, another model's would follow it rather
     // than stand in its place.
     !failure.stands
-        && matches!(
-            failure.kind,
+        && match failure.kind {
             FailureKind::Overloaded
-                | FailureKind::Server
-                | FailureKind::Quota
-                | FailureKind::RateLimit
-                | FailureKind::NotFound
-        )
+            | FailureKind::Server
+            | FailureKind::Quota
+            | FailureKind::RateLimit
+            | FailureKind::NotFound
+            | FailureKind::Network => true,
+            FailureKind::Auth => failure.hosted(),
+            _ => false,
+        }
 }
 
 /// Whether a fallback's failure is its own rather than the request's: its
-/// gateway has no key, is not set up or cannot be reached, or the model reads
-/// less than the chosen one. The next fallback may well answer.
+/// gateway has no key or is not set up, or the model reads less than the
+/// chosen one. The next fallback may well answer.
 fn own(failure: &Failure) -> bool {
     !failure.stands
         && matches!(
             failure.kind,
-            FailureKind::Auth
-                | FailureKind::Settings
-                | FailureKind::Network
-                | FailureKind::ContextTooLong
+            FailureKind::Auth | FailureKind::Settings | FailureKind::ContextTooLong
         )
 }
 
@@ -189,9 +198,16 @@ pub fn chain(
 /// that one down; a chosen model that was cooling is asked last. One that is
 /// not `usable` is passed over quietly. `switched` hears of each switch
 /// before the model is asked; an error from it ends the call, as nobody is
-/// listening any more.
+/// listening any more. `custom` is the Custom gateway's address, so that a
+/// failure there, and a switch to it, can name it.
+///
+/// Each failure says the gateway it came from. When every one fails, the
+/// one given back is the chosen model's own: a fallback's, such as a
+/// Letronna account out of credit behind a key of the user's that is down,
+/// would send them to mend what they never chose.
 pub fn run(
     chain: &[Connection],
+    custom: &str,
     mut usable: impl FnMut(&Connection) -> bool,
     mut send: impl FnMut(&Connection) -> Result<(), Failure>,
     mut switched: impl FnMut(Switch) -> Result<(), Failure>,
@@ -206,44 +222,106 @@ pub fn run(
     // the task would end on a fallback's failure while it was never asked.
     let order = (ready.into_iter()).chain(resting.into_iter().filter(|c| same(c, primary)));
     let mut after: Option<(&Connection, FailureKind)> = None;
+    let mut chosen_failed: Option<Failure> = None;
     let mut last = None;
+    // The chosen model is passed over only once another took the request
+    // in its place. Had every one failed, the next request would sit
+    // through theirs again before coming back to it.
+    let passed_over = |failed: &Option<Failure>| {
+        if failed.is_some() {
+            cool(primary, Instant::now() + COOLDOWN);
+        }
+    };
     for connection in order {
-        if !same(connection, primary) && !usable(connection) {
+        let chosen = same(connection, primary);
+        if !chosen && !usable(connection) {
             continue;
         }
         // Going back to the chosen model after a fallback failed is a
         // switch too, or its reply would carry the fallback's name.
-        if after.is_some() || !same(connection, primary) {
-            // The same model on another account is told by the account.
+        if after.is_some() || !chosen {
             let from = after.map_or(primary, |(from, _)| from);
-            let by_account = from.model.trim() == connection.model.trim();
-            let label = |c: &Connection| {
-                let model = c.model.trim().to_owned();
-                match crate::gateway::named(&c.endpoint) {
-                    Some(name) if by_account => name.to_owned(),
-                    _ => model,
-                }
-            };
+            let why = after.take().map(|(_, kind)| kind);
+            let (label, given_up) = labels(from, connection, why, custom);
             switched(Switch {
                 model: connection.model.trim().to_owned(),
-                label: label(connection),
+                label,
                 endpoint: connection.endpoint.clone(),
-                after: after.take().map(|(from, kind)| (label(from), kind)),
+                after: why.map(|kind| (given_up, kind)),
             })?;
         }
-        let failure = match send(connection) {
-            Ok(()) => return Ok(()),
-            Err(failure) if mends(&failure) => failure,
-            // Else a fallback with no key, or one not running, ends the task
-            // and, with the chosen model cooling, every request after it.
-            Err(failure) if !same(connection, primary) && own(&failure) => failure,
-            Err(failure) => return Err(failure),
+        let mut failure = match send(connection) {
+            Ok(()) => {
+                if !chosen {
+                    passed_over(&chosen_failed);
+                }
+                return Ok(());
+            }
+            Err(failure) => failure,
         };
-        cool(connection, Instant::now() + COOLDOWN);
+        failure.gateway = gateway_of(connection, custom);
+        // Else a fallback with no key, or one not running, ends the task
+        // and, with the chosen model cooling, every request after it.
+        if !(mends(&failure) || (!chosen && own(&failure))) {
+            if !chosen {
+                passed_over(&chosen_failed);
+            }
+            return Err(failure);
+        }
         after = Some((connection, failure.kind));
-        last = Some(failure);
+        if chosen {
+            chosen_failed = Some(failure);
+        } else {
+            cool(connection, Instant::now() + COOLDOWN);
+            last = Some(failure);
+        }
     }
-    Err(last.unwrap_or_else(|| Failure::new(FailureKind::Unknown, "No model answered.")))
+    Err((chosen_failed.or(last))
+        .unwrap_or_else(|| Failure::new(FailureKind::Unknown, "No model answered.")))
+}
+
+/// The gateway `connection` goes to, by name: as `gateway::named` tells it,
+/// or Custom at its address `custom`, which that leaves unnamed.
+fn gateway_of(connection: &Connection, custom: &str) -> Option<&'static str> {
+    let address = |text: &str| text.trim().trim_end_matches('/').to_owned();
+    crate::gateway::named(&connection.endpoint).or_else(|| {
+        (!custom.trim().is_empty() && address(custom) == address(&connection.endpoint))
+            .then_some("Custom")
+    })
+}
+
+/// What a switch from `from` to `to`, after a failure of `kind` when one
+/// failed, calls each. The same model on another account is told by the
+/// account, and another model on another gateway by both. The one given up
+/// on is told by its gateway alone when what failed was the account's:
+/// its credit, its key, its limits or its being down.
+fn labels(
+    from: &Connection,
+    to: &Connection,
+    kind: Option<FailureKind>,
+    custom: &str,
+) -> (String, String) {
+    let moved = key(from).0 != key(to).0;
+    let by_account = from.model.trim() == to.model.trim();
+    let accounts = matches!(
+        kind,
+        Some(
+            FailureKind::Quota
+                | FailureKind::Auth
+                | FailureKind::RateLimit
+                | FailureKind::Network
+                | FailureKind::Settings
+        )
+    );
+    let label = |c: &Connection, by_gateway: bool| match gateway_of(c, custom) {
+        Some(name) if by_gateway => name.to_owned(),
+        Some(name) if moved => format!("{} on {name}", c.model.trim()),
+        _ => c.model.trim().to_owned(),
+    };
+    (
+        label(to, by_account),
+        label(from, by_account || (moved && accounts)),
+    )
 }
 
 /// Whether two connections ask the same model at the same place.
@@ -295,14 +373,25 @@ mod tests {
         chain: &[Connection],
         answer: impl Fn(&str) -> Result<(), Failure>,
     ) -> (Result<(), Failure>, Vec<String>, Vec<Switch>) {
+        asked_on(chain, "", |c| answer(&c.model))
+    }
+
+    /// `asked`, with Custom at `custom`, each connection answering as
+    /// `answer` says.
+    fn asked_on(
+        chain: &[Connection],
+        custom: &str,
+        answer: impl Fn(&Connection) -> Result<(), Failure>,
+    ) -> (Result<(), Failure>, Vec<String>, Vec<Switch>) {
         let asked = RefCell::new(Vec::new());
         let mut switches = Vec::new();
         let result = run(
             chain,
+            custom,
             |_| true,
             |c| {
                 asked.borrow_mut().push(c.model.clone());
-                answer(&c.model)
+                answer(c)
             },
             |switch| {
                 switches.push(switch);
@@ -398,21 +487,137 @@ mod tests {
             assert!(cooling(&chain[1]));
         }
         // The chosen model's own key or settings are the request's, and go no further.
-        let chain = [at("primary-key", "big"), at("primary-key", "small")];
-        let (result, asked, _) = asked(&chain, |_| fails(FailureKind::Auth));
-        assert_eq!(result.unwrap_err().kind, FailureKind::Auth);
-        assert_eq!(asked, ["big"]);
+        for (test, kind) in [
+            ("primary-key", FailureKind::Auth),
+            ("primary-settings", FailureKind::Settings),
+        ] {
+            let chain = [at(test, "big"), at(test, "small")];
+            let (result, asked, _) = asked(&chain, |_| fails(kind));
+            assert_eq!(result.unwrap_err().kind, kind);
+            assert_eq!(asked, ["big"]);
+        }
+        // A gateway of its own that is down is handed on from too.
+        let chain = [at("primary-down", "big"), at("primary-down-too", "big")];
+        let (result, asked, switches) = asked_on(&chain, "", |c| match c.endpoint.as_str() {
+            "https://primary-down.fallback.test/v1" => fails(FailureKind::Network),
+            _ => Ok(()),
+        });
+        assert!(result.is_ok());
+        assert_eq!(asked, ["big", "big"]);
+        assert_eq!(
+            switches[0].after,
+            Some(("big".into(), FailureKind::Network))
+        );
+    }
+
+    /// A connection to `model` on the Letronna account.
+    fn hosted(model: &str) -> Connection {
+        Connection {
+            endpoint: crate::gateway::base_url(crate::gateway::LETRONNA, ""),
+            model: model.into(),
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn fallbacks_are_asked_in_order_and_the_last_failure_is_kept() {
+    fn the_letronna_account_turning_a_request_away_hands_it_to_a_gateway_of_your_own() {
+        let custom = "https://own-key.fallback.test/v1";
+        let chain = [
+            hosted("plan-gated"),
+            Connection {
+                endpoint: custom.into(),
+                ..hosted("plan-gated")
+            },
+        ];
+        let (result, _, switches) = asked_on(&chain, custom, |c| {
+            if c.endpoint == custom {
+                Ok(())
+            } else {
+                fails(FailureKind::Auth)
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(
+            switches[0].to_string(),
+            "Switched to Custom: Letronna turned the request away. It is asked again in 5 minutes."
+        );
+        // Only now that another answered is it passed over.
+        assert!(cooling(&chain[0]));
+
+        // Out of credit, on to the model chosen on another gateway.
+        let chain = [
+            hosted("out-of-credit"),
+            Connection {
+                endpoint: custom.into(),
+                model: "qwen3".into(),
+                ..Default::default()
+            },
+        ];
+        let (result, asked, switches) = asked_on(&chain, custom, |c| match c.model.as_str() {
+            "qwen3" => Ok(()),
+            _ => fails(FailureKind::Quota),
+        });
+        assert!(result.is_ok());
+        assert_eq!(asked, ["out-of-credit", "qwen3"]);
+        assert_eq!(
+            switches[0].to_string(),
+            "Switched to qwen3 on Custom: Letronna is out of credit. It is asked again in 5 minutes."
+        );
+    }
+
+    #[test]
+    fn when_every_model_fails_the_chosen_ones_failure_is_shown_and_it_is_not_passed_over() {
+        let custom = "https://every-fails.fallback.test/v1";
+        let chain = [
+            Connection {
+                endpoint: custom.into(),
+                model: "every-fails".into(),
+                ..Default::default()
+            },
+            hosted("every-fails"),
+        ];
+        let (result, asked, _) = asked_on(&chain, custom, |c| {
+            fails(if c.endpoint == custom {
+                FailureKind::Network
+            } else {
+                FailureKind::Quota
+            })
+        });
+        assert_eq!(asked.len(), 2);
+        // A Letronna account out of credit says nothing of a server of
+        // the user's own that is down.
+        let failure = result.unwrap_err();
+        assert_eq!(failure.kind, FailureKind::Network);
+        assert_eq!(failure.gateway, Some("Custom"));
+        assert!(!failure.hosted());
+        assert!(!cooling(&chain[0]));
+        assert!(cooling(&chain[1]));
+    }
+
+    #[test]
+    fn a_failure_says_which_gateway_it_came_from() {
+        let chain = [hosted("turned-down"), at("turned-down", "small")];
+        let (result, _, _) = asked(&chain, |_| fails(FailureKind::BadRequest));
+        let failure = result.unwrap_err();
+        assert_eq!(failure.gateway, Some(crate::gateway::LETRONNA));
+        assert!(failure.hosted());
+        // One that ends on a fallback is the fallback's.
+        let (result, _, _) = asked_on(&chain, "", |c| match c.model.as_str() {
+            "turned-down" => fails(FailureKind::Overloaded),
+            _ => fails(FailureKind::BadRequest),
+        });
+        assert_eq!(result.unwrap_err().gateway, None);
+    }
+
+    #[test]
+    fn fallbacks_are_asked_in_order_and_the_chosen_models_failure_is_kept() {
         let chain = [at("order", "a"), at("order", "b"), at("order", "c")];
         let (result, asked, switches) = asked(&chain, |model| match model {
             "c" => fails(FailureKind::Quota),
             _ => fails(FailureKind::Overloaded),
         });
         assert_eq!(asked, ["a", "b", "c"]);
-        assert_eq!(result.unwrap_err().kind, FailureKind::Quota);
+        assert_eq!(result.unwrap_err().kind, FailureKind::Overloaded);
         let told: Vec<_> = switches.iter().map(|s| s.model.as_str()).collect();
         assert_eq!(told, ["b", "c"]);
         assert_eq!(

@@ -222,6 +222,13 @@ pub fn footer(runner: &Runner) -> String {
     let session = runner.store.active;
     let (gateway, model) = runner.store.model(session);
     let mut parts = vec![model.to_owned(), gateway.to_owned()];
+    // What it sends would only be refused, so the note says so while it does.
+    let account = letronna_core::auth::account();
+    if letronna_core::gateway::used_up_today(gateway, model, account.as_ref()) {
+        parts.push("free allowance used up today · /model".into());
+    } else if letronna_core::gateway::needs_subscription(gateway, model, account.as_ref()) {
+        parts.push("needs a subscription · /model".into());
+    }
     // The mode is not here: the bar shows it at the front, with its key.
     let crew =
         (runner.store.conversations.get(session)).is_some_and(|c| letronna_core::crew::on(c.id));

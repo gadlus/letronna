@@ -179,6 +179,11 @@ impl Chat {
     }
 
     /// A session row; `picked` rings it as the one the sidebar's keys are on.
+    ///
+    /// Its menu opens from a right-click (a two-finger click or Control and
+    /// click on a Mac), a long press, or the "…" that shows while the
+    /// pointer is over it. Everything on it names the session by id: the
+    /// rows move as sessions are started and deleted.
     pub(crate) fn session_row(
         &self,
         index: usize,
@@ -187,10 +192,41 @@ impl Chat {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let c = &self.store.conversations[index];
+        let id = c.id;
         let active = index == self.store.active && self.page == Page::Chat;
-        let menu = self.session_menu(index, cx);
-        let row = h_flex()
-            .id(("session", index))
+        let menu_open = self.session_menu.as_ref().is_some_and(|open| open.id == id);
+        // The session a reply is running in says so, on screen or not.
+        let age = if self.busy && self.streaming_id == Some(id) {
+            // In the age's colour: the primary is lost on the sidebar.
+            crate::ui::busy::Spinner::new()
+                .xsmall()
+                .color(cx.theme().muted_foreground)
+                .into_any_element()
+        } else {
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(age_label(c.updated, now))
+                .into_any_element()
+        };
+        let more = Button::new(("session-more", id))
+            .plain(cx)
+            .xsmall()
+            // In the title's colour and a size up: muted and small, as a
+            // turn's is, it was all but lost where the age stands.
+            .icon(
+                Icon::new(IconName::Ellipsis)
+                    .size_4()
+                    .text_color(cx.theme().sidebar_foreground),
+            )
+            .tooltip("More")
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                this.open_session_menu(id, event.position(), window, cx);
+            }));
+        h_flex()
+            .id(("session", id))
+            .group(SESSION_ROW)
             .relative()
             .h(px(26.))
             .px_2()
@@ -226,7 +262,7 @@ impl Chat {
             })
             .child(div().flex_1().min_w_0().truncate().child(c.shown_title()))
             // A run beside the chat holds it.
-            .when(self.runs.contains_key(&c.id), |this| {
+            .when(self.runs.contains_key(&id), |this| {
                 this.child(
                     Icon::new(AppIcon::Play)
                         .size_3()
@@ -235,7 +271,7 @@ impl Chat {
             })
             // A notice started a turn there, or a run ended, while you were
             // elsewhere.
-            .when(self.unseen.contains(&c.id), |this| {
+            .when(self.unseen.contains(&id), |this| {
                 this.child(
                     div()
                         .size(px(6.))
@@ -245,7 +281,7 @@ impl Chat {
                 )
             })
             // Green, as a running job's chip is: a helper works for it.
-            .when(self.helpers_working_in(c.id), |this| {
+            .when(self.helpers_working_in(id), |this| {
                 this.child(
                     div()
                         .size(px(6.))
@@ -254,20 +290,35 @@ impl Chat {
                         .bg(cx.theme().green),
                 )
             })
-            // The session a reply is running in says so, on screen or not.
-            .child(if self.busy && self.streaming_id == Some(c.id) {
-                // In the age's colour: the primary is lost on the sidebar.
-                crate::ui::busy::Spinner::new()
-                    .xsmall()
-                    .color(cx.theme().muted_foreground)
-                    .into_any_element()
-            } else {
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(age_label(c.updated, now))
-                    .into_any_element()
-            })
+            // The age, and in its place while the pointer is over the row
+            // or its menu is open, the "…" that opens the menu: found
+            // without knowing to right-click.
+            .child(
+                h_flex()
+                    .relative()
+                    .h_full()
+                    .flex_shrink_0()
+                    .min_w(px(20.))
+                    .justify_end()
+                    .child(
+                        div()
+                            .when(menu_open, |this| this.invisible())
+                            .group_hover(SESSION_ROW, |s| s.invisible())
+                            .child(age),
+                    )
+                    .child(
+                        h_flex()
+                            .absolute()
+                            .inset_0()
+                            .justify_end()
+                            .when(!menu_open, |this| this.invisible())
+                            .group_hover(SESSION_ROW, |s| s.visible())
+                            // Its press is its own, neither a long press
+                            // nor a click on the row.
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(more),
+                    ),
+            )
             .when(picked, |this| {
                 this.child(
                     div()
@@ -278,7 +329,42 @@ impl Chat {
                         .border_color(cx.theme().ring),
                 )
             })
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    // Nothing above it takes the press, nor the keys.
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    this.session_press = None;
+                    this.open_session_menu(id, event.position, window, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.press_session(id, event.position, window, cx);
+                }),
+            )
+            .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, _| {
+                this.move_press(id, event.position);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, _| this.let_go_press(id, true)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, _| this.let_go_press(id, false)),
+            )
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                // Let go of after a long press: the menu it opened is the
+                // answer, not the session.
+                if this.held_press() {
+                    return;
+                }
+                let Some(index) = this.store.index_of(id) else {
+                    return;
+                };
                 if event.modifiers().shift {
                     this.store.conversations[index].pinned ^= true;
                 } else {
@@ -293,10 +379,21 @@ impl Chat {
                 this.save();
                 cx.notify();
             }))
-            .context_menu(menu);
-        // Its own id, so each row's menu keeps its own state: sharing one,
-        // every row drew the open menu, their shadows stacked into black.
-        div().id(("session-menu", index)).child(row)
+    }
+
+    /// The open session menu, drawn over everything at the place it opened,
+    /// whichever row it came from and wherever that row has moved since.
+    fn open_session_menu_layer(&self) -> Option<impl IntoElement> {
+        let open = self.session_menu.as_ref()?;
+        Some(
+            deferred(
+                anchored()
+                    .position(open.at)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(open.menu.clone()),
+            )
+            .with_priority(1),
+        )
     }
 
     /// The sessions the search and the filter let through, by index, the
@@ -321,7 +418,7 @@ impl Chat {
 
     /// The sessions the sidebar lists, by index, in the order it draws
     /// them: pinned first, then by project or the newest first.
-    fn listed_sessions(&self, cx: &App) -> Vec<usize> {
+    pub(crate) fn listed_sessions(&self, cx: &App) -> Vec<usize> {
         drawn_order(
             &self.store.conversations,
             self.visible_sessions(cx),
@@ -585,8 +682,12 @@ impl Chat {
             )
             .children(self.grain(&self.grains.sidebar))
             .children(self.ring(crate::ui::keys::Region::Sidebar, cx))
+            .children(self.open_session_menu_layer())
     }
 }
+
+/// The group a session row's hover is told by, for its "…" button.
+const SESSION_ROW: &str = "session-row";
 
 /// The `visible` sessions in the order the sidebar draws them: pinned
 /// first, then by project with `by_project`, else as they come.

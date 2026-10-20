@@ -379,6 +379,7 @@ fn turn(prompt: &str, yes: bool) -> Result<String, String> {
         voice: None,
         review: Default::default(),
         plain_terminal: false,
+        way_out: None,
     };
     let session = runner.start(std::env::current_dir().ok());
     let connection = runner.connection(session);

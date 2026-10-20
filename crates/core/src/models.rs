@@ -45,6 +45,9 @@ pub struct Facts {
     pub efforts: Option<Vec<Effort>>,
     /// What it costs, as its gateway's list gives it.
     pub price: Option<Price>,
+    /// Who made it, such as `Anthropic`, as the hosted gateway's list says in
+    /// `owned_by`.
+    pub maker: Option<String>,
 }
 
 /// What a model costs, in US dollars a token.
@@ -270,6 +273,7 @@ fn put_together(
         parameters: listed.parameters,
         efforts: listed.efforts,
         price: listed.price,
+        maker: listed.maker,
     };
     (facts, context.map(|(_, source)| source))
 }
@@ -477,7 +481,17 @@ fn read(entry: &Value) -> Facts {
             })
             .or_else(|| levels(&capabilities["effort"])),
         price: price(&entry["pricing"]),
+        maker: maker(entry),
     }
+}
+
+/// Who made the model in a list entry: its `owned_by`, or the `maker` the
+/// hosted catalogue calls it. OpenAI's list says `system` and Ollama's
+/// `library`, which are no maker.
+fn maker(entry: &Value) -> Option<String> {
+    let named = (entry["owned_by"].as_str()).or_else(|| entry["maker"].as_str())?;
+    let named = named.trim();
+    (!named.is_empty() && !matches!(named, "system" | "library")).then(|| named.to_owned())
 }
 
 /// What Anthropic's `capabilities` say a model takes in: text, and pictures
@@ -697,7 +711,7 @@ mod tests {
 
         let gpt = facts(endpoint, "gpt-4o-2024-08-06");
         assert_eq!((gpt.context, gpt.max_output), (Some(128_000), Some(16_384)));
-        assert_eq!((gpt.inputs, gpt.parameters), (None, None));
+        assert_eq!((gpt.inputs, gpt.parameters, gpt.maker), (None, None, None));
         assert_eq!(facts(endpoint, "text-embedding-3-small"), Facts::default());
     }
 
@@ -794,6 +808,8 @@ mod tests {
         let sonnet = facts(endpoint, "claude-sonnet-5");
         assert_eq!(sonnet.context, Some(500_000));
         assert_eq!(sonnet.max_output, Some(128_000));
+        // Who made it, which a perk for one maker's models turns on.
+        assert_eq!(sonnet.maker.as_deref(), Some("Anthropic"));
     }
 
     #[test]

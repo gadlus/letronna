@@ -54,9 +54,15 @@ pub fn dashboard() -> String {
     format!("{}/dashboard", site.trim_end_matches('/'))
 }
 
-/// Where credit is bought on the website.
+/// Where a subscription is bought on the website: the Pro plan, which its
+/// checkout opens on unless told otherwise.
 pub fn checkout() -> String {
-    format!("{}/checkout", dashboard())
+    format!("{}/checkout?plan=pro", dashboard())
+}
+
+/// Where credit is topped up on the website, without a plan.
+pub fn credit_checkout() -> String {
+    format!("{}/checkout?plan=credits", dashboard())
 }
 
 /// How long to hold the port open before giving up on the browser. Ten
@@ -82,6 +88,82 @@ pub struct Account {
     /// The team this computer bills hosted models to, if one was picked.
     #[serde(default)]
     pub team: Option<Team>,
+    /// The hosted models Letronna pays for today, as of the last check.
+    #[serde(default)]
+    pub perks: Vec<Perk>,
+}
+
+/// Letronna paying for some hosted models today, all of the price or a
+/// share of it: those of one kind, one maker or one model, or of any where
+/// a rule is left out. Each comes with an allowance for the day, and once
+/// that is used up it is not `available` again until 00:00 UTC.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "serde_json::Value")]
+pub struct Perk {
+    pub id: String,
+    pub name: String,
+    /// The kind of model, such as `chat` or `image`; `None` is any.
+    pub kind: Option<String>,
+    /// Who made the model, such as `Anthropic`; `None` is any.
+    pub maker: Option<String>,
+    /// One model's id; `None` is any.
+    pub model: Option<String>,
+    /// How much of the price Letronna pays, out of 100: 100 is free.
+    pub share: u32,
+    /// False once today's allowance is used up.
+    pub available: bool,
+    pub left_requests: Option<u64>,
+    /// What is left of today's allowance, in millionths of a dollar.
+    pub left_micros: Option<u64>,
+}
+
+/// A perk as the API or `account.json` gives it, taking what it can: a
+/// field missing, null or of another type is left at its default rather
+/// than losing the sign-in over it.
+impl From<serde_json::Value> for Perk {
+    fn from(value: serde_json::Value) -> Self {
+        use serde_json::Value;
+        let text = |key: &str| match &value[key] {
+            Value::String(text) => text.trim().to_owned(),
+            Value::Number(number) => number.to_string(),
+            _ => String::new(),
+        };
+        // An empty rule is no rule, as the website reads it.
+        let rule = |key: &str| Some(text(key)).filter(|rule| !rule.is_empty());
+        let count = |key: &str| {
+            let value = &value[key];
+            let number = (value.as_f64()).or_else(|| value.as_str()?.trim().parse().ok());
+            (value.as_u64()).or_else(|| number.filter(|n| *n >= 0.).map(|n| n as u64))
+        };
+        Perk {
+            id: text("id"),
+            name: text("name"),
+            kind: rule("kind"),
+            maker: rule("maker"),
+            model: rule("model"),
+            share: count("share").unwrap_or_default().min(100) as u32,
+            available: value["available"].as_bool().unwrap_or_default(),
+            left_requests: count("left_requests"),
+            left_micros: count("left_micros"),
+        }
+    }
+}
+
+impl Perk {
+    /// Whether it is for a model of `kind`, made by `maker`, called `model`.
+    /// A maker not known matches no perk for one maker only.
+    fn covers(&self, kind: &str, maker: Option<&str>, model: &str) -> bool {
+        self.kind.as_deref().is_none_or(|k| k == kind)
+            && self.maker.as_deref().is_none_or(|m| Some(m) == maker)
+            && self.model.as_deref().is_none_or(|m| m == model)
+    }
+
+    /// How particular it is: a model's beats a maker's beats a kind's.
+    fn weight(&self) -> u8 {
+        4 * u8::from(self.model.is_some())
+            + 2 * u8::from(self.maker.is_some())
+            + u8::from(self.kind.is_some())
+    }
 }
 
 /// A team: its id, its name, and (for the one in use) the pool left, in cents.
@@ -113,6 +195,43 @@ impl Account {
             self.credits / 100,
             self.credits.rem_euclid(100)
         )
+    }
+
+    /// Hosted models cannot be paid for: a Free plan with no credit left
+    /// where its calls are billed. An account never checked has no plan yet,
+    /// so it is not taken for one.
+    pub fn needs_upgrade(&self) -> bool {
+        let credit = self.team.as_ref().map_or(self.credits, |team| team.credits);
+        self.plan_name() == "Free" && credit <= 0
+    }
+
+    /// The perk that pays for a model of `kind`, made by `maker`, called
+    /// `model`, today, as the API picks one: of those whose allowance is not
+    /// used up, the most particular, and of those the one that pays most;
+    /// the first listed between two the same.
+    pub fn perk_for(&self, kind: &str, maker: Option<&str>, model: &str) -> Option<&Perk> {
+        (self.perks.iter())
+            .filter(|perk| perk.available && perk.covers(kind, maker, model))
+            .min_by_key(|perk| {
+                (
+                    std::cmp::Reverse(perk.weight()),
+                    std::cmp::Reverse(perk.share),
+                )
+            })
+    }
+
+    /// Whether that model is free today: a perk pays all of it.
+    pub fn free_for(&self, kind: &str, maker: Option<&str>, model: &str) -> bool {
+        self.perk_for(kind, maker, model)
+            .is_some_and(|perk| perk.share >= 100)
+    }
+
+    /// Whether that model would be free today but for a perk's allowance
+    /// being used up, which comes back at 00:00 UTC.
+    pub fn perk_used_up_for(&self, kind: &str, maker: Option<&str>, model: &str) -> bool {
+        !self.free_for(kind, maker, model)
+            && (self.perks.iter())
+                .any(|perk| !perk.available && perk.share >= 100 && perk.covers(kind, maker, model))
     }
 }
 
@@ -209,7 +328,7 @@ pub fn refresh() -> Result<Account, String> {
 }
 
 /// `refresh`, giving up on the API after `wait`.
-pub(crate) fn refresh_within(wait: Duration) -> Result<Account, String> {
+pub fn refresh_within(wait: Duration) -> Result<Account, String> {
     let mut account = account().ok_or("Not signed in.")?;
     let response = client(wait)?
         .get(api("/me"))
@@ -232,6 +351,10 @@ pub(crate) fn refresh_within(wait: Duration) -> Result<Account, String> {
         credits: i64,
         #[serde(default)]
         team: Option<Team>,
+        /// Read leniently, so a list in a shape not known yet loses the
+        /// perks and not the rest.
+        #[serde(default)]
+        perks: serde_json::Value,
     }
     let me: Me = response
         .error_for_status()
@@ -248,6 +371,9 @@ pub(crate) fn refresh_within(wait: Duration) -> Result<Account, String> {
     account.plan = me.plan;
     account.credits = me.credits;
     account.team = me.team;
+    account.perks = (me.perks.as_array())
+        .map(|list| list.iter().cloned().map(Perk::from).collect())
+        .unwrap_or_default();
     remember(&account)?;
     Ok(account)
 }
@@ -579,7 +705,7 @@ fn unescape(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Account, Client, Pending, begin, page, token, unescape};
+    use super::{Account, Client, Pending, Perk, begin, page, token, unescape};
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::sync::atomic::Ordering;
@@ -701,6 +827,128 @@ mod tests {
             assert!(html.contains("<meta charset='utf-8'>"));
             assert!(html.contains(&format!("<h1>{heading}</h1>")));
             assert!(!html.contains("http"), "the page fetches nothing");
+        }
+    }
+
+    /// A Free plan with no credit, given these perks as `/me` lists them.
+    fn given(perks: serde_json::Value) -> Account {
+        Account {
+            plan: "free".into(),
+            perks: serde_json::from_value(perks).unwrap(),
+            ..Account::default()
+        }
+    }
+
+    #[test]
+    fn the_most_particular_perk_pays_for_a_model() {
+        let account = given(serde_json::json!([
+            {"id": "a", "name": "Any chat", "kind": "chat", "share": 100, "available": true},
+            {"id": "b", "name": "Anthropic", "kind": "chat", "maker": "Anthropic",
+             "share": 50, "available": true},
+            {"id": "c", "name": "Fable", "model": "claude-fable-5", "share": 25,
+             "available": true},
+        ]));
+        let named = |maker, model| {
+            account
+                .perk_for("chat", maker, model)
+                .map(|p| p.id.as_str())
+        };
+        // A model's rule beats a maker's, which beats a kind's, whatever
+        // each pays.
+        assert_eq!(named(Some("Anthropic"), "claude-fable-5"), Some("c"));
+        assert_eq!(named(Some("Anthropic"), "claude-sonnet-5"), Some("b"));
+        assert_eq!(named(Some("OpenAI"), "gpt-6"), Some("a"));
+        // A maker not known is no maker's, but a model's and a kind's rule
+        // still match.
+        assert_eq!(named(None, "claude-sonnet-5"), Some("a"));
+        assert_eq!(named(None, "claude-fable-5"), Some("c"));
+        assert_eq!(account.perk_for("image", Some("OpenAI"), "gpt-image"), None);
+        // Free only where it pays all of it.
+        assert!(account.free_for("chat", Some("OpenAI"), "gpt-6"));
+        assert!(!account.free_for("chat", Some("Anthropic"), "claude-sonnet-5"));
+        assert!(!account.free_for("chat", Some("Anthropic"), "claude-fable-5"));
+    }
+
+    #[test]
+    fn of_two_as_particular_the_one_that_pays_most_is_taken() {
+        let account = given(serde_json::json!([
+            {"id": "half", "maker": "Qwen", "share": 50, "available": true},
+            {"id": "all", "maker": "Qwen", "share": 100, "available": true},
+        ]));
+        let perk = account.perk_for("chat", Some("Qwen"), "qwen-4").unwrap();
+        assert_eq!(perk.id, "all");
+    }
+
+    #[test]
+    fn a_perk_whose_allowance_is_used_up_pays_for_nothing_today() {
+        let account = given(serde_json::json!([
+            {"id": "fast", "model": "letronna/fast", "kind": "chat", "share": 100,
+             "available": true},
+            {"id": "smart", "model": "letronna/smart", "kind": "chat", "share": 100,
+             "available": false, "left_requests": 0},
+            {"id": "cheap", "model": "letronna/cheap", "share": 50, "available": false},
+        ]));
+        assert!(account.free_for("chat", None, "letronna/fast"));
+        assert!(!account.perk_used_up_for("chat", None, "letronna/fast"));
+        assert_eq!(account.perk_for("chat", None, "letronna/smart"), None);
+        assert!(!account.free_for("chat", None, "letronna/smart"));
+        assert!(account.perk_used_up_for("chat", None, "letronna/smart"));
+        // Half off is no free model, used up or not.
+        assert!(!account.perk_used_up_for("chat", None, "letronna/cheap"));
+        assert!(!account.perk_used_up_for("chat", None, "letronna/deep"));
+    }
+
+    #[test]
+    fn a_perk_with_fields_missing_or_odd_is_still_read() {
+        let perks: Vec<Perk> = serde_json::from_value(serde_json::json!([
+            {"id": "a", "name": "Any", "share": 100, "available": true},
+            {"id": 7, "name": "Odd", "kind": null, "maker": "", "model": null,
+             "share": "100", "available": null, "left_requests": null, "left_micros": 1500},
+            {},
+        ]))
+        .unwrap();
+        assert_eq!(perks.len(), 3);
+        assert_eq!((perks[0].kind.as_deref(), perks[0].share), (None, 100));
+        assert!(perks[0].available);
+        assert_eq!(perks[1].id, "7");
+        assert_eq!((perks[1].maker.as_deref(), perks[1].share), (None, 100));
+        assert!(!perks[1].available);
+        assert_eq!(
+            (perks[1].left_requests, perks[1].left_micros),
+            (None, Some(1500))
+        );
+        assert_eq!(perks[2], Perk::default());
+    }
+
+    #[test]
+    fn an_account_file_with_or_without_perks_reads_back() {
+        let old = r#"{"name": "Ada", "email": "a@b.c", "token": "", "since": 1,
+            "plan": "free", "credits": 0}"#;
+        let account: Account = serde_json::from_str(old).unwrap();
+        assert!(account.perks.is_empty() && account.needs_upgrade());
+        let perked = given(serde_json::json!([
+            {"id": "a", "name": "Fast", "kind": "chat", "model": "letronna/fast",
+             "share": 100, "available": true, "left_requests": 40, "left_micros": null},
+        ]));
+        let kept = serde_json::to_vec(&perked).unwrap();
+        let back: Account = serde_json::from_slice(&kept).unwrap();
+        assert_eq!(back.perks, perked.perks);
+        assert!(back.free_for("chat", None, "letronna/fast"));
+    }
+
+    #[test]
+    fn a_subscription_and_credit_are_bought_on_their_own_pages() {
+        let dashboard = super::dashboard();
+        assert_eq!(super::checkout(), format!("{dashboard}/checkout?plan=pro"));
+        assert_eq!(
+            super::credit_checkout(),
+            format!("{dashboard}/checkout?plan=credits")
+        );
+        if std::env::var_os("LETRONNA_WEB").is_none() {
+            assert_eq!(
+                super::checkout(),
+                "https://letronna.ai/dashboard/checkout?plan=pro"
+            );
         }
     }
 }

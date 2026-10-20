@@ -5,6 +5,7 @@ Both front ends sit on the same core and share the account, sessions and setting
 ## The window
 
 - **Sessions sidebar**: search, pinning and date groups. Each session is its own file, so several windows can run at once.
+- **A session's menu**: right-click a session in the sidebar (on a Mac, a two-finger click or Control-click), press and hold it, or click the `…` that shows when you point at it, to rename, pin, export or delete it. With the sidebar focused (`F6`), `Delete` or `Backspace` deletes the picked session once you confirm. A session with a reply, summary or run going in it is deleted once that stops; one busy elsewhere does not hold it.
 - **Model menu**: lists the models of every configured gateway. Effort, thinking and web search can be toggled where the model supports them.
 - **Side panels**: Browser, Files, Changes and Jobs.
 - **Command palette**: `Ctrl+K`. The whole window is reachable from the keyboard.
