@@ -1671,6 +1671,27 @@ fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Asked, String> {
             let streamed = &spec.status.streamed;
             streamed.fetch_add(text.len() as u64, Ordering::Relaxed);
         }
+        // A long reply (a whole file written in one call) can stream for
+        // minutes, so a watcher hears what it is at while it is written,
+        // not only once it is done.
+        let now = match &event {
+            Event::Reasoning(text) if !text.trim().is_empty() => Some("Thinking…".to_owned()),
+            Event::Drafting(drafts) if !drafts.is_empty() => Some(
+                drafts
+                    .iter()
+                    .take(2)
+                    .map(|d| d.label())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            _ => None,
+        };
+        if let Some(now) = now
+            && let Ok(mut doing) = spec.status.doing.lock()
+            && *doing != now
+        {
+            *doing = now;
+        }
         // Told as it streams, so the words of a try a 429 cuts short stay
         // with the watcher though the reply drops them, as on a screen.
         match &event {

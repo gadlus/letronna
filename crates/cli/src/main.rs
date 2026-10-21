@@ -1283,7 +1283,9 @@ fn progress(status: &Status) -> Value {
         "rounds": status.rounds.load(Ordering::Relaxed),
         "input": status.input.load(Ordering::Relaxed),
         "cached": status.cached.load(Ordering::Relaxed),
-        "output": status.output.load(Ordering::Relaxed),
+        // With what is streaming now, at about four characters to a token,
+        // so the count moves while a long reply is still being written.
+        "output": status.output.load(Ordering::Relaxed) + status.streamed.load(Ordering::Relaxed) / 4,
         "doing": status.doing.lock().map(|d| d.clone()).unwrap_or_default(),
     })
 }
