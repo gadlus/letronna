@@ -1152,7 +1152,14 @@ impl Chat {
                     .disabled(self.composer_empty && self.attached().is_empty())
                     .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
             );
-        let frame = if compact {
+        // Narrow, or a message past a line, the text takes the whole width
+        // and the controls go under it, rather than the text being squeezed
+        // to a few words a line beside them.
+        let stacked = compact || {
+            let text = self.composer.read(cx).value();
+            text.contains('\n') || text.chars().count() > 60
+        };
+        let frame = if stacked {
             v_flex()
         } else {
             h_flex().items_center()
@@ -1170,9 +1177,7 @@ impl Chat {
             self.ring(crate::ui::keys::Region::Composer, cx)
                 .map(|ring| ring.rounded(cx.theme().radius)),
         );
-        // Narrow, the text takes the whole width and the controls go under
-        // it, rather than the text being squeezed to a few words a line.
-        let frame = if compact {
+        let frame = if stacked {
             frame.child(input.w_full()).child(
                 h_flex()
                     .items_center()
