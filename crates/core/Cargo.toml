@@ -86,6 +86,10 @@ bip39 = { version = "3", default-features = false, features = ["std"] }
 # which importing one needs to find the project again. Already built here,
 # for lopdf under pdf-extract.
 md-5 = "0.10"
+# What this computer has for running a model on it (on_device): its memory
+# and the free space on a disk, on every system. Already in the lock file
+# under the window's screen capture, at this version; only these parts.
+sysinfo = { version = "0.31", default-features = false, features = ["system", "disk"] }
 
 # Stopping a background job ends everything it started: a Job Object on
 # Windows, a process group elsewhere; a Ctrl-C is heard by a console handler
@@ -94,7 +98,17 @@ md-5 = "0.10"
 # keys and tokens on Windows. Both also keep Letronna alive through Ctrl-C
 # while an editor has the terminal (interrupt.rs).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Credentials", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Credentials", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Power", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+# A model on this computer: each graphics card's memory, and what is free
+# of it, from DXGI, whose COM interfaces windows-sys does not wrap; at the
+# version the window already uses.
+windows = { version = "0.61", features = ["Win32_Graphics_Dxgi"] }
+
+# A model on this computer on Windows and Linux: Vulkan's devices and their
+# memory, loading the loader at run time so a system without one still
+# starts; already in the lock file under wgpu.
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+ash = { version = "0.38", default-features = false, features = ["loaded", "std"] }
 
 [target.'cfg(unix)'.dependencies]
 # Also stops a git that ran past its time together with what it started.
@@ -112,6 +126,11 @@ iana-time-zone = "0.1"
 security-framework = "3"
 core-foundation = "0.10"
 core-graphics = { version = "0.24", features = ["highsierra", "elcapitan"] }
+# A model on this computer: how much of the shared memory Metal can use
+# well, and whether Low Power Mode is on; both already in the lock file
+# under wgpu, at these versions, with only the parts used here.
+objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLDevice"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSProcessInfo", "NSString"] }
 
 # Computer use on Linux: X11 through x11rb, which the window already uses,
 # with XTest for input and X-Resource for which process owns a window;

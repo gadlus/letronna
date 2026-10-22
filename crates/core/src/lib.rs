@@ -76,6 +76,7 @@ mod missing;
 pub mod models;
 mod notebook;
 pub mod notify;
+pub mod on_device;
 mod page;
 pub mod palette;
 mod patch;
