@@ -645,6 +645,29 @@ pub(crate) fn head(folder: &Path) -> Option<String> {
     Some(out.trim().to_owned()).filter(|head| !head.is_empty())
 }
 
+/// The text of the file at `path` in `folder`'s repository as the commit
+/// checked out holds it, read without filters, or `None` where the commit
+/// has no such file or there is no repository.
+pub(crate) fn at_head(folder: &Path, path: &str) -> Option<String> {
+    let blob = format!("HEAD:{path}");
+    let (out, _) = git(folder, &["cat-file", "blob", &blob], 8 << 20).ok()?;
+    Some(out)
+}
+
+/// The paths of the files in the commit checked out in `folder`'s
+/// repository with a line that matches the extended regular expression
+/// `pattern`; none where nothing matches or there is no repository.
+pub(crate) fn matching_at_head(folder: &Path, pattern: &str) -> Vec<String> {
+    let args = ["grep", "-l", "-I", "-E", "-e", pattern, "HEAD", "--"];
+    let Ok((out, _)) = run(folder, &args, 1 << 20, &[0, 1], &[]) else {
+        return Vec::new();
+    };
+    out.lines()
+        .filter_map(|line| line.strip_prefix("HEAD:"))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// The config that turns off each filter the repository's own config
 /// names, as `GIT_CONFIG_*` pairs to follow the guards': a clean filter
 /// runs on every changed file a diff reads, a smudge filter on every file

@@ -586,6 +586,7 @@ fn steps(
     let mut swept = false;
     let mut built = false;
     let mut listed = false;
+    let mut twinned = false;
     // From the first request, since a run told of its time only near the
     // end has often thought most of it away by then.
     if let Some(deadline) = spec.connection.deadline {
@@ -861,6 +862,19 @@ fn steps(
                 && let Some(notice) = echoed(spec, turn, &report.files, began)
             {
                 reworded = true;
+                spec.transcript.conversation.messages.push(notice);
+                save(&mut spec.transcript)?;
+                continue;
+            }
+            // Before the requirements are checked, so what it moves into the
+            // project's own class is checked too; once, and with a round and
+            // budget left, as above.
+            if !twinned
+                && report.rounds < spec.rounds
+                && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
+                && let Some(notice) = twin_classes(spec, turn, &report.files)
+            {
+                twinned = true;
                 spec.transcript.conversation.messages.push(notice);
                 save(&mut spec.transcript)?;
                 continue;
@@ -2197,6 +2211,35 @@ fn requirements(
     Some(Message {
         role: "user".into(),
         content: crate::requirements::notice(&found, review, &outputs),
+        notice: true,
+        // Folded into the run, so the window keeps the task it is for.
+        folded: true,
+        ..Default::default()
+    })
+}
+
+/// The notice telling a session's own run nobody watches where the project's
+/// own class is, when the run made a new one of a name the request uses.
+fn twin_classes(spec: &Spec, turn: &Turn, written: &[String]) -> Option<Message> {
+    // A helper's work is its parent's to judge, a person reads a watched
+    // run's end, and past the round cap or in plan mode nothing can change.
+    if !unwatched(spec) || turn.capped().is_some() || !turn.runs_commands() {
+        return None;
+    }
+    let own = (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
+    let request = own.iter().rfind(|message| chat::opens_turn(message))?;
+    if request.notice {
+        return None;
+    }
+    let workspace = spec.connection.workspace.as_deref()?;
+    let typed = crate::references::typed(&request.content);
+    let twins = crate::twins::twins(typed, workspace, written);
+    if twins.is_empty() {
+        return None;
+    }
+    Some(Message {
+        role: "user".into(),
+        content: crate::twins::notice(&twins),
         notice: true,
         // Folded into the run, so the window keeps the task it is for.
         folded: true,
@@ -6997,6 +7040,67 @@ pub(crate) mod tests {
         assert_eq!(report.status, Outcome::Done);
         assert_eq!(provider.sent().len(), 3);
         assert_eq!(report.text, "Done.");
+    }
+
+    /// `dir` made a git repository whose first commit holds kombu's
+    /// `Consumer` in kombu/messaging.py.
+    fn kombu_project(dir: &Path) {
+        std::fs::create_dir_all(dir.join("kombu")).unwrap();
+        std::fs::write(
+            dir.join("kombu/messaging.py"),
+            "class Consumer:\n    pass\n",
+        )
+        .unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["add", "-A"],
+            &[
+                "-c",
+                "user.name=user_a",
+                "-c",
+                "user.email=user_a@example.com",
+            ],
+        ] {
+            let mut git = std::process::Command::new("git");
+            git.args(args).current_dir(dir);
+            if args[0] == "-c" {
+                git.args(["commit", "-q", "-m", "first"]);
+            }
+            assert!(git.status().unwrap().success(), "git {args:?}");
+        }
+    }
+
+    #[test]
+    fn a_class_made_beside_the_projects_own_of_a_name_the_request_uses_is_sent_back_once() {
+        let _data = data("twins");
+        let dir = scratch("twins");
+        kombu_project(&dir);
+        let made = (
+            "write_file",
+            json!({"path": "kombu/base.py", "content": "class Consumer:\n    pass\n"}),
+        );
+        let ended = "Moved on_cancel into kombu.Consumer. Done.";
+        let (spec, provider) = specified(
+            &dir,
+            AGENTS + 1_830,
+            "`Consumer.__init__` accepts `on_cancel=None`.",
+            vec![reply("", &[made]), reply("Done.", &[]), reply(ended, &[])],
+        );
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+        let asked = messages(&sent[2]).last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let twin = crate::twins::Twin {
+            name: "Consumer".into(),
+            made: "kombu/base.py".into(),
+            had: vec!["kombu/messaging.py".into()],
+        };
+        assert_eq!(asked, crate::twins::notice(&[twin]));
+        // Once: the answer after it ends the run.
+        assert_eq!(report.text, ended);
     }
 
     #[test]
