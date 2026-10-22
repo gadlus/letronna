@@ -237,6 +237,13 @@ pub fn run(
         if !chosen && !usable(connection) {
             continue;
         }
+        let failed = chosen_failed
+            .as_ref()
+            .map(|f| f.kind)
+            .or(after.map(|(_, kind)| kind));
+        if !chosen && !crate::on_device::reach::may_stand_in(primary, connection, failed) {
+            continue;
+        }
         // Going back to the chosen model after a fallback failed is a
         // switch too, or its reply would carry the fallback's name.
         if after.is_some() || !chosen {
@@ -314,6 +321,12 @@ fn labels(
         )
     );
     let label = |c: &Connection, by_gateway: bool| match gateway_of(c, custom) {
+        _ if crate::on_device::shown(c).is_some() => {
+            format!(
+                "{} on this computer",
+                crate::on_device::shown(c).unwrap_or_default()
+            )
+        }
         Some(name) if by_gateway => name.to_owned(),
         Some(name) if moved => format!("{} on {name}", c.model.trim()),
         _ => c.model.trim().to_owned(),
@@ -719,5 +732,62 @@ mod tests {
         );
         assert!(Fallback::parse("OpenAI:").is_err());
         assert!(Fallback::parse("  ").is_err());
+    }
+
+    #[test]
+    fn this_computer_stands_in_for_a_hosted_model_only_once_it_cannot_be_reached() {
+        let _seams = crate::on_device::reach::tests::SEAMS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::on_device::reach::tests::forget_standing();
+        let hosted = Connection {
+            endpoint: crate::auth::hosted_base(),
+            // Its own id, as a model that fails here cools down for others.
+            model: "stand-in-test".into(),
+            key: "ltr_test".into(),
+            ..Default::default()
+        };
+        let local = Connection {
+            endpoint: crate::on_device::BASE.into(),
+            model: "bonsai-2-4b".into(),
+            ..Default::default()
+        };
+        let chain = [hosted.clone(), local];
+        let ask = |kind: FailureKind| {
+            let mut asked = Vec::new();
+            let mut switches = Vec::new();
+            let result = run(
+                &chain,
+                "",
+                |_| true,
+                |c| {
+                    asked.push(c.model.clone());
+                    match c.model.as_str() {
+                        "stand-in-test" => Err(Failure::new(kind, "It failed.")),
+                        _ => Ok(()),
+                    }
+                },
+                |switch| {
+                    switches.push(switch.to_string());
+                    Ok(())
+                },
+            );
+            (result.is_ok(), asked, switches)
+        };
+        let (answered, asked, _) = ask(FailureKind::Quota);
+        assert!(!answered);
+        assert_eq!(asked, ["stand-in-test"]);
+        let (answered, asked, switches) = ask(FailureKind::Network);
+        assert!(answered);
+        assert_eq!(asked, ["stand-in-test", "bonsai-2-4b"]);
+        assert_eq!(
+            switches,
+            [
+                "Switched to Ternary Bonsai 2 · 4B on this computer: Letronna could not be \
+              reached. It is asked again in 5 minutes."
+            ]
+        );
+        cool(&hosted, Instant::now());
+        crate::on_device::reach::tests::forget_standing();
     }
 }

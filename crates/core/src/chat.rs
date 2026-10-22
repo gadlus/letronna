@@ -2518,6 +2518,7 @@ pub(crate) fn fit_quirks(connection: &Connection, body: &mut Value) {
             apply_quirk(body, quirk);
         }
     }
+    crate::on_device::reach::shape_body(connection, body);
 }
 
 /// Change `body` as `quirk` asks, saying whether it carried the field.
@@ -4152,6 +4153,7 @@ fn begin(
         crate::memory::heard(connection.conversation, &messages);
     }
     let (sender, receiver) = async_channel::bounded(64);
+    let pictures = messages.iter().any(|m| !m.images.is_empty());
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
         // Taken once for the call, as each error is told once: a resend
@@ -4165,8 +4167,28 @@ fn begin(
             &connection,
             given,
             |asked| {
+                // A model on this computer is started, or swapped in, as it
+                // is asked, and holds the server until it has answered.
+                let note = |note: String| {
+                    let _ = sender.send_blocking(Event::Note(note));
+                };
+                let woken = crate::on_device::reach::wake(
+                    asked,
+                    &connection,
+                    pictures,
+                    &note,
+                    &extra.cancel,
+                )?;
+                let asked = woken.as_ref().map_or(asked, |woken| &woken.connection);
                 let budget = budget_for(asked, &connection, budget, &messages);
-                send_window(asked, &messages, &budget, &extra, lsp.as_deref(), &sender)
+                let since = (std::time::SystemTime::now(), std::time::Instant::now());
+                let sent = send_window(asked, &messages, &budget, &extra, lsp.as_deref(), &sender);
+                match (sent, &woken) {
+                    (Err(failure), Some(_)) => {
+                        Err(crate::on_device::reach::after_sleep(failure, since))
+                    }
+                    (sent, _) => sent,
+                }
             },
             |switch| {
                 sender
@@ -4196,7 +4218,9 @@ fn begin(
         // Claimed before the reply is said to be over, so a request sent the
         // moment it is finds the summary being made and waits for it rather
         // than asking for another.
-        let making = if ahead && result.is_ok() {
+        // Not on this computer, where it would hold the one server while
+        // the user reads.
+        let making = if ahead && result.is_ok() && !crate::on_device::at(&connection.endpoint) {
             claim_next(&connection, &messages, &budget, extra.floor)
         } else {
             None
@@ -4221,7 +4245,12 @@ fn budget_for(
     own: Budget,
     messages: &[Message],
 ) -> Budget {
-    if connection.endpoint == primary.endpoint && connection.model == primary.model {
+    // A model on this computer is sized again once it is woken, when its
+    // context is known.
+    if connection.endpoint == primary.endpoint
+        && connection.model == primary.model
+        && !crate::on_device::at(&connection.endpoint)
+    {
         return own;
     }
     budget(connection, crate::store::sizing(), messages)
@@ -4489,6 +4518,7 @@ fn stream(
     sender: &async_channel::Sender<Event>,
 ) -> Result<(), Failure> {
     let endpoint = validate(connection).map_err(|e| Failure::new(FailureKind::Settings, e))?;
+    let endpoint = crate::on_device::reach::address(endpoint);
     // The facts about a model come from its gateway's list, which the window
     // reads when it opens and the terminal only for /model and /gateways, so
     // the first request to a host whose list is not known asks for it. This
@@ -4501,23 +4531,29 @@ fn stream(
     // What the window no longer holds goes in as a summary rather than not at
     // all. It is made here, on the worker, so the wait is part of the reply's.
     let (dropped, window) = messages.split_at(start);
-    let summary = crate::compact::summary(
-        connection,
-        dropped,
-        budget.tokens,
-        || {
-            let _ = sender.send_blocking(Event::Compacting);
-        },
-        |text| {
-            let _ = sender.send_blocking(Event::Summarized {
-                upto: dropped.len(),
-                text: text.to_owned(),
-            });
-        },
-        |paid| {
-            let _ = sender.send_blocking(Event::SummaryUsage(paid));
-        },
-    );
+    // Standing in for a hosted model out of reach, whose summarizer is out
+    // of reach too, the dropped turns go in as a digest.
+    let summary = if crate::on_device::reach::standing_in() {
+        crate::compact::unasked(dropped)
+    } else {
+        crate::compact::summary(
+            connection,
+            dropped,
+            budget.tokens,
+            || {
+                let _ = sender.send_blocking(Event::Compacting);
+            },
+            |text| {
+                let _ = sender.send_blocking(Event::Summarized {
+                    upto: dropped.len(),
+                    text: text.to_owned(),
+                });
+            },
+            |paid| {
+                let _ = sender.send_blocking(Event::SummaryUsage(paid));
+            },
+        )
+    };
     // After the summary, which may be what was turned away, and also for a
     // summary made ahead or a commit message asked for since the last one.
     if let Some(note) = crate::side::notice(connection.conversation) {
@@ -4572,6 +4608,7 @@ fn stream(
         (None, Some((_, body))) => carrying(request, connection, body),
         (None, None) => carrying(request, connection, &sent),
     };
+    let request = crate::on_device::reach::signed(request);
     // A rate limit or a dropped connection part way through an agent loop
     // would otherwise lose the whole task, though it passes on its own.
     let mut tried = 0;
@@ -15589,5 +15626,194 @@ mod tests {
         std::fs::create_dir_all(home.join("Letronna/.git")).unwrap();
         assert_eq!(fallback_in(&home, &data), None);
         std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// What a stood-in server heard: the target, the authorization and the body.
+    type Heard = (String, String, Value);
+
+    /// A llama-server stood in for a test: its address, and what it was sent
+    /// as (target, authorization, body), answering each request with the
+    /// next of `replies` (status and body) and then with "Hello".
+    fn here_server(replies: Vec<(u16, &'static str)>) -> (String, Arc<Mutex<Vec<Heard>>>) {
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let kept = heard.clone();
+        let replies = Mutex::new(replies.into_iter());
+        let base = crate::mcp_auth::tests::serve(move |request| {
+            kept.lock().unwrap().push((
+                request.target.clone(),
+                request
+                    .headers
+                    .get("authorization")
+                    .cloned()
+                    .unwrap_or_default(),
+                serde_json::from_str(&request.body).unwrap_or(Value::Null),
+            ));
+            match replies.lock().unwrap().next() {
+                Some((status, body)) => (status, Vec::new(), body.to_owned()),
+                None => (
+                    200,
+                    vec![("Content-Type", "text/event-stream".to_owned())],
+                    line_of("Hello") + "data: [DONE]\n\n",
+                ),
+            }
+        });
+        (format!("{base}/v1"), heard)
+    }
+
+    /// Bonsai 2 4B on this computer, its server stood in at `endpoint`
+    /// with `context`, offline so it is offered no search.
+    fn on_this_computer(
+        name: &str,
+        endpoint: &str,
+        context: u64,
+    ) -> (
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+        crate::store::tests::Scratch,
+    ) {
+        use crate::on_device::reach::tests::{ONLINE, SEAMS, SERVING, shelved};
+        let seams = SEAMS.lock().unwrap_or_else(|e| e.into_inner());
+        *SERVING.lock().unwrap() = Some((endpoint.to_owned(), "k-live".to_owned(), context));
+        *ONLINE.lock().unwrap() = Some(false);
+        let (lock, scratch) = shelved(name, &["bonsai-2-4b"]);
+        (seams, lock, scratch)
+    }
+
+    fn here(model: &str) -> Connection {
+        Connection {
+            endpoint: crate::on_device::BASE.into(),
+            model: model.into(),
+            tools: true,
+            ..connection()
+        }
+    }
+
+    #[test]
+    fn a_chat_on_this_computer_goes_to_its_server_with_its_key_and_sampling() {
+        let (endpoint, heard) = here_server(Vec::new());
+        let (_seams, _lock, _scratch) = on_this_computer("chat-here", &endpoint, 12_288);
+        let rx = start_with(here("bonsai-2-4b"), hi(), Extra::default());
+        let (mut notes, mut text) = (Vec::new(), String::new());
+        while let Ok(event) = rx.recv_blocking() {
+            match event {
+                Event::Note(note) => notes.push(note),
+                Event::Delta(delta) => text.push_str(&delta),
+                Event::Finished(done) => assert!(done.is_ok(), "{done:?}"),
+                _ => {}
+            }
+        }
+        assert_eq!(notes, ["Loading Ternary Bonsai 2 · 4B…"]);
+        assert_eq!(text, "Hello");
+        let heard = heard.lock().unwrap();
+        assert_eq!(heard.len(), 1);
+        let (target, key, body) = &heard[0];
+        assert_eq!(target, "/v1/chat/completions");
+        assert_eq!(key, "Bearer k-live");
+        assert_eq!(body["top_k"], 20);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert!(body["max_tokens"].as_u64().is_some_and(|n| n <= 2048));
+        assert!(body.get("tools").is_none() && body.get("reasoning_effort").is_none());
+        let system = body["messages"][0]["content"].as_str().unwrap_or_default();
+        assert!(
+            system.contains("You run on this computer as Ternary Bonsai 2 · 4B"),
+            "{system}"
+        );
+        let facts = crate::models::facts(crate::on_device::BASE, "bonsai-2-4b");
+        assert_eq!(facts.context, Some(12_288));
+        *crate::on_device::reach::tests::SERVING.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn an_overflow_on_this_computer_is_learned_under_its_address_and_sent_again_shorter() {
+        let overflow = r#"{"error":{"code":400,"message":"the request exceeds the available context size, try increasing it","type":"exceed_context_size_error","n_prompt_tokens":9000,"n_ctx":4096}}"#;
+        let (endpoint, heard) = here_server(vec![(400, overflow)]);
+        // Bonsai 2 9B, as the limit learned here outlasts the test.
+        let (_seams, _lock, _scratch) = on_this_computer("chat-here-overflow", &endpoint, 32_768);
+        crate::on_device::reach::tests::shelve(&["bonsai-2-9b"]);
+        let mut messages = Vec::new();
+        for turn in 0..24 {
+            messages.push(said(
+                "user",
+                &format!("Question {turn}: {}", "word ".repeat(300)),
+            ));
+            messages.push(said(
+                "assistant",
+                &format!("Answer {turn}: {}", "word ".repeat(300)),
+            ));
+        }
+        messages.push(said("user", "And now?"));
+        let result = outcome(start_with(here("bonsai-2-9b"), messages, Extra::default()));
+        assert_eq!(result, Ok(()));
+        // Between the two, the turns the window drops are summarized, by the
+        // same model on the same server.
+        let heard = heard.lock().unwrap();
+        let streamed: Vec<&Value> = heard
+            .iter()
+            .map(|(_, _, body)| body)
+            .filter(|body| body["stream"] == true)
+            .collect();
+        assert_eq!(streamed.len(), 2);
+        let sent = |i: usize| streamed[i]["messages"].as_array().map_or(0, Vec::len);
+        assert!(sent(1) < sent(0), "{} then {}", sent(0), sent(1));
+        let window = crate::models::window_or(crate::on_device::BASE, "bonsai-2-9b", None);
+        assert_eq!(window.map(|(tokens, _)| tokens), Some(4_096));
+        *crate::on_device::reach::tests::SERVING.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn standing_in_for_a_hosted_model_sends_the_local_window_without_asking_for_a_summary() {
+        let (endpoint, heard) = here_server(Vec::new());
+        let (_seams, _lock, _scratch) = on_this_computer("chat-here-standing", &endpoint, 8_192);
+        let hosted = Connection {
+            endpoint: "https://api.letronna.ai/v1".into(),
+            model: "auto".into(),
+            key: "ltr_test".into(),
+            ..connection()
+        };
+        let mut messages = Vec::new();
+        for turn in 0..30 {
+            messages.push(said(
+                "user",
+                &format!("Question {turn}: {}", "word ".repeat(300)),
+            ));
+            messages.push(said(
+                "assistant",
+                &format!("Answer {turn}: {}", "word ".repeat(300)),
+            ));
+        }
+        messages.push(said("user", "And now?"));
+        let held = messages.len();
+        let extra = Extra {
+            route: Some(vec![here("bonsai-2-4b")]),
+            ..Default::default()
+        };
+        let rx = start_with(hosted, messages, extra);
+        let mut compacting = false;
+        while let Ok(event) = rx.recv_blocking() {
+            match event {
+                Event::Compacting => compacting = true,
+                Event::Finished(done) => assert!(done.is_ok(), "{done:?}"),
+                _ => {}
+            }
+        }
+        assert!(!compacting);
+        let heard = heard.lock().unwrap();
+        assert_eq!(heard.len(), 1, "a summary was asked for");
+        let sent = heard[0].2["messages"].as_array().map_or(0, Vec::len);
+        assert!(sent < held, "{sent} of {held}");
+        *crate::on_device::reach::tests::SERVING.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn the_short_system_prompt_on_this_computer_matches_its_golden_copy() {
+        golden(
+            "system_prompt_this_computer.txt",
+            &crate::on_device::reach::words(
+                "Test Model 4B",
+                "Test Lab",
+                "Thursday, 22 October 2026",
+                true,
+            ),
+        );
     }
 }

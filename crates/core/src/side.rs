@@ -99,7 +99,12 @@ pub(crate) fn ask_on<T>(
 /// session's own.
 fn on(connection: &Connection, side: &str) -> Option<Connection> {
     let side = side.trim();
-    if side.is_empty() || side == connection.model.trim() {
+    // A chat on this computer keeps to its own model: another would be
+    // loaded in its place.
+    if side.is_empty()
+        || side == connection.model.trim()
+        || crate::on_device::at(&connection.endpoint)
+    {
         return None;
     }
     Some(Connection {
@@ -267,5 +272,23 @@ pub(crate) mod tests {
             assert_eq!(asked, ["small-model"]);
         }
         assert_eq!(notice(9_004), None);
+    }
+
+    #[test]
+    fn a_chat_on_this_computer_keeps_its_side_calls_on_its_own_model() {
+        let here = Connection {
+            endpoint: crate::on_device::BASE.into(),
+            model: "bonsai-2-4b".into(),
+            ..Default::default()
+        };
+        assert!(on(&here, "small-model").is_none());
+        let hosted = Connection {
+            endpoint: "https://api.example.com/v1".into(),
+            ..here
+        };
+        assert_eq!(
+            on(&hosted, "small-model").map(|c| c.model).as_deref(),
+            Some("small-model")
+        );
     }
 }

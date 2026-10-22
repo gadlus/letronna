@@ -1639,11 +1639,17 @@ fn child(
     id: AgentId,
 ) -> Connection {
     let setting = (!limits.model.is_empty()).then_some(limits.model.as_str());
-    let model = model
-        .or(def.model.as_deref())
-        .or(setting)
-        .unwrap_or(&parent.model)
-        .to_owned();
+    // A helper of a chat on this computer runs on the model loaded there;
+    // another would be loaded in its place, or be named on no other gateway.
+    let model = if crate::on_device::at(&parent.endpoint) {
+        parent.model.clone()
+    } else {
+        model
+            .or(def.model.as_deref())
+            .or(setting)
+            .unwrap_or(&parent.model)
+            .to_owned()
+    };
     let mode = helper_mode(parent, def.plan);
     Connection {
         model,
@@ -3614,6 +3620,16 @@ mod tests {
         assert_eq!(
             (nested.model.as_str(), nested.judge_model()),
             ("setting-model", "parent-model")
+        );
+        // On this computer a helper runs on the model loaded there, whatever
+        // the call, its type or Settings name.
+        let here = Connection {
+            endpoint: crate::on_device::BASE.into(),
+            ..parent(false)
+        };
+        assert_eq!(
+            child(&here, &typed, Some("call-model"), &limits, 1).model,
+            "parent-model"
         );
     }
 

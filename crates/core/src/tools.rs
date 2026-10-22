@@ -831,6 +831,7 @@ pub(crate) fn callable<'a>(
         .filter(|t| history || !t.needs_history())
         .filter(|t| t.offered(connection))
         .filter(|t| t.suits(&connection.model))
+        .filter(|t| crate::on_device::reach::lets(connection, t.name()))
         .collect()
 }
 

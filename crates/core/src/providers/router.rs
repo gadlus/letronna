@@ -63,7 +63,14 @@ pub(crate) fn run(
             let settings = crate::store::current_settings();
             let keys = crate::store::load_keys();
             let ready = ready(&keys, &settings);
-            let (chain, accounts) = route(primary, &settings, &keys, &ready);
+            let (mut chain, accounts) = route(primary, &settings, &keys, &ready);
+            // Last of all, a model on this computer, asked only once the
+            // others could not be reached (`fallback::run`).
+            if let Some(local) = stand_in(primary, &settings)
+                && !chain.iter().any(|c| fallback::same(c, &local))
+            {
+                chain.push(local);
+            }
             (chain, accounts, settings.custom_endpoint)
         }
     };
@@ -80,6 +87,11 @@ fn route(
     keys: &HashMap<String, String>,
     ready: &[(&'static str, String, String)],
 ) -> (Vec<Connection>, Vec<Connection>) {
+    // What is said on this computer stays there: no other account, no
+    // fallback, no default model elsewhere.
+    if crate::on_device::at(&primary.endpoint) {
+        return (vec![primary.clone()], Vec::new());
+    }
     let accounts = accounts(primary, &order(settings), ready);
     // Entries that do not read are passed over here; the frontends say why
     // when they are written.
@@ -117,6 +129,17 @@ fn default_elsewhere(
 }
 
 #[cfg(not(test))]
+fn stand_in(primary: &Connection, settings: &Settings) -> Option<Connection> {
+    crate::on_device::reach::stand_in(primary, settings)
+}
+
+/// No test reaches this machine's downloads.
+#[cfg(test)]
+fn stand_in(_: &Connection, _: &Settings) -> Option<Connection> {
+    None
+}
+
+#[cfg(not(test))]
 fn ready(
     keys: &HashMap<String, String>,
     settings: &Settings,
@@ -146,6 +169,8 @@ fn accounts(
     };
     let own = rank(crate::gateway::named(&primary.endpoint));
     let mut accounts: Vec<_> = (ready.iter())
+        // A model here is no account for another's: it never serves its id.
+        .filter(|(name, ..)| *name != crate::on_device::NAME)
         .map(|(name, base, key)| {
             let connection = Connection {
                 endpoint: base.clone(),
@@ -604,5 +629,65 @@ mod tests {
             ..settings
         };
         assert_eq!(asked(&letronna("letronna/auto"), &elsewhere).len(), 2);
+    }
+
+    #[test]
+    fn a_chat_on_this_computer_is_never_handed_to_another_gateway() {
+        let primary = Connection {
+            endpoint: crate::on_device::BASE.into(),
+            model: "bonsai-2-4b".into(),
+            ..Default::default()
+        };
+        let settings = Settings {
+            fallbacks: vec!["OpenRouter:some/model".into()],
+            gateway: "Ollama".into(),
+            model: "qwen3".into(),
+            ..Default::default()
+        };
+        let ready = [
+            (
+                "Letronna",
+                "https://api.letronna.ai/v1".to_owned(),
+                "ltr".to_owned(),
+            ),
+            (
+                "Ollama",
+                "http://localhost:11434/v1".to_owned(),
+                String::new(),
+            ),
+            (
+                crate::on_device::NAME,
+                crate::on_device::BASE.to_owned(),
+                String::new(),
+            ),
+        ];
+        let (chain, accounts) = route(&primary, &settings, &HashMap::new(), &ready);
+        assert_eq!(chain.len(), 1);
+        assert!(fallback::same(&chain[0], &primary));
+        assert!(accounts.is_empty());
+    }
+
+    #[test]
+    fn this_computer_is_never_an_account_for_another_model() {
+        let primary = Connection {
+            endpoint: "https://api.letronna.ai/v1".into(),
+            model: "bonsai-2-4b".into(),
+            ..Default::default()
+        };
+        let ready = [
+            (
+                "Ollama",
+                "http://localhost:11434/v1".to_owned(),
+                String::new(),
+            ),
+            (
+                crate::on_device::NAME,
+                crate::on_device::BASE.to_owned(),
+                String::new(),
+            ),
+        ];
+        let accounts = accounts(&primary, &order(&Settings::default()), &ready);
+        assert_eq!(accounts.len(), 1);
+        assert!(accounts.iter().all(|c| !crate::on_device::at(&c.endpoint)));
     }
 }

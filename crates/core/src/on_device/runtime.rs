@@ -267,6 +267,47 @@ pub fn stop() {
     }
 }
 
+/// On the way out: stop the server this process started, unless another
+/// Letronna is answering with it, which keeps it (on macOS; elsewhere the
+/// system ends it with this process).
+pub fn quit() {
+    let Some(mut mine) = running().take() else {
+        return;
+    };
+    if another_answering() {
+        std::mem::forget(mine);
+        return;
+    }
+    let pid = mine.child.id();
+    end(&mut mine.child);
+    if read_record().is_some_and(|r| r.pid == pid) {
+        write_record(None);
+    }
+}
+
+/// Whether another process holds the line to the server.
+fn another_answering() -> bool {
+    if !idle() {
+        return false;
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(shelf::dir().join("turn.lock"))
+    else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => false,
+    }
+}
+
 fn end(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
@@ -877,10 +918,6 @@ pub(crate) mod tests {
 
     const GIB: u64 = 1 << 30;
 
-    /// The line is one for the process, so tests that wait in it go one at
-    /// a time.
-    pub(crate) static LINE: Mutex<()> = Mutex::new(());
-
     #[test]
     fn the_server_is_started_on_loopback_with_a_key_one_slot_and_no_web_page() {
         let args = launch_args(
@@ -995,7 +1032,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_chat_behind_another_waits_its_turn_and_is_told() {
-        let _line = LINE.lock().unwrap_or_else(PoisonError::into_inner);
+        let _line = crate::on_device::reach::tests::SEAMS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let _lock = crate::store::tests::DATA_DIR
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
@@ -1018,7 +1057,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_stopped_chat_leaves_the_line() {
-        let _line = LINE.lock().unwrap_or_else(PoisonError::into_inner);
+        let _line = crate::on_device::reach::tests::SEAMS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let first = Turn::stand_in();
         let cancel = Cancel::default();
         let stop = cancel.clone();
@@ -1075,7 +1116,9 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "Downloads llama.cpp and runs Bonsai 2 4B: LETRONNA_TEST_MODEL=<its .gguf> cargo test -p letronna-core --release -- --ignored a_real_model"]
     fn a_real_model_answers_on_this_computer_and_is_shared() {
-        let _line = LINE.lock().unwrap_or_else(PoisonError::into_inner);
+        let _line = crate::on_device::reach::tests::SEAMS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let _lock = crate::store::tests::DATA_DIR
             .lock()
             .unwrap_or_else(PoisonError::into_inner);

@@ -959,6 +959,7 @@ fn install(runtime: &Runtime, key: &str, stop: &AtomicBool) -> Result<(), Stop> 
     for archive in archives {
         let _ = std::fs::remove_file(archive);
     }
+    let _ = std::fs::remove_dir(&downloads);
     keep_out_of_backups(&runtimes());
     Ok(())
 }

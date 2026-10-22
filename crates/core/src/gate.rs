@@ -1185,6 +1185,11 @@ fn unavailable(
     plan: bool,
 ) -> Option<String> {
     let name = tool.name();
+    if let Some(connection) = ctx.caller.connection.as_deref()
+        && !crate::on_device::reach::lets(connection, name)
+    {
+        return Some(crate::on_device::reach::refused(name));
+    }
     // A tool the user switched off is not offered either, but the model may
     // remember it from earlier in the conversation.
     if tools::switched_off(name, &crate::store::disabled_tools()) {

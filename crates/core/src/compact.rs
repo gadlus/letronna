@@ -225,6 +225,20 @@ pub fn summary(
     with_index(text, dropped)
 }
 
+/// What stands for `dropped` without asking a model: a summary made of it
+/// before, or a digest. For a request whose summarizer cannot be reached.
+pub(crate) fn unasked(dropped: &[Message]) -> Option<String> {
+    if dropped.is_empty() {
+        return None;
+    }
+    let key = keys(dropped)[dropped.len()];
+    let made = cache().lock().ok().and_then(|cache| match cache.get(&key) {
+        Some(Entry::Made(text)) => Some(text.clone()),
+        _ => None,
+    });
+    with_index(made.or_else(|| digest(dropped)), dropped)
+}
+
 /// `text`, what stands for `dropped`, followed by lines read from the
 /// messages themselves: the files worked on and the background jobs
 /// started, which a digest names already, and the skills loaded in those
@@ -1205,6 +1219,8 @@ fn ask_of(
     transcript: &str,
 ) -> Result<(String, Paid), crate::side::Failed> {
     let endpoint = crate::chat::validate(connection)?;
+    let reached = crate::on_device::reach::reach(connection, endpoint, false)?;
+    let endpoint = reached.url.clone();
     let input = match earlier {
         Some(earlier) => format!("Earlier summary:\n{earlier}\n\nNew messages:\n{transcript}"),
         None => format!("Messages:\n{transcript}"),
@@ -1212,7 +1228,8 @@ fn ask_of(
     let body = body(connection, &input);
     let (endpoint, body) =
         crate::chat::to_responses(connection, &endpoint, &body).unwrap_or((endpoint, body));
-    let value: Value = crate::chat::carrying(post(endpoint)?, connection, &body)
+    let value: Value = reached
+        .sign(crate::chat::carrying(post(endpoint)?, connection, &body))
         .send()
         .and_then(|r| r.error_for_status())
         .and_then(crate::providers::wire::openai_responses::json)
@@ -2538,5 +2555,24 @@ mod tests {
         let gpt = sent("https://api.openai.com/v1", "gpt-5");
         assert!(gpt.get("max_tokens").is_none(), "{gpt}");
         assert!(gpt["max_completion_tokens"].is_u64(), "{gpt}");
+    }
+
+    #[test]
+    fn a_request_that_cannot_reach_its_summarizer_gets_the_digest_without_a_call() {
+        let dropped = vec![
+            Message {
+                role: "user".into(),
+                content: "Fix the login page.".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".into(),
+                content: "Done.".into(),
+                ..Default::default()
+            },
+        ];
+        let stood_in = unasked(&dropped).unwrap();
+        assert!(stood_in.contains("Fix the login page."), "{stood_in}");
+        assert_eq!(unasked(&[]), None);
     }
 }

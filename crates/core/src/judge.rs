@@ -619,6 +619,8 @@ fn quoted(text: &str) -> String {
 /// cap rather than a cost.
 fn ask(connection: &Connection, prompt: &str) -> Result<String, String> {
     let endpoint = crate::chat::validate(connection)?;
+    let reached = crate::on_device::reach::reach(connection, endpoint, false)?;
+    let endpoint = reached.url.clone();
     // As the session's own requests are sized, so a reply the model is
     // known not to take is not asked for.
     let sizing = crate::store::sizing();
@@ -633,7 +635,7 @@ fn ask(connection: &Connection, prompt: &str) -> Result<String, String> {
     if wait.is_zero() {
         return Err("The run's time is up.".to_owned());
     }
-    let body = json!({
+    let mut body = json!({
         "model": connection.model.trim(),
         "messages": [
             {"role": "system", "content": POLICY},
@@ -643,6 +645,7 @@ fn ask(connection: &Connection, prompt: &str) -> Result<String, String> {
         "max_tokens": tokens,
         "reasoning_effort": "low",
     });
+    crate::on_device::reach::shape_body(connection, &mut body);
     let (endpoint, body) =
         crate::chat::to_responses(connection, &endpoint, &body).unwrap_or((endpoint, body));
     let client = reqwest::blocking::Client::builder()
@@ -651,7 +654,12 @@ fn ask(connection: &Connection, prompt: &str) -> Result<String, String> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| e.to_string())?;
-    let value: Value = crate::chat::carrying(client.post(endpoint), connection, &body)
+    let value: Value = reached
+        .sign(crate::chat::carrying(
+            client.post(endpoint),
+            connection,
+            &body,
+        ))
         .send()
         .and_then(|r| r.error_for_status())
         .and_then(crate::providers::wire::openai_responses::json)
@@ -1687,5 +1695,44 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn the_judge_of_a_chat_on_this_computer_asks_that_computer() {
+        use crate::on_device::reach::tests::{SEAMS, SERVING, shelved};
+        use std::sync::{Arc, Mutex};
+        let _seams = SEAMS.lock().unwrap_or_else(|e| e.into_inner());
+        let (_lock, _scratch) = shelved("judge-here", &["bonsai-2-4b"]);
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let kept = heard.clone();
+        let base = crate::mcp_auth::tests::serve(move |request| {
+            kept.lock().unwrap().push((
+                request
+                    .headers
+                    .get("authorization")
+                    .cloned()
+                    .unwrap_or_default(),
+                serde_json::from_str::<Value>(&request.body).unwrap_or(Value::Null),
+            ));
+            let reply = json!({"choices": [{"message": {"content": "allow"}}]});
+            (
+                200,
+                vec![("Content-Type", "application/json".to_owned())],
+                reply.to_string(),
+            )
+        });
+        *SERVING.lock().unwrap() = Some((format!("{base}/v1"), "k-live".into(), 16_384));
+        let chat = Connection {
+            endpoint: crate::on_device::BASE.into(),
+            model: "bonsai-2-4b".into(),
+            ..Default::default()
+        };
+        assert_eq!(ask(&chat, "May it read notes.txt?").as_deref(), Ok("allow"));
+        let heard = heard.lock().unwrap();
+        let (key, body) = &heard[0];
+        assert_eq!(key, "Bearer k-live");
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
+        assert_eq!(body["top_k"], 20);
+        *SERVING.lock().unwrap() = None;
     }
 }
