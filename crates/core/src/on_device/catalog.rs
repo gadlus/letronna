@@ -107,6 +107,35 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// Ask this model as it answers best: its sampling, its thinking
+    /// turned off, llama-server's own reading of any thoughts, and a reply
+    /// held to `cap` tokens.
+    pub fn shape(&self, body: &mut serde_json::Value, cap: u64) {
+        let Some(body) = body.as_object_mut() else {
+            return;
+        };
+        let s = self.sampling;
+        body.insert("temperature".into(), s.temperature.into());
+        body.insert("top_p".into(), s.top_p.into());
+        body.insert("top_k".into(), s.top_k.into());
+        body.insert("presence_penalty".into(), s.presence_penalty.into());
+        if self.thinking == Thinking::Off {
+            let kwargs = body
+                .entry("chat_template_kwargs")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(kwargs) = kwargs.as_object_mut() {
+                kwargs.insert("enable_thinking".into(), false.into());
+            }
+        }
+        body.insert("reasoning_format".into(), "auto".into());
+        let asked = body
+            .get("max_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(cap);
+        body.insert("max_tokens".into(), asked.min(cap).into());
+        body.remove("reasoning_effort");
+    }
+
     /// The file to run on a machine, given whether the main one fits there.
     pub fn pack(&self, smaller: bool) -> &Pack {
         match (smaller, &self.smaller) {
@@ -687,6 +716,25 @@ mod tests {
             .map(|e| e.id)
             .collect();
         assert_eq!(searching, ["bonsai-2-4b"]);
+    }
+
+    #[test]
+    fn a_request_carries_the_models_sampling_and_turns_its_thinking_off() {
+        let mut body = serde_json::json!({"max_tokens": 32_000, "reasoning_effort": "high"});
+        entry("bonsai-2-4b").unwrap().shape(&mut body, 2048);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5,
+                "chat_template_kwargs": {"enable_thinking": false},
+                "reasoning_format": "auto", "max_tokens": 2048,
+            })
+        );
+        let mut body = serde_json::json!({"max_tokens": 100});
+        entry("qwen3-coder-next").unwrap().shape(&mut body, 2048);
+        assert_eq!(body["max_tokens"], 100);
+        assert_eq!(body["top_k"], 40);
+        assert!(body.get("chat_template_kwargs").is_none());
     }
 
     #[test]

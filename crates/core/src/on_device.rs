@@ -14,6 +14,8 @@
 mod catalog;
 mod fit;
 mod machine;
+pub mod runtime;
+pub mod shelf;
 
 pub use catalog::{
     Asset, BUILD, CATALOG, Entry, Pack, RUNTIMES, Runtime, SAMPLING, Sampling, Thinking, Tools,
