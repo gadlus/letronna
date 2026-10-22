@@ -4382,6 +4382,7 @@ dependencies = [
 name = "letronna-core"
 version = "0.1.0-alpha.4.2"
 dependencies = [
+ "ash",
  "async-channel",
  "base64",
  "bip39",
@@ -4397,6 +4398,8 @@ dependencies = [
  "landlock",
  "libc",
  "md-5",
+ "objc2-foundation 0.3.2",
+ "objc2-metal 0.3.2",
  "pdf-extract",
  "quick-xml",
  "regex",
@@ -4409,6 +4412,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sysinfo",
  "tar",
  "tiny-keccak",
  "toml 1.1.6+spec-1.1.0",
@@ -4421,6 +4425,7 @@ dependencies = [
  "tungstenite",
  "webpki-roots 1.0.9",
  "weezl",
+ "windows 0.61.3",
  "windows-sys 0.59.0",
  "x11rb",
  "zbus",
