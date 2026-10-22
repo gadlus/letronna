@@ -225,6 +225,9 @@ pub struct Live {
     /// Set while the turns the window dropped are summarized, until the
     /// reply starts.
     pub compacting: bool,
+    /// What the reply waits on before its first word, as told: a model on
+    /// this computer loading, or another chat ahead of it.
+    pub waiting: Option<String>,
 }
 
 /// One user turn in flight.
@@ -371,6 +374,9 @@ impl Turn {
         // follows the summary from the reply, so either is under way.
         self.live.retrying = None;
         self.live.compacting = false;
+        if !matches!(event, Event::Note(_)) {
+            self.live.waiting = None;
+        }
         match event {
             Event::Delta(text) => self.live.content.push_str(text),
             Event::Reasoning(text) => self.live.reasoning.push_str(text),
@@ -413,8 +419,7 @@ impl Turn {
                 self.live.retrying = Some(retry.clone());
             }
             Event::Switched(switch) => self.live.switched = Some(switch.clone()),
-            // The front end tells the user.
-            Event::Note(_) => {}
+            Event::Note(note) => self.live.waiting = Some(note.clone()),
             Event::Compacting => self.live.compacting = true,
             // The front end keeps it with the session.
             Event::Summarized { .. } => {}

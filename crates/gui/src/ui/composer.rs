@@ -33,6 +33,8 @@ impl Chat {
     /// search box.
     pub(crate) fn model_matches(&self, cx: &App) -> Vec<(String, String)> {
         let mut matches = self.models_named(&self.model_search.read(cx).value());
+        // Models on this computer have a section of their own above these.
+        matches.retain(|(gateway, _)| gateway != letronna_core::on_device::NAME);
         if let Some(provider) = &self.model_provider {
             matches.retain(|(gateway, _)| gateway == provider);
         }
@@ -189,6 +191,7 @@ impl Chat {
     pub(crate) fn open_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let here = self.store.conversations[self.store.active].id;
         self.model_open = true;
+        self.look_at_this_computer(cx);
         self.model_kind = self.media_kinds.get(&here).copied().unwrap_or("chat");
         self.model_search.update(cx, |search, cx| {
             search.set_value("", window, cx);
@@ -296,6 +299,11 @@ impl Chat {
                 Some(model) => model.rsplit('/').next().unwrap_or(model).to_string(),
                 None => format!("{} · Auto", kind_label(kind)),
             },
+            // A model here by its name, as its id is a file's.
+            None if on == letronna_core::on_device::NAME => {
+                letronna_core::on_device::entry(&current)
+                    .map_or_else(|| current.clone(), |entry| entry.name.to_owned())
+            }
             None => current.rsplit('/').next().unwrap_or(&current).to_string(),
         };
         let mut list = v_flex()
@@ -318,7 +326,12 @@ impl Chat {
         } else {
             Vec::new()
         };
-        if self.model_open && chat && matches.is_empty() {
+        let here = (self.model_open && chat)
+            .then(|| self.on_device_section(&self.model_search.read(cx).value(), cx))
+            .flatten();
+        let any_here = here.is_some();
+        list = list.children(here);
+        if self.model_open && chat && matches.is_empty() && !any_here {
             list = list.child(
                 div()
                     .px_2()
@@ -406,6 +419,11 @@ impl Chat {
                         }))
                     }),
             );
+        }
+        // With nothing downloaded, one quiet line says where to get a model
+        // that runs offline; the downloads themselves are in Settings.
+        if self.model_open && chat && self.shelved.is_empty() && self.model_provider.is_none() {
+            list = list.child(self.on_device_hint(cx));
         }
         if self.model_open && !chat {
             let query = self.model_search.read(cx).value().to_lowercase();

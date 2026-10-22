@@ -395,9 +395,9 @@ mod tests {
     // Deliberately not `use super::*`: the prelude re-exports gpui, whose own
     // `test` macro would shadow the built-in attribute here.
     use super::{
-        BLUE, BLUE_PRESSED, DANGER, DANGER_PRESSED, MIDNIGHT, MUTED, NIGHT, NIGHT_PALETTE, ON_BLUE,
-        PAPER_PALETTE, RAISED, SELECTED, SIDEBAR_ON, SIDEBAR_TEXT, SIGNAL, TEXT, follows_system,
-        palette_for, paper_highlight, pinned_dark,
+        BLUE, BLUE_PRESSED, DANGER, DANGER_PRESSED, GREEN, MIDNIGHT, MUTED, NIGHT, NIGHT_PALETTE,
+        ON_BLUE, PAPER_PALETTE, RAISED, SELECTED, SIDEBAR_ON, SIDEBAR_TEXT, SIGNAL, TEXT,
+        follows_system, palette_for, paper_highlight, pinned_dark,
     };
     use gpui::{Rgba, WindowAppearance};
     use gpui_component::highlighter::HighlightTheme;
@@ -442,6 +442,9 @@ mod tests {
             ("muted on the selected sidebar row", MUTED, SIDEBAR_ON),
             ("text on midnight, the title bar's glyphs", TEXT, MIDNIGHT),
             ("danger on night", DANGER, NIGHT),
+            // A model's verdict, "Runs well", on Settings and in the picker.
+            ("green on night", GREEN, NIGHT),
+            ("green on raised", GREEN, RAISED),
             ("midnight on danger", MIDNIGHT, DANGER),
             ("midnight on pressed danger", MIDNIGHT, DANGER_PRESSED),
         ];

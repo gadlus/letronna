@@ -196,6 +196,15 @@ pub(crate) struct Chat {
     /// The provider the model picker is narrowed to; None shows them all.
     pub(crate) model_provider: Option<String>,
     pub(crate) model_search: Entity<InputState>,
+    /// This computer, as last looked at, for the verdicts on the models it
+    /// could download; None until the first look is in.
+    pub(crate) machine: Option<letronna_core::on_device::Machine>,
+    /// When the picker or the Manage page last asked for a look.
+    pub(crate) machine_asked: Option<std::time::Instant>,
+    /// The models downloaded, and those that read photos, as last seen, so
+    /// one finishing is told and listed.
+    pub(crate) shelved: Vec<&'static str>,
+    pub(crate) seeing: Vec<&'static str>,
     pub(crate) keys: std::collections::HashMap<String, String>,
     pub(crate) gateway_pick: Entity<String>,
     pub(crate) presence_pick: Entity<String>,
@@ -954,7 +963,9 @@ impl Chat {
             account.is_some(),
             keys.values().any(|k| !k.trim().is_empty()),
             !store.settings.custom_endpoint.trim().is_empty()
-                || !letronna_core::gateway::own().is_empty(),
+                || !letronna_core::gateway::own().is_empty()
+                // A model downloaded to this computer answers with nothing set up.
+                || !letronna_core::on_device::shelf::ready_ids().is_empty(),
             active.messages.is_empty(),
         )
         .then_some(active.id);
@@ -1002,6 +1013,14 @@ impl Chat {
             media_turn: false,
             model_open: false,
             model_provider: None,
+            machine: letronna_core::on_device::cached(),
+            machine_asked: None,
+            shelved: letronna_core::on_device::shelf::ready_ids(),
+            seeing: letronna_core::on_device::CATALOG
+                .iter()
+                .filter(|e| letronna_core::on_device::shelf::eyes_ready(e))
+                .map(|e| e.id)
+                .collect(),
             model_search,
             keys,
             gateway_pick,
@@ -1208,6 +1227,10 @@ impl Chat {
         });
         this._subscriptions.push(quitting);
         this.load_models(window, cx);
+        // Downloads redraw their rings, and the verdicts on models to get
+        // need a look at this computer, taken off this thread.
+        this.watch_shelf(cx);
+        this.look_at_this_computer(cx);
         // Directly, not through `focus_composer`: the window's root does
         // not exist yet to ask about dialogs, and there can be none.
         this.composer
@@ -1641,6 +1664,13 @@ impl Chat {
         if prompt.chars().count() > 12_000 {
             self.error = Some("Please keep each message under 12,000 characters.".into());
             cx.notify();
+            return;
+        }
+        // A photo to a model on this computer waits for its photo reading,
+        // fetched once; the message stays in the box as typed.
+        if !images.is_empty() && self.photos_wait(window, cx) {
+            self.composer
+                .update(cx, |input, cx| input.set_value(prompt, window, cx));
             return;
         }
         // Hosted models the account cannot pay for: the message stays in the
