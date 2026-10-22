@@ -261,7 +261,10 @@ fn beside(args: &Value) -> Value {
 /// as the same bytes every time, so the cached prefix holds, and `resolve`
 /// reads it back as it was saved.
 pub(crate) fn wrap(wired: &mut Value, connection: &Connection, on_demand: OnDemand) {
-    let Some(calls) = wired["tool_calls"].as_array_mut() else {
+    // Indexed for writing, a message with no calls would gain
+    // `"tool_calls": null`, which a strict gateway turns the request down
+    // over.
+    let Some(calls) = wired.get_mut("tool_calls").and_then(Value::as_array_mut) else {
         return;
     };
     for function in calls.iter_mut().map(|call| &mut call["function"]) {
@@ -1015,6 +1018,24 @@ pub(crate) mod tests {
         };
         wrap(&mut wired, &connection(), mcp);
         assert_eq!(wired, saved());
+    }
+
+    #[test]
+    fn a_message_with_no_calls_goes_out_with_no_tool_calls_field() {
+        // Vercel's AI Gateway turned a request down with "expected array,
+        // received null" at a user message's tool_calls.
+        let on_demand = OnDemand {
+            mcp: true,
+            rare: true,
+        };
+        for message in [
+            json!({"role": "user", "content": "a"}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "b"}),
+        ] {
+            let mut wired = message.clone();
+            wrap(&mut wired, &connection(), on_demand);
+            assert_eq!(wired, message);
+        }
     }
 
     /// A Jev on this computer that answers every question with `answer`
