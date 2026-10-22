@@ -2249,8 +2249,8 @@ fn unbuilt(spec: &Spec, turn: &Turn, begun: usize) -> Option<Message> {
 }
 
 /// The TypeScript and JavaScript files the tool results in `messages`
-/// changed after the last build that passed, each once and as the model
-/// named them.
+/// changed after the last build of their package that passed, each once and
+/// as the model named them.
 fn unbuilt_files(messages: &[Message], workspace: &Path) -> Vec<String> {
     let mut files: Vec<String> = Vec::new();
     for result in messages.iter().filter(|message| message.role == "tool") {
@@ -2258,7 +2258,7 @@ fn unbuilt_files(messages: &[Message], workspace: &Path) -> Vec<String> {
         if result.name == "run_command" {
             let line = args["command"].as_str().unwrap_or_default();
             if crate::builds::builds(line) && passed(result, &args, workspace) {
-                files.clear();
+                files.retain(|file| !crate::builds::built(line, workspace, file));
             }
             continue;
         }
@@ -6997,6 +6997,36 @@ pub(crate) mod tests {
         assert_eq!(report.status, Outcome::Done);
         assert_eq!(provider.sent().len(), 3);
         assert_eq!(report.text, "Done.");
+    }
+
+    #[test]
+    fn a_check_of_the_whole_project_does_not_stand_in_for_a_packages_build() {
+        let _data = data("unbuilt-package");
+        let dir = scratch("unbuilt-package");
+        typescript_project(&dir);
+        std::fs::create_dir_all(dir.join("packages/app")).unwrap();
+        std::fs::write(
+            dir.join("packages/app/package.json"),
+            r#"{"scripts": {"build": "rollup -c"}}"#,
+        )
+        .unwrap();
+        let (endpoint, provider) = provider(vec![
+            reply("", &[write_to("packages/app/src/a.ts")]),
+            // The top's check passes, but it is not the package's build.
+            reply("", &[command("./tsc")]),
+            reply("Done.", &[]),
+            reply("Built. Done.", &[]),
+        ]);
+        let report = finished(own(endpoint, &dir, AGENTS + 1_815));
+        let sent = provider.sent();
+        assert_eq!(report.status, Outcome::Done);
+        let asked = messages(&sent[3]).last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let package = "cd packages/app && npm run build".to_owned();
+        assert_eq!(asked, crate::builds::notice(&[package]));
+        assert_eq!(report.text, "Built. Done.");
     }
 
     #[test]
