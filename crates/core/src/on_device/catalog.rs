@@ -266,7 +266,8 @@ pub static CATALOG: &[Entry] = &[
         native_context: 262_144,
         sampling: SAMPLING,
         thinking: Thinking::Off,
-        tools: Tools::Chat,
+        // 12/12 twice on the search eval, asked as Letronna asks it.
+        tools: Tools::Search,
     },
     Entry {
         id: "qwen-3.5-9b",
@@ -715,7 +716,7 @@ mod tests {
             .filter(|e| e.tools != Tools::Chat)
             .map(|e| e.id)
             .collect();
-        assert_eq!(searching, ["bonsai-2-4b"]);
+        assert_eq!(searching, ["bonsai-2-4b", "bonsai-2-9b"]);
     }
 
     #[test]
