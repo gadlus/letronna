@@ -26,6 +26,7 @@ mod letronna;
 mod ollama;
 mod openai;
 mod openrouter;
+mod this_computer;
 mod xai;
 
 #[cfg(test)]
@@ -142,6 +143,7 @@ pub static PROVIDERS: &[&dyn Provider] = &[
     &gemini::Gemini,
     &xai::Xai,
     &openrouter::OpenRouter,
+    &this_computer::ThisComputer,
     &ollama::Ollama,
     &custom::Custom,
 ];

@@ -448,6 +448,8 @@ fn suggest_of(
     subjects: &[String],
 ) -> Result<String, crate::side::Failed> {
     let endpoint = crate::chat::validate(connection)?;
+    let reached = crate::on_device::reach::reach(connection, endpoint, false)?;
+    let endpoint = reached.url.clone();
     let body = suggest_body(connection, diff, subjects);
     let (endpoint, body) =
         crate::chat::to_responses(connection, &endpoint, &body).unwrap_or((endpoint, body));
@@ -455,7 +457,8 @@ fn suggest_of(
     let request = crate::chat::client()?
         .post(endpoint)
         .timeout(Duration::from_secs(60));
-    let value: Value = crate::chat::carrying(request, connection, &body)
+    let value: Value = reached
+        .sign(crate::chat::carrying(request, connection, &body))
         .send()
         .and_then(|r| r.error_for_status())
         .and_then(crate::providers::wire::openai_responses::json)

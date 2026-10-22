@@ -314,6 +314,10 @@ fn models(connection: Option<&Connection>) -> String {
                         false => "not signed in".to_owned(),
                     }
                 }
+                crate::on_device::NAME => match crate::on_device::shelf::ready_ids().len() {
+                    0 => "with nothing downloaded".to_owned(),
+                    n => format!("with {n} downloaded"),
+                },
                 _ if !gateway.needs_key => "needs no key".to_owned(),
                 name => match key(name) {
                     Some(at) => format!("key set {at}"),
@@ -1103,7 +1107,8 @@ mod tests {
             // ChatGPT and Claude are left out while their plugins are off.
             "Providers: Letronna signed in; OpenAI key set in the vault; \
              Anthropic no key; Gemini no key; xAI no key; \
-             OpenRouter key set in keys.json; Ollama needs no key; Custom address set, no key.",
+             OpenRouter key set in keys.json; This computer with nothing downloaded; \
+             Ollama needs no key; Custom address set, no key.",
             "Web search: Brave in use, key in the vault; Tavily not set up; Exa not set up; \
              SearXNG saved, not in use; DuckDuckGo not in use.",
             "Also set: Browser in the vault.",

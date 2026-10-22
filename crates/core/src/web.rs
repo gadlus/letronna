@@ -515,6 +515,17 @@ pub(crate) fn stopped(url: &reqwest::Url, asker: &Asker, now: Instant) -> Result
     })
 }
 
+/// Whether a request to the web failed to connect lately, so the next
+/// would only wait to fail too.
+pub(crate) fn out_of_reach() -> bool {
+    let now = Instant::now();
+    with_unreachable(|last| {
+        last.as_ref().is_some_and(|last| {
+            last.sure && now.saturating_duration_since(last.at) < UNREACHABLE_TIME
+        })
+    })
+}
+
 /// Notes how a request to `url` went, `failure` when it got no answer and
 /// `moved` when a redirect chose `url`: one that could not connect to the
 /// web stops the next, and any answer, an error page too, shows the web is

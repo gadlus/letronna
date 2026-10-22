@@ -686,13 +686,13 @@ fn says_version(program: &Path, version: &str) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn make_runnable(path: &Path) {
+pub(crate) fn make_runnable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
 }
 
 #[cfg(not(unix))]
-fn make_runnable(_: &Path) {}
+pub(crate) fn make_runnable(_: &Path) {}
 
 fn client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
@@ -715,7 +715,7 @@ fn client() -> Result<reqwest::blocking::Client, String> {
 
 /// Updates come over https. Plain http is let through only to this computer,
 /// where the tests serve them.
-fn allowed(url: &reqwest::Url) -> bool {
+pub(crate) fn allowed(url: &reqwest::Url) -> bool {
     match url.scheme() {
         "https" => true,
         "http" => matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")),

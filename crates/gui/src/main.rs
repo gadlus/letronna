@@ -832,6 +832,7 @@ fn main() {
             letronna_core::mcp::stop_all();
             letronna_core::lsp::stop_all();
             letronna_core::browser::close_hidden();
+            letronna_core::on_device::runtime::quit();
             letronna_core::schedule::stop();
             letronna_core::diag::stop();
             async {}

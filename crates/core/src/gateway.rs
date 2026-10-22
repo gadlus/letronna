@@ -548,6 +548,11 @@ pub fn status(
             true,
         ),
         Some(AuthKind::OAuth(_)) => ("Not signed in".into(), false, false),
+        // Its models are files, there whether or not a server runs them.
+        Some(AuthKind::None) if name == crate::on_device::NAME => match models {
+            0 => ("Nothing downloaded".into(), false, false),
+            n => (format!("Downloaded · {}", count(n)), true, true),
+        },
         Some(AuthKind::None) if models > 0 => (format!("Running · {}", count(models)), true, true),
         Some(AuthKind::None) => ("Not running".into(), false, false),
         Some(AuthKind::Url) if base_url(name, custom).trim().is_empty() => {

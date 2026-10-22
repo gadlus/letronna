@@ -14,6 +14,12 @@
 mod catalog;
 mod fit;
 mod machine;
+pub(crate) mod reach;
+pub mod runtime;
+pub mod shelf;
+
+pub(crate) use reach::remember_all;
+pub use reach::{BASE, NAME, at, entry_of, shown};
 
 pub use catalog::{
     Asset, BUILD, CATALOG, Entry, Pack, RUNTIMES, Runtime, SAMPLING, Sampling, Thinking, Tools,

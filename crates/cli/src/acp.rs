@@ -185,6 +185,7 @@ pub fn run() -> i32 {
     );
     letronna_core::jobs::stop_all();
     letronna_core::mcp::stop_all();
+    letronna_core::on_device::runtime::quit();
     letronna_core::browser::close_hidden();
     letronna_core::diag::stop();
     0

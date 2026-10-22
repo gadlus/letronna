@@ -103,6 +103,11 @@ fn every_base_is_given_or_asked_for_and_speaks_its_format() {
 #[test]
 fn every_provider_reads_its_model_list() {
     for p in all() {
+        // Its list is what is downloaded, which no server is asked for; its
+        // own test reads it.
+        if p.info().base == crate::on_device::BASE {
+            continue;
+        }
         let (body, ids) = fixture(p.wire());
         let base = serve(body);
         if p.wire() == Wire::Anthropic {

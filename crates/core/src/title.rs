@@ -85,13 +85,18 @@ pub fn name(chat: &Connection, messages: &[Message]) -> Result<String, String> {
         return Err("Nothing has been said yet to name the session after.".into());
     };
     let at_letronna = hosted(&chat.endpoint);
-    let namers = order(
-        &settings.title_model,
-        &settings.side_model,
-        &chat.model,
-        at_letronna,
-        crate::auth::signed_in(),
-    );
+    // A chat on this computer is named by its own model, the one loaded.
+    let namers = if crate::on_device::at(&chat.endpoint) {
+        vec![Namer::Chat]
+    } else {
+        order(
+            &settings.title_model,
+            &settings.side_model,
+            &chat.model,
+            at_letronna,
+            crate::auth::signed_in(),
+        )
+    };
     let mut why = String::from("No model gave a name.");
     for namer in namers {
         // The chat's own model is taken at its word; a quicker one is
@@ -228,6 +233,10 @@ fn cut(text: &str, chars: usize) -> String {
 /// least one.
 fn names(connection: &Connection, said: &str) -> Result<Vec<String>, String> {
     let endpoint = crate::chat::validate(connection)?;
+    // Only while its server is loaded and idle: a name is not worth loading
+    // a model for, nor making an answer wait.
+    let reached = crate::on_device::reach::reach(connection, endpoint, true)?;
+    let endpoint = reached.url.clone();
     let mut body = json!({
         "model": connection.model.trim(),
         "messages": [
@@ -241,7 +250,8 @@ fn names(connection: &Connection, said: &str) -> Result<Vec<String>, String> {
     let (endpoint, body) =
         crate::chat::to_responses(connection, &endpoint, &body).unwrap_or((endpoint, body));
     let request = crate::chat::client()?.post(endpoint).timeout(WAIT);
-    let value: Value = crate::chat::carrying(request, connection, &body)
+    let value: Value = reached
+        .sign(crate::chat::carrying(request, connection, &body))
         .send()
         .and_then(|r| r.error_for_status())
         .and_then(crate::providers::wire::openai_responses::json)
@@ -441,5 +451,68 @@ mod tests {
                 .ends_with("The latest message:\nnow the logout too")
         );
         assert_eq!(said(&[said_as("assistant", "hello")]), None);
+    }
+
+    #[test]
+    fn a_chat_on_this_computer_is_named_by_its_own_model_only_while_it_is_idle() {
+        use crate::on_device::reach::tests::{SEAMS, SERVING, shelved};
+        use std::sync::{Arc, Mutex};
+        let _seams = SEAMS.lock().unwrap_or_else(|e| e.into_inner());
+        let (_lock, scratch) = shelved("title-here", &["bonsai-2-4b"]);
+        // Settings that would send any other chat's words to other models.
+        std::fs::write(
+            scratch.join("settings.json"),
+            r#"{"endpoint": "", "model": "m", "title_model": "tiny", "side_model": "small"}"#,
+        )
+        .unwrap();
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let kept = heard.clone();
+        let base = crate::mcp_auth::tests::serve(move |request| {
+            let body: Value = serde_json::from_str(&request.body).unwrap_or(Value::Null);
+            kept.lock().unwrap().push((
+                body["model"].as_str().unwrap_or_default().to_owned(),
+                request
+                    .headers
+                    .get("authorization")
+                    .cloned()
+                    .unwrap_or_default(),
+            ));
+            let reply = json!({"choices": [{"message": {"content": "Fixing the login page"}}]});
+            (
+                200,
+                vec![("Content-Type", "application/json".to_owned())],
+                reply.to_string(),
+            )
+        });
+        let chat = Connection {
+            endpoint: crate::on_device::BASE.into(),
+            model: "bonsai-2-4b".into(),
+            ..Default::default()
+        };
+        let messages = [
+            Message {
+                role: "user".into(),
+                content: "Fix the login page.".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".into(),
+                content: "Done.".into(),
+                ..Default::default()
+            },
+        ];
+        *SERVING.lock().unwrap() = None;
+        assert!(name(&chat, &messages).is_err());
+        assert!(heard.lock().unwrap().is_empty());
+        *SERVING.lock().unwrap() = Some((format!("{base}/v1"), "k-live".into(), 16_384));
+        assert_eq!(
+            name(&chat, &messages).as_deref(),
+            Ok("Fixing the login page")
+        );
+        assert_eq!(
+            *heard.lock().unwrap(),
+            [("bonsai-2-4b".to_owned(), "Bearer k-live".to_owned())]
+        );
+        *SERVING.lock().unwrap() = None;
     }
 }

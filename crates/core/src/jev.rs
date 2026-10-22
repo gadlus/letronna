@@ -297,6 +297,10 @@ fn route_of(
     key: Option<&str>,
     account: Option<&str>,
 ) -> Result<Route, &'static str> {
+    // Whatever Settings say, a chat on this computer is never sent out.
+    if crate::on_device::at(&connection.endpoint) {
+        return Err(NEARBY);
+    }
     match mode.trim() {
         "names" => return Err(WORDS_ONLY),
         // Asked anywhere it can be reached.
@@ -657,5 +661,24 @@ mod tests {
         assert_eq!(read(&answer("none", 0.9)), Ok(Judged::Nothing));
         assert_eq!(read(&answer("browse", 0.2)), Ok(Judged::Nothing));
         assert!(read(&json!({"error": "no"})).is_err());
+    }
+
+    #[test]
+    fn a_chat_on_this_computer_never_asks_jev_whatever_the_settings() {
+        let here = on(crate::on_device::BASE);
+        for mode in ["", "auto", "jev"] {
+            assert_eq!(
+                route_of(
+                    &here,
+                    mode,
+                    "https://api.example.com/v1",
+                    "m",
+                    Some("k"),
+                    Some("tok")
+                ),
+                Err(NEARBY),
+                "{mode}"
+            );
+        }
     }
 }

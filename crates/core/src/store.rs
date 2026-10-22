@@ -556,6 +556,10 @@ pub struct Settings {
     /// says how to turn it back on or add a key.
     #[serde(default = "yes")]
     pub keyless_search: bool,
+    /// Answer with a model downloaded to this computer when the hosted one
+    /// cannot be reached, rather than not at all.
+    #[serde(default = "yes")]
+    pub local_stand_in: bool,
     /// How find_tools ranks the tools it finds: "auto" or empty for Jev
     /// where it can be reached and the chat is hosted anyway, "jev" for Jev
     /// wherever it can be reached, "names" for the words alone (`jev`).
@@ -602,6 +606,7 @@ impl Default for Settings {
             memory_saving: crate::memory::Saving::WhenAsked,
             memory_scope: crate::memory::Scope::Auto,
             keyless_search: true,
+            local_stand_in: true,
             tool_search: String::new(),
             jev_endpoint: String::new(),
             jev_model: String::new(),
@@ -6014,6 +6019,16 @@ pub(crate) mod tests {
         // A file from before the setting starts it on, as a first run does.
         assert!(read("").keyless_search && super::Settings::default().keyless_search);
         assert!(!read(r#", "keyless_search": false"#).keyless_search);
+    }
+
+    #[test]
+    fn a_settings_file_from_before_lets_this_computer_stand_in() {
+        let read = |extra: &str| {
+            let text = format!(r#"{{"endpoint": "", "model": "m"{extra}}}"#);
+            super::read_settings(text.as_bytes()).unwrap()
+        };
+        assert!(read("").local_stand_in && super::Settings::default().local_stand_in);
+        assert!(!read(r#", "local_stand_in": false"#).local_stand_in);
     }
 
     #[test]
