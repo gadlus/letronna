@@ -89,7 +89,10 @@ impl AssetSource for Assets {
                 "tree-structure",
                 "users-three",
                 "brain",
-                "wallet"
+                "wallet",
+                "download",
+                "cpu",
+                "hard-drives"
             ),
             ("telegram", "discord", "slack", "whatsapp")
         ))
@@ -146,6 +149,9 @@ pub(crate) enum AppIcon {
     Crew,
     Brain,
     Wallet,
+    Download,
+    Cpu,
+    Drives,
 }
 impl IconNamed for AppIcon {
     fn path(self) -> SharedString {
@@ -195,6 +201,9 @@ impl IconNamed for AppIcon {
             AppIcon::Crew => "icons/users-three.svg",
             AppIcon::Brain => "icons/brain.svg",
             AppIcon::Wallet => "icons/wallet.svg",
+            AppIcon::Download => "icons/download.svg",
+            AppIcon::Cpu => "icons/cpu.svg",
+            AppIcon::Drives => "icons/hard-drives.svg",
         }
         .into()
     }

@@ -294,6 +294,18 @@ pub fn used() -> u64 {
     walk(&dir()) + walk(&runtimes())
 }
 
+/// What `entry`'s files take on the disk, parts included.
+pub fn used_by(entry: &Entry) -> u64 {
+    let Ok(items) = std::fs::read_dir(dir().join(entry.id)) else {
+        return 0;
+    };
+    items
+        .flatten()
+        .filter_map(|item| item.metadata().ok())
+        .map(|meta| meta.len())
+        .sum()
+}
+
 /// The free space on the disk the models go to.
 pub fn free_space() -> Option<u64> {
     let dir = dir();

@@ -137,8 +137,8 @@ impl Chat {
             ),
             (
                 "On this computer",
-                "Ollama: works offline, no key.",
-                ollama > 0,
+                "A model downloaded here, or Ollama: works offline, no key.",
+                ollama > 0 || !self.shelved.is_empty(),
             ),
         ];
         let mut options = v_flex().gap_2();
@@ -225,7 +225,11 @@ impl Chat {
                 cx,
             )
             .into_any_element(),
-            _ => self.local_model_row(cx).into_any_element(),
+            _ => v_flex()
+                .gap_2()
+                .children(self.suggested_model_row(cx))
+                .child(self.local_model_row(cx))
+                .into_any_element(),
         };
         let ready = self.account.is_some() || !self.models.is_empty();
         v_flex()

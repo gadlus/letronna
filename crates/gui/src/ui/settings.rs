@@ -19,6 +19,7 @@ pub(crate) const PAGES: &[(&str, AppIcon)] = &[
     ("Accounts", AppIcon::Plugs),
     ("Search", AppIcon::Search),
     ("Model", AppIcon::Robot),
+    ("On this computer", AppIcon::Cpu),
     ("Appearance", AppIcon::Palette),
     ("Thinking", AppIcon::Sparkles),
     ("Memory", AppIcon::FileText),
@@ -1020,6 +1021,7 @@ impl Chat {
                 .child(self.memory.clone())
                 .into_any_element(),
             "About" => about_page(&chat, self, cx).into_any_element(),
+            "On this computer" => self.on_device_page(cx).into_any_element(),
             "Search" => search_page(
                 self.account_search(),
                 self.search_rows(),
@@ -1173,6 +1175,9 @@ fn show_page(name: &'static str, page: &Entity<&'static str>, chat: &Entity<Chat
     });
     if name == "Usage" {
         chat.update(cx, |this, cx| this.load_usage(cx));
+    }
+    if name == "On this computer" {
+        chat.update(cx, |this, cx| this.look_at_this_computer(cx));
     }
     // The terminal may have changed the wallet since this last looked.
     if name == "Wallet" {

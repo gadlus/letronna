@@ -282,7 +282,11 @@ impl Chat {
                 (Some(retry), _) => Some(retry.waiting()),
                 (None, true) => Some("Compacting…".to_owned()),
                 // A long write streams for a while; say so, not Thinking.
-                (None, false) => writing.clone(),
+                // Before the first word, a model on this computer may be
+                // loading or waiting behind another chat, which it says.
+                (None, false) => writing
+                    .clone()
+                    .or_else(|| live.and_then(|l| l.waiting.clone())),
             };
             // Thinking shown as it comes in says Thinking above this already.
             let thinking_shown = !message.reasoning.is_empty() && self.store.settings.thinking;
