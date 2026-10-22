@@ -13,6 +13,13 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ## [Unreleased]
 
+### Added
+- **All** — Models that run on this computer, with no internet and nothing sent anywhere: Ternary Bonsai 2 (4B, 9B, 27B), Gemma 4 E4B, Qwen3.5 9B, Qwen3.8 27B, Qwen3.6 35B-A3B and Qwen3-Coder-Next, run by llama.cpp's server, which is downloaded with the first one and checked by its hash. Each says before it is downloaded whether it runs well here and about how fast, and the one that suits this computer best is marked. Bonsai 2 4B and 9B may search the web while online; the others chat.
+- **All** — When Letronna or another gateway cannot be reached, a downloaded model answers instead and says so ("Switched to Ternary Bonsai 2 · 4B on this computer: Letronna could not be reached"). It can be turned off in Settings › On this computer.
+- **App** — Settings › On this computer: what this computer has, every model with its verdict, and Get, a progress ring with Pause, Resume and Cancel, Use, Delete, Show in Finder or Explorer, and photo reading to add or remove. The model menu lists the models downloaded, under On this computer, and first-run setup offers the suggested one.
+- **App** — Each web search shows as a card above the answer, for every model: "Searching the web" while it runs, then "Searched the web · 5 results" with the query, and a click lists the pages, each opening in the browser.
+- **Terminal** — A model downloaded to this computer is in `/model`, and `letronna --gateway "This computer" --model bonsai-2-4b` runs one; it says when it is loading, or waiting for another chat.
+
 ## [0.1.0-alpha.4.2] - 2026-10-20
 
 ### Added

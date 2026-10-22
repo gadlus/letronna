@@ -23,6 +23,8 @@ Everything Letronna keeps lives in one folder:
 | `media/` | Media made with no project attached, browser screenshots, and pictures attached with `/image` |
 | `pasted/` | A picture taken off the clipboard with Ctrl+V in the terminal, until `/image` attaches it |
 | `browser/` | The shared browser profile. Delete it to sign out of everything. |
+| `models/` | Models downloaded to this computer, their vision packs, and downloads part way (`.part`); also what llama.cpp's server is running now (`runtime.json`) and how fast each model answered here. Delete a model from Settings › On this computer. |
+| `runtime/` | The llama.cpp build that runs those models, checked by its SHA-256 |
 | `prompt-history.jsonl` | What you sent at the terminal's prompt, with its project folder, for ↑ and Ctrl+R in later sessions: the newest 1,000 for each folder, readable by you alone. Answers to questions, keys among them, are never kept, nor is anything typed in a private chat, whether `--private` or `/remember`'s list made it one, a `/branch` of one and one opened again with `/resume` included. Delete it to forget them. |
 | `drafts/` | What is in the terminal's box while Ctrl+G has it open in your editor, readable by you alone; removed when the editor closes |
 
@@ -36,6 +38,7 @@ Keys never reach the model. File tools cannot read the data folder, and the brow
 
 - **Chat text** goes only to the gateway of the selected model. With the Letronna gateway, that is `api.letronna.ai`, which records each request's model and cost for your usage page.
 - **Session names**: once a session's first reply is in, a model gives it a short name. It reads the first message and the start of the reply, never a tool's output. By default (automatic) that is Letronna's quick model when the chat is on the Letronna gateway, otherwise your side model or the chat's own, on the chat's own gateway: a chat on your own key, a company's gateway or a model on this computer is never sent elsewhere to be named. A name from a quick model is checked by Jev where tool search may ask it (Settings › Search), which reads the same words and the names; Letronna's own Jev checks only a chat on the Letronna gateway. Settings › Model or `/model names` picks another model, or turns naming off, which keeps the first line of what you asked.
+- **A model on this computer** keeps everything there: its chats, their names, summaries, the judge of Auto mode and its helpers are all answered by the same model, which listens only on this computer with a key of its own. The one exception is a web search, made only by a model allowed to search, only while this computer is online, and only with the search's words. Downloading a model fetches it from Hugging Face, and llama.cpp from GitHub; nothing of yours goes with them.
 - **Cloud tasks** carry only what the task itself contains (see [Cloud](cloud.md)).
 - **Search, browsing and media tools** contact their services only when the agent uses them, and they ask first.
 - **Local data**: diagnostic logs and crash files stay local.
