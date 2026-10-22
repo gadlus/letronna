@@ -18,7 +18,7 @@ use super::fit::{self, size};
 use super::machine::{self, Backend, Device, Machine};
 use async_channel::{Receiver, Sender};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -626,10 +626,16 @@ fn fetch(
             })?;
         }
     }
+    // Opened to write and moved to its end rather than opened to append: on
+    // Windows an append handle may neither be cut back, as `set_len` below
+    // and a server that ignores the range do, nor flushed to disk.
     let mut out = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(false)
         .open(&part)
+        .map_err(|e| failed(format!("Could not write {}: {e}", part.display())))?;
+    out.seek(SeekFrom::Start(got))
         .map_err(|e| failed(format!("Could not write {}: {e}", part.display())))?;
     if got == 0 {
         out.set_len(0).map_err(|e| failed(e.to_string()))?;
@@ -822,6 +828,7 @@ fn restart(
     out: &mut std::fs::File,
 ) -> Result<(), Attempt> {
     out.set_len(0).map_err(Attempt::Disk)?;
+    out.seek(SeekFrom::Start(0)).map_err(Attempt::Disk)?;
     *got = 0;
     *hash = ring::digest::Context::new(&ring::digest::SHA256);
     Ok(())
@@ -1485,6 +1492,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "a symlink on Windows needs Developer Mode; the tar builds are for macOS and Linux"
+    )]
     fn a_build_keeps_its_library_links_and_refuses_one_reaching_out() {
         let (_lock, scratch) = scratch("shelf-unpack");
         let good = scratch.as_path().join("good.tar.gz");
