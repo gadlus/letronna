@@ -12,7 +12,10 @@
 //! One of those that must end by a deadline, as a benchmark's run does,
 //! keeps trying past them while a wait still ends before it: a gateway down
 //! for longer than eight minutes would otherwise end the run with most of
-//! its time unused, and giving up gains it nothing.
+//! its time unused, and giving up gains it nothing. Such a run does not give
+//! up on a gateway that asks it to come back in an hour either, as one with
+//! no provider for the model does: it keeps asking at its own pace, though a
+//! rate limit's wait, a quota's, is still kept.
 //! A reply whose stream is cut part way is tried again the same way, and
 //! what it had said so far is dropped, never kept or run as if whole.
 //!
@@ -149,9 +152,17 @@ pub fn after(
     if !passes(failure.kind) || failure.lasting {
         return None;
     }
-    let wait = backoff(tried, jitter()).max(failure.retry_after.unwrap_or_default());
+    let mut wait = backoff(tried, jitter()).max(failure.retry_after.unwrap_or_default());
+    let timed = deadline.filter(|_| unattended);
     if wait > patience {
-        return None;
+        // A gateway with no provider for the model asks for an hour or more,
+        // and a run that must end by a deadline would lose the rest of its
+        // time by giving up, so it keeps asking at its own pace. A rate
+        // limit's wait is a quota's, so it is kept.
+        if timed.is_none() || failure.kind == FailureKind::RateLimit {
+            return None;
+        }
+        wait = backoff(tried, jitter());
     }
     if tried < of {
         return Some(Retry {
@@ -163,7 +174,7 @@ pub fn after(
             error: failure.to_string(),
         });
     }
-    let deadline = deadline.filter(|_| unattended)?;
+    let deadline = timed?;
     let left =
         (deadline.saturating_duration_since(Instant::now())).checked_sub(wait + DEADLINE_MARGIN)?;
     // The tries still to come at the longest wait, so the count the
@@ -309,6 +320,15 @@ mod tests {
         let soon = Instant::now() + Duration::from_secs(90);
         assert!(after(&overloaded, 20, true, Some(soon)).is_none());
         assert!(after(&overloaded, 6, false, Some(later)).is_none());
+        // A gateway's hour-long Retry-After is not slept through but not
+        // given up on either; a rate limit's is still kept.
+        let mut down = failure(FailureKind::Overloaded, Some(Duration::from_secs(3_788)));
+        let next = after(&down, 1, true, Some(later)).unwrap();
+        assert!(next.wait <= Duration::from_secs(40), "{:?}", next.wait);
+        assert!(after(&down, 1, true, None).is_none());
+        assert!(after(&down, 1, false, Some(later)).is_none());
+        down.kind = FailureKind::RateLimit;
+        assert!(after(&down, 1, true, Some(later)).is_none());
         // What never passes is never waited out, deadline or not.
         let refused = failure(FailureKind::Auth, None);
         assert!(after(&refused, 1, true, Some(later)).is_none());

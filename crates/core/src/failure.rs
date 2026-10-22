@@ -1091,6 +1091,24 @@ mod tests {
     }
 
     #[test]
+    fn a_gateway_with_no_lender_for_an_hour_is_waited_out_only_by_a_timed_run_nobody_watches() {
+        // As pool.example answered through a DeepSWE round, for about an hour.
+        let body = serde_json::json!({"error": {
+            "message": "no lender was eligible to serve this request",
+            "type": "upstream_error",
+        }});
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, "3788".parse().unwrap());
+        let failure = classify(Some(503), &headers, &body);
+        assert!(!failure.lasting);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30 * 60);
+        let retry = crate::retry::after(&failure, 1, true, Some(deadline)).unwrap();
+        assert!(retry.wait < Duration::from_secs(60), "{:?}", retry.wait);
+        assert!(crate::retry::after(&failure, 1, true, None).is_none());
+        assert!(crate::retry::after(&failure, 1, false, Some(deadline)).is_none());
+    }
+
+    #[test]
     fn what_a_reply_that_is_not_json_said_is_kept() {
         let said = |status, raw: &str| {
             let body: Value = serde_json::from_str(raw).unwrap_or_default();
