@@ -120,11 +120,17 @@ impl Chat {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if message.role == "tool" {
+            // A web search is a card of its own, its pages a click away.
+            let row = if message.name == letronna_core::search::NAME {
+                self.search_card(index, message, cx)
+            } else {
+                self.tool_row(index, message, window, cx).into_any_element()
+            };
             // A turn stopped part way ends on a tool; its buttons go under it.
             return v_flex()
                 .w_full()
                 .gap_1()
-                .child(self.tool_row(index, message, window, cx))
+                .child(row)
                 .children(bar)
                 .into_any_element();
         }

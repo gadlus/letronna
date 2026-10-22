@@ -1042,12 +1042,15 @@ fn lock(gateways: &Mutex<Gateways>) -> MutexGuard<'_, Gateways> {
 /// The model's way to search the web.
 pub struct SearchWeb;
 
+/// The search tool's name, as calls and their results carry it.
+pub const NAME: &str = "search_web";
+
 impl Tool for SearchWeb {
     fn hides_key_shapes(&self) -> bool {
         true
     }
     fn name(&self) -> &'static str {
-        "search_web"
+        NAME
     }
     fn description(&self) -> &'static str {
         "Search the web. Returns a numbered list of results, each with its title, address and a snippet. Snippets are cut short and may be stale: read the page that settles a fact with web_fetch, preferring the primary source, and give its address. The same search again within 10 minutes gives the earlier answer."
@@ -2170,6 +2173,45 @@ fn words(html: &str) -> String {
     plain.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// A page a search found, as the window lists it under the search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    pub title: String,
+    pub url: String,
+}
+
+/// The pages in what search_web answered, in its order: each numbered line
+/// of its listing and the address under it. The fences around it, a memo's
+/// note before it and a gateway's longer name pass by; an answer that found
+/// nothing has none.
+pub fn sources(output: &str) -> Vec<Source> {
+    let (text, _) = crate::untrusted::shown(NAME, output);
+    let mut found = Vec::new();
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some((number, title)) = line.split_once(". ") else {
+            continue;
+        };
+        if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Some(next) = lines.peek() else {
+            break;
+        };
+        let url = next.trim();
+        if !next.starts_with("   ") || !(url.starts_with("https://") || url.starts_with("http://"))
+        {
+            continue;
+        }
+        found.push(Source {
+            title: title.trim().to_owned(),
+            url: url.to_owned(),
+        });
+        lines.next();
+    }
+    found
+}
+
 /// The numbered list the model reads.
 fn listing(service: &str, query: &str, hits: &[Hit]) -> String {
     if hits.is_empty() {
@@ -2263,6 +2305,47 @@ pub(crate) mod tests {
             "no more than asked for"
         );
         assert!(hits("Brave", &json!({"error": "nope"}), 5).is_empty());
+    }
+
+    #[test]
+    fn the_pages_a_search_found_are_read_back_from_its_listing() {
+        let hits = vec![
+            Hit {
+                title: "Tokyo weather. Today".into(),
+                url: "https://weather.example/tokyo".into(),
+                snippet: "2. Sunny, 18°C".into(),
+            },
+            Hit {
+                title: String::new(),
+                url: "https://two.example/".into(),
+                snippet: String::new(),
+            },
+        ];
+        let shown = listing("Pool search (serper/google-search)", "tokyo weather", &hits);
+        let want = vec![
+            Source {
+                title: "Tokyo weather. Today".into(),
+                url: "https://weather.example/tokyo".into(),
+            },
+            Source {
+                title: "https://two.example/".into(),
+                url: "https://two.example/".into(),
+            },
+        ];
+        assert_eq!(sources(&shown), want);
+        let again = format!(
+            "(The same search was made a few minutes ago; this is its answer again.)\n\n{shown}"
+        );
+        assert_eq!(sources(&again), want);
+        let fenced = crate::untrusted::fence(&shown, 100_000).unwrap();
+        assert_eq!(sources(&fenced), want);
+        assert!(sources(&listing("Exa", "cats", &[])).is_empty());
+        assert!(
+            sources(
+                "Brave found results for \"cats\", but none from the sites allowed and not blocked."
+            )
+            .is_empty()
+        );
     }
 
     #[test]

@@ -40,6 +40,7 @@ pub(crate) mod switcher;
 pub(crate) mod update;
 pub(crate) mod usage;
 pub(crate) mod viewer;
+pub(crate) mod web_search;
 pub(crate) mod voice;
 pub(crate) mod wallet;
 pub(crate) mod workflows;

@@ -78,6 +78,9 @@ fn folds(message: &Message) -> bool {
     message.role == "tool"
         && message.name != tools::ASK_USER
         && message.name != tools::EXIT_PLAN
+        // A search is a card of its own, its sources a click away, which a
+        // run's one line would hide.
+        && message.name != crate::search::NAME
         && !(message.is_error && tools::is_declined(&message.content))
 }
 
@@ -572,5 +575,24 @@ mod tests {
         assert_eq!(duration(14), "14s");
         assert_eq!(duration(125), "2m 5s");
         assert_eq!(duration(3_780), "1h 3m");
+    }
+
+    #[test]
+    fn a_web_search_stands_on_its_own_between_folded_calls() {
+        let messages = [
+            asking(1),
+            call("read_file", serde_json::json!({"path": "a.rs"})),
+            call("read_file", serde_json::json!({"path": "b.rs"})),
+            call(
+                crate::search::NAME,
+                serde_json::json!({"query": "rust 2024 edition"}),
+            ),
+            call("read_file", serde_json::json!({"path": "c.rs"})),
+            call("read_file", serde_json::json!({"path": "d.rs"})),
+            answer(2),
+        ];
+        let runs = find(&messages, 0..messages.len(), false);
+        assert_eq!(runs, [Run { first: 1, last: 2 }, Run { first: 4, last: 5 }]);
+        assert_eq!(holding(&runs, 3), None);
     }
 }

@@ -365,6 +365,10 @@ impl Chat {
             let lines = running_calls(turn, self.outstanding)
                 .into_iter()
                 .map(|call| {
+                    // A search says so in words, with what it looks for.
+                    if call.name == letronna_core::search::NAME {
+                        return self.searching_line(&call.arguments, window, cx);
+                    }
                     let checking = self.judging.as_ref().is_some_and(|(id, _)| *id == call.id);
                     let line = h_flex()
                         .gap_2()
@@ -389,6 +393,7 @@ impl Chat {
                         .gap(px(3.))
                         .child(line)
                         .child(crate::ui::busy::Sweep)
+                        .into_any_element()
                 });
             let lines = v_flex().items_start().gap_1().children(lines);
             return Some(lines.into_any_element());
