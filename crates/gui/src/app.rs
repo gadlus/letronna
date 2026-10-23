@@ -603,6 +603,9 @@ pub(crate) struct Chat {
     pub(crate) hit_at: Option<(Pixels, bool)>,
     /// The list of modes, while the mode chip has it open.
     pub(crate) mode_menu: Option<Entity<gpui_component::menu::PopupMenu>>,
+    /// The effort levels of the session's model, while the effort chip has
+    /// them open.
+    pub(crate) effort_menu: Option<Entity<gpui_component::menu::PopupMenu>>,
     /// When the chat on screen saves to memory and where, while the memory
     /// chip has its menu open.
     pub(crate) memory_menu: Option<Entity<gpui_component::menu::PopupMenu>>,
@@ -1185,6 +1188,7 @@ impl Chat {
             revealed: None,
             hit_at: None,
             mode_menu: None,
+            effort_menu: None,
             memory_menu: None,
             drawn: false,
             mic: None,
@@ -1568,6 +1572,12 @@ impl Chat {
             }
             cx.notify();
             return;
+        }
+        // For Letronna, not the model, and taken while a reply runs too: it
+        // is the next request that thinks harder.
+        if name == "/effort" {
+            let rest = rest.to_owned();
+            return self.effort_command(&rest, prompt, window, cx);
         }
         if prompt.starts_with("/mcp__") {
             return self.send_mcp_prompt(prompt, window, cx);

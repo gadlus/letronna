@@ -336,6 +336,36 @@ pub fn clamp<'a>(levels: &'a [Effort], effort: &str) -> Option<&'a Effort> {
         .map(|(_, level)| level)
 }
 
+/// What `/effort <asked>` saves on `model`, which offers `levels`: the id of
+/// the level it names, by its id or its name (`extra high` is `xhigh`), or ""
+/// for auto; or why it names none. A level this model lacks but another
+/// has is saved as named and sent as the nearest this one offers, as the
+/// terminal's `/effort` does, so it is as named again on a model that has it.
+pub fn named(levels: &[Effort], asked: &str, model: &str) -> Result<String, String> {
+    let asked = asked.trim().to_lowercase();
+    if matches!(asked.as_str(), "" | "auto" | "automatic") {
+        return Ok(String::new());
+    }
+    // Spaces, dashes and underscores aside: `x-high` and `Extra high` are
+    // what people type for `xhigh`.
+    let squash = |text: &str| text.to_lowercase().replace([' ', '-', '_'], "");
+    let wanted = squash(&asked);
+    let found = (levels.iter()).find(|l| squash(&l.id) == wanted || squash(&l.label) == wanted);
+    if let Some(level) = found {
+        return Ok(level.id.clone());
+    }
+    if clamp(levels, &asked).is_some() {
+        return Ok(asked);
+    }
+    let offered: Vec<&str> = std::iter::once("auto")
+        .chain(levels.iter().map(|level| level.id.as_str()))
+        .collect();
+    Err(format!(
+        "{asked} is not a level {model} has: {}.",
+        offered.join(", ")
+    ))
+}
+
 /// Remember a limit a provider's error gave away for `model` at `endpoint`.
 pub fn learn(endpoint: &str, model: &str, limit: Limit) {
     let Ok(mut known) = known().lock() else {
@@ -1251,6 +1281,29 @@ mod tests {
         // Automatic, and a word that is no level, send nothing.
         assert_eq!(sent("gpt-5.5", ""), None);
         assert_eq!(sent("gpt-5.5", "turbo"), None);
+    }
+
+    #[test]
+    fn effort_is_named_by_id_or_by_what_it_is_called() {
+        let endpoint = "https://named.test/v1";
+        hosted_efforts(endpoint);
+        let opus = efforts(endpoint, "claude-opus-5");
+        let gpt = efforts(endpoint, "gpt-5.5");
+        let named = |levels: &[Effort], asked: &str| named(levels, asked, "gpt-5.5");
+        assert_eq!(named(&opus, "max").as_deref(), Ok("max"));
+        assert_eq!(named(&opus, " Extra high ").as_deref(), Ok("xhigh"));
+        assert_eq!(named(&opus, "x-high").as_deref(), Ok("xhigh"));
+        assert_eq!(named(&gpt, "light").as_deref(), Ok("low"));
+        // Auto is saved as nothing.
+        assert_eq!(named(&opus, "auto").as_deref(), Ok(""));
+        assert_eq!(named(&opus, "").as_deref(), Ok(""));
+        // A level this model lacks is kept as named; it is sent as the nearest.
+        assert_eq!(named(&gpt, "max").as_deref(), Ok("max"));
+        // A word that is no level says what there is.
+        assert_eq!(
+            named(&gpt, "turbo"),
+            Err("turbo is not a level gpt-5.5 has: auto, low, medium, high, xhigh.".to_owned())
+        );
     }
 
     #[test]

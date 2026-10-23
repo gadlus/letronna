@@ -11,6 +11,7 @@ actions!(
 const COMMANDS: &[(&str, &str)] = &[
     ("new", "start a fresh session"),
     ("mode", "change how much runs without asking"),
+    ("effort", "change how hard the model thinks"),
     ("btw", "ask a side question that stays out of the session"),
     (
         "cloud",
@@ -228,6 +229,10 @@ impl Chat {
                 "/mode" => {
                     self.replace_composer(rest, start, window, cx);
                     return self.open_mode_menu(window, cx);
+                }
+                "/effort" => {
+                    self.replace_composer(rest, start, window, cx);
+                    return self.open_effort_menu(window, cx);
                 }
                 _ => {}
             }

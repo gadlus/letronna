@@ -963,6 +963,204 @@ impl Chat {
         cx.notify();
     }
 
+    /// The effort levels the session on screen's model offers, least first,
+    /// and the one its next request sends: `None` is auto. A level saved on
+    /// another model is sent as the nearest this one offers.
+    pub(crate) fn effort_here(&self) -> (Vec<letronna_core::models::Effort>, Option<String>) {
+        let (gateway, model) = self.store.model(self.store.active);
+        // No model picked yet has no levels, not the usual three.
+        if model.trim().is_empty() {
+            return (Vec::new(), None);
+        }
+        let endpoint = base_url(gateway, &self.store.settings.custom_endpoint);
+        let offered = letronna_core::models::efforts(&endpoint, model);
+        let saved = self.store.effort(self.store.active);
+        let sent = letronna_core::models::clamp(&offered, saved).map(|level| level.id.clone());
+        (offered, sent)
+    }
+
+    /// How hard the model thinks, beside the model it is for, opening the
+    /// levels that model offers. Changed often, from one question to the
+    /// next, so it is here rather than only in Settings; and not here at
+    /// all for a model that decides for itself, or while the session makes
+    /// media, so the row only grows where it is of use.
+    fn effort_chip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.making_here().is_some() {
+            return None;
+        }
+        let (offered, sent) = self.effort_here();
+        if offered.is_empty() {
+            return None;
+        }
+        let level = sent.and_then(|id| offered.into_iter().find(|level| level.id == id));
+        let chat = cx.entity();
+        let chip = Button::new("effort")
+            .plain(cx)
+            .xsmall()
+            .tooltip(match &level {
+                Some(level) => format!(
+                    "Thinking: {}. Click to change, or type /effort.",
+                    level.label
+                ),
+                None => "Thinking: auto, as the model likes. Click to change, or type /effort."
+                    .to_owned(),
+            })
+            .text_color(match level {
+                Some(_) => cx.theme().primary,
+                None => cx.theme().muted_foreground,
+            })
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(Icon::new(AppIcon::Brain).size_3())
+                    .child(level.map_or_else(|| "Auto".to_owned(), |level| level.label)),
+            )
+            // The popover opens on a mouse press only, so a key opens it here.
+            .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                if event.is_keyboard() {
+                    this.open_effort_menu(window, cx);
+                }
+            }));
+        Some(
+            Popover::new("effort-menu")
+                .appearance(false)
+                .overlay_closable(false)
+                .open(self.effort_menu.is_some())
+                .on_open_change(move |open, window, cx| {
+                    chat.update(cx, |this, cx| {
+                        if *open {
+                            this.open_effort_menu(window, cx);
+                        } else {
+                            this.effort_menu = None;
+                            cx.notify();
+                        }
+                    })
+                })
+                .trigger(chip)
+                .when_some(self.effort_menu.clone(), |popover, menu| {
+                    popover.content(move |_, _, _| menu.clone())
+                }),
+        )
+    }
+
+    /// Open the effort levels of the session's model with the keys in them,
+    /// as the effort chip's popover shows them; for a model that decides
+    /// for itself, say so instead.
+    pub(crate) fn open_effort_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.effort_menu.is_some() {
+            return;
+        }
+        let (offered, sent) = self.effort_here();
+        if offered.is_empty() {
+            let model = self.store.model(self.store.active).1.to_owned();
+            window.push_notification(
+                gpui_component::notification::Notification::info(format!(
+                    "{model} decides for itself how hard to think."
+                )),
+                cx,
+            );
+            return;
+        }
+        let chat = cx.entity();
+        // Closed, the menu hands the keys back to the composer, where
+        // /effort was typed; otherwise they would go nowhere.
+        let back = self.composer.focus_handle(cx);
+        let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+            let menu = menu.action_context(back).min_w(px(160.));
+            let settings = chat.clone();
+            let auto = (String::new(), "Auto".to_owned());
+            let levels = offered.into_iter().map(|level| (level.id, level.label));
+            std::iter::once(auto)
+                .chain(levels)
+                .fold(menu, |menu, (id, label)| {
+                    let chat = chat.clone();
+                    let checked = sent.as_deref().unwrap_or_default() == id;
+                    menu.item(PopupMenuItem::new(label).checked(checked).on_click(
+                        move |_, _, cx| {
+                            chat.update(cx, |this, cx| {
+                                this.store.choose_effort(this.store.active, &id);
+                                this.save();
+                                cx.notify();
+                            })
+                        },
+                    ))
+                })
+                .separator()
+                .item(
+                    PopupMenuItem::new("Thinking settings…").on_click(move |_, window, cx| {
+                        settings.update(cx, |this, cx| {
+                            this.settings_page.update(cx, |page, cx| {
+                                *page = "Thinking";
+                                cx.notify();
+                            });
+                            this.open_settings(window, cx);
+                        })
+                    }),
+                )
+        });
+        menu.focus_handle(cx).focus(window, cx);
+        cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.effort_menu = None;
+            cx.notify();
+        })
+        .detach();
+        self.effort_menu = Some(menu);
+        cx.notify();
+    }
+
+    /// `/effort` typed in the composer and sent: the levels to pick from
+    /// with nothing after it, or the one it names (`/effort max`, `/effort
+    /// extra high`, `/effort auto`) set for this session and new ones.
+    pub(crate) fn effort_command(
+        &mut self,
+        asked: &str,
+        typed: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let clear = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+            this.composer
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        };
+        if asked.trim().is_empty() {
+            clear(self, window, cx);
+            return self.open_effort_menu(window, cx);
+        }
+        let (offered, _) = self.effort_here();
+        let model = self.store.model(self.store.active).1.to_owned();
+        if offered.is_empty() {
+            clear(self, window, cx);
+            self.error = Some(format!("{model} decides for itself how hard to think."));
+            return cx.notify();
+        }
+        match letronna_core::models::named(&offered, asked, &model) {
+            Ok(effort) => {
+                clear(self, window, cx);
+                self.store.choose_effort(self.store.active, &effort);
+                self.save();
+                let sent = letronna_core::models::clamp(&offered, &effort);
+                let said = match sent {
+                    None => "Thinking left to the model.".to_owned(),
+                    Some(level) if level.id == effort => format!("Thinking: {}.", level.label),
+                    Some(level) => format!(
+                        "Thinking: {}, the nearest {model} has to {effort}.",
+                        level.label
+                    ),
+                };
+                window
+                    .push_notification(gpui_component::notification::Notification::info(said), cx);
+            }
+            // Kept as typed, without the line Enter added, to be mended.
+            Err(why) => {
+                self.composer
+                    .update(cx, |input, cx| input.set_value(typed, window, cx));
+                self.error = Some(why);
+            }
+        }
+        cx.notify();
+    }
+
     /// The box a message is written in, with its controls. `compact` puts
     /// the controls under the text, for a narrow pane.
     pub(crate) fn composer(&self, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1121,6 +1319,8 @@ impl Chat {
                     })),
             )
             .child(self.model_picker(cx))
+            // How hard it thinks, beside the model it is for.
+            .children(self.effort_chip(cx))
             .child(self.mic_button(cx))
             // Stop only where the reply is: in another session it would end
             // a reply that is not on screen.

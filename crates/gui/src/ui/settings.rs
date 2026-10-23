@@ -2199,7 +2199,8 @@ fn thinking_page(chat: &Entity<Chat>, store: &Store, window: &mut Window, cx: &m
         .gap_4()
         .child(heading(
             "Thinking",
-            "Models that can be told how hard to think will; the rest carry on as they are.",
+            "Models that can be told how hard to think will; the rest carry on as they are. \
+             The chip beside the model in the chat box, and /effort, change it too.",
             cx,
         ))
         .child(v_flex().gap_1().child(label("Effort", cx)).child(levels))
