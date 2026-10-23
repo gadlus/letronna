@@ -232,7 +232,7 @@ impl Chat {
                 }
                 "/effort" => {
                     self.replace_composer(rest, start, window, cx);
-                    return self.open_effort_menu(window, cx);
+                    return self.open_effort(window, cx);
                 }
                 _ => {}
             }
