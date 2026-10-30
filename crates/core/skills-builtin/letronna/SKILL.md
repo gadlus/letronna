@@ -47,9 +47,9 @@ Then `letronna mcp list`, `get <name>`, `remove <name>`, and `login <name>` or `
 - Asking first: /mode, /plan, /decisions (what auto mode's judge allowed or blocked), /verify (build or test after edits).
 - Account: /login, /logout, /whoami, /team (bill hosted models to a team).
 - Web and voice: /search (lets the model search the web; /search services sets up one of the user's own), /voice (read replies aloud), /notify (say when a reply ends or needs the user).
-- Sessions: /resume, /branch (a copy), /rename, /rewind, /undo (any message), /retry, /compact (summarize old turns), /context, /diff, /where, /status, /export, /import (Claude Code, Codex), /btw (an aside, not kept), /copy, /image <path>, /preview <path>, /usage, /insights.
+- Sessions: /resume, /branch (a copy), /rename, /rewind, /undo (any message), /redo, /retry, /compact (sum up old turns), /context, /diff, /where, /status, /export, /import (Claude Code, Codex), /btw (an aside, not kept), /copy, /image <path>, /preview <path>, /usage, /insights.
 - Long work: /goal (keep working until a goal is met, `--check <command>`), /loop (run a prompt every so often; /loop stop), /heartbeat (look in on this session every so many minutes), /jobs (background commands), /agents (helpers), /workflows, /crew (workflows of helpers for big tasks).
-- Cloud: just ask in chat to run or host something (a bot 24/7), check it or take it down.
+- Cloud: ask in chat to run or host something (a bot 24/7), check it or take it down.
 - Keeping and adding: /remember (keep something now, or change when this chat saves), /memory (`/memory edit, log or restore user|memory|project|soul`), /memory-review, /retention (delete old sessions), /init (write AGENTS.md), /skills, /mcp, /plugins, /tool-search.
 
 ## The window
