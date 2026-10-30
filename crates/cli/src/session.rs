@@ -85,6 +85,13 @@ pub static SYSTEM_REPLACED: std::sync::OnceLock<std::sync::Arc<str>> = std::sync
 
 /// The instructions `--append-system-prompt` gave, after all the rest.
 pub static SYSTEM_APPENDED: std::sync::OnceLock<std::sync::Arc<str>> = std::sync::OnceLock::new();
+/// What a session's latest reply's request carried, out of the window it
+/// was sized by; `None` before there is one.
+fn filled(messages: &[Message]) -> Option<(u64, u64)> {
+    (messages.iter().rev())
+        .find(|m| m.role == "assistant" && m.window > 0 && m.input_tokens() > 0)
+        .map(|reply| (reply.input_tokens(), reply.window))
+}
 
 impl Runner {
     /// Say a turn failed with `error`, and the way out of it when there is
@@ -106,10 +113,58 @@ impl Runner {
     /// latest reply's request carried, out of the window it was sized by,
     /// as the window's status bar shows it.
     pub fn show_context(&mut self, session: usize) {
-        let filled = (self.store.conversations[session].messages.iter().rev())
-            .find(|m| m.role == "assistant" && m.window > 0 && m.input_tokens() > 0)
-            .map(|reply| (reply.input_tokens(), reply.window));
+        let filled = filled(&self.store.conversations[session].messages);
         self.bar.set_context(filled);
+        // At start, after each command and each turn: whatever the line is
+        // given has most likely changed then.
+        self.ask_status(session);
+    }
+
+    /// Run the status line, when one is set, with the session as its input.
+    pub fn ask_status(&self, session: usize) {
+        let command = &self.store.settings.status_line;
+        let input = match command.trim() {
+            "" => String::new(),
+            _ => self.status_input(session).to_string(),
+        };
+        let folder = self.store.conversations[session].workspace.as_deref();
+        self.bar.ask_status(command, input, folder);
+    }
+
+    /// What the status line's command is given: the session in the shape
+    /// Claude Code's statusLine reads, with Letronna's own fields beside it.
+    pub fn status_input(&self, session: usize) -> serde_json::Value {
+        let conversation = &self.store.conversations[session];
+        let (gateway, model) = self.store.model(session);
+        let here = std::env::current_dir().ok();
+        let (used, window) = filled(&conversation.messages).unwrap_or((0, 0));
+        let share = (window > 0).then(|| used.saturating_mul(100) / window);
+        let style = match self.store.settings.style.as_str() {
+            "" => letronna_core::styles::DEFAULT,
+            style => style,
+        };
+        serde_json::json!({
+            "hook_event_name": "Status",
+            "session_id": conversation.id.to_string(),
+            "session_name": conversation.title,
+            "cwd": here,
+            "model": { "id": model, "display_name": model },
+            "gateway": gateway,
+            "mode": self.current_mode().name(),
+            "effort": self.store.effort(session),
+            "workspace": {
+                "current_dir": conversation.workspace.clone().or(here),
+                "project_dir": conversation.workspace,
+            },
+            "version": env!("CARGO_PKG_VERSION"),
+            "output_style": { "name": style },
+            "cost": { "total_cost_usd": crate::cost(&conversation.messages) },
+            "context_window": {
+                "used_tokens": used,
+                "context_window_size": window,
+                "used_percentage": share,
+            },
+        })
     }
 
     /// Change the mode, everywhere it is shown or obeyed.

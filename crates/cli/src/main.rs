@@ -36,6 +36,7 @@ mod serve;
 mod session;
 mod setup;
 mod spinner;
+mod status;
 mod syntax;
 mod terminal_setup;
 mod theme;

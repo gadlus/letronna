@@ -113,6 +113,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "the terminal's colours: auto, dark, light, colour-blind or ansi",
     },
     Command {
+        name: "/statusline",
+        blurb: "a line of your own under the footer: /statusline <command>, input or off",
+    },
+    Command {
         name: "/thinking",
         blurb: "show the model's thinking, or hide it",
     },
@@ -1049,6 +1053,10 @@ pub struct Bar {
     copied_at: Option<(std::time::Instant, String)>,
     /// Vim's keys in the box, while `/vim` has them on.
     vim: Option<crate::vim::Vim>,
+    /// The user's status line, run off the draw path, and what it last
+    /// printed, shown under the footer.
+    status_line: crate::status::StatusLine,
+    status: Option<String>,
 }
 
 impl Bar {
@@ -1115,6 +1123,8 @@ impl Bar {
             turn_began: None,
             clock_shown: 0,
             context: None,
+            status_line: Default::default(),
+            status: None,
             session: String::new(),
             place: String::new(),
             places: None,
@@ -1198,6 +1208,17 @@ impl Bar {
 
     /// Show on the box's foot how full the open session's context is: the
     /// tokens its latest request carried and its window, or nothing.
+    /// Run the status line's `command` with `input` soon, in `folder`; an
+    /// empty command takes the line away.
+    pub fn ask_status(&self, command: &str, input: String, folder: Option<&std::path::Path>) {
+        self.status_line.ask(command, input, folder);
+    }
+
+    /// What the status line shows now.
+    pub fn status(&self) -> Option<String> {
+        self.status_line.shown()
+    }
+
     pub fn set_context(&mut self, filled: Option<(u64, u64)>) {
         if filled != self.context {
             self.context = filled;
@@ -2143,6 +2164,10 @@ impl Bar {
         }
         // And once a copy has been said long enough to be seen.
         if self.forget_copied() {
+            self.settle();
+        }
+        if let Some(status) = self.status_line.take_new() {
+            self.status = status;
             self.settle();
         }
     }
@@ -3311,6 +3336,10 @@ impl Bar {
             }
             None => format!("{}{mode}{}", render::PAD, render::dim(&note)),
         });
+        // A row of its own, so the footer above keeps every word it had.
+        if let Some(status) = &self.status {
+            lines.push(format!("{}{}", render::PAD, status_row(status, width)));
+        }
 
         // The plan gets only the rows the rest leaves over: what is being
         // typed or asked comes first, and a screen of chrome would push its
@@ -4202,6 +4231,21 @@ fn plugin_status(shown: &[(String, letronna_core::plugins::code::ui::Surfaces)])
         .take(PLUGIN_STATUSES)
         .collect::<Vec<_>>()
         .join("  ·  ")
+}
+
+/// The status line's text in `width` columns: dim like the footer unless its
+/// command coloured it, and with any colour it left on ended at the cut.
+/// Its colours go too where colour is turned off.
+fn status_row(status: &str, width: usize) -> String {
+    let cut = render::clip(status, width);
+    if !render::colour() {
+        return render::plain(&cut);
+    }
+    if cut.contains('\x1b') {
+        format!("{cut}\x1b[0m")
+    } else {
+        render::dim(&cut)
+    }
 }
 
 /// The footer with `then` after it, in `width` columns. The footer gives way
@@ -5879,6 +5923,22 @@ mod tests {
         });
         let footer = bar.lines(40).last().unwrap().clone();
         assert!(visible(&footer) < crate::render::width(), "{footer}");
+    }
+
+    #[test]
+    fn the_status_line_has_a_row_of_its_own_under_the_footer() {
+        let mut bar = Bar::new("stub-model  ·  Custom".into());
+        let without = bar.lines(40);
+        bar.status = Some(format!("\x1b[32mmain ↑2\x1b[0m  {}", "x".repeat(300)));
+        let with = bar.lines(40);
+        assert_eq!(with.len(), without.len() + 1);
+        // The footer keeps every word it had; the line under it is cut to
+        // the window, and its colour goes where colour is off.
+        assert_eq!(with[with.len() - 2], *without.last().unwrap());
+        let status = with.last().unwrap();
+        assert!(status.contains("main ↑2"), "{status}");
+        assert!(visible(status) < crate::render::width(), "{status}");
+        assert!(!status.contains("\x1b[32m"), "{status}");
     }
 
     #[test]

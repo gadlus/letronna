@@ -233,6 +233,10 @@ pub fn command(
             theme(runner, rest);
             Flow::Handled
         }
+        "/statusline" => {
+            status_line(runner, *session, rest);
+            Flow::Handled
+        }
         "/thinking" => {
             let Some(on) = switched("/thinking", rest, runner.store.settings.thinking) else {
                 return Flow::Handled;
@@ -2003,6 +2007,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/copy",
             "/export",
             "/status",
+            "/statusline",
             "/diff",
             "/where",
             "/window",
@@ -2706,6 +2711,61 @@ fn theme(runner: &mut Runner, name: &str) {
         },
         name => format!("Colours: {name}."),
     }));
+}
+
+/// The status line: what it runs and shows, the input it is given, or a
+/// command set for it or taken away with off. The main loop runs it again
+/// after every command, so a new one shows at once.
+fn status_line(runner: &mut Runner, session: usize, rest: &str) {
+    render::blank();
+    match rest {
+        "" => {
+            let command = runner.store.settings.status_line.trim().to_owned();
+            if command.is_empty() {
+                render::line(&render::dim(
+                    "No status line. /statusline <command> shows the first line it prints \
+                     under the footer. It is given the session as JSON on its input, as Claude \
+                     Code's statusLine is, so a script for that works here.",
+                ));
+                return;
+            }
+            render::line(&format!("{}  {command}", render::dim("runs ")));
+            match runner.bar.status() {
+                Some(shown) => {
+                    // Its own colours, ended after it, or none where colour is off.
+                    let shown = match render::colour() {
+                        true => format!("{shown}\x1b[0m"),
+                        false => render::plain(&shown),
+                    };
+                    render::line(&format!("{}  {shown}", render::dim("shows")));
+                }
+                None => render::line(&render::dim("It has printed nothing yet.")),
+            }
+            render::line(&render::dim(
+                "/statusline input shows what it is given; /statusline off takes it away.",
+            ));
+        }
+        "input" => {
+            let input = runner.status_input(session);
+            let text = serde_json::to_string_pretty(&input).unwrap_or_default();
+            for line in text.lines() {
+                render::line(&render::dim(line));
+            }
+        }
+        "off" | "clear" | "none" => {
+            runner.store.settings.status_line.clear();
+            runner.persist();
+            render::line(&render::dim("Status line off."));
+        }
+        command => {
+            runner.store.settings.status_line = command.to_owned();
+            runner.persist();
+            render::line(&render::dim(
+                "Status line on: its first line shows under the footer, run again after \
+                 each command and turn, at most every 0.3 s.",
+            ));
+        }
+    }
 }
 
 /// The reply styles with the chosen one marked, or `name` chosen.
