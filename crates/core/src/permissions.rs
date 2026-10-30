@@ -351,6 +351,19 @@ pub fn keep(file: &Path, rule: Rule) -> Result<(), String> {
     })
 }
 
+/// Takes `rule` out of the rules in `file`, every copy of it, saying whether
+/// it was there; a file that cannot be read as rules is left alone.
+pub fn forget(file: &Path, rule: &Rule) -> Result<bool, String> {
+    let mut found = false;
+    change(file, |rules| {
+        let before = rules.len();
+        rules.retain(|kept| kept != rule);
+        found = rules.len() != before;
+        found
+    })?;
+    Ok(found)
+}
+
 /// Switches each of `tools` on or off in every folder by the rules in
 /// `file`: off is a deny rule on every call of it, and on takes that away.
 pub fn switch(file: &Path, tools: &[String], on: bool) -> Result<(), String> {
@@ -1195,6 +1208,33 @@ mod tests {
             saver.join().unwrap().unwrap();
         }
         assert_eq!(load(&file).unwrap().len(), 8);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn forgetting_a_rule_takes_out_only_that_one_in_its_own_folder() {
+        let folder = scratch("forget");
+        let file = folder.join(USER_FILE);
+        let here = Rule {
+            project: Some(folder.clone()),
+            ..rule("cargo test", Effect::Allow)
+        };
+        let everywhere = rule("cargo test", Effect::Allow);
+        let push = rule("git push", Effect::Deny);
+        for rule in [here.clone(), everywhere.clone(), push.clone()] {
+            keep(&file, rule).unwrap();
+        }
+        assert_eq!(forget(&file, &here), Ok(true));
+        assert_eq!(load(&file).unwrap(), [everywhere.clone(), push.clone()]);
+        // Gone already, so nothing is written.
+        assert_eq!(forget(&file, &here), Ok(false));
+        assert_eq!(forget(&file, &everywhere), Ok(true));
+        assert_eq!(load(&file).unwrap(), [push]);
+        // A file that is not rules is never written over.
+        let broken = folder.join("broken.json");
+        std::fs::write(&broken, "not json").unwrap();
+        assert!(forget(&broken, &everywhere).is_err());
+        assert_eq!(std::fs::read_to_string(&broken).unwrap(), "not json");
         std::fs::remove_dir_all(folder).unwrap();
     }
 
