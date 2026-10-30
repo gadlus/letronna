@@ -98,6 +98,7 @@ Then `letronna mcp list`, `get <name>`, `remove <name>`, and `login <name>` or `
 - Cloud: just ask in chat to run or host something (a bot 24/7), check it or take it down.
 - Keeping and adding: /remember (keep something now, or change when this chat saves), /memory (`/memory edit, log or restore user|memory|project|soul`), /memory-review, /retention (delete old sessions), /init (write AGENTS.md), /skills, /mcp, /plugins, /tools, /tool-search.
 - Keeping and adding: /remember (keep something now, or change when this chat saves), /memory (`/memory edit, log or restore user|memory|project|soul`), /memory-review, /retention (delete old sessions), /init (write AGENTS.md), /skills, /mcp, /plugins, /tool-search, /lsp (language servers check edits).
+- Keeping and adding: /remember (keep something now, or change when this chat saves), /memory (`/memory edit, log or restore user|memory|project|soul`), /memory-review, /retention (delete old sessions), /init (write AGENTS.md), /skills, /mcp, /plugins, /hooks, /tool-search.
 
 ## The window
 
@@ -108,5 +109,8 @@ The sidebar has New session, Capabilities (tabs Skills, Tools and MCP), Activity
 - Skills: `/skills` switches them on or off, `/skills <name>` puts one in the message box, and `/skills add <owner/repo, link or path>` installs from GitHub, a link or a folder (`anthropics/skills` has Word, Excel, PowerPoint and PDF ones). This one comes with Letronna and can be switched off; a skill of the user's called `letronna` takes its place, and Copy to edit on the window's Skills page makes one from this.
 - Profiles: separate data folders, switched or made (empty, or cloned) under Profile in the window's account menu; see `settings-and-data.md`.
 - Schedules: a prompt that runs on a timer, made with New job on the Scheduled jobs page, or by asking in a chat (added once the user says yes). They run while the window, the terminal or `letronna serve` is open.
+- Skills: `/skills` switches them on or off, `/skills <name>` puts one in the message box, and `/skills add <owner/repo, link or path>` installs one (`anthropics/skills` has Word, Excel, PowerPoint and PDF ones). This one comes with Letronna and can be switched off; a skill of the user's called `letronna` takes its place, and Copy to edit on the window's Skills page makes one from this.
+- Profiles: separate data folders for separate identities, switched or made (empty, or cloned) under Profile in the window's account menu. See `settings-and-data.md`.
+- Schedules: a prompt that runs on a timer, made with New job on the Scheduled jobs page, or by asking in a chat, which adds one once the user says yes. They run while the window, the terminal or `letronna serve` is open.
 
 If this skill is silent, say so and web_fetch https://letronna.ai/docs; never invent a menu, setting or command.

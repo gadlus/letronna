@@ -251,7 +251,49 @@ struct Hook {
     timeout: Option<u64>,
 }
 
+/// A hook in hooks.json, as `/hooks` lists it.
+pub struct Listed {
+    /// The event it runs at, by Claude Code's name for it.
+    pub event: &'static str,
+    /// What it runs for as written: names joined by `|`, a pattern, or `*`
+    /// for everything, and "always" at an event that takes no matcher.
+    pub matcher: String,
+    pub command: String,
+    /// In seconds, when it names its own.
+    pub timeout: Option<u64>,
+}
+
 impl Hooks {
+    /// Every hook that runs, event by event in the order a turn meets them.
+    pub fn listed(&self) -> Vec<Listed> {
+        let mut listed = Vec::new();
+        for event in Event::ALL {
+            let always = matches!(event, Event::Stop | Event::UserPromptSubmit);
+            let groups = self.events.get(event.name()).map_or(&[][..], Vec::as_slice);
+            for group in groups {
+                let matcher = if always {
+                    "always".to_owned()
+                } else {
+                    group.matcher.written()
+                };
+                for hook in &group.hooks {
+                    listed.push(Listed {
+                        event: event.name(),
+                        matcher: matcher.clone(),
+                        command: hook.command.clone(),
+                        timeout: hook.timeout,
+                    });
+                }
+            }
+        }
+        listed
+    }
+
+    /// What the file holds that does not run here, as notices for the user.
+    pub fn skipped(&self) -> &[String] {
+        &self.skipped
+    }
+
     /// Whether any hook is set for `event`, which costs no process.
     pub fn has(&self, event: Event) -> bool {
         self.events
@@ -277,6 +319,15 @@ impl Matcher {
         Regex::new(text)
             .map(Self::Pattern)
             .map_err(|error| format!("the matcher `{text}` is not a regular expression: {error}"))
+    }
+
+    /// The matcher as it would be written.
+    fn written(&self) -> String {
+        match self {
+            Self::All => "*".into(),
+            Self::Names(names) => names.join("|"),
+            Self::Pattern(pattern) => pattern.as_str().to_owned(),
+        }
     }
 
     /// Whether the group runs for `name`, or for Claude Code's name for it.
@@ -2278,6 +2329,42 @@ mod tests {
             opening
                 .blocked
                 .is_some_and(|why| why.ends_with("Ask in the other session.")),
+        );
+    }
+
+    #[test]
+    fn hooks_are_listed_in_the_order_a_turn_meets_them_with_their_matchers() {
+        let file = json!({ "hooks": {
+            "Stop": [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "npm test" }] }],
+            "PreToolUse": [
+                { "matcher": "Edit|Write", "hooks": [
+                    { "type": "command", "command": "guard", "timeout": 5 },
+                ] },
+                { "matcher": "mcp__.*", "hooks": [{ "type": "command", "command": "log" }] },
+            ],
+            "SessionStart": [{ "hooks": [{ "type": "command", "command": "git status" }] }],
+            "SessionEnd": [{ "hooks": [{ "type": "command", "command": "bye" }] }],
+        } });
+        let hooks = parse(&file.to_string()).unwrap();
+        let listed: Vec<String> = (hooks.listed().iter())
+            .map(|hook| {
+                let (event, matcher, command) = (hook.event, &hook.matcher, &hook.command);
+                format!("{event} · {matcher} · {command} · {:?}", hook.timeout)
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                "SessionStart · * · git status · None",
+                "PreToolUse · Edit|Write · guard · Some(5)",
+                "PreToolUse · mcp__.* · log · None",
+                "Stop · always · npm test · None",
+            ]
+        );
+        assert!(
+            hooks.skipped()[0].contains("SessionEnd"),
+            "{:?}",
+            hooks.skipped()
         );
     }
 

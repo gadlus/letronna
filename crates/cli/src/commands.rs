@@ -607,6 +607,10 @@ pub fn command(
             context(runner, *session);
             Flow::Handled
         }
+        "/hooks" => {
+            list_hooks();
+            Flow::Handled
+        }
         "/retention" => {
             retention(runner, rest);
             Flow::Handled
@@ -1699,6 +1703,57 @@ fn usage(session: u64) {
     }
 }
 
+/// The hooks in hooks.json, event by event in the order a turn meets them,
+/// read afresh as a turn reads them. Only listed: the file is where they
+/// are changed, and a project can add none.
+fn list_hooks() {
+    let file = letronna_core::hooks::file();
+    render::blank();
+    render::said(&render::blue("●"), &render::bold("Hooks"));
+    let hooks = match letronna_core::hooks::load(&file) {
+        Ok(hooks) => hooks,
+        Err(why) => {
+            render::line(&render::red(&why));
+            return;
+        }
+    };
+    let listed = hooks.listed();
+    if listed.is_empty() {
+        render::line(&render::dim(&format!(
+            "None. They go in {}, in Claude Code's format.",
+            file.display()
+        )));
+    }
+    let width = (listed.iter())
+        .map(|hook| hook.matcher.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut event = "";
+    for hook in &listed {
+        if hook.event != event {
+            event = hook.event;
+            render::blank();
+            render::line(&render::dim(event));
+        }
+        let timeout = (hook.timeout)
+            .map(|seconds| render::dim(&format!("  {seconds} s")))
+            .unwrap_or_default();
+        let matcher = format!("{:<width$}", hook.matcher);
+        let command = render::one_line(&hook.command);
+        render::line(&format!("{}  {command}{timeout}", render::bold(&matcher)));
+    }
+    if !listed.is_empty() {
+        render::blank();
+        render::line(&render::dim(&format!(
+            "From {}; edit it to change them.",
+            file.display()
+        )));
+    }
+    for skipped in hooks.skipped() {
+        render::line(&render::dim(skipped));
+    }
+}
+
 /// How the last weeks went: replies and tokens by day, the hours they came
 /// in, the tools and models used most, and what the cache served.
 fn insights(rest: &str) {
@@ -2178,6 +2233,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/skills",
             "/mcp",
             "/plugins",
+            "/hooks",
             "/image",
             "/preview",
             "/ide",

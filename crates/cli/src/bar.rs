@@ -209,6 +209,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "plugins: add from git, switch on or off, allow, settings, reload, update, remove, market",
     },
     Command {
+        name: "/hooks",
+        blurb: "the hooks in hooks.json, by event; the file is where they change",
+    },
+    Command {
         name: "/wallet",
         blurb: "the wallet the agent pays from: balances, limits, x402, networks, history",
     },
