@@ -903,6 +903,9 @@ pub struct Bar {
     /// Set by the send-now key: what is queued should go in without waiting
     /// for the reply to finish.
     hurry: bool,
+    /// True while the model's reply comes in, which the send-now key cuts
+    /// short; a running tool it waits for.
+    replying: bool,
     /// Keys and pastes handled in the drain now running, an enter's place
     /// among them, and how many enters there were. Together these say whether
     /// an enter ended what you were typing or sat in the middle of something
@@ -1029,6 +1032,7 @@ impl Bar {
             working: false,
             interrupt: false,
             hurry: false,
+            replying: false,
             note: None,
             handled: 0,
             enter_at: None,
@@ -2161,6 +2165,15 @@ impl Bar {
         self.settle();
     }
 
+    /// Say whether the model's reply is coming in, so the queued line offers
+    /// the send-now key only while it would cut in.
+    pub fn replying(&mut self, on: bool) {
+        if self.replying != on {
+            self.replying = on;
+            self.settle();
+        }
+    }
+
     /// Say whether a turn is running, so escape knows what it means.
     pub fn working(&mut self, on: bool) {
         if on && !self.working {
@@ -2760,6 +2773,40 @@ impl Bar {
             .put_cursor(shown.starts[wanted] + render::char_at(&shown.rows[wanted], column));
     }
 
+    /// The line over what is queued: when it goes in, and the keys that
+    /// change that, as many as fit in `room` columns. Each key is offered
+    /// only where it does something: the send-now key while the reply comes
+    /// in, up while the box is empty.
+    fn queued_line(&self, room: usize) -> String {
+        let sendable = self.sendable() > 0;
+        if self.hurry && sendable && self.replying {
+            return "queued · sending now".to_owned();
+        }
+        let mut keys = Vec::new();
+        if sendable && self.replying {
+            keys.push("ctrl+s sends now");
+        }
+        if self.line.is_empty() {
+            keys.push(match self.queued.len() {
+                1 => "↑ edits it",
+                _ => "↑ edits the last",
+            });
+        }
+        let when = "queued · goes in after this step";
+        let whole = [when].into_iter().chain(keys.iter().copied());
+        let whole = whole.collect::<Vec<_>>().join(" · ");
+        if render::visible(&whole) <= room {
+            return whole;
+        }
+        // The keys are what can be done about it, so they outlast the when.
+        let short = ["queued"].into_iter().chain(keys.iter().copied());
+        let short = short.collect::<Vec<_>>().join(" · ");
+        if !keys.is_empty() && render::visible(&short) <= room {
+            return short;
+        }
+        when.to_owned()
+    }
+
     /// Build the box and hand it to the screen, which paints it under the
     /// conversation. Nothing here touches the terminal, so there is no frame
     /// held in it that a resize could strand.
@@ -2790,7 +2837,7 @@ impl Bar {
             lines.push(format!(
                 "{}{}",
                 render::PAD,
-                render::dim("queued · goes in after this step")
+                render::dim(&self.queued_line(room))
             ));
             let hidden = self.queued.len().saturating_sub(QUEUED_LIMIT);
             if hidden > 0 {
@@ -4731,6 +4778,68 @@ mod tests {
         bar.working(false);
         hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
         assert!(bar.queued.is_empty(), "stopping led into the rewind");
+    }
+
+    #[test]
+    fn the_queued_line_offers_sending_now_only_while_the_reply_comes_in() {
+        let mut bar = Bar::new(String::new());
+        bar.working(true);
+        bar.queued = ["check the docs too".to_owned()].into();
+        // A tool running is waited for whatever is pressed, so only up is
+        // offered then.
+        assert_eq!(
+            bar.queued_line(80),
+            "queued · goes in after this step · ↑ edits it"
+        );
+        bar.replying(true);
+        assert_eq!(
+            bar.queued_line(80),
+            "queued · goes in after this step · ctrl+s sends now · ↑ edits it"
+        );
+        // Up moves in the box while it has words in it.
+        bar.line.set("and");
+        assert!(!bar.queued_line(80).contains('↑'));
+        bar.line.clear();
+        hit(&mut bar, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(bar.hurried());
+        assert_eq!(bar.queued_line(80), "queued · sending now");
+        // A command first in line runs after the reply, so it cannot go now.
+        let mut bar = Bar::new(String::new());
+        bar.working(true);
+        bar.replying(true);
+        bar.queued = ["/usage".to_owned(), "and then this".to_owned()].into();
+        assert_eq!(
+            bar.queued_line(80),
+            "queued · goes in after this step · ↑ edits the last"
+        );
+    }
+
+    #[test]
+    fn a_narrow_queued_line_keeps_its_keys_before_its_when() {
+        let mut bar = Bar::new(String::new());
+        bar.working(true);
+        bar.replying(true);
+        bar.queued = ["check the docs too".to_owned()].into();
+        assert_eq!(
+            bar.queued_line(40),
+            "queued · ctrl+s sends now · ↑ edits it"
+        );
+        assert_eq!(bar.queued_line(20), "queued · goes in after this step");
+    }
+
+    #[test]
+    fn a_queued_line_taken_back_can_be_dropped_and_found_again() {
+        let mut bar = Bar::new(String::new());
+        bar.working(true);
+        bar.queued = ["check the docs too".to_owned()].into();
+        hit(&mut bar, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(bar.line.text(), "check the docs too");
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(bar.line.is_empty() && bar.queued.is_empty());
+        assert!(!bar.interrupted(), "dropping it stopped the reply");
+        // Dropped, not lost: up finds it again.
+        hit(&mut bar, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(bar.line.text(), "check the docs too");
     }
 
     #[test]

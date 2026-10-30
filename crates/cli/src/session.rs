@@ -572,7 +572,10 @@ impl Runner {
         let mut answer = String::new();
         let mut sent_back = 0;
         loop {
-            let Some(mut reply) = self.stream_once(turn, session)? else {
+            self.bar.replying(true);
+            let reply = self.stream_once(turn, session);
+            self.bar.replying(false);
+            let Some(mut reply) = reply? else {
                 self.keep_stopped(turn, session);
                 // Ctrl-C stops the turn and leaves; escape only stops the
                 // turn, so say so in the one case where you stay.

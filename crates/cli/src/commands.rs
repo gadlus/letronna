@@ -1743,7 +1743,10 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
     ),
     ("ctrl+d", "leave, on an empty line"),
     ("ctrl+s", "while it works: send what is queued now"),
-    ("↑ while it works", "take back the newest queued line"),
+    (
+        "↑ while it works",
+        "take the newest queued line back to change or drop",
+    ),
     ("ctrl+o", "open or fold the latest thinking"),
     ("ctrl+a/e", "go to the start or end of the line"),
     (
