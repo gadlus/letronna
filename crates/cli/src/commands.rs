@@ -5613,9 +5613,30 @@ fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
         "" => format!("{} (branch)", from.title),
         name => name.to_owned(),
     };
+    let notes = copy_session(runner, session, title.clone());
+    letronna_core::review::stop(&runner.review);
+    runner.show_goal();
+    render::blank();
+    render::line(&render::dim(&format!(
+        "Now in {title}. The original is kept; /resume goes back to it."
+    )));
+    if let Err(error) = notes {
+        render::line(&render::red(&error));
+    }
+}
+
+/// Make a copy of the session at `session` called `title`, its chat notes
+/// and summaries with it, and open the copy there, the original kept as it
+/// was. Copying the notes is the error, the copy being made either way.
+pub(crate) fn copy_session(
+    runner: &mut Runner,
+    session: &mut usize,
+    title: String,
+) -> Result<(), String> {
+    let from = &runner.store.conversations[*session];
     let mut copy = store::Conversation {
         id: runner.store.reserve_id(),
-        title: title.clone(),
+        title,
         messages: from.messages.clone(),
         updated: letronna_core::chat::now(),
         workspace: from.workspace.clone(),
@@ -5632,18 +5653,10 @@ fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
     history::share(from.id, copy.id);
     let notes = letronna_core::memory::copy_chat_notes(from.id, copy.id);
     runner.store.conversations.push(copy);
-    letronna_core::review::stop(&runner.review);
     *session = runner.store.conversations.len() - 1;
     runner.store.active = *session;
     runner.persist();
-    runner.show_goal();
-    render::blank();
-    render::line(&render::dim(&format!(
-        "Now in {title}. The original is kept; /resume goes back to it."
-    )));
-    if let Err(error) = notes {
-        render::line(&render::red(&error));
-    }
+    notes
 }
 
 /// Models listed at once where they cannot be steered through. Some gateways

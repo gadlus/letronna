@@ -324,6 +324,19 @@ fn main() {
         },
         _ => runner.open(false, workspace.clone()),
     };
+    // Carried on in a copy, the session continued or resumed kept as it
+    // was. A copy of nothing is only the new session it already is.
+    if args.fork && !runner.store.conversations[session].messages.is_empty() {
+        let title = (args.name.clone())
+            .unwrap_or_else(|| format!("{} (fork)", runner.store.conversations[session].title));
+        if let Err(error) = commands::copy_session(&mut runner, &mut session, title) {
+            eprintln!("{}", render::red(&error));
+        }
+    }
+    if let Some(name) = &args.name {
+        runner.store.conversations[session].title = name.clone();
+        runner.persist();
+    }
     // Before anything runs in it: a session that cannot have its worktree
     // must not work in the checkout instead.
     let conversation = &mut runner.store.conversations[session];

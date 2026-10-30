@@ -29,6 +29,9 @@ Options
   -p, --print <prompt>     ask one question, print the answer, exit
   -c, --continue           resume this folder's most recent session
   -r, --resume [id]        choose a session, or open the one with this id
+      --fork-session       with -c or -r <id>: carry on in a copy of it,
+                           leaving that session as it was
+      --name <name>        name the session, new or carried on
       --worktree           work in a git worktree of its own, on a branch
                            made from HEAD, leaving your checkout alone
       --mode <mode>        how much runs without asking: default, accept-edits,
@@ -177,6 +180,11 @@ pub struct Args {
     pub memory_scope: Option<Scope>,
     /// `--private`: the new session is a private chat.
     pub private: bool,
+    /// `--name`: what to call the session.
+    pub name: Option<String>,
+    /// `--fork-session`: carry on in a copy of the session continued or
+    /// resumed.
+    pub fork: bool,
 }
 
 pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -218,6 +226,8 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         memory: None,
         memory_scope: None,
         private: false,
+        name: None,
+        fork: false,
     };
     // Only as the first word, so `-p mcp` still asks about it.
     if raw.next_if(|first| first == "mcp").is_some() {
@@ -336,6 +346,12 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
                 args.memory_scope = Some(Scope::parse(&raw.next().unwrap_or_default())?);
             }
             "--private" => args.private = true,
+            "--fork-session" => args.fork = true,
+            "--name" => {
+                let name = raw.next().map(|name| name.trim().to_owned());
+                let name = name.filter(|name| !name.is_empty() && !name.starts_with('-'));
+                args.name = Some(name.ok_or("--name takes what to call the session.")?);
+            }
             "--gateway" => args.gateway = raw.next(),
             "--effort" => args.effort = raw.next(),
             "setup" | "--install" => args.install = true,
@@ -365,6 +381,14 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
     if args.private && args.start != Start::Fresh {
         return Err(
             "--private starts a new chat, so it does not go with --continue or --resume.".into(),
+        );
+    }
+    // The list to choose from comes after the window is taken, too late to
+    // copy what is picked from it before anything runs.
+    if args.fork && !matches!(args.start, Start::Last | Start::Named(_)) {
+        return Err(
+            "--fork-session copies the session carried on, so it goes with --continue or --resume <id>."
+                .into(),
         );
     }
     // A session carried on keeps the folder it had, worktree or not.
@@ -825,6 +849,19 @@ mod tests {
         assert!(refused(&["--memory", "often"]).contains("when-asked, ask or auto"));
         assert!(refused(&["--memory-scope", "team"]).contains("auto, project or chat"));
         assert!(refused(&["--private", "--continue"]).starts_with("--private starts a new chat"));
+    }
+
+    #[test]
+    fn a_session_is_named_and_forked_from_the_command_line() {
+        let named = args(&["--name", "release notes", "-c"]);
+        assert_eq!(named.name.as_deref(), Some("release notes"));
+        assert_eq!(named.start, super::Start::Last);
+        assert!(args(&["--fork-session", "-r", "42"]).fork);
+        assert!(args(&["-c", "--fork-session", "-p", "q"]).fork);
+        assert!(refused(&["--fork-session"]).starts_with("--fork-session copies"));
+        assert!(refused(&["--fork-session", "--resume"]).starts_with("--fork-session copies"));
+        assert!(refused(&["--name"]).starts_with("--name takes"));
+        assert!(refused(&["--name", "-c"]).starts_with("--name takes"));
     }
 
     /// The skill that tells the model how Letronna works keeps up with what
