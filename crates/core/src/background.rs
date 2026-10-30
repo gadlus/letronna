@@ -376,7 +376,14 @@ fn path(dir: &Path, session: u64, kind: &str) -> PathBuf {
 
 /// Write `bytes` to `path` whole, so a reader never finds half of it.
 fn put(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+    // A name of its own for each write: two files of one session, or two
+    // threads writing one, would otherwise share it and rename each
+    // other's away.
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let write = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(format!(".tmp-{}-{write}", std::process::id()));
+    let temp = path.with_file_name(name);
     crate::store::write_private(&temp, bytes)?;
     std::fs::rename(&temp, path)
 }

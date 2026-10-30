@@ -15,9 +15,6 @@ Letronna's file tools do not reach this folder, so the user edits these files th
 - `mcp.json`: MCP servers under `"mcpServers"`, in the shape Claude Desktop and Cursor use: `command`, `args`, `env` and `cwd` for one run here, `url` and `headers` for one elsewhere, plus `autoApprove` (tool names, or `"readOnly"`), `"disabled": true`, `includeTools`, `excludeTools`, `timeout_ms`, `startup_timeout_ms` and `${VAR}` or `${VAR:-default}` from the environment. `letronna mcp add` writes it.
 - `lsp.json`: language servers that check the files Letronna edits, each with `command`, `extensions` and the `projects` it serves.
 - `format.json`: the `projects` where each file Letronna writes goes through the project's own formatter (rustfmt, prettier, Biome, ruff, black, gofmt, clang-format), if set up and installed.
-- `hooks.json`: the user's commands run before and after tool calls, when a turn ends and when a card waits, in Claude Code's hook format.
-- `hooks.json`: the user's commands run before and after tool calls, after a failed one, when a turn or a helper ends and when a card waits, in Claude Code's hook format.
-- `hooks.json`: the user's commands run before and after tool calls, after a failed one, when a turn or a helper ends, before a summary and when a card waits, in Claude Code's hook format.
 - `hooks.json`: the user's commands run as a session starts, on each prompt, before and after tool calls, after a failed one, when a turn or a helper ends, before a summary and when a card waits, in Claude Code's hook format.
 - `permissions.json`: rules that allow, ask about or deny a tool by what it is called with, everywhere or for one project folder.
 - `search.json`: the search service set up with `/search services` or Settings, Search.
@@ -28,8 +25,7 @@ Letronna's file tools do not reach this folder, so the user edits these files th
 
 ## settings.json
 
-Most of it is set in the window's Settings or with a slash command (`mode`, `effort`, `style`, `thinking`, `fallbacks` with /fallback, `keep_days` with /retention, `memory_review` with /memory-review, `side_model` with /model side, `verify_edits` with /verify, `voice` with /voice, `notifications` with /notify, `terminal_theme` with /theme, `tool_search`, `jev_endpoint` and `jev_model` (how find_tools ranks: auto, jev or names, and where Jev is asked) with /tool-search, `manual_updates` with Update automatically in Settings, About). These are edited by hand:
-Most of it is set in the window's Settings or with a slash command (`mode`, `effort`, `style`, `thinking`, `fallbacks` with /fallback, `keep_days` with /retention, `memory_review` with /memory-review, `side_model` with /model side, `verify_edits` with /verify, `voice` with /voice, `notifications` with /notify, `status_line` with /statusline, `tool_search`, `jev_endpoint` and `jev_model` (how find_tools ranks: auto, jev or names, and where Jev is asked) with /tool-search, `manual_updates` with Update automatically in Settings, About). These are edited by hand:
+Most of it is set in the window's Settings or with a slash command (`mode`, `effort`, `style`, `thinking`, `fallbacks` with /fallback, `keep_days` with /retention, `memory_review` with /memory-review, `side_model` with /model side, `verify_edits` with /verify, `voice` with /voice, `notifications` with /notify, `terminal_theme` with /theme, `status_line` with /statusline, `tool_search`, `jev_endpoint` and `jev_model` (how find_tools ranks: auto, jev or names, and where Jev is asked) with /tool-search, `manual_updates` with Update automatically in Settings, About). These are edited by hand:
 
 - `context_cap`: the most tokens a request carries besides the reply; 0 keeps the default of 64,000.
 - `computer_use`: `true` offers the computer tool, which sees and uses other apps' windows, asking once for each app.

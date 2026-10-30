@@ -123,6 +123,8 @@ pub const COMMANDS: &[Command<'static>] = &[
     Command {
         name: "/vim",
         blurb: "vim's keys in the box: esc for normal mode, i to type; /vim off ends them",
+    },
+    Command {
         name: "/keybindings",
         blurb: "move keys: open keybindings.json, made with every action listed",
     },
@@ -157,6 +159,8 @@ pub const COMMANDS: &[Command<'static>] = &[
     Command {
         name: "/format",
         blurb: "run this project's own formatter on each file written, or not",
+    },
+    Command {
         name: "/lsp",
         blurb: "check this project's edits with the language servers installed here",
     },

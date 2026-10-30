@@ -2221,7 +2221,15 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Modes",
-        &["/mode", "/plan", "/decisions", "/permissions", "/verify", "/format", "/coauthor"],
+        &[
+            "/mode",
+            "/plan",
+            "/decisions",
+            "/permissions",
+            "/verify",
+            "/format",
+            "/coauthor",
+        ],
     ),
     (
         "Tools",
@@ -2270,7 +2278,17 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/wallet",
         ],
     ),
-    ("Help", &["/help", "/keybindings", "/vim", "/theme", "/terminal-setup", "/exit"]),
+    (
+        "Help",
+        &[
+            "/help",
+            "/keybindings",
+            "/vim",
+            "/theme",
+            "/terminal-setup",
+            "/exit",
+        ],
+    ),
 ];
 
 /// Letronna's own commands under their headings, those under none last.
@@ -2355,6 +2373,7 @@ fn coauthor(runner: &mut Runner, rest: &str) {
         "A commit a session writes here ends with \u{201c}Co-authored-by: Letronna\u{201d}, and a pull request with Letronna's mark."
     } else {
         "Commits and pull requests written here are yours alone."
+    }));
 }
 
 /// Turn running the project's own formatter on each file the agent writes
