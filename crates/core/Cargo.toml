@@ -82,6 +82,9 @@ k256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 tiny-keccak = { version = "2", features = ["keccak"] }
 curve25519-dalek = { version = "5", default-features = false }
 bip39 = { version = "3", default-features = false, features = ["std"] }
+# The QR code a phone scans to pair (phone.rs): Nayuki's encoder, one file
+# with nothing under it. Both the window and the terminal draw what it makes.
+qrcodegen = "1.8"
 # Kimi CLI names each project's folder of sessions by the MD5 of its path,
 # which importing one needs to find the project again. Already built here,
 # for lopdf under pdf-extract.

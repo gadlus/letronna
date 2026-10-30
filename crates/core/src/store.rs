@@ -514,6 +514,18 @@ pub struct Settings {
     /// The port it listens on; 0 for `providers::local::DEFAULT_PORT`.
     #[serde(default)]
     pub local_port: u16,
+    /// Let the phone app reach this computer through Letronna's relay,
+    /// encrypted end to end; see `phone`. Off unless turned on.
+    #[serde(default)]
+    pub phone: bool,
+    /// While `phone` is on, also let a phone on the same tailnet connect
+    /// straight to this computer over Tailscale; see `phone::direct`. Off
+    /// unless turned on.
+    #[serde(default)]
+    pub phone_direct: bool,
+    /// The port it listens on; 0 for `phone::direct::PORT`.
+    #[serde(default)]
+    pub phone_port: u16,
     /// The sidebar's list narrowed to one state: "needs_you", "working",
     /// "unseen" or "pinned"; empty for no filter.
     #[serde(default)]
@@ -601,6 +613,9 @@ impl Default for Settings {
             fallbacks: Vec::new(),
             provider_order: Vec::new(),
             local_endpoint: false,
+            phone: false,
+            phone_direct: false,
+            phone_port: 0,
             local_port: 0,
             memory_review: false,
             memory_saving: crate::memory::Saving::WhenAsked,

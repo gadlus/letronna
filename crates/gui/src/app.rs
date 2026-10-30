@@ -365,6 +365,8 @@ pub(crate) struct Chat {
     pub(crate) slack_code: Option<letronna_core::messaging::pairing::Code>,
     /// What the Slack listener last said it was doing; none while it is off.
     pub(crate) slack_state: Option<letronna_core::messaging::SlackState>,
+    /// The phone app's remote for this computer, while Settings let it in.
+    pub(crate) phones: crate::ui::phone::Phones,
     /// Runs beside the chat by session: held ones the window started, and
     /// scheduled ones its runner started.
     pub(crate) runs: std::collections::BTreeMap<u64, crate::runs::Run>,
@@ -1090,6 +1092,7 @@ impl Chat {
             heard_elsewhere: None,
             waiting_to_hear: false,
             slack_listener: None,
+            phones: Default::default(),
             voice: None,
             token_input,
             webhook_input,
@@ -1254,6 +1257,7 @@ impl Chat {
         Self::watch_clicks(window, cx);
         Self::watch_jobs(window, cx);
         this.restart_messaging(cx);
+        this.restart_phone(cx);
         if this.store.settings.presence == "off" {
             plugins::set_enabled(cx, plugins::DISCORD, false);
             this.store.settings.presence = "detailed".into();

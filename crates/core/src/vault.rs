@@ -452,6 +452,9 @@ fn what(name: &str) -> String {
     if name.starts_with("wallet.") {
         return "a wallet's key".into();
     }
+    if name.starts_with("phone.") {
+        return "this computer's key for your phones".into();
+    }
     match name
         .strip_prefix("messaging.")
         .and_then(|rest| rest.split_once('.'))
@@ -561,6 +564,7 @@ fn move_in(open: &Open) {
     }
     move_fields(open, &crate::auth::path(), crate::auth::SECRETS);
     move_fields(open, &crate::messaging::path(), crate::messaging::SECRETS);
+    move_fields(open, &crate::phone::path(), crate::phone::SECRETS);
 }
 
 /// Move the secrets at `fields` of the JSON file `path` into the vault, each
@@ -723,6 +727,7 @@ fn home(name: &str) -> Option<(PathBuf, String)> {
     [
         (crate::auth::path(), crate::auth::SECRETS),
         (crate::messaging::path(), crate::messaging::SECRETS),
+        (crate::phone::path(), crate::phone::SECRETS),
     ]
     .into_iter()
     .find_map(|(path, fields)| {
@@ -1055,7 +1060,7 @@ pub(crate) mod tests {
     }
 
     /// The same vault as the next start of the program sees it: nothing read.
-    fn restart(fake: &Arc<Fake>) {
+    pub(crate) fn restart(fake: &Arc<Fake>) {
         let open = Open::new("the test vault", TEST_SERVICE, fake.clone());
         FAKE.with(|slot| *slot.borrow_mut() = Some(Arc::new(open)));
     }

@@ -4,9 +4,9 @@ use super::PageColumn;
 use crate::prelude::*;
 use letronna_core::messaging::{self, pairing};
 
-struct Channel {
-    name: &'static str,
-    blurb: &'static str,
+pub(crate) struct Channel {
+    pub(crate) name: &'static str,
+    pub(crate) blurb: &'static str,
     icon: &'static str,
     colour: u32,
     built: bool,
@@ -35,6 +35,13 @@ const CHANNELS: &[Channel] = &[
         blurb: "Talk to Letronna in a direct message, or mention it in a channel.",
         icon: "icons/brands/slack.svg",
         colour: 0x611f69,
+        built: true,
+    },
+    Channel {
+        name: "Letronna app",
+        blurb: "Use this computer from the Letronna app on your phone, encrypted end to end.",
+        icon: "icons/device-mobile.svg",
+        colour: 0x1f4fd8,
         built: true,
     },
     Channel {
@@ -474,6 +481,7 @@ impl Chat {
             "Telegram" => self.messaging.telegram.ready(),
             "Discord" => self.messaging.discord.ready() || self.messaging.discord.bot_ready(),
             "Slack" => self.messaging.slack.ready(),
+            "Letronna app" => self.phone_live(),
             _ => false,
         }
     }
@@ -482,6 +490,9 @@ impl Chat {
         let pane = match CHANNELS[self.channel].name {
             "Discord" => self.discord_pane(cx).into_any_element(),
             "Slack" => self.slack_pane(cx).into_any_element(),
+            "Letronna app" => self
+                .phone_pane(&CHANNELS[self.channel], cx)
+                .into_any_element(),
             _ => self.telegram_pane(cx).into_any_element(),
         };
         v_flex()
@@ -505,7 +516,7 @@ impl Chat {
 
 /// The channel's own mark on its own colour. The marks are single-path and
 /// monochrome, so they take the tint rather than needing per-brand artwork.
-fn badge(channel: &Channel) -> impl IntoElement {
+pub(crate) fn badge(channel: &Channel) -> impl IntoElement {
     div()
         .size(px(26.))
         .flex()
@@ -536,7 +547,7 @@ pub(crate) fn pill(text: &'static str, colour: Hsla, cx: &App) -> impl IntoEleme
         .child(text)
 }
 
-fn section(text: &'static str, cx: &App) -> impl IntoElement {
+pub(crate) fn section(text: &'static str, cx: &App) -> impl IntoElement {
     div()
         .text_xs()
         .font_family(HEADING_FONT)
@@ -545,7 +556,7 @@ fn section(text: &'static str, cx: &App) -> impl IntoElement {
         .child(text.to_uppercase())
 }
 
-fn help(text: &str, cx: &App) -> Div {
+pub(crate) fn help(text: &str, cx: &App) -> Div {
     div()
         .min_w_0()
         .max_w(px(620.))
@@ -554,7 +565,7 @@ fn help(text: &str, cx: &App) -> Div {
         .child(text.to_owned())
 }
 
-fn field(label: &'static str, hint: &'static str, cx: &App) -> impl IntoElement {
+pub(crate) fn field(label: &'static str, hint: &'static str, cx: &App) -> impl IntoElement {
     v_flex()
         .min_w_0()
         .gap_0p5()

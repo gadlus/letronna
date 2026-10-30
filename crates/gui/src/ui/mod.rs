@@ -25,6 +25,7 @@ pub(crate) mod on_device;
 pub(crate) mod pace;
 pub(crate) mod palette;
 pub(crate) mod panel;
+pub(crate) mod phone;
 pub(crate) mod pictures;
 pub(crate) mod plugin_page;
 pub(crate) mod profiles;
@@ -41,9 +42,9 @@ pub(crate) mod switcher;
 pub(crate) mod update;
 pub(crate) mod usage;
 pub(crate) mod viewer;
-pub(crate) mod web_search;
 pub(crate) mod voice;
 pub(crate) mod wallet;
+pub(crate) mod web_search;
 pub(crate) mod workflows;
 
 use crate::prelude::*;

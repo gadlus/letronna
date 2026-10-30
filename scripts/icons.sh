@@ -17,7 +17,7 @@ search:magnifying-glass pin:push-pin folder:folder image:image square-pen:note-p
 info:info plugs:plugs palette:palette trash:trash export:export pencil:pencil-simple envelope:envelope-simple play:play stop:stop
 circle:circle list-checks:list-checks arrow-left:arrow-left arrow-right:arrow-right rotate-cw:arrow-clockwise pop-out:arrow-square-out pop-in:arrow-square-in view:sliders-horizontal arrows-out-line-horizontal:arrows-out-line-horizontal arrows-in-line-horizontal:arrows-in-line-horizontal eye:eye redo:arrow-clockwise undo:arrow-counter-clockwise git-branch:git-branch keyboard:keyboard cursor-click:cursor-click terminal:terminal-window pause:pause skip-forward:skip-forward tree-structure:tree-structure users-three:users-three
 circle-x:x-circle circle-check:check-circle triangle-alert:warning shield:shield-check puzzle:puzzle-piece circle-user:user-circle brain:brain wallet:wallet
-download:download-simple cpu:cpu hard-drives:hard-drives"
+download:download-simple cpu:cpu hard-drives:hard-drives device-mobile:device-mobile"
 for pair in $map; do
   cp "$src/${pair#*:}-light.svg" "assets/icons/${pair%%:*}.svg"
 done

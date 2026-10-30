@@ -131,6 +131,8 @@ impl Chat {
                     // stayed in it after a sign-out, refused when picked.
                     if this.account.is_some() != was {
                         this.reload_models(cx);
+                        // The relay connection is the account's too.
+                        this.restart_phone(cx);
                     }
                     this.account_note = match result {
                         Ok(account) if this.account.is_some() => {

@@ -94,3 +94,9 @@ A hook can block an action or keep a turn going. It can never allow something th
 ## Chat apps
 
 Telegram, Discord and Slack can each reach your agent. Telegram pairs by a code, and only the owner gets answers. Replies come with Allow/Deny buttons, and files and voice notes work in both directions. Scheduled jobs report there too. `letronna serve` answers with no window open.
+
+## The phone app
+
+The Letronna app on your phone can use this computer. Turn it on in Messaging › Letronna app, choose Pair a phone, and scan the code with the app. Both screens then show six digits; choose Pair only if they match. The phone and the computer each keep a connection to Letronna's servers, which pass messages between them encrypted end to end, with keys made when you pair: the servers cannot read them, and nothing on the computer listens on the network. A phone's chats are ordinary sessions, in the sidebar here. It works in Default or Plan mode only, and every call that needs a yes asks on the phone, one call at a time. Remove a phone in the same place to cut it off.
+
+If this computer and your phone are both on your Tailscale network, turn on Let phones connect straight here, under Over Tailscale on the same page. This computer then also listens on its tailnet address, port 47821 (`phone_port` in settings.json for another), and only there, so nothing off your tailnet reaches it. The pairing code then carries the address too, so a phone on the tailnet pairs over it, and one paired before learns it the next time it connects. Either way the phone tries the tailnet first from then on, falling back to the servers when it is not on it. What crosses is encrypted end to end the same way. The page says when Tailscale is not running, and Letronna picks it up when it starts.

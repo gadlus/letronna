@@ -102,6 +102,27 @@ const MODES: [Mode; 5] = [
     Mode::Bypass,
 ];
 
+/// Who the agent serves.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Client {
+    /// An editor, beside the user at this computer.
+    Editor,
+    /// The phone app, through the relay (core's `phone`). Whoever holds the
+    /// phone may not be at the desk, so as with a chat app's runs nothing
+    /// is freer than Default: those modes alone, and a yes is for one call,
+    /// never for the rest of the session.
+    Phone,
+}
+
+impl Client {
+    fn modes(self) -> &'static [Mode] {
+        match self {
+            Client::Editor => &MODES,
+            Client::Phone => &[Mode::Default, Mode::Plan],
+        }
+    }
+}
+
 /// What the model is told when it puts a plan up for a yes, which the driver
 /// cannot take: the plan comes as the answer, and the editor's mode lifts it.
 const PLAN_IN_REPLY: &str = "A plan cannot be approved from the editor, so plan mode stays on. \
@@ -143,10 +164,12 @@ struct Agent {
     grants: Arc<Mutex<Grants>>,
     next_id: Arc<AtomicU64>,
     turns: Vec<JoinHandle<()>>,
+    client: Client,
 }
 
-/// Serves the editor on stdin and stdout until it closes stdin, and gives the exit code.
-pub fn run() -> i32 {
+/// Serves `client` on stdin and stdout until it closes stdin, and gives the
+/// exit code.
+pub fn run(client: Client) -> i32 {
     // The terminal's panic hook paints the screen back through stdout, which
     // here would put escape codes between frames.
     drop(std::panic::take_hook());
@@ -182,6 +205,7 @@ pub fn run() -> i32 {
         stdin.lock().lines(),
         Box::new(std::io::stdout()),
         Box::new(runner),
+        client,
     );
     letronna_core::jobs::stop_all();
     letronna_core::mcp::stop_all();
@@ -255,12 +279,13 @@ fn open_session(runner: &mut Runner, cwd: &Path) -> Result<(Connection, Transcri
     Ok((connection, transcript))
 }
 
-/// Answers the editor's messages as they arrive on `input` until it ends,
+/// Answers `client`'s messages as they arrive on `input` until it ends,
 /// writing every frame to `output`, then waits for the turns still running.
 pub fn serve(
     input: impl Iterator<Item = std::io::Result<String>>,
     output: Box<dyn Write + Send>,
     home: Box<dyn Home>,
+    client: Client,
 ) {
     let mut agent = Agent {
         out: Arc::new(Mutex::new(output)),
@@ -271,6 +296,7 @@ pub fn serve(
         grants: Arc::default(),
         next_id: Arc::new(AtomicU64::new(0)),
         turns: Vec::new(),
+        client,
     };
     // Served before any turn starts, since a request with nobody serving is
     // declined at once.
@@ -309,6 +335,7 @@ fn forward_approvals(agent: &Agent) {
         agent.next_id.clone(),
     );
     let (sessions, grants) = (agent.sessions.clone(), agent.grants.clone());
+    let client = agent.client;
     std::thread::spawn(move || {
         for request in requests {
             // In the most a helper of the session may run in, as helpers
@@ -344,7 +371,7 @@ fn forward_approvals(agent: &Agent) {
             }
             hooks::card(ctx, &request.call.name);
             let id = next_id.fetch_add(1, Ordering::Relaxed);
-            let frame = permission_request(id, &request);
+            let frame = permission_request(id, &request, client);
             // Kept before it goes, so an answer quicker than this thread finds it.
             lock(&asked).insert(id, request);
             send(&out, &frame);
@@ -409,11 +436,15 @@ impl Agent {
 
     /// Opens a session working in the folder the editor names.
     fn new_session(&mut self, params: &Value) -> Result<Value, (i64, String)> {
-        let cwd = folder(params)?;
+        // A phone knows none of this computer's folders, so one that names
+        // none works where a session with no project does.
+        let cwd = match self.client == Client::Phone && params["cwd"].is_null() {
+            true => no_project()?,
+            false => folder(params)?,
+        };
         let (connection, transcript) = self.home.start(&cwd).map_err(|e| (INTERNAL_ERROR, e))?;
         let id = transcript.conversation.id;
-        let modes = modes(connection.mode);
-        let options = self.keep(connection, transcript);
+        let (modes, options) = self.keep(connection, transcript);
         Ok(json!({"sessionId": id.to_string(), "configOptions": options, "modes": modes}))
     }
 
@@ -421,7 +452,11 @@ impl Agent {
     /// telling the editor what was said in it before the reply.
     fn load_session(&mut self, params: &Value) -> Result<Value, (i64, String)> {
         let session = session_id(params)?;
-        let cwd = folder(params)?;
+        // A phone that names no folder reopens the session in its own.
+        let cwd = match self.client == Client::Phone && params["cwd"].is_null() {
+            true => None,
+            false => Some(folder(params)?),
+        };
         // Its turn would carry on into a conversation no longer held here.
         let running = lock(&self.sessions)
             .get(&session)
@@ -432,26 +467,32 @@ impl Agent {
         let Some(mut conversation) = store::saved(session) else {
             return Err((INVALID_PARAMS, format!("There is no session {session}.")));
         };
-        let elsewhere = (conversation.workspace.as_deref())
-            .is_none_or(|workspace| !same_folder(workspace, &cwd));
-        if elsewhere {
-            return Err((
-                INVALID_PARAMS,
-                format!("Session {session} does not work in `{}`.", cwd.display()),
-            ));
+        if let Some(cwd) = &cwd {
+            let elsewhere = (conversation.workspace.as_deref())
+                .is_none_or(|workspace| !same_folder(workspace, cwd));
+            if elsewhere {
+                return Err((
+                    INVALID_PARAMS,
+                    format!("Session {session} does not work in `{}`.", cwd.display()),
+                ));
+            }
         }
         let connection = (self.home.connect(&mut conversation)).map_err(|e| (INTERNAL_ERROR, e))?;
         for update_of in replay(&conversation) {
             send(&self.out, &update(session, update_of));
         }
         let path = store::sessions_dir().join(format!("{session}.jsonl"));
-        let modes = modes(connection.mode);
-        let options = self.keep(connection, Transcript { path, conversation });
+        let (modes, options) = self.keep(connection, Transcript { path, conversation });
         Ok(json!({"configOptions": options, "modes": modes}))
     }
 
-    /// Holds a session the editor opened or reopened, and gives its options.
-    fn keep(&self, connection: Connection, transcript: Transcript) -> Value {
+    /// Holds a session the editor opened or reopened, and gives its modes
+    /// and options. One in a mode its client may not pick is put in Default.
+    fn keep(&self, mut connection: Connection, transcript: Transcript) -> (Value, Value) {
+        if !self.client.modes().contains(&connection.mode) {
+            connection.switch_to(Mode::Default);
+        }
+        let modes = modes(connection.mode, self.client);
         let id = transcript.conversation.id;
         let open = Session {
             gateway: (transcript.conversation.gateway.clone()).unwrap_or_default(),
@@ -459,9 +500,9 @@ impl Agent {
             transcript: Some(transcript),
             cancel: Cancel::default(),
         };
-        let options = options(&open, &lock(&self.models));
+        let options = options(&open, &lock(&self.models), self.client);
         lock(&self.sessions).insert(id, open);
-        options
+        (modes, options)
     }
 
     /// Puts the session the editor names on the model it picked, from its
@@ -472,7 +513,7 @@ impl Agent {
         let option = params["configId"].as_str().unwrap_or_default();
         let picked = params["value"].as_str().unwrap_or_default();
         if option == MODE {
-            let mode = mode_named(picked)?;
+            let mode = mode_named(picked, self.client)?;
             let models = lock(&self.models).clone();
             let mut sessions = lock(&self.sessions);
             let Some(open) = sessions.get_mut(&session) else {
@@ -480,7 +521,7 @@ impl Agent {
             };
             // Unlike the model, mid-turn too: the gate reads it at each call.
             open.connection.switch_to(mode);
-            return Ok(json!({"configOptions": options(open, &models)}));
+            return Ok(json!({"configOptions": options(open, &models, self.client)}));
         }
         if option != MODEL {
             return Err((
@@ -528,7 +569,7 @@ impl Agent {
         if let Err(e) = transcript.save() {
             eprintln!("Could not save the model picked for session {session}: {e}");
         }
-        Ok(json!({"configOptions": options(open, &models)}))
+        Ok(json!({"configOptions": options(open, &models, self.client)}))
     }
 
     /// Asks the gateways for their models off this thread, then offers them
@@ -537,6 +578,7 @@ impl Agent {
         let ask = self.home.models();
         let (out, sessions, models) =
             (self.out.clone(), self.sessions.clone(), self.models.clone());
+        let client = self.client;
         std::thread::spawn(move || {
             let mut answered = ask();
             // None answering is no news: the list known before still holds.
@@ -547,7 +589,7 @@ impl Agent {
             answered.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
             *lock(&models) = answered.clone();
             let Some(options) =
-                (lock(&sessions).get(&session)).map(|open| options(open, &answered))
+                (lock(&sessions).get(&session)).map(|open| options(open, &answered, client))
             else {
                 return;
             };
@@ -561,7 +603,7 @@ impl Agent {
     /// are gated in it from the next one on, and its next turn starts in it.
     fn set_mode(&self, params: &Value) -> Result<Value, (i64, String)> {
         let session = session_id(params)?;
-        let mode = mode_named(params["modeId"].as_str().unwrap_or_default())?;
+        let mode = mode_named(params["modeId"].as_str().unwrap_or_default(), self.client)?;
         let mut sessions = lock(&self.sessions);
         let Some(open) = sessions.get_mut(&session) else {
             return Err((INVALID_PARAMS, format!("There is no session {session}.")));
@@ -689,6 +731,11 @@ impl Agent {
         let decision = match (outcome["outcome"].as_str(), option, place) {
             (Some("selected"), _, Some(place)) => Decision::Keep(place),
             (Some("selected"), Some("allow-once"), _) => Decision::Once,
+            // A phone is never offered it; one that answers it anyway is
+            // taken to have said yes to this call alone.
+            (Some("selected"), Some("allow-always"), _) if self.client == Client::Phone => {
+                Decision::Once
+            }
             // Kept as the terminal keeps "stop asking": a grant the gate
             // reads after the floor's own questions, which a yes for the
             // whole run would skip.
@@ -766,12 +813,12 @@ fn decide(call: &ToolCall, ctx: &ToolContext, mode: Mode, grants: &Mutex<Grants>
     outcome
 }
 
-/// The mode of those an editor can pick that goes by `name`.
-fn mode_named(name: &str) -> Result<Mode, (i64, String)> {
-    if let Some(mode) = MODES.into_iter().find(|mode| mode.name() == name) {
+/// The mode of those `client` can pick that goes by `name`.
+fn mode_named(name: &str, client: Client) -> Result<Mode, (i64, String)> {
+    if let Some(&mode) = client.modes().iter().find(|mode| mode.name() == name) {
         return Ok(mode);
     }
-    let names: Vec<&str> = MODES.iter().map(|mode| mode.name()).collect();
+    let names: Vec<&str> = client.modes().iter().map(|mode| mode.name()).collect();
     Err((
         INVALID_PARAMS,
         format!(
@@ -781,9 +828,10 @@ fn mode_named(name: &str) -> Result<Mode, (i64, String)> {
     ))
 }
 
-/// The modes the editor can pick from, with `current` the session's.
-fn modes(current: Mode) -> Value {
-    let available: Vec<Value> = MODES
+/// The modes `client` can pick from, with `current` the session's.
+fn modes(current: Mode, client: Client) -> Value {
+    let available: Vec<Value> = client
+        .modes()
         .iter()
         .map(|mode| json!({"id": mode.name(), "name": mode.label(), "description": mode.about()}))
         .collect();
@@ -817,6 +865,21 @@ fn session_id(params: &Value) -> Result<u64, (i64, String)> {
             INVALID_PARAMS,
             "`sessionId` does not name a session.".into(),
         ))
+}
+
+/// The folder a session with no project works in, made if it is not there.
+fn no_project() -> Result<PathBuf, (i64, String)> {
+    let folder = letronna_core::chat::fallback_folder().ok_or((
+        INTERNAL_ERROR,
+        "This computer has no folder for a session with no project.".to_owned(),
+    ))?;
+    std::fs::create_dir_all(&folder).map_err(|e| {
+        (
+            INTERNAL_ERROR,
+            format!("Could not make `{}`: {e}", folder.display()),
+        )
+    })?;
+    Ok(folder)
 }
 
 /// The folder a request names as `cwd`, which must be one given in full.
@@ -906,7 +969,7 @@ fn info(session: &Summary) -> Option<Value> {
 
 /// The options of `open` the editor can change: its model, among `models`,
 /// and its mode, which an editor that reads options reads here alone.
-fn options(open: &Session, models: &[(String, String)]) -> Value {
+fn options(open: &Session, models: &[(String, String)], client: Client) -> Value {
     let current = (open.gateway.clone(), open.connection.model.clone());
     let mut offered = models.to_vec();
     // Its own is offered too, before the gateways have answered, or when
@@ -920,7 +983,8 @@ fn options(open: &Session, models: &[(String, String)]) -> Value {
             json!({"value": choice(gateway, model), "name": format!("{model} · {gateway}")})
         })
         .collect();
-    let modes: Vec<Value> = MODES
+    let modes: Vec<Value> = client
+        .modes()
         .iter()
         .map(
             |mode| json!({"value": mode.name(), "name": mode.label(), "description": mode.about()}),
@@ -1148,8 +1212,9 @@ fn kind(name: &str) -> &'static str {
     }
 }
 
-/// Asks the editor about `request` under the id `id`, offering the gate's answers.
-fn permission_request(id: u64, request: &Request) -> Value {
+/// Asks the editor about `request` under the id `id`, offering the gate's
+/// answers: a phone has no yes for the rest of the session.
+fn permission_request(id: u64, request: &Request, client: Client) -> Value {
     let call = &request.call;
     let mut asked = tool_call(&call.id, &call.name, &call.arguments);
     // A helper's calls are not shown as they are made, so this one says whose it is.
@@ -1164,7 +1229,7 @@ fn permission_request(id: u64, request: &Request) -> Value {
     // other call asked about each time, as a message to post is, has no yes
     // for the session, which the gate would not keep.
     let options = match request.places.as_slice() {
-        [] if tools::asked_each_time(&call.name) => json!([
+        [] if tools::asked_each_time(&call.name) || client == Client::Phone => json!([
             {"optionId": "allow-once", "name": "Allow", "kind": "allow_once"},
             {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"},
         ]),
@@ -1376,6 +1441,11 @@ mod tests {
     impl Editor {
         /// Connects to an agent whose sessions ask the provider at `endpoint`.
         fn connect(endpoint: String, first: u64) -> Self {
+            Self::connect_as(endpoint, first, Client::Editor)
+        }
+
+        /// The same, as `client`.
+        fn connect_as(endpoint: String, first: u64, client: Client) -> Self {
             let serving = lock(&SERVING);
             let data =
                 std::env::temp_dir().join(format!("letronna-acp-{}-data", std::process::id()));
@@ -1388,7 +1458,7 @@ mod tests {
                     line: Vec::new(),
                     frames,
                 });
-                serve(input.into_iter(), output, opener(endpoint, first))
+                serve(input.into_iter(), output, opener(endpoint, first), client)
             });
             Self {
                 to: Some(to),
@@ -1838,6 +1908,72 @@ mod tests {
         choose(&editor, &asked, "reject-once");
         let (_, ended) = editor.reply(prompt);
         assert_eq!(ended["result"]["stopReason"], "end_turn");
+    }
+
+    #[test]
+    fn a_phone_picks_only_default_or_plan_and_says_yes_to_one_call_at_a_time() {
+        let dir = scratch("phone");
+        let run = |command: &str| ("run_command", json!({"command": command}));
+        let endpoint = provider(vec![
+            reply("", &[run("touch one.txt")]),
+            reply("", &[run("touch two.txt")]),
+            reply("Done.", &[]),
+        ]);
+        let mut phone = Editor::connect_as(endpoint, SESSIONS + 300, Client::Phone);
+        let initialize = phone.ask("initialize", json!({"protocolVersion": 1}));
+        phone.reply(initialize);
+        // Naming no folder, it works where a session with no project does.
+        let bare = phone.ask("session/new", json!({"mcpServers": []}));
+        let (_, opened) = phone.reply(bare);
+        assert!(opened["result"]["sessionId"].is_string(), "{opened}");
+        let new = phone.ask("session/new", json!({"cwd": dir, "mcpServers": []}));
+        let (_, opened) = phone.reply(new);
+        let offered: Vec<&str> = opened["result"]["modes"]["availableModes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|mode| mode["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(offered, ["default", "plan"]);
+        let session = opened["result"]["sessionId"].as_str().unwrap().to_owned();
+        let freer = phone.ask(
+            "session/set_mode",
+            json!({"sessionId": session, "modeId": "bypass"}),
+        );
+        let (_, refused) = phone.reply(freer);
+        assert_eq!(refused["error"]["code"], INVALID_PARAMS);
+
+        let prompt = start(&mut phone, &session, "Make two files.");
+        let (_, asked) = phone.until(is_permission);
+        let options: Vec<&str> = asked["params"]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| option["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(options, ["allow_once", "reject_once"]);
+        // An answer it was not offered is a yes to this call alone: the
+        // next one asks again.
+        choose(&phone, &asked, "allow-always");
+        let (_, asked) = asked_or_ended(&phone, prompt);
+        assert!(is_permission(&asked), "allow always held for a phone");
+        assert_eq!(
+            asked["params"]["toolCall"]["rawInput"]["command"],
+            "touch two.txt"
+        );
+        choose(&phone, &asked, "reject-once");
+        let (_, ended) = phone.reply(prompt);
+        assert_eq!(ended["result"]["stopReason"], "end_turn");
+    }
+
+    #[test]
+    fn an_editor_names_the_folder_a_session_works_in() {
+        let mut editor = Editor::connect(provider(vec![]), SESSIONS + 320);
+        let initialize = editor.ask("initialize", json!({"protocolVersion": 1}));
+        editor.reply(initialize);
+        let bare = editor.ask("session/new", json!({"mcpServers": []}));
+        let (_, refused) = editor.reply(bare);
+        assert_eq!(refused["error"]["code"], INVALID_PARAMS);
     }
 
     #[test]

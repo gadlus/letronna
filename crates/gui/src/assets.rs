@@ -92,7 +92,8 @@ impl AssetSource for Assets {
                 "wallet",
                 "download",
                 "cpu",
-                "hard-drives"
+                "hard-drives",
+                "device-mobile"
             ),
             ("telegram", "discord", "slack", "whatsapp")
         ))

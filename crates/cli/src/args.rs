@@ -156,6 +156,9 @@ pub struct Args {
     pub wallet: Option<Vec<String>>,
     /// `letronna acp`: speak the Agent Client Protocol on stdin and stdout.
     pub acp: bool,
+    /// `letronna acp --phone`: the same for the phone app, which the window
+    /// starts for each paired phone (core's `phone`).
+    pub acp_phone: bool,
     /// `--dump-config`: print what a `-p` run with these flags would get
     /// instead of running one.
     pub dump_config: bool,
@@ -203,6 +206,7 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         cloud: None,
         wallet: None,
         acp: false,
+        acp_phone: false,
         dump_config: false,
         schema: None,
         worktree: false,
@@ -227,6 +231,7 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
     // after and `letronna acp` anywhere else is a question about it.
     if raw.next_if(|first| first == "acp").is_some() {
         args.acp = true;
+        args.acp_phone = raw.next_if(|next| next == "--phone").is_some();
         return Ok(args);
     }
     while let Some(arg) = raw.next() {
@@ -533,6 +538,8 @@ mod tests {
         );
         assert_eq!(args(&["-p", "mcp"]).prompt.as_deref(), Some("mcp"));
         assert!(args(&["acp"]).acp && args(&["acp"]).prompt.is_none());
+        assert!(!args(&["acp"]).acp_phone);
+        assert!(args(&["acp", "--phone"]).acp && args(&["acp", "--phone"]).acp_phone);
         assert_eq!(args(&["-p", "acp"]).prompt.as_deref(), Some("acp"));
         assert!(args(&["--worktree"]).worktree && !bare.worktree);
         assert!(args(&["--worktree", "-p", "fix it"]).worktree);

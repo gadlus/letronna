@@ -131,6 +131,7 @@ pub(crate) fn secrets() -> Vec<String> {
     ]);
     all.extend(crate::mcp::secrets());
     all.extend(crate::wallet::secrets());
+    all.extend(crate::phone::secrets());
     let mut all: Vec<String> = all
         .into_iter()
         .map(|secret| secret.trim().to_owned())

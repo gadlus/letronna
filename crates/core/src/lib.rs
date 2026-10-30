@@ -82,6 +82,7 @@ pub mod palette;
 mod patch;
 pub mod paths;
 pub mod permissions;
+pub mod phone;
 pub mod plugins;
 mod prefilter;
 pub mod preview;

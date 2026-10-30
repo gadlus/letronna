@@ -19,6 +19,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **App** — Settings › On this computer: what this computer has, every model with its verdict, and Get, a progress ring with Pause, Resume and Cancel, Use, Delete, Show in Finder or Explorer, and photo reading to add or remove. The model menu lists the models downloaded, under On this computer, and first-run setup offers the suggested one.
 - **App** — Each web search shows as a card above the answer, for every model: "Searching the web" while it runs, then "Searched the web · 5 results" with the query, and a click lists the pages, each opening in the browser.
 - **Terminal** — A model downloaded to this computer is in `/model`, and `letronna --gateway "This computer" --model bonsai-2-4b` runs one; it says when it is loading, or waiting for another chat.
+- **App** — Use this computer from the Letronna app on your phone, encrypted end to end. Messaging › Letronna app pairs a phone with a QR code and six digits to compare, and lists the phones paired. A phone's chats are sessions on this computer, in Default or Plan mode, and each call that needs a yes asks on the phone. Letronna's servers pass the messages on without being able to read them, and nothing on this computer listens on the network. Turn on Over Tailscale there and a phone on the same tailnet pairs and connects straight to this computer instead, which still works when Letronna's servers cannot be reached; only the tailnet address is listened on, port 47821.
 
 ## [0.1.0-alpha.4.2] - 2026-10-20
 

@@ -2816,6 +2816,14 @@ fn slack_connect(
     url: &str,
     quiet: std::time::Duration,
 ) -> Option<tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>> {
+    tungstenite::client_tls(url, reach(url, quiet)?)
+        .ok()
+        .map(|(socket, _)| socket)
+}
+
+/// A connection to the host of WebSocket `url`, with a timeout on the
+/// lookup and the connect, and `quiet` on each read and write after.
+pub(crate) fn reach(url: &str, quiet: std::time::Duration) -> Option<std::net::TcpStream> {
     use std::net::ToSocketAddrs;
     let step = std::time::Duration::from_secs(10);
     let parsed = reqwest::Url::parse(url).ok()?;
@@ -2837,9 +2845,7 @@ fn slack_connect(
         .find_map(|address| std::net::TcpStream::connect_timeout(address, step).ok())?;
     stream.set_read_timeout(Some(quiet)).ok()?;
     stream.set_write_timeout(Some(quiet)).ok()?;
-    tungstenite::client_tls(url, stream)
-        .ok()
-        .map(|(socket, _)| socket)
+    Some(stream)
 }
 
 /// A read that timed out: Unix says it would block, Windows that it timed

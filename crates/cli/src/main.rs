@@ -135,7 +135,11 @@ fn main() {
         std::process::exit(wallet::run(words));
     }
     if args.acp {
-        std::process::exit(acp::run());
+        let client = match args.acp_phone {
+            true => acp::Client::Phone,
+            false => acp::Client::Editor,
+        };
+        std::process::exit(acp::run(client));
     }
     // Before the update is seen to: the window counts its own start and
     // installs what is waiting, so counting here too would put a working
