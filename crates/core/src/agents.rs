@@ -256,6 +256,18 @@ fn is_zero(n: &usize) -> bool {
     *n == 0
 }
 
+/// The type of the helper whose transcript is `transcript`, as its sidecar
+/// names it, or "fork" for one started from its parent's messages; `None`
+/// for a run that is no helper the model started.
+pub(crate) fn kind_of(transcript: &Path) -> Option<String> {
+    let sidecar = Sidecar::read(&transcript.with_extension("json")).ok()?;
+    Some(if sidecar.fork {
+        "fork".into()
+    } else {
+        sidecar.kind
+    })
+}
+
 impl Sidecar {
     /// Reads one back, saying what went wrong when it cannot.
     fn read(path: &Path) -> Result<Self, String> {

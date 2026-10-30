@@ -91,7 +91,7 @@ A plugin whose `main` is a `.js` or `.py` file runs it: JavaScript on the engine
 
 `hooks.json` uses the same shape as Claude Code's hooks, so existing scripts carry over:
 
-- Events: before and after a tool call, at the end of a turn, and when an approval waits.
+- Events: before and after a tool call (`PreToolUse`, `PostToolUse`), after one that failed (`PostToolUseFailure`), at the end of a turn or of a helper's work (`Stop`, `SubagentStop`), and when an approval waits (`Notification`).
 - Hooks read JSON on stdin.
 - Exit code `2` blocks the action, with stderr as the reason.
 

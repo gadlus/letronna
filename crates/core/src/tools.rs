@@ -993,9 +993,11 @@ pub(crate) fn run_found(
     let ran = match ran {
         Ok(ran) => ran,
         Err(e) => {
-            let failed = crate::redact::scrub(&e, shapes) + &note + &heard;
+            let e = crate::redact::scrub(&e, shapes);
+            let failed = e.clone() + &note + &heard;
             let said = crate::plugins::code::failed(tool.name(), &args, &failed, took, ctx);
-            return Err(failed + &said);
+            let hooked = crate::hooks::failed(hooks, tool.name(), &args, &e, took, ctx);
+            return Err(failed + &said + &hooked);
         }
     };
     // Before the scrub: a key with a hidden character inside reads as a key
@@ -9205,6 +9207,42 @@ mod tests {
         fn run(&self, _: &Value, _: &ToolContext) -> Result<String, String> {
             Ok("ran".into())
         }
+    }
+
+    /// A tool whose every call fails.
+    struct Failing;
+    impl Tool for Failing {
+        fn name(&self) -> &'static str {
+            "failing_tool"
+        }
+        fn description(&self) -> &'static str {
+            "Always fails."
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn run(&self, _: &Value, _: &ToolContext) -> Result<String, String> {
+            Err("it broke".into())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_call_carries_what_its_failure_hooks_said_and_a_success_runs_none() {
+        let (_turn, dir) = data_folder("failure-hooks");
+        let file = dir.join("hooks.json");
+        let hooks = json!({ "hooks": { "PostToolUseFailure": [{
+            "matcher": "failing_tool",
+            "hooks": [{ "type": "command", "command": "sh -c 'echo read the log >&2; exit 2'" }],
+        }] } });
+        std::fs::write(&file, hooks.to_string()).unwrap();
+        let hooks = crate::hooks::load(&file);
+        let ctx = ToolContext::default();
+        let why = run_found(&Failing, "{}", &ctx, &hooks).unwrap_err();
+        assert_eq!(why, "it broke\n\n[PostToolUseFailure hook] read the log");
+        let fine = run_found(&Named("failing_tool"), "{}", &ctx, &hooks);
+        assert_eq!(fine.as_deref(), Ok("ran"));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
     #[test]

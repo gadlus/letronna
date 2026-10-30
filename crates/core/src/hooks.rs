@@ -1,6 +1,6 @@
 //! The user's own commands, run at points in a session: before and after a
-//! tool call, when the model has finished its turn, and when a card waits
-//! for the user.
+//! tool call, after one that failed, when the model or a helper has
+//! finished its turn, and when a card waits for the user.
 //!
 //! `hooks.json` in the data folder takes the shape Claude Code's settings
 //! give hooks, so a script written for it carries over: the JSON it reads on
@@ -134,8 +134,12 @@ pub enum Event {
     PreToolUse,
     /// A call ran and succeeded; a hook may tell the model something.
     PostToolUse,
+    /// A call ran and failed; a hook may tell the model something.
+    PostToolUseFailure,
     /// The model has finished its turn; a hook may send it back to work.
     Stop,
+    /// A helper has finished; a hook may send it back to work.
+    SubagentStop,
     /// A card waits for the user.
     Notification,
 }
@@ -150,16 +154,16 @@ const KNOWN_ELSEWHERE: &[&str] = &[
     "PreCompact",
     "PostCompact",
     "SubagentStart",
-    "SubagentStop",
     "PermissionRequest",
-    "PostToolUseFailure",
 ];
 
 impl Event {
-    const ALL: [Event; 4] = [
+    const ALL: [Event; 6] = [
         Self::PreToolUse,
         Self::PostToolUse,
+        Self::PostToolUseFailure,
         Self::Stop,
+        Self::SubagentStop,
         Self::Notification,
     ];
 
@@ -168,7 +172,9 @@ impl Event {
         match self {
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
+            Self::PostToolUseFailure => "PostToolUseFailure",
             Self::Stop => "Stop",
+            Self::SubagentStop => "SubagentStop",
             Self::Notification => "Notification",
         }
     }
@@ -337,9 +343,10 @@ fn parse(text: &str) -> Result<Hooks, String> {
             continue;
         }
         if !Event::ALL.iter().any(|event| event.name() == name) {
+            let names: Vec<String> = Event::ALL.iter().map(|e| e.name().to_owned()).collect();
             return Err(format!(
-                "hooks do not run at `{name}` here, only at PreToolUse, PostToolUse, \
-                 Stop and Notification"
+                "hooks do not run at `{name}` here, only at {}",
+                spoken(&names)
             ));
         }
         let guard = name == Event::PreToolUse.name();
@@ -604,6 +611,50 @@ pub(crate) fn after(
     said
 }
 
+/// Runs the PostToolUseFailure hooks for a call that ran for `took` and
+/// failed with `error`: what they said for the model, as lines to add to the
+/// error, or nothing. The call has failed already, so exit code 2 only tells
+/// the model its stderr, as in Claude Code.
+pub(crate) fn failed(
+    hooks: &Result<Hooks, String>,
+    tool: &str,
+    args: &Value,
+    error: &str,
+    took: Duration,
+    ctx: &ToolContext,
+) -> String {
+    let Ok(hooks) = hooks else {
+        return String::new();
+    };
+    if !hooks.has(Event::PostToolUseFailure) {
+        return String::new();
+    }
+    // A stop is the user's, which no hook hears of, so nothing here is one.
+    let own = json!({
+        "tool_name": tool,
+        "tool_input": tool_input(tool, args, ctx),
+        "error": error,
+        "is_interrupt": false,
+        "duration_ms": took.as_millis() as u64,
+    });
+    let input = input(Event::PostToolUseFailure, ctx, own);
+    let heard = hear(hooks, Event::PostToolUseFailure, tool, &input, ctx);
+    report(heard.problems);
+    let mut said: String = heard
+        .blocks
+        .into_iter()
+        .chain(heard.context)
+        .map(|said| format!("\n\n[PostToolUseFailure hook] {said}"))
+        .collect();
+    if let Some(why) = heard.halt {
+        let why = format!("A PostToolUseFailure hook ended the turn: {why}");
+        said.push_str(&format!("\n\n[{why}]"));
+        report(vec![why]);
+        halt(ctx);
+    }
+    said
+}
+
 /// Runs the Stop hooks once the model has finished a turn with `last` as its
 /// reply: what one says is left to do, as the message that sends the model
 /// back to it, if any. `again` when a Stop hook already did this turn. The
@@ -638,6 +689,64 @@ pub fn stop(ctx: &ToolContext, last: &str, again: bool) -> Option<String> {
 /// What starts a Stop hook's word sent back as the next message of a turn,
 /// which the user's kept words leave out as the hook's, not theirs.
 pub(crate) const FEEDBACK: &str = "Stop hook feedback:";
+
+/// Runs the SubagentStop hooks once a helper of the session `root` has
+/// finished with `last` as its answer: what one says is left to do, as the
+/// message that sends the helper back to it, if any. `kind` is the helper's
+/// type, which a matcher is held to, `transcript` its own file, and `again`
+/// says a SubagentStop hook already sent it back.
+pub(crate) fn subagent_stop(
+    ctx: &ToolContext,
+    root: u64,
+    kind: &str,
+    transcript: &Path,
+    last: &str,
+    again: bool,
+) -> Option<String> {
+    let hooks = current();
+    let Ok(hooks) = hooks.as_ref() else {
+        return None;
+    };
+    helper_stopped(hooks, ctx, root, kind, transcript, last, again)
+}
+
+/// `subagent_stop`, with the hooks handed in.
+fn helper_stopped(
+    hooks: &Hooks,
+    ctx: &ToolContext,
+    root: u64,
+    kind: &str,
+    transcript: &Path,
+    last: &str,
+    again: bool,
+) -> Option<String> {
+    if !hooks.has(Event::SubagentStop) {
+        return None;
+    }
+    let own = json!({
+        "stop_hook_active": again,
+        "agent_id": ctx.conversation.to_string(),
+        "agent_type": kind,
+        "agent_transcript_path": transcript.to_string_lossy(),
+        "last_assistant_message": last,
+    });
+    // The session's id and file, as Claude Code gives a helper's hook; the
+    // helper's own are the agent's fields.
+    let session = ToolContext {
+        conversation: root,
+        ..ctx.clone()
+    };
+    let input = input(Event::SubagentStop, &session, own);
+    let heard = hear(hooks, Event::SubagentStop, kind, &input, ctx);
+    report(heard.problems);
+    // The helper is ending anyway; `continue: false` only keeps it ended.
+    if let Some(why) = heard.halt {
+        report(vec![format!("A SubagentStop hook ended the helper: {why}")]);
+        return None;
+    }
+    let why = heard.blocks.into_iter().next()?;
+    Some(format!("{FEEDBACK}\n{why}"))
+}
 
 /// Runs the Notification hooks for the card a call of `tool` puts up, on a
 /// thread of their own, since nothing waits on them; their failures are
@@ -802,9 +911,9 @@ struct Heard {
 }
 
 /// Runs the hooks set for `event` whose matcher fits `subject`, one after
-/// another. A PreToolUse or Stop hook's block or end is the answer, so the
-/// rest do not run; PostToolUse and Notification hooks run whatever an
-/// earlier one said, as a formatter after a linter should.
+/// another. A PreToolUse, Stop or SubagentStop hook's block or end is the
+/// answer, so the rest do not run; the others run whatever an earlier one
+/// said, as a formatter after a linter should.
 fn hear(hooks: &Hooks, event: Event, subject: &str, input: &Value, ctx: &ToolContext) -> Heard {
     let mut heard = Heard::default();
     let input = input.to_string();
@@ -816,7 +925,7 @@ fn hear(hooks: &Hooks, event: Event, subject: &str, input: &Value, ctx: &ToolCon
     let fitting = groups
         .iter()
         .filter(|group| event == Event::Stop || group.matcher.fits(subject));
-    let decisive = matches!(event, Event::PreToolUse | Event::Stop);
+    let decisive = matches!(event, Event::PreToolUse | Event::Stop | Event::SubagentStop);
     for hook in fitting.flat_map(|group| &group.hooks) {
         // The user's own stop is no failure to tell them of; `tools::run`
         // keeps a call stopped here from running.
@@ -1416,25 +1525,25 @@ mod tests {
         let dir = scratch("skipped");
         let file = dir.join("hooks.json");
         let hook = json!([{ "hooks": [{ "type": "command", "command": "guard" }] }]);
-        let two = json!({ "hooks": { "UserPromptSubmit": hook, "SessionStart": hook } });
+        let two = json!({ "hooks": { "SubagentStart": hook, "SessionEnd": hook } });
         std::fs::write(&file, two.to_string()).unwrap();
         let read = Mutex::new(None);
         assert_eq!(
             reread_at(&file, &read),
             [
-                "hooks.json: SessionStart and UserPromptSubmit hooks do not run in Letronna \
+                "hooks.json: SessionEnd and SubagentStart hooks do not run in Letronna \
                  yet; the rest of the file is in use."
             ]
         );
         assert!(reread_at(&file, &read).is_empty());
         let three = json!({ "hooks": {
-            "PreCompact": hook, "SubagentStop": hook, "SessionEnd": hook, "Stop": hook,
+            "PostCompact": hook, "SubagentStart": hook, "SessionEnd": hook, "Stop": hook,
         } });
         std::fs::write(&file, three.to_string()).unwrap();
         let told = reread_at(&file, &read);
         assert_eq!(told.len(), 1, "{told:?}");
         assert!(
-            told[0].starts_with("hooks.json: PreCompact, SessionEnd and SubagentStop hooks"),
+            told[0].starts_with("hooks.json: PostCompact, SessionEnd and SubagentStart hooks"),
             "{told:?}"
         );
         assert!(reread_at(&file, &read).is_empty());
@@ -1744,6 +1853,85 @@ mod tests {
             "command": "sh -c 'echo two tests fail >&2; exit 2'"}]}]}}"#;
         let heard = hear(&parse(stop).unwrap(), Event::Stop, "", &json!({}), &ctx);
         assert_eq!(heard.blocks, ["two tests fail"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failure_hook_reads_what_failed_and_speaks_to_the_model() {
+        let dir = scratch("failure");
+        let seen = dir.join("input.json");
+        let said = r#"{"hookSpecificOutput": {"additionalContext": "check the lockfile"}}"#;
+        let command = script(
+            &dir,
+            "failure.sh",
+            &format!("cat > '{}'; echo '{said}'", seen.display()),
+        );
+        let hooks = Ok(one("PostToolUseFailure", &command, None));
+        let args = json!({ "command": "npm test" });
+        let took = Duration::from_millis(1500);
+        let ctx = ToolContext::default();
+        let heard = failed(&hooks, "run_command", &args, "Exit code 1", took, &ctx);
+        assert_eq!(heard, "\n\n[PostToolUseFailure hook] check the lockfile");
+        let input: Value = serde_json::from_slice(&std::fs::read(&seen).unwrap()).unwrap();
+        assert_eq!(input["hook_event_name"], "PostToolUseFailure");
+        assert_eq!(input["tool_name"], "run_command");
+        assert_eq!(input["tool_input"]["command"], "npm test");
+        assert_eq!(input["error"], "Exit code 1");
+        assert_eq!(input["duration_ms"], 1500);
+        assert_eq!(input["is_interrupt"], false);
+        // Exit code 2 cannot stop what has failed already; the model hears it.
+        let two = Ok(one(
+            "PostToolUseFailure",
+            "sh -c 'echo rerun it >&2; exit 2'",
+            None,
+        ));
+        let heard = failed(&two, "edit_file", &json!({}), "No match.", took, &ctx);
+        assert_eq!(heard, "\n\n[PostToolUseFailure hook] rerun it");
+        // A success is PostToolUse's, never this event's.
+        assert!(after(&two, "edit_file", &json!({}), "Edited.", &ctx).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_s_stop_hook_sends_it_back_and_is_told_whose_helper_it_is() {
+        let dir = scratch("subagent");
+        let seen = dir.join("input.json");
+        let command = script(
+            &dir,
+            "subagent.sh",
+            &format!(
+                "cat > '{}'; echo write the tests too >&2; exit 2",
+                seen.display()
+            ),
+        );
+        let file = json!({ "hooks": { "SubagentStop": [{ "matcher": "Explore", "hooks": [
+            { "type": "command", "command": command },
+        ] }] } });
+        let hooks = parse(&file.to_string()).unwrap();
+        let ctx = ToolContext {
+            conversation: 77,
+            ..ToolContext::default()
+        };
+        let transcript = dir.join("77.jsonl");
+        let back = helper_stopped(&hooks, &ctx, 5, "Explore", &transcript, "Found 3.", false);
+        assert_eq!(
+            back.as_deref(),
+            Some("Stop hook feedback:\nwrite the tests too")
+        );
+        let input: Value = serde_json::from_slice(&std::fs::read(&seen).unwrap()).unwrap();
+        assert_eq!(input["hook_event_name"], "SubagentStop");
+        assert_eq!(input["session_id"], "5");
+        assert_eq!(input["agent_id"], "77");
+        assert_eq!(input["agent_type"], "Explore");
+        assert_eq!(input["last_assistant_message"], "Found 3.");
+        assert_eq!(input["stop_hook_active"], false);
+        assert_eq!(
+            input["agent_transcript_path"],
+            transcript.to_string_lossy().as_ref()
+        );
+        // Held to the helper's type, unlike a Stop hook.
+        let other = helper_stopped(&hooks, &ctx, 5, "review", &transcript, "Done.", false);
+        assert_eq!(other, None);
     }
 
     #[test]

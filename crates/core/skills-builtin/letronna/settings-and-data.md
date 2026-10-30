@@ -16,6 +16,7 @@ Letronna's file tools do not reach this folder, so the user edits these files th
 - `lsp.json`: language servers that check the files Letronna edits, each with `command`, `extensions` and the `projects` it serves.
 - `format.json`: the `projects` where each file Letronna writes goes through the project's own formatter (rustfmt, prettier, Biome, ruff, black, gofmt, clang-format), if set up and installed.
 - `hooks.json`: the user's commands run before and after tool calls, when a turn ends and when a card waits, in Claude Code's hook format.
+- `hooks.json`: the user's commands run before and after tool calls, after a failed one, when a turn or a helper ends and when a card waits, in Claude Code's hook format.
 - `permissions.json`: rules that allow, ask about or deny a tool by what it is called with, everywhere or for one project folder.
 - `search.json`: the search service set up with `/search services` or Settings, Search.
 - `messaging.json`: the chat apps (see `chat-apps.md`). `schedules.json`: the scheduled jobs.

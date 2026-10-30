@@ -951,11 +951,27 @@ fn steps(
                 continue;
             }
             // A session's own agent, as `-p` runs it, hears its Stop hooks as a
-            // turn in the terminal does; a helper's answer is its parent's to judge.
-            let feedback = (spec.depth == 0 && sent_back < crate::hooks::STOP_BLOCKS)
+            // turn in the terminal does; a helper's answer is its parent's to
+            // judge, but the SubagentStop hooks the user set may send it back.
+            let feedback = (sent_back < crate::hooks::STOP_BLOCKS)
                 .then(|| {
                     let last = last_said(&spec.transcript.conversation.messages);
-                    crate::hooks::stop(&context(spec), &last, sent_back > 0)
+                    if spec.depth == 0 {
+                        return crate::hooks::stop(&context(spec), &last, sent_back > 0);
+                    }
+                    // Only a helper the model started has a type; an aside
+                    // or a goal's check is Letronna's own.
+                    let kind = crate::agents::kind_of(&spec.transcript.path)?;
+                    let path = &spec.transcript.path;
+                    let again = sent_back > 0;
+                    crate::hooks::subagent_stop(
+                        &context(spec),
+                        spec.root,
+                        &kind,
+                        path,
+                        &last,
+                        again,
+                    )
                 })
                 .flatten();
             let Some(feedback) = feedback else {
