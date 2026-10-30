@@ -614,6 +614,8 @@ pub(crate) struct Chat {
     pub(crate) hit_at: Option<(Pixels, bool)>,
     /// The find bar over the chat, while it is open.
     pub(crate) finder: Option<crate::ui::find::Finder>,
+    /// What stops the command typed with `!`, while it runs.
+    pub(crate) shell: Option<letronna_core::cancel::Cancel>,
     /// The list of modes, while the mode chip has it open.
     pub(crate) mode_menu: Option<Entity<gpui_component::menu::PopupMenu>>,
     /// When the chat on screen saves to memory and where, while the memory
@@ -1211,6 +1213,7 @@ impl Chat {
             artifacts: None,
             reveal: None,
             finder: None,
+            shell: None,
             revealed: None,
             hit_at: None,
             mode_menu: None,
@@ -1565,6 +1568,14 @@ impl Chat {
 
     pub(crate) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let prompt = self.composer.read(cx).value().trim().to_owned();
+        // Run here, as in a shell, rather than sent: what it prints goes to
+        // the model with the next message.
+        if let Some(command) = crate::ui::shell::shell_command(&prompt) {
+            let command = command.to_owned();
+            self.composer
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            return self.shell_line(&command, cx);
+        }
         // `/loop` and `/heartbeat` are for Letronna, not the model, and are
         // taken while a reply runs too: `/loop stop` most of all.
         let (name, rest) = prompt
@@ -4258,6 +4269,10 @@ impl Chat {
             cx.notify();
         } else if self.finder.is_some() && self.page == Page::Chat {
             self.close_find(window, cx);
+        } else if self.stop_shell() {
+            // Before the reply: the command is what was started last.
+            self.note = Some("Stopping the command…".into());
+            cx.notify();
         } else if let Some(aside) = self.aside_to_close() {
             aside.cancel.set();
             cx.notify();

@@ -40,6 +40,7 @@ pub(crate) mod search;
 pub(crate) mod sessions;
 pub(crate) mod settings;
 pub(crate) mod setup;
+pub(crate) mod shell;
 pub(crate) mod sidebar;
 pub(crate) mod skills;
 pub(crate) mod switcher;
