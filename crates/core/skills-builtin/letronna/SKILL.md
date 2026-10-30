@@ -40,7 +40,7 @@ Then `letronna mcp list`, `get <name>`, `remove <name>`, and `login <name>` or `
 
 ## Slash commands in the terminal
 
-- /help lists them all, /new or /clear starts a fresh session (ctrl+l clears the screen), /exit leaves.
+- /help lists them all, /terminal-setup (shift+enter), /new or /clear starts a fresh session (ctrl+l clears the screen), /exit leaves.
 - Model: /model (also image, speech or video models, and `/model side` for a cheaper one for summaries), /fallback (models to carry on with when one is overloaded or out of credit), /connect, /effort, /thinking, /style (reply styles).
 - Asking first: /mode, /plan, /decisions (what auto mode's judge allowed or blocked), /verify (build or test after edits), /coauthor (Letronna as co-author of commits).
 - Model: /model (also image, speech or video models, and `/model side` for a cheaper one for summaries), /fallback (models to carry on with when one is overloaded or out of credit), /connect, /limits (what is left of each plan), /effort, /thinking, /style (reply styles).
@@ -49,6 +49,8 @@ Then `letronna mcp list`, `get <name>`, `remove <name>`, and `login <name>` or `
 - Account: /login, /logout, /whoami, /team (bill hosted models to a team).
 - Web and voice: /search (lets the model search the web; /search services sets up one of the user's own), /voice (read replies aloud), /notify (say when a reply ends or needs the user).
 - Sessions: /resume, /branch (a copy), /rename, /rewind, /undo (any message), /redo, /retry, /compact (sum up old turns), /context, /diff, /where, /status, /export, /import (Claude Code, Codex), /btw (an aside, not kept), /copy, /image <path>, /preview <path>, /usage, /insights.
+- Web and voice: /search (web search; /search services sets up the user's own), /voice (read replies aloud), /notify (say when a reply ends or needs the user).
+- Sessions: /resume, /branch (a copy), /rename, /rewind, /undo (any message), /retry, /compact (summarize old turns), /context, /diff, /where, /status, /export, /import (Claude Code, Codex), /btw (an aside, not kept), /copy, /image <path>, /preview <path>, /usage, /insights.
 - Long work: /goal (keep working until a goal is met, `--check <command>`), /loop (run a prompt every so often; /loop stop), /heartbeat (look in on this session every so many minutes), /jobs (background commands), /agents (helpers), /workflows, /crew (workflows of helpers for big tasks).
 - Cloud: ask in chat to run or host something (a bot 24/7), check it or take it down.
 - Keeping and adding: /remember (keep something now, or change when this chat saves), /memory (`/memory edit, log or restore user|memory|project|soul`), /memory-review, /retention (delete old sessions), /init (write AGENTS.md), /skills, /mcp, /plugins, /tool-search.

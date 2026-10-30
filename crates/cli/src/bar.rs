@@ -45,6 +45,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "what Letronna can do here",
     },
     Command {
+        name: "/terminal-setup",
+        blurb: "what this terminal does with shift+enter and Option, and what to change",
+    },
+    Command {
         name: "/new",
         blurb: "start a fresh session",
     },

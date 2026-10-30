@@ -75,6 +75,10 @@ pub fn command(
             status(runner, *session);
             Flow::Handled
         }
+        "/terminal-setup" => {
+            crate::terminal_setup::terminal_setup(runner);
+            Flow::Handled
+        }
         "/export" => {
             export(runner, *session, rest);
             Flow::Handled
@@ -2005,7 +2009,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/wallet",
         ],
     ),
-    ("Help", &["/help", "/exit"]),
+    ("Help", &["/help", "/terminal-setup", "/exit"]),
 ];
 
 /// Letronna's own commands under their headings, those under none last.

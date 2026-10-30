@@ -37,6 +37,7 @@ mod session;
 mod setup;
 mod spinner;
 mod syntax;
+mod terminal_setup;
 mod title;
 mod wallet;
 
