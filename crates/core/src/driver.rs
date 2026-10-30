@@ -501,7 +501,14 @@ pub fn run_keeping(mut spec: Spec) -> (Report, Transcript) {
         contract: Vec::new(),
     };
     let contract = required(&spec);
-    let status = steps(&mut spec, &mut turn, &mut report, &contract)
+    // A session's own run hears the user's hooks at its start, as a turn in
+    // the terminal does; a helper is given its task, not a prompt.
+    let blocked = (spec.depth == 0).then(|| opened(&mut spec)).flatten();
+    let status = match blocked {
+        Some(why) => Ok(Outcome::Failed(why)),
+        None => steps(&mut spec, &mut turn, &mut report, &contract),
+    };
+    let status = status
         .and_then(|status| {
             // Calls that ran before a stop keep their results, so
             // whoever resumes the transcript knows what they did.
@@ -1028,6 +1035,38 @@ fn steps(
             return Ok(Outcome::Failed(why.to_owned()));
         }
     }
+}
+
+/// Runs the hooks at the start of a session's own run on its prompt, the
+/// last message: a notice of what they added goes just before it, and a
+/// prompt one blocks is taken out again, the reason given back. A run that
+/// carries on with no new prompt of the user's hears none.
+fn opened(spec: &mut Spec) -> Option<String> {
+    let messages = &spec.transcript.conversation.messages;
+    let last = messages.last()?;
+    if last.role != "user" || last.notice || last.folded {
+        return None;
+    }
+    let prompt = crate::references::typed(&last.content).to_owned();
+    let replied = messages.iter().any(|message| message.role == "assistant");
+    let model = spec.connection.model.clone();
+    let opening = crate::hooks::opening(&context(spec), &prompt, &model, replied);
+    if opening.is_empty() {
+        return None;
+    }
+    let conversation = &mut spec.transcript.conversation;
+    if let Some(title) = opening.title {
+        conversation.title = title;
+    }
+    // The prompt may be on disk already, which these write again.
+    if let Some(notice) = opening.notice {
+        conversation.insert_before_last(notice);
+    }
+    if opening.blocked.is_some() {
+        conversation.retract_last();
+    }
+    let _ = save(&mut spec.transcript);
+    opening.blocked
 }
 
 /// Works through one reply's calls, running together the ones that may, then

@@ -4587,6 +4587,7 @@ pub fn compact(
     if after >= before {
         return Err("The summary would not save anything, so every turn is kept.".into());
     }
+    crate::hooks::summarized(connection.conversation);
     Ok(Compacted {
         upto: end,
         before,
@@ -4743,6 +4744,7 @@ fn stream(
                 let _ = sender.send_blocking(Event::Compacting);
             },
             |text| {
+                crate::hooks::summarized(connection.conversation);
                 let _ = sender.send_blocking(Event::Summarized {
                     upto: dropped.len(),
                     text: text.to_owned(),

@@ -1,5 +1,6 @@
-//! The user's own commands, run at points in a session: before and after a
-//! tool call, after one that failed, when the model or a helper has
+//! The user's own commands, run at points in a session: as it starts or is
+//! picked up, as the user's prompt is about to reach the model, before and
+//! after a tool call, after one that failed, when the model or a helper has
 //! finished its turn, before a session is summarized, and when a card waits
 //! for the user.
 //!
@@ -38,6 +39,7 @@
 //! wait would need a thread per hook holding the child, and then the kill
 //! could come after the reap, when the group's id may have passed on.
 
+use crate::chat::Message;
 use crate::tools::ToolContext;
 use regex::Regex;
 use serde::Deserialize;
@@ -121,6 +123,13 @@ static READ: Mutex<Option<Read>> = Mutex::new(None);
 /// The conversations whose turn a hook has ended, until their loop has seen it.
 static HALTS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
+/// The sessions whose SessionStart hooks have run in this process.
+static STARTED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// The sessions summarized since their SessionStart hooks last ran, which
+/// run again at the next turn, as Claude Code's do after a compact.
+static SUMMARIZED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
 /// What hooks.json held when it was read, and its modified time and length
 /// then, or `None` where there was no file.
 struct Read {
@@ -131,6 +140,12 @@ struct Read {
 /// The points in a session a hook can run at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
+    /// The session starts, is picked up, or was summarized; a hook may add
+    /// context for the model.
+    SessionStart,
+    /// The user's prompt is about to reach the model; a hook may add context
+    /// beside it or keep it from the model.
+    UserPromptSubmit,
     /// A call the gate let through is about to run; a hook may block it.
     PreToolUse,
     /// A call ran and succeeded; a hook may tell the model something.
@@ -151,16 +166,16 @@ pub enum Event {
 /// with a notice rather than breaking the file, since every call still meets
 /// the gate, which decides itself what a PermissionRequest hook would have.
 const KNOWN_ELSEWHERE: &[&str] = &[
-    "SessionStart",
     "SessionEnd",
-    "UserPromptSubmit",
     "PostCompact",
     "SubagentStart",
     "PermissionRequest",
 ];
 
 impl Event {
-    const ALL: [Event; 7] = [
+    const ALL: [Event; 9] = [
+        Self::SessionStart,
+        Self::UserPromptSubmit,
         Self::PreToolUse,
         Self::PostToolUse,
         Self::PostToolUseFailure,
@@ -173,6 +188,8 @@ impl Event {
     /// The event's key in hooks.json, which is Claude Code's name for it.
     fn name(self) -> &'static str {
         match self {
+            Self::SessionStart => "SessionStart",
+            Self::UserPromptSubmit => "UserPromptSubmit",
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
             Self::PostToolUseFailure => "PostToolUseFailure",
@@ -417,6 +434,140 @@ fn spoken(items: &[String]) -> String {
     }
 }
 
+/// What the hooks at a turn's start made of it.
+#[derive(Default)]
+pub struct Opening {
+    /// Why the prompt must not reach the model, when a hook said so, in a
+    /// sentence for the user.
+    pub blocked: Option<String>,
+    /// What SessionStart and UserPromptSubmit hooks added for the model, as
+    /// a notice to go just before the prompt; one blocked prompt keeps only
+    /// what SessionStart added, since the session did start.
+    pub notice: Option<Message>,
+    /// The name a hook gave the session.
+    pub title: Option<String>,
+}
+
+/// Runs the hooks at the start of a turn whose prompt is `prompt`, in the
+/// session `ctx` is for, on `model`: its SessionStart hooks first, at the
+/// session's first turn in this process or its first since a summary, then
+/// its UserPromptSubmit hooks. `replied` says the session has a reply from
+/// before, so it was picked up rather than started. It may run commands for
+/// up to their timeouts, so never on a UI thread.
+pub fn opening(ctx: &ToolContext, prompt: &str, model: &str, replied: bool) -> Opening {
+    let source = started(ctx.conversation, replied);
+    let hooks = current();
+    // One that cannot be used holds every call at the gate, and says why.
+    let Ok(hooks) = hooks.as_ref() else {
+        return Opening::default();
+    };
+    opened(hooks, ctx, prompt, model, source)
+}
+
+/// Marks `conversation` summarized, so its SessionStart hooks run again
+/// with "compact" before its next turn.
+pub(crate) fn summarized(conversation: u64) {
+    let mut summarized = lock(&SUMMARIZED);
+    if conversation != 0 && !summarized.contains(&conversation) {
+        summarized.push(conversation);
+    }
+}
+
+/// How the session `conversation` comes to this turn, as SessionStart's
+/// `source` says it, or `None` when its hooks ran for it already in this
+/// process and no summary came since. A run in no session always starts.
+fn started(conversation: u64, replied: bool) -> Option<&'static str> {
+    if conversation == 0 {
+        return Some("startup");
+    }
+    let was_summarized = {
+        let mut summarized = lock(&SUMMARIZED);
+        let had = summarized.contains(&conversation);
+        summarized.retain(|&other| other != conversation);
+        had
+    };
+    let mut started = lock(&STARTED);
+    if started.contains(&conversation) {
+        return was_summarized.then_some("compact");
+    }
+    started.push(conversation);
+    Some(if replied { "resume" } else { "startup" })
+}
+
+/// `opening`, with the hooks and how the session comes to the turn handed in.
+fn opened(
+    hooks: &Hooks,
+    ctx: &ToolContext,
+    prompt: &str,
+    model: &str,
+    source: Option<&str>,
+) -> Opening {
+    let mut opening = Opening::default();
+    let mut added = Vec::new();
+    if let Some(source) = source.filter(|_| hooks.has(Event::SessionStart)) {
+        let own = json!({ "source": source, "model": model });
+        let input = input(Event::SessionStart, ctx, own);
+        let heard = hear(hooks, Event::SessionStart, source, &input, ctx);
+        report(heard.problems);
+        // Exit code 2 is for the user's eyes only, as in Claude Code.
+        report(
+            (heard.blocks.iter())
+                .map(|why| format!("A SessionStart hook says: {why}"))
+                .collect(),
+        );
+        added.extend(heard.context.into_iter().map(|said| ("SessionStart", said)));
+        opening.title = heard.title;
+        if let Some(why) = heard.halt {
+            opening.blocked = Some(format!("A SessionStart hook ended the turn: {why}"));
+            opening.notice = notice(&added);
+            return opening;
+        }
+    }
+    if hooks.has(Event::UserPromptSubmit) {
+        let own = json!({ "prompt": prompt });
+        let input = input(Event::UserPromptSubmit, ctx, own);
+        let heard = hear(hooks, Event::UserPromptSubmit, "", &input, ctx);
+        report(heard.problems);
+        let why = heard.halt.or_else(|| heard.blocks.into_iter().next());
+        opening.title = heard.title.or(opening.title);
+        if let Some(why) = why {
+            opening.blocked = Some(format!(
+                "A UserPromptSubmit hook blocked this prompt: {why}"
+            ));
+        } else {
+            added.extend((heard.context.into_iter()).map(|said| ("UserPromptSubmit", said)));
+        }
+    }
+    opening.notice = notice(&added);
+    opening
+}
+
+impl Opening {
+    /// Whether the hooks left the turn as it was.
+    pub fn is_empty(&self) -> bool {
+        self.blocked.is_none() && self.notice.is_none() && self.title.is_none()
+    }
+}
+
+/// The notice carrying what hooks added for the model, under the event
+/// each came from.
+fn notice(added: &[(&str, String)]) -> Option<Message> {
+    if added.is_empty() {
+        return None;
+    }
+    let content = added
+        .iter()
+        .map(|(event, said)| format!("{event} hook context:\n{said}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Some(Message {
+        role: "user".into(),
+        content,
+        notice: true,
+        ..Default::default()
+    })
+}
+
 /// Readies the hooks for a turn in `conversation`: an end a hook asked for
 /// in an earlier turn is forgotten, and hooks.json is read again if its
 /// modified time or length changed. The plugins' code hears the turn start
@@ -488,6 +639,18 @@ pub fn wanted(event: Event) -> bool {
     // hook does, so a front end asks then too.
     (event == Event::Stop && crate::plugins::code::stops())
         || cached().is_some_and(|hooks| hooks.as_ref().as_ref().is_ok_and(|hooks| hooks.has(event)))
+}
+
+/// Whether a turn's start may run hooks: hooks.json was never read, or holds
+/// SessionStart or UserPromptSubmit hooks. It never reads the file, so a
+/// window can ask before it starts a turn.
+pub fn may_open() -> bool {
+    cached().is_none_or(|hooks| {
+        hooks
+            .as_ref()
+            .as_ref()
+            .is_ok_and(|hooks| hooks.has(Event::SessionStart) || hooks.has(Event::UserPromptSubmit))
+    })
 }
 
 /// Why hooks.json cannot be used, as last read, if it cannot. It never reads
@@ -943,6 +1106,8 @@ struct Heard {
     halt: Option<String>,
     /// What a hook added for the model without blocking.
     context: Vec<String>,
+    /// The name a hook gave the session, the last one's.
+    title: Option<String>,
     /// Hooks that failed without blocking, for the user.
     problems: Vec<String>,
 }
@@ -958,13 +1123,19 @@ fn hear(hooks: &Hooks, event: Event, subject: &str, input: &Value, ctx: &ToolCon
         .events
         .get(event.name())
         .map_or(&[][..], Vec::as_slice);
-    // Claude Code runs every Stop hook whatever its matcher says.
+    // Claude Code runs every Stop and UserPromptSubmit hook whatever its
+    // matcher says.
+    let every = matches!(event, Event::Stop | Event::UserPromptSubmit);
     let fitting = groups
         .iter()
-        .filter(|group| event == Event::Stop || group.matcher.fits(subject));
+        .filter(|group| every || group.matcher.fits(subject));
     let decisive = matches!(
         event,
-        Event::PreToolUse | Event::Stop | Event::SubagentStop | Event::PreCompact
+        Event::UserPromptSubmit
+            | Event::PreToolUse
+            | Event::Stop
+            | Event::SubagentStop
+            | Event::PreCompact
     );
     for hook in fitting.flat_map(|group| &group.hooks) {
         // The user's own stop is no failure to tell them of; `tools::run`
@@ -991,7 +1162,17 @@ fn hear(hooks: &Hooks, event: Event, subject: &str, input: &Value, ctx: &ToolCon
                 continue;
             }
         };
+        // What these print that is no JSON object is context for the model,
+        // as in Claude Code.
+        let plain = matches!(event, Event::SessionStart | Event::UserPromptSubmit)
+            && !serde_json::from_str::<Value>(ran.stdout.trim()).is_ok_and(|out| out.is_object());
         match ran.code {
+            Some(0) if plain => {
+                let said = clip(&ran.stdout);
+                if !said.is_empty() {
+                    heard.context.push(said);
+                }
+            }
             Some(0) => said(&ran.stdout, ctx.approved, &mut heard),
             Some(2) if ran.stderr.trim().is_empty() => heard
                 .blocks
@@ -1057,6 +1238,10 @@ fn said(stdout: &str, approved: bool, heard: &mut Heard) {
     let context = text(&own["additionalContext"]);
     if !context.is_empty() {
         heard.context.push(context);
+    }
+    let title = text(&own["sessionTitle"]);
+    if !title.is_empty() {
+        heard.title = Some(title);
     }
     let message = text(&out["systemMessage"]);
     if !message.is_empty() {
@@ -2002,6 +2187,97 @@ mod tests {
         assert_eq!(
             summarizing(&blocks, &ctx, "manual"),
             Err("backing up first".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_session_starts_once_in_a_process_and_again_after_a_summary() {
+        let id = 9_101;
+        assert_eq!(started(id, false), Some("startup"));
+        assert_eq!(started(id, false), None);
+        summarized(id);
+        assert_eq!(started(id, true), Some("compact"));
+        assert_eq!(started(id, true), None);
+        assert_eq!(started(9_102, true), Some("resume"));
+        // A run in no session has nothing to have started before.
+        assert_eq!(started(0, false), Some("startup"));
+        assert_eq!(started(0, false), Some("startup"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_start_hook_s_word_goes_before_the_prompt_as_a_notice() {
+        let dir = scratch("session-start");
+        let seen = dir.join("input.json");
+        let body = format!("cat > '{}'; echo On branch main.", seen.display());
+        let command = script(&dir, "start.sh", &body);
+        let file = json!({ "hooks": { "SessionStart": [{ "matcher": "startup|resume", "hooks": [
+            { "type": "command", "command": command },
+        ] }] } });
+        let hooks = parse(&file.to_string()).unwrap();
+        let ctx = ToolContext::default();
+        let opening = opened(&hooks, &ctx, "fix the bug", "model-1", Some("resume"));
+        assert!(opening.blocked.is_none());
+        let notice = opening.notice.unwrap();
+        assert!(notice.notice && notice.role == "user");
+        assert_eq!(
+            notice.content,
+            "SessionStart hook context:\nOn branch main."
+        );
+        let input: Value = serde_json::from_slice(&std::fs::read(&seen).unwrap()).unwrap();
+        assert_eq!(input["hook_event_name"], "SessionStart");
+        assert_eq!(input["source"], "resume");
+        assert_eq!(input["model"], "model-1");
+        // Not after a summary, which its matcher leaves out, nor once started.
+        assert!(opened(&hooks, &ctx, "go on", "model-1", Some("compact")).is_empty());
+        assert!(opened(&hooks, &ctx, "go on", "model-1", None).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_prompt_hook_adds_context_beside_the_prompt_or_keeps_it_from_the_model() {
+        let dir = scratch("prompt");
+        let seen = dir.join("input.json");
+        let said = r#"{"hookSpecificOutput": {"additionalContext": "They mean staging.", "sessionTitle": "Deploy"}}"#;
+        let body = format!("cat > '{}'; echo '{said}'", seen.display());
+        let hooks = one("UserPromptSubmit", &script(&dir, "prompt.sh", &body), None);
+        let ctx = ToolContext::default();
+        let opening = opened(&hooks, &ctx, "deploy it", "model-1", None);
+        assert!(opening.blocked.is_none());
+        assert_eq!(
+            opening.notice.map(|notice| notice.content).as_deref(),
+            Some("UserPromptSubmit hook context:\nThey mean staging.")
+        );
+        assert_eq!(opening.title.as_deref(), Some("Deploy"));
+        let input: Value = serde_json::from_slice(&std::fs::read(&seen).unwrap()).unwrap();
+        assert_eq!(input["hook_event_name"], "UserPromptSubmit");
+        assert_eq!(input["prompt"], "deploy it");
+        // Exit code 2 keeps the prompt from the model whatever the matcher;
+        // what SessionStart added stays, since the session did start.
+        let file = json!({ "hooks": {
+            "SessionStart": [{ "hooks": [{ "type": "command", "command": "echo On main." }] }],
+            "UserPromptSubmit": [{ "matcher": "Bash", "hooks": [
+                { "type": "command", "command": "sh -c 'echo no keys in prompts >&2; exit 2'" },
+            ] }],
+        } });
+        let both = parse(&file.to_string()).unwrap();
+        let opening = opened(&both, &ctx, "my key is sk-1", "model-1", Some("startup"));
+        assert_eq!(
+            opening.blocked.as_deref(),
+            Some("A UserPromptSubmit hook blocked this prompt: no keys in prompts")
+        );
+        assert_eq!(
+            opening.notice.map(|notice| notice.content).as_deref(),
+            Some("SessionStart hook context:\nOn main.")
+        );
+        // So does a decision of "block".
+        let json = r#"echo '{"decision": "block", "reason": "Ask in the other session."}'"#;
+        let blocks = one("UserPromptSubmit", &script(&dir, "block.sh", json), None);
+        let opening = opened(&blocks, &ctx, "deploy it", "model-1", None);
+        assert!(
+            opening
+                .blocked
+                .is_some_and(|why| why.ends_with("Ask in the other session.")),
         );
     }
 

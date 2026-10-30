@@ -761,6 +761,33 @@ impl Conversation {
         }
     }
 
+    /// Put `message` just before the newest message, on disk too once it is
+    /// saved, as what has to be read ahead of the user's prompt is.
+    pub fn insert_before_last(&mut self, message: Message) {
+        let at = self.messages.len().saturating_sub(1);
+        self.messages.insert(at, message);
+        self.write_again_from(at);
+    }
+
+    /// Take the newest message back, on disk too once it is saved, as a
+    /// prompt a hook kept from the model is: nothing was done with it, so
+    /// none of what a rewind undoes needs undoing.
+    pub fn retract_last(&mut self) -> Option<Message> {
+        let last = self.messages.pop()?;
+        self.write_again_from(self.messages.len());
+        Some(last)
+    }
+
+    /// Has the next save write the file again from message `at` on, as a
+    /// rewind's does.
+    fn write_again_from(&mut self, at: usize) {
+        self.counted = self.counted.min(at);
+        if self.flushed > at {
+            self.flushed = at;
+            self.rewound = Some(at);
+        }
+    }
+
     /// Take the conversation back to its first `len` messages, on disk too
     /// once it is saved.
     pub fn rewind(&mut self, len: usize) {
@@ -4803,6 +4830,39 @@ pub(crate) mod tests {
 
         let back = replay(&dir.join("sessions/1.jsonl")).unwrap();
         assert_eq!(back.messages.len(), 2);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_message_put_before_a_saved_prompt_or_a_prompt_taken_back_reaches_the_file() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("before-last");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(numbered(3));
+        store.save().unwrap();
+        store.conversations[0].insert_before_last(said("user", "notice"));
+        store.save().unwrap();
+        let file = dir.join("sessions/1.jsonl");
+        let back = replay(&file).unwrap();
+        let contents: Vec<&str> = back.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["0", "1", "notice", "2"]);
+
+        let taken = store.conversations[0].retract_last();
+        assert_eq!(taken.map(|m| m.content).as_deref(), Some("2"));
+        store.save().unwrap();
+        let back = replay(&file).unwrap();
+        let contents: Vec<&str> = back.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["0", "1", "notice"]);
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("\"2\""));
+        // Before a save there is nothing on disk to write again.
+        store.conversations[0].messages.push(said("user", "3"));
+        store.conversations[0].insert_before_last(said("user", "next"));
+        store.save().unwrap();
+        let back = replay(&file).unwrap();
+        let contents: Vec<&str> = back.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["0", "1", "notice", "next", "3"]);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 

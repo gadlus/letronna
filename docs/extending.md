@@ -91,11 +91,11 @@ A plugin whose `main` is a `.js` or `.py` file runs it: JavaScript on the engine
 
 `hooks.json` uses the same shape as Claude Code's hooks, so existing scripts carry over:
 
-- Events: before and after a tool call (`PreToolUse`, `PostToolUse`), after one that failed (`PostToolUseFailure`), at the end of a turn or of a helper's work (`Stop`, `SubagentStop`), before the session is summarized (`PreCompact`, matched by `manual` or `auto`), and when an approval waits (`Notification`).
+- Events: as a session starts or is picked up again (`SessionStart`, matched by `startup`, `resume` or `compact`), as your prompt is about to reach the model (`UserPromptSubmit`), before and after a tool call (`PreToolUse`, `PostToolUse`), after one that failed (`PostToolUseFailure`), at the end of a turn or of a helper's work (`Stop`, `SubagentStop`), before the session is summarized (`PreCompact`, matched by `manual` or `auto`), and when an approval waits (`Notification`).
 - Hooks read JSON on stdin.
 - Exit code `2` blocks the action, with stderr as the reason.
 
-A hook can block an action or keep a turn going. It can never allow something the approval gate stopped.
+A hook can block an action or keep a turn going, and SessionStart and UserPromptSubmit hooks can add context for the model: JSON `additionalContext`, or anything else they print. A prompt a UserPromptSubmit hook blocks never reaches the model and goes back in the box. A hook can never allow something the approval gate stopped.
 
 ## Project instructions
 

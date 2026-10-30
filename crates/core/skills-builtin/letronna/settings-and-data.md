@@ -18,6 +18,7 @@ Letronna's file tools do not reach this folder, so the user edits these files th
 - `hooks.json`: the user's commands run before and after tool calls, when a turn ends and when a card waits, in Claude Code's hook format.
 - `hooks.json`: the user's commands run before and after tool calls, after a failed one, when a turn or a helper ends and when a card waits, in Claude Code's hook format.
 - `hooks.json`: the user's commands run before and after tool calls, after a failed one, when a turn or a helper ends, before a summary and when a card waits, in Claude Code's hook format.
+- `hooks.json`: the user's commands run as a session starts, on each prompt, before and after tool calls, after a failed one, when a turn or a helper ends, before a summary and when a card waits, in Claude Code's hook format.
 - `permissions.json`: rules that allow, ask about or deny a tool by what it is called with, everywhere or for one project folder.
 - `search.json`: the search service set up with `/search services` or Settings, Search.
 - `messaging.json`: the chat apps (see `chat-apps.md`). `schedules.json`: the scheduled jobs.
