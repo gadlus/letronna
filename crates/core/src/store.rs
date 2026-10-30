@@ -553,6 +553,11 @@ pub struct Settings {
     /// "ctrl+shift+space". Empty until the window fills in its default.
     #[serde(default)]
     pub quick_entry_hotkey: String,
+    /// A command whose first line of output the terminal shows under its
+    /// footer, given the session as JSON on its input, as Claude Code's
+    /// statusLine is; empty for none.
+    #[serde(default)]
+    pub status_line: String,
     /// How big a workflow Crew suggests: small, medium or large; empty for
     /// medium.
     #[serde(default)]
@@ -681,6 +686,7 @@ impl Default for Settings {
             session_filter: String::new(),
             group_by_project: false,
             quick_entry_hotkey: String::new(),
+            status_line: String::new(),
             crew: String::new(),
         }
     }
