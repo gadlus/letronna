@@ -1949,6 +1949,76 @@ impl Drop for Running {
     }
 }
 
+/// Each conversation's foreground commands that can move to the background:
+/// how many run, and how many times the user has asked them to move.
+static MOVABLE: Mutex<std::collections::BTreeMap<u64, Asked>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// How many of one conversation's commands can move, and the asks so far.
+#[derive(Default)]
+struct Asked {
+    running: usize,
+    asks: u64,
+}
+
+/// Counts a foreground command of `owner` as one the user can send to the
+/// background for as long as it is held, and remembers the asks before it,
+/// so only one made while it runs moves it.
+struct Movable {
+    owner: u64,
+    asks: u64,
+}
+
+impl Movable {
+    fn start(owner: u64) -> Movable {
+        let mut all = MOVABLE.lock().unwrap_or_else(|e| e.into_inner());
+        let asked = all.entry(owner).or_default();
+        asked.running += 1;
+        Movable {
+            owner,
+            asks: asked.asks,
+        }
+    }
+
+    /// Whether the user asked for the background since it started.
+    fn asked(&self) -> bool {
+        let all = MOVABLE.lock().unwrap_or_else(|e| e.into_inner());
+        all.get(&self.owner)
+            .is_some_and(|asked| asked.asks > self.asks)
+    }
+}
+
+impl Drop for Movable {
+    fn drop(&mut self) {
+        let mut all = MOVABLE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(asked) = all.get_mut(&self.owner) {
+            asked.running -= 1;
+            if asked.running == 0 {
+                all.remove(&self.owner);
+            }
+        }
+    }
+}
+
+/// Whether conversation `conversation` has a foreground command running that
+/// `to_background` would move.
+pub fn can_go_to_background(conversation: u64) -> bool {
+    let all = MOVABLE.lock().unwrap_or_else(|e| e.into_inner());
+    all.get(&conversation)
+        .is_some_and(|asked| asked.running > 0)
+}
+
+/// Move every foreground command conversation `conversation` is running to
+/// the background as a job, as the user asked, and say whether there was one.
+pub fn to_background(conversation: u64) -> bool {
+    let mut all = MOVABLE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(asked) = all.get_mut(&conversation).filter(|asked| asked.running > 0) else {
+        return false;
+    };
+    asked.asks += 1;
+    true
+}
+
 /// End every command running in the foreground, with everything it started,
 /// and wait up to `limit` for them to be gone. Each runs in a process group
 /// or Job Object of its own, where neither a Ctrl-C at the terminal nor
@@ -2011,6 +2081,8 @@ enum Cut {
     /// A notice came for the model, such as a job's exit, which it hears
     /// only once the call is over.
     Notice,
+    /// The user sent it to the background, to have the turn go on.
+    Asked,
 }
 
 impl Cut {
@@ -2019,6 +2091,7 @@ impl Cut {
         match self {
             Cut::Warning => "at this run's time warning".to_owned(),
             Cut::Notice => "with a notice waiting for you".to_owned(),
+            Cut::Asked => "when the user sent it to the background".to_owned(),
             Cut::Deadline(at) => format!(
                 "with about {} s of this run left",
                 at.saturating_duration_since(Instant::now()).as_secs()
@@ -2169,6 +2242,7 @@ fn run_shell_into(
         Some((sooner, cut)) if owner.is_none() => (sooner, cut, false),
         _ => (limit, None, false),
     };
+    let movable = owner.filter(|_| tree.is_some()).map(Movable::start);
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         let _ = child.kill();
         return Err("Cannot read the command's output.".into());
@@ -2237,6 +2311,10 @@ fn run_shell_into(
         // default waits as it asked.
         if timed && started.elapsed() > LEAST_HELD && owner.is_some_and(crate::inbox::urgent) {
             cut = Some(Cut::Notice);
+            break Ok(None);
+        }
+        if movable.as_ref().is_some_and(Movable::asked) {
+            cut = Some(Cut::Asked);
             break Ok(None);
         }
         let leaving = LEAVING.load(std::sync::atomic::Ordering::Relaxed);
@@ -2360,6 +2438,15 @@ fn run_shell_into(
                  wait with job {id} to wait for it, read_job to read what it \
                  prints, or stop_job if you no longer need it.{SO_FAR}",
                 limit.as_secs()
+            ),
+            // The user wants the turn to go on, so it is not waited for.
+            Some(Cut::Asked) => format!(
+                "Still running after {:.0}s, {}, so it carries on in the background as \
+                 job #{id}. Go on with the next step rather than wait for it: a notice \
+                 comes when it exits, read_job reads what it prints, and stop_job ends \
+                 it.{SO_FAR}",
+                started.elapsed().as_secs_f64(),
+                Cut::Asked.when()
             ),
             // Near the end a job left running holds the CPU the next steps
             // need and is stopped with the run anyway, so it is the model's
@@ -6895,6 +6982,80 @@ mod tests {
             "{out}"
         );
         assert!(began.elapsed() < Duration::from_secs(20));
+    }
+
+    #[test]
+    fn a_command_the_user_sends_to_the_background_becomes_a_job_at_once() {
+        let command = if cfg!(windows) {
+            "Write-Output before; Start-Sleep 30"
+        } else {
+            "echo before; sleep 30"
+        };
+        assert!(!to_background(7_716), "it moved what was not running");
+        let asker = std::thread::spawn(|| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !can_go_to_background(7_716) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            to_background(7_716)
+        });
+        let began = Instant::now();
+        let said = run_for(command, Duration::from_secs(60), Some(7_716)).unwrap();
+        assert!(asker.join().unwrap(), "nothing was running to move");
+        assert!(
+            began.elapsed() < Duration::from_secs(30),
+            "it was waited for"
+        );
+        let (told, _) = said.split_once(SO_FAR).unwrap_or_else(|| panic!("{said}"));
+        assert!(
+            told.contains("when the user sent it to the background, so it carries on"),
+            "{said}"
+        );
+        let id: u64 = told
+            .split_once(MOVED)
+            .and_then(|(_, rest)| rest.split_once('.'))
+            .and_then(|(id, _)| id.parse().ok())
+            .unwrap_or_else(|| panic!("{said}"));
+        // What it prints after the move goes on into the job's log.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !crate::jobs::log(id).unwrap().contains("before") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(crate::jobs::log(id).unwrap().contains("before"));
+        assert!(crate::jobs::running(id).unwrap(), "it was stopped");
+        crate::jobs::stop(id).unwrap();
+        assert!(!can_go_to_background(7_716));
+    }
+
+    #[test]
+    fn an_ask_that_moved_a_command_leaves_the_next_one_waited_for() {
+        let command = if cfg!(windows) {
+            "Start-Sleep 30"
+        } else {
+            "sleep 30"
+        };
+        let first =
+            std::thread::spawn(move || run_for(command, Duration::from_secs(60), Some(7_717)));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !can_go_to_background(7_717) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(to_background(7_717));
+        let said = first.join().unwrap().unwrap();
+        let id: u64 = said
+            .split_once(MOVED)
+            .and_then(|(_, rest)| rest.split_once('.'))
+            .and_then(|(id, _)| id.parse().ok())
+            .unwrap_or_else(|| panic!("{said}"));
+        crate::jobs::stop(id).unwrap();
+        // Started once the first has moved, so the ask is spent.
+        let quick = if cfg!(windows) {
+            "Start-Sleep 2; Write-Output done"
+        } else {
+            "sleep 2; echo done"
+        };
+        let said = run_for(quick, Duration::from_secs(60), Some(7_717)).unwrap();
+        assert_eq!(said.trim(), "done");
     }
 
     /// A context in the temporary folder for conversation `conversation`, in
