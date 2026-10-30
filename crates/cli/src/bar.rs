@@ -205,6 +205,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "what changed in the project; /diff session for this session's files",
     },
     Command {
+        name: "/window",
+        blurb: "carry this session on in the window",
+    },
+    Command {
         name: "/import",
         blurb: "continue a session from Claude Code or Codex",
     },

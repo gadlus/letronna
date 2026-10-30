@@ -1886,6 +1886,52 @@ fn update_now() {
 /// Start the window. It is a separate binary because a GUI-subsystem
 /// executable on Windows cannot write to the console that launched it.
 fn launch_window() {
+    if !start_window(&[]) {
+        render::line(&render::red("Could not find the Letronna window binary."));
+    }
+}
+
+/// The file in the data folder a session to open is asked for in, which
+/// the window takes and removes (its `ui::handoff`).
+const OPEN_SESSION: &str = "open-session";
+
+/// The Mac app's bundle id, which `open` finds it by wherever it is.
+#[cfg(target_os = "macos")]
+const BUNDLE: &str = "com.gadlus.letronna";
+
+/// Open session `id` in the window: asked of one already running through
+/// the data folder, and started with it named where none is. A release
+/// build on the usual data folder opens the Mac app by its bundle id,
+/// which brings a running one forward rather than start a second; a build
+/// of one's own, or another data folder, starts the window beside it.
+fn open_in_window(id: u64) -> Result<(), String> {
+    let folder = letronna_core::chat::data_dir();
+    let asked = folder.join(OPEN_SESSION);
+    std::fs::create_dir_all(&folder)
+        .and_then(|()| std::fs::write(&asked, id.to_string()))
+        .map_err(|e| format!("Could not ask the window for it: {e}"))?;
+    let args = ["--session".to_owned(), id.to_string()];
+    #[cfg(target_os = "macos")]
+    if !cfg!(debug_assertions) && std::env::var_os("AGENT_DATA_DIR").is_none() {
+        let opened = std::process::Command::new("open")
+            .args(["-b", BUNDLE, "--args"])
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if opened.is_ok_and(|status| status.success()) {
+            return Ok(());
+        }
+    }
+    if start_window(&args) {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(&asked);
+    Err("Could not find the Letronna window.".into())
+}
+
+/// Start the window with `args`, saying whether it could be found.
+fn start_window(args: &[String]) -> bool {
     let beside = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join(window_name())));
@@ -1897,15 +1943,15 @@ fn launch_window() {
             .and_then(|d| d.parent())
             .map(|d| d.join(installed_name()))
     });
-    for candidate in [beside, above, Some(std::path::PathBuf::from(window_name()))]
+    [beside, above, Some(std::path::PathBuf::from(window_name()))]
         .into_iter()
         .flatten()
-    {
-        if std::process::Command::new(&candidate).spawn().is_ok() {
-            return;
-        }
-    }
-    render::line(&render::red("Could not find the Letronna window binary."));
+        .any(|candidate| {
+            std::process::Command::new(&candidate)
+                .args(args)
+                .spawn()
+                .is_ok()
+        })
 }
 
 fn window_name() -> &'static str {

@@ -79,6 +79,10 @@ pub fn command(
             crate::terminal_setup::terminal_setup(runner);
             Flow::Handled
         }
+        "/window" => {
+            window(runner, *session);
+            Flow::Handled
+        }
         "/export" => {
             export(runner, *session, rest);
             Flow::Handled
@@ -534,6 +538,28 @@ pub fn command(
             let conversation = (runner.store.conversations.get(*session)).map_or(0, |c| c.id);
             added(runner, whole, here, conversation)
         }
+    }
+}
+
+/// `/window`: carry the open session on in the window.
+fn window(runner: &mut Runner, session: usize) {
+    render::blank();
+    let conversation = &runner.store.conversations[session];
+    if conversation.length() == 0 {
+        render::line(&render::dim(
+            "Nothing has been said here yet; the window starts its own with New session.",
+        ));
+        return;
+    }
+    let id = conversation.id;
+    // On disk before the window reads it.
+    runner.persist();
+    match crate::open_in_window(id) {
+        Ok(()) => render::line(&render::dim(&format!(
+            "Opened this session in the window. Carry it on there or here, one at a \
+             time; letronna --resume {id} brings it back to a terminal."
+        ))),
+        Err(why) => render::line(&render::red(&why)),
     }
 }
 
@@ -1944,6 +1970,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/status",
             "/diff",
             "/where",
+            "/window",
             "/import",
             "/retention",
             "/clear",
