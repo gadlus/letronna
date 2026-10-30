@@ -120,6 +120,12 @@ fn main() {
         println!("letronna {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    if let Some(text) = &args.system_prompt {
+        let _ = session::SYSTEM_REPLACED.set(text.as_str().into());
+    }
+    if let Some(text) = &args.append_system_prompt {
+        let _ = session::SYSTEM_APPENDED.set(text.as_str().into());
+    }
     // Before an update goes in or the start counts, as for `--version`: a
     // runner asks this of a build it is about to measure, and only reads.
     if args.dump_config {

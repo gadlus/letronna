@@ -78,6 +78,13 @@ pub struct Runner {
 /// process alone, never saved with the keys.
 pub static GIVEN_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// The instructions `--system-prompt` gave in place of Letronna's own, for
+/// every session this run opens, as the command line is this run's alone.
+pub static SYSTEM_REPLACED: std::sync::OnceLock<std::sync::Arc<str>> = std::sync::OnceLock::new();
+
+/// The instructions `--append-system-prompt` gave, after all the rest.
+pub static SYSTEM_APPENDED: std::sync::OnceLock<std::sync::Arc<str>> = std::sync::OnceLock::new();
+
 impl Runner {
     /// Say a turn failed with `error`, and the way out of it when there is
     /// one to say.
@@ -155,8 +162,8 @@ impl Runner {
             // Its own: the judge runs on `model`.
             session_model: String::new(),
             system: None,
-            system_replaced: None,
-            system_appended: None,
+            system_replaced: SYSTEM_REPLACED.get().cloned(),
+            system_appended: SYSTEM_APPENDED.get().cloned(),
             plain_terminal: self.plain_terminal,
             // Set by `-p` alone, once it knows whether its tools were named.
             lean_tools: false,

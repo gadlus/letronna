@@ -48,6 +48,16 @@ Options
                            auto (everywhere), project or chat
       --private            a new private chat: only its own notes load, and
                            it saves to them only when asked
+      --system-prompt <text>
+                           this run's instructions in place of Letronna's
+                           own; the project's, the skills and memory still
+                           load
+      --system-prompt-file <file>
+                           the same, read from a file
+      --append-system-prompt <text>
+                           instructions this run adds after all the rest
+      --append-system-prompt-file <file>
+                           the same, read from a file
       --offline            with doctor: leave the network alone
       --dump-config        print the settings and limits a -p run in a new
                            session gets with the same flags, as JSON
@@ -185,6 +195,12 @@ pub struct Args {
     /// `--fork-session`: carry on in a copy of the session continued or
     /// resumed.
     pub fork: bool,
+    /// This run's instructions in place of Letronna's own, from
+    /// `--system-prompt` or the file `--system-prompt-file` names.
+    pub system_prompt: Option<String>,
+    /// Instructions this run adds after all the rest, from
+    /// `--append-system-prompt` or `--append-system-prompt-file`.
+    pub append_system_prompt: Option<String>,
 }
 
 pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -228,6 +244,8 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         private: false,
         name: None,
         fork: false,
+        system_prompt: None,
+        append_system_prompt: None,
     };
     // Only as the first word, so `-p mcp` still asks about it.
     if raw.next_if(|first| first == "mcp").is_some() {
@@ -352,6 +370,22 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
                 let name = name.filter(|name| !name.is_empty() && !name.starts_with('-'));
                 args.name = Some(name.ok_or("--name takes what to call the session.")?);
             }
+            "--system-prompt"
+            | "--system-prompt-file"
+            | "--append-system-prompt"
+            | "--append-system-prompt-file" => {
+                let text = given_prompt(&arg, raw.next())?;
+                let (slot, flag) = match arg.starts_with("--append") {
+                    true => (&mut args.append_system_prompt, "--append-system-prompt"),
+                    false => (&mut args.system_prompt, "--system-prompt"),
+                };
+                // As text or from a file, never both: one would quietly win.
+                if slot.replace(text).is_some() {
+                    return Err(format!(
+                        "{flag} was given twice; give it once, as text or with {flag}-file."
+                    ));
+                }
+            }
             "--gateway" => args.gateway = raw.next(),
             "--effort" => args.effort = raw.next(),
             "setup" | "--install" => args.install = true,
@@ -471,6 +505,27 @@ fn above_zero<T: std::str::FromStr + PartialOrd + From<u8>>(
         .and_then(|value| value.parse::<T>().ok())
         .filter(|n| *n > T::from(0))
         .ok_or_else(|| error.to_owned())
+}
+
+/// The instructions after `flag`: the text itself, or for a `-file` flag
+/// what the file it names holds.
+fn given_prompt(flag: &str, value: Option<String>) -> Result<String, String> {
+    let file = flag.ends_with("-file");
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Err(match file {
+            true => format!("{flag} takes a file, like {flag} rules.md."),
+            false => format!("{flag} takes the instructions, like {flag} \"Answer in French.\""),
+        });
+    };
+    if !file {
+        return Ok(value);
+    }
+    let text = std::fs::read_to_string(&value)
+        .map_err(|e| format!("Could not read the instructions in {value}: {e}"))?;
+    if text.trim().is_empty() {
+        return Err(format!("{value} is empty, so it gives no instructions."));
+    }
+    Ok(text)
 }
 
 /// The tool names after `--tools`, split at the commas.
@@ -862,6 +917,32 @@ mod tests {
         assert!(refused(&["--fork-session", "--resume"]).starts_with("--fork-session copies"));
         assert!(refused(&["--name"]).starts_with("--name takes"));
         assert!(refused(&["--name", "-c"]).starts_with("--name takes"));
+    }
+
+    #[test]
+    fn the_system_prompt_flags_take_text_or_a_file_and_each_once() {
+        let given = args(&["--system-prompt", "You review code.", "-p", "q"]);
+        assert_eq!(given.system_prompt.as_deref(), Some("You review code."));
+        assert_eq!(given.prompt.as_deref(), Some("q"));
+        let file = std::env::temp_dir().join(format!("letronna-append-{}.md", std::process::id()));
+        std::fs::write(&file, "Answer in French.\n").unwrap();
+        let path = file.to_str().unwrap();
+        let appended = args(&["--append-system-prompt-file", path]);
+        assert_eq!(
+            appended.append_system_prompt.as_deref(),
+            Some("Answer in French.\n")
+        );
+        assert_eq!(appended.system_prompt, None);
+        let twice = refused(&["--system-prompt", "a", "--system-prompt-file", path]);
+        std::fs::remove_file(&file).unwrap();
+        assert!(twice.contains("given twice"), "{twice}");
+        assert!(refused(&["--system-prompt"]).contains("takes the instructions"));
+        assert!(refused(&["--append-system-prompt-file", path]).contains("Could not read"));
+        let empty = std::env::temp_dir().join(format!("letronna-empty-{}.md", std::process::id()));
+        std::fs::write(&empty, " \n").unwrap();
+        let blank = refused(&["--system-prompt-file", empty.to_str().unwrap()]);
+        std::fs::remove_file(&empty).unwrap();
+        assert!(blank.contains("is empty"), "{blank}");
     }
 
     /// The skill that tells the model how Letronna works keeps up with what
