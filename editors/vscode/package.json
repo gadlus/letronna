@@ -1,0 +1,91 @@
+{
+  "name": "letronna",
+  "displayName": "Letronna",
+  "description": "Use Letronna's terminal from VS Code: open it, hand it the code you select, and see the edits it asks to make as diffs.",
+  "version": "0.1.0",
+  "publisher": "gadlus",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gadlus/letronna"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "letronna.open",
+        "title": "Open in terminal",
+        "category": "Letronna"
+      },
+      {
+        "command": "letronna.addSelection",
+        "title": "Add selection to chat",
+        "category": "Letronna"
+      },
+      {
+        "command": "letronna.addFile",
+        "title": "Add file to chat",
+        "category": "Letronna"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "letronna.addSelection",
+        "key": "ctrl+alt+k",
+        "mac": "cmd+alt+k",
+        "when": "editorTextFocus"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "letronna.addSelection",
+          "group": "letronna"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "letronna.addFile",
+          "group": "letronna"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "letronna.addFile",
+          "group": "letronna"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Letronna",
+      "properties": {
+        "letronna.command": {
+          "type": "string",
+          "default": "letronna",
+          "description": "The command that starts Letronna in the terminal."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "test": "tsc -p . && node --test out/test/*.test.js",
+    "package": "tsc -p . && vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "~22.20.0",
+    "@types/vscode": "~1.90.0",
+    "@vscode/vsce": "^4.1.0",
+    "typescript": "~5.9.3"
+  }
+}
