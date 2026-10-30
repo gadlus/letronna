@@ -28,7 +28,7 @@ use std::collections::VecDeque;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
-use crate::edit::Line;
+use crate::edit::{Aside, Line};
 use crate::render;
 
 /// A line of the `/` menu: Letronna's own commands, or one the user, the
@@ -1003,6 +1003,9 @@ pub struct Bar {
     mode_note: Option<std::time::Instant>,
     /// The mode in use before plan mode was turned on.
     before_plan: Mode,
+    /// What was being written when a command was taken to run, which has
+    /// the box to itself until the next prompt gives this back.
+    aside: Option<Aside>,
 }
 
 impl Bar {
@@ -1072,6 +1075,7 @@ impl Bar {
             places: None,
             mode_note: None,
             before_plan: Mode::Default,
+            aside: None,
         }
     }
 
@@ -1468,6 +1472,10 @@ impl Bar {
     /// request, for what the schedules' runner says, or for a note. `None`
     /// when the user is done.
     pub fn wait(&mut self) -> Option<Waited> {
+        if let Some(aside) = self.aside.take() {
+            self.line.bring_back(aside);
+            self.settle();
+        }
         loop {
             if self.done {
                 return None;
@@ -1563,6 +1571,11 @@ impl Bar {
     /// unless it is a key or a question skipped.
     fn next_line(&mut self) -> Option<String> {
         let line = self.queued.pop_front()?;
+        // A question the command asks is answered in the box, which must
+        // not start with words meant for the model.
+        if is_command(&line) && self.aside.is_none() && !self.line.text().is_empty() {
+            self.aside = Some(self.line.set_aside());
+        }
         if !self.secret && !line.is_empty() {
             self.echo(&line);
         }
@@ -2332,6 +2345,16 @@ impl Bar {
             KeyCode::Tab if shift && self.mode.is_some() => self.step_mode(),
             // For a terminal that keeps shift-tab to itself.
             KeyCode::Char('m') if alt && !control && self.mode.is_some() => self.step_mode(),
+            // The model, and how hard it thinks, as Claude Code's alt+p and
+            // alt+t pick them: queued as if typed, while what is in the box
+            // stays to be sent after. Alt is Option where the terminal sends
+            // it as Escape, as alt+m needs too.
+            KeyCode::Char('p') if alt && !control && self.picks_here() => {
+                self.queued.push_back("/model".into())
+            }
+            KeyCode::Char('t') if alt && !control && self.picks_here() => {
+                self.queued.push_back("/effort".into())
+            }
             KeyCode::Tab => {
                 if let Some(choice) = options.get(self.picked) {
                     self.line.set(&choice.line());
@@ -2432,6 +2455,12 @@ impl Bar {
         }
         let shown = menu_for(&self.line, &self.added).len();
         self.menu_top = menu_top(self.menu_top, self.picked, shown, MENU_LIMIT);
+    }
+
+    /// Whether a key may queue a command now: in a session, and not while
+    /// the box answers a question, whose answer it would be taken for.
+    fn picks_here(&self) -> bool {
+        self.mode.is_some() && self.asking.is_none()
     }
 
     /// Send what is in the box: the line ending the enter put in comes off,
@@ -5531,6 +5560,33 @@ mod tests {
         bar.mode_note = Instant::now().checked_sub(super::MODE_NOTE);
         let footer = plain(bar.lines(40).last().unwrap());
         assert!(footer.contains("shift+tab to switch"), "{footer}");
+    }
+
+    #[test]
+    fn alt_p_picks_the_model_and_what_was_typed_waits_for_it() {
+        let mut bar = Bar::new(String::new());
+        bar.set_mode(Mode::Default);
+        bar.line.set("half a thought");
+        hit(&mut bar, KeyCode::Char('p'), KeyModifiers::ALT);
+        hit(&mut bar, KeyCode::Char('t'), KeyModifiers::ALT);
+        assert_eq!(bar.line.text(), "half a thought");
+        assert_eq!(bar.queued, ["/model", "/effort"]);
+        // Taken to run, the command has the box to itself, so a question it
+        // asks starts empty, and the next prompt gives the words back.
+        assert_eq!(bar.next_line().as_deref(), Some("/model"));
+        assert!(bar.line.text().is_empty());
+        bar.done = true;
+        assert!(bar.wait().is_none());
+        assert_eq!(bar.line.text(), "half a thought");
+        // An answer typed meanwhile does not take their place.
+        assert_eq!(bar.next_line().as_deref(), Some("/effort"));
+        bar.line.set("gpt-5");
+        bar.wait();
+        assert_eq!(bar.line.text(), "half a thought");
+        // While the box answers a question, an answer is what it waits for.
+        bar.asking = Some("Which branch?".into());
+        hit(&mut bar, KeyCode::Char('p'), KeyModifiers::ALT);
+        assert!(bar.queued.is_empty());
     }
 
     #[test]

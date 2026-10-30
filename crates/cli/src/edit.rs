@@ -32,6 +32,13 @@ enum Edit {
 /// The most changes undo goes back through.
 const UNDO: usize = 100;
 
+/// A line taken out of the box, pastes and cursor with it, to come back.
+pub struct Aside {
+    text: String,
+    cursor: usize,
+    pastes: Vec<Paste>,
+}
+
 #[derive(Default)]
 pub struct Line {
     text: String,
@@ -494,6 +501,27 @@ impl Line {
                 self.put(&draft);
             }
         }
+    }
+
+    /// Take what is being written out of the line for `bring_back`.
+    pub fn set_aside(&mut self) -> Aside {
+        let aside = Aside {
+            text: std::mem::take(&mut self.text),
+            cursor: self.cursor,
+            pastes: std::mem::take(&mut self.pastes),
+        };
+        self.cursor = 0;
+        self.recalled = None;
+        aside
+    }
+
+    /// Put back what `set_aside` took; anything written meanwhile goes
+    /// where up finds it, so neither is lost.
+    pub fn bring_back(&mut self, aside: Aside) {
+        self.shelve();
+        self.text = aside.text;
+        self.cursor = aside.cursor;
+        self.pastes = aside.pastes;
     }
 
     /// Clear the line, keeping what was typed among the lines sent earlier,

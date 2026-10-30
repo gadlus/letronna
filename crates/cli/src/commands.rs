@@ -1742,6 +1742,10 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
     ),
     ("esc esc", "go back to an earlier message"),
     (
+        "alt+p, alt+t",
+        "pick the model, or how hard it thinks; what is typed stays",
+    ),
+    (
         "ctrl+c",
         "copy, stop an answer, clear the line, or twice to leave",
     ),

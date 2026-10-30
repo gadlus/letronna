@@ -60,6 +60,8 @@ In the terminal, a card that asks about a tool while you are typing keeps your t
 
 In the terminal, Shift+Tab (or Alt+M) steps through Ask, Accept edits, Plan and Auto, and Bypass once you have chosen it; the footer says what each lets run as you land on it. With no flag, the terminal starts in the mode the window's settings start sessions in.
 
+In the terminal, Alt+P opens the model picker and Alt+T how hard the model thinks, as `/model` and `/effort` do, without clearing what you are typing: it waits and comes back once you have picked. Option works as Alt where the terminal sends it as Meta (Terminal's "Use Option as Meta key", or Esc+ in iTerm2). Pressed while a reply runs, the picker opens once it is done.
+
 ## Slash commands
 
 Type `/` to list them all. The common ones:
