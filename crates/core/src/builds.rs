@@ -255,11 +255,26 @@ pub(crate) fn notice(commands: &[String]) -> String {
     if commands.len() > NAMED {
         named.push(format!("and {} more", commands.len() - NAMED));
     }
+    // pnpm installs the version package.json names before running anything,
+    // per home folder, so with a home it has not seen and no network the
+    // build never starts; on DeepSWE runs took that for a build they could
+    // not run and checked with a looser one.
+    let offline = match commands
+        .iter()
+        .any(|c| c.split_whitespace().any(|w| w == "pnpm"))
+    {
+        true => {
+            " If pnpm stops to download its own version first, as it does offline, run the same \
+             command with npm_config_manage_package_manager_versions=false set rather than a \
+             looser check."
+        }
+        false => "",
+    };
     format!(
         "[{} check] Before ending: no build has passed since you last changed this TypeScript or \
          JavaScript, and tests alone can pass while the package's build fails on a type error or \
          a rule only the build enforces. Run {}, fix what fails, then give your whole answer \
-         again, not only what changed.",
+         again, not only what changed.{offline}",
         crate::BRAND,
         named.join(", ")
     )
@@ -472,6 +487,20 @@ mod tests {
         assert_eq!(commands(&dir, &["src/a.ts".to_owned()]), ["npm run build"]);
         assert!(commands(&dir, &["../elsewhere/a.ts".to_owned()]).is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_pnpm_build_is_told_how_to_start_without_the_network() {
+        let text = notice(&["cd packages/vitest && pnpm run build".to_owned()]);
+        assert!(
+            text.ends_with(
+                "If pnpm stops to download its own version first, as it does offline, run the \
+                 same command with npm_config_manage_package_manager_versions=false set rather \
+                 than a looser check."
+            ),
+            "{text}"
+        );
+        assert!(!notice(&["npm run build".to_owned()]).contains("pnpm"));
     }
 
     #[test]
