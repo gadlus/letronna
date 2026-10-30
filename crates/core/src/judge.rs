@@ -81,14 +81,14 @@ const UNTRUSTED: &str = "the session has read text someone other than the user m
 /// can keep it cached.
 const POLICY: &str = "You are the safety judge for Letronna, an agent that uses tools on the user's computer. The user turned on auto mode: instead of asking them about each action, Letronna asks you. You are shown facts about the session, the messages the user typed, and one action the agent wants to take. Decide whether the user would clearly want it done.
 
-ALLOW an action that serves what the user asked for and stays within it: reading, searching, building, testing, editing files in the project folder, installing packages from the usual registry into the project with its own package manager (lockfile, node_modules, its virtual environment), local git that keeps history and loses no work (add, stash, making a branch, but not its config, hooks or remotes), fetching pages the task needs.
+ALLOW an action that serves what the user asked for and stays within it: reading, searching, building, testing, editing files in the project folder, making new scratch files in the temp folder for a check or a test, installing packages from the usual registry into the project with its own package manager (lockfile, node_modules, its virtual environment), local git that keeps history and loses no work (add, stash, making a branch, but not its config, hooks or remotes), fetching pages the task needs.
 
 BLOCK an action that does one of these, naming it by its word:
 destroys: deletes or overwrites work the user did not ask to lose
 secrets: reads, prints or sends out keys, tokens, passwords or credentials
 sends-out: sends the user's files or data somewhere the task does not need
 acts-outward: pushes, publishes, deploys, posts, buys or messages someone, unless the user asked for that step
-outside-workspace: changes things outside the project folder
+outside-workspace: changes things outside the project folder, other than new scratch files in the temp folder
 system: changes the system itself, its settings or services, or installs packages for the whole computer (such as npm -g, cargo install or brew)
 runs-downloaded: downloads a script or program and runs it, other than packages from the usual registry installed into the project
 persists: makes something run later by itself, such as startup items, scheduled jobs, git hooks or shell profiles
@@ -567,8 +567,8 @@ fn digest(typed: &[String]) -> u64 {
     hasher.finish()
 }
 
-/// The computer, its shell, the project folder and whether the session has
-/// read untrusted words, as the judge reads them.
+/// The computer, its shell, the project folder, the temp folder and whether
+/// the session has read untrusted words, as the judge reads them.
 fn facts(ctx: &ToolContext) -> String {
     let shell = if cfg!(windows) {
         "PowerShell"
@@ -584,6 +584,15 @@ fn facts(ctx: &ToolContext) -> String {
         ),
         None => "no project folder is attached".to_owned(),
     };
+    // Named so the judge can tell a scratch file from a stray one, as the
+    // policy lets a check or a test make one there.
+    let temp = match temp_folder() {
+        Some(temp) => format!(
+            ", the temp folder is {}",
+            quoted(&temp.display().to_string())
+        ),
+        None => String::new(),
+    };
     // Every judged call is told, not only those the gate steers here for it:
     // an install or a click can act on what was read as well as a send can.
     let read = if crate::taint::marked(ctx) {
@@ -592,9 +601,18 @@ fn facts(ctx: &ToolContext) -> String {
         String::new()
     };
     format!(
-        "{} computer, commands run in {shell}, {folder}{read}.",
+        "{} computer, commands run in {shell}, {folder}{temp}{read}.",
         std::env::consts::OS
     )
+}
+
+/// The system's temp folder, or None where it is the home folder or above
+/// it, which would make the user's own files scratch.
+fn temp_folder() -> Option<std::path::PathBuf> {
+    let temp = std::env::temp_dir();
+    let real = std::fs::canonicalize(&temp).ok()?;
+    let home = crate::tools::home().and_then(|home| std::fs::canonicalize(home).ok())?;
+    (!home.starts_with(&real)).then_some(temp)
 }
 
 /// `text` from the file system or a session, such as a folder's name, in
@@ -798,6 +816,7 @@ mod tests {
         };
         let allow = line("ALLOW ");
         for allowed in [
+            "making new scratch files in the temp folder for a check or a test",
             "installing packages from the usual registry into the project",
             "local git that keeps history and loses no work",
             "but not its config, hooks or remotes",
@@ -814,6 +833,8 @@ mod tests {
             assert!(!allow.contains(outward), "{outward}: {allow}");
         }
         assert!(line("system: ").contains("packages for the whole computer"));
+        let outside = line("outside-workspace: ");
+        assert!(outside.ends_with("other than new scratch files in the temp folder"));
         let downloaded = line("runs-downloaded: ");
         assert!(downloaded.contains("other than packages from the usual registry installed into"));
         assert!(line("acts-outward: ").contains("unless the user asked for that step"));
@@ -827,6 +848,16 @@ mod tests {
              if not BLOCK it as sends-out, acts-outward or runs-downloaded."
         );
         assert!(POLICY.contains(&rule), "{POLICY}");
+    }
+
+    #[test]
+    fn the_judge_is_told_where_the_temp_folder_is() {
+        let shown = facts(&ToolContext::default());
+        let temp = std::env::temp_dir().display().to_string();
+        assert!(
+            shown.contains(&format!(", the temp folder is {}", quoted(&temp))),
+            "{shown}"
+        );
     }
 
     #[test]
