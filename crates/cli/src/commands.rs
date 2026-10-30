@@ -249,6 +249,23 @@ pub fn command(
             }));
             Flow::Handled
         }
+        "/vim" => {
+            let Some(on) = switched("/vim", rest, runner.bar.vim_on()) else {
+                return Flow::Handled;
+            };
+            runner.bar.set_vim(on);
+            let kept = crate::vim::save(on);
+            render::blank();
+            render::line(&render::dim(if on {
+                "Vim keys on: esc for normal mode, i to type again, /vim off to end them."
+            } else {
+                "Vim keys off."
+            }));
+            if let Err(why) = kept {
+                render::line(&render::red(&why));
+            }
+            Flow::Handled
+        }
         "/search" if rest == "services" => {
             search_services(runner);
             Flow::Handled
@@ -2040,7 +2057,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/wallet",
         ],
     ),
-    ("Help", &["/help", "/theme", "/terminal-setup", "/exit"]),
+    ("Help", &["/help", "/vim", "/theme", "/terminal-setup", "/exit"]),
 ];
 
 /// Letronna's own commands under their headings, those under none last.

@@ -40,6 +40,7 @@ mod syntax;
 mod terminal_setup;
 mod theme;
 mod title;
+mod vim;
 mod wallet;
 
 use args::{Args, HELP, Output, Start, parse};
@@ -263,6 +264,10 @@ fn main() {
     // At the prompt, what is sent goes into the folder's history, which
     // up and ctrl-r reach from later sessions too.
     runner.bar.keep_history(!args.once());
+    // Vim's keys, when they were left on, at the prompt alone.
+    if runner.plain_terminal {
+        runner.bar.set_vim(vim::saved());
+    }
     // With no flag picking one, the mode the window starts sessions in, so
     // the two agree; a `-p` run keeps to its flags alone.
     if !args.mode_picked && !args.once() {

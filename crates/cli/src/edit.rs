@@ -68,7 +68,6 @@ impl Line {
         &self.text
     }
 
-    #[cfg(test)]
     pub fn cursor(&self) -> usize {
         self.cursor
     }
@@ -233,6 +232,42 @@ impl Line {
     /// Put the cursor at character `at`, as a move between rows does.
     pub fn put_cursor(&mut self, at: usize) {
         self.cursor = at.min(self.text.chars().count());
+    }
+
+    /// Move the cursor to character `at`, as a key that moves does: a run
+    /// of typing ends there.
+    pub fn go(&mut self, at: usize) {
+        self.move_to(at.min(self.text.chars().count()));
+    }
+
+    /// Take out the characters from `from` to `to`, kept for undo, and give
+    /// them. A placeholder they cut into goes whole, so no piece of one is
+    /// left to stand for a paste it no longer names.
+    pub fn take_range(&mut self, from: usize, to: usize) -> String {
+        let (from, to) = self.widened(from, to.min(self.text.chars().count()));
+        if from >= to {
+            return String::new();
+        }
+        self.keep(Edit::Other, false);
+        let taken = self.chars()[from..to].iter().collect();
+        self.cut(from, to);
+        taken
+    }
+
+    /// `from` to `to` grown to the whole of any placeholder they overlap.
+    fn widened(&self, mut from: usize, mut to: usize) -> (usize, usize) {
+        for (i, paste) in self.pastes.iter().enumerate() {
+            let marker = format!("[Pasted #{} +{} lines]", i + 1, paste.lines);
+            for (byte, _) in self.text.match_indices(&marker) {
+                let start = self.text[..byte].chars().count();
+                let end = start + marker.chars().count();
+                if start < to && from < end {
+                    from = from.min(start);
+                    to = to.max(end);
+                }
+            }
+        }
+        (from, to)
     }
 
     pub fn left(&mut self) {

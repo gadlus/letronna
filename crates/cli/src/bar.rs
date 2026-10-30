@@ -117,6 +117,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "show the model's thinking, or hide it",
     },
     Command {
+        name: "/vim",
+        blurb: "vim's keys in the box: esc for normal mode, i to type; /vim off ends them",
+    },
+    Command {
         name: "/search",
         blurb: "let the model search the web; /search services for your own, /search keyless for DuckDuckGo, /search letronna auto, free or paid",
     },
@@ -1039,6 +1043,8 @@ pub struct Bar {
     /// When something was last copied and what the footer said of it, which
     /// it says for a moment rather than until the next key.
     copied_at: Option<(std::time::Instant, String)>,
+    /// Vim's keys in the box, while `/vim` has them on.
+    vim: Option<crate::vim::Vim>,
 }
 
 impl Bar {
@@ -1113,6 +1119,7 @@ impl Bar {
             aside: None,
             attached: 0,
             copied_at: None,
+            vim: None,
         }
     }
 
@@ -1457,6 +1464,72 @@ impl Bar {
 
     /// Open what was sent before in a list narrowed by typing, newest first,
     /// as ctrl-r does in a shell: enter puts the one picked in the box.
+    /// Turn vim's keys in the box on or off; on, typing starts in insert
+    /// mode.
+    pub fn set_vim(&mut self, on: bool) {
+        self.vim = on.then(crate::vim::Vim::default);
+        self.settle();
+    }
+
+    pub fn vim_on(&self) -> bool {
+        self.vim.is_some()
+    }
+
+    /// A key for vim's keys, while they are on, before the box's own: says
+    /// whether it was theirs. Escape leaves insert mode, and in normal mode
+    /// a letter is a command rather than a letter.
+    fn vim_key(&mut self, key: &KeyEvent) -> bool {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        // A secret is typed plainly, and escape over a selection drops it.
+        if self.secret || crate::screen::selecting() {
+            return false;
+        }
+        // A reply or a question waiting on an empty box is stopped or
+        // skipped at the first escape, whatever the mode: "esc to stop"
+        // means one press.
+        let urgent = self.line.is_empty() && (self.working || self.asking.is_some());
+        let Some(vim) = self.vim.as_mut() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Esc if !vim.normal() => {
+                vim.escape(&mut self.line);
+                !urgent
+            }
+            KeyCode::Esc if vim.escape(&mut self.line) => true,
+            // Never what is typed shelved, as vim's escape never throws text
+            // away; on an empty box it is escape as ever, which stops a run,
+            // skips a question, or twice goes back to an earlier message.
+            KeyCode::Esc => !self.line.is_empty(),
+            KeyCode::Char(ch) if vim.normal() && !control && !alt => {
+                match vim.key(ch, &mut self.line) {
+                    crate::vim::Asked::Search => self.search_history(),
+                    crate::vim::Asked::Keys => self.keys_card = true,
+                    crate::vim::Asked::NothingToUndo => {
+                        self.note = Some("nothing to undo".to_owned())
+                    }
+                    crate::vim::Asked::Nothing => {}
+                }
+                self.picked = 0;
+                true
+            }
+            KeyCode::Backspace if vim.normal() && !control => {
+                self.line.left();
+                true
+            }
+            // Enter sends from anywhere in the line, never splits it where
+            // the cursor sits, and the next message is typed in insert mode.
+            KeyCode::Enter if vim.normal() && !shift && !alt => {
+                self.line.end();
+                vim.insert();
+                false
+            }
+            _ => false,
+        }
+    }
+
     fn search_history(&mut self) {
         let sent = self.line.sent_newest_first();
         if sent.is_empty() {
@@ -2382,11 +2455,17 @@ impl Bar {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let options = menu_for(&self.line, &self.added);
         // Leaving takes two ctrl-c's in a row; anything between starts over.
         if !(control && key.code == KeyCode::Char('c')) {
             self.quit_at = None;
         }
+        if self.vim_key(&key) {
+            if let Some(vim) = &self.vim {
+                vim.settle(&mut self.line);
+            }
+            return;
+        }
+        let options = menu_for(&self.line, &self.added);
         match key.code {
             // What was sent before, searched for, as a shell's ctrl-r is.
             KeyCode::Char('r') if control => self.search_history(),
@@ -2586,6 +2665,10 @@ impl Bar {
                 self.picked = 0;
             }
             _ => {}
+        }
+        // An arrow or end leaves the cursor on a character in normal mode.
+        if let Some(vim) = &self.vim {
+            vim.settle(&mut self.line);
         }
         let shown = menu_for(&self.line, &self.added).len();
         self.menu_top = menu_top(self.menu_top, self.picked, shown, MENU_LIMIT);
@@ -3188,6 +3271,19 @@ impl Bar {
             self.mode_tag(width)
         } else {
             String::new()
+        };
+        // Vim's mode leads whenever the box is typed in, as a mode a key
+        // changes has to be seen.
+        let mode = match &self.vim {
+            Some(vim)
+                if !self.secret
+                    && self.slider.is_none()
+                    && self.choice.is_none()
+                    && self.switches.is_none() =>
+            {
+                format!("{}{mode}", vim_tag(vim.mode()))
+            }
+            _ => mode,
         };
         // Cut to the window whatever it says: a wrapped last row would run
         // off the foot of the window and scroll everything above it.
@@ -4066,6 +4162,15 @@ impl Bar {
     }
 }
 
+/// Vim's mode as the footer leads with it: normal stands out, since there
+/// letters do not type.
+fn vim_tag(mode: crate::vim::Mode) -> String {
+    match mode {
+        crate::vim::Mode::Normal => format!("{}{}", render::blue("normal"), render::dim("  ·  ")),
+        crate::vim::Mode::Insert => render::dim("insert  ·  "),
+    }
+}
+
 /// Columns the footer keeps for what follows the mode before the hint after
 /// it gives way.
 const MODE_ROOM: usize = 16;
@@ -4265,6 +4370,63 @@ mod tests {
         bar.working(true);
         bar.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(bar.interrupted() && !bar.finished());
+    }
+
+    /// Type `text` into the box a key at a time.
+    fn type_keys(bar: &mut Bar, text: &str) {
+        for ch in text.chars() {
+            hit(bar, KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+    }
+
+    #[test]
+    fn with_vim_keys_escape_gives_normal_mode_where_letters_are_commands() {
+        let mut bar = Bar::new(String::new());
+        bar.set_vim(true);
+        assert!(
+            bar.lines(40)
+                .last()
+                .is_some_and(|foot| foot.contains("insert"))
+        );
+        type_keys(&mut bar, "hello world");
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(
+            bar.lines(40)
+                .last()
+                .is_some_and(|foot| foot.contains("normal"))
+        );
+        type_keys(&mut bar, "bdw");
+        assert_eq!(bar.line.text(), "hello ");
+        // Escape again never shelves what is typed.
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(bar.line.text(), "hello ");
+        assert!(bar.note.is_none());
+        // Enter sends the line whole, not split where the cursor sat, and
+        // the next message starts in insert mode.
+        type_keys(&mut bar, "0");
+        hit(&mut bar, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(bar.line.text(), "hello \n");
+        assert!(
+            bar.lines(40)
+                .last()
+                .is_some_and(|foot| foot.contains("insert"))
+        );
+    }
+
+    #[test]
+    fn with_vim_keys_one_escape_still_stops_a_reply_on_an_empty_box() {
+        let mut bar = Bar::new(String::new());
+        bar.set_vim(true);
+        bar.working(true);
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(bar.interrupted(), "the reply was not stopped");
+        // With words in the box, escape only leaves insert mode.
+        bar.working(true);
+        hit(&mut bar, KeyCode::Char('i'), KeyModifiers::NONE);
+        type_keys(&mut bar, "more");
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!bar.interrupted());
+        assert_eq!(bar.line.text(), "more");
     }
 
     #[test]

@@ -44,6 +44,7 @@ Then `letronna mcp list`, `get <name>`, `remove <name>`, and `login <name>` or `
 
 - /help lists them all, /terminal-setup (shift+enter), /new or /clear starts a fresh session (ctrl+l clears the screen), /exit leaves.
 - /help lists them all, /new or /clear starts afresh (ctrl+l clears the screen), /theme (colours), /exit leaves.
+- /help lists them all, /new or /clear starts a fresh session (ctrl+l clears the screen), /vim (vim keys), /exit leaves.
 - Model: /model (also image, speech or video models, and `/model side` for a cheaper one for summaries), /fallback (models to carry on with when one is overloaded or out of credit), /connect, /effort, /thinking, /style (reply styles).
 - Asking first: /mode, /plan, /decisions (what auto mode's judge allowed or blocked), /verify (build or test after edits), /coauthor (Letronna as co-author of commits).
 - Model: /model (also image, speech or video models, and `/model side` for a cheaper one for summaries), /fallback (models to carry on with when one is overloaded or out of credit), /connect, /limits (what is left of each plan), /effort, /thinking, /style (reply styles).
