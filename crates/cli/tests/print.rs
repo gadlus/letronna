@@ -33,14 +33,25 @@ fn scratch(name: &str) -> (PathBuf, PathBuf) {
 /// A model server answering every request with the stream `body`, and the
 /// base URL to set up for it.
 fn model(body: &str) -> String {
+    model_saying(&[body])
+}
+
+/// A model server answering with each stream of `bodies` in turn, and with
+/// the last once they are used, and the base URL to set up for it.
+fn model_saying(bodies: &[&str]) -> String {
     let server = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}/v1", server.local_addr().unwrap());
-    let answer = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
+    let answers: Vec<String> = bodies
+        .iter()
+        .map(|body| {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        })
+        .collect();
     std::thread::spawn(move || {
-        for socket in server.incoming() {
+        for (n, socket) in server.incoming().enumerate() {
             let Ok(mut socket) = socket else {
                 continue;
             };
@@ -64,6 +75,7 @@ fn model(body: &str) -> String {
                     break;
                 }
             }
+            let answer = &answers[n.min(answers.len() - 1)];
             let _ = socket.write_all(answer.as_bytes());
         }
     });
@@ -168,4 +180,50 @@ fn a_print_run_reports_the_rules_it_left_out() {
     assert_eq!(all["prompt"]["dropped"], json!([]));
     assert_eq!(fewer["prompt"]["dropped"], json!(["compute", "literals"]));
     assert_ne!(all["prompt"]["rules_sha"], fewer["prompt"]["rules_sha"]);
+}
+
+#[test]
+fn a_stream_json_run_says_each_step_it_took() {
+    let (data, work) = scratch("steps");
+    let arguments = json!({"path": "hello.txt", "content": "hi\nthere\n"}).to_string();
+    let call = json!({"choices": [{"delta": {"tool_calls": [{
+        "index": 0, "id": "call_1", "type": "function",
+        "function": {"name": "write_file", "arguments": arguments},
+    }]}, "finish_reason": "tool_calls"}]});
+    let base = model_saying(&[
+        &format!("data: {call}\n\ndata: [DONE]\n\n"),
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Done.\"}}]}\n\ndata: [DONE]\n\n",
+    ]);
+    let settings = json!({"endpoint": base, "model": "test-model", "gateway": "Custom", "custom_endpoint": base});
+    std::fs::write(data.join("settings.json"), settings.to_string()).unwrap();
+    let out = run(
+        &data,
+        &work,
+        &["-p", "--yes", "--output", "stream-json", "write hello"],
+    );
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{said}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines: Vec<serde_json::Value> = said
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let steps: Vec<&serde_json::Value> = lines.iter().filter(|l| l["type"] == "step").collect();
+    assert_eq!(steps.len(), 1, "{said}");
+    let step = steps[0];
+    assert_eq!(
+        (&step["tool"], &step["ok"], &step["file"]),
+        (&json!("write_file"), &json!(true), &json!("hello.txt"))
+    );
+    assert_eq!((&step["added"], &step["removed"]), (&json!(2), &json!(0)));
+    assert_eq!(step["lines"], json!(["+ hi", "+ there"]));
+    // Before the result, which ends the lines.
+    assert_eq!(lines.last().map(|l| &l["type"]), Some(&json!("result")));
+    assert_eq!(
+        std::fs::read_to_string(work.join("hello.txt")).unwrap(),
+        "hi\nthere\n"
+    );
 }

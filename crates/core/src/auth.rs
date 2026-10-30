@@ -91,6 +91,11 @@ pub struct Account {
     /// The hosted models Letronna pays for today, as of the last check.
     #[serde(default)]
     pub perks: Vec<Perk>,
+    /// Whether Letronna Cloud's sessions name Letronna as co-author of their
+    /// commits and mark their pull requests, as of the last check; None
+    /// until one, when they do.
+    #[serde(default)]
+    pub letronna_coauthor: Option<bool>,
 }
 
 /// Letronna paying for some hosted models today, all of the price or a
@@ -355,6 +360,8 @@ pub fn refresh_within(wait: Duration) -> Result<Account, String> {
         /// perks and not the rest.
         #[serde(default)]
         perks: serde_json::Value,
+        #[serde(default)]
+        letronna_coauthor: Option<bool>,
     }
     let me: Me = response
         .error_for_status()
@@ -374,6 +381,30 @@ pub fn refresh_within(wait: Duration) -> Result<Account, String> {
     account.perks = (me.perks.as_array())
         .map(|list| list.iter().cloned().map(Perk::from).collect())
         .unwrap_or_default();
+    account.letronna_coauthor = me.letronna_coauthor;
+    remember(&account)?;
+    Ok(account)
+}
+
+/// Whether Letronna Cloud's sessions name Letronna as co-author of their
+/// commits and mark their pull requests: the account's choice, which the
+/// phone app's GitHub settings make too. Keeps the answer.
+pub fn set_letronna_coauthor(on: bool) -> Result<Account, String> {
+    let mut account = account().ok_or("Not signed in.")?;
+    #[derive(Deserialize)]
+    struct Kept {
+        letronna_coauthor: bool,
+    }
+    let kept: Kept = client(Duration::from_secs(20))?
+        .put(api("/v1/github/coauthor"))
+        .bearer_auth(&account.token)
+        .json(&serde_json::json!({ "on": on }))
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|_| "Letronna could not keep that just now. Try again.".to_owned())?
+        .json()
+        .map_err(|_| "The account service sent something unexpected.".to_owned())?;
+    account.letronna_coauthor = Some(kept.letronna_coauthor);
     remember(&account)?;
     Ok(account)
 }

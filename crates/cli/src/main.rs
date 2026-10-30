@@ -71,6 +71,11 @@ const END_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
 /// Lines of a call's preview shown above the question, as the conversation shows.
 const PREVIEW_LINES: usize = 12;
+/// Lines a stream-json step line carries of a call's diff or result, and
+/// the characters of each: enough for a phone to show what a step did,
+/// while a run of a hundred steps stays a few hundred kilobytes.
+const STEP_LINES: usize = 20;
+const STEP_WIDTH: usize = 160;
 /// How long a new version runs before it counts as working and is kept, as
 /// in the window.
 const SETTLED: std::time::Duration = std::time::Duration::from_secs(10);
@@ -811,6 +816,9 @@ fn ask_once(
     // The gate's refusals reach only the model, so a script that left out
     // --yes would otherwise see an answer that changed nothing and no why.
     say_unanswered(spec.connection.mode, keyboard);
+    if args.output == Output::StreamJson {
+        hear_steps(&spec.status, context.clone());
+    }
     answer_approvals(keyboard, context, spec.cancel.clone());
     if args.output == Output::StreamJson {
         emit(&opening);
@@ -1268,6 +1276,93 @@ fn show_progress(
         // A switch made just before the end is said too.
         tell(&mut notes);
     })
+}
+
+/// Writes a stream-json step line as each of the run's calls ends, so a
+/// screen that shows the run, as a phone shows a cloud run, can list its
+/// work as it goes. A change to a file is read as it is asked for, before
+/// it is made, as an approval's diff is.
+fn hear_steps(status: &Status, context: tools::ToolContext) {
+    let asked = std::sync::Mutex::new(std::collections::HashMap::new());
+    let _ = status.calls.set(Arc::new(move |step| match step {
+        driver::Step::Asked(call) => {
+            let change = diff::plain(&call.name, &call.arguments, &context);
+            if let Ok(mut asked) = asked.lock() {
+                asked.insert(call.id.clone(), (call, change));
+            }
+        }
+        driver::Step::Finished { id, output, failed } => {
+            let Some((call, change)) = asked.lock().ok().and_then(|mut asked| asked.remove(&id))
+            else {
+                return;
+            };
+            emit(&step_line(&call, change, &output, failed));
+        }
+        _ => {}
+    }));
+}
+
+/// A call that ended, as a stream-json line: the tool, what it worked on and
+/// whether it worked, with a change it made to a file as the file, the lines
+/// it added and took away and the first rows of its diff, and with anything
+/// else as a few lines of what it gave back: a command's last, where its
+/// errors and its sums land, and any other tool's first. A command that
+/// exited non-zero failed, as the window's rows count it, though its result
+/// is no error.
+fn step_line(
+    call: &chat::ToolCall,
+    change: Option<diff::Plain>,
+    output: &str,
+    error: bool,
+) -> Value {
+    let failed = letronna_core::tool_runs::failed(&Message {
+        role: "tool".into(),
+        name: call.name.clone(),
+        content: output.to_owned(),
+        is_error: error,
+        ..Default::default()
+    });
+    let cut = |line: &str| -> String {
+        let line = line.replace('\t', "    ");
+        match line.chars().count() > STEP_WIDTH {
+            true => line.chars().take(STEP_WIDTH - 1).chain(['…']).collect(),
+            false => line,
+        }
+    };
+    let mut line = json!({
+        "type": "step",
+        "tool": call.name,
+        "what": cut(&tools::summary(&call.name, &call.arguments)),
+        "ok": !failed,
+    });
+    let (rows, more) = match change.filter(|_| !error) {
+        Some(change) => {
+            line["file"] = change.path.into();
+            line["added"] = change.added.into();
+            line["removed"] = change.removed.into();
+            let more = change.rows.len().saturating_sub(STEP_LINES);
+            (change.rows.into_iter().take(STEP_LINES).collect(), more)
+        }
+        None => {
+            let said: Vec<&str> = output.lines().collect();
+            let more = said.len().saturating_sub(STEP_LINES);
+            let kept = match call.name.as_str() {
+                "run_command" => &said[more..],
+                _ => &said[..said.len() - more],
+            };
+            (
+                kept.iter()
+                    .map(|line| (*line).to_owned())
+                    .collect::<Vec<_>>(),
+                more,
+            )
+        }
+    };
+    line["lines"] = rows.iter().map(|row| cut(row)).collect::<Vec<_>>().into();
+    if more > 0 {
+        line["more"] = more.into();
+    }
+    line
 }
 
 /// The stream-json line a run opens with: the session at `session`, by the
@@ -1830,6 +1925,80 @@ mod tests {
             contract: Vec::new(),
             value: None,
         }
+    }
+
+    #[test]
+    fn a_step_line_carries_an_edit_as_its_file_counts_and_diff() {
+        let edit = call(
+            "edit_file",
+            json!({"path": "src/a.rs", "old": "one\ntwo", "new": "one\nTWO\nthree"}),
+        );
+        let change = diff::plain(&edit.name, &edit.arguments, &tools::ToolContext::default());
+        let line = step_line(&edit, change, "Edited src/a.rs", false);
+        assert_eq!(line["type"], "step");
+        assert_eq!(line["tool"], "edit_file");
+        assert_eq!(line["what"], "src/a.rs");
+        assert_eq!(line["ok"], true);
+        assert_eq!(line["file"], "src/a.rs");
+        assert_eq!(
+            (line["added"].as_u64(), line["removed"].as_u64()),
+            (Some(2), Some(1))
+        );
+        assert_eq!(line["lines"], json!(["  one", "- two", "+ TWO", "+ three"]));
+        assert!(line.get("more").is_none());
+    }
+
+    #[test]
+    fn a_step_line_keeps_a_commands_last_lines_and_any_other_tools_first() {
+        let said: Vec<String> = (1..=30).map(|n| format!("line {n}")).collect();
+        let said = said.join("\n");
+        let ran = step_line(
+            &call("run_command", json!({"command": "cargo test"})),
+            None,
+            &said,
+            true,
+        );
+        assert_eq!(
+            (&ran["what"], &ran["ok"]),
+            (&json!("cargo test"), &json!(false))
+        );
+        assert_eq!(ran["lines"][0], "line 11");
+        assert_eq!(ran["lines"][STEP_LINES - 1], "line 30");
+        assert_eq!(ran["more"], 10);
+        // A command that exited non-zero failed, though its result is no error.
+        let exited = step_line(
+            &call("run_command", json!({"command": "cargo test"})),
+            None,
+            "test result: FAILED\n[exit code 101]",
+            false,
+        );
+        assert_eq!(exited["ok"], false);
+        let passed = step_line(
+            &call("run_command", json!({"command": "ls"})),
+            None,
+            "a.txt",
+            false,
+        );
+        assert_eq!(passed["ok"], true);
+        let read = step_line(
+            &call("read_file", json!({"path": "a.txt"})),
+            None,
+            &said,
+            false,
+        );
+        assert_eq!(read["lines"][0], "line 1");
+        assert_eq!(read["lines"].as_array().map(Vec::len), Some(STEP_LINES));
+        // A long line is cut, and a failed edit says why rather than its diff.
+        let long = step_line(&call("read_file", json!({})), None, &"x".repeat(500), false);
+        assert_eq!(
+            long["lines"][0].as_str().map(|l| l.chars().count()),
+            Some(STEP_WIDTH)
+        );
+        let edit = call("write_file", json!({"path": "b.txt", "content": "new"}));
+        let change = diff::plain(&edit.name, &edit.arguments, &tools::ToolContext::default());
+        let refused = step_line(&edit, change, "Not allowed here.", true);
+        assert!(refused.get("file").is_none());
+        assert_eq!(refused["lines"], json!(["Not allowed here."]));
     }
 
     #[test]

@@ -23,12 +23,57 @@ const MAX_ROWS: usize = 28;
 
 /// The diff for a call, or `None` for a tool that does not change a file.
 pub fn of(name: &str, args: &str, ctx: &ToolContext) -> Option<Vec<String>> {
+    changed(name, args, ctx).map(|(_, edits)| edits.iter().flat_map(|rows| paint(rows)).collect())
+}
+
+/// A change to a file in plain words for another screen to show, as a
+/// phone shows a cloud run's: the file, how many lines it adds and takes
+/// away, and its diff as text, each row marked "+", "-" or " ".
+pub struct Plain {
+    pub path: String,
+    pub added: usize,
+    pub removed: usize,
+    pub rows: Vec<String>,
+}
+
+/// `of` in plain words, read before the call runs as `of` is, or `None`
+/// for a tool that does not change a file.
+pub fn plain(name: &str, args: &str, ctx: &ToolContext) -> Option<Plain> {
+    let (path, edits) = changed(name, args, ctx)?;
+    let rows: Vec<Row> = edits.into_iter().flatten().collect();
+    let count = |new: bool| {
+        rows.iter()
+            .filter(|row| match row {
+                Row::New(_) => new,
+                Row::Gone(_) => !new,
+                Row::Same(_) => false,
+            })
+            .count()
+    };
+    Some(Plain {
+        path,
+        added: count(true),
+        removed: count(false),
+        rows: rows
+            .iter()
+            .map(|row| match row {
+                Row::Same(text) => format!("  {text}"),
+                Row::Gone(text) => format!("- {text}"),
+                Row::New(text) => format!("+ {text}"),
+            })
+            .collect(),
+    })
+}
+
+/// The file a call changes and the rows of each of its edits, folded, or
+/// `None` for a tool that does not change a file.
+fn changed(name: &str, args: &str, ctx: &ToolContext) -> Option<(String, Vec<Vec<Row>>)> {
     let mut args: Value = serde_json::from_str(args).ok()?;
     // Read under the names the tool runs with, or an edit sent as
     // `old_string` would be approved as an empty diff.
     letronna_core::tools::rename_aliases(name, &mut args);
     let path = args["path"].as_str().unwrap_or_default();
-    match name {
+    let edits = match name {
         "write_file" => {
             let new = args["content"].as_str().unwrap_or_default();
             // A file that is not there yet is all addition; one that is gets
@@ -42,24 +87,25 @@ pub fn of(name: &str, args: &str, ctx: &ToolContext) -> Option<Vec<String>> {
                 .map(|root| root.join(path))
                 .and_then(|full| std::fs::read_to_string(full).ok())
                 .unwrap_or_default();
-            Some(render_diff(&old, new))
+            vec![compared(&old, new)]
         }
         "edit_file" => {
             // Edits sent as a list are shown too, or they would be approved
             // unseen.
             let listed = args["edits"].as_array().into_iter().flatten();
-            let mut rows = Vec::new();
+            let mut edits = Vec::new();
             for edit in std::iter::once(&args).chain(listed) {
                 let Some(old) = edit["old"].as_str() else {
                     continue;
                 };
                 let new = edit["new"].as_str().unwrap_or_default();
-                rows.extend(render_diff(old, new));
+                edits.push(compared(old, new));
             }
-            Some(rows)
+            edits
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some((path.to_owned(), edits))
 }
 
 /// One line of the comparison.
@@ -70,7 +116,8 @@ enum Row {
     New(String),
 }
 
-fn render_diff(old: &str, new: &str) -> Vec<String> {
+/// The rows from `old` to `new`, folded.
+fn compared(old: &str, new: &str) -> Vec<Row> {
     let before: Vec<&str> = old.lines().collect();
     let after: Vec<&str> = new.lines().collect();
     let rows = if before.len().max(after.len()) > COMPARE_LIMIT {
@@ -82,7 +129,7 @@ fn render_diff(old: &str, new: &str) -> Vec<String> {
     } else {
         compare(&before, &after)
     };
-    paint(&fold(rows))
+    fold(rows)
 }
 
 /// Line-by-line comparison, longest common subsequence. Quadratic, which is

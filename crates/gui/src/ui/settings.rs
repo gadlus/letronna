@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use gpui_component::radio::{Radio, RadioGroup};
 use letronna_core::jev::KEY_SLOT;
 
 actions!(
@@ -987,6 +988,9 @@ impl Chat {
                 &self.browser_address,
                 &self.keep_days,
                 &self.store.settings,
+                self.account
+                    .as_ref()
+                    .map(|account| account.letronna_coauthor.unwrap_or(true)),
                 cx,
             )
             .into_any_element(),
@@ -1026,6 +1030,7 @@ impl Chat {
                 self.account_search(),
                 self.search_rows(),
                 self.store.settings.keyless_search,
+                letronna_core::store::search_named(&self.store.settings.letronna_search),
                 &pick,
                 &endpoint,
                 &key,
@@ -1415,6 +1420,7 @@ fn privacy_page(
     address: &Entity<InputState>,
     keep_days: &Entity<InputState>,
     settings: &Settings,
+    cloud_coauthor: Option<bool>,
     cx: &App,
 ) -> Div {
     let (default_mode, shared) = (settings.mode, settings.browser_shared);
@@ -1646,6 +1652,12 @@ fn privacy_page(
         ))
         .child(approvals)
         .child(heading(
+            "Commits and pull requests",
+            "What Letronna adds to the commits and pull requests it writes.",
+            cx,
+        ))
+        .child(coauthor_rows(settings.letronna_coauthor, cloud_coauthor, chat, cx))
+        .child(heading(
             "Notifications",
             "What the computer is told while Letronna's window is hidden or behind others.",
             cx,
@@ -1692,6 +1704,46 @@ fn privacy_page(
                 .child("Discord Rich Presence is off. Enable it in the Plugins tab to choose what to share.")
                 .into_any_element()
         })
+}
+
+/// Letronna as co-author: of what a session on this computer commits, kept
+/// in this computer's settings; and of what Letronna Cloud's sessions commit,
+/// the account's choice, which needs a sign-in to see or change.
+fn coauthor_rows(here: bool, cloud: Option<bool>, chat: &Entity<Chat>, cx: &App) -> Div {
+    let cloud_row = match cloud {
+        Some(on) => {
+            let chat = chat.clone();
+            switch_row(
+                "coauthor-cloud",
+                "In Letronna Cloud",
+                "The same for cloud sessions on a GitHub repository, wherever they start. Your Letronna account keeps this, so the phone app shows it too.",
+                on,
+                cx,
+                move |cx| chat.update(cx, |this, cx| this.set_cloud_coauthor(!on, cx)),
+            )
+        }
+        None => v_flex()
+            .gap_0p5()
+            .child(div().text_sm().child("In Letronna Cloud"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Sign in on the Account page to choose this for cloud sessions."),
+            ),
+    };
+    v_flex()
+        .gap_3()
+        .child(toggle_row(
+            "coauthor-here",
+            "Letronna as co-author on this computer",
+            "A commit a session makes here ends with \u{201c}Co-authored-by: Letronna\u{201d}, and a pull request it opens with Letronna's mark.",
+            here,
+            chat,
+            cx,
+            std::rc::Rc::new(move |this: &mut Chat| this.store.settings.letronna_coauthor = !here),
+        ))
+        .child(cloud_row)
 }
 
 fn about_page(chat: &Entity<Chat>, this: &Chat, cx: &App) -> Div {
@@ -2222,6 +2274,25 @@ pub(crate) fn toggle_row(
     set: std::rc::Rc<dyn Fn(&mut Chat)>,
 ) -> Div {
     let chat = chat.clone();
+    switch_row(id, title, blurb, on, cx, move |cx| {
+        let set = set.clone();
+        chat.update(cx, |this, cx| {
+            set(this);
+            this.save();
+            cx.notify();
+        })
+    })
+}
+
+/// `toggle_row`'s look, with `turn` doing whatever turning it does.
+fn switch_row(
+    id: &'static str,
+    title: &'static str,
+    blurb: &'static str,
+    on: bool,
+    cx: &App,
+    turn: impl Fn(&mut App) + 'static,
+) -> Div {
     h_flex()
         .justify_between()
         .items_center()
@@ -2242,16 +2313,11 @@ pub(crate) fn toggle_row(
                 ),
         )
         .child(
-            div()
-                .cursor_pointer()
-                .child(KeyedSwitch::new(id).checked(on).on_click(move |_, _, cx| {
-                    let set = set.clone();
-                    chat.update(cx, |this, cx| {
-                        set(this);
-                        this.save();
-                        cx.notify();
-                    })
-                })),
+            div().cursor_pointer().child(
+                KeyedSwitch::new(id)
+                    .checked(on)
+                    .on_click(move |_, _, cx| turn(cx)),
+            ),
         )
 }
 
@@ -2614,6 +2680,7 @@ fn search_page(
     account: AccountSearch,
     rows: Vec<SearchRow>,
     keyless_search: bool,
+    letronna_search: &'static str,
     pick: &Entity<String>,
     endpoint: &Entity<InputState>,
     key: &Entity<InputState>,
@@ -2804,6 +2871,7 @@ fn search_page(
             cx,
         ))
         .child(list)
+        .child(letronna_search_choice(letronna_search, chat, cx))
         .child(toggle_row(
             "keyless-search",
             "Search with DuckDuckGo when no search key is set",
@@ -2816,6 +2884,50 @@ fn search_page(
                 this.store.settings.keyless_search = !keyless_search
             }),
         ))
+}
+
+/// Which of Letronna's own searches a search through the account asks for:
+/// its free search first, either alone, or the paid one.
+fn letronna_search_choice(now: &'static str, chat: &Entity<Chat>, cx: &App) -> Div {
+    const OFFERED: [(&str, &str, &str); 3] = [
+        (
+            "auto",
+            "Auto",
+            "Letronna's free search first, and the paid one, from your credit, when it finds nothing.",
+        ),
+        (
+            "free",
+            "Free",
+            "Letronna's free search alone: no credit is used. It can find less, or nothing while it is busy.",
+        ),
+        (
+            "paid",
+            "Paid",
+            "The paid search alone, by the search from your credit: the steadiest results.",
+        ),
+    ];
+    let chat = chat.clone();
+    let choice = RadioGroup::vertical("letronna-search")
+        .selected_index(OFFERED.iter().position(|(name, _, _)| *name == now))
+        .children(OFFERED.map(|(name, title, about)| {
+            Radio::new(name).small().label(title).child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(about),
+            )
+        }))
+        .on_click(move |at, _, cx| {
+            chat.update(cx, |this, cx| {
+                this.store.settings.letronna_search = OFFERED[*at].0.to_owned();
+                this.save();
+                cx.notify();
+            })
+        });
+    v_flex()
+        .gap_2()
+        .child(label("Letronna's search", cx))
+        .child(choice)
 }
 
 /// The row of the shared fields that Jev's address and key open in.

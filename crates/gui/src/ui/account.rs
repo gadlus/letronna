@@ -46,6 +46,16 @@ impl Chat {
         self.off_thread(move || auth::use_team(id.as_deref()), cx);
     }
 
+    /// Whether Letronna Cloud's sessions name Letronna as co-author: the
+    /// account's choice, so the phone app shows the same. Turned at once,
+    /// and back again if the account service could not keep it.
+    pub(crate) fn set_cloud_coauthor(&mut self, on: bool, cx: &mut Context<Self>) {
+        if let Some(account) = &mut self.account {
+            account.letronna_coauthor = Some(on);
+        }
+        self.off_thread(move || auth::set_letronna_coauthor(on), cx);
+    }
+
     /// Settings, open on this page.
     pub(crate) fn open_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_page.update(cx, |page, cx| {

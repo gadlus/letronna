@@ -1,6 +1,9 @@
 # Letronna Cloud
 
-Letronna Cloud runs the same agent on Letronna's servers. A task keeps going after you close your laptop, and what it builds can stay up. It comes with Pro and is paid from your credit.
+Letronna Cloud runs the same agent on Letronna's servers. A task keeps going after you close your laptop, and what it builds can stay up.
+
+- **Who can use it.** It comes with Pro and is paid from your credit.
+- **On the Free plan.** Tasks run from your own credit too, on the light tier, one at a time.
 
 ## Tasks
 
@@ -18,6 +21,12 @@ letronna cloud "task" [--repo <https-url>] [--tier light|normal|heavy] [--thread
 
 - **Isolation**: each task runs in its own container. The cloud sees nothing on your computer, so a task carries its inputs or clones an https repository.
 - **Threads**: a thread keeps its folder and history between messages.
+- **GitHub repositories**: connect the Letronna GitHub App to the repositories you choose (from the phone app). A task on one of them can be private.
+  - **Its branch.** The task works on a branch of its own, `letronna/<thread>`. What it commits is pushed there and opened as a pull request, and nothing is ever pushed to another branch.
+  - **No token in the task.** The GitHub token stays out of the task's container. Each git step gets one for that repository alone, and it is revoked as soon as the step ends.
+  - **Protect your main branch.** Branch protection on your main branch is still the real guard.
+  - **Letronna as co-author.** Each commit ends with `Co-authored-by: Letronna`, and the pull request with Letronna's mark. Turn this off under Settings › Privacy › Commits and pull requests (In Letronna Cloud), or in the phone app's GitHub settings: it is your account's choice.
+  - **Other repositories.** An https repository that is not connected must be public, and nothing is pushed to it.
 - **Previews**: a page a task makes gets a private preview link.
 
 ## Services

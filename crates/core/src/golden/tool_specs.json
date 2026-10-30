@@ -1405,7 +1405,7 @@
   },
   {
     "function": {
-      "description": "Run a task in Letronna Cloud, on Letronna's servers, and get its answer. Where to build what the user asks for, in order: a page, chart, document or small app that one self-contained file can hold is written here as an .html or .svg file the user previews; anything else is built here, in the project, with the tools on this computer; only when this computer cannot (a tool it needs is not on PATH and cannot be installed, it would take more memory or time than this machine has, or the user asks for the cloud) send it here. It also hosts: a web app it leaves wakes on each visit, and a bot or worker the user wants kept online (a Discord or Telegram bot listening for events, a scheduler) runs 24/7 from their credit; say so in `task` only when the user asked for it to stay up, and put any keys it needs in `task` for /work/.env. cloud_apps shows what is left running and cloud_app_power takes it down or back up. The cloud cannot see this computer's files: pass folder: true to send it the project folder (what .gitignore keeps, without .git), which works for a private or local-only repository; or an https `repo` it clones, which must be public, as the cloud has no git sign-in. Say in your reply that it ran in the cloud. It costs the user's credit, so each call is asked about.",
+      "description": "Run a task in Letronna Cloud, on Letronna's servers, and get its answer. Where to build what the user asks for, in order: a page, chart, document or small app that one self-contained file can hold is written here as an .html or .svg file the user previews; anything else is built here, in the project, with the tools on this computer; only when this computer cannot (a tool it needs is not on PATH and cannot be installed, it would take more memory or time than this machine has, or the user asks for the cloud) send it here. It also hosts: a web app it leaves wakes on each visit, and a bot or worker the user wants kept online (a Discord or Telegram bot listening for events, a scheduler) runs 24/7 from their credit; say so in `task` only when the user asked for it to stay up, and put any keys it needs in `task` for /work/.env. cloud_apps shows what is left running and cloud_app_power takes it down or back up. The cloud cannot see this computer's files: pass folder: true to send it the project folder (what .gitignore keeps, without .git), which works for a local-only repository; or an https `repo` it clones. A https://github.com/<owner>/<name> repo the user connected to the Letronna GitHub App may be private: the task works on its own branch, letronna/<thread>, and what it commits is pushed there and opened as a pull request, never pushed to another branch. Any other repo must be public, and nothing is pushed. Say in your reply that it ran in the cloud, and give the branch and pull request it reports. It costs the user's credit, so each call is asked about.",
       "name": "cloud_task",
       "parameters": {
         "properties": {
@@ -1417,7 +1417,7 @@
             "type": "boolean"
           },
           "repo": {
-            "description": "A public https git address to clone and work in.",
+            "description": "An https git address to clone and work in: public, or a GitHub repo connected to the Letronna GitHub App, whose commits are pushed to a branch of its own with a pull request.",
             "type": "string"
           },
           "task": {

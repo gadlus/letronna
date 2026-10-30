@@ -102,7 +102,7 @@ pub const COMMANDS: &[Command<'static>] = &[
     },
     Command {
         name: "/search",
-        blurb: "let the model search the web; /search services for your own, /search keyless for DuckDuckGo",
+        blurb: "let the model search the web; /search services for your own, /search keyless for DuckDuckGo, /search letronna auto, free or paid",
     },
     Command {
         name: "/tool-search",
@@ -111,6 +111,10 @@ pub const COMMANDS: &[Command<'static>] = &[
     Command {
         name: "/notify",
         blurb: "say when a reply ends or needs you while you are away, or stop",
+    },
+    Command {
+        name: "/coauthor",
+        blurb: "name Letronna as co-author of commits and on pull requests, or not; /coauthor cloud for Letronna Cloud's",
     },
     Command {
         name: "/voice",

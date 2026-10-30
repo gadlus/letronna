@@ -1014,6 +1014,15 @@ mod tests {
         let settings = r#"{"endpoint": "", "model": "", "keyless_search": false}"#;
         std::fs::write(dir.join("settings.json"), settings).unwrap();
         let off = told();
+        // Letronna's free search alone, or its paid one alone (/search letronna).
+        let with = |search: &str| {
+            let settings = format!(
+                r#"{{"endpoint": "", "model": "", "keyless_search": false, "letronna_search": "{search}"}}"#
+            );
+            std::fs::write(dir.join("settings.json"), settings).unwrap();
+            told()
+        };
+        let (free, paid) = (with("free"), with("paid"));
         // Chosen by name, DuckDuckGo keeps every search off the gateway.
         std::fs::write(dir.join("search.json"), r#"{"service": "DuckDuckGo"}"#).unwrap();
         let alone = told();
@@ -1021,17 +1030,26 @@ mod tests {
         assert!(
             on.contains(
                 "; DuckDuckGo in use. With no service chosen, searches go through Letronna, \
-                 paid from the account's credit by the search, and to DuckDuckGo when it \
-                 cannot answer.\n"
+                 free where its free search finds something, otherwise paid from the account's \
+                 credit by the search, and to DuckDuckGo when it cannot answer.\n"
             ),
             "{on}"
         );
         assert!(
             off.contains(
                 "; DuckDuckGo switched off. With no service chosen, searches go through \
-                 Letronna alone, paid from the account's credit by the search.\n"
+                 Letronna alone, free where its free search finds something, otherwise paid \
+                 from the account's credit by the search.\n"
             ),
             "{off}"
+        );
+        assert!(
+            free.contains("Letronna alone, free: its free search alone, which uses no credit.\n"),
+            "{free}"
+        );
+        assert!(
+            paid.contains("Letronna alone, paid from the account's credit by the search.\n"),
+            "{paid}"
         );
         assert!(!alone.contains("With no service chosen"), "{alone}");
     }

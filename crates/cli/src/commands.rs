@@ -237,6 +237,10 @@ pub fn command(
             search_services(runner);
             Flow::Handled
         }
+        "/search" if rest.split_whitespace().next() == Some("letronna") => {
+            letronna_search(runner, rest["letronna".len()..].trim());
+            Flow::Handled
+        }
         "/search" if rest.split_whitespace().next() == Some("keyless") => {
             let words = rest["keyless".len()..].trim();
             let now = runner.store.settings.keyless_search;
@@ -277,6 +281,10 @@ pub fn command(
             } else {
                 "Notifications off."
             }));
+            Flow::Handled
+        }
+        "/coauthor" => {
+            coauthor(runner, rest);
             Flow::Handled
         }
         "/voice" => {
@@ -1817,7 +1825,10 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/voice",
         ],
     ),
-    ("Modes", &["/mode", "/plan", "/decisions", "/verify"]),
+    (
+        "Modes",
+        &["/mode", "/plan", "/decisions", "/verify", "/coauthor"],
+    ),
     (
         "Tools",
         &[
@@ -1904,6 +1915,48 @@ fn switched(command: &str, rest: &str, now: bool) -> Option<bool> {
             None
         }
     }
+}
+
+/// Name Letronna as co-author of what a session here commits, and put its
+/// mark on a pull request it writes, or not; with `cloud`, the same for
+/// Letronna Cloud's sessions, which the account keeps.
+fn coauthor(runner: &mut Runner, rest: &str) {
+    let rest = rest.trim();
+    if let Some(rest) = rest.strip_prefix("cloud") {
+        let Some(account) = letronna_core::auth::account() else {
+            render::blank();
+            render::line(&render::red(
+                "Letronna Cloud's choice is your account's: /login first.",
+            ));
+            return;
+        };
+        let now = account.letronna_coauthor.unwrap_or(true);
+        let Some(on) = switched("/coauthor cloud", rest, now) else {
+            return;
+        };
+        render::blank();
+        match letronna_core::auth::set_letronna_coauthor(on) {
+            Ok(_) if on => render::line(&render::dim(
+                "Letronna Cloud's sessions name Letronna as co-author, and mark their pull requests.",
+            )),
+            Ok(_) => render::line(&render::dim(
+                "Letronna Cloud's sessions' commits and pull requests are yours alone.",
+            )),
+            Err(why) => render::line(&render::red(&why)),
+        }
+        return;
+    }
+    let Some(on) = switched("/coauthor", rest, runner.store.settings.letronna_coauthor) else {
+        return;
+    };
+    runner.store.settings.letronna_coauthor = on;
+    runner.persist();
+    render::blank();
+    render::line(&render::dim(if on {
+        "A commit a session writes here ends with \u{201c}Co-authored-by: Letronna\u{201d}, and a pull request with Letronna's mark."
+    } else {
+        "Commits and pull requests written here are yours alone."
+    }));
 }
 
 /// Turn reading replies aloud on or off.
@@ -5576,6 +5629,37 @@ fn keyless_search(runner: &mut Runner, on: bool) {
     }));
 }
 
+/// Which of Letronna's own searches a search through the account asks for:
+/// `auto`, its free search first and the paid one when that finds nothing;
+/// `free` alone, which uses no credit; or `paid` alone. With no word, says
+/// which is used.
+fn letronna_search(runner: &mut Runner, word: &str) {
+    let now = store::search_named(&runner.store.settings.letronna_search);
+    let next = match word {
+        "" => now,
+        "auto" | "free" | "paid" => word,
+        _ => {
+            render::blank();
+            render::line(&render::red("Say /search letronna auto, free or paid."));
+            return;
+        }
+    };
+    if next != now {
+        runner.store.settings.letronna_search = next.to_owned();
+        runner.persist();
+    }
+    render::blank();
+    render::line(&render::dim(match next {
+        "free" => {
+            "Letronna's search: free alone. It uses no credit, and can find less, or nothing while it is busy; DuckDuckGo answers then."
+        }
+        "paid" => "Letronna's search: paid alone, by the search from your credit, the steadiest.",
+        _ => {
+            "Letronna's search: auto. Its free search first, and the paid one, from your credit, when that finds nothing."
+        }
+    }));
+}
+
 /// Every search service and where it stands, then set one up to search with,
 /// remove one, use DuckDuckGo alone, or switch it on or off. The one set up
 /// last is used, and while none is, the gateway's search where it sells one,
@@ -5763,7 +5847,12 @@ fn account_search_line(account: Option<&letronna_core::auth::Account>, chosen: b
             "○ {name:<10} No credit · add some at letronna.ai to search through your account; DuckDuckGo answers until then"
         ),
         (false, false) => format!(
-            "● {name:<10} In use · through your account, paid by the search from its credit"
+            "● {name:<10} In use · through your account, {} (/search letronna)",
+            match store::letronna_search() {
+                "free" => "its free search alone",
+                "paid" => "paid by the search from its credit",
+                _ => "free search first, then paid from its credit",
+            }
         ),
     }
 }

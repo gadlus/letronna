@@ -568,6 +568,17 @@ pub struct Settings {
     /// says how to turn it back on or add a key.
     #[serde(default = "yes")]
     pub keyless_search: bool,
+    /// Which of Letronna's own web searches a search through the account
+    /// asks for: "auto", its free search first and the paid one, from
+    /// credit, when that finds nothing; "free" alone, using no credit; or
+    /// "paid" alone. Empty, or anything else, is "auto".
+    #[serde(default)]
+    pub letronna_search: String,
+    /// Name Letronna as co-author of what a session here commits, and put
+    /// its mark on a pull request one opens. Letronna Cloud's sessions
+    /// follow the account's choice instead (`Account::letronna_coauthor`).
+    #[serde(default = "yes")]
+    pub letronna_coauthor: bool,
     /// Answer with a model downloaded to this computer when the hosted one
     /// cannot be reached, rather than not at all.
     #[serde(default = "yes")]
@@ -621,6 +632,8 @@ impl Default for Settings {
             memory_saving: crate::memory::Saving::WhenAsked,
             memory_scope: crate::memory::Scope::Auto,
             keyless_search: true,
+            letronna_search: String::new(),
+            letronna_coauthor: true,
             local_stand_in: true,
             tool_search: String::new(),
             jev_endpoint: String::new(),
@@ -3437,6 +3450,33 @@ pub(crate) fn keyless_search() -> bool {
     settings().0.keyless_search
 }
 
+/// The variable that has a run name no co-author of its own when it is 0,
+/// as Letronna Cloud starts its runs: the cloud credits its sessions'
+/// commits itself, as the account chose.
+pub const COAUTHOR: &str = "LETRONNA_COAUTHOR";
+
+/// Whether a session names Letronna as co-author of its commits: the
+/// settings file's choice, read again each time, unless `COAUTHOR` says 0.
+pub(crate) fn letronna_coauthor() -> bool {
+    std::env::var(COAUTHOR).map_or(true, |v| v.trim() != "0") && settings().0.letronna_coauthor
+}
+
+/// The search Letronna's own gateway is asked for (search.rs): "auto",
+/// "free" or "paid", as `letronna_search` names it, read again each time.
+pub fn letronna_search() -> &'static str {
+    search_named(&settings().0.letronna_search)
+}
+
+/// One of Letronna's searches by its name in the settings: "auto" unless
+/// it is "free" or "paid".
+pub fn search_named(name: &str) -> &'static str {
+    match name.trim() {
+        "free" => "free",
+        "paid" => "paid",
+        _ => crate::search::AUTO,
+    }
+}
+
 /// The settings file. A file that will not read at all is kept aside by
 /// `state::read` as before.
 fn read_settings_file() -> Settings {
@@ -6023,6 +6063,25 @@ pub(crate) mod tests {
         assert!(read("").verifies_edits());
         assert!(!read(r#", "verify_edits": false"#).verifies_edits());
         assert!(!read(r#", "disabled_tools": ["run_command"]"#).verifies_edits());
+    }
+
+    #[test]
+    fn letronnas_search_is_auto_unless_free_or_paid_is_named() {
+        let read = |extra: &str| {
+            let text = format!(r#"{{"endpoint": "", "model": "m"{extra}}}"#);
+            super::read_settings(text.as_bytes()).unwrap()
+        };
+        assert_eq!(read("").letronna_search, "");
+        assert_eq!(super::search_named(&read("").letronna_search), "auto");
+        assert_eq!(
+            super::search_named(&read(r#", "letronna_search": "free""#).letronna_search),
+            "free"
+        );
+        assert_eq!(
+            super::search_named(&read(r#", "letronna_search": " paid ""#).letronna_search),
+            "paid"
+        );
+        assert_eq!(super::search_named("anything"), "auto");
     }
 
     #[test]

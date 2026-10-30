@@ -56,6 +56,8 @@ enum To {
     /// Where someone watches a session that has `letronna_info`: the
     /// window's, the terminal's, an editor's or a chat app's private chat.
     Letronna,
+    /// Where the settings name Letronna as co-author of what is committed.
+    Coauthor,
 }
 
 impl To {
@@ -71,6 +73,7 @@ impl To {
             To::Terminal => connection.plain_terminal,
             To::Plan => crate::tools::offers_plan(connection),
             To::Letronna => watched(connection) && crate::tools::offers_info(connection),
+            To::Coauthor => crate::store::letronna_coauthor(),
         }
     }
 
@@ -341,11 +344,20 @@ pub(crate) const TOOLS: [Rule; 26] = [
 /// The rules after where the project folder is.
 // Not "ask about uncommitted changes", which stalls work in any repository
 // someone is using; and a push is the outward rule's.
-pub(crate) const PROJECT: [Rule; 1] = [Rule {
-    id: "git",
-    to: To::Every,
-    text: "Changes in the project you did not make are the user's: work with them. Unless asked, never revert or discard them (git checkout --, git restore, git reset --hard), commit, or rewrite git history; never commit secrets.",
-}];
+pub(crate) const PROJECT: [Rule; 2] = [
+    Rule {
+        id: "git",
+        to: To::Every,
+        text: "Changes in the project you did not make are the user's: work with them. Unless asked, never revert or discard them (git checkout --, git restore, git reset --hard), commit, or rewrite git history; never commit secrets.",
+    },
+    // Named as the Letronna GitHub App's own account, so GitHub shows its
+    // avatar, as on a cloud session's commits; Settings › Privacy turns it off.
+    Rule {
+        id: "coauthor",
+        to: To::Coauthor,
+        text: "End each commit message you write with a blank line and `Co-authored-by: Letronna <348030694+letronna-ai[bot]@users.noreply.github.com>`, and each pull request description you write with `Made with [Letronna](https://letronna.ai)`.",
+    },
+];
 
 /// The rules after what plan mode allows, where it takes tools away: what a
 /// request means there and when to ask, so "add a test" is planned rather
@@ -939,6 +951,41 @@ mod tests {
         assert!(!in_a_run);
         assert!(without_schedule);
         assert!(!without_info);
+    }
+
+    #[test]
+    fn letronna_is_named_co_author_unless_the_settings_or_the_cloud_say_not() {
+        let _turn = settings_held();
+        let dir = crate::store::tests::Scratch::new("rules-coauthor");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let first = tells(&window(), "coauthor");
+        let unwatched = tells(&headless(), "coauthor");
+        let row = told_without(&window(), &PROJECT, &[]);
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"endpoint": "", "model": "m", "letronna_coauthor": false}"#,
+        )
+        .unwrap();
+        let turned_off = tells(&window(), "coauthor");
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"endpoint": "", "model": "m"}"#,
+        )
+        .unwrap();
+        // Letronna Cloud credits its sessions itself, and says so.
+        unsafe { std::env::set_var(crate::store::COAUTHOR, "0") };
+        let in_the_cloud = tells(&headless(), "coauthor");
+        unsafe { std::env::remove_var(crate::store::COAUTHOR) };
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+
+        // On from the first run, watched or not.
+        assert!(first && unwatched);
+        assert!(row.contains(
+            "`Co-authored-by: Letronna <348030694+letronna-ai[bot]@users.noreply.github.com>`"
+        ));
+        assert!(row.contains("`Made with [Letronna](https://letronna.ai)`"));
+        assert!(!turned_off);
+        assert!(!in_the_cloud);
     }
 
     #[test]

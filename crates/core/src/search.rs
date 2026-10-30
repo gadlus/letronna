@@ -14,8 +14,10 @@
 //! only at the address it is given. Emptied, an address goes back to the
 //! official one.
 //!
-//! While no service is chosen, a search goes through Letronna's own search,
-//! paid from the account's credit, whenever this computer is signed in,
+//! While no service is chosen, a search goes through Letronna's own search
+//! whenever this computer is signed in: its free search first and its paid
+//! one, from the account's credit, when that finds nothing; or either alone,
+//! as `letronna_search` in the settings has it (/search letronna),
 //! whatever gateway the chat is on, as pictures and speech are made there.
 //! Signed out, it goes through the session's own gateway when that sells
 //! search -- one that lists search models in its `/models`, the cheapest
@@ -93,9 +95,10 @@ const NO_ROUTE: &str = "it has no search route yet";
 const JUDGED_TIME: Duration = Duration::from_secs(60);
 /// Why a gateway is not asked for a search auto mode let run as free.
 const JUDGED_FREE: &str = "it was not known to sell search when auto mode let a search run as free";
-/// The search model Letronna's own gateway is asked for: whichever it finds
-/// cheapest of those that have not been failing lately.
-const AUTO: &str = "auto";
+/// The search Letronna's own gateway is asked for unless the settings say
+/// otherwise (`letronna_search`): its free search first, then whichever paid
+/// one it finds cheapest of those that have not been failing lately.
+pub(crate) const AUTO: &str = "auto";
 /// What the memo calls a search through the session's gateway.
 const GATEWAY: &str = "gateway";
 /// How many results a search returns unless asked for more, and the most.
@@ -298,18 +301,18 @@ pub(crate) fn through_note(connection: Option<&Connection>) -> Option<String> {
         return None;
     }
     let gate = named_gate(connection, gateways(), Instant::now()).filter(sells)?;
-    let payer = match gate.hosted {
-        true => "from the account's credit",
-        false => "to that gateway",
+    let how = match gate.hosted {
+        true => letronna_pays(false),
+        false => "paid to that gateway by the search",
     };
     Some(match crate::store::keyless_search() {
         true => format!(
-            "With no service chosen, searches go through {}, paid {payer} by the search, \
+            "With no service chosen, searches go through {}, {how}, \
              and to DuckDuckGo when it cannot answer.",
             gate.name
         ),
         false => format!(
-            "With no service chosen, searches go through {} alone, paid {payer} by the search.",
+            "With no service chosen, searches go through {} alone, {how}.",
             gate.name
         ),
     })
@@ -566,19 +569,36 @@ fn heading(routes: &[Route], query: &str) -> String {
     }
 }
 
+/// Who pays for a search through Letronna's own gateway, as its search
+/// setting (`letronna_search`) has it: said to `you` on the card, or of the
+/// account in what the model is told.
+fn letronna_pays(you: bool) -> &'static str {
+    match (crate::store::letronna_search(), you) {
+        ("free", _) => "free: its free search alone, which uses no credit",
+        ("paid", true) => "paid from your Letronna credit",
+        ("paid", false) => "paid from the account's credit by the search",
+        (_, true) => {
+            "free where its free search finds something, otherwise paid from your Letronna credit"
+        }
+        (_, false) => {
+            "free where its free search finds something, otherwise paid from the account's credit by the search"
+        }
+    }
+}
+
 /// Who pays for a search through the gateway among `routes`, as the card
 /// says it below the filters, the way the media cards do; nothing when no
 /// gateway is among them, as a service's plan is the user's own.
 fn paid(routes: &[Route]) -> String {
     let payer = |gate: &Gate| match gate.hosted {
-        true => "from your Letronna credit",
-        false => "to that gateway",
+        true => letronna_pays(true),
+        false => "paid to that gateway",
     };
     routes
         .iter()
         .find_map(|route| match route {
             Route::Gateway(gate) => Some(format!(
-                "\n\nA search through {} is paid {}.",
+                "\n\nA search through {} is {}.",
                 gate.name,
                 payer(gate)
             )),
@@ -927,7 +947,7 @@ impl Gateways {
         match self.sold.get(base) {
             Some(Sold::None(at)) if lately(at) => Known::SellsNone,
             Some(Sold::Lapsed(at, why)) if lately(at) => Known::Failing(why),
-            _ if hosted => Known::Sells(vec![AUTO.to_owned()]),
+            _ if hosted => Known::Sells(vec![crate::store::letronna_search().to_owned()]),
             Some(Sold::Models(models)) => Known::Sells(models.clone()),
             _ => Known::Unknown,
         }
@@ -3369,7 +3389,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             paid(&routes),
-            "\n\nA search through Letronna is paid from your Letronna credit."
+            "\n\nA search through Letronna is free where its free search finds something, otherwise paid from your Letronna credit."
         );
     }
 
@@ -3591,9 +3611,32 @@ pub(crate) mod tests {
         };
         assert_eq!(
             paid_for(Some(letronna), false),
-            "\n\nA search through Letronna is paid from your Letronna credit."
+            "\n\nA search through Letronna is free where its free search finds something, otherwise paid from your Letronna credit."
         );
         assert_eq!(paid_for(None, false), "");
+    }
+
+    #[test]
+    fn letronnas_search_is_asked_for_by_the_setting() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::store::tests::Scratch::new("search-letronna-setting");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        let now = Instant::now();
+        let asked = || match Gateways::default().known("https://api.letronna.ai/v1", true, now) {
+            Known::Sells(models) => models,
+            _ => Vec::new(),
+        };
+        // Unset: its free search first, the paid one behind it.
+        assert_eq!(asked(), vec![AUTO.to_owned()]);
+        for (set, want) in [("free", "free"), ("paid", "paid"), ("odd", "auto")] {
+            let settings =
+                format!(r#"{{"endpoint": "", "model": "", "letronna_search": "{set}"}}"#);
+            std::fs::write(dir.join("settings.json"), settings).unwrap();
+            assert_eq!(asked(), vec![want.to_owned()], "{set}");
+        }
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
     #[test]
@@ -3620,7 +3663,7 @@ pub(crate) mod tests {
         let unasked = switched_off(ctx.caller.connection.as_deref());
         let alone = SearchWeb.preview(&call, &ToolContext::default());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
-        let paid = "\n\nA search through Letronna is paid from your Letronna credit.";
+        let paid = "\n\nA search through Letronna is free where its free search finds something, otherwise paid from your Letronna credit.";
         assert_eq!(
             on,
             format!(

@@ -7392,7 +7392,7 @@ mod tests {
     /// provider caches after the first. Held here so a prompt or description
     /// edit shows its cost in the failure, with the bytes themselves in the
     /// golden copies.
-    const STATIC_TOKENS: usize = 5_393;
+    const STATIC_TOKENS: usize = 5_451;
 
     #[test]
     #[cfg_attr(
