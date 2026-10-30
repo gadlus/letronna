@@ -4,9 +4,14 @@
 //! switched to something else, so the title says whether it still wants you.
 //! Idle it is just the name; working, a mark turns in front of it, which is
 //! enough to catch the eye from across a taskbar without being a notification.
+//!
+//! A terminal that draws progress in its tab (OSC 9;4) shows a running bar
+//! there too, while a turn runs. Only those known to draw it are asked:
+//! iTerm2 before 3.6.6 takes any OSC 9 for a notification, and would pop
+//! one up saying "4;3".
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::render;
@@ -57,6 +62,7 @@ pub fn save() {
 /// Put back the title the terminal had before: cleared first, for a
 /// terminal that keeps no stack, then taken off the stack by one that does.
 pub fn restore() {
+    progress(false);
     render::title("");
     if render::colour() {
         print!("\x1b[23;0t");
@@ -102,6 +108,50 @@ const TEXT_PRESENTATION: char = '\u{FE0E}';
 /// redrawing it eleven times a second would be work nobody sees.
 const TICK: Duration = Duration::from_millis(400);
 
+/// Whether the terminal whose variables `var` reads draws OSC 9;4 progress
+/// in its tab: Windows Terminal, ConEmu, Ghostty from 1.2 and iTerm2 from
+/// 3.6.6. Inside tmux or screen none is, since they keep it to themselves.
+fn draws_progress(var: impl Fn(&str) -> Option<String>) -> bool {
+    if var("TMUX").is_some() || var("STY").is_some() {
+        return false;
+    }
+    if var("WT_SESSION").is_some() || var("ConEmuANSI").as_deref() == Some("ON") {
+        return true;
+    }
+    let version = var("TERM_PROGRAM_VERSION").unwrap_or_default();
+    match var("TERM_PROGRAM").as_deref() {
+        Some("ghostty") => at_least(&version, &[1, 2, 0]),
+        Some("iTerm.app") => at_least(&version, &[3, 6, 6]),
+        _ => false,
+    }
+}
+
+/// Whether `version`, such as "3.6.6" or "1.2.0-main+abc", is `least` or
+/// later; one that cannot be read is not.
+fn at_least(version: &str, least: &[u32]) -> bool {
+    let parts: Option<Vec<u32>> = version
+        .split('.')
+        .take(least.len())
+        .map(|part| {
+            let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok()
+        })
+        .collect();
+    parts.is_some_and(|parts| parts.len() == least.len() && parts.as_slice() >= least)
+}
+
+/// Show a running bar in the tab, or take it away, where the terminal draws
+/// one. Sent again with each turn of the mark, since Ghostty drops a bar
+/// that is not kept up.
+fn progress(running: bool) {
+    static DRAWN: OnceLock<bool> = OnceLock::new();
+    let drawn = *DRAWN.get_or_init(|| draws_progress(|name| std::env::var(name).ok()));
+    if drawn && render::ansi() {
+        print!("\x1b]9;4;{}\x07", if running { 3 } else { 0 });
+        render::flush();
+    }
+}
+
 /// Say the window is doing nothing.
 pub fn idle() {
     render::title(&said(None));
@@ -125,10 +175,12 @@ impl Busy {
             let mut at = 0usize;
             while !flag.load(Ordering::Relaxed) {
                 render::title(&said(Some(MARKS[at % MARKS.len()])));
+                progress(true);
                 at += 1;
                 std::thread::sleep(TICK);
             }
             BUSY.store(false, Ordering::Relaxed);
+            progress(false);
             idle();
         });
         Self {
@@ -149,7 +201,34 @@ impl Drop for Busy {
 
 #[cfg(test)]
 mod tests {
-    use super::{NAME, TEXT_PRESENTATION, titled};
+    use super::{NAME, TEXT_PRESENTATION, draws_progress, titled};
+
+    fn in_terminal(vars: &[(&str, &str)]) -> bool {
+        draws_progress(|name| {
+            vars.iter()
+                .find(|(set, _)| *set == name)
+                .map(|(_, value)| (*value).to_owned())
+        })
+    }
+
+    #[test]
+    fn the_tab_shows_progress_only_in_a_terminal_that_draws_it() {
+        let term =
+            |program, version| [("TERM_PROGRAM", program), ("TERM_PROGRAM_VERSION", version)];
+        assert!(in_terminal(&[("WT_SESSION", "x")]));
+        assert!(in_terminal(&[("ConEmuANSI", "ON")]));
+        assert!(in_terminal(&term("ghostty", "1.2.0")));
+        assert!(in_terminal(&term("ghostty", "1.3.0-main+0a1b2c")));
+        assert!(!in_terminal(&term("ghostty", "1.1.3")));
+        assert!(in_terminal(&term("iTerm.app", "3.6.6")));
+        assert!(in_terminal(&term("iTerm.app", "3.10.0")));
+        // An older iTerm2 would show it as a notification.
+        assert!(!in_terminal(&term("iTerm.app", "3.6.5")));
+        assert!(!in_terminal(&[("TERM_PROGRAM", "iTerm.app")]));
+        assert!(!in_terminal(&term("Apple_Terminal", "455")));
+        assert!(!in_terminal(&[]));
+        assert!(!in_terminal(&[("TMUX", "/tmp/tmux"), ("WT_SESSION", "x")]));
+    }
 
     #[test]
     fn the_title_leads_with_the_session_and_says_when_it_waits() {
