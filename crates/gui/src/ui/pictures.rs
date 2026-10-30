@@ -12,6 +12,7 @@ use gpui_component::input::Paste;
 use image::{DynamicImage, ImageFormat};
 use letronna_core::media;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 /// The long side a picture is scaled down to before it is attached: the most
@@ -22,6 +23,33 @@ const LONG_SIDE: u32 = 1_568;
 const THUMB: f32 = 56.;
 
 impl Chat {
+    /// Attach what was dropped on the chat: pictures as pictures, and any
+    /// other file or a folder as an `@` reference in the box, which sending
+    /// expands the way a typed one is.
+    pub(crate) fn attach_dropped(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (pictures, others): (Vec<_>, Vec<_>) =
+            paths.into_iter().partition(|path| is_picture(path));
+        if !others.is_empty() {
+            let workspace = self.store.conversations[self.store.active]
+                .workspace
+                .clone();
+            let typed = self.composer.read(cx).value().to_string();
+            self.insert(
+                &referenced(&others, workspace.as_deref(), &typed),
+                window,
+                cx,
+            );
+        }
+        if !pictures.is_empty() {
+            self.attach_files(pictures, window, cx);
+        }
+    }
+
     /// Attach the pictures among `paths` to the active session's next message.
     pub(crate) fn attach_files(
         &mut self,
@@ -359,6 +387,26 @@ fn shrunk(picture: Arc<RenderImage>, longest: u32) -> Arc<RenderImage> {
     Arc::new(RenderImage::new([image::Frame::new(small)]))
 }
 
+/// Whether `path` is a file of a kind of picture this window reads, by its
+/// name: a folder or anything else goes in as a reference instead.
+fn is_picture(path: &Path) -> bool {
+    path.is_file() && ImageFormat::from_path(path).is_ok_and(|kind| kind.reading_enabled())
+}
+
+/// The references naming `paths`, to go after `typed`, from which they are
+/// kept apart by a space.
+fn referenced(paths: &[PathBuf], workspace: Option<&Path>, typed: &str) -> String {
+    let mut text = String::new();
+    if !typed.is_empty() && !typed.ends_with(char::is_whitespace) {
+        text.push(' ');
+    }
+    for path in paths {
+        text.push_str(&letronna_core::references::reference(path, workspace));
+        text.push(' ');
+    }
+    text
+}
+
 /// `bytes` as a picture goes to the model: as they are when they are a kind
 /// every provider takes and small enough; otherwise scaled to `LONG_SIDE`, as
 /// a PNG, which keeps a screenshot's text sharp, unless that is still too
@@ -400,7 +448,10 @@ fn encode(picture: &DynamicImage, format: ImageFormat) -> Result<Vec<u8>, String
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{Arc, DynamicImage, ImageFormat, LONG_SIDE, encode, fit, media, shrunk};
+    use super::{
+        Arc, DynamicImage, ImageFormat, LONG_SIDE, encode, fit, is_picture, media, referenced,
+        shrunk,
+    };
 
     fn png(width: u32, height: u32) -> Vec<u8> {
         let picture = DynamicImage::ImageRgb8(image::RgbImage::new(width, height));
@@ -444,5 +495,40 @@ mod tests {
         assert_eq!((tall.size(0).width.0, tall.size(0).height.0), (72, 720));
         let small = picture(640, 480);
         assert!(Arc::ptr_eq(&shrunk(small.clone(), 720), &small));
+    }
+
+    #[test]
+    fn a_dropped_picture_is_attached_and_anything_else_goes_in_as_a_reference() {
+        let dir = std::env::temp_dir().join(format!("letronna-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("shots.png")).unwrap();
+        for name in [
+            "shot.png",
+            "Photo.JPG",
+            "notes.pdf",
+            "main.rs",
+            "my file.txt",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        assert!(is_picture(&dir.join("shot.png")));
+        assert!(is_picture(&dir.join("Photo.JPG")));
+        assert!(!is_picture(&dir.join("notes.pdf")));
+        assert!(!is_picture(&dir.join("main.rs")));
+        // A folder is listed, whatever it is called.
+        assert!(!is_picture(&dir.join("shots.png")));
+
+        let others = [
+            dir.join("notes.pdf"),
+            dir.join("shots.png"),
+            dir.join("my file.txt"),
+        ];
+        assert_eq!(
+            referenced(&others, Some(&dir), "look at"),
+            " @notes.pdf @shots.png/ @my\\ file.txt "
+        );
+        assert_eq!(referenced(&others[..1], Some(&dir), ""), "@notes.pdf ");
+        assert_eq!(referenced(&others[..1], Some(&dir), "see "), "@notes.pdf ");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -4976,7 +4976,7 @@ impl Render for Chat {
             .child(body)
             .when(self.page == Page::Chat, |this| {
                 this.on_drop(cx.listener(|this, dropped: &ExternalPaths, window, cx| {
-                    this.attach_files(dropped.paths().to_vec(), window, cx)
+                    this.attach_dropped(dropped.paths().to_vec(), window, cx)
                 }))
                 .child(
                     v_flex()
