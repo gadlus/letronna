@@ -177,10 +177,22 @@ impl Chat {
         .top_0()
         .left_0()
         .size_full();
+        // While finding, a bar at its edge says which message matched.
+        let found = self.finder.is_some().then(|| {
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(-12.))
+                .w(px(2.))
+                .rounded_full()
+                .bg(cx.theme().primary)
+        });
         div()
             .relative()
             .w_full()
             .child(row)
+            .children(found)
             .child(marker)
             .into_any_element()
     }

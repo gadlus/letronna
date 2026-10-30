@@ -91,6 +91,12 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             KeyBinding::new("secondary-k", ui::palette::OpenPalette, Some("Chat")),
             Some("Open the command palette"),
         ),
+        // The box passes it on, as an input that searches nothing of its
+        // own does.
+        (
+            KeyBinding::new("secondary-f", ui::find::OpenFind, Some("Chat")),
+            Some("Find in this chat"),
+        ),
         (
             KeyBinding::new(
                 "secondary-shift-k",

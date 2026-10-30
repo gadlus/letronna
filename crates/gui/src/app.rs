@@ -612,6 +612,8 @@ pub(crate) struct Chat {
     /// Where the message it opened was last drawn, and whether the chat has
     /// yet to be moved for it since.
     pub(crate) hit_at: Option<(Pixels, bool)>,
+    /// The find bar over the chat, while it is open.
+    pub(crate) finder: Option<crate::ui::find::Finder>,
     /// The list of modes, while the mode chip has it open.
     pub(crate) mode_menu: Option<Entity<gpui_component::menu::PopupMenu>>,
     /// When the chat on screen saves to memory and where, while the memory
@@ -1207,6 +1209,7 @@ impl Chat {
             open: std::collections::VecDeque::new(),
             artifacts: None,
             reveal: None,
+            finder: None,
             revealed: None,
             hit_at: None,
             mode_menu: None,
@@ -4252,6 +4255,8 @@ impl Chat {
             // own Escape needs; the status bar's chip keeps it.
             self.context_report = None;
             cx.notify();
+        } else if self.finder.is_some() && self.page == Page::Chat {
+            self.close_find(window, cx);
         } else if let Some(aside) = self.aside_to_close() {
             aside.cancel.set();
             cx.notify();
@@ -4929,6 +4934,7 @@ impl Render for Chat {
                 .child(list(self.list.clone(), row).size_full())
                 .vertical_scrollbar(&self.list)
                 .children(self.jump_to_latest(cx))
+                .children(self.find_bar(cx))
                 .children(self.browser_preview(pane, window, cx))
                 .children(self.ring(crate::ui::keys::Region::Transcript, cx))
                 .into_any_element()
@@ -5179,6 +5185,11 @@ impl Render for Chat {
             .on_action(
                 cx.listener(|this, _: &crate::ui::typed::ExportSession, window, cx| {
                     this.export_session(this.store.active, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::find::OpenFind, window, cx| {
+                    this.open_find(window, cx)
                 }),
             )
             .on_action(

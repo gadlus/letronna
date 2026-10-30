@@ -94,6 +94,7 @@ fn commands() -> Vec<(&'static str, Rc<dyn Action>)> {
     vec![
         ("New session", Rc::new(NewSession)),
         ("Focus the composer", Rc::new(FocusComposer)),
+        ("Find in this chat", Rc::new(super::find::OpenFind)),
         ("Show or hide the sidebar", Rc::new(ToggleSidebar)),
         ("Show or hide the panel", Rc::new(super::panel::TogglePanel)),
         ("Show the browser", Rc::new(super::panel::BrowserTab)),
