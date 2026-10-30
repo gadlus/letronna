@@ -366,6 +366,10 @@ pub fn command(
             skills(runner, rest, here);
             Flow::Handled
         }
+        "/permissions" => {
+            crate::permissions::permissions(runner, rest, here);
+            Flow::Handled
+        }
         "/mcp" => match rest.split_once(char::is_whitespace).unwrap_or((rest, "")) {
             // A prompt by its name under /mcp, as the menu offers it: none of
             // what /mcp does to a server has `__` in it.
@@ -1950,7 +1954,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Modes",
-        &["/mode", "/plan", "/decisions", "/verify", "/coauthor"],
+        &["/mode", "/plan", "/decisions", "/permissions", "/verify", "/coauthor"],
     ),
     (
         "Tools",

@@ -61,6 +61,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "what auto mode's judge let run or blocked in this session",
     },
     Command {
+        name: "/permissions",
+        blurb: "the rules \"always allow\" kept; pick one to remove it",
+    },
+    Command {
         name: "/model",
         blurb: "show or change the model; add image, speech or video for those, side for summaries, or names for session names",
     },

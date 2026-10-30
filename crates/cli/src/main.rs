@@ -27,6 +27,7 @@ mod local;
 mod mcp;
 mod memory;
 mod notify;
+mod permissions;
 mod picture;
 mod presence;
 mod render;
