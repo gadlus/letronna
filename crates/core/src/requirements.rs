@@ -49,7 +49,7 @@ pub(crate) const FEWEST: usize = 4;
 /// table, a row per numbered requirement and case, is what `unchecked`
 /// holds the run to afterwards: a helper asked only for what fails samples
 /// cases, and files the ones it is unsure of as asides.
-const REVIEW: &str = "First ask a helper that hasn't seen your work: with the agent tool, start a review helper and wait for its report. Give it the request word for word, the numbered requirements above and the files you changed or made. Ask it to change no file, to work out each value it checks with code of its own, not your scripts or helpers, and to end its report with a table of one row per requirement and case, written `R1 | case | PASS` or `R1 | case | FAIL | command that shows it`, with a row for each of these cases that applies: a field, argument or part the requirement names left out, undefined or empty; a plain value as well as the same value wrapped, such as in an object or a parser's state; two of something the requirement allows only once; and each call that can cause the event the requirement is about, such as a demotion, a close or a removal. Fix every row that fails, and any case it calls unclear or sets aside, unless the request rules that case out.";
+const REVIEW: &str = "First ask a helper that hasn't seen your work: with the agent tool, start a review helper and wait for its report. Give it the request word for word, the numbered requirements above, the files you changed or made and each case you chose not to handle, with why. Ask it to change no file, to work out each value it checks with code of its own, not your scripts or helpers, and to end its report with a table of one row per requirement and case, written `R1 | case | PASS` or `R1 | case | FAIL | command that shows it`, with a row for each of these cases that applies: a field, argument or part the requirement names left out, undefined or empty; a plain value as well as the same value wrapped, such as in an object or a parser's state, each also built by hand and passed straight to the method that reads it; each other way the same input can be written, such as its parts in another order or a spelling the project's docs or tests use, including any the parser might reject before the new check runs; an error the requirement names, matched by its exact words, not a generic error; two of something the requirement allows only once; the new form beside the existing form of the same thing in one call, where one applies and the other must not; each place in the code that records the event the requirement is about or changes that state, such as a demotion, a close or a removal, found by searching the code, not only the call the request names; and each case you chose not to handle, which fails when the request's words say what should happen in it, quoted in the row, whatever the reason it was set aside. Judge each row by what the request says should happen, not by what the code now does. Fix every row that fails by changing the work, not the case, and any case it calls unclear or sets aside, unless the request rules that case out.";
 
 /// The least time a run with a deadline needs left to be asked for the
 /// review: the helper takes a few minutes, and the run about as long again
@@ -973,6 +973,28 @@ mod tests {
         assert_eq!(found, [(1, true), (2, false), (3, false), (4, true)]);
         assert!(tabled(report));
         assert!(!tabled("Every behaviour holds. Verdict: right."));
+    }
+
+    #[test]
+    fn the_review_asks_a_row_for_each_way_a_case_has_been_missed() {
+        for case in [
+            "built by hand and passed straight to the method that reads it",
+            "each other way the same input can be written",
+            "matched by its exact words, not a generic error",
+            "the new form beside the existing form of the same thing in one call",
+            "found by searching the code, not only the call the request names",
+            "and each case you chose not to handle,",
+        ] {
+            assert!(REVIEW.contains(case), "{case}");
+        }
+        // A case set aside that the request decides fails, whatever kept it out,
+        // and each row is judged by the request rather than by the code.
+        assert!(REVIEW.contains("fails when the request's words say what should happen in it"));
+        assert!(REVIEW.contains("not by what the code now does"));
+        // What the run set aside goes to the helper, and a failed row is fixed
+        // in the work.
+        assert!(REVIEW.contains("each case you chose not to handle, with why"));
+        assert!(REVIEW.contains("by changing the work, not the case"));
     }
 
     #[test]
