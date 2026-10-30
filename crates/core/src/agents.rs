@@ -2126,7 +2126,12 @@ fn answer(
     if report.text.is_empty() {
         out.push_str(NO_ANSWER);
     } else {
-        out.push_str(&quoted(&report.text, share));
+        let quote = quoted(&report.text, share);
+        // A review's table is what the run is held to, so rows the cut lost
+        // come back after it.
+        let lost = crate::requirements::cut_rows(&report.text, &quote);
+        out.push_str(&quote);
+        out.push_str(lost.as_deref().unwrap_or_default());
     }
     match report.status {
         Outcome::Stopped | Outcome::Failed(_) => Err(out),
@@ -3266,6 +3271,40 @@ mod tests {
             None,
         );
         assert!(failed.unwrap_err().starts_with("a failed: No key."));
+    }
+
+    #[test]
+    fn a_review_table_reaches_the_caller_whole_from_a_cut_report() {
+        let table: String = (1..=40)
+            .map(|n| {
+                let verdict = if n == 20 {
+                    "FAIL | node r20.js"
+                } else {
+                    "PASS"
+                };
+                format!("| R{n} | the case for requirement {n} | {verdict} |\n")
+            })
+            .collect();
+        let long = format!("{}\n{table}Verdict: wrong.", "Notes. ".repeat(600));
+        let out = answer(
+            "review-1",
+            &report(Outcome::Done, &long),
+            ROUNDS,
+            MAX_REPORT / 2,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !out.contains("    | R20 |"),
+            "the cut is meant to reach the table"
+        );
+        // Every requirement has its row, and the failed one keeps its command.
+        let text = crate::requirements::unchecked(&out, 40).unwrap();
+        assert!(!text.contains("has no row"), "{text}");
+        assert!(
+            text.contains("R20 | the case for requirement 20 | FAIL | node r20.js"),
+            "{text}"
+        );
     }
 
     #[test]

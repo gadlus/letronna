@@ -586,6 +586,7 @@ fn steps(
     let mut swept = false;
     let mut built = false;
     let mut listed = false;
+    let mut tabled = false;
     let mut twinned = false;
     // From the first request, since a run told of its time only near the
     // end has often thought most of it away by then.
@@ -888,6 +889,20 @@ fn steps(
                 && let Some(notice) = requirements(spec, turn, &report.files, began)
             {
                 listed = true;
+                spec.transcript.conversation.messages.push(notice);
+                save(&mut spec.transcript)?;
+                continue;
+            }
+            // Once the review the requirements notice asked for is in, so
+            // what it left without a row or found failing is checked too;
+            // once, and with a round and budget left, as above.
+            if listed
+                && !tabled
+                && report.rounds < spec.rounds
+                && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
+                && let Some(notice) = review_rows(spec, turn)
+            {
+                tabled = true;
                 spec.transcript.conversation.messages.push(notice);
                 save(&mut spec.transcript)?;
                 continue;
@@ -2216,6 +2231,44 @@ fn requirements(
         folded: true,
         ..Default::default()
     })
+}
+
+/// The notice sending a session's own run nobody watches back once more
+/// when the review its requirements notice asked for came back with a table
+/// that leaves a numbered requirement without a row, or has rows that failed.
+fn review_rows(spec: &Spec, turn: &Turn) -> Option<Message> {
+    if !unwatched(spec) || turn.capped().is_some() || !turn.runs_commands() {
+        return None;
+    }
+    let own = (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
+    let content = unreviewed(own)?;
+    Some(Message {
+        role: "user".into(),
+        content,
+        notice: true,
+        // Folded into the run, so the window keeps the task it is for.
+        folded: true,
+        ..Default::default()
+    })
+}
+
+/// What the latest review's table in `messages` leaves unchecked of the
+/// requirements the latest requirements notice numbers, as the notice that
+/// sends the run back says it; None with no such notice, no review with a
+/// table after it, or nothing left. A review comes back as the agent tool's
+/// result, or as mail when the helper ran in the background.
+fn unreviewed(messages: &[Message]) -> Option<String> {
+    let at = messages.iter().rposition(|message| {
+        message.notice && crate::requirements::listed(&message.content).is_some()
+    })?;
+    let count = crate::requirements::listed(&messages[at].content)?;
+    let check = format!("[{} check]", crate::BRAND);
+    let report = messages[at + 1..].iter().rev().find(|message| {
+        let reply = message.role == "tool" && message.name == "agent";
+        let mail = message.role == "user" && message.notice && !message.content.starts_with(&check);
+        (reply || mail) && crate::requirements::tabled(&message.content)
+    })?;
+    crate::requirements::unchecked(&report.content, count)
 }
 
 /// The notice telling a session's own run nobody watches where the project's
@@ -6340,6 +6393,45 @@ pub(crate) mod tests {
             .as_str()
             .unwrap()
             .into()
+    }
+
+    #[test]
+    fn the_latest_review_after_the_requirements_notice_is_held_to_its_table() {
+        let stated = STATED.map(String::from);
+        let said = |role: &str, content: &str, name: &str, notice: bool| Message {
+            role: role.into(),
+            content: content.into(),
+            name: name.into(),
+            notice,
+            ..Default::default()
+        };
+        let asked = said(
+            "user",
+            &crate::requirements::notice(&stated, true, &[]),
+            "",
+            true,
+        );
+        let table = "Verdict: wrong.\nR1 | a | PASS\nR2 | b | FAIL | cargo test\nR3 | c | PASS";
+        let report = said("tool", table, "agent", false);
+        let mut messages = vec![said("user", SPECIFIED, "", false), asked.clone(), report];
+        let text = unreviewed(&messages).unwrap();
+        assert!(text.contains("has no row for R4 and R5"), "{text}");
+        assert!(text.contains("- R2 | b | FAIL | cargo test"), "{text}");
+
+        // A later review, as mail from a helper in the background, is the
+        // one held to its table.
+        let covered = "R1 | a | PASS\nR2 | b | PASS\nR3 | c | PASS\nR4 | d | PASS\nR5 | e | PASS";
+        let mail = format!("helper review finished (review · 9 rounds):\n{covered}");
+        messages.push(said("user", &mail, "", true));
+        assert_eq!(unreviewed(&messages), None);
+
+        // A command's output is no review, nor is the run's own check.
+        let mut others = vec![asked.clone(), said("tool", table, "run_command", false)];
+        assert_eq!(unreviewed(&others), None);
+        others.push(said("user", &unreviewed(&messages[..3]).unwrap(), "", true));
+        assert_eq!(unreviewed(&others), None);
+        // Nor is there anything to hold a review to without the notice.
+        assert_eq!(unreviewed(&[said("tool", table, "agent", false)]), None);
     }
 
     #[test]

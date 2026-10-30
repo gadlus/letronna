@@ -45,8 +45,11 @@ pub(crate) const FEWEST: usize = 4;
 
 /// What a run that can start a helper is told first after the sentences: a
 /// helper that has not seen the work reads the request afresh, where the
-/// run itself tends to check only the paths it built, with its own code.
-const REVIEW: &str = "First ask a helper that hasn't seen your work: with the agent tool, start a review helper and wait for its report. Give it the request word for word and the files you changed or made, and ask it to try each behaviour the request states against your work and report every one that fails, with the command that shows it, changing no file, and to work out each value it checks with code of its own, not your scripts or helpers. Fix what it reports along with the list, including any case it calls unclear or sets aside, unless the request rules that case out.";
+/// run itself tends to check only the paths it built, with its own code. Its
+/// table, a row per numbered requirement and case, is what `unchecked`
+/// holds the run to afterwards: a helper asked only for what fails samples
+/// cases, and files the ones it is unsure of as asides.
+const REVIEW: &str = "First ask a helper that hasn't seen your work: with the agent tool, start a review helper and wait for its report. Give it the request word for word, the numbered requirements above and the files you changed or made. Ask it to change no file, to work out each value it checks with code of its own, not your scripts or helpers, and to end its report with a table of one row per requirement and case, written `R1 | case | PASS` or `R1 | case | FAIL | command that shows it`, with a row for each of these cases that applies: a field, argument or part the requirement names left out, undefined or empty; a plain value as well as the same value wrapped, such as in an object or a parser's state; two of something the requirement allows only once; and each call that can cause the event the requirement is about, such as a demotion, a close or a removal. Fix every row that fails, and any case it calls unclear or sets aside, unless the request rules that case out.";
 
 /// The least time a run with a deadline needs left to be asked for the
 /// review: the helper takes a few minutes, and the run about as long again
@@ -273,8 +276,8 @@ pub(crate) fn notice(sentences: &[String], review: bool, outputs: &[String]) -> 
     let mut text = format!(
         "[{brand} check] Before ending, check {work} against each requirement the request states:"
     );
-    for sentence in sentences.iter().take(LISTED) {
-        text.push_str(&format!("\n- {sentence}"));
+    for (at, sentence) in sentences.iter().take(LISTED).enumerate() {
+        text.push_str(&format!("\n- R{}: {sentence}", at + 1));
     }
     if sentences.len() > LISTED {
         let more = sentences.len() - LISTED;
@@ -293,6 +296,182 @@ pub(crate) fn notice(sentences: &[String], review: bool, outputs: &[String]) -> 
         CHECK_OUTPUT
     });
     text
+}
+
+/// How many requirements `text` numbers, when it is the notice `notice`
+/// writes; None for any other text.
+pub(crate) fn listed(text: &str) -> Option<usize> {
+    let opening = format!("[{} check] Before ending, check ", crate::BRAND);
+    if !text.starts_with(&opening) {
+        return None;
+    }
+    let numbered = |line: &str| {
+        let rest = line.strip_prefix("- R")?;
+        let (number, _) = rest.split_once(": ")?;
+        number.parse::<usize>().ok()
+    };
+    text.lines().filter_map(numbered).max()
+}
+
+/// The rows of a review's table in `report`: each requirement's number,
+/// whether the case passed, and the row as written. A line is a row when a
+/// cell of it opens with `R` and a number and a later cell says PASS or
+/// FAIL, however the helper laid the table out.
+fn rows(report: &str) -> Vec<(usize, bool, String)> {
+    let mut found = Vec::new();
+    for line in report.lines() {
+        let cells = cells(line);
+        let Some(first) = cells.first() else {
+            continue;
+        };
+        let digits: String = (first.strip_prefix('R').unwrap_or_default().chars())
+            .take_while(char::is_ascii_digit)
+            .collect();
+        let Ok(number) = digits.parse::<usize>() else {
+            continue;
+        };
+        if let Some(passed) = cells[1..].iter().find_map(|cell| verdict(cell)) {
+            found.push((number, passed, line.trim().to_owned()));
+        }
+    }
+    found
+}
+
+/// The cells of a table's `line`, cut at each `|` and stripped of the marks
+/// a table is often written with.
+fn cells(line: &str) -> Vec<&str> {
+    line.split('|')
+        .map(|cell| cell.trim().trim_matches(|c| c == '*' || c == '`').trim())
+        .filter(|cell| !cell.is_empty())
+        .collect()
+}
+
+/// Whether a table's `cell` says a case passed or failed, if it says either.
+fn verdict(cell: &str) -> Option<bool> {
+    match cell.to_ascii_uppercase().as_str() {
+        "PASS" | "PASSED" | "PASSES" => Some(true),
+        "FAIL" | "FAILED" | "FAILS" => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether `report` holds a review's table, with a row of at least one
+/// requirement.
+pub(crate) fn tabled(report: &str) -> bool {
+    !rows(report).is_empty()
+}
+
+/// Rows of a failed case a follow-up quotes: enough to act on, and past
+/// them the run reads the report it already has.
+const FAILED_SHOWN: usize = 10;
+
+/// The longest row a follow-up quotes, in characters.
+const ROW_CHARS: usize = 300;
+
+/// The longest case a row the quote cut is written again with, in characters.
+const CASE_CHARS: usize = 120;
+
+/// Rows the quote cut that are written again after it; a bigger table is
+/// read in the helper's whole report.
+const CUT_SHOWN: usize = 60;
+
+/// The rows of a review's table in `report` that `quote`, the report as cut
+/// to fit, lost, to go after it so the run is held to the whole table: each
+/// failed row with what shows it, and each passed one by its requirement and
+/// case. None when the quote kept every row.
+pub(crate) fn cut_rows(report: &str, quote: &str) -> Option<String> {
+    let cut = |text: &str, most: usize| -> String { text.chars().take(most).collect() };
+    let lost: Vec<String> = (rows(report).into_iter())
+        .filter(|(_, _, line)| !quote.contains(line.as_str()))
+        .map(|(number, passed, line)| {
+            let cells = cells(&line);
+            let at = (cells.iter().skip(1))
+                .position(|cell| verdict(cell).is_some())
+                .map_or(cells.len(), |at| at + 1);
+            let case = cut(&cells[1..at].join(" | "), CASE_CHARS);
+            let shows = cut(&cells[(at + 1).min(cells.len())..].join(" | "), ROW_CHARS);
+            match (passed, shows.is_empty()) {
+                (true, _) => format!("R{number} | {case} | PASS"),
+                (false, true) => format!("R{number} | {case} | FAIL"),
+                (false, false) => format!("R{number} | {case} | FAIL | {shows}"),
+            }
+        })
+        .collect();
+    if lost.is_empty() {
+        return None;
+    }
+    let mut text = String::from("\nRows of its table the quote above cut, written again:");
+    for row in lost.iter().take(CUT_SHOWN) {
+        text.push_str(&format!("\n{row}"));
+    }
+    if lost.len() > CUT_SHOWN {
+        text.push_str(&format!("\nand {} more rows", lost.len() - CUT_SHOWN));
+    }
+    Some(text)
+}
+
+/// What sends a run back once more when the review's table in `report`
+/// leaves some of the first `count` requirements without a row, or has rows
+/// that failed; None when it covers each and every row passed.
+pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
+    let rows = rows(report);
+    let missing: Vec<String> = (1..=count)
+        .filter(|number| !rows.iter().any(|(row, _, _)| row == number))
+        .map(|number| format!("R{number}"))
+        .collect();
+    let failed: Vec<&String> = (rows.iter())
+        .filter(|(number, passed, _)| !passed && *number <= count)
+        .map(|(_, _, row)| row)
+        .collect();
+    if missing.is_empty() && failed.is_empty() {
+        return None;
+    }
+    let brand = crate::BRAND;
+    let mut text = format!("[{brand} check] The review's table ");
+    if !missing.is_empty() {
+        text.push_str(&format!("has no row for {}", and_list(&missing)));
+    }
+    if !failed.is_empty() {
+        if !missing.is_empty() {
+            text.push_str(", and ");
+        }
+        text.push_str("has these rows that failed:");
+        for row in failed.iter().take(FAILED_SHOWN) {
+            let row: String = row.chars().take(ROW_CHARS).collect();
+            text.push_str(&format!("\n- {row}"));
+        }
+        if failed.len() > FAILED_SHOWN {
+            text.push_str(&format!("\n- and {} more", failed.len() - FAILED_SHOWN));
+        }
+        text.push('\n');
+    } else {
+        text.push_str(". ");
+    }
+    if !missing.is_empty() {
+        text.push_str(
+            "Test each requirement without a row yourself, through the entry point a caller \
+             uses, in every case the table asks for that applies to it. ",
+        );
+    }
+    if !failed.is_empty() {
+        text.push_str(
+            "Run each failed row's command again and see it pass now, or fix what it shows. ",
+        );
+    }
+    text.push_str(
+        "Fix what fails unless the request rules that case out. Only your last message is \
+         passed on as your answer, so end with your whole answer again, not only what changed.",
+    );
+    Some(text)
+}
+
+/// `items` joined as a sentence lists them: "a", "a and b", "a, b and c".
+fn and_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 /// `outputs` as a notice names them: "`a`", "`a` and `b`", or the first
@@ -749,11 +928,111 @@ mod tests {
             .collect();
         let text = notice(&all, false, &[]);
         assert!(text.starts_with("[Letronna check] Before ending, check your change"));
-        assert!(text.contains(&format!("\n- Rule {LISTED} must hold.\n")));
+        assert!(text.contains(&format!("\n- R{LISTED}: Rule {LISTED} must hold.\n")));
         assert!(!text.contains(&format!("Rule {} must", LISTED + 1)));
         assert!(text.contains("\n- and 3 more in the request; check those too.\n"));
         assert!(text.ends_with(CHECK) && !text.contains(REVIEW));
         assert!(notice(&all, true, &[]).ends_with(&format!("\n{REVIEW} {CHECK}")));
+    }
+
+    #[test]
+    fn the_notice_numbers_its_requirements_and_says_how_many() {
+        let rules: Vec<String> = [
+            "Dates must parse.",
+            "Times must parse.",
+            "Zones must parse.",
+        ]
+        .map(String::from)
+        .into();
+        let text = notice(&rules, true, &[]);
+        assert!(text.contains("\n- R1: Dates must parse.\n- R2: Times must parse.\n- R3: "));
+        assert_eq!(listed(&text), Some(3));
+        // Past the quoted ones, only those numbered count.
+        let all: Vec<String> = (1..=LISTED + 3)
+            .map(|n| format!("Rule {n} must hold."))
+            .collect();
+        assert_eq!(listed(&notice(&all, false, &[])), Some(LISTED));
+        assert_eq!(listed("- R1: Dates must parse."), None);
+        assert_eq!(listed("Helper finished: R1 | missing | PASS"), None);
+    }
+
+    #[test]
+    fn a_review_table_is_read_however_it_is_laid_out() {
+        let report = "Checked the work.\n\n\
+                      | Req | Case | Result | Command |\n\
+                      |-----|------|--------|---------|\n\
+                      | R1 | missing field | PASS | |\n\
+                      | **R2** | plain value | **FAIL** | `node check.js` |\n\
+                      R3 | two rests | fail | go run probe.go\n\
+                      `R4` | close | Passed\n\
+                      R5 is mentioned in prose, as is PASS.\n\
+                      Verdict: wrong.";
+        let found: Vec<(usize, bool)> = (rows(report).into_iter())
+            .map(|(number, passed, _)| (number, passed))
+            .collect();
+        assert_eq!(found, [(1, true), (2, false), (3, false), (4, true)]);
+        assert!(tabled(report));
+        assert!(!tabled("Every behaviour holds. Verdict: right."));
+    }
+
+    #[test]
+    fn rows_a_cut_report_lost_are_written_again_after_it() {
+        let report = "Checked.\n| R1 | missing field | PASS |\n| **R2** | plain value | \
+                      **FAIL** | `node check.js` |\nR3 | two rests | fail\nDone.";
+        // The quote kept the first row and lost the others.
+        let quote = "    Checked.\n    | R1 | missing field | PASS |\n    [… cut …]\n    Done.";
+        assert_eq!(
+            cut_rows(report, quote).as_deref(),
+            Some(
+                "\nRows of its table the quote above cut, written again:\nR2 | plain value | \
+                 FAIL | node check.js\nR3 | two rests | FAIL"
+            )
+        );
+        // Written again, they read as the rows they were.
+        let whole = format!("{quote}{}", cut_rows(report, quote).unwrap());
+        let found: Vec<(usize, bool)> = (rows(&whole).into_iter())
+            .map(|(number, passed, _)| (number, passed))
+            .collect();
+        assert_eq!(found, [(1, true), (2, false), (3, false)]);
+        assert_eq!(cut_rows(report, report), None);
+        assert_eq!(cut_rows("No table here.", ""), None);
+        // A long case is cut, and past the limit the rest are counted.
+        let long = format!("R1 | {} | PASS", "x".repeat(500));
+        let again = cut_rows(&long, "").unwrap();
+        assert!(again.ends_with(&format!("R1 | {} | PASS", "x".repeat(CASE_CHARS))));
+        let many: String = (1..=CUT_SHOWN + 2)
+            .map(|n| format!("R{n} | c | PASS\n"))
+            .collect();
+        assert!(cut_rows(&many, "").unwrap().ends_with("\nand 2 more rows"));
+    }
+
+    #[test]
+    fn a_table_missing_requirements_or_failing_rows_sends_the_run_back() {
+        let report = "| R1 | missing | PASS |\n\
+                      | R2 | plain value | FAIL | node check.js |\n\
+                      | R4 | close | PASS |\n\
+                      | R9 | beyond the list | FAIL | x |";
+        let text = unchecked(report, 5).unwrap();
+        assert!(
+            text.starts_with(
+                "[Letronna check] The review's table has no row for R3 and R5, and has these \
+                 rows that failed:\n- | R2 | plain value | FAIL | node check.js |\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("R9"), "{text}");
+        assert!(text.contains("Test each requirement without a row yourself"));
+        assert!(text.contains("Run each failed row's command again"));
+        assert!(text.ends_with("not only what changed."));
+        // Each row there and passing, nothing is left.
+        let passed = "R1 | a | PASS\nR2 | b | PASS\nR2 | c | PASS";
+        assert_eq!(unchecked(passed, 2), None);
+        // Only missing rows: no failed ones are spoken of.
+        let short = unchecked("R1 | a | PASS", 3).unwrap();
+        assert!(
+            short.starts_with("[Letronna check] The review's table has no row for R2 and R3. ")
+        );
+        assert!(!short.contains("failed"), "{short}");
     }
 
     #[test]
@@ -767,7 +1046,7 @@ mod tests {
             text,
             format!(
                 "[Letronna check] Before ending, check `out/part1.csv` against each requirement \
-                 the request states:\n- Rows must be sorted by date.\n{CHECK_OUTPUT}"
+                 the request states:\n- R1: Rows must be sorted by date.\n{CHECK_OUTPUT}"
             )
         );
         let two = notice(&rules, true, &outputs(2));
