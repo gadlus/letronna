@@ -22,6 +22,7 @@ mod diff;
 mod doctor;
 mod edit;
 mod history;
+mod ide;
 mod input;
 mod install;
 mod keybindings;
@@ -546,6 +547,10 @@ fn main() {
     runner.bar.hear_schedules(events);
     let here = session_folder(&runner, session, workspace.as_deref());
     offer_added(&mut runner, here.as_deref());
+    // Inside VS Code its extension is linked at once, as /ide would.
+    if let Some(linked) = here.as_deref().or(workspace.as_deref()).and_then(ide::auto) {
+        render::line(&render::dim(&linked));
+    }
     loop {
         // Before every wait, so a session opened, named or renamed by
         // whatever ran last shows on the box's edge and in the title.

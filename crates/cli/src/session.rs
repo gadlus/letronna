@@ -1616,10 +1616,16 @@ impl Runner {
         }
         choices.extend(here.as_deref());
         choices.extend(["No, tell it why not", "No, and stop here"]);
+        // In a linked editor too, as the whole file beside the question.
+        let shown = crate::ide::show_change(&call.name, &call.id, &call.arguments, &ctx);
         // It comes up while the model works, under whatever is being typed:
         // an enter or a digit meant for that must not be taken for a yes.
         let picked = self.bar.interject(&question, detail, &choices);
         let picked = picked.and_then(|at| choices.get(at).copied());
+        crate::ide::answered(
+            shown,
+            picked.is_some_and(|choice| choice.starts_with("Yes")),
+        );
         if let Some(at) = picked.and_then(|choice| kept.iter().position(|&k| k == choice)) {
             let place = places[at];
             return Ok(self.run_call(turn, call, true, false, None, Some(place)));

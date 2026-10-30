@@ -548,6 +548,18 @@ pub fn command(
             preview(rest, here);
             Flow::Handled
         }
+        "/ide" => {
+            render::blank();
+            let folder = here.map_or_else(
+                || std::env::current_dir().unwrap_or_default(),
+                std::path::Path::to_path_buf,
+            );
+            match crate::ide::command(rest, &folder) {
+                Ok(said) => render::line(&render::dim(&said)),
+                Err(error) => render::line(&render::red(&error)),
+            }
+            Flow::Handled
+        }
         "/where" => {
             render::blank();
             render::line(&format!(
@@ -2114,6 +2126,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/plugins",
             "/image",
             "/preview",
+            "/ide",
         ],
     ),
     (

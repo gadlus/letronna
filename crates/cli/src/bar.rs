@@ -287,6 +287,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "serve an HTML or SVG file to your browser: /preview [--open] <path>",
     },
     Command {
+        name: "/ide",
+        blurb: "link VS Code: its selection comes here, changes open there as diffs; /ide off",
+    },
+    Command {
         name: "/where",
         blurb: "show the project folder and session file",
     },
@@ -2114,6 +2118,21 @@ impl Bar {
             crate::screen::repaint();
             self.settle();
         }
+        // A reference the linked editor sent goes in as though pasted, once
+        // no question has the box.
+        if self.choice.is_none() && self.switches.is_none() && self.slider.is_none() {
+            let added = crate::ide::take_added(self.folder.as_deref());
+            for text in &added {
+                self.line.paste(text);
+                self.picked = 0;
+            }
+            if !added.is_empty() {
+                self.settle();
+            }
+        }
+        if crate::ide::take_changed() {
+            self.settle();
+        }
         // Nobody types eight characters inside one poll. If that many arrived
         // and they put several lines in the box, it was a paste, and it is
         // stood behind a placeholder now that it is all here.
@@ -3209,7 +3228,7 @@ impl Bar {
         lines.push(format!(
             "{}{}",
             render::MARGIN,
-            top_edge(&self.session, &self.place, room + 2)
+            top_edge(&self.session, &crate::ide::with_seen(&self.place), room + 2)
         ));
         match (&self.slider, &self.choice, &self.switches) {
             (Some(slider), _, _) => self.sliding(slider, room, &mut lines),
