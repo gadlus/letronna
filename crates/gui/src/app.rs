@@ -1640,6 +1640,11 @@ impl Chat {
             cx.notify();
             return;
         }
+        // The terminal's commands the window has a way of its own for, run
+        // whether or not a reply is under way.
+        if self.typed_command(&prompt, window, cx) {
+            return;
+        }
         // An added command fills the composer, as a skill's Use does, so what
         // it gives is read before the next send sends it.
         match self.added_command(&prompt) {
@@ -1681,6 +1686,12 @@ impl Chat {
                 return;
             }
             None => {}
+        }
+        // Kept as typed, without the line Enter added.
+        if self.terminal_command(&prompt, cx) {
+            self.composer
+                .update(cx, |input, cx| input.set_value(prompt, window, cx));
+            return;
         }
         if self.run_holds_open() && (!prompt.is_empty() || !self.attached().is_empty()) {
             return self.queue_after_run(prompt, window, cx);
@@ -5139,6 +5150,37 @@ impl Render for Chat {
                 this.focus_composer_anywhere(window, cx)
             }))
             .on_action(cx.listener(|this, _: &ShowKeys, window, cx| this.show_keys(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &crate::ui::typed::PickModel, window, cx| {
+                    this.open_model_picker(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::typed::TogglePlan, _, cx| {
+                    this.plan_command("", cx);
+                    cx.notify();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::typed::CompactSession, window, cx| {
+                    this.compact_now(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::typed::RenameSession, window, cx| {
+                    this.rename_command("", window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::typed::ForkSession, window, cx| {
+                    this.fork_now(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::typed::ExportSession, window, cx| {
+                    this.export_session(this.store.active, window, cx)
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &crate::ui::actions::GoBack, window, cx| {
                     this.go_back(window, cx)

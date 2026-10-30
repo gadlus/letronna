@@ -782,7 +782,7 @@ impl Chat {
 
     /// Open a copy of the session's first `keep` messages, leaving the
     /// session itself as it is.
-    fn fork_at(&mut self, keep: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn fork_at(&mut self, keep: usize, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.store.reserve_id();
         let source = &self.store.conversations[self.store.active];
         let messages = source.messages[..keep.min(source.messages.len())].to_vec();

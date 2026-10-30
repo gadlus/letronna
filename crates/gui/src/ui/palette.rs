@@ -109,6 +109,21 @@ fn commands() -> Vec<(&'static str, Rc<dyn Action>)> {
         ("Show the changes", Rc::new(super::changes::ChangesTab)),
         ("Show the jobs", Rc::new(super::jobs::JobsTab)),
         ("Switch Crew on or off", Rc::new(ToggleCrew)),
+        ("Pick the model", Rc::new(super::typed::PickModel)),
+        (
+            "Switch plan mode on or off",
+            Rc::new(super::typed::TogglePlan),
+        ),
+        (
+            "Summarize the earlier turns now",
+            Rc::new(super::typed::CompactSession),
+        ),
+        ("Rename this session", Rc::new(super::typed::RenameSession)),
+        ("Fork this session", Rc::new(super::typed::ForkSession)),
+        (
+            "Export this session as Markdown",
+            Rc::new(super::typed::ExportSession),
+        ),
         (
             "Memory: when this chat saves and where it keeps it",
             Rc::new(super::remember::MemoryMenu),

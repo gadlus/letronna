@@ -99,7 +99,10 @@ impl Chat {
                 self.completer.added = self.added_commands();
             }
             let added = (self.completer.added.iter()).map(|(n, d)| (n.as_str(), d.as_str()));
-            let offered: Vec<(&str, &str)> = COMMANDS.iter().copied().chain(added).collect();
+            let offered: Vec<(&str, &str)> = (COMMANDS.iter().copied())
+                .chain(super::typed::LISTED.iter().copied())
+                .chain(added)
+                .collect();
             open.choices = complete::commands(typing.query, &offered, &self.skills);
         } else {
             // What was offered stays up until the new list is ready, rather
@@ -122,7 +125,9 @@ impl Chat {
     /// are offered as skills, and a name another has first is left out.
     fn added_commands(&self) -> Vec<(String, String)> {
         use letronna_core::slash::{self, Origin};
-        let own: Vec<&str> = COMMANDS.iter().map(|&(name, _)| name).collect();
+        let own: Vec<&str> = (COMMANDS.iter().chain(super::typed::LISTED))
+            .map(|&(name, _)| name)
+            .collect();
         let workspace = self.store.conversations[self.store.active]
             .workspace
             .as_deref();
