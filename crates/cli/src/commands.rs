@@ -514,7 +514,10 @@ pub fn command(
             Flow::Handled
         }
         name if name.starts_with("/mcp__") => send_prompt(runner, name, rest),
-        _ => added(runner, whole, here),
+        _ => {
+            let conversation = (runner.store.conversations.get(*session)).map_or(0, |c| c.id);
+            added(runner, whole, here, conversation)
+        }
     }
 }
 
@@ -975,9 +978,15 @@ fn mcp_prompt(runner: &mut Runner, command: &str, rest: &str) -> Option<Result<S
 }
 
 /// A command the user, the project or a skill added: what it gives goes in
-/// the box, to be read before it is sent. A saved workflow's runs instead.
-/// Unknown when none has the name.
-fn added(runner: &mut Runner, line: &str, workspace: Option<&std::path::Path>) -> Flow {
+/// the box, to be read before it is sent. A saved workflow's runs instead,
+/// and so does a plugin's action, in `conversation`. Unknown when none has
+/// the name.
+fn added(
+    runner: &mut Runner,
+    line: &str,
+    workspace: Option<&std::path::Path>,
+    conversation: u64,
+) -> Flow {
     let Some((name, args)) = slash::split(line) else {
         return Flow::Unknown;
     };
@@ -1000,6 +1009,10 @@ fn added(runner: &mut Runner, line: &str, workspace: Option<&std::path::Path>) -
             render::dim(&format!("· {}", from(command.origin)))
         ),
     );
+    if command.origin == Origin::PluginAction {
+        plugin_action(runner, &command.name, args, workspace, conversation);
+        return Flow::Handled;
+    }
     match slash::fill(command, args) {
         Ok(given) => {
             // Queued while a turn ran, it can find a next line begun, which stays.
@@ -1012,6 +1025,62 @@ fn added(runner: &mut Runner, line: &str, workspace: Option<&std::path::Path>) -
         Err(error) => render::line(&render::red(&error)),
     }
     Flow::Handled
+}
+
+/// Runs a plugin's action `name` with what was typed after it, with the
+/// wheel turning: what it gives back is shown, or put in the box when it is
+/// words for the user to send. Escape stops waiting for it.
+fn plugin_action(
+    runner: &mut Runner,
+    name: &str,
+    args: &str,
+    workspace: Option<&std::path::Path>,
+    conversation: u64,
+) {
+    use letronna_core::plugins::code::{self, Said};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::RecvTimeoutError;
+    let (name, args) = (name.to_owned(), args.to_owned());
+    let workspace = workspace.map(std::path::Path::to_path_buf);
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let given_up = stop.clone();
+    let label = format!("running /{name} · esc to cancel");
+    let outcome = runner.bar.busy_cancellable(&label, stop, move || {
+        let cancel = letronna_core::cancel::Cancel::default();
+        let (done, answer) = std::sync::mpsc::channel();
+        let asked = cancel.clone();
+        std::thread::spawn(move || {
+            let said = code::run_action(&name, &args, conversation, workspace.as_deref(), &asked);
+            let _ = done.send(said);
+        });
+        loop {
+            match answer.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(outcome) => return Some(outcome),
+                Err(RecvTimeoutError::Disconnected) => return None,
+                Err(RecvTimeoutError::Timeout) if given_up.load(Ordering::Relaxed) => {
+                    cancel.set();
+                    return None;
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
+    });
+    match outcome {
+        Some(Ok(Said::Text(text))) => {
+            for line in text.lines() {
+                render::line(line);
+            }
+        }
+        Some(Ok(Said::Compose(given))) => {
+            let given = match runner.bar.draft().trim() {
+                "" => given,
+                draft => format!("{draft}\n{given}"),
+            };
+            runner.bar.say(&given);
+        }
+        Some(Err(error)) => render::line(&render::red(&error)),
+        None => render::line(&render::dim("Stopped waiting for it.")),
+    }
 }
 
 /// Offer the added commands in the `/` menu, read afresh, so a file made or
@@ -1067,6 +1136,7 @@ fn about(command: &slash::Command) -> String {
         Origin::Project => "the project's",
         Origin::Skill => "a skill",
         Origin::Workflow => "a saved workflow",
+        Origin::PluginAction => "a plugin's code",
     };
     format!("{from} · hidden, {winner} has the name")
 }
@@ -1081,6 +1151,7 @@ fn from(origin: Origin) -> &'static str {
         Origin::Project => "project",
         Origin::Skill => "skill",
         Origin::Workflow => "workflow",
+        Origin::PluginAction => "plugin",
     }
 }
 
@@ -3932,7 +4003,10 @@ fn plugins(runner: &mut Runner, rest: &str) {
     let (verb, target) = rest
         .split_once(' ')
         .map_or((rest, ""), |(verb, target)| (verb, target.trim()));
-    let needs_name = matches!(verb, "on" | "off" | "allow" | "remove" | "add");
+    let needs_name = matches!(
+        verb,
+        "on" | "off" | "allow" | "remove" | "add" | "settings" | "set"
+    );
     if matches!(verb, "on" | "off") && target.is_empty() && switch_plugins(runner) {
         return;
     }
@@ -3999,8 +4073,12 @@ fn plugins(runner: &mut Runner, rest: &str) {
             )));
         }),
         "update" => return update_plugins(runner, target),
+        "settings" => return plugin_settings(target),
+        "set" => return set_plugin_setting(target),
+        "reload" => return reload_plugins(target),
         _ => Err(format!(
-            "/plugins {verb} is not one of add, on, off, allow, update, remove or market."
+            "/plugins {verb} is not one of add, on, off, allow, update, remove, settings, set, \
+             reload or market."
         )),
     };
     if let Err(why) = done {
@@ -4041,8 +4119,98 @@ fn plugins(runner: &mut Runner, rest: &str) {
         describe_plugin(plugin);
     }
     render::line(&render::dim(
-        "/plugins add <url|owner/repo> · on|off|allow|update|remove <name> · market",
+        "/plugins add <url|owner/repo> · on|off|allow|update|remove|settings <name> · reload · \
+         market",
     ));
+}
+
+/// A plugin's settings with their values now, and how to change them.
+fn plugin_settings(name: &str) {
+    use letronna_core::plugins::code::{self, SettingKind};
+    let settings = match code::settings(name) {
+        Ok(settings) => settings,
+        Err(why) => return render::line(&render::red(&why)),
+    };
+    render::said(
+        &render::blue("●"),
+        &render::bold(&format!("{name}'s settings")),
+    );
+    if settings.is_empty() {
+        return render::line(&render::dim("It has none."));
+    }
+    for (setting, value) in &settings {
+        let value = match (setting.kind, value) {
+            (SettingKind::Switch, serde_json::Value::Bool(on)) => {
+                if *on { "on" } else { "off" }.to_owned()
+            }
+            (_, serde_json::Value::String(text)) if text.is_empty() => "(empty)".to_owned(),
+            (_, serde_json::Value::String(text)) => text.clone(),
+            (_, other) => other.to_string(),
+        };
+        let choices = match setting.kind {
+            SettingKind::Choice => format!("  ·  one of {}", setting.choices.join(", ")),
+            _ => String::new(),
+        };
+        render::line(&format!(
+            "{}  {}  {}",
+            render::bold(&setting.key),
+            value,
+            render::dim(&format!("{}{choices}", setting.label))
+        ));
+    }
+    render::line(&render::dim(&format!(
+        "/plugins set {name} <key> <value> to change one; a switch takes on or off"
+    )));
+}
+
+/// `/plugins set <name> <key> <value>`: keeps a plugin's setting.
+fn set_plugin_setting(rest: &str) {
+    use letronna_core::plugins::code::{self, SettingKind};
+    let mut words = rest.splitn(3, char::is_whitespace);
+    let (Some(name), Some(key)) = (words.next(), words.next()) else {
+        return render::line(&render::red("Usage: /plugins set <name> <key> <value>"));
+    };
+    let given = words.next().unwrap_or_default().trim();
+    let kind = code::settings(name)
+        .ok()
+        .and_then(|settings| settings.into_iter().find(|(setting, _)| setting.key == key))
+        .map(|(setting, _)| setting.kind);
+    let value = match (kind, given) {
+        (Some(SettingKind::Switch), "on" | "yes" | "true") => serde_json::Value::Bool(true),
+        (Some(SettingKind::Switch), "off" | "no" | "false") => serde_json::Value::Bool(false),
+        _ => serde_json::Value::from(given),
+    };
+    match code::set_setting(name, key, value) {
+        Ok(()) => render::line(&render::dim(&format!("{name}'s {key} is now {given}."))),
+        Err(why) => render::line(&render::red(&why)),
+    }
+}
+
+/// `/plugins reload [name]`: starts a plugin's code afresh, or every one's,
+/// for an author who changed it in place.
+fn reload_plugins(name: &str) {
+    use letronna_core::plugins::code;
+    code::reload();
+    let names = match name {
+        "" => (letronna_core::plugins::list()
+            .unwrap_or_default()
+            .into_iter())
+        .filter(|plugin| plugin.code.is_some() && plugin.enabled && plugin.allowed)
+        .map(|plugin| plugin.name)
+        .collect(),
+        name => vec![name.to_owned()],
+    };
+    if names.is_empty() {
+        return render::line(&render::dim("No plugin runs code."));
+    }
+    for name in names {
+        match code::restart(&name) {
+            Ok(()) => render::line(&render::dim(&format!(
+                "{name} starts afresh when it is next used."
+            ))),
+            Err(why) => render::line(&render::red(&why)),
+        }
+    }
 }
 
 /// What a plugin brings, what of it is left out, and whether its servers
@@ -4068,13 +4236,39 @@ fn describe_plugin(plugin: &letronna_core::plugins::Plugin) {
     for (name, base) in &plugin.providers {
         render::line(&render::dim(&format!("     Provider {name}: {base}")));
     }
+    if let Some(code) = &plugin.code {
+        render::line(&render::dim(&format!("     {}", code.consent())));
+        for brings in code.brings() {
+            render::line(&render::dim(&format!("     {brings}")));
+        }
+        let runtime = letronna_core::plugins::code::Runtime::Python;
+        if code.runtime == runtime && letronna_core::plugins::code::python_found() == Some(false) {
+            render::line(&render::amber(
+                "     It needs Python 3.9 or later, which was not found here; install it from \
+                 python.org, or set LETRONNA_PYTHON to the one to use.",
+            ));
+        }
+    }
     for why in &plugin.clashes {
         render::line(&render::amber(&format!("     {why}")));
     }
     if !plugin.allowed {
+        let what = match (
+            plugin.code.is_some(),
+            plugin.servers.is_empty() && plugin.providers.is_empty(),
+        ) {
+            (true, true) => "Its code runs on this computer",
+            (true, false) => {
+                "Its code and MCP servers run on this computer and its providers are sent your \
+                 messages"
+            }
+            (false, _) => {
+                "Its MCP servers run programs on this computer and its providers are sent your \
+                 messages"
+            }
+        };
         render::line(&render::amber(&format!(
-            "     Its MCP servers run programs on this computer and its providers are sent \
-             your messages, so they wait for your say: /plugins allow {} to use them.",
+            "     {what}, so it waits for your say: /plugins allow {} to use it.",
             plugin.name
         )));
     }

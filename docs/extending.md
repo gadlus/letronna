@@ -67,11 +67,15 @@ A skill is a folder holding a `SKILL.md` (frontmatter, then instructions) and wh
 
 ## Plugins
 
-A plugin is a git repository with a `plugin.json`. It can bring skills, slash commands, output styles, MCP servers and model providers. `/plugins` adds, updates, removes and browses marketplaces.
+A plugin is a git repository with a `plugin.json`. It can bring skills, slash commands, output styles, MCP servers, model providers and code in JavaScript or Python. `/plugins` adds, updates, removes, allows, shows settings and browses marketplaces.
 
-`plugin.json` keys: `name`, `version`, `description`, `skills`, `commands`, `styles` (each a folder or a list of them), `mcpServers` (as in `mcp.json`) and `providers` (OpenAI-compatible APIs, data only; see [providers.md](providers.md#from-a-plugin)).
+`plugin.json` keys: `name`, `version`, `description`, `skills`, `commands`, `styles` (each a folder or a list of them), `mcpServers` (as in `mcp.json`), `providers` (OpenAI-compatible APIs, data only; see [providers.md](providers.md#from-a-plugin)), and `main`, `start`, `permissions` and `contributes` for code.
 
-Every plugin is scanned before it is installed. Its MCP servers and providers are used only after you allow them, and you are asked again whenever an update changes them.
+Every plugin is scanned before it is installed. Its MCP servers, providers and code are used only after you allow them, and you are asked again whenever an update changes them.
+
+### Plugins that run code
+
+A plugin whose `main` is a `.js` or `.py` file runs it: JavaScript on the engine Letronna already ships, Python on the Python already on the computer. Its code can add tools, block or annotate tool calls, follow turns, add slash commands that run code, keep settings, and show a status, a panel and notices. Nothing runs until something it brings is used. See [Plugins that run code](plugins.md), and the examples in [`examples/plugins`](../examples/plugins).
 
 ## Hooks
 

@@ -1,0 +1,19 @@
+{
+  "name": "guard",
+  "version": "1.0.0",
+  "description": "Blocks commands that are hard to take back: force pushes, hard resets, deleting / or ~.",
+  "main": "plugin.js",
+  "permissions": ["conversation"],
+  "contributes": {
+    "events": ["tool.before"],
+    "actions": [
+      { "name": "guard", "description": "How many commands Guard looked at and blocked" }
+    ],
+    "status": true,
+    "settings": [
+      { "key": "force_push", "label": "Block git push --force", "type": "switch", "default": true },
+      { "key": "reset_hard", "label": "Block git reset --hard", "type": "switch", "default": true },
+      { "key": "delete_home", "label": "Block deleting / or ~", "type": "switch", "default": true }
+    ]
+  }
+}

@@ -2624,7 +2624,7 @@ impl Server {
 /// The next line a server sends, without its newline; `Err` for one longer
 /// than `MAX_MESSAGE`, which is read past rather than held. None once the
 /// server has gone.
-fn next_line(from: &mut impl BufRead) -> Option<Result<Vec<u8>, ()>> {
+pub(crate) fn next_line(from: &mut impl BufRead) -> Option<Result<Vec<u8>, ()>> {
     let mut line = Vec::new();
     match from
         .by_ref()
@@ -3211,7 +3211,7 @@ fn hashed(name: &str, server: &str, tool: &str, salt: u32) -> String {
 /// A string kept for the rest of the run. Tool names and descriptions must
 /// be `'static`, and an MCP server's arrive while Letronna runs; each
 /// different one is leaked once and then reused, so it costs one copy.
-fn keep(text: String) -> &'static str {
+pub(crate) fn keep(text: String) -> &'static str {
     static KEPT: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
     let Ok(mut kept) = KEPT.get_or_init(Default::default).lock() else {
         return Box::leak(text.into_boxed_str());

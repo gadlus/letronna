@@ -146,11 +146,11 @@ plugins::init(cx, vec![
 Add `pub(crate) mod hello;` to `mod.rs`, and it shows up in Settings › Plugins
 with a toggle, a "Built in" badge, and persistence — no other wiring.
 
-## External plugins (planned)
+## Plugins without Rust
 
-Built-in plugins are compiled into the app. Loading third-party plugins at
-runtime is a separate, sandboxed path: WASM modules in a `plugins/` folder next
-to the executable, each with a `manifest.json` (id, name, description,
-permissions) and a capability-gated host API. Such a plugin reports
-`builtin() == false` and shows an "External" badge. This is not built yet; the
-trait and the event bus are the seam it will plug into.
+The plugins here are compiled into the window. A plugin that should not need
+Rust, Cargo or a rebuild -- most of them -- is written in JavaScript or Python
+instead and installed like any marketplace plugin: see
+[Plugins that run code](../../../../docs/plugins.md). Those live in core
+(`letronna_core::plugins::code`), so the terminal runs them too, and the
+window draws what they show in `src/ui/plugin_ui.rs`.

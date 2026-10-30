@@ -59,6 +59,8 @@ pub mod insights;
 pub mod interrupt;
 pub mod jev;
 pub mod jobs;
+#[cfg(feature = "js")]
+mod js;
 pub mod judge;
 pub mod limits;
 mod login_env;

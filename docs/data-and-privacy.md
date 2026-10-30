@@ -20,6 +20,8 @@ Everything Letronna keeps lives in one folder:
 | `USER.md`, `MEMORY.md` | What it knows about you, and its own notes. You can edit both. |
 | `mcp.json`, `lsp.json`, `hooks.json` | See [Extending](extending.md) |
 | `skills/`, `plugins/` | Installed skills and plugins |
+| `plugin-data/` | Each plugin's settings, storage and log, a folder each |
+| `plugin-sdk/` | The runner and `letronna` module Python plugins import, written from Letronna's own copy |
 | `media/` | Media made with no project attached, browser screenshots, and pictures attached with `/image` |
 | `pasted/` | A picture taken off the clipboard with Ctrl+V in the terminal, until `/image` attaches it |
 | `browser/` | The shared browser profile. Delete it to sign out of everything. |

@@ -213,6 +213,7 @@ impl Runner {
             ..Default::default()
         });
         self.persist();
+        self.add_plugins_context(session, prompt);
 
         let answer = self.run(connection, session);
         let answer = self.pursue(session, answer);
@@ -220,6 +221,47 @@ impl Runner {
             self.name_after_first_reply(session);
         }
         answer
+    }
+
+    /// What plugins add for the model to read with `prompt`, just sent in
+    /// `session`, put just before it; waited for with the wheel turning,
+    /// and only when a plugin hears prompts. Escape stops waiting.
+    fn add_plugins_context(&mut self, session: usize, prompt: &str) {
+        use letronna_core::plugins::code;
+        if !code::hears_prompts() {
+            return;
+        }
+        let conversation = &self.store.conversations[session];
+        let (id, workspace) = (conversation.id, conversation.workspace.clone());
+        let (prompt, stop) = (prompt.to_owned(), Cancel::default());
+        let asked = stop.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = sender.send(code::prompt_context(
+                id,
+                workspace.as_deref(),
+                &prompt,
+                &asked,
+            ));
+        });
+        self.bar.wait_line_about("plugins");
+        let added = match self.wait_on(&receiver) {
+            Ok(added) => added,
+            Err(Unheard::Stopped) => {
+                stop.set();
+                None
+            }
+            Err(Unheard::Gone) => None,
+        };
+        self.bar.wait_line(false);
+        show_hook_problems();
+        if let Some(added) = added {
+            let messages = &mut self.store.conversations[session].messages;
+            // Before the prompt, which the model reads last.
+            let at = messages.len().saturating_sub(1);
+            messages.insert(at, added);
+            self.persist();
+        }
     }
 
     /// Have a model name the session once its first reply is in, when
@@ -457,6 +499,8 @@ impl Runner {
         // tick, and a stop ends it.
         let id = self.store.conversations[session].id;
         let ended = (!self.stopped).then(|| answer.as_deref().unwrap_or_default());
+        let workspace = self.store.conversations[session].workspace.clone();
+        letronna_core::plugins::code::turn_ended(id, workspace.as_deref(), ended);
         if let Some(said) = wake::turn_ended(id, ended) {
             render::blank();
             render::line(&render::dim(&said));

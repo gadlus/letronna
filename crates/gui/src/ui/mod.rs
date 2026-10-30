@@ -29,6 +29,7 @@ pub(crate) mod panel;
 pub(crate) mod phone;
 pub(crate) mod pictures;
 pub(crate) mod plugin_page;
+pub(crate) mod plugin_ui;
 pub(crate) mod profiles;
 pub(crate) mod quick;
 pub(crate) mod remember;

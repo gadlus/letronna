@@ -1,0 +1,24 @@
+{
+  "name": "test-gate",
+  "version": "1.0.0",
+  "description": "Runs your tests when the model says it is done, and sends it back to fix what fails.",
+  "main": "plugin.py",
+  "contributes": {
+    "events": ["turn.stop"],
+    "status": true,
+    "settings": [
+      {
+        "key": "command",
+        "label": "Test command, run in the project folder (empty is off)",
+        "type": "text",
+        "default": ""
+      },
+      {
+        "key": "only_after_changes",
+        "label": "Skip when nothing changed since the tests last passed",
+        "type": "switch",
+        "default": true
+      }
+    ]
+  }
+}

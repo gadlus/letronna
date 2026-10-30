@@ -1,5 +1,6 @@
 //! The Plugins page: plugins added from git, what each brings, the one
-//! consent a plugin's MCP servers wait for, and the marketplaces' lists.
+//! consent a plugin's MCP servers and code wait for, a plugin's own
+//! settings, and the marketplaces' lists.
 
 use super::PageColumn;
 use crate::prelude::*;
@@ -267,7 +268,12 @@ impl Chat {
         .detach();
     }
 
-    fn plugin_row(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
+    fn plugin_row(
+        &self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let plugin = &self.plugins.list[index];
         let enabled = plugin.enabled;
         let busy = self.plugins.busy;
@@ -296,9 +302,34 @@ impl Chat {
         for (name, base) in &plugin.providers {
             brings.push(small(format!("Provider {name}: {base}"), muted));
         }
+        if let Some(code) = &plugin.code {
+            brings.push(small(code.consent(), muted));
+            for line in code.brings() {
+                brings.push(small(capitalised(&line), muted));
+            }
+            let python = letronna_core::plugins::code::Runtime::Python;
+            if code.runtime == python && letronna_core::plugins::code::python_found() == Some(false)
+            {
+                brings.push(small(
+                    "It needs Python 3.9 or later, which was not found on this computer. \
+                     Install it from python.org, or set LETRONNA_PYTHON to the one to use."
+                        .into(),
+                    cx.theme().warning,
+                ));
+            }
+        }
         for why in &plugin.clashes {
             brings.push(small(why.clone(), cx.theme().warning));
         }
+        // Its own settings and its panel, once its code may run.
+        let running = plugin.enabled && plugin.allowed && plugin.broken.is_none();
+        let settings = (running && plugin.code.is_some())
+            .then(|| self.plugin_settings_form(&plugin.name, window, cx))
+            .flatten();
+        let panel = (running.then(letronna_core::plugins::code::panels))
+            .into_iter()
+            .flatten()
+            .find(|(name, _)| *name == plugin.name);
         let heading = match plugin.version.as_str() {
             "" => plugin.name.clone(),
             version => format!("{} {version}", plugin.name),
@@ -340,6 +371,19 @@ impl Chat {
                             .flex_shrink_0()
                             .gap_1()
                             .items_center()
+                            .when_some(panel, |this, (name, title)| {
+                                this.child(
+                                    Button::new(("plugin-panel", index))
+                                        .plain(cx)
+                                        .xsmall()
+                                        .icon(Icon::new(AppIcon::Puzzle))
+                                        .tooltip(format!("Show {title}"))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            let tab = crate::ui::panel::PanelTab::Plugin(name);
+                                            this.show_tab(tab, window, cx)
+                                        })),
+                                )
+                            })
                             .when(!plugin.source.is_empty(), |this| {
                                 this.child(
                                     Button::new(("update-plugin", index))
@@ -382,6 +426,7 @@ impl Chat {
             .when(!brings.is_empty(), |this| {
                 this.child(v_flex().gap_0p5().children(brings))
             })
+            .children(settings)
             .when(waits_for_consent(plugin), |this| {
                 this.child(
                     h_flex()
@@ -399,12 +444,7 @@ impl Chat {
                                 .min_w_0()
                                 .text_xs()
                                 .text_color(cx.theme().foreground)
-                                .child(
-                                    "Its MCP servers run the programs above on this computer, \
-                                     and its providers are sent your messages. None is used \
-                                     until you allow them; an update that changes them asks \
-                                     again.",
-                                ),
+                                .child(consent_words(plugin)),
                         )
                         .child(
                             Button::new(("allow-plugin", index))
@@ -524,10 +564,14 @@ impl Chat {
             .children(rows)
     }
 
-    pub(crate) fn plugins_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn plugins_page(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let busy = self.plugins.busy;
         let rows: Vec<AnyElement> = (0..self.plugins.list.len())
-            .map(|index| self.plugin_row(index, cx).into_any_element())
+            .map(|index| self.plugin_row(index, window, cx).into_any_element())
             .collect();
         let markets: Vec<AnyElement> = (0..self.plugins.markets.len())
             .map(|index| self.market_section(index, cx).into_any_element())
@@ -557,9 +601,9 @@ impl Chat {
             .gap_4()
             .child(super::page_header(
                 "Plugins",
-                "A plugin brings skills, commands, styles and MCP servers in one git \
-                 repository. It is checked before it is installed, and its servers start only \
-                 once you allow them.",
+                "A plugin brings skills, commands, styles, MCP servers and code in JavaScript \
+                 or Python in one git repository. It is checked before it is installed, and its \
+                 servers and code run only once you allow them.",
                 [],
                 cx,
             ))
@@ -638,20 +682,51 @@ impl Chat {
     }
 }
 
-/// Whether the plugin has servers that wait to be allowed. One whose
-/// manifest does not read is not allowed either, but has none to show.
-fn waits_for_consent(plugin: &Plugin) -> bool {
-    !plugin.allowed && !(plugin.servers.is_empty() && plugin.providers.is_empty())
+/// What allowing `plugin` lets happen, for the box that asks.
+fn consent_words(plugin: &Plugin) -> &'static str {
+    let elsewhere = !(plugin.servers.is_empty() && plugin.providers.is_empty());
+    match (plugin.code.is_some(), elsewhere) {
+        (true, false) => {
+            "Its code runs on this computer as it says above. Nothing runs until you allow \
+             it; an update that changes its code asks again."
+        }
+        (true, true) => {
+            "Its code and MCP servers run on this computer, and its providers are sent your \
+             messages. None is used until you allow them; an update that changes them asks again."
+        }
+        (false, _) => {
+            "Its MCP servers run the programs above on this computer, and its providers are sent \
+             your messages. None is used until you allow them; an update that changes them asks \
+             again."
+        }
+    }
 }
 
-/// Whether the plugin `shown` is in `now` with the version and servers the
-/// page showed, which is what allowing it consents to.
+/// `line` with its first letter a capital, as a line on its own starts.
+fn capitalised(line: &str) -> String {
+    let mut letters = line.chars();
+    match letters.next() {
+        Some(first) => first.to_uppercase().chain(letters).collect(),
+        None => String::new(),
+    }
+}
+
+/// Whether the plugin has servers or code that wait to be allowed. One
+/// whose manifest does not read is not allowed either, but has none to show.
+fn waits_for_consent(plugin: &Plugin) -> bool {
+    !plugin.allowed
+        && !(plugin.servers.is_empty() && plugin.providers.is_empty() && plugin.code.is_none())
+}
+
+/// Whether the plugin `shown` is in `now` with the version, servers and code
+/// the page showed, which is what allowing it consents to.
 fn unchanged(shown: &Plugin, now: &[Plugin]) -> bool {
     now.iter().any(|plugin| {
         plugin.name == shown.name
             && plugin.version == shown.version
             && plugin.servers == shown.servers
             && plugin.providers == shown.providers
+            && plugin.code == shown.code
     })
 }
 
@@ -692,6 +767,7 @@ mod tests {
                 .map(|(name, target)| (name.to_string(), target.to_string()))
                 .collect(),
             providers: Vec::new(),
+            code: None,
             clashes: Vec::new(),
             broken: None,
         }
@@ -706,6 +782,31 @@ mod tests {
         let bumped = plugin("1.1", &[("notes:db", "node db.js")]);
         assert!(!unchanged(&shown, &[bumped]));
         assert!(!unchanged(&shown, &[]));
+    }
+
+    #[test]
+    fn code_waits_for_consent_and_allowing_waits_for_a_look_at_code_that_changed() {
+        use letronna_core::plugins::code::{Code, Runtime, Start};
+        let code = |network: bool| Code {
+            runtime: Runtime::JavaScript,
+            main: "plugin.js".into(),
+            start: Start::OnUse,
+            network,
+            conversation: false,
+            contributes: Default::default(),
+        };
+        let shown = Plugin {
+            code: Some(code(false)),
+            ..plugin("1.0", &[])
+        };
+        assert!(waits_for_consent(&shown), "code is a program, so it waits");
+        assert!(unchanged(&shown, std::slice::from_ref(&shown)));
+        let reaching = Plugin {
+            code: Some(code(true)),
+            ..plugin("1.0", &[])
+        };
+        assert!(!unchanged(&shown, &[reaching]));
+        assert_eq!(super::capitalised("tools: count"), "Tools: count");
     }
 
     #[test]

@@ -1,0 +1,23 @@
+{
+  "name": "session-meter",
+  "version": "1.0.0",
+  "description": "What each turn used in the status bar, and a word to the model when a call keeps failing the same way.",
+  "main": "plugin.js",
+  "permissions": ["conversation"],
+  "contributes": {
+    "events": ["model.reply", "turn.end", "tool.failed"],
+    "status": true,
+    "actions": [
+      { "name": "meter", "description": "What this session's turns used so far" }
+    ],
+    "settings": [
+      {
+        "key": "repeats",
+        "label": "Speak up when a call fails the same way this many times",
+        "type": "choice",
+        "choices": ["2", "3", "5"],
+        "default": "2"
+      }
+    ]
+  }
+}

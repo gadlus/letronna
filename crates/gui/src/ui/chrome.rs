@@ -436,6 +436,15 @@ impl Chat {
                     .map(|holder| div().min_w_0().truncate().child(holder.line())),
             )
             .children(self.context_chip(cx))
+            // The first to give way when the bar is narrow, as the panel
+            // docked beside the chat makes it.
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .gap_2()
+                    .children(self.plugin_chips(cx)),
+            )
             .child(div().flex_1())
             .children(self.update_chip(cx))
             .child(concat!("v", env!("CARGO_PKG_VERSION")))

@@ -25,8 +25,8 @@
 //! same engine, held to the same limits.
 
 use super::{Run, Step};
-use rquickjs::context::{EvalOptions, intrinsic};
-use rquickjs::{Context, Ctx, Exception, Function, Object, Promise, Runtime, Undefined};
+pub(crate) use crate::js::{STACK, engine, options, thrown};
+use rquickjs::{Ctx, Exception, Function, Object, Promise, Undefined};
 use serde_json::Value;
 use std::cell::{Cell, RefCell};
 use std::fs::File;
@@ -47,14 +47,6 @@ const TURNS_PER_ASK: u64 = 10_000;
 /// The engine time a run may use in all, so a script that spins stops even
 /// while it keeps handing control back.
 const ENGINE_TIME: Duration = Duration::from_secs(30);
-/// The heap a script may use: far past a run's answers, which the journal
-/// keeps anyway, and far short of what would squeeze the machine.
-const HEAP: usize = 256 * 1024 * 1024;
-/// The stack the engine may use, QuickJS's own default: calls a few thousand
-/// deep, and a script nested past that fails to parse rather than overflow.
-const JS_STACK: usize = 1024 * 1024;
-/// The script thread's stack: the engine's, with room for the host around it.
-pub(crate) const STACK: usize = 8 * 1024 * 1024;
 /// How deep meta's objects and arrays may nest: it is two or three deep.
 const META_DEPTH: usize = 16;
 /// Lines of a run's log kept from one launch, Claude Code's cap, so a
@@ -256,31 +248,6 @@ fn drive(run: Run, find: Find, body: &str, args: &str, most: Duration) -> End {
     end
 }
 
-/// An engine held to the heap and stack limits, asking `stop` now and then
-/// while a script runs whether to stop it, with a context of its own.
-pub(crate) fn engine(stop: impl FnMut() -> bool + 'static) -> Result<(Runtime, Context), String> {
-    let engine = Runtime::new().and_then(|runtime| {
-        runtime.set_memory_limit(HEAP);
-        runtime.set_max_stack_size(JS_STACK);
-        runtime.set_interrupt_handler(Some(Box::new(stop)));
-        // No WeakRef, which shows when the collector runs, and no
-        // performance clock: only what a script needs.
-        type Intrinsics = (
-            intrinsic::Date,
-            intrinsic::Eval,
-            intrinsic::RegExpCompiler,
-            intrinsic::RegExp,
-            intrinsic::Json,
-            intrinsic::Proxy,
-            intrinsic::MapSet,
-            intrinsic::TypedArrays,
-            intrinsic::Promise,
-        );
-        Context::custom::<Intrinsics>(&runtime).map(|context| (runtime, context))
-    });
-    engine.map_err(|e| format!("Could not start the script engine: {e}"))
-}
-
 /// The host's loop: runs what the script can, then waits for its next answer
 /// and hands it in, until the script returns or throws, its run pauses or is
 /// stopped, or it waits on something nothing will answer.
@@ -368,16 +335,6 @@ fn begin<'js>(
     Ok((promise, settle))
 }
 
-/// How a script is evaluated: as global code, not strict unless it says so,
-/// named `file` where its errors say where they were.
-pub(crate) fn options(file: &str) -> EvalOptions {
-    // Made from the default, as the engine may add fields to it.
-    let mut options = EvalOptions::default();
-    options.strict = false;
-    options.filename = Some(file.into());
-    options
-}
-
 /// Why the script failed, in words for the user: the limit that stopped it,
 /// or what it threw, and where in the script.
 fn failed(ctx: &Ctx, clock: &Clock, error: rquickjs::Error) -> String {
@@ -385,36 +342,6 @@ fn failed(ctx: &Ctx, clock: &Clock, error: rquickjs::Error) -> String {
         return why;
     }
     format!("The workflow script failed: {}", thrown(ctx, error))
-}
-
-/// What a script threw, or the engine's own error: its name and message,
-/// then where in the script, without the prelude's own frames.
-pub(crate) fn thrown(ctx: &Ctx, error: rquickjs::Error) -> String {
-    if !matches!(error, rquickjs::Error::Exception) {
-        return error.to_string();
-    }
-    let thrown = ctx.catch();
-    if let Some(exception) = thrown.as_exception() {
-        let name: String = exception.get("name").unwrap_or_else(|_| "Error".into());
-        let message = exception.message().unwrap_or_default();
-        // Where in the script, without the prelude's own frames.
-        let stack = exception.stack().unwrap_or_default();
-        let script = stack
-            .lines()
-            .filter(|line| !line.trim().is_empty() && !line.contains("prelude.js"));
-        std::iter::once(format!("{name}: {message}"))
-            .chain(script.map(str::to_owned))
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else if let Some(text) = thrown.as_string() {
-        text.to_string().unwrap_or_default()
-    } else {
-        ctx.json_stringify(thrown)
-            .ok()
-            .flatten()
-            .and_then(|text| text.to_string().ok())
-            .unwrap_or_else(|| "a value that is not an error".into())
-    }
 }
 
 /// An error the script can catch, saying `message`.

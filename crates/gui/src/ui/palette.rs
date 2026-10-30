@@ -31,6 +31,10 @@ enum Pick {
     ChooseFolder,
     /// Sign in to a Letronna account in the browser.
     SignIn,
+    /// Run a plugin's command, with nothing after it.
+    PluginAction(String),
+    /// Show a plugin's panel.
+    PluginPanel(&'static str),
 }
 
 #[derive(Clone)]
@@ -435,6 +439,30 @@ impl Chat {
             current: self.store.settings.appearance == value,
             ..Row::new(AppIcon::Palette, label, Pick::Look(value))
         }));
+        // What the plugins' code brings: its commands, run as typed bare,
+        // and its panels.
+        actions.extend(
+            letronna_core::plugins::code::actions()
+                .into_iter()
+                .map(|action| Row {
+                    detail: format!("{} plugin · {}", action.plugin, action.description).into(),
+                    ..Row::new(
+                        AppIcon::Puzzle,
+                        format!("/{}", action.name),
+                        Pick::PluginAction(action.name),
+                    )
+                }),
+        );
+        actions.extend(letronna_core::plugins::code::panels().into_iter().map(
+            |(plugin, title)| Row {
+                detail: format!("{plugin} plugin").into(),
+                ..Row::new(
+                    AppIcon::Puzzle,
+                    format!("Show {title}"),
+                    Pick::PluginPanel(plugin),
+                )
+            },
+        ));
         // Only while it would do something: signed in, the account menu
         // signs out, and a sign-in already waiting is the account page's.
         if self.account.is_none() && self.sign_in_url.is_none() {
@@ -562,6 +590,10 @@ impl Chat {
                 self.retake_backdrop(window, cx);
             }
             Pick::ChooseFolder => self.attach_workspace(window, cx),
+            Pick::PluginAction(name) => self.run_plugin_action(name, String::new(), window, cx),
+            Pick::PluginPanel(plugin) => {
+                self.show_tab(crate::ui::panel::PanelTab::Plugin(plugin), window, cx)
+            }
             // On the Account page, where the wait for the browser shows,
             // as the account menu does it.
             Pick::SignIn => {

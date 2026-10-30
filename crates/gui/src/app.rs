@@ -578,6 +578,8 @@ pub(crate) struct Chat {
     pub(crate) note: Option<String>,
     /// Hook failures to show once, the next time the window is drawn.
     pub(crate) hook_note: Option<String>,
+    /// What plugins' code shows, as last read.
+    pub(crate) plugin_ui: crate::ui::plugin_ui::PluginUi,
     /// The session whose goal is being looked at after its turn, and what
     /// ends the look when the user stops or sends.
     pub(crate) goal_check: Option<(u64, letronna_core::cancel::Cancel)>,
@@ -1193,6 +1195,7 @@ impl Chat {
             updating: Default::default(),
             note: None,
             hook_note: None,
+            plugin_ui: Default::default(),
             goal_check: None,
             stop_blocks: 0,
             list: ListState::new(0, ListAlignment::Top, OVERDRAW),
@@ -1275,6 +1278,7 @@ impl Chat {
         Self::watch_ended(cx);
         Self::watch_clicks(window, cx);
         Self::watch_jobs(window, cx);
+        Self::watch_plugins(window, cx);
         this.restart_messaging(cx);
         this.restart_phone(cx);
         if this.store.settings.presence == "off" {
@@ -1646,6 +1650,12 @@ impl Chat {
                 });
                 return;
             }
+            Some(Ok(Given::Action(name, args))) => {
+                self.composer
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.run_plugin_action(name, args, window, cx);
+                return;
+            }
             Some(Ok(Given::Run(asked))) => {
                 if self.busy {
                     // Folded into a turn as it runs, it would reach the model
@@ -1844,7 +1854,59 @@ impl Chat {
             let asked = letronna_core::workflow::saved::prompt(&command.name, args);
             return Some(Ok(Given::Run(asked)));
         }
+        if command.origin == Origin::PluginAction {
+            return Some(Ok(Given::Action(command.name.clone(), args.to_owned())));
+        }
         Some(slash::fill(command, args).map(Given::Text))
+    }
+
+    /// Runs the plugin action `name` with `args` off the window's thread.
+    /// What it gives back shows as a notice, or goes in the box when it is
+    /// words for the user to send and the box is still empty in the session
+    /// it was run from.
+    pub(crate) fn run_plugin_action(
+        &mut self,
+        name: String,
+        args: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use letronna_core::plugins::code::{self, Said};
+        let ix = self.store.active;
+        let session = self.store.conversations[ix].id;
+        let workspace = self.store.conversations[ix].workspace.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        let asked = name.clone();
+        std::thread::spawn(move || {
+            let cancel = letronna_core::cancel::Cancel::default();
+            let said = code::run_action(&asked, &args, session, workspace.as_deref(), &cancel);
+            let _ = tx.send_blocking(said);
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(said) = rx.recv().await else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                let here = this.store.conversations[this.store.active].id == session;
+                let empty = this.composer.read(cx).value().trim().is_empty();
+                match said {
+                    Ok(Said::Text(text)) if text.trim().is_empty() => {}
+                    Ok(Said::Text(text)) => this.note = Some(text),
+                    Ok(Said::Compose(text)) if here && empty => {
+                        this.composer
+                            .update(cx, |input, cx| input.insert(text, window, cx));
+                    }
+                    Ok(Said::Compose(_)) => {
+                        this.error = Some(format!(
+                            "/{name} gave words to send, but the box or the session changed                              while it ran."
+                        ));
+                    }
+                    Err(why) => this.error = Some(why),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Sends `asked`, the prompt a saved workflow's command `typed` gives,
@@ -2040,9 +2102,51 @@ impl Chat {
         self.follow();
         match making {
             Some(kind) => self.make(kind, &prompt, cx),
+            None if letronna_core::plugins::code::hears_prompts() => {
+                self.run_turn_after_plugins(target_id, prompt, cx)
+            }
             None => self.run_turn(cx),
         }
         Ok(())
+    }
+
+    /// Starts the turn once the plugins that hear prompts have added what
+    /// they add, off this thread: put just before `prompt`, which the model
+    /// reads last. A stop meanwhile ends the wait, and no turn starts.
+    fn run_turn_after_plugins(&mut self, session: u64, prompt: String, cx: &mut Context<Self>) {
+        let generation = self.generation;
+        let workspace = (self.store.index_of(session))
+            .and_then(|ix| self.store.conversations[ix].workspace.clone());
+        let stop = self.turn_stop.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let added = letronna_core::plugins::code::prompt_context(
+                session,
+                workspace.as_deref(),
+                &prompt,
+                &stop,
+            );
+            let _ = tx.send_blocking(added);
+        });
+        cx.spawn(async move |this, cx| {
+            let added = rx.recv().await.ok().flatten();
+            let _ = this.update(cx, |this, cx| {
+                if this.generation != generation || this.streaming_id != Some(session) {
+                    return;
+                }
+                this.show_hook_problems();
+                if let Some(added) = added
+                    && let Some(ix) = this.store.index_of(session)
+                {
+                    let messages = &mut this.store.conversations[ix].messages;
+                    let at = messages.len().saturating_sub(1);
+                    messages.insert(at, added);
+                    this.save();
+                }
+                this.run_turn(cx);
+            });
+        })
+        .detach();
     }
 
     /// The media kind the active session's messages are made into, or
@@ -3204,7 +3308,7 @@ impl Chat {
     }
 
     /// Hook failures since the last look, for a notice the next draw shows.
-    fn show_hook_problems(&mut self) {
+    pub(crate) fn show_hook_problems(&mut self) {
         let problems = letronna_core::hooks::problems();
         if problems.is_empty() {
             return;
@@ -4191,6 +4295,9 @@ impl Chat {
                 .and_then(|ix| self.store.conversations[ix].messages.last())
                 .filter(|m| m.role == "assistant")
                 .map_or("", |m| m.content.as_str());
+            let workspace = (self.store.index_of(id))
+                .and_then(|ix| self.store.conversations[ix].workspace.as_deref());
+            letronna_core::plugins::code::turn_ended(id, workspace, (!stopped).then_some(answer));
             if let Some(said) = letronna_core::wake::turn_ended(id, (!stopped).then_some(answer)) {
                 self.loop_note = Some(said);
             }
@@ -4675,6 +4782,7 @@ impl Render for Chat {
                 cx,
             );
         }
+        self.plugin_toasts(window, cx);
         if let Some(error) = self.error.take() {
             let text = error.clone();
             window.push_notification(
@@ -4750,7 +4858,7 @@ impl Render for Chat {
         } else if self.page == Page::Capabilities {
             self.capabilities_page(window, cx).into_any_element()
         } else if self.page == Page::Plugins {
-            self.plugins_page(cx).into_any_element()
+            self.plugins_page(window, cx).into_any_element()
         } else if self.page == Page::Messaging {
             self.messaging_page(cx).into_any_element()
         } else if self.page == Page::Activity {
@@ -5257,6 +5365,9 @@ pub(crate) enum Given {
     /// A saved workflow's prompt, sent at once with the `workflow` tool
     /// granted for its turn.
     Run(String),
+    /// A plugin's action by its name, with what was typed after it, which
+    /// its code runs.
+    Action(String, String),
 }
 
 /// Hands Crew what was said from `source` as a turn starts in `session`,

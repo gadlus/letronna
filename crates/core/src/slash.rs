@@ -27,7 +27,10 @@
 //! prompt, are left as the text they are: nothing here runs anything. A
 //! saved workflow is sent at once instead, as all it sends is a request to
 //! call the `workflow` tool, whose launch card shows the script and waits
-//! for the user before anything runs.
+//! for the user before anything runs. A plugin's action runs its code, which
+//! the user allowed, and what it gives back is shown or put in the box; it
+//! comes after a plugin's command files, so neither the user's commands nor
+//! a plugin's files can be swapped out by one.
 
 use crate::chat as backend;
 use crate::skills::{self, Skill, Source};
@@ -75,6 +78,9 @@ pub enum Origin {
     /// A saved workflow, bundled or from a file: it runs rather than filling
     /// the box, and has no body.
     Workflow,
+    /// A switched-on plugin's code, which the front end runs with
+    /// `plugins::code::run_action`; it has no body.
+    PluginAction,
 }
 
 /// A command as the list shows it.
@@ -104,17 +110,37 @@ pub fn list(workspace: Option<&Path>, built_ins: &[&str]) -> Vec<Command> {
     let skills = skills::list(workspace).unwrap_or_default();
     let data = backend::data_dir();
     let workflows = workflows(&data, workspace);
-    list_in(&data, workspace, &skills, &workflows, built_ins)
+    let actions = plugin_actions();
+    list_in(&data, workspace, &skills, &workflows, built_ins, &actions)
 }
 
-/// `list` with the data folder, the skills and the saved workflows (each with
-/// whether it is the project's) given.
+/// The commands plugins' code runs, as the list holds them.
+fn plugin_actions() -> Vec<Command> {
+    crate::plugins::code::actions()
+        .into_iter()
+        .map(|action| Command {
+            description: match action.description.trim() {
+                "" => format!("Runs the {} plugin", action.plugin),
+                said => said.to_owned(),
+            },
+            name: action.name,
+            hint: action.hint,
+            body: String::new(),
+            origin: Origin::PluginAction,
+            hidden_by: None,
+        })
+        .collect()
+}
+
+/// `list` with the data folder, the skills, the saved workflows (each with
+/// whether it is the project's) and the plugins' actions given.
 fn list_in(
     data: &Path,
     workspace: Option<&Path>,
     skills: &[Skill],
     workflows: &[(Command, bool)],
     built_ins: &[&str],
+    actions: &[Command],
 ) -> Vec<Command> {
     let roots = roots(data, workspace);
     let files = |origin: Origin| {
@@ -140,6 +166,7 @@ fn list_in(
         .chain(skills_of(Source::User))
         .chain(workflows_of(false))
         .chain(files(Origin::Plugin))
+        .chain(actions.iter().cloned())
         .chain(files(Origin::Project))
         .chain(skills_of(Source::Project))
         .chain(workflows_of(true));
@@ -179,6 +206,12 @@ pub fn split(line: &str) -> Option<(&str, &str)> {
 /// What `command` gives for the user to read and send, refused when that text
 /// would itself run as a command once sent.
 pub fn fill(command: &Command, args: &str) -> Result<String, String> {
+    if command.origin == Origin::PluginAction {
+        return Err(format!(
+            "/{} runs a plugin's code; it gives no text.",
+            command.name
+        ));
+    }
     let given = expand(command, args);
     if split(&given).is_some() {
         return Err(format!(
@@ -547,7 +580,7 @@ mod tests {
         write(&project.join(".claude/commands/review.md"), "/mode bypass");
         write(&project.join(".claude/commands/look.md"), "/src/a.rs: $1");
         write(&project.join(".claude/commands/aside.md"), "//tmp is full");
-        let listed = list_in(&data, Some(&project), &[], &[], &[]);
+        let listed = list_in(&data, Some(&project), &[], &[], &[], &[]);
         let review = find(&listed, "review").unwrap();
         assert_eq!(
             fill(review, ""),
@@ -558,6 +591,34 @@ mod tests {
         let look = find(&listed, "look").unwrap();
         assert_eq!(fill(look, "why").unwrap(), "/src/a.rs: why");
         assert!(fill(find(&listed, "aside").unwrap(), "").is_ok());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_plugins_actions_come_after_the_users_and_a_plugins_own_files_and_give_no_text() {
+        let root = scratch("actions");
+        let (data, project) = (root.join("data"), root.join("project"));
+        write(&data.join("commands/ship.md"), "Ship it my way.");
+        write(&project.join(".claude/commands/deploy.md"), "Deploy.");
+        let action = |name: &str| Command {
+            name: name.into(),
+            description: "Runs code.".into(),
+            hint: String::new(),
+            body: String::new(),
+            origin: Origin::PluginAction,
+            hidden_by: None,
+        };
+        let actions = [action("ship"), action("deploy"), action("wc")];
+        let listed = list_in(&data, Some(&project), &[], &[], &["help"], &actions);
+        assert_eq!(find(&listed, "ship").unwrap().origin, Origin::User);
+        // Before the project's, as a plugin's command files are.
+        assert_eq!(
+            find(&listed, "deploy").unwrap().origin,
+            Origin::PluginAction
+        );
+        let wc = find(&listed, "wc").unwrap();
+        assert_eq!(wc.origin, Origin::PluginAction);
+        assert!(fill(wc, "").unwrap_err().contains("runs a plugin's code"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -599,7 +660,7 @@ mod tests {
             skill("pdf", Source::User),
             skill("ship", Source::Project),
         ];
-        let listed = list_in(&data, Some(&project), &skills, &[], &["help", "model"]);
+        let listed = list_in(&data, Some(&project), &skills, &[], &["help", "model"], &[]);
         let seen: Vec<(&str, Origin, Option<Origin>)> = listed
             .iter()
             .map(|c| (c.name.as_str(), c.origin, c.hidden_by))
@@ -645,7 +706,7 @@ mod tests {
             "Not the review.",
         );
         let workflows = super::workflows(&data, Some(&project));
-        let listed = list_in(&data, Some(&project), &[], &workflows, &["help"]);
+        let listed = list_in(&data, Some(&project), &[], &workflows, &["help"], &[]);
         let seen: Vec<(&str, Origin, Option<Origin>)> = listed
             .iter()
             .map(|c| (c.name.as_str(), c.origin, c.hidden_by))
@@ -709,7 +770,7 @@ mod tests {
             &data.join("commands/plain.md"),
             "# Plain\n\nFirst paragraph here.",
         );
-        let listed = list_in(&data, None, &[], &[], &[]);
+        let listed = list_in(&data, None, &[], &[], &[], &[]);
         let names: Vec<&str> = listed.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["a:b:name", "bell", "git:ship", "plain"]);
         // The user's own text is not vetted, but the box still cannot draw
@@ -754,7 +815,7 @@ mod tests {
             &commands.join("labels.md"),
             "---\ndescription: Safe\u{202e}txt\nargument-hint: [a\u{200b}]\n---\nBody\u{200b}.",
         );
-        let listed = list_in(&data, Some(&project), &[off, theirs], &[], &[]);
+        let listed = list_in(&data, Some(&project), &[off, theirs], &[], &[], &[]);
         let names: Vec<&str> = listed.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["hidden", "labels", "theirs"]);
         let labels = find(&listed, "labels").unwrap();
@@ -792,7 +853,7 @@ mod tests {
             body: "Mine\u{200b}.".into(),
             ..skill("mine", Source::User)
         };
-        let listed = list_in(&data, None, &[tidy, mine], &[], &[]);
+        let listed = list_in(&data, None, &[tidy, mine], &[], &[], &[]);
         let tidy = find(&listed, "tidy").unwrap();
         assert_eq!(tidy.description, "Tidies up");
         assert!(
@@ -831,7 +892,7 @@ mod tests {
             &data.join("plugins.json"),
             r#"{"plugins": {"off": {"off": true}}}"#,
         );
-        let listed = list_in(&data, Some(&project), &[], &[], &[]);
+        let listed = list_in(&data, Some(&project), &[], &[], &[], &[]);
         let seen: Vec<(&str, Origin, Option<Origin>)> = listed
             .iter()
             .map(|c| (c.name.as_str(), c.origin, c.hidden_by))
@@ -868,7 +929,7 @@ mod tests {
         );
         std::fs::create_dir_all(data.join("commands")).unwrap();
         symlink(root.join("home"), data.join("commands/mine")).unwrap();
-        let listed = list_in(&data, Some(&project), &[], &[], &[]);
+        let listed = list_in(&data, Some(&project), &[], &[], &[], &[]);
         let seen: Vec<(&str, Origin)> =
             listed.iter().map(|c| (c.name.as_str(), c.origin)).collect();
         assert_eq!(seen, [("mine:notes", Origin::User)]);
@@ -885,11 +946,11 @@ mod tests {
         for n in 0..ROOT_ENTRIES {
             std::fs::write(lot.join(format!("{n}.txt")), "").unwrap();
         }
-        assert!(list_in(&data, None, &[], &[], &[]).is_empty());
+        assert!(list_in(&data, None, &[], &[], &[], &[]).is_empty());
         // With the folder and `z.md`, two fewer files make exactly the cap.
         std::fs::remove_file(lot.join("0.txt")).unwrap();
         std::fs::remove_file(lot.join("1.txt")).unwrap();
-        let names: Vec<String> = list_in(&data, None, &[], &[], &[])
+        let names: Vec<String> = list_in(&data, None, &[], &[], &[], &[])
             .into_iter()
             .map(|c| c.name)
             .collect();

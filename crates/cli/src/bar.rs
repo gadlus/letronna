@@ -174,7 +174,7 @@ pub const COMMANDS: &[Command<'static>] = &[
     },
     Command {
         name: "/plugins",
-        blurb: "plugins: add from git, switch on or off, allow servers, update, remove, market",
+        blurb: "plugins: add from git, switch on or off, allow, settings, reload, update, remove, market",
     },
     Command {
         name: "/wallet",
@@ -468,6 +468,8 @@ const QUEUED_LIMIT: usize = 4;
 /// How often the helpers are looked in on: four times a second is live to
 /// the eye, and what their lines say changes by the second at most.
 const LOOK: Duration = Duration::from_millis(250);
+/// The plugins' statuses the footer has room for.
+const PLUGIN_STATUSES: usize = 3;
 
 /// Helpers given a line of their own. The rest share one line, so a fan-out
 /// of helpers cannot squeeze the conversation out of a short window.
@@ -869,6 +871,12 @@ pub struct Bar {
     /// The first of the menu's rows on show, when there are more than fit.
     menu_top: usize,
     footer: String,
+    /// What the plugins that show a status say, after the footer.
+    plugin_status: String,
+    /// The plugins' surfaces as last looked at, by their count of changes.
+    plugins_seen: u64,
+    /// Notices plugins put up, waiting for the prompt.
+    plugin_notes: VecDeque<String>,
     /// Lines entered but not yet answered, in the order they were typed.
     queued: VecDeque<String>,
     live: bool,
@@ -1003,6 +1011,9 @@ impl Bar {
             picked: 0,
             menu_top: 0,
             footer,
+            plugin_status: String::new(),
+            plugins_seen: 0,
+            plugin_notes: VecDeque::new(),
             queued: VecDeque::new(),
             live: false,
             done: false,
@@ -1480,6 +1491,9 @@ impl Bar {
         {
             return Some(Waited::Note(note));
         }
+        if let Some(note) = self.plugin_notes.pop_front() {
+            return Some(Waited::Note(note));
+        }
         if let Some((id, was, name)) = self.names.as_ref().and_then(|names| names.try_recv().ok()) {
             return Some(Waited::Named(id, was, name));
         }
@@ -1906,7 +1920,7 @@ impl Bar {
         }
         if self.looked.elapsed() >= LOOK {
             self.looked = std::time::Instant::now();
-            if self.look_at_helpers() {
+            if self.look_at_helpers() | self.look_at_plugins() {
                 self.settle();
             }
         }
@@ -1954,6 +1968,32 @@ impl Bar {
     /// Read how the open session's helpers and workflow runs are getting on,
     /// and say whether that changes the screen. Their lines stay once the
     /// turn is done, since that is when work out of sight is easiest to miss.
+    fn look_at_plugins(&mut self) -> bool {
+        use letronna_core::plugins::code::ui;
+        self.plugin_notes.extend(
+            ui::take_toasts()
+                .into_iter()
+                .map(|toast| format!("{} · {}", toast.plugin, toast.text)),
+        );
+        let seen = ui::generation();
+        if seen == self.plugins_seen {
+            return false;
+        }
+        self.plugins_seen = seen;
+        let status = plugin_status(&ui::snapshot());
+        let changed = status != self.plugin_status;
+        self.plugin_status = status;
+        changed
+    }
+
+    /// The footer, with what the plugins' status says after it.
+    fn footer_line(&self) -> String {
+        match self.plugin_status.as_str() {
+            "" => self.footer.clone(),
+            status => format!("{}  ·  {status}", self.footer),
+        }
+    }
+
     fn look_at_helpers(&mut self) -> bool {
         let now = std::time::Instant::now();
         let relay: Vec<String> = (letronna_core::agents::seen().iter())
@@ -2892,14 +2932,14 @@ impl Bar {
                 _ => String::new(),
             };
             fitted(
-                &self.footer,
+                &self.footer_line(),
                 &format!("{helpers}  ·  esc to stop{clock}"),
                 width,
             )
         } else {
             let reach = reach(self.relay.len(), self.runs.len());
             let width = width.saturating_sub(self.mode_width(width));
-            fitted(&self.footer, &format!("{helpers}{reach}"), width)
+            fitted(&self.footer_line(), &format!("{helpers}{reach}"), width)
         };
         // The mode leads the footer while nothing else has taken it over.
         let plain = self.note.is_none()
@@ -3703,6 +3743,17 @@ fn mode_said(mark: &str, words: &str, width: usize) -> (String, String) {
     (render::clip(&said, room), gap.to_owned())
 }
 
+/// What the plugins' status says, the first `PLUGIN_STATUSES` that say
+/// anything, each on its own part of the footer.
+fn plugin_status(shown: &[(String, letronna_core::plugins::code::ui::Surfaces)]) -> String {
+    (shown.iter())
+        .map(|(_, shown)| shown.status.as_str())
+        .filter(|status| !status.is_empty())
+        .take(PLUGIN_STATUSES)
+        .collect::<Vec<_>>()
+        .join("  ·  ")
+}
+
 /// The footer with `then` after it, in `width` columns. The footer gives way
 /// first, so the model's name loses its end before what the user can do now.
 fn fitted(footer: &str, then: &str, width: usize) -> String {
@@ -3767,7 +3818,7 @@ mod tests {
         Added, Bar, CHOICE_ROWS, Choice, MENU_LIMIT, NAME_WIDTH, PLAN_ROWS, QUEUED_LIMIT,
         RELAY_LIMIT, Row, STILL, SWITCH_ROWS, Slider, Switch, Switches, TWICE, Waited, as_typed,
         at_work, checklist, closest, fitted, is_command, keys_card, matches, menu_top, mode_said,
-        name_width, offered, one_row, reach, relay_line, stops_at, track, unescaped,
+        name_width, offered, one_row, plugin_status, reach, relay_line, stops_at, track, unescaped,
     };
     use crate::render::{MARGIN, plain, visible};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -3790,6 +3841,30 @@ mod tests {
             .map(String::as_str)
             .map(plain)
             .collect()
+    }
+
+    #[test]
+    fn the_footer_carries_what_plugins_say_after_it_and_gives_way_first() {
+        use letronna_core::plugins::code::ui::Surfaces;
+        let shown = |status: &str| Surfaces {
+            status: status.into(),
+            ..Surfaces::default()
+        };
+        let shown = [
+            ("a".to_owned(), shown("3 turns")),
+            ("b".to_owned(), shown("")),
+            ("c".to_owned(), shown("main ✓")),
+            ("d".to_owned(), shown("one")),
+            ("e".to_owned(), shown("too many")),
+        ];
+        assert_eq!(plugin_status(&shown), "3 turns  ·  main ✓  ·  one");
+        let mut bar = Bar::new("gpt-5 · OpenAI".into());
+        bar.plugin_status = plugin_status(&shown[..1]);
+        assert_eq!(bar.footer_line(), "gpt-5 · OpenAI  ·  3 turns");
+        // Narrow, the footer and the plugins' part go before what the user
+        // can do now.
+        let line = fitted(&bar.footer_line(), "  ·  esc to stop", 24);
+        assert!(line.ends_with("esc to stop"), "{line}");
     }
 
     #[test]

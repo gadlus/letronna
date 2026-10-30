@@ -88,23 +88,40 @@ pub(crate) enum PanelTab {
     Changes,
     Files,
     Jobs,
+    /// A plugin's panel, by the plugin's name, which its code draws.
+    Plugin(&'static str),
 }
 
 impl PanelTab {
-    /// Every tab, in the order the bar shows them.
-    const ALL: [PanelTab; 4] = [
+    /// The window's own tabs, in the order the bar shows them.
+    const OWN: [PanelTab; 4] = [
         PanelTab::Browser,
         PanelTab::Changes,
         PanelTab::Files,
         PanelTab::Jobs,
     ];
 
-    fn label(self) -> &'static str {
+    /// Every tab, the plugins' after the window's own.
+    fn all() -> Vec<PanelTab> {
+        let plugins = letronna_core::plugins::code::panels();
+        (Self::OWN.into_iter())
+            .chain(
+                plugins
+                    .into_iter()
+                    .map(|(plugin, _)| PanelTab::Plugin(plugin)),
+            )
+            .collect()
+    }
+
+    fn label(self) -> String {
         match self {
-            PanelTab::Browser => "Browser",
-            PanelTab::Changes => "Changes",
-            PanelTab::Files => "Files",
-            PanelTab::Jobs => "Jobs",
+            PanelTab::Browser => "Browser".into(),
+            PanelTab::Changes => "Changes".into(),
+            PanelTab::Files => "Files".into(),
+            PanelTab::Jobs => "Jobs".into(),
+            PanelTab::Plugin(plugin) => (letronna_core::plugins::code::panels().into_iter())
+                .find(|(name, _)| *name == plugin)
+                .map_or_else(|| plugin.to_owned(), |(_, title)| title),
         }
     }
 }
@@ -220,9 +237,11 @@ fn preview_width(pane: Pixels) -> Pixels {
 
 /// The tabs that show, with how many things in each wait on the user,
 /// given what each has: None for nothing to show.
-fn shown_tabs(state: impl Fn(PanelTab) -> Option<usize>) -> Vec<(PanelTab, usize)> {
-    PanelTab::ALL
-        .into_iter()
+fn shown_tabs(
+    tabs: Vec<PanelTab>,
+    state: impl Fn(PanelTab) -> Option<usize>,
+) -> Vec<(PanelTab, usize)> {
+    tabs.into_iter()
         .filter_map(|tab| state(tab).map(|waiting| (tab, waiting)))
         .collect()
 }
@@ -230,7 +249,7 @@ fn shown_tabs(state: impl Fn(PanelTab) -> Option<usize>) -> Vec<(PanelTab, usize
 /// A tab's title, with the count of what waits in it.
 fn title(tab: PanelTab, waiting: usize) -> String {
     match waiting {
-        0 => tab.label().to_owned(),
+        0 => tab.label(),
         n => format!("{} {n}", tab.label()),
     }
 }
@@ -261,6 +280,12 @@ impl Chat {
                 let chosen = self.panel.tabs.get(&self.session_on_screen()) == Some(&tab);
                 (chosen || !letronna_core::jobs::list().is_empty()).then_some(0)
             }
+            // Once it has drawn, or while it is the tab asked for, which is
+            // how it is first started: its chip, the palette or its page.
+            PanelTab::Plugin(plugin) => {
+                let chosen = self.panel.tabs.get(&self.session_on_screen()) == Some(&tab);
+                (chosen || self.plugin_drew(plugin)).then_some(0)
+            }
         }
     }
 
@@ -270,13 +295,14 @@ impl Chat {
             PanelTab::Changes => self.changes_tab(cx),
             PanelTab::Files => self.files_tab(window, cx),
             PanelTab::Jobs => self.jobs_tab(window, cx),
+            PanelTab::Plugin(plugin) => self.plugin_panel(plugin, window, cx),
         }
     }
 
     /// The tabs that show for this draw, with their counts, and the one the
     /// session has open among them.
     fn tabs_now(&self, cx: &App) -> (Vec<(PanelTab, usize)>, Option<PanelTab>) {
-        let shown = shown_tabs(|tab| self.tab_state(tab, cx));
+        let shown = shown_tabs(PanelTab::all(), |tab| self.tab_state(tab, cx));
         let tabs: Vec<PanelTab> = shown.iter().map(|&(tab, _)| tab).collect();
         let open = self.panel.tab(self.session_on_screen(), &tabs);
         (shown, open)
@@ -373,6 +399,10 @@ impl Chat {
         }
         if tab == PanelTab::Jobs {
             self.focus_jobs(window, cx);
+        }
+        // It starts if need be, and draws on hearing it was opened.
+        if let PanelTab::Plugin(plugin) = tab {
+            letronna_core::plugins::code::panel_opened(plugin);
         }
         cx.notify();
     }
@@ -892,13 +922,14 @@ mod tests {
 
     #[test]
     fn a_tab_shows_only_with_something_to_show_and_counts_what_waits() {
-        assert!(shown_tabs(|_| None).is_empty());
+        let own = || PanelTab::OWN.to_vec();
+        assert!(shown_tabs(own(), |_| None).is_empty());
         assert_eq!(
-            shown_tabs(|tab| (tab == PanelTab::Browser).then_some(1)),
+            shown_tabs(own(), |tab| (tab == PanelTab::Browser).then_some(1)),
             vec![(PanelTab::Browser, 1)]
         );
         assert_eq!(
-            shown_tabs(|_| Some(0)),
+            shown_tabs(own(), |_| Some(0)),
             vec![
                 (PanelTab::Browser, 0),
                 (PanelTab::Changes, 0),
@@ -907,9 +938,16 @@ mod tests {
             ]
         );
         assert_eq!(
-            shown_tabs(|tab| (tab == PanelTab::Files).then_some(0)),
+            shown_tabs(own(), |tab| (tab == PanelTab::Files).then_some(0)),
             vec![(PanelTab::Files, 0)]
         );
+        // A plugin's tab comes after the window's own, under its plugin's
+        // name while no panel of that name is loaded.
+        let mut all = own();
+        all.push(PanelTab::Plugin("pomodoro"));
+        let shown = shown_tabs(all, |tab| matches!(tab, PanelTab::Plugin(_)).then_some(0));
+        assert_eq!(shown, vec![(PanelTab::Plugin("pomodoro"), 0)]);
+        assert_eq!(title(PanelTab::Plugin("pomodoro"), 0), "pomodoro");
         assert_eq!(title(PanelTab::Browser, 0), "Browser");
         assert_eq!(title(PanelTab::Browser, 1), "Browser 1");
         assert_eq!(title(PanelTab::Jobs, 0), "Jobs");

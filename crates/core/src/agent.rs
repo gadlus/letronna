@@ -395,10 +395,20 @@ impl Turn {
                 self.live.cached_tokens = *cached;
                 let (endpoint, model) = self.served();
                 let facts = crate::models::facts(endpoint, model.trim());
+                let model = model.trim().to_owned();
                 self.live.window = facts.context.unwrap_or(0);
                 self.live.cache_write_tokens = *cache_write;
                 self.live.reasoning_tokens = *reasoning;
                 self.live.cost = *cost;
+                let usage = serde_json::json!({
+                    "input_tokens": prompt,
+                    "output_tokens": completion,
+                    "cached_tokens": cached,
+                    "reasoning_tokens": reasoning,
+                    "per_second": per_second,
+                    "cost": cost,
+                });
+                crate::plugins::code::model_replied(self.connection.conversation, &model, &usage);
             }
             Event::SummaryUsage(paid) => {
                 self.live.summary_usage = Some(paid.usage);

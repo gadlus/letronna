@@ -1,5 +1,6 @@
 //! Plugins: a git repository whose `plugin.json` brings skills, slash
-//! commands, output styles and MCP servers in one go.
+//! commands, output styles, MCP servers and code in JavaScript or Python in
+//! one go (see `code`).
 //!
 //! A plugin is cloned with `git clone --depth 1` into a staging folder and
 //! scanned there before anything in the data folder changes: its files pass
@@ -16,7 +17,9 @@
 //! the user has allowed that plugin's servers once. The consent is kept as
 //! the version and a hash of the server entries it was given for, so an
 //! update that changes either asks again, and a plugin with no servers never
-//! asks. What is kept per plugin -- where it came from, whether it is off,
+//! asks. A plugin's code waits for the same consent, which then also covers
+//! what the code may reach and brings, and, for a plugin installed from
+//! somewhere, the code itself. What is kept per plugin -- where it came from, whether it is off,
 //! what was allowed -- lives in `plugins.json`, along with the marketplace
 //! index links. A marketplace is only a JSON list of plugins someone
 //! publishes; nothing here is hosted.
@@ -34,6 +37,8 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+pub mod code;
 
 /// The file that makes a folder a plugin.
 const MANIFEST: &str = "plugin.json";
@@ -82,8 +87,8 @@ pub struct Plugin {
     pub folder: PathBuf,
     /// Switched on: what it brings is offered.
     pub enabled: bool,
-    /// Its MCP servers may start: the user allowed them as they are in this
-    /// version, or it has none.
+    /// Its MCP servers may start and its code run: the user allowed them as
+    /// they are in this version, or it has none.
     pub allowed: bool,
     pub skills: Vec<String>,
     pub commands: Vec<String>,
@@ -92,6 +97,8 @@ pub struct Plugin {
     pub servers: Vec<(String, String)>,
     /// The providers it declares, each with the URL its requests go to.
     pub providers: Vec<(String, String)>,
+    /// The code it runs, and what that brings.
+    pub code: Option<code::Code>,
     /// What it brings that is left out, each with why.
     pub clashes: Vec<String>,
     /// Why its manifest does not read now, when it does not; then it brings
@@ -149,6 +156,12 @@ struct Manifest {
     /// OpenAI-compatible APIs it offers as providers: data, never a program.
     #[serde(default)]
     providers: Vec<crate::providers::declared::Entry>,
+    /// The code it runs, as written.
+    #[serde(flatten)]
+    code: code::Spec,
+    /// That code, as `read_manifest` checked it.
+    #[serde(skip)]
+    checked: Option<code::Code>,
 }
 
 /// A folder given as one path or a list of them.
@@ -244,6 +257,7 @@ fn described(folder: &Path, name: String, record: &Record, taken: &mut Vec<Strin
         styles: Vec::new(),
         servers: Vec::new(),
         providers: Vec::new(),
+        code: None,
         clashes: Vec::new(),
         broken: None,
     };
@@ -256,8 +270,9 @@ fn described(folder: &Path, name: String, record: &Record, taken: &mut Vec<Strin
     };
     plugin.version = skills::printable(&manifest.version);
     plugin.description = skills::printable(&manifest.description);
-    let consent = consent_key(&manifest);
+    let consent = consent_key(folder, &manifest, record);
     plugin.allowed = consent.is_empty() || record.allowed == consent;
+    plugin.code = manifest.checked.clone();
     for root in skill_folders(folder, &manifest) {
         for skill in skills::read_root(&root, Source::Plugin) {
             if taken.iter().any(|name| same(name, &skill.name)) {
@@ -389,6 +404,18 @@ fn active(data: &Path) -> Vec<(String, PathBuf, Manifest, Record)> {
         .collect()
 }
 
+/// The plugins switched on and allowed whose code reads, each with its
+/// folder and that code.
+pub(crate) fn coded_in(data: &Path) -> Vec<(String, PathBuf, code::Code)> {
+    active(data)
+        .into_iter()
+        .filter(|(_, folder, manifest, record)| {
+            record.allowed == consent_key(folder, manifest, record)
+        })
+        .filter_map(|(name, folder, manifest, _)| Some((name, folder, manifest.checked?)))
+        .collect()
+}
+
 /// The folders of skill folders the plugins switched on bring, for the
 /// skills to be gathered from after the user's own.
 pub(crate) fn skill_roots_in(data: &Path) -> Vec<PathBuf> {
@@ -428,7 +455,7 @@ pub fn servers() -> Vec<Server> {
 fn servers_in(data: &Path) -> Vec<Server> {
     let mut servers = Vec::new();
     for (plugin, folder, manifest, record) in active(data) {
-        if record.allowed != consent_key(&manifest) {
+        if record.allowed != consent_key(&folder, &manifest, &record) {
             continue;
         }
         for (name, config) in &manifest.servers {
@@ -456,29 +483,66 @@ fn servers_in(data: &Path) -> Vec<Server> {
 pub(crate) fn providers() -> Vec<crate::providers::declared::Entry> {
     active(&backend::data_dir())
         .into_iter()
-        .filter(|(_, _, manifest, record)| record.allowed == consent_key(manifest))
+        .filter(|(_, folder, manifest, record)| {
+            record.allowed == consent_key(folder, manifest, record)
+        })
         .flat_map(|(_, _, manifest, _)| manifest.providers)
         .collect()
 }
 
-/// What the user agrees to by allowing a plugin's servers and providers:
-/// its version and a hash of their entries. Empty for a plugin with none.
-fn consent_key(manifest: &Manifest) -> String {
-    if manifest.servers.is_empty() && manifest.providers.is_empty() {
+/// What the user agrees to by allowing a plugin's servers, providers and
+/// code: its version and a hash of their entries, and of the code itself
+/// when the plugin came from somewhere. Empty for a plugin with none.
+fn consent_key(folder: &Path, manifest: &Manifest, record: &Record) -> String {
+    if manifest.servers.is_empty() && manifest.providers.is_empty() && manifest.checked.is_none() {
         return String::new();
     }
-    // Servers alone hash as they always did, so their consent still holds.
-    let entries = match manifest.providers.is_empty() {
-        true => serde_json::to_vec(&manifest.servers),
-        false => serde_json::to_vec(&(&manifest.servers, &manifest.providers)),
+    // Servers alone hash as they always did, so their consent still holds,
+    // and so do servers and providers without code. With code, the keys are
+    // put in order first: whether serde_json keeps a map's order depends on
+    // what else a binary is built with, and the window and the terminal
+    // must agree on what the user allowed.
+    let entries = match (manifest.providers.is_empty(), manifest.checked.is_none()) {
+        (true, true) => serde_json::to_vec(&manifest.servers),
+        (false, true) => serde_json::to_vec(&(&manifest.servers, &manifest.providers)),
+        (_, false) => {
+            serde_json::to_value((&manifest.servers, &manifest.providers, &manifest.code))
+                .and_then(|entries| serde_json::to_vec(&in_order(entries)))
+        }
     }
     .unwrap_or_default();
-    let hash = ring::digest::digest(&ring::digest::SHA256, &entries);
+    let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+    hash.update(&entries);
+    // The user's own edits to a plugin they put in the folder themselves
+    // are theirs; one installed from somewhere asks again for new code.
+    if manifest.checked.is_some() && !record.source.is_empty() {
+        code::digest(folder, &mut hash);
+    }
+    let hash = hash.finish();
     let hex: String = hash.as_ref()[..8]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
     format!("{}#{hex}", manifest.version)
+}
+
+/// `value` with every object's keys in order, however the map it was read
+/// into keeps them.
+fn in_order(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, in_order(value)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(in_order).collect()),
+        other => other,
+    }
 }
 
 /// The skill folders a plugin declares: `skills`, or its `skills` folder
@@ -550,7 +614,12 @@ fn add_in(data: &Path, source: &str) -> Result<Plugin, String> {
 /// changed; else where the earlier copy went. Its switch is kept, and so is
 /// the consent unless its version or servers changed.
 pub fn update(name: &str) -> Result<Option<PathBuf>, String> {
-    let done = update_in(&backend::data_dir(), name, || crate::mcp::stop_plugin(name));
+    let done = update_in(&backend::data_dir(), name, || {
+        crate::mcp::stop_plugin(name);
+        // A process with its folder open would keep the folder from moving
+        // on Windows.
+        code::stop(name);
+    });
     // Stopped or not, its servers start from whichever copy is in place.
     let restarted = restart_servers(name);
     let done = done?;
@@ -611,7 +680,10 @@ fn head(folder: &Path) -> Option<String> {
 /// Take a plugin out: its folder goes into `plugins-archive`, whole, and
 /// what was kept for it is forgotten. Says where it went.
 pub fn remove(name: &str) -> Result<PathBuf, String> {
-    let kept = remove_in(&backend::data_dir(), name, || crate::mcp::stop_plugin(name));
+    let kept = remove_in(&backend::data_dir(), name, || {
+        crate::mcp::stop_plugin(name);
+        code::stop(name);
+    });
     // Started again from the folder left in place if the move failed.
     let restarted = restart_servers(name);
     let kept = kept?;
@@ -657,10 +729,15 @@ pub fn allow(name: &str) -> Result<(), String> {
 fn allow_in(data: &Path, name: &str) -> Result<(), String> {
     let folder = installed(data, name)?;
     let manifest = read_manifest(&folder)?;
-    let key = consent_key(&manifest);
+    let record = read_saved(data)?
+        .plugins
+        .get(name)
+        .cloned()
+        .unwrap_or_default();
+    let key = consent_key(&folder, &manifest, &record);
     if key.is_empty() {
         return Err(format!(
-            "{name} brings no MCP servers or providers, so there is nothing to allow."
+            "{name} brings no MCP servers, providers or code, so there is nothing to allow."
         ));
     }
     change_saved(data, |saved| {
@@ -669,9 +746,10 @@ fn allow_in(data: &Path, name: &str) -> Result<(), String> {
     })
 }
 
-/// Bring the MCP servers in line after `name` changed.
+/// Bring the MCP servers and the plugins' code in line after `name` changed.
 fn restart_servers(name: &str) -> Result<(), String> {
     crate::providers::reload();
+    code::reload();
     crate::mcp::reload()
         .map(drop)
         .map_err(|why| format!("{name} changed, but its MCP servers did not follow: {why}"))
@@ -832,7 +910,7 @@ fn read_manifest(folder: &Path) -> Result<Manifest, String> {
     if bytes.len() as u64 > MANIFEST_BYTES {
         return Err(format!("{MANIFEST} is over {MANIFEST_BYTES} bytes."));
     }
-    let manifest: Manifest =
+    let mut manifest: Manifest =
         serde_json::from_slice(&bytes).map_err(|e| format!("{MANIFEST} will not read: {e}"))?;
     if !valid_name(&manifest.name) {
         return Err(format!(
@@ -879,6 +957,7 @@ fn read_manifest(folder: &Path) -> Result<Manifest, String> {
             inside(cwd).map_err(|why| format!("The server {name}'s cwd: {why}"))?;
         }
     }
+    manifest.checked = code::checked(&manifest.name, folder, &manifest.code)?;
     Ok(manifest)
 }
 
@@ -926,6 +1005,18 @@ fn scan(folder: &Path, manifest: &Manifest) -> Result<(), String> {
             .iter()
             .map(|(relative, size, _)| (relative.as_str(), *size)),
     )?;
+    let code: u64 = files
+        .iter()
+        .filter(|(relative, ..)| code::is_code(relative))
+        .map(|(_, size, _)| size)
+        .sum();
+    if code > code::CODE_BYTES {
+        return Err(format!(
+            "The plugin holds {code} bytes of code, more than the {} a plugin may, so it was \
+             not installed.",
+            code::CODE_BYTES
+        ));
+    }
     let homes: Vec<String> = skill_folders(folder, manifest)
         .into_iter()
         .chain(declared(folder, &manifest.commands, "commands"))
@@ -1514,6 +1605,219 @@ mod tests {
             1
         );
         assert!(parse_index(b"{}").is_err());
+    }
+
+    /// A repository holding a plugin called `name` whose code is
+    /// `plugin.js`, with `extra` merged into its manifest.
+    fn code_repo(root: &Path, name: &str, extra: Value) -> PathBuf {
+        let repo = root.join(format!("{name}-source"));
+        let mut manifest = serde_json::json!({
+            "name": name, "version": "1.0.0", "main": "plugin.js",
+            "contributes": {"tools": [{"name": "count", "description": "Counts words."}]},
+        });
+        for (key, value) in extra.as_object().into_iter().flatten() {
+            manifest[key] = value.clone();
+        }
+        write(&repo.join(MANIFEST), manifest.to_string().as_bytes());
+        write(
+            &repo.join("plugin.js"),
+            b"letronna.tool('count', () => '1');",
+        );
+        commit(&repo);
+        repo
+    }
+
+    #[test]
+    fn a_plugin_without_code_keeps_the_consent_it_had() {
+        // The key as it was made before plugins ran code, so a consent the
+        // user gave then still holds.
+        let before = |entries: Vec<u8>| {
+            let hash = ring::digest::digest(&ring::digest::SHA256, &entries);
+            let hex: String = hash.as_ref()[..8]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            format!("2.0#{hex}")
+        };
+        let servers: Manifest = serde_json::from_value(serde_json::json!({
+            "name": "kit", "version": "2.0",
+            "mcpServers": {"files": {"command": "node", "args": ["server.js"]}},
+        }))
+        .unwrap();
+        let record = Record::default();
+        assert_eq!(
+            consent_key(Path::new("."), &servers, &record),
+            before(serde_json::to_vec(&servers.servers).unwrap())
+        );
+        let both: Manifest = serde_json::from_value(serde_json::json!({
+            "name": "kit", "version": "2.0",
+            "mcpServers": {"files": {"command": "node"}},
+            "providers": [{"name": "Acme", "base": "https://api.acme.test/v1"}],
+        }))
+        .unwrap();
+        assert_eq!(
+            consent_key(Path::new("."), &both, &record),
+            before(serde_json::to_vec(&(&both.servers, &both.providers)).unwrap())
+        );
+    }
+
+    #[test]
+    fn what_is_allowed_of_code_does_not_hang_on_the_order_its_manifest_is_written_in() {
+        let read = |text: &str| -> Manifest { serde_json::from_str(text).unwrap() };
+        let folder = std::env::temp_dir().join(format!("letronna-order-{}", std::process::id()));
+        write(&folder.join("plugin.js"), b"");
+        let checked = |mut manifest: Manifest| {
+            manifest.checked = code::checked("kit", &folder, &manifest.code).unwrap();
+            consent_key(&folder, &manifest, &Record::default())
+        };
+        let one = read(
+            r#"{"name": "kit", "main": "plugin.js", "contributes": {"tools": [{"name": "t",
+                "description": "d", "parameters": {"type": "object", "properties": {"a": {}}}}]}}"#,
+        );
+        let other = read(
+            r#"{"contributes": {"tools": [{"parameters": {"properties": {"a": {}}, "type": "object"},
+                "description": "d", "name": "t"}]}, "main": "plugin.js", "name": "kit"}"#,
+        );
+        assert_eq!(checked(one), checked(other));
+        assert_eq!(
+            in_order(serde_json::json!({"b": [{"d": 1, "c": 2}], "a": 0})).to_string(),
+            r#"{"a":0,"b":[{"c":2,"d":1}]}"#
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_plugins_code_waits_for_allow_and_asks_again_when_it_changes() {
+        let data = scratch("code-consent");
+        let repo = code_repo(&data, "words", serde_json::json!({}));
+        let plugin = add_in(&data, &source(&repo)).unwrap();
+        assert!(!plugin.allowed, "code is a program, so it waits");
+        let code = plugin.code.unwrap();
+        assert_eq!(code.runtime, code::Runtime::JavaScript);
+        assert_eq!(code.main, "plugin.js");
+        assert!(code.consent().contains("JavaScript sandbox"));
+        allow_in(&data, "words").unwrap();
+        assert!(plugin_in(&data, "words").unwrap().allowed);
+
+        // Same manifest, other code: a new question.
+        write(
+            &repo.join("plugin.js"),
+            b"letronna.tool('count', () => '2');",
+        );
+        commit(&repo);
+        update_in(&data, "words", || {}).unwrap().unwrap();
+        assert!(!plugin_in(&data, "words").unwrap().allowed);
+        allow_in(&data, "words").unwrap();
+
+        // Same code, more reach: a new question too.
+        let manifest = serde_json::json!({
+            "name": "words", "version": "1.0.0", "main": "plugin.js",
+            "permissions": ["network"],
+            "contributes": {"tools": [{"name": "count", "description": "Counts words."}]},
+        });
+        write(&repo.join(MANIFEST), manifest.to_string().as_bytes());
+        commit(&repo);
+        update_in(&data, "words", || {}).unwrap().unwrap();
+        let plugin = plugin_in(&data, "words").unwrap();
+        assert!(!plugin.allowed);
+        assert!(
+            plugin
+                .code
+                .unwrap()
+                .consent()
+                .contains("reach the internet")
+        );
+    }
+
+    #[test]
+    fn the_users_own_edits_to_a_plugin_they_put_in_place_are_not_asked_about_again() {
+        let data = scratch("code-own");
+        let folder = data.join(PLUGINS_DIR).join("mine");
+        let manifest = serde_json::json!({
+            "name": "mine", "main": "plugin.py",
+            "contributes": {"actions": [{"name": "hello"}]},
+        });
+        write(&folder.join(MANIFEST), manifest.to_string().as_bytes());
+        write(&folder.join("plugin.py"), b"print('one')");
+        assert!(!plugin_in(&data, "mine").unwrap().allowed);
+        allow_in(&data, "mine").unwrap();
+        write(&folder.join("plugin.py"), b"print('two')");
+        let plugin = plugin_in(&data, "mine").unwrap();
+        assert!(plugin.allowed);
+        assert_eq!(plugin.code.unwrap().runtime, code::Runtime::Python);
+    }
+
+    #[test]
+    fn a_manifest_whose_code_cannot_be_used_says_why() {
+        let data = scratch("code-refused");
+        let refused = |extra: Value, why: &str| {
+            let folder = data.join(PLUGINS_DIR).join("bad");
+            let _ = std::fs::remove_dir_all(&folder);
+            let mut manifest = serde_json::json!({"name": "bad", "main": "plugin.js"});
+            for (key, value) in extra.as_object().into_iter().flatten() {
+                manifest[key] = value.clone();
+            }
+            write(&folder.join(MANIFEST), manifest.to_string().as_bytes());
+            write(&folder.join("plugin.js"), b"");
+            let Err(error) = read_manifest(&folder) else {
+                panic!("{extra} was read");
+            };
+            assert!(error.contains(why), "{error}");
+        };
+        refused(
+            serde_json::json!({"main": "../plugin.js"}),
+            "not a folder inside",
+        );
+        refused(
+            serde_json::json!({"main": "/tmp/plugin.js"}),
+            "absolute path",
+        );
+        refused(serde_json::json!({"main": "plugin.rb"}), ".js or a .py");
+        refused(serde_json::json!({"main": "other.js"}), "is not there");
+        refused(serde_json::json!({"permissions": ["files"]}), "can ask for");
+        refused(
+            serde_json::json!({"contributes": {"events": ["window.focus"]}}),
+            "the events are",
+        );
+        refused(
+            serde_json::json!({
+                "name": "a-plugin-whose-name-is-long",
+                "contributes": {"tools": [{"name": "x".repeat(30), "description": "d"}]},
+            }),
+            "longer than the 64",
+        );
+        refused(
+            serde_json::json!({"contributes": {"tools": [{"name": "t"}]}}),
+            "no description",
+        );
+        refused(
+            serde_json::json!({"contributes": {"tools": [
+                {"name": "t", "description": "d"}, {"name": "T", "description": "d"},
+            ]}}),
+            "Two of its tools",
+        );
+        refused(
+            serde_json::json!({"contributes": {"settings": [{"key": "k", "type": "choice"}]}}),
+            "nothing to choose",
+        );
+        refused(
+            serde_json::json!({"main": "", "contributes": {"status": true}}),
+            "names no main file",
+        );
+    }
+
+    #[test]
+    fn a_plugin_holding_more_code_than_a_plugin_may_is_not_installed() {
+        let data = scratch("code-big");
+        let repo = code_repo(&data, "heavy", serde_json::json!({}));
+        let part = vec![b'/'; 1_500_000];
+        for n in 0..3 {
+            write(&repo.join(format!("lib/part{n}.js")), &part);
+        }
+        commit(&repo);
+        let error = add_in(&data, &source(&repo)).unwrap_err();
+        assert!(error.contains("bytes of code"), "{error}");
+        assert!(plugin_folders(&data).is_empty());
     }
 
     #[test]

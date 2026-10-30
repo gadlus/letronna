@@ -368,12 +368,15 @@ fn plugin_tools() -> &'static Mutex<Vec<Arc<dyn Tool>>> {
     EXTRA.get_or_init(Default::default)
 }
 
-/// The names of the tools the plugins add now.
+/// The names of the tools the plugins add now, the window's own and those
+/// plugins' code brings.
 pub fn plugin_names() -> Vec<String> {
-    plugin_tools()
+    let mut names: Vec<String> = plugin_tools()
         .lock()
         .map(|tools| tools.iter().map(|tool| tool.name().to_owned()).collect())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    names.extend(crate::plugins::code::tool_names());
+    names
 }
 
 /// Replace the plugin-contributed tools. The registry calls this at startup and
@@ -453,6 +456,9 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
             }
         }
     }
+    // Their names all start with `plugin__`, so they cannot shadow one of
+    // the above.
+    tools.extend(crate::plugins::code::tools());
     // MCP servers' tools, once they have answered. Their names all start
     // with `mcp__`, so they cannot shadow one of the above either.
     tools.extend(crate::mcp::tools());
@@ -953,6 +959,11 @@ pub(crate) fn run_found(
     // After the gate, so a hook sees only a call that would run, and can
     // only add a block to what the rules, the mode and the card allowed.
     let heard = crate::hooks::before(hooks, tool.name(), &args, ctx).map_err(|e| e + &note)?;
+    // The plugins that look at calls, after the user's own hooks, which
+    // can block it without asking anyone else.
+    let plugged =
+        crate::plugins::code::before(tool.name(), &args, ctx).map_err(|e| e + &note + &heard)?;
+    let heard = heard + &plugged;
     // A stop while a hook ran came after the card: the call must not run.
     if ctx.cancel.is_set() {
         return Err(crate::agent::STOPPED_BEFORE_START.into());
@@ -960,7 +971,9 @@ pub(crate) fn run_found(
     // Hidden before the cut, which could split a key and leave half of it
     // showing, and before anything is wrapped around the result.
     let shapes = tool.hides_key_shapes();
+    let began = std::time::Instant::now();
     let ran = tool.run(&args, ctx);
+    let took = began.elapsed();
     // An error can quote a page or a server too, but one in Letronna's own
     // words, as when the page could not be reached, gave the model nothing
     // to be talked into anything by; marked anyway, an offline session would
@@ -977,7 +990,14 @@ pub(crate) fn run_found(
     if tool.untrusted() && reached {
         crate::taint::mark(ctx);
     }
-    let ran = ran.map_err(|e| crate::redact::scrub(&e, shapes) + &note + &heard)?;
+    let ran = match ran {
+        Ok(ran) => ran,
+        Err(e) => {
+            let failed = crate::redact::scrub(&e, shapes) + &note + &heard;
+            let said = crate::plugins::code::failed(tool.name(), &args, &failed, took, ctx);
+            return Err(failed + &said);
+        }
+    };
     // Before the scrub: a key with a hidden character inside reads as a key
     // only once the character is gone.
     let (ran, hid) = if NOTED.contains(&tool.name()) {
@@ -1035,6 +1055,8 @@ pub(crate) fn run_found(
     out.push_str(&heard);
     let said = crate::hooks::after(hooks, tool.name(), &args, &out, ctx);
     out.push_str(&said);
+    let plugged = crate::plugins::code::after(tool.name(), &args, &out, took, ctx);
+    out.push_str(&plugged);
     Ok(out)
 }
 

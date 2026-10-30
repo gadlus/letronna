@@ -408,11 +408,12 @@ fn spoken(items: &[String]) -> String {
 
 /// Readies the hooks for a turn in `conversation`: an end a hook asked for
 /// in an earlier turn is forgotten, and hooks.json is read again if its
-/// modified time or length changed. It reads the disk, so never on a UI
-/// thread.
+/// modified time or length changed. The plugins' code hears the turn start
+/// here too, in every front end. It reads the disk, so never on a UI thread.
 pub fn new_turn(conversation: u64) {
     lock(&HALTS).retain(|&halted| halted != conversation);
     reread();
+    crate::plugins::code::turn_started(conversation);
 }
 
 /// Reads hooks.json again if it changed since it was last read, telling the
@@ -472,7 +473,10 @@ pub(crate) fn current() -> Arc<Result<Hooks, String>> {
 /// Whether the hooks as last read run anything at `event`. It never reads
 /// the file, so a window can ask.
 pub fn wanted(event: Event) -> bool {
-    cached().is_some_and(|hooks| hooks.as_ref().as_ref().is_ok_and(|hooks| hooks.has(event)))
+    // A plugin's code can send the model back at a turn's end as a Stop
+    // hook does, so a front end asks then too.
+    (event == Event::Stop && crate::plugins::code::stops())
+        || cached().is_some_and(|hooks| hooks.as_ref().as_ref().is_ok_and(|hooks| hooks.has(event)))
 }
 
 /// Why hooks.json cannot be used, as last read, if it cannot. It never reads
@@ -602,15 +606,20 @@ pub(crate) fn after(
 
 /// Runs the Stop hooks once the model has finished a turn with `last` as its
 /// reply: what one says is left to do, as the message that sends the model
-/// back to it, if any. `again` when a Stop hook already did this turn.
+/// back to it, if any. `again` when a Stop hook already did this turn. The
+/// plugins whose code hears `turn.stop` are asked after the user's own
+/// hooks, and send the model back the same way.
 pub fn stop(ctx: &ToolContext, last: &str, again: bool) -> Option<String> {
+    let plugged = || {
+        crate::plugins::code::turn_stop(ctx, last, again).map(|why| format!("{FEEDBACK}\n{why}"))
+    };
     let hooks = current();
     // One that cannot be used is shown to the user beside the cards it holds.
     let Ok(hooks) = hooks.as_ref() else {
-        return None;
+        return plugged();
     };
     if !hooks.has(Event::Stop) {
-        return None;
+        return plugged();
     }
     let own = json!({ "stop_hook_active": again, "last_assistant_message": last });
     let heard = hear(hooks, Event::Stop, "", &input(Event::Stop, ctx, own), ctx);
@@ -620,8 +629,10 @@ pub fn stop(ctx: &ToolContext, last: &str, again: bool) -> Option<String> {
         report(vec![format!("A Stop hook ended the turn: {why}")]);
         return None;
     }
-    let why = heard.blocks.into_iter().next()?;
-    Some(format!("{FEEDBACK}\n{why}"))
+    match heard.blocks.into_iter().next() {
+        Some(why) => Some(format!("{FEEDBACK}\n{why}")),
+        None => plugged(),
+    }
 }
 
 /// What starts a Stop hook's word sent back as the next message of a turn,
@@ -632,6 +643,7 @@ pub(crate) const FEEDBACK: &str = "Stop hook feedback:";
 /// thread of their own, since nothing waits on them; their failures are
 /// kept for `problems`.
 pub fn card(ctx: ToolContext, tool: &str) {
+    crate::plugins::code::approval_waits(&ctx, tool);
     if !wanted(Event::Notification) {
         return;
     }
@@ -680,8 +692,9 @@ pub fn problems() -> Vec<String> {
 }
 
 /// Keeps `problems` for a frontend to show, each cut to one line, dropping
-/// the oldest past `UNSHOWN`.
-fn report(problems: Vec<String>) {
+/// the oldest past `UNSHOWN`. Plugins report theirs here too, so every place
+/// that shows a hook's failure shows a plugin's.
+pub(crate) fn report(problems: Vec<String>) {
     tell(
         &FAILURES,
         problems.iter().map(|problem| shown(problem)).collect(),

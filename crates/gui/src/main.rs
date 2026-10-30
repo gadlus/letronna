@@ -805,6 +805,9 @@ fn main() {
         // MCP servers can take seconds to start; started with the window,
         // their tools are there by the first message.
         letronna_core::mcp::start();
+        // Plugins whose status shows from the start start now, off this
+        // thread.
+        letronna_core::plugins::code::init();
         // Off unless Settings turned it on.
         let _ = letronna_core::providers::local::apply(&letronna_core::store::current_settings());
         cx.bind_keys(
@@ -830,6 +833,7 @@ fn main() {
             // worktree; one kept for its work is left for the user to find.
             let _ = letronna_core::agents::stop_all();
             letronna_core::mcp::stop_all();
+            letronna_core::plugins::code::stop_all();
             letronna_core::lsp::stop_all();
             letronna_core::browser::close_hidden();
             letronna_core::on_device::runtime::quit();

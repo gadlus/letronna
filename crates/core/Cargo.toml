@@ -152,7 +152,11 @@ landlock = "0.4"
 default = ["workflows", "syntax"]
 # Orchestration scripts that run many agents at once. On by default, so CI
 # builds, lints and tests it; a build without it leaves the runtime out.
-workflows = ["dep:rquickjs"]
+workflows = ["js"]
+# The JavaScript engine itself, which workflows, the script tool and
+# plugins written in JavaScript run on. A build without it still runs
+# plugins written in Python.
+js = ["dep:rquickjs"]
 # The note a write's result carries when code no longer parses. On by
 # default; a build without it leaves out the grammars, about 5 MB of the
 # terminal's binary as estimated from their compiled objects.

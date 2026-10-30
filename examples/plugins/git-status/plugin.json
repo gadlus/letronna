@@ -1,0 +1,38 @@
+{
+  "name": "git-status",
+  "version": "1.0.0",
+  "description": "The session's branch in the status bar, what changed in a panel, and a tool the model can ask.",
+  "main": "plugin.py",
+  "contributes": {
+    "events": [
+      "turn.end",
+      "prompt.submit"
+    ],
+    "tools": [
+      {
+        "name": "summary",
+        "description": "The git branch of the session's project and the files changed in it, as git status says.",
+        "readOnly": true,
+        "openWorld": false
+      }
+    ],
+    "actions": [
+      {
+        "name": "changed",
+        "description": "What changed in this session's project"
+      }
+    ],
+    "status": true,
+    "panel": {
+      "title": "Git"
+    },
+    "settings": [
+      {
+        "key": "tell_model",
+        "label": "Tell the model the branch and what changed with each message",
+        "type": "switch",
+        "default": false
+      }
+    ]
+  }
+}

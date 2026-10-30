@@ -320,6 +320,7 @@ fn serve(words: &[String]) -> Result<(), String> {
     letronna_core::browser::close_hidden();
     letronna_core::jobs::stop_all();
     mcp::stop_all();
+    letronna_core::plugins::code::stop_all();
     letronna_core::on_device::runtime::quit();
     letronna_core::diag::stop();
     served

@@ -31,6 +31,8 @@ Letronna is an agent that works on your computer. It reads and edits files, runs
 - **Helpers and workflows**: sub-agents that work side by side on a shared task list, plus scripted workflows that run many of them.
 - **Any model**: hosted models on your Letronna account, your ChatGPT or Claude plan, OpenAI, Anthropic, Gemini, xAI, OpenRouter, OpenCode Go/Zen, Ollama, or any base URL. A provider takes more than one account, each plan shows how much is left, and a request goes on with your next account when one runs out.
 - **Extensible**: MCP servers (stdio and HTTP), plugins, skills, hooks, language servers, and editors over ACP.
+- **Any model**: hosted models on your Letronna account, OpenAI, Anthropic, OpenRouter, Ollama, or any base URL.
+- **Extensible**: MCP servers (stdio and HTTP), plugins (with code in JavaScript or Python, nothing to build), skills, hooks, language servers, and editors over ACP.
 - **Chat apps**: answer from Telegram, Discord or Slack with `letronna serve`.
 - **Letronna Cloud**: run tasks on Letronna's servers, keep services running, and host web apps.
 - **Small and local**: one executable, no runtime, and sessions stay on your disk.

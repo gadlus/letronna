@@ -367,6 +367,7 @@ fn main() {
         letronna_core::browser::close_hidden();
         letronna_core::jobs::stop_all();
         letronna_core::mcp::stop_all();
+        letronna_core::plugins::code::stop_all();
         letronna_core::lsp::stop_all();
         letronna_core::on_device::runtime::quit();
         // On stderr, which a script reading the answer leaves alone.
@@ -406,6 +407,8 @@ fn main() {
     runner.serve_helpers(std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
     render::clear();
     banner(&runner, &folder, session);
+    // Plugins whose status shows from the start start now, off this thread.
+    letronna_core::plugins::code::init();
     let (on, model) = runner.store.model(session);
     let keys = store::load_keys();
     let ready = letronna_core::gateway::ready(&keys, &runner.store.settings.custom_endpoint);
@@ -620,6 +623,7 @@ fn main() {
     // After the jobs, which may have been writing in a helper's worktree.
     let helpers_kept = letronna_core::agents::stop_all();
     letronna_core::mcp::stop_all();
+    letronna_core::plugins::code::stop_all();
     letronna_core::lsp::stop_all();
     letronna_core::on_device::runtime::quit();
     letronna_core::browser::close_hidden();

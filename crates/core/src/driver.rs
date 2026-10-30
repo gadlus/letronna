@@ -955,6 +955,12 @@ fn steps(
                 })
                 .flatten();
             let Some(feedback) = feedback else {
+                if spec.depth == 0 {
+                    let last = last_said(&spec.transcript.conversation.messages);
+                    let (id, workspace) =
+                        (spec.connection.conversation, &spec.connection.workspace);
+                    crate::plugins::code::turn_ended(id, workspace.as_deref(), Some(&last));
+                }
                 return Ok(Outcome::Done);
             };
             sent_back += 1;
