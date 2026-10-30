@@ -241,6 +241,11 @@ const STORY: &[&str] = &[
     "me",
 ];
 
+/// Words of `STORY` in the past tense, which in a specification say what a
+/// rule depends on, as "whether or not a cursor was given" does, rather than
+/// telling a story.
+const PAST: &[&str] = &["was", "were", "previously"];
+
 /// Words, in lower case and without their stop, after which a stop ends no
 /// sentence.
 const ABBREVIATIONS: &[&str] = &[
@@ -259,9 +264,17 @@ struct Block {
 }
 
 /// The requirement sentences of `request`, in its order, each once and as
-/// written but for its spacing.
+/// written but for its spacing. Where `FEWEST` or more state one by their
+/// wording, the request is a specification, whose plain sentences state one
+/// too, such as "Keys are matched without case": then each sentence is kept
+/// but a question, a story, how to work or code.
 pub(crate) fn sentences(request: &str) -> Vec<String> {
-    let mut found: Vec<String> = Vec::new();
+    let (mut stated, mut specified): (Vec<String>, Vec<String>) = Default::default();
+    let keep = |found: &mut Vec<String>, sentence: &str| {
+        if !found.iter().any(|kept| kept == sentence) {
+            found.push(sentence.to_owned());
+        }
+    };
     for block in blocks(request) {
         for (at, sentence) in split(&block.text).into_iter().enumerate() {
             // One starting in lower case goes on from words cut off by code,
@@ -270,12 +283,19 @@ pub(crate) fn sentences(request: &str) -> Vec<String> {
             if lower && !(block.item && at == 0) {
                 continue;
             }
-            if states(sentence) && !found.iter().any(|kept| kept == sentence) {
-                found.push(sentence.to_owned());
+            let states = states(sentence);
+            if states {
+                keep(&mut stated, sentence);
+            }
+            if states || specifies(sentence) {
+                keep(&mut specified, sentence);
             }
         }
     }
-    found
+    match stated.len() >= FEWEST {
+        true => specified,
+        false => stated,
+    }
 }
 
 /// What sends a run back to check its change against `sentences`, the
@@ -742,8 +762,15 @@ fn split(text: &str) -> Vec<&str> {
                 .unwrap_or_default();
             let last = last.trim_start_matches(['(', '"', '\'']).to_lowercase();
             let next = text[at + 1..].trim_start().chars().next();
-            let goes_on = c == b'.'
-                && (ABBREVIATIONS.contains(&last.as_str()) || next.is_some_and(char::is_lowercase));
+            // After a bang, words in lower case or in brackets go on, as "and
+            // ! (complement)" does.
+            let goes_on = match c {
+                b'.' => {
+                    ABBREVIATIONS.contains(&last.as_str()) || next.is_some_and(char::is_lowercase)
+                }
+                b'!' => next.is_some_and(|next| next.is_lowercase() || next == '('),
+                _ => false,
+            };
             if !goes_on {
                 sentences.push(text[start..=at].trim());
                 start = at + 1;
@@ -768,7 +795,10 @@ fn states(sentence: &str) -> bool {
         .to_lowercase()
         .replace('\u{2019}', "'");
     let words: Vec<&str> = prose.split_whitespace().collect();
-    if words.len() < 3 {
+    let first =
+        (words.first().copied().unwrap_or_default()).trim_matches(|c: char| !c.is_alphanumeric());
+    // Two words do when the first asks for something, as "Export `Result`." does.
+    if words.len() < 2 || (words.len() == 2 && !IMPERATIVES.contains(&first)) {
         return false;
     }
     // More than one word in five that reads as code is a snippet, not a sentence.
@@ -781,7 +811,6 @@ fn states(sentence: &str) -> bool {
     if STORY.iter().any(|word| holds(&prose, word)) {
         return false;
     }
-    let first = words[0].trim_matches(|c: char| !c.is_alphanumeric());
     let condition = CONDITIONS.contains(&first) && prose.contains(',');
     // A sentence that opens with a name in code and goes on with a word says
     // what that name does.
@@ -790,6 +819,36 @@ fn states(sentence: &str) -> bool {
         || condition
         || named
         || MARKERS.iter().any(|marker| holds(&prose, marker))
+}
+
+/// Whether `sentence`, in a request that is a specification, states
+/// something it asks for: any sentence but a question, a story, how to work
+/// or a snippet of code, where an interface spelled out in prose, such as
+/// routes and what each returns, is no snippet.
+fn specifies(sentence: &str) -> bool {
+    if sentence.ends_with('?') {
+        return false;
+    }
+    let prose = outside_code(sentence)
+        .to_lowercase()
+        .replace('\u{2019}', "'");
+    let words: Vec<&str> = prose.split_whitespace().collect();
+    if words.len() < 3 {
+        return false;
+    }
+    // Mostly code is a snippet, unless it opens in words, as "Web API at
+    // /api/x: save(POST, returns {id})" does.
+    let opens_in_words = words.iter().take(3).all(|word| !codelike(word));
+    let code = words.iter().filter(|word| codelike(word)).count();
+    if code * 2 > words.len() && !opens_in_words {
+        return false;
+    }
+    if PROCESS.iter().any(|phrase| prose.contains(phrase)) {
+        return false;
+    }
+    !(STORY.iter())
+        .filter(|word| !PAST.contains(word))
+        .any(|word| holds(&prose, word))
 }
 
 /// `sentence` with each closed code span standing as `SPAN`.
@@ -851,10 +910,15 @@ fn prompt(line: &str) -> bool {
             .any(|p| line.starts_with(p))
 }
 
-/// Whether `line` is a markdown heading.
+/// Whether `line` is a markdown heading, not a sentence that starts with a
+/// `#`, as a comment directive written out in prose does.
 fn heading(line: &str) -> bool {
     let marks = line.bytes().take_while(|&b| b == b'#').count();
-    marks > 0 && (line.len() == marks || line[marks..].starts_with(' '))
+    let title = line[marks..].trim();
+    marks > 0
+        && (line.len() == marks || line[marks..].starts_with(' '))
+        && !title.ends_with('.')
+        && !title.contains(". ")
 }
 
 /// Whether `line` is a lone tag a task is wrapped in, as `<task>` is.
@@ -1011,6 +1075,71 @@ mod tests {
                 "`Channel.close()` cancels all consumers.",
                 "Links in a chain are checked each on its own.",
             ]
+        );
+    }
+
+    #[test]
+    fn in_a_specification_each_plain_sentence_is_a_requirement_too() {
+        let request = "The parser must accept tabs. Keys must be unique. Values should be trimmed. \
+                       Each key returns its value. Keys are matched without case. \
+                       Later keys break ties from earlier keys. \
+                       Every reply holds `next` whether or not a cursor was given. \
+                       Web API at /api/items/: save(POST, returns {id}), list(GET, returns {items}). \
+                       I think the old parser was slow. Should keys allow dots? \
+                       x = load(path_a, path_b) # [skip]";
+        assert_eq!(
+            sentences(request),
+            [
+                "The parser must accept tabs.",
+                "Keys must be unique.",
+                "Values should be trimmed.",
+                "Each key returns its value.",
+                "Keys are matched without case.",
+                "Later keys break ties from earlier keys.",
+                "Every reply holds `next` whether or not a cursor was given.",
+                "Web API at /api/items/: save(POST, returns {id}), list(GET, returns {items}).",
+            ]
+        );
+        // With fewer sentences that state a requirement by their wording, a
+        // plain one is description.
+        assert_eq!(
+            sentences("The parser must accept tabs. Keys are matched without case."),
+            ["The parser must accept tabs."]
+        );
+    }
+
+    #[test]
+    fn a_line_that_starts_with_a_hash_and_reads_as_a_sentence_is_no_heading() {
+        let request = "# Directives\n\n\
+                       # begin-skip [RULES]: Start a region that must cover the lines after it.\n\
+                       # end-skip: End the latest region, which must not cover this line.";
+        assert_eq!(
+            sentences(request),
+            [
+                "# begin-skip [RULES]: Start a region that must cover the lines after it.",
+                "# end-skip: End the latest region, which must not cover this line.",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bang_before_words_in_lower_case_or_brackets_ends_no_sentence() {
+        let request = "The operators | (union), & (intersection) and ! (complement) must combine \
+                       rules. Stop! Each rule must apply once.";
+        assert_eq!(
+            sentences(request),
+            [
+                "The operators | (union), & (intersection) and ! (complement) must combine rules.",
+                "Each rule must apply once.",
+            ]
+        );
+    }
+
+    #[test]
+    fn two_words_that_ask_for_something_are_a_requirement() {
+        assert_eq!(
+            sentences("Export `Result`. `retry` option. Respect `strict`."),
+            ["Export `Result`.", "Respect `strict`."]
         );
     }
 
