@@ -387,6 +387,10 @@ pub struct Settings {
     /// while the computer asks for reduced motion.
     #[serde(default = "yes")]
     pub motion: bool,
+    /// How many steps larger the window draws its text than the usual size,
+    /// or smaller below zero, as Cmd+= and Cmd+- step it.
+    #[serde(default)]
+    pub text_step: i8,
     /// Tell the computer when a run ends or needs an answer while nobody is
     /// looking at the window or the terminal.
     #[serde(default = "yes")]
@@ -660,6 +664,7 @@ impl Default for Settings {
             appearance: String::new(),
             grain: true,
             motion: true,
+            text_step: 0,
             notifications: true,
             voice: false,
             verify_edits: true,
@@ -6031,6 +6036,21 @@ pub(crate) mod tests {
         let first = load().settings;
         assert_eq!((first.appearance.as_str(), first.grain), ("", true));
         assert!(first.motion);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn the_windows_text_size_starts_usual_and_is_kept_once_stepped() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("text-step");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        // As a build from before the text size wrote it.
+        std::fs::write(dir.join("settings.json"), r#"{"model":"a/model"}"#).unwrap();
+        let mut store = load();
+        assert_eq!(store.settings.text_step, 0);
+        store.settings.text_step = -2;
+        store.save().unwrap();
+        assert_eq!(load().settings.text_step, -2);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
