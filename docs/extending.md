@@ -61,7 +61,7 @@ Each server runs only for the projects listed. Most language servers execute pro
 { "projects": ["/home/me/code/letronna"] }
 ```
 
-It uses only a formatter the project has set up and this computer already has: rustfmt in a Cargo project, prettier or Biome from the project's `node_modules` under their config, ruff or black under their `pyproject.toml` section, gofmt beside a `go.mod`, clang-format under a `.clang-format`. Nothing is installed or fetched, and a formatter gets ten seconds. Like language servers, it is off until you list a project, since a formatter can run code the project picks.
+It uses only a formatter the project has set up and this computer already has: rustfmt in a Cargo project, prettier or Biome from the project's `node_modules` under their config, ruff or black under their `pyproject.toml` section, gofmt beside a `go.mod`, clang-format under a `.clang-format`. Nothing is installed or fetched, and a formatter gets ten seconds. Like language servers, it is off until you list a project, since a formatter can run code the project picks. `/format` in the terminal, or Format edits in this project under Settings › Thinking in the window, lists or unlists the project you are in.
 
 ## Skills
 

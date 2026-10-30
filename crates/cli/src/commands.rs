@@ -355,6 +355,10 @@ pub fn command(
             }));
             Flow::Handled
         }
+        "/format" => {
+            format_edits(here, rest);
+            Flow::Handled
+        }
         "/memory-review" => {
             let Some(on) = switched("/memory-review", rest, runner.store.settings.memory_review)
             else {
@@ -2087,7 +2091,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Modes",
-        &["/mode", "/plan", "/decisions", "/permissions", "/verify", "/coauthor"],
+        &["/mode", "/plan", "/decisions", "/permissions", "/verify", "/format", "/coauthor"],
     ),
     (
         "Tools",
@@ -2218,6 +2222,46 @@ fn coauthor(runner: &mut Runner, rest: &str) {
         "A commit a session writes here ends with \u{201c}Co-authored-by: Letronna\u{201d}, and a pull request with Letronna's mark."
     } else {
         "Commits and pull requests written here are yours alone."
+}
+
+/// Turn running the project's own formatter on each file the agent writes
+/// on or off for the project `here`, saying what it would use.
+fn format_edits(here: Option<&std::path::Path>, rest: &str) {
+    render::blank();
+    let Some(root) = here else {
+        render::line(&render::dim(
+            "This session has no project folder to format in.",
+        ));
+        return;
+    };
+    let Some(on) = switched("/format", rest, letronna_core::formatter::on(root)) else {
+        return;
+    };
+    if let Err(error) = letronna_core::formatter::switch(root, on) {
+        render::line(&render::red(&error));
+        return;
+    }
+    if !on {
+        render::line(&render::dim(
+            "Files the model writes here are left as it writes them.",
+        ));
+        return;
+    }
+    let found: Vec<String> = letronna_core::formatter::found(root)
+        .iter()
+        .map(|(formatter, kinds)| format!("{} for {kinds}", formatter.name))
+        .collect();
+    render::line(&render::dim(&if found.is_empty() {
+        "On, but nothing is set up at the top of this project: rustfmt in a Cargo project, \
+         prettier or Biome in node_modules under their config, ruff or black in pyproject.toml, \
+         gofmt beside go.mod, clang-format under .clang-format. One set up deeper in is used \
+         for the files under it."
+            .to_owned()
+    } else {
+        format!(
+            "Each file the model writes here now goes through {}.",
+            found.join(", ")
+        )
     }));
 }
 

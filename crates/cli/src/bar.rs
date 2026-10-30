@@ -155,6 +155,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "ask the model to build or test after it changes files, or not",
     },
     Command {
+        name: "/format",
+        blurb: "run this project's own formatter on each file written, or not",
+    },
+    Command {
         name: "/retention",
         blurb: "delete sessions older than N days, or off to keep them",
     },

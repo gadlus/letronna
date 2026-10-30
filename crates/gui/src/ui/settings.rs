@@ -2482,6 +2482,52 @@ fn thinking_page(chat: &Entity<Chat>, store: &Store, window: &mut Window, cx: &m
         .child(search)
         .child(voice)
         .child(verify)
+        .children(format_row(store, chat, cx))
+}
+
+/// The switch that runs the project's own formatter on each file Letronna
+/// writes there, for the project of the session on screen, with what it
+/// would use; none for a session with no project folder.
+fn format_row(store: &Store, chat: &Entity<Chat>, cx: &App) -> Option<Div> {
+    let root = store.conversations.get(store.active)?.workspace.clone()?;
+    let on = letronna_core::formatter::on(&root);
+    let found: Vec<String> = letronna_core::formatter::found(&root)
+        .iter()
+        .map(|(formatter, kinds)| format!("{} for {kinds}", formatter.name))
+        .collect();
+    let name = root.file_name().map_or_else(
+        || root.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let here = if found.is_empty() {
+        format!(
+            "Nothing is set up at the top of {name}; one set up deeper in is used for the files under it."
+        )
+    } else {
+        format!("In {name}: {}.", found.join(", "))
+    };
+    let row = toggle_row(
+        "format-edits",
+        "Format edits in this project",
+        "Run the formatter this project already uses on each file Letronna writes, never one it \
+         would have to fetch. Off for every project until you turn it on.",
+        on,
+        chat,
+        cx,
+        std::rc::Rc::new(move |this: &mut Chat| {
+            if let Err(error) = letronna_core::formatter::switch(&root, !on) {
+                this.error = Some(error);
+            }
+        }),
+    );
+    Some(
+        v_flex().gap_1().child(row).child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(here),
+        ),
+    )
 }
 
 /// A switch with a name and a line about what it does.
