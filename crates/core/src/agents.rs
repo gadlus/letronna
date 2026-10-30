@@ -445,7 +445,7 @@ impl Tool for Agent {
         json!({"type": "object", "properties": {
             "description": {"type": "string", "description": "Three to five words, shown to the user."},
             "prompt": {"type": "string", "description": "The whole task. The helper has not seen this conversation: say what to do, what you already know, and what to report back."},
-            "type": {"type": "string", "description": "general (default), explore (read-only, cheaper), plan, review, or another type your instructions name."},
+            "type": {"type": "string", "description": "general (default), explore (read-only, cheaper), plan, review, tester, or another type your instructions name."},
             "name": {"type": "string", "description": "A handle for the agents tool. Defaults to the type."},
             "model": {"type": "string", "description": "A model id on this gateway. Default: the type's, then Settings, then yours."},
             "background": {"type": "boolean", "description": "false waits for the report. Default true in the window and terminal, unless the type says otherwise."},
@@ -1364,6 +1364,11 @@ fn reserve(
     given.push(name.clone());
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     Ok(occupy(&mut registry, id, name, owner, at_once, cancel))
+}
+
+/// The most helpers session `root` may run at once.
+pub(crate) fn at_once(root: u64) -> usize {
+    Limits::read(root).at_once.most
 }
 
 /// Refuses another helper when `at_once` is reached by the helpers started

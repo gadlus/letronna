@@ -110,6 +110,7 @@ mod side;
 pub mod skills;
 pub mod slash;
 mod snapshot;
+mod spec_tests;
 pub mod speech;
 mod state;
 pub mod store;

@@ -373,23 +373,32 @@ pub(crate) fn brief(request: &str, sentences: &[String], share: (usize, usize)) 
     text
 }
 
-/// What the run is told when helpers that have not seen its work reviewed it
-/// for the run: the numbered requirements, as `notice` lists them, the
-/// helpers' `reports` with their tables, and the check to make after.
-pub(crate) fn reviewed(sentences: &[String], reports: &[String]) -> String {
-    let mut text = notice(sentences, false, &[]);
+/// What the run is told when helpers that have not seen its work reviewed or
+/// tested it for the run: the numbered requirements, as `notice` lists them,
+/// the reviewers' `reports` with their tables, or with none the ask for a
+/// review as `notice` makes it, what it is told of the tester's report when
+/// there is one, `tested`, and the check to make after.
+pub(crate) fn reviewed(sentences: &[String], reports: &[String], tested: Option<&str>) -> String {
+    // With no review's table the run still asks for a review itself.
+    let mut text = notice(sentences, reports.is_empty(), &[]);
     let at = text.find(CHECK).unwrap_or(text.len());
     text.truncate(at);
-    text.push_str(
-        "Helpers that haven't seen your work reviewed it against the request; their reports \
-         follow, each ending with a table of its rows. Fix every row that fails by changing \
-         the work, not the case, and any case a report calls unclear or sets aside, unless \
-         the request rules that case out.",
-    );
-    for report in reports {
-        text.push_str(&format!("\n\n{}", report.trim()));
+    if !reports.is_empty() {
+        text.push_str(
+            "Helpers that haven't seen your work reviewed it against the request; their \
+             reports follow, each ending with a table of its rows. Fix every row that fails by \
+             changing the work, not the case, and any case a report calls unclear or sets \
+             aside, unless the request rules that case out.",
+        );
+        for report in reports {
+            text.push_str(&format!("\n\n{}", report.trim()));
+        }
+        text.push_str("\n\n");
     }
-    text.push_str("\n\n");
+    if let Some(tested) = tested {
+        text.push_str(tested.trim());
+        text.push_str("\n\n");
+    }
     text.push_str(CHECK);
     text
 }
@@ -1112,13 +1121,25 @@ mod tests {
             .map(String::from)
             .into();
         let reports = ["review-r1 finished: 3 rounds.\nR1 | iso | PASS\nR2 | utc | FAIL | t.sh"];
-        let text = reviewed(&rules, &reports.map(String::from));
+        let text = reviewed(&rules, &reports.map(String::from), None);
         assert!(text.starts_with(&notice(&rules, false, &[])[..60]));
         assert_eq!(listed(&text), Some(2));
         assert!(text.contains("Helpers that haven't seen your work reviewed it"));
         assert!(text.contains("\n\nreview-r1 finished: 3 rounds.\nR1 | iso | PASS\n"));
         assert!(text.ends_with(CHECK) && !text.contains(REVIEW));
         assert_eq!(rows(&text).len(), 2);
+    }
+
+    #[test]
+    fn with_only_the_testers_table_the_run_still_asks_for_a_review() {
+        let rules: Vec<String> = ["Dates must parse.", "Times must parse."]
+            .map(String::from)
+            .into();
+        let tested = "A tester wrote tests.\nR1 | iso | FAIL | t.sh | got None";
+        let text = reviewed(&rules, &[], Some(tested));
+        assert!(text.contains(REVIEW), "{text}");
+        assert!(!text.contains("Helpers that haven't seen your work reviewed it"));
+        assert!(text.contains(&format!("{tested}\n\n{CHECK}")), "{text}");
     }
 
     #[test]

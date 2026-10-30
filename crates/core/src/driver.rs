@@ -517,6 +517,16 @@ pub fn run_keeping(mut spec: Spec) -> (Report, Transcript) {
             Ok(status)
         })
         .unwrap_or_else(Outcome::Failed);
+    // However it ended: a run stopped at its deadline never deletes the
+    // tester's files it put back to run them, and a patch would take them.
+    if spec.depth == 0
+        && let Some(workspace) = &spec.connection.workspace
+    {
+        let deleted = crate::spec_tests::tidy(spec.id);
+        report.files.retain(|file| {
+            !(deleted.iter()).any(|gone| workspace.join(file) == workspace.join(gone))
+        });
+    }
     // Before the unread mail is passed on, so a job that exits from here on
     // tells the owner itself, and one that exited already goes with the mail.
     report.jobs = tasks::reown(spec.id, spec.owner)
@@ -2321,12 +2331,13 @@ fn requirements(
     // Started for the run, so the brief holds what the run's own tends to
     // leave out and each helper is of the type that judges by the request;
     // the run asks for one itself only where none came back with a table.
-    let reports = (review && outputs.is_empty())
-        .then(|| reviews(spec, typed, &found))
-        .flatten();
-    let content = match reports {
-        Some(reports) => crate::requirements::reviewed(&found, &reports),
-        None => crate::requirements::notice(&found, review, &outputs),
+    let (reports, tested) = match review && outputs.is_empty() {
+        true => reviews(spec, typed, &found),
+        false => Default::default(),
+    };
+    let content = match reports.is_empty() && tested.is_none() {
+        false => crate::requirements::reviewed(&found, &reports, tested.as_deref()),
+        true => crate::requirements::notice(&found, review, &outputs),
     };
     Some(Message {
         role: "user".into(),
@@ -2385,8 +2396,10 @@ fn unreviewed(messages: &[Message]) -> Option<String> {
 
 /// The reports of review helpers started side by side for a run nobody
 /// watches, each checking its share of `found`, the requirements `request`
-/// states, and waited for; None when none came back with a table.
-fn reviews(spec: &Spec, request: &str, found: &[String]) -> Option<Vec<String>> {
+/// states, and beside them a tester's, writing tests from the request alone,
+/// all waited for: the reviews that came back with a table, and the tester's
+/// as the run is told it, with where its tests are kept, if it had one.
+fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option<String>) {
     let mut ctx = context(spec);
     // On a run with a deadline the review and the fix after it share the
     // time left evenly: each helper gives its answer at its own deadline,
@@ -2405,8 +2418,27 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Option<Vec<String>> 
     let afford = (spec.budget.as_ref()).map_or(usize::MAX, |budget| {
         (budget.left() / crate::requirements::REVIEW_TOKENS).max(1) as usize
     });
-    let reports: Vec<String> = std::thread::scope(|scope| {
-        let started: Vec<_> = (crate::requirements::shares(found.len()).into_iter())
+    let shares = crate::requirements::shares(found.len());
+    // A place of its own beside the reviews, or no tester: no review is
+    // refused for it.
+    let testing = crate::agents::at_once(ctx.caller.root) > shares.len();
+    let workspace = spec.connection.workspace.as_deref();
+    // In a copy of the project where one can be made, so its tests, half
+    // written or failing on purpose, never meet the reviews running the
+    // project's suite.
+    let copied = workspace
+        .filter(|_| testing)
+        .and_then(crate::spec_tests::copy);
+    let mut tester_ctx = ctx.clone();
+    if let (Some(copy), Some(parent)) = (&copied, ctx.caller.connection.as_deref()) {
+        tester_ctx.workspace = Some(copy.clone());
+        tester_ctx.caller.connection = Some(Arc::new(Connection {
+            workspace: Some(copy.clone()),
+            ..parent.clone()
+        }));
+    }
+    let (reports, tested): (Vec<String>, Option<String>) = std::thread::scope(|scope| {
+        let started: Vec<_> = (shares.into_iter())
             .take(afford)
             .map(|share| {
                 let ctx = ctx.clone();
@@ -2420,12 +2452,34 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Option<Vec<String>> 
                 scope.spawn(move || tools::Tool::run(&crate::agents::Agent, &args, &ctx))
             })
             .collect();
-        (started.into_iter())
+        let tester = testing.then(|| {
+            let args = json!({
+                "description": "Test from the request alone",
+                "name": "tester",
+                "type": "tester",
+                "background": false,
+                "prompt": crate::spec_tests::brief(request, found),
+            });
+            scope.spawn(move || tools::Tool::run(&crate::agents::Agent, &args, &tester_ctx))
+        });
+        let reports = (started.into_iter())
             .filter_map(|helper| helper.join().ok()?.ok())
             .filter(|report| crate::requirements::tabled(report))
-            .collect()
+            .collect();
+        let tested = tester.and_then(|tester| tester.join().ok()?.ok());
+        (reports, tested)
     });
-    (!reports.is_empty()).then_some(reports)
+    // Kept apart whatever the tester reported, so no patch of the project
+    // takes them; the run puts them back to run them.
+    let kept = workspace.and_then(|workspace| {
+        crate::spec_tests::keep(spec.id, copied.as_deref().unwrap_or(workspace), workspace)
+    });
+    if let Some(copy) = &copied {
+        crate::spec_tests::discard(copy);
+    }
+    let tested = (tested.filter(|report| crate::requirements::tabled(report)))
+        .map(|report| crate::spec_tests::told(&report, kept.as_ref()));
+    (reports, tested)
 }
 
 /// The notice telling a session's own run nobody watches where the project's
@@ -6596,7 +6650,8 @@ pub(crate) mod tests {
 
     /// The requests of a run asked `SPECIFIED` in a folder `name`, as `setup`
     /// leaves it, once it has changed source and been sent back, with the one
-    /// review helper started for it answering `reviewer`, if one is.
+    /// review helper and the tester started for it each answering `reviewer`,
+    /// if they are: they run side by side, so either may be asked first.
     fn requirements_sent(
         name: &str,
         id: AgentId,
@@ -6606,7 +6661,11 @@ pub(crate) mod tests {
         let _data = data(name);
         let dir = scratch(name);
         let mut answers = vec![reply("", &[write_made()]), reply("Added parse_range.", &[])];
-        answers.extend(reviewer.map(|said| reply(said, &[])));
+        answers.extend(
+            reviewer
+                .iter()
+                .flat_map(|said| [reply(said, &[]), reply(said, &[])]),
+        );
         answers.push(reply("Each requirement holds.", &[]));
         let (mut spec, provider) = specified(&dir, id, SPECIFIED, answers);
         setup(&mut spec);
@@ -6693,10 +6752,10 @@ pub(crate) mod tests {
         assert!(asked.contains("\n\nreview-r1"), "{asked}");
         // The review is started for the run: a helper of the review type,
         // with the request and the cases, and none of the run's reasons.
-        let task = (messages(&sent[2]).iter())
+        let task = (sent[2..4].iter().flat_map(messages))
             .filter_map(|message| message["content"].as_str())
             .find(|content| content.contains("You are a helper (review)."))
-            .unwrap_or_else(|| panic!("{:?}", sent[2]))
+            .unwrap_or_else(|| panic!("{:?}", &sent[2..4]))
             .to_owned();
         assert!(task.contains("The request, word for word:"), "{task}");
         assert!(
@@ -6788,6 +6847,177 @@ pub(crate) mod tests {
                 .any(|m| m.contains("This run has about 40 minutes")),
             "{run:?}"
         );
+        // The tester beside it has the same.
+        let tester = (sent.iter().map(said))
+            .find(|said| {
+                said.iter()
+                    .any(|m| m.contains("You are a helper (tester)."))
+            })
+            .expect("no tester was started");
+        assert!(
+            tester
+                .iter()
+                .any(|m| m.contains("This run has about 20 minutes")),
+            "{tester:?}"
+        );
+    }
+
+    /// A provider that answers `count` requests, each with what `answer`
+    /// says to what it carried, and hands back what each carried: helpers
+    /// side by side ask in no set order, so each is answered by who it is.
+    fn provider_by(
+        count: usize,
+        answer_to: impl Fn(&Value) -> String + Send + 'static,
+    ) -> (String, Stub) {
+        let (server, endpoint) = listen();
+        let address = server.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            (0..count)
+                .map(|_| {
+                    let (mut socket, _) = server.accept().unwrap();
+                    let sent = request(&mut socket);
+                    answer(&mut socket, &answer_to(&sent));
+                    sent
+                })
+                .collect()
+        });
+        (endpoint, Stub { address, worker })
+    }
+
+    #[test]
+    fn a_tester_beside_the_reviews_tests_from_the_request_alone_and_its_tests_leave_the_project() {
+        let _data = data("requirements-tester");
+        let dir = scratch("requirements-tester");
+        // A git project, so the tester works in a copy of it.
+        for args in [&["init", "-q"][..], &["add", "-A"]] {
+            let mut git = std::process::Command::new("git");
+            git.args(args).current_dir(&*dir);
+            assert!(git.status().unwrap().success(), "git {args:?}");
+        }
+        let (project, in_project) = (dir.to_path_buf(), Arc::new(AtomicBool::new(true)));
+        let (seen, kept_then) = (in_project.clone(), Arc::new(std::sync::Mutex::new(None)));
+        let read = kept_then.clone();
+        let test = (
+            "write_file",
+            json!({"path": "tests/letronna_spec_range.rs", "content": "#[test] fn reversed() {}"}),
+        );
+        let table = "Wrote one test.\nR3 | b..a is rejected with `empty range` | FAIL | \
+                     cargo test --test letronna_spec_range | expected Err(empty range), got Ok";
+        let run = std::sync::Mutex::new(
+            vec![
+                reply("", &[write_made()]),
+                reply("Added parse_range.", &[]),
+                reply("Each requirement holds.", &[]),
+                // It copies the kept test back to run it, and leaves it.
+                reply("", std::slice::from_ref(&test)),
+                reply("Rejected b..a.", &[]),
+                // The edits are checked once more, as at any run's end.
+                reply("Rejected b..a; the test passes now.", &[]),
+            ]
+            .into_iter(),
+        );
+        let (tests, wrote) = (reply("", &[test]), reply(table, &[]));
+        let (endpoint, provider) = provider_by(9, move |sent| {
+            let said = |what: &str| {
+                messages(sent)
+                    .iter()
+                    .any(|m| m["content"].as_str().is_some_and(|c| c.contains(what)))
+            };
+            match () {
+                // Once it has written its test, the call is in what it sends.
+                _ if said("You are a helper (tester).")
+                    && sent.to_string().contains("letronna_spec_range.rs") =>
+                {
+                    let written = project.join("tests/letronna_spec_range.rs");
+                    seen.store(written.exists(), Ordering::SeqCst);
+                    wrote.clone()
+                }
+                _ if said("You are a helper (tester).") => tests.clone(),
+                _ if said("You are a helper (review).") => reply(PASSED, &[]),
+                _ => {
+                    // What is kept while the run goes on.
+                    let notice = (messages(sent).iter())
+                        .filter_map(|message| message["content"].as_str())
+                        .find_map(|content| content.split("kept out of the project, in `").nth(1))
+                        .and_then(|rest| rest.split('`').next());
+                    if let Some(kept) = notice {
+                        let test = Path::new(kept).join("tests/letronna_spec_range.rs");
+                        *read.lock().unwrap() = std::fs::read_to_string(test).ok();
+                    }
+                    run.lock().unwrap().next().unwrap()
+                }
+            }
+        });
+        let mut spec = spec(endpoint, &dir, AGENTS + 1_798);
+        spec.depth = 0;
+        // The gate itself decides, for the helpers too, as in a `-p` run in
+        // Bypass.
+        spec.decide = None;
+        spec.connection.mode = crate::gate::Mode::Bypass;
+        spec.transcript.conversation.messages[0].content = SPECIFIED.into();
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "Rejected b..a; the test passes now.");
+        let sent = provider.sent();
+
+        // Its task is the request word for word, and nothing of the work.
+        let said = |body: &Value| -> String {
+            let contents = messages(body).iter().filter_map(|m| m["content"].as_str());
+            contents.collect::<Vec<_>>().join("\n")
+        };
+        let task = (sent.iter().map(said))
+            .find(|said| said.contains("You are a helper (tester)."))
+            .unwrap();
+        assert!(task.contains("The request, word for word:"), "{task}");
+        assert!(
+            task.contains("Do not modify or add test files unless the task requires it."),
+            "{task}"
+        );
+        assert!(
+            task.contains("R3: A range whose start is past its end"),
+            "{task}"
+        );
+        assert!(!task.contains("Added parse_range."), "{task}");
+        // It wrote its test in a copy of the project, gone once it answered,
+        // so the reviews beside it never met the test in the project.
+        assert!(!in_project.load(Ordering::SeqCst));
+        let copy = task.split("The project folder is `").nth(1).unwrap();
+        let copy = Path::new(copy.split('`').next().unwrap());
+        assert!(copy.to_string_lossy().contains("-spec-copy-"), "{task}");
+        assert!(!copy.exists());
+
+        // Its test left the project, the copy the run put back is gone as
+        // the run ends, and the run is told where it is kept.
+        assert!(!dir.join("tests/letronna_spec_range.rs").exists());
+        let notice = (sent.iter().flat_map(messages))
+            .filter_map(|message| message["content"].as_str())
+            .find(|content| content.contains("A tester that hasn't seen your work"))
+            .unwrap()
+            .to_owned();
+        assert!(brings_reviews(&notice), "{notice}");
+        assert!(
+            notice.contains("`tests/letronna_spec_range.rs`"),
+            "{notice}"
+        );
+        let kept = notice
+            .split("kept out of the project, in `")
+            .nth(1)
+            .unwrap();
+        let kept = Path::new(kept.split('`').next().unwrap());
+        assert_eq!(
+            kept_then.lock().unwrap().as_deref(),
+            Some("#[test] fn reversed() {}")
+        );
+        // And the folder it was kept in goes as the run ends.
+        assert!(!kept.exists());
+
+        // And a test of its that failed holds the run as a review's row does.
+        let held = (sent.iter().flat_map(messages))
+            .filter_map(|message| message["content"].as_str())
+            .any(|content| {
+                content.contains("has these rows that failed:\n- R3 | b..a is rejected")
+            });
+        assert!(held);
     }
 
     #[test]
@@ -6798,6 +7028,7 @@ pub(crate) mod tests {
         let answers = vec![
             reply("", &[write_made()]),
             reply("Added parse_range.", &[]),
+            reply(PASSED, &[]),
             reply(PASSED, &[]),
             reply("", &[fixed]),
             reply("Fixed the empty range.", &[]),
@@ -6954,7 +7185,9 @@ pub(crate) mod tests {
         let answers = vec![
             reply("", &[command("echo pass > orders.py")]),
             reply("Wrote the script.", &[]),
-            // The review started for it brings no table, so it asks for one.
+            // The review and the tester started for it bring no table, so it
+            // asks for one.
+            reply("Fine.", &[]),
             reply("Fine.", &[]),
             reply("Each rule holds.", &[]),
         ];

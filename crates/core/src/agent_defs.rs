@@ -301,6 +301,22 @@ fn built_ins() -> Vec<AgentDef> {
                 .into(),
             ..Default::default()
         },
+        AgentDef {
+            name: "tester".into(),
+            description: "Writes and runs tests of work it has not seen, from its request's \
+                          words alone, and reports which fail."
+                .into(),
+            tools: names(&[LOOKING, &["run_command", "write_file", "edit_file"]].concat()),
+            // Not plan mode: it writes its tests and runs them.
+            plan: false,
+            prompt: "Test the work you are pointed at by what its request says should happen, \
+                     not by what the code does. Read the code only to learn how to call it, write \
+                     each test the way the project's own tests are written, and run it. A test \
+                     that fails on what the request says is a finding to report, never one to \
+                     change until it passes."
+                .into(),
+            ..Default::default()
+        },
     ]
 }
 
@@ -537,10 +553,13 @@ mod tests {
 
         let defs = loaded(&data, Some(&project));
         let names: Vec<&str> = defs.iter().map(|(def, _)| def.name.as_str()).collect();
-        assert_eq!(names, ["general", "explore", "plan", "review", "docs"]);
-        assert_eq!(defs[4].0.prompt, "Project.");
-        assert_eq!(defs[4].1, Some(letronna.join("docs.md")));
-        assert_eq!(loaded(&data, None)[4].0.prompt, "User.");
+        assert_eq!(
+            names,
+            ["general", "explore", "plan", "review", "tester", "docs"]
+        );
+        assert_eq!(defs[5].0.prompt, "Project.");
+        assert_eq!(defs[5].1, Some(letronna.join("docs.md")));
+        assert_eq!(loaded(&data, None)[5].0.prompt, "User.");
 
         // Only types from files are advertised: the tool names the built-ins.
         let advert = advert_in(&data, Some(&project)).unwrap();
@@ -627,7 +646,7 @@ mod tests {
         let missing = find_in(&data, Some(&project), "nope", AVAILABLE).unwrap_err();
         assert_eq!(
             missing,
-            "No helper type \"nope\". Available: general, explore, plan, review, typo."
+            "No helper type \"nope\". Available: general, explore, plan, review, tester, typo."
         );
         assert!(find_in(&data, Some(&project), "review", AVAILABLE).is_ok());
     }

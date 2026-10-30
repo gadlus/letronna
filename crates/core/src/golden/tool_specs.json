@@ -1300,7 +1300,7 @@
             "type": "string"
           },
           "type": {
-            "description": "general (default), explore (read-only, cheaper), plan, review, or another type your instructions name.",
+            "description": "general (default), explore (read-only, cheaper), plan, review, tester, or another type your instructions name.",
             "type": "string"
           }
         },
