@@ -261,6 +261,12 @@ impl Runner {
     pub fn ask(&mut self, session: usize, prompt: &str) -> Result<String, String> {
         let connection = self.connection(session);
         chat::validate(&connection)?;
+        // Before the prompt is kept anywhere, so one a hook blocks is never
+        // written down, nor names the session.
+        let opened = match self.open_turn(&connection, session, prompt) {
+            Ok(notice) => notice,
+            Err(ended) => return ended,
+        };
         self.store.pin(session);
 
         {
@@ -279,7 +285,9 @@ impl Runner {
         self.take_notices(session, true);
         let workspace = self.store.conversations[session].workspace.as_deref();
         let content = letronna_core::references::expand(prompt, workspace);
-        self.store.conversations[session].messages.push(Message {
+        let messages = &mut self.store.conversations[session].messages;
+        messages.extend(opened);
+        messages.push(Message {
             role: "user".into(),
             content,
             images: std::mem::take(&mut self.images),
@@ -1231,6 +1239,84 @@ impl Runner {
         show_hook_problems();
         turn.finish_call(outcome);
         !stopped
+    }
+
+    /// Let the SessionStart and UserPromptSubmit hooks look at `prompt`
+    /// before it goes into the session, off the loop so escape still works:
+    /// the notice of what they added, to go just before it, or how the turn
+    /// ends instead. A prompt one blocks, or one the user stopped waiting
+    /// on, goes back in the box, the block's reason as the error.
+    fn open_turn(
+        &mut self,
+        connection: &Connection,
+        session: usize,
+        prompt: &str,
+    ) -> Result<Option<Message>, Result<String, String>> {
+        let conversation = &self.store.conversations[session];
+        hooks::new_turn(conversation.id);
+        if !hooks::wanted(hooks::Event::SessionStart)
+            && !hooks::wanted(hooks::Event::UserPromptSubmit)
+        {
+            return Ok(None);
+        }
+        let replied = (conversation.messages.iter()).any(|m| m.role == "assistant");
+        let ctx = tools::ToolContext::of(connection);
+        let stop = ctx.cancel.clone();
+        let (typed, model) = (prompt.to_owned(), connection.model.clone());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = sender.send(hooks::opening(&ctx, &typed, &model, replied));
+        });
+        // Working, so escape stops the wait as it stops a turn.
+        self.bar.working(true);
+        self.bar.wait_line_about("prompt hooks");
+        let heard = self.wait_on(&receiver);
+        self.bar.wait_line(false);
+        self.bar.working(false);
+        show_hook_problems();
+        let opening = match heard {
+            Ok(opening) => opening,
+            Err(Unheard::Stopped) => {
+                stop.set();
+                self.stopped = true;
+                self.return_prompt(prompt);
+                return Err(Ok(String::new()));
+            }
+            Err(Unheard::Gone) => return Ok(None),
+        };
+        if let Some(title) = opening.title {
+            self.store.conversations[session].title = title;
+            self.bar
+                .set_session(&self.store.conversations[session].title);
+        }
+        if let Some(notice) = &opening.notice {
+            render::blank();
+            render::said(
+                &render::dim("●"),
+                &render::dim(&tools::one_line(&notice.content)),
+            );
+        }
+        let Some(why) = opening.blocked else {
+            return Ok(opening.notice);
+        };
+        // What SessionStart added goes in still, since the session did start.
+        if let Some(notice) = opening.notice {
+            self.store.conversations[session].messages.push(notice);
+            self.persist();
+        }
+        self.return_prompt(prompt);
+        Err(Err(why))
+    }
+
+    /// Put `prompt` back in the box as typed, ahead of anything typed since.
+    fn return_prompt(&mut self, prompt: &str) {
+        let typed = self.bar.draft().trim().to_owned();
+        let text = if typed.is_empty() {
+            prompt.to_owned()
+        } else {
+            format!("{prompt}\n\n{typed}")
+        };
+        self.bar.say(&text);
     }
 
     /// Let the Stop hooks look at the finished turn, whose reply was `last`,

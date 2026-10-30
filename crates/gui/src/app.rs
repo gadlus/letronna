@@ -2217,9 +2217,27 @@ impl Chat {
         // What the session's kept helpers wake on from now on.
         agents::connected(&connection);
         // Off this thread, as it may read hooks.json; long before the model
-        // asks for its first call.
+        // asks for its first call. The hooks at a turn's start, when there
+        // may be any, are heard before the model is asked anything.
         let conversation = connection.conversation;
-        std::thread::spawn(move || letronna_core::hooks::new_turn(conversation));
+        let opening = (making.is_none() && letronna_core::hooks::may_open()).then(|| {
+            let mut ctx = letronna_core::tools::ToolContext::of(&connection);
+            ctx.cancel = self.turn_stop.clone();
+            let messages = &self.store.conversations[self.store.active].messages;
+            let replied = messages.iter().any(|m| m.role == "assistant");
+            let typed = prompt.clone();
+            let model = connection.model.clone();
+            let (sender, heard) = async_channel::bounded(1);
+            std::thread::spawn(move || {
+                letronna_core::hooks::new_turn(conversation);
+                let opening = letronna_core::hooks::opening(&ctx, &typed, &model, replied);
+                let _ = sender.send_blocking(opening);
+            });
+            heard
+        });
+        if opening.is_none() {
+            std::thread::spawn(move || letronna_core::hooks::new_turn(conversation));
+        }
         self.turn =
             Some(agent::Turn::new(connection).verifying(self.store.settings.verifies_edits()));
         // A browser closed during the last turn shows again in this one.
@@ -2236,12 +2254,13 @@ impl Chat {
         self.error = None;
         self.save();
         self.follow();
-        match making {
-            Some(kind) => self.make(kind, &prompt, cx),
-            None if letronna_core::plugins::code::hears_prompts() => {
+        match (making, opening) {
+            (Some(kind), _) => self.make(kind, &prompt, cx),
+            (None, Some(heard)) => self.open_then_run(heard, prompt, cx),
+            (None, None) if letronna_core::plugins::code::hears_prompts() => {
                 self.run_turn_after_plugins(target_id, prompt, cx)
             }
-            None => self.run_turn(cx),
+            (None, None) => self.run_turn(cx),
         }
         Ok(())
     }
@@ -2283,6 +2302,78 @@ impl Chat {
             });
         })
         .detach();
+    }
+
+    /// Starts the turn once the hooks at its start are heard: what they add
+    /// goes in as a notice just before the prompt, and a prompt one blocks
+    /// comes out again, back into the box, with the reason shown.
+    fn open_then_run(
+        &mut self,
+        heard: async_channel::Receiver<letronna_core::hooks::Opening>,
+        prompt: String,
+        cx: &mut Context<Self>,
+    ) {
+        let generation = self.generation;
+        cx.spawn(async move |this, cx| {
+            let Ok(opening) = heard.recv().await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                // A stop since ended the turn, and its own way.
+                if this.generation == generation && this.turn.is_some() {
+                    this.opened(opening, &prompt, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// `open_then_run`'s step once the hooks have answered.
+    fn opened(
+        &mut self,
+        opening: letronna_core::hooks::Opening,
+        prompt: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_hook_problems();
+        let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) else {
+            self.finish(cx);
+            return;
+        };
+        let conversation = &mut self.store.conversations[ix];
+        if let Some(title) = opening.title {
+            conversation.title = title;
+        }
+        // The prompt is saved already, which these write again.
+        if let Some(notice) = opening.notice {
+            conversation.insert_before_last(notice);
+        }
+        let Some(why) = opening.blocked else {
+            self.save();
+            // Then the plugins that hear prompts, as for a turn with no hooks.
+            match self.streaming_id {
+                Some(session) if letronna_core::plugins::code::hears_prompts() => {
+                    self.run_turn_after_plugins(session, prompt.to_owned(), cx)
+                }
+                _ => self.run_turn(cx),
+            }
+            return;
+        };
+        conversation.retract_last();
+        // A chat app's message is someone else's, for no box of the user's.
+        let typed_here = self
+            .turn
+            .as_ref()
+            .is_some_and(|t| t.connection.remote.is_none());
+        if typed_here {
+            self.returned_follow_ups = Some(match self.returned_follow_ups.take() {
+                Some(later) => format!("{prompt}\n\n{later}"),
+                None => prompt.to_owned(),
+            });
+        }
+        self.error = Some(why);
+        self.save();
+        self.finish(cx);
     }
 
     /// The media kind the active session's messages are made into, or
