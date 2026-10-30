@@ -683,6 +683,7 @@ impl Chat {
             ],
         );
         crate::theme::apply(&store.settings.appearance, window, cx);
+        crate::theme::text_size(store.settings.text_step, window, cx);
         letronna_core::browser::share_browser(store.settings.browser_shared);
         std::thread::spawn(letronna_core::browser::close_left_over);
         if store.conversations.is_empty() {
@@ -5190,6 +5191,21 @@ impl Render for Chat {
             .on_action(
                 cx.listener(|this, _: &crate::ui::find::OpenFind, window, cx| {
                     this.open_find(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::settings::TextLarger, window, cx| {
+                    this.step_text(Some(1), window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::settings::TextSmaller, window, cx| {
+                    this.step_text(Some(-1), window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::settings::TextUsual, window, cx| {
+                    this.step_text(None, window, cx)
                 }),
             )
             .on_action(

@@ -206,6 +206,7 @@ impl Chat {
             .unwrap_or_default();
 
         crate::theme::apply(&store.settings.appearance, window, cx);
+        crate::theme::text_size(store.settings.text_step, window, cx);
         letronna_core::browser::share_browser(store.settings.browser_shared);
 
         self.endpoint.update(cx, |input, cx| {

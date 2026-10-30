@@ -8,7 +8,10 @@ actions!(
         PreviousSettingsPage,
         NextSettingsPage,
         SettingsTab,
-        SettingsTabBack
+        SettingsTabBack,
+        TextLarger,
+        TextSmaller,
+        TextUsual
     ]
 );
 
@@ -38,6 +41,29 @@ pub(crate) const PAGES: &[(&str, AppIcon)] = &[
 pub(crate) const TOASTS_TOP: Pixels = px(88.);
 
 impl Chat {
+    /// Draw the window's text a step larger or smaller by `by`, or at its
+    /// usual size with `None`, and keep it so.
+    pub(crate) fn step_text(
+        &mut self,
+        by: Option<i8>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (low, high) = (
+            *crate::theme::TEXT_STEPS.start(),
+            *crate::theme::TEXT_STEPS.end(),
+        );
+        let now = self.store.settings.text_step;
+        let step = by.map_or(0, |by| now.saturating_add(by).clamp(low, high));
+        if step != now {
+            self.store.settings.text_step = step;
+            self.save();
+            crate::theme::text_size(step, window, cx);
+        }
+        self.note = Some(text_said(step, by.is_some() && step == now));
+        cx.notify();
+    }
+
     /// Open a gateway's row to set it up, or close it if it is already open.
     pub(crate) fn select_gateway(
         &mut self,
@@ -1966,6 +1992,85 @@ fn updates(chat: &Entity<Chat>, this: &Chat, cx: &App) -> Div {
 }
 
 /// Night, Paper or the computer's own, and the film grain on or off.
+/// What a step of the text size says: how large it is now, and that it
+/// goes no further when `at_end`.
+fn text_said(step: i8, at_end: bool) -> String {
+    let percent = (crate::theme::text_scale(step) * 100.).round();
+    match at_end {
+        true => format!("Text at {percent}%, as far as it goes."),
+        false => format!("Text at {percent}%."),
+    }
+}
+
+/// The row that steps the text size, with the keys that do it too.
+fn text_size_row(chat: &Entity<Chat>, step: i8, cx: &App) -> Div {
+    let percent = (crate::theme::text_scale(step) * 100.).round();
+    let (low, high) = (
+        *crate::theme::TEXT_STEPS.start(),
+        *crate::theme::TEXT_STEPS.end(),
+    );
+    let stepper = |id: &'static str, icon: IconName, by: Option<i8>, tip: &'static str| {
+        let chat = chat.clone();
+        Button::new(id)
+            .plain(cx)
+            .xsmall()
+            .icon(Icon::new(icon))
+            .tooltip(tip)
+            .on_click(move |_, window, cx| {
+                chat.update(cx, |this, cx| this.step_text(by, window, cx))
+            })
+    };
+    h_flex()
+        .justify_between()
+        .items_center()
+        .gap_4()
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(div().text_sm().child("Text size"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if cfg!(target_os = "macos") {
+                            "Everything in the window grows with it. ⌘= larger, ⌘- smaller, ⌘0 back to 100%."
+                        } else {
+                            "Everything in the window grows with it. Ctrl+= larger, Ctrl+- smaller, Ctrl+0 back to 100%."
+                        }),
+                ),
+        )
+        .child(
+            h_flex()
+                .flex_shrink_0()
+                .gap_1()
+                .items_center()
+                .child(
+                    stepper("text-smaller", IconName::Minus, Some(-1), "Smaller")
+                        .disabled(step <= low),
+                )
+                .child(
+                    Button::new("text-usual")
+                        .plain(cx)
+                        .xsmall()
+                        .label(format!("{percent}%"))
+                        .tooltip("Back to 100%")
+                        .disabled(step == 0)
+                        .on_click({
+                            let chat = chat.clone();
+                            move |_, window, cx| {
+                                chat.update(cx, |this, cx| this.step_text(None, window, cx))
+                            }
+                        }),
+                )
+                .child(
+                    stepper("text-larger", IconName::Plus, Some(1), "Larger")
+                        .disabled(step >= high),
+                ),
+        )
+}
+
 fn appearance_page(
     chat: &Entity<Chat>,
     settings: &Settings,
@@ -2067,6 +2172,7 @@ fn appearance_page(
             cx,
         ))
         .child(v_flex().gap_1().child(label("Theme", cx)).child(looks))
+        .child(text_size_row(chat, settings.text_step, cx))
         .child(grain)
         .child(motion)
 }
@@ -4665,7 +4771,7 @@ fn more_options(
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{KeyedSwitch, keeps_keys, keys_back};
+    use super::{KeyedSwitch, keeps_keys, keys_back, text_said};
     use crate::app::Dismiss;
     use gpui::{
         AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
@@ -4776,5 +4882,15 @@ mod tests {
         // A menu it was opened from is gone by then, so it gets nothing back.
         let menu = cx.update(|_, cx| cx.focus_handle().tab_stop(true));
         cx.update(|window, _| assert_eq!(keys_back(Some(menu), window), None));
+    }
+
+    #[test]
+    fn the_text_size_steps_by_tenths_and_says_where_it_stops() {
+        assert_eq!(text_said(0, false), "Text at 100%.");
+        assert_eq!(text_said(2, false), "Text at 120%.");
+        assert_eq!(text_said(-3, true), "Text at 70%, as far as it goes.");
+        // A setting written by hand past the ends is drawn at the end.
+        assert_eq!(crate::theme::text_scale(40), crate::theme::text_scale(6));
+        assert!((crate::theme::text_scale(6) - 1.6).abs() < 1e-6);
     }
 }

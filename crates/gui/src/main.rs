@@ -98,6 +98,28 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             Some("Find in this chat"),
         ),
         (
+            KeyBinding::new("secondary-=", ui::settings::TextLarger, Some("Chat")),
+            Some("Larger text"),
+        ),
+        // The plus is the shifted equals on most keyboards, and Windows hands
+        // it over with the Shift that typed it.
+        (
+            KeyBinding::new("secondary-+", ui::settings::TextLarger, Some("Chat")),
+            None,
+        ),
+        (
+            KeyBinding::new("secondary-shift-+", ui::settings::TextLarger, Some("Chat")),
+            None,
+        ),
+        (
+            KeyBinding::new("secondary--", ui::settings::TextSmaller, Some("Chat")),
+            Some("Smaller text"),
+        ),
+        (
+            KeyBinding::new("secondary-0", ui::settings::TextUsual, Some("Chat")),
+            Some("Text back to its usual size"),
+        ),
+        (
             KeyBinding::new(
                 "secondary-shift-k",
                 capabilities::OpenCapabilities,

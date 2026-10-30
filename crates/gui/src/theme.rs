@@ -271,6 +271,31 @@ pub(crate) fn reply_text_style(theme: &Theme) -> gpui_base::TextViewStyle {
         .with_heading(|_| StyleRefinement::default().pb(rems(1.)))
 }
 
+/// The window's text, and so its rem, at the usual size, and its code's.
+const TEXT_PX: f32 = 16.;
+const MONO_PX: f32 = 13.;
+
+/// The steps Cmd+= and Cmd+- go to either side of the usual size, each a
+/// tenth of it: from 70% to 160%.
+pub(crate) const TEXT_STEPS: std::ops::RangeInclusive<i8> = -3..=6;
+
+/// The share of the usual size text is drawn at `step` steps from it.
+pub(crate) fn text_scale(step: i8) -> f32 {
+    1. + 0.1 * f32::from(step.clamp(*TEXT_STEPS.start(), *TEXT_STEPS.end()))
+}
+
+/// Draw the window's text `step` steps from its usual size. Spacing given
+/// in rems grows with it, as a browser's zoom does, so the layout keeps
+/// its proportions.
+pub(crate) fn text_size(step: i8, window: &mut Window, cx: &mut App) {
+    let scale = text_scale(step);
+    Theme::update(cx, |t| {
+        t.font_size = px(TEXT_PX * scale);
+        t.mono_font_size = px(MONO_PX * scale);
+    });
+    window.refresh();
+}
+
 /// Colour the window as the appearance setting asks.
 pub(crate) fn apply(appearance: &str, window: &mut Window, cx: &mut App) {
     crate::platform::window::pin_chrome(window, pinned_dark(appearance));
@@ -278,11 +303,16 @@ pub(crate) fn apply(appearance: &str, window: &mut Window, cx: &mut App) {
     // only updates it once this change has settled.
     let p = palette_for(appearance, cx.window_appearance());
     let before = cx.theme().background;
+    // Kept through the change of theme, which the text size is not part of.
+    let sizes = (cx.theme().font_size, cx.theme().mono_font_size);
     Theme::change(p.mode, None, cx);
     let first = GENERATION.fetch_add(1, Ordering::Relaxed) == 0;
     // Through `update`: an edit made in place reaches only the colours, and
     // the dialogs, the scrollbars and the text views read their copies.
-    Theme::update(cx, |t| paint(t, p));
+    Theme::update(cx, |t| {
+        paint(t, p);
+        (t.font_size, t.mono_font_size) = sizes;
+    });
     // The old page lifts off the new colours, unless there were none
     // before, at the first frame, or they are the same.
     if !first && cx.theme().background != before {
