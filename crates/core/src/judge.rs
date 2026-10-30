@@ -65,6 +65,11 @@ const DENIALS_IN_A_ROW: u8 = 3;
 /// Denials in all after which the same happens, so a session that keeps
 /// getting blocked is looked at even when allowed calls come in between.
 const DENIALS_IN_ALL: u16 = 20;
+/// Calls a hold refuses where nobody may be watching before the judge
+/// decides again: enough that a run stops pushing at what was blocked and
+/// tries another way, and few enough that it can still finish, since nobody
+/// will come to lift the hold and every later call is judged as before.
+const HELD_UNWATCHED: u8 = 3;
 /// Judge calls that fail in a row before the judge rests, and how long it
 /// rests: three rules out one dropped request, and ten minutes lets a rate
 /// limit or an outage pass without every call meanwhile waiting out its
@@ -204,6 +209,8 @@ struct Case<'a> {
     /// The computer, its shell, the project folder and whether the session
     /// has read untrusted words, from Letronna.
     facts: String,
+    /// Whether nobody may be watching, and so nobody may lift a hold.
+    unattended: bool,
     /// The session's mode, by name.
     mode: &'a str,
 }
@@ -218,8 +225,9 @@ struct Session {
     /// Denials in a row, and in all since the counts last started over.
     in_a_row: u8,
     in_all: u16,
-    /// A limit on denials was hit: the user decides until they type again.
-    held: bool,
+    /// A limit on denials was hit: the user decides until they type again,
+    /// with the calls refused since then counted.
+    held: Option<u8>,
     /// Calls the user stopped, by tool and arguments: they decide those
     /// until they type again.
     stopped: HashSet<String>,
@@ -264,6 +272,7 @@ pub fn judge(
         input,
         typed,
         facts: facts(ctx),
+        unattended: connection.unattended,
         mode: mode.name(),
     };
     judge_in(memory(), &case, &nonce, |prompt| ask(connection, prompt))
@@ -346,8 +355,14 @@ fn judge_in(
         };
         let session = memory.entry(case.session).or_default();
         session.current(typed);
-        if session.held {
-            return Verdict::Unsure(HELD.into());
+        if let Some(refused) = session.held {
+            // Nobody will come to review a hold nobody watches, so after a
+            // few refusals the judge decides again, call by call.
+            if !case.unattended || refused < HELD_UNWATCHED {
+                session.held = Some(refused.saturating_add(1));
+                return Verdict::Unsure(HELD.into());
+            }
+            session.held = None;
         }
         // Before the verdicts, since one given before the stop is no answer
         // to it.
@@ -398,7 +413,7 @@ impl Session {
             self.typed = typed;
             self.verdicts.clear();
             self.stopped.clear();
-            self.held = false;
+            self.held = None;
         }
     }
 
@@ -425,7 +440,7 @@ fn record(session: &mut Session, key: String, verdict: &Verdict) {
             session.in_a_row = session.in_a_row.saturating_add(1);
             session.in_all = session.in_all.saturating_add(1);
             if session.in_a_row >= DENIALS_IN_A_ROW || session.in_all >= DENIALS_IN_ALL {
-                session.held = true;
+                session.held = Some(0);
                 session.in_a_row = 0;
                 session.in_all = 0;
             }
@@ -745,6 +760,7 @@ mod tests {
             input: input.to_owned(),
             typed,
             facts: "macos computer, commands run in sh.".into(),
+            unattended: false,
             mode: "auto",
         }
     }
@@ -1247,6 +1263,43 @@ mod tests {
         }
         assert_eq!(judged("x", block, &typed), blocked);
         assert_eq!(judged("z", "ALLOW", &typed), Verdict::Unsure(HELD.into()));
+    }
+
+    #[test]
+    fn a_hold_nobody_watches_lifts_after_a_few_refusals() {
+        let memory = Memory::default();
+        let typed = typed(&["review the change"]);
+        let judged = |input: &str, word: &str| {
+            let mut call = case(input, &typed);
+            call.unattended = true;
+            let reply = format!("{NONCE} {word}");
+            judge_in(&memory, &call, NONCE, |_| Ok(reply))
+        };
+        let block = "BLOCK beyond-request";
+        for input in ["a", "b", "c"] {
+            assert_eq!(
+                judged(input, block),
+                Verdict::Block(Category::BeyondRequest)
+            );
+        }
+        // Held for a few calls, the judge unasked, as where someone watches.
+        for n in 0..HELD_UNWATCHED {
+            let mut call = case(&format!("h{n}"), &typed);
+            call.unattended = true;
+            let verdict = judge_in(&memory, &call, NONCE, |_| {
+                panic!("the judge was asked while held")
+            });
+            assert_eq!(verdict, Verdict::Unsure(HELD.into()));
+        }
+        // Then it decides again, and blocks still count towards a new hold.
+        assert_eq!(judged("d", "ALLOW"), Verdict::Allow);
+        for input in ["e", "f", "g"] {
+            assert_eq!(
+                judged(input, block),
+                Verdict::Block(Category::BeyondRequest)
+            );
+        }
+        assert_eq!(judged("h", "ALLOW"), Verdict::Unsure(HELD.into()));
     }
 
     /// The call `case(input, ..)` is judged about, as the agent made it.
