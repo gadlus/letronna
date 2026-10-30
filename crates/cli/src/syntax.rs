@@ -107,12 +107,13 @@ impl Kind {
     /// line already had -- a diff paints its own background and the text has
     /// to stay legible on it.
     fn ink(self) -> Option<&'static str> {
+        let theme = crate::theme::now();
         match self {
             Kind::Plain => None,
-            Kind::Keyword => Some("38;5;176"),
-            Kind::Text => Some("38;5;144"),
-            Kind::Note => Some("38;5;102"),
-            Kind::Number => Some("38;5;180"),
+            Kind::Keyword => Some(theme.keyword),
+            Kind::Text => Some(theme.text),
+            Kind::Note => Some(theme.note),
+            Kind::Number => Some(theme.number),
         }
     }
 }

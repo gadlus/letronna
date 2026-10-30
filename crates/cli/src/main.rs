@@ -38,6 +38,7 @@ mod setup;
 mod spinner;
 mod syntax;
 mod terminal_setup;
+mod theme;
 mod title;
 mod wallet;
 
@@ -253,6 +254,12 @@ fn main() {
         way_out: None,
     };
     letronna_core::diag::mark("listed");
+    // Before anything is drawn in colour, and before the screen reads keys,
+    // which would take the terminal's answer about its background for typing.
+    theme::start(
+        &runner.store.settings.terminal_theme,
+        runner.human && !args.once(),
+    );
     // At the prompt, what is sent goes into the folder's history, which
     // up and ctrl-r reach from later sessions too.
     runner.bar.keep_history(!args.once());

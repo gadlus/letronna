@@ -25,7 +25,7 @@ Letronna's file tools do not reach this folder, so the user edits these files th
 
 ## settings.json
 
-Most of it is set in the window's Settings or with a slash command (`mode`, `effort`, `style`, `thinking`, `fallbacks` with /fallback, `keep_days` with /retention, `memory_review` with /memory-review, `side_model` with /model side, `verify_edits` with /verify, `voice` with /voice, `notifications` with /notify, `tool_search`, `jev_endpoint` and `jev_model` (how find_tools ranks: auto, jev or names, and where Jev is asked) with /tool-search, `manual_updates` with Update automatically in Settings, About). These are edited by hand:
+Most of it is set in the window's Settings or with a slash command (`mode`, `effort`, `style`, `thinking`, `fallbacks` with /fallback, `keep_days` with /retention, `memory_review` with /memory-review, `side_model` with /model side, `verify_edits` with /verify, `voice` with /voice, `notifications` with /notify, `terminal_theme` with /theme, `tool_search`, `jev_endpoint` and `jev_model` (how find_tools ranks: auto, jev or names, and where Jev is asked) with /tool-search, `manual_updates` with Update automatically in Settings, About). These are edited by hand:
 
 - `context_cap`: the most tokens a request carries besides the reply; 0 keeps the default of 64,000.
 - `computer_use`: `true` offers the computer tool, which sees and uses other apps' windows, asking once for each app.

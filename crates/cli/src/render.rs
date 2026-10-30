@@ -120,16 +120,16 @@ pub fn bold(text: &str) -> String {
     wrap("1", text)
 }
 pub fn blue(text: &str) -> String {
-    wrap("38;5;69", text)
+    wrap(crate::theme::now().blue, text)
 }
 pub fn red(text: &str) -> String {
-    wrap("38;5;167", text)
+    wrap(crate::theme::now().red, text)
 }
 pub fn green(text: &str) -> String {
-    wrap("38;5;114", text)
+    wrap(crate::theme::now().green, text)
 }
 pub fn amber(text: &str) -> String {
-    wrap("38;5;179", text)
+    wrap(crate::theme::now().amber, text)
 }
 
 /// The left margin of the input box.
@@ -469,7 +469,8 @@ impl Stream {
             '`' => {
                 self.code = !self.code;
                 let code = self.code;
-                self.toggle(out, code, "\x1b[38;5;180m");
+                let ink = format!("\x1b[{}m", crate::theme::now().code);
+                self.toggle(out, code, &ink);
             }
             '\n' => {
                 if std::mem::take(&mut self.heading) {

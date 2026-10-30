@@ -109,6 +109,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "list reply styles, or pick one: /style concise",
     },
     Command {
+        name: "/theme",
+        blurb: "the terminal's colours: auto, dark, light, colour-blind or ansi",
+    },
+    Command {
         name: "/thinking",
         blurb: "show the model's thinking, or hide it",
     },

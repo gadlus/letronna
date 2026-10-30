@@ -215,26 +215,19 @@ fn paint(rows: &[Row]) -> Vec<String> {
         .iter()
         .take(shown)
         .flat_map(|row| {
-            let (mark, text, colour) = match row {
+            let theme = crate::theme::now();
+            let (mark, text, paint) = match row {
                 Row::Same(text) => (" ", text, None),
-                Row::Gone(text) => ("-", text, Some((52, 210))),
-                Row::New(text) => ("+", text, Some((22, 157))),
+                Row::Gone(text) => ("-", text, Some(theme.gone)),
+                Row::New(text) => ("+", text, Some(theme.new)),
             };
             // A changed line longer than the block goes on under itself
             // rather than being cut, which could hide the change itself.
             pieces(&format!("{mark} {text}"), width)
                 .into_iter()
-                .map(move |body| match colour {
-                    Some((back, front)) if render::colour() => {
-                        // The background and the default ink are set first,
-                        // and the code colours itself on top. Anything it
-                        // leaves alone falls back to the ink set here, which
-                        // is what keeps a removed line readable on red.
-                        format!(
-                            "{}\x1b[48;5;{back}m\x1b[38;5;{front}m{}\x1b[0m",
-                            render::PAD,
-                            crate::syntax::paint(&body)
-                        )
+                .map(move |body| match paint {
+                    Some(paint) if render::colour() => {
+                        format!("{}{}", render::PAD, painted(paint, &body))
                     }
                     _ => format!("{}{}", render::PAD, render::dim(&body)),
                 })
@@ -249,6 +242,22 @@ fn paint(rows: &[Row]) -> Vec<String> {
         ));
     }
     out
+}
+
+/// A changed row in its colours. The background and the default ink are set
+/// first, and the code colours itself on top. Anything it leaves alone falls
+/// back to the ink set here, which is what keeps a removed line readable on
+/// red. With no background the ink is all that marks the row, so the code
+/// is left in it rather than coloured over.
+fn painted(paint: crate::theme::Paint, body: &str) -> String {
+    match paint.back {
+        Some(back) => format!(
+            "\x1b[{back}m\x1b[{}m{}\x1b[0m",
+            paint.ink,
+            crate::syntax::paint(body)
+        ),
+        None => format!("\x1b[{}m{body}\x1b[0m", paint.ink),
+    }
 }
 
 /// A diff row as rows `width` wide, each padded to it: the first with its
@@ -303,7 +312,7 @@ fn clip(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Row, ToolContext, compare, fold, of, patch_line};
+    use super::{Row, ToolContext, compare, fold, of, painted, patch_line};
 
     fn rows(text: &[&str]) -> Vec<String> {
         text.iter().map(|t| (*t).to_owned()).collect()
@@ -409,5 +418,24 @@ mod tests {
         assert!(rows.iter().all(|row| row.chars().count() == 20), "{rows:?}");
         assert!(rows[1].starts_with("  y"));
         assert_eq!(super::pieces("  short", 20).len(), 1);
+    }
+
+    #[test]
+    fn a_changed_row_in_the_default_theme_is_drawn_as_it_always_was() {
+        let dark = crate::theme::DARK;
+        // Byte for byte what the rows were written as before themes.
+        assert_eq!(
+            painted(dark.gone, "- old"),
+            "\x1b[48;5;52m\x1b[38;5;210m- old\x1b[0m"
+        );
+        assert_eq!(
+            painted(dark.new, "+ new"),
+            "\x1b[48;5;22m\x1b[38;5;157m+ new\x1b[0m"
+        );
+        let ink_alone = crate::theme::Paint {
+            back: None,
+            ink: "31",
+        };
+        assert_eq!(painted(ink_alone, "- old"), "\x1b[31m- old\x1b[0m");
     }
 }

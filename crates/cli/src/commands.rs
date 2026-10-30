@@ -229,6 +229,10 @@ pub fn command(
             style(runner, rest);
             Flow::Handled
         }
+        "/theme" => {
+            theme(runner, rest);
+            Flow::Handled
+        }
         "/thinking" => {
             let Some(on) = switched("/thinking", rest, runner.store.settings.thinking) else {
                 return Flow::Handled;
@@ -2036,7 +2040,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/wallet",
         ],
     ),
-    ("Help", &["/help", "/terminal-setup", "/exit"]),
+    ("Help", &["/help", "/theme", "/terminal-setup", "/exit"]),
 ];
 
 /// Letronna's own commands under their headings, those under none last.
@@ -2576,6 +2580,101 @@ fn slid_to(picked: &str, current: &str, saved: &str) -> String {
         true => saved.to_owned(),
         false => picked.to_owned(),
     }
+}
+
+/// The terminal's colours: bare on a keyboard, each theme drawn as it looks
+/// and one picked from them; bare off one, the themes with the one in use
+/// marked; or `name` chosen.
+fn theme(runner: &mut Runner, name: &str) {
+    use crate::theme::{self as themes, AUTO, THEMES};
+    render::blank();
+    let saved = runner.store.settings.terminal_theme.clone();
+    let here = match themes::light_background() {
+        Some(true) => "light here",
+        Some(false) => "dark here",
+        None => "dark here, as the terminal has not said",
+    };
+    let auto_about = format!("light or dark as the terminal's background is ({here})");
+    let rows: Vec<(String, String, bool)> =
+        std::iter::once((AUTO.to_owned(), auto_about, themes::is_auto(&saved)))
+            .chain(THEMES.iter().map(|theme| {
+                let using = themes::setting_for(&saved).as_deref()
+                    == themes::setting_for(theme.name).as_deref();
+                (theme.name.to_owned(), theme.about.to_owned(), using)
+            }))
+            .collect();
+    let width = rows
+        .iter()
+        .map(|(name, ..)| name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let picked = if !name.is_empty() {
+        name.to_owned()
+    } else if runner.bar.steered() {
+        // Each drawn in its own colours, whatever is drawn with now.
+        if render::colour() {
+            for theme in THEMES {
+                for (at, row) in themes::sample(theme).iter().enumerate() {
+                    let name = if at == 0 { theme.name } else { "" };
+                    let name = render::bold(&format!("{name:<width$}"));
+                    render::line(&format!("{name}  {row}"));
+                }
+            }
+            render::blank();
+        }
+        let labels: Vec<(String, String)> = (rows.iter())
+            .map(|(name, about, using)| {
+                let using = if *using { "  (in use)" } else { "" };
+                (name.clone(), format!("{name}  ·  {about}{using}"))
+            })
+            .collect();
+        let Some(picked) = pick_name(runner, "Colours", &labels) else {
+            return;
+        };
+        picked
+    } else {
+        for (name, about, using) in &rows {
+            let mark = if *using {
+                render::blue("●")
+            } else {
+                " ".into()
+            };
+            render::line(&format!(
+                "{mark} {}  {}",
+                render::bold(&format!("{name:<width$}")),
+                render::dim(about)
+            ));
+        }
+        render::line(&render::dim("Pick one with /theme and its name."));
+        return;
+    };
+    let Some(setting) = themes::setting_for(&picked) else {
+        render::line(&render::red(&format!(
+            "No theme called {picked}. /theme lists them."
+        )));
+        return;
+    };
+    runner.store.settings.terminal_theme = setting.clone();
+    runner.persist();
+    themes::choose(&setting);
+    let note = footer(runner);
+    runner.bar.set_footer(note);
+    render::line(&render::dim(&match setting.as_str() {
+        "" => "Colours: dark, as Letronna has always looked.".to_owned(),
+        AUTO => match themes::light_background() {
+            Some(light) => format!(
+                "Colours follow the terminal's background: {} here.",
+                if light { "light" } else { "dark" }
+            ),
+            None if themes::asked_at_start() => "Colours follow the terminal's background; \
+                 this one did not say, so dark."
+                .to_owned(),
+            None => "Colours follow the terminal's background, which it is asked at the \
+                     next start; dark until then."
+                .to_owned(),
+        },
+        name => format!("Colours: {name}."),
+    }));
 }
 
 /// The reply styles with the chosen one marked, or `name` chosen.
