@@ -13,6 +13,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("mode", "change how much runs without asking"),
     ("effort", "change how hard the model thinks"),
     ("btw", "ask a side question that stays out of the session"),
+    ("recap", "a few lines on where this session stands"),
     (
         "cloud",
         "run a task in Letronna Cloud, on Letronna's servers",

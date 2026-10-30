@@ -638,7 +638,10 @@ impl Chat {
                         .selectable(!window.has_active_dialog(cx))
                         .line_height(px(26.)),
                 )
-                .child(div().text_xs().child(usage_line(reply)))
+                // A recap's cost is counted with the session's in /usage.
+                .when(!aside.recap, |answer| {
+                    answer.child(div().text_xs().child(usage_line(reply)))
+                })
                 .into_any_element(),
             Some(Err(error)) => div()
                 .text_color(cx.theme().danger)
@@ -655,7 +658,11 @@ impl Chat {
                     .text_xs()
                     .font_family(HEADING_FONT)
                     .text_color(cx.theme().muted_foreground)
-                    .child("Aside · not kept in the session")
+                    .child(if aside.recap {
+                        "Recap · not kept in the session"
+                    } else {
+                        "Aside · not kept in the session"
+                    })
                     .child(
                         Button::new("aside-close")
                             .plain(cx)
@@ -679,7 +686,7 @@ impl Chat {
                     .rounded(cx.theme().radius_lg)
                     .border_1()
                     .border_color(cx.theme().border)
-                    .child(aside.question.clone())
+                    .when(!aside.recap, |card| card.child(aside.question.clone()))
                     .child(answer),
             );
         Some(row.into_any_element())

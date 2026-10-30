@@ -36,7 +36,7 @@ const FOLLOW_SLACK: Pixels = px(48.);
 
 /// The composer's own slash commands, without the slash, which win over any
 /// the user, a project or a skill adds.
-const OWN_COMMANDS: &[&str] = &["btw", "init"];
+const OWN_COMMANDS: &[&str] = &["btw", "recap", "init"];
 
 /// The chat column's widest, gutters included: about 90 characters of
 /// text, which reads as one measure. A wider window gets wider margins
@@ -107,6 +107,8 @@ pub(crate) struct Aside {
     pub(crate) cancel: letronna_core::cancel::Cancel,
     /// When it was asked, which tells its answer from an earlier one's.
     asked: std::time::Instant,
+    /// A recap of where the session stands rather than a question.
+    pub(crate) recap: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -559,6 +561,9 @@ pub(crate) struct Chat {
     /// the session whose browser it shows: each session has its own.
     pub(crate) browser: Entity<crate::ui::browser::BrowserView>,
     pub(crate) browser_for: u64,
+    /// The session last on screen when a recap was thought of, so one is
+    /// offered once per opening rather than on every frame.
+    recap_for: u64,
     /// The Files tab's tree and preview.
     pub(crate) files: crate::ui::files::Files,
     /// The Jobs tab's choice of job, its output and the Run line.
@@ -1195,6 +1200,7 @@ impl Chat {
             changes: crate::ui::changes::Changes::new(window, cx),
             browser: cx.new(|cx| crate::ui::browser::BrowserView::new(window, cx)),
             browser_for: 0,
+            recap_for: 0,
             files: crate::ui::files::Files::new(cx),
             jobs: crate::ui::jobs::Jobs::new(window, cx),
             drafts: std::collections::HashMap::new(),
@@ -1627,6 +1633,13 @@ impl Chat {
         if prompt.starts_with("/mcp__") {
             return self.send_mcp_prompt(prompt, window, cx);
         }
+        if prompt.trim() == "/recap" {
+            self.composer
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.ask_recap(cx);
+            self.follow();
+            return;
+        }
         // Asked beside the session, so it waits for no reply to end.
         if let Some(question) = side_question(&prompt) {
             let question = question.to_owned();
@@ -2003,6 +2016,7 @@ impl Chat {
             answer: None,
             cancel: cancel.clone(),
             asked,
+            recap: false,
         });
         let (sender, receiver) = async_channel::bounded(1);
         std::thread::spawn(move || {
@@ -2026,6 +2040,75 @@ impl Chat {
         cx.notify();
     }
 
+    /// Recaps where the active session stands from a quick look, shown
+    /// where a side question's answer is and never kept in the session.
+    fn ask_recap(&mut self, cx: &mut Context<Self>) {
+        let ix = self.store.active;
+        self.fill_now(ix);
+        let connection = match self.connection_for(ix, None) {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        let messages = self.store.conversations[ix].messages.clone();
+        if let Some(earlier) = self.aside.take() {
+            earlier.cancel.set();
+        }
+        let cancel = letronna_core::cancel::Cancel::default();
+        let asked = std::time::Instant::now();
+        self.aside = Some(Aside {
+            session: connection.conversation,
+            question: "Where this stands".into(),
+            answer: None,
+            cancel: cancel.clone(),
+            asked,
+            recap: true,
+        });
+        let (sender, receiver) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let recap = letronna_core::recap::recap(&connection, &messages, &cancel);
+            let _ = sender.send_blocking(recap);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(recap) = receiver.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(aside) = this.aside.as_mut().filter(|a| a.asked == asked) {
+                        aside.answer = Some(recap.map(|content| Message {
+                            role: "assistant".into(),
+                            content,
+                            ..Default::default()
+                        }));
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Offer a recap of the session on screen once per opening, when its
+    /// last reply finished more than `recap::AWAY` ago and nothing else is
+    /// showing there: coming back to it after a while, or to the app.
+    fn recap_on_opening(&mut self, cx: &mut Context<Self>) {
+        let ix = self.store.active;
+        let on_screen = self.store.conversations[ix].id;
+        if self.recap_for == on_screen {
+            return;
+        }
+        self.recap_for = on_screen;
+        if self.busy || self.aside.is_some() || self.runs.contains_key(&on_screen) {
+            return;
+        }
+        self.fill_now(ix);
+        let now = backend::now();
+        if letronna_core::recap::due(&self.store.conversations[ix].messages, now) {
+            self.ask_recap(cx);
+        }
+    }
+
     /// Send a prompt in the active session. Split out of `send` so a chat app
     /// can fire one with no window in hand. `Err` means the gateway is not
     /// usable; the caller decides whether to open Settings about it.
@@ -2039,6 +2122,14 @@ impl Chat {
         // What is said goes after what was said before, and the model is
         // sent all of it.
         self.fill_now(self.store.active);
+        // A recap was for coming back; what is sent now moves on from it.
+        let here = self.store.conversations[self.store.active].id;
+        if let Some(recap) = self
+            .aside
+            .take_if(|aside| aside.recap && aside.session == here)
+        {
+            recap.cancel.set();
+        }
         let from_chat_app = remote.is_some();
         let making = self.making(&prompt, from_chat_app);
         // Asking anything at all means the setup page has done its job.
@@ -4754,6 +4845,8 @@ impl Render for Chat {
             self.browser_for = on_screen;
             letronna_core::browser::show_conversation(on_screen);
         }
+        // And a session left a while is recapped as it opens.
+        self.recap_on_opening(cx);
         // And the composer holds its draft, however the session was switched
         // to: a click, or a message from a chat app.
         self.swap_draft(window, cx);
@@ -5705,6 +5798,12 @@ mod tests {
         assert!(escape_closes_aside(1, 1, Some(2)));
         // An aside of another session is hidden, so escape is not for it.
         assert!(!escape_closes_aside(1, 2, None));
+    }
+
+    #[test]
+    fn recap_is_the_window_s_own_command_and_never_a_side_question() {
+        assert!(super::OWN_COMMANDS.contains(&"recap"));
+        assert_eq!(side_question("/recap"), None);
     }
 
     #[test]
