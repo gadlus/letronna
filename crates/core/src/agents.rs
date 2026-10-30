@@ -94,6 +94,14 @@ const DEPTH: u8 = 2;
 /// Dozens of rounds of reading files, and a ceiling on what a tree that goes
 /// round in circles can cost.
 pub(crate) const BUDGET: u64 = 500_000;
+
+/// What a helper whose turn may take `rounds` may spend of `budget`, which is
+/// for the usual rounds: a type given more has more in proportion, so its
+/// budget does not end it before its rounds do.
+pub(crate) const fn budget_for(budget: u64, rounds: usize) -> u64 {
+    let rounds = if rounds > ROUNDS { rounds } else { ROUNDS };
+    budget.saturating_mul(rounds as u64) / ROUNDS as u64
+}
 /// How long a kept helper waits idle for more work: long enough for the rest
 /// of the turn that kept it, or a build or a review, to bring the next task,
 /// and short enough that a forgotten one ends well before the session does.
@@ -632,7 +640,11 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
         leave(worktree.as_ref(), &[], None);
     })?;
     let run = Run::new(owner, background);
-    let budget = Arc::new(Budget::new(limits.budget, caller.budget.clone()));
+    let rounds = def.rounds.unwrap_or(ROUNDS);
+    let budget = Arc::new(Budget::new(
+        budget_for(limits.budget, rounds),
+        caller.budget.clone(),
+    ));
     let spec = Spec {
         connection,
         transcript,
@@ -642,7 +654,7 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
         run: caller.run.unwrap_or(slot.id),
         label: slot.name.clone(),
         allow,
-        rounds: def.rounds.unwrap_or(ROUNDS),
+        rounds,
         cancel,
         budget: Some(budget.clone()),
         status: run.status.clone(),
@@ -2669,8 +2681,13 @@ fn rerun(
     };
     let tools = usable(&connection, def);
     // A kept one's for its whole life, or a new one under the caller's.
-    let budget = (claimed.kept.clone())
-        .unwrap_or_else(|| Arc::new(Budget::new(limits.budget, caller.budget.clone())));
+    let rounds = def.rounds.unwrap_or(ROUNDS);
+    let budget = (claimed.kept.clone()).unwrap_or_else(|| {
+        Arc::new(Budget::new(
+            budget_for(limits.budget, rounds),
+            caller.budget.clone(),
+        ))
+    });
     Spec {
         connection,
         transcript,
@@ -2685,7 +2702,7 @@ fn rerun(
             None if fork => Allow::All,
             None => allow(def, tools),
         },
-        rounds: def.rounds.unwrap_or(ROUNDS),
+        rounds,
         cancel: claimed.cancel.clone(),
         budget: Some(budget),
         status: claimed.status.clone(),
@@ -5582,6 +5599,15 @@ mod tests {
         assert!(listed().idle);
         assert!(stop(id));
         assert!(!listed().idle);
+    }
+
+    #[test]
+    fn a_type_given_more_rounds_has_more_budget_in_proportion() {
+        assert_eq!(budget_for(BUDGET, ROUNDS), BUDGET);
+        // Fewer rounds keep the whole budget: a short type is not starved.
+        assert_eq!(budget_for(BUDGET, 12), BUDGET);
+        assert_eq!(budget_for(BUDGET, 2 * ROUNDS), 2 * BUDGET);
+        assert_eq!(budget_for(u64::MAX, 2 * ROUNDS), u64::MAX / ROUNDS as u64);
     }
 
     #[test]

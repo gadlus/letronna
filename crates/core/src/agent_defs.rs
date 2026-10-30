@@ -18,6 +18,10 @@ use std::path::{Path, PathBuf};
 /// The most rounds a definition may give its helpers: four times the usual 50,
 /// room for a long job that still ends a helper going round in circles.
 const MOST_ROUNDS: usize = 200;
+/// The rounds a review helper's turn may take: twice the usual 50, since it
+/// checks every requirement and case with a command or two each, and most
+/// reviews of a long request reached 50 with cases still unchecked.
+pub(crate) const REVIEW_ROUNDS: usize = 100;
 /// How much of each description the types line carries. The line goes into
 /// every request, and Claude Code's descriptions can run to paragraphs of
 /// examples, where a sentence is enough to choose by.
@@ -281,6 +285,7 @@ fn built_ins() -> Vec<AgentDef> {
             // Not plan mode: running the tests is the point, and plan mode
             // refuses commands.
             plan: false,
+            rounds: Some(REVIEW_ROUNDS),
             prompt: "Look for what is wrong with the work you are pointed at. Verify by running \
                      tests. Where the work does less than its request's words allow, or two of \
                      its parts disagree about the same thing, that is wrong, not an open question \
@@ -449,6 +454,15 @@ mod tests {
                 .contains("in the temp folder, never in the project")
         );
         assert!(review.prompt.contains("keep each command you run short"));
+    }
+
+    #[test]
+    fn a_review_helper_has_the_rounds_a_whole_table_takes() {
+        let review = (built_ins().into_iter())
+            .find(|def| def.name == "review")
+            .unwrap();
+        assert_eq!(review.rounds, Some(REVIEW_ROUNDS));
+        const { assert!(REVIEW_ROUNDS > 50 && REVIEW_ROUNDS <= MOST_ROUNDS) };
     }
 
     #[test]
