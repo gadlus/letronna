@@ -3119,6 +3119,37 @@ fn edits(args: &Value) -> Result<Vec<crate::edit::Edit<'_>>, String> {
     Ok(edits)
 }
 
+/// A file a write_file or edit_file call would change: where it is, what it
+/// holds now, and what the call would leave in it.
+pub struct Proposed {
+    pub path: PathBuf,
+    pub before: String,
+    pub after: String,
+}
+
+/// What a write_file or edit_file call would make of its file, worked out
+/// without writing, for an editor to show beside the question that asks for
+/// it; `None` for any other call, or one the tool would refuse.
+pub fn proposed(name: &str, args: &str, ctx: &ToolContext) -> Option<Proposed> {
+    let mut args: Value = serde_json::from_str(args).ok()?;
+    rename_aliases(name, &mut args);
+    if !matches!(name, "write_file" | "edit_file") {
+        return None;
+    }
+    // Refused where the tool would refuse it, before anything is read.
+    let path = resolve_write_or_scratch(path_arg(&args), ctx).ok()?;
+    let before = std::fs::read_to_string(&path).unwrap_or_default();
+    let after = match name {
+        "write_file" => args["content"].as_str()?.to_owned(),
+        _ => crate::edit::apply(&before, &edits(&args).ok()?).ok()?.text,
+    };
+    Some(Proposed {
+        path,
+        before,
+        after,
+    })
+}
+
 struct RunCommand;
 impl Tool for RunCommand {
     fn hides_key_shapes(&self) -> bool {
@@ -6070,6 +6101,30 @@ mod tests {
             "\u{FEFF}fn b(x) {\r\n    two(x);\r\n}\r\n"
         );
         assert!(edit(json!({"path": "a.rs"})).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_proposed_write_or_edit_is_worked_out_without_writing() {
+        let (dir, ctx) = workspace_with("proposed", "fn a() {\n    one();\n}\n");
+        let edit = json!({"path": "a.txt", "old": "one();", "new": "two();"}).to_string();
+        let change = proposed("edit_file", &edit, &ctx).unwrap();
+        assert_eq!(change.path, dir.join("a.txt"));
+        assert_eq!(change.before, "fn a() {\n    one();\n}\n");
+        assert_eq!(change.after, "fn a() {\n    two();\n}\n");
+        let new = json!({"path": "b.txt", "content": "new\n"}).to_string();
+        let change = proposed("write_file", &new, &ctx).unwrap();
+        assert_eq!(
+            (change.before.as_str(), change.after.as_str()),
+            ("", "new\n")
+        );
+        // Nothing was written, and what the tools would refuse is not worked out.
+        assert!(!dir.join("b.txt").exists());
+        let missing = json!({"path": "a.txt", "old": "three();", "new": "x"}).to_string();
+        assert!(proposed("edit_file", &missing, &ctx).is_none());
+        let outside = json!({"path": "../x.txt", "content": "x"}).to_string();
+        assert!(proposed("write_file", &outside, &ctx).is_none());
+        assert!(proposed("read_file", r#"{"path": "a.txt"}"#, &ctx).is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
