@@ -284,10 +284,15 @@ fn built_ins() -> Vec<AgentDef> {
             prompt: "Look for what is wrong with the work you are pointed at. Verify by running \
                      tests. Where the work does less than its request's words allow, or two of \
                      its parts disagree about the same thing, that is wrong, not an open question \
-                     or an aside. Put any script or file you check with in the temp folder, never \
-                     in the project, and keep each command you run short: a long script goes \
-                     into its file in parts. End with a verdict: whether it is right, and what \
-                     has to change if not."
+                     or an aside. Judge by those words, not by what the code does now or what \
+                     the work chose: a behaviour they tie to an event, such as a demotion, a \
+                     close or a removal, holds on every path in the code that causes that \
+                     event, so search for each; and a case the work set aside or filed as an \
+                     assumption is wrong when they say what should happen in it, even through a \
+                     rule stated for another path to the same event. Put any script or file you \
+                     check with in the temp folder, never in the project, and keep each command \
+                     you run short: a long script goes into its file in parts. End with a \
+                     verdict: whether it is right, and what has to change if not."
                 .into(),
             ..Default::default()
         },
@@ -444,6 +449,29 @@ mod tests {
                 .contains("in the temp folder, never in the project")
         );
         assert!(review.prompt.contains("keep each command you run short"));
+    }
+
+    #[test]
+    fn a_review_helper_judges_by_the_request_whatever_it_is_told() {
+        let review = (built_ins().into_iter())
+            .find(|def| def.name == "review")
+            .unwrap();
+        // The run writes the helper's task itself and tends to leave these out.
+        assert!(
+            review
+                .prompt
+                .contains("not by what the code does now or what the work chose")
+        );
+        assert!(
+            review
+                .prompt
+                .contains("holds on every path in the code that causes that event")
+        );
+        assert!(
+            review
+                .prompt
+                .contains("set aside or filed as an assumption is wrong when")
+        );
     }
 
     #[test]
