@@ -1334,8 +1334,101 @@ pub fn list() -> Vec<JobInfo> {
 /// Open the user's own terminal in `folder`, for work that wants a person at
 /// the keyboard: Windows Terminal, Terminal.app, or `$TERMINAL` elsewhere.
 pub fn open_terminal(folder: &Path) -> Result<(), String> {
+    start_terminal(terminals(folder, std::env::var("TERMINAL").ok()), folder)
+}
+
+/// Open the user's own terminal in `folder` running `program` with `args`,
+/// as a session carried on from the window is. Each argument reaches it
+/// whole: on macOS through a script that quotes it, which Terminal.app runs
+/// and which removes itself, elsewhere as the terminal's own arguments.
+pub fn open_terminal_running(folder: &Path, program: &str, args: &[String]) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        static SCRIPTS: AtomicU64 = AtomicU64::new(0);
+        let n = SCRIPTS.fetch_add(1, Ordering::Relaxed);
+        let script =
+            std::env::temp_dir().join(format!("letronna-{}-{n}.command", std::process::id()));
+        std::fs::write(&script, running_script(folder, program, args))
+            .and_then(|()| {
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            })
+            .map_err(|e| format!("Cannot open a terminal: {e}"))?;
+        let open = vec!["-a".into(), "Terminal".into(), script.display().to_string()];
+        start_terminal(vec![("open".into(), open)], folder)
+    }
+    #[cfg(not(target_os = "macos"))]
+    start_terminal(
+        terminals_running(folder, program, args, std::env::var("TERMINAL").ok()),
+        folder,
+    )
+}
+
+/// What Terminal.app runs for `open_terminal_running`: removed as it starts,
+/// then the program in the folder, every word quoted for the shell.
+#[cfg(any(target_os = "macos", test))]
+fn running_script(folder: &Path, program: &str, args: &[String]) -> String {
+    let quote = |word: &str| format!("'{}'", word.replace('\'', "'\\''"));
+    let words: Vec<String> = std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .map(quote)
+        .collect();
+    format!(
+        "#!/bin/sh\nrm -f -- \"$0\"\ncd {} || exit 1\n{}\n",
+        quote(&folder.display().to_string()),
+        words.join(" ")
+    )
+}
+
+/// The terminals to try for `open_terminal_running` on Windows and Linux,
+/// as `terminals` gives them with the program and its arguments added.
+#[cfg(not(target_os = "macos"))]
+fn terminals_running(
+    folder: &Path,
+    program: &str,
+    args: &[String],
+    terminal: Option<String>,
+) -> Vec<(String, Vec<String>)> {
+    let words = || std::iter::once(program.to_owned()).chain(args.iter().cloned());
+    if cfg!(windows) {
+        // PowerShell takes the command as one line, so each word is quoted
+        // the way it reads them: in single quotes, doubled inside.
+        let line: Vec<String> = words()
+            .map(|word| format!("'{}'", word.replace('\'', "''")))
+            .collect();
+        return vec![
+            (
+                "wt.exe".into(),
+                ["-d".into(), folder.display().to_string()]
+                    .into_iter()
+                    .chain(words())
+                    .collect(),
+            ),
+            (
+                "powershell.exe".into(),
+                vec![
+                    "-NoExit".into(),
+                    "-Command".into(),
+                    format!("& {}", line.join(" ")),
+                ],
+            ),
+        ];
+    }
+    terminals(folder, terminal)
+        .into_iter()
+        .map(|(terminal, mut given)| {
+            given.push("-e".into());
+            given.extend(words());
+            (terminal, given)
+        })
+        .collect()
+}
+
+/// Start the first of `candidates`, as program and arguments, that will,
+/// in `folder`.
+fn start_terminal(candidates: Vec<(String, Vec<String>)>, folder: &Path) -> Result<(), String> {
     let mut tried = Vec::new();
-    for (program, args) in terminals(folder, std::env::var("TERMINAL").ok()) {
+    for (program, args) in candidates {
         let mut command = std::process::Command::new(&program);
         command.args(&args).current_dir(folder);
         // PowerShell is a console program, so it needs a window of its own,
@@ -1659,6 +1752,32 @@ mod tests {
             terminals(folder, Some("  ".into())),
             [("x-terminal-emulator".to_owned(), Vec::new())]
         );
+    }
+
+    #[test]
+    fn a_terminal_runs_each_word_whole_in_the_folder() {
+        let script = running_script(
+            Path::new("/work/it's here"),
+            "letronna",
+            &["--resume".into(), "12".into(), "a; rm -rf ~".into()],
+        );
+        assert_eq!(
+            script,
+            "#!/bin/sh\nrm -f -- \"$0\"\ncd '/work/it'\\''s here' || exit 1\n\
+             'letronna' '--resume' '12' 'a; rm -rf ~'\n"
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_terminal_elsewhere_is_given_the_program_after_dash_e() {
+        let tried = terminals_running(
+            Path::new("/work"),
+            "letronna",
+            &["--resume".into(), "12".into()],
+            Some("kitty".into()),
+        );
+        assert_eq!(tried[0].1, ["-e", "letronna", "--resume", "12"]);
     }
 
     #[test]
