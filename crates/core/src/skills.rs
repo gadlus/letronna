@@ -109,6 +109,10 @@ const BUILT_IN: &[(&str, &[(&str, &str)])] = &[(
             include_str!("../skills-builtin/letronna/chat-apps.md"),
         ),
         (
+            "commands.md",
+            include_str!("../skills-builtin/letronna/commands.md"),
+        ),
+        (
             "settings-and-data.md",
             include_str!("../skills-builtin/letronna/settings-and-data.md"),
         ),
@@ -2641,7 +2645,7 @@ mod tests {
             .join("letronna");
         assert!(page.contains(&folder.display().to_string()), "{page}");
         assert!(
-            page.contains("- chat-apps.md\n- settings-and-data.md\n"),
+            page.contains("- chat-apps.md\n- commands.md\n- settings-and-data.md\n"),
             "{page}"
         );
         // One page each, with no note on reading on.
@@ -2651,6 +2655,8 @@ mod tests {
         assert!(apps.contains("Pair a chat") && !apps.contains("… [characters"));
         let paths = load(&data, None, "letronna", Some("settings-and-data.md"), 0).unwrap();
         assert!(paths.contains("AGENT_DATA_DIR") && !paths.contains("… [characters"));
+        let verbs = load(&data, None, "letronna", Some("commands.md"), 0).unwrap();
+        assert!(verbs.contains("--resume") && !verbs.contains("… [characters"));
 
         // A copy changed by hand is put back by the next load.
         std::fs::write(folder.join("chat-apps.md"), "Wrong.").unwrap();

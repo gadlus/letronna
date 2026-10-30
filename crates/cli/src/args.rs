@@ -866,10 +866,15 @@ mod tests {
 
     /// The skill that tells the model how Letronna works keeps up with what
     /// `--help` and `/help` list, so a verb added since is not left to a
-    /// guess.
+    /// guess. Its page or its `commands.md` may name each, whichever has
+    /// room.
     #[test]
     fn the_help_skill_names_every_cli_verb_and_slash_command() {
-        let skill = include_str!("../../core/skills-builtin/letronna/SKILL.md");
+        let skill = [
+            include_str!("../../core/skills-builtin/letronna/SKILL.md"),
+            include_str!("../../core/skills-builtin/letronna/commands.md"),
+        ]
+        .join("\n");
         // Named whole: `/mode` inside `/model` is not `/mode`.
         let names = |word: &str| {
             skill.match_indices(word).any(|(at, _)| {

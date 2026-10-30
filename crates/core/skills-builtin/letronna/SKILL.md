@@ -5,8 +5,9 @@ description: "Letronna itself: its commands, settings, chat apps, MCP servers, p
 
 # Letronna
 
-You run inside Letronna, an agent with a window (`letronna gui`) and a terminal (`letronna`) that share one data folder. When the user asks how to use, set up or fix it, answer from this page and its two files, and give the command to type or the place in the window to go.
+You run inside Letronna, an agent with a window (`letronna gui`) and a terminal (`letronna`) that share one data folder. When the user asks how to use, set up or fix it, answer from this page and its three files, and give the command to type or the place in the window to go.
 
+- `commands.md`: every `letronna` verb and flag: `-p` and its options, resuming, modes, models, worktrees, `cloud`, `wallet`, `mcp`, `acp`, `update`, `--uninstall`.
 - `chat-apps.md`: Telegram, Discord and Slack, pairing, and `letronna serve`.
 - `settings-and-data.md`: the data folder and its files, `settings.json`, environment variables, profiles, a project's own files.
 
@@ -27,6 +28,7 @@ You run inside Letronna, an agent with a window (`letronna gui`) and a terminal 
 - `letronna mcp` manages MCP servers; `letronna mcp serve` offers Letronna's browser, media and search tools to another agent over stdio (`--yes` runs them without asking, `--allow-turn` adds a whole agent turn).
 - `letronna acp` serves an editor over the Agent Client Protocol.
 - `letronna --uninstall` takes it off again. `--help` (`-h`), `--version` (`-V`).
+`letronna` opens a session in the terminal and `letronna gui` the window; `letronna -p "question"` asks once and prints the answer; `letronna setup` changes the first-run answers; `letronna doctor` checks everything, so suggest it first when something is wrong. Every other verb and flag is in `commands.md`.
 
 ## MCP servers
 
