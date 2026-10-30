@@ -269,6 +269,10 @@ pub fn command(
             }));
             Flow::Handled
         }
+        "/tools" => {
+            tools(runner, rest);
+            Flow::Handled
+        }
         "/tool-search" => {
             tool_search(runner, rest);
             Flow::Handled
@@ -1959,6 +1963,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
     (
         "Tools",
         &[
+            "/tools",
             "/search",
             "/tool-search",
             "/skills",
@@ -3667,6 +3672,96 @@ fn switch_skills(runner: &mut Runner, saved: &[Skill]) -> bool {
         ));
     }
     switched
+}
+
+/// `/tools`: Letronna's own tools in the families the window's Capabilities
+/// page has, switched with the arrows, or by `on` or `off` and a family's
+/// name; `/tools list`, or a run off a keyboard, lists them.
+fn tools(runner: &mut Runner, rest: &str) {
+    use letronna_core::toolset::{self, FAMILIES, Family};
+    let (verb, target) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, ""), |(verb, target)| (verb, target.trim()));
+    // One that has no tools yet, as Plugins before a plugin adds some,
+    // would switch nothing.
+    let families = || FAMILIES.iter().filter(|family| !family.tools().is_empty());
+    let rows = || {
+        families()
+            .map(|family| {
+                let off = toolset::switched_off(&family.tools());
+                family_row(*family, &off, family.readiness().map(|ready| ready.note))
+            })
+            .collect::<Vec<_>>()
+    };
+    let find = |name: &str| -> Result<Family, String> {
+        let family = families().find(|family| family.title().eq_ignore_ascii_case(name));
+        family.copied().ok_or_else(|| {
+            let names: Vec<&str> = families().map(|family| family.title()).collect();
+            format!("No family {name}; there are {}.", names.join(", "))
+        })
+    };
+    let flip = &mut |name: &str, on: bool| toolset::switch(&find(name)?.tools(), on);
+    render::blank();
+    match verb {
+        "" if switch_list(runner, "Tools", rows(), flip) => {}
+        "on" | "off" if !target.is_empty() => match flip(target, verb == "on") {
+            Ok(()) => {
+                let name = find(target).map_or(target, |family| family.title());
+                render::line(&render::dim(&format!("{name}: switched {verb}.")));
+            }
+            Err(why) => {
+                render::line(&render::red(&why));
+                return;
+            }
+        },
+        "" | "list" => {
+            let rows = rows();
+            let wide = rows.iter().map(|row| row.name.len()).max().unwrap_or(0);
+            for row in rows {
+                let state = if row.on {
+                    render::green("on ")
+                } else {
+                    render::dim("off")
+                };
+                let name = render::bold(&format!("{:wide$}", row.name));
+                render::line(&format!("  {state}  {name}  {}", render::dim(&row.about)));
+            }
+        }
+        _ => {
+            render::line(&render::red(
+                "/tools · /tools list · /tools on|off <family>",
+            ));
+            return;
+        }
+    }
+    render::line(&render::dim(
+        "For every session and helper; asking you and the to-do list stay on · \
+         /tools on|off <family>",
+    ));
+}
+
+/// A family as `/tools` lists it, with `off` its tools that are switched off
+/// and `note` what it still needs: on unless every one of its tools is off,
+/// as the window's switch has it.
+fn family_row(
+    family: letronna_core::toolset::Family,
+    off: &[String],
+    note: Option<&str>,
+) -> crate::bar::Switch {
+    let tools = family.tools();
+    let off = tools.iter().filter(|name| off.contains(name)).count();
+    let mut about = family.blurb().to_owned();
+    if off > 0 && off < tools.len() {
+        about.push_str(&format!(" · {off} of {} off", tools.len()));
+    }
+    if let Some(note) = note {
+        about.push_str(&format!(" · {note}"));
+    }
+    crate::bar::Switch {
+        name: family.title().to_owned(),
+        about,
+        on: off < tools.len(),
+    }
 }
 
 /// A mode picked from those offered, each with what it does, the one in use
@@ -7509,6 +7604,21 @@ mod tests {
             let (_, rest) = line.split_once(char::is_whitespace).unwrap();
             assert_eq!(super::typed_path(rest.trim(), None), path);
         }
+    }
+
+    #[test]
+    fn a_tool_family_reads_as_on_until_every_tool_in_it_is_off() {
+        use letronna_core::toolset::Family;
+        let files = Family::Files.tools();
+        let row = super::family_row(Family::Files, &[], None);
+        assert!(row.on);
+        assert_eq!(row.about, Family::Files.blurb());
+        let row = super::family_row(Family::Files, &files[..2], None);
+        assert!(row.on);
+        assert!(row.about.ends_with(&format!("2 of {} off", files.len())));
+        let row = super::family_row(Family::Files, &files, Some("no search key"));
+        assert!(!row.on);
+        assert!(row.about.ends_with(" · no search key"));
     }
 
     #[test]

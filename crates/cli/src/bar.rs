@@ -113,6 +113,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "let the model search the web; /search services for your own, /search keyless for DuckDuckGo, /search letronna auto, free or paid",
     },
     Command {
+        name: "/tools",
+        blurb: "switch Letronna's tool families on or off: files, commands, web, browser and more",
+    },
+    Command {
         name: "/tool-search",
         blurb: "how find_tools ranks the tools left out -- Jev or their words -- and a check of Jev",
     },
