@@ -40,7 +40,7 @@ Flags:
 
 For scripted runs, `-p` also takes a deadline and a JSON Schema for the answer.
 
-In the box, Enter sends. `\` then Enter, or Ctrl+J, starts a new line, and so does Shift+Enter in terminals that can tell it from Enter. Option+arrows (Alt+B/F) move a word, and Ctrl+P/N step through what you sent before, as ↑ and ↓ do.
+In the box, Enter sends. `\` then Enter, or Ctrl+J, starts a new line, and so does Shift+Enter in terminals that can tell it from Enter. Option+arrows (Alt+B/F) move a word, and Ctrl+P/N step through what you sent before, as ↑ and ↓ do, and Ctrl+R searches it.
 
 In the terminal, Esc or Ctrl+C stops a reply and keeps Letronna open; Ctrl+C twice on an empty box leaves, as does Ctrl+D. A line cleared with Esc comes back with ↑.
 

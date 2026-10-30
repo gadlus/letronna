@@ -1727,11 +1727,15 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
     ("enter", "send"),
     (
         "\\+enter, ctrl+j",
-        "a new line (or shift+enter, where it works)",
+        "a new line (or shift+enter or alt+enter, where they work)",
     ),
     ("tab", "finish a command or an @file name"),
     ("↑ ↓, ctrl+p/n", "step through what you said before"),
-    ("shift+tab", "switch mode: asks first, edits, plan, auto"),
+    ("ctrl+r", "search what you said before"),
+    (
+        "shift+tab, alt+m",
+        "switch mode: asks first, edits, plan, auto",
+    ),
     (
         "esc",
         "stop an answer, or clear the line (↑ brings it back)",
@@ -1747,21 +1751,36 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
         "↑ while it works",
         "take the newest queued line back to change or drop",
     ),
-    ("ctrl+o", "open or fold the latest thinking"),
-    ("ctrl+a/e", "go to the start or end of the line"),
+    (
+        "ctrl+o, click",
+        "open or fold the latest thinking, or the one clicked",
+    ),
+    (
+        "ctrl+a/e",
+        "go to the start or end of the line; home and end, of the whole box",
+    ),
     (
         "ctrl+u/k",
         "delete to the start or end of the line; ctrl+y puts it back",
     ),
-    ("ctrl+w", "delete a word back"),
-    ("alt+← →", "move a word, as alt+b/f do; alt+d deletes one"),
+    ("ctrl+w", "delete a word back, as alt+backspace does"),
+    (
+        "alt+← →",
+        "move a word, as ctrl+← → and alt+b/f do; alt+d deletes one",
+    ),
     ("ctrl+_", "undo the last change to the line"),
     (
         "ctrl+g",
         "write the line in your editor ($VISUAL or $EDITOR)",
     ),
-    ("page up/down", "scroll back through the conversation"),
-    ("end", "follow the conversation again"),
+    (
+        "page up/down, end",
+        "scroll back through the conversation; end follows it again",
+    ),
+    (
+        "ctrl+l",
+        "a clean screen, the conversation going on as it was",
+    ),
     ("drag", "select and copy; a picture dragged in is attached"),
     ("ctrl+v", "attach the picture on the clipboard"),
     ("@path", "attach a file, a line range or a folder"),
@@ -7366,6 +7385,14 @@ mod tests {
         for entry in crate::bar::COMMANDS {
             let times = shown.iter().filter(|name| **name == entry.name).count();
             assert_eq!(times, 1, "{}", entry.name);
+        }
+    }
+
+    #[test]
+    fn help_lists_the_keys_that_search_wipe_and_switch_mode() {
+        let keys: Vec<&str> = super::KEYS.iter().map(|(key, _)| *key).collect();
+        for key in ["ctrl+r", "ctrl+l", "alt+m", "click", "end"] {
+            assert!(keys.iter().any(|listed| listed.contains(key)), "{key}");
         }
     }
 
