@@ -15,6 +15,7 @@ pub(crate) mod files;
 pub(crate) mod from_link;
 pub(crate) mod find;
 pub(crate) mod grain;
+pub(crate) mod handoff;
 pub(crate) mod import;
 pub(crate) mod jobs;
 pub(crate) mod keys;

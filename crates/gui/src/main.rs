@@ -810,6 +810,11 @@ fn main() {
         platform::install::uninstall();
     }
     if platform::install::ensure_installed() || !platform::install::single_instance() {
+        // The window that runs, or the installed copy started instead,
+        // takes the session from the file this leaves.
+        if let Some(id) = ui::handoff::session_flag() {
+            ui::handoff::ask_for(id);
+        }
         return;
     }
     // An update downloaded last time goes in now, before anything is running,

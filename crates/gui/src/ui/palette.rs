@@ -126,6 +126,10 @@ fn commands() -> Vec<(&'static str, Rc<dyn Action>)> {
             Rc::new(super::typed::ExportSession),
         ),
         (
+            "Continue this session in the terminal",
+            Rc::new(super::handoff::ContinueInTerminal),
+        ),
+        (
             "Memory: when this chat saves and where it keeps it",
             Rc::new(super::remember::MemoryMenu),
         ),

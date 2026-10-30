@@ -698,6 +698,12 @@ impl Chat {
         }
         store.assign_ids();
         store.active = store.active.min(store.conversations.len() - 1);
+        // The session the terminal asked to carry on here: named when the
+        // window was started, or left for it by a start that handed over.
+        let asked = crate::ui::handoff::session_flag().or_else(crate::ui::handoff::take_asked);
+        if let Some(ix) = asked.and_then(|id| store.index_of(id)) {
+            store.active = ix;
+        }
         if store.settings.gateway.is_empty() {
             store.settings.gateway = gateways()[0].name.into();
         }
@@ -1278,6 +1284,7 @@ impl Chat {
         letronna_core::wake::serve_every();
         Self::watch_sessions(cx);
         Self::watch_accounts(cx);
+        Self::watch_asked(cx);
         // What the file says of the plan is as of the last check, which may
         // be from before an upgrade on the website.
         this.check_upgrade(cx);
@@ -5221,6 +5228,11 @@ impl Render for Chat {
             .on_action(
                 cx.listener(|this, _: &crate::ui::settings::TextUsual, window, cx| {
                     this.step_text(None, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::handoff::ContinueInTerminal, _, cx| {
+                    this.continue_in_terminal(cx)
                 }),
             )
             .on_action(
