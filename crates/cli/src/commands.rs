@@ -412,6 +412,10 @@ pub fn command(
             }
             Flow::Handled
         }
+        "/redo" => {
+            redo(runner, *session, here);
+            Flow::Handled
+        }
         "/retry" => {
             match take_back(runner, *session, here) {
                 // Queued rather than asked from here, so it goes the way a
@@ -1917,6 +1921,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/branch",
             "/rewind",
             "/undo",
+            "/redo",
             "/retry",
             "/compact",
             "/context",
@@ -5007,22 +5012,34 @@ fn go_back(
             runner.bar.say(&prompt);
             render::blank();
             render::line(&render::dim(&format!(
-                "Went back to before “{said}”. Your message is back in the box."
+                "Went back to before “{said}”. Your message is back in the box; /redo puts \
+                 it all back."
             )));
+            let mut undone = Undone {
+                session: id,
+                left: at,
+                messages: Some(dropped.to_vec()),
+                files: None,
+                said: said.clone(),
+            };
             if back == Back::Conversation {
                 if let Some(stay) = staying(&plan, folder.as_deref()) {
                     render::line(&render::dim(&stay));
                 }
+                keep_undone(undone);
                 return true;
             }
             // The question went with the redraw, so what was left alone is
             // said again here.
-            for line in history::restore(id, &plan, folder.as_deref()).lines() {
+            let restored = history::restore(id, &plan, folder.as_deref());
+            for line in restored.lines() {
                 render::line(&render::dim(&line));
             }
             for line in &commands {
                 render::line(&render::dim(line));
             }
+            undone.files = restored.notice();
+            keep_undone(undone);
         }
         Back::Code => {
             let restored = history::restore(id, &plan, folder.as_deref());
@@ -5036,8 +5053,18 @@ fn go_back(
             // The conversation still holds the edits, which the model would
             // otherwise take for what is on disk.
             if let Some(notice) = restored.notice() {
-                runner.store.conversations[*session].messages.push(notice);
+                let messages = &mut runner.store.conversations[*session].messages;
+                messages.push(notice.clone());
+                let left = messages.len();
                 runner.persist();
+                render::line(&render::dim("/redo puts the agent's versions back."));
+                keep_undone(Undone {
+                    session: id,
+                    left,
+                    messages: None,
+                    files: Some(notice),
+                    said: said.clone(),
+                });
             }
         }
         Back::Summary => {
@@ -5062,6 +5089,120 @@ fn go_back(
         }
     }
     true
+}
+
+/// What a rewind took back, for `/redo` to put back.
+struct Undone {
+    /// The session it was in.
+    session: u64,
+    /// How many messages it left there, which is all there may be for it
+    /// to be put back: anything said since was said without it.
+    left: usize,
+    /// The messages it took out of the chat; `None` when only the code went
+    /// back, whose notice is the last of `left` and goes again.
+    messages: Option<Vec<Message>>,
+    /// The notice of the files it put back, which a rewind past it would
+    /// undo, and so does `/redo`.
+    files: Option<Message>,
+    /// The start of the message it went back to before, as it said it.
+    said: String,
+}
+
+/// The rewinds `/redo` can put back, the latest last: each one after
+/// another, for as long as nothing new is said.
+static UNDONE: std::sync::Mutex<Vec<Undone>> = std::sync::Mutex::new(Vec::new());
+
+/// The rewinds kept, whole even after a panic while they were held.
+fn undone() -> std::sync::MutexGuard<'static, Vec<Undone>> {
+    UNDONE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Keep `latest` for `/redo`. A rewind of another session starts the list
+/// over, since `/redo` only reaches the one it is in.
+fn keep_undone(latest: Undone) {
+    let mut kept = undone();
+    kept.retain(|undone| undone.session == latest.session);
+    kept.push(latest);
+}
+
+/// The latest rewind of session `id`, which holds `now` messages, taken off
+/// the list to be put back, or why there is none to put back.
+fn redoable(id: u64, now: usize) -> Result<Undone, &'static str> {
+    let mut kept = undone();
+    let Some(last) = kept.pop_if(|undone| undone.session == id) else {
+        return Err("Nothing to redo: /redo puts back what /undo or /rewind last took back.");
+    };
+    if last.left != now {
+        // What was said since was said without them, and every rewind
+        // before it was one more back.
+        kept.clear();
+        return Err(
+            "Not redone: something was said since /undo, without what it took \
+                    back. /rewind can still go back to any message.",
+        );
+    }
+    Ok(last)
+}
+
+/// Put back what the latest rewind in this session took back: its messages
+/// and the files as the agent had left them, unless something was said
+/// since, which would have been said without them.
+fn redo(runner: &mut Runner, session: usize, workspace: Option<&std::path::Path>) {
+    render::blank();
+    let conversation = &runner.store.conversations[session];
+    let (id, now) = (conversation.id, conversation.messages.len());
+    let last = match redoable(id, now) {
+        Ok(last) => last,
+        Err(why) => return render::line(&render::dim(why)),
+    };
+    let folder = conversation.workspace.clone();
+    let mut files = Vec::new();
+    if let Some(notice) = &last.files {
+        let plan = history::plan(id, std::slice::from_ref(notice), folder.as_deref());
+        let restored = history::restore(id, &plan, folder.as_deref());
+        match restored.back {
+            0 => {}
+            1 => files.push("1 file is as the agent left it again.".to_owned()),
+            n => files.push(format!("{n} files are as the agent left them again.")),
+        }
+        files.extend(restored.left);
+    }
+    let say = |files: &[String]| {
+        for line in files {
+            render::line(&render::dim(line));
+        }
+    };
+    let Some(messages) = last.messages else {
+        // Only the code went back, and its notice is all there is to take
+        // out again.
+        runner.store.conversations[session].rewind(now.saturating_sub(1));
+        runner.persist();
+        return say(&files);
+    };
+    // The pictures of the message taken back went into the box with it,
+    // and come back with it instead.
+    if messages
+        .first()
+        .is_some_and(|first| first.images == runner.images)
+    {
+        runner.images.clear();
+    }
+    let conversation = &mut runner.store.conversations[session];
+    conversation.messages.extend(messages);
+    conversation.todos = store::todos_in(&conversation.messages);
+    runner.bar.set_plan(&conversation.todos);
+    // What came back is drawn where it was, as the rewind drew what was left.
+    render::clear();
+    banner(runner, &folder_name(workspace), session);
+    replay(runner, session);
+    runner.persist();
+    render::blank();
+    render::line(&render::dim(&format!(
+        "Redone: “{}” and what came after it are back.",
+        last.said
+    )));
+    // After the redraw, which would take them off the screen.
+    say(&files);
 }
 
 /// What restoring the conversation takes out of the chat, `gone` messages
@@ -7221,6 +7362,43 @@ mod tests {
         let narrow = run_rows(&runs, 40);
         assert_eq!(narrow[1], "wf-3   running · 4s · 1 of 2 done  1.2M…");
         assert!(narrow.iter().all(|row| row.chars().count() <= 40));
+    }
+
+    #[test]
+    fn redo_puts_back_the_latest_undo_only_while_nothing_new_was_said() {
+        let undo = |session: u64, left: usize, said: &str| super::Undone {
+            session,
+            left,
+            messages: Some(Vec::new()),
+            files: None,
+            said: said.to_owned(),
+        };
+        fn said(taken: Result<super::Undone, &'static str>) -> Result<String, &'static str> {
+            taken.map(|undone| undone.said)
+        }
+        assert!(
+            said(super::redoable(7, 3))
+                .unwrap_err()
+                .starts_with("Nothing to redo")
+        );
+        // Two rewinds come back latest first, each where the one after it
+        // left the session.
+        super::keep_undone(undo(7, 5, "first"));
+        super::keep_undone(undo(7, 2, "second"));
+        assert_eq!(said(super::redoable(7, 2)), Ok("second".to_owned()));
+        assert_eq!(said(super::redoable(7, 5)), Ok("first".to_owned()));
+        assert!(super::redoable(7, 5).is_err());
+        // Another session's rewind is not this one's to put back, and one
+        // of its own starts the list over.
+        super::keep_undone(undo(7, 4, "elsewhere"));
+        assert!(super::redoable(8, 4).is_err());
+        super::keep_undone(undo(8, 1, "here"));
+        assert!(super::redoable(7, 4).is_err());
+        // Something said since, and no rewind before it holds either.
+        super::keep_undone(undo(8, 3, "later"));
+        let refused = said(super::redoable(8, 4)).unwrap_err();
+        assert!(refused.starts_with("Not redone"), "{refused}");
+        assert!(super::redoable(8, 1).is_err());
     }
 
     #[test]

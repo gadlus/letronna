@@ -82,6 +82,7 @@ Type `/` to list them all. The common ones:
 | `/context` | What fills the context, part by part; the box's bottom edge says how full it is |
 | `/btw` | Ask something aside without derailing the turn |
 | `/rewind`, `/undo` | Go back to any message you sent; see below |
+| `/redo` | Put back what the last `/rewind` or `/undo` took back |
 | `/rename` | Name the session, or with no name have a model name it now |
 | `/model names` | How sessions get their names: automatically, by the chat's model, by another, or not at all |
 | `/loop`, `/heartbeat` | Keep a session working toward a goal |
@@ -108,3 +109,5 @@ In the terminal, Ctrl+V attaches the picture on the clipboard to your next messa
 | Branch from here | A copy of the session carries on from before the message; the original keeps everything |
 
 What a command changed in the project goes back as well as what the file tools wrote. A file someone changed since, a link, or anything outside the project is left alone and named.
+
+In the terminal, `/redo` puts back what the last restore took back: the messages, and the files as the agent left them. Several restores come back one `/redo` at a time, the latest first. Once you send something, or go back in another session, there is nothing to redo, since what you said was said without them. A file changed since the restore is left alone and named.

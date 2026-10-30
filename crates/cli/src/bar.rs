@@ -205,6 +205,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "the same as /rewind",
     },
     Command {
+        name: "/redo",
+        blurb: "put back what /undo or /rewind last took back",
+    },
+    Command {
         name: "/retry",
         blurb: "ask your last message again",
     },
@@ -4453,6 +4457,7 @@ mod tests {
                 "/remember",
                 "/resume",
                 "/rewind",
+                "/redo",
                 "/retry",
                 "/rename",
                 "/review"
