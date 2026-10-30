@@ -492,6 +492,19 @@ pub fn command(
             aside(runner, *session, rest);
             Flow::Handled
         }
+        "/recap" => {
+            render::blank();
+            match runner.recap(*session) {
+                Ok(recap) => {
+                    let mut lines = recap.lines();
+                    let first = lines.next().unwrap_or_default();
+                    render::said(&render::dim("◇"), &render::dim(first));
+                    lines.for_each(|line| render::line(&render::dim(line)));
+                }
+                Err(error) => render::line(&render::red(&error)),
+            }
+            Flow::Handled
+        }
         "/goal" => {
             let goal = &mut runner.store.conversations[*session].goal;
             let said = goal::apply_command(goal, goal::parse(rest));
@@ -1986,6 +1999,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/compact",
             "/context",
             "/btw",
+            "/recap",
             "/copy",
             "/export",
             "/status",
@@ -4889,6 +4903,7 @@ fn pick_up(
     // was taken from, and saying it twice reads as the command having run
     // twice.
     replay(runner, index);
+    runner.recap_if_due(index);
     // Notices that came for it while another session was open rang for that
     // one, so they are taken now; and a turn stopped over there is no reason
     // for this one to stay quiet.

@@ -257,6 +257,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "ask something aside; the answer is not kept",
     },
     Command {
+        name: "/recap",
+        blurb: "a few lines on where this session stands",
+    },
+    Command {
         name: "/goal",
         blurb: "keep working until a goal is met: /goal <text>, --check <command>, resume, clear",
     },
@@ -4672,6 +4676,7 @@ mod tests {
                 "/redo",
                 "/retry",
                 "/rename",
+                "/recap",
                 "/review"
             ]
         );

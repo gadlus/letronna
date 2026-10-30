@@ -62,7 +62,8 @@ pub struct Runner {
     pub images: Vec<std::path::PathBuf>,
     /// The queue that reads replies aloud, there only while `/voice` is on.
     pub voice: Option<Voice>,
-    /// Stops the memory review a turn started, when the next one begins, the
+    /// Stops the memory review a turn started, or the recap a session picked
+    /// up again started, when the next one begins, the
     /// exchange it read is taken back or the session is left.
     pub review: Cancel,
     /// Replies print here at the prompt, which shows only bold and code;
@@ -461,6 +462,71 @@ impl Runner {
         self.bar.wait_line(false);
         self.bar.working(false);
         answer
+    }
+
+    /// Recap what `session` was doing, from a quick look, waiting for it as
+    /// /btw does; Esc gives up on it.
+    pub fn recap(&mut self, session: usize) -> Result<String, String> {
+        let connection = self.connection(session);
+        chat::validate(&connection)?;
+        let messages = self.store.conversations[session].messages.clone();
+        let cancel = Cancel::default();
+        let stop = cancel.clone();
+        let (sender, receiver) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let recap = letronna_core::recap::recap(&connection, &messages, &stop);
+            let _ = sender.send_blocking(recap);
+        });
+        self.bar.working(true);
+        self.bar.wait_line_about("recap");
+        let recap = loop {
+            self.bar.pump();
+            if self.bar.interrupted() {
+                cancel.set();
+                break Err("Stopped.".to_owned());
+            }
+            match receiver.try_recv() {
+                Ok(recap) => break recap,
+                Err(async_channel::TryRecvError::Empty) => continue,
+                Err(async_channel::TryRecvError::Closed) => {
+                    break Err("The recap stopped before it was written.".to_owned());
+                }
+            }
+        };
+        self.bar.wait_line(false);
+        self.bar.working(false);
+        recap
+    }
+
+    /// Recap a session left more than `recap::AWAY` ago as it is picked up
+    /// again. It comes to the prompt as a note, so nothing waits for it, and
+    /// the next turn or session stops it as it does a memory review.
+    pub fn recap_if_due(&mut self, session: usize) {
+        if !self.human || !self.plain_terminal {
+            return;
+        }
+        let messages = &self.store.conversations[session].messages;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        if !letronna_core::recap::due(messages, now) {
+            return;
+        }
+        let connection = self.connection(session);
+        if chat::validate(&connection).is_err() {
+            return;
+        }
+        let messages = messages.clone();
+        self.review = Cancel::default();
+        let stop = self.review.clone();
+        let (tell, heard) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            if let Ok(recap) = letronna_core::recap::recap(&connection, &messages, &stop) {
+                let recap = recap.lines().collect::<Vec<_>>().join(" ");
+                let _ = tell.send_blocking(format!("Where this stands: {recap} · /recap again"));
+            }
+        });
+        self.bar.hear(heard);
     }
 
     /// Run the agent to completion on the conversation as it stands.

@@ -476,6 +476,7 @@ fn main() {
         resume(&mut runner, &mut session, workspace.as_deref(), "");
     } else if runner.store.conversations[session].length() > 0 {
         replay(&runner, session);
+        runner.recap_if_due(session);
     }
     // Painting is throttled, and nothing else paints until a key: without
     // this a resumed session's conversation stayed off the screen until
