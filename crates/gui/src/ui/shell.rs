@@ -48,7 +48,7 @@ impl Chat {
         let mut ctx = letronna_core::tools::ToolContext::of(&connection);
         ctx.approved = true;
         let cancel = ctx.cancel.clone();
-        self.shell = Some(cancel);
+        self.shell = Some(cancel.clone());
         let command = command.to_owned();
         let args = serde_json::json!({ "command": command }).to_string();
         let running = cx
@@ -58,7 +58,11 @@ impl Chat {
         cx.spawn(async move |this, cx| {
             let output = running.await.unwrap_or_else(|error| error);
             let _ = this.update(cx, |this, cx| {
-                this.shell = None;
+                // Only its own: one stopped with Esc may end after the next
+                // has started, whose stop this must leave in place.
+                if this.shell.as_ref().is_some_and(|shell| shell.same(&cancel)) {
+                    this.shell = None;
+                }
                 this.shell_ran(session, ran(&command, &output), cx);
             });
         })

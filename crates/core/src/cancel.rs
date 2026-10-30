@@ -69,6 +69,12 @@ impl Drop for Waker {
 }
 
 impl Cancel {
+    /// Whether `other` is this signal or a clone of it, rather than another
+    /// made apart from it.
+    pub fn same(&self, other: &Cancel) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     /// Whether the token has been set.
     pub fn is_set(&self) -> bool {
         self.0.stopped.load(Ordering::Acquire)
@@ -288,6 +294,13 @@ pub(crate) mod tests {
         move || {
             ran.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn a_clone_is_the_same_signal_and_a_new_one_is_not() {
+        let one = Cancel::default();
+        assert!(one.same(&one.clone()));
+        assert!(!one.same(&Cancel::default()));
     }
 
     #[test]
