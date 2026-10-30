@@ -12,6 +12,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("new", "start a fresh session"),
     ("mode", "change how much runs without asking"),
     ("effort", "change how hard the model thinks"),
+    (
+        "add-dir",
+        "let this session reach another folder, until the window closes",
+    ),
     ("btw", "ask a side question that stays out of the session"),
     ("recap", "a few lines on where this session stands"),
     (

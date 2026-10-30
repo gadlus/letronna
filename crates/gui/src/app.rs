@@ -578,6 +578,9 @@ pub(crate) struct Chat {
     /// Pictures pasted, dropped or picked for each session's next message,
     /// saved already, by session id.
     pub(crate) attachments: std::collections::HashMap<u64, Vec<PathBuf>>,
+    /// Folders added beside each session's project, by session id, for as
+    /// long as the window is open; see `ui::added`.
+    pub(crate) added: std::collections::HashMap<u64, Vec<PathBuf>>,
     pub(crate) error: Option<String>,
     /// Where updating stands, for the About page and the status bar.
     pub(crate) updating: crate::ui::update::Updating,
@@ -1210,6 +1213,7 @@ impl Chat {
             drafts: std::collections::HashMap::new(),
             draft_for,
             attachments: std::collections::HashMap::new(),
+            added: std::collections::HashMap::new(),
             error: error
                 .or(skills_error)
                 .or_else(letronna_core::vault::trouble),
@@ -1641,6 +1645,12 @@ impl Chat {
         if name == "/effort" {
             let rest = rest.to_owned();
             return self.effort_command(&rest, prompt, window, cx);
+        }
+        // Taken while a reply runs too: the folder is in reach from the
+        // session's next turn.
+        if name == "/add-dir" {
+            let rest = rest.to_owned();
+            return self.add_dir_command(&rest, prompt, window, cx);
         }
         if prompt.starts_with("/mcp__") {
             return self.send_mcp_prompt(prompt, window, cx);
@@ -2523,8 +2533,7 @@ impl Chat {
             key,
             tools: true,
             workspace: None,
-            // Only the terminal adds folders beside the project.
-            added: Default::default(),
+            added: self.added_to(session),
             plan: mode == letronna_core::gate::Mode::Plan,
             effort: self.store.effort(ix).to_owned(),
             search: self.store.settings.search,

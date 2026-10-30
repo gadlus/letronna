@@ -271,11 +271,14 @@ impl Chat {
     }
 
     /// The session's project folder, with its branch and how many files
-    /// changed when it is in git. Click for a menu: open another folder,
-    /// one of the recent ones, or the changes; or to pick a folder when
+    /// changed when it is in git, and how many folders were added beside it.
+    /// Click for a menu: open another folder, one of the recent ones, add a
+    /// folder or take one away, or the changes; or to pick a folder when
     /// there is none.
     fn workspace_chip(&self, cx: &mut Context<Self>) -> AnyElement {
         let workspace = &self.store.conversations[self.store.active].workspace;
+        let session = self.store.conversations[self.store.active].id;
+        let added = self.added_to(session);
         let Some(folder) = workspace else {
             return Button::new("workspace")
                 .plain(cx)
@@ -297,10 +300,18 @@ impl Chat {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| folder.display().to_string());
         let status = self.git_status();
-        let (icon, label) = match status {
+        let (icon, mut label) = match status {
             Some(status) => (AppIcon::Branch, format!("{name} · {}", status.describe())),
             None => (AppIcon::Folder, name),
         };
+        let mut tip = folder.display().to_string();
+        if !added.is_empty() {
+            label.push_str(&format!(" · +{}", added.len()));
+            tip.push_str("\nAdded until the window closes:");
+            for folder in added.iter() {
+                tip.push_str(&format!("\n{}", folder.display()));
+            }
+        }
         // Enough to get back to this week's projects without a long menu.
         const RECENT: usize = 5;
         let recent: Vec<PathBuf> =
@@ -314,7 +325,7 @@ impl Chat {
             .plain(cx)
             .xsmall()
             .text_color(cx.theme().muted_foreground)
-            .tooltip(folder.display().to_string())
+            .tooltip(tip)
             .child(
                 h_flex()
                     .gap_1()
@@ -322,7 +333,7 @@ impl Chat {
                     .child(Icon::new(icon).size_3())
                     .child(label),
             )
-            .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, _, _| {
+            .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, _, cx| {
                 let open = chat.clone();
                 let mut menu = menu.min_w(px(220.)).item(
                     PopupMenuItem::new("Open folder…")
@@ -348,6 +359,41 @@ impl Chat {
                             }));
                     }
                 }
+                // Beside the project, for this session and only until the
+                // window closes, as the terminal's /add-dir is for its run.
+                menu = menu
+                    .separator()
+                    .label("Also in reach until the window closes");
+                for folder in added.iter() {
+                    let name = folder
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| folder.display().to_string());
+                    let path = folder.display().to_string();
+                    let muted = cx.theme().muted_foreground;
+                    let (chat, folder) = (chat.clone(), folder.clone());
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, _| {
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(Icon::new(IconName::Close).size_3())
+                                .child(format!("Remove {name}"))
+                                .child(div().text_color(muted).truncate().child(path.clone()))
+                        })
+                        .on_click(move |_, _, cx| {
+                            chat.update(cx, |this, cx| this.remove_added(session, &folder, cx))
+                        }),
+                    );
+                }
+                let add = chat.clone();
+                menu = menu.item(
+                    PopupMenuItem::new("Add folder…")
+                        .icon(Icon::new(AppIcon::Folder))
+                        .on_click(move |_, window, cx| {
+                            add.update(cx, |this, cx| this.pick_added_folder(window, cx))
+                        }),
+                );
                 let changes = chat.clone();
                 menu.separator().item(
                     PopupMenuItem::new("See changes")
