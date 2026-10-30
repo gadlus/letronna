@@ -1595,6 +1595,14 @@ impl Chat {
             .split_once(char::is_whitespace)
             .unwrap_or((prompt.as_str(), ""));
         let here = self.store.conversations[self.store.active].id;
+        // A run in the background writes this session already, and a second
+        // writer would put their turns in among each other's. Kept as typed,
+        // to send once it is done.
+        if letronna_core::background::running(here) {
+            self.error = Some(background_busy(here));
+            cx.notify();
+            return;
+        }
         // A chat app's session is woken only by its next message, which
         // would carry the ticks, and what they did, into the chat.
         let done = if matches!(name, "/loop" | "/heartbeat") && self.remote.holds(here) {
@@ -5555,6 +5563,13 @@ fn side_question(prompt: &str) -> Option<&str> {
     (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
 }
 
+/// Why session `id` takes no message here: a run in the background has it.
+fn background_busy(id: u64) -> String {
+    format!(
+        "This session is working in the background. To watch it and answer what it asks, run letronna attach {id} in a terminal; letronna stop {id} ends it."
+    )
+}
+
 /// What an added command gives.
 pub(crate) enum Given {
     /// Text for the composer, read before it is sent.
@@ -5583,8 +5598,8 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        card_is_up, cuts_in, escape_closes_aside, first_line, front_call, name_after, run_ended,
-        running_calls, side_question, until_repeated_id, untouched,
+        background_busy, card_is_up, cuts_in, escape_closes_aside, first_line, front_call,
+        name_after, run_ended, running_calls, side_question, until_repeated_id, untouched,
     };
     use letronna_core::agent::{MAX_BATCH, Next, Turn};
     use letronna_core::chat::{Connection, ToolCall};
@@ -5876,5 +5891,12 @@ mod tests {
             ..Default::default()
         };
         assert!(!untouched(&named));
+    }
+
+    #[test]
+    fn a_session_working_in_the_background_says_how_to_reach_it() {
+        let said = background_busy(42);
+        assert!(said.contains("letronna attach 42"), "{said}");
+        assert!(said.contains("letronna stop 42"), "{said}");
     }
 }
