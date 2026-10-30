@@ -5168,6 +5168,11 @@ impl Render for Chat {
                     this.deny_by_key(window, cx)
                 }),
             )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::approval::ToBackground, _, cx| {
+                    this.send_to_background(cx)
+                }),
+            )
             .capture_key_up(cx.listener(|this, event: &KeyUpEvent, _, _| this.card_key_up(event)))
             // Last, after every binding had its chance: a key that typed
             // nothing where the focus is goes to the composer.

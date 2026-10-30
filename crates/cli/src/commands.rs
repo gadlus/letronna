@@ -1270,7 +1270,7 @@ pub fn shell_line(runner: &mut Runner, session: usize, command: &str) {
     let connection = runner.connection(session);
     let mut ctx = letronna_core::tools::ToolContext::of(&connection);
     ctx.approved = true;
-    let cancel = ctx.cancel.clone();
+    let (cancel, conversation) = (ctx.cancel.clone(), ctx.conversation);
     let args = serde_json::json!({ "command": command }).to_string();
     let handle = std::thread::spawn(move || letronna_core::tools::run("run_command", &args, &ctx));
     runner.bar.wait_line_about(&format!("! {command}"));
@@ -1279,6 +1279,10 @@ pub fn shell_line(runner: &mut Runner, session: usize, command: &str) {
         runner.bar.pump();
         if runner.bar.interrupted() {
             cancel.set();
+        }
+        let movable = letronna_core::tools::can_go_to_background(conversation);
+        if runner.bar.background_asked(movable) {
+            letronna_core::tools::to_background(conversation);
         }
     }
     runner.bar.working(false);
@@ -1763,6 +1767,7 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
         "ctrl+o, click",
         "open or fold the latest thinking, or the one clicked",
     ),
+    ("ctrl+b", "run the command it is running in the background"),
     (
         "ctrl+a/e",
         "go to the start or end of the line; home and end, of the whole box",

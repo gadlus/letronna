@@ -11,6 +11,15 @@ mod ui;
 
 use prelude::*;
 
+/// The key that sends a running command to the background: ctrl+b, as in
+/// Claude Code, where Cmd+B leaves it free; off macOS ctrl+b is the
+/// sidebar's, which no key bound in the chat can outrank, so alt+b.
+const BACKGROUND_KEY: &str = if cfg!(target_os = "macos") {
+    "ctrl-b"
+} else {
+    "alt-b"
+};
+
 /// Every key the window answers, each with what it does as the key list
 /// (F1) shows it; a binding with no words is left off the list.
 pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Option<&'static str>)> {
@@ -735,6 +744,10 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             None,
         ),
     ]);
+    keys.push((
+        KeyBinding::new(BACKGROUND_KEY, approval::ToBackground, Some("Chat")),
+        Some("While a command runs: run it in the background, and the reply goes on"),
+    ));
     // One binding per letter, so the list says it once.
     keys.extend(('a'..='z').enumerate().map(|(n, letter)| {
         (
@@ -912,6 +925,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::keys;
+    use gpui::KeyBinding;
 
     #[test]
     fn every_key_but_the_window_wide_ones_is_bound_in_a_context() {
@@ -939,6 +953,25 @@ mod tests {
         assert!(binding.action().partial_eq(&crate::app::Quit));
         assert!(binding.predicate().is_none());
         assert!(about.is_some());
+    }
+
+    #[test]
+    fn the_background_key_is_none_a_window_wide_key_takes() {
+        let keys = keys(&gpui::DummyKeyboardMapper);
+        let key = |wanted: &dyn Fn(&KeyBinding) -> bool| -> Vec<String> {
+            (keys.iter())
+                .filter(|(binding, _)| wanted(binding))
+                .map(|(binding, _)| binding.keystrokes()[0].unparse())
+                .collect()
+        };
+        let background = key(&|binding| {
+            binding
+                .action()
+                .partial_eq(&crate::ui::approval::ToBackground)
+        });
+        assert_eq!(background.len(), 1, "{background:?}");
+        let window_wide = key(&|binding| binding.predicate().is_none());
+        assert!(!window_wide.contains(&background[0]), "{window_wide:?}");
     }
 
     #[test]

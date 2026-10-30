@@ -97,7 +97,7 @@ pub(crate) struct Place {
 #[action(namespace = question, no_json)]
 pub(crate) struct PickOption(pub(crate) usize);
 
-actions!(approval, [AllowCall, DenyCall]);
+actions!(approval, [AllowCall, DenyCall, ToBackground]);
 
 /// A key that answers a permission card.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -338,6 +338,18 @@ impl Chat {
         Some(place((session, at), before, behind))
     }
 
+    /// Send the commands the reply is running to the background, where they
+    /// carry on as jobs and the reply with them, or hand the key back when
+    /// none of them can go.
+    pub(crate) fn send_to_background(&mut self, cx: &mut Context<Self>) {
+        let moved = (self.turn.as_ref())
+            .is_some_and(|turn| tools::to_background(turn.connection.conversation));
+        match moved {
+            true => cx.notify(),
+            false => cx.propagate(),
+        }
+    }
+
     /// Empties the card's reason field and hands back what was in it, so a
     /// reason typed on one card cannot go with the next.
     fn take_reason(&mut self, window: &mut Window, cx: &mut Context<Self>) -> String {
@@ -358,6 +370,9 @@ impl Chat {
         let (call, waiting) = front_call(turn, self.asking.as_deref())?;
         let ctx = tools::ToolContext::of(&turn.connection);
         let summary = tools::summary(&call.name, &call.arguments);
+        // Asked on every frame the line is drawn, so it comes as the
+        // command starts and goes as it ends.
+        let movable = tools::can_go_to_background(turn.connection.conversation);
         if !waiting {
             // Calls from one reply that run together get a line each, which
             // goes as its result comes back; one Auto mode's judge is still
@@ -387,7 +402,23 @@ impl Chat {
                             row.child(name)
                                 .child(div().font_family(MONO_FONT).child(summary))
                         })
-                        .when(checking, |row| row.child("checking…"));
+                        .when(checking, |row| row.child("checking…"))
+                        .when(movable && call.name == "run_command", |row| {
+                            row.child(
+                                Button::new(SharedString::from(format!("background-{}", call.id)))
+                                    .framed(cx)
+                                    .xsmall()
+                                    .label("Run in background")
+                                    .tooltip_with_action(
+                                        "Let it run on as a job, and the reply go on",
+                                        &ToBackground,
+                                        Some("Chat"),
+                                    )
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.send_to_background(cx)),
+                                    ),
+                            )
+                        });
                     // The sweep under it as wide as what it says.
                     v_flex()
                         .gap(px(3.))

@@ -1162,11 +1162,18 @@ impl Runner {
             .zip(tags)
             .filter_map(|(call, tag)| Some((call.id.clone(), tag?)))
             .collect();
+        let conversation = ctx.conversation;
         let mut batch = Batch::start(calls, &ctx, tools::run);
         let mut about = batch.waiting();
         self.bar.wait_line_about(&about);
         while !batch.done() {
             self.bar.pump();
+            if self
+                .bar
+                .background_asked(tools::can_go_to_background(conversation))
+            {
+                tools::to_background(conversation);
+            }
             let ready = if self.bar.interrupted() {
                 batch.stop()
             } else {
@@ -1241,6 +1248,12 @@ impl Runner {
                 shown = now;
             }
             self.bar.pump();
+            if self
+                .bar
+                .background_asked(tools::can_go_to_background(conversation))
+            {
+                tools::to_background(conversation);
+            }
             self.answer_helpers(true);
             self.bar.interrupted()
         });

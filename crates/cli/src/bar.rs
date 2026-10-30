@@ -922,6 +922,10 @@ pub struct Bar {
     waiting: Option<crate::spinner::Waiting>,
     /// When the waiting line was last moved on.
     ticked: std::time::Instant,
+    /// Whether a command running now can go to the background, which the
+    /// footer then says, and whether the user asked for that.
+    movable: bool,
+    background: bool,
     /// The open session's checklist, shown over the box while any of it is
     /// left to do.
     plan: Vec<Todo>,
@@ -1047,6 +1051,8 @@ impl Bar {
             enters: 0,
             waiting: None,
             ticked: std::time::Instant::now(),
+            movable: false,
+            background: false,
             plan: Vec::new(),
             goal: None,
             helpers_of: 0,
@@ -2259,6 +2265,8 @@ impl Bar {
             // What the turn changed shows on the box's edge.
             self.look_at_place();
             self.turn_began = None;
+            self.movable = false;
+            self.background = false;
         }
         // The footer says whether escape will stop anything, so it is
         // redrawn now rather than at the next key; that also brings out the
@@ -2276,6 +2284,16 @@ impl Bar {
     /// Whether the user has asked to stop the turn, clearing the request.
     pub fn interrupted(&mut self) -> bool {
         std::mem::take(&mut self.interrupt)
+    }
+
+    /// Say whether a command running now can go to the background, and
+    /// give whether the user asked for that, clearing the request.
+    pub fn background_asked(&mut self, movable: bool) -> bool {
+        if movable != self.movable {
+            self.movable = movable;
+            self.settle();
+        }
+        movable && std::mem::take(&mut self.background)
     }
 
     /// True once the user has asked to leave.
@@ -2357,6 +2375,15 @@ impl Bar {
                 }
             }
             KeyCode::Char('d') if control && self.line.is_empty() => self.done = true,
+            // The command running goes on as a job and the turn with it, as
+            // Claude Code's ctrl+b does.
+            KeyCode::Char('b') if control && self.working => {
+                if self.movable {
+                    self.background = true;
+                } else {
+                    self.note = Some("nothing running now can go to the background".to_owned());
+                }
+            }
             // Open or fold the latest thinking, as Claude Code's ctrl+o does.
             KeyCode::Char('o') if control => crate::screen::toggle_last(),
             // A picture on the clipboard goes with the next message.
@@ -2909,6 +2936,21 @@ impl Bar {
         crate::screen::chrome(self.lines(height as usize));
     }
 
+    /// The waiting line in a window `width` columns wide, saying after it
+    /// what can be done about a command that can go to the background. The
+    /// keys give way before what is waited for, esc first, which the footer
+    /// says as well.
+    fn waiting_line(&self, waiting: &crate::spinner::Waiting, width: usize) -> String {
+        let key = format!("  ·  {}", background_key());
+        let hints = [format!("{key}  ·  esc stops it"), key];
+        let fits = |hint: &String| width >= render::visible(hint) + WAIT_ROOM;
+        let Some(hint) = hints.into_iter().find(fits).filter(|_| self.movable) else {
+            return waiting.line(width);
+        };
+        let line = waiting.line(width - render::visible(&hint));
+        format!("{line}{}", render::dim(&hint))
+    }
+
     /// The waiting line, the plan, the box, the menu when one is open, and
     /// the footer, for a window `height` rows tall.
     fn lines(&self, height: usize) -> Vec<String> {
@@ -2919,7 +2961,7 @@ impl Bar {
         // The waiting line sits above the box, where the answer it is waiting
         // for will appear.
         if let Some(waiting) = &self.waiting {
-            lines.push(waiting.line(render::width()));
+            lines.push(self.waiting_line(waiting, render::width()));
         }
         // Lines entered while something runs wait here rather than in the
         // conversation, which only gets them once they go in. At the prompt
@@ -3448,6 +3490,20 @@ fn checklist(todos: &[Todo], room: usize) -> Vec<String> {
         lines.push(format!("{}{}", render::PAD, render::dim(&more)));
     }
     lines
+}
+
+/// Columns the waiting line keeps for what it waits for before the keys
+/// said after it give way: enough for the spinner, a tool and its clock.
+const WAIT_ROOM: usize = 30;
+
+/// What sends a running command to the background, as the waiting line
+/// says it. Inside tmux, whose prefix ctrl+b is, a second press reaches us.
+fn background_key() -> &'static str {
+    if std::env::var_os("TMUX").is_some() {
+        "ctrl+b twice runs it in the background"
+    } else {
+        "ctrl+b runs it in the background"
+    }
 }
 
 /// Readline's keys as the ones they stand for: ctrl-p and ctrl-n step like
@@ -5481,6 +5537,42 @@ mod tests {
         bar.line.set("!git status");
         let footer = plain(bar.lines(40).last().unwrap());
         assert!(footer.contains("runs this in"), "{footer}");
+    }
+
+    #[test]
+    fn ctrl_b_sends_a_running_command_to_the_background_as_its_line_says() {
+        let mut bar = Bar::new("fake".into());
+        bar.working(true);
+        bar.waiting = Some(crate::spinner::Waiting::about("run_command(npm run dev)"));
+        let said =
+            |bar: &Bar, width| plain(&bar.waiting_line(bar.waiting.as_ref().unwrap(), width));
+        assert!(!said(&bar, 120).contains("ctrl+b"), "{}", said(&bar, 120));
+        // With nothing that can move, it says so and asks nothing.
+        hit(&mut bar, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(!bar.background_asked(false));
+        assert!(plain(bar.lines(40).last().unwrap()).contains("nothing running now"));
+
+        assert!(!bar.background_asked(true));
+        let wide = said(&bar, 120);
+        assert!(wide.contains("run_command(npm"), "{wide}");
+        assert!(
+            wide.ends_with("runs it in the background  ·  esc stops it"),
+            "{wide}"
+        );
+        assert!(visible(&wide) <= 120, "{wide}");
+        // Narrower, esc goes first, which the footer says too; narrower
+        // still, the line keeps what it is waiting for.
+        let middle = said(&bar, 80);
+        assert!(middle.ends_with("runs it in the background"), "{middle}");
+        assert!(middle.contains("run_command("), "{middle}");
+        assert!(!said(&bar, 50).contains("ctrl+b"), "{}", said(&bar, 50));
+        hit(&mut bar, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(bar.background_asked(true));
+        // Asked once, it moves once.
+        assert!(!bar.background_asked(true));
+        // A turn that ends forgets what could move.
+        bar.working(false);
+        assert!(!said(&bar, 120).contains("ctrl+b"));
     }
 
     #[test]
