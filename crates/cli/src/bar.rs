@@ -251,6 +251,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "carry on in a copy of this session",
     },
     Command {
+        name: "/background",
+        blurb: "leave this session working with the terminal closed: /background <what to do>",
+    },
+    Command {
         name: "/rename",
         blurb: "name this session, or have a model name it",
     },

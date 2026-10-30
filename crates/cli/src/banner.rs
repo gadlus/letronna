@@ -23,6 +23,12 @@ pub fn replay(runner: &Runner, session: usize) {
             if from == 1 { "" } else { "s" }
         )));
     }
+    replay_from(messages, from);
+}
+
+/// Put `messages` from `from` on the screen as `replay` does; the earlier
+/// ones are read only for what a tool ran on.
+pub fn replay_from(messages: &[letronna_core::chat::Message], from: usize) {
     for (at, message) in messages.iter().enumerate().skip(from) {
         match message.role.as_str() {
             "user" if message.notice => render::notice(&message.content),

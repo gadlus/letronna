@@ -12,6 +12,7 @@
 
 mod acp;
 mod args;
+mod background;
 mod banner;
 mod bar;
 mod cloud;
@@ -161,6 +162,14 @@ fn main() {
             false => acp::Client::Editor,
         };
         std::process::exit(acp::run(client));
+    }
+    if let Some(runs) = &args.runs {
+        std::process::exit(background::look(runs));
+    }
+    // The run itself is this program again, started with the same words.
+    if args.bg {
+        let words = std::env::args().skip(1).filter(|word| word != "--bg");
+        std::process::exit(background::start(words.collect()));
     }
     // Before the update is seen to: the window counts its own start and
     // installs what is waiting, so counting here too would put a working
@@ -378,6 +387,13 @@ fn main() {
     // The one it opened with, whose worktree is seen to on the way out
     // even when another session is open by then.
     let opened = runner.store.conversations[session].id;
+    // A run in the background writes that session already, and a second
+    // writer would put their turns in among each other's.
+    if args.background.is_none() && letronna_core::background::running(opened) {
+        runner.store.release_unused();
+        show(args.output, &failed(background::busy(opened)), None, false);
+        std::process::exit(1);
+    }
     choose_by_flags(&mut runner, session, gateway, &args, routed);
     letronna_core::diag::mark("session");
 
@@ -388,11 +404,30 @@ fn main() {
         let interrupted = Cancel::default();
         let code = match &args.prompt {
             Some(prompt) => {
+                // Claimed before it starts, so its starter hears which
+                // session it is, and a second run of the session is refused.
+                let ran = match &args.background {
+                    Some(token) => match background::claim(&runner, session, prompt, token) {
+                        Ok(run) => Some(run),
+                        Err(error) => {
+                            show(args.output, &failed(error), None, false);
+                            std::process::exit(1);
+                        }
+                    },
+                    None => None,
+                };
                 // From here a Ctrl-C stops the run instead, so what it
                 // started is ended below before the process goes. Not during
                 // the wait above, which would not hear it.
                 letronna_core::cancel::on_interrupt(interrupted.clone());
-                let finished = ask_once(&mut runner, session, prompt, &args, &interrupted, started);
+                let finished = ask_once(
+                    &mut runner,
+                    session,
+                    prompt,
+                    &args,
+                    &interrupted,
+                    (started, ran.as_ref()),
+                );
                 if finished {
                     keep.now();
                 }
@@ -673,7 +708,9 @@ fn main() {
     render::blank();
     // On the screen the terminal is given back, where the conversation was
     // not, which session it was and how to come back to it.
-    if let Some(left) = runner.store.conversations.get(session)
+    if let Some(run) = background::handed() {
+        background::say_started(run);
+    } else if let Some(left) = runner.store.conversations.get(session)
         && left.length() > 0
     {
         render::line(&render::dim(&format!(
@@ -822,7 +859,10 @@ fn ask_once(
     prompt: &str,
     args: &Args,
     interrupted: &Cancel,
-    started: std::time::Instant,
+    (started, ran): (
+        std::time::Instant,
+        Option<&Arc<letronna_core::background::Run>>,
+    ),
 ) -> bool {
     let budget = args.budget.map(|limit| Arc::new(Budget::new(limit, None)));
     // Before the prompt goes on the session, which a mistake leaves alone.
@@ -835,6 +875,10 @@ fn ask_once(
     };
     // Named while the session is in the store, which the run takes it out of.
     let opening = init(runner, session);
+    let title = match runner.store.conversations[session].title.trim() {
+        "" => crate::session::first_line(prompt),
+        title => title.to_owned(),
+    };
     let (mut spec, context, before) = match begin(runner, session, prompt, args, budget) {
         Ok(begun) => begun,
         Err(error) => {
@@ -859,15 +903,26 @@ fn ask_once(
     // Served before the run starts, since a request with nobody serving is
     // declined at once.
     let keyboard = args.output == Output::Text && render::interactive();
-    // Its own gate asks only when someone can answer.
-    spec.connection.human = keyboard;
-    // The gate's refusals reach only the model, so a script that left out
-    // --yes would otherwise see an answer that changed nothing and no why.
-    say_unanswered(spec.connection.mode, keyboard);
+    // Its own gate asks only when someone can answer: in the background,
+    // whoever attaches, for as long as the card waits.
+    spec.connection.human = keyboard || ran.is_some();
     if args.output == Output::StreamJson {
         hear_steps(&spec.status, context.clone());
     }
-    answer_approvals(keyboard, context, spec.cancel.clone());
+    let mut following = None;
+    match ran {
+        Some(run) => {
+            background::serve(run, &title, spec.cancel.clone());
+            following = Some(background::follow(run, spec.status.clone()));
+        }
+        None => {
+            // The gate's refusals reach only the model, so a script that left
+            // out --yes would otherwise see an answer that changed nothing
+            // and no why.
+            say_unanswered(spec.connection.mode, keyboard);
+            answer_approvals(keyboard, context, spec.cancel.clone());
+        }
+    }
     if args.output == Output::StreamJson {
         emit(&opening);
     }
@@ -876,6 +931,10 @@ fn ask_once(
     // apart from the session's.
     let connection = spec.connection.clone();
     let report = run_following(spec, args.output);
+    drop(following);
+    if let Some(run) = ran {
+        background::end(run, &title, &report);
+    }
     let ran_out = ran_out.load(Ordering::SeqCst);
     finish(
         runner,

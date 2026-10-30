@@ -11,6 +11,11 @@ Letronna — a small agent in your terminal
   letronna --continue      pick up this folder's most recent session
   letronna --resume        choose from the recent sessions
   letronna --resume <id>   open that session, by the id /where shows
+  letronna --bg \"task\"     work on it in the background, terminal closed
+  letronna sessions        what is working in the background
+  letronna attach <id>     watch one, and answer what it asks
+  letronna logs <id>       what a session has done so far
+  letronna stop <id>       stop one working in the background
   letronna gui             open the window instead
   letronna serve           answer chat apps and run schedules, no window
   letronna setup           name, sign in, provider, model, install
@@ -32,6 +37,8 @@ Options
       --fork-session       with -c or -r <id>: carry on in a copy of it,
                            leaving that session as it was
       --name <name>        name the session, new or carried on
+      --bg                 work in the background: says the session's id
+                           and leaves it working with the terminal closed
       --worktree           work in a git worktree of its own, on a branch
                            made from HEAD, leaving your checkout alone
       --mode <mode>        how much runs without asking: default, accept-edits,
@@ -110,6 +117,15 @@ pub enum Start {
     Choose,
     /// A named one, by the id in its file name.
     Named(u64),
+}
+
+/// What `letronna sessions`, `attach`, `logs` and `stop` look at.
+#[derive(Debug, PartialEq)]
+pub enum Runs {
+    List,
+    Attach(u64),
+    Logs(u64),
+    Stop(u64),
 }
 
 /// How `-p` gives its answer.
@@ -201,6 +217,12 @@ pub struct Args {
     /// Instructions this run adds after all the rest, from
     /// `--append-system-prompt` or `--append-system-prompt-file`.
     pub append_system_prompt: Option<String>,
+    /// `--bg`: start the run in a process of its own and return.
+    pub bg: bool,
+    /// Set in that process: the token its starter finds its record by.
+    pub background: Option<String>,
+    /// `letronna sessions`, `attach`, `logs` or `stop`.
+    pub runs: Option<Runs>,
 }
 
 pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -246,6 +268,9 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         fork: false,
         system_prompt: None,
         append_system_prompt: None,
+        bg: false,
+        background: None,
+        runs: None,
     };
     // Only as the first word, so `-p mcp` still asks about it.
     if raw.next_if(|first| first == "mcp").is_some() {
@@ -262,6 +287,22 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
     }
     if raw.next_if(|first| first == "local").is_some() {
         args.local = Some(raw.collect());
+        return Ok(args);
+    }
+    // Only as the first word, so `letronna "stop the server"` still asks.
+    if let Some(verb) = raw.next_if(|first| RUNS.contains(&first.as_str())) {
+        let id = raw.next().and_then(|id| id.parse().ok());
+        let named = |id: Option<u64>| {
+            id.ok_or(format!(
+                "letronna {verb} takes a session id, like letronna {verb} 42; letronna sessions lists them."
+            ))
+        };
+        args.runs = Some(match verb.as_str() {
+            "attach" => Runs::Attach(named(id)?),
+            "logs" => Runs::Logs(named(id)?),
+            "stop" => Runs::Stop(named(id)?),
+            _ => Runs::List,
+        });
         return Ok(args);
     }
     // Only as the first word too, since an editor starts it with nothing
@@ -386,6 +427,11 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
                     ));
                 }
             }
+            "--bg" => args.bg = true,
+            // Not in --help: only `--bg` starts a run with it.
+            "--background" => {
+                args.background = Some(raw.next().ok_or("--background takes a token.")?);
+            }
             "--gateway" => args.gateway = raw.next(),
             "--effort" => args.effort = raw.next(),
             "setup" | "--install" => args.install = true,
@@ -433,6 +479,20 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         );
     }
     let streamed = args.input == Input::StreamJson;
+    if args.bg && args.prompt.is_none() {
+        return Err("--bg takes what to do, like letronna --bg \"fix the flaky test\".".into());
+    }
+    // Nobody reads what it prints, and the list to choose from has nobody
+    // to choose.
+    if args.bg && (args.output != Output::Text || streamed || args.schema.is_some()) {
+        return Err(
+            "--bg works on its own, so it takes no --output, --input-format or --json-schema."
+                .into(),
+        );
+    }
+    if args.bg && args.start == Start::Choose {
+        return Err("With --bg, --resume takes a session id, like --resume 42.".into());
+    }
     if streamed && !print {
         return Err("--input-format stream-json only works with -p.".into());
     }
@@ -488,6 +548,9 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
     }
     Ok(args)
 }
+
+/// The words that look at runs in the background, as the first word.
+const RUNS: [&str; 4] = ["sessions", "attach", "logs", "stop"];
 
 impl Args {
     /// Whether this is a `-p` run, answered and left rather than a conversation.
@@ -885,6 +948,35 @@ mod tests {
             "`is` came after the question; a question of more than one word goes in quotes, like -p \"what is this\"."
         );
         assert!(refused(&["what", "--plan", "now"]).starts_with("`now` came after the question"));
+    }
+
+    #[test]
+    fn bg_takes_a_task_and_the_run_words_take_an_id_only_as_the_first_word() {
+        use super::Runs;
+        let started = args(&["--bg", "fix the flaky test", "--mode", "auto"]);
+        assert!(started.bg && started.once());
+        assert_eq!(started.prompt.as_deref(), Some("fix the flaky test"));
+        assert!(args(&["--bg", "-r", "42", "carry on"]).bg);
+        assert!(refused(&["--bg"]).starts_with("--bg takes what to do"));
+        assert!(refused(&["--bg", "--output", "json", "x"]).contains("no --output"));
+        assert!(refused(&["--bg", "-r", "x"]).contains("session id"));
+        assert_eq!(args(&["sessions"]).runs, Some(Runs::List));
+        assert_eq!(args(&["attach", "42"]).runs, Some(Runs::Attach(42)));
+        assert_eq!(args(&["logs", "7"]).runs, Some(Runs::Logs(7)));
+        assert_eq!(args(&["stop", "7"]).runs, Some(Runs::Stop(7)));
+        assert!(refused(&["stop"]).contains("letronna sessions lists them"));
+        assert!(refused(&["attach", "it"]).contains("takes a session id"));
+        // A question that only starts with one of them is still a question.
+        let asked = args(&["stop the server"]);
+        assert_eq!(asked.runs, None);
+        assert_eq!(asked.prompt.as_deref(), Some("stop the server"));
+        assert_eq!(args(&["-p", "stop"]).runs, None);
+        // The run's own token is not offered in --help.
+        assert_eq!(
+            args(&["--background", "t1", "x"]).background.as_deref(),
+            Some("t1")
+        );
+        assert!(!super::HELP.contains("--background"));
     }
 
     #[test]

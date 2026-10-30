@@ -481,6 +481,15 @@ pub fn command(
             branch(runner, session, rest);
             Flow::Handled
         }
+        "/background" => match crate::background::hand_over(runner, *session, rest) {
+            // Said on the way out, on the screen the terminal is given back.
+            Ok(_) => Flow::Stop,
+            Err(why) => {
+                render::blank();
+                render::line(&render::dim(&why));
+                Flow::Handled
+            }
+        },
         "/rename" => {
             rename(runner, *session, rest);
             Flow::Handled
@@ -2057,6 +2066,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/resume",
             "/rename",
             "/branch",
+            "/background",
             "/rewind",
             "/undo",
             "/redo",
@@ -4860,8 +4870,12 @@ fn choice_label(conversation: &store::Conversation) -> String {
         .unwrap_or_else(|| "no project".into());
     // Listed sessions are not read yet, so their messages are empty and the
     // count comes from the listing.
+    let away = match letronna_core::background::running(conversation.id) {
+        true => "  ·  working in the background",
+        false => "",
+    };
     format!(
-        "{title}  ·  {folder}  ·  {} messages",
+        "{title}  ·  {folder}  ·  {} messages{away}",
         conversation.length()
     )
 }
@@ -5047,6 +5061,12 @@ fn pick_up(
     workspace: Option<&std::path::Path>,
     index: usize,
 ) {
+    let id = runner.store.conversations[index].id;
+    if letronna_core::background::running(id) {
+        render::blank();
+        render::line(&render::dim(&crate::background::busy(id)));
+        return;
+    }
     *session = index;
     runner.enter(index);
     // A session carries its own project folder; one that never had a folder
