@@ -477,6 +477,9 @@ pub struct Command {
     /// this does not know, or spelt by braces the shell expands -- and
     /// nothing is piped in for it to act on.
     pub spelled_out: bool,
+    /// Whether its input is the output of the command before it, whose exit
+    /// status the shell then drops for its own, unless `pipefail` is set.
+    pub piped: bool,
     /// Every folder it may run in, where its relative paths lead: the line's
     /// own, and where each `cd` before it that names a folder plainly leads,
     /// as that `cd` may have failed or run in a subshell; None once one leads
@@ -1389,6 +1392,7 @@ fn judge(simple: &Simple, dialect: Dialect, places: &Places, depth: u8) -> Comma
             .collect(),
         dir: places.dir.clone(),
         spelled_out,
+        piped: simple.piped,
         dirs: places.runs_in.clone(),
     }
 }

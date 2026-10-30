@@ -153,6 +153,10 @@ const OPEN_ITEMS: &str = "Your checklist still has open items. Finish them, or s
 /// usual advice to send a file in parts, which would leave an answer short.
 const CUT_OFF: &str = "Your answer was cut off before it was complete, so it was not taken. Call structured_output again with the whole answer, worded more briefly: an answer cannot be sent in parts.";
 
+/// Why a check whose output went through a pipe did not count, said when the
+/// latest one did.
+const PIPED: &str = "A command whose output went into another, such as `cargo test | tail`, ends with the last one's exit status, so it showed no pass: run it with `set -o pipefail` first, or without the pipe.";
+
 /// What a session's own run is told, after the files it names, when it ends
 /// with source changed since its last passing build or test; it asks for the
 /// whole answer again, since the reply after it is what `-p` prints.
@@ -2119,10 +2123,17 @@ fn unchecked_edits(spec: &Spec, turn: &Turn, begun: usize) -> Option<Message> {
     if files.len() > NAMED {
         named.push(format!("and {} more", files.len() - NAMED));
     }
+    // A check that only a pipe kept from passing would look passed to the
+    // run, so it is told why it did not count.
+    let piped = match piped_check(messages, workspace) {
+        true => format!("{PIPED} "),
+        false => String::new(),
+    };
     Some(Message {
         role: "user".into(),
         content: format!(
-            "You changed these files and no build or test has passed since: {}. {CHECK_EDITS}",
+            "You changed these files and no build or test has passed since: {}. \
+             {piped}{CHECK_EDITS}",
             named.join(", ")
         ),
         notice: true,
@@ -2494,6 +2505,30 @@ fn unchecked(messages: &[Message], workspace: &Path) -> Vec<String> {
     files
 }
 
+/// Whether the latest command in `messages` since source last changed would
+/// have checked it but for a pipe hiding its status.
+fn piped_check(messages: &[Message], workspace: &Path) -> bool {
+    let mut hidden = false;
+    for result in messages.iter().filter(|message| message.role == "tool") {
+        let args = tools::parse_args_for(&result.name, &result.args).unwrap_or_default();
+        if result.name == "run_command" {
+            let line = args["command"].as_str().unwrap_or_default();
+            let dialect = crate::command::Dialect::here();
+            let assessed = crate::command::assess(line, dialect, Some(workspace));
+            let ran = !result.is_error && crate::tool_runs::exit_code(result).is_none();
+            hidden = ran && hides_status(&assessed, line);
+        } else if !result.is_error
+            && matches!(
+                result.name.as_str(),
+                "write_file" | "edit_file" | crate::patch::APPLY_PATCH
+            )
+        {
+            hidden = false;
+        }
+    }
+    hidden
+}
+
 /// Whether a command's result shows a build or a test that passed: it ran to
 /// its end with nothing failing, in the foreground, and did more than read,
 /// as `ls` or `git diff` only do.
@@ -2509,7 +2544,20 @@ fn passed(result: &Message, args: &Value, workspace: &Path) -> bool {
     }
     let line = args["command"].as_str().unwrap_or_default();
     let dialect = crate::command::Dialect::here();
-    crate::command::assess(line, dialect, Some(workspace)).risk != crate::command::Risk::ReadOnly
+    let assessed = crate::command::assess(line, dialect, Some(workspace));
+    !hides_status(&assessed, line) && assessed.risk != crate::command::Risk::ReadOnly
+}
+
+/// Whether `line`, judged as `assessed`, pipes the output of a command that
+/// does more than read into another, as `cargo test | tail` does: the shell
+/// ends it with the last command's status, so the tests could have failed,
+/// unless `pipefail` is set. A file read into a test, as `cat input | pytest`
+/// does, hides nothing.
+fn hides_status(assessed: &crate::command::Assessment, line: &str) -> bool {
+    let read_only =
+        |command: &crate::command::Command| command.risk == crate::command::Risk::ReadOnly;
+    !line.contains("pipefail")
+        && (assessed.commands.windows(2)).any(|pair| pair[1].piped && !read_only(&pair[0]))
 }
 
 /// Whether `path` is source code or a build's own file, which a build or test
@@ -7561,6 +7609,37 @@ pub(crate) mod tests {
         messages.push(wrote("Cargo.toml"));
         messages.push(wrote("web/App.TSX"));
         assert_eq!(unchecked(&messages, &dir), ["Cargo.toml", "web/App.TSX"]);
+    }
+
+    #[test]
+    fn a_test_piped_into_another_command_checks_nothing_unless_pipefail_is_set() {
+        let dir = scratch("checks-piped");
+        let tool = |name: &str, args: Value, content: &str| Message {
+            role: "tool".into(),
+            name: name.into(),
+            args: args.to_string(),
+            content: content.into(),
+            ..Default::default()
+        };
+        let ran = |line: &str| tool("run_command", json!({"command": line}), "1 failed");
+        let edited = tool("edit_file", json!({"path": "src/app.py"}), "Edited.");
+        // The tail's status stands in for the tests', which may have failed.
+        let mut messages = vec![edited.clone(), ran("pytest -q 2>&1 | tail -5")];
+        assert_eq!(unchecked(&messages, &dir), ["src/app.py"]);
+        assert!(piped_check(&messages, &dir));
+        messages.push(ran("go test ./... | grep -v ok"));
+        assert_eq!(unchecked(&messages, &dir), ["src/app.py"]);
+        // With pipefail its status is the tests' own.
+        messages.push(ran("set -o pipefail; pytest -q 2>&1 | tail -5"));
+        assert!(unchecked(&messages, &dir).is_empty());
+        assert!(!piped_check(&messages, &dir));
+        // A file read into a test hides nothing.
+        let mut fed = vec![edited.clone(), ran("cat cases.txt | python check.py")];
+        assert!(unchecked(&fed, &dir).is_empty());
+        // Nor is a piped check told of once a later change made it stale.
+        fed.push(ran("pytest | tail"));
+        fed.push(edited);
+        assert!(!piped_check(&fed, &dir));
     }
 
     #[test]
