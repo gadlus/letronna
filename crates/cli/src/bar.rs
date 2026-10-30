@@ -1862,7 +1862,13 @@ impl Bar {
                 // restoring one sends several at once. Note it and deal with
                 // the last shape rather than every shape on the way there.
                 Ok(Event::Resize(_, _)) => resized = true,
-                Ok(Event::FocusGained) => self.focus.report(true),
+                // Back in front, as its tab is when switched back to: what
+                // was drawn while it was away may be gone, so it is all
+                // drawn again, as for a resize.
+                Ok(Event::FocusGained) => {
+                    self.focus.report(true);
+                    resized = true;
+                }
                 Ok(Event::FocusLost) => self.focus.report(false),
                 // A pointer passing over the window is not someone looking at
                 // it, and changes nothing on it: nothing to read or draw.
@@ -1879,6 +1885,7 @@ impl Bar {
             }
         }
         if resized {
+            crate::screen::repaint();
             self.settle();
         }
         // Nobody types eight characters inside one poll. If that many arrived

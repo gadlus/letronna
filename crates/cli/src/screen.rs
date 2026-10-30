@@ -669,6 +669,16 @@ pub fn settle() {
     now();
 }
 
+/// Have the next paint write every row, not only those that changed, for a
+/// terminal that may no longer show the last frame: Apple's Terminal can
+/// drop what a tab showed while another tab was in front, and a window
+/// resized and put back between two paints comes back the size it was.
+pub fn repaint() {
+    if let Ok(mut s) = screen().lock() {
+        s.shown.clear();
+    }
+}
+
 impl Screen {
     /// Rows of the conversation as they are on screen, the open line
     /// included. Built fresh for the tail only; the rest is cached.
