@@ -1088,6 +1088,228 @@ fn left(deadline: Instant) -> Option<Duration> {
     Some(deadline.saturating_duration_since(Instant::now())).filter(|left| !left.is_zero())
 }
 
+/// A language server this computer has for a language a project uses, as
+/// the switch shows it before writing it into `lsp.json`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Available {
+    /// The name it goes under in `lsp.json`.
+    pub name: &'static str,
+    /// The language, as a person would say it.
+    pub language: &'static str,
+    pub command: PathBuf,
+    pub args: &'static [&'static str],
+    pub extensions: &'static [&'static str],
+}
+
+/// A language: what says a project uses it, and the servers for it, best
+/// first, each with the arguments that make it speak over its pipes.
+struct Language {
+    language: &'static str,
+    markers: &'static [&'static str],
+    servers: &'static [(&'static str, &'static [&'static str])],
+    extensions: &'static [&'static str],
+}
+
+/// The languages a project is looked at for.
+const LANGUAGES: [Language; 5] = [
+    Language {
+        language: "Rust",
+        markers: &["Cargo.toml"],
+        servers: &[("rust-analyzer", &[])],
+        extensions: &["rs"],
+    },
+    Language {
+        language: "TypeScript and JavaScript",
+        markers: &["tsconfig.json", "jsconfig.json", "package.json"],
+        servers: &[("typescript-language-server", &["--stdio"])],
+        extensions: &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
+    },
+    Language {
+        language: "Python",
+        markers: &[
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "requirements.txt",
+        ],
+        servers: &[
+            ("pyright-langserver", &["--stdio"]),
+            ("basedpyright-langserver", &["--stdio"]),
+            ("pylsp", &[]),
+        ],
+        extensions: &["py", "pyi"],
+    },
+    Language {
+        language: "Go",
+        markers: &["go.mod"],
+        servers: &[("gopls", &[])],
+        extensions: &["go"],
+    },
+    Language {
+        language: "C and C++",
+        markers: &["compile_commands.json", "CMakeLists.txt", ".clangd"],
+        servers: &[("clangd", &[])],
+        extensions: &["c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx"],
+    },
+];
+
+/// How long `rust-analyzer --version` gets to show it is more than
+/// rustup's stand-in for a component that was never added.
+const VERSION_WAIT: Duration = Duration::from_secs(3);
+
+/// The servers the project at `root` would be checked with: for each
+/// language its top folder shows it uses, the first server this computer
+/// has. Nothing is started but `rust-analyzer --version`.
+pub fn found(root: &Path) -> Vec<Available> {
+    found_with(root, &installed)
+}
+
+fn found_with(root: &Path, installed: &dyn Fn(&str) -> Option<PathBuf>) -> Vec<Available> {
+    LANGUAGES
+        .iter()
+        .filter(|language| {
+            language
+                .markers
+                .iter()
+                .any(|marker| root.join(marker).exists())
+        })
+        .filter_map(|language| {
+            language.servers.iter().find_map(|(name, args)| {
+                Some(Available {
+                    name,
+                    language: language.language,
+                    command: installed(name)?,
+                    args,
+                    extensions: language.extensions,
+                })
+            })
+        })
+        .collect()
+}
+
+/// Where the server `name` is on PATH, when it is really there.
+fn installed(name: &str) -> Option<PathBuf> {
+    let program = crate::files::on_path(name)?;
+    if name != "rust-analyzer" {
+        return Some(program);
+    }
+    // rustup puts a rust-analyzer on PATH whether or not the component was
+    // added. Asked from the home folder, since in a project a toolchain
+    // file could have rustup fetch a whole toolchain first.
+    let mut command = std::process::Command::new(&program);
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        command.current_dir(home);
+    }
+    let mut child = command.spawn().ok()?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success().then_some(program),
+            Ok(None) if started.elapsed() < VERSION_WAIT => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// The servers in `lsp.json` that serve the project at `root`.
+pub fn serving(root: &Path) -> Vec<String> {
+    let Some(config) = config_file().and_then(|file| load(&file)) else {
+        return Vec::new();
+    };
+    config
+        .servers
+        .into_iter()
+        .filter(|(_, entry)| {
+            entry
+                .projects
+                .iter()
+                .any(|project| same_folder(project, root))
+        })
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Write `found` into `lsp.json` for the project at `root`, as the user
+/// could have by hand: a server already there under that name gets the
+/// project added to its `projects`, and a new one comes in whole.
+pub fn set_up(root: &Path, found: &[Available]) -> Result<(), String> {
+    let file = config_file().ok_or("There is no data folder to keep lsp.json in.")?;
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let project = Value::from(root.to_string_lossy().into_owned());
+    crate::state::update::<Value>(&file, |disk| {
+        let Some(servers) = servers_in(disk) else {
+            return;
+        };
+        for server in found {
+            let entry = servers.entry(server.name).or_insert_with(|| {
+                json!({
+                    "command": server.command,
+                    "args": server.args,
+                    "extensions": server.extensions,
+                    "projects": [],
+                })
+            });
+            let Some(projects) = entry.get_mut("projects").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            let there = projects.iter().any(|had| {
+                had.as_str()
+                    .is_some_and(|had| same_folder(Path::new(had), &root))
+            });
+            if !there {
+                projects.push(project.clone());
+            }
+        }
+    })
+}
+
+/// Take the project at `root` off every server in `lsp.json`, which then
+/// checks nothing there; the servers themselves stay for other projects.
+pub fn turn_off(root: &Path) -> Result<(), String> {
+    let Some(file) = config_file() else {
+        return Ok(());
+    };
+    crate::state::update::<Value>(&file, |disk| {
+        let Some(servers) = servers_in(disk) else {
+            return;
+        };
+        for entry in servers.values_mut() {
+            if let Some(projects) = entry.get_mut("projects").and_then(Value::as_array_mut) {
+                projects.retain(|had| {
+                    had.as_str()
+                        .is_none_or(|had| !same_folder(Path::new(had), root))
+                });
+            }
+        }
+    })
+}
+
+/// The `servers` map of `lsp.json` as read, made where there is none.
+fn servers_in(disk: &mut Value) -> Option<&mut serde_json::Map<String, Value>> {
+    if !disk.is_object() {
+        *disk = json!({});
+    }
+    let servers = disk
+        .as_object_mut()?
+        .entry("servers")
+        .or_insert_with(|| json!({}));
+    if !servers.is_object() {
+        *servers = json!({});
+    }
+    servers.as_object_mut()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1574,5 +1796,86 @@ mod tests {
             same_uri("file:///c:/src/a.rs")
         );
         assert_ne!(same_uri("file:///src/a.rs"), same_uri("file:///src/b.rs"));
+    }
+
+    #[test]
+    fn a_project_is_checked_with_the_first_server_here_for_each_language_it_uses() {
+        let root = scratch("found");
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        std::fs::write(root.join("pyproject.toml"), "").unwrap();
+        let here = |name: &str| {
+            ["rust-analyzer", "pylsp", "gopls"]
+                .contains(&name)
+                .then(|| PathBuf::from("/opt/bin").join(name))
+        };
+        let found = found_with(&root, &here);
+        let names: Vec<_> = found
+            .iter()
+            .map(|found| (found.name, found.language))
+            .collect();
+        // No go.mod, so no gopls; no Python server before pylsp is here.
+        assert_eq!(names, vec![("rust-analyzer", "Rust"), ("pylsp", "Python")]);
+        assert_eq!(found[0].command, PathBuf::from("/opt/bin/rust-analyzer"));
+        assert_eq!(found[1].extensions, &["py", "pyi"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn setting_a_project_up_adds_it_to_a_server_already_there_and_keeps_that_server_s_own_settings()
+    {
+        let dir = scratch("set-up");
+        let root = std::fs::canonicalize(&dir).unwrap();
+        let file = dir.join(FILE);
+        let mine = json!({"servers": {"rust-analyzer": {"command": "my-ra",
+            "env": {"RA_LOG": "error"}, "extensions": ["rs"], "projects": ["/elsewhere"]}}});
+        std::fs::write(&file, mine.to_string()).unwrap();
+        CONFIG.with(|config| *config.borrow_mut() = Some(file.clone()));
+        let found = [
+            Available {
+                name: "rust-analyzer",
+                language: "Rust",
+                command: PathBuf::from("/opt/bin/rust-analyzer"),
+                args: &[],
+                extensions: &["rs"],
+            },
+            Available {
+                name: "pylsp",
+                language: "Python",
+                command: PathBuf::from("/opt/bin/pylsp"),
+                args: &[],
+                extensions: &["py", "pyi"],
+            },
+        ];
+        set_up(&root, &found).unwrap();
+        set_up(&root, &found).unwrap();
+        assert_eq!(
+            serving(&root),
+            vec!["pylsp".to_owned(), "rust-analyzer".to_owned()]
+        );
+        let written: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        let ra = &written["servers"]["rust-analyzer"];
+        assert_eq!(ra["command"], "my-ra");
+        assert_eq!(ra["env"]["RA_LOG"], "error");
+        assert_eq!(ra["projects"].as_array().map(Vec::len), Some(2));
+        assert_eq!(written["servers"]["pylsp"]["command"], "/opt/bin/pylsp");
+        // What was written serves the project's files, as a hand-written one does.
+        let config = load(&file).unwrap();
+        let serves = |path: &str| {
+            config
+                .servers
+                .values()
+                .any(|e| e.serves(&root.join(path), &root))
+        };
+        assert!(serves("src/main.rs") && serves("app.py") && !serves("main.go"));
+
+        turn_off(&root).unwrap();
+        assert!(serving(&root).is_empty());
+        let written: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(
+            written["servers"]["rust-analyzer"]["projects"],
+            json!(["/elsewhere"])
+        );
+        CONFIG.with(|config| *config.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
