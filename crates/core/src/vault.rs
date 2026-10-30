@@ -9,6 +9,17 @@
 //! for nothing else. MCP servers' headers and variables stay in `mcp.json`,
 //! which people write by hand.
 //!
+//! On macOS every entry is read, saved and removed through Apple's own
+//! `security` tool, so it trusts that one program rather than the build
+//! that saved it. Letronna's builds are signed ad hoc, which names each by
+//! the hash of its code, so an entry the window saved asked again, entry by
+//! entry, of the terminal and of every later build, however often it was
+//! allowed. Through the tool no build asks. The trade is that
+//! any program running as the user can read them through the tool too, as
+//! it could the files before; they stay encrypted, and locked with the
+//! login. An entry an older build saved asks once more, for the tool, and
+//! no more once it is always allowed or saved again.
+//!
 //! The files still say what there is. `vault.json` records the service the
 //! entries are filed under and lists each name the vault holds with a stamp
 //! that changes on every write, so a secret is read from the vault once and
@@ -64,6 +75,13 @@ const FILES: &str = "files";
 /// looks the keys up for every tool result, and a locked Keychain need not
 /// be asked each time, while one unlocked meanwhile is read within a turn.
 const RETRY: Duration = Duration::from_secs(10);
+
+/// What to do about a vault that would not give a secret. On macOS the
+/// dialog asks for the tool Letronna reads the Keychain through.
+#[cfg(target_os = "macos")]
+const ALLOW: &str = "choose Always Allow when it asks for \"security\"";
+#[cfg(not(target_os = "macos"))]
+const ALLOW: &str = "allow Letronna";
 
 /// What to call the system's vault when none is open.
 #[cfg(target_os = "macos")]
@@ -216,10 +234,13 @@ pub fn open() {
     }
     move_in(&open);
     // Read now, so a locked vault is said at start rather than at the
-    // first request.
-    for (name, stamp) in open.listed() {
-        let _ = open.read(&name, stamp);
-    }
+    // first request, and side by side, since each read can start a program.
+    std::thread::scope(|scope| {
+        for (name, stamp) in open.listed() {
+            let open = &open;
+            scope.spawn(move || open.read(&name, stamp));
+        }
+    });
 }
 
 /// The service to file entries under, or `None` to keep the files. A debug
@@ -425,7 +446,7 @@ pub fn trouble() -> Option<String> {
     let refused = refused.map(|why| {
         format!(
             "{label} would not give Letronna its saved keys ({why}). They are still \
-             there: unlock it or allow Letronna, and they are read again."
+             there: unlock it or {ALLOW}, and they are read again."
         )
     });
     let gone = (!gone.is_empty()).then(|| {
@@ -755,12 +776,14 @@ fn put(json: &mut Value, pointer: &str, value: Value) {
 
 #[cfg(target_os = "macos")]
 mod keychain {
+    use std::io::Write;
+    use std::process::{Command, Output, Stdio};
+    use std::sync::{Mutex, MutexGuard};
+
     use security_framework::base::Error;
     use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
     use security_framework::os::macos::keychain::{KeychainUserInteractionLock, SecKeychain};
-    use security_framework::passwords::{
-        PasswordOptions, delete_generic_password, generic_password, set_generic_password,
-    };
+    use security_framework::passwords::{PasswordOptions, generic_password};
 
     /// errSecItemNotFound: nothing is kept under that name.
     const NOT_FOUND: i32 = -25300;
@@ -768,6 +791,17 @@ mod keychain {
     const LOCKED: i32 = -25308;
     /// errSecAuthFailed and userCanceledErr: the person said no.
     const REFUSED: [i32; 2] = [-25293, -128];
+
+    /// Apple's own Keychain tool, the one program every entry trusts.
+    const TOOL: &str = "/usr/bin/security";
+
+    /// The longest line `security -i` reads whole; a longer one is cut, and
+    /// what is left of it saved as though it were the secret.
+    const LINE: usize = 4096;
+
+    /// A debug or test build raises no dialog: a hand test must not put one
+    /// on the desktop, so a locked Keychain just says it is locked.
+    const QUIET: bool = cfg!(any(debug_assertions, test));
 
     /// The login Keychain: a generic password per secret, filed under the
     /// service, with the secret's name as its account.
@@ -777,31 +811,78 @@ mod keychain {
 
     impl super::Vault for Keychain {
         fn get(&self, name: &str) -> Result<Option<String>, String> {
-            let _quiet = quiet();
-            match generic_password(PasswordOptions::new_generic_password(&self.service, name)) {
-                Ok(bytes) => String::from_utf8(bytes)
-                    .map(Some)
-                    .map_err(|_| "what it holds is not text".into()),
-                Err(error) if error.code() == NOT_FOUND => Ok(None),
-                Err(error) => Err(said(error)),
+            match quietly(&self.service, name) {
+                Ok(bytes) => return text(bytes).map(Some),
+                Err(NOT_FOUND) => return Ok(None),
+                Err(LOCKED) if QUIET => return Err("it is locked".into()),
+                // The tool's, or another build's: the tool reads either.
+                Err(_) => {}
             }
+            let out = tool(
+                &[
+                    "find-generic-password",
+                    "-s",
+                    &self.service,
+                    "-a",
+                    name,
+                    "-g",
+                ],
+                "",
+            )?;
+            if exited(&out, NOT_FOUND) {
+                return Ok(None);
+            }
+            if !out.status.success() {
+                return Err(failed(&out));
+            }
+            let said = String::from_utf8_lossy(&out.stderr);
+            let shown = said
+                .lines()
+                .find_map(|line| line.strip_prefix("password:"))
+                .ok_or("it gave no secret")?;
+            text(shown_as(shown.trim_start())?).map(Some)
         }
 
         fn set(&self, name: &str, value: &str) -> Result<(), String> {
-            let _quiet = quiet();
-            set_generic_password(&self.service, name, value.as_bytes()).map_err(said)
+            unlocked(&self.service, name)?;
+            let (service, name) = (quoted(&self.service)?, quoted(name)?);
+            // On the tool's input rather than its arguments, which `ps`
+            // shows to every account on this Mac.
+            let secret = if value.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+                format!("-w {}", quoted(value)?)
+            } else {
+                format!("-X {}", hex(value.as_bytes()))
+            };
+            let add = format!("add-generic-password -s {service} -a {name} {secret}");
+            if add.len() >= LINE {
+                return Err("it is too long for the Keychain".into());
+            }
+            // Removed and saved anew rather than updated, so the entry is the
+            // tool's whichever build saved it before.
+            let input = format!("delete-generic-password -s {service} -a {name}\n{add}\n");
+            let out = tool(&["-i"], &input)?;
+            if out.status.success() {
+                Ok(())
+            } else {
+                Err(failed(&out))
+            }
         }
 
         fn delete(&self, name: &str) -> Result<(), String> {
-            let _quiet = quiet();
-            match delete_generic_password(&self.service, name) {
-                Err(error) if error.code() != NOT_FOUND => Err(said(error)),
-                _ => Ok(()),
+            unlocked(&self.service, name)?;
+            let out = tool(
+                &["delete-generic-password", "-s", &self.service, "-a", name],
+                "",
+            )?;
+            if out.status.success() || exited(&out, NOT_FOUND) {
+                Ok(())
+            } else {
+                Err(failed(&out))
             }
         }
 
         fn names(&self) -> Result<Vec<String>, String> {
-            let _quiet = quiet();
+            let _hush = QUIET.then(hush);
             // Attributes only: a list reads no secret, so it asks nothing.
             let found = ItemSearchOptions::new()
                 .class(ItemClass::generic_password())
@@ -820,13 +901,123 @@ mod keychain {
         }
     }
 
-    /// A debug or test build raises no dialog: a hand test must not put one
-    /// on the desktop, so a locked Keychain just says it is locked.
-    fn quiet() -> Option<KeychainUserInteractionLock> {
-        if cfg!(any(debug_assertions, test)) {
-            SecKeychain::disable_user_interaction().ok()
-        } else {
-            None
+    /// The secret `name` as this process reads it itself, raising no
+    /// dialog. An entry the tool saved trusts only the tool, so this mostly
+    /// finds out that there is none, which then needs no tool started, or
+    /// that the Keychain is locked.
+    fn quietly(service: &str, name: &str) -> Result<Vec<u8>, i32> {
+        let _hush = hush();
+        generic_password(PasswordOptions::new_generic_password(service, name))
+            .map_err(|error| error.code())
+    }
+
+    /// In a quiet build, stop at a locked Keychain before the tool asks to
+    /// unlock it.
+    fn unlocked(service: &str, name: &str) -> Result<(), String> {
+        if QUIET && quietly(service, name) == Err(LOCKED) {
+            return Err("it is locked".into());
+        }
+        Ok(())
+    }
+
+    /// Run the tool with `args` and `input` written to it.
+    fn tool(args: &[&str], input: &str) -> Result<Output, String> {
+        let mut child = Command::new(TOOL)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("{TOOL} would not start ({e})"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            // One that stopped reading has said why on stderr.
+            let _ = stdin.write_all(input.as_bytes());
+        }
+        child.wait_with_output().map_err(|e| e.to_string())
+    }
+
+    /// Whether the tool exited with `code`, which it gives as its low byte.
+    fn exited(out: &Output, code: i32) -> bool {
+        out.status.code() == Some(code & 0xff)
+    }
+
+    /// Why the tool failed, in the words `said` uses for the same codes.
+    fn failed(out: &Output) -> String {
+        if exited(out, LOCKED) {
+            return "it is locked".into();
+        }
+        if REFUSED.iter().any(|&code| exited(out, code)) {
+            return "access was not allowed".into();
+        }
+        // Its own words follow the name of the call that failed.
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("security: "))
+            .and_then(|line| line.rsplit(": ").next())
+            .map_or_else(
+                || format!("{TOOL} failed"),
+                |why| why.trim().trim_end_matches('.').to_owned(),
+            )
+    }
+
+    /// The secret as `-g` shows it: `"text"`, `0x<hex>  "..."` for anything
+    /// but plain ASCII, or nothing at all for an empty one.
+    pub(super) fn shown_as(shown: &str) -> Result<Vec<u8>, String> {
+        let Some(hex) = shown.strip_prefix("0x") else {
+            let text = shown
+                .strip_prefix('"')
+                .and_then(|text| text.strip_suffix('"'));
+            return Ok(text.unwrap_or(shown).as_bytes().to_vec());
+        };
+        let hex = hex.split_whitespace().next().unwrap_or_default();
+        unhex(hex).ok_or_else(|| "what it holds came back garbled".into())
+    }
+
+    /// `text` in double quotes as `security -i` reads it; a line break or
+    /// other control character would end its line, so is refused.
+    pub(super) fn quoted(text: &str) -> Result<String, String> {
+        if text.chars().any(char::is_control) {
+            return Err("its name has a line break or other control character in it".into());
+        }
+        Ok(format!(
+            "\"{}\"",
+            text.replace('\\', "\\\\").replace('"', "\\\"")
+        ))
+    }
+
+    fn text(bytes: Vec<u8>) -> Result<String, String> {
+        String::from_utf8(bytes).map_err(|_| "what it holds is not text".into())
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn unhex(hex: &str) -> Option<Vec<u8>> {
+        if !hex.len().is_multiple_of(2) {
+            return None;
+        }
+        (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(hex.get(at..at + 2)?, 16).ok())
+            .collect()
+    }
+
+    /// While held, this process's own Keychain calls raise no dialog. The
+    /// switch is the whole process's, so one hold at a time: a call ending
+    /// must not let a dialog through for another still under way.
+    struct Hush {
+        _quiet: Option<KeychainUserInteractionLock>,
+        _turn: MutexGuard<'static, ()>,
+    }
+
+    fn hush() -> Hush {
+        static TURN: Mutex<()> = Mutex::new(());
+        let turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        Hush {
+            _quiet: SecKeychain::disable_user_interaction().ok(),
+            _turn: turn,
         }
     }
 
@@ -1571,5 +1762,82 @@ pub(crate) mod tests {
         assert_eq!(keychain.get("key"), Ok(None));
         assert_eq!(keychain.names(), Ok(Vec::new()));
         keychain.delete("key").unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes to the login Keychain under a scratch service it deletes again: \
+                cargo test -p letronna-core --release -- --ignored the_keychain"]
+    fn the_keychain_keeps_any_text_a_secret_can_be() {
+        let service = format!("Letronna-test-text-{}", std::process::id());
+        let keychain = super::keychain::Keychain { service };
+        let _tidy = Tidy(&keychain);
+        for secret in [
+            "deadbeef0011",
+            "clé-ключ-🔑",
+            "line one\nline two",
+            r#"a "quoted" \ one"#,
+            "it's $HOME # x\ttab",
+        ] {
+            keychain.set("key", secret).unwrap();
+            assert_eq!(
+                keychain.get("key"),
+                Ok(Some(secret.to_owned())),
+                "{secret:?}"
+            );
+        }
+        // Refused whole rather than cut short where the tool's line ends.
+        assert!(keychain.set("key", &"k".repeat(5000)).is_err());
+        assert_eq!(keychain.get("key"), Ok(Some("it's $HOME # x\ttab".into())));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes to the login Keychain under a scratch service it deletes again: \
+                cargo test -p letronna-core --release -- --ignored the_keychain"]
+    fn the_keychain_reads_what_an_older_build_saved_and_saves_it_anew_for_every_build() {
+        use security_framework::os::macos::keychain::SecKeychain;
+        use security_framework::passwords::{
+            PasswordOptions, generic_password, set_generic_password,
+        };
+        let service = format!("Letronna-test-old-{}", std::process::id());
+        // As a build before the tool saved it: straight from this program.
+        set_generic_password(&service, "key", b"sk-old").unwrap();
+        let keychain = super::keychain::Keychain { service };
+        let _tidy = Tidy(&keychain);
+        assert_eq!(keychain.get("key"), Ok(Some("sk-old".into())));
+        keychain.set("key", "sk-new").unwrap();
+        assert_eq!(keychain.get("key"), Ok(Some("sk-new".into())));
+        // The tool's now, so this program is a stranger to it, as any other
+        // build is, and only the tool reads it.
+        let _quiet = SecKeychain::disable_user_interaction().unwrap();
+        let options = PasswordOptions::new_generic_password(&keychain.service, "key");
+        assert!(generic_password(options).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_secret_the_keychain_tool_shows_reads_back_in_either_form() {
+        use super::keychain::shown_as;
+        assert_eq!(
+            shown_as(r#""sk-abc_DEF-123""#),
+            Ok(b"sk-abc_DEF-123".to_vec())
+        );
+        assert_eq!(shown_as(r#""deadbeef0011""#), Ok(b"deadbeef0011".to_vec()));
+        let shown = r#"0x636CC3A9  "cl\303\251""#;
+        assert_eq!(shown_as(shown), Ok("clé".as_bytes().to_vec()));
+        let shown = r#"0x6C696E65310A6C696E6532  "line1\012line2""#;
+        assert_eq!(shown_as(shown), Ok(b"line1\nline2".to_vec()));
+        assert_eq!(shown_as(""), Ok(Vec::new()));
+        assert!(shown_as("0x6G").is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_name_is_quoted_for_the_keychain_tool_and_a_line_break_refused() {
+        use super::keychain::quoted;
+        let quoted_name = quoted(r#"keys.My "odd" \ one"#);
+        assert_eq!(quoted_name, Ok(r#""keys.My \"odd\" \\ one""#.to_owned()));
+        assert!(quoted("keys.a\ndelete-keychain login.keychain").is_err());
     }
 }
