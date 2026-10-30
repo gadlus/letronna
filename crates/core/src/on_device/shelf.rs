@@ -175,7 +175,7 @@ fn shelf() -> MutexGuard<'static, Shelf> {
 /// Downloads a quit left part way, as paused, so they can be resumed.
 fn left_from_before() -> Vec<(String, State)> {
     let mut found = Vec::new();
-    for entry in catalog::CATALOG {
+    for entry in catalog::all() {
         for pack in packs(entry) {
             let part = beside(&path(entry, pack), "part");
             if let Ok(meta) = std::fs::metadata(&part)
@@ -259,10 +259,11 @@ pub fn ready(entry: &Entry) -> Option<&Pack> {
         .find(|pack| state(entry, pack) == State::Ready)
 }
 
-/// The ids of the models that are here, in the catalog's order.
+/// The ids of the models that are here, in the catalog's order and then
+/// those added from a link.
 pub fn ready_ids() -> Vec<&'static str> {
-    catalog::CATALOG
-        .iter()
+    catalog::all()
+        .into_iter()
         .filter(|entry| ready(entry).is_some())
         .map(|entry| entry.id)
         .collect()
@@ -276,34 +277,30 @@ pub fn eyes_ready(entry: &Entry) -> bool {
         .is_some_and(|eyes| state(entry, eyes) == State::Ready)
 }
 
-/// What the models here take on the disk, parts included.
-pub fn used() -> u64 {
-    fn walk(dir: &Path) -> u64 {
-        let Ok(items) = std::fs::read_dir(dir) else {
-            return 0;
-        };
-        items
-            .flatten()
-            .map(|item| match item.metadata() {
-                Ok(meta) if meta.is_dir() => walk(&item.path()),
-                Ok(meta) => meta.len(),
-                Err(_) => 0,
-            })
-            .sum()
-    }
-    walk(&dir()) + walk(&runtimes())
-}
-
-/// What `entry`'s files take on the disk, parts included.
-pub fn used_by(entry: &Entry) -> u64 {
-    let Ok(items) = std::fs::read_dir(dir().join(entry.id)) else {
+/// What the files under `dir` take on the disk.
+fn walk(dir: &Path) -> u64 {
+    let Ok(items) = std::fs::read_dir(dir) else {
         return 0;
     };
     items
         .flatten()
-        .filter_map(|item| item.metadata().ok())
-        .map(|meta| meta.len())
+        .map(|item| match item.metadata() {
+            Ok(meta) if meta.is_dir() => walk(&item.path()),
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        })
         .sum()
+}
+
+/// What the models here take on the disk, parts included.
+pub fn used() -> u64 {
+    walk(&dir()) + walk(&runtimes())
+}
+
+/// What `entry`'s files take on the disk, parts included: a model added
+/// from a link may keep its file in a folder, as its repository does.
+pub fn used_by(entry: &Entry) -> u64 {
+    walk(&dir().join(entry.id))
 }
 
 /// The free space on the disk the models go to.

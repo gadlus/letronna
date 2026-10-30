@@ -185,6 +185,10 @@ pub fn command(
             switch_model(runner, Some(*session), rest);
             Flow::Handled
         }
+        "/local" => {
+            crate::local::slash(&mut runner.bar, rest, crate::local::watch);
+            Flow::Handled
+        }
         "/fallback" => {
             fallback(runner, rest);
             Flow::Handled
@@ -1822,6 +1826,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
         "Model",
         &[
             "/model",
+            "/local",
             "/effort",
             "/thinking",
             "/style",

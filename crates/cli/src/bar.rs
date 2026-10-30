@@ -65,6 +65,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "show or change the model; add image, speech or video for those, side for summaries, or names for session names",
     },
     Command {
+        name: "/local",
+        blurb: "models on this computer: get one, or add one from Hugging Face",
+    },
+    Command {
         name: "/fallback",
         blurb: "models to carry on with when yours is overloaded or out of credit",
     },
@@ -330,6 +334,34 @@ const WALLET_VERBS: &[Command<'static>] = &[
     },
 ];
 
+/// What `/local` does, offered under it.
+const LOCAL_VERBS: &[Command<'static>] = &[
+    Command {
+        name: "get",
+        blurb: "download one by its id",
+    },
+    Command {
+        name: "add",
+        blurb: "add one from a Hugging Face link",
+    },
+    Command {
+        name: "pause",
+        blurb: "stop a download, keeping what has come",
+    },
+    Command {
+        name: "resume",
+        blurb: "carry on a paused download",
+    },
+    Command {
+        name: "cancel",
+        blurb: "stop a download and throw away what has come",
+    },
+    Command {
+        name: "remove",
+        blurb: "delete one; one from a link comes off the list",
+    },
+];
+
 /// What `/mcp` does to a server, offered under it after the prompts.
 const MCP_VERBS: &[Command<'static>] = &[
     Command {
@@ -574,6 +606,12 @@ fn under<'a>(text: &str, added: &'a Added) -> Option<Vec<Row<'a>>> {
             "wallets, rules and what was spent",
             Vec::new(),
             WALLET_VERBS,
+        ),
+        "/local" => (
+            "/local ",
+            "every model: how it runs here, and where it comes from",
+            Vec::new(),
+            LOCAL_VERBS,
         ),
         _ => return None,
     };
@@ -892,6 +930,9 @@ pub struct Bar {
     schedules: Option<async_channel::Receiver<letronna_core::schedule::Event>>,
     /// Where a note comes from work that went on after the last turn.
     notes: Option<async_channel::Receiver<String>>,
+    /// Where a note comes from a model downloading in the background: its
+    /// own, as the notes above are taken over by each memory review.
+    downloads: Option<async_channel::Receiver<String>>,
     /// Where a session's name comes from, once a model has given one.
     names: Option<async_channel::Receiver<(u64, String, String)>>,
     /// Helpers' requests for a yes, once the terminal answers them.
@@ -992,6 +1033,7 @@ impl Bar {
             bell: None,
             schedules: None,
             notes: None,
+            downloads: None,
             names: None,
             asks: None,
             held: None,
@@ -1374,6 +1416,11 @@ impl Bar {
         self.notes = Some(notes);
     }
 
+    /// Show at the prompt what comes on `notes` about downloads.
+    pub fn hear_downloads(&mut self, notes: async_channel::Receiver<String>) {
+        self.downloads = Some(notes);
+    }
+
     /// Let a session's name, given by a model, end a wait at the prompt.
     pub fn hear_name(&mut self, names: async_channel::Receiver<(u64, String, String)>) {
         self.names = Some(names);
@@ -1426,7 +1473,11 @@ impl Bar {
     fn waited(&mut self) -> Option<Waited> {
         // Before a line, whose turn would push it below its answer: a note
         // only prints, so it holds nothing up.
-        if let Some(note) = self.notes.as_ref().and_then(|notes| notes.try_recv().ok()) {
+        if let Some(note) = [&self.notes, &self.downloads]
+            .into_iter()
+            .flatten()
+            .find_map(|notes| notes.try_recv().ok())
+        {
             return Some(Waited::Note(note));
         }
         if let Some((id, was, name)) = self.names.as_ref().and_then(|names| names.try_recv().ok()) {

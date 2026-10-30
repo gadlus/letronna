@@ -32,8 +32,11 @@ impl Pack {
     /// for every attempt.
     pub fn url(&self) -> String {
         format!(
-            "https://huggingface.co/{}/resolve/{}/{}",
-            self.repo, self.commit, self.file
+            "{}/{}/resolve/{}/{}",
+            super::hub::HUB,
+            self.repo,
+            self.commit,
+            self.file
         )
     }
 }
@@ -134,6 +137,12 @@ impl Entry {
             .unwrap_or(cap);
         body.insert("max_tokens".into(), asked.min(cap).into());
         body.remove("reasoning_effort");
+    }
+
+    /// The Hugging Face page its file comes from, with its model card and
+    /// licence.
+    pub fn page(&self) -> String {
+        super::hub::page(self.file.repo)
     }
 
     /// The file to run on a machine, given whether the main one fits there.
@@ -423,9 +432,17 @@ pub static CATALOG: &[Entry] = &[
     },
 ];
 
-/// The model with this id, if Letronna offers it.
+/// The model with this id, offered by Letronna or added from a link.
 pub fn entry(id: &str) -> Option<&'static Entry> {
-    CATALOG.iter().find(|entry| entry.id == id)
+    CATALOG
+        .iter()
+        .find(|entry| entry.id == id)
+        .or_else(|| super::added::entry(id))
+}
+
+/// Every model offered here: the catalog's, then those added from a link.
+pub fn all() -> Vec<&'static Entry> {
+    CATALOG.iter().chain(super::added::all()).collect()
 }
 
 /// The llama.cpp build every runtime below is: b11556 is the first that runs

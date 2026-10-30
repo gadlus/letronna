@@ -13,7 +13,7 @@ use gpui_component::{
     progress::ProgressCircle,
 };
 use letronna_core::on_device::{
-    self, CATALOG, Entry, Machine, Verdict,
+    self, Entry, Machine, Verdict, added,
     shelf::{self, State},
 };
 use std::time::{Duration, Instant};
@@ -117,8 +117,8 @@ impl Chat {
             .filter(|id| !self.shelved.contains(id))
             .copied()
             .collect();
-        let eyes: Vec<&'static str> = CATALOG
-            .iter()
+        let eyes: Vec<&'static str> = on_device::all()
+            .into_iter()
             .filter(|e| shelf::eyes_ready(e))
             .map(|e| e.id)
             .collect();
@@ -232,14 +232,19 @@ impl Chat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match shelf::get(entry, &machine) {
-            Ok(()) => window.push_notification(
-                Notification::info(format!(
-                    "Downloading {}. Keep chatting meanwhile.",
-                    entry.name
-                )),
-                cx,
-            ),
+        // One from a link joins the list only as its download starts.
+        let started = added::keep(entry).and_then(|kept| shelf::get(kept, &machine).map(|()| kept));
+        match started {
+            Ok(kept) => {
+                window.push_notification(
+                    Notification::info(format!(
+                        "Downloading {}. Keep chatting meanwhile.",
+                        kept.name
+                    )),
+                    cx,
+                );
+                self.got_from_link(entry, window, cx);
+            }
             Err(why) => window.push_notification(Notification::warning(why), cx),
         }
         cx.notify();
@@ -387,8 +392,8 @@ impl Chat {
         {
             return None;
         }
-        let entries: Vec<&'static Entry> = CATALOG
-            .iter()
+        let entries: Vec<&'static Entry> = on_device::all()
+            .into_iter()
             .filter(|e| self.shelved.contains(&e.id) && matches(e, query))
             .collect();
         if entries.is_empty() {
@@ -664,7 +669,8 @@ impl Chat {
             cx,
             std::rc::Rc::new(move |this: &mut Chat| this.store.settings.local_stand_in = !stand_in),
         );
-        let used = match CATALOG.iter().map(shelf::used_by).sum::<u64>() {
+        let entries = on_device::all();
+        let used = match entries.iter().map(|e| shelf::used_by(e)).sum::<u64>() {
             0 => "Nothing downloaded yet".to_owned(),
             bytes => format!("Models use {}", on_device::size(bytes)),
         };
@@ -676,7 +682,7 @@ impl Chat {
             .border_1()
             .border_color(cx.theme().border)
             .rounded(cx.theme().radius);
-        for (i, entry) in CATALOG.iter().enumerate() {
+        for (i, entry) in entries.into_iter().enumerate() {
             list = list.child(self.manage_row(i, entry, cx));
         }
         v_flex()
@@ -697,6 +703,7 @@ impl Chat {
                     .child(storage),
             )
             .child(list)
+            .child(self.hugging_face_box(cx))
             .child(toggle)
     }
 
@@ -831,6 +838,7 @@ impl Chat {
             .as_ref()
             .and_then(on_device::suggest)
             .is_some_and(|best| best.id == entry.id);
+        let from_link = added::is_added(entry);
         let mut actions = h_flex().gap_1().items_center().flex_wrap();
         if ready {
             actions = actions
@@ -899,13 +907,30 @@ impl Chat {
                         .plain(cx)
                         .xsmall()
                         .icon(Icon::new(AppIcon::Trash))
-                        .tooltip("Delete from this computer")
+                        .tooltip(if from_link {
+                            "Delete and remove from the list"
+                        } else {
+                            "Delete from this computer"
+                        })
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.delete_model(entry, window, cx)
                         })),
                 );
         } else {
-            actions = actions.children(self.row_control("od-manage", entry, pack, &state, cx));
+            actions = actions
+                .children(self.row_control("od-manage", entry, pack, &state, cx))
+                .when(from_link && !state.moving(), |row| {
+                    row.child(
+                        Button::new(("od-remove", i))
+                            .plain(cx)
+                            .xsmall()
+                            .icon(Icon::new(AppIcon::Trash))
+                            .tooltip("Remove from the list")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.delete_model(entry, window, cx)
+                            })),
+                    )
+                });
         }
         let name_line = h_flex()
             .gap_1p5()
@@ -927,6 +952,17 @@ impl Chat {
                         .text_xs()
                         .text_color(cx.theme().link)
                         .child("Best for this computer"),
+                )
+            })
+            .when(from_link, |row| {
+                row.child(
+                    div()
+                        .px_1p5()
+                        .rounded(cx.theme().radius)
+                        .bg(cx.theme().secondary)
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Added from a link"),
                 )
             });
         h_flex()
@@ -957,7 +993,9 @@ impl Chat {
                             .when_some(verdict, |row, (text, color)| {
                                 row.child(div().text_color(cx.theme().muted_foreground).child("·"))
                                     .child(div().text_color(color).child(text))
-                            }),
+                            })
+                            .child(div().text_color(cx.theme().muted_foreground).child("·"))
+                            .child(super::from_link::source_link(("od-source", i), entry, cx)),
                     )
                     .when_some(status.filter(|_| !ready), |col, status| {
                         col.child(
@@ -996,17 +1034,35 @@ impl Chat {
                     && turn.connection.model == entry.id
             });
         let chat = cx.entity();
-        let size = on_device::size(shelf::used_by(entry));
-        let body = if answering {
-            format!("It is answering now. The answer stops, and this frees {size}.")
-        } else {
-            format!("This frees {size}. You can download it again at any time.")
+        // One added from a link goes off the list with its files: what is
+        // kept of it is only ever the link's answer, which a paste gets again.
+        let from_link = added::is_added(entry);
+        let bytes = shelf::used_by(entry);
+        let size = on_device::size(bytes);
+        let body = match (answering, from_link) {
+            (false, true) if bytes == 0 => format!(
+                "{} comes off the list. Paste its link again to get it back.",
+                entry.name
+            ),
+            (true, false) => {
+                format!("It is answering now. The answer stops, and this frees {size}.")
+            }
+            (false, false) => format!("This frees {size}. You can download it again at any time."),
+            (true, true) => format!(
+                "It is answering now. The answer stops, {} comes off the list, and this frees \
+                 {size}. Paste its link again to get it back.",
+                entry.name
+            ),
+            (false, true) => format!(
+                "{} comes off the list, and this frees {size}. Paste its link again to get it back.",
+                entry.name
+            ),
         };
         super::confirm_delete(
-            if answering {
-                "Stop the answer and delete?"
-            } else {
-                "Delete this model?"
+            match (answering, from_link) {
+                (true, _) => "Stop the answer and delete?",
+                (false, true) => "Remove this model?",
+                (false, false) => "Delete this model?",
             },
             body,
             window,
@@ -1016,7 +1072,11 @@ impl Chat {
                     if answering {
                         this.stop_turn(cx);
                     }
-                    if let Err(why) = shelf::delete(entry) {
+                    let done = shelf::delete(entry).and_then(|()| match from_link {
+                        true => added::forget(entry.id),
+                        false => Ok(()),
+                    });
+                    if let Err(why) = done {
                         this.error = Some(why);
                     }
                     cx.notify();

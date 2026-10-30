@@ -95,8 +95,20 @@ Settings › On this computer downloads models that then run on this computer, w
 - **One model at a time** is loaded, shared by the window and the terminal; a second chat waits its turn and says so. It is let go after ten idle minutes or when memory runs short.
 - **Tools**: these models chat. Ternary Bonsai 2 · 4B and 9B, which passed a test of when to search, may also search the web while this computer is online. No other tool is offered.
 - **Photos**: the first photo sent to a model asks for its vision pack (about 370–930 MB), downloaded once.
+- **Source**: each model links to the Hugging Face page its file comes from, with its model card and licence.
 
 In the model menu they are under **On this computer**; in the terminal, `/model`, or `letronna --gateway "This computer" --model bonsai-2-4b`.
+
+### A model from a Hugging Face link
+
+**Add from Hugging Face**, under the list, takes a link to any public GGUF model: its page (`https://huggingface.co/unsloth/Qwen3.5-9B-GGUF`), a file's `blob` or `resolve` link, `hf.co/owner/model`, or `owner/model:Q4_K_M` as llama.cpp and Ollama take it. Letronna asks the hub what the repository holds and lists its GGUF files, each with its size and whether it runs well here; a 4-bit one is suggested, or the one the link named. The one you pick is downloaded like the models above: pinned to the commit it was read at, and kept only once its size and SHA-256 match what Hugging Face said of it. A vision file (`mmproj`) in the same repository becomes its photo reading.
+
+- Models that are split into several files, or that need a Hugging Face sign-in, can't be added; the page says which.
+- What it needs is estimated from its parameters, as nobody has measured it here; once it answers, its speed is timed as the others' is.
+- It chats only, without web search, until a model is known to call tools well.
+- Deleting it takes it off the list; paste its link again to get it back. The list is `models/added.json`.
+
+In the terminal, `/local` (or `letronna local`) lists every model with its verdict, its download and its Hugging Face page; `/local get <id>` downloads one, `/local add <link>` adds one from a link, offering its files to pick from, and `pause`, `resume`, `cancel` and `remove` take an id too. `letronna local get` and `letronna local add` wait for the download and show how far it has got; Ctrl-C stops it, and `letronna local resume <id>` carries on.
 
 ## Hosted models
 

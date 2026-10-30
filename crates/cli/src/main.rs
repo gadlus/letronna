@@ -23,6 +23,7 @@ mod edit;
 mod history;
 mod input;
 mod install;
+mod local;
 mod mcp;
 mod memory;
 mod notify;
@@ -138,6 +139,9 @@ fn main() {
     }
     if let Some(words) = &args.wallet {
         std::process::exit(wallet::run(words));
+    }
+    if let Some(words) = &args.local {
+        std::process::exit(local::run(words));
     }
     if args.acp {
         let client = match args.acp_phone {

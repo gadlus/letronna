@@ -516,8 +516,8 @@ pub(crate) fn stand_in(primary: &Connection, settings: &Settings) -> Option<Conn
         return None;
     }
     let machine = machine::cached().unwrap_or_else(machine::now);
-    let entry = catalog::CATALOG
-        .iter()
+    let entry = catalog::all()
+        .into_iter()
         .filter(|entry| shelf::ready(entry).is_some() && fit::fits(entry, &machine))
         .max_by_key(|entry| entry.rank)?;
     Some(Connection {

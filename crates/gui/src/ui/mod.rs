@@ -12,6 +12,7 @@ pub(crate) mod chrome;
 pub(crate) mod complete;
 pub(crate) mod composer;
 pub(crate) mod files;
+pub(crate) mod from_link;
 pub(crate) mod grain;
 pub(crate) mod import;
 pub(crate) mod jobs;

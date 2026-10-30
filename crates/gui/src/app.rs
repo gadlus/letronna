@@ -207,6 +207,8 @@ pub(crate) struct Chat {
     /// one finishing is told and listed.
     pub(crate) shelved: Vec<&'static str>,
     pub(crate) seeing: Vec<&'static str>,
+    /// Settings › On this computer's box for a model from a link.
+    pub(crate) from_link: crate::ui::from_link::FromLink,
     pub(crate) keys: std::collections::HashMap<String, String>,
     pub(crate) gateway_pick: Entity<String>,
     /// Settings › Accounts shows its less used options: the order accounts
@@ -827,6 +829,7 @@ impl Chat {
                 .placeholder("What should Letronna do?")
         });
         let plugins = crate::ui::plugin_page::PluginsPage::new(window, cx);
+        let from_link = crate::ui::from_link::FromLink::new(window, cx);
         let skill_source = cx.new(|cx| {
             InputState::new(window, cx).placeholder("GitHub repo, link to a SKILL.md, or a folder")
         });
@@ -912,6 +915,15 @@ impl Chat {
                     this.add_plugin(window, cx);
                 }
             }),
+            cx.subscribe_in(
+                &from_link.link,
+                window,
+                |this, _, event, window, cx| match event {
+                    InputEvent::PressEnter { .. } => this.look_up_link(window, cx),
+                    InputEvent::Change => this.link_edited(cx),
+                    _ => {}
+                },
+            ),
             cx.subscribe_in(
                 &plugins.market_source,
                 window,
@@ -1023,8 +1035,8 @@ impl Chat {
             machine: letronna_core::on_device::cached(),
             machine_asked: None,
             shelved: letronna_core::on_device::shelf::ready_ids(),
-            seeing: letronna_core::on_device::CATALOG
-                .iter()
+            seeing: letronna_core::on_device::all()
+                .into_iter()
                 .filter(|e| letronna_core::on_device::shelf::eyes_ready(e))
                 .map(|e| e.id)
                 .collect(),
@@ -1128,6 +1140,7 @@ impl Chat {
             capabilities,
             wallet,
             plugins,
+            from_link,
             aside: None,
             waiting_retry: None,
             unseen: std::collections::HashSet::new(),

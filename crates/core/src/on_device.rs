@@ -11,8 +11,10 @@
 //! an out-of-memory ends that process and not the app, and taking a newer
 //! llama.cpp is a change of pin.
 
+pub mod added;
 mod catalog;
 mod fit;
+pub mod hub;
 mod machine;
 pub(crate) mod reach;
 pub mod runtime;
@@ -23,7 +25,7 @@ pub use reach::{BASE, NAME, at, entry_of, shown};
 
 pub use catalog::{
     Asset, BUILD, CATALOG, Entry, Pack, RUNTIMES, Runtime, SAMPLING, Sampling, Thinking, Tools,
-    entry, runtime,
+    all, entry, runtime,
 };
 pub use fit::{
     AGENT_CONTEXT, CONTEXT, Fit, LEAST_CONTEXT, ON_BATTERY, Verdict, fit, fits, memory, size,
