@@ -1780,6 +1780,7 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
         "open or fold the latest thinking, or the one clicked",
     ),
     ("ctrl+b", "run the command it is running in the background"),
+    ("ctrl+z", "go to the shell; fg comes back"),
     (
         "ctrl+a/e",
         "go to the start or end of the line; home and end, of the whole box",

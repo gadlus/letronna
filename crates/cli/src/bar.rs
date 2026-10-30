@@ -1235,6 +1235,32 @@ impl Bar {
         work()
     }
 
+    /// Stop as ctrl-z stops a program in a cooked terminal, with the window
+    /// given back first, and take it again, painted whole, once the shell's
+    /// fg wakes Letronna. Only under a shell that gives its jobs a process
+    /// group of their own: stopped anywhere else, as the only program in a
+    /// tab or a tmux pane, nothing could ever wake it.
+    #[cfg(unix)]
+    fn suspend(&mut self) {
+        // SAFETY: both only read this process's own ids.
+        let job = unsafe { libc::getpgrp() != libc::getsid(0) };
+        if !job {
+            self.note =
+                Some("ctrl+z needs a shell that can bring Letronna back with fg".to_owned());
+            return;
+        }
+        self.lend(|| {
+            println!("Letronna is stopped; fg brings it back.");
+            // The whole group, as the terminal's own ctrl-z stops it. It
+            // returns once fg has sent it on.
+            // SAFETY: a signal to this process's own group; no memory.
+            unsafe { libc::kill(0, libc::SIGTSTP) };
+        });
+        if !self.working {
+            crate::title::idle();
+        }
+    }
+
     /// Attach the picture on the clipboard to the next message: taken off it
     /// now, to wait where pasted pictures do, and handed to /image as one
     /// named by path is.
@@ -2400,6 +2426,10 @@ impl Bar {
             KeyCode::Char('o') if control => crate::screen::toggle_last(),
             // A picture on the clipboard goes with the next message.
             KeyCode::Char('v') if control => self.paste_picture(),
+            // To the shell, as ctrl-z does in a terminal raw mode keeps it
+            // from; fg brings the session back.
+            #[cfg(unix)]
+            KeyCode::Char('z') if control => self.suspend(),
             // Write a long prompt where writing is easy.
             KeyCode::Char('g') if control => self.edit_draft(),
             // Undo the last change to the line: ctrl-_ reaches us as ctrl-7
