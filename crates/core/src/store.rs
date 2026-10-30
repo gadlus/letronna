@@ -379,6 +379,12 @@ pub struct Settings {
     /// the computer's light or dark mode.
     #[serde(default)]
     pub appearance: String,
+    /// The terminal's colours: empty for the dark ones it has always used,
+    /// or "auto" (light or dark as the terminal's background is), "light",
+    /// "dark-colour-blind", "light-colour-blind" or "ansi" (the terminal's
+    /// own sixteen).
+    #[serde(default)]
+    pub terminal_theme: String,
     /// A faint film grain on the window's chrome and empty pages, never over
     /// the transcript, code or diffs.
     #[serde(default = "yes")]
@@ -662,6 +668,7 @@ impl Default for Settings {
             browse_unseen: false,
             preview_opens_by_itself: true,
             appearance: String::new(),
+            terminal_theme: String::new(),
             grain: true,
             motion: true,
             text_step: 0,
