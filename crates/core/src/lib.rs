@@ -11,6 +11,7 @@ pub mod agent_defs;
 pub mod agents;
 pub mod approvals;
 pub mod auth;
+pub mod background;
 #[cfg(test)]
 mod bench;
 pub mod browser;
