@@ -14,6 +14,12 @@ A provider implements the `Provider` trait in `providers/mod.rs`:
 | `auth()` | What it needs: `ApiKey`, `None` (runs locally), `Account` (Letronna sign-in), `Url` (the user gives the base URL) or `OAuth(&SPEC)` (a sign-in in the browser) |
 | `wire()` | The format its base URL speaks. Defaults to OpenAI chat completions. |
 | `models()` | The model ids it serves. Defaults to `GET <base>/models`. |
+| `quota()` | How full its limits are, read off a reply's headers. Defaults to the standard rate-limit headers. |
+| `usage()` | Each window of a plan, asked of the provider's own usage page. Defaults to none. |
+| `wire_for()` | The format one model goes out in on a given key, for a provider that serves some models in another than its base URL speaks. Defaults to the address's. |
+| `base_for()` | Another base URL for one model on a given key, for a provider whose key reaches more than one address, such as a plan's and a pay-as-you-go one. Defaults to its own. |
+| `plan_covers()` | Whether a model on a given key is paid by the plan whose usage `usage()` reports, so a full plan holds back only the models it pays for. Defaults to yes. |
+| `headers()` | Headers every request carries beyond the key, given a mark that stays the same for a session. Defaults to none. |
 
 The **name** is how settings, saved keys and fallbacks refer to the provider, so it never changes once shipped.
 
@@ -23,7 +29,7 @@ The **tier** says what using it costs: `Subscription`, `ApiKey`, `Credit` or `Fr
 
 1. **Copy the template.** Copy `providers/_template/` to a new folder named for the provider in lowercase, for example `providers/mistral/`. Rename the struct.
 2. **Fill in `info()`.** Use the base URL of its OpenAI-shaped API, ending in the version (`https://api.example.com/v1`, no trailing slash). Link `docs` to the page where people get a key.
-3. **Pick `auth()` and `wire()`.** Most providers take an API key and speak OpenAI chat completions, and then there is nothing to change. If it speaks Anthropic's Messages format, return `Wire::Anthropic`; if only OpenAI's Responses API, `Wire::OpenAiResponses`.
+3. **Pick `auth()` and `wire()`.** Most providers take an API key and speak OpenAI chat completions, and then there is nothing to change. If it speaks Anthropic's Messages format, return `Wire::Anthropic`; if only OpenAI's Responses API, `Wire::OpenAiResponses`. Google's own `generateContent` is `Wire::Google`, for `wire_for()` alone: a model served only in it goes there, with `base_for()` naming the address, as OpenCode's Gemini models do.
 4. **Register it.** In `providers/mod.rs`, add `mod mistral;` and one line to `PROVIDERS`, in the place it should appear in the gateway list.
 5. **Run the suite.** `scripts/x.sh test -p letronna-core --lib providers::`
 
@@ -46,9 +52,15 @@ Say in the PR which models you tried it with, and how (a real key, or the record
 
 Keys are saved in the system's vault: macOS Keychain or Windows Credential Manager. A provider never reads or writes a key itself; the gateway hands it the one saved under its name. Never log a key, put one in a fixture, or write one to a file.
 
+## More than one account
+
+A provider whose `auth()` is `ApiKey` or `OAuth` takes more than one account with no code of its own: `providers/accounts.rs` keeps each extra one in `accounts.json` as a gateway called "<name> · <label>", `providers::find` resolves it to the provider, its key or sign-in is kept under its own name, and requests carry the account they are on (`chat::Connection::gateway`). A provider needs nothing more for it, as long as what it does with a key or sign-in goes through the account it is given rather than its own name.
+
 ## Browser sign-in
 
 A provider signed in to in the browser describes its OAuth sign-in as data, a `static` `OAuthSpec` (`providers/auth/`): its authorize and token URLs, client id, scopes, the loopback port and path the browser comes back to, any extra authorize parameters, whether the token endpoint takes JSON or a form, PKCE, and where the account id and plan are in the id token. Return `AuthKind::OAuth(&SPEC)` and nothing else is needed: `providers::auth` opens the browser, waits on the loopback (or takes the address or `code#state` pasted back), trades the code for tokens, keeps them in the vault under `provider:<name>`, and refreshes the access token shortly before it ends or once when it is refused. `providers/chatgpt/` is the example.
+
+A sign-in can also be finished on another device, as a phone or a terminal over SSH needs: a spec with `device` signs in by a code typed on the provider's page (ChatGPT's, as Codex's device sign-in does), and one with `manual_redirect` sends the browser to a page that shows a code to paste back (Claude's). `auth::begin_away` starts either.
 
 ## Offered by a plugin
 

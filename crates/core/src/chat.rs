@@ -225,6 +225,11 @@ impl Draft {
 pub struct Replay {
     pub endpoint: String,
     pub model: String,
+    /// The account it came from, of those at `endpoint`: its encrypted or
+    /// signed reasoning is that account's, which another of the same
+    /// provider may refuse. Empty in what was kept before accounts were.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub account: String,
     /// OpenRouter's `reasoning_details`, or Anthropic's thinking blocks with
     /// the place each goes back to among the reply's, whole and in the order
     /// they came.
@@ -327,9 +332,25 @@ pub struct Connection {
     /// `-p` and the control protocol do on their way out: set by them
     /// alone, and its helpers keep it.
     pub jobs_end_with_run: bool,
+    /// The gateway the connection was made for, by name: two accounts of a
+    /// provider share its address, so the address alone cannot say which
+    /// account a request is on. Empty for one made for an address alone.
+    pub gateway: String,
 }
 
 impl Connection {
+    /// The account requests go to: the gateway the connection was made for,
+    /// or else the one whose address it is; empty for Custom and an
+    /// address no gateway has.
+    pub fn account(&self) -> String {
+        match self.gateway.trim() {
+            "" => crate::gateway::named(&self.endpoint)
+                .unwrap_or_default()
+                .to_owned(),
+            gateway => gateway.to_owned(),
+        }
+    }
+
     /// Puts the session in `mode` mid-turn, so the helpers it starts from
     /// now on narrow from the new mode rather than the one the turn began in.
     pub fn switch_to(&mut self, mode: Mode) {
@@ -508,7 +529,10 @@ pub fn validate(connection: &Connection) -> Result<String, String> {
     if connection.model.trim().is_empty() {
         return Err("Enter the model ID served by your provider in Connection settings.".into());
     }
-    let base = connection.endpoint.trim().trim_end_matches('/');
+    let routed = routed_base(connection);
+    let base = (routed.as_deref())
+        .unwrap_or(connection.endpoint.trim())
+        .trim_end_matches('/');
     // The Letronna gateway signs requests with this computer's account token.
     if connection.key.trim().is_empty() && base == crate::auth::hosted_base() {
         return Err(
@@ -516,7 +540,9 @@ pub fn validate(connection: &Connection) -> Result<String, String> {
         );
     }
     let chat = base.strip_suffix("/chat/completions");
-    if crate::providers::wire::anthropic::speaks(base) {
+    if crate::providers::wire::anthropic::speaks(base)
+        || named_wire(connection) == Some(crate::providers::Wire::Anthropic)
+    {
         let root = chat.or_else(|| base.strip_suffix("/messages"));
         return Ok(format!("{}/messages", root.unwrap_or(base)));
     }
@@ -1985,7 +2011,7 @@ fn body_hashed(
     let marks = marks_cache(connection);
     if marks {
         // Anthropic's own API spends the fourth marker on the tools instead.
-        if !crate::providers::wire::anthropic::speaks(&connection.endpoint) {
+        if !speaks_messages(connection) {
             split_system(&mut context[0], system.identity);
         }
         mark_cache(&mut context);
@@ -2028,7 +2054,7 @@ fn body_hashed(
         // connection's own: they stay cached when the date or the summary in
         // the system prompt moves.
         if marks
-            && crate::providers::wire::anthropic::speaks(&connection.endpoint)
+            && speaks_messages(connection)
             && let Some(last) = tools
                 .iter_mut()
                 .rfind(|tool| tool.get("function").is_some())
@@ -2491,6 +2517,15 @@ fn route(connection: &Connection) -> (String, String) {
     )
 }
 
+/// Whether what `replay` kept goes back on a request over `connection`: to
+/// the endpoint, model and account that sent it, and no other.
+fn goes_back(replay: &Replay, connection: &Connection) -> bool {
+    let (endpoint, model) = route(connection);
+    replay.endpoint == endpoint
+        && replay.model == model
+        && (replay.account.is_empty() || replay.account == connection.account())
+}
+
 /// Whether requests to this model need `quirk`, learned this run or known
 /// before the first one is sent.
 fn has_quirk(connection: &Connection, quirk: Quirk) -> bool {
@@ -2792,13 +2827,10 @@ fn as_messages(connection: &Connection, body: &Value) -> Value {
 /// request after it. A model that turned thinking down is never asked.
 pub(crate) fn effort_starts_thinking(connection: &Connection, messages: &[Message]) -> bool {
     use crate::providers::wire::anthropic;
-    let (endpoint, model) = route(connection);
     let thought = |replay: &Replay| {
-        replay.endpoint == endpoint
-            && replay.model == model
-            && replay.reasoning_details.iter().any(anthropic::is_thinking)
+        goes_back(replay, connection) && replay.reasoning_details.iter().any(anthropic::is_thinking)
     };
-    anthropic::speaks(&connection.endpoint)
+    speaks_messages(connection)
         && !has_quirk(connection, Quirk::Thinking)
         && !(messages.iter())
             .filter_map(|m| m.replay.as_deref())
@@ -2813,17 +2845,27 @@ pub(crate) fn carrying(
     body: &Value,
 ) -> reqwest::blocking::RequestBuilder {
     let key = connection.key.trim();
-    if crate::providers::wire::anthropic::speaks(&connection.endpoint) {
+    let request = provider_headers(request, connection, body);
+    if speaks_messages(connection) {
         return crate::providers::wire::anthropic::sign(
             request,
             &connection.endpoint,
+            &connection.account(),
             key,
             &as_messages(connection, body),
         );
     }
     let request = request.json(body);
+    if speaks_google(connection) {
+        return crate::providers::wire::google::keyed(request, key);
+    }
     if crate::providers::wire::openai_responses::chatgpt(&connection.endpoint) {
-        return crate::providers::wire::openai_responses::as_chatgpt(request, key);
+        let account = connection.account();
+        return crate::providers::wire::openai_responses::as_chatgpt(
+            request,
+            Some(account.as_str()).filter(|a| !a.is_empty()),
+            key,
+        );
     }
     if key.is_empty() {
         request
@@ -2835,8 +2877,10 @@ pub(crate) fn carrying(
 /// A reply that was not streamed, as a chat completion, whichever wire it
 /// came over.
 pub(crate) fn as_chat(connection: &Connection, reply: Value) -> Value {
-    if crate::providers::wire::anthropic::speaks(&connection.endpoint) {
+    if speaks_messages(connection) {
         crate::providers::wire::anthropic::reply(&reply)
+    } else if speaks_google(connection) {
+        crate::providers::wire::google::reply(&reply)
     } else {
         reply
     }
@@ -2847,8 +2891,82 @@ pub(crate) fn as_chat(connection: &Connection, reply: Value) -> Value {
 /// run and they have chat/completions to go to instead.
 fn speaks_responses(connection: &Connection) -> bool {
     let model = connection.model.trim();
-    crate::providers::wire::openai_responses::serves(&connection.endpoint, model)
+    (crate::providers::wire::openai_responses::serves(&connection.endpoint, model)
+        || named_wire(connection) == Some(crate::providers::Wire::OpenAiResponses))
         && (only_responses(connection) || !has_quirk(connection, Quirk::Responses))
+}
+
+/// Whether requests over `connection` go out as Messages requests: to an
+/// address that speaks it, or for a model its provider serves only in it.
+pub(crate) fn speaks_messages(connection: &Connection) -> bool {
+    crate::providers::wire::anthropic::speaks(&connection.endpoint)
+        || named_wire(connection) == Some(crate::providers::Wire::Anthropic)
+}
+
+/// Whether requests over `connection` go out in Google's own format: to an
+/// address that speaks it, or for a model its provider serves only in it.
+pub(crate) fn speaks_google(connection: &Connection) -> bool {
+    crate::providers::wire::google::speaks(&connection.endpoint)
+        || named_wire(connection) == Some(crate::providers::Wire::Google)
+}
+
+/// The format the provider of `connection`'s account sends its model in,
+/// for one that serves some models in another than its address speaks.
+fn named_wire(connection: &Connection) -> Option<crate::providers::Wire> {
+    let account = connection.account();
+    if account.is_empty() {
+        return None;
+    }
+    crate::providers::find(&account)?.wire_for(connection.key.trim(), connection.model.trim())
+}
+
+/// The address the provider of `connection`'s account sends its model to,
+/// for one that serves some models at another than its own.
+fn routed_base(connection: &Connection) -> Option<String> {
+    let account = connection.account();
+    if account.is_empty() {
+        return None;
+    }
+    crate::providers::find(&account)?.base_for(connection.key.trim(), connection.model.trim())
+}
+
+/// What a request over `connection` carrying `body` says of the session it
+/// belongs to, for a provider that routes by it: the session's id, or with
+/// none, as the local endpoint's requests have, a hash of how the
+/// conversation opened, which every request of it repeats.
+fn session_mark(connection: &Connection, body: &Value) -> String {
+    if connection.conversation != 0 {
+        return format!("letronna-{}", connection.conversation);
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::hash::DefaultHasher::new();
+    let messages = body["messages"].as_array().or(body["input"].as_array());
+    let opening = (messages.into_iter().flatten())
+        .find(|m| m["role"] == "user")
+        .map(|m| m["content"].to_string())
+        .unwrap_or_default();
+    opening.hash(&mut hash);
+    format!("letronna-{:016x}", hash.finish())
+}
+
+/// `request` with the headers the provider of `connection`'s account wants
+/// on every request beyond the key.
+pub(crate) fn provider_headers(
+    request: reqwest::blocking::RequestBuilder,
+    connection: &Connection,
+    body: &Value,
+) -> reqwest::blocking::RequestBuilder {
+    let account = connection.account();
+    let Some(provider) = (!account.is_empty())
+        .then(|| crate::providers::find(&account))
+        .flatten()
+    else {
+        return request;
+    };
+    let headers = provider.headers(&session_mark(connection, body));
+    headers.into_iter().fold(request, |request, (name, value)| {
+        request.header(name, value)
+    })
 }
 
 /// Whether the Responses API is the only route to `connection`'s model: a
@@ -2857,6 +2975,31 @@ fn only_responses(connection: &Connection) -> bool {
     crate::providers::wire::openai_responses::only(connection.model.trim())
         || crate::providers::wire::openai_responses::chatgpt(&connection.endpoint)
         || crate::gateway::responses_at(&connection.endpoint)
+}
+
+/// Where a request over `connection` carrying `body`, built chat-shaped as
+/// every request is, goes instead of `endpoint`, the URL `validate` gave,
+/// and in what form: Google's own or the Responses API, for a route that
+/// takes one of them; `None` for one that takes it as it is.
+pub(crate) fn wired(
+    connection: &Connection,
+    endpoint: &str,
+    body: &Value,
+) -> Option<(String, Value)> {
+    to_google(connection, endpoint, body).or_else(|| to_responses(connection, endpoint, body))
+}
+
+/// Google's URL for the model and form of `body`, for a request over
+/// `connection` that goes out in Google's own format.
+fn to_google(connection: &Connection, endpoint: &str, body: &Value) -> Option<(String, Value)> {
+    if !speaks_google(connection) {
+        return None;
+    }
+    let mut body = body.clone();
+    fit_quirks(connection, &mut body);
+    let stream = body["stream"] == true;
+    let url = crate::providers::wire::google::url(endpoint, &connection.model, stream);
+    Some((url, crate::providers::wire::google::request(&body)))
 }
 
 /// The Responses API's URL and form of `body`, built chat-shaped as every
@@ -2989,8 +3132,7 @@ fn marks_cache(connection: &Connection) -> bool {
         .rsplit('/')
         .next()
         .is_some_and(|id| id.to_lowercase().starts_with("claude"));
-    let chat_shaped = crate::providers::wire::anthropic::speaks(&connection.endpoint)
-        || !speaks_responses(connection);
+    let chat_shaped = speaks_messages(connection) || !speaks_responses(connection);
     claude
         && chat_shaped
         && !SUSPECTING.get()
@@ -3246,12 +3388,7 @@ fn carry_back(wired: &mut Value, m: &Message, connection: &Connection, this_turn
     if m.role != "assistant" {
         return;
     }
-    let (endpoint, model) = route(connection);
-    if let Some(replay) = m
-        .replay
-        .as_ref()
-        .filter(|r| r.endpoint == endpoint && r.model == model)
-    {
+    if let Some(replay) = m.replay.as_ref().filter(|r| goes_back(r, connection)) {
         if !replay.reasoning_details.is_empty() && !cut {
             wired["reasoning_details"] = replay.reasoning_details.clone().into();
         }
@@ -4027,6 +4164,9 @@ pub(crate) fn client() -> Result<&'static reqwest::blocking::Client, String> {
     CLIENT
         .get_or_init(|| {
             reqwest::blocking::Client::builder()
+                // Its own name, which some providers route by and ask every
+                // client to send; a request that names another keeps that.
+                .user_agent(concat!("Letronna/", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(Duration::from_secs(10))
                 // In the blocking client this bounds the wait for the headers
                 // and each read after them, not the whole body. A timeout on
@@ -4052,16 +4192,21 @@ pub fn list_models(base: &str, key: &str) -> Result<Vec<String>, String> {
     let anthropic = crate::providers::wire::anthropic::speaks(base);
     // Anthropic's list comes twenty models at a time unless asked for up to
     // 1000, the most it gives at once.
-    let url = match anthropic {
-        true => format!(
+    let google = crate::providers::wire::google::speaks(base);
+    let url = match (anthropic, google) {
+        (true, _) => format!(
             "{}/models?limit=1000",
             crate::providers::wire::anthropic::root(base)
         ),
-        false => format!("{base}/models"),
+        // Google's comes fifty at a time unless asked for up to 1000.
+        (false, true) => format!("{}/models?pageSize=1000", base.trim_end_matches('/')),
+        (false, false) => format!("{base}/models"),
     };
     let mut request = client()?.get(url).timeout(Duration::from_secs(20));
     if anthropic {
         request = crate::providers::wire::anthropic::keyed(request, key);
+    } else if google {
+        request = crate::providers::wire::google::keyed(request, key);
     } else if !key.trim().is_empty() {
         request = request.bearer_auth(key.trim());
     }
@@ -4077,9 +4222,16 @@ pub fn list_models(base: &str, key: &str) -> Result<Vec<String>, String> {
     let value: Value = response
         .json()
         .map_err(|_| "Invalid model list.".to_owned())?;
-    let list = unwrap_response(&value)?["data"]
-        .as_array()
-        .ok_or("Invalid model list.")?;
+    let listed;
+    let list = match google {
+        true => {
+            listed = crate::providers::wire::google::listed(&value);
+            &listed
+        }
+        false => unwrap_response(&value)?["data"]
+            .as_array()
+            .ok_or("Invalid model list.")?,
+    };
     crate::models::remember(base, list);
     crate::search::heard_list(base, list);
     let models = list
@@ -4599,19 +4751,22 @@ fn stream(
     let ticket = crate::cache_miss::sent(connection.conversation, prefix);
     // What goes out in its place on Anthropic's own API, kept to learn from
     // a refusal of it; an OpenAI reasoning model's goes to the Responses API.
-    let posted = crate::providers::wire::anthropic::speaks(&connection.endpoint)
-        .then(|| as_messages(connection, &sent));
-    let wired = to_responses(connection, &endpoint, &sent);
-    let url = wired
-        .as_ref()
-        .map_or(endpoint.as_str(), |(url, _)| url.as_str());
+    let posted = speaks_messages(connection).then(|| as_messages(connection, &sent));
+    // Google's format, for a model served only in it, goes ahead of both.
+    let googled = to_google(connection, &endpoint, &sent);
+    let wired = (googled.is_none())
+        .then(|| to_responses(connection, &endpoint, &sent))
+        .flatten();
+    let reshaped = googled.as_ref().or(wired.as_ref());
+    let url = reshaped.map_or(endpoint.as_str(), |(url, _)| url.as_str());
     let request = client()
         .map_err(|e| Failure::new(FailureKind::Unknown, e))?
         .post(url);
-    let request = match (&posted, &wired) {
+    let request = match (&posted, reshaped) {
         (Some(posted), _) => crate::providers::wire::anthropic::sign(
-            request,
+            provider_headers(request, connection, &sent),
             &connection.endpoint,
+            &connection.account(),
             &connection.key,
             posted,
         ),
@@ -4636,7 +4791,7 @@ fn stream(
             .ok_or_else(|| Failure::new(FailureKind::Unknown, "Could not prepare the request."))?
             .send();
         if let Ok(response) = &send {
-            crate::providers::router::heard(&connection.endpoint, response.headers());
+            crate::providers::router::heard(connection, response.headers());
         }
         let mut stands = false;
         let mut begun = false;
@@ -4685,7 +4840,7 @@ fn stream(
                 // A ChatGPT sign-in refused is refreshed once, and the request
                 // sent again with the new token `carrying` now finds.
                 if status == reqwest::StatusCode::UNAUTHORIZED
-                    && crate::providers::wire::openai_responses::refreshed(&connection.endpoint)
+                    && crate::providers::wire::openai_responses::refreshed(connection)
                     && !sender.is_closed()
                 {
                     return stream(connection, messages, start, budget, extra, lsp, sender);
@@ -4920,8 +5075,11 @@ fn read(
     let mut done = false;
     // A Messages stream says in many events what a chat completion says in
     // one chunk, so it is read through what it has said so far.
-    let mut messages = crate::providers::wire::anthropic::speaks(&connection.endpoint)
-        .then(crate::providers::wire::anthropic::Stream::default);
+    let mut messages =
+        speaks_messages(connection).then(crate::providers::wire::anthropic::Stream::default);
+    // Google's says each part once, in a response of its own.
+    let mut google =
+        speaks_google(connection).then(crate::providers::wire::google::Stream::default);
     for line in BufReader::new(response).lines() {
         let line = match line {
             Ok(line) => line,
@@ -4951,12 +5109,13 @@ fn read(
             done = true;
             break;
         }
-        let chunk = match &mut messages {
-            None if responses => parse_chunk(&crate::providers::wire::openai_responses::chunk(
-                &read_event(data)?,
-            ))?,
-            None => parse_event(data)?,
-            Some(messages) => match messages.event(&read_event(data)?) {
+        let chunk = match (&mut messages, &mut google) {
+            (None, Some(google)) => parse_chunk(&google.event(&read_event(data)?))?,
+            (None, None) if responses => parse_chunk(
+                &crate::providers::wire::openai_responses::chunk(&read_event(data)?),
+            )?,
+            (None, None) => parse_event(data)?,
+            (Some(messages), _) => match messages.event(&read_event(data)?) {
                 crate::providers::wire::anthropic::Said::Chunk(chunk) => parse_chunk(&chunk)?,
                 crate::providers::wire::anthropic::Said::Nothing => continue,
                 crate::providers::wire::anthropic::Said::Over => {
@@ -5261,6 +5420,7 @@ impl Reply {
         let replay = Replay {
             endpoint,
             model,
+            account: connection.account(),
             reasoning_details: self.reasoning_details,
             extra_content: calls
                 .iter()
@@ -5316,6 +5476,127 @@ impl Reply {
 mod tests {
     use super::*;
     use crate::store::Sizing;
+    #[test]
+    fn each_opencode_model_goes_to_go_or_zen_as_each_serves_it_and_names_its_session() {
+        // A key with a Go plan, and Go serving these; asked of no one.
+        crate::providers::opencode::tests::known(
+            "go-key",
+            true,
+            &["glm-5.3", "minimax-m3", "gpt-6-luna", "gemini-4-argon"],
+        );
+        let on = |model: &str, conversation: u64| Connection {
+            endpoint: "https://opencode.ai/inference/openai/v1".into(),
+            model: model.into(),
+            key: "go-key".into(),
+            gateway: crate::providers::opencode::NAME.into(),
+            conversation,
+            ..connection()
+        };
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "Hi"}]});
+        let built = |c: &Connection| {
+            let url = validate(c).unwrap();
+            let (url, body) = wired(c, &url, &body).unwrap_or((url, body.clone()));
+            carrying(client().unwrap().post(&url), c, &body)
+                .build()
+                .unwrap()
+        };
+        let path = |c: &Connection| built(c).url().path().to_owned();
+        // On the Go plan, each in the format Go serves it in, at Go's
+        // address for that format.
+        let go = "/inference/go";
+        assert_eq!(
+            path(&on("glm-5.3", 7)),
+            format!("{go}/openai/v1/chat/completions")
+        );
+        assert_eq!(
+            path(&on("minimax-m3", 7)),
+            format!("{go}/anthropic/v1/messages")
+        );
+        assert_eq!(
+            path(&on("gpt-6-luna", 7)),
+            format!("{go}/openai/v1/responses")
+        );
+        assert_eq!(
+            path(&on("gemini-4-argon", 7)),
+            format!("{go}/google/v1beta/models/gemini-4-argon:generateContent")
+        );
+        // What Go does not serve goes to Zen, pay-as-you-go.
+        assert_eq!(
+            path(&on("claude-sonnet-5-5", 7)),
+            "/inference/anthropic/v1/messages"
+        );
+        assert_eq!(
+            path(&on("kimi-k3", 7)),
+            "/inference/openai/v1/chat/completions"
+        );
+        assert_eq!(path(&on("gpt-5.5", 7)), "/inference/openai/v1/responses");
+        assert_eq!(
+            path(&on("gemini-3.8-flash", 7)),
+            "/inference/google/v1beta/models/gemini-3.8-flash:generateContent"
+        );
+        // Google reads the key from a header of its own, and no bearer.
+        let gemini = built(&on("gemini-3.8-flash", 7));
+        assert_eq!(gemini.headers()["x-goog-api-key"], "go-key");
+        assert!(!gemini.headers().contains_key("authorization"));
+        let sent: Value =
+            serde_json::from_slice(gemini.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(
+            sent["contents"],
+            json!([{"role": "user", "parts": [{"text": "Hi"}]}])
+        );
+        for model in [
+            "glm-5.3",
+            "minimax-m3",
+            "gpt-6-luna",
+            "claude-sonnet-5-5",
+            "gemini-4-argon",
+        ] {
+            let request = built(&on(model, 7));
+            assert_eq!(
+                request.headers()["x-opencode-session"],
+                "letronna-7",
+                "{model}"
+            );
+        }
+        // A Messages request carries the key as a key, not a subscription's.
+        assert_eq!(built(&on("minimax-m3", 7)).headers()["x-api-key"], "go-key");
+        // With no session, as on the local endpoint, the opening names it,
+        // the same for every request of the conversation.
+        let a = built(&on("glm-5.3", 0)).headers()["x-opencode-session"].clone();
+        let b = built(&on("glm-5.3", 0)).headers()["x-opencode-session"].clone();
+        assert_eq!(a, b);
+        assert!(a.to_str().unwrap().starts_with("letronna-"));
+        // Nothing of OpenCode's goes to another provider.
+        let other = Connection {
+            gateway: "OpenRouter".into(),
+            endpoint: "https://openrouter.ai/api/v1".into(),
+            ..on("glm-5.3", 7)
+        };
+        assert!(!built(&other).headers().contains_key("x-opencode-session"));
+        assert_eq!(path(&other), "/api/v1/chat/completions");
+    }
+
+    #[test]
+    fn requests_name_letronna_as_the_client() {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0; 1];
+            while !head.ends_with(b"\r\n\r\n") && socket.read(&mut byte).unwrap() == 1 {
+                head.push(byte[0]);
+            }
+            let reply = r#"{"data":[{"id":"m"}]}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            String::from_utf8_lossy(&head).to_lowercase()
+        });
+        assert_eq!(list_models(&base, "k").unwrap(), ["m"]);
+        let head = worker.join().unwrap();
+        assert!(head.contains("user-agent: letronna/"), "{head}");
+    }
+
     fn connection() -> Connection {
         Connection {
             endpoint: "http://localhost:11434/v1/".into(),
@@ -14362,6 +14643,7 @@ mod tests {
         first.replay = Some(Box::new(Replay {
             endpoint: c.endpoint.clone(),
             model: c.model.clone(),
+            account: Default::default(),
             reasoning_details: vec![json!({"type": "reasoning.text", "text": "t", "index": 0})],
             extra_content: BTreeMap::new(),
             reasoning_items: Vec::new(),
@@ -14545,6 +14827,7 @@ mod tests {
         reply.replay = Some(Box::new(Replay {
             endpoint: "https://strict.example/v1".into(),
             model: "moonshotai/kimi-k2-instruct".into(),
+            account: Default::default(),
             reasoning_details: vec![json!({"type": "reasoning.text", "text": "t", "index": 0})],
             extra_content: BTreeMap::from([("a".into(), json!({"google": {}}))]),
             reasoning_items: Vec::new(),
@@ -14895,6 +15178,7 @@ mod tests {
         reply.replay = Some(Box::new(Replay {
             endpoint: "https://api.openai.com/v1".into(),
             model: model.into(),
+            account: Default::default(),
             reasoning_details: Vec::new(),
             extra_content: BTreeMap::new(),
             reasoning_items: vec![item.clone()],
@@ -15316,6 +15600,7 @@ mod tests {
                 replay: Some(Box::new(Replay {
                     endpoint,
                     model,
+                    account: Default::default(),
                     reasoning_details: vec![thinking],
                     extra_content: BTreeMap::new(),
                     reasoning_items: Vec::new(),

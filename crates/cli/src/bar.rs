@@ -249,6 +249,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "tokens and cost: this session, by day and by model",
     },
     Command {
+        name: "/limits",
+        blurb: "how much of each plan is left, and when it resets",
+    },
+    Command {
         name: "/context",
         blurb: "what fills the context, part by part, and how full it is",
     },

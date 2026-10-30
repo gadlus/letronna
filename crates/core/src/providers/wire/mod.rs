@@ -5,6 +5,7 @@
 //! it names its format.
 
 pub(crate) mod anthropic;
+pub(crate) mod google;
 pub(crate) mod openai_responses;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,4 +16,7 @@ pub enum Wire {
     Anthropic,
     /// OpenAI's Responses API, which alone some backends speak.
     OpenAiResponses,
+    /// Google's own `generateContent`, in which alone some gateways serve
+    /// Gemini.
+    Google,
 }

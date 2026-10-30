@@ -1472,6 +1472,7 @@ mod tests {
             label: "small".into(),
             endpoint: "https://fallback.test/v1".into(),
             after: None,
+            back: None,
         }));
         turn.absorb(&Event::Delta("Done.".into()));
         assert_eq!(turn.take_reply("test").model, "small");

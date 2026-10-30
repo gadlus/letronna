@@ -1125,7 +1125,7 @@ mod tests {
             // ChatGPT and Claude are left out while their plugins are off.
             "Providers: Letronna signed in; OpenAI key set in the vault; \
              Anthropic no key; Gemini no key; xAI no key; \
-             OpenRouter key set in keys.json; This computer with nothing downloaded; \
+             OpenRouter key set in keys.json; OpenCode Go/Zen no key; This computer with nothing downloaded; \
              Ollama needs no key; Custom address set, no key.",
             "Web search: Brave in use, key in the vault; Tavily not set up; Exa not set up; \
              SearXNG saved, not in use; DuckDuckGo not in use.",

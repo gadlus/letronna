@@ -1227,7 +1227,7 @@ fn ask_of(
     };
     let body = body(connection, &input);
     let (endpoint, body) =
-        crate::chat::to_responses(connection, &endpoint, &body).unwrap_or((endpoint, body));
+        crate::chat::wired(connection, &endpoint, &body).unwrap_or((endpoint, body));
     let value: Value = reached
         .sign(crate::chat::carrying(post(endpoint)?, connection, &body))
         .send()

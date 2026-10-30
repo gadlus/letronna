@@ -507,6 +507,11 @@ pub struct Settings {
     /// out follow in their usual order; see `providers::router`.
     #[serde(default)]
     pub provider_order: Vec<String>,
+    /// When an account reaches its limit, go on with the same model on the
+    /// next account of the same provider, in the order the accounts are
+    /// kept; see `providers::accounts`. On unless turned off.
+    #[serde(default = "yes")]
+    pub switch_accounts: bool,
     /// Serve the connected accounts on 127.0.0.1 as an OpenAI-compatible
     /// endpoint; see `providers::local`. Off unless turned on.
     #[serde(default)]
@@ -623,6 +628,7 @@ impl Default for Settings {
             keys_in: String::new(),
             fallbacks: Vec::new(),
             provider_order: Vec::new(),
+            switch_accounts: true,
             local_endpoint: false,
             phone: false,
             phone_direct: false,

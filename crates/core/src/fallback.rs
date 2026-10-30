@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 /// How long a model that failed is passed over.
 pub const COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
-/// When each (endpoint, model) that failed may be asked again.
-static COOLING: Mutex<BTreeMap<(String, String), Instant>> = Mutex::new(BTreeMap::new());
+/// When each (endpoint, account, model) that failed may be asked again.
+static COOLING: Mutex<BTreeMap<(String, String, String), Instant>> = Mutex::new(BTreeMap::new());
 
 /// A model to go on with, as written in Settings: `model`, or `Gateway:model`
 /// for one on another gateway.
@@ -71,19 +71,25 @@ impl Fallback {
         keys: &HashMap<String, String>,
         custom: &str,
     ) -> Connection {
-        let (endpoint, key) = if self.gateway.is_empty() {
-            (primary.endpoint.clone(), primary.key.clone())
+        let (endpoint, key, gateway) = if self.gateway.is_empty() {
+            (
+                primary.endpoint.clone(),
+                primary.key.clone(),
+                primary.gateway.clone(),
+            )
         } else {
             let key = keys
                 .get(crate::gateway::key_slot(&self.gateway))
                 .cloned()
                 .unwrap_or_default();
-            crate::gateway::resolve(&self.gateway, custom, &key)
+            let (endpoint, key) = crate::gateway::resolve(&self.gateway, custom, &key);
+            (endpoint, key, self.gateway.clone())
         };
         Connection {
             endpoint,
             key,
             model: self.model.clone(),
+            gateway,
             ..primary.clone()
         }
     }
@@ -112,6 +118,9 @@ pub struct Switch {
     /// when this request went to the fallback because the one it would have
     /// asked is still cooling down, which the user was told of already.
     pub after: Option<(String, FailureKind)>,
+    /// When the account given up on is asked again, when a limit of its plan
+    /// is full and its page or replies said when it starts again.
+    pub back: Option<u64>,
 }
 
 impl fmt::Display for Switch {
@@ -135,6 +144,17 @@ impl fmt::Display for Switch {
             FailureKind::ContextTooLong => "cannot read this much at once",
             _ => "had a server error",
         };
+        if let Some(at) = self.back {
+            let why = match kind {
+                FailureKind::RateLimit | FailureKind::Quota => "reached its limit",
+                _ => why,
+            };
+            return write!(
+                f,
+                ": {from} {why}. It is back at {}.",
+                crate::failure::clock(at)
+            );
+        }
         let minutes = COOLDOWN.as_secs() / 60;
         write!(f, ": {from} {why}. It is asked again in {minutes} minutes.")
     }
@@ -255,6 +275,9 @@ pub fn run(
                 label,
                 endpoint: connection.endpoint.clone(),
                 after: why.map(|kind| (given_up, kind)),
+                back: spent(from)
+                    .then(|| crate::providers::usage::spent(&from.account()))
+                    .flatten(),
             })?;
         }
         let mut failure = match send(connection) {
@@ -291,10 +314,16 @@ pub fn run(
 /// or Custom at its address `custom`, which that leaves unnamed.
 fn gateway_of(connection: &Connection, custom: &str) -> Option<&'static str> {
     let address = |text: &str| text.trim().trim_end_matches('/').to_owned();
-    crate::gateway::named(&connection.endpoint).or_else(|| {
-        (!custom.trim().is_empty() && address(custom) == address(&connection.endpoint))
-            .then_some("Custom")
-    })
+    let account = connection.account();
+    let made_for = (crate::gateway::gateways().into_iter())
+        .map(|g| g.name)
+        .find(|name| !account.is_empty() && *name == account);
+    made_for
+        .or_else(|| crate::gateway::named(&connection.endpoint))
+        .or_else(|| {
+            (!custom.trim().is_empty() && address(custom) == address(&connection.endpoint))
+                .then_some("Custom")
+        })
 }
 
 /// What a switch from `from` to `to`, after a failure of `kind` when one
@@ -308,7 +337,8 @@ fn labels(
     kind: Option<FailureKind>,
     custom: &str,
 ) -> (String, String) {
-    let moved = key(from).0 != key(to).0;
+    let (was, now) = (key(from), key(to));
+    let moved = (was.0, was.1) != (now.0, now.1);
     let by_account = from.model.trim() == to.model.trim();
     let accounts = matches!(
         kind,
@@ -337,15 +367,26 @@ fn labels(
     )
 }
 
-/// Whether two connections ask the same model at the same place.
+/// Whether two connections ask the same model at the same place, on the
+/// same account.
 pub(crate) fn same(a: &Connection, b: &Connection) -> bool {
     key(a) == key(b)
 }
 
-/// What a model is cooled down by: its gateway, told by its address, and its id.
-fn key(connection: &Connection) -> (String, String) {
+/// What a model is cooled down by: its gateway's address, the account,
+/// since two accounts of a provider share the address but not their limits,
+/// and its id.
+fn key(connection: &Connection) -> (String, String, String) {
+    // Only a provider that takes more than one account is told apart by it;
+    // any other gateway is told by its address alone, made for it or not.
+    let account = connection.account();
+    let account = match crate::providers::accounts::provider_of(&account) {
+        Some(provider) if crate::providers::accounts::takes_more(provider) => account,
+        _ => String::new(),
+    };
     (
         connection.endpoint.trim().trim_end_matches('/').to_owned(),
+        account,
         connection.model.trim().to_owned(),
     )
 }
@@ -361,7 +402,17 @@ fn cooling(connection: &Connection) -> bool {
     let mut cooling = COOLING.lock().unwrap_or_else(PoisonError::into_inner);
     let now = Instant::now();
     cooling.retain(|_, until| *until > now);
-    cooling.contains_key(&key(connection))
+    // An account whose plan has a full window is passed over until it
+    // starts again, as its page or its replies said, not just for minutes.
+    cooling.contains_key(&key(connection)) || spent(connection)
+}
+
+/// Whether `connection`'s account has a full plan that pays for its model.
+fn spent(connection: &Connection) -> bool {
+    let account = connection.account();
+    crate::providers::usage::spent(&account).is_some()
+        && crate::providers::find(&account)
+            .is_none_or(|p| p.plan_covers(connection.key.trim(), connection.model.trim()))
 }
 
 #[cfg(test)]
@@ -789,5 +840,46 @@ mod tests {
         );
         cool(&hosted, Instant::now());
         crate::on_device::reach::tests::forget_standing();
+    }
+
+    #[test]
+    fn a_plan_at_its_limit_hands_on_to_the_next_account_and_says_when_it_is_back() {
+        let _held = crate::providers::auth::tests::vault("fallback-accounts");
+        let work = crate::providers::accounts::add("ChatGPT", "Work").unwrap();
+        let on = |gateway: &str| Connection {
+            endpoint: crate::gateway::base_url("ChatGPT", ""),
+            model: "gpt-6".into(),
+            key: format!("key-{gateway}"),
+            gateway: gateway.into(),
+            ..Default::default()
+        };
+        let chain = [on("ChatGPT"), on(work)];
+        // The first account's limit is reached, and its reply said till when.
+        let (result, asked, switches) = asked_on(&chain, "", |c| match c.gateway.as_str() {
+            "ChatGPT" => {
+                let back = crate::chat::now() + 3_600;
+                crate::providers::usage::tests::full("ChatGPT", back);
+                Err(Failure::new(FailureKind::RateLimit, "Limit reached."))
+            }
+            _ => Ok(()),
+        });
+        assert!(result.is_ok());
+        assert_eq!(asked, ["gpt-6", "gpt-6"]);
+        let told = switches[0].to_string();
+        assert!(
+            told.starts_with(
+                "Switched to ChatGPT · Work: ChatGPT reached its limit. It is back at "
+            ),
+            "{told}"
+        );
+        // The next request goes straight to the other account, without
+        // asking the full one first.
+        let (_, asked, _) = asked_on(&chain, "", |c| {
+            assert_eq!(c.gateway, work);
+            Ok(())
+        });
+        assert_eq!(asked.len(), 1);
+        cool(&chain[0], Instant::now());
+        crate::providers::usage::forget("ChatGPT");
     }
 }

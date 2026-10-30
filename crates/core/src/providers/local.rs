@@ -184,6 +184,7 @@ fn connection_for(model: &str) -> Option<Connection> {
         endpoint,
         key,
         model: model.to_owned(),
+        gateway: owner,
         ..Default::default()
     })
 }

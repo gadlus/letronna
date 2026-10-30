@@ -424,6 +424,7 @@ fn spec(id: u64, run: &Run) -> Result<Spec, String> {
         human: true,
         // What the user asked for, for the judge in Auto mode.
         typed: judge::typed(&conversation.messages).into(),
+        gateway: gateway.to_owned(),
         ..Default::default()
     };
     backend::validate(&connection)?;

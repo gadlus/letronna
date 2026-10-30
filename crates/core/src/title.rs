@@ -248,7 +248,7 @@ fn names(connection: &Connection, said: &str) -> Result<Vec<String>, String> {
     });
     crate::chat::fit_quirks(connection, &mut body);
     let (endpoint, body) =
-        crate::chat::to_responses(connection, &endpoint, &body).unwrap_or((endpoint, body));
+        crate::chat::wired(connection, &endpoint, &body).unwrap_or((endpoint, body));
     let request = crate::chat::client()?.post(endpoint).timeout(WAIT);
     let value: Value = reached
         .sign(crate::chat::carrying(request, connection, &body))

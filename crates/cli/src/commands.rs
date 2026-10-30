@@ -493,6 +493,10 @@ pub fn command(
             usage(runner.store.conversations[*session].id);
             Flow::Handled
         }
+        "/limits" => {
+            limits(runner);
+            Flow::Handled
+        }
         "/context" => {
             context(runner, *session);
             Flow::Handled
@@ -1867,6 +1871,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/logout",
             "/whoami",
             "/usage",
+            "/limits",
             "/insights",
             "/wallet",
         ],
@@ -5260,7 +5265,7 @@ pub fn pick_model(runner: &mut Runner, session: Option<usize>, filter: &str, in_
     // An account whose hosted models need a subscription is checked again
     // beside it, as it may have been bought since the file was written.
     let check = letronna_core::auth::account().is_some_and(|a| a.needs_upgrade());
-    let (mut models, errors, account) =
+    let (models, errors, account) =
         runner
             .bar
             .busy("asking every gateway what it has", move || {
@@ -5283,6 +5288,8 @@ pub fn pick_model(runner: &mut Runner, session: Option<usize>, filter: &str, in_
             false => Access::Open,
         }
     };
+    // A model on several accounts of one provider is listed once.
+    let mut models = letronna_core::gateway::one_per_provider(models, (&gateway, &model));
     for error in &errors {
         render::line(&render::red(error));
     }
@@ -5877,8 +5884,17 @@ pub fn connect(runner: &mut Runner) {
     // The list sits in the box with its choices, not in the conversation.
     let mut rows = Vec::new();
     let mut choices: Vec<(String, &'static str, &'static str)> = Vec::new();
+    let listed: Vec<_> = (gateways().into_iter())
+        .filter(|g| providers::offered(g.name))
+        .collect();
+    // Wide enough for "ChatGPT · Work", where a provider has more accounts.
+    let wide = (listed.iter().map(|g| g.name.chars().count()))
+        .max()
+        .unwrap_or(0)
+        .max(11);
     // One a plugin offers is listed only while the plugin is on.
-    for g in gateways().iter().filter(|g| providers::offered(g.name)) {
+    for g in &listed {
+        let further = providers::accounts::get(g.name).is_some();
         let count = models.iter().filter(|(n, _)| n == g.name).count();
         let (status, good, set_up) = gateway::status(g.name, &keys, &custom, count);
         let usage = router::usage(g.name);
@@ -5894,28 +5910,57 @@ pub fn connect(runner: &mut Runner) {
             false => status,
         };
         rows.push(format!(
-            "{} {:<11} {status}",
+            "{} {:<wide$} {status}",
             if good { "●" } else { "○" },
             g.name
         ));
         let provider = providers::find(g.name);
-        if !set_up && let Some(caveat) = provider.and_then(|p| p.caveat()) {
-            rows.push(format!("  {:<11} {}", "", g.blurb));
-            rows.push(format!("  {:<11} {caveat}", ""));
+        if !set_up
+            && !further
+            && let Some(caveat) = provider.and_then(|p| p.caveat())
+        {
+            rows.push(format!("  {:<wide$} {}", "", g.blurb));
+            rows.push(format!("  {:<wide$} {caveat}", ""));
         }
-        let signs_in = match provider.map(|p| p.auth()) {
+        let auth = provider.map(|p| p.auth());
+        let signs_in = match auth {
             Some(AuthKind::None) => continue,
             Some(AuthKind::Account | AuthKind::OAuth(_)) => true,
             _ => false,
         };
+        // A sign-in that can be finished on a phone, or over SSH.
+        let away = matches!(auth, Some(AuthKind::OAuth(spec))
+            if spec.device.is_some() || spec.manual_redirect.is_some());
         match (signs_in, set_up) {
-            (true, false) => choices.push((format!("Sign in to {}", g.name), g.name, "in")),
+            (true, false) => {
+                choices.push((format!("Sign in to {}", g.name), g.name, "in"));
+                if away {
+                    choices.push((
+                        format!("Sign in to {} with a code, on another device", g.name),
+                        g.name,
+                        "away",
+                    ));
+                }
+            }
             (true, true) => choices.push((format!("Sign out of {}", g.name), g.name, "out")),
             (false, false) => choices.push((format!("Set up {}", g.name), g.name, "set")),
             (false, true) => {
                 choices.push((format!("Change {}", g.name), g.name, "set"));
-                choices.push((format!("Remove {}", g.name), g.name, "remove"));
+                if !further {
+                    choices.push((format!("Remove {}", g.name), g.name, "remove"));
+                }
             }
+        }
+        if further {
+            if providers::accounts::of(providers::accounts::provider_of(g.name).unwrap_or(""))
+                .first()
+                != Some(&g.name)
+            {
+                choices.push((format!("Use {} first", g.name), g.name, "first"));
+            }
+            choices.push((format!("Remove the account {}", g.name), g.name, "drop"));
+        } else if set_up && providers::accounts::takes_more(g.name) {
+            choices.push((format!("Add another {} account", g.name), g.name, "more"));
         }
     }
     choices.push((
@@ -5964,9 +6009,210 @@ pub fn connect(runner: &mut Runner) {
             )));
         }
         "add" => add_own_gateway(runner),
+        "away" => provider_sign_in_away(runner, name),
+        "more" => add_account(runner, name),
+        "first" => {
+            render::blank();
+            let moved = (0..providers::accounts::of(name).len())
+                .try_for_each(|_| providers::accounts::shift(name, true));
+            match moved {
+                Ok(()) => render::line(&render::dim(&format!("{name} is reached for first now."))),
+                Err(error) => render::line(&render::red(&error)),
+            }
+        }
+        "drop" => {
+            render::blank();
+            match providers::accounts::remove(name) {
+                Ok(()) => render::line(&render::dim(&format!(
+                    "{name} removed, with its sign-in or key. Its models leave /model."
+                ))),
+                Err(error) => render::line(&render::red(&error)),
+            }
+        }
         _ => set_up_gateway(runner, name),
     }
     runner.persist();
+}
+
+/// Add another account of `provider`: a name for it, then its sign-in or
+/// key, then a check that it answers.
+fn add_account(runner: &mut Runner, provider: &'static str) {
+    use letronna_core::providers::{self, AuthKind, accounts};
+    render::blank();
+    if let Some(caveat) = providers::find(provider).and_then(|p| p.caveat()) {
+        render::line(&render::dim(caveat));
+    }
+    if matches!(
+        providers::find(provider).map(|p| p.info().tier),
+        Some(providers::Tier::Subscription)
+    ) {
+        render::line(&render::dim(&format!(
+            "Using another account to get past a plan's limits may be against {provider}'s terms."
+        )));
+    }
+    let suggested = accounts::next_label(provider);
+    let label = runner
+        .bar
+        .ask(
+            &format!("A name for this {provider} account, like Work (Enter for {suggested})"),
+            false,
+        )
+        .unwrap_or_default();
+    let label = match label.trim() {
+        "" => suggested,
+        given => given.to_owned(),
+    };
+    let name = match accounts::add(provider, &label) {
+        Ok(name) => name,
+        Err(error) => return render::line(&render::red(&error)),
+    };
+    match providers::find(name).map(|p| p.auth()) {
+        Some(AuthKind::OAuth(_)) => {
+            let options = ["In the browser here", "With a code, on another device"];
+            let picked = runner
+                .bar
+                .choose(&format!("Sign in to {name}"), Vec::new(), &options);
+            match picked {
+                Some(1) => provider_sign_in_away(runner, name),
+                Some(_) => provider_sign_in(runner, name),
+                // Not signed in yet: it waits in /connect for that.
+                None => {}
+            }
+        }
+        _ => {
+            if ask_key(runner, name) {
+                runner.persist();
+                check_gateway(runner, name);
+            }
+        }
+    }
+}
+
+/// Sign in to a provider on another device: a code to type there, or a page
+/// that shows one to paste back here.
+fn provider_sign_in_away(runner: &mut Runner, name: &'static str) {
+    use letronna_core::providers::auth;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    render::blank();
+    let flow = match auth::begin_away(name) {
+        Ok(flow) => flow,
+        Err(error) => return render::line(&render::red(&error)),
+    };
+    render::said(
+        &render::blue("●"),
+        &render::bold(&format!("Sign in to {name}")),
+    );
+    match &flow.code {
+        Some(code) => {
+            render::line(&render::dim("On any device, open:"));
+            render::line(&flow.url);
+            render::line(&format!(
+                "{} {}",
+                render::dim("and type the code"),
+                render::bold(code)
+            ));
+        }
+        None => {
+            render::line(&render::dim(
+                "On any device, open this and sign in; the page then shows a code:",
+            ));
+            render::line(&flow.url);
+            let pasted = runner
+                .bar
+                .ask("Paste the code the page shows", false)
+                .unwrap_or_default();
+            if pasted.trim().is_empty() {
+                flow.cancel();
+                return render::line(&render::dim("Sign-in cancelled."));
+            }
+            if let Err(error) = flow.paste(pasted.trim()) {
+                flow.cancel();
+                return render::line(&render::red(&error));
+            }
+        }
+    }
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let watch = (stop.clone(), flow.clone());
+    let waiting = {
+        let flow = flow.clone();
+        std::thread::spawn(move || flow.finish())
+    };
+    let done = runner.bar.busy_cancellable(
+        "waiting for the sign-in · esc to cancel",
+        stop,
+        move || {
+            while !waiting.is_finished() {
+                if watch.0.load(Ordering::Relaxed) {
+                    watch.1.cancel();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            waiting
+                .join()
+                .unwrap_or_else(|_| Err("The sign-in stopped.".into()))
+        },
+    );
+    match done {
+        Ok(_) => {
+            render::line(&render::dim(&format!("Signed in to {name}.")));
+            check_gateway(runner, name);
+        }
+        Err(error) => render::line(&render::red(&error)),
+    }
+}
+
+/// Each account's plan and how much of each of its windows is left, asked
+/// of the plans that have a page for it.
+fn limits(runner: &mut Runner) {
+    use letronna_core::gateway;
+    use letronna_core::providers::{self, usage};
+    let keys = store::load_keys();
+    let custom = runner.store.settings.custom_endpoint.clone();
+    let ready: Vec<&'static str> = (gateway::ready(&keys, &custom).into_iter())
+        .map(|(name, ..)| name)
+        .filter(|name| *name != gateway::LETRONNA)
+        .filter(|name| providers::find(name).is_some())
+        .collect();
+    let asked = ready.clone();
+    let known = runner.bar.busy("asking each plan what is left", move || {
+        (asked.iter())
+            .map(|name| (*name, usage::check(name, true)))
+            .collect::<Vec<_>>()
+    });
+    render::blank();
+    let now = letronna_core::chat::now();
+    let mut any = false;
+    for (name, known) in known {
+        let usage = match known {
+            Ok(usage) if usage.windows.is_empty() && usage.note.is_none() => continue,
+            Ok(usage) => usage,
+            Err(error) => {
+                render::line(&format!("{} {}", render::bold(name), render::red(&error)));
+                any = true;
+                continue;
+            }
+        };
+        any = true;
+        let plan = (usage.plan.as_deref())
+            .map(|p| format!(" · {}", usage::capitalised(p)))
+            .unwrap_or_default();
+        render::line(&format!("{}{}", render::bold(name), render::dim(&plan)));
+        if let Some(note) = &usage.note {
+            render::line(&render::dim(&format!("  {note}")));
+        }
+        for window in &usage.windows {
+            let line = format!("  {}", usage::window_line(window, now));
+            render::line(&match window.full(now) {
+                true => render::red(&line),
+                false => line,
+            });
+        }
+    }
+    if !any {
+        render::line(&render::dim(
+            "No plan has said yet. /connect signs in to ChatGPT or Claude, or takes an OpenCode Go/Zen key.",
+        ));
+    }
 }
 
 /// Ask for a gateway's address where it takes one and its key, save them,

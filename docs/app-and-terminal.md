@@ -69,7 +69,8 @@ Type `/` to list them all. The common ones:
 | `/new`, `/clear`, `/resume` | Start a session, or reopen one; Ctrl+L clears the screen |
 | `/status`, `/export` | Where things stand on one screen; the conversation as Markdown |
 | `/model`, `/effort`, `/thinking` | Model and reasoning controls |
-| `/connect`, `/search` | Providers, their plan and usage, and web search |
+| `/connect`, `/search` | Providers, their accounts, plan and usage, and web search |
+| `/limits` | How much of each plan is left, and when each window resets |
 | `/plan` | Switch to read-only |
 | `/init` | Have the model write the project's `AGENTS.md` |
 | `/skills`, `/mcp` | Skills and MCP servers |

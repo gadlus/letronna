@@ -140,7 +140,7 @@ impl Tool for EditImage {
     // account; on it, the credit does. Anthropic's API makes no pictures.
     fn offered(&self, connection: &Connection) -> bool {
         (crate::auth::signed_in() || !hosted(&connection.endpoint))
-            && !crate::providers::wire::anthropic::speaks(&connection.endpoint)
+            && !crate::chat::speaks_messages(connection)
     }
     fn mutates(&self) -> bool {
         true

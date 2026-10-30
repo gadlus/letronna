@@ -132,7 +132,7 @@ impl Chat {
             ),
             (
                 "My own API key",
-                "OpenAI, Anthropic, OpenRouter, or any compatible server.",
+                "OpenAI, Anthropic, OpenRouter, OpenCode Go/Zen, or any compatible server.",
                 self.key_gateway_rows().iter().any(|r| r.set_up),
             ),
             (

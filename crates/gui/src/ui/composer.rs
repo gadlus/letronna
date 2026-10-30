@@ -216,12 +216,19 @@ impl Chat {
     /// come.
     pub(crate) fn providers(&self) -> Vec<String> {
         let mut providers: Vec<String> = Vec::new();
-        for (gateway, _) in &self.models {
+        for (gateway, _) in &self.listed_models() {
             if !providers.contains(gateway) {
                 providers.push(gateway.clone());
             }
         }
         providers
+    }
+
+    /// The models as the picker lists them: each once for all of a
+    /// provider's accounts.
+    fn listed_models(&self) -> Vec<(String, String)> {
+        let (on, current) = self.store.model(self.store.active);
+        letronna_core::gateway::one_per_provider(self.models.clone(), (on, current))
     }
 
     /// A chip for each provider over the model list, and All, to narrow it
@@ -231,7 +238,8 @@ impl Chat {
         if providers.len() < 2 {
             return None;
         }
-        let count = |provider: &str| self.models.iter().filter(|(g, _)| g == provider).count();
+        let listed = self.listed_models();
+        let count = |provider: &str| listed.iter().filter(|(g, _)| g == provider).count();
         let mut chips = h_flex()
             .p_1()
             .gap_0p5()
@@ -273,7 +281,10 @@ impl Chat {
         let (on, current) = self.store.model(self.store.active);
         let (on, current) = (on.to_owned(), current.to_owned());
         let query = query.to_lowercase();
-        let mut ids = self.models.clone();
+        // A model on several accounts of one provider is listed once: the
+        // router moves to the others when that one runs out.
+        let mut ids =
+            letronna_core::gateway::one_per_provider(self.models.clone(), (&on, &current));
         // The model in use stays on the list even when its gateway did not
         // offer it, or the picker could not show what is picked.
         if !current.is_empty() && !ids.iter().any(|(g, m)| *g == on && *m == current) {

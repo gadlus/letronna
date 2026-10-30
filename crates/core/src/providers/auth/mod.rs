@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How a provider is signed in to, as data.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OAuthSpec {
     pub authorize: &'static str,
     pub token: &'static str,
@@ -43,6 +43,27 @@ pub struct OAuthSpec {
     /// claims, or else the access token's.
     pub account_claim: Option<&'static str>,
     pub plan_claim: Option<&'static str>,
+    /// A sign-in finished by typing a code on another device, for a
+    /// provider that offers one.
+    pub device: Option<&'static DeviceSpec>,
+    /// A page the provider shows the code on, to be pasted back, in place of
+    /// the loopback: for a sign-in finished on a device that cannot reach
+    /// this machine, such as a phone.
+    pub manual_redirect: Option<&'static str>,
+}
+
+/// A sign-in by a code the user types on any device, as a provider that
+/// offers one describes it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DeviceSpec {
+    /// Where a code for the user to type is asked for.
+    pub usercode: &'static str,
+    /// Where Letronna asks whether the code was typed yet.
+    pub token: &'static str,
+    /// The page the code is typed on.
+    pub verify: &'static str,
+    /// The address the code that comes back is traded under.
+    pub redirect: &'static str,
 }
 
 /// A provider's sign-in: its tokens, and whose they are.
@@ -315,14 +336,215 @@ pub struct SignIn {
     listeners: Mutex<Vec<TcpListener>>,
     pasted: Mutex<Option<String>>,
     stop: AtomicBool,
+    /// Finished only by a paste, as one finished on another device is:
+    /// nothing comes back to this machine.
+    pasted_only: bool,
 }
 
 /// Start signing in to provider `name`: listen for the browser and work out
 /// the page to send it to. `open_browser` sends it there; `finish` waits.
 pub fn begin(name: &str) -> Result<Arc<SignIn>, String> {
     let spec = spec_of(name)?;
-    let name = super::find(name).map(|p| p.info().name).unwrap_or_default();
+    // Kept under the account's own name: a provider's further account has
+    // a sign-in apart from its first.
+    let name = (crate::gateway::gateways().into_iter())
+        .map(|g| g.name)
+        .find(|g| *g == name)
+        .or_else(|| super::find(name).map(|p| p.info().name))
+        .unwrap_or_default();
     start(name, spec)
+}
+
+/// A sign-in started here and finished on another device: a phone, or the
+/// browser of a computer this terminal is reached from over SSH.
+pub struct Away {
+    pub name: &'static str,
+    /// The page to open, on any device.
+    pub url: String,
+    /// The code to type on that page, for a provider that signs in by one;
+    /// `None` for one whose page shows a code to paste back instead.
+    pub code: Option<String>,
+    how: AwayHow,
+}
+
+enum AwayHow {
+    Device {
+        spec: &'static OAuthSpec,
+        device: &'static DeviceSpec,
+        id: String,
+        every: Duration,
+        stop: AtomicBool,
+    },
+    Paste(Arc<SignIn>),
+}
+
+/// How long a code typed on another device may take.
+const AWAY_PATIENCE: Duration = Duration::from_secs(15 * 60);
+
+/// Start signing in to `name` on another device: a code to type there, or a
+/// page that shows one to paste back. `finish` waits for it.
+pub fn begin_away(name: &str) -> Result<Arc<Away>, String> {
+    let spec = spec_of(name)?;
+    let name = (crate::gateway::gateways().into_iter())
+        .map(|g| g.name)
+        .find(|g| *g == name)
+        .or_else(|| super::find(name).map(|p| p.info().name))
+        .unwrap_or_default();
+    away_with(name, spec)
+}
+
+fn away_with(name: &'static str, spec: &'static OAuthSpec) -> Result<Arc<Away>, String> {
+    if let Some(device) = spec.device {
+        let client = crate::chat::client()?;
+        let reply: Value = client
+            .post(device.usercode)
+            .timeout(CALL_LIMIT)
+            .json(&serde_json::json!({"client_id": spec.client_id}))
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|_| format!("{name} would not give a code to sign in with."))?
+            .json()
+            .map_err(|_| format!("{name} gave a code Letronna cannot read."))?;
+        let field = |key: &str| {
+            reply[key]
+                .as_str()
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        };
+        let (Some(id), Some(code)) = (field("device_auth_id"), field("user_code")) else {
+            return Err(format!("{name} gave no code to sign in with."));
+        };
+        let every = (field("interval").and_then(|i| i.parse().ok()))
+            .or(reply["interval"].as_u64())
+            .unwrap_or(5)
+            .max(1);
+        return Ok(Arc::new(Away {
+            name,
+            url: device.verify.to_owned(),
+            code: Some(code),
+            how: AwayHow::Device {
+                spec,
+                device,
+                id,
+                every: Duration::from_secs(every),
+                stop: AtomicBool::new(false),
+            },
+        }));
+    }
+    let Some(redirect) = spec.manual_redirect else {
+        return Err(format!(
+            "{name} can only be signed in to in a browser on this computer."
+        ));
+    };
+    let state = random(32)?;
+    let verifier = random(64)?;
+    let url = authorize_url(spec, redirect, &state, &verifier);
+    let flow = Arc::new(SignIn {
+        name,
+        url: url.clone(),
+        spec,
+        redirect: redirect.to_owned(),
+        state,
+        verifier,
+        // Nothing comes back here: the code is pasted.
+        listeners: Mutex::new(Vec::new()),
+        pasted: Mutex::new(None),
+        stop: AtomicBool::new(false),
+        pasted_only: true,
+    });
+    Ok(Arc::new(Away {
+        name,
+        url,
+        code: None,
+        how: AwayHow::Paste(flow),
+    }))
+}
+
+impl Away {
+    /// Take the code the provider's page showed, for a sign-in finished by
+    /// pasting one back.
+    pub fn paste(&self, text: &str) -> Result<(), String> {
+        match &self.how {
+            AwayHow::Paste(flow) => flow.paste(text),
+            AwayHow::Device { .. } => Err("Type the code on the page instead.".into()),
+        }
+    }
+
+    pub fn cancel(&self) {
+        match &self.how {
+            AwayHow::Paste(flow) => flow.cancel(),
+            AwayHow::Device { stop, .. } => stop.store(true, Ordering::Relaxed),
+        }
+    }
+
+    /// Wait for the code to be typed or pasted, trade it for tokens and keep
+    /// them under the account's name.
+    pub fn finish(&self) -> Result<Tokens, String> {
+        let AwayHow::Device {
+            spec,
+            device,
+            id,
+            every,
+            stop,
+        } = &self.how
+        else {
+            let AwayHow::Paste(flow) = &self.how else {
+                unreachable!()
+            };
+            return flow.finish();
+        };
+        let client = crate::chat::client()?;
+        let deadline = Instant::now() + AWAY_PATIENCE;
+        let code = self.code.clone().unwrap_or_default();
+        let granted = loop {
+            if stop.load(Ordering::Relaxed) {
+                return Err(CANCELLED.into());
+            }
+            if Instant::now() >= deadline {
+                return Err("The code was not typed in 15 minutes; start again.".into());
+            }
+            let reply = client
+                .post(device.token)
+                .timeout(CALL_LIMIT)
+                .json(&serde_json::json!({"device_auth_id": id, "user_code": code}))
+                .send()
+                .map_err(|e| format!("Cannot reach {}'s sign-in: {e}.", self.name))?;
+            match reply.status().as_u16() {
+                200 => break reply.json::<Value>().unwrap_or_default(),
+                // Not typed yet.
+                403 | 404 => {
+                    // Slept in steps, so a cancel is heard at once.
+                    let until = Instant::now() + *every;
+                    while Instant::now() < until && !stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+                status => {
+                    return Err(format!(
+                        "{} turned the code down (HTTP {status}); start again.",
+                        self.name
+                    ));
+                }
+            }
+        };
+        let field = |key: &str| granted[key].as_str().unwrap_or_default().to_owned();
+        let (code, verifier) = (field("authorization_code"), field("code_verifier"));
+        if code.is_empty() {
+            return Err(format!("{} said yes but gave no code.", self.name));
+        }
+        let mut params = vec![
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", device.redirect),
+        ];
+        if !verifier.is_empty() {
+            params.push(("code_verifier", &verifier));
+        }
+        let reply = token_call(spec, &params).map_err(|(_, why)| why)?;
+        let tokens = from_reply(spec, &reply, None)?;
+        store(self.name, &tokens)?;
+        Ok(tokens)
+    }
 }
 
 fn start(name: &'static str, spec: &'static OAuthSpec) -> Result<Arc<SignIn>, String> {
@@ -341,6 +563,7 @@ fn start(name: &'static str, spec: &'static OAuthSpec) -> Result<Arc<SignIn>, St
         listeners: Mutex::new(listeners),
         pasted: Mutex::new(None),
         stop: AtomicBool::new(false),
+        pasted_only: false,
     }))
 }
 
@@ -418,7 +641,7 @@ impl SignIn {
             .lock()
             .map(|mut held| std::mem::take(&mut *held))
             .unwrap_or_default();
-        if listeners.is_empty() {
+        if listeners.is_empty() && !self.pasted_only {
             return Err("This sign-in has already ended; start it again.".into());
         }
         // Blocking in `accept` would never look at the time, the switch or
@@ -723,7 +946,79 @@ pub(crate) mod tests {
             state_in_token: false,
             account_claim: Some("/auth/account"),
             plan_claim: Some("/auth/plan"),
+            device: None,
+            manual_redirect: Some("https://auth.example.com/code"),
         }))
+    }
+
+    #[test]
+    fn a_code_typed_on_another_device_signs_in_once_it_is_typed() {
+        let (vault, _held) = vault("provider-sign-in-away");
+        let (token, bodies) = token_server(vec![
+            (
+                200,
+                json!({"device_auth_id": "dev-1", "user_code": "K392-Z5EW5", "interval": "1"}),
+            ),
+            (403, json!({"error": "pending"})),
+            (
+                200,
+                json!({"authorization_code": "auth-1", "code_verifier": "ver-1"}),
+            ),
+            (
+                200,
+                json!({"access_token": "access-away", "refresh_token": "refresh-away"}),
+            ),
+        ]);
+        let device: &'static DeviceSpec = Box::leak(Box::new(DeviceSpec {
+            usercode: token,
+            token,
+            verify: "https://auth.example.com/device",
+            redirect: "https://auth.example.com/device/callback",
+        }));
+        let spec: &'static OAuthSpec = Box::leak(Box::new(OAuthSpec {
+            device: Some(device),
+            json: true,
+            ..spec(token).clone()
+        }));
+        let flow = away("Away", spec).unwrap();
+        assert_eq!(flow.code.as_deref(), Some("K392-Z5EW5"));
+        assert_eq!(flow.url, "https://auth.example.com/device");
+        assert!(flow.paste("anything").is_err());
+        let tokens = flow.finish().unwrap();
+        assert_eq!(tokens.access, "access-away");
+        let sent: Vec<String> = bodies.try_iter().collect();
+        assert!(sent[0].contains("client-1"));
+        assert!(sent[1].contains("dev-1") && sent[1].contains("K392-Z5EW5"));
+        assert!(sent[3].contains("auth-1") && sent[3].contains("ver-1"));
+        assert!(sent[3].contains("device/callback"));
+        assert!(vault.holds("provider:Away").is_some());
+    }
+
+    #[test]
+    fn a_page_that_shows_a_code_is_finished_by_pasting_it() {
+        let (_vault, _held) = vault("provider-sign-in-paste");
+        let (token, bodies) = token_server(vec![(
+            200,
+            json!({"access_token": "access-pasted", "refresh_token": "refresh-pasted"}),
+        )]);
+        let flow = away("Pasted", spec(token)).unwrap();
+        assert!(flow.code.is_none());
+        let url = Url::parse(&flow.url).unwrap();
+        let asked: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(asked["redirect_uri"], "https://auth.example.com/code");
+        flow.paste(&format!("c9#{}", asked["state"])).unwrap();
+        assert_eq!(flow.finish().unwrap().access, "access-pasted");
+        assert!(
+            bodies
+                .recv()
+                .unwrap()
+                .contains("redirect_uri=https%3A%2F%2Fauth.example.com%2Fcode")
+        );
+    }
+
+    /// `begin_away` for a spec of the test's own, as `start` is for `begin`.
+    fn away(name: &'static str, spec: &'static OAuthSpec) -> Result<Arc<Away>, String> {
+        super::away_with(name, spec)
     }
 
     fn knock(port: u16, target: &str) -> String {

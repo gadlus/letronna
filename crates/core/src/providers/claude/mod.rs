@@ -27,7 +27,9 @@
 pub(crate) mod cloak;
 
 use super::auth::OAuthSpec;
-use super::{AuthKind, Provider, ProviderInfo, Tier, Wire};
+use super::usage::{self, Usage, Window};
+use super::{AuthKind, Provider, ProviderInfo, Quota, Tier, Wire};
+use serde_json::Value;
 
 pub(crate) const NAME: &str = "Claude";
 
@@ -53,6 +55,10 @@ static SIGN_IN: OAuthSpec = OAuthSpec {
     // account is comes from the bootstrap call instead.
     account_claim: None,
     plan_claim: None,
+    device: None,
+    // Claude Code's own page for a sign-in finished elsewhere: it shows
+    // `code#state` to paste back, which `code=true` above asks for.
+    manual_redirect: Some("https://platform.claude.com/oauth/code/callback"),
 };
 
 pub struct Claude;
@@ -104,6 +110,27 @@ impl Provider for Claude {
             .collect())
     }
 
+    /// A subscription's replies name its own windows, not the API's
+    /// request and token limits; an API key's replies on this address are
+    /// read as Anthropic's are.
+    fn quota(&self, headers: &reqwest::header::HeaderMap) -> Option<Quota> {
+        plan_limits(headers, crate::chat::now())
+            .or_else(|| super::router::rate_limits(headers, crate::chat::now()))
+    }
+
+    /// The page Claude Code's `/usage` reads: each window of the plan.
+    fn usage(&self, _account: &str, base: &str, key: &str) -> Result<Option<Usage>, String> {
+        let root = base.trim().trim_end_matches('/');
+        let root = root.strip_suffix("/v1").unwrap_or(root);
+        let request = crate::chat::client()?
+            .get(format!("{root}/api/oauth/usage"))
+            .bearer_auth(key.trim())
+            .header("anthropic-beta", cloak::OAUTH_BETA)
+            .header("user-agent", cloak::USER_AGENT);
+        let body = usage::ask(request, "Claude")?;
+        Ok(body.map(|body| usage_page(&body)))
+    }
+
     fn caveat(&self) -> Option<&'static str> {
         Some(
             "Letronna presents itself to Anthropic as the client your subscription's \
@@ -117,9 +144,123 @@ impl Provider for Claude {
     }
 }
 
+/// The plan's windows as a subscription's reply names them: how much of
+/// each is used, from 0 to 1, and when each starts again.
+fn plan_limits(headers: &reqwest::header::HeaderMap, now: u64) -> Option<Quota> {
+    let get = |name: String| headers.get(name)?.to_str().ok().map(str::trim);
+    let windows: Vec<Window> = [("5h", "5-hour"), ("7d", "Weekly")]
+        .into_iter()
+        .filter_map(|(window, label)| {
+            let used = get(format!("anthropic-ratelimit-unified-{window}-utilization"))?
+                .parse::<f64>()
+                .ok()?;
+            let resets_at = get(format!("anthropic-ratelimit-unified-{window}-reset"))
+                .and_then(|at| usage::instant(&Value::from(at)));
+            Some(Window {
+                label: label.into(),
+                used_percent: (used * 100.0).clamp(0.0, 100.0),
+                resets_at,
+            })
+        })
+        .collect();
+    let mut tightest = windows
+        .iter()
+        .max_by(|a, b| a.used_percent.total_cmp(&b.used_percent))?
+        .clone();
+    // A refusal says so outright, whatever the windows read.
+    if get("anthropic-ratelimit-unified-status".into()) == Some("rejected") {
+        tightest.used_percent = 100.0;
+        tightest.resets_at = get("anthropic-ratelimit-unified-reset".into())
+            .and_then(|at| usage::instant(&Value::from(at)))
+            .or(tightest.resets_at)
+            .filter(|&at| at > now);
+    }
+    Some(Quota {
+        plan: None,
+        used_percent: tightest.used_percent,
+        resets_at: tightest.resets_at,
+        windows,
+    })
+}
+
+/// Claude's usage page: the 5-hour and weekly windows, used from 0 to 100,
+/// and any weekly window of a model of its own.
+fn usage_page(body: &Value) -> Usage {
+    let window = |key: &str, label: String| {
+        let at = &body[key];
+        Some(Window {
+            label,
+            used_percent: usage::percent(&at["utilization"])?,
+            resets_at: usage::instant(&at["resets_at"]),
+        })
+    };
+    let mut windows: Vec<Window> = [
+        window("five_hour", "5-hour".into()),
+        window("seven_day", "Weekly".into()),
+        window("seven_day_opus", "Weekly · Opus".into()),
+        window("seven_day_sonnet", "Weekly · Sonnet".into()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for scoped in body["model_scoped"].as_array().into_iter().flatten() {
+        let (Some(name), Some(used)) = (
+            scoped["display_name"].as_str(),
+            usage::percent(&scoped["utilization"]),
+        ) else {
+            continue;
+        };
+        let label = format!("Weekly · {name}");
+        if !windows.iter().any(|w| w.label == label) {
+            windows.push(Window {
+                label,
+                used_percent: used,
+                resets_at: usage::instant(&scoped["resets_at"]),
+            });
+        }
+    }
+    Usage {
+        windows,
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_subscriptions_windows_are_read_from_its_replies_and_its_page() {
+        let headers: reqwest::header::HeaderMap = [
+            ("anthropic-ratelimit-unified-5h-utilization", "0.62"),
+            ("anthropic-ratelimit-unified-5h-reset", "1793110000"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.2"),
+            ("anthropic-ratelimit-unified-7d-reset", "1793500000"),
+            ("anthropic-ratelimit-unified-status", "allowed"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.parse().unwrap(), v.parse().unwrap()))
+        .collect();
+        let quota = plan_limits(&headers, 1_793_100_000).unwrap();
+        assert_eq!(quota.windows.len(), 2);
+        assert_eq!(quota.windows[0].label, "5-hour");
+        assert!((quota.used_percent - 62.0).abs() < 1e-9);
+        assert_eq!(quota.resets_at, Some(1_793_110_000));
+        assert!(plan_limits(&Default::default(), 0).is_none());
+
+        let page = serde_json::json!({
+            "five_hour": {"utilization": 23.0, "resets_at": "2026-10-27T12:00:00+00:00"},
+            "seven_day": {"utilization": 41, "resets_at": "2026-10-30T09:00:00+00:00"},
+            "seven_day_opus": null,
+            "model_scoped": [{"display_name": "Opus", "utilization": 70, "resets_at": null}],
+            "extra_usage": {"is_enabled": false},
+        });
+        let usage = usage_page(&page);
+        let labels: Vec<&str> = usage.windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(labels, ["5-hour", "Weekly", "Weekly · Opus"]);
+        assert_eq!(usage.windows[0].resets_at, Some(1_793_102_400));
+        assert_eq!(usage.windows[2].used_percent, 70.0);
+    }
 
     /// Each of these is a bare "Invalid request format" with no redirect when
     /// it is wrong, so they are pinned rather than trusted.

@@ -66,11 +66,13 @@ const ACCOUNTS_SETTLE: std::time::Duration = std::time::Duration::from_millis(30
 /// The files in the data folder whose change can change the models on offer
 /// or whether the hosted ones can be paid for: keys, the vault's list (keys
 /// and browser sign-ins), gateways of your own, the Custom address, the
-/// sign-in, and which plugins' providers are on.
+/// sign-in, which plugins' providers are on, and a provider's further
+/// accounts, which the terminal or a paired phone may add.
 const ACCOUNT_FILES: &[&str] = &[
     "keys.json",
     "vault.json",
     "gateways.json",
+    "accounts.json",
     "settings.json",
     "account.json",
     "plugin-switches.json",
@@ -207,6 +209,9 @@ pub(crate) struct Chat {
     pub(crate) seeing: Vec<&'static str>,
     pub(crate) keys: std::collections::HashMap<String, String>,
     pub(crate) gateway_pick: Entity<String>,
+    /// Settings › Accounts shows its less used options: the order accounts
+    /// take over in, and the endpoint other tools reach them on.
+    pub(crate) accounts_more: bool,
     pub(crate) presence_pick: Entity<String>,
     pub(crate) settings_page: Entity<&'static str>,
     /// The Usage page's totals, added up when it was last opened.
@@ -1026,6 +1031,7 @@ impl Chat {
             model_search,
             keys,
             gateway_pick,
+            accounts_more: false,
             presence_pick,
             settings_page,
             usage_report: None,
@@ -2202,6 +2208,7 @@ impl Chat {
             warn_at: None,
             // The window's jobs run on after its turns.
             jobs_end_with_run: false,
+            gateway: gateway.to_owned(),
         };
         backend::validate(&connection)?;
         Ok(connection)

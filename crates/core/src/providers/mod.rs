@@ -11,9 +11,12 @@
 //! A provider is named by its `name`: settings, saved keys and fallbacks
 //! all refer to it that way, so a name never changes once shipped.
 
+pub mod accounts;
 pub mod auth;
 pub mod local;
+pub mod remote;
 pub mod router;
+pub mod usage;
 pub mod wire;
 
 mod anthropic;
@@ -25,6 +28,7 @@ mod gemini;
 mod letronna;
 mod ollama;
 mod openai;
+pub(crate) mod opencode;
 mod openrouter;
 mod this_computer;
 mod xai;
@@ -108,6 +112,36 @@ pub trait Provider: Send + Sync {
         Wire::OpenAiChat
     }
 
+    /// The format `model` goes out in with `key`, for a provider that
+    /// serves some of its models in another than its address speaks;
+    /// `None`, as for nearly every provider, leaves it to the address.
+    fn wire_for(&self, key: &str, model: &str) -> Option<Wire> {
+        let _ = (key, model);
+        None
+    }
+
+    /// The address `model` goes to with `key`, for a provider that serves
+    /// some models at another than its own; `None` for its own.
+    fn base_for(&self, key: &str, model: &str) -> Option<String> {
+        let _ = (key, model);
+        None
+    }
+
+    /// Whether the plan whose limits `usage` and `quota` tell of pays for
+    /// `model` with `key`: always, but for a provider that sends some models
+    /// elsewhere, whose full plan holds back only the rest.
+    fn plan_covers(&self, key: &str, model: &str) -> bool {
+        let _ = (key, model);
+        true
+    }
+
+    /// Headers every request to it carries beyond the key, given `session`,
+    /// a mark that stays the same for every request of one conversation.
+    fn headers(&self, session: &str) -> Vec<(&'static str, String)> {
+        let _ = session;
+        Vec::new()
+    }
+
     /// The model ids it serves at `base`, asked with `key`.
     fn models(&self, base: &str, key: &str) -> Result<Vec<String>, String> {
         crate::chat::list_models(base, key)
@@ -117,6 +151,14 @@ pub trait Provider: Send + Sync {
     /// headers: the standard rate-limit ones unless it says otherwise.
     fn quota(&self, headers: &reqwest::header::HeaderMap) -> Option<Quota> {
         router::rate_limits(headers, crate::chat::now())
+    }
+
+    /// How much of the plan `account` is on is used, asked of the provider's
+    /// own page with `key` at `base`; `None` for a provider with no such
+    /// page, whose replies' headers are all there is to go on.
+    fn usage(&self, account: &str, base: &str, key: &str) -> Result<Option<usage::Usage>, String> {
+        let _ = (account, base, key);
+        Ok(None)
     }
 
     /// What the user should know before connecting it, shown beside its
@@ -143,6 +185,7 @@ pub static PROVIDERS: &[&dyn Provider] = &[
     &gemini::Gemini,
     &xai::Xai,
     &openrouter::OpenRouter,
+    &opencode::OpenCode,
     &this_computer::ThisComputer,
     &ollama::Ollama,
     &custom::Custom,
@@ -156,11 +199,12 @@ pub fn all() -> Vec<&'static dyn Provider> {
     all
 }
 
-/// The provider called `name`.
+/// The provider called `name`, or that `name` is a further account of.
 pub fn find(name: &str) -> Option<&'static dyn Provider> {
     (PROVIDERS.iter().copied())
         .find(|p| p.info().name == name)
         .or_else(|| declared::list().into_iter().find(|p| p.info().name == name))
+        .or_else(|| accounts::find(name))
 }
 
 /// Whether the provider called `name` is offered now: always, unless a

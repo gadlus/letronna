@@ -665,7 +665,7 @@ fn ask(connection: &Connection, prompt: &str) -> Result<String, String> {
     });
     crate::on_device::reach::shape_body(connection, &mut body);
     let (endpoint, body) =
-        crate::chat::to_responses(connection, &endpoint, &body).unwrap_or((endpoint, body));
+        crate::chat::wired(connection, &endpoint, &body).unwrap_or((endpoint, body));
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(wait)

@@ -7006,7 +7006,9 @@ pub(crate) mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = scratch("long-command");
-        let id = AGENTS + 500;
+        // Its own: another run under the same id would take the job's exit
+        // notice out of the inbox before this one looks for it.
+        let id = AGENTS + 990;
         // As `-p` runs a prompt: the session's own agent, whose mail is its own.
         let mut top = spec(String::new(), &dir, id);
         (top.depth, top.owner) = (0, id);

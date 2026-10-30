@@ -28,6 +28,9 @@ fn fixture(wire: Wire) -> (&'static str, &'static [&'static str]) {
             include_str!("fixtures/chatgpt_models.json"),
             &["gpt-test-codex", "gpt-test-codex-mini"],
         ),
+        // Only ever chosen for one model at a time (`wire_for`): no
+        // provider's own base speaks it.
+        Wire::Google => unreachable!("no provider's base speaks Google's format"),
     }
 }
 

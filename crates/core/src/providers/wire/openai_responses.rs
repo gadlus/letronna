@@ -51,15 +51,32 @@ pub(crate) fn for_endpoint(endpoint: &str, body: &mut Value) {
     }
 }
 
-/// `request` signed as the ChatGPT plan: its access token, fresh, in place
-/// of `key` where there is a sign-in, and the account it is for.
+/// `request` signed as the ChatGPT plan: the access token of `signed_in`,
+/// one of the plan's accounts, fresh, in place of `key`, and the account it
+/// is for. With no account named, as when a list of models is asked for
+/// with a key alone, `key` goes as it is, for the account its claims name.
 pub(crate) fn as_chatgpt(
     request: reqwest::blocking::RequestBuilder,
+    signed_in: Option<&str>,
     key: &str,
 ) -> reqwest::blocking::RequestBuilder {
     use super::super::{auth, chatgpt::NAME};
-    let token = auth::access(NAME).unwrap_or_else(|_| key.trim().to_owned());
-    let account = auth::tokens(NAME).map(|t| t.account).unwrap_or_default();
+    let signed_in = signed_in.filter(|name| auth::tokens(name).is_some());
+    let token = match signed_in {
+        Some(name) => auth::access(name).unwrap_or_else(|_| key.trim().to_owned()),
+        None => key.trim().to_owned(),
+    };
+    // The plan's tokens name the account they are for; the first account's
+    // sign-in answers for a key that does not.
+    let claimed = auth::claims(&token)
+        .and_then(|claims| {
+            let id = claims.pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id")?;
+            id.as_str().map(str::to_owned)
+        })
+        .filter(|id| !id.is_empty());
+    let account = claimed
+        .or_else(|| auth::tokens(signed_in.unwrap_or(NAME)).map(|t| t.account))
+        .unwrap_or_default();
     let request = request.bearer_auth(token).header("originator", "letronna");
     match account.is_empty() {
         true => request,
@@ -67,13 +84,19 @@ pub(crate) fn as_chatgpt(
     }
 }
 
-/// Whether a request ChatGPT's backend at `endpoint` refused can go again:
-/// the sign-in was refreshed, which a refusal right after one never is, so
-/// this sends again at most once.
-pub(crate) fn refreshed(endpoint: &str) -> bool {
+/// Whether a request ChatGPT's backend refused on `connection` can go again:
+/// its account's sign-in was refreshed, which a refusal right after one
+/// never is, so this sends again at most once.
+pub(crate) fn refreshed(connection: &crate::chat::Connection) -> bool {
     use super::super::{auth, chatgpt::NAME};
-    chatgpt(endpoint)
-        && auth::tokens(NAME).is_some_and(|held| auth::refused(NAME, &held.access).is_ok())
+    let account = connection.account();
+    let name = if account.is_empty() {
+        NAME
+    } else {
+        account.as_str()
+    };
+    chatgpt(&connection.endpoint)
+        && auth::tokens(name).is_some_and(|held| auth::refused(name, &held.access).is_ok())
 }
 
 /// A reply read whole: JSON as it came, or the response a Responses stream

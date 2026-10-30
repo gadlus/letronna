@@ -101,10 +101,13 @@ pub(crate) fn keyed(request: RequestBuilder, key: &str) -> RequestBuilder {
 }
 
 /// `request` to `endpoint` carrying `posted`, a Messages request, keyed, and
-/// naming the binding beta when `posted` uses it.
+/// naming the binding beta when `posted` uses it. `account` is the gateway
+/// the key is for, whose sign-in names the account a subscription's marks
+/// carry.
 pub(crate) fn sign(
     request: RequestBuilder,
     endpoint: &str,
+    account: &str,
     key: &str,
     posted: &Value,
 ) -> RequestBuilder {
@@ -117,8 +120,15 @@ pub(crate) fn sign(
     // they carry the signed-in account's ids, which a proxy is not shown.
     if subscription(key) && own(endpoint) {
         use crate::providers::claude::cloak;
-        let tokens =
-            crate::providers::auth::tokens(crate::providers::claude::NAME).unwrap_or_default();
+        // The marks name the account the token is for: a further Claude
+        // account's own, else the first's.
+        let claude = crate::providers::claude::NAME;
+        let signed_in = if crate::providers::accounts::provider_of(account) == Some(claude) {
+            account
+        } else {
+            claude
+        };
+        let tokens = crate::providers::auth::tokens(signed_in).unwrap_or_default();
         let has_tools = posted["tools"]
             .as_array()
             .is_some_and(|tools| !tools.is_empty());
@@ -970,6 +980,7 @@ mod tests {
         let thought = Replay {
             endpoint: endpoint.clone(),
             model: c.model.clone(),
+            account: Default::default(),
             reasoning_details: vec![json!({"type": "thinking", "thinking": "A plan first.",
                 "signature": "c2lnbmVk", "index": 0})],
             extra_content: Default::default(),
@@ -1203,6 +1214,7 @@ mod tests {
         sign(
             client.post(&endpoint),
             &endpoint,
+            "Claude",
             "sk-ant-oat01-test",
             &posted,
         )
@@ -1250,6 +1262,7 @@ mod tests {
         sign(
             client.post(&endpoint),
             &endpoint,
+            "Claude",
             "sk-ant-oat01-test",
             &posted,
         )

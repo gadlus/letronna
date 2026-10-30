@@ -92,7 +92,13 @@ fn route(
     if crate::on_device::at(&primary.endpoint) {
         return (vec![primary.clone()], Vec::new());
     }
-    let accounts = accounts(primary, &order(settings), ready);
+    let mut accounts = accounts(primary, &order(settings), ready);
+    // Another account of the same provider is reached for only while the
+    // user lets it be.
+    if !settings.switch_accounts {
+        let own = primary.account();
+        accounts.retain(|c| !super::accounts::same_provider(&c.account(), &own));
+    }
     // Entries that do not read are passed over here; the frontends say why
     // when they are written.
     let mut fallbacks: Vec<_> = (settings.fallbacks.iter())
@@ -122,7 +128,14 @@ fn default_elsewhere(
     let address = |text: &str| text.trim().trim_end_matches('/').to_owned();
     let (gateway, model) = (settings.gateway.trim(), settings.model.trim());
     let (_, base, _) = ready.iter().find(|(name, ..)| *name == gateway)?;
-    (!model.is_empty() && address(base) != address(&primary.endpoint)).then(|| Fallback {
+    // Another account of the session's provider is elsewhere too.
+    let there = Connection {
+        endpoint: address(base),
+        gateway: gateway.to_owned(),
+        ..primary.clone()
+    };
+    let elsewhere = !fallback::same(&there, primary);
+    (!model.is_empty() && elsewhere).then(|| Fallback {
         gateway: gateway.to_owned(),
         model: model.to_owned(),
     })
@@ -155,9 +168,10 @@ fn ready(_: &HashMap<String, String>, _: &Settings) -> Vec<(&'static str, String
 
 /// The session's model on each of `ready` (name, base, key) but its own
 /// account, by tier in `order`: those at its tier or after it first, then
-/// those before it; within a tier in the order the providers are offered. A
-/// gateway no provider declares, as the user's own and those plugins add
-/// are, is ranked as Custom is, among the API keys.
+/// those before it; within a tier the other accounts of the session's own
+/// provider first, in the order the user keeps them, then in the order the
+/// providers are offered. A gateway no provider declares, as the user's own
+/// and those plugins add are, is ranked as Custom is, among the API keys.
 fn accounts(
     primary: &Connection,
     order: &[Tier],
@@ -167,7 +181,8 @@ fn accounts(
         let tier = (name.and_then(super::find)).map_or(Tier::ApiKey, |p| p.info().tier);
         order.iter().position(|t| *t == tier).unwrap_or(order.len())
     };
-    let own = rank(crate::gateway::named(&primary.endpoint));
+    let account = primary.account();
+    let own = rank(Some(account.as_str()).filter(|a| !a.is_empty()));
     let mut accounts: Vec<_> = (ready.iter())
         // A model here is no account for another's: it never serves its id.
         .filter(|(name, ..)| *name != crate::on_device::NAME)
@@ -175,10 +190,12 @@ fn accounts(
             let connection = Connection {
                 endpoint: base.clone(),
                 key: key.clone(),
+                gateway: (*name).to_owned(),
                 ..primary.clone()
             };
             let rank = rank(Some(name));
-            ((rank < own, rank), connection)
+            let kin = super::accounts::same_provider(name, &account);
+            ((rank < own, !kin, rank), connection)
         })
         .filter(|(_, c)| !fallback::same(c, primary))
         .collect();
@@ -230,7 +247,8 @@ fn serves(connection: &Connection) -> bool {
         Some(models) => models,
         None => {
             let endpoint = &at.0;
-            let listed = match crate::gateway::named(endpoint).and_then(super::find) {
+            let account = connection.account();
+            let listed = match super::find(&account) {
                 Some(provider) => provider.models(endpoint, &connection.key),
                 None => crate::chat::list_models(endpoint, &connection.key),
             };
@@ -254,17 +272,28 @@ pub struct Quota {
     pub used_percent: f64,
     /// When that limit starts again, in Unix seconds, if it was said.
     pub resets_at: Option<u64>,
+    /// Each of the plan's limits, for a provider whose replies name them;
+    /// empty when only the tightest is known.
+    pub windows: Vec<super::usage::Window>,
 }
 
-/// The last quota each provider's replies told of, in memory only.
-static QUOTAS: Mutex<BTreeMap<&'static str, Quota>> = Mutex::new(BTreeMap::new());
+/// The last quota each account's replies told of, in memory only.
+static QUOTAS: Mutex<BTreeMap<String, Quota>> = Mutex::new(BTreeMap::new());
 
-/// Keep the quota a reply from `endpoint` tells of.
-pub(crate) fn heard(endpoint: &str, headers: &HeaderMap) {
-    let Some(name) = crate::gateway::named(endpoint) else {
+/// Keep the quota a reply on `connection` tells of, for its account.
+pub(crate) fn heard(connection: &Connection, headers: &HeaderMap) {
+    let name = connection.account();
+    if name.is_empty() {
+        return;
+    }
+    let Some(provider) = super::find(&name) else {
         return;
     };
-    if let Some(quota) = super::find(name).and_then(|p| p.quota(headers)) {
+    if let Some(quota) = provider.quota(headers) {
+        // A reply from somewhere the plan does not pay for says nothing of it.
+        if provider.plan_covers(connection.key.trim(), connection.model.trim()) {
+            super::usage::heard(&name, &quota);
+        }
         (QUOTAS.lock().unwrap_or_else(PoisonError::into_inner)).insert(name, quota);
     }
 }
@@ -291,6 +320,11 @@ pub fn usage(name: &str) -> String {
     let signed = super::auth::tokens(name)
         .map(|t| t.plan)
         .filter(|p| !p.is_empty());
+    // Each window of the plan, as its page or its replies named them.
+    if let Some(mut known) = super::usage::get(name).filter(|u| !u.windows.is_empty()) {
+        known.plan = known.plan.or(signed);
+        return super::usage::line(&known, crate::chat::now());
+    }
     describe(quota(name), signed, crate::chat::now())
 }
 
@@ -363,6 +397,7 @@ pub fn rate_limits(headers: &HeaderMap, now: u64) -> Option<Quota> {
                 plan: None,
                 used_percent,
                 resets_at: get(reset).and_then(|r| reset_at(r, now)),
+                windows: Vec::new(),
             });
         }
     }
@@ -433,6 +468,7 @@ mod tests {
             plan: plan.map(str::to_owned),
             used_percent: 42.4,
             resets_at: at,
+            windows: Vec::new(),
         };
         assert_eq!(describe(None, None, 0), "");
         assert_eq!(describe(None, Some("plus".into()), 0), "Plus");
@@ -550,6 +586,39 @@ mod tests {
             (first.key.as_str(), first.model.as_str()),
             ("key-OpenAI", "gpt-5")
         );
+    }
+
+    #[test]
+    fn a_plan_at_its_limit_goes_on_to_the_next_account_of_the_same_plan_first() {
+        let _held = super::super::auth::tests::vault("router-accounts");
+        let work = super::super::accounts::add("ChatGPT", "Work").unwrap();
+        let ready: Vec<_> = (["OpenAI", "ChatGPT", work].iter())
+            .map(|n| (*n, crate::gateway::base_url(n, ""), format!("key-{n}")))
+            .collect();
+        let primary = Connection {
+            endpoint: crate::gateway::base_url("ChatGPT", ""),
+            model: "gpt-6".into(),
+            key: "key-ChatGPT".into(),
+            gateway: "ChatGPT".into(),
+            ..Default::default()
+        };
+        let asked = |settings: &Settings| -> Vec<String> {
+            (route(&primary, settings, &HashMap::new(), &ready).0.iter())
+                .map(|c| c.account())
+                .collect()
+        };
+        // The other ChatGPT account shares the plan's address, yet it is an
+        // account of its own, and the first one reached for.
+        assert_eq!(asked(&Settings::default()), ["ChatGPT", work, "OpenAI"]);
+        let chain = route(&primary, &Settings::default(), &HashMap::new(), &ready).0;
+        assert_eq!(chain[1].key, format!("key-{work}"));
+        assert!(!fallback::same(&chain[0], &chain[1]));
+        // Unless the user keeps to one account of a provider.
+        let one = Settings {
+            switch_accounts: false,
+            ..Default::default()
+        };
+        assert_eq!(asked(&one), ["ChatGPT", "OpenAI"]);
     }
 
     /// A gateway set up, as `gateway::ready` gives it.

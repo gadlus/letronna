@@ -1434,6 +1434,7 @@ fn open(job: &Schedule, note: Option<&str>) -> Result<Spec, String> {
         workspace: job.workspace.clone(),
         effort: settings.effort.clone(),
         search: settings.search,
+        gateway: settings.gateway.clone(),
         ..Default::default()
     };
     // Before the session is made, so a run that cannot start leaves none.

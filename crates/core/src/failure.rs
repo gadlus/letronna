@@ -408,6 +408,8 @@ const CODES: &[(&str, FailureKind)] = &[
     ("insufficient_quota", FailureKind::Quota),
     ("rate_limit_exceeded", FailureKind::RateLimit),
     ("rate_limit_error", FailureKind::RateLimit),
+    // OpenCode Go's plan with a window full: another account may answer.
+    ("GoUsageLimitError", FailureKind::RateLimit),
     ("overloaded_error", FailureKind::Overloaded),
     ("context_length_exceeded", FailureKind::ContextTooLong),
     ("exceed_context_size_error", FailureKind::ContextTooLong),

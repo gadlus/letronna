@@ -164,6 +164,7 @@ impl Runner {
             warn_at: None,
             // Set by `-p` alone: the terminal's jobs run on after its turns.
             jobs_end_with_run: false,
+            gateway: self.store.model(session).0.to_owned(),
         }
     }
 

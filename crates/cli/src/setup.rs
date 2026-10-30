@@ -85,7 +85,7 @@ fn connect(runner: &mut Runner) -> bool {
         Vec::new(),
         &[
             account.as_str(),
-            "My own API key  —  OpenAI, Anthropic or OpenRouter.",
+            "My own API key  —  OpenAI, Anthropic, OpenRouter or OpenCode Go/Zen.",
             "On this computer  —  Ollama. Works offline, no key.",
             "Another server  —  anything OpenAI-compatible, by its URL.",
             "Skip for now",

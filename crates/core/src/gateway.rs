@@ -36,14 +36,20 @@ pub fn gateways() -> Vec<Gateway> {
     let own = own().into_iter().map(|g| as_gateway(&g));
     crate::providers::all()
         .into_iter()
-        .map(|p| {
+        .flat_map(|p| {
             let info = p.info();
-            Gateway {
-                name: info.name,
+            // A provider's further accounts stand beside it, in the order
+            // the user gave them, which is the order they are reached for.
+            let accounts = match crate::providers::accounts::takes_more(info.name) {
+                true => crate::providers::accounts::of(info.name),
+                false => vec![info.name],
+            };
+            accounts.into_iter().map(move |name| Gateway {
+                name,
                 base: info.base,
                 needs_key: p.auth() == AuthKind::ApiKey,
                 blurb: info.blurb,
-            }
+            })
         })
         .chain(own)
         .collect()
@@ -604,6 +610,65 @@ pub fn all_models(
     (models, errors)
 }
 
+/// `models`, as (gateway, model), with each model listed once per provider
+/// rather than once per account: on the first of the provider's accounts,
+/// in the order the user keeps them, whose plan is not at its limit, or on
+/// `keep`'s account when that is the one in use. The router moves to the
+/// others when that one runs out, so a menu need not show them all.
+pub fn one_per_provider(
+    models: Vec<(String, String)>,
+    keep: (&str, &str),
+) -> Vec<(String, String)> {
+    use crate::providers::{accounts, usage};
+    let provider = |gateway: &str| {
+        accounts::provider_of(gateway)
+            .filter(|p| accounts::takes_more(p) && accounts::of(p).len() > 1)
+    };
+    // How a model's account ranks among its provider's: the one in use
+    // first, then those with room, each in the user's order.
+    let keys = std::cell::OnceCell::new();
+    let rank = |gateway: &str, model: &str, of: &str| {
+        let order = accounts::of(of);
+        let at = order
+            .iter()
+            .position(|a| *a == gateway)
+            .unwrap_or(order.len());
+        let in_use = (gateway, model) == keep;
+        // Read once, and only for a provider with more than one account.
+        let key = (keys
+            .get_or_init(crate::store::load_keys)
+            .get(key_slot(gateway)))
+        .cloned()
+        .unwrap_or_default();
+        let full = usage::spent(gateway).is_some()
+            && crate::providers::find(gateway).is_none_or(|p| p.plan_covers(&key, model));
+        (!in_use, full, at)
+    };
+    // By (provider, model): the account chosen so far and how it ranks.
+    type Rank = (bool, bool, usize);
+    let mut best: HashMap<(String, String), (String, Rank)> = HashMap::new();
+    for (gateway, model) in &models {
+        let Some(of) = provider(gateway) else {
+            continue;
+        };
+        let ranked = rank(gateway, model, of);
+        let entry = best
+            .entry((of.to_owned(), model.clone()))
+            .or_insert_with(|| (gateway.clone(), ranked));
+        if ranked < entry.1 {
+            *entry = (gateway.clone(), ranked);
+        }
+    }
+    (models.into_iter())
+        .filter(|(gateway, model)| match provider(gateway) {
+            Some(of) => best
+                .get(&(of.to_owned(), model.clone()))
+                .is_some_and(|(chosen, _)| chosen == gateway),
+            None => true,
+        })
+        .collect()
+}
+
 /// Whether `model` on `name` is listed but cannot be picked or sent to: one
 /// of the hosted pool's, while `account` has no plan or credit to pay for it
 /// and no perk makes it free today.
@@ -699,6 +764,11 @@ pub fn models_of(
 pub fn key_slot(name: &str) -> &str {
     match own_as(name) {
         Some(own) => interned(&format!("gateway:{}", own.name)),
+        // A provider's further account keeps its key apart from the
+        // provider's own, as a gateway of the user's own does.
+        None if crate::providers::accounts::get(name).is_some() => {
+            interned(&crate::providers::accounts::key_slot_of(name))
+        }
         None => name,
     }
 }
@@ -713,6 +783,44 @@ pub fn gateway(name: &str) -> Gateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_menu_lists_a_model_once_for_all_of_a_providers_accounts() {
+        let _held = crate::providers::auth::tests::vault("one-per-provider");
+        let work = crate::providers::accounts::add("ChatGPT", "Work").unwrap();
+        let listed = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            (pairs.iter())
+                .map(|(g, m)| ((*g).to_owned(), (*m).to_owned()))
+                .collect()
+        };
+        let models = listed(&[
+            ("ChatGPT", "gpt-6"),
+            (work, "gpt-6"),
+            (work, "gpt-6-mini"),
+            ("OpenAI", "gpt-6"),
+        ]);
+        // The first account in the user's order, the others left to the router.
+        assert_eq!(
+            one_per_provider(models.clone(), ("", "")),
+            listed(&[
+                ("ChatGPT", "gpt-6"),
+                (work, "gpt-6-mini"),
+                ("OpenAI", "gpt-6")
+            ])
+        );
+        // The one in use stays as it is.
+        assert_eq!(
+            one_per_provider(models.clone(), (work, "gpt-6"))[0],
+            (work.to_owned(), "gpt-6".to_owned())
+        );
+        // One at its limit gives way to one with room.
+        crate::providers::usage::tests::full("ChatGPT", crate::chat::now() + 600);
+        assert_eq!(
+            one_per_provider(models, ("", ""))[0],
+            (work.to_owned(), "gpt-6".to_owned())
+        );
+        crate::providers::usage::forget("ChatGPT");
+    }
 
     #[test]
     fn a_model_goes_to_its_own_gateway_and_custom_keeps_its_url() {

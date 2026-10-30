@@ -7,6 +7,7 @@
 //! added at the edge, in `wire::openai_responses`.
 
 use super::auth::OAuthSpec;
+use super::usage::{self, Usage, Window};
 use super::{AuthKind, Provider, ProviderInfo, Quota, Tier, Wire};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -35,7 +36,17 @@ static SIGN_IN: OAuthSpec = OAuthSpec {
     pkce: true,
     state_in_token: false,
     account_claim: Some("/https:~1~1api.openai.com~1auth/chatgpt_account_id"),
-    plan_claim: Some("/https:~1~1api.openai.com~1auth/chatgpt_plan_type"),
+    plan_claim: Some("/https:~1~1api.openai.com~1auth/chatgpt_plan_type"), // Codex's own sign-in by a code, for a phone or a terminal over SSH,
+    // whose browser cannot come back to this machine's port.
+    device: Some(&DEVICE),
+    manual_redirect: None,
+};
+
+static DEVICE: super::auth::DeviceSpec = super::auth::DeviceSpec {
+    usercode: "https://auth.openai.com/api/accounts/deviceauth/usercode",
+    token: "https://auth.openai.com/api/accounts/deviceauth/token",
+    verify: "https://auth.openai.com/codex/device",
+    redirect: "https://auth.openai.com/deviceauth/callback",
 };
 
 /// The Codex version the model list is asked for as. Each model names the
@@ -140,12 +151,22 @@ impl Provider for ChatGpt {
         plan_usage(headers, crate::chat::now())
     }
 
+    /// The page Codex reads its limits from, beside the backend it sends to.
+    fn usage(&self, account: &str, base: &str, key: &str) -> Result<Option<Usage>, String> {
+        let base = base.trim().trim_end_matches('/');
+        let root = base.strip_suffix("/codex").unwrap_or(base);
+        let request = crate::chat::client()?.get(format!("{root}/wham/usage"));
+        let request = super::wire::openai_responses::as_chatgpt(request, Some(account), key);
+        let body = usage::ask(request, "ChatGPT")?;
+        Ok(body.map(|body| usage_page(&body, crate::chat::now())))
+    }
+
     fn models(&self, base: &str, key: &str) -> Result<Vec<String>, String> {
         let base = base.trim().trim_end_matches('/');
         let request = crate::chat::client()?
             .get(format!("{base}/models?client_version={CLIENT_VERSION}"))
             .timeout(Duration::from_secs(20));
-        let response = super::wire::openai_responses::as_chatgpt(request, key)
+        let response = super::wire::openai_responses::as_chatgpt(request, None, key)
             .send()
             .and_then(|r| r.error_for_status())
             .map_err(|e| match e.status().map(|s| s.as_u16()) {
@@ -207,25 +228,73 @@ fn listing(catalog: &Value) -> Vec<Value> {
         .collect()
 }
 
-/// The tighter of the plan's two windows at `now`, as its headers give them.
+/// The plan's two windows at `now`, as its headers give them, the tighter
+/// as the quota. Which account's plan it is, the reply does not say; the
+/// account's sign-in does (`usage::heard`).
 fn plan_usage(headers: &reqwest::header::HeaderMap, now: u64) -> Option<Quota> {
     let number = |name: String| headers.get(name)?.to_str().ok()?.trim().parse::<f64>().ok();
-    let (used_percent, reset) = (["primary", "secondary"].into_iter())
-        .filter_map(|window| {
+    let windows: Vec<Window> = [("primary", "5-hour"), ("secondary", "Weekly")]
+        .into_iter()
+        .filter_map(|(window, usual)| {
             let used = number(format!("x-codex-{window}-used-percent"))?;
-            Some((
-                used,
-                number(format!("x-codex-{window}-reset-after-seconds")),
-            ))
+            let resets_at = number(format!("x-codex-{window}-reset-at"))
+                .map(|at| at as u64)
+                .or_else(|| {
+                    number(format!("x-codex-{window}-reset-after-seconds"))
+                        .map(|after| now + after.max(0.0) as u64)
+                });
+            let label = number(format!("x-codex-{window}-window-minutes"))
+                .filter(|m| *m > 0.0)
+                .map_or_else(|| usual.to_owned(), |m| usage::length_label(m as u64 * 60));
+            Some(Window {
+                label,
+                used_percent: used.clamp(0.0, 100.0),
+                resets_at,
+            })
         })
-        .max_by(|a, b| a.0.total_cmp(&b.0))?;
+        .collect();
+    let tightest = windows
+        .iter()
+        .max_by(|a, b| a.used_percent.total_cmp(&b.used_percent))?;
     Some(Quota {
-        plan: super::auth::tokens(NAME)
-            .map(|t| t.plan)
-            .filter(|plan| !plan.is_empty()),
-        used_percent,
-        resets_at: reset.map(|after| now + after.max(0.0) as u64),
+        plan: None,
+        used_percent: tightest.used_percent,
+        resets_at: tightest.resets_at,
+        windows: windows.clone(),
     })
+}
+
+/// The plan's usage page, beside the Codex backend at `base`: the plan and
+/// each window, as `wham/usage` gives them.
+fn usage_page(body: &Value, now: u64) -> Usage {
+    let windows = ["primary_window", "secondary_window"]
+        .into_iter()
+        .filter_map(|key| {
+            let window = body.pointer(&format!("/rate_limit/{key}"))?;
+            let used_percent = usage::percent(&window["used_percent"])?;
+            let resets_at = usage::instant(&window["reset_at"]).or_else(|| {
+                (window["reset_after_seconds"].as_f64()).map(|after| now + after.max(0.0) as u64)
+            });
+            let label = match window["limit_window_seconds"].as_u64() {
+                Some(seconds) if seconds > 0 => usage::length_label(seconds),
+                _ if key == "primary_window" => "5-hour".into(),
+                _ => "Weekly".into(),
+            };
+            Some(Window {
+                label,
+                used_percent,
+                resets_at,
+            })
+        })
+        .collect();
+    Usage {
+        plan: body["plan_type"]
+            .as_str()
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned),
+        windows,
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +353,27 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(without, (true, false));
         assert!(with);
+    }
+
+    #[test]
+    fn the_plans_usage_page_gives_each_window_by_its_length() {
+        let page = json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "allowed": true, "limit_reached": false,
+                "primary_window": {"used_percent": 12, "limit_window_seconds": 18000,
+                    "reset_after_seconds": 600, "reset_at": 1793100600},
+                "secondary_window": {"used_percent": 55.5, "limit_window_seconds": 604800,
+                    "reset_after_seconds": 86400},
+            },
+        });
+        let usage = usage_page(&page, 1_793_100_000);
+        assert_eq!(usage.plan.as_deref(), Some("pro"));
+        assert_eq!(usage.windows[0].label, "5-hour");
+        assert_eq!(usage.windows[0].resets_at, Some(1_793_100_600));
+        assert_eq!(usage.windows[1].label, "Weekly");
+        assert_eq!(usage.windows[1].resets_at, Some(1_793_186_400));
+        assert!(usage_page(&json!({}), 0).windows.is_empty());
     }
 
     #[test]

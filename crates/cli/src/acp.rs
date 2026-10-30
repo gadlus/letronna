@@ -400,6 +400,19 @@ impl Agent {
             }
             return;
         };
+        // A phone's questions about this computer's accounts may wait on a
+        // provider, so they are answered off this loop.
+        if let Some(asked) = method.strip_prefix(ACCOUNTS) {
+            let (out, asked, params) = (self.out.clone(), asked.to_owned(), params.clone());
+            std::thread::spawn(move || {
+                let frame = match accounts_call(&asked, &params) {
+                    Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                    Err((code, error)) => failure(id, code, &error),
+                };
+                send(&out, &frame);
+            });
+            return;
+        }
         let reply = match method {
             "initialize" => Ok(initialized()),
             "session/new" => self.new_session(params),
@@ -856,6 +869,56 @@ fn initialized() -> Value {
     })
 }
 
+/// What Letronna's own methods for this computer's accounts start with:
+/// a paired phone lists them, adds a key or a sign-in, orders them and
+/// checks how much of each plan is left. No reply carries a key or a token.
+const ACCOUNTS: &str = "_letronna/accounts/";
+
+/// Answer one of the account methods, `asked` being its name after
+/// `ACCOUNTS`.
+fn accounts_call(asked: &str, params: &Value) -> Result<Value, (i64, String)> {
+    use letronna_core::providers::remote;
+    let text = |key: &str| {
+        params[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+    };
+    let needed = |key: &str| text(key).ok_or((INVALID_PARAMS, format!("`{key}` is missing.")));
+    let done = || json!({"ok": true});
+    let refused = |why: String| (INVALID_PARAMS, why);
+    match asked {
+        "list" => Ok(remote::list()),
+        "add_key" => {
+            remote::add_key(needed("provider")?, text("label"), needed("key")?).map_err(refused)
+        }
+        "sign_in" => remote::sign_in_start(needed("provider")?, text("label")).map_err(refused),
+        "sign_in_paste" => remote::sign_in_paste(needed("id")?, needed("code")?).map_err(refused),
+        "sign_in_status" => Ok(remote::sign_in_status(needed("id")?)),
+        "sign_in_cancel" => {
+            remote::sign_in_cancel(needed("id")?);
+            Ok(done())
+        }
+        "remove" => remote::remove(needed("name")?)
+            .map(|()| done())
+            .map_err(refused),
+        "move" => remote::shift(needed("name")?, params["up"].as_bool().unwrap_or(true))
+            .map(|()| done())
+            .map_err(refused),
+        "switch" => remote::set_switch(params["on"].as_bool().unwrap_or(true))
+            .map(|()| done())
+            .map_err(refused),
+        "usage" => Ok(remote::check_usage(
+            text("name"),
+            params["asked"].as_bool().unwrap_or(false),
+        )),
+        _ => Err((
+            METHOD_NOT_FOUND,
+            format!("There is no method `{ACCOUNTS}{asked}` here."),
+        )),
+    }
+}
+
 /// The session a request names, as the number its id is made from.
 fn session_id(params: &Value) -> Result<u64, (i64, String)> {
     params["sessionId"]
@@ -971,7 +1034,9 @@ fn info(session: &Summary) -> Option<Value> {
 /// and its mode, which an editor that reads options reads here alone.
 fn options(open: &Session, models: &[(String, String)], client: Client) -> Value {
     let current = (open.gateway.clone(), open.connection.model.clone());
-    let mut offered = models.to_vec();
+    // A model on several accounts of one provider is offered once.
+    let mut offered =
+        letronna_core::gateway::one_per_provider(models.to_vec(), (&current.0, &current.1));
     // Its own is offered too, before the gateways have answered, or when
     // none of them offers it any more.
     if !offered.contains(&current) {
@@ -2236,6 +2301,30 @@ mod tests {
         let bad = editor.ask("session/list", json!({"cursor": "somewhere"}));
         let (_, refused) = editor.reply(bad);
         assert_eq!(refused["error"]["code"], INVALID_PARAMS);
+    }
+
+    #[test]
+    fn a_phone_lists_this_computers_accounts_and_is_told_when_it_asks_for_nothing_known() {
+        let mut editor = Editor::connect(provider(Vec::new()), SESSIONS + 160);
+        let list = editor.ask("_letronna/accounts/list", json!({}));
+        let (_, listed) = editor.reply(list);
+        let result = &listed["result"];
+        assert!(result["accounts"].is_array(), "{listed}");
+        // Go, a plan paid for with a key, is one a phone can set up.
+        let go = (result["providers"].as_array().unwrap().iter())
+            .find(|p| p["name"] == "OpenCode Go/Zen")
+            .unwrap();
+        assert_eq!(go["auth"], "key");
+        // A key is required, and a method that is not there says so.
+        let empty = editor.ask(
+            "_letronna/accounts/add_key",
+            json!({"provider": "OpenAI", "key": ""}),
+        );
+        let (_, refused) = editor.reply(empty);
+        assert_eq!(refused["error"]["code"], INVALID_PARAMS);
+        let unknown = editor.ask("_letronna/accounts/fly", json!({}));
+        let (_, refused) = editor.reply(unknown);
+        assert_eq!(refused["error"]["code"], METHOD_NOT_FOUND);
     }
 
     /// Asks for session `session` to be put on `value` and gives the request's id.

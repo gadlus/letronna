@@ -452,7 +452,7 @@ fn suggest_of(
     let endpoint = reached.url.clone();
     let body = suggest_body(connection, diff, subjects);
     let (endpoint, body) =
-        crate::chat::to_responses(connection, &endpoint, &body).unwrap_or((endpoint, body));
+        crate::chat::wired(connection, &endpoint, &body).unwrap_or((endpoint, body));
     // The shared client would give up on a slow reply after its idle wait.
     let request = crate::chat::client()?
         .post(endpoint)
