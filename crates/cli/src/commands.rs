@@ -55,7 +55,11 @@ pub fn command(
     match line {
         "/exit" | "/quit" => Flow::Stop,
         "/help" => {
-            help(here, rest);
+            help(here, rest, &runner.bar.moved_keys());
+            Flow::Handled
+        }
+        "/keybindings" => {
+            keybindings(runner);
             Flow::Handled
         }
         // A fresh start, as Claude Code's /clear is: a new session on a
@@ -1892,7 +1896,7 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
 /// The commands, then the added ones, then the keys, each in one column so
 /// it reads straight down. Skills are left to `/skills`: there can be
 /// dozens, and each is a line there already.
-fn help(workspace: Option<&std::path::Path>, rest: &str) {
+fn help(workspace: Option<&std::path::Path>, rest: &str, moved: &[(String, String)]) {
     render::blank();
     let asked = rest.trim().trim_start_matches('/');
     if !asked.is_empty() {
@@ -1934,8 +1938,61 @@ fn help(workspace: Option<&std::path::Path>, rest: &str) {
     ));
     render::blank();
     keys();
+    if !moved.is_empty() {
+        render::blank();
+        render::line(&render::dim("Moved in keybindings.json (/keybindings)"));
+        for (key, what) in moved {
+            row(key, what);
+        }
+    }
     render::blank();
     render::line(&render::dim("The guide: https://letronna.ai/docs"));
+}
+
+/// Open keybindings.json in the user's editor, made first when there is
+/// none, then say where it is and what it moves now.
+fn keybindings(runner: &mut Runner) {
+    render::blank();
+    let path = crate::keybindings::file();
+    if !path.exists()
+        && let Err(error) = std::fs::write(&path, crate::keybindings::template())
+    {
+        render::line(&render::red(&format!(
+            "Could not make {}: {error}",
+            path.display()
+        )));
+        return;
+    }
+    // Only with somebody at the keyboard: piped, nobody is at an editor.
+    if runner.human {
+        let (program, args) = crate::memory::editor();
+        let program = crate::memory::found(&program);
+        // Started directly, never through a shell, as /memory edit is.
+        let ran = runner.bar.lend(|| {
+            std::process::Command::new(&program)
+                .args(&args)
+                .arg(&path)
+                .status()
+        });
+        if let Err(error) = ran {
+            render::line(&render::red(&format!(
+                "Could not start {}: {error}. Set VISUAL or EDITOR to the editor you use.",
+                program.display()
+            )));
+        }
+    }
+    runner.bar.read_keybindings();
+    render::line(&render::dim(&format!(
+        "Keys are moved in {}, which is read again when it changes; it lists every action with its key.",
+        path.display()
+    )));
+    let moved = runner.bar.moved_keys();
+    if moved.is_empty() {
+        render::line(&render::dim("No key is moved yet."));
+    }
+    for (key, what) in moved {
+        render::line(&format!("{}  {}", render::bold(&key), render::dim(&what)));
+    }
 }
 
 /// The keys, one to a row, as `/help` and `?` list them.
@@ -2076,7 +2133,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/wallet",
         ],
     ),
-    ("Help", &["/help", "/vim", "/theme", "/terminal-setup", "/exit"]),
+    ("Help", &["/help", "/keybindings", "/vim", "/theme", "/terminal-setup", "/exit"]),
 ];
 
 /// Letronna's own commands under their headings, those under none last.

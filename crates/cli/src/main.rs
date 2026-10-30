@@ -23,6 +23,7 @@ mod edit;
 mod history;
 mod input;
 mod install;
+mod keybindings;
 mod local;
 mod mcp;
 mod memory;
@@ -274,6 +275,10 @@ fn main() {
     // Vim's keys, when they were left on, at the prompt alone.
     if runner.plain_terminal {
         runner.bar.set_vim(vim::saved());
+    }
+    // Keys moved in keybindings.json, at the prompt alone.
+    if runner.plain_terminal {
+        runner.bar.read_keybindings();
     }
     // With no flag picking one, the mode the window starts sessions in, so
     // the two agree; a `-p` run keeps to its flags alone.

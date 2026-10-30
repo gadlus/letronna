@@ -123,6 +123,8 @@ pub const COMMANDS: &[Command<'static>] = &[
     Command {
         name: "/vim",
         blurb: "vim's keys in the box: esc for normal mode, i to type; /vim off ends them",
+        name: "/keybindings",
+        blurb: "move keys: open keybindings.json, made with every action listed",
     },
     Command {
         name: "/search",
@@ -1057,6 +1059,8 @@ pub struct Bar {
     /// printed, shown under the footer.
     status_line: crate::status::StatusLine,
     status: Option<String>,
+    /// The keys moved in keybindings.json.
+    keys: crate::keybindings::Keys,
 }
 
 impl Bar {
@@ -1134,6 +1138,7 @@ impl Bar {
             attached: 0,
             copied_at: None,
             vim: None,
+            keys: crate::keybindings::Keys::default(),
         }
     }
 
@@ -1487,8 +1492,6 @@ impl Bar {
         self.keep_history && !self.private
     }
 
-    /// Open what was sent before in a list narrowed by typing, newest first,
-    /// as ctrl-r does in a shell: enter puts the one picked in the box.
     /// Turn vim's keys in the box on or off; on, typing starts in insert
     /// mode.
     pub fn set_vim(&mut self, on: bool) {
@@ -1555,6 +1558,21 @@ impl Bar {
         }
     }
 
+    /// Read keybindings.json, saying in the conversation what in it could
+    /// not be taken.
+    pub fn read_keybindings(&mut self) {
+        for why in self.keys.load() {
+            render::line(&render::amber(&why));
+        }
+    }
+
+    /// The keys keybindings.json moves, with what each does now.
+    pub fn moved_keys(&self) -> Vec<(String, String)> {
+        self.keys.listed()
+    }
+
+    /// Open what was sent before in a list narrowed by typing, newest first,
+    /// as ctrl-r does in a shell: enter puts the one picked in the box.
     fn search_history(&mut self) {
         let sent = self.line.sent_newest_first();
         if sent.is_empty() {
@@ -2472,6 +2490,23 @@ impl Bar {
         }
         // Only escape after escape counts as a double press.
         let escaped = self.esc_at.take();
+        // A key moved in keybindings.json is the key of what it was bound
+        // to from here on, the file read again once it changes.
+        if let Some(said) = self.keys.reread() {
+            for why in &said {
+                render::line(&render::amber(why));
+            }
+            self.note = Some("keybindings.json read again".to_owned());
+        }
+        let key = match self.keys.bound(&key) {
+            Some(Some(crate::keybindings::Bound::Key(own))) => *own,
+            Some(Some(crate::keybindings::Bound::Command(name))) => {
+                self.queued.push_back(format!("/{name}"));
+                return;
+            }
+            Some(None) => return,
+            None => key,
+        };
         let key = readline(key);
         // The keys over the box go with the next key, which then does what
         // it does; `?` on an empty line puts them there.
@@ -3355,7 +3390,11 @@ impl Bar {
         // The keys, asked for with `?`, over everything else above the box,
         // in the rows the rest leaves, one kept for the conversation.
         if self.keys_card {
-            let card = keys_card(render::width(), height.saturating_sub(lines.len() + 1));
+            let card = keys_card(
+                render::width(),
+                height.saturating_sub(lines.len() + 1),
+                &self.keys.listed(),
+            );
             lines.splice(0..0, card);
         }
         lines
@@ -3892,8 +3931,12 @@ fn typing_words_of(text: &str) -> Option<&'static str> {
 /// columns wide leaves them: one to a row where they all fit, side by side in two columns
 /// where they do not and the window is wide enough, and past that the rest
 /// left to `/help`, which lists every one.
-fn keys_card(width: usize, rows: usize) -> Vec<String> {
-    let keys = crate::commands::KEYS;
+fn keys_card(width: usize, rows: usize, moved: &[(String, String)]) -> Vec<String> {
+    // The box's own keys, then those keybindings.json moves.
+    let keys: Vec<(String, String)> = (crate::commands::KEYS.iter())
+        .map(|(key, what)| (key.to_string(), what.to_string()))
+        .chain(moved.iter().cloned())
+        .collect();
     let width = width.saturating_sub(render::INSIDE.len());
     let key_width = keys
         .iter()
@@ -4475,6 +4518,35 @@ mod tests {
         hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
         assert!(!bar.interrupted());
         assert_eq!(bar.line.text(), "more");
+    }
+
+    #[test]
+    fn a_key_moved_in_keybindings_does_what_it_was_bound_to() {
+        let mut bar = Bar::new(String::new());
+        bar.keys = crate::keybindings::from_text(
+            r#"{"bindings": [{"context": "Chat", "bindings": {
+                "ctrl+x": "chat:lineStart", "ctrl+a": null,
+                "ctrl+t": "command:compact"}}]}"#,
+        );
+        for ch in "abc".chars() {
+            hit(&mut bar, KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        // Unbound, ctrl+a no longer goes to the start.
+        hit(&mut bar, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        hit(&mut bar, KeyCode::Char('z'), KeyModifiers::NONE);
+        assert_eq!(bar.line.text(), "abcz");
+        hit(&mut bar, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        hit(&mut bar, KeyCode::Char('>'), KeyModifiers::NONE);
+        assert_eq!(bar.line.text(), ">abcz");
+        hit(&mut bar, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(bar.queued.back().map(String::as_str), Some("/compact"));
+        assert_eq!(bar.line.text(), ">abcz", "the draft stays");
+        // Listed with the box's own keys under ?.
+        let card = super::keys_card(120, 40, &bar.keys.listed()).join("\n");
+        assert!(
+            card.contains("ctrl+x") && card.contains("runs /compact"),
+            "{card}"
+        );
     }
 
     #[test]
@@ -5855,7 +5927,7 @@ mod tests {
         // rest left to /help, and the box and footer still fit under them.
         assert!(bar.lines(24).len() < 24);
         let card = |width: usize, rows: usize| -> Vec<String> {
-            let card: Vec<String> = keys_card(width, rows)
+            let card: Vec<String> = keys_card(width, rows, &[])
                 .iter()
                 .map(|row| plain(row))
                 .collect();
