@@ -53,6 +53,16 @@ All of these files live in the [data folder](data-and-privacy.md). A project can
 
 Each server runs only for the projects listed. Most language servers execute project code (build scripts, compilers), so list only projects you would build yourself. A server shuts down after ten minutes idle.
 
+## Formatting after edits
+
+`format.json` lists the projects where each file Letronna writes is run through the project's own formatter straight away, so its edits come out in the project's layout:
+
+```json
+{ "projects": ["/home/me/code/letronna"] }
+```
+
+It uses only a formatter the project has set up and this computer already has: rustfmt in a Cargo project, prettier or Biome from the project's `node_modules` under their config, ruff or black under their `pyproject.toml` section, gofmt beside a `go.mod`, clang-format under a `.clang-format`. Nothing is installed or fetched, and a formatter gets ten seconds. Like language servers, it is off until you list a project, since a formatter can run code the project picks.
+
 ## Skills
 
 A skill is a folder holding a `SKILL.md` (frontmatter, then instructions) and whatever files those instructions use. It is the same layout as [anthropics/skills](https://github.com/anthropics/skills).

@@ -42,6 +42,7 @@ pub mod failure;
 pub mod fallback;
 pub mod files;
 mod filestate;
+pub mod formatter;
 pub mod gate;
 pub mod gateway;
 pub mod git;

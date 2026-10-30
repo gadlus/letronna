@@ -435,6 +435,26 @@ fn wrote(state: &mut State, conversation: u64, path: &Path, bytes: &[u8], mark: 
     state.record(conversation, key(path), seen);
 }
 
+/// Records that the project's formatter turned `path` from `was`, which the
+/// conversation had just written, into `now`, as what it has seen of it:
+/// its own text in the project's layout. Left alone when something else
+/// changed the file in between, which then reads as changed.
+pub(crate) fn reformatted(conversation: u64, path: &Path, was: &[u8], now: &[u8]) {
+    let mut state = state();
+    let Some(seen) = state.seen.get(&(conversation, key(path))) else {
+        return;
+    };
+    if seen.print != print_of(was, path) {
+        return;
+    }
+    let mark = Mark {
+        whole: seen.whole,
+        reply: seen.reply,
+        own: seen.own,
+    };
+    wrote(&mut state, conversation, path, now, mark);
+}
+
 /// Several files one apply_patch call changes, held under one lock from the
 /// first check to the last write, so the patch is judged on the bytes it
 /// then replaces.

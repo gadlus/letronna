@@ -18,7 +18,7 @@ Everything Letronna keeps lives in one folder:
 | `settings.json` | Settings |
 | `SOUL.md` | Optional. Who Letronna is, in your words; replaces the first line of the prompt. |
 | `USER.md`, `MEMORY.md` | What it knows about you, and its own notes. You can edit both. |
-| `mcp.json`, `lsp.json`, `hooks.json` | See [Extending](extending.md) |
+| `mcp.json`, `lsp.json`, `format.json`, `hooks.json` | See [Extending](extending.md) |
 | `skills/`, `plugins/` | Installed skills and plugins |
 | `plugin-data/` | Each plugin's settings, storage and log, a folder each |
 | `plugin-sdk/` | The runner and `letronna` module Python plugins import, written from Letronna's own copy |

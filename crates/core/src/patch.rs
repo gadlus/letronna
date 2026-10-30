@@ -564,6 +564,18 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
     for path in &added {
         crate::taint::made(ctx, path);
     }
+    // After the batch lets go, as the formatter takes a moment and records
+    // what it changed under the same lock.
+    drop(batch);
+    for step in &steps {
+        if let Step::Write {
+            path, raw, after, ..
+        } = step
+            && let Some((_, said)) = crate::formatter::after_write(ctx, path, raw, after)
+        {
+            notes.push_str(&said);
+        }
+    }
     Ok(format!("Applied the patch: {}.{notes}", said.join(", ")))
 }
 

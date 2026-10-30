@@ -2933,6 +2933,13 @@ impl Tool for WriteFile {
         if new {
             crate::taint::made(ctx, &path);
         }
+        let text = match crate::formatter::after_write(ctx, &path, path_arg(args), &text) {
+            Some((now, said)) => {
+                note.push_str(&said);
+                now
+            }
+            None => text,
+        };
         crate::lsp::wrote(lsp, &text);
         // Named, so the result still says what changed where its call's
         // arguments are not shown, as in a trace or a cleared history.
@@ -3072,8 +3079,15 @@ impl Tool for EditFile {
         ));
         let lsp = crate::lsp::before_write(ctx, &path, Some(text));
         change.write(done.text.as_bytes(), &ctx.files)?;
-        crate::lsp::wrote(lsp, &done.text);
         let raw = path_arg(args);
+        let after = match crate::formatter::after_write(ctx, &path, raw, &done.text) {
+            Some((now, said)) => {
+                note.push_str(&said);
+                now
+            }
+            None => done.text,
+        };
+        crate::lsp::wrote(lsp, &after);
         let edited = match (done.replaced, done.already) {
             (1, 0) => format!("Edited `{raw}`."),
             (n, 0) => format!("Edited `{raw}` in {n} places."),
@@ -5972,6 +5986,48 @@ mod tests {
             "{read}"
         );
         std::fs::remove_dir_all(data).unwrap();
+    }
+
+    /// A project with formatting on gets the file its formatter makes, and
+    /// the model's next edit goes through on that without a fresh read.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_the_formatter_changed_can_be_edited_next_without_reading_it_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Scratch::new("formatter");
+        let project = std::fs::canonicalize(dir.join(".")).unwrap();
+        let config = project.join("format.json");
+        crate::formatter::CONFIG.with(|file| *file.borrow_mut() = config);
+        std::fs::write(project.join(".prettierrc"), "{}").unwrap();
+        let bin = project.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // Stands in for prettier: puts the file it is given in capitals.
+        let fake = bin.join("prettier");
+        let script = "#!/bin/sh\nfor file; do :; done\n\
+                      tr a-z A-Z < \"$file\" > \"$file.up\" && mv \"$file.up\" \"$file\"\n";
+        std::fs::write(&fake, script).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(project.clone()),
+            conversation: 7_401,
+            ..Default::default()
+        };
+        let file = project.join("a.ts");
+        let write = json!({"path": "a.ts", "content": "let a = 1;\n"});
+        WriteFile.run(&write, &ctx).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "let a = 1;\n");
+
+        crate::formatter::switch(&project, true).unwrap();
+        let wrote = WriteFile.run(&write, &ctx).unwrap();
+        assert!(
+            wrote.contains("Then prettier put `a.ts` in the project's layout"),
+            "{wrote}"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "LET A = 1;\n");
+        let edit = json!({"path": "a.ts", "old": "LET A = 1;", "new": "let b = 2;"});
+        let edited = EditFile.run(&edit, &ctx).unwrap();
+        assert!(edited.starts_with("Edited `a.ts`."), "{edited}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "LET B = 2;\n");
     }
 
     #[test]
