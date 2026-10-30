@@ -20,45 +20,99 @@ pub fn pasted(path: &Path) -> bool {
     path.parent() == Some(pasted_folder().as_path())
 }
 
-/// Write the picture on the clipboard to `to` as a PNG, saying whether there
-/// was one: AppleScript asks for it on macOS, PowerShell on Windows, and
-/// wl-paste or xclip, whichever is there, on Linux. Nothing new is needed
-/// for it, and text on the clipboard is left to the terminal's own paste.
-pub fn from_clipboard(to: &Path) -> bool {
-    let took = if cfg!(target_os = "macos") {
-        macos(to)
-    } else if cfg!(windows) {
-        windows(to)
-    } else {
-        linux(to)
-    };
-    let written = took && std::fs::metadata(to).is_ok_and(|file| file.len() > 0);
-    if !written {
-        let _ = std::fs::remove_file(to);
-    }
-    written
+/// What a paste found on the clipboard.
+#[derive(Debug, PartialEq)]
+pub enum Clipboard {
+    /// A picture, now written where it was asked for as a PNG.
+    Picture,
+    /// Files copied in a file manager, by path: such a copy also carries
+    /// the file's icon, which is not the picture anybody meant.
+    Files(Vec<PathBuf>),
+    /// No picture: text, or nothing at all.
+    Empty,
 }
 
-fn macos(to: &Path) -> bool {
-    // A clipboard holding no picture fails the write inside the try, which
-    // leaves an empty file, read above as none.
-    let file = to
-        .display()
-        .to_string()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
-    let lines = [
-        format!("set f to (open for access POSIX file \"{file}\" with write permission)"),
-        "try".to_owned(),
-        "write (the clipboard as «class PNGf») to f".to_owned(),
-        "end try".to_owned(),
-        "close access f".to_owned(),
-    ];
-    let mut command = Command::new("osascript");
-    for line in &lines {
-        command.arg("-e").arg(line);
+/// Write the picture on the clipboard to `to` as a PNG, or give the files
+/// copied there: AppKit is asked on macOS, PowerShell on Windows, and
+/// wl-paste or xclip, whichever is there, on Linux. Nothing new is needed
+/// for it, and text on the clipboard is left to the terminal's own paste.
+pub fn from_clipboard(to: &Path) -> Clipboard {
+    let found = if cfg!(target_os = "macos") {
+        macos(to)
+    } else if cfg!(windows) {
+        picture_if(windows(to))
+    } else {
+        picture_if(linux(to))
+    };
+    let written = std::fs::metadata(to).is_ok_and(|file| file.len() > 0);
+    if found != Clipboard::Picture || !written {
+        let _ = std::fs::remove_file(to);
     }
-    quietly(&mut command)
+    match found {
+        Clipboard::Picture if !written => Clipboard::Empty,
+        found => found,
+    }
+}
+
+fn picture_if(took: bool) -> Clipboard {
+    if took {
+        Clipboard::Picture
+    } else {
+        Clipboard::Empty
+    }
+}
+
+/// Reads the clipboard through AppKit, which turns any picture it holds
+/// into a PNG: a screenshot comes as one, but Preview and Safari copy a
+/// TIFF, which asking AppleScript for a PNG found nothing in. File URLs
+/// come first, since a file copied in Finder brings its icon along too.
+const MACOS: &str = r#"
+ObjC.import('AppKit');
+function run(argv) {
+  const board = $.NSPasteboard.generalPasteboard;
+  const urls = board.readObjectsForClassesOptions($([$.NSURL]), $({ NSPasteboardURLReadingFileURLsOnlyKey: true }));
+  if (urls.count > 0) {
+    const paths = [];
+    for (let at = 0; at < urls.count; at++) paths.push('file ' + urls.objectAtIndex(at).path.js);
+    return paths.join('\n');
+  }
+  let png = board.dataForType($.NSPasteboardTypePNG);
+  if (png.isNil()) {
+    const image = $.NSImage.alloc.initWithPasteboard(board);
+    if (image.isNil()) return 'none';
+    const rep = $.NSBitmapImageRep.imageRepWithData(image.TIFFRepresentation);
+    if (rep.isNil()) return 'none';
+    png = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $({}));
+  }
+  return png.writeToFileAtomically(argv[0], true) ? 'picture' : 'none';
+}
+"#;
+
+fn macos(to: &Path) -> Clipboard {
+    let read = Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", MACOS])
+        .arg(to)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    match read {
+        Ok(out) if out.status.success() => found(&String::from_utf8_lossy(&out.stdout)),
+        _ => Clipboard::Empty,
+    }
+}
+
+/// What the macOS reader said it found: `picture`, a `file <path>` line for
+/// each file, or `none`.
+fn found(said: &str) -> Clipboard {
+    let files: Vec<PathBuf> = said
+        .lines()
+        .filter_map(|line| line.strip_prefix("file "))
+        .map(PathBuf::from)
+        .collect();
+    if !files.is_empty() {
+        return Clipboard::Files(files);
+    }
+    picture_if(said.trim() == "picture")
 }
 
 fn windows(to: &Path) -> bool {
@@ -128,8 +182,15 @@ pub fn dropped(text: &str) -> Option<PathBuf> {
         None => line,
     };
     let path = PathBuf::from(line);
-    let kind = path.extension()?.to_str()?.to_lowercase();
-    (KINDS.contains(&kind.as_str()) && path.is_absolute() && path.is_file()).then_some(path)
+    picture_file(&path).then_some(path)
+}
+
+/// Whether `path` is a picture file `/image` takes: absolute, there, and
+/// of a kind it knows by the extension.
+pub fn picture_file(path: &Path) -> bool {
+    let kind = path.extension().and_then(|kind| kind.to_str());
+    let kind = kind.unwrap_or_default().to_lowercase();
+    KINDS.contains(&kind.as_str()) && path.is_absolute() && path.is_file()
 }
 
 /// The path a file:// address names, from what follows `file://`, as
@@ -173,7 +234,7 @@ pub fn image_line(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{address_path, dropped, pasted, pasted_folder};
+    use super::{Clipboard, address_path, dropped, found, pasted, pasted_folder, picture_file};
 
     #[test]
     fn only_a_picture_waiting_in_the_pasted_folder_is_taken_for_one() {
@@ -236,5 +297,35 @@ mod tests {
         // A broken escape is no address.
         assert_eq!(address_path("/tmp/a%2", false), None);
         assert_eq!(address_path("/tmp/a%zz.png", false), None);
+    }
+
+    #[test]
+    fn the_macos_reader_s_answer_is_a_picture_the_files_copied_or_nothing() {
+        assert_eq!(found("picture\n"), Clipboard::Picture);
+        assert_eq!(
+            found("file /Users/someone/a shot.png\nfile /Users/someone/notes.txt\n"),
+            Clipboard::Files(vec![
+                "/Users/someone/a shot.png".into(),
+                "/Users/someone/notes.txt".into()
+            ])
+        );
+        assert_eq!(found("none\n"), Clipboard::Empty);
+        assert_eq!(found(""), Clipboard::Empty);
+    }
+
+    #[test]
+    fn only_a_picture_file_that_is_there_is_taken_for_one() {
+        let dir = std::env::temp_dir().join(format!("letronna-picture-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("folder.png")).unwrap();
+        let shot = dir.join("Shot.PNG");
+        std::fs::write(&shot, b"not really a png").unwrap();
+        let notes = dir.join("notes.txt");
+        std::fs::write(&notes, b"words").unwrap();
+        assert!(picture_file(&shot));
+        assert!(!picture_file(&notes));
+        assert!(!picture_file(&dir.join("folder.png")));
+        assert!(!picture_file(&dir.join("gone.png")));
+        assert!(!picture_file(std::path::Path::new("Shot.PNG")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

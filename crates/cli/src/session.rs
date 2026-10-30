@@ -212,6 +212,7 @@ impl Runner {
             images: std::mem::take(&mut self.images),
             ..Default::default()
         });
+        self.bar.set_attached(0);
         self.persist();
         self.add_plugins_context(session, prompt);
 

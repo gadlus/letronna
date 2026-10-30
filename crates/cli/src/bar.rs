@@ -1006,6 +1006,11 @@ pub struct Bar {
     /// What was being written when a command was taken to run, which has
     /// the box to itself until the next prompt gives this back.
     aside: Option<Aside>,
+    /// Pictures `/image` has attached to the next message.
+    attached: usize,
+    /// When something was last copied and what the footer said of it, which
+    /// it says for a moment rather than until the next key.
+    copied_at: Option<(std::time::Instant, String)>,
 }
 
 impl Bar {
@@ -1076,6 +1081,8 @@ impl Bar {
             mode_note: None,
             before_plan: Mode::Default,
             aside: None,
+            attached: 0,
+            copied_at: None,
         }
     }
 
@@ -1219,14 +1226,40 @@ impl Bar {
         let folder = crate::picture::pasted_folder();
         let _ = std::fs::create_dir_all(&folder);
         let path = folder.join(format!("{at}.png"));
-        if crate::picture::from_clipboard(&path) {
-            self.attach_picture(&path);
-        } else {
-            self.note = Some(
-                "no picture on the clipboard  ·  text pastes with your terminal's own paste"
-                    .to_owned(),
-            );
+        match crate::picture::from_clipboard(&path) {
+            crate::picture::Clipboard::Picture => self.attach_picture(&path),
+            crate::picture::Clipboard::Files(files) => {
+                let (pictures, others): (Vec<_>, Vec<_>) =
+                    (files.into_iter()).partition(|file| crate::picture::picture_file(file));
+                for picture in &pictures {
+                    self.attach_picture(picture);
+                }
+                self.note = not_pictures(&others, pictures.is_empty());
+            }
+            crate::picture::Clipboard::Empty => {
+                let text = if cfg!(target_os = "macos") {
+                    "cmd+v pastes text"
+                } else {
+                    "text pastes with your terminal's own paste"
+                };
+                self.note = Some(format!("no picture on the clipboard  ·  {text}"));
+            }
         }
+    }
+
+    /// How many pictures go with the next message: those `/image` attached,
+    /// and those still waiting in the queue to be.
+    pub fn set_attached(&mut self, pictures: usize) {
+        self.attached = pictures;
+        self.settle();
+    }
+
+    /// Say in the footer what came of a copy: marked done for a moment where
+    /// the clipboard `took` it, and until the next key where only the
+    /// terminal was handed it, which cannot say whether it was.
+    fn say_copied(&mut self, said: String, took: bool) {
+        self.copied_at = took.then(|| (std::time::Instant::now(), said.clone()));
+        self.note = Some(said);
     }
 
     /// Attach the picture at `path` to the next message, as /image does.
@@ -1975,6 +2008,26 @@ impl Bar {
             self.mode_note = None;
             self.settle();
         }
+        // And once a copy has been said long enough to be seen.
+        if self.forget_copied() {
+            self.settle();
+        }
+    }
+
+    /// Take back the footer's word on a copy once it has been up for
+    /// `COPIED_NOTE`, saying whether it was taken back.
+    fn forget_copied(&mut self) -> bool {
+        let Some((at, said)) = &self.copied_at else {
+            return false;
+        };
+        if at.elapsed() < COPIED_NOTE {
+            return false;
+        }
+        if self.note.as_ref() == Some(said) {
+            self.note = None;
+        }
+        self.copied_at = None;
+        true
     }
 
     /// Follow the helpers of `session`, the one now open: a line for each at
@@ -2276,7 +2329,7 @@ impl Bar {
                 if let Some(text) = crate::screen::selected() {
                     let took = crate::screen::copy(&text);
                     crate::screen::unselect();
-                    self.note = Some(copied(&text, took));
+                    self.say_copied(copied(&text, took), took);
                 }
             }
             KeyCode::Char('c') if control => {
@@ -2549,7 +2602,8 @@ impl Bar {
                 }
                 if let Some(text) = text {
                     let took = crate::screen::copy(&text);
-                    self.note = Some(format!("{}  ·  ctrl-c copies again", copied(&text, took)));
+                    let said = format!("{}  ·  ctrl-c copies again", copied(&text, took));
+                    self.say_copied(said, took);
                     self.settle();
                 }
             }
@@ -2742,6 +2796,7 @@ impl Bar {
         // to the foot, which output alone no longer pulls it to.
         crate::screen::follow();
         render::blank();
+        let line = as_queued(line);
         let mut parts = line.lines();
         render::said(
             &render::blue("›"),
@@ -2888,7 +2943,7 @@ impl Bar {
                     "{}{} {}",
                     render::GUTTER,
                     render::dim("›"),
-                    render::dim(&one_row(line, room))
+                    render::dim(&one_row(&as_queued(line), room))
                 ));
             }
         }
@@ -3046,6 +3101,18 @@ impl Bar {
         // had, which comes back after.
         lines.push(match self.mode_note(width) {
             Some(said) => format!("{}{said}", render::PAD),
+            // A copy is marked as done, so the eye finds it after a drag.
+            None if self.copied_at.as_ref().map(|(_, said)| said) == self.note.as_ref()
+                && self.note.is_some() =>
+            {
+                let note = render::clip(&note, room.saturating_sub(2));
+                format!(
+                    "{}{} {}",
+                    render::PAD,
+                    render::green("✓"),
+                    render::dim(&note)
+                )
+            }
             None => format!("{}{mode}{}", render::PAD, render::dim(&note)),
         });
 
@@ -3108,6 +3175,11 @@ impl Bar {
                 lines.push(self.boxed(&render::bold(&part), width, room));
             }
         }
+        if self.asking.is_none()
+            && let Some((chips, width)) = self.pictures_row(room.saturating_sub(2))
+        {
+            lines.push(self.boxed(&format!("  {chips}"), 2 + width, room));
+        }
         let (rows, (on, cursor_column)) = self.rows();
         for (i, text) in rows.iter().enumerate() {
             let lead = if i == 0 {
@@ -3134,6 +3206,30 @@ impl Bar {
             };
             lines.push(self.boxed(&format!("{lead}{body}"), 2 + width, room));
         }
+    }
+
+    /// The pictures going with the next message, as chips at the top of the
+    /// box, so a paste shows that it took, with their width in `room`.
+    fn pictures_row(&self, room: usize) -> Option<(String, usize)> {
+        let waiting = self.queued.iter().filter(|line| picture_waiting(line));
+        let pictures = self.attached + waiting.count();
+        let chips = match pictures {
+            0 => return None,
+            1..=3 => (1..=pictures)
+                .map(|n| format!("[picture {n}]"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            n => format!("[{n} pictures]"),
+        };
+        let them = if pictures == 1 { "it" } else { "them" };
+        let hint = format!("  goes with your next message  ·  /image clear drops {them}");
+        let chips = render::clip(&chips, room);
+        let width = render::visible(&chips);
+        if width + render::visible(&hint) > room {
+            return Some((render::blue(&chips), width));
+        }
+        let shown = format!("{}{}", render::blue(&chips), render::dim(&hint));
+        Some((shown, width + render::visible(&hint)))
     }
 
     /// The box while it holds a slider: the question, the names of the stops
@@ -3430,13 +3526,40 @@ fn lines_waiting(fd: std::os::fd::RawFd) -> Vec<String> {
 
 /// What the footer says of a copy: copied, where the system's clipboard
 /// took it, and only handed to the terminal where nothing could say it did.
+/// Within a line it counts characters, since "1 line" says nothing of how
+/// much of one a drag took.
 pub fn copied(text: &str, took: bool) -> String {
     let lines = text.lines().count().max(1);
-    let lines = format!("{lines} line{}", if lines == 1 { "" } else { "s" });
+    let how_much = match lines {
+        1 => {
+            let characters = text.trim_end_matches(['\n', '\r']).chars().count();
+            format!(
+                "{characters} character{}",
+                if characters == 1 { "" } else { "s" }
+            )
+        }
+        lines => format!("{lines} lines"),
+    };
     match took {
-        true => format!("copied {lines}"),
-        false => format!("{lines} sent to the terminal's clipboard"),
+        true => format!("copied {how_much}"),
+        false => format!("{how_much} sent to the terminal's clipboard"),
     }
+}
+
+/// What the footer says when files copied in a file manager were pasted:
+/// which of them were not pictures, or nothing when every one was.
+fn not_pictures(others: &[std::path::PathBuf], none_taken: bool) -> Option<String> {
+    let first = others.first()?;
+    let name = first.file_name().unwrap_or(first.as_os_str());
+    let name = name.to_string_lossy();
+    Some(match (others.len(), none_taken) {
+        (1, true) => format!("{name} is not a picture  ·  @ and its path attach a file"),
+        (1, false) => format!("{name} is not a picture, so it was left out"),
+        (n, true) => {
+            format!("the {n} copied files are not pictures  ·  @ and a path attach a file")
+        }
+        (n, false) => format!("{n} of the copied files are not pictures, so they were left out"),
+    })
 }
 
 /// Typed text as the box draws it.
@@ -3653,6 +3776,27 @@ fn draft_file() -> std::path::PathBuf {
     (letronna_core::chat::data_dir().join("drafts")).join(format!("{}.md", std::process::id()))
 }
 
+/// Whether a queued line attaches a picture once it runs, as a paste or a
+/// picture dragged in queues one.
+fn picture_waiting(line: &str) -> bool {
+    line.strip_prefix("/image ")
+        .is_some_and(|rest| !rest.trim().is_empty() && rest.trim() != "clear")
+}
+
+/// A queued line as the queue shows it: a picture taken off the clipboard
+/// by what it is, rather than by the file it waits in.
+fn as_queued(line: &str) -> std::borrow::Cow<'_, str> {
+    let path = (line.strip_prefix("/image \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .map(std::path::Path::new);
+    match path {
+        Some(path) if crate::picture::pasted(path) => {
+            "/image (the picture from the clipboard)".into()
+        }
+        _ => line.into(),
+    }
+}
+
 /// A queued line cut to one row `room` columns wide: its first line, with an
 /// ellipsis where anything was left off.
 fn one_row(text: &str, room: usize) -> String {
@@ -3728,6 +3872,10 @@ const MODE_HINT: &str = "shift+tab to switch";
 
 /// How long the footer says what a mode just picked does.
 const MODE_NOTE: Duration = Duration::from_secs(3);
+
+/// How long the footer says something was copied: long enough to see after
+/// letting go of a drag, gone before it is in the way.
+const COPIED_NOTE: Duration = Duration::from_secs(4);
 
 /// Whether shift-tab steps onto `mode`. "Allowed calls only" refuses
 /// whatever would ask without a word, which a key pressed once too often
@@ -5778,5 +5926,97 @@ mod tests {
         // Not the shared temp folder, where the data folder is only in tests.
         let file = super::draft_file();
         assert!(file.starts_with(letronna_core::chat::data_dir().join("drafts")));
+    }
+
+    #[test]
+    fn a_copy_within_a_line_counts_its_characters_and_one_across_lines_its_lines() {
+        assert_eq!(super::copied("cargo test", true), "copied 10 characters");
+        assert_eq!(super::copied("x\n", true), "copied 1 character");
+        assert_eq!(super::copied("one\ntwo\nthree", true), "copied 3 lines");
+        assert_eq!(
+            super::copied("one\ntwo", false),
+            "2 lines sent to the terminal's clipboard"
+        );
+    }
+
+    #[test]
+    fn a_copy_is_marked_done_in_the_footer_and_gives_it_back_after_a_moment() {
+        let mut bar = Bar::new("model".into());
+        bar.say_copied(super::copied("cargo test", true), true);
+        let footer = plain(bar.lines(40).last().unwrap());
+        assert!(footer.contains("✓ copied 10 characters"), "{footer}");
+        // Still up a moment later, so a glance after letting go finds it.
+        assert!(!bar.forget_copied());
+        let (_, said) = bar.copied_at.clone().unwrap();
+        bar.copied_at = Instant::now()
+            .checked_sub(super::COPIED_NOTE)
+            .map(|at| (at, said));
+        assert!(bar.forget_copied());
+        assert!(bar.note.is_none());
+        // Only handed to the terminal, it is not marked done, nor timed.
+        bar.say_copied(super::copied("cargo test", false), false);
+        let footer = plain(bar.lines(40).last().unwrap());
+        assert!(!footer.contains('✓'), "{footer}");
+        assert!(!bar.forget_copied());
+    }
+
+    #[test]
+    fn a_note_put_up_after_a_copy_is_not_taken_down_with_it() {
+        let mut bar = Bar::new("model".into());
+        bar.say_copied(super::copied("cargo test", true), true);
+        bar.note = Some("nothing to undo".into());
+        let (_, said) = bar.copied_at.clone().unwrap();
+        bar.copied_at = Instant::now()
+            .checked_sub(super::COPIED_NOTE)
+            .map(|at| (at, said));
+        assert!(bar.forget_copied());
+        assert_eq!(bar.note.as_deref(), Some("nothing to undo"));
+    }
+
+    #[test]
+    fn pictures_going_with_the_next_message_show_as_chips_in_the_box() {
+        let mut bar = Bar::new("model".into());
+        assert!(bar.pictures_row(80).is_none());
+        bar.set_attached(1);
+        // One pasted during a turn waits in the queue, and counts as well.
+        let waiting = crate::picture::pasted_folder().join("1.png");
+        bar.queued.push_back(crate::picture::image_line(&waiting));
+        bar.queued.push_back("/image clear".into());
+        let (row, width) = bar.pictures_row(80).unwrap();
+        let row = plain(&row);
+        assert!(row.starts_with("[picture 1] [picture 2]"), "{row}");
+        assert!(row.contains("/image clear drops them"), "{row}");
+        assert_eq!(visible(&row), width);
+        // Where the words do not fit, the chips alone do.
+        let (row, _) = bar.pictures_row(30).unwrap();
+        assert_eq!(plain(&row), "[picture 1] [picture 2]");
+        bar.set_attached(5);
+        assert!(plain(&bar.pictures_row(80).unwrap().0).starts_with("[6 pictures]"));
+    }
+
+    #[test]
+    fn a_picture_from_the_clipboard_is_queued_and_echoed_by_what_it_is() {
+        let waiting = crate::picture::pasted_folder().join("1791995592021.png");
+        let line = crate::picture::image_line(&waiting);
+        assert_eq!(
+            super::as_queued(&line),
+            "/image (the picture from the clipboard)"
+        );
+        // One named by its own path is shown by it.
+        assert_eq!(
+            super::as_queued("/image \"/tmp/a.png\""),
+            "/image \"/tmp/a.png\""
+        );
+        assert_eq!(super::as_queued("fix the build"), "fix the build");
+    }
+
+    #[test]
+    fn copied_files_that_are_not_pictures_are_named() {
+        let notes = std::path::PathBuf::from("/tmp/notes.txt");
+        let none = super::not_pictures(std::slice::from_ref(&notes), true).unwrap();
+        assert!(none.starts_with("notes.txt is not a picture"), "{none}");
+        let some = super::not_pictures(&[notes.clone(), notes], false).unwrap();
+        assert!(some.contains("2 of the copied files"), "{some}");
+        assert_eq!(super::not_pictures(&[], true), None);
     }
 }

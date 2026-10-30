@@ -1238,7 +1238,11 @@ fn copy_reply(runner: &mut Runner, session: usize, rest: &str) {
     };
     let took = crate::screen::copy(reply);
     render::blank();
-    render::line(&render::dim(&crate::bar::copied(reply, took)));
+    let said = render::dim(&crate::bar::copied(reply, took));
+    render::line(&match took {
+        true => format!("{} {said}", render::green("✓")),
+        false => said,
+    });
 }
 
 /// The text of the reply `back` from the latest, the latest being 1: what
@@ -1786,7 +1790,10 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
         "a clean screen, the conversation going on as it was",
     ),
     ("drag", "select and copy; a picture dragged in is attached"),
-    ("ctrl+v", "attach the picture on the clipboard"),
+    (
+        "ctrl+v",
+        "attach the picture, or picture files, on the clipboard",
+    ),
     ("@path", "attach a file, a line range or a folder"),
     ("//", "start a message with one /, as in //tmp is full"),
     (
@@ -5202,6 +5209,7 @@ fn take_back_to(
     let conversation = &mut runner.store.conversations[session];
     // Its pictures come back with its words, to go with them again.
     runner.images = std::mem::take(&mut conversation.messages[at].images);
+    runner.bar.set_attached(runner.images.len());
     conversation.rewind(at);
     // The checklist is the one the last `todo` left standing.
     conversation.todos = store::todos_in(&conversation.messages);
@@ -5226,6 +5234,7 @@ fn attach(runner: &mut Runner, raw: &str, workspace: Option<&std::path::Path>) {
     render::blank();
     if raw == "clear" {
         runner.images.clear();
+        runner.bar.set_attached(0);
         render::line(&render::dim("No pictures attached."));
         return;
     }
@@ -5251,6 +5260,7 @@ fn attach(runner: &mut Runner, raw: &str, workspace: Option<&std::path::Path>) {
                 let _ = std::fs::remove_file(&path);
             }
             runner.images.push(saved);
+            runner.bar.set_attached(runner.images.len());
             let what = if pasted {
                 "the picture from the clipboard".to_owned()
             } else {
