@@ -92,6 +92,9 @@ fn filled(messages: &[Message]) -> Option<(u64, u64)> {
         .find(|m| m.role == "assistant" && m.window > 0 && m.input_tokens() > 0)
         .map(|reply| (reply.input_tokens(), reply.window))
 }
+/// The folders `--add-dir` and `/add-dir` added beside the project, for
+/// every session this run opens, as Claude Code keeps them: for the run.
+pub static ADDED: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 impl Runner {
     /// Say a turn failed with `error`, and the way out of it when there is
@@ -202,7 +205,11 @@ impl Runner {
             key,
             tools: true,
             workspace,
-            added: Default::default(),
+            added: ADDED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .into(),
             plan: self.current_mode() == Mode::Plan,
             remote: None,
             effort: self.store.effort(session).to_owned(),

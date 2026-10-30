@@ -65,6 +65,8 @@ Options
                            instructions this run adds after all the rest
       --append-system-prompt-file <file>
                            the same, read from a file
+      --add-dir <folder>   a folder the session reads and changes as it does
+                           the project, for this run; once per folder
       --offline            with doctor: leave the network alone
       --dump-config        print the settings and limits a -p run in a new
                            session gets with the same flags, as JSON
@@ -223,6 +225,8 @@ pub struct Args {
     pub background: Option<String>,
     /// `letronna sessions`, `attach`, `logs` or `stop`.
     pub runs: Option<Runs>,
+    /// The folders `--add-dir` named, as typed, to add beside the project.
+    pub add_dirs: Vec<String>,
 }
 
 pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -271,6 +275,7 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         bg: false,
         background: None,
         runs: None,
+        add_dirs: Vec::new(),
     };
     // Only as the first word, so `-p mcp` still asks about it.
     if raw.next_if(|first| first == "mcp").is_some() {
@@ -432,6 +437,12 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
             "--background" => {
                 args.background = Some(raw.next().ok_or("--background takes a token.")?);
             }
+            // One folder a flag, as a bare word after them is the question.
+            "--add-dir" => args.add_dirs.push(
+                raw.next()
+                    .filter(|folder| !folder.trim().is_empty() && !folder.starts_with('-'))
+                    .ok_or("--add-dir takes a folder, like --add-dir ../shared.")?,
+            ),
             "--gateway" => args.gateway = raw.next(),
             "--effort" => args.effort = raw.next(),
             "setup" | "--install" => args.install = true,
@@ -1035,6 +1046,15 @@ mod tests {
         let blank = refused(&["--system-prompt-file", empty.to_str().unwrap()]);
         std::fs::remove_file(&empty).unwrap();
         assert!(blank.contains("is empty"), "{blank}");
+    }
+
+    #[test]
+    fn add_dir_takes_one_folder_a_flag_and_leaves_the_question_alone() {
+        let given = args(&["--add-dir", "../lib", "--add-dir", "~/docs", "fix it"]);
+        assert_eq!(given.add_dirs, ["../lib", "~/docs"]);
+        assert_eq!(given.prompt.as_deref(), Some("fix it"));
+        assert!(refused(&["--add-dir"]).contains("takes a folder"));
+        assert!(refused(&["--add-dir", "-p", "q"]).contains("takes a folder"));
     }
 
     /// The skill that tells the model how Letronna works keeps up with what

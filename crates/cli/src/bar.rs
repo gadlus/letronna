@@ -295,6 +295,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "show the project folder and session file",
     },
     Command {
+        name: "/add-dir",
+        blurb: "let this run's sessions work in another folder too; bare, list them",
+    },
+    Command {
         name: "/copy",
         blurb: "copy the last reply as written; /copy 2 the one before it",
     },

@@ -568,12 +568,23 @@ pub fn command(
                 here.map(|p| p.display().to_string())
                     .unwrap_or_else(|| "none".into())
             ));
+            for folder in crate::session::ADDED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+            {
+                render::line(&format!("{}  {}", render::dim("added  "), folder.display()));
+            }
             let id = runner.store.conversations[*session].id;
             render::line(&format!(
                 "{}  {}",
                 render::dim("session"),
                 store::sessions_dir().join(format!("{id}.jsonl")).display()
             ));
+            Flow::Handled
+        }
+        "/add-dir" => {
+            add_dir(rest, here);
             Flow::Handled
         }
         "/copy" => {
@@ -2067,6 +2078,43 @@ fn help_for(asked: &str) {
     }
 }
 
+/// `/add-dir <folder>` adds a folder beside the project, which this run's
+/// sessions read and change as they do the project, from their next turn;
+/// bare, it lists those added.
+fn add_dir(rest: &str, here: Option<&std::path::Path>) {
+    render::blank();
+    let mut added = crate::session::ADDED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if rest.trim().is_empty() {
+        if added.is_empty() {
+            render::line(&render::dim(
+                "No folders are added beside the project; /add-dir <folder> adds one for this run.",
+            ));
+        }
+        for folder in added.iter() {
+            render::line(&format!("{}  {}", render::dim("added"), folder.display()));
+        }
+        return;
+    }
+    match letronna_core::tools::added_folder(rest, here) {
+        Ok(folder) if added.contains(&folder) => {
+            render::line(&render::dim(&format!(
+                "{} is added already.",
+                folder.display()
+            )));
+        }
+        Ok(folder) => {
+            render::line(&format!("{}  {}", render::dim("added"), folder.display()));
+            render::line(&render::dim(
+                "Sessions read and change files there as in the project, with the same asks, until you leave Letronna.",
+            ));
+            added.push(folder);
+        }
+        Err(error) => render::line(&render::red(&error)),
+    }
+}
+
 /// The headings `/help` puts Letronna's own commands under, in the order it
 /// shows them. A name listed that is not a command here is passed over, and
 /// a command under no heading goes under the last.
@@ -2094,6 +2142,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/diff",
             "/where",
             "/window",
+            "/add-dir",
             "/import",
             "/retention",
             "/clear",

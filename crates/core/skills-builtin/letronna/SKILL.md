@@ -13,7 +13,7 @@ You run inside Letronna, an agent with a window (`letronna gui`) and a terminal 
 
 ## Command line
 
-- `letronna` opens a conversation in the terminal. `--memory when-asked|ask|auto` sets when that session saves to memory, `--memory-scope auto|project|chat` where it keeps memory and what of it loads, and `--private` starts a private chat whose notes stay its own.
+- `letronna` opens a conversation in the terminal. `--memory when-asked|ask|auto` sets when that session saves to memory, `--memory-scope auto|project|chat` where it keeps memory and what of it loads, and `--private` starts a private chat whose notes stay its own. `--add-dir <folder>` (or /add-dir) lets it work in another folder too.
 - `letronna cloud "task"` runs it on Letronna's servers (Pro, from credit); `--repo <url>`, `--tier light|normal|heavy`, `--thread <id>`; `letronna cloud list|show|stop|relay|apps|logs|down|up`.
 - `letronna wallet` (/wallet): the crypto wallet, see `--help`; sends and keys need Windows Hello or Touch ID.
 - `letronna local` (/local): on-device models, adding from Hugging Face.
@@ -30,6 +30,8 @@ You run inside Letronna, an agent with a window (`letronna gui`) and a terminal 
 - `letronna doctor` checks the setup, gateway, sign-in, keys, logs and last crash. It exits 1 on any problem and never prints a key; `--offline` leaves the network alone. Suggest it first when something is wrong.
 - `letronna doctor` checks the setup, keys, logs and last crash, exits 1 on any problem and never prints a key; `--offline` leaves the network alone. Suggest it first when something is wrong.
 - `letronna mcp` manages MCP servers; `letronna mcp serve` offers Letronna's browser, media and search tools to another agent over stdio (`--yes` runs them without asking, `--allow-turn` adds a whole agent turn).
+- `letronna doctor` checks the version, system, data folder, settings, gateway, model, sign-in, keys, logs and last crash. It exits 1 on any problem and never prints a key; `--offline` leaves the network alone. Suggest it first when something is wrong.
+- `letronna mcp` manages MCP servers; `letronna mcp serve` offers Letronna's browser, media and search tools to another agent over stdio (`--yes` runs them unasked, `--allow-turn` adds an agent turn).
 - `letronna acp` serves an editor over the Agent Client Protocol.
 - `letronna --uninstall` takes it off again. `--help` (`-h`), `--version` (`-V`).
 `letronna` opens a session in the terminal and `letronna gui` the window; `letronna -p "question"` asks once and prints the answer; `letronna setup` changes the first-run answers; `letronna doctor` checks everything, so suggest it first when something is wrong. Every other verb and flag is in `commands.md`.
@@ -56,7 +58,7 @@ You run inside Letronna, an agent with a window (`letronna gui`) and a terminal 
 - `letronna mcp add --transport http sentry https://mcp.sentry.dev/mcp`
 - `-e KEY=value` sets the command's environment, `-H "K: v"` a URL's header.
 
-Then `letronna mcp list`, `get <name>`, `remove <name>`, and `login <name>` or `logout <name>` for one reached by URL. They are kept in `mcp.json` in the data folder; in a session `/mcp` shows them, and `/mcp reload` reads the file again.
+Then `letronna mcp list`, `get <name>`, `remove <name>`, and `login <name>` or `logout <name>` for one reached by URL. They are kept in the data folder's `mcp.json`; in a session `/mcp` shows them, and `/mcp reload` reads the file again.
 
 ## Slash commands in the terminal
 
@@ -100,7 +102,7 @@ The sidebar has New session, Capabilities (tabs Skills, Tools and MCP), Activity
 ## Skills, profiles and schedules
 
 - Skills: `/skills` switches them on or off, `/skills <name>` puts one in the message box, and `/skills add <owner/repo, link or path>` installs from GitHub, a link or a folder (`anthropics/skills` has Word, Excel, PowerPoint and PDF ones). This one comes with Letronna and can be switched off; a skill of the user's called `letronna` takes its place, and Copy to edit on the window's Skills page makes one from this.
-- Profiles: separate data folders for separate identities, switched or made (empty, or cloned) under Profile in the window's account menu. See `settings-and-data.md`.
-- Schedules: a prompt that runs on a timer, made with New job on the Scheduled jobs page, or by asking in a chat, which adds one once the user says yes. They run while the window, the terminal or `letronna serve` is open.
+- Profiles: separate data folders, switched or made (empty, or cloned) under Profile in the window's account menu; see `settings-and-data.md`.
+- Schedules: a prompt that runs on a timer, made with New job on the Scheduled jobs page, or by asking in a chat (added once the user says yes). They run while the window, the terminal or `letronna serve` is open.
 
 If this skill is silent, say so and web_fetch https://letronna.ai/docs; never invent a menu, setting or command.

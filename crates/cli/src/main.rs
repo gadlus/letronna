@@ -130,6 +130,21 @@ fn main() {
     if let Some(text) = &args.append_system_prompt {
         let _ = session::SYSTEM_APPENDED.set(text.as_str().into());
     }
+    // Each checked before a session starts, from where it was typed.
+    if !args.add_dirs.is_empty() {
+        let here = std::env::current_dir().ok();
+        let mut added = session::ADDED.lock().unwrap_or_else(|e| e.into_inner());
+        for raw in &args.add_dirs {
+            match letronna_core::tools::added_folder(raw, here.as_deref()) {
+                Ok(folder) if added.contains(&folder) => {}
+                Ok(folder) => added.push(folder),
+                Err(error) => {
+                    eprintln!("{}", render::red(&format!("--add-dir: {error}")));
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
     // Before an update goes in or the start counts, as for `--version`: a
     // runner asks this of a build it is about to measure, and only reads.
     if args.dump_config {
