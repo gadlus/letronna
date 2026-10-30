@@ -46,7 +46,7 @@ pub(crate) const FEWEST: usize = 4;
 /// What a run that can start a helper is told first after the sentences: a
 /// helper that has not seen the work reads the request afresh, where the
 /// run itself tends to check only the paths it built, with its own code.
-const REVIEW: &str = "First ask a helper that hasn't seen your work: with the agent tool, start a review helper and wait for its report. Give it the request word for word and the files you changed or made, and ask it to try each behaviour the request states against your work and report every one that fails, with the command that shows it, changing no file, and to work out each value it checks with code of its own, not your scripts or helpers. Check what it reports along with the list.";
+const REVIEW: &str = "First ask a helper that hasn't seen your work: with the agent tool, start a review helper and wait for its report. Give it the request word for word and the files you changed or made, and ask it to try each behaviour the request states against your work and report every one that fails, with the command that shows it, changing no file, and to work out each value it checks with code of its own, not your scripts or helpers. Fix what it reports along with the list, including any case it calls unclear or sets aside, unless the request rules that case out.";
 
 /// The least time a run with a deadline needs left to be asked for the
 /// review: the helper takes a few minutes, and the run about as long again

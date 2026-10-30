@@ -282,8 +282,10 @@ fn built_ins() -> Vec<AgentDef> {
             // refuses commands.
             plan: false,
             prompt: "Look for what is wrong with the work you are pointed at. Verify by running \
-                     tests; end with a verdict: whether it is right, and what has to change if \
-                     not."
+                     tests. Where the work does less than its request's words allow, or two of \
+                     its parts disagree about the same thing, that is wrong, not an open question \
+                     or an aside. End with a verdict: whether it is right, and what has to change \
+                     if not."
                 .into(),
             ..Default::default()
         },
