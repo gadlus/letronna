@@ -309,6 +309,14 @@ pub struct Connection {
     /// The whole system message, in place of Letronna's own, for a quick
     /// look that brings its own instructions.
     pub system: Option<Arc<str>>,
+    /// The user's own instructions in place of Letronna's, from
+    /// `--system-prompt`: who it is, its style and its rules go, while what
+    /// the session is given -- the project's instructions, the skills,
+    /// memory, the date -- stays. Its helpers keep it.
+    pub system_replaced: Option<Arc<str>>,
+    /// The user's own instructions after all the rest, from
+    /// `--append-system-prompt`. Its helpers keep it.
+    pub system_appended: Option<Arc<str>>,
     /// Replies print in the interactive terminal, which shows only bold and
     /// code: set by its prompt alone, not for `-p` or an editor. Its helpers
     /// keep it, so their system message stays the session's and the cache
@@ -1334,6 +1342,8 @@ struct SystemPrompt {
     /// What the session remembers, after the model line: the part of memory
     /// that differs from one session to the next.
     remembered: Range<usize>,
+    /// The user's own instructions from the command line, after the rest.
+    appended: Range<usize>,
 }
 
 /// The commands a run nobody watches is told are on PATH or not: those a
@@ -1391,6 +1401,7 @@ fn system_prompt(
             skills: end..end,
             model: end,
             remembered: end..end,
+            appended: end..end,
         };
     }
     let mut system = identity(connection, crate::styles::chosen());
@@ -1488,6 +1499,17 @@ fn system_prompt(
     if system[..head].ends_with('\n') && system[head..].starts_with(' ') {
         system.remove(head);
     }
+    // The user's own in place of all that, bar where the project is and what
+    // the fenced text means, which tool results still come in.
+    if let Some(own) = &connection.system_replaced {
+        system = own.trim().to_owned();
+        if let Some(folder) =
+            (connection.workspace.as_ref()).filter(|_| connection.tools && !shared)
+        {
+            system.push_str(&format!(" The project folder is `{}`.", folder.display()));
+        }
+        system.push_str(&format!(" {}", crate::untrusted::RULE));
+    }
     // The project's rules and skills first: they change rarely, so the
     // prompt's start stays cacheable; the summary of dropped turns changes
     // as the conversation grows.
@@ -1558,6 +1580,17 @@ fn system_prompt(
         system.push_str(kept.trim_start());
     }
     let remembered = start..system.len();
+    // After all the rest, as other agents put it, and the same for the whole
+    // run, so no part before it changes.
+    let start = system.len();
+    if let Some(more) = (connection.system_appended.as_deref())
+        .map(str::trim)
+        .filter(|more| !more.is_empty())
+    {
+        system.push_str("\n\n");
+        system.push_str(more);
+    }
+    let appended = start..system.len();
     // Fenced, as what it paraphrases may be a page's or a file's words, which
     // would otherwise speak with the system prompt's authority; the rules and
     // decisions the user gave keep their weight through the line before it.
@@ -1588,6 +1621,7 @@ fn system_prompt(
         skills,
         model,
         remembered,
+        appended,
     }
 }
 
@@ -1820,9 +1854,10 @@ fn body_hashed(
         use crate::cache_miss::Reason;
         let text = system.text.as_str();
         let rest = &text[system.skills.end..system.model];
+        let appended = &text[system.appended.clone()];
         prefix.set(
             Reason::System,
-            (&text[..system.identity], rest, around.as_deref()),
+            (&text[..system.identity], rest, appended, around.as_deref()),
         );
         let remembered = &text[system.remembered.clone()];
         prefix.set(Reason::Memory, (&text[system.memory.clone()], remembered));
@@ -8907,6 +8942,65 @@ mod tests {
             ..connection()
         });
         golden("system_prompt_terminal.txt", &terminal);
+    }
+
+    #[test]
+    fn a_system_prompt_given_in_place_of_letronna_s_keeps_what_the_session_is_given() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("system-replaced");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let c = Connection {
+            tools: true,
+            workspace: Some("/w".into()),
+            system_replaced: Some(" You review code and nothing else.\n".into()),
+            ..connection()
+        };
+        let prompt = system_prompt(&c, None, None);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = prompt.text.as_str();
+        let own = format!(
+            "You review code and nothing else. The project folder is `/w`. {}",
+            crate::untrusted::RULE
+        );
+        assert_eq!(&text[..prompt.identity], own);
+        assert!(!text.contains("You are Letronna"), "{text}");
+        assert!(
+            text.contains("The model behind you is test-model."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_appended_system_prompt_comes_after_the_rest_and_moves_nothing_before_it() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("system-appended");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let c = Connection {
+            tools: true,
+            workspace: Some("/w".into()),
+            ..connection()
+        };
+        let more = Connection {
+            system_appended: Some("Answer in French.\n".into()),
+            ..c.clone()
+        };
+        let plain = system_prompt(&c, None, None).text;
+        let appended = system_prompt(&more, None, None).text;
+        let summarized = system_prompt(&more, Some("They asked for a test."), None).text;
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(appended, format!("{plain}\n\nAnswer in French."));
+        // Before the summary of dropped turns, which changes as they go.
+        let (told, summary) = (
+            summarized.find("Answer in French.").unwrap(),
+            summarized.find("They asked for a test.").unwrap(),
+        );
+        assert!(told < summary, "{summarized}");
     }
 
     #[test]

@@ -155,6 +155,8 @@ impl Runner {
             // Its own: the judge runs on `model`.
             session_model: String::new(),
             system: None,
+            system_replaced: None,
+            system_appended: None,
             plain_terminal: self.plain_terminal,
             // Set by `-p` alone, once it knows whether its tools were named.
             lean_tools: false,

@@ -2348,6 +2348,9 @@ impl Chat {
             // Its own: the judge runs on `model`.
             session_model: String::new(),
             system: None,
+            // Only the terminal's command line gives them.
+            system_replaced: None,
+            system_appended: None,
             // The window shows Markdown whole.
             plain_terminal: false,
             // Someone is watching, so every tool goes out in the array.
