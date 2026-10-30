@@ -2,15 +2,16 @@
 //! how much it can write in one reply, what it takes in, which parameters
 //! it accepts, and how hard it can be told to think.
 //!
-//! Three sources, cheapest first. The gateways' model lists already say most
+//! Four sources, cheapest first. The gateways' model lists already say most
 //! of it -- OpenRouter gives the window, the output limit, the kinds of input
 //! and the parameters, and the hosted gateway all but the parameters -- so
 //! listing models keeps that instead of only the ids. Where a list says
-//! nothing, as OpenAI's does, a small table of well-known families fills in
-//! the window and the output limit by the longest prefix of the id. And a
-//! provider's error can give away a limit lower than either, which is the one
-//! the route actually enforces; what is learned that way only ever lowers
-//! what is known.
+//! nothing, as OpenAI's and OpenCode Go's do, the public catalogue of routes
+//! gives the window and the output limit its provider publishes for that
+//! host, and else a small table of well-known families does by the longest
+//! prefix of the id. And a provider's error can give away a limit lower than
+//! any of those, which is the one the route actually enforces; what is
+//! learned that way only ever lowers what is known.
 //!
 //! Facts are kept per host and model, because one id served somewhere else
 //! is another route: Ollama serves a smaller window than a model was trained
@@ -144,6 +145,15 @@ const ANTHROPIC_EFFORTS: [(&str, &str); 5] = [
 /// long without it.
 const ASK_AGAIN_AFTER: Duration = Duration::from_secs(10 * 60);
 
+/// The public catalogue of models and the routes serving them, the one
+/// OpenCode reads: for each provider, the address its API is reached at and
+/// the window and output limit of each model it serves there.
+const CATALOGUE: &str = "https://models.dev/api.json";
+
+/// How long the limits taken from the catalogue are kept on disk before it is
+/// read again: it is six megabytes, and routes change their limits seldom.
+const CATALOGUE_KEPT: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// How long a request that sets an effort waits for a list it has just asked
 /// for: the hosted list comes in well under a second, and a gateway slower
 /// than this should not hold up the answer, which then goes with the levels
@@ -161,6 +171,11 @@ struct Known {
     lists: HashSet<String>,
     /// When each host was last asked for its list by `ask_for_list`.
     asked: HashMap<String, Instant>,
+    /// What the public catalogue says each route's models take, by host and
+    /// plain id; only `context` and `max_output` are set.
+    catalogue: HashMap<(String, String), Facts>,
+    /// When the catalogue was last asked for by `look_up_catalogue`.
+    catalogue_asked: Option<Instant>,
 }
 
 fn known() -> &'static Mutex<Known> {
@@ -175,6 +190,8 @@ pub enum Source {
     Listed,
     /// Its gateway's list, under an id that differs only by its vendor's path.
     ListedAlias,
+    /// The public catalogue, for its gateway's host.
+    Catalogue,
     /// `FAMILIES`.
     Family,
     /// The window the settings or `LETRONNA_CONTEXT_WINDOW` assume.
@@ -189,6 +206,7 @@ impl Source {
         match self {
             Source::Listed => "listed",
             Source::ListedAlias => "listed-alias",
+            Source::Catalogue => "catalogue",
             Source::Family => "family",
             Source::Setting => "setting",
             Source::Learned => "learned",
@@ -229,7 +247,7 @@ fn put_together(
 ) -> (Facts, Option<Source>) {
     let host = host(endpoint);
     let key = (host.clone(), model.to_owned());
-    let (listed, alias, learned) = known()
+    let (listed, alias, catalogue, learned) = known()
         .lock()
         .map(|known| {
             let listed = known.listed.get(&key).cloned();
@@ -242,6 +260,9 @@ fn put_together(
             (
                 listed.unwrap_or_default(),
                 alias,
+                (known.catalogue.get(&(host.clone(), plain(model))))
+                    .cloned()
+                    .unwrap_or_default(),
                 known.learned.get(&key).cloned().unwrap_or_default(),
             )
         })
@@ -250,6 +271,7 @@ fn put_together(
     let given = [
         (listed.context, Source::Listed),
         (alias.context, Source::ListedAlias),
+        (catalogue.context, Source::Catalogue),
         (family.context, Source::Family),
         (window, Source::Setting),
     ]
@@ -265,6 +287,7 @@ fn put_together(
         max_output: lowest(
             (listed.max_output)
                 .or(alias.max_output)
+                .or(catalogue.max_output)
                 .or(family.max_output)
                 .or(output),
             learned.max_output,
@@ -411,7 +434,10 @@ pub fn ask_for_list(endpoint: &str, key: &str) -> Option<mpsc::Receiver<()>> {
     // A list that did not come is not asked for again until `ASK_AGAIN_AFTER`
     // has passed since this ask, so what went wrong does not matter here.
     std::thread::spawn(move || {
-        let _ = crate::chat::list_models(&base, &key);
+        // A list that came looks the catalogue up itself if it says nothing.
+        if crate::chat::list_models(&base, &key).is_err() {
+            look_up_catalogue(&base);
+        }
         let _ = over.send(());
     });
     Some(heard)
@@ -433,6 +459,133 @@ fn due(host: &str) -> bool {
     }
     known.asked.insert(host.to_owned(), Instant::now());
     true
+}
+
+/// Look the public catalogue up on a thread of its own when `endpoint`'s host
+/// gave no list, or one with no window in it, unless it is already here or
+/// was asked for lately. It goes to the catalogue's own address, which hears
+/// nothing of the gateway it is looked up for.
+pub(crate) fn look_up_catalogue(endpoint: &str) {
+    // Tests reach neither the catalogue nor the data folder from here.
+    if !catalogue_due(&host(endpoint)) || cfg!(test) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let Some(found) = kept_catalogue().or_else(fetch_catalogue) else {
+            return;
+        };
+        if let Ok(mut known) = known().lock() {
+            known.catalogue = found;
+        }
+    });
+}
+
+/// Whether the catalogue should be asked for now on behalf of `host`, noting
+/// the ask if so.
+fn catalogue_due(host: &str) -> bool {
+    let Ok(mut known) = known().lock() else {
+        return false;
+    };
+    let windows =
+        (known.listed.iter()).any(|((at, _), facts)| at == host && facts.context.is_some());
+    let lately = (known.catalogue_asked).is_some_and(|at| at.elapsed() < ASK_AGAIN_AFTER);
+    if windows || lately || !known.catalogue.is_empty() {
+        return false;
+    }
+    known.catalogue_asked = Some(Instant::now());
+    true
+}
+
+/// Where the limits taken from the catalogue are kept between runs.
+fn catalogue_file() -> std::path::PathBuf {
+    crate::chat::data_dir().join("model-catalogue.json")
+}
+
+/// The limits taken from the catalogue in the last `CATALOGUE_KEPT`.
+fn kept_catalogue() -> Option<HashMap<(String, String), Facts>> {
+    let file = catalogue_file();
+    let age = std::fs::metadata(&file)
+        .ok()?
+        .modified()
+        .ok()?
+        .elapsed()
+        .ok()?;
+    if age > CATALOGUE_KEPT {
+        return None;
+    }
+    let kept: Value = serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
+    let found: HashMap<_, _> = (kept.as_array()?.iter())
+        .filter_map(|entry| {
+            let key = (
+                entry["host"].as_str()?.to_owned(),
+                entry["id"].as_str()?.to_owned(),
+            );
+            let facts = Facts {
+                context: entry["context"].as_u64(),
+                max_output: entry["output"].as_u64(),
+                ..Facts::default()
+            };
+            Some((key, facts))
+        })
+        .collect();
+    (!found.is_empty()).then_some(found)
+}
+
+/// The catalogue's limits, read from its address and kept on disk for the
+/// next run.
+fn fetch_catalogue() -> Option<HashMap<(String, String), Facts>> {
+    let response = crate::chat::client()
+        .ok()?
+        .get(CATALOGUE)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .and_then(|r| r.error_for_status())
+        .ok()?;
+    let found = catalogued(&response.json().ok()?);
+    if found.is_empty() {
+        return None;
+    }
+    let kept: Vec<Value> = (found.iter())
+        .map(|((host, id), facts)| {
+            serde_json::json!({
+                "host": host, "id": id, "context": facts.context, "output": facts.max_output,
+            })
+        })
+        .collect();
+    let _ = std::fs::write(catalogue_file(), Value::from(kept).to_string());
+    Some(found)
+}
+
+/// The windows and output limits in the catalogue, by the host each
+/// provider's API is reached at and the plain id of each model it serves
+/// there, the lowest of each where two providers share a host. A provider on
+/// this computer or its network, or one whose address the user fills in, says
+/// nothing about any server Letronna reaches.
+fn catalogued(catalogue: &Value) -> HashMap<(String, String), Facts> {
+    let mut found: HashMap<(String, String), Facts> = HashMap::new();
+    let providers = catalogue
+        .as_object()
+        .into_iter()
+        .flat_map(|all| all.values());
+    for provider in providers {
+        let Some(api) = provider["api"].as_str().filter(|api| !api.contains("${")) else {
+            continue;
+        };
+        let Ok(url) = reqwest::Url::parse(api) else {
+            continue;
+        };
+        if crate::web::local(&url) {
+            continue;
+        }
+        let models = provider["models"].as_object().into_iter().flatten();
+        for (id, model) in models {
+            let tokens = |key: &str| model["limit"][key].as_u64().filter(|&n| n > 0);
+            let slot = found.entry((host(api), plain(id))).or_default();
+            slot.context = lowest(slot.context, tokens("context"));
+            slot.max_output = lowest(slot.max_output, tokens("output"));
+        }
+    }
+    found
 }
 
 /// Keep what a gateway's `/models` list says about each of its models.
@@ -905,6 +1058,99 @@ mod tests {
     }
 
     #[test]
+    fn the_catalogue_gives_each_routes_limits_by_its_host_the_lowest_where_two_share_one() {
+        let catalogue = json!({
+            "route-go": {"api": "https://routes.test/inference/go/v1", "models": {
+                "deepseek-v4.1-flash": {"limit": {"context": 1_000_000, "output": 384_000}},
+                "Vendor/Some.Model": {"limit": {"context": 200_000, "output": 0}}
+            }},
+            "route-zen": {"api": "https://routes.test/zen/v1", "models": {
+                "deepseek-v4.1-flash": {"limit": {"context": 900_000, "output": 400_000}}
+            }},
+            "on-this-computer": {"api": "http://127.0.0.1:1234/v1", "models": {
+                "local-model": {"limit": {"context": 1_000_000, "output": 8_192}}
+            }},
+            "filled-in": {"api": "https://${GATEWAY_HOST}/v1", "models": {
+                "their-model": {"limit": {"context": 1_000_000, "output": 8_192}}
+            }},
+            "no-address": {"models": {"their-model": {"limit": {"context": 1_000_000}}}}
+        });
+
+        let found = catalogued(&catalogue);
+        let at = |id: &str| found.get(&("routes.test:443".to_owned(), id.to_owned()));
+        assert_eq!(
+            at("deepseek-v4-1-flash").map(|f| (f.context, f.max_output)),
+            Some((Some(900_000), Some(384_000)))
+        );
+        // Ids are kept plain, and a limit of nothing is none.
+        assert_eq!(
+            at("some-model").map(|f| (f.context, f.max_output)),
+            Some((Some(200_000), None))
+        );
+        assert_eq!(found.len(), 2);
+    }
+
+    #[test]
+    fn a_route_whose_list_says_nothing_takes_its_window_from_the_catalogue_before_a_family() {
+        let endpoint = "https://catalogued.test/inference/v1";
+        remember(
+            endpoint,
+            json!([{"id": "deepseek-v4.1-flash"}, {"id": "gpt-4o"}, {"id": "listed", "context_length": 32_000}])
+                .as_array()
+                .unwrap(),
+        );
+        let entry = |context, output| Facts {
+            context: Some(context),
+            max_output: Some(output),
+            ..Facts::default()
+        };
+        known().lock().unwrap().catalogue.extend([
+            (
+                ("catalogued.test:443".into(), "deepseek-v4-1-flash".into()),
+                entry(1_000_000, 384_000),
+            ),
+            (
+                ("catalogued.test:443".into(), "gpt-4o".into()),
+                entry(64_000, 4_096),
+            ),
+            (
+                ("catalogued.test:443".into(), "listed".into()),
+                entry(1_000_000, 8_192),
+            ),
+        ]);
+
+        assert_eq!(
+            window_or(endpoint, "deepseek-v4.1-flash", Some(64_000)),
+            Some((1_000_000, Source::Catalogue))
+        );
+        assert_eq!(
+            facts(endpoint, "deepseek-v4.1-flash").max_output,
+            Some(384_000)
+        );
+        // What the route publishes for itself comes before what a family has.
+        assert_eq!(
+            window_or(endpoint, "gpt-4o", None),
+            Some((64_000, Source::Catalogue))
+        );
+        // And what the gateway's own list says comes before it.
+        assert_eq!(
+            window_or(endpoint, "listed", None),
+            Some((32_000, Source::Listed))
+        );
+        // An error still lowers it.
+        learn(endpoint, "deepseek-v4.1-flash", Limit::Context(500_000));
+        assert_eq!(
+            window_or(endpoint, "deepseek-v4.1-flash", None),
+            Some((500_000, Source::Learned))
+        );
+        // Another host's route is not this one.
+        assert_eq!(
+            facts("https://elsewhere.test/v1", "deepseek-v4.1-flash").context,
+            None
+        );
+    }
+
+    #[test]
     fn a_model_listed_under_its_own_id_keeps_its_own_entry() {
         let endpoint = "https://exact.test/v1";
         let list = json!([
@@ -949,6 +1195,7 @@ mod tests {
             Some((50_000, Source::Setting))
         );
         assert_eq!(Source::ListedAlias.name(), "listed-alias");
+        assert_eq!(Source::Catalogue.name(), "catalogue");
     }
 
     #[test]

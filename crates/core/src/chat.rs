@@ -4280,6 +4280,11 @@ pub fn list_models(base: &str, key: &str) -> Result<Vec<String>, String> {
             .ok_or("Invalid model list.")?,
     };
     crate::models::remember(base, list);
+    // A server without a key is one of the user's own, which the catalogue
+    // knows nothing of.
+    if !key.trim().is_empty() {
+        crate::models::look_up_catalogue(base);
+    }
     crate::search::heard_list(base, list);
     let models = list
         .iter()
