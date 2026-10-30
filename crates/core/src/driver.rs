@@ -980,6 +980,12 @@ fn steps(
         if let Ok(mut doing) = spec.status.doing.lock() {
             *doing = doing_line(&calls);
         }
+        // A helper given less time than its run, as each review started for
+        // a run is, gives its answer at its own deadline as at the round cap;
+        // the run itself is stopped at its deadline.
+        if spec.depth > 0 && (spec.connection.deadline).is_some_and(|at| Instant::now() >= at) {
+            turn.time_up();
+        }
         if capped || !turn.begin(calls) {
             return at_limit(spec, report);
         }
@@ -2234,9 +2240,19 @@ fn requirements(
     // A helper reads the request afresh, where one is allowed and the run
     // has the time and tokens left for its review and the fix after it.
     let review = refused(spec, "agent").is_none() && affords_review(spec);
+    // Started for the run, so the brief holds what the run's own tends to
+    // leave out and each helper is of the type that judges by the request;
+    // the run asks for one itself only where none came back with a table.
+    let reports = (review && outputs.is_empty())
+        .then(|| reviews(spec, typed, &found))
+        .flatten();
+    let content = match reports {
+        Some(reports) => crate::requirements::reviewed(&found, &reports),
+        None => crate::requirements::notice(&found, review, &outputs),
+    };
     Some(Message {
         role: "user".into(),
-        content: crate::requirements::notice(&found, review, &outputs),
+        content,
         notice: true,
         // Folded into the run, so the window keeps the task it is for.
         folded: true,
@@ -2266,20 +2282,72 @@ fn review_rows(spec: &Spec, turn: &Turn) -> Option<Message> {
 /// What the latest review's table in `messages` leaves unchecked of the
 /// requirements the latest requirements notice numbers, as the notice that
 /// sends the run back says it; None with no such notice, no review with a
-/// table after it, or nothing left. A review comes back as the agent tool's
-/// result, or as mail when the helper ran in the background.
+/// table, or nothing left. A review comes back as the agent tool's result,
+/// as mail when the helper ran in the background, or in the notice itself
+/// when it was started for the run.
 fn unreviewed(messages: &[Message]) -> Option<String> {
     let at = messages.iter().rposition(|message| {
         message.notice && crate::requirements::listed(&message.content).is_some()
     })?;
     let count = crate::requirements::listed(&messages[at].content)?;
     let check = format!("[{} check]", crate::BRAND);
-    let report = messages[at + 1..].iter().rev().find(|message| {
-        let reply = message.role == "tool" && message.name == "agent";
-        let mail = message.role == "user" && message.notice && !message.content.starts_with(&check);
-        (reply || mail) && crate::requirements::tabled(&message.content)
-    })?;
+    // A later review wins over the ones the notice itself brought.
+    let report = (messages[at + 1..].iter().rev())
+        .find(|message| {
+            let reply = message.role == "tool" && message.name == "agent";
+            let mail =
+                message.role == "user" && message.notice && !message.content.starts_with(&check);
+            (reply || mail) && crate::requirements::tabled(&message.content)
+        })
+        .or_else(|| {
+            Some(&messages[at]).filter(|notice| crate::requirements::tabled(&notice.content))
+        })?;
     crate::requirements::unchecked(&report.content, count)
+}
+
+/// The reports of review helpers started side by side for a run nobody
+/// watches, each checking its share of `found`, the requirements `request`
+/// states, and waited for; None when none came back with a table.
+fn reviews(spec: &Spec, request: &str, found: &[String]) -> Option<Vec<String>> {
+    let mut ctx = context(spec);
+    // On a run with a deadline the review and the fix after it share the
+    // time left evenly: each helper gives its answer at its own deadline,
+    // which leaves the run the time to act on it.
+    if let (Some(parent), Some(deadline)) =
+        (ctx.caller.connection.as_deref(), spec.connection.deadline)
+    {
+        let left = deadline.saturating_duration_since(Instant::now());
+        ctx.caller.connection = Some(Arc::new(Connection {
+            deadline: Some(Instant::now() + left / 2),
+            ..parent.clone()
+        }));
+    }
+    // Each helper spends up to a review's tokens, so only as many start as
+    // the budget leaves room for: the fix after them needs the rest.
+    let afford = (spec.budget.as_ref()).map_or(usize::MAX, |budget| {
+        (budget.left() / crate::requirements::REVIEW_TOKENS).max(1) as usize
+    });
+    let reports: Vec<String> = std::thread::scope(|scope| {
+        let started: Vec<_> = (crate::requirements::shares(found.len()).into_iter())
+            .take(afford)
+            .map(|share| {
+                let ctx = ctx.clone();
+                let args = json!({
+                    "description": format!("Review R{} to R{}", share.0, share.1),
+                    "name": format!("review-r{}", share.0),
+                    "type": "review",
+                    "background": false,
+                    "prompt": crate::requirements::brief(request, found, share),
+                });
+                scope.spawn(move || tools::Tool::run(&crate::agents::Agent, &args, &ctx))
+            })
+            .collect();
+        (started.into_iter())
+            .filter_map(|helper| helper.join().ok()?.ok())
+            .filter(|report| crate::requirements::tabled(report))
+            .collect()
+    });
+    (!reports.is_empty()).then_some(reports)
 }
 
 /// The notice telling a session's own run nobody watches where the project's
@@ -6390,26 +6458,55 @@ pub(crate) mod tests {
         (spec, provider)
     }
 
-    /// What a run asked `SPECIFIED` in a folder `name`, as `setup` leaves it,
-    /// is sent back with once it has changed source.
-    fn requirements_asked(name: &str, id: AgentId, setup: impl FnOnce(&mut Spec)) -> String {
+    /// A review helper's report on `SPECIFIED`, each requirement passing.
+    const PASSED: &str = "Checked each.\nR1 | a | PASS\nR2 | b | PASS\nR3 | c | PASS\n\
+                          R4 | d | PASS\nR5 | e | PASS";
+
+    /// The requests of a run asked `SPECIFIED` in a folder `name`, as `setup`
+    /// leaves it, once it has changed source and been sent back, with the one
+    /// review helper started for it answering `reviewer`, if one is.
+    fn requirements_sent(
+        name: &str,
+        id: AgentId,
+        reviewer: Option<&str>,
+        setup: impl FnOnce(&mut Spec),
+    ) -> Vec<Value> {
         let _data = data(name);
         let dir = scratch(name);
-        let answers = vec![
-            reply("", &[write_made()]),
-            reply("Added parse_range.", &[]),
-            reply("Each requirement holds.", &[]),
-        ];
+        let mut answers = vec![reply("", &[write_made()]), reply("Added parse_range.", &[])];
+        answers.extend(reviewer.map(|said| reply(said, &[])));
+        answers.push(reply("Each requirement holds.", &[]));
         let (mut spec, provider) = specified(&dir, id, SPECIFIED, answers);
         setup(&mut spec);
         let report = finished(spec);
         assert_eq!(report.status, Outcome::Done);
         assert_eq!(report.text, "Each requirement holds.");
-        let sent = provider.sent();
-        messages(&sent[2]).last().unwrap()["content"]
+        provider.sent()
+    }
+
+    /// What such a run is sent back with.
+    fn requirements_asked(
+        name: &str,
+        id: AgentId,
+        reviewer: Option<&str>,
+        setup: impl FnOnce(&mut Spec),
+    ) -> String {
+        let sent = requirements_sent(name, id, reviewer, setup);
+        messages(sent.last().unwrap()).last().unwrap()["content"]
             .as_str()
             .unwrap()
             .into()
+    }
+
+    /// Whether `asked` is the notice bringing the reviews started for the
+    /// run, numbering `SPECIFIED`'s requirements and ending with the check.
+    fn brings_reviews(asked: &str) -> bool {
+        let plain = crate::requirements::notice(&STATED.map(String::from), false, &[]);
+        let (list, check) = plain.rsplit_once('\n').unwrap();
+        asked.starts_with(list)
+            && asked.contains("Helpers that haven't seen your work reviewed it")
+            && asked.contains("    R5 | e | PASS")
+            && asked.ends_with(check)
     }
 
     #[test]
@@ -6453,7 +6550,39 @@ pub(crate) mod tests {
 
     #[test]
     fn an_unwatched_run_that_changed_source_is_sent_back_once_with_the_requirements() {
-        let asked = requirements_asked("requirements", AGENTS + 1_700, |_| {});
+        let sent = requirements_sent("requirements", AGENTS + 1_700, Some(PASSED), |_| {});
+        let asked = messages(sent.last().unwrap()).last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(brings_reviews(&asked), "{asked}");
+        // Named by its first row, with a number after where tests side by
+        // side took the name.
+        assert!(asked.contains("\n\nreview-r1"), "{asked}");
+        // The review is started for the run: a helper of the review type,
+        // with the request and the cases, and none of the run's reasons.
+        let task = (messages(&sent[2]).iter())
+            .filter_map(|message| message["content"].as_str())
+            .find(|content| content.contains("You are a helper (review)."))
+            .unwrap_or_else(|| panic!("{:?}", sent[2]))
+            .to_owned();
+        assert!(task.contains("The request, word for word:"), "{task}");
+        assert!(
+            task.contains("R3: A range whose start is past its end"),
+            "{task}"
+        );
+        assert!(task.contains("Check each requirement. "), "{task}");
+        assert!(!task.contains("Added parse_range."), "{task}");
+    }
+
+    #[test]
+    fn a_run_asks_for_the_review_itself_when_none_started_for_it_brings_a_table() {
+        let asked = requirements_asked(
+            "requirements-untabled",
+            AGENTS + 1_750,
+            Some("Fine."),
+            |_| {},
+        );
         assert_eq!(
             asked,
             crate::requirements::notice(&STATED.map(String::from), true, &[])
@@ -6462,7 +6591,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_run_that_may_not_start_a_helper_is_not_asked_for_a_review() {
-        let asked = requirements_asked("requirements-no-agent", AGENTS + 1_760, |spec| {
+        let asked = requirements_asked("requirements-no-agent", AGENTS + 1_760, None, |spec| {
             spec.allow = Allow::Only(vec!["write_file".into(), "run_command".into()]);
         });
         assert_eq!(
@@ -6478,20 +6607,55 @@ pub(crate) mod tests {
             crate::requirements::REVIEW_TIME,
             crate::requirements::REVIEW_TOKENS,
         );
-        let near = requirements_asked("requirements-near-deadline", AGENTS + 1_770, |spec| {
+        let near = requirements_asked("requirements-near-deadline", AGENTS + 1_770, None, |spec| {
             spec.connection.deadline = Some(Instant::now() + time - Duration::from_secs(60));
         });
         assert_eq!(near, crate::requirements::notice(&stated, false, &[]));
-        let spent = requirements_asked("requirements-low-budget", AGENTS + 1_780, |spec| {
+        let spent = requirements_asked("requirements-low-budget", AGENTS + 1_780, None, |spec| {
             spec.budget = Some(Arc::new(Budget::new(tokens - 1, None)));
         });
         assert_eq!(spent, crate::requirements::notice(&stated, false, &[]));
         // With both to spare, it is.
-        let ample = requirements_asked("requirements-ample", AGENTS + 1_790, |spec| {
-            spec.connection.deadline = Some(Instant::now() + 2 * time);
-            spec.budget = Some(Arc::new(Budget::new(2 * tokens, None)));
-        });
-        assert_eq!(ample, crate::requirements::notice(&stated, true, &[]));
+        let ample =
+            requirements_asked("requirements-ample", AGENTS + 1_790, Some(PASSED), |spec| {
+                spec.connection.deadline = Some(Instant::now() + 2 * time);
+                spec.budget = Some(Arc::new(Budget::new(2 * tokens, None)));
+            });
+        assert!(brings_reviews(&ample), "{ample}");
+    }
+
+    #[test]
+    fn a_review_started_for_a_run_with_a_deadline_has_half_the_time_left() {
+        let sent = requirements_sent(
+            "requirements-review-time",
+            AGENTS + 1_795,
+            Some(PASSED),
+            |spec| {
+                spec.connection.deadline = Some(Instant::now() + Duration::from_secs(40 * 60));
+            },
+        );
+        let said = |body: &Value| -> Vec<String> {
+            let contents = messages(body).iter().map(|m| m["content"].to_string());
+            contents.collect()
+        };
+        let review = (sent.iter().map(said))
+            .find(|said| {
+                said.iter()
+                    .any(|m| m.contains("Review a change you have not seen"))
+            })
+            .expect("no review was started");
+        assert!(
+            review
+                .iter()
+                .any(|m| m.contains("This run has about 20 minutes")),
+            "{review:?}"
+        );
+        let run = said(&sent[0]);
+        assert!(
+            run.iter()
+                .any(|m| m.contains("This run has about 40 minutes")),
+            "{run:?}"
+        );
     }
 
     #[test]
@@ -6502,6 +6666,7 @@ pub(crate) mod tests {
         let answers = vec![
             reply("", &[write_made()]),
             reply("Added parse_range.", &[]),
+            reply(PASSED, &[]),
             reply("", &[fixed]),
             reply("Fixed the empty range.", &[]),
         ];
@@ -6511,7 +6676,7 @@ pub(crate) mod tests {
         let sent = provider.sent();
 
         // Changed again after the notice, it still ends at its next answer.
-        let notices = messages(&sent[3])
+        let notices = messages(sent.last().unwrap())
             .iter()
             .filter(|m| {
                 m["content"]
@@ -6657,6 +6822,8 @@ pub(crate) mod tests {
         let answers = vec![
             reply("", &[command("echo pass > orders.py")]),
             reply("Wrote the script.", &[]),
+            // The review started for it brings no table, so it asks for one.
+            reply("Fine.", &[]),
             reply("Each rule holds.", &[]),
         ];
         let (spec, provider) = specified(&dir, AGENTS + 1_590, &request, answers);
@@ -6664,7 +6831,7 @@ pub(crate) mod tests {
         assert_eq!(report.status, Outcome::Done);
         let sent = provider.sent();
 
-        let asked = messages(&sent[2]).last().unwrap()["content"]
+        let asked = messages(sent.last().unwrap()).last().unwrap()["content"]
             .as_str()
             .unwrap();
         let rules = crate::requirements::sentences(&request);
@@ -8050,6 +8217,24 @@ pub(crate) mod tests {
             "{notice}"
         );
         assert!(!sent.iter().any(|body| carries(body, WARNING)));
+    }
+
+    #[test]
+    fn a_helper_past_its_deadline_gives_its_answer_instead_of_another_round() {
+        let dir = scratch("helper-time-up");
+        let (endpoint, provider) = provider(vec![
+            reply("", &[("read_file", json!({"path": "ticket.txt"}))]),
+            reply("R1 | a | PASS", &[]),
+        ]);
+        let mut helper = spec(endpoint, &dir, AGENTS + 1542);
+        helper.connection.deadline = Some(Instant::now());
+        let report = finished(helper);
+        assert_eq!(report.text, "R1 | a | PASS");
+        assert_eq!(report.rounds, 0);
+        let sent = provider.sent();
+        assert_eq!(sent.len(), 2);
+        assert!(carries(&sent[1], "Not run: the time for this task is up."));
+        assert!(carries(&sent[1], "Your time for this task is up."));
     }
 
     #[test]

@@ -2029,17 +2029,27 @@ impl Cut {
 
 /// How long a foreground call in `ctx` waits, and why when that is sooner
 /// than `asked`; None when it waits as asked, being no call of a session's
-/// own agent on a run with a deadline. Such a call is held no longer than
-/// half the time left, or the least it is held if that is more, nor past
-/// the run's time warning, nor past the moment just before the deadline
-/// once the warning has come.
+/// own agent or a helper on a run with a deadline. A session's agent's call
+/// is held no longer than half the time left, or the least it is held if
+/// that is more, nor past the run's time warning, nor past the moment just
+/// before the deadline once the warning has come; a helper's, which hears
+/// no warning, only until that moment before its own deadline.
 fn sooner(asked: Duration, ctx: &ToolContext) -> Option<(Duration, Option<Cut>)> {
+    let connection = ctx.caller.connection.as_deref()?;
+    let now = Instant::now();
+    if ctx.caller.depth > 0 {
+        let deadline = connection.deadline?;
+        let left = deadline.saturating_duration_since(now);
+        let limit = left - BEFORE_DEADLINE.min(left / 2);
+        return Some(match limit < asked {
+            true => (limit, Some(Cut::Deadline(deadline))),
+            false => (asked, None),
+        });
+    }
     // Only that agent is told of the warning, and only its commands can go
     // on in the background rather than be stopped.
     owner_at_limit(ctx)?;
-    let connection = ctx.caller.connection.as_deref()?;
     let (deadline, warn_at) = (connection.deadline?, connection.warn_at?);
-    let now = Instant::now();
     let (limit, cut) = match warn_at.checked_duration_since(now) {
         // A call given most of the run would leave the rest of it no time
         // to act on what came of it.
@@ -2154,6 +2164,9 @@ fn run_shell_into(
     // stopped there waits as long as it was given.
     let (limit, mut cut, timed) = match sooner {
         Some((sooner, cut)) if owner.is_some() && tree.is_some() => (sooner, cut, true),
+        // A helper's is stopped there instead, so it can still give its
+        // answer in time.
+        Some((sooner, cut)) if owner.is_none() => (sooner, cut, false),
         _ => (limit, None, false),
     };
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
@@ -2203,6 +2216,13 @@ fn run_shell_into(
                 break Ok(None);
             }
             let _ = child.kill();
+            if let Some(cut) = cut {
+                break Err(format!(
+                    "Stopped after {}s {}, before it finished.",
+                    limit.as_secs(),
+                    cut.when()
+                ));
+            }
             break Err(format!(
                 "Timed out after {}s and was stopped. If it only needs longer, call \
                  it again with a longer timeout, up to {MAX_COMMAND_SECS} seconds. If \
@@ -6852,6 +6872,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_helper_s_command_is_stopped_shortly_before_its_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut helper = timed(7_706, deadline, deadline);
+        helper.caller.depth = 1;
+        let command = if cfg!(windows) {
+            "Start-Sleep 30"
+        } else {
+            "sleep 30"
+        };
+        let began = Instant::now();
+        let out = run_shell_in(
+            command,
+            &std::env::temp_dir(),
+            &helper,
+            Duration::from_secs(600),
+        )
+        .unwrap_err();
+        assert!(
+            out.starts_with("Stopped after ") && out.ends_with("left, before it finished."),
+            "{out}"
+        );
+        assert!(began.elapsed() < Duration::from_secs(20));
+    }
+
     /// A context in the temporary folder for conversation `conversation`, in
     /// a run that stops its jobs as it ends when `print`.
     fn in_run(conversation: u64, print: bool) -> ToolContext {
@@ -6978,8 +7023,8 @@ mod tests {
         // One that asked for less waits as it asked.
         let less = Duration::from_secs(60);
         assert_eq!(sooner(less, &early), Some((less, None)));
-        // A helper's call, a call for no session in particular and one on a
-        // run with no deadline are never cut short.
+        // A helper's, which hears no warning, until shortly before its own
+        // deadline.
         let helper = ToolContext {
             caller: Caller {
                 depth: 1,
@@ -6987,7 +7032,20 @@ mod tests {
             },
             ..early.clone()
         };
-        assert_eq!(sooner(asked, &helper), None);
+        let (limit, cut) = sooner(asked, &helper).unwrap();
+        let deadline = early
+            .caller
+            .connection
+            .as_deref()
+            .unwrap()
+            .deadline
+            .unwrap();
+        assert!(
+            near(limit, 470) && cut == Some(Cut::Deadline(deadline)),
+            "{limit:?} {cut:?}"
+        );
+        // A call for no session in particular and one on a run with no
+        // deadline are never cut short.
         let nobody = ToolContext {
             conversation: 0,
             ..early.clone()

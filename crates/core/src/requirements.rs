@@ -43,13 +43,26 @@ pub(crate) const LISTED: usize = 40;
 /// a build or test covers, while a specification states many.
 pub(crate) const FEWEST: usize = 4;
 
+/// The cases a review's table has a row for where they apply, as a
+/// literal that both the notice asking a run for a review and the brief
+/// of a review started for the run are built from.
+macro_rules! cases {
+    () => {
+        "a field, argument or part the requirement names left out, undefined or empty; a plain value as well as the same value wrapped, such as in an object or a parser's state, each also built by hand and passed straight to the method that reads it; each other way the same input can be written, such as its parts in another order or a spelling the project's docs or tests use, including any the parser might reject before the new check runs; an error the requirement names, matched by its exact words, not a generic error; two of something the requirement allows only once; the new form beside the existing form of the same thing in one call, where one applies and the other must not; each place in the code that records the event the requirement is about or changes that state, such as a demotion, a close or a removal, found by searching the code, not only the call the request names;"
+    };
+}
+
 /// What a run that can start a helper is told first after the sentences: a
 /// helper that has not seen the work reads the request afresh, where the
 /// run itself tends to check only the paths it built, with its own code. Its
 /// table, a row per numbered requirement and case, is what `unchecked`
 /// holds the run to afterwards: a helper asked only for what fails samples
 /// cases, and files the ones it is unsure of as asides.
-const REVIEW: &str = "First ask a helper that hasn't seen your work: with the agent tool, start a helper of type `review`, not general, and wait for its report. Give it the request word for word, the numbered requirements above, the files you changed or made and each case you chose not to handle, with why. Ask it to change no file, to work out each value it checks with code of its own, not your scripts or helpers, and to end its report with a table of one row per requirement and case, written `R1 | case | PASS` or `R1 | case | FAIL | command that shows it`, with a row for each of these cases that applies: a field, argument or part the requirement names left out, undefined or empty; a plain value as well as the same value wrapped, such as in an object or a parser's state, each also built by hand and passed straight to the method that reads it; each other way the same input can be written, such as its parts in another order or a spelling the project's docs or tests use, including any the parser might reject before the new check runs; an error the requirement names, matched by its exact words, not a generic error; two of something the requirement allows only once; the new form beside the existing form of the same thing in one call, where one applies and the other must not; each place in the code that records the event the requirement is about or changes that state, such as a demotion, a close or a removal, found by searching the code, not only the call the request names; and each case you chose not to handle, which fails when the request's words say what should happen in it, quoted in the row, whatever the reason it was set aside. Judge each row by what the request says should happen, not by what the code now does. Fix every row that fails by changing the work, not the case, and any case it calls unclear or sets aside, unless the request rules that case out.";
+const REVIEW: &str = concat!(
+    "First ask a helper that hasn't seen your work: with the agent tool, start a helper of type `review`, not general, and wait for its report. Give it the request word for word, the numbered requirements above, the files you changed or made and each case you chose not to handle, with why. Ask it to change no file, to work out each value it checks with code of its own, not your scripts or helpers, and to end its report with a table of one row per requirement and case, written `R1 | case | PASS` or `R1 | case | FAIL | command that shows it`, with a row for each of these cases that applies: ",
+    cases!(),
+    " and each case you chose not to handle, which fails when the request's words say what should happen in it, quoted in the row, whatever the reason it was set aside. Judge each row by what the request says should happen, not by what the code now does. Fix every row that fails by changing the work, not the case, and any case it calls unclear or sets aside, unless the request rules that case out."
+);
 
 /// The least time a run with a deadline needs left to be asked for the
 /// review: the helper takes a few minutes, and the run about as long again
@@ -297,6 +310,87 @@ pub(crate) fn notice(sentences: &[String], review: bool, outputs: &[String]) -> 
     } else {
         CHECK_OUTPUT
     });
+    text
+}
+
+/// Requirements one review helper is given rows for: past about this many a
+/// helper's rounds end before its table does, so a longer list is shared
+/// between helpers that run side by side.
+const PER_REVIEW: usize = 10;
+
+/// The most review helpers started for one run.
+const REVIEWS: usize = 4;
+
+/// The rows of `count` numbered requirements each review helper is given,
+/// first and last, shared as evenly as `PER_REVIEW` and `REVIEWS` allow.
+pub(crate) fn shares(count: usize) -> Vec<(usize, usize)> {
+    let count = count.min(LISTED);
+    let helpers = count.div_ceil(PER_REVIEW).clamp(1, REVIEWS);
+    let (each, over) = (count / helpers, count % helpers);
+    let mut first = 1;
+    (0..helpers)
+        .map(|at| {
+            let last = first + each + usize::from(at < over) - 1;
+            let share = (first, last);
+            first = last + 1;
+            share
+        })
+        .collect()
+}
+
+/// The task of a review helper the run is given, checking rows `share` of
+/// `sentences`, the requirements `request` states. It is told what the run
+/// would leave out: the request word for word, how to find the change, and
+/// each case its table has a row for; and not the run's reasons for what it
+/// left out, which a reviewer tends to agree with.
+pub(crate) fn brief(request: &str, sentences: &[String], share: (usize, usize)) -> String {
+    let mut text = String::from(
+        "Review a change you have not seen, made to the project in your working folder, \
+         against the request below. Its author's reasons are not given, so judge it by the \
+         request's words alone. See the change with `git status --short` and `git diff`, \
+         new files included. Change no file, and work out each value you check with code of \
+         your own, not the change's scripts or helpers.\n\nThe request, word for word:\n",
+    );
+    text.push_str(request.trim());
+    text.push_str("\n\nThe requirements it states, numbered:");
+    for (at, sentence) in sentences.iter().take(LISTED).enumerate() {
+        text.push_str(&format!("\n- R{}: {sentence}", at + 1));
+    }
+    let (first, last) = share;
+    let whole = first == 1 && last >= sentences.len().min(LISTED);
+    let rows = match whole {
+        true => "each requirement".to_owned(),
+        false => format!("R{first} to R{last}; other helpers check the rest"),
+    };
+    text.push_str(&format!(
+        "\n\nCheck {rows}. End your report with a table of one row per requirement and \
+         case, written `R{first} | case | PASS` or `R{first} | case | FAIL | command that \
+         shows it`, with a row for each of these cases that applies: {} and each case the \
+         change leaves out or handles more narrowly than the request's words, which fails \
+         when those words say what should happen in it, quoted in the row.",
+        cases!()
+    ));
+    text
+}
+
+/// What the run is told when helpers that have not seen its work reviewed it
+/// for the run: the numbered requirements, as `notice` lists them, the
+/// helpers' `reports` with their tables, and the check to make after.
+pub(crate) fn reviewed(sentences: &[String], reports: &[String]) -> String {
+    let mut text = notice(sentences, false, &[]);
+    let at = text.find(CHECK).unwrap_or(text.len());
+    text.truncate(at);
+    text.push_str(
+        "Helpers that haven't seen your work reviewed it against the request; their reports \
+         follow, each ending with a table of its rows. Fix every row that fails by changing \
+         the work, not the case, and any case a report calls unclear or sets aside, unless \
+         the request rules that case out.",
+    );
+    for report in reports {
+        text.push_str(&format!("\n\n{}", report.trim()));
+    }
+    text.push_str("\n\n");
+    text.push_str(CHECK);
     text
 }
 
@@ -975,6 +1069,56 @@ mod tests {
         assert_eq!(found, [(1, true), (2, false), (3, false), (4, true)]);
         assert!(tabled(report));
         assert!(!tabled("Every behaviour holds. Verdict: right."));
+    }
+
+    #[test]
+    fn a_long_list_is_shared_between_review_helpers() {
+        assert_eq!(shares(5), [(1, 5)]);
+        assert_eq!(shares(10), [(1, 10)]);
+        assert_eq!(shares(11), [(1, 6), (7, 11)]);
+        // Kombu's 37 go to four helpers, and no more than four start.
+        assert_eq!(shares(37), [(1, 10), (11, 19), (20, 28), (29, 37)]);
+        assert_eq!(shares(LISTED + 10).len(), REVIEWS);
+        assert_eq!(shares(LISTED + 10).last(), Some(&(31, LISTED)));
+    }
+
+    #[test]
+    fn a_review_brief_holds_the_request_and_the_cases_but_no_reasons() {
+        let request = "Add `parse_range`. Ranges must be written as `a..b`.";
+        let rules: Vec<String> = ["Ranges must be written as `a..b`.", "Open ranges default."]
+            .map(String::from)
+            .into();
+        let whole = brief(request, &rules, (1, 2));
+        assert!(
+            whole.contains(&format!("word for word:\n{request}\n")),
+            "{whole}"
+        );
+        assert!(whole.contains("\n- R1: Ranges must be written as `a..b`.\n- R2: Open ranges"));
+        assert!(whole.contains("Check each requirement. "), "{whole}");
+        assert!(whole.contains(cases!()));
+        assert!(whole.contains("git diff"));
+        assert!(!whole.contains("with why"));
+        let part = brief(request, &rules, (2, 2));
+        assert!(
+            part.contains("Check R2 to R2; other helpers check the rest."),
+            "{part}"
+        );
+        assert!(part.contains("written `R2 | case | PASS`"), "{part}");
+    }
+
+    #[test]
+    fn the_reviews_started_for_a_run_come_in_its_notice() {
+        let rules: Vec<String> = ["Dates must parse.", "Times must parse."]
+            .map(String::from)
+            .into();
+        let reports = ["review-r1 finished: 3 rounds.\nR1 | iso | PASS\nR2 | utc | FAIL | t.sh"];
+        let text = reviewed(&rules, &reports.map(String::from));
+        assert!(text.starts_with(&notice(&rules, false, &[])[..60]));
+        assert_eq!(listed(&text), Some(2));
+        assert!(text.contains("Helpers that haven't seen your work reviewed it"));
+        assert!(text.contains("\n\nreview-r1 finished: 3 rounds.\nR1 | iso | PASS\n"));
+        assert!(text.ends_with(CHECK) && !text.contains(REVIEW));
+        assert_eq!(rows(&text).len(), 2);
     }
 
     #[test]

@@ -104,6 +104,10 @@ const ANNOUNCEMENT_CHARS: usize = 400;
 const WRAP_UP: &str = "You have reached the tool-round limit. Summarize what is done and \
     what remains, then stop.";
 
+/// The notice in its place once the turn's time is up.
+const TIME_UP: &str = "Your time for this task is up. Give your answer now, in the form the \
+    task asks for, from what you have found.";
+
 /// The answer a call gets when the turn is stopped while it runs; the front
 /// end that stopped it records it before `Turn::stop`. The call may have
 /// done part of its work, so the model is told to look first.
@@ -294,6 +298,9 @@ pub struct Turn {
     /// The settings turn parallel tool calls off, so no batch holds more
     /// than one.
     one_at_a_time: bool,
+    /// Its time is up, so the next round asks for the wrap-up as the round
+    /// cap does.
+    timed_out: bool,
 }
 
 impl Turn {
@@ -327,7 +334,13 @@ impl Turn {
             progress_notes: 0,
             noted_round: 0,
             one_at_a_time: !crate::store::parallel_tool_calls(),
+            timed_out: false,
         }
+    }
+
+    /// Ends the turn as the round cap does, at its next round: its time is up.
+    pub fn time_up(&mut self) {
+        self.timed_out = true;
     }
 
     /// The same turn, ended by a call it keeps repeating whatever its
@@ -600,17 +613,20 @@ impl Turn {
         self.order = calls.iter().map(|call| call.id.clone()).collect();
         self.queue = calls.into();
         self.results.clear();
-        if self.rounds >= self.limit {
-            let why = format!(
-                "Not run: the tool-round limit ({}) was reached.",
-                self.limit
-            );
+        if self.rounds >= self.limit || self.timed_out {
+            let why = match self.timed_out {
+                true => "Not run: the time for this task is up.".to_owned(),
+                false => format!(
+                    "Not run: the tool-round limit ({}) was reached.",
+                    self.limit
+                ),
+            };
             while !self.queue.is_empty() {
                 self.finish_call(Err(why.clone()));
             }
             self.results.push(Message {
                 role: "user".into(),
-                content: WRAP_UP.into(),
+                content: (if self.timed_out { TIME_UP } else { WRAP_UP }).into(),
                 notice: true,
                 // It ends the turn it is in, as a nudge goes on with one.
                 folded: true,
@@ -630,11 +646,12 @@ impl Turn {
 
     /// What to tell the user when the turn stopped at its round cap.
     pub fn capped(&self) -> Option<String> {
-        self.connection.wrap_up.then(|| {
-            format!(
+        self.connection.wrap_up.then(|| match self.timed_out {
+            true => "Stopped when its time was up.".to_owned(),
+            false => format!(
                 "Stopped after {} rounds; send \"continue\" to keep going.",
                 self.limit
-            )
+            ),
         })
     }
 
@@ -1572,6 +1589,31 @@ mod tests {
         );
         // An empty batch ends the turn rather than looping on nothing.
         assert!(!self::turn().begin(Vec::new()));
+    }
+
+    #[test]
+    fn a_turn_whose_time_is_up_asks_for_its_answer_as_at_the_round_cap() {
+        let mut turn = turn();
+        assert!(turn.begin(vec![call("read_file")]));
+        turn.finish_call(Ok("contents".into()));
+        turn.take_results();
+        // Well short of the round cap, its next calls are answered as not
+        // run and a notice after them asks for its answer.
+        turn.time_up();
+        assert!(turn.begin(vec![call("read_file")]));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Ask);
+        let sent = turn.take_results();
+        assert_eq!(sent[0].content, "Not run: the time for this task is up.");
+        assert_eq!(sent[1].content, TIME_UP);
+        assert!(turn.connection.wrap_up);
+        let mut answer = answer(&mut turn, "R1 | a | PASS");
+        answer.tool_calls = vec![call("read_file")];
+        assert!(matches!(turn.continuation(&mut answer), Ok(None)));
+        assert!(!turn.begin(answer.tool_calls));
+        assert_eq!(
+            turn.capped().as_deref(),
+            Some("Stopped when its time was up.")
+        );
     }
 
     #[test]
