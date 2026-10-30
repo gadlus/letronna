@@ -3004,7 +3004,7 @@ impl Chat {
 
     /// Reads the rules files again where either changed since last time,
     /// which the terminal may have done, and shows a new error in them once.
-    fn read_rules(&mut self) {
+    pub(crate) fn read_rules(&mut self) {
         let user = letronna_core::permissions::user_file();
         let workspace = self.call_context().workspace;
         let project = workspace

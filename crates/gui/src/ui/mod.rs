@@ -27,6 +27,7 @@ pub(crate) mod on_device;
 pub(crate) mod pace;
 pub(crate) mod palette;
 pub(crate) mod panel;
+pub(crate) mod permissions;
 pub(crate) mod phone;
 pub(crate) mod pictures;
 pub(crate) mod plugin_page;

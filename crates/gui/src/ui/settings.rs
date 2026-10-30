@@ -25,6 +25,7 @@ pub(crate) const PAGES: &[(&str, AppIcon)] = &[
     ("Thinking", AppIcon::Sparkles),
     ("Memory", AppIcon::FileText),
     ("Privacy", AppIcon::Shield),
+    ("Permissions", AppIcon::Checklist),
     ("Wallet", AppIcon::Wallet),
     ("Shortcuts", AppIcon::Keyboard),
     ("Plugins", AppIcon::Puzzle),
@@ -792,6 +793,9 @@ impl Chat {
         if *self.settings_page.read(cx) == "Wallet" {
             self.read_wallet(false, cx);
         }
+        if *self.settings_page.read(cx) == "Permissions" {
+            self.read_rules();
+        }
         // Memory may have been written since, by the model or by hand.
         let on_screen = self.store.conversations.get(self.store.active);
         let workspace = on_screen.and_then(|conversation| conversation.workspace.clone());
@@ -1103,6 +1107,7 @@ impl Chat {
             )
             .into_any_element(),
             "Thinking" => thinking_page(&chat, &self.store, window, cx).into_any_element(),
+            "Permissions" => self.permissions_page(cx).into_any_element(),
             "Shortcuts" => shortcuts_page(&hotkey, &chat, cx).into_any_element(),
             "Plugins" => plugins_page(
                 self.gateway_rows(),
@@ -1286,6 +1291,13 @@ fn show_page(name: &'static str, page: &Entity<&'static str>, chat: &Entity<Chat
     // The terminal may have changed the wallet since this last looked.
     if name == "Wallet" {
         chat.update(cx, |this, cx| this.read_wallet(false, cx));
+    }
+    // Or the rules, with its own /permissions.
+    if name == "Permissions" {
+        chat.update(cx, |this, cx| {
+            this.read_rules();
+            cx.notify();
+        });
     }
 }
 
