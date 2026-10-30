@@ -207,6 +207,9 @@ pub fn summary(
         Instant::now(),
         |earlier, transcript| {
             compact();
+            // A PreCompact hook may keep the model from being asked; then a
+            // digest stands in, as when the model cannot make a summary.
+            crate::hooks::compacting(connection, "auto")?;
             // What asking took is told whatever came of it.
             let reply = ask(connection, earlier, transcript).map(|(text, paid)| {
                 spent(paid);
@@ -511,6 +514,7 @@ impl Making<'_> {
     /// `window` tokens.
     pub(crate) fn make(self, connection: &Connection, window: usize) {
         self.make_in(cache(), INPUT_TOKENS.max(window), |earlier, transcript| {
+            crate::hooks::compacting(connection, "auto")?;
             ask(connection, earlier, transcript)
         });
     }

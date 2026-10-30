@@ -1,6 +1,7 @@
 //! The user's own commands, run at points in a session: before and after a
 //! tool call, after one that failed, when the model or a helper has
-//! finished its turn, and when a card waits for the user.
+//! finished its turn, before a session is summarized, and when a card waits
+//! for the user.
 //!
 //! `hooks.json` in the data folder takes the shape Claude Code's settings
 //! give hooks, so a script written for it carries over: the JSON it reads on
@@ -140,6 +141,8 @@ pub enum Event {
     Stop,
     /// A helper has finished; a hook may send it back to work.
     SubagentStop,
+    /// The session is about to be summarized; a hook may keep it whole.
+    PreCompact,
     /// A card waits for the user.
     Notification,
 }
@@ -151,19 +154,19 @@ const KNOWN_ELSEWHERE: &[&str] = &[
     "SessionStart",
     "SessionEnd",
     "UserPromptSubmit",
-    "PreCompact",
     "PostCompact",
     "SubagentStart",
     "PermissionRequest",
 ];
 
 impl Event {
-    const ALL: [Event; 6] = [
+    const ALL: [Event; 7] = [
         Self::PreToolUse,
         Self::PostToolUse,
         Self::PostToolUseFailure,
         Self::Stop,
         Self::SubagentStop,
+        Self::PreCompact,
         Self::Notification,
     ];
 
@@ -175,6 +178,7 @@ impl Event {
             Self::PostToolUseFailure => "PostToolUseFailure",
             Self::Stop => "Stop",
             Self::SubagentStop => "SubagentStop",
+            Self::PreCompact => "PreCompact",
             Self::Notification => "Notification",
         }
     }
@@ -748,6 +752,39 @@ fn helper_stopped(
     Some(format!("{FEEDBACK}\n{why}"))
 }
 
+/// Runs the PreCompact hooks before the session on `connection` is
+/// summarized, `trigger` saying how: "manual" for the user's /compact,
+/// "auto" for the turns its window drops. `Err` with the reason when one
+/// blocks the summary.
+pub(crate) fn compacting(
+    connection: &crate::chat::Connection,
+    trigger: &str,
+) -> Result<(), String> {
+    // Read now if never read, since a summary can come before any turn.
+    let hooks = current();
+    let Ok(hooks) = hooks.as_ref() else {
+        return Ok(());
+    };
+    if !hooks.has(Event::PreCompact) {
+        return Ok(());
+    }
+    summarizing(hooks, &ToolContext::of(connection), trigger)
+}
+
+/// `compacting`, with the hooks and the session's context handed in.
+fn summarizing(hooks: &Hooks, ctx: &ToolContext, trigger: &str) -> Result<(), String> {
+    // Letronna's /compact takes no instructions of the user's.
+    let own = json!({ "trigger": trigger, "custom_instructions": null });
+    let input = input(Event::PreCompact, ctx, own);
+    let heard = hear(hooks, Event::PreCompact, trigger, &input, ctx);
+    report(heard.problems);
+    // `continue: false` means nothing here, as in Claude Code.
+    match heard.blocks.into_iter().next() {
+        Some(why) => Err(why),
+        None => Ok(()),
+    }
+}
+
 /// Runs the Notification hooks for the card a call of `tool` puts up, on a
 /// thread of their own, since nothing waits on them; their failures are
 /// kept for `problems`.
@@ -911,9 +948,9 @@ struct Heard {
 }
 
 /// Runs the hooks set for `event` whose matcher fits `subject`, one after
-/// another. A PreToolUse, Stop or SubagentStop hook's block or end is the
-/// answer, so the rest do not run; the others run whatever an earlier one
-/// said, as a formatter after a linter should.
+/// another. A PreToolUse, Stop, SubagentStop or PreCompact hook's block or
+/// end is the answer, so the rest do not run; the others run whatever an
+/// earlier one said, as a formatter after a linter should.
 fn hear(hooks: &Hooks, event: Event, subject: &str, input: &Value, ctx: &ToolContext) -> Heard {
     let mut heard = Heard::default();
     let input = input.to_string();
@@ -925,7 +962,10 @@ fn hear(hooks: &Hooks, event: Event, subject: &str, input: &Value, ctx: &ToolCon
     let fitting = groups
         .iter()
         .filter(|group| event == Event::Stop || group.matcher.fits(subject));
-    let decisive = matches!(event, Event::PreToolUse | Event::Stop | Event::SubagentStop);
+    let decisive = matches!(
+        event,
+        Event::PreToolUse | Event::Stop | Event::SubagentStop | Event::PreCompact
+    );
     for hook in fitting.flat_map(|group| &group.hooks) {
         // The user's own stop is no failure to tell them of; `tools::run`
         // keeps a call stopped here from running.
@@ -1932,6 +1972,37 @@ mod tests {
         // Held to the helper's type, unlike a Stop hook.
         let other = helper_stopped(&hooks, &ctx, 5, "review", &transcript, "Done.", false);
         assert_eq!(other, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pre_compact_hook_hears_how_and_can_keep_the_session_whole() {
+        let dir = scratch("compact");
+        let seen = dir.join("input.json");
+        let command = script(&dir, "compact.sh", &format!("cat > '{}'", seen.display()));
+        let ctx = ToolContext::default();
+        let file = json!({ "hooks": { "PreCompact": [
+            { "matcher": "manual", "hooks": [{ "type": "command", "command": command }] },
+            { "matcher": "auto", "hooks": [
+                { "type": "command", "command": "sh -c 'echo keep it all >&2; exit 2'" },
+            ] },
+        ] } });
+        let hooks = parse(&file.to_string()).unwrap();
+        assert_eq!(summarizing(&hooks, &ctx, "manual"), Ok(()));
+        let input: Value = serde_json::from_slice(&std::fs::read(&seen).unwrap()).unwrap();
+        assert_eq!(input["hook_event_name"], "PreCompact");
+        assert_eq!(input["trigger"], "manual");
+        assert!(input["custom_instructions"].is_null());
+        assert_eq!(
+            summarizing(&hooks, &ctx, "auto"),
+            Err("keep it all".to_owned())
+        );
+        let json = r#"echo '{"decision": "block", "reason": "backing up first"}'"#;
+        let blocks = one("PreCompact", &script(&dir, "block.sh", json), None);
+        assert_eq!(
+            summarizing(&blocks, &ctx, "manual"),
+            Err("backing up first".to_owned())
+        );
     }
 
     #[test]

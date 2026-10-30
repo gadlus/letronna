@@ -4553,6 +4553,8 @@ pub fn compact(
     if end <= start {
         return Err("Nothing to summarize: the turns before it are summarized already.".into());
     }
+    crate::hooks::compacting(connection, "manual")
+        .map_err(|why| format!("A PreCompact hook kept every turn as it was: {why}"))?;
     let sums = token_sums(messages, budget.tool_chars, Some(connection));
     let fixed = fixed_tokens(connection);
     // A summary goes out only when the window leaves something out, and
