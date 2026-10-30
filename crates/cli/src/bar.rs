@@ -157,6 +157,8 @@ pub const COMMANDS: &[Command<'static>] = &[
     Command {
         name: "/format",
         blurb: "run this project's own formatter on each file written, or not",
+        name: "/lsp",
+        blurb: "check this project's edits with the language servers installed here",
     },
     Command {
         name: "/retention",

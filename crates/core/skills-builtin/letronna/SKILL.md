@@ -74,6 +74,9 @@ Then `letronna mcp list`, `get <name>`, `remove <name>`, and `login <name>` or `
 - /help lists them all, /new or /clear starts a fresh session (ctrl+l clears the screen), /exit leaves.
 - Model: /model (also image, speech or video models, and `/model side` for a cheaper one for summaries), /fallback (models to carry on with when one fails), /connect, /effort, /thinking, /style (reply styles).
 - Asking first: /mode, /plan, /decisions (what auto mode's judge did), /verify (build or test after edits), /format (its formatter after edits).
+- /help lists them all, /new or /clear starts a fresh session (ctrl+l clears the screen), /exit leaves.
+- Model: /model (also image, speech or video models, and `/model side` for a cheaper one for summaries), /fallback (models to carry on with when one fails), /connect, /effort, /thinking, /style (reply styles).
+- Asking first: /mode, /plan, /decisions (what auto mode's judge did), /verify (build or test after edits).
 - Account: /login, /logout, /whoami, /team (bill hosted models to a team).
 - Web and voice: /search (lets the model search the web; /search services sets up one of the user's own), /voice (read replies aloud), /notify (say when a reply ends or needs the user).
 - Sessions: /resume, /branch (a copy), /rename, /rewind, /undo (any message), /redo, /retry, /compact (sum up old turns), /context, /diff, /where, /status, /export, /import (Claude Code, Codex), /btw (an aside, not kept), /copy, /image <path>, /preview <path>, /usage, /insights.
@@ -94,6 +97,7 @@ Then `letronna mcp list`, `get <name>`, `remove <name>`, and `login <name>` or `
 - Keeping and adding: /remember (keep something now, or change when this chat saves), /memory (`/memory edit, log or restore user|memory|project|soul`), /memory-review, /retention (delete old sessions), /init (write AGENTS.md), /skills, /mcp, /plugins, /tool-search.
 - Cloud: just ask in chat to run or host something (a bot 24/7), check it or take it down.
 - Keeping and adding: /remember (keep something now, or change when this chat saves), /memory (`/memory edit, log or restore user|memory|project|soul`), /memory-review, /retention (delete old sessions), /init (write AGENTS.md), /skills, /mcp, /plugins, /tools, /tool-search.
+- Keeping and adding: /remember (keep something now, or change when this chat saves), /memory (`/memory edit, log or restore user|memory|project|soul`), /memory-review, /retention (delete old sessions), /init (write AGENTS.md), /skills, /mcp, /plugins, /tool-search, /lsp (language servers check edits).
 
 ## The window
 

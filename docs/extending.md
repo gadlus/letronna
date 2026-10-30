@@ -51,7 +51,7 @@ All of these files live in the [data folder](data-and-privacy.md). A project can
 }
 ```
 
-Each server runs only for the projects listed. Most language servers execute project code (build scripts, compilers), so list only projects you would build yourself. A server shuts down after ten minutes idle.
+Each server runs only for the projects listed. Most language servers execute project code (build scripts, compilers), so list only projects you would build yourself. A server shuts down after ten minutes idle. `/lsp` in the terminal, or Check edits with language servers under Settings › Thinking in the window, finds the servers installed for the project you are in (rust-analyzer, typescript-language-server, pyright, basedpyright or pylsp, gopls, clangd), shows them, and writes them here for that project.
 
 ## Formatting after edits
 

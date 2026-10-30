@@ -564,6 +564,9 @@ pub(crate) struct Chat {
     /// The session last on screen when a recap was thought of, so one is
     /// offered once per opening rather than on every frame.
     recap_for: u64,
+    /// While Settings is open, the project on screen and the language
+    /// servers found for it, None until the look comes back.
+    pub(crate) servers_found: Option<(PathBuf, Option<Vec<letronna_core::lsp::Available>>)>,
     /// The Files tab's tree and preview.
     pub(crate) files: crate::ui::files::Files,
     /// The Jobs tab's choice of job, its output and the Run line.
@@ -1201,6 +1204,7 @@ impl Chat {
             browser: cx.new(|cx| crate::ui::browser::BrowserView::new(window, cx)),
             browser_for: 0,
             recap_for: 0,
+            servers_found: None,
             files: crate::ui::files::Files::new(cx),
             jobs: crate::ui::jobs::Jobs::new(window, cx),
             drafts: std::collections::HashMap::new(),
@@ -4857,6 +4861,8 @@ impl Render for Chat {
         }
         // And a session left a while is recapped as it opens.
         self.recap_on_opening(cx);
+        // And Settings says which language servers its project could use.
+        self.look_for_servers(cx);
         // And the composer holds its draft, however the session was switched
         // to: a click, or a message from a chat app.
         self.swap_draft(window, cx);

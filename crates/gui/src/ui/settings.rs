@@ -41,6 +41,41 @@ pub(crate) const PAGES: &[(&str, AppIcon)] = &[
 pub(crate) const TOASTS_TOP: Pixels = px(88.);
 
 impl Chat {
+    /// While Settings is open, look once, off the UI thread, for the
+    /// language servers the project on screen could be checked with; with
+    /// it closed, forget them, so opening it again looks again.
+    pub(crate) fn look_for_servers(&mut self, cx: &mut Context<Self>) {
+        let root = (self.store.conversations.get(self.store.active))
+            .and_then(|conversation| conversation.workspace.clone());
+        let Some(root) = root.filter(|_| self.settings_open) else {
+            self.servers_found = None;
+            return;
+        };
+        if self
+            .servers_found
+            .as_ref()
+            .is_some_and(|(looked, _)| *looked == root)
+        {
+            return;
+        }
+        self.servers_found = Some((root.clone(), None));
+        let looking = root.clone();
+        let found =
+            (cx.background_executor()).spawn(async move { letronna_core::lsp::found(&looking) });
+        cx.spawn(async move |this, cx| {
+            let found = found.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some((looked, slot)) = this.servers_found.as_mut()
+                    && *looked == root
+                {
+                    *slot = Some(found);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Draw the window's text a step larger or smaller by `by`, or at its
     /// usual size with `None`, and keep it so.
     pub(crate) fn step_text(
@@ -1132,7 +1167,8 @@ impl Chat {
                 cx,
             )
             .into_any_element(),
-            "Thinking" => thinking_page(&chat, &self.store, window, cx).into_any_element(),
+            "Thinking" => thinking_page(&chat, &self.store, self.servers_found.as_ref(), window, cx)
+                .into_any_element(),
             "Permissions" => self.permissions_page(cx).into_any_element(),
             "Shortcuts" => shortcuts_page(&hotkey, &chat, cx).into_any_element(),
             "Plugins" => plugins_page(
@@ -2326,7 +2362,13 @@ fn naming_section(
 /// gateway's model list, or low, medium and high when the list does not say.
 /// The one marked is what the next request sends, which for a level picked on
 /// another model is the nearest this one offers.
-fn thinking_page(chat: &Entity<Chat>, store: &Store, window: &mut Window, cx: &mut App) -> Div {
+fn thinking_page(
+    chat: &Entity<Chat>,
+    store: &Store,
+    servers: Option<&Found>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Div {
     let settings = &store.settings;
     let (gateway, model) = store.model(store.active);
     let endpoint = base_url(gateway, &settings.custom_endpoint);
@@ -2483,6 +2525,7 @@ fn thinking_page(chat: &Entity<Chat>, store: &Store, window: &mut Window, cx: &m
         .child(voice)
         .child(verify)
         .children(format_row(store, chat, cx))
+        .children(lsp_row(store, servers, chat, cx))
 }
 
 /// The switch that runs the project's own formatter on each file Letronna
@@ -2516,6 +2559,70 @@ fn format_row(store: &Store, chat: &Entity<Chat>, cx: &App) -> Option<Div> {
         cx,
         std::rc::Rc::new(move |this: &mut Chat| {
             if let Err(error) = letronna_core::formatter::switch(&root, !on) {
+                this.error = Some(error);
+            }
+        }),
+    );
+    Some(
+        v_flex().gap_1().child(row).child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(here),
+        ),
+    )
+}
+
+/// The project Settings looked for language servers in, and what it found
+/// there once the look is back.
+type Found = (PathBuf, Option<Vec<letronna_core::lsp::Available>>);
+
+/// The switch that has language servers check the edits in the project of
+/// the session on screen, with what checks it or what was found for it;
+/// none for a session with no project folder.
+fn lsp_row(store: &Store, servers: Option<&Found>, chat: &Entity<Chat>, cx: &App) -> Option<Div> {
+    let root = store.conversations.get(store.active)?.workspace.clone()?;
+    let serving = letronna_core::lsp::serving(&root);
+    let on = !serving.is_empty();
+    let found = servers
+        .filter(|(looked, _)| *looked == root)
+        .and_then(|(_, found)| found.clone());
+    let name = root.file_name().map_or_else(
+        || root.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let here = match &found {
+        _ if on => format!("In {name}: checked by {}.", serving.join(", ")),
+        None => format!("Looking for language servers for {name}…"),
+        Some(found) if found.is_empty() => format!(
+            "No language server for {name}'s languages is installed: rust-analyzer, \
+             typescript-language-server, pyright, pylsp, gopls or clangd."
+        ),
+        Some(found) => {
+            let named: Vec<String> = (found.iter())
+                .map(|server| format!("{} for {}", server.name, server.language))
+                .collect();
+            format!("In {name}, this starts {}.", named.join(", "))
+        }
+    };
+    let row = toggle_row(
+        "lsp-check",
+        "Check edits with language servers",
+        "Errors an edit brings in are told to the model before its next step. A server runs \
+         the project's own code as it checks it, so only turn this on where you would build.",
+        on,
+        chat,
+        cx,
+        std::rc::Rc::new(move |this: &mut Chat| {
+            let done = match &found {
+                _ if on => letronna_core::lsp::turn_off(&root),
+                Some(found) if !found.is_empty() => letronna_core::lsp::set_up(&root, found),
+                Some(_) => {
+                    Err("No language server for this project's languages is installed.".into())
+                }
+                None => Err("Still looking for this project's language servers.".into()),
+            };
+            if let Err(error) = done {
                 this.error = Some(error);
             }
         }),

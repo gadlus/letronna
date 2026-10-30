@@ -359,6 +359,10 @@ pub fn command(
             format_edits(here, rest);
             Flow::Handled
         }
+        "/lsp" => {
+            language_servers(runner, here, rest);
+            Flow::Handled
+        }
         "/memory-review" => {
             let Some(on) = switched("/memory-review", rest, runner.store.settings.memory_review)
             else {
@@ -2170,6 +2174,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "/tools",
             "/search",
             "/tool-search",
+            "/lsp",
             "/skills",
             "/mcp",
             "/plugins",
@@ -2335,6 +2340,84 @@ fn format_edits(here: Option<&std::path::Path>, rest: &str) {
             found.join(", ")
         )
     }));
+}
+
+/// Check the edits in the project `here` with the language servers this
+/// computer has for its languages, or stop: `/lsp` says what checks it, or
+/// what was found and asks before writing that into lsp.json; `/lsp on`
+/// writes it without asking, and `/lsp off` takes the project off every
+/// server.
+fn language_servers(runner: &mut Runner, here: Option<&std::path::Path>, rest: &str) {
+    use letronna_core::lsp;
+    render::blank();
+    let Some(root) = here else {
+        render::line(&render::dim("This session has no project folder to check."));
+        return;
+    };
+    let serving = lsp::serving(root);
+    let ask = match rest.trim() {
+        "off" => {
+            match lsp::turn_off(root) {
+                Err(error) => render::line(&render::red(&error)),
+                Ok(()) if serving.is_empty() => {
+                    render::line(&render::dim("No language server checks this project."));
+                }
+                Ok(()) => render::line(&render::dim(
+                    "Edits here are no longer checked by a language server.",
+                )),
+            }
+            return;
+        }
+        "" if !serving.is_empty() => {
+            render::line(&render::dim(&format!(
+                "Edits here are checked by {}; /lsp off stops it.",
+                serving.join(", ")
+            )));
+            return;
+        }
+        "" => true,
+        "on" => false,
+        _ => {
+            render::line(&render::dim(
+                "/lsp looks for language servers to check this project's edits; /lsp on or /lsp off.",
+            ));
+            return;
+        }
+    };
+    let found = lsp::found(root);
+    if found.is_empty() {
+        render::line(&render::dim(
+            "No language server for this project's languages is on PATH: rust-analyzer for Rust, \
+             typescript-language-server for TypeScript and JavaScript, pyright, basedpyright or \
+             pylsp for Python, gopls for Go, clangd for C and C++.",
+        ));
+        return;
+    }
+    for server in &found {
+        render::line(&format!(
+            "{} for {}  {}",
+            server.name,
+            server.language,
+            render::dim(&server.command.display().to_string())
+        ));
+    }
+    render::line(&render::dim(
+        "A server runs this project's own code as it checks it, such as build scripts.",
+    ));
+    if ask {
+        let options = ["Check edits here with them", "Not now"];
+        if runner.bar.pick_from("Turn them on?", Vec::new(), &options) != Some(0) {
+            render::line(&render::dim("Left as it was."));
+            return;
+        }
+    }
+    match lsp::set_up(root, &found) {
+        Ok(()) => render::line(&render::dim(
+            "On: errors an edit brings in are told to the model before its next step; \
+             /lsp off stops it.",
+        )),
+        Err(error) => render::line(&render::red(&error)),
+    }
 }
 
 /// Turn reading replies aloud on or off.
