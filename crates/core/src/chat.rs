@@ -3947,7 +3947,8 @@ pub fn data_dir() -> std::path::PathBuf {
 }
 
 /// The folder a session with no project folder works in, `Letronna` in the
-/// home folder, which its first write or command makes.
+/// home folder or `Letronna Sessions` where that is a git checkout, which its
+/// first write or command makes.
 #[cfg(not(test))]
 pub fn fallback_folder() -> Option<PathBuf> {
     // None without a home folder, or where `fallback_in` refuses it.
@@ -3967,11 +3968,20 @@ pub fn fallback_folder() -> Option<PathBuf> {
 fn fallback_in(home: &std::path::Path, data: &std::path::Path) -> Option<PathBuf> {
     // Not where the two would hold one another, as `AGENT_DATA_DIR` can make
     // them, since the keys there stay out of reach; nor where a git checkout
-    // is there already, which is someone's project, as a clone of Letronna's
-    // own source at `~/letronna` is on a disk that ignores case.
+    // is there already, which is someone's project.
+    let apart = |folder: &PathBuf| !folder.starts_with(data) && !data.starts_with(folder);
     let folder = home.join("Letronna");
-    let apart = !folder.starts_with(data) && !data.starts_with(&folder);
-    (apart && !folder.join(".git").exists()).then_some(folder)
+    if !apart(&folder) {
+        return None;
+    }
+    if !folder.join(".git").exists() {
+        return Some(folder);
+    }
+    // A clone of Letronna's own source at `~/letronna` is such a checkout on
+    // a disk that ignores case, and would leave every session with no project
+    // nowhere to work, so the folder beside it stands in, under the same rules.
+    let beside = home.join("Letronna Sessions");
+    (apart(&beside) && !beside.join(".git").exists()).then_some(beside)
 }
 
 /// Point `data_dir` at `dir` from now on, or back at `base_dir` for `None`.
@@ -15624,6 +15634,21 @@ mod tests {
             assert_eq!(fallback_in(&home, &data), None, "{}", data.display());
         }
         std::fs::create_dir_all(home.join("Letronna/.git")).unwrap();
+        assert_ne!(fallback_in(&home, &data), Some(home.join("Letronna")));
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn a_git_checkout_at_the_fallback_moves_it_beside() {
+        let home = empty_data_dir("fallback-beside");
+        let data = home.join("Library/Application Support/Letronna");
+        let beside = home.join("Letronna Sessions");
+        std::fs::create_dir_all(home.join("Letronna/.git")).unwrap();
+        assert_eq!(fallback_in(&home, &data), Some(beside.clone()));
+        for data in [beside.clone(), beside.join("data"), home.clone()] {
+            assert_eq!(fallback_in(&home, &data), None, "{}", data.display());
+        }
+        std::fs::create_dir_all(beside.join(".git")).unwrap();
         assert_eq!(fallback_in(&home, &data), None);
         std::fs::remove_dir_all(&home).unwrap();
     }
