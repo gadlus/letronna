@@ -622,6 +622,9 @@ fn steps(
     // The run's own effort while the reply after one stopped for thinking
     // asks for less.
     let mut lowered_from: Option<String> = None;
+    // What the last reply's request read, to tell when the history it sends
+    // was cut.
+    let mut read = 0;
     loop {
         if spec.cancel.is_set() {
             return Ok(Outcome::Stopped);
@@ -679,6 +682,15 @@ fn steps(
                 continue;
             }
         };
+        // A turn's history only grows, so a request that read less than the
+        // one before went out with part of it cleared or summed up.
+        let input = reply.input_tokens();
+        if input > 0 && input < read {
+            turn.history_cut();
+        }
+        if input > 0 {
+            read = input;
+        }
         report.input += reply.input_tokens();
         report.cached += reply.cached_tokens;
         report.output += reply.tokens;
@@ -5471,6 +5483,23 @@ pub(crate) mod tests {
         let told = results(&sent[3]);
         assert!(!told[1].contains("Change your approach"));
         assert!(told[2].contains("made this call 3 times"));
+    }
+
+    #[test]
+    fn a_call_made_again_after_the_history_was_cut_starts_the_count_again() {
+        let dir = scratch("loops-cut");
+        std::fs::create_dir(dir.join("empty")).unwrap();
+        let look = ("list_dir", json!({"path": "empty"}));
+        let mut replies = vec![reply("", std::slice::from_ref(&look)); 5];
+        // The third request read less than the second: part of the history
+        // went out of it.
+        replies[2] = replies[2].replace("\"prompt_tokens\":1000", "\"prompt_tokens\":400");
+        replies.push(reply("The folder is empty.", &[]));
+        let (endpoint, provider) = provider(replies);
+        let report = finished(spec(endpoint, &dir, AGENTS + 92));
+        provider.sent();
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "The folder is empty.");
     }
 
     #[test]

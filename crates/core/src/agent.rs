@@ -358,6 +358,15 @@ impl Turn {
         self.looped.as_deref()
     }
 
+    /// Part of the history went out of the requests, where a cleared result
+    /// tells the model to repeat its call if it needs it: a call made again
+    /// from here may bring back what the model no longer has, so the counts
+    /// start again, as they do after an edit.
+    pub fn history_cut(&mut self) {
+        self.repeats.clear();
+        self.alike.clear();
+    }
+
     /// This turn, sending back once an answer that follows file edits with
     /// no command since that checked them, when `on`.
     pub fn verifying(self, on: bool) -> Self {
@@ -1547,6 +1556,27 @@ mod tests {
         // A denial is an outcome like any other, so the loop moves on.
         turn.finish_call(Err(tools::DECLINED.into()));
         assert_eq!(turn.next(gate), Next::Ask);
+    }
+
+    #[test]
+    fn a_call_made_again_once_the_history_is_cut_is_no_repeat() {
+        let mut turn = turn().unattended();
+        let read = |turn: &mut Turn| {
+            assert!(turn.begin(vec![call("read_file")]));
+            turn.finish_call(Ok("contents".into()));
+            turn.take_results().remove(0).content
+        };
+        for _ in 0..REPEATS_NOTED - 1 {
+            read(&mut turn);
+        }
+        turn.history_cut();
+        for _ in 0..REPEATS_STOPPED - 1 {
+            read(&mut turn);
+        }
+        assert_eq!(turn.looping(), None);
+        // Unbroken, the repeats still end it.
+        assert!(read(&mut turn).contains("Change your approach"));
+        assert!(turn.looping().is_some());
     }
 
     #[test]
