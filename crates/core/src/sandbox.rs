@@ -59,15 +59,24 @@ impl Drop for Scratch {
 }
 
 impl Policy {
-    /// The policy for a command run in `project`: it writes there and in a
-    /// new temp folder, and Letronna's data folder is hidden from it.
-    pub fn for_project(project: &Path) -> Result<(Policy, Scratch), String> {
+    /// The policy for a command run in `project`: it writes there, in the
+    /// folders the user `added` beside it and in a new temp folder, and
+    /// Letronna's data folder is hidden from it.
+    pub fn for_project(project: &Path, added: &[PathBuf]) -> Result<(Policy, Scratch), String> {
         let project = std::fs::canonicalize(project)
             .map_err(|e| format!("Cannot find the project folder to sandbox: {e}"))?;
+        let mut writable = vec![project];
+        for folder in added {
+            writable.push(
+                std::fs::canonicalize(folder)
+                    .map_err(|e| format!("Cannot find {} to sandbox: {e}", folder.display()))?,
+            );
+        }
         let scratch = scratch()?;
+        writable.push(scratch.0.clone());
         let data = crate::chat::data_dir();
         let policy = Policy {
-            writable: vec![project, scratch.0.clone()],
+            writable,
             temp: scratch.0.clone(),
             hidden: vec![std::fs::canonicalize(&data).unwrap_or(data)],
         };
@@ -380,6 +389,34 @@ mod tests {
         assert!(text.contains("HIDDEN_0"));
     }
 
+    #[test]
+    fn a_folder_the_user_added_is_writable_beside_the_project() {
+        let dir =
+            std::env::temp_dir().join(format!("letronna-sandbox-added-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("project")).unwrap();
+        std::fs::create_dir_all(dir.join("shared")).unwrap();
+        let (policy, _scratch) =
+            Policy::for_project(&dir.join("project"), &[dir.join("shared")]).unwrap();
+        let real = |name: &str| std::fs::canonicalize(dir.join(name)).unwrap();
+        assert_eq!(policy.writable[..2], [real("project"), real("shared")]);
+        assert_eq!(policy.writable[2], policy.temp);
+        let gone = Policy::for_project(&dir.join("project"), &[dir.join("gone")]);
+        assert!(gone.is_err());
+        // A real run where Seatbelt can: the write lands in the added folder.
+        #[cfg(target_os = "macos")]
+        if Seatbelt.available() {
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg("echo hi > ../shared/in.txt")
+                .current_dir(dir.join("project"));
+            assert!(run_for_test(Seatbelt.wrap(&command, &policy).unwrap()).success());
+            let landed = std::fs::read_to_string(dir.join("shared/in.txt")).unwrap();
+            assert_eq!(landed, "hi\n");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A real Seatbelt run: a write inside the project lands, one outside it
     /// and any reach for the network do not. Skipped where `sandbox-exec`
     /// itself cannot run, such as a sandboxed CI container.
@@ -395,7 +432,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("project")).unwrap();
         std::fs::write(dir.join("outside.txt"), "original").unwrap();
 
-        let (policy, _scratch) = Policy::for_project(&dir.join("project")).unwrap();
+        let (policy, _scratch) = Policy::for_project(&dir.join("project"), &[]).unwrap();
         let run = |line: &str| {
             let mut command = Command::new("/bin/sh");
             command.arg("-c").arg(line).current_dir(dir.join("project"));

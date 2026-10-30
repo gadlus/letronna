@@ -275,6 +275,11 @@ pub struct Connection {
     pub tools: bool,
     /// Folder the session works in, shown to the model.
     pub workspace: Option<std::path::PathBuf>,
+    /// Folders the user added beside it, from `--add-dir` or `/add-dir`, as
+    /// `tools::added_folder` gives them: the session reads and changes files
+    /// there as in the project, held to the same checks. Its helpers keep
+    /// them.
+    pub added: Arc<[std::path::PathBuf]>,
     /// Plan mode: read and ask only, nothing that changes the project.
     pub plan: bool,
     /// How hard to think, when the model can be told. Empty leaves it to the
@@ -1444,6 +1449,13 @@ fn system_prompt(
                 Some(folder) => system.push_str(&format!(" No project folder is attached, so you work in your own folder `{}`: files you make go there, commands run there, and when you report, say where a file is. You can read anywhere under the home folder; to change files elsewhere, ask the user to attach that folder.", folder.display())),
                 None => system.push_str(" No project folder is attached: you can only read under the home folder. Ask the user to attach one before writing or running anything."),
             },
+        }
+        // Only where there are some, so every other prompt is as it was.
+        if !connection.added.is_empty() {
+            let named: Vec<String> = (connection.added.iter())
+                .map(|folder| format!("`{}`", folder.display()))
+                .collect();
+            system.push_str(&format!(" The user also added {} to this session: you read and change files there as in the project, by their full paths.", named.join(", ")));
         }
     } else if !connection.tools {
         system.push_str(" You have no tools or filesystem access on this gateway.");
@@ -16002,6 +16014,34 @@ mod tests {
         assert!(alone.contains(&told), "{alone}");
         assert!(!alone.contains("Ask the user to attach one"), "{alone}");
         assert!(!shared.contains("your own folder"), "{shared}");
+    }
+
+    #[test]
+    fn the_folders_the_user_added_are_named_after_the_project_folder() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("added-folders");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let c = Connection {
+            tools: true,
+            workspace: Some("/w/app".into()),
+            ..connection()
+        };
+        let added = Connection {
+            added: vec!["/w/lib".into(), "/w/docs".into()].into(),
+            ..c.clone()
+        };
+        let plain = system_prompt(&c, None, None).text;
+        let named = system_prompt(&added, None, None).text;
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!plain.contains("also added"), "{plain}");
+        let project = named.find("The project folder is `/w/app`.").unwrap();
+        let told = named
+            .find("The user also added `/w/lib`, `/w/docs` to this session")
+            .unwrap();
+        assert!(project < told, "{named}");
     }
 
     #[test]

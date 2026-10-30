@@ -1654,10 +1654,20 @@ fn editable_path(raw: &str, ctx: &ToolContext) -> bool {
     let Some(workspace) = &ctx.workspace else {
         return false;
     };
-    let (Ok(root), Some(path)) = (
+    let (Ok(project), Some(path)) = (
         std::fs::canonicalize(workspace),
         landing(&workspace.join(raw)),
     ) else {
+        return false;
+    };
+    // A folder the user added is held to the same checks as the project.
+    let added = tools::added_roots(ctx)
+        .into_iter()
+        .map(|(_, folder)| folder);
+    let Some(root) = std::iter::once(project)
+        .chain(added)
+        .find(|root| path.starts_with(root))
+    else {
         return false;
     };
     let Ok(inside) = path.strip_prefix(&root) else {
@@ -1692,7 +1702,13 @@ fn confinable(args: &Value, ctx: &ToolContext) -> bool {
     let Ok(dir) = tools::workdir(args, ctx) else {
         return false;
     };
-    if dir.strip_prefix(workspace).is_ok_and(protected) {
+    let added = tools::added_roots(ctx);
+    let roots =
+        std::iter::once(workspace.as_path()).chain(added.iter().map(|(given, _)| given.as_path()));
+    if roots
+        .filter_map(|root| dir.strip_prefix(root).ok())
+        .any(protected)
+    {
         return false;
     }
     let line = args["command"].as_str().unwrap_or_default();
@@ -4175,6 +4191,66 @@ mod tests {
         assert_eq!(decided("cargo test", ".git"), Outcome::Ask);
         let named = command("cd api/.ssh && cat id_rsa");
         assert_eq!(decide_with(&named, &gate, None, true), Outcome::Ask);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A folder the user added is held to the checks the project is: an
+    /// edit there runs in Accept edits and asks in Default, one on a
+    /// protected path there asks, and a command run there is confined.
+    #[test]
+    fn an_added_folder_goes_through_the_same_checks_as_the_project() {
+        let dir = project_dir("added");
+        std::fs::create_dir_all(dir.join("shared/.git/hooks")).unwrap();
+        let shared = tools::added_folder("../shared", Some(&dir.join("project"))).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.join("project")),
+            added: vec![shared.clone()].into(),
+            ..Default::default()
+        };
+        let none = Grants::new();
+        let gate = |mode| Gate {
+            ctx: &ctx,
+            mode,
+            grants: &none,
+            rules: &[],
+            broken: None,
+            human: true,
+        };
+        let write = |path: PathBuf| {
+            let args = serde_json::json!({"path": path.to_str().unwrap(), "content": "x"});
+            call("write_file", args)
+        };
+        let plain = write(shared.join("notes.txt"));
+        let hook = write(shared.join(".git/hooks/pre-commit"));
+        let elsewhere = write(dir.join("elsewhere.txt"));
+        assert_eq!(
+            decide_with(&plain, &gate(Mode::AcceptEdits), None, true),
+            Outcome::Run
+        );
+        assert_eq!(
+            decide_with(&plain, &gate(Mode::Default), None, true),
+            Outcome::Ask
+        );
+        assert_eq!(
+            decide_with(&hook, &gate(Mode::AcceptEdits), None, true),
+            Outcome::Ask
+        );
+        assert_eq!(
+            decide_with(&elsewhere, &gate(Mode::AcceptEdits), None, true),
+            Outcome::Ask
+        );
+        let test = |workdir: &Path| {
+            let args =
+                serde_json::json!({"command": "cargo test", "workdir": workdir.to_str().unwrap()});
+            decide_with(
+                &call("run_command", args),
+                &gate(Mode::AcceptEdits),
+                None,
+                true,
+            )
+        };
+        assert_eq!(test(&shared), Outcome::Sandboxed);
+        assert_eq!(test(&shared.join(".git")), Outcome::Ask);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -202,6 +202,7 @@ impl Runner {
             key,
             tools: true,
             workspace,
+            added: Default::default(),
             plan: self.current_mode() == Mode::Plan,
             remote: None,
             effort: self.store.effort(session).to_owned(),

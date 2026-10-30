@@ -27,6 +27,9 @@ pub struct ToolContext {
     /// `workspace` is `chat::fallback_folder`, not a project the user
     /// attached: it keeps no project memory and no schedule takes it along.
     pub fallback: bool,
+    /// Folders the user added beside the project, which a write may land
+    /// in and a command may run in as in the project.
+    pub added: Arc<[PathBuf]>,
     /// Set when a chat app is driving the session: where `read_chat` reads,
     /// and whether other people can see the replies.
     pub remote: Option<Remote>,
@@ -101,6 +104,7 @@ impl ToolContext {
         Self {
             fallback: fallback.is_some(),
             workspace: connection.workspace.clone().or(fallback),
+            added: connection.added.clone(),
             remote: connection.remote.clone(),
             conversation: connection.conversation,
             files: crate::history::Log::default(),
@@ -1681,7 +1685,11 @@ fn resolve_write_in(
             "`{raw}` goes through a link that leads nowhere, so where it lands cannot be checked."
         )
     })?;
-    if !existing.starts_with(&root) && !(scratch && in_scratch(&target, ctx, data)) {
+    let added = added_roots(ctx);
+    if !existing.starts_with(&root)
+        && !added.iter().any(|(_, folder)| existing.starts_with(folder))
+        && !(scratch && in_scratch(&target, ctx, data))
+    {
         return Err(match scratch {
             true => format!(
                 "`{raw}` is outside the project folder; use the project folder, or a new file \
@@ -1705,6 +1713,58 @@ fn resolve_write_in(
         ));
     }
     Ok(target)
+}
+
+/// Each folder the user added beside `ctx`'s project, as it was given and
+/// with its links followed; one that is gone is left out.
+pub(crate) fn added_roots(ctx: &ToolContext) -> Vec<(PathBuf, PathBuf)> {
+    (ctx.added.iter())
+        .filter_map(|folder| Some((folder.clone(), std::fs::canonicalize(folder).ok()?)))
+        .collect()
+}
+
+/// The folder `raw` names, for the user to add beside `project`: from the
+/// project, or from the home folder after `~/`, and held to what a project
+/// is held to before a command may be confined to it -- a folder that is
+/// there, neither the home folder, one above it nor among its settings,
+/// not one the system needs, not Letronna's own and not inside the project.
+/// It is given with `..` and links followed, so a path into it needs neither.
+pub fn added_folder(raw: &str, project: Option<&Path>) -> Result<PathBuf, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("Name the folder to add.".into());
+    }
+    if let Some(why) = crate::paths::unsafe_raw(raw, project) {
+        return Err(format!("`{raw}` {why}."));
+    }
+    let given = match raw.strip_prefix("~/").or((raw == "~").then_some("")) {
+        Some(rest) => home().ok_or("There is no home folder here.")?.join(rest),
+        None => project.map_or_else(|| PathBuf::from(raw), |project| project.join(raw)),
+    };
+    let real = std::fs::canonicalize(&given).map_err(|_| format!("`{raw}` does not exist."))?;
+    if !real.is_dir() {
+        return Err(format!("`{raw}` is a file; add the folder it is in."));
+    }
+    if !crate::gate::holdable(&real) || crate::command::system(&real) {
+        return Err(format!(
+            "`{raw}` is the home folder, a folder above it, among its settings, one the \
+             system needs or Letronna's own, so it cannot be added."
+        ));
+    }
+    if let Some(project) = project.and_then(|project| std::fs::canonicalize(project).ok())
+        && real.starts_with(&project)
+    {
+        return Err(format!(
+            "`{raw}` is inside the project folder, which is in reach already."
+        ));
+    }
+    // Without the `\\?\` Windows puts on a canonical path, which the checks
+    // on a command read as another drive.
+    let text = real.to_string_lossy();
+    Ok(match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC") => PathBuf::from(rest),
+        _ => real.clone(),
+    })
 }
 
 /// Whether a write to `path` may land in the system's temp folder, as
@@ -2156,19 +2216,21 @@ struct SaveTo {
     cap: usize,
 }
 
-/// Runs `command` in `dir`, in the sandbox for `cwd`, the project, as
-/// `run_shell_saving` runs any other, and says in the result that it did.
+/// Runs `command` in `dir`, in the sandbox for `cwd`, the project, and the
+/// folders `added` beside it, as `run_shell_saving` runs any other, and says
+/// in the result that it did.
 /// One still running at the limit is stopped rather than moved to the
 /// background, where nothing would keep it confined to what it was allowed.
 fn run_sandboxed(
     command: &str,
     cwd: &Path,
+    added: &[PathBuf],
     dir: &Path,
     cancel: &Cancel,
     save: Option<SaveTo>,
     limit: Duration,
 ) -> Result<String, String> {
-    let (policy, _scratch) = crate::sandbox::Policy::for_project(cwd)?;
+    let (policy, _scratch) = crate::sandbox::Policy::for_project(cwd, added)?;
     let wrapped = crate::sandbox::here().wrap(&shell(command, Some(dir)), &policy)?;
     match run_shell_saving(wrapped, command, cancel, save, limit, None, None) {
         Ok(text) => Ok(crate::sandbox::noted(&text)),
@@ -3266,7 +3328,7 @@ impl Tool for RunCommand {
             // Last before it runs, so as little as can be falls between.
             let watch = crate::snapshot::watch(command, &dir, cwd, ctx);
             let out = if ctx.sandboxed {
-                run_sandboxed(command, cwd, &dir, &ctx.cancel, save, limit)
+                run_sandboxed(command, cwd, &ctx.added, &dir, &ctx.cancel, save, limit)
             } else {
                 let (owner, sooner) = (owner_at_limit(ctx), sooner(limit, ctx));
                 let cmd = shell(command, Some(&dir));
@@ -3392,10 +3454,19 @@ pub(crate) fn workdir(args: &Value, ctx: &ToolContext) -> Result<PathBuf, String
     let root = std::fs::canonicalize(workspace).map_err(|_| "The project folder is missing.")?;
     let real = std::fs::canonicalize(workspace.join(raw))
         .map_err(|_| format!("The folder `{raw}` does not exist."))?;
-    let Ok(inside) = real.strip_prefix(&root) else {
-        return Err(format!(
-            "`{raw}` is outside the project folder. Give a folder inside it as workdir, or leave workdir out."
-        ));
+    // A folder the user added is run in as the project is, and spelled from
+    // that folder as the session has it.
+    let added = added_roots(ctx)
+        .into_iter()
+        .find_map(|(given, folder)| Some(given.join(real.strip_prefix(&folder).ok()?)));
+    let (base, inside) = match (real.strip_prefix(&root), &added) {
+        (Ok(inside), _) => (workspace, inside),
+        (Err(_), Some(added)) => (added.as_path(), Path::new("")),
+        (Err(_), None) => {
+            return Err(format!(
+                "`{raw}` is outside the project folder. Give a folder inside it as workdir, or leave workdir out."
+            ));
+        }
     };
     if !real.is_dir() {
         return Err(format!("`{raw}` is a file; workdir names a folder."));
@@ -3409,7 +3480,7 @@ pub(crate) fn workdir(args: &Value, ctx: &ToolContext) -> Result<PathBuf, String
     // the command is judged where it really runs. Spelled from the project
     // folder as the session has it: the checks on a command would read a
     // canonical Windows path's `\\?\` as another drive.
-    Ok(workspace.join(inside))
+    Ok(base.join(inside))
 }
 
 /// The user's own earlier conversations, by name and size only.
@@ -4465,6 +4536,7 @@ pub(crate) fn resolve(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
     let allowed = [ctx.workspace.clone(), home()]
         .into_iter()
         .flatten()
+        .chain(ctx.added.iter().cloned())
         .filter_map(|p| std::fs::canonicalize(p).ok())
         .any(|root| path.starts_with(root));
     if !allowed {
@@ -8032,6 +8104,65 @@ mod tests {
         for path in [repro, theirs, link] {
             std::fs::remove_file(path).unwrap();
         }
+    }
+
+    #[test]
+    fn a_folder_the_user_added_is_in_reach_as_the_project_is_and_nothing_else_outside_it() {
+        let dir = std::env::temp_dir().join(format!("letronna-added-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for folder in ["project", "shared/src", "other", "Letronna"] {
+            std::fs::create_dir_all(dir.join(folder)).unwrap();
+        }
+        std::fs::write(dir.join("shared/notes.md"), "a").unwrap();
+        std::fs::write(dir.join("other/notes.md"), "a").unwrap();
+        let shared = added_folder("../shared", Some(&dir.join("project"))).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.join("project")),
+            added: vec![shared.clone()].into(),
+            ..Default::default()
+        };
+        let data = dir.join("Letronna");
+        let write =
+            |path: &Path| resolve_write_in(path.to_str().unwrap(), &ctx, &data, None, false);
+        assert!(write(&shared.join("src/new.rs")).is_ok());
+        assert!(write(&dir.join("project/new.rs")).is_ok());
+        let refused = write(&dir.join("other/new.rs")).unwrap_err();
+        assert!(refused.contains("outside the project folder"), "{refused}");
+        // The way back up stays refused there too.
+        let climbed = write(&shared.join("../other/new.rs")).unwrap_err();
+        assert!(climbed.contains("climbs up"), "{climbed}");
+        assert!(resolve(shared.join("notes.md").to_str().unwrap(), &ctx).is_ok());
+        let args = json!({"workdir": shared.join("src").to_str().unwrap()});
+        assert_eq!(workdir(&args, &ctx).unwrap(), shared.join("src"));
+        let args = json!({"workdir": dir.join("other").to_str().unwrap()});
+        assert!(
+            workdir(&args, &ctx)
+                .unwrap_err()
+                .contains("outside the project folder")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_home_folder_a_system_folder_a_file_and_the_project_itself_cannot_be_added() {
+        let dir = std::env::temp_dir().join(format!("letronna-adding-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("project/src")).unwrap();
+        std::fs::write(dir.join("file.txt"), "a").unwrap();
+        let project = dir.join("project");
+        let refused = |raw: &str| added_folder(raw, Some(&project)).unwrap_err();
+        assert!(refused("~").contains("home folder"));
+        assert!(refused("/").contains("home folder"));
+        if cfg!(unix) {
+            assert!(refused("/usr").contains("the system needs"));
+        }
+        assert!(refused("../file.txt").contains("is a file"));
+        assert!(refused("../missing").contains("does not exist"));
+        assert!(refused("src").contains("inside the project folder"));
+        assert!(refused(" ").contains("Name the folder"));
+        let added = added_folder("..", Some(&project)).unwrap();
+        assert_eq!(added, std::fs::canonicalize(&dir).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

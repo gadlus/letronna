@@ -2428,6 +2428,8 @@ impl Chat {
             key,
             tools: true,
             workspace: None,
+            // Only the terminal adds folders beside the project.
+            added: Default::default(),
             plan: mode == letronna_core::gate::Mode::Plan,
             effort: self.store.effort(ix).to_owned(),
             search: self.store.settings.search,
