@@ -284,8 +284,10 @@ fn built_ins() -> Vec<AgentDef> {
             prompt: "Look for what is wrong with the work you are pointed at. Verify by running \
                      tests. Where the work does less than its request's words allow, or two of \
                      its parts disagree about the same thing, that is wrong, not an open question \
-                     or an aside. End with a verdict: whether it is right, and what has to change \
-                     if not."
+                     or an aside. Put any script or file you check with in the temp folder, never \
+                     in the project, and keep each command you run short: a long script goes \
+                     into its file in parts. End with a verdict: whether it is right, and what \
+                     has to change if not."
                 .into(),
             ..Default::default()
         },
@@ -424,6 +426,24 @@ mod tests {
     fn write(dir: &Path, file: &str, text: &str) {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join(file), text).unwrap();
+    }
+
+    #[test]
+    fn a_review_helper_keeps_its_scratch_out_of_the_project() {
+        let review = (built_ins().into_iter())
+            .find(|def| def.name == "review")
+            .unwrap();
+        // It has no write_file, so its scripts go through commands, which the
+        // gate lets make new files in the temp folder and the judge reads whole.
+        let tools = review.tools.unwrap();
+        assert!(tools.contains(&"run_command".to_owned()));
+        assert!(!tools.contains(&"write_file".to_owned()));
+        assert!(
+            review
+                .prompt
+                .contains("in the temp folder, never in the project")
+        );
+        assert!(review.prompt.contains("keep each command you run short"));
     }
 
     #[test]
