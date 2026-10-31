@@ -1411,8 +1411,35 @@ fn show_progress(
 /// it is made, as an approval's diff is.
 fn hear_steps(status: &Status, context: tools::ToolContext) {
     let asked = std::sync::Mutex::new(std::collections::HashMap::new());
+    let reply = std::sync::Mutex::new(Reply::of("text"));
+    let thought = std::sync::Mutex::new(Reply::of("thinking"));
+    // What is held back of one goes out, and it starts afresh next time.
+    let end = |of: &std::sync::Mutex<Reply>| {
+        if let Ok(mut of) = of.lock()
+            && let Some(line) = of.end()
+        {
+            emit(&line);
+        }
+    };
+    let add = |of: &std::sync::Mutex<Reply>, words: &str| {
+        if let Ok(mut of) = of.lock()
+            && let Some(line) = of.add(words, std::time::Instant::now())
+        {
+            emit(&line);
+        }
+    };
     let _ = status.calls.set(Arc::new(move |step| match step {
+        driver::Step::Thought(words) => add(&thought, &words),
+        driver::Step::Said(words) => {
+            // A reply's thinking comes before its words.
+            end(&thought);
+            add(&reply, &words);
+        }
         driver::Step::Asked(call) => {
+            // The words before a call are all said: the last of them go out
+            // now, and the next reply's start afresh.
+            end(&thought);
+            end(&reply);
             let change = diff::plain(&call.name, &call.arguments, &context);
             if let Ok(mut asked) = asked.lock() {
                 asked.insert(call.id.clone(), (call, change));
@@ -1427,6 +1454,70 @@ fn hear_steps(status: &Status, context: tools::ToolContext) {
         }
         _ => {}
     }));
+}
+
+/// How often a reply's words go out as a stream-json line while it streams.
+const SAID_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
+/// The most of one reply a text line carries: its end, past that.
+const SAID_MOST: usize = 20_000;
+
+/// The reply streaming now, as stream-json tells it: its words so far, or
+/// its thinking, the whole of them in each `text` or `thinking` line, so a
+/// reader that missed one is never out of step; a reply after a call starts
+/// afresh.
+struct Reply {
+    /// The line's type: `text` or `thinking`.
+    kind: &'static str,
+    said: String,
+    /// Whether words came since the last line went out.
+    new: bool,
+    /// Whether the reply ended, so the next words begin another.
+    ended: bool,
+    sent: Option<std::time::Instant>,
+}
+
+impl Reply {
+    fn of(kind: &'static str) -> Reply {
+        Reply {
+            kind,
+            said: String::new(),
+            new: false,
+            ended: false,
+            sent: None,
+        }
+    }
+
+    /// `words` streamed in at `now`: the line to write, when one is due.
+    fn add(&mut self, words: &str, now: std::time::Instant) -> Option<Value> {
+        if self.ended {
+            self.said.clear();
+            self.ended = false;
+        }
+        self.said.push_str(words);
+        self.new = true;
+        let due = self
+            .sent
+            .is_none_or(|at| now.duration_since(at) >= SAID_EVERY);
+        due.then(|| {
+            self.sent = Some(now);
+            self.line()
+        })
+    }
+
+    /// The reply is done: its last words, if any are not out yet.
+    fn end(&mut self) -> Option<Value> {
+        self.ended = true;
+        self.new.then(|| self.line())
+    }
+
+    fn line(&mut self) -> Value {
+        self.new = false;
+        let start = self.said.len().saturating_sub(SAID_MOST);
+        let start = (start..=self.said.len())
+            .find(|at| self.said.is_char_boundary(*at))
+            .unwrap_or(0);
+        json!({ "type": self.kind, "text": &self.said[start..] })
+    }
 }
 
 /// A call that ended, as a stream-json line: the tool, what it worked on and
@@ -2098,6 +2189,38 @@ mod tests {
             contract: Vec::new(),
             value: None,
         }
+    }
+
+    #[test]
+    fn a_reply_goes_out_whole_while_it_streams_and_afresh_after_a_call() {
+        let start = std::time::Instant::now();
+        let at = |ms| start + std::time::Duration::from_millis(ms);
+        let mut reply = Reply::of("text");
+        // The first words go out at once; more within the pause wait.
+        assert_eq!(reply.add("Looking", at(0)).unwrap()["text"], "Looking");
+        assert!(reply.add(" at the", at(50)).is_none());
+        assert_eq!(
+            reply.add(" files.", at(250)).unwrap()["text"],
+            "Looking at the files."
+        );
+        assert!(reply.add(" Then", at(260)).is_none());
+        // A call ends the reply: what was held back goes out with it.
+        assert_eq!(reply.end().unwrap()["text"], "Looking at the files. Then");
+        assert!(reply.end().is_none());
+        // The next reply starts afresh.
+        assert_eq!(reply.add("Done.", at(900)).unwrap()["text"], "Done.");
+        // A long one keeps its end.
+        let long = "é".repeat(SAID_MOST);
+        let line = reply.add(&long, at(2_000)).unwrap();
+        let text = line["text"].as_str().unwrap();
+        assert!(text.len() <= SAID_MOST && text.ends_with('é'));
+        // Thinking goes out the same way, as its own kind of line.
+        let mut thought = Reply::of("thinking");
+        let line = thought.add("Which file?", at(0)).unwrap();
+        assert_eq!(
+            (&line["type"], &line["text"]),
+            (&json!("thinking"), &json!("Which file?"))
+        );
     }
 
     #[test]

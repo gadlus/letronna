@@ -192,7 +192,7 @@ fn a_stream_json_run_says_each_step_it_took() {
     }]}, "finish_reason": "tool_calls"}]});
     let base = model_saying(&[
         &format!("data: {call}\n\ndata: [DONE]\n\n"),
-        "data: {\"choices\":[{\"delta\":{\"content\":\"Done.\"}}]}\n\ndata: [DONE]\n\n",
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Checking the file.\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"Done.\"}}]}\n\ndata: [DONE]\n\n",
     ]);
     let settings = json!({"endpoint": base, "model": "test-model", "gateway": "Custom", "custom_endpoint": base});
     std::fs::write(data.join("settings.json"), settings.to_string()).unwrap();
@@ -220,6 +220,23 @@ fn a_stream_json_run_says_each_step_it_took() {
     );
     assert_eq!((&step["added"], &step["removed"]), (&json!(2), &json!(0)));
     assert_eq!(step["lines"], json!(["+ hi", "+ there"]));
+    // The reply's words as they streamed, after the step it came after.
+    let said: Vec<&serde_json::Value> = lines.iter().filter(|l| l["type"] == "text").collect();
+    assert_eq!(
+        said.last().map(|l| &l["text"]),
+        Some(&json!("Done.")),
+        "{said:?}"
+    );
+    let at = |kind: &str| lines.iter().position(|l| l["type"] == kind);
+    assert!(at("step") < lines.iter().rposition(|l| l["type"] == "text"));
+    // And its thinking, before its words.
+    let thought = lines.iter().find(|l| l["type"] == "thinking");
+    assert_eq!(
+        thought.map(|l| &l["text"]),
+        Some(&json!("Checking the file.")),
+        "{said:?}"
+    );
+    assert!(at("thinking") < at("text"));
     // Before the result, which ends the lines.
     assert_eq!(lines.last().map(|l| &l["type"]), Some(&json!("result")));
     assert_eq!(

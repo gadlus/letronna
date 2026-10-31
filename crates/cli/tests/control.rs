@@ -183,11 +183,14 @@ impl Driven {
         self.send(&json!({"type": "user", "message": {"role": "user", "content": text}}));
     }
 
-    /// The next line it wrote other than the opening one and progress.
+    /// The next line it wrote other than the opening one and what it says
+    /// as it goes: progress, its steps and the words and thinking of its reply.
     fn next(&self) -> Value {
         loop {
             let line = self.first();
-            if line["type"] != "progress" && line["type"] != "init" {
+            if !["progress", "init", "step", "text", "thinking"]
+                .contains(&line["type"].as_str().unwrap_or_default())
+            {
                 return line;
             }
         }

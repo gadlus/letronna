@@ -371,10 +371,11 @@ pub struct Status {
     pub notes: AtomicU64,
     /// The last of them as a screen says it, with what the provider said.
     pub note: std::sync::Mutex<String>,
-    /// Hears each call as it is asked for and as it ends, as `Spec::watch`
-    /// hears them, for a frontend that only shows the run's work, as
-    /// stream-json shows a cloud run's on a phone. Set here, it leaves the
-    /// run one nobody watches, so the run is held to the same checks.
+    /// Hears each call as it is asked for and as it ends, and the words and
+    /// the thinking of each reply as they stream in, as `Spec::watch` hears them, for a
+    /// frontend that only shows the run, as stream-json shows a cloud run's
+    /// on a phone. Set here, it leaves the run one nobody watches, so the
+    /// run is held to the same checks.
     pub calls: std::sync::OnceLock<Watch>,
 }
 
@@ -2754,10 +2755,13 @@ fn tests(name: &str) -> bool {
 }
 
 /// Tells the run's watcher about `step`, if it has one, and whoever hears
-/// its calls about a call asked for or ended.
+/// its calls about a call asked for or ended, or words said or thought.
 fn tell(spec: &Spec, step: Step) {
     if let Some(calls) = spec.status.calls.get()
-        && matches!(step, Step::Asked(_) | Step::Finished { .. })
+        && matches!(
+            step,
+            Step::Asked(_) | Step::Finished { .. } | Step::Said(_) | Step::Thought(_)
+        )
     {
         calls(step.clone());
     }
