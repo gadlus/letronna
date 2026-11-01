@@ -10,11 +10,12 @@
 //! waits until it says which session it is, so its id can be given, or why
 //! it could not start.
 
+use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use letronna_core::background::{self, Answer, Asking, Record, Run, State};
+use letronna_core::background::{self, Answer, Asking, Record, Run, State, Waiting};
 use letronna_core::cancel::Cancel;
 use letronna_core::driver::{Outcome, Report, Status};
 use letronna_core::notify::{self, Note, Why};
@@ -224,15 +225,49 @@ pub fn claim(
 }
 
 /// Have `run` answer its calls' cards through `attach` and hear a stop
-/// through `cancel`, while the desktop is told when a card waits.
-pub fn serve(run: &Arc<Run>, title: &str, cancel: Cancel) {
+/// through `cancel`, while the desktop is told when a card waits. With
+/// `lines` (stream-json), each card and its answer are also said on stdout,
+/// so whoever started the run (Letronna Cloud) can put the card to its user
+/// and write the answer where the run waits for it.
+pub fn serve(run: &Arc<Run>, title: &str, cancel: Cancel, lines: bool) {
     let (id, title) = (run.session(), title.to_owned());
     run.serve(
         letronna_core::approvals::serve(),
         cancel.clone(),
-        move |call| call_back(id, &title, Why::Waiting(call, None)),
+        move |waiting| {
+            if lines {
+                let line = waiting_line(id, &waiting);
+                let _ = writeln!(std::io::stdout().lock(), "{line}");
+            }
+            if let Waiting::Asked(asking) = waiting {
+                call_back(id, &title, Why::Waiting(&asking.call, None));
+            }
+        },
     );
     run.watch(cancel);
+}
+
+// What a card says on the stream is cut to this: its preview can be a
+// whole file's change, and the line goes on to a phone.
+const CARD_CHARS: usize = 1200;
+
+/// A card going up or answered, as a stream-json line. `session` names the
+/// run's answer file, `<data>/background/<session>.answer`.
+fn waiting_line(session: u64, waiting: &Waiting) -> serde_json::Value {
+    match waiting {
+        Waiting::Asked(asking) => serde_json::json!({
+            "type": "ask",
+            "session": session,
+            "call": asking.call.id,
+            "tool": asking.call.name,
+            "preview": asking.preview.chars().take(CARD_CHARS).collect::<String>(),
+            "why": asking.why,
+            "for_run": asking.for_run,
+        }),
+        Waiting::Answered(call) => {
+            serde_json::json!({ "type": "answered", "session": session, "call": call })
+        }
+    }
 }
 
 /// Keep `run`'s record saying what `status` says it is on, until the
@@ -620,6 +655,35 @@ mod tests {
         assert_eq!(age(3_599), "59m");
         assert_eq!(age(7_200), "2h");
         assert_eq!(age(90_000), "1d");
+    }
+
+    #[test]
+    fn a_card_and_its_answer_are_said_on_the_stream_naming_the_answer_file() {
+        let asking = Asking {
+            call: letronna_core::chat::ToolCall {
+                id: "call_7".into(),
+                name: "run_command".into(),
+                arguments: r#"{"command":"rm -rf build"}"#.into(),
+            },
+            preview: "rm -rf build".repeat(200),
+            why: "It deletes files.".into(),
+            ..Default::default()
+        };
+        let asked = waiting_line(42, &Waiting::Asked(&asking));
+        assert_eq!(asked["type"], "ask");
+        assert_eq!(asked["session"], 42);
+        assert_eq!(asked["call"], "call_7");
+        assert_eq!(asked["tool"], "run_command");
+        assert_eq!(asked["why"], "It deletes files.");
+        assert_eq!(
+            asked["preview"].as_str().unwrap().chars().count(),
+            CARD_CHARS
+        );
+        let answered = waiting_line(42, &Waiting::Answered("call_7"));
+        assert_eq!(
+            answered,
+            serde_json::json!({ "type": "answered", "session": 42, "call": "call_7" })
+        );
     }
 
     #[test]

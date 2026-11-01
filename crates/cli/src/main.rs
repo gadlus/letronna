@@ -932,7 +932,12 @@ fn ask_once(
     let mut following = None;
     match ran {
         Some(run) => {
-            background::serve(run, &title, spec.cancel.clone());
+            background::serve(
+                run,
+                &title,
+                spec.cancel.clone(),
+                args.output == Output::StreamJson,
+            );
             following = Some(background::follow(run, spec.status.clone()));
         }
         None => {

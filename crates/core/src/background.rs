@@ -148,6 +148,13 @@ pub enum Answer {
     Stop,
 }
 
+/// What a run's server hears of a card: one put up, waiting for a yes, and
+/// the call it was for answered.
+pub enum Waiting<'a> {
+    Asked(&'a Asking),
+    Answered(&'a str),
+}
+
 /// An answer as `<id>.answer` holds it, with the call it is for.
 #[derive(Serialize, Deserialize)]
 struct Answered {
@@ -262,18 +269,17 @@ impl Run {
     }
 
     /// Answer each call `requests` brings by waiting for the user, telling
-    /// `told` first, until the requests end. A stop answered stops the run
-    /// through `cancel`.
+    /// `told` as each card goes up and once it is answered, until the
+    /// requests end. A stop answered stops the run through `cancel`.
     pub fn serve(
         self: &Arc<Self>,
         requests: std::sync::mpsc::Receiver<Request>,
         cancel: Cancel,
-        told: impl Fn(&ToolCall) + Send + 'static,
+        told: impl Fn(Waiting) + Send + 'static,
     ) {
         let run = self.clone();
         std::thread::spawn(move || {
             for request in requests {
-                told(&request.call);
                 let asking = Asking {
                     call: request.call.clone(),
                     preview: request.preview.clone(),
@@ -283,7 +289,10 @@ impl Run {
                         .map(|place| place.save_label().to_owned())
                         .collect(),
                 };
+                told(Waiting::Asked(&asking));
+                let call = asking.call.id.clone();
                 let answer = run.wait(asking, &cancel);
+                told(Waiting::Answered(&call));
                 if answer == Answer::Stop {
                     cancel.set();
                 }
