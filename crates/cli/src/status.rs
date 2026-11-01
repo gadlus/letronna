@@ -206,7 +206,8 @@ fn stop(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-#[cfg(test)]
+// Every test here runs sh; on Windows the shell is PowerShell.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

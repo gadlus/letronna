@@ -18,6 +18,7 @@
 //! back to run them, and what it put back is deleted as it ends.
 
 use std::path::{Path, PathBuf};
+#[cfg(any(unix, test))]
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
@@ -33,7 +34,8 @@ const WALKED: usize = 100_000;
 const SKIPPED: [&str; 4] = [".git", "node_modules", "target", ".venv"];
 
 /// Files and folders a copy of the project for the tester holds at most;
-/// past that it works in the project itself.
+/// past that it works in the project itself. Only Unix makes a copy.
+#[cfg(unix)]
 const COPIED: usize = 50_000;
 
 /// Kept test files the run's notice names at most; the rest are in the same
@@ -76,6 +78,7 @@ fn folder(what: &str) -> PathBuf {
 
 /// What git printed in `dir` for `args`, split at each NUL or newline; None
 /// when it could not run or failed. It gets no input and may not prompt.
+#[cfg(any(unix, test))]
 fn git(dir: &Path, args: &[&str]) -> Option<Vec<String>> {
     let output = Command::new("git")
         .arg("-C")

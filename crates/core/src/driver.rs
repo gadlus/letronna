@@ -4891,17 +4891,27 @@ pub(crate) mod tests {
         (middle, times.last().copied().unwrap_or_default())
     }
 
-    /// Every agent reads a file five times and answers, one token a reply,
-    /// all in line for one local provider.
+    /// Every agent reads five files, one a round, and answers, one token a
+    /// reply, all in line for one local provider. A file of its own each
+    /// round, as the same read five times over is a loop an unattended agent
+    /// is stopped for (`REPEATS_STOPPED` in agent.rs).
     fn busy_agents_share_one_provider() {
         let dir = scratch("bench");
+        for round in 0..BENCH_ROUNDS {
+            std::fs::write(
+                dir.join(format!("notes-{round}.txt")),
+                "hello from the notes",
+            )
+            .unwrap();
+        }
         let (endpoint, seen) = paced(|_, body| {
             let replied = messages(body)
                 .iter()
                 .filter(|message| message["role"] == "assistant")
                 .count();
             Some(if replied < BENCH_ROUNDS {
-                reply("", &[read_notes()])
+                let path = format!("notes-{replied}.txt");
+                reply("", &[("read_file", json!({ "path": path }))])
             } else {
                 reply("The notes say hello.", &[])
             })

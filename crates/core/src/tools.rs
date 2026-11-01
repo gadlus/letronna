@@ -9340,8 +9340,10 @@ mod tests {
         }
     }
 
-    /// A tool whose every call fails.
+    /// A tool whose every call fails; only the hooks test, which needs `sh`, uses it.
+    #[cfg(unix)]
     struct Failing;
+    #[cfg(unix)]
     impl Tool for Failing {
         fn name(&self) -> &'static str {
             "failing_tool"

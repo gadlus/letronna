@@ -62,15 +62,20 @@ fn write_kept(kept: &[Kept]) -> Result<(), String> {
     let _ = std::fs::create_dir_all(crate::chat::data_dir());
     let bytes = serde_json::to_vec_pretty(kept).map_err(|e| e.to_string())?;
     std::fs::write(path(), bytes).map_err(|e| format!("Cannot save the accounts: {e}"))?;
+    // A write within the clock's step keeps the old time, and a reorder the
+    // old length, so what was read before is no longer trusted.
+    *SEEN.lock().unwrap_or_else(PoisonError::into_inner) = None;
     super::router::forget();
     Ok(())
 }
 
+/// The file as last read here: where, its time and length, and its lines.
+type Seen = (PathBuf, Option<(SystemTime, u64)>, Vec<Kept>);
+static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
+
 /// The file as it is, read again only once it has changed: every list of
 /// gateways asks, and the window and the terminal each write it.
 fn kept() -> Vec<Kept> {
-    type Seen = (PathBuf, Option<(SystemTime, u64)>, Vec<Kept>);
-    static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
     let path = path();
     let stamp = std::fs::metadata(&path)
         .ok()

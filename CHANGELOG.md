@@ -37,6 +37,9 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **Terminal** — `/local` and `letronna local` list the models that run on this computer, each with how it runs here, how far its download has got and the Hugging Face page it comes from. `get <id>` downloads one, `add <link>` adds one from a Hugging Face link (offering its files to pick from at a keyboard) and downloads it, and `pause`, `resume`, `cancel` and `remove` steer them. In a session a download goes on in the background and says when the model is ready; `letronna local get` and `add` wait for it, showing how far it has got.
 - **Terminal** — A `-p --background` run with `--output stream-json` says on its stream when it stops for a yes: an `ask` line with the session, the call, the tool, what it would do and why it asks, and an `answered` line once the answer file is read, so whatever started the run (Letronna Cloud for the phone) can show the question and write the answer.
 
+### Fixed
+- **All** — Moving an account up or down twice in quick succession could leave the list showing the order from before the second move, as the accounts file was read again only when its time or size changed.
+
 ## [0.1.0-alpha.4.2] - 2026-10-20
 
 ### Added

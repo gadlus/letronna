@@ -16,6 +16,7 @@
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(unix)]
 use std::time::Duration;
 
 /// A diff row's colours: a background, or none for ink alone, and the ink.
@@ -173,6 +174,7 @@ pub const AUTO: &str = "auto";
 /// comes in a few milliseconds and ends the wait; this bounds one that never
 /// answers, with room for one over a slow ssh link, whose late answer would
 /// otherwise land in the box as typing.
+#[cfg(unix)]
 const WAIT: Duration = Duration::from_secs(1);
 
 /// Which of `THEMES` is drawn with now.
@@ -313,6 +315,7 @@ fn asked() -> Option<bool> {
 }
 
 /// Whether the device-attributes answer, `ESC [ ? ... c`, has come.
+#[cfg(any(unix, test))]
 fn answered(said: &[u8]) -> bool {
     said.windows(3)
         .position(|three| three == b"\x1b[?")
@@ -321,6 +324,7 @@ fn answered(said: &[u8]) -> bool {
 
 /// Whether the terminal's answer to OSC 11, `ESC ] 11 ; rgb:R/G/B`, names a
 /// light background, each part being one to four hex digits.
+#[cfg(any(unix, test))]
 fn light_from_answer(said: &[u8]) -> Option<bool> {
     let said = String::from_utf8_lossy(said);
     let (_, rgb) = said.split_once("]11;rgb:")?;
