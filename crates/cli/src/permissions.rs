@@ -192,7 +192,9 @@ mod tests {
             Effect::Deny,
             Some("/home/user_a/site"),
         );
-        assert_eq!(said(&push), "deny `git push` in ~/site");
+        // In the system's own spelling of a path: `~\site` on Windows.
+        let site = format!("deny `git push` in ~{}site", std::path::MAIN_SEPARATOR);
+        assert_eq!(said(&push), site);
         let docs = rule("web_fetch", "docs.rs", Effect::Ask, None);
         assert_eq!(
             said(&docs),

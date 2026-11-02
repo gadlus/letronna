@@ -239,7 +239,27 @@ fn running(pid: u32) -> bool {
     there || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn running(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, STILL_ACTIVE};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: the handle is used only once opened, and closed after.
+    unsafe {
+        let process = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(process) => process,
+            // One that is there but not ours to look at still runs.
+            Err(e) => return e.code() == ERROR_ACCESS_DENIED.to_hresult(),
+        };
+        let mut code = 0;
+        let read = GetExitCodeProcess(process, &mut code).is_ok();
+        let _ = CloseHandle(process);
+        read && code == STILL_ACTIVE.0 as u32
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn running(_pid: u32) -> bool {
     true
 }

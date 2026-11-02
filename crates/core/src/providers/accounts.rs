@@ -18,7 +18,7 @@ use super::Provider;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 /// What separates a provider's name from an account's label: never in a
 /// gateway's own name, so an account's name cannot be mistaken for one.
@@ -69,28 +69,39 @@ fn write_kept(kept: &[Kept]) -> Result<(), String> {
     Ok(())
 }
 
-/// The file as last read here: where, its time and length, and its lines.
-type Seen = (PathBuf, Option<(SystemTime, u64)>, Vec<Kept>);
+/// The file as last read here: where, its time and length, its lines, and
+/// when it was last looked at.
+type Seen = (PathBuf, Option<(SystemTime, u64)>, Vec<Kept>, Instant);
 static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
 
-/// The file as it is, read again only once it has changed: every list of
-/// gateways asks, and the window and the terminal each write it.
+/// The file as it is, read again only once it has changed, and looked at
+/// no more than every `crate::gateway::FRESH`: every list of gateways asks,
+/// several hundred times a model call, and the window and the terminal each
+/// write it.
 fn kept() -> Vec<Kept> {
     let path = path();
-    let stamp = std::fs::metadata(&path)
-        .ok()
-        .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
     let mut seen = SEEN.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some((at, was, list)) = seen.as_ref()
+    if let Some((at, _, list, looked)) = seen.as_ref()
         && *at == path
-        && *was == stamp
-        // A write within the clock's step keeps the old time.
-        && stamp.is_some()
+        && looked.elapsed() < crate::gateway::FRESH
     {
         return list.clone();
     }
+    let stamp = std::fs::metadata(&path)
+        .ok()
+        .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+    // No file stays no accounts until one is written; a write from here
+    // forgets what was read (`write_kept`), as one within the clock's step
+    // keeps the old time.
+    if let Some((at, was, list, looked)) = seen.as_mut()
+        && *at == path
+        && *was == stamp
+    {
+        *looked = Instant::now();
+        return list.clone();
+    }
     let list = read_kept(&path);
-    *seen = Some((path, stamp, list.clone()));
+    *seen = Some((path, stamp, list.clone(), Instant::now()));
     list
 }
 
@@ -116,8 +127,13 @@ pub fn takes_more(provider: &str) -> bool {
 
 /// Every account beyond a provider's first, in the order kept.
 pub fn list() -> Vec<Account> {
+    list_in(&kept())
+}
+
+/// The accounts beyond each provider's first that `kept` holds.
+fn list_in(kept: &[Kept]) -> Vec<Account> {
     let mut list: Vec<Account> = Vec::new();
-    for line in kept() {
+    for line in kept {
         let label = line.label.trim();
         let Some(provider) = built_in(line.provider.trim()).map(|p| p.info().name) else {
             continue;
@@ -160,13 +176,36 @@ pub(crate) fn find(name: &str) -> Option<&'static dyn Provider> {
 /// Every account of `provider`, its own first one included, in the order
 /// they are reached for.
 pub fn of(provider: &str) -> Vec<&'static str> {
+    Accounts::now().of(provider)
+}
+
+/// The accounts file read once, for asking about every provider in turn:
+/// a list of gateways asks for each, and is drawn every frame.
+pub struct Accounts {
+    kept: Vec<Kept>,
+    extra: Vec<Account>,
+}
+
+impl Accounts {
+    pub fn now() -> Accounts {
+        let kept = kept();
+        let extra = list_in(&kept);
+        Accounts { kept, extra }
+    }
+
+    /// Every account of `provider`, as `of` gives them.
+    pub fn of(&self, provider: &str) -> Vec<&'static str> {
+        of_in(&self.kept, &self.extra, provider)
+    }
+}
+
+fn of_in(kept: &[Kept], extra: &[Account], provider: &str) -> Vec<&'static str> {
     let Some(own) = built_in(provider).map(|p| p.info().name) else {
         return Vec::new();
     };
-    let extra = list();
     let mut names = Vec::new();
     let mut placed = false;
-    for line in kept() {
+    for line in kept {
         if line.provider.trim() != own {
             continue;
         }

@@ -15,8 +15,8 @@ use crate::providers::AuthKind;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::SystemTime;
+use std::sync::{Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant, SystemTime};
 
 /// The hosted pool on your Letronna account: no key, charged to your credit.
 /// First in the list, and what a new install starts on.
@@ -34,6 +34,8 @@ pub struct Gateway {
 /// user's own.
 pub fn gateways() -> Vec<Gateway> {
     let own = own().into_iter().map(|g| as_gateway(&g));
+    // Read once for all of them, not once for each provider.
+    let further = crate::providers::accounts::Accounts::now();
     crate::providers::all()
         .into_iter()
         .flat_map(|p| {
@@ -41,7 +43,7 @@ pub fn gateways() -> Vec<Gateway> {
             // A provider's further accounts stand beside it, in the order
             // the user gave them, which is the order they are reached for.
             let accounts = match crate::providers::accounts::takes_more(info.name) {
-                true => crate::providers::accounts::of(info.name),
+                true => further.of(info.name),
                 false => vec![info.name],
             };
             accounts.into_iter().map(move |name| Gateway {
@@ -87,28 +89,43 @@ fn own_path() -> PathBuf {
     crate::chat::data_dir().join("gateways.json")
 }
 
+/// How long a file of the user's gateways or accounts, once looked at, is
+/// taken as it was without asking the disk again. A write from this process
+/// forgets it at once; one from the other front end is seen within this.
+pub(crate) const FRESH: Duration = Duration::from_millis(250);
+
+/// gateways.json as last read here: where, its time and length, what it
+/// gave, and when it was last looked at.
+type Seen = (PathBuf, Option<(SystemTime, u64)>, Vec<Own>, Instant);
+static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
+
 /// The gateways the user added, as gateways.json has them now.
 pub fn own() -> Vec<Own> {
-    // Asked for every gateway listed, every frame a page shows them, so the
-    // file is read again only once it has changed: the terminal and the
-    // window each save it, and each has to see the other's change.
-    type Seen = (PathBuf, Option<(SystemTime, u64)>, Vec<Own>);
-    static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
+    // Asked for every gateway listed, every frame a page shows them and
+    // several hundred times a model call, so the file is read again only
+    // once it has changed, and looked at no more than every FRESH: the
+    // terminal and the window each save it, and each has to see the other's
+    // change.
     let path = own_path();
-    let stamp = std::fs::metadata(&path)
-        .ok()
-        .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
-    if let Ok(seen) = SEEN.lock()
-        && let Some((at, was, list)) = seen.as_ref()
+    let mut seen = SEEN.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((at, _, list, looked)) = seen.as_ref()
         && *at == path
-        && *was == stamp
+        && looked.elapsed() < FRESH
     {
         return list.clone();
     }
-    let list = read_own(&path);
-    if let Ok(mut seen) = SEEN.lock() {
-        *seen = Some((path, stamp, list.clone()));
+    let stamp = std::fs::metadata(&path)
+        .ok()
+        .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+    if let Some((at, was, list, looked)) = seen.as_mut()
+        && *at == path
+        && *was == stamp
+    {
+        *looked = Instant::now();
+        return list.clone();
     }
+    let list = read_own(&path);
+    *seen = Some((path, stamp, list.clone(), Instant::now()));
     list
 }
 
@@ -142,7 +159,10 @@ fn read_own(path: &Path) -> Vec<Own> {
 fn write_kept(kept: &[Kept]) -> Result<(), String> {
     let _ = std::fs::create_dir_all(crate::chat::data_dir());
     let bytes = serde_json::to_vec_pretty(kept).map_err(|e| e.to_string())?;
-    std::fs::write(own_path(), bytes).map_err(|e| format!("Cannot save the gateways: {e}"))
+    std::fs::write(own_path(), bytes).map_err(|e| format!("Cannot save the gateways: {e}"))?;
+    // What was read before is no longer the file.
+    *SEEN.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    Ok(())
 }
 
 fn own_as(name: &str) -> Option<Own> {
