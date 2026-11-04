@@ -43,6 +43,11 @@ pub(crate) const LISTED: usize = 40;
 /// a build or test covers, while a specification states many.
 pub(crate) const FEWEST: usize = 4;
 
+/// Plain sentences that make a request with at least one ask a
+/// specification however few use the words that mark a requirement: a bug
+/// report tells what goes wrong in fewer.
+const RULES: usize = 8;
+
 /// The cases a review's table has a row for where they apply, as a
 /// literal that both the notice asking a run for a review and the brief
 /// of a review started for the run are built from.
@@ -265,9 +270,10 @@ struct Block {
 
 /// The requirement sentences of `request`, in its order, each once and as
 /// written but for its spacing. Where `FEWEST` or more state one by their
-/// wording, the request is a specification, whose plain sentences state one
-/// too, such as "Keys are matched without case": then each sentence is kept
-/// but a question, a story, how to work or code.
+/// wording, or one does and `RULES` or more do with the plain ones counted,
+/// the request is a specification, whose plain sentences state one too,
+/// such as "Keys are matched without case": then each sentence is kept but
+/// a question, a story, how to work or code.
 pub(crate) fn sentences(request: &str) -> Vec<String> {
     let (mut stated, mut specified): (Vec<String>, Vec<String>) = Default::default();
     let keep = |found: &mut Vec<String>, sentence: &str| {
@@ -292,7 +298,11 @@ pub(crate) fn sentences(request: &str) -> Vec<String> {
             }
         }
     }
-    match stated.len() >= FEWEST {
+    // Many plain rules beside one ask make a specification too, though few
+    // of them use the words that mark one, as a list of how a new type
+    // behaves does.
+    let specification = stated.len() >= FEWEST || (!stated.is_empty() && specified.len() >= RULES);
+    match specification {
         true => specified,
         false => stated,
     }
@@ -1139,6 +1149,28 @@ mod tests {
         assert_eq!(
             sentences("The parser must accept tabs. Keys are matched without case."),
             ["The parser must accept tabs."]
+        );
+    }
+
+    #[test]
+    fn many_plain_rules_beside_one_ask_are_a_specification() {
+        let request = "Add a CharClass variant to OptimizedExpr. Choice chains of qualifying \
+                       alternatives collapse into CharClass holding merged ranges. Coalescing \
+                       runs as the final optimizer pass. A choice alternative qualifies if it is \
+                       a single-character Str. A wrapped alternative qualifies when its inner \
+                       expression qualifies. A coalesced result is emitted only when merging \
+                       produces fewer ranges. A single merged range simplifies to Range. \
+                       Overlapping and adjacent ranges merge. Merged ranges are sorted ascending \
+                       by start code point.";
+        let found = sentences(request);
+        assert_eq!(found.len(), 9, "{found:?}");
+        assert!(found.contains(&"Overlapping and adjacent ranges merge.".to_owned()));
+        // A few plain sentences beside an ask describe; only the ask is kept.
+        let short = "Add a CharClass variant to OptimizedExpr. Choice chains collapse into it. \
+                     Coalescing runs as the final pass. Ranges are sorted.";
+        assert_eq!(
+            sentences(short),
+            ["Add a CharClass variant to OptimizedExpr."]
         );
     }
 
