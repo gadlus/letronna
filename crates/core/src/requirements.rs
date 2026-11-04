@@ -602,7 +602,12 @@ pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
     }
     if !failed.is_empty() {
         text.push_str(
-            "Run each failed row's command again and see it pass now, or fix what it shows. ",
+            "A failed row stands for its whole case, not only its example: fix the rule behind \
+             it, then test one more input of that case written another way, such as one from \
+             outside the project's own code that uses the request's words. Run each failed \
+             row's command again and see it pass now, or fix what it shows. A fix for one row \
+             can break another, so then run every row's command again, those that passed too, \
+             and any tests a tester's report says are kept for you, and fix any that now fail. ",
         );
     }
     if failed.iter().any(|row| left_unclear(row)) {
@@ -1338,6 +1343,30 @@ mod tests {
             "{asked}"
         );
         assert!(REVIEW.contains("`R1 | case | UNCLEAR | what it doubts`"));
+    }
+
+    #[test]
+    fn a_run_sent_back_fixes_the_case_and_runs_every_row_again() {
+        let text = unchecked("R1 | iso | PASS\nR2 | utc | FAIL | t.sh", 2).unwrap();
+        assert!(
+            text.contains("stands for its whole case, not only its example"),
+            "{text}"
+        );
+        assert!(text.contains("uses the request's words"), "{text}");
+        assert!(
+            text.contains("run every row's command again, those that passed too"),
+            "{text}"
+        );
+        assert!(
+            text.contains("tests a tester's report says are kept for you"),
+            "{text}"
+        );
+        // With only a row missing there is no fix to check again.
+        let missing = unchecked("R1 | iso | PASS", 2).unwrap();
+        assert!(
+            !missing.contains("run every row's command again"),
+            "{missing}"
+        );
     }
 
     #[test]
