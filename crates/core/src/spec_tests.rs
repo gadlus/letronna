@@ -259,8 +259,11 @@ pub(crate) fn brief(request: &str, sentences: &[String], before: Option<&Path>) 
          the test's name or a comment.\n\n\
          For each requirement, test the behaviour it states through the entry point a caller \
          of the project uses, end to end: each case it names, each form its input can be \
-         written in, the side a limiting word such as only, unless or otherwise keeps out, and \
-         each other feature it is said to work with, used together with it in one call. Set \
+         written in, the side a limiting word such as only, unless, otherwise or and not keeps \
+         out, with both sides in one input, steps it sets in no order in each order, such as the \
+         later one first, each category it maps to an output with an input from outside the \
+         project's own code that uses the request's words for it, and each other feature it is \
+         said to work with, used together with it in one call. Set \
          each test up the way the project's own tests set up the nearest feature it already \
          has, and make each change before the first call or query, as a caller would, rather \
          than calling once beforehand to warm anything up. Where the project's data, docs or \
@@ -421,6 +424,9 @@ mod tests {
         assert!(brief.contains("- R1: Pairs compose with Or.\n- R2: Targets differ."));
         assert!(brief.contains("run no `git diff`"));
         assert!(brief.contains(&format!("names hold `{MARKER}`")));
+        assert!(brief.contains("otherwise or and not keeps"), "{brief}");
+        assert!(brief.contains("in each order"), "{brief}");
+        assert!(brief.contains("uses the request's words for it"), "{brief}");
         assert!(brief.ends_with("what it expected and what it got`."));
     }
 
