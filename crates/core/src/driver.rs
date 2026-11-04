@@ -630,6 +630,11 @@ fn steps(
     // One begun past its warning, as a later turn over stdin can be, has
     // just been told how little time it has.
     let mut warned = past_warning(spec);
+    // The time the run was given, to tell a run long enough to end early for
+    // its review from one whose whole time is about that long.
+    let given = (spec.connection.deadline)
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+    let mut due = false;
     // The run's own effort while the reply after one stopped for thinking
     // asks for less.
     let mut lowered_from: Option<String> = None;
@@ -648,6 +653,13 @@ fn steps(
             return Ok(Outcome::OverBudget);
         }
         if let Some(text) = time_warning(spec, &mut warned) {
+            deadline_notice(spec, text)?;
+        }
+        if !due
+            && !listed
+            && let Some(text) = review_due(spec, report, given)
+        {
+            due = true;
             deadline_notice(spec, text)?;
         }
         let mut reply = match ask_in_line(spec, turn)? {
@@ -1940,6 +1952,50 @@ fn time_warning(spec: &Spec, warned: &mut bool) -> Option<String> {
         "About {} s are left before this run is stopped: write every output the task asks \
          for now, complete and valid, and {TIDY}; improve the outputs in place only after that.",
         left.as_secs()
+    ))
+}
+
+/// How long before its deadline a run still at work is told to end its first
+/// complete version: the review that starts at its end gives its helpers half
+/// the time left and the fix after them the rest, and a run that ends later
+/// gets a review too short to find much, or none.
+const REVIEW_DUE: Duration = Duration::from_secs(25 * 60);
+
+/// What a session's own run nobody watches is told once its review is due:
+/// `REVIEW_DUE` before its deadline, when it was `given` at least twice that,
+/// has changed files, may run commands and its request states enough
+/// requirements to be reviewed, while the time a review needs is still left;
+/// None otherwise.
+fn review_due(spec: &Spec, report: &Report, given: Option<Duration>) -> Option<String> {
+    if !unwatched(spec) || report.files.is_empty() {
+        return None;
+    }
+    // No review starts for a run that may run no commands.
+    if refused(spec, "run_command").is_some() {
+        return None;
+    }
+    if given? < REVIEW_DUE * 2 {
+        return None;
+    }
+    let left = (spec.connection.deadline?).saturating_duration_since(Instant::now());
+    if left > REVIEW_DUE || left < crate::requirements::REVIEW_TIME {
+        return None;
+    }
+    let own = (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
+    let request = own.iter().rfind(|message| chat::opens_turn(message))?;
+    if request.notice {
+        return None;
+    }
+    let typed = crate::references::typed(&request.content);
+    if crate::requirements::sentences(typed).len() < crate::requirements::FEWEST {
+        return None;
+    }
+    Some(format!(
+        "About {} minutes are left before this run is stopped. Your work is reviewed against the \
+         request when you end your turn, and the review with the fix after it takes most of \
+         that: finish a complete version of the change now, run its tests once, and end your \
+         turn. You are sent back with what the review finds, to fix it in the time left.",
+        left.as_secs() / 60
     ))
 }
 
@@ -6911,6 +6967,64 @@ pub(crate) mod tests {
                 .collect()
         });
         (endpoint, Stub { address, worker })
+    }
+
+    #[test]
+    fn a_run_still_at_work_when_its_review_is_due_is_told_to_end_its_first_version() {
+        let dir = scratch("review-due");
+        let mut spec = spec("http://127.0.0.1:9".into(), &dir, AGENTS + 1_990);
+        spec.depth = 0;
+        spec.transcript.conversation.messages[0].content = SPECIFIED.into();
+        let left = |spec: &mut Spec, minutes: u64| {
+            spec.connection.deadline = Some(Instant::now() + Duration::from_secs(minutes * 60));
+        };
+        let mut report = Report {
+            status: Outcome::Done,
+            text: String::new(),
+            value: None,
+            rounds: 0,
+            input: 0,
+            cached: 0,
+            output: 0,
+            seconds: 0,
+            files: vec!["src/range.rs".into()],
+            changes: Vec::new(),
+            jobs: Vec::new(),
+            contract: Vec::new(),
+        };
+        let hour = Some(Duration::from_secs(60 * 60));
+        left(&mut spec, 20);
+        let told = review_due(&spec, &report, hour).unwrap();
+        assert!(told.starts_with("About 19 minutes are left"), "{told}");
+        assert!(told.contains("end your turn"), "{told}");
+        // Not yet with more than its review needs left, nor once too little is.
+        left(&mut spec, 40);
+        assert_eq!(review_due(&spec, &report, hour), None);
+        left(&mut spec, 5);
+        assert_eq!(review_due(&spec, &report, hour), None);
+        // Nor for a run given about the review's time in all, one that has
+        // changed nothing yet, a helper, or a request with too little to review.
+        left(&mut spec, 20);
+        assert_eq!(
+            review_due(&spec, &report, Some(Duration::from_secs(30 * 60))),
+            None
+        );
+        report.files.clear();
+        assert_eq!(review_due(&spec, &report, hour), None);
+        report.files.push("src/range.rs".into());
+        spec.depth = 1;
+        assert_eq!(review_due(&spec, &report, hour), None);
+        spec.depth = 0;
+        // Nor for one that may run no commands, as no review starts for it.
+        let allow = std::mem::replace(
+            &mut spec.allow,
+            Allow::Only(vec!["read_file".into(), "write_file".into()]),
+        );
+        assert_eq!(review_due(&spec, &report, hour), None);
+        spec.allow = allow;
+        assert!(review_due(&spec, &report, hour).is_some());
+        spec.transcript.conversation.messages[0].content = "Fix the typo in the readme.".into();
+        assert_eq!(review_due(&spec, &report, hour), None);
     }
 
     #[test]
