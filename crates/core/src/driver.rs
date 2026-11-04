@@ -2430,11 +2430,21 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
     let copied = workspace
         .filter(|_| testing)
         .and_then(crate::spec_tests::copy);
+    // With the project as it was to read how to call things, so it copies
+    // nothing of the work, which is all its copy would otherwise show it.
+    let before = workspace
+        .filter(|_| copied.is_some())
+        .and_then(crate::spec_tests::before);
     let mut tester_ctx = ctx.clone();
     if let (Some(copy), Some(parent)) = (&copied, ctx.caller.connection.as_deref()) {
+        let added: Arc<[std::path::PathBuf]> = (parent.added.iter().cloned())
+            .chain(before.clone())
+            .collect();
         tester_ctx.workspace = Some(copy.clone());
+        tester_ctx.added = added.clone();
         tester_ctx.caller.connection = Some(Arc::new(Connection {
             workspace: Some(copy.clone()),
+            added,
             ..parent.clone()
         }));
     }
@@ -2459,7 +2469,7 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
                 "name": "tester",
                 "type": "tester",
                 "background": false,
-                "prompt": crate::spec_tests::brief(request, found),
+                "prompt": crate::spec_tests::brief(request, found, before.as_deref()),
             });
             scope.spawn(move || tools::Tool::run(&crate::agents::Agent, &args, &tester_ctx))
         });
@@ -2475,8 +2485,8 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
     let kept = workspace.and_then(|workspace| {
         crate::spec_tests::keep(spec.id, copied.as_deref().unwrap_or(workspace), workspace)
     });
-    if let Some(copy) = &copied {
-        crate::spec_tests::discard(copy);
+    for folder in [&copied, &before].into_iter().flatten() {
+        crate::spec_tests::discard(folder);
     }
     let tested = (tested.filter(|report| crate::requirements::tabled(report)))
         .map(|report| crate::spec_tests::told(&report, kept.as_ref()));
@@ -6902,8 +6912,22 @@ pub(crate) mod tests {
     fn a_tester_beside_the_reviews_tests_from_the_request_alone_and_its_tests_leave_the_project() {
         let _data = data("requirements-tester");
         let dir = scratch("requirements-tester");
-        // A git project, so the tester works in a copy of it.
-        for args in [&["init", "-q"][..], &["add", "-A"]] {
+        // A git project with a commit, so the tester works in a copy of it
+        // and reads the project as it was.
+        for args in [
+            &["init", "-q"][..],
+            &["add", "-A"],
+            &[
+                "-c",
+                "user.name=user_a",
+                "-c",
+                "user.email=user_a@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "first",
+            ],
+        ] {
             let mut git = std::process::Command::new("git");
             git.args(args).current_dir(&*dir);
             assert!(git.status().unwrap().success(), "git {args:?}");
@@ -6999,6 +7023,11 @@ pub(crate) mod tests {
         let copy = Path::new(copy.split('`').next().unwrap());
         assert!(copy.to_string_lossy().contains("-spec-copy-"), "{task}");
         assert!(!copy.exists());
+        // It was told where the project as it was is, gone once it answered too.
+        let was = task.split("before the change is in `").nth(1).unwrap();
+        let was = Path::new(was.split('`').next().unwrap());
+        assert!(was.to_string_lossy().contains("-spec-before-"), "{task}");
+        assert!(!was.exists());
 
         // Its test left the project, the copy the run put back is gone as
         // the run ends, and the run is told where it is kept.

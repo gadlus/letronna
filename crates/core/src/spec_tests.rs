@@ -177,6 +177,52 @@ pub(crate) fn copy(_workspace: &Path) -> Option<PathBuf> {
     None
 }
 
+/// The project in `workspace` as its last commit holds it, in a new folder of
+/// the temp folder, for the tester to read how to call what already existed
+/// without seeing the work; None where it can't be written out, as in a
+/// project with no commit yet.
+#[cfg(unix)]
+pub(crate) fn before(workspace: &Path) -> Option<PathBuf> {
+    let to = folder("before");
+    std::fs::create_dir_all(&to).ok()?;
+    let written = (|| {
+        let mut archive = Command::new("git")
+            .arg("-C")
+            .arg(workspace)
+            .args(["archive", "--format=tar", "HEAD"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let unpacked = Command::new("tar")
+            .arg("-xf")
+            .arg("-")
+            .arg("-C")
+            .arg(&to)
+            .stdin(archive.stdout.take()?)
+            .stderr(Stdio::null())
+            .status()
+            .ok()?;
+        (archive.wait().ok()?.success() && unpacked.success()).then_some(())
+    })();
+    if written.is_none() {
+        discard(&to);
+        return None;
+    }
+    Some(to)
+}
+
+/// The tester reads what it has, as `copy` makes none here either.
+#[cfg(not(unix))]
+pub(crate) fn before(_workspace: &Path) -> Option<PathBuf> {
+    None
+}
+
 /// Deletes `copy`, a copy `copy` made: its links go, never what they lead to.
 pub(crate) fn discard(copy: &Path) {
     if copy.starts_with(std::env::temp_dir()) {
@@ -186,15 +232,31 @@ pub(crate) fn discard(copy: &Path) {
 
 /// The task of the tester started for a run, for `sentences`, the
 /// requirements `request` states. It is given the request word for word and
-/// nothing of the work, and told to keep it that way.
-pub(crate) fn brief(request: &str, sentences: &[String]) -> String {
+/// nothing of the work, and told to keep it that way: anything the request
+/// spells out is used as it spells it, and code is read in `before`, the
+/// project as it was, where there is one.
+pub(crate) fn brief(request: &str, sentences: &[String], before: Option<&Path>) -> String {
+    let read_there = match before {
+        Some(before) => format!(
+            "The project as it was before the change is in `{}`: read code there, to learn how \
+             to call what already existed and how its tests are set up, and not in your \
+             working folder, which holds the change and is only where your tests run. ",
+            before.display()
+        ),
+        None => String::new(),
+    };
     let mut text = format!(
         "Test a change you have not seen, made to the project in your working folder, \
          against the request below, by writing tests from the request's words alone. Do not \
          look at what was changed or how: run no `git diff`, `git status`, `git log` or \
          `git show`, and read the project's code only to learn what to call and how, such as \
-         names, arguments and set-up, never to decide what a result should be. What each test \
-         expects comes from the request's words; quote them in the test's name or a comment.\n\n\
+         names, arguments and set-up, never to decide what a result should be. {read_there}\
+         Every name the request spells out, such as a path, route, field, flag, key or \
+         command, is used in your tests as the request spells it, never as the code does: a \
+         test that fails because the work spells it differently is a finding. Where the request \
+         names nothing for something new, search your working folder for that name alone, not \
+         for how it works. What each test expects comes from the request's words; quote them in \
+         the test's name or a comment.\n\n\
          For each requirement, test the behaviour it states through the entry point a caller \
          of the project uses, end to end: each case it names, each form its input can be \
          written in, the side a limiting word such as only, unless or otherwise keeps out, and \
@@ -206,9 +268,10 @@ pub(crate) fn brief(request: &str, sentences: &[String]) -> String {
          Write the tests in the project's own test language and style, in new files whose \
          names hold `{MARKER}`, where its test runner finds them, such as beside its other \
          tests, and run them with that runner. Change no other file. A test that fails because \
-         you called the code wrongly, such as a guessed name, import or argument, is yours to \
-         fix from the code; one that fails on what the request says should happen is a \
-         finding: keep it as it is, and do not make it pass.\n\nThe request, word for word:\n"
+         you called the code wrongly, such as a guessed name, import or argument the request \
+         does not spell, is yours to fix from the code; one that fails on what the request \
+         says should happen is a finding: keep it as it is, and do not make it pass.\n\n\
+         The request, word for word:\n"
     );
     text.push_str(request.trim());
     text.push_str("\n\nThe requirements it states, numbered:");
@@ -345,7 +408,11 @@ mod tests {
             "Pairs compose with Or.".to_owned(),
             "Targets differ.".to_owned(),
         ];
-        let brief = brief("  Make pairs work.\nPairs compose with Or.  ", &sentences);
+        let brief = brief(
+            "  Make pairs work.\nPairs compose with Or.  ",
+            &sentences,
+            None,
+        );
         assert!(
             brief.contains(
                 "The request, word for word:\nMake pairs work.\nPairs compose with Or.\n"
@@ -402,6 +469,76 @@ mod tests {
         std::fs::create_dir_all(root.join(".config/tests")).unwrap();
         std::fs::write(root.join(".config/tests/letronna_spec.ts"), "test").unwrap();
         assert_eq!(left(&root), [".config/tests/letronna_spec.ts"]);
+    }
+
+    #[test]
+    fn names_the_request_spells_are_used_as_it_spells_them() {
+        let brief = brief("Save at /api/items/save.", &[], Some(Path::new("/tmp/was")));
+        assert!(
+            brief.contains("as the request spells it, never as the code does"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("spells it differently is a finding"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("search your working folder for that name alone"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("before the change is in `/tmp/was`"),
+            "{brief}"
+        );
+        assert!(brief.contains("only where your tests run"), "{brief}");
+    }
+
+    #[test]
+    fn with_nothing_from_before_the_brief_names_no_folder() {
+        let brief = brief("Save at /api/items/save.", &[], None);
+        assert!(!brief.contains("before the change is in"), "{brief}");
+        assert!(brief.contains("as the request spells it"), "{brief}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_project_as_it_was_holds_the_last_commit_and_nothing_of_the_work() {
+        let root = Scratch::new("spec-tests-before");
+        let repo = |args: &[&str]| assert!(git(&root, args).is_some(), "git {args:?}");
+        repo(&["init", "-q"]);
+        // No commit yet, so nothing to write out.
+        assert_eq!(before(&root), None);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.ts"), "export const a = 1;").unwrap();
+        repo(&["add", "."]);
+        repo(&[
+            "-c",
+            "user.name=user_a",
+            "-c",
+            "user.email=user_a@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "first",
+        ]);
+        // The run's change, and a new file of its.
+        std::fs::write(root.join("src/lib.ts"), "export const a = 2;").unwrap();
+        std::fs::write(root.join("src/new.ts"), "export const b = 3;").unwrap();
+
+        let was = before(&root).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(was.join("src/lib.ts")).unwrap(),
+            "export const a = 1;"
+        );
+        assert!(!was.join("src/new.ts").exists());
+        assert!(!was.join(".git").exists());
+        discard(&was);
+        assert!(!was.exists());
+        // The project itself is as the run left it.
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/lib.ts")).unwrap(),
+            "export const a = 2;"
+        );
     }
 
     #[cfg(unix)]
