@@ -294,8 +294,10 @@ fn built_ins() -> Vec<AgentDef> {
                      close or a removal, holds on every path in the code that causes that \
                      event, so search for each; and a case the work set aside or filed as an \
                      assumption is wrong when they say what should happen in it, even through a \
-                     rule stated for another path to the same event. Put any script or file you \
-                     check with in the temp folder, never in the project, and keep each command \
+                     rule stated for another path to the same event. Say each doubt, caveat or \
+                     problem you notice in your verdict as something to settle, and in a table \
+                     if you were asked for one as a row of its own, not as an aside. Put any \
+                     script or file you check with in the temp folder, never in the project, and keep each command \
                      you run short: a long script goes into its file in parts. End with a \
                      verdict: whether it is right, and what has to change if not."
                 .into(),

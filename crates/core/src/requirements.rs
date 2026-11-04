@@ -61,7 +61,7 @@ macro_rules! cases {
 const REVIEW: &str = concat!(
     "First ask a helper that hasn't seen your work: with the agent tool, start a helper of type `review`, not general, and wait for its report. Give it the request word for word, the numbered requirements above, the files you changed or made and each case you chose not to handle, with why. Ask it to change no file, to work out each value it checks with code of its own, not your scripts or helpers, and to end its report with a table of one row per requirement and case, written `R1 | case | PASS` or `R1 | case | FAIL | command that shows it`, with a row for each of these cases that applies: ",
     cases!(),
-    " and each case you chose not to handle, which fails when the request's words say what should happen in it, quoted in the row, whatever the reason it was set aside. Judge each row by what the request says should happen, not by what the code now does. Fix every row that fails by changing the work, not the case, and any case it calls unclear or sets aside, unless the request rules that case out."
+    " and each case you chose not to handle, which fails when the request's words say what should happen in it, quoted in the row, whatever the reason it was set aside. Ask it to write any doubt, caveat or problem it notices beyond those rows as a row of its own, `R1 | case | UNCLEAR | what it doubts`, never only prose, and the same for a row that can only pass by bending another requirement's words. Judge each row by what the request says should happen, not by what the code now does. Fix every row that fails by changing the work, not the case, and any case it calls unclear or sets aside, unless the request rules that case out."
 );
 
 /// The least time a run with a deadline needs left to be asked for the
@@ -387,7 +387,12 @@ pub(crate) fn brief(request: &str, sentences: &[String], share: (usize, usize)) 
          case, written `R{first} | case | PASS` or `R{first} | case | FAIL | command that \
          shows it`, with a row for each of these cases that applies: {} and each case the \
          change leaves out or handles more narrowly than the request's words, which fails \
-         when those words say what should happen in it, quoted in the row.",
+         when those words say what should happen in it, quoted in the row. Any doubt about a \
+         case, any caveat to a row, and anything wrong you notice beyond the rows asked for \
+         gets a row of its own, written `R{first} | case | UNCLEAR | what you doubt`, never \
+         only prose, since prose may be cut before the change's author reads it. A row that \
+         can only pass by bending another requirement's words is UNCLEAR too: quote both, and \
+         prescribe no fix.",
         cases!()
     ));
     text
@@ -471,13 +476,21 @@ fn cells(line: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Whether a table's `cell` says a case passed or failed, if it says either.
+/// Whether a table's `cell` says a case passed or failed, if it says either;
+/// one left `UNCLEAR` holds the run as one that failed does.
 fn verdict(cell: &str) -> Option<bool> {
     match cell.to_ascii_uppercase().as_str() {
         "PASS" | "PASSED" | "PASSES" => Some(true),
-        "FAIL" | "FAILED" | "FAILS" => Some(false),
+        "FAIL" | "FAILED" | "FAILS" | UNCLEAR => Some(false),
         _ => None,
     }
+}
+
+/// Whether a table's row `line` was left `UNCLEAR` rather than failed.
+fn left_unclear(line: &str) -> bool {
+    cells(line)
+        .iter()
+        .any(|cell| cell.eq_ignore_ascii_case(UNCLEAR))
 }
 
 /// Whether `report` holds a review's table, with a row of at least one
@@ -485,6 +498,10 @@ fn verdict(cell: &str) -> Option<bool> {
 pub(crate) fn tabled(report: &str) -> bool {
     !rows(report).is_empty()
 }
+
+/// What a review's row says of a case it doubts, so the doubt reaches the run
+/// as a row rather than as prose a cut can lose.
+const UNCLEAR: &str = "UNCLEAR";
 
 /// Rows of a failed case a follow-up quotes: enough to act on, and past
 /// them the run reads the report it already has.
@@ -515,10 +532,11 @@ pub(crate) fn cut_rows(report: &str, quote: &str) -> Option<String> {
                 .map_or(cells.len(), |at| at + 1);
             let case = cut(&cells[1..at].join(" | "), CASE_CHARS);
             let shows = cut(&cells[(at + 1).min(cells.len())..].join(" | "), ROW_CHARS);
+            let word = if left_unclear(&line) { UNCLEAR } else { "FAIL" };
             match (passed, shows.is_empty()) {
                 (true, _) => format!("R{number} | {case} | PASS"),
-                (false, true) => format!("R{number} | {case} | FAIL"),
-                (false, false) => format!("R{number} | {case} | FAIL | {shows}"),
+                (false, true) => format!("R{number} | {case} | {word}"),
+                (false, false) => format!("R{number} | {case} | {word} | {shows}"),
             }
         })
         .collect();
@@ -560,7 +578,11 @@ pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
         if !missing.is_empty() {
             text.push_str(", and ");
         }
-        text.push_str("has these rows that failed:");
+        let unclear = failed.iter().any(|row| left_unclear(row));
+        text.push_str(match unclear {
+            true => "has these rows that failed or were left unclear:",
+            false => "has these rows that failed:",
+        });
         for row in failed.iter().take(FAILED_SHOWN) {
             let row: String = row.chars().take(ROW_CHARS).collect();
             text.push_str(&format!("\n- {row}"));
@@ -581,6 +603,13 @@ pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
     if !failed.is_empty() {
         text.push_str(
             "Run each failed row's command again and see it pass now, or fix what it shows. ",
+        );
+    }
+    if failed.iter().any(|row| left_unclear(row)) {
+        text.push_str(
+            "A row left unclear is a doubt its reviewer could not settle: decide it by the \
+             request's words, quote them in your answer, and test the case; where they settle \
+             nothing, keep to the reading closest to them and say which you took. ",
         );
     }
     text.push_str(
@@ -1269,6 +1298,46 @@ mod tests {
         assert!(text.contains(REVIEW), "{text}");
         assert!(!text.contains("Helpers that haven't seen your work reviewed it"));
         assert!(text.contains(&format!("{tested}\n\n{CHECK}")), "{text}");
+    }
+
+    #[test]
+    fn a_row_left_unclear_holds_the_run_as_one_that_failed_does() {
+        let report = "A caveat.\nR1 | iso | PASS\n\
+                      R2 | scope first | UNCLEAR | parent singletons start too; the words may rule it out";
+        assert!(tabled(report));
+        let text = unchecked(report, 2).unwrap();
+        assert!(text.contains("has these rows that failed or were left unclear:\n- R2 | scope"));
+        assert!(text.contains("decide it by the request's words"), "{text}");
+        // A table with only failed rows is told nothing of doubts.
+        let failed = unchecked("R1 | iso | PASS\nR2 | utc | FAIL | t.sh", 2).unwrap();
+        assert!(failed.contains("has these rows that failed:\n- R2 | utc"));
+        assert!(!failed.contains("left unclear"), "{failed}");
+    }
+
+    #[test]
+    fn a_doubt_a_cut_lost_is_written_again_as_a_doubt() {
+        let report = "R1 | iso | PASS\nR2 | scope first | UNCLEAR | starts the parent's too\n";
+        let again = cut_rows(report, "cut").unwrap();
+        assert!(
+            again.contains("R2 | scope first | UNCLEAR | starts the parent's too"),
+            "{again}"
+        );
+    }
+
+    #[test]
+    fn a_review_is_asked_to_write_each_doubt_as_a_row() {
+        let rules: Vec<String> = ["Dates must parse.".to_owned()].into();
+        let asked = brief("Dates must parse.", &rules, (1, 1));
+        assert!(
+            asked.contains("`R1 | case | UNCLEAR | what you doubt`"),
+            "{asked}"
+        );
+        assert!(asked.contains("never only prose"), "{asked}");
+        assert!(
+            asked.contains("bending another requirement's words"),
+            "{asked}"
+        );
+        assert!(REVIEW.contains("`R1 | case | UNCLEAR | what it doubts`"));
     }
 
     #[test]
