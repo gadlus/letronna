@@ -48,7 +48,7 @@ pub(crate) const FEWEST: usize = 4;
 /// of a review started for the run are built from.
 macro_rules! cases {
     () => {
-        "a field, argument or part the requirement names left out, undefined or empty; a plain value as well as the same value wrapped, such as in an object or a parser's state, each also built by hand and passed straight to the method that reads it; each other way the same input can be written, such as its parts in another order or a spelling the project's docs or tests use, including any the parser might reject before the new check runs; an error the requirement names, matched by its exact words, not a generic error; two of something the requirement allows only once; the new form beside the existing form of the same thing in one call, where one applies and the other must not; each place in the code that records the event the requirement is about or changes that state, such as a demotion, a close or a removal, found by searching the code, not only the call the request names; the other side of a condition, such as what \"and is not ended\" or \"unless\" keeps out, with both sides in one input; steps the requirement sets in no order, in each order, such as the later one first; and each category the requirement maps to an output, with an input from outside the project's own code, such as a caller's function or a returned error, that uses the requirement's own words for it;"
+        "a field, argument or part the requirement names left out, undefined or empty; a plain value as well as the same value wrapped, such as in an object or a parser's state, each also built by hand and passed straight to the method that reads it; each other way the same input can be written, such as its parts in another order or a spelling the project's docs or tests use, including any the parser might reject before the new check runs; an error the requirement names, matched by its exact words, not a generic error; two of something the requirement allows only once; the new form beside the existing form of the same thing in one call, where one applies and the other must not; each place in the code that records the event the requirement is about or changes that state, such as a demotion, a close or a removal, found by searching the code, not only the call the request names; the other side of a condition, such as what \"and is not ended\" or \"unless\" keeps out, with both sides in one input; steps the requirement sets in no order, in each order, such as the later one first; each category the requirement maps to an output, with an input from outside the project's own code, such as a caller's function or a returned error, that uses the requirement's own words for it; and each case the project's own tests check of the existing feature nearest to it, done again for the new one in the same order of calls, with the same fixtures and through the same entry point, such as a query made for the first time only after the change it should see;"
     };
 }
 
@@ -1393,6 +1393,8 @@ mod tests {
             "the other side of a condition",
             "steps the requirement sets in no order, in each order",
             "uses the requirement's own words for it",
+            "each case the project's own tests check of the existing feature nearest to it",
+            "a query made for the first time only after the change it should see",
             "and each case you chose not to handle,",
         ] {
             assert!(REVIEW.contains(case), "{case}");

@@ -263,11 +263,15 @@ pub(crate) fn brief(request: &str, sentences: &[String], before: Option<&Path>) 
          out, with both sides in one input, steps it sets in no order in each order, such as the \
          later one first, each category it maps to an output with an input from outside the \
          project's own code that uses the request's words for it, and each other feature it is \
-         said to work with, used together with it in one call. Set \
-         each test up the way the project's own tests set up the nearest feature it already \
-         has, and make each change before the first call or query, as a caller would, rather \
-         than calling once beforehand to warm anything up. Where the project's data, docs or \
-         tests already spell an output, expect that spelling.\n\n\
+         said to work with, used together with it in one call. Then find the project's own \
+         tests of the feature nearest to each new one, such as one it is said to work like or \
+         with, or one of the same kind in the same module, and write each of their cases again \
+         for the new one, in the same order of calls, with the same fixtures and through the \
+         same entry point, such as a query made for the first time only after the change it \
+         should see. Set each test up the way those tests do, and make each change before the \
+         first call or query, as a caller would, rather than calling once beforehand to warm \
+         anything up. Where the project's data, docs or tests already spell an output, expect \
+         that spelling.\n\n\
          Write the tests in the project's own test language and style, in new files whose \
          names hold `{MARKER}`, where its test runner finds them, such as beside its other \
          tests, and run them with that runner. Change no other file. A test that fails because \
@@ -452,6 +456,14 @@ mod tests {
         assert!(brief.contains("otherwise or and not keeps"), "{brief}");
         assert!(brief.contains("in each order"), "{brief}");
         assert!(brief.contains("uses the request's words for it"), "{brief}");
+        // The nearest feature's own tests, done again for the new one.
+        assert!(
+            brief.contains(
+                "write each of their cases again for the new one, in the same order of calls"
+            ),
+            "{brief}"
+        );
+        assert!(brief.contains("for the first time only after the change it should see"));
         assert!(brief.ends_with("what it expected and what it got`."));
     }
 
