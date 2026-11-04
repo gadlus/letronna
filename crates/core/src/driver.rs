@@ -2488,8 +2488,13 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
     for folder in [&copied, &before].into_iter().flatten() {
         crate::spec_tests::discard(folder);
     }
-    let tested = (tested.filter(|report| crate::requirements::tabled(report)))
-        .map(|report| crate::spec_tests::told(&report, kept.as_ref()));
+    // A report with no table of tests that ran still leaves its tests for the
+    // run to run, where it kept any: a tester without the run's set-up wrote
+    // them all the same.
+    let tested = tested.and_then(|report| match crate::requirements::tabled(&report) {
+        true => Some(crate::spec_tests::told(&report, kept.as_ref())),
+        false => Some(crate::spec_tests::unrun(&report, kept.as_ref()?)),
+    });
     (reports, tested)
 }
 

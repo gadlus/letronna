@@ -372,6 +372,40 @@ fn left(workspace: &Path) -> Vec<String> {
     found
 }
 
+/// What the run is told of the tester's `report` when it has no table of
+/// tests that ran, where it left tests `kept`: a tester that could not run
+/// them in its copy, such as one without the toolchain or set-up the run
+/// found, still wrote each from the request, so the run runs them itself.
+pub(crate) fn unrun(report: &str, kept: &Kept) -> String {
+    format!(
+        "A tester that hasn't seen your work wrote tests from the request alone but could not \
+         run them where it worked; its report follows. {} Run them with the project's own \
+         runner and the set-up you found works, fix a test only where it calls the code wrongly, \
+         such as a guessed name or import the request does not spell, and fix your work for \
+         each test that fails on what the request's words say. Then delete the copies, since \
+         they are not part of the task.\n\n{}",
+        where_kept(kept),
+        report.trim()
+    )
+}
+
+/// Where the tester's tests are `kept`, and how to run them, as the run is
+/// told it.
+fn where_kept(kept: &Kept) -> String {
+    let mut named: Vec<String> = (kept.files.iter().take(NAMED))
+        .map(|file| format!("`{file}`"))
+        .collect();
+    if kept.files.len() > NAMED {
+        named.push(format!("and {} more", kept.files.len() - NAMED));
+    }
+    format!(
+        "Its test files are kept out of the project, in `{}`, at the paths they ran from: {}. \
+         Copy them back into the project at those paths to run them.",
+        kept.dir.display(),
+        named.join(", ")
+    )
+}
+
 /// What the run is told of the tester's `report`, with its table, and of
 /// where its tests are `kept`.
 pub(crate) fn told(report: &str, kept: Option<&Kept>) -> String {
@@ -382,18 +416,9 @@ pub(crate) fn told(report: &str, kept: Option<&Kept>) -> String {
          quote the words that show it in your answer.",
     );
     if let Some(kept) = kept {
-        let mut named: Vec<String> = (kept.files.iter().take(NAMED))
-            .map(|file| format!("`{file}`"))
-            .collect();
-        if kept.files.len() > NAMED {
-            named.push(format!("and {} more", kept.files.len() - NAMED));
-        }
         text.push_str(&format!(
-            " Its test files are kept out of the project, in `{}`, at the paths they ran from: \
-             {}. Copy them back into the project at those paths to run them, and delete the \
-             copies before you end, since they are not part of the task.",
-            kept.dir.display(),
-            named.join(", ")
+            " {} Delete the copies before you end, since they are not part of the task.",
+            where_kept(kept)
         ));
     }
     text.push_str(&format!("\n\n{}", report.trim()));
@@ -647,8 +672,30 @@ mod tests {
         );
         assert!(text.contains("kept out of the project, in `/tmp/kept`"));
         assert!(text.contains("`tests/letronna_spec.test.ts`"));
-        assert!(text.contains("delete the copies before you end"));
+        assert!(text.contains("Delete the copies before you end"));
         assert!(text.ends_with("R1 | adds a pair | FAIL | npx vitest run x | got []"));
         assert!(!told("R1 | x | PASS", None).contains("kept out of the project"));
+    }
+
+    #[test]
+    fn tests_a_tester_could_not_run_are_left_for_the_run_to_run() {
+        let kept = Kept {
+            dir: PathBuf::from("/tmp/kept"),
+            files: vec!["drift/letronna_spec_test.go".to_owned()],
+        };
+        let report = "No Go toolchain in my copy.\nR1 | resolves | NOT RUN";
+        let text = unrun(report, &kept);
+        assert!(
+            text.contains("could not run them where it worked"),
+            "{text}"
+        );
+        assert!(text.contains("kept out of the project, in `/tmp/kept`"));
+        assert!(text.contains("`drift/letronna_spec_test.go`"));
+        assert!(text.contains("the set-up you found works"), "{text}");
+        assert!(
+            text.contains("fix your work for each test that fails"),
+            "{text}"
+        );
+        assert!(text.ends_with(report));
     }
 }
