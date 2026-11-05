@@ -38,12 +38,57 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **Terminal** — `-p --output stream-json` prints a `step` line as each tool call ends: the tool, what it worked on, whether it worked, and a few lines of what it gave back, or for a change to a file the file, the lines added and taken away and its diff. Letronna Cloud passes these on, so the phone lists a run's steps as it goes.
 - **Terminal** — `/local` and `letronna local` list the models that run on this computer, each with how it runs here, how far its download has got and the Hugging Face page it comes from. `get <id>` downloads one, `add <link>` adds one from a Hugging Face link (offering its files to pick from at a keyboard) and downloads it, and `pause`, `resume`, `cancel` and `remove` steer them. In a session a download goes on in the background and says when the model is ready; `letronna local get` and `add` wait for it, showing how far it has got.
 - **Terminal** — A `-p --background` run with `--output stream-json` says on its stream when it stops for a yes: an `ask` line with the session, the call, the tool, what it would do and why it asks, and an `answered` line once the answer file is read, so whatever started the run (Letronna Cloud for the phone) can show the question and write the answer.
+- **App** — Effort sits at the foot of the model menu (Auto, Low, Med, High, XHigh, Max, as the model has them), and the model's name shows the level only when one is set. `/effort` opens it, and `/effort max`, `/effort extra high` or `/effort auto` sets one straight away. The mode, Crew and Web switches in the chat box show only their icon while at their default and name themselves when on.
+- **Terminal** — Alt+P picks the model and Alt+T the effort without losing what is in the box: the draft is set aside while the picker runs and comes back after. Pressed while a reply runs, the picker opens when it ends.
+- **All** — A command running in the foreground can be sent to the background and goes on as a job. In the terminal the waiting line ends with `ctrl+b runs it in the background · esc stops it` (`ctrl+b twice` inside tmux), and it works for a `!` line too.
+- **All** — A rule kept by "Always allow" can be taken back. `/permissions` in the terminal lists the kept rules, allowed, asked first and denied, each with where it holds, and picking one removes it. Settings › Permissions in the window shows the same rules with a button to remove each.
+- **Terminal** — `/tools` switches Letronna's own tool families (Files, Commands, Web, Browser, Media, Messaging, a plugin's) on or off, as the window's Capabilities › Tools page does, with how many of each are off and what each still needs. `/tools on|off <family>` switches one by name.
+- **All** — `/redo` puts back what the last `/undo` or `/rewind` took back: the messages, pictures included, and the files as the agent had left them. A file changed since the restore is left alone and named.
+- **App** — The terminal's everyday commands work when typed in the window: `/model`, `/mode`, `/plan`, `/compact`, `/rewind`, `/retry`, `/copy`, `/branch` and the rest do what their menus and buttons do, where before they went to the model as text.
+- **App** — A line starting with `!` runs as a command in the session's folder, as in the terminal, and its output goes into the chat for the model to see. Esc stops it.
+- **App** — Dropping a file or folder on the chat puts it in the box as an `@` reference, so it is attached when sent. A dropped picture is still attached as a picture.
+- **App** — Cmd+F (Ctrl+F on Windows), or Find in this chat in the palette, finds words in the open chat, with a count ("2 of 5") and arrows to step between matches.
+- **App** — Cmd+= and Cmd+- make the window's text larger or smaller, from 70% to 160%, and Cmd+0 puts it back. The size is kept.
+- **All** — A session carries on from the window to the terminal and back. Continue this session in the terminal, in the palette, opens your terminal in its folder running `letronna --resume <id>`, and `/window` in the terminal opens the session on screen in the window.
+- **Terminal** — `--name` names the session a run starts or picks up, and `--fork-session` with `--continue` or `--resume <id>` carries on in a copy, leaving the original as it was.
+- **Terminal** — `--system-prompt` and `--append-system-prompt` (and their `-file` forms) replace Letronna's own instructions with yours, or add yours after them, for that run. The project's instructions, skills and tool rules are kept either way.
+- **Terminal** — `/terminal-setup` names the terminal you are in, says which keys make a new line there, and gives the exact setting for Shift+Enter and Option or Alt where they do not work yet.
+- **Terminal** — Ctrl+Z hands the screen back to the shell, and `fg` brings the session back as it was.
+- **Terminal** — While a turn runs, terminals that draw progress in the tab (Windows Terminal, ConEmu, Ghostty, iTerm2) show a running bar there.
+- **Terminal** — A copy says so with a green check and how much was taken ("copied 35 characters"), then the footer comes back after four seconds. Ctrl+V takes any picture on the clipboard, such as one copied in Preview or Safari, and a file copied in Finder.
+- **Terminal** — The queued line says how to send it now or take it back (`ctrl+s sends now · ↑ edits it`), and `/help` and the `?` card list every key the box answers to, Ctrl+R and Ctrl+L included.
+- **Terminal** — `/vim` gives the box vim's keys: normal and insert mode shown in the footer, motions, `d c y` with counts, text objects, `p`, `J` and `u`.
+- **Terminal** — `/theme` picks the terminal's colours, with themes for dark and light backgrounds and ones that tell an added line from a removed one by more than red and green. The default looks as it did, and the choice is kept.
+- **Terminal** — `/statusline <command>` shows your own status line under the footer. The command is handed the session as JSON in the same shape as Claude Code's `statusLine`, so a script written for it works here.
+- **Terminal** — Keys can be moved in `keybindings.json`, which `/keybindings` opens: each key maps to an action, a `/command`, or nothing to unbind it.
+- **All** — A recap of where a session stands, in two or three short lines: what was asked, what was done and what is left. `/recap` asks for one in the terminal and the window, and a session picked up more than 30 minutes after its last reply gets one unasked.
+- **All** — More hooks in hooks.json run: `PostToolUseFailure` after a call that failed, `SubagentStop` when a helper finishes, `PreCompact` before a session is summarized, and `SessionStart` and `UserPromptSubmit` at a turn's start, which can add context or turn a prompt back. `/hooks` in the terminal lists the hooks the file holds.
+- **All** — A project can have its own formatter run on every file the model writes (rustfmt, prettier, black, gofmt and others, as the project sets up), so edits come out in the project's layout. `/format` in the terminal and "Format edits in this project" in Settings › Thinking switch it on.
+- **All** — Language servers can check a project's edits with one switch: `/lsp` in the terminal and "Check edits with language servers" in Settings › Thinking find the servers this computer has for the project's languages and set them up, after asking.
+- **All** — `/review` takes a GitHub pull request by its number or link, fetching it without touching your checkout, and posts nothing to it without a yes.
+- **Terminal** — `letronna --bg "task"` works on with the terminal closed, and `/background` sends the session there. `letronna attach <id>` watches it and answers what it asks, and `letronna stop <id>` ends it. The window sends nothing into a session working in the background and says how to reach it.
+- **All** — `/ide` links the terminal to VS Code: a selection sent with Cmd+Alt+K (Ctrl+Alt+K elsewhere) lands in the box as `@file#L10-20`, and a change the model asks to make opens there as a diff beside the question. A terminal started inside VS Code links by itself.
+- **All** — A Letronna extension for VS Code: Open in terminal, Add selection to chat and Add file to chat, from the command palette and the editor's and Explorer's menus.
+- **All** — A session can work in folders beside its project: `--add-dir <folder>` and `/add-dir <folder>` in the terminal, and Add folder… in the project folder's menu in the window. Added folders last until the run or the window ends.
+- **Terminal** — `-p --output stream-json` prints `text` and `thinking` lines with each reply's words and thinking as they are written, so Letronna Cloud and the phone show them as they come rather than all at the end.
+
+### Changed
+- **App** — A message longer than a line takes the whole width of the chat box with the controls under it, where it used to be squeezed into half the box.
+- **All** — A run writing a big file in one call says what it is writing, or that it is thinking, while the reply still streams, and its output count takes in what has streamed so far, where it used to look frozen for minutes.
 
 ### Fixed
 - **All** — Updates install on their own: releases trust Letronna's signing key and an offline backup, where until now a release build had no key and refused every update. Copies from before this release need one download by hand.
 - **All** — Each model call stopped reading the accounts and gateways files thousands of times: a missing accounts file is remembered as missing, a list of gateways reads the file once rather than once a provider, and each file is looked at no more than every quarter second (a change from this window or terminal is seen at once, one from the other within that). A busy computer running many agents spends about a third of the time it did between calls.
 - **Windows** — A note an editor that crashed left behind is passed over when linking the terminal to an editor, as on macOS and Linux.
 - **All** — Moving an account up or down twice in quick succession could leave the list showing the order from before the second move, as the accounts file was read again only when its time or size changed.
+- **macOS** — The Keychain asks once, not again after every update or build, and not separately in the terminal and the window.
+- **Terminal** — Switching to another tab of the terminal and back could leave the conversation blank; coming back into focus now draws everything again.
+- **All** — A session with no project works in `~/Letronna Sessions` when `~/Letronna` already holds a git checkout, where before it could only read and a paired phone was refused.
+- **All** — In auto mode a check or a test may make scratch files in the system's temp folder, and on a run nobody watches a hold after several refused calls lifts again, so the run is not refused everything for the rest of its work.
+- **All** — A timed run nobody watches keeps retrying at its own pace when a gateway asks it to wait an hour, rather than ending at once.
+- **All** — Requests that leave tools to be found on demand no longer send an empty `tool_calls` field, which some gateways rejected outright.
+- **All** — A gateway whose model list gives no context sizes, such as OpenCode Go's, takes them from the public models.dev catalogue, so a model with a long context gets it rather than 64,000 tokens.
+- **App** — A `!` command stopped with Esc no longer stops Esc from working on the next one started while it was ending.
 
 ## [0.1.0-alpha.4.2] - 2026-10-20
 
