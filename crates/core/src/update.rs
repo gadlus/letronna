@@ -35,8 +35,11 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The public halves of the keys releases are signed with, as the hex that
 /// `openssl pkey -pubout -outform DER | tail -c 32` gives: the key in use, and
 /// a backup kept offline so that losing the first does not strand every copy
-/// already out there. Until one is set, every update is refused.
-const RELEASE_KEYS: &[[u8; 32]] = &[];
+/// already out there.
+const RELEASE_KEYS: &[[u8; 32]] = &[
+    key("6623015d7cd4b860da654512cf64305e9134f646f518d0d466106c618d9d66cd"),
+    key("8867495cb26bc65f5f323912bcf098befac4fd96daaace6e30a82ebe18d25344"),
+];
 
 /// A key whose private half is in the repository, `scripts/test-release-key.pem`,
 /// so an update can be tried end to end. Only debug builds trust it.

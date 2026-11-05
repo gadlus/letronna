@@ -38,6 +38,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **Terminal** — A `-p --background` run with `--output stream-json` says on its stream when it stops for a yes: an `ask` line with the session, the call, the tool, what it would do and why it asks, and an `answered` line once the answer file is read, so whatever started the run (Letronna Cloud for the phone) can show the question and write the answer.
 
 ### Fixed
+- **All** — Updates install on their own: releases trust Letronna's signing key and an offline backup, where until now a release build had no key and refused every update. Copies from before this release need one download by hand.
 - **All** — Each model call stopped reading the accounts and gateways files thousands of times: a missing accounts file is remembered as missing, a list of gateways reads the file once rather than once a provider, and each file is looked at no more than every quarter second (a change from this window or terminal is seen at once, one from the other within that). A busy computer running many agents spends about a third of the time it did between calls.
 - **Windows** — A note an editor that crashed left behind is passed over when linking the terminal to an editor, as on macOS and Linux.
 - **All** — Moving an account up or down twice in quick succession could leave the list showing the order from before the second move, as the accounts file was read again only when its time or size changed.
