@@ -13,6 +13,8 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.5] - 2026-11-05
+
 ### Added
 - **All** — A provider takes more than one account: a second ChatGPT or Claude plan, or another OpenAI, Anthropic, Gemini, xAI, OpenRouter or OpenCode Go/Zen key, each named (ChatGPT · Work) and listed under its provider in Settings › Accounts with Add another account, and in `/connect`. When an account reaches its limit, the same model goes on on your next account of that provider first, which Settings › Accounts › When one runs out can turn off, and a full plan is passed over until it resets: "Switched to ChatGPT · Work: ChatGPT reached its limit. It is back at 14:20." The model menu and `/model` list a model once for all of a provider's accounts.
 - **All** — Plan usage: each window of a ChatGPT, Claude or OpenCode Go plan (5-hour, weekly, monthly, a model's own) with how much is left and when it resets, from its replies and its own usage page. Settings › Accounts draws a bar for each and Check now asks again; `/limits` lists them in the terminal.
