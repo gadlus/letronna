@@ -147,10 +147,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("app")).unwrap();
         std::fs::create_dir_all(dir.join("lib")).unwrap();
-        (
-            dir.join("app"),
-            std::fs::canonicalize(dir.join("lib")).unwrap(),
-        )
+        // Without the `\\?\` Windows puts on a canonical path, as an added
+        // folder is given.
+        let lib = std::fs::canonicalize(dir.join("lib")).unwrap();
+        let lib = PathBuf::from(lib.to_string_lossy().replace(r"\\?\", ""));
+        (dir.join("app"), lib)
     }
 
     #[test]

@@ -228,7 +228,9 @@ mod tests {
             Effect::Deny,
             Some("/home/user_a/site"),
         );
-        assert_eq!(said(&push).1, "commands · in ~/site");
+        // Shown with this computer's own separator.
+        let site = if cfg!(windows) { r"~\site" } else { "~/site" };
+        assert_eq!(said(&push).1, format!("commands · in {site}"));
         let docs = rule("web_fetch", "docs.rs", Effect::Allow, None);
         assert_eq!(
             said(&docs),
