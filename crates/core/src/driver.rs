@@ -7803,6 +7803,11 @@ pub(crate) mod tests {
             r#"{"scripts": {"build": "tsc", "test": "vitest"}}"#,
         )
         .unwrap();
+        // PowerShell runs `./tsc` as tsc.cmd, and has nothing to run a
+        // script with no extension with, so `./tsc` there failed or hung.
+        #[cfg(windows)]
+        std::fs::write(dir.join("tsc.cmd"), "@exit /b 0\r\n").unwrap();
+        #[cfg(unix)]
         std::fs::write(dir.join("tsc"), "#!/bin/sh\nexit 0\n").unwrap();
         #[cfg(unix)]
         {
