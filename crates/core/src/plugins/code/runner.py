@@ -20,6 +20,7 @@ def main():
     folder, main_file = sys.argv[1], sys.argv[2]
     messages = os.fdopen(os.dup(1), "w", encoding="utf-8", newline="\n", buffering=1)
     os.dup2(2, 1)
+    windows_handle(STD_OUTPUT_HANDLE, 1)
     sys.stdout = sys.stderr
     incoming = os.fdopen(os.dup(0), "rb")
     read_nothing()
@@ -47,19 +48,35 @@ def read_nothing():
     input, so it never meets the messages. It would read them away, and on
     Windows it would hang: a program that looks at a pipe another thread is
     reading waits for that read to end, which is the next message, so git,
-    run from a tool, never started. Python hands a program Windows' own
-    standard input handle rather than fd 0, so that is set as well."""
+    run from a tool, never started."""
     null = os.open(os.devnull, os.O_RDONLY)
     os.dup2(null, 0)
     os.close(null)
-    if os.name == "nt":
-        import ctypes
-        import msvcrt
+    windows_handle(STD_INPUT_HANDLE, 0)
 
-        kernel32 = ctypes.WinDLL("kernel32")
-        kernel32.SetStdHandle.argtypes = (ctypes.c_uint32, ctypes.c_void_p)
-        STD_INPUT_HANDLE = -10 & 0xFFFFFFFF
-        kernel32.SetStdHandle(STD_INPUT_HANDLE, msvcrt.get_osfhandle(0))
+
+STD_INPUT_HANDLE, STD_OUTPUT_HANDLE = -10, -11
+
+
+def windows_handle(which, fd):
+    """On Windows, makes the standard handle `which` the one under `fd`:
+    Python hands a program Windows' own standard handles, not fds 0 and 1,
+    so without this a program a plugin starts would still be given the
+    messages' pipes. Says so in the log when Windows refuses."""
+    if os.name != "nt":
+        return
+    import ctypes
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetStdHandle.argtypes = (ctypes.c_uint32, ctypes.c_void_p)
+    kernel32.SetStdHandle.restype = ctypes.c_int
+    if not kernel32.SetStdHandle(which & 0xFFFFFFFF, msvcrt.get_osfhandle(fd)):
+        sys.stderr.write(
+            "letronna: Windows' standard handle %d could not be set (error %d); "
+            "a program this plugin starts may be handed the messages' pipe\n"
+            % (which, ctypes.get_last_error())
+        )
 
 
 if __name__ == "__main__":
