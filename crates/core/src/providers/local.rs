@@ -9,7 +9,7 @@ use crate::chat::{Connection, Event, Message};
 use crate::store::Settings;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
@@ -93,6 +93,11 @@ pub fn start(port: u16, token: String) -> Result<(u16, Arc<AtomicBool>), String>
 }
 
 fn handle(stream: TcpStream, token: &str) -> std::io::Result<()> {
+    // Dropped last, once the reply is written: it ends the connection for
+    // the client even where a program started meanwhile holds a copy of
+    // this socket, as Windows can hand one, and closing would leave the
+    // client waiting until that program ended.
+    let _ends = Ends(stream.try_clone()?);
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut out = stream;
     let mut first = String::new();
@@ -133,6 +138,15 @@ fn handle(stream: TcpStream, token: &str) -> std::io::Result<()> {
             404,
             &error("Only /v1/models and /v1/chat/completions are here."),
         ),
+    }
+}
+
+/// Says no more is coming on its connection when dropped.
+struct Ends(TcpStream);
+
+impl Drop for Ends {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(Shutdown::Write);
     }
 }
 
