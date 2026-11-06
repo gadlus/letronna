@@ -1252,7 +1252,12 @@ fn places(word: &str, workspace: &Path, bases: &[PathBuf]) -> Vec<PathBuf> {
         Some((folder, last)) if last.contains('*') => folder.to_owned(),
         _ => word,
     };
-    if word.is_empty() || word.contains(['*', '?', '<', '>', '{', '}', '$', '~']) {
+    // A `~` is the home folder only where a word starts, as a shell has it;
+    // inside one it is part of a name, as in Windows' short `RUNNER~1`.
+    if word.is_empty()
+        || word.starts_with('~')
+        || word.contains(['*', '?', '<', '>', '{', '}', '$'])
+    {
         return Vec::new();
     }
     let given = Path::new(&word);
@@ -1749,6 +1754,20 @@ mod tests {
         std::fs::create_dir_all(dir.join("in/app/tools")).unwrap();
         std::fs::write(dir.join("in/app/tools/check.py"), "print('ok')").unwrap();
         assert_eq!(kept(&request, &dir), ["in/app/tools/check.py"]);
+    }
+
+    #[test]
+    fn a_tilde_inside_a_folder_s_name_is_part_of_it_and_only_one_in_front_is_home() {
+        // As Windows names a folder in its short form, `RUNNER~1`.
+        let dir = workspace("short", &["RUNNER~1/in/app/test_config.py"]);
+        let request = format!(
+            "Run `pytest {}/RUNNER~1/in/app/test_config.py`.\n\
+             Do not modify the test file `test_config.py`.",
+            dir.display()
+        );
+        assert_eq!(kept(&request, &dir), ["RUNNER~1/in/app/test_config.py"]);
+        let home = "Do not modify `~/RUNNER~1/in/app/test_config.py`.";
+        assert!(kept(home, &dir).is_empty());
     }
 
     #[test]

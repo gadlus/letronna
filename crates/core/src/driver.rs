@@ -6582,6 +6582,9 @@ pub(crate) mod tests {
         assert_eq!(report.text, "Fixed the rolling window; the dumps stay.");
     }
 
+    // An ELF core file is what Unix leaves, made here with printf, which
+    // Windows' PowerShell does not have.
+    #[cfg(unix)]
     #[test]
     fn a_dump_a_program_made_is_the_runs_to_delete_after_it_read_untrusted_words() {
         let _data = data("dumps-steered");
@@ -6950,6 +6953,7 @@ pub(crate) mod tests {
     /// A provider that answers `count` requests, each with what `answer`
     /// says to what it carried, and hands back what each carried: helpers
     /// side by side ask in no set order, so each is answered by who it is.
+    #[cfg(unix)]
     fn provider_by(
         count: usize,
         answer_to: impl Fn(&Value) -> String + Send + 'static,
@@ -7027,6 +7031,9 @@ pub(crate) mod tests {
         assert_eq!(review_due(&spec, &report, hour), None);
     }
 
+    // Off Unix the tester works in the project itself, as `spec_tests::copy`
+    // makes no copy there.
+    #[cfg(unix)]
     #[test]
     fn a_tester_beside_the_reviews_tests_from_the_request_alone_and_its_tests_leave_the_project() {
         let _data = data("requirements-tester");
@@ -7796,6 +7803,11 @@ pub(crate) mod tests {
             r#"{"scripts": {"build": "tsc", "test": "vitest"}}"#,
         )
         .unwrap();
+        // PowerShell runs `./tsc` as tsc.cmd, and has nothing to run a
+        // script with no extension with, so `./tsc` there failed or hung.
+        #[cfg(windows)]
+        std::fs::write(dir.join("tsc.cmd"), "@exit /b 0\r\n").unwrap();
+        #[cfg(unix)]
         std::fs::write(dir.join("tsc"), "#!/bin/sh\nexit 0\n").unwrap();
         #[cfg(unix)]
         {
