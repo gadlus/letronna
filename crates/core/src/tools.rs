@@ -8161,7 +8161,10 @@ mod tests {
         assert!(refused("src").contains("inside the project folder"));
         assert!(refused(" ").contains("Name the folder"));
         let added = added_folder("..", Some(&project)).unwrap();
-        assert_eq!(added, std::fs::canonicalize(&dir).unwrap());
+        // Without the `\\?\` Windows puts on a canonical path, as it is given.
+        let real = std::fs::canonicalize(&dir).unwrap();
+        let shown = real.to_string_lossy().replace(r"\\?\", "");
+        assert_eq!(added, std::path::PathBuf::from(shown));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

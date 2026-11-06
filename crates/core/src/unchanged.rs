@@ -1734,17 +1734,21 @@ mod tests {
             "protects",
             &["in/app/config_manager.py", "in/app/test_config.py"],
         );
+        // Named in full, as a person names it: Windows can give the temp
+        // folder in its short form, such as `RUNNER~1`, and a word with a
+        // `~` is never read as a path.
+        let real = std::fs::canonicalize(&*dir).unwrap();
+        let named = real.to_string_lossy().replace(r"\\?\", "");
         let request = format!(
             "Fix the bug in `{0}/in/app/config_manager.py`.\n\
              Run `pytest {0}/in/app/test_config.py`.\n\
              - **No cheating**: Absolutely do not modify any code or assertions in the test file `test_config.py`.",
-            dir.display()
+            named
         );
         assert_eq!(kept(&request, &dir), ["in/app/test_config.py"]);
         let request = format!(
-            "Run `python tools/check.py` from `{}/in/app` and make it pass.\n\
-             Do not modify `tools/check.py`.",
-            dir.display()
+            "Run `python tools/check.py` from `{named}/in/app` and make it pass.\n\
+             Do not modify `tools/check.py`."
         );
         std::fs::create_dir_all(dir.join("in/app/tools")).unwrap();
         std::fs::write(dir.join("in/app/tools/check.py"), "print('ok')").unwrap();
