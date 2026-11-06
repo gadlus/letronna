@@ -2153,6 +2153,36 @@ def guard(call):
     }
 
     #[test]
+    fn a_program_a_python_plugin_starts_reads_nothing_of_its_messages() {
+        if !python_here() {
+            return;
+        }
+        // Given the messages' pipe, the program would wait on it, and on
+        // Windows a git started like this never even began.
+        let built = plugin(
+            "pyquiet",
+            json!({"main": "plugin.py", "contributes": {
+                "tools": [{"name": "child", "description": "Starts a program."}],
+            }}),
+            r#"
+import subprocess, sys
+import letronna
+
+@letronna.tool("child")
+def child(args):
+    done = subprocess.run(
+        [sys.executable, "-c", "import sys; print(repr(sys.stdin.read()))"],
+        capture_output=True, text=True, timeout=5,
+    )
+    return done.stdout.strip()
+"#,
+        );
+        let ctx = ToolContext::default();
+        let child = built.tool("plugin__pyquiet__child");
+        assert_eq!(child.run(&json!({}), &ctx).unwrap(), "''");
+    }
+
+    #[test]
     fn a_python_plugin_that_dies_starts_again_after_a_wait_and_stops_when_switched_off() {
         if !python_here() {
             return;
@@ -2392,7 +2422,11 @@ def die(args):
         let plugin = gate.find("test-gate").unwrap();
         // Off until a command is set.
         assert_eq!(turn_stop_in(&gate, &ctx, "Done.", false), None);
-        let test = r#"python3 -c "import sys; ok = open('ok').read(); print('1 failed' if ok != 'yes' else 'all pass'); sys.exit(ok != 'yes')""#;
+        // Windows has python; a python3 there may be the store's stand-in.
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let test = format!(
+            r#"{python} -c "import sys; ok = open('ok').read(); print('1 failed' if ok != 'yes' else 'all pass'); sys.exit(ok != 'yes')""#
+        );
         plugin.set("command", json!(test)).unwrap();
         wait_for("the setting", || {
             turn_stop_in(&gate, &ctx, "Done.", false).is_some_and(|back| back.contains("1 failed"))
