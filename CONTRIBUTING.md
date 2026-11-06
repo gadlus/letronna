@@ -146,6 +146,25 @@ repository secrets are set, and builds unsigned (as before) when they are not.
   `APPLE_API_ISSUER`. The app is signed with the hardened runtime, the disk
   image is notarized and stapled, and the bare terminal binary is signed.
 
+Without notarization, macOS says Apple "could not verify Letronna is free of
+malware" and opens it only from System Settings › Privacy & Security › Open
+Anyway. To notarize a release built on a Mac instead of by CI, which needs
+the paid Apple Developer Program:
+
+1. In Xcode › Settings › Accounts › Manage Certificates, add a
+   **Developer ID Application** certificate. It lands in the login keychain.
+2. Make an app-specific password at account.apple.com, then store it once:
+   `xcrun notarytool store-credentials letronna-notary --apple-id <apple-id>
+   --team-id <team-id>`.
+3. Build with both set:
+   `MACOS_SIGN_IDENTITY="Developer ID Application: <name> (<team-id>)"
+   MACOS_NOTARY_PROFILE=letronna-notary scripts/bundle-macos.sh --dmg`
+   (`security find-identity -v -p codesigning` prints the identity). The app
+   and the disk image are notarized and stapled, and the terminal at
+   `target/release/letronna` is signed and notarized, so upload that copy.
+   `spctl -a -vv target/Letronna.app` then says `source=Notarized Developer
+   ID`.
+
 ## Reporting bugs
 
 Open an issue with the gateway you used, the model, and what you expected.
