@@ -148,9 +148,13 @@ mod tests {
         std::fs::create_dir_all(dir.join("app")).unwrap();
         std::fs::create_dir_all(dir.join("lib")).unwrap();
         // Without the `\\?\` Windows puts on a canonical path, as an added
-        // folder is given.
-        let lib = std::fs::canonicalize(dir.join("lib")).unwrap();
-        let lib = PathBuf::from(lib.to_string_lossy().replace(r"\\?\", ""));
+        // folder is given: dropped in front of a drive, kept before a share.
+        let real = std::fs::canonicalize(dir.join("lib")).unwrap();
+        let text = real.to_string_lossy();
+        let lib = match text.strip_prefix(r"\\?\") {
+            Some(rest) if !rest.starts_with("UNC") => PathBuf::from(rest),
+            _ => real.clone(),
+        };
         (dir.join("app"), lib)
     }
 

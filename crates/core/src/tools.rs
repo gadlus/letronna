@@ -8161,10 +8161,15 @@ mod tests {
         assert!(refused("src").contains("inside the project folder"));
         assert!(refused(" ").contains("Name the folder"));
         let added = added_folder("..", Some(&project)).unwrap();
-        // Without the `\\?\` Windows puts on a canonical path, as it is given.
+        // Without the `\\?\` Windows puts on a canonical path, as it is given:
+        // dropped in front of a drive, kept in front of a share.
         let real = std::fs::canonicalize(&dir).unwrap();
-        let shown = real.to_string_lossy().replace(r"\\?\", "");
-        assert_eq!(added, std::path::PathBuf::from(shown));
+        let text = real.to_string_lossy();
+        let shown = match text.strip_prefix(r"\\?\") {
+            Some(rest) if !rest.starts_with("UNC") => std::path::PathBuf::from(rest),
+            _ => real.clone(),
+        };
+        assert_eq!(added, shown);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
