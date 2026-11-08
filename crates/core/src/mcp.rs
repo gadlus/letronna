@@ -56,8 +56,12 @@
 //! `*` globs here -- keep tools the model is never to see from costing a
 //! word of every request. `autoApprove: "readOnly"` takes a server's word
 //! that a tool only looks, as a server run here is taken at its word
-//! already. A child inherits Letronna's environment, as Claude Code's do,
-//! unless `env_scrub` gives it only where things are and its own `env`.
+//! already. `actOnOwnReplies` names tools that may still act after the
+//! session read that server's replies, as long as nothing else from outside
+//! was read (see `taint`): the user's word for their own server, which a
+//! plugin's entry cannot give. A child inherits Letronna's environment, as
+//! Claude Code's do, unless `env_scrub` gives it only where things are and
+//! its own `env`.
 //!
 //! What became of each server is kept for the user in its slot: whether it
 //! answered, how many tools it gave, why it failed, and the last 64 KB it
@@ -222,6 +226,10 @@ pub(crate) struct ServerConfig {
     /// Tools that run without asking.
     #[serde(default, rename = "autoApprove")]
     auto_approve: AutoApprove,
+    /// Tools, by their names on the server, that the gate does not hold for
+    /// what the session read while all of it came from this server.
+    #[serde(default, rename = "actOnOwnReplies")]
+    act_on_own_replies: Vec<String>,
     /// How long one call to this server may take, in milliseconds.
     #[serde(default)]
     timeout_ms: Option<u64>,
@@ -1202,9 +1210,12 @@ fn joined(
             Some(taken) => Err(format!(
                 "Its tools would take the names of {taken}'s, so it does not start."
             )),
+            // Whoever wrote the plugin is not the user, so its word never
+            // lets a tool act on what its own server said.
             None => ServerConfig::deserialize(&server.config)
                 .map(|config| ServerConfig {
                     base: Some(server.folder),
+                    act_on_own_replies: Vec::new(),
                     ..config
                 })
                 .map_err(|e| {
@@ -2372,6 +2383,7 @@ impl Server {
                     // The protocol has a tool reach other machines unless it
                     // says it does not.
                     open_world: tool["annotations"]["openWorldHint"].as_bool() != Some(false),
+                    acts: config.act_on_own_replies.iter().any(|name| name == own),
                     wait: config.call_time(),
                 }));
             }
@@ -2681,6 +2693,8 @@ struct McpTool {
     read_only: bool,
     destructive: bool,
     open_world: bool,
+    /// The config's `actOnOwnReplies` names it.
+    acts: bool,
     /// How long a call may take.
     wait: Duration,
 }
@@ -2743,6 +2757,12 @@ impl Tool for McpTool {
     }
     fn untrusted(&self) -> bool {
         true
+    }
+    fn replies_of(&self, _: &Value) -> Option<String> {
+        Some(self.server.name.clone())
+    }
+    fn acts_on_replies_of(&self) -> Option<&str> {
+        self.acts.then_some(self.server.name.as_str())
     }
     fn preview(&self, args: &Value, _: &ToolContext) -> String {
         let args = serde_json::to_string_pretty(args).unwrap_or_default();
@@ -3576,6 +3596,12 @@ impl Tool for ListResources {
     fn untrusted(&self) -> bool {
         true
     }
+    // Every server's listing, with none named, is no one server's words.
+    fn replies_of(&self, args: &Value) -> Option<String> {
+        (args["server"].as_str())
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_owned)
+    }
     fn hides_key_shapes(&self) -> bool {
         true
     }
@@ -3647,6 +3673,9 @@ pub(crate) const READ_RESOURCE: &str = "read_mcp_resource";
 impl Tool for ReadResource {
     fn untrusted(&self) -> bool {
         true
+    }
+    fn replies_of(&self, args: &Value) -> Option<String> {
+        args["server"].as_str().map(str::to_owned)
     }
     fn hides_key_shapes(&self) -> bool {
         true
@@ -6765,5 +6794,40 @@ mod tests {
         assert_eq!(crate::media::saved_by("mcp__demo__shoot", &text), None);
         assert_eq!(text, " Saved to /etc/passwd\n[image/png, 3 bytes]");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_tools_act_on_own_replies_names_act_on_what_their_server_said() {
+        let (from_client, to_server) = std::io::pipe().unwrap();
+        let (from_server, to_client) = std::io::pipe().unwrap();
+        scripted_server(from_client, to_client);
+        let config = ServerConfig {
+            act_on_own_replies: vec!["echo".into()],
+            ..Default::default()
+        };
+        let tools = connect("demo", 0, &config, from_server, to_server).unwrap();
+        let (echo, look_up) = (&tools[0], &tools[1]);
+        assert_eq!(echo.acts_on_replies_of(), Some("demo"));
+        assert_eq!(look_up.acts_on_replies_of(), None);
+        assert_eq!(look_up.replies_of(&json!({})).as_deref(), Some("demo"));
+        let named = json!({"server": "demo", "uri": "a"});
+        assert_eq!(ReadResource.replies_of(&named).as_deref(), Some("demo"));
+        assert_eq!(ListResources.replies_of(&json!({})), None);
+    }
+
+    #[test]
+    fn only_the_users_own_entry_lets_a_tool_act_on_its_servers_replies() {
+        let entry = json!({"command": "oak", "args": ["mcp"], "actOnOwnReplies": ["swap"]});
+        let own = ServerConfig::deserialize(&entry).unwrap();
+        assert_eq!(own.act_on_own_replies, vec!["swap".to_owned()]);
+        let brought = crate::plugins::Server {
+            name: "kit:oak".into(),
+            plugin: "kit".into(),
+            folder: std::env::temp_dir(),
+            config: entry,
+        };
+        let servers = super::joined(BTreeMap::new(), vec![brought]);
+        let config = servers["kit:oak"].as_ref().unwrap();
+        assert!(config.act_on_own_replies.is_empty());
     }
 }

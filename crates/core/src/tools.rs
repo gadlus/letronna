@@ -228,6 +228,19 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// The MCP server whose words alone it returns when called with `args`,
+    /// for an untrusted tool that reads from one server; `None` for any
+    /// other, whose words count as from anywhere.
+    fn replies_of(&self, _args: &Value) -> Option<String> {
+        None
+    }
+
+    /// The MCP server on whose own replies the user lets it act, in a
+    /// session whose every untrusted word came from that server.
+    fn acts_on_replies_of(&self) -> Option<&str> {
+        None
+    }
+
     /// Whether each error it returns was checked to fence whatever it quotes
     /// from outside, so that an error without a fence tells nothing someone
     /// else wrote reached the model. Off by default: an untrusted tool's
@@ -992,7 +1005,10 @@ pub(crate) fn run_found(
         |_| true,
     );
     if tool.untrusted() && reached {
-        crate::taint::mark(ctx);
+        match tool.replies_of(&args) {
+            Some(server) => crate::taint::mark_from(ctx, &server),
+            None => crate::taint::mark(ctx),
+        }
     }
     let ran = match ran {
         Ok(ran) => ran,
