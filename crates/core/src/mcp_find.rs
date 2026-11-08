@@ -119,6 +119,12 @@ pub(crate) fn is_rare(name: &str) -> bool {
     RARE.contains(&name)
 }
 
+/// Whether a request over `connection` leaves Letronna's less used tools to
+/// `find_tools`: a lean run's does, and so do the window's and the terminal's.
+fn rare_left_out(connection: &Connection) -> bool {
+    connection.lean_tools || connection.rare_on_demand
+}
+
 /// Which tools a request leaves out of its array, for `find_tools` to find.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct OnDemand {
@@ -134,7 +140,7 @@ impl OnDemand {
     pub(crate) fn of(connection: &Connection, tools: &[Arc<dyn Tool>]) -> Self {
         Self {
             mcp: on_demand(tools),
-            rare: connection.lean_tools || connection.rare_on_demand,
+            rare: rare_left_out(connection),
         }
     }
 
@@ -315,7 +321,7 @@ impl Tool for FindTools {
     fn description(&self) -> &'static str {
         "Search the tools left out of this list: the user's MCP servers' tools when they are too many to list. Give a few words for what you need done, or a tool's exact name; the matching tools come back with their descriptions and arguments. Then call one with call_mcp_tool."
     }
-    // A lean run names the less used tools it left out, and only those it
+    // A run that left out the less used tools names them, and only those it
     // would offer, so none is looked for that is not there. The names are
     // the array's own, which keep from one request to the next.
     fn description_for(&self, connection: &Connection, offered: &[&str]) -> Cow<'static, str> {
@@ -323,7 +329,7 @@ impl Tool for FindTools {
         let rare: Vec<&str> = offered
             .iter()
             .copied()
-            .filter(|name| connection.lean_tools && is_rare(name))
+            .filter(|name| rare_left_out(connection) && is_rare(name))
             .collect();
         let Some((last, rest)) = rare.split_last() else {
             return said.into();
@@ -354,15 +360,17 @@ impl Tool for FindTools {
                 .is_none_or(|names| names.iter().any(|name| name == tool.name()))
         };
         let tools: Vec<Arc<dyn Tool>> = crate::tools::all().into_iter().filter(allowed).collect();
-        // Letronna's own tools a lean run left out, as far as it would offer
+        // Letronna's own tools the run left out, as far as it would offer
         // them at all.
         let rare: Vec<String> = match ctx.caller.connection.as_deref() {
-            Some(connection) if connection.lean_tools => crate::tools::callable(&tools, connection)
-                .iter()
-                .map(|tool| tool.name())
-                .filter(|name| is_rare(name))
-                .map(str::to_owned)
-                .collect(),
+            Some(connection) if rare_left_out(connection) => {
+                crate::tools::callable(&tools, connection)
+                    .iter()
+                    .map(|tool| tool.name())
+                    .filter(|name| is_rare(name))
+                    .map(str::to_owned)
+                    .collect()
+            }
             _ => Vec::new(),
         };
         let connection = ctx.caller.connection.as_deref();
@@ -989,6 +997,31 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert!(!found.contains("\nbrowse: "), "{found}");
+    }
+
+    #[test]
+    fn the_window_and_the_terminal_find_the_less_used_tools_they_leave_out() {
+        let window = Connection {
+            rare_on_demand: true,
+            ..connection()
+        };
+        let sent = names(&crate::tools::specs(&window));
+        assert!(!sent.iter().any(|name| name == "schedule"), "{sent:?}");
+        // The search finds it by what it does, and by its name.
+        for query in ["schedule a job every day", "schedule"] {
+            let found = FindTools
+                .run(&json!({"query": query}), &ToolContext::of(&window))
+                .unwrap();
+            assert!(found.contains("\nschedule: "), "{query}: {found}");
+        }
+        // And the search's own description names what was left out.
+        let specs = crate::tools::specs(&window);
+        let find = specs
+            .iter()
+            .find(|spec| spec["function"]["name"] == FIND_TOOLS)
+            .unwrap();
+        let said = find["function"]["description"].as_str().unwrap();
+        assert!(said.contains("schedule"), "{said}");
     }
 
     #[test]
