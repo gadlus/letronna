@@ -24,6 +24,7 @@ All of these files live in the [data folder](data-and-privacy.md). A project can
 ```
 
 - Tools appear as `mcp__<server>__<tool>`. Each call asks first unless the tool is listed in `autoApprove`. `"autoApprove": "readOnly"` trusts the server's own read-only hints.
+- Once a session has read words someone else wrote (a page, a document, any server's reply), a call that changes something through an MCP server waits for your yes in every mode, in case those words steered it. `actOnOwnReplies` lists tools that may still act after reading their own server's replies, as long as that server wrote everything the session read from outside: a page or another server's reply brings the check back. Only your own `mcp.json` can set it, never a plugin. Leave out tools that send money or data to an address, and keep the server's own limits on.
 - Remote servers use streamable HTTP. The legacy SSE transport is not supported.
 - Any string field can use `${VAR}` or `${VAR:-default}`.
 - Other per-server options:
