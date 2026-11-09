@@ -1251,6 +1251,54 @@ fn sets(command: &crate::command::Command) -> bool {
     matches!(runs(command).as_deref(), None | Some("export"))
 }
 
+/// Programs whose first word is a subcommand, as `go test` and `cargo
+/// build` are: a line of one that set nothing says the program needs no
+/// set-up only for the same subcommand, since `go version` and `go env`
+/// run without the module cache `go test` cannot.
+const SUBCOMMANDS: [&str; 18] = [
+    "go", "cargo", "npm", "pnpm", "yarn", "bun", "deno", "dotnet", "mvn", "gradle", "gradlew",
+    "mix", "stack", "swift", "uv", "poetry", "pip", "make",
+];
+
+/// Words that only ask a program about itself, so a line of them ran no
+/// test and says nothing of the set-up a test needs.
+const PROBES: [&str; 4] = ["--version", "-V", "--help", "-h"];
+
+/// Whether `line`, a command of the run's that runs `program` with no
+/// set-up, ran what `command`, the tester's, runs, so that it says the
+/// program needs none: the same subcommand, for a program that takes one
+/// (`SUBCOMMANDS`), as `go test` is to `go test` and not to `go version`;
+/// anything but a probe of the program (`PROBES`), for one that does not,
+/// as `pytest -q tests/` is and `pytest --version` is not. False when
+/// either does not run `program`.
+pub(crate) fn same_run(line: &str, command: &str, program: &str) -> bool {
+    let (Some(ran), Some(wanted)) = (arguments(line, program), arguments(command, program)) else {
+        return false;
+    };
+    if SUBCOMMANDS.contains(&program) {
+        return subcommand(&ran).is_some() && subcommand(&ran) == subcommand(&wanted);
+    }
+    !ran.iter().any(|word| PROBES.contains(&word.as_str()))
+}
+
+/// The words after `program` on the last command of `line` that runs it;
+/// None when none does.
+fn arguments(line: &str, program: &str) -> Option<Vec<String>> {
+    let dialect = crate::command::Dialect::here();
+    let assessed = crate::command::assess(line, dialect, None);
+    (assessed.commands.iter().rev())
+        .find(|command| runs(command).as_deref() == Some(program))
+        .map(|command| command.argv[command.at + 1..].to_vec())
+}
+
+/// The subcommand among `arguments`, a program's: the first that is not a
+/// flag.
+fn subcommand(arguments: &[String]) -> Option<&str> {
+    (arguments.iter())
+        .find(|word| !word.starts_with('-'))
+        .map(String::as_str)
+}
+
 /// Whether `word` sets a variable to a value with nothing in it for the
 /// shell to expand or to end the word at, and no credentials in an address,
 /// under a name that marks it neither as a secret nor as one never lent.
@@ -1283,7 +1331,7 @@ fn go_flags(name: &str, value: &str) -> bool {
 /// or the tester gave no command.
 pub(crate) fn to_run(run: u64) -> Option<(Kept, String)> {
     let moved = moved().lock().ok()?;
-    let kept = moved.iter().find(|kept| kept.run == run)?;
+    let kept = first_kept(&moved, run)?;
     Some((kept.kept.clone(), kept.command.clone()?))
 }
 
@@ -2863,14 +2911,14 @@ pub(crate) fn keep(
 }
 
 /// Records `set_up`, the variables the tester's own command that ran its
-/// tests set, with the files last kept for run `run`, for the driver to
+/// tests set, with `kept`, its files as `keep` gave them, for the driver to
 /// export ahead of their command (`lent`): the module cache the tester's
 /// copy needed, the driver's copy needs too.
-pub(crate) fn lend(run: u64, set_up: Vec<String>) {
+pub(crate) fn lend(kept: &Kept, set_up: Vec<String>) {
     if let Ok(mut moved) = moved().lock()
-        && let Some(kept) = moved.iter_mut().rfind(|kept| kept.run == run)
+        && let Some(entry) = moved.iter_mut().find(|entry| entry.kept.dir == kept.dir)
     {
-        kept.set_up = set_up;
+        entry.set_up = set_up;
     }
 }
 
@@ -2880,9 +2928,15 @@ pub(crate) fn lent(run: u64) -> Vec<String> {
     let Ok(moved) = moved().lock() else {
         return Vec::new();
     };
-    (moved.iter().find(|kept| kept.run == run))
+    (first_kept(&moved, run))
         .map(|kept| kept.set_up.clone())
         .unwrap_or_default()
+}
+
+/// The tester's files kept for run `run` that the driver runs, as `to_run`
+/// and `lent` both read them: the first kept for it.
+fn first_kept(moved: &[Moved], run: u64) -> Option<&Moved> {
+    moved.iter().find(|kept| kept.run == run)
 }
 
 /// `keep`, for the files of a tester started with run `run`: written in the
@@ -2896,9 +2950,9 @@ pub(crate) fn keep_ahead(
 ) -> Option<Kept> {
     let kept = keep(run, from, workspace, command)?;
     if let Ok(mut moved) = moved().lock()
-        && let Some(kept) = moved.iter_mut().rfind(|kept| kept.run == run)
+        && let Some(entry) = moved.iter_mut().find(|entry| entry.kept.dir == kept.dir)
     {
-        kept.unmet = true;
+        entry.unmet = true;
     }
     Some(kept)
 }
@@ -6599,6 +6653,48 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_line_of_the_program_counts_only_where_it_ran_what_the_tester_runs() {
+        let go = "go test -tags analyze -run LetronnaSpec .";
+        assert!(same_run(
+            "cd /app && go test ./... 2>&1 | tail -20",
+            go,
+            "go"
+        ));
+        assert!(!same_run("go version", go, "go"));
+        assert!(!same_run("go env GOMODCACHE", go, "go"));
+        assert!(!same_run("go vet ./...", go, "go"));
+        assert!(!same_run("cargo --version", "cargo test -p pest", "cargo"));
+        assert!(!same_run("cargo build", "cargo test -p pest", "cargo"));
+        assert!(same_run("cargo test", "cargo test -p pest", "cargo"));
+        assert!(same_run("npm test", "npm test", "npm"));
+        assert!(!same_run("npm run build", "npm test", "npm"));
+        // A program without subcommands ran its tests unless it was asked
+        // about itself.
+        let pytest = "pytest -q tests/test_letronna_spec.py";
+        assert!(same_run("pytest", pytest, "pytest"));
+        assert!(same_run(
+            "cd /app && pytest -q 2>&1 | tail -5",
+            pytest,
+            "pytest"
+        ));
+        assert!(!same_run("pytest --version", pytest, "pytest"));
+        assert!(!same_run(
+            "python --version",
+            "python -m pytest tests/",
+            "python"
+        ));
+        assert!(same_run(
+            "python -m pytest -q",
+            "python -m pytest tests/",
+            "python"
+        ));
+        // Nothing where either does not run the program.
+        assert!(!same_run("ls", go, "go"));
+        assert!(!same_run("go test .", "pytest -q", "go"));
     }
 
     #[cfg(unix)]
