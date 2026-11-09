@@ -323,10 +323,15 @@ fn moved() -> &'static Mutex<Vec<Moved>> {
 }
 
 /// What a run that ended leaves to sweep from its project (`sweep`): the
-/// copies of its tester's files found there as it ended, by their paths.
+/// names of its tester's files, the files so named that were there as they
+/// were kept, and the copies found as it ended (`copies`), by their paths;
+/// None where git could not say then, and the sweep lists them when it is
+/// made rather than losing them.
 struct Sweep {
     workspace: PathBuf,
-    paths: Vec<String>,
+    names: Vec<String>,
+    there: Vec<String>,
+    listed: Option<Vec<String>>,
 }
 
 /// The sweeps left for the last run at work in a project to make as it
@@ -2869,26 +2874,36 @@ pub(crate) fn tidy(run: u64) -> Vec<String> {
     });
     let busy: Vec<PathBuf> = moved.iter().map(|kept| kept.workspace.clone()).collect();
     drop(moved);
+    ended.sort();
+    ended.dedup();
+    // Git is asked once for each project the run ended in, for what is
+    // listed now and what is swept now alike.
+    let found: BTreeMap<PathBuf, Option<Vec<String>>> = (ended.iter())
+        .map(|workspace| (workspace.clone(), marked(workspace)))
+        .collect();
     // The copies to sweep are listed now, as the run ends, whether the
     // sweep is made now or left for the last run in the folder: a file made
     // there later, such as a copy the user keeps of a kept test, is not the
-    // run's whatever its name.
-    let listed = (due.into_iter()).filter_map(|(workspace, names, there)| {
-        let paths = copies(&workspace, &names, &there)?;
-        Some(Sweep { workspace, paths })
+    // run's whatever its name. Where git could not say, the sweep lists
+    // them when it is made.
+    let due = due.into_iter().map(|(workspace, names, there)| Sweep {
+        listed: (found.get(&workspace).and_then(|found| found.as_deref()))
+            .map(|found| copies(found, &names, &there)),
+        workspace,
+        names,
+        there,
     });
     if let Ok(mut sweeps) = sweeps().lock() {
-        sweeps.extend(listed);
+        sweeps.extend(due);
     }
-    ended.sort();
-    ended.dedup();
     for workspace in &ended {
         // Another run there, or a tester writing there, may be running
         // copies of its own, so the last to end sweeps for all of them.
         let written_in = (writing().lock())
             .is_ok_and(|writing| writing.iter().any(|writer| writer.workspace == *workspace));
         if !busy.contains(workspace) && !written_in {
-            deleted.extend(sweep(workspace));
+            let listing = found.get(workspace).and_then(|found| found.as_deref());
+            deleted.extend(sweep(workspace, listing));
         }
     }
     deleted.sort();
@@ -2896,31 +2911,34 @@ pub(crate) fn tidy(run: u64) -> Vec<String> {
     deleted
 }
 
-/// The copies of a tester's files, `names`, that a run left in `workspace`
-/// as it ends, by their paths: each file there that git neither tracks nor
-/// ignores (`marked`), outside the folders `SKIPPED` names, whose name is
-/// one of `names` and which was not `there` when the run kept them. A `cp
-/// -r` into the wrong folder leaves such copies, and a patch of the project
-/// would take them. Git lists only what it finds untracked, so a file it
-/// reads otherwise, in a repository inside the project or by a name the
-/// disk spells another way, is left out; None outside the top of a git
-/// project, or where git could not say.
-fn copies(workspace: &Path, names: &[String], there: &[String]) -> Option<Vec<String>> {
-    let found = marked(workspace)?;
-    Some(
-        (found.into_iter())
-            .filter(|path| !path.split('/').any(|part| SKIPPED.contains(&part)))
-            .filter(|path| names.iter().any(|kept| kept == name(path)) && !there.contains(path))
-            .collect(),
-    )
+/// The copies of a tester's files, `names`, that a run left in its project
+/// among `found`, the files there that git neither tracks nor ignores
+/// (`marked`), by their paths: each outside the folders `SKIPPED` names
+/// whose name is one of `names` and which was not `there` when the run
+/// kept them. A `cp -r` into the wrong folder leaves such copies, and a
+/// patch of the project would take them. Git lists only what it finds
+/// untracked, so a file it reads otherwise, in a repository inside the
+/// project or by a name the disk spells another way, is left out.
+fn copies(found: &[String], names: &[String], there: &[String]) -> Vec<String> {
+    (found.iter())
+        .filter(|path| !path.split('/').any(|part| SKIPPED.contains(&part)))
+        .filter(|path| names.iter().any(|kept| kept == name(path)) && !there.contains(path))
+        .cloned()
+        .collect()
 }
 
 /// Deletes from `workspace` the copies of their tester's files that the runs
 /// which ended there left, as their sweeps list them (`copies`), and gives
-/// their paths: each that is still there and that git still neither tracks
-/// nor ignores, so one the user has added since stays. The folders the
-/// deletions leave empty go too.
-fn sweep(workspace: &Path) -> Vec<String> {
+/// their paths: each that is still among `found`, the files there that git
+/// neither tracks nor ignores (`marked`) now, so one the user has added
+/// since stays; a sweep that could not list them as its run ended lists
+/// them now. Nothing where git could not say, `found` None: the sweeps are
+/// left for a later run's end. The folders the deletions leave empty go
+/// too.
+fn sweep(workspace: &Path, found: Option<&[String]>) -> Vec<String> {
+    let Some(found) = found else {
+        return Vec::new();
+    };
     let due: Vec<Sweep> = match sweeps().lock() {
         Ok(mut sweeps) => {
             let (due, rest) = (std::mem::take(&mut *sweeps).into_iter())
@@ -2933,13 +2951,20 @@ fn sweep(workspace: &Path) -> Vec<String> {
     if due.is_empty() {
         return Vec::new();
     }
-    let Some(found) = marked(workspace) else {
-        return Vec::new();
-    };
-    let found: HashSet<String> = found.into_iter().collect();
-    let mut listed: Vec<String> = due.into_iter().flat_map(|sweep| sweep.paths).collect();
+    let mut listed: Vec<String> = (due.into_iter())
+        .flat_map(|sweep| {
+            let Sweep {
+                names,
+                there,
+                listed,
+                ..
+            } = sweep;
+            listed.unwrap_or_else(|| copies(found, &names, &there))
+        })
+        .collect();
     listed.sort();
     listed.dedup();
+    let found: HashSet<&String> = found.iter().collect();
     let deleted: Vec<String> = (listed.into_iter())
         .filter(|path| found.contains(path))
         .filter(|path| std::fs::remove_file(workspace.join(path)).is_ok())
@@ -3462,6 +3487,26 @@ mod tests {
         assert_eq!(tidy(153), ["tests/tests/x_letronna_spec_test.go"]);
         assert!(root.join("tests/x_letronna_spec_test.go").exists());
         assert!(!root.join("tests/tests").exists());
+    }
+
+    #[test]
+    fn a_sweep_git_could_not_list_waits_for_a_later_runs_end() {
+        let root = Scratch::new("spec-tests-strays-git-off");
+        let from = Scratch::new("spec-tests-strays-git-off-from");
+        assert!(git(&root, &["init", "-q"]).is_some());
+        written(&from, "t/x_letronna_spec_test.go");
+        keep(157, &from, &root, None).unwrap();
+        written(&root, "t/t/x_letronna_spec_test.go");
+        // Git cannot read the repository as the run ends: nothing is swept,
+        // and nothing is lost.
+        std::fs::rename(root.join(".git"), root.join("git-off")).unwrap();
+        assert!(tidy(157).is_empty());
+        assert!(root.join("t/t/x_letronna_spec_test.go").exists());
+        std::fs::rename(root.join("git-off"), root.join(".git")).unwrap();
+        // The next run to end there sweeps what the first left.
+        written(&from, "u/y_letronna_spec_test.go");
+        keep(158, &from, &root, None).unwrap();
+        assert_eq!(tidy(158), ["t/t/x_letronna_spec_test.go"]);
     }
 
     #[test]
