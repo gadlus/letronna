@@ -2765,13 +2765,15 @@ enum Verdict {
 /// commit the run began from, and its work takes the first's place when it
 /// passes the tests that the first, and the project as it was, do not. None,
 /// with the run's work kept and nothing said, when the first attempt passes
-/// after all, when the tests pass on the project as it was and so choose
-/// nothing, when the attempt's tests would import the first attempt's code,
-/// when the second attempt does not pass, ran no test or left the project as
-/// it was, when the helper could not start, when the run moved the commit
-/// or has not the time or tokens for an attempt, when the gate would not
-/// let the tests run, or when a build of the whole workspace would not fit
-/// in the time. With the notice, whether the project now holds the attempt.
+/// after all, when the failures its output names are all in tests the
+/// tester did not write, when the tests pass on the project as it was and
+/// so choose nothing, when the attempt's tests would import the first
+/// attempt's code, when the second attempt does not pass, ran no test or
+/// left the project as it was, when the helper could not start, when the
+/// run moved the commit or has not the time or tokens for an attempt, when
+/// the gate would not let the tests run, or when a build of the whole
+/// workspace would not fit in the time. With the notice, whether the
+/// project now holds the attempt.
 fn second_attempt(spec: &Spec, turn: &Turn, head: &str) -> Option<(Message, bool)> {
     // A helper's work is its parent's to judge, a person reads a watched
     // run's end, and past the round cap or in plan mode nothing can change.
@@ -2813,6 +2815,13 @@ fn second_attempt(spec: &Spec, turn: &Turn, head: &str) -> Option<(Message, bool
         return None;
     }
     let (ended, output) = crate::spec_tests::failure(&first)?;
+    // Failures all in tests the tester did not write, such as the project's
+    // own under a command that runs its whole suite, say nothing of the
+    // work: a fresh attempt would fail them the same way.
+    if crate::spec_tests::own_failing(&command, output) == Some(false) {
+        crate::diag::event("second_attempt_skipped", &[("why", json!("others_tests"))]);
+        return None;
+    }
     let took = began.elapsed();
     let base = crate::spec_tests::base(workspace)?;
     let verdict = (|| {
@@ -9100,6 +9109,81 @@ pub(crate) mod tests {
         );
         assert!(affords_attempt(&spec));
         crate::spec_tests::tidy(id);
+    }
+
+    /// A provider that turns every request down and counts them, until a
+    /// connection that sends nothing ends it.
+    fn refusing() -> (String, SocketAddr, Arc<AtomicUsize>) {
+        let (server, endpoint) = listen();
+        let address = server.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let counted = count.clone();
+        std::thread::spawn(move || {
+            loop {
+                let Ok((mut socket, _)) = server.accept() else {
+                    return;
+                };
+                let mut bytes = Vec::new();
+                let mut block = [0; 65536];
+                loop {
+                    match socket.read(&mut block) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => bytes.extend_from_slice(&block[..n]),
+                    }
+                    let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                    let length: usize = (headers.lines())
+                        .find_map(|l| l.strip_prefix("content-length: "))
+                        .and_then(|l| l.parse().ok())
+                        .unwrap_or(0);
+                    if bytes.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+                counted.fetch_add(1, Ordering::SeqCst);
+                let error = json!({"error": {"message": "Turned down."}}).to_string();
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{error}",
+                    error.len()
+                );
+            }
+        });
+        (endpoint, address, count)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_second_attempt_is_made_when_only_tests_the_tester_did_not_write_fail() {
+        let dir = scratch("second-attempt-others");
+        let commit = committed(&dir);
+        let id = AGENTS + 1_935;
+        // Were an attempt started, its model call would reach this and be
+        // turned down at once, counted.
+        let (endpoint, address, count) = refusing();
+        let mut spec = own_run(endpoint, &dir, id);
+        spec.decide = Some(Arc::new(|_, _| gate::Outcome::Run));
+        // The tester's command runs the project's whole suite, as it were,
+        // naming none of its own files, and only a test of the project's
+        // own fails.
+        std::fs::write(
+            dir.join("letronna_spec_test.sh"),
+            "echo '--- FAIL: TestEnvNoColor (0.00s)'; echo '    termenv_test.go:45: expected \
+             true'; echo FAIL; exit 1\n",
+        )
+        .unwrap();
+        let command = Some("sh ./*_test.sh".to_owned());
+        crate::spec_tests::keep(id, &dir, &dir, command).unwrap();
+        let turn = Turn::new(spec.connection.clone());
+
+        assert!(second_attempt(&spec, &turn, &commit).is_none());
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert!(!dir.join("letronna_spec_test.sh").exists());
+        crate::spec_tests::tidy(id);
+        let _ = TcpStream::connect(address);
     }
 
     #[test]

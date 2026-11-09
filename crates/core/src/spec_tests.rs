@@ -50,8 +50,11 @@
 //! the project is made to hold it, the first kept aside as a patch, and the
 //! run is told to answer for the work as it stands. Tests that pass on the
 //! project as it was choose nothing, so no attempt is made on them; nor
-//! where the attempt's tests would import the first attempt's code through
-//! an editable install; and an attempt that installed anything from its
+//! where the failures the run's output names are all in tests the tester
+//! did not write (`own_failing`), such as the project's own under a command
+//! that runs its whole suite, which say nothing of the work; nor where the
+//! attempt's tests would import the first attempt's code through an
+//! editable install; and an attempt that installed anything from its
 //! folder is not taken, and its folder stays for what may lead into it.
 //!
 //! A copy of the work as it stood when the run first said it was done is
@@ -1396,14 +1399,26 @@ pub(crate) fn failure(outcome: &Result<String, String>) -> Option<(String, &str)
 
 /// The notice sending the run back with `outcome`, what `command` made of
 /// the tester's tests `kept` run against its work; None when they passed.
+/// Where the failures it names are all in tests the tester did not write
+/// (`own_failing`), it says so: they may be the project's own as it was, or
+/// this environment's, and the run is to check before it changes anything
+/// for them.
 fn failed(kept: &Kept, command: &str, outcome: &Result<String, String>) -> Option<String> {
     let (ended, output) = failure(outcome)?;
     let (shown, left_out) = quoted(output);
+    let others = match own_failing(command, output) {
+        Some(false) => {
+            "The failures shown are in tests the tester did not write, and may be the \
+             project's own as it was or this environment's: check whether they fail on the \
+             project as it was too, and say so where they do. "
+        }
+        _ => "",
+    };
     Some(format!(
         "Your work as it stands was run against the tests a tester wrote from the request \
          alone, in a copy of the project with them put back at the paths they are kept from, \
          so nothing in the project was touched: `{command}` {ended}. Its \
-         output{left_out}:\n\n{shown}\n\nFix your work for each test that fails on what the \
+         output{left_out}:\n\n{shown}\n\n{others}Fix your work for each test that fails on what the \
          request's words say, and run the tests again the same way. A test that expects what \
          the words do not say is answered by quoting them in your answer. One that calls the \
          code wrongly, such as with a name or import the request does not spell, or that \
@@ -1646,9 +1661,7 @@ fn excerpt(output: &str) -> String {
     if output.chars().count() <= SHOWN {
         return output.to_owned();
     }
-    let lines: Vec<&str> = (output.split('\n'))
-        .flat_map(|line| line.strip_suffix('\r').unwrap_or(line).split('\r'))
-        .collect();
+    let lines = lines_of(output);
     let names = named_lines(&lines);
     let gap = "…\n".chars().count();
     let mut picked: BTreeMap<usize, String> = BTreeMap::new();
@@ -1714,6 +1727,56 @@ fn excerpt(output: &str) -> String {
     }
     shown.pop();
     shown
+}
+
+/// The lines of `output`, a test command's: a bare carriage return, as a
+/// progress bar prints, ends a line too.
+fn lines_of(output: &str) -> Vec<&str> {
+    (output.split('\n'))
+        .flat_map(|line| line.strip_suffix('\r').unwrap_or(line).split('\r'))
+        .collect()
+}
+
+/// Whether the failures `output`, what `command` made of the tester's
+/// tests, names are the tester's own: Some(true) when `command` runs its
+/// tests alone, naming its files or a filter on their names (`names_own`),
+/// or when a failure's lines, as `excerpt` shows them, name one of its files
+/// or tests; Some(false) when the output names failures (`named`) and none
+/// of them is; None when it names none, as a runner this does not know
+/// prints, or as a command that did not finish leaves it. Under a command
+/// that runs the project's whole suite, a test of the project's own can fail
+/// for reasons of its own, such as a variable the run's commands set, and
+/// says nothing of the work.
+pub(crate) fn own_failing(command: &str, output: &str) -> Option<bool> {
+    if names_own(command) {
+        return Some(true);
+    }
+    let lines = lines_of(output);
+    let names = named_lines(&lines);
+    let mut any = false;
+    for at in (0..lines.len()).filter(|at| names[*at].is_some()) {
+        any = true;
+        let mut size = 0;
+        for (next, line) in lines.iter().enumerate().skip(at) {
+            let cost = clipped(line).chars().count() + 1;
+            if next > at && (size + cost > FAILURE_SHOWN || another_part(line)) {
+                break;
+            }
+            size += cost;
+            if names_own(line) {
+                return Some(true);
+            }
+        }
+    }
+    any.then_some(false)
+}
+
+/// Whether `text` names one of the tester's files or tests: holds `MARKER`
+/// in any case, with or without its underscore, as `letronna_spec` in a
+/// path does and `LetronnaSpec` in a test's name.
+fn names_own(text: &str) -> bool {
+    let flat: String = (text.chars().filter(|c| !matches!(c, '_' | '-'))).collect();
+    flat.to_lowercase().contains(&MARKER.replace('_', ""))
 }
 
 /// Whether `line` starts another part of a runner's report, where a
@@ -4104,6 +4167,79 @@ mod tests {
             cut.contains("Its output, with `…` for lines left out:\n\n…\n--- FAIL"),
             "{cut}"
         );
+    }
+
+    #[test]
+    fn whose_tests_fail_is_read_off_the_failures_lines_or_the_command() {
+        // The project's whole suite, with a test of the project's own
+        // failing: none of the tester's.
+        let others = "--- FAIL: TestEnvNoColor (0.00s)\n    termenv_test.go:45: expected \
+                      true\nFAIL\nFAIL\tgithub.com/acme/termenv\t0.4s\n[exit code 1]";
+        assert_eq!(own_failing("go test ./...", others), Some(false));
+        // The tester's: by the test's name in any case, by its file among the
+        // failure's lines, or by a command that runs its tests alone.
+        let named = "--- FAIL: TestLetronnaSpecRestoresColor (0.00s)\n    x_test.go:9: wrong\nFAIL";
+        assert_eq!(own_failing("go test ./...", named), Some(true));
+        let filed = "--- FAIL: TestRestoresColor (0.00s)\n    color_letronna_spec_test.go:9: \
+                     wrong\nFAIL";
+        assert_eq!(own_failing("go test ./...", filed), Some(true));
+        assert_eq!(
+            own_failing("go test -run TestLetronnaSpec ./pkg/a/ ./pkg/b/", others),
+            Some(true)
+        );
+        assert_eq!(
+            own_failing("pytest -q tests/test_letronna_spec.py", others),
+            Some(true)
+        );
+        // Other runners' summaries name the file.
+        let pytest = "FAILED tests/test_other.py::test_y - assert 1 == 2\n[exit code 1]";
+        assert_eq!(own_failing("pytest -q", pytest), Some(false));
+        let own = "FAILED tests/test_letronna_spec.py::test_y - assert 1 == 2\n[exit code 1]";
+        assert_eq!(own_failing("pytest -q", own), Some(true));
+        let jest = " FAIL  src/other.test.ts\n  ● adds\n\n    Expected: 4\n    Received: 3\n";
+        assert_eq!(own_failing("npx jest", jest), Some(false));
+        let hyphened = " FAIL  src/letronna-spec.test.ts\n  ● adds\n\n    Expected: 4\n";
+        assert_eq!(own_failing("npx jest", hyphened), Some(true));
+        // A mention of the tester's package well past a failure's lines is
+        // no failure of its own.
+        let apart = format!(
+            "{others}\n{}ok  \tgithub.com/acme/letronna_spec\t0.1s",
+            "    a log line\n".repeat(60)
+        );
+        assert_eq!(own_failing("go test ./...", &apart), Some(false));
+        // Output naming no failure, as a runner this does not know prints or
+        // a command that did not finish leaves it, says nothing either way.
+        assert_eq!(
+            own_failing("sh ./*_test.sh", "made.txt is missing\n[exit code 1]"),
+            None
+        );
+        assert_eq!(own_failing("go test ./...", "Timed out after 600s."), None);
+    }
+
+    #[test]
+    fn failures_in_tests_the_tester_did_not_write_are_said_to_be_such() {
+        let kept = Kept {
+            dir: PathBuf::from("/tmp/kept"),
+            files: vec!["color_letronna_spec_test.go".to_owned()],
+        };
+        let said = "The failures shown are in tests the tester did not write, and may be the \
+                    project's own as it was or this environment's: check whether they fail on \
+                    the project as it was too, and say so where they do. Fix your work";
+        let others = Ok(
+            "--- FAIL: TestEnvNoColor (0.00s)\n    termenv_test.go:45: expected \
+                        true\nFAIL\n[exit code 1]"
+                .to_owned(),
+        );
+        let text = failed(&kept, "go test ./...", &others).unwrap();
+        assert!(text.contains(said), "{text}");
+        // Not of the tester's own failing, nor of output naming no failure.
+        let own =
+            Ok("--- FAIL: TestLetronnaSpecRestoresColor (0.00s)\nFAIL\n[exit code 1]".to_owned());
+        let text = failed(&kept, "go test ./...", &own).unwrap();
+        assert!(!text.contains("the tester did not write"), "{text}");
+        let plain = Ok("made.txt is missing\n[exit code 1]".to_owned());
+        let text = failed(&kept, "sh ./*_test.sh", &plain).unwrap();
+        assert!(!text.contains("the tester did not write"), "{text}");
     }
 
     #[cfg(unix)]
