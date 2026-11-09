@@ -1502,8 +1502,8 @@ pub(crate) fn failure(outcome: &Result<String, String>) -> Option<(String, &str)
 const WORDS_FIRST: &str = "Before changing what your work does for a test, find the request's \
                            words for that exact case: where they set a narrower rule the test \
                            ignores, such as a filter, a condition or an exception, keep what \
-                           your work does, as a review's row that passed it is a sign you read \
-                           the words right, and answer the test by quoting the words.";
+                           your work does (where a review's row passed it, that is a sign you \
+                           read the words right) and answer the test by quoting the words.";
 
 /// `WORDS_FIRST`, then what to do where the words are silent on the case,
 /// `silent`, which each notice says for itself.
@@ -4965,8 +4965,9 @@ mod tests {
         assert!(
             WORDS_FIRST.contains(
                 "where they set a narrower rule the test ignores, such as a filter, a condition \
-                 or an exception, keep what your work does, as a review's row that passed it is \
-                 a sign you read the words right, and answer the test by quoting the words."
+                 or an exception, keep what your work does (where a review's row passed it, \
+                 that is a sign you read the words right) and answer the test by quoting the \
+                 words."
             ),
             "{WORDS_FIRST}"
         );
