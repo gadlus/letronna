@@ -2600,8 +2600,9 @@ fn slashed(inside: &Path) -> String {
 /// all the same, so none stays where a patch would take it. In the project
 /// itself, a file that was there as the tester began writing
 /// (`writing_in`) is the project's own or the user's whatever its name, and
-/// stays, with no word from git needed; where no tester was marked as
-/// writing there, each is taken.
+/// stays, with no word from git needed, as does one git tracks or ignores;
+/// where no tester was marked as writing there and git cannot say, each
+/// is taken.
 pub(crate) fn keep(
     run: u64,
     from: &Path,
@@ -2610,12 +2611,17 @@ pub(crate) fn keep(
 ) -> Option<Kept> {
     let dir = folder("tests");
     // In the project itself, the files that were there as the tester began
-    // are the project's own or the user's, whatever git makes of them.
-    let before = (from == workspace)
-        .then(|| written_before(run, workspace))
+    // are the project's own or the user's, whatever git makes of them; and
+    // one git tracks or ignores is the project's whatever its name, which
+    // tells them apart where no tester was marked as writing there.
+    let in_project = from == workspace;
+    let before = in_project.then(|| written_before(run, workspace)).flatten();
+    let theirs = in_project
+        .then(|| crate::git::untracked(from, &format!("*{MARKER}*")))
         .flatten();
     let files: Vec<String> = (left(from).into_iter())
         .filter(|file| before.as_ref().is_none_or(|before| !before.contains(file)))
+        .filter(|file| theirs.as_ref().is_none_or(|theirs| theirs.contains(file)))
         .filter(|file| {
             let to = dir.join(file);
             let copied = to
@@ -3498,6 +3504,19 @@ mod tests {
         assert_eq!(tidy(151), Vec::<String>::new());
         assert!(root.join("tests/old_letronna_spec_test.go").exists());
         assert!(root.join("tests/mine_letronna_spec_test.go").exists());
+        // With no tester marked as writing there, as when none ran, git
+        // tells the project's own from the rest.
+        written(&root, "tests/late_letronna_spec_test.go");
+        let kept = keep(156, &root, &root, None).unwrap();
+        assert_eq!(
+            kept.files,
+            [
+                "tests/late_letronna_spec_test.go",
+                "tests/mine_letronna_spec_test.go"
+            ]
+        );
+        tidy(156);
+        assert!(root.join("tests/old_letronna_spec_test.go").exists());
 
         // The same where git cannot read the repository, as it cannot one
         // another user owns: nothing that was there is taken.
@@ -3512,8 +3531,8 @@ mod tests {
         drop(writing);
         tidy(154);
         assert!(broken.join("tests/old_letronna_spec_test.go").exists());
-        // With no tester marked as writing there, as from a copy of the
-        // tester's own, every file so named is the tester's.
+        // With no tester marked as writing there and git unable to say,
+        // every file so named is the tester's.
         written(&broken, "tests/more_letronna_spec_test.go");
         let kept = keep(155, &broken, &broken, None).unwrap();
         assert_eq!(
