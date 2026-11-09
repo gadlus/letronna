@@ -283,9 +283,10 @@ const LENT: usize = 8;
 /// lent: the command is written into a notice.
 const SECRETS: [&str; 6] = ["KEY", "TOKEN", "SECRET", "PASSW", "CREDENTIAL", "AUTH"];
 
-/// Variables never lent, as no `LD_*` or `*FLAGS` is: they say where
-/// programs and libraries are found, or how a build goes, which the run may
-/// have set for a build against what its tests need; nor the import path,
+/// Variables never lent, as no `LD_*` or `*FLAGS` is, but for `GOFLAGS`
+/// set to the flags of `GOFLAGS`: they say where programs and libraries
+/// are found, or how a build goes, which the run may have set for a build
+/// against what its tests need; nor the import path,
 /// which the copy is put first on for the run (`with_import_path`), and a
 /// lent one, exported after that, would undo.
 const UNLENT: [&str; 7] = [
@@ -297,6 +298,41 @@ const UNLENT: [&str; 7] = [
     "PYTHONPATH",
     "PYTHONSAFEPATH",
 ];
+
+/// The `GOFLAGS` flags lent all the same: each says where Go takes modules
+/// from, or that no version stamp is read, which a test run in a copy of
+/// the project needs as the run's own did; any other Go flag, as any other
+/// `*FLAGS` variable, says how a build goes.
+const GOFLAGS: [&str; 4] = [
+    "-mod=mod",
+    "-mod=vendor",
+    "-mod=readonly",
+    "-buildvcs=false",
+];
+
+/// What a command's output holds when its program's set-up failed before
+/// anything of its own ran: Go's own line, and what Go, pip and npm print
+/// when a module or package they lack cannot be fetched, as none can be
+/// where the run has no network. A pipe into `tail` hides the exit code
+/// such a command ends with, so its output is read instead.
+const SET_UP_FAILED: [&str; 10] = [
+    "[setup failed]",
+    "proxy.golang.org",
+    "server misbehaving",
+    "no such host",
+    "network is unreachable",
+    "Temporary failure in name resolution",
+    "NewConnectionError",
+    "No matching distribution found",
+    "ENOTFOUND",
+    "EAI_AGAIN",
+];
+
+/// Whether `output`, a command's, says its program's set-up failed before
+/// anything of its own ran, by `SET_UP_FAILED`.
+pub(crate) fn set_up_failed(output: &str) -> bool {
+    SET_UP_FAILED.iter().any(|sign| output.contains(sign))
+}
 
 /// A tester's files kept for a run: its id, the project it puts them back
 /// in, where they are kept, and the command the tester gave to run them
@@ -1149,50 +1185,60 @@ fn folder_as_dot(text: &str, path: &str) -> String {
 /// the first past the `cd`s, exports and assignments that only set it up;
 /// None when `line` only sets up.
 pub(crate) fn program(line: &str) -> Option<String> {
-    set_up(line).0
+    let dialect = crate::command::Dialect::here();
+    let assessed = crate::command::assess(line, dialect, None);
+    (assessed.commands.iter())
+        .filter_map(runs)
+        .find(|program| !matches!(program.as_str(), "export" | "cd"))
 }
 
 /// The variables `line`, a command of the run's, sets for `program`, as
-/// `VAR=value` words: those before the program, those `export`ed or set on
-/// their own before it, and those on a command after a `cd`, which only
-/// moves it. The tester's command runs with them, so a tester that lacked
-/// the run's set-up, such as a module cache, gets it. None when `line` runs
-/// another program, whose set-up may be a build's against the tests; only a
-/// value the shell reads as written, none whose name marks it as a secret or
-/// as `UNLENT`, and `LENT` at most.
+/// `VAR=value` words: those before the program on its own command, and
+/// those `export`ed or set on their own anywhere before it on the line,
+/// past the `cd`s and the other programs the line runs first, such as an
+/// `ls` or an `rm`, since the shell keeps them past `;` and `&&`; not one
+/// set before another program, as `FOO=1 make` does, which is gone once
+/// that program ends. The tester's command runs with them, so a tester that
+/// lacked the run's set-up, such as a module cache, gets it. None when
+/// `line` never runs `program`, as a build's set-up may be against the
+/// tests; only a value the shell reads as written, none whose name marks it
+/// as a secret or as `UNLENT`, and `LENT` at most.
 pub(crate) fn environment(line: &str, program: &str) -> Vec<String> {
-    let (runs, mut found) = set_up(line);
-    if runs.as_deref() != Some(program) {
-        return Vec::new();
-    }
-    found.truncate(LENT);
-    found
-}
-
-/// What `line` runs and sets up: the first program past the `cd`s, exports
-/// and assignments before it, if it reaches one, and the variables set on
-/// the way, as `plain` allows them.
-fn set_up(line: &str) -> (Option<String>, Vec<String>) {
     let dialect = crate::command::Dialect::here();
     let assessed = crate::command::assess(line, dialect, None);
     let mut found = Vec::new();
     for command in &assessed.commands {
-        let program = (command.argv.get(command.at)).map(|word| crate::command::name_of(word));
-        let sets = matches!(program.as_deref(), None | Some("export"));
-        let words = match sets {
-            true => &command.argv[..],
-            false => &command.argv[..command.at],
+        let reached = runs(command).as_deref() == Some(program);
+        let words: &[String] = if sets(command) {
+            &command.argv
+        } else if reached {
+            &command.argv[..command.at]
+        } else {
+            &[]
         };
         // A word made by running something, or holding a variable this does
         // not know, is not what the shell read.
         if command.spelled_out {
             found.extend(words.iter().filter(|word| plain(word)).cloned());
         }
-        if !sets && program.as_deref() != Some("cd") {
-            return (program, found);
+        if reached {
+            found.truncate(LENT);
+            return found;
         }
     }
-    (None, found)
+    Vec::new()
+}
+
+/// The program `command`, one of a line's, runs, as the tables name it;
+/// None for a lone assignment, which runs none.
+fn runs(command: &crate::command::Command) -> Option<String> {
+    (command.argv.get(command.at)).map(|word| crate::command::name_of(word))
+}
+
+/// Whether `command` only sets variables, as an `export` or a lone
+/// assignment does, which the shell keeps for the commands after it.
+fn sets(command: &crate::command::Command) -> bool {
+    matches!(runs(command).as_deref(), None | Some("export"))
 }
 
 /// Whether `word` sets a variable to a value with nothing in it for the
@@ -1207,8 +1253,16 @@ fn plain(word: &str) -> bool {
         && !SECRETS.iter().any(|secret| upper.contains(secret))
         && !UNLENT.contains(&upper.as_str())
         && !upper.starts_with("LD_")
-        && !upper.ends_with("FLAGS")
+        && (!upper.ends_with("FLAGS") || go_flags(&upper, value))
         && (value.chars()).all(|c| c.is_ascii_alphanumeric() || "_-./:,+@%=".contains(c))
+}
+
+/// Whether `name`, in capitals, is `GOFLAGS` set to flags of `GOFLAGS` and
+/// no other.
+fn go_flags(name: &str, value: &str) -> bool {
+    name == "GOFLAGS"
+        && !value.is_empty()
+        && (value.split_whitespace()).all(|flag| GOFLAGS.contains(&flag))
 }
 
 /// The tester's files kept for run `run` and the command that runs them,
@@ -6373,7 +6427,7 @@ mod tests {
         // build goes.
         assert_eq!(
             environment(
-                "PATH=/usr/local/go/bin HOME=/root LD_LIBRARY_PATH=/opt/lib GOFLAGS=-mod=mod \
+                "PATH=/usr/local/go/bin HOME=/root LD_LIBRARY_PATH=/opt/lib GOFLAGS=-race \
                  CGO_ENABLED=0 NODE_ENV=test PYTHONHOME=/py GOMODCACHE=/m go test",
                 "go"
             ),
@@ -6429,5 +6483,83 @@ mod tests {
         );
         assert_eq!(program("export X=1"), None);
         assert_eq!(program(""), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_up_exported_past_other_programs_on_the_line_is_read_too() {
+        // As a run writes it: a listing before the exports, and a pipe after
+        // the program.
+        assert_eq!(
+            environment(
+                "cd /app && ls zz_* 2>/dev/null; export GOMODCACHE=/root/go/pkg/mod \
+                 GOFLAGS=-mod=mod && go test -tags analyze -run LetronnaSpec -v . 2>&1 | tail -40",
+                "go"
+            ),
+            ["GOMODCACHE=/root/go/pkg/mod", "GOFLAGS=-mod=mod"]
+        );
+        // An export or a lone assignment stays set past the program before
+        // it; a variable set before another program is gone with it.
+        assert_eq!(
+            environment(
+                "rm -rf out; FOO=1 make; export BAR=2; BAZ=3; go test .",
+                "go"
+            ),
+            ["BAR=2", "BAZ=3"]
+        );
+        // Nothing from a line that never runs the program.
+        assert_eq!(
+            environment("export GOMODCACHE=/m; ls", "go"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn go_flags_saying_where_modules_come_from_are_lent_and_build_flags_are_not() {
+        assert_eq!(
+            environment(
+                "CFLAGS=-O2 LDFLAGS=-s RUSTFLAGS=-Dwarnings GOFLAGS=-mod=mod go test",
+                "go"
+            ),
+            ["GOFLAGS=-mod=mod"]
+        );
+        for flag in ["-mod=vendor", "-mod=readonly", "-buildvcs=false"] {
+            assert_eq!(
+                environment(&format!("GOFLAGS={flag} go test"), "go"),
+                [format!("GOFLAGS={flag}")]
+            );
+        }
+        for value in ["-race", "-mod=mod,-race", "-ldflags=-s", ""] {
+            assert_eq!(
+                environment(&format!("GOFLAGS={value} go test"), "go"),
+                Vec::<String>::new(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_set_up_failure_is_told_from_a_commands_output() {
+        assert!(set_up_failed(
+            "go: downloading github.com/x/y v1.2.3\ngo: github.com/x/y@v1.2.3: Get \
+             \"https://proxy.golang.org/github.com/x/y/@v/v1.2.3.mod\": dial tcp: lookup \
+             proxy.golang.org on 127.0.0.11:53: server misbehaving\nFAIL\tapp [setup failed]"
+        ));
+        assert!(set_up_failed(
+            "WARNING: Retrying (Retry(total=0)) after connection broken by \
+             'NewConnectionError(...: Failed to establish a new connection: [Errno -3] \
+             Temporary failure in name resolution)'\nERROR: No matching distribution found \
+             for pytest"
+        ));
+        assert!(set_up_failed(
+            "npm ERR! code ENOTFOUND\nnpm ERR! network request to \
+             https://registry.npmjs.org/vitest failed, reason: getaddrinfo ENOTFOUND \
+             registry.npmjs.org"
+        ));
+        assert!(!set_up_failed(
+            "=== RUN   TestLetronnaSpec\n--- PASS: TestLetronnaSpec (0.00s)\nPASS\nok  \tapp\t0.012s"
+        ));
+        assert!(!set_up_failed("3 passed in 0.10s"));
     }
 }

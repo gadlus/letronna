@@ -2881,17 +2881,28 @@ fn report(caller: &Caller, to: &str, offset: usize) -> Result<String, String> {
     page(&name, &said, offset, Some(REPORT_HEADER))
 }
 
-/// The commands helper `to` of `caller`'s asked `run_command` for, in order,
-/// whether or not each ran; None when no such helper is known or its
+/// The `run_command` results in helper `to` of `caller`'s conversation, in
+/// order, each with the command asked for among its arguments and how it
+/// went, whether or not it ran; None when no such helper is known or its
 /// conversation could not be read.
-pub(crate) fn commands_run(caller: &Caller, to: &str) -> Option<Vec<String>> {
+pub(crate) fn command_results(caller: &Caller, to: &str) -> Option<Vec<Message>> {
     let n = {
         let registry = registry();
         mine(&registry, caller, to).ok()?.n
     };
     let transcript = Transcript::open(caller.root, n)?;
-    let commands = (transcript.conversation.messages.iter())
+    let results = (transcript.conversation.messages.iter())
         .filter(|message| message.role == "tool" && message.name == "run_command")
+        .cloned()
+        .collect();
+    Some(results)
+}
+
+/// The commands helper `to` of `caller`'s asked `run_command` for, in order,
+/// whether or not each ran; None when no such helper is known or its
+/// conversation could not be read.
+pub(crate) fn commands_run(caller: &Caller, to: &str) -> Option<Vec<String>> {
+    let commands = (command_results(caller, to)?.iter())
         .filter_map(|message| {
             let args = crate::tools::parse_args_for(&message.name, &message.args).ok()?;
             Some(args["command"].as_str()?.to_owned())
@@ -5078,6 +5089,29 @@ mod tests {
             "worker ended before it read this, from user:\nmessage from the user:\nAnd the docs.";
         assert_eq!(passed, [text]);
         assert!(!steer(id, "Gone."));
+    }
+
+    #[test]
+    fn a_helpers_command_results_are_read_off_its_conversation() {
+        let session = Session::new("command-results");
+        let (endpoint, provider) = Stub::start(vec![
+            reply("", Some(("run_command", json!({"command": "echo ok"})))),
+            reply("Echoed.", None),
+        ]);
+        let args = json!({"description": "Echo once", "type": "general", "name": "echoer",
+            "background": false, "prompt": "Run `echo ok` and report."});
+        let ctx = session.context(endpoint);
+        let out = call(ctx.clone(), args).unwrap();
+        provider.sent();
+        assert!(out.starts_with("echoer finished"), "{out}");
+        // Its one command, with what was asked for, whether or not it ran.
+        let results = command_results(&ctx.caller, "echoer").unwrap();
+        assert_eq!(results.len(), 1);
+        let args = crate::tools::parse_args_for(&results[0].name, &results[0].args).unwrap();
+        assert_eq!(args["command"], "echo ok");
+        assert_eq!(commands_run(&ctx.caller, "echoer").unwrap(), ["echo ok"]);
+        // None for a helper the caller has not started.
+        assert!(command_results(&ctx.caller, "nobody").is_none());
     }
 
     #[test]

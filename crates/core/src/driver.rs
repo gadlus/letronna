@@ -2583,8 +2583,8 @@ fn test_run(spec: &Spec, turn: &Turn, refereed: bool) -> crate::spec_tests::Ran 
     let Some(ctx) = test_context(spec, &command, limit) else {
         return Ran::Unrun(format!("the gate would not run `{command}` as it stands"));
     };
-    // With the set-up the run's own passing command had, such as a module
-    // cache, which a tester that lacked it could not give its command; after
+    // With the set-up the run's own command of the same program ran with,
+    // such as a module cache, where the tester gave its command none; after
     // the gate, which judges the command as the tester ran it.
     let command = with_test_environment(spec, &command);
     // Judged against the run's first complete version where the work fails
@@ -2641,13 +2641,15 @@ fn tester_notice(
     }
 }
 
-/// `command`, the tester's, with the variables the run's own last passing
-/// command of the same program set for it, as `spec_tests::environment`
-/// reads them off its line, exported ahead of it so they reach each program
-/// of its line: a tester that lacked the run's set-up, such as a module
-/// cache, still runs with it. As it is when no such command set any. A path
-/// into the project among the values is written as the folder the command
-/// runs in, which is a copy of the project, not the project.
+/// `command`, the tester's, with the variables the run's own newest command
+/// of the same program that ran with set-up (`lent_set_up`) set for it,
+/// exported ahead of it so they reach each program of its line: a tester
+/// that lacked the run's set-up, such as a module cache, still runs with
+/// it. As it is when it carries set-up of its own already, as the tester
+/// gave it on its `Run:` line or its own commands had it (`tester_command`),
+/// since its tests ran with that, and when no command of the run's set any.
+/// A path into the project among the values is written as the folder the
+/// command runs in, which is a copy of the project, not the project.
 fn with_test_environment(spec: &Spec, command: &str) -> String {
     let Some(workspace) = spec.connection.workspace.as_deref() else {
         return command.to_owned();
@@ -2657,22 +2659,62 @@ fn with_test_environment(spec: &Spec, command: &str) -> String {
     let Some(program) = crate::spec_tests::program(command) else {
         return command.to_owned();
     };
+    if !crate::spec_tests::environment(command, &program).is_empty() {
+        return command.to_owned();
+    }
     let own = (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
-    let lent = (own.iter().rev())
-        .filter(|message| message.role == "tool" && message.name == "run_command")
-        .find_map(|result| {
-            let args = tools::parse_args_for(&result.name, &result.args).ok()?;
-            let line = args["command"].as_str()?;
-            let found = crate::spec_tests::environment(line, &program);
-            (!found.is_empty() && passed(result, &args, workspace)).then_some(found)
-        });
-    match lent {
+    match lent_set_up(own.iter().rev(), &program) {
         Some(found) => crate::spec_tests::relative(
             &format!("export {}; {command}", found.join(" ")),
             &[workspace],
         ),
         None => command.to_owned(),
     }
+}
+
+/// The variables the first of `results`, a run's messages newest first,
+/// that is a `run_command` result whose line set variables for `program`
+/// (`spec_tests::environment`) and whose set-up let it run (`ran_set_up`)
+/// set for it; None when none did.
+fn lent_set_up<'a>(
+    results: impl Iterator<Item = &'a Message>,
+    program: &str,
+) -> Option<Vec<String>> {
+    results
+        .filter(|message| message.role == "tool" && message.name == "run_command")
+        .find_map(|result| {
+            let args = tools::parse_args_for(&result.name, &result.args).ok()?;
+            let line = args["command"].as_str()?;
+            let found = crate::spec_tests::environment(line, program);
+            (!found.is_empty() && ran_set_up(result, &args)).then_some(found)
+        })
+}
+
+/// The command the tester's `report` gives to run its tests
+/// (`spec_tests::command`), as the driver runs it elsewhere: with the
+/// variables the tester's own newest command of the same program ran with
+/// (`lent_set_up`) exported ahead of it, where its `Run:` line carries none
+/// -- the module cache its copy needed, the driver's copy needs too -- and
+/// each of `folders`, where the tester worked, written as the folder the
+/// command runs in. The tester's commands are read off its transcript,
+/// under the name that opens its report as the agent tool writes it. None
+/// when the report gives no command.
+fn tester_command(spec: &Spec, report: &str, folders: &[&Path]) -> Option<String> {
+    let command = crate::spec_tests::command(report)?;
+    let own = || {
+        let program = crate::spec_tests::program(&command)?;
+        if !crate::spec_tests::environment(&command, &program).is_empty() {
+            return None;
+        }
+        let name = report.split_whitespace().next()?;
+        let results = crate::agents::command_results(&context(spec).caller, name)?;
+        lent_set_up(results.iter().rev(), &program)
+    };
+    let command = match own() {
+        Some(found) => format!("export {}; {command}", found.join(" ")),
+        None => command,
+    };
+    Some(crate::spec_tests::relative(&command, folders))
 }
 
 /// The notice sending a session's own run nobody watches back with what
@@ -3112,14 +3154,12 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
     // takes them; the run puts them back to run them, and the driver runs
     // them against its work with the command the report gives.
     // The command as the driver runs it elsewhere: the tester may have spelt
-    // out the folder it worked in.
-    let command = tested
-        .as_deref()
-        .and_then(crate::spec_tests::command)
-        .map(|command| {
-            let folders: Vec<&Path> = (copied.as_deref().into_iter()).chain(workspace).collect();
-            crate::spec_tests::relative(&command, &folders)
-        });
+    // out the folder it worked in, and set up what the command needs on its
+    // own commands rather than on its `Run:` line.
+    let command = tested.as_deref().and_then(|report| {
+        let folders: Vec<&Path> = (copied.as_deref().into_iter()).chain(workspace).collect();
+        tester_command(spec, report, &folders)
+    });
     // Run against the work only where a copy of the project can be made,
     // as one was for the tester.
     let again = copied.is_some() && command.is_some();
@@ -3141,14 +3181,15 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
 }
 
 /// The tests of a tester started with the run kept from `folder`, where it
-/// worked, with the command its `report` gives, if any, made relative to
-/// the project, as tests that have not met the work (`keep_ahead`); the
-/// folder is deleted after. None when it left no test file.
+/// worked, with the command its `report` gives, if any, as the driver runs
+/// it (`tester_command`), as tests that have not met the work
+/// (`keep_ahead`); the folder is deleted after. None when it left no test
+/// file.
 fn kept_ahead(spec: &Spec, folder: &Path, report: Option<&str>) -> Option<crate::spec_tests::Kept> {
     let workspace = spec.connection.workspace.as_deref();
-    let command = report.and_then(crate::spec_tests::command).map(|command| {
+    let command = report.and_then(|report| {
         let folders: Vec<&Path> = std::iter::once(folder).chain(workspace).collect();
-        crate::spec_tests::relative(&command, &folders)
+        tester_command(spec, report, &folders)
     });
     let kept = workspace
         .and_then(|workspace| crate::spec_tests::keep_ahead(spec.id, folder, workspace, command));
@@ -3621,6 +3662,22 @@ fn passed(result: &Message, args: &Value, workspace: &Path) -> bool {
     let dialect = crate::command::Dialect::here();
     let assessed = crate::command::assess(line, dialect, Some(workspace));
     !hides_status(&assessed, line) && assessed.risk != crate::command::Risk::ReadOnly
+}
+
+/// Whether a command's result shows that its set-up let its program run: it
+/// ran to its end in the foreground, with no `[exit code N]` line and
+/// nothing in its output of a module or package still to fetch
+/// (`spec_tests::set_up_failed`). Looser than `passed`: a pipe into `tail`,
+/// as most of a run's commands end, hides how the tests went, not that the
+/// program ran.
+fn ran_set_up(result: &Message, args: &Value) -> bool {
+    if result.is_error || crate::tool_runs::exit_code(result).is_some() {
+        return false;
+    }
+    if args["background"].as_bool().unwrap_or(false) {
+        return false;
+    }
+    !crate::spec_tests::set_up_failed(&result.content)
 }
 
 /// Whether `line`, judged as `assessed`, pipes the output of a command that
@@ -9272,6 +9329,88 @@ pub(crate) mod tests {
         assert_eq!(found(&messages).unwrap().0, "\"pytest tests/c.py\"");
         messages.push(passed("pytest tests/c.py"));
         assert_eq!(found(&messages).unwrap().0, "\"python scripts/check.py\"");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_testers_command_runs_with_the_set_up_the_runs_own_command_ran_with() {
+        let dir = scratch("env-lending");
+        let mut spec = spec("http://127.0.0.1:9/v1".into(), &dir, 7);
+        let tool = |line: &str, out: &str, background: bool| Message {
+            role: "tool".into(),
+            name: "run_command".into(),
+            args: json!({"command": line, "background": background}).to_string(),
+            content: out.into(),
+            ..Default::default()
+        };
+        let given = "cd /app && ls zz_* 2>/dev/null; export GOMODCACHE=/root/go/pkg/mod \
+                     GOFLAGS=-mod=mod && go test -tags analyze -run LetronnaSpec -v . 2>&1 | \
+                     tail -40";
+        let bare = "go test -tags analyze -run LetronnaSpec .";
+        // Nothing to lend yet.
+        assert_eq!(with_test_environment(&spec, bare), bare);
+        // Not from a command whose set-up failed, though its pipe hides the
+        // exit code it ended with; nor from one that ended with an exit
+        // code, nor from a job left running.
+        let fetch = "go: downloading github.com/x/y v1.2.3\ngo: github.com/x/y@v1.2.3: Get \
+                     \"https://proxy.golang.org/github.com/x/y/@v/v1.2.3.mod\": dial tcp: \
+                     lookup proxy.golang.org on 127.0.0.11:53: server misbehaving\nFAIL\tapp \
+                     [setup failed]";
+        spec.transcript.conversation.messages.extend([
+            tool(given, fetch, false),
+            tool(
+                "export GOMODCACHE=/elsewhere; go test .",
+                "FAIL\n[exit code 1]",
+                false,
+            ),
+            tool(
+                "export GOMODCACHE=/elsewhere; go test .",
+                "Started as job #3 (running).",
+                true,
+            ),
+        ]);
+        assert_eq!(with_test_environment(&spec, bare), bare);
+        // From one that ran to its end, though its pipe hides how the tests
+        // went: its exports, read past the `ls` before them, the `GOFLAGS`
+        // that says where modules come from among them.
+        spec.transcript.conversation.messages.push(tool(
+            given,
+            "--- PASS: TestLetronnaSpec (0.00s)\nPASS\nok  \tapp\t0.012s",
+            false,
+        ));
+        assert_eq!(
+            with_test_environment(&spec, bare),
+            format!("export GOMODCACHE=/root/go/pkg/mod GOFLAGS=-mod=mod; {bare}")
+        );
+        // The newest such command's, with a path into the project among its
+        // values written as the folder the command runs in; nothing for a
+        // command running another program, or carrying set-up of its own.
+        spec.transcript.conversation.messages.push(tool(
+            &format!("GOMODCACHE={}/mod go test ./... | tail -5", dir.display()),
+            "ok",
+            false,
+        ));
+        assert_eq!(
+            with_test_environment(&spec, bare),
+            format!("export GOMODCACHE=./mod; {bare}")
+        );
+        let other = "pytest -q tests/letronna_spec_test.py";
+        assert_eq!(with_test_environment(&spec, other), other);
+        let own = "GOMODCACHE=/own go test -run LetronnaSpec .";
+        assert_eq!(with_test_environment(&spec, own), own);
+        // The tester's command off its report, which opens with no helper
+        // of this run's: as given, with the tester's folder written as the
+        // folder it runs in; and none off a report that gives none.
+        let folder: &Path = &dir;
+        let report = format!(
+            "Wrote tests.\nRun: sh {}/letronna_spec_test.sh",
+            dir.display()
+        );
+        assert_eq!(
+            tester_command(&spec, &report, &[folder]).as_deref(),
+            Some("sh ./letronna_spec_test.sh")
+        );
+        assert_eq!(tester_command(&spec, "Wrote nothing.", &[folder]), None);
     }
 
     /// A git project in `project` whose own test, `check.sh`, passes as
