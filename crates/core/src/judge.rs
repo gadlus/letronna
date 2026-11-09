@@ -14,9 +14,13 @@
 //! It fails closed. Any answer that is not a clear verdict carrying this
 //! call's code -- an error, a timeout, nothing, garbage, a missing or wrong
 //! code -- is `Unsure`, which asks the user, or refuses when nobody can be
-//! asked. The code is a fresh random nonce per call that wraps the call's
-//! text, so a web page or file that talked the agent into writing "ALLOW"
-//! into a command cannot write the verdict too.
+//! asked. A request the gateway could not take for a moment, dropped or
+//! answered with a status that passes by itself, is made once more after a
+//! short pause, within the run's deadline (`again`); a refusal or a bad
+//! request is not, since it would come back the same. The code is a fresh
+//! random nonce per call that wraps the call's text, so a web page or file
+//! that talked the agent into writing "ALLOW" into a command cannot write
+//! the verdict too.
 //!
 //! Verdicts are kept per session until the user types again, since a new
 //! message can change what they want; so are the denials, and after a few
@@ -26,6 +30,7 @@
 //! out its timeout.
 
 use crate::chat::{Connection, Message, ToolCall};
+use crate::failure::{Failure, FailureKind};
 use crate::gate::Mode;
 use crate::tools::{self, ToolContext};
 use serde_json::{Value, json};
@@ -639,7 +644,8 @@ fn quoted(text: &str) -> String {
     format!("{text:?}")
 }
 
-/// One verdict from the session's own model, not streamed.
+/// One verdict from the session's own model, not streamed; asked for once
+/// more when the first request failed in a way that passes (`again`).
 ///
 /// No `temperature` or `stop`: some reasoning models refuse either, and a
 /// refused request would leave auto mode asking about everything. The
@@ -653,7 +659,6 @@ fn quoted(text: &str) -> String {
 fn ask(connection: &Connection, prompt: &str) -> Result<String, String> {
     let endpoint = crate::chat::validate(connection)?;
     let reached = crate::on_device::reach::reach(connection, endpoint, false)?;
-    let endpoint = reached.url.clone();
     // As the session's own requests are sized, so a reply the model is
     // known not to take is not asked for.
     let sizing = crate::store::sizing();
@@ -663,10 +668,34 @@ fn ask(connection: &Connection, prompt: &str) -> Result<String, String> {
         sizing.window,
         sizing.output,
     );
-    let (wait, tokens) = patience(connection, &limits, Instant::now());
+    let value = match send(connection, &reached, &limits, prompt) {
+        Err(failure) if again(connection, &failure) => send(connection, &reached, &limits, prompt),
+        sent => sent,
+    }
+    .map_err(|failure| failure.to_string())?;
+    let value =
+        crate::providers::wire::openai_responses::reply(crate::chat::as_chat(connection, value));
+    crate::chat::unwrap_response(&value)?
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "No verdict came back.".to_owned())
+}
+
+/// The judge's request for `prompt` over `connection`, once, to the server
+/// `reached`, given its model's `limits`: sized by `patience` for the time
+/// left now, and what came back, as JSON. A failure's kind says whether it
+/// passes by itself (`kind`); the words are the error's own.
+fn send(
+    connection: &Connection,
+    reached: &crate::on_device::reach::Reached,
+    limits: &crate::models::Facts,
+    prompt: &str,
+) -> Result<Value, Failure> {
+    let (wait, tokens) = patience(connection, limits, Instant::now());
     // A request given no time is still sent before it gives up.
     if wait.is_zero() {
-        return Err("The run's time is up.".to_owned());
+        return Err(Failure::new(FailureKind::Stopped, "The run's time is up."));
     }
     let mut body = json!({
         "model": connection.model.trim(),
@@ -679,6 +708,7 @@ fn ask(connection: &Connection, prompt: &str) -> Result<String, String> {
         "reasoning_effort": "low",
     });
     crate::on_device::reach::shape_body(connection, &mut body);
+    let endpoint = reached.url.clone();
     let (endpoint, body) =
         crate::chat::wired(connection, &endpoint, &body).unwrap_or((endpoint, body));
     let client = reqwest::blocking::Client::builder()
@@ -686,8 +716,8 @@ fn ask(connection: &Connection, prompt: &str) -> Result<String, String> {
         .timeout(wait)
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|e| e.to_string())?;
-    let value: Value = reached
+        .map_err(|e| Failure::new(FailureKind::Unknown, e.to_string()))?;
+    reached
         .sign(crate::chat::carrying(
             client.post(endpoint),
             connection,
@@ -696,14 +726,61 @@ fn ask(connection: &Connection, prompt: &str) -> Result<String, String> {
         .send()
         .and_then(|r| r.error_for_status())
         .and_then(crate::providers::wire::openai_responses::json)
-        .map_err(|e| e.to_string())?;
-    let value =
-        crate::providers::wire::openai_responses::reply(crate::chat::as_chat(connection, value));
-    crate::chat::unwrap_response(&value)?
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| "No verdict came back.".to_owned())
+        .map_err(|e| Failure::new(kind(&e), e.to_string()))
+}
+
+/// What kind of failure `e`, a failed request's error, is, as far as a
+/// second request needs to know: the connection's when the server could
+/// not be reached or dropped it before the reply was whole, as a gateway
+/// restarting does for a moment, and the server's when it answered with a
+/// status that passes by itself (`chat::transient`); otherwise one that
+/// waiting would not mend, such as a refusal, a bad request, a slow
+/// model's timeout or a reply that is no JSON.
+fn kind(e: &reqwest::Error) -> FailureKind {
+    if let Some(status) = e.status() {
+        return match crate::chat::transient(status) {
+            true => FailureKind::Server,
+            false => FailureKind::Unknown,
+        };
+    }
+    match !e.is_timeout() && (e.is_request() || e.is_body()) {
+        true => FailureKind::Network,
+        false => FailureKind::Unknown,
+    }
+}
+
+/// Whether the judge's request that failed with `failure` is made once
+/// more, having waited the short pause the session's own calls take before
+/// a second try (`retry::after`): when the failure passes by itself and the
+/// pause ends before the run's deadline. Once only, since a call stands
+/// waiting on the verdict, and a gateway down for longer rests the judge
+/// (`FAILURES_IN_A_ROW`).
+fn again(connection: &Connection, failure: &Failure) -> bool {
+    let Some(retry) = crate::retry::after(failure, 1, connection.unattended, connection.deadline)
+    else {
+        return false;
+    };
+    let left =
+        (connection.deadline).map(|deadline| deadline.saturating_duration_since(Instant::now()));
+    if left.is_some_and(|left| left <= retry.wait) {
+        return false;
+    }
+    crate::diag::event(
+        "judge_retry",
+        &[
+            (
+                "outcome",
+                format!("{:?}", failure.kind).to_lowercase().into(),
+            ),
+            (
+                "wait_ms",
+                u64::try_from(retry.wait.as_millis())
+                    .unwrap_or(u64::MAX)
+                    .into(),
+            ),
+        ],
+    );
+    crate::retry::pause(retry.wait, || false)
 }
 
 /// How long the judge is waited for over `connection` and how many tokens
@@ -742,6 +819,8 @@ fn patience(
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
 
     /// The code the tests' judge is given; a real one is random per call.
     const NONCE: &str = "0f1e2d3c4b5a6978";
@@ -1161,6 +1240,146 @@ mod tests {
             ask(&late, "May it run?"),
             Err("The run's time is up.".to_owned())
         );
+    }
+
+    /// A provider on a thread of its own that answers each request with the
+    /// next of `replies`, raw, and closes the connection unanswered for a
+    /// None, counting the requests it got; a connection that sends nothing
+    /// ends a wait for a request that never comes.
+    fn served(
+        replies: Vec<Option<String>>,
+    ) -> (Connection, SocketAddr, std::thread::JoinHandle<usize>) {
+        let (server, endpoint) = crate::driver::tests::listen();
+        let address = server.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut served = 0;
+            for reply in replies {
+                let Ok((mut socket, _)) = server.accept() else {
+                    break;
+                };
+                if !read_request(&mut socket) {
+                    break;
+                }
+                served += 1;
+                if let Some(reply) = reply {
+                    let _ = socket.write_all(reply.as_bytes());
+                }
+            }
+            served
+        });
+        let connection = Connection {
+            endpoint,
+            model: "test-model".into(),
+            ..Default::default()
+        };
+        (connection, address, worker)
+    }
+
+    /// Reads one whole request off `socket`; false when the connection
+    /// ended before one came.
+    fn read_request(socket: &mut TcpStream) -> bool {
+        let mut bytes = Vec::new();
+        let mut block = [0; 65536];
+        loop {
+            match socket.read(&mut block) {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => bytes.extend_from_slice(&block[..n]),
+            }
+            let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+            let length: usize = (headers.lines())
+                .find_map(|l| l.strip_prefix("content-length: "))
+                .and_then(|l| l.parse().ok())
+                .unwrap_or(0);
+            if bytes.len() >= end + 4 + length {
+                return true;
+            }
+        }
+    }
+
+    /// A whole reply with `status` and `body`.
+    fn answered(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn a_judge_the_gateway_could_not_take_for_a_moment_is_asked_once_more() {
+        let verdict = json!({"choices": [{"message": {"content": "ALLOW"}}]}).to_string();
+        // A gateway restarting answers with a status that passes, or drops
+        // the connection; the second request gets the verdict.
+        for first in [Some(answered("503 Service Unavailable", "")), None] {
+            let (connection, address, worker) =
+                served(vec![first, Some(answered("200 OK", &verdict))]);
+            assert_eq!(ask(&connection, "May it run?"), Ok("ALLOW".to_owned()));
+            let _ = TcpStream::connect(address);
+            assert_eq!(worker.join().unwrap(), 2);
+        }
+    }
+
+    #[test]
+    fn a_judge_that_turned_the_request_down_is_not_asked_again() {
+        let refused = json!({"error": {"message": "Bad request."}}).to_string();
+        let (connection, address, worker) = served(vec![
+            Some(answered("400 Bad Request", &refused)),
+            Some(answered("200 OK", "{}")),
+        ]);
+        let verdict = ask(&connection, "May it run?");
+        assert!(
+            matches!(&verdict, Err(why) if why.contains("400")),
+            "{verdict:?}"
+        );
+        let _ = TcpStream::connect(address);
+        assert_eq!(worker.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn the_judge_is_not_asked_again_past_the_runs_deadline() {
+        let (mut connection, address, worker) = served(vec![
+            Some(answered("503 Service Unavailable", "")),
+            Some(answered("200 OK", "{}")),
+        ]);
+        connection.unattended = true;
+        // Less than the pause before a second request would take.
+        connection.deadline = Some(Instant::now() + Duration::from_millis(300));
+        let verdict = ask(&connection, "May it run?");
+        assert!(
+            matches!(&verdict, Err(why) if why.contains("503")),
+            "{verdict:?}"
+        );
+        let _ = TcpStream::connect(address);
+        assert_eq!(worker.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn only_a_failure_that_passes_by_itself_is_tried_again() {
+        let connection = Connection::default();
+        let passing = Failure::new(FailureKind::Network, "Dropped.");
+        let began = Instant::now();
+        assert!(again(&connection, &passing));
+        // After the short pause the session's own calls take.
+        assert!(
+            began.elapsed() >= Duration::from_millis(400),
+            "{:?}",
+            began.elapsed()
+        );
+        assert!(again(
+            &connection,
+            &Failure::new(FailureKind::Server, "503")
+        ));
+        for kind in [
+            FailureKind::Unknown,
+            FailureKind::BadRequest,
+            FailureKind::Auth,
+            FailureKind::Stopped,
+        ] {
+            assert!(!again(&connection, &Failure::new(kind, "No.")), "{kind:?}");
+        }
     }
 
     #[test]
