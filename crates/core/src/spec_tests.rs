@@ -508,12 +508,15 @@ pub(crate) fn snapshot_of(run: u64) -> Option<PathBuf> {
     (firsts.iter().find(|first| first.run == run)).map(|first| first.dir.clone())
 }
 
-/// A new folder of the temp folder for `what`, named for this process.
+/// A new folder of the temp folder for `what`, named for this process. Not
+/// with `MARKER` or any spelling of it: a runner printing absolute paths
+/// puts the folder a command runs in among a failure's lines, which are
+/// read for the tester's files (`names_own`).
 fn folder(what: &str) -> PathBuf {
     let stamp = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
         .map_or(0, |since| since.as_nanos());
     std::env::temp_dir().join(format!(
-        "{}-spec-{what}-{}-{stamp}",
+        "{}-harness-{what}-{}-{stamp}",
         crate::BRAND.to_lowercase(),
         std::process::id()
     ))
@@ -1812,7 +1815,8 @@ pub(crate) fn own_failing(command: &str, output: &str) -> Option<bool> {
 
 /// Whether `text` names one of the tester's files or tests: holds `MARKER`
 /// in any case, with or without its underscore, as `letronna_spec` in a
-/// path does and `LetronnaSpec` in a test's name.
+/// path does and `LetronnaSpec` in a test's name. The run's own folders
+/// (`folder`) are named so as never to.
 fn names_own(text: &str) -> bool {
     let flat: String = (text.chars().filter(|c| !matches!(c, '_' | '-'))).collect();
     flat.to_lowercase().contains(&MARKER.replace('_', ""))
@@ -3556,11 +3560,11 @@ mod tests {
 
     #[test]
     fn a_command_spelt_for_the_testers_folder_is_made_relative() {
-        let copy = Path::new("/tmp/letronna-spec-copy-1");
+        let copy = Path::new("/tmp/letronna-harness-copy-1");
         let project = Path::new("/work/project");
         assert_eq!(
             relative(
-                "cd /tmp/letronna-spec-copy-1 && pytest /tmp/letronna-spec-copy-1/tests/t_letronna_spec.py",
+                "cd /tmp/letronna-harness-copy-1 && pytest /tmp/letronna-harness-copy-1/tests/t_letronna_spec.py",
                 &[copy, project]
             ),
             "cd . && pytest ./tests/t_letronna_spec.py"
@@ -3750,8 +3754,8 @@ mod tests {
 
     #[test]
     fn a_python_command_runs_with_the_copy_first_on_the_import_path() {
-        let copy = Path::new("/tmp/letronna-spec-copy-7");
-        let prefix = "export PYTHONPATH=\"/tmp/letronna-spec-copy-7/src:/tmp/letronna-spec-copy-7\
+        let copy = Path::new("/tmp/letronna-harness-copy-7");
+        let prefix = "export PYTHONPATH=\"/tmp/letronna-harness-copy-7/src:/tmp/letronna-harness-copy-7\
                       ${PYTHONPATH:+:$PYTHONPATH}\"; ";
         for line in [
             "python -m pytest -q tests/test_letronna_spec.py",
@@ -4342,6 +4346,12 @@ mod tests {
         assert_eq!(own_failing("npx jest", jest), Some(false));
         let hyphened = " FAIL  src/letronna-spec.test.ts\n  ● adds\n\n    Expected: 4\n";
         assert_eq!(own_failing("npx jest", hyphened), Some(true));
+        // The folder the command runs in, as a runner printing absolute
+        // paths shows it, names nothing of the tester's.
+        let traced = "--- FAIL: TestEnvNoColor (0.00s)\n    Error Trace:\t\
+                      /tmp/letronna-harness-copy-4242-7/termenv_test.go:45\n    Error:      \t\
+                      Should be true\n    Test:       \tTestEnvNoColor\nFAIL";
+        assert_eq!(own_failing("go test ./...", traced), Some(false));
         // A mention of the tester's package well past a failure's lines is
         // no failure of its own.
         let apart = format!(
@@ -4458,7 +4468,10 @@ mod tests {
         write("newmod/node_modules/dep/index.js", "a dependency");
 
         let was = base(&root).unwrap();
-        assert!(was.to_string_lossy().contains("-spec-before-"), "{was:?}");
+        assert!(
+            was.to_string_lossy().contains("-harness-before-"),
+            "{was:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(was.join("src/lib.ts")).unwrap(),
             "export const a = 1;"
@@ -5386,7 +5399,7 @@ mod tests {
         snapshot(21, &root);
         let dir = snapshot_of(21).unwrap();
         assert!(
-            dir.to_string_lossy().contains("-spec-copy-"),
+            dir.to_string_lossy().contains("-harness-copy-"),
             "{}",
             dir.display()
         );

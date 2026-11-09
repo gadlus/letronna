@@ -8127,7 +8127,7 @@ pub(crate) mod tests {
         assert!(!in_project.load(Ordering::SeqCst));
         let copy = task.split("The project folder is `").nth(1).unwrap();
         let copy = Path::new(copy.split('`').next().unwrap());
-        assert!(copy.to_string_lossy().contains("-spec-copy-"), "{task}");
+        assert!(copy.to_string_lossy().contains("-harness-copy-"), "{task}");
         assert!(!copy.exists());
 
         // Its test left the project, the copy the run put back is gone as
@@ -8159,7 +8159,7 @@ pub(crate) mod tests {
         let first = first_kept.lock().unwrap().clone();
         let first: std::path::PathBuf = first.expect("no first complete version was kept");
         assert!(
-            first.to_string_lossy().contains("-spec-copy-"),
+            first.to_string_lossy().contains("-harness-copy-"),
             "{}",
             first.display()
         );
@@ -8286,7 +8286,10 @@ pub(crate) mod tests {
         assert!(!task.contains("Added parse_range."), "{task}");
         let base = task.split("The project folder is `").nth(1).unwrap();
         let base = Path::new(base.split('`').next().unwrap());
-        assert!(base.to_string_lossy().contains("-spec-before-"), "{task}");
+        assert!(
+            base.to_string_lossy().contains("-harness-before-"),
+            "{task}"
+        );
         // It wrote its test there, never in the project, and the folder is
         // gone once its report was taken.
         assert!(!in_project.load(Ordering::SeqCst));
