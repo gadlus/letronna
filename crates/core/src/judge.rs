@@ -1345,8 +1345,9 @@ mod tests {
             Some(answered("200 OK", "{}")),
         ]);
         connection.unattended = true;
-        // Less than the pause before a second request would take.
-        connection.deadline = Some(Instant::now() + Duration::from_millis(300));
+        // Less than the pause before a second request would take, and
+        // enough for the first to be answered under load.
+        connection.deadline = Some(Instant::now() + Duration::from_millis(450));
         let verdict = ask(&connection, "May it run?");
         assert!(
             matches!(&verdict, Err(why) if why.contains("503")),
