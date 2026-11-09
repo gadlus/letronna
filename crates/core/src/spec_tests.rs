@@ -1437,9 +1437,24 @@ pub(crate) fn failure(outcome: &Result<String, String>) -> Option<(String, &str)
 /// first, and a narrower rule in them wins over a test that ignores it.
 const WORDS_FIRST: &str = "Before changing what your work does for a test, find the request's \
                            words for that exact case: where they set a narrower rule the test \
-                           ignores, such as a filter, a condition or an exception, or a review's \
-                           row passed what your work does, keep it and answer the test by \
-                           quoting the words; where they are silent on it, say so.";
+                           ignores, such as a filter, a condition or an exception, keep what \
+                           your work does, as a review's row that passed it is a sign you read \
+                           the words right, and answer the test by quoting the words.";
+
+/// `WORDS_FIRST`, then what to do where the words are silent on the case,
+/// `silent`, which each notice says for itself.
+fn words_first(silent: &str) -> String {
+    format!("{WORDS_FIRST} Where the words are silent on the case, {silent}.")
+}
+
+/// What the report of a tester started ahead of the work tells the run in
+/// place of `WORDS_FIRST`: its tests are read before the work exists, so
+/// the rule is about what to build, not what to keep.
+const WORDS_FIRST_AHEAD: &str = "Before making your work do what a test expects, find the \
+                                 request's words for that exact case: where they set a narrower \
+                                 rule the test ignores, such as a filter, a condition or an \
+                                 exception, follow the words and answer the test by quoting \
+                                 them; where they are silent on the case, say so in your answer.";
 
 /// The notice sending the run back with `outcome`, what `command` made of
 /// the tester's tests `kept` run against its work; None when they passed.
@@ -1458,12 +1473,13 @@ fn failed(kept: &Kept, command: &str, outcome: &Result<String, String>) -> Optio
         }
         _ => "",
     };
+    let words = words_first("say so in your answer");
     Some(format!(
         "Your work as it stands was run against the tests a tester wrote from the request \
          alone, in a copy of the project with them put back at the paths they are kept from, \
          so nothing in the project was touched: `{command}` {ended}. Its \
          output{left_out}:\n\n{shown}\n\n{others}Fix your work for each test that fails on what the \
-         request's words say, and run the tests again the same way. {WORDS_FIRST} One that \
+         request's words say, and run the tests again the same way. {words} One that \
          calls the code wrongly, such as with a name or import the request does not spell, or that \
          fails for want of a fixture, helper or set-up the tester left out, is the tester's to \
          fix where it is kept, in `{}`, since that is where it is run from; never something to \
@@ -1489,6 +1505,7 @@ fn regressed(command: &str, ended: &str, output: &str, differ: &[String]) -> Str
         false => named.join(", "),
     };
     let (shown, left_out) = quoted(output);
+    let words = words_first("put back what broke the test and say so");
     format!(
         "Your first complete version, the work as it stood when you first said you were done, \
          passed `{command}`; what you ended with fails it. Both were run against the tests a \
@@ -1496,8 +1513,8 @@ fn regressed(command: &str, ended: &str, output: &str, differ: &[String]) -> Str
          at the paths they are kept from, so nothing in the project was touched: your work as \
          it stands {ended}. Its output{left_out}:\n\n{shown}\n\nThe files that \
          differ between that first version and your work as it stands: {changed}. Put back \
-         what broke the test, unless the request's words side with your change. {WORDS_FIRST} \
-         Then end with your whole answer again."
+         what broke the test, unless the request's words side with your change. {words} Then \
+         end with your whole answer again."
     )
 }
 
@@ -2995,12 +3012,13 @@ fn files_under(dir: &Path) -> Vec<String> {
 /// them in its copy, such as one without the toolchain or set-up the run
 /// found, still wrote each from the request, so the run runs them itself.
 pub(crate) fn unrun(report: &str, kept: &Kept, again: bool) -> String {
+    let words = words_first("say so in your answer");
     format!(
         "A tester that hasn't seen your work wrote tests from the request alone but could not \
          run them where it worked; its report follows. {} Run them with the project's own \
          runner and the set-up you found works, fix a test only where it calls the code wrongly, \
          such as a guessed name or import the request does not spell, and fix your work for \
-         each test that fails on what the request's words say. {WORDS_FIRST} Then delete the \
+         each test that fails on what the request's words say. {words} Then delete the \
          copies, since they are not part of the task.{}\n\n{}",
         where_kept(kept),
         run_again(again),
@@ -3042,11 +3060,12 @@ fn where_kept(kept: &Kept) -> String {
 /// its tests are `kept`, and that the driver runs them against its work,
 /// when it will (`again`).
 pub(crate) fn told(report: &str, kept: Option<&Kept>, again: bool) -> String {
+    let words = words_first("say so in your answer");
     tell(
         &format!(
             "A tester that hasn't seen your work wrote tests from the request alone and ran \
              them; its report follows, ending with a table of its tests. Fix your work for each \
-             test that fails on what the request's words say. {WORDS_FIRST}"
+             test that fails on what the request's words say. {words}"
         ),
         report,
         kept,
@@ -3075,7 +3094,7 @@ pub(crate) fn told_ahead(report: &str, kept: Option<&Kept>) -> String {
              worked, in the project as it was before your change, where none could pass yet; \
              its report follows, ending with a table of its tests, whose rows say NOT RUN or \
              FAIL for want of your change, not what your work does. Make your work do what each \
-             test expects where the request's words say so. {WORDS_FIRST}"
+             test expects where the request's words say so. {WORDS_FIRST_AHEAD}"
         ),
         &marked,
         kept,
@@ -4624,28 +4643,46 @@ mod tests {
             dir: PathBuf::from("/tmp/kept"),
             files: vec!["tests/letronna_spec.test.ts".to_owned()],
         };
+        // A narrower rule in the words wins; a review's row is a sign of
+        // having read them right, not a licence of its own.
         assert!(
-            WORDS_FIRST
-                .contains("where they set a narrower rule the test ignores, such as a filter"),
-            "{WORDS_FIRST}"
-        );
-        assert!(
-            WORDS_FIRST.contains("or a review's row passed what your work does, keep it"),
+            WORDS_FIRST.contains(
+                "where they set a narrower rule the test ignores, such as a filter, a condition \
+                 or an exception, keep what your work does, as a review's row that passed it is \
+                 a sign you read the words right, and answer the test by quoting the words."
+            ),
             "{WORDS_FIRST}"
         );
         let report = "R1 | adds | FAIL | npx vitest run x | got []\nRun: npx vitest run x";
         let failing = Ok("FAIL tests/letronna_spec.test.ts\n[exit code 1]".to_owned());
+        let silent = "Where the words are silent on the case, say so in your answer.";
         let notices = [
             failed(&kept, "npx vitest run x", &failing).unwrap(),
-            regressed("npx vitest run x", "exited with code 1", "FAIL", &[]),
             told(report, Some(&kept), true),
-            told_ahead(report, Some(&kept)),
             unrun(report, &kept, true),
         ];
         for text in notices {
             assert!(text.contains(WORDS_FIRST), "{text}");
             assert_eq!(text.matches(WORDS_FIRST).count(), 1, "{text}");
+            assert!(text.contains(silent), "{text}");
         }
+        // Beside "put back what broke the test", silence says what to put back.
+        let regressed = regressed("npx vitest run x", "exited with code 1", "FAIL", &[]);
+        assert!(regressed.contains(WORDS_FIRST), "{regressed}");
+        assert!(
+            regressed.contains(
+                "Where the words are silent on the case, put back what broke the test and say so."
+            ),
+            "{regressed}"
+        );
+        // Ahead of the work, the rule is about what to build.
+        let ahead = told_ahead(report, Some(&kept));
+        assert!(ahead.contains(WORDS_FIRST_AHEAD), "{ahead}");
+        assert!(!ahead.contains(WORDS_FIRST), "{ahead}");
+        assert!(
+            WORDS_FIRST_AHEAD.starts_with("Before making your work do what a test expects"),
+            "{WORDS_FIRST_AHEAD}"
+        );
     }
 
     #[test]
@@ -5746,7 +5783,8 @@ mod tests {
         assert!(
             text.ends_with(&format!(
                 "Put back what broke the test, unless the request's words side with your \
-                 change. {WORDS_FIRST} Then end with your whole answer again."
+                 change. {} Then end with your whole answer again.",
+                words_first("put back what broke the test and say so")
             )),
             "{text}"
         );
