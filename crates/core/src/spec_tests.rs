@@ -336,34 +336,59 @@ fn sweeps() -> &'static Mutex<Vec<Sweep>> {
     SWEEPS.get_or_init(Default::default)
 }
 
-/// The projects a tester is writing in, one entry for each, as one does
-/// where no copy of the project could be made: its files there are its own
-/// until it answers, so no run's end sweeps them.
-fn writing() -> &'static Mutex<Vec<PathBuf>> {
-    static WRITING: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+/// A tester at work in a project itself, as one is where no copy of the
+/// project could be made: whose run, where, and the files there whose
+/// names hold `MARKER` as it began (`left`), which are the project's own or
+/// the user's, not the tester's, so `keep` leaves them. Its files there are
+/// its own until it answers, so no run's end sweeps them meanwhile.
+struct Writer {
+    run: u64,
+    workspace: PathBuf,
+    before: Vec<String>,
+}
+
+/// The testers writing in a project itself, one entry for each.
+fn writing() -> &'static Mutex<Vec<Writer>> {
+    static WRITING: OnceLock<Mutex<Vec<Writer>>> = OnceLock::new();
     WRITING.get_or_init(Default::default)
 }
 
 /// A tester at work in a project itself, from `writing_in` until dropped.
-pub(crate) struct Writing(PathBuf);
+pub(crate) struct Writing(u64);
 
-/// Marks `workspace` as one a tester writes in, until what this gives is
-/// dropped.
-pub(crate) fn writing_in(workspace: &Path) -> Writing {
+/// Marks `workspace` as one the tester of run `run` writes in, until what
+/// this gives is dropped, with the files there whose names hold `MARKER`
+/// listed first, so `keep` takes only those the tester adds.
+pub(crate) fn writing_in(run: u64, workspace: &Path) -> Writing {
+    let before = left(workspace);
     if let Ok(mut writing) = writing().lock() {
-        writing.push(workspace.to_path_buf());
+        writing.push(Writer {
+            run,
+            workspace: workspace.to_path_buf(),
+            before,
+        });
     }
-    Writing(workspace.to_path_buf())
+    Writing(run)
 }
 
 impl Drop for Writing {
     fn drop(&mut self) {
         if let Ok(mut writing) = writing().lock()
-            && let Some(at) = writing.iter().position(|folder| *folder == self.0)
+            && let Some(at) = writing.iter().position(|writer| writer.run == self.0)
         {
             writing.remove(at);
         }
     }
+}
+
+/// The files whose names hold `MARKER` that were in `workspace` as the
+/// tester of run `run` began writing there; None when no tester of the run
+/// writes there.
+fn written_before(run: u64, workspace: &Path) -> Option<Vec<String>> {
+    let writing = writing().lock().ok()?;
+    (writing.iter())
+        .find(|writer| writer.run == run && writer.workspace == workspace)
+        .map(|writer| writer.before.clone())
 }
 
 /// A tester started with a run, at work on a thread of its own: the folder
@@ -2418,9 +2443,10 @@ fn slashed(inside: &Path) -> String {
 /// gave to run them, so `tidy` deletes what it puts back and the driver can
 /// run them; None when it left none. One that could not be kept is deleted
 /// all the same, so none stays where a patch would take it. In the project
-/// itself, a file git tracks or ignores there is the project's whatever its
-/// name, and stays; where git cannot say, as outside a git project, each is
-/// taken.
+/// itself, a file that was there as the tester began writing
+/// (`writing_in`) is the project's own or the user's whatever its name, and
+/// stays, with no word from git needed; where no tester was marked as
+/// writing there, each is taken.
 pub(crate) fn keep(
     run: u64,
     from: &Path,
@@ -2428,11 +2454,13 @@ pub(crate) fn keep(
     command: Option<String>,
 ) -> Option<Kept> {
     let dir = folder("tests");
-    let theirs = (from == workspace)
-        .then(|| crate::git::untracked(from, &format!("*{MARKER}*")))
+    // In the project itself, the files that were there as the tester began
+    // are the project's own or the user's, whatever git makes of them.
+    let before = (from == workspace)
+        .then(|| written_before(run, workspace))
         .flatten();
     let files: Vec<String> = (left(from).into_iter())
-        .filter(|file| theirs.as_ref().is_none_or(|theirs| theirs.contains(file)))
+        .filter(|file| before.as_ref().is_none_or(|before| !before.contains(file)))
         .filter(|file| {
             let to = dir.join(file);
             let copied = to
@@ -2679,9 +2707,8 @@ pub(crate) fn tidy(run: u64) -> Vec<String> {
     for workspace in &ended {
         // Another run there, or a tester writing there, may be running
         // copies of its own, so the last to end sweeps for all of them.
-        let written_in = writing()
-            .lock()
-            .is_ok_and(|writing| writing.contains(workspace));
+        let written_in = (writing().lock())
+            .is_ok_and(|writing| writing.iter().any(|writer| writer.workspace == *workspace));
         if !busy.contains(workspace) && !written_in {
             deleted.extend(sweep(workspace));
         }
@@ -3287,7 +3314,7 @@ mod tests {
         written(&from, "t/x_letronna_spec_test.go");
         keep(149, &from, &root, None).unwrap();
         written(&root, "t/t/x_letronna_spec_test.go");
-        let writing = writing_in(&root);
+        let writing = writing_in(150, &root);
         assert!(tidy(149).is_empty());
         assert!(root.join("t/t/x_letronna_spec_test.go").exists());
         drop(writing);
@@ -3298,18 +3325,50 @@ mod tests {
     }
 
     #[test]
-    fn a_tester_in_the_project_itself_leaves_the_files_git_tracks() {
+    fn a_tester_in_the_project_itself_leaves_the_files_that_were_there() {
         let root = Scratch::new("spec-tests-keep-tracked");
         assert!(git(&root, &["init", "-q"]).is_some());
         written(&root, "tests/old_letronna_spec_test.go");
         committed(&root, "first");
+        // The user's own copy of an earlier run's test, which git does not
+        // track either.
+        written(&root, "tests/mine_letronna_spec_test.go");
+        let writing = writing_in(151, &root);
         written(&root, "tests/new_letronna_spec_test.go");
 
         let kept = keep(151, &root, &root, None).unwrap();
         assert_eq!(kept.files, ["tests/new_letronna_spec_test.go"]);
         assert!(!root.join("tests/new_letronna_spec_test.go").exists());
+        drop(writing);
         assert_eq!(tidy(151), Vec::<String>::new());
         assert!(root.join("tests/old_letronna_spec_test.go").exists());
+        assert!(root.join("tests/mine_letronna_spec_test.go").exists());
+
+        // The same where git cannot read the repository, as it cannot one
+        // another user owns: nothing that was there is taken.
+        let broken = Scratch::new("spec-tests-keep-broken-git");
+        std::fs::write(broken.join(".git"), "not a repository").unwrap();
+        assert!(git(&broken, &["status"]).is_none());
+        written(&broken, "tests/old_letronna_spec_test.go");
+        let writing = writing_in(154, &broken);
+        written(&broken, "tests/new_letronna_spec_test.go");
+        let kept = keep(154, &broken, &broken, None).unwrap();
+        assert_eq!(kept.files, ["tests/new_letronna_spec_test.go"]);
+        drop(writing);
+        tidy(154);
+        assert!(broken.join("tests/old_letronna_spec_test.go").exists());
+        // With no tester marked as writing there, as from a copy of the
+        // tester's own, every file so named is the tester's.
+        written(&broken, "tests/more_letronna_spec_test.go");
+        let kept = keep(155, &broken, &broken, None).unwrap();
+        assert_eq!(
+            kept.files,
+            [
+                "tests/more_letronna_spec_test.go",
+                "tests/old_letronna_spec_test.go"
+            ]
+        );
+        tidy(155);
     }
 
     #[test]

@@ -3028,7 +3028,7 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
     let _writing = (testing && copied.is_none())
         .then_some(workspace)
         .flatten()
-        .map(crate::spec_tests::writing_in);
+        .map(|workspace| crate::spec_tests::writing_in(spec.id, workspace));
     // With the project as it was to read how to call things, so it copies
     // nothing of the work, which is all its copy would otherwise show it.
     let before = workspace
