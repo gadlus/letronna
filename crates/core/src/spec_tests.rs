@@ -1934,7 +1934,7 @@ pub(crate) fn own_failing(kept: &Kept, command: &str, output: &str) -> Option<bo
 /// Whether every failure `output`, a run of the tester's command against
 /// the work, attributes to a test or file (`attributed`) is attributed in
 /// `bare` too, its run on the project as it was, each line read with its
-/// digits left out (`undated`), since Go prints a test's time: then the
+/// timings left out (`untimed`), since Go prints a test's time: then the
 /// failures are the project's own as it was, and the work caused none.
 /// False where `output` attributes none.
 pub(crate) fn already_failing(output: &str, bare: &str) -> bool {
@@ -1943,20 +1943,63 @@ pub(crate) fn already_failing(output: &str, bare: &str) -> bool {
         let names = named_lines(&lines);
         (0..lines.len())
             .filter(|at| names[*at].is_some() && attributed(lines[*at]))
-            .map(|at| undated(lines[at]))
+            .map(|at| untimed(lines[at]))
             .collect()
     };
     let first = attributed_in(output);
     !first.is_empty() && first.is_subset(&attributed_in(bare))
 }
 
-/// `line` trimmed, with its digits left out: a test's time, a count or a
-/// line number differs from one run to the next.
-fn undated(line: &str) -> String {
-    line.trim()
-        .chars()
-        .filter(|c| !c.is_ascii_digit())
-        .collect()
+/// `line` with its timings left out and its spaces made one: a test's time
+/// differs from one run to the next, as Go's `(0.01s)`, jest's `(12 ms)`,
+/// pytest's `in 0.42s` and a package line's trailing `0.4s` do, where a
+/// subtest's or a case's number, `TestTable/case_1` or `test_x[1]`, tells
+/// one test from another and stays.
+fn untimed(line: &str) -> String {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(words.len());
+    let mut at = 0;
+    while at < words.len() {
+        let number = bare(words[at]);
+        // A number and its unit as two words, `(12 ms)`.
+        if !number.is_empty()
+            && number.chars().all(|c| c.is_ascii_digit() || c == '.')
+            && words
+                .get(at + 1)
+                .is_some_and(|unit| duration_unit(bare(unit)))
+        {
+            at += 2;
+            continue;
+        }
+        if duration(number) {
+            // With the `in` of a summary's `in 0.42s`.
+            if kept.last() == Some(&"in") {
+                kept.pop();
+            }
+            at += 1;
+            continue;
+        }
+        kept.push(words[at]);
+        at += 1;
+    }
+    kept.join(" ")
+}
+
+/// `word` without the brackets and comma a runner puts around a timing.
+fn bare(word: &str) -> &str {
+    word.trim_matches(|c| matches!(c, '(' | ')' | '[' | ']' | ','))
+}
+
+/// Whether `word` is a duration, digits with a unit after them: `0.01s`,
+/// `12ms`.
+fn duration(word: &str) -> bool {
+    let unit = word.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
+    unit.len() < word.len() && duration_unit(unit)
+}
+
+/// Whether `unit` is a unit of time a runner prints a duration in.
+fn duration_unit(unit: &str) -> bool {
+    matches!(unit, "s" | "ms" | "µs" | "us" | "ns" | "m" | "h")
 }
 
 /// The names of the tests in the tester's Go files `kept`, `TestX` for each
@@ -4851,6 +4894,37 @@ mod tests {
             "{same}\n--- FAIL: TestColorProfile (0.00s)\n    termenv_test.go:80: wrong\nFAIL"
         );
         assert!(!already_failing(&more, bare));
+        // A sibling case the work newly breaks is a failure of its own,
+        // though only a number tells it from one the project had.
+        let table = |case: &str, took: &str| {
+            format!(
+                "--- FAIL: TestTable ({took})\n    --- FAIL: TestTable/case_{case} ({took})\nFAIL"
+            )
+        };
+        assert!(already_failing(&table("1", "0.02s"), &table("1", "0.00s")));
+        assert!(!already_failing(&table("2", "0.00s"), &table("1", "0.00s")));
+        let parametrised = |case: &str| {
+            format!(
+                "FAILED tests/test_x.py::test_x[{case}] - assert 1 == 2\n1 failed in 0.4{case}s"
+            )
+        };
+        assert!(already_failing(&parametrised("1"), &parametrised("1")));
+        assert!(!already_failing(&parametrised("2"), &parametrised("1")));
+        // Only the timings go.
+        assert_eq!(
+            untimed("--- FAIL: TestTotal (0.01s)"),
+            "--- FAIL: TestTotal"
+        );
+        assert_eq!(untimed("    ✕ adds (12 ms)"), "✕ adds");
+        assert_eq!(
+            untimed("FAIL\tgithub.com/acme/termenv\t0.4s"),
+            "FAIL github.com/acme/termenv"
+        );
+        assert_eq!(untimed("1 failed, 3 passed in 0.42s"), "1 failed, 3 passed");
+        assert_eq!(
+            untimed("FAILED tests/test_x.py::test_x[1] - assert 1 == 2"),
+            "FAILED tests/test_x.py::test_x[1] - assert 1 == 2"
+        );
         // Nothing attributed says nothing.
         assert!(!already_failing("panic: boom\n[exit code 2]", bare));
         let plain = "made.txt is missing\n[exit code 1]";
