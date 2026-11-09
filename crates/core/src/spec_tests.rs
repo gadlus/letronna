@@ -2085,7 +2085,8 @@ fn titled(trimmed: &str) -> bool {
 
 /// Whether `line` is a runner's word on a test that passed or is starting,
 /// past which a failure's lines have ended: Go's `--- PASS`, `=== RUN` and
-/// `ok`, its `PASS` alone, jest's ticks and pytest's `PASSED`.
+/// `ok`, its `PASS` alone, jest's ticks, and pytest's `PASSED` and `XPASS`,
+/// which its `-rA` summary lists after what failed.
 fn passing(line: &str) -> bool {
     let trimmed = line.trim_start();
     let ended = trimmed.trim_end();
@@ -2094,6 +2095,8 @@ fn passing(line: &str) -> bool {
         "=== RUN",
         "=== PAUSE",
         "=== CONT",
+        "PASSED",
+        "XPASS",
         "ok ",
         "ok\t",
         "✓",
@@ -2117,11 +2120,12 @@ fn names_own(text: &str) -> bool {
 
 /// Whether `line` starts another part of a runner's report, where a
 /// failure's lines end: another file's, as jest's and vitest's `PASS ` and
-/// `FAIL ` start one, or a test's logs, as jest's `● Console` and its
-/// `console.log` and the like do.
+/// `FAIL ` start one, a test's logs, as jest's `● Console` and its
+/// `console.log` and the like do, or another binary's, as cargo's `test
+/// result:` ends one and its `Running ` opens the next.
 fn another_part(line: &str) -> bool {
     let trimmed = line.trim_start();
-    ["PASS ", "FAIL ", "● Console"]
+    ["PASS ", "FAIL ", "● Console", "Running ", "test result:"]
         .iter()
         .any(|start| trimmed.starts_with(start))
         || CONSOLE.contains(&trimmed.trim_end())
@@ -4827,6 +4831,18 @@ mod tests {
         let passed = "--- FAIL: TestTotal (0.00s)\n    cart_test.go:9: wrong\n=== RUN   \
                       TestLetronnaSpecEmpty\n--- PASS: TestLetronnaSpecEmpty (0.00s)\nFAIL";
         assert_eq!(whose("go test ./pkg/", passed), Some(false));
+        // pytest's -rA summary lists what passed after what failed, and
+        // cargo goes on to the next binary: neither names a failure of the
+        // tester's own.
+        let summary = "FAILED tests/test_other.py::test_y - assert 1 == 2\nPASSED \
+                       tests/test_letronna_spec.py::test_adds\nXPASS \
+                       tests/test_letronna_spec.py::test_more\n1 failed, 2 passed in 0.3s";
+        assert_eq!(whose("pytest -rA", summary), Some(false));
+        let binaries = "test tests::adds ... FAILED\n\nfailures:\n    tests::adds\n\ntest result: \
+                        FAILED. 0 passed; 1 failed; 0 ignored\n\n     Running \
+                        tests/letronna_spec_cart.rs (target/debug/deps/letronna_spec_cart-1a2b)\n\n\
+                        running 0 tests\n[exit code 101]";
+        assert_eq!(whose("cargo test --no-fail-fast", binaries), Some(false));
     }
 
     #[test]
