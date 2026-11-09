@@ -226,8 +226,18 @@ const SECRETS: [&str; 6] = ["KEY", "TOKEN", "SECRET", "PASSW", "CREDENTIAL", "AU
 
 /// Variables never lent, as no `LD_*` or `*FLAGS` is: they say where
 /// programs and libraries are found, or how a build goes, which the run may
-/// have set for a build against what its tests need.
-const UNLENT: [&str; 5] = ["PATH", "HOME", "CGO_ENABLED", "NODE_ENV", "PYTHONHOME"];
+/// have set for a build against what its tests need; nor the import path,
+/// which the copy is put first on for the run (`with_import_path`), and a
+/// lent one, exported after that, would undo.
+const UNLENT: [&str; 7] = [
+    "PATH",
+    "HOME",
+    "CGO_ENABLED",
+    "NODE_ENV",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "PYTHONSAFEPATH",
+];
 
 /// A tester's files kept for a run: its id, the project it puts them back
 /// in, where they are kept, and the command the tester gave to run them
@@ -1245,8 +1255,9 @@ fn pythonic(command: &str) -> bool {
 /// project's own folder, and a test run in a copy would otherwise import the
 /// project's code rather than the copy's. The standard finder reads sys.path
 /// first, PYTHONPATH ahead of site-packages, and setuptools appends its
-/// editable finder to sys.meta_path, so the copy's code wins. As it is for
-/// any other command.
+/// editable finder to sys.meta_path, so the copy's code wins; a PYTHONPATH
+/// of the run's own is not lent (`UNLENT`), since exported after this one
+/// it would take its place. As it is for any other command.
 fn with_import_path(command: &str, folder: &Path) -> String {
     if !pythonic(command) {
         return command.to_owned();
@@ -2691,7 +2702,8 @@ mod tests {
         // A report longer than the agent tool quotes is cut in the middle,
         // keeping both ends, and each line indented, as `agents::answer`
         // quotes it: the command, written last, is kept and read; written
-        // before a long table, it would be lost.
+        // before a long table, the cut loses it, and `agents::answer` writes
+        // it again after the quote.
         let rows: Vec<String> = (1..=40)
             .map(|n| {
                 format!(
@@ -4322,12 +4334,12 @@ mod tests {
         // through `env`, and quoted.
         assert_eq!(
             environment(
-                "export PYTHONPATH=src; CI=1; cd /app && env DJANGO_SETTINGS_MODULE=\"app.settings\" \
-                 pytest -q 2>&1 | tail -20",
+                "export COVERAGE_FILE=.coverage; CI=1; cd /app && env \
+                 DJANGO_SETTINGS_MODULE=\"app.settings\" pytest -q 2>&1 | tail -20",
                 "pytest"
             ),
             [
-                "PYTHONPATH=src",
+                "COVERAGE_FILE=.coverage",
                 "CI=1",
                 "DJANGO_SETTINGS_MODULE=app.settings"
             ]
@@ -4357,6 +4369,11 @@ mod tests {
                 "go"
             ),
             ["GOMODCACHE=/m"]
+        );
+        // Nor the import path, which the copy is put first on for the run.
+        assert_eq!(
+            environment("PYTHONPATH=/opt/x PYTHONSAFEPATH=1 D=1 pytest", "pytest"),
+            ["D=1"]
         );
         // Nor anything off a command running another program than the
         // tester's, however it is reached.

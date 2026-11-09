@@ -2161,6 +2161,14 @@ fn answer(
         let lost = crate::requirements::cut_rows(&report.text, &quote);
         out.push_str(&quote);
         out.push_str(lost.as_deref().unwrap_or_default());
+        // A tester's command is what the driver runs its tests with, read
+        // off the last `Run:` line: one the cut lost comes back after the
+        // quote too, wherever in its report the tester wrote it.
+        if let Some(command) = crate::spec_tests::command(&report.text)
+            && crate::spec_tests::command(&quote).as_deref() != Some(command.as_str())
+        {
+            out.push_str(&format!("\nRun: {command}"));
+        }
     }
     match report.status {
         Outcome::Stopped | Outcome::Failed(_) => Err(out),
@@ -3265,6 +3273,44 @@ mod tests {
             .find(|message| message["role"] == "user")
             .and_then(|message| message["content"].as_str())
             .unwrap()
+    }
+
+    #[test]
+    fn a_testers_command_outlives_the_cut_wherever_it_wrote_it() {
+        // Written before a long table, the `Run:` line falls in the middle
+        // the cut drops: it is written again after the quote, where the
+        // driver reads it from, as a review's lost rows are.
+        let rows: Vec<String> = (1..=40)
+            .map(|n| {
+                format!(
+                    "R{n} | case {n} of the request, checked end to end | FAIL | pytest -q \
+                     tests/test_letronna_spec.py::test_{n} | not yet implemented"
+                )
+            })
+            .collect();
+        let table = rows.join("\n");
+        let prose = "Wrote the tests from the request. ".repeat(70);
+        let given = "python -m pytest -q tests/test_letronna_spec.py";
+        let quoted = |text: &str| {
+            answer(
+                "tester",
+                &report(Outcome::Done, text),
+                ROUNDS,
+                MAX_REPORT,
+                None,
+            )
+            .unwrap()
+        };
+        let first = quoted(&format!("{prose}\nRun: {given}\n{table}"));
+        assert!(first.contains("[middle trimmed]"), "{first}");
+        assert!(first.ends_with(&format!("\nRun: {given}")), "{first}");
+        assert_eq!(crate::spec_tests::command(&first).as_deref(), Some(given));
+        // One the cut kept is not written twice, nor is one never given.
+        let last = quoted(&format!("{prose}\n{table}\nRun: {given}"));
+        assert_eq!(last.matches("Run: ").count(), 1, "{last}");
+        assert_eq!(crate::spec_tests::command(&last).as_deref(), Some(given));
+        let none = quoted(&format!("{prose}\n{table}"));
+        assert!(!none.contains("Run: "), "{none}");
     }
 
     #[test]

@@ -2611,7 +2611,8 @@ fn spare_for_rebuild(spec: &Spec) -> bool {
 /// the driver's run of the tester's tests against its work, `ran`: both,
 /// where both are there; the report with how the tests went, where they
 /// passed or could not be run, so the run still learns of them and where
-/// they are kept; or what failed alone. None with neither, and none of a
+/// they are kept, and that it is to answer again, since what it says next
+/// is its answer; or what failed alone. None with neither, and none of a
 /// failure the run has no time left to fix, as `tested_work` keeps it.
 fn tester_notice(
     spec: &Spec,
@@ -2628,10 +2629,13 @@ fn tester_notice(
     match (late, sent) {
         (Some(told), Some(sent)) => Some(format!("{told}\n\n{}", sent.content)),
         (Some(_), None) if failed => None,
-        (Some(told), None) => Some(match went {
-            Some(went) => format!("{told}\n\n{went}"),
-            None => told,
-        }),
+        (Some(told), None) => {
+            let again = "Then end with your whole answer again.";
+            Some(match went {
+                Some(went) => format!("{told}\n\n{went} {again}"),
+                None => format!("{told}\n\n{again}"),
+            })
+        }
         (None, Some(sent)) => Some(sent.content),
         (None, None) => None,
     }
@@ -2952,13 +2956,14 @@ fn unreviewed(messages: &[Message]) -> Option<String> {
     crate::requirements::unchecked(&report.content, count)
 }
 
-/// Whether `message` carries a review helper's report: the agent tool's
-/// result for a helper of the review type, or the mail one that ran in the
+/// Whether `message` carries a report a review's table is read from: the
+/// agent tool's result for any helper but a tester, whose rows are of its
+/// tests, not the requirements, or the mail a review helper that ran in the
 /// background sent as it ended, which names its type (`agents::ended`).
 fn review_report(message: &Message) -> bool {
     if message.role == "tool" && message.name == "agent" {
         let args = tools::parse_args_for(&message.name, &message.args).unwrap_or_default();
-        return args["type"].as_str() == Some("review");
+        return args["type"].as_str() != Some("tester");
     }
     message.role == "user" && message.notice && message.content.contains("(review ·")
 }
@@ -7702,17 +7707,22 @@ pub(crate) mod tests {
         let mail = format!("helper review finished (review · 9 rounds):\n{covered}");
         messages.push(said("user", &mail, "", true));
         assert_eq!(unreviewed(&messages), None);
-        // Only a review helper's table counts: not another kind of helper's,
-        // nor a table in a later notice that is no review's, such as a
-        // tester's report, whose rows are of its tests, not the requirements.
+        // A tester's table does not count, since its rows are of its tests,
+        // not the requirements, nor does a table in a later notice that is
+        // no review's, such as a tester's report; any other helper's does,
+        // since the run may have asked a general one for its review.
         let unseen = "R1 | a | FAIL | cargo test\nR2 | b | FAIL | cargo test";
-        messages.push(helper("general", unseen));
+        messages.push(helper("tester", unseen));
         assert_eq!(unreviewed(&messages), None);
         messages.push(said("user", unseen, "", true));
         assert_eq!(unreviewed(&messages), None);
         let tester = crate::spec_tests::told_ahead(unseen, None);
         messages.push(said("user", &tester, "", true));
         assert_eq!(unreviewed(&messages), None);
+        messages.push(helper("general", unseen));
+        let text = unreviewed(&messages).unwrap();
+        assert!(text.contains("has no row for R3, R4 and R5"), "{text}");
+        assert!(text.contains("- R1 | a | FAIL | cargo test"), "{text}");
 
         // A command's output is no review, nor is the run's own check.
         let mut others = vec![asked.clone(), said("tool", table, "run_command", false)];
@@ -8615,21 +8625,31 @@ pub(crate) mod tests {
         let mut spec = own_run("http://127.0.0.1:1/v1".into(), &dir, AGENTS + 1_921);
         let told = "A tester wrote tests while you worked.".to_owned();
         let failed = || Some(Ran::Failed("the failure".into()));
-        // Its tests passed, or could not be run: the report, with how it went.
+        // Its tests passed, or could not be run: the report, with how it
+        // went, and the ask to answer again, since its next words are its
+        // answer.
         let passed = Some(Ran::Passed("pytest -q".into()));
         let text = tester_notice(&spec, Some(told.clone()), passed).unwrap();
         assert!(text.starts_with(&told), "{text}");
         assert!(text.contains("`pytest -q` passed"), "{text}");
+        assert!(
+            text.ends_with("to you. Then end with your whole answer again."),
+            "{text}"
+        );
         let unrun = Some(Ran::Unrun("no copy".into()));
         let text = tester_notice(&spec, Some(told.clone()), unrun).unwrap();
         assert!(
             text.contains("could not be run against your work as it stands: no copy"),
             "{text}"
         );
-        // No command to run them: the report alone.
+        assert!(
+            text.ends_with("you end. Then end with your whole answer again."),
+            "{text}"
+        );
+        // No command to run them: the report alone, with the same ask.
         assert_eq!(
             tester_notice(&spec, Some(told.clone()), None),
-            Some(told.clone())
+            Some(format!("{told}\n\nThen end with your whole answer again."))
         );
         // They failed: the report with what failed, unless the fix has no
         // time left, when neither goes.
