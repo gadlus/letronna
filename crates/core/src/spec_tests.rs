@@ -62,6 +62,12 @@
 //! same program set, such as a module cache, so a tester that lacked the
 //! run's set-up gets it. All of it happens in copies in the temp folder,
 //! discarded as the run ends; nothing is written into the project.
+//!
+//! The project as it was serves one more check (`verdict`): a test command
+//! of the run's own that failed, still fails in a fresh copy of the work, and
+//! passes there found a regression, and the run is told so (`broken`); one
+//! that ran no test (`ran_nothing`), or whose stores lead back into the
+//! project (`imports_elsewhere`), proves nothing.
 
 use crate::cancel::Cancel;
 use crate::tools::ToolContext;
@@ -103,6 +109,11 @@ pub(crate) const RUNS: usize = 2;
 /// a test suite's worth; the driver gives less when less is left to the
 /// run's deadline, which does not cut a command run for no conversation.
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// How many suites' worth of time, `TIMEOUT` each, a run has to have left
+/// before a command that rebuilds the whole workspace in a copy is compared
+/// with the project as it was.
+pub(crate) const REBUILD_SPARE: u32 = 3;
 
 /// The most time a tester started with the run is given: enough to read
 /// the project and write its tests, and well within the time a run that
@@ -1282,6 +1293,103 @@ fn artefact(part: &str) -> bool {
 /// Whether a component of `path` is hidden.
 fn hidden(path: &str) -> bool {
     path.split('/').any(|part| part.starts_with('.'))
+}
+
+/// Whether `command` runs cargo, which keys its artifacts by each package's
+/// path: in a copy of the project it builds every crate of the workspace
+/// again from scratch, minutes on a small machine, holding the target
+/// folder's lock meanwhile, and twice over, for the work's copy and the
+/// project as it was. So it is compared only with `REBUILD_SPARE` suites'
+/// worth of time to spare; the other builders reuse their caches by content.
+pub(crate) fn rebuilds_all(command: &str) -> bool {
+    let apart =
+        |c: char| c.is_whitespace() || matches!(c, '&' | ';' | '|' | '(' | ')' | '"' | '\'');
+    (command.split(apart)).any(|word| {
+        Path::new(word)
+            .file_name()
+            .is_some_and(|name| name == "cargo")
+    })
+}
+
+/// Words a runner's output holds when it ran no test at all, with the
+/// spaces between them squeezed to one.
+const NOTHING_RAN: [&str; 8] = [
+    "no tests to run",
+    "no test files",
+    "tests: 0 total",
+    "collected 0 items",
+    "no tests found",
+    "0 tests run",
+    "no tests ran",
+    "ran 0 tests",
+];
+
+/// Whether `output`, a test runner's that exited 0, shows that nothing ran,
+/// as a filter matching no test leaves it: Go marks each package's line
+/// where nothing ran, and says nothing ran only where every line is marked;
+/// jest counts `0 total` or finds no tests; cargo and mocha count `0 passed`
+/// or `0 passing`, cargo once per test binary, so only a count of 0 wherever
+/// one stands means nothing ran. Finer than `VACUOUS`, which a crate's
+/// doc-tests with `0 passed` beside its tests would trip.
+pub(crate) fn ran_nothing(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    // A package with tests beside one without is a run all the same.
+    let marked =
+        |line: &str| line.contains("[no tests to run]") || line.contains("[no test files]");
+    if lower.lines().any(marked) {
+        return (lower.lines())
+            .filter(|line| line.starts_with("ok") || line.starts_with('?'))
+            .all(marked);
+    }
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    let squeezed = words.join(" ");
+    if NOTHING_RAN.iter().any(|said| squeezed.contains(said)) {
+        return true;
+    }
+    let counts: Vec<u64> = (words.windows(2))
+        .filter(|pair| pair[1].starts_with("passed") || pair[1].starts_with("passing"))
+        .filter_map(|pair| {
+            pair[0]
+                .trim_matches(|c: char| !c.is_ascii_digit())
+                .parse()
+                .ok()
+        })
+        .collect();
+    !counts.is_empty() && counts.iter().all(|count| *count == 0)
+}
+
+/// Whether `command`, run in `folder` within `limit` as `run_command` runs
+/// it, passed: Some(true) when it ran to its end with tests run, Some(false)
+/// when it failed or did not finish, as `failure` reads it, and None when it
+/// passed with nothing run, as `ran_nothing` reads it, which proves nothing.
+pub(crate) fn verdict(
+    command: &str,
+    folder: &Path,
+    ctx: &ToolContext,
+    limit: Duration,
+) -> Option<bool> {
+    let outcome = run_command(command, folder, ctx, limit);
+    if failure(&outcome).is_some() {
+        return Some(false);
+    }
+    let output = outcome.as_deref().unwrap_or_default();
+    (!ran_nothing(output)).then_some(true)
+}
+
+/// The notice sending a run back when `command`, a test of the project's own
+/// that failed for it with `output`, passes on the project as it was: a
+/// regression, unless the request changes what the test expects. It is told
+/// to run it once more, since a test can fail by chance, and that the test
+/// itself is not to go.
+pub(crate) fn broken(command: &str, output: &str) -> String {
+    format!(
+        "`{command}` passes on the project as it was and fails with your change. Its output \
+         ends:\n\n{}\n\nRun it once more first. If it still fails, then where the request's \
+         words change what that test expects, update the test's expectation and quote the \
+         words in your answer; otherwise fix the code so it passes again. Do not delete, skip \
+         or weaken the test. Then end with your whole answer again.",
+        tail(output)
+    )
 }
 
 /// The end of `output`: `SHOWN` characters at most, from a line's start.
@@ -2683,6 +2791,85 @@ mod tests {
         // Without the tool's advice to a model to call it again.
         assert!(!text.contains("If it only needs longer"), "{text}");
         tidy(7);
+    }
+
+    #[test]
+    fn a_runner_that_ran_no_test_proves_nothing() {
+        // Cargo counts once per test binary; a filter matching nothing
+        // leaves every count at 0, while doc-tests with none beside tests
+        // that ran are a run.
+        assert!(ran_nothing(
+            "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 42 filtered \
+             out\n\n   Doc-tests meta\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed"
+        ));
+        assert!(!ran_nothing(
+            "test result: ok. 3 passed; 0 failed\n\ntest result: ok. 0 passed; 0 failed"
+        ));
+        // Go marks each package's line; nothing ran only where every one is.
+        assert!(ran_nothing(
+            "testing: warning: no tests to run\nPASS\nok  \tpkg\t0.002s [no tests to run]"
+        ));
+        assert!(ran_nothing(
+            "?   \tpkg/a\t[no test files]\n?   \tpkg/b\t[no test files]"
+        ));
+        assert!(!ran_nothing(
+            "ok  \tpkg/a\t0.1s\n?   \tpkg/b\t[no test files]"
+        ));
+        // Jest, vitest, pytest, unittest and mocha each say it their way.
+        assert!(ran_nothing("Tests:       0 total\nSnapshots:   0 total"));
+        assert!(ran_nothing("No tests found, exiting with code 0"));
+        assert!(ran_nothing("No test files found, exiting with code 0"));
+        assert!(ran_nothing("collected 0 items\n\nno tests ran in 0.01s"));
+        assert!(ran_nothing("Ran 0 tests in 0.000s\n\nOK"));
+        assert!(ran_nothing("  0 passing (2ms)"));
+        assert!(!ran_nothing("3 passed in 0.2s"));
+        assert!(!ran_nothing("Ran 12 tests in 0.1s\n\nOK"));
+        assert!(!ran_nothing("(no output)"));
+    }
+
+    #[test]
+    fn only_cargo_builds_the_whole_workspace_again_in_a_copy() {
+        assert!(rebuilds_all("cargo test -p meta"));
+        assert!(rebuilds_all("cd crates/meta && cargo test"));
+        assert!(rebuilds_all("/usr/local/bin/cargo nextest run"));
+        assert!(!rebuilds_all("go test ./..."));
+        assert!(!rebuilds_all("pytest -q tests"));
+        assert!(!rebuilds_all("npm run cargo-like"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_commands_verdict_is_a_pass_a_failure_or_nothing_run() {
+        let root = Scratch::new("spec-tests-verdict");
+        let ctx = ToolContext::of(&crate::chat::Connection {
+            workspace: Some(root.to_path_buf()),
+            ..Default::default()
+        });
+        let verdict = |line: &str| verdict(line, &root, &ctx, TIMEOUT);
+        assert_eq!(verdict("echo '3 passed'"), Some(true));
+        assert_eq!(verdict("true"), Some(true));
+        assert_eq!(verdict("false"), Some(false));
+        assert_eq!(verdict("echo 'test result: ok. 0 passed; 0 failed'"), None);
+    }
+
+    #[test]
+    fn the_run_hears_which_test_passed_before_its_change_and_what_to_do() {
+        let text = broken(
+            "cargo test -p meta",
+            "test parses ... FAILED\n\n[exit code 101]",
+        );
+        assert!(
+            text.starts_with(
+                "`cargo test -p meta` passes on the project as it was and fails with your \
+                 change. Its output ends:\n\ntest parses ... FAILED\n\n[exit code 101]\n\n\
+                 Run it once more first. If it still fails, then where the request's words \
+                 change what that test expects, update the test's expectation and quote the \
+                 words in your answer; otherwise fix the code so it passes again. Do not \
+                 delete, skip or weaken the test."
+            ),
+            "{text}"
+        );
+        assert!(text.ends_with("Then end with your whole answer again."));
     }
 
     #[test]

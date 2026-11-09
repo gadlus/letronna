@@ -1047,7 +1047,7 @@ fn says_what_failed(line: &str) -> bool {
 }
 
 /// Whether `command` runs a project's tests.
-fn runs_tests(command: &str) -> bool {
+pub(crate) fn runs_tests(command: &str) -> bool {
     const RUNNERS: [&str; 16] = [
         "cargo test",
         "cargo nextest",

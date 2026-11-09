@@ -63,6 +63,10 @@
 //! One that changed TypeScript or JavaScript and has passed no build since,
 //! though its tests may have passed, is told once which script builds it
 //! (`builds`).
+//! One whose last failing test command passes on the project as it was,
+//! run in a copy of the last commit with the project's packages linked in,
+//! is told once that it broke an existing test, to fix the code or, where
+//! the request changes what the test expects, the test (`spec_tests::base`).
 //!
 //! Nothing here polls. Each wait -- for the model, for a tool, for an
 //! approval -- is a blocking receive that a stop closes, so a stop is heard at
@@ -627,6 +631,7 @@ fn steps(
         .then(|| (spec.connection.workspace.as_deref()).and_then(crate::spec_tests::baseline))
         .flatten();
     let mut twinned = false;
+    let mut compared = false;
     // From the first request, since a run told of its time only near the
     // end has often thought most of it away by then.
     if let Some(deadline) = spec.connection.deadline {
@@ -1067,6 +1072,19 @@ fn steps(
                 && let Some(notice) = unbuilt(spec, turn, begun)
             {
                 built = true;
+                spec.transcript.conversation.messages.push(notice);
+                save(&mut spec.transcript)?;
+                continue;
+            }
+            // After the edits are checked, so the tests that check had run
+            // are compared too; once the project as it was has been run,
+            // whatever came of it, which `broken_tests` marks, since that
+            // run costs a build; and with a round and budget left, as above.
+            if !compared
+                && report.rounds < spec.rounds
+                && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
+                && let Some(notice) = broken_tests(spec, turn, begun, &mut compared)
+            {
                 spec.transcript.conversation.messages.push(notice);
                 save(&mut spec.transcript)?;
                 continue;
@@ -3240,6 +3258,161 @@ fn unbuilt_files(messages: &[Message], workspace: &Path) -> Vec<String> {
         }
     }
     files
+}
+
+/// The notice sending a session's own run nobody watches back once when the
+/// last test command of its own that failed since `begun`, with no later
+/// pass of the same line, still fails in a fresh copy of its work and passes
+/// on the project as it was before its change, in a copy of the last commit
+/// with the project's package stores linked in: a test that passed before
+/// and fails now is a regression unless the request changes what it expects,
+/// and nothing else checks that. A failure the run has fixed since under a
+/// wider line, as `pytest tests/x.py` fixes `pytest tests/x.py::a`, passes
+/// in the work's copy and is left alone, as is one whose stores lead back
+/// into the project (`imports_elsewhere`), where the project as it was would
+/// run the work's code. `looked` is set once the project as it was has been
+/// run, whatever came of it: a test that fails there too, as one needing
+/// set-up the copy lacks does, or that ran nothing, tells nothing of the
+/// change and is not run again.
+fn broken_tests(spec: &Spec, turn: &Turn, begun: usize, looked: &mut bool) -> Option<Message> {
+    // A helper's tests are its parent's to judge, a person watching reads
+    // what failed, and past the round cap or in plan mode nothing runs.
+    if !unwatched(spec) || turn.capped().is_some() || !turn.runs_commands() {
+        return None;
+    }
+    if refused(spec, "run_command").is_some() {
+        return None;
+    }
+    let workspace = spec.connection.workspace.as_deref()?;
+    let messages = spec.transcript.conversation.messages.get(begun..)?;
+    let (args, output) = failing_test(messages, workspace)?;
+    // With the time and tokens for the fix after it, as for a review.
+    if !affords_review(spec) {
+        return None;
+    }
+    let left = (spec.connection.deadline)
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+    let command = args["command"].as_str()?.trim().to_owned();
+    // A command that builds the whole workspace again in each copy is
+    // compared only with time to spare, as `rebuilds_all` says.
+    let spare = crate::spec_tests::TIMEOUT * crate::spec_tests::REBUILD_SPARE;
+    if crate::spec_tests::rebuilds_all(&command) && left.is_some_and(|left| left <= spare) {
+        return None;
+    }
+    // As the run spelt it, for the folder each copy stands in for: the run
+    // may have spelt the project's path out in the line or its workdir,
+    // which goes ahead of the line as a `cd`. A folder outside the project
+    // is never run elsewhere.
+    let mut line = crate::spec_tests::relative(&command, &[workspace]);
+    if let Some(workdir) = args["workdir"].as_str().map(str::trim) {
+        let workdir = crate::spec_tests::relative(workdir, &[workspace]);
+        let folder = Path::new(&workdir);
+        if folder.is_absolute() || folder.components().any(|part| part == Component::ParentDir) {
+            return None;
+        }
+        if !workdir.is_empty() {
+            line = format!("cd '{}' && {line}", workdir.replace('\'', "'\\''"));
+        }
+    }
+    let limit = test_limit(spec);
+    // Through the gate, as the run's own call went.
+    let ctx = test_context(spec, &line, limit)?;
+    // In a fresh copy of the work first: the failure the run saw may be
+    // stale, fixed since under a wider line.
+    let work = crate::spec_tests::copy(workspace)?;
+    let still = crate::spec_tests::verdict(&line, &work, &ctx, limit);
+    crate::spec_tests::discard(&work);
+    if still != Some(false) {
+        return None;
+    }
+    let base = crate::spec_tests::base(workspace)?;
+    if crate::spec_tests::imports_elsewhere(workspace, &base).is_some() {
+        crate::spec_tests::discard(&base);
+        return None;
+    }
+    *looked = true;
+    let before = crate::spec_tests::verdict(&line, &base, &ctx, limit);
+    crate::spec_tests::discard(&base);
+    if before != Some(true) {
+        return None;
+    }
+    // The runs may have taken the time the fix needed: then the run is left
+    // to end with its first version rather than a half-made fix.
+    let left = (spec.connection.deadline)
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+    if left.is_some_and(|left| left < crate::requirements::REVIEW_TIME / 2) {
+        return None;
+    }
+    Some(Message {
+        role: "user".into(),
+        content: crate::spec_tests::broken(&command, &output),
+        notice: true,
+        // Folded into the run, so the window keeps the task it is for.
+        folded: true,
+        ..Default::default()
+    })
+}
+
+/// The last `run_command` result in `messages` whose command did more than
+/// read, as `passed` counts a check, and ended with a non-zero exit, with no
+/// later result of the same line in the same folder that ran to its end: its
+/// arguments as the run made them, and its output as the run saw it. One
+/// that runs a test runner `compact::runs_tests` knows comes before any
+/// other, which is as often a script of the run's own as a test of the
+/// project's. One that would install anything is left out, as the tester's
+/// command is, since run in a copy whose packages are links into the project
+/// it would change them.
+fn failing_test(messages: &[Message], workspace: &Path) -> Option<(Value, String)> {
+    let results: Vec<(Value, &Message)> = (messages.iter())
+        .filter(|message| message.role == "tool" && message.name == "run_command")
+        .map(|message| {
+            let args = tools::parse_args_for(&message.name, &message.args).unwrap_or_default();
+            (args, message)
+        })
+        // A job left running has shown nothing yet.
+        .filter(|(args, _)| !args["background"].as_bool().unwrap_or(false))
+        .collect();
+    let line = |args: &Value| {
+        let command = args["command"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let workdir = args["workdir"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        (command, workdir)
+    };
+    let failed: Vec<(Value, String)> = (results.iter().enumerate().rev())
+        .filter_map(|(at, (args, result))| {
+            let key = line(args);
+            let command = key.0.as_str();
+            if command.is_empty()
+                || result.is_error
+                || crate::tool_runs::exit_code(result).is_none()
+                || crate::spec_tests::installs(command)
+            {
+                return None;
+            }
+            let dialect = crate::command::Dialect::here();
+            let assessed = crate::command::assess(command, dialect, Some(workspace));
+            if assessed.risk == crate::command::Risk::ReadOnly {
+                return None;
+            }
+            let passed_since = results[at + 1..].iter().any(|(later, result)| {
+                line(later) == key
+                    && !result.is_error
+                    && crate::tool_runs::exit_code(result).is_none()
+            });
+            (!passed_since).then(|| (args.clone(), result.content.clone()))
+        })
+        .collect();
+    let runner = failed
+        .iter()
+        .find(|(args, _)| crate::compact::runs_tests(args["command"].as_str().unwrap_or_default()));
+    runner.or_else(|| failed.first()).cloned()
 }
 
 /// The source files the tool results in `messages` changed after the last
@@ -8660,6 +8833,328 @@ pub(crate) mod tests {
         );
         assert!(affords_attempt(&spec));
         crate::spec_tests::tidy(id);
+    }
+
+    #[test]
+    fn the_last_failing_test_command_without_a_later_pass_of_its_line_is_found() {
+        let dir = scratch("failing-test");
+        let tool = |args: Value, content: &str, is_error: bool| Message {
+            role: "tool".into(),
+            name: "run_command".into(),
+            args: args.to_string(),
+            content: content.into(),
+            is_error,
+            ..Default::default()
+        };
+        let ran = |line: &str, out: &str| tool(json!({"command": line}), out, false);
+        let failed = |line: &str| ran(line, "1 failed\n[exit code 1]");
+        let passed = |line: &str| ran(line, "3 passed");
+        let found = |messages: &[Message]| {
+            failing_test(messages, &dir).map(|(args, out)| (args["command"].to_string(), out))
+        };
+        // Nothing failed, or only a read did.
+        let mut messages = vec![
+            passed("pytest"),
+            ran("grep -q TODO src/app.py", "[exit code 1]"),
+        ];
+        assert_eq!(found(&messages), None);
+        // The last failing wins, with its output as the run saw it.
+        messages.push(failed("pytest tests/a.py"));
+        messages.push(ran("pytest tests/b.py", "2 failed\n[exit code 1]"));
+        assert_eq!(
+            found(&messages),
+            Some((
+                "\"pytest tests/b.py\"".into(),
+                "2 failed\n[exit code 1]".into()
+            ))
+        );
+        // A later pass of the same line clears it, and the earlier one stands.
+        messages.push(passed("pytest tests/b.py"));
+        assert_eq!(found(&messages).unwrap().0, "\"pytest tests/a.py\"");
+        messages.push(passed("pytest tests/a.py"));
+        assert_eq!(found(&messages), None);
+        // A pass of another line, a timeout, a job or a failed install clears
+        // nothing, and none of them is a test that failed.
+        messages.push(failed("cargo test -p meta"));
+        messages.push(passed("cargo test -p pest"));
+        messages.push(tool(
+            json!({"command": "cargo test -p meta"}),
+            "Timed out.",
+            true,
+        ));
+        let job = json!({"command": "cargo test -p meta", "background": true});
+        messages.push(tool(job, "Started as job #3 (running).", false));
+        messages.push(failed("pip install -e ."));
+        assert_eq!(found(&messages).unwrap().0, "\"cargo test -p meta\"");
+        // The same line in another folder is another test.
+        let elsewhere = json!({"command": "cargo test -p meta", "workdir": "crates/meta"});
+        messages.push(tool(elsewhere, "3 passed", false));
+        assert_eq!(found(&messages).unwrap().0, "\"cargo test -p meta\"");
+        messages.push(passed("cargo test -p meta"));
+        assert_eq!(found(&messages), None);
+        // A test runner's failure comes before any other command's.
+        messages.push(failed("pytest tests/c.py"));
+        messages.push(failed("python scripts/check.py"));
+        assert_eq!(found(&messages).unwrap().0, "\"pytest tests/c.py\"");
+        messages.push(passed("pytest tests/c.py"));
+        assert_eq!(found(&messages).unwrap().0, "\"python scripts/check.py\"");
+    }
+
+    /// A git project in `project` whose own test, `check.sh`, passes as
+    /// committed: the notes say hello, and the packages git ignores are there.
+    #[cfg(unix)]
+    fn checked_project(project: &Path) -> impl Fn(&[&str]) + '_ {
+        std::fs::create_dir_all(project.join("node_modules/pkg")).unwrap();
+        let git = move |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(project)
+                .args([
+                    "-c",
+                    "user.name=user_a",
+                    "-c",
+                    "user.email=user_a@example.com",
+                ])
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(project.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::write(project.join("node_modules/pkg/index.js"), "a package").unwrap();
+        std::fs::write(project.join("notes.txt"), "hello\n").unwrap();
+        std::fs::write(
+            project.join("check.sh"),
+            "test -f node_modules/pkg/index.js || { echo 'no packages'; exit 1; }\n\
+             grep -q hello notes.txt || { echo 'notes.txt lacks hello'; exit 1; }\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "first"]);
+        git
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_test_that_passes_on_the_project_as_it_was_and_fails_with_the_change_is_sent_back() {
+        let dir = scratch("broken-tests");
+        let project = dir.join("project");
+        let git = checked_project(&project);
+        // The run's change breaks the project's own test.
+        std::fs::write(project.join("notes.txt"), "bye\n").unwrap();
+        let mut spec = own_run("http://127.0.0.1:1/v1".into(), &dir, AGENTS + 1_950);
+        spec.connection.workspace = Some(project.clone());
+        spec.decide = Some(Arc::new(|_, _| gate::Outcome::Run));
+        let ran = |content: &str| Message {
+            role: "tool".into(),
+            name: "run_command".into(),
+            args: json!({"command": "sh check.sh"}).to_string(),
+            content: content.into(),
+            ..Default::default()
+        };
+        let messages = &mut spec.transcript.conversation.messages;
+        messages.push(ran("notes.txt lacks hello\n[exit code 1]"));
+        let turn = Turn::new(spec.connection.clone());
+        let mut looked = false;
+
+        let notice = broken_tests(&spec, &turn, 0, &mut looked).unwrap();
+        assert!(looked);
+        assert!(notice.notice && notice.folded && notice.role == "user");
+        assert!(
+            notice.content.starts_with(
+                "`sh check.sh` passes on the project as it was and fails with your change. Its \
+                 output ends:\n\nnotes.txt lacks hello\n[exit code 1]\n\nRun it once more \
+                 first. If it still fails, then where the request's words change what that \
+                 test expects, update the test's expectation and quote the words in your \
+                 answer; otherwise fix the code so it passes again. Do not delete, skip or \
+                 weaken the test."
+            ),
+            "{}",
+            notice.content
+        );
+        // The project is as the run left it, with nothing added.
+        assert_eq!(
+            std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+            "bye\n"
+        );
+        let mut entries: Vec<String> = (std::fs::read_dir(&project).unwrap())
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            [
+                ".git",
+                ".gitignore",
+                "check.sh",
+                "node_modules",
+                "notes.txt"
+            ]
+        );
+        // A watched run's tests are the user's to judge, and a command the
+        // session's gate would not run as it stands is left to the run:
+        // neither runs the project as it was.
+        looked = false;
+        spec.connection.human = true;
+        assert!(broken_tests(&spec, &turn, 0, &mut looked).is_none());
+        spec.connection.human = false;
+        spec.decide = Some(Arc::new(|_, _| gate::Outcome::Ask));
+        assert!(broken_tests(&spec, &turn, 0, &mut looked).is_none());
+        assert!(!looked);
+        spec.decide = Some(Arc::new(|_, _| gate::Outcome::Run));
+        // Once the same line has passed, there is nothing to compare.
+        spec.transcript.conversation.messages.push(ran(""));
+        assert!(broken_tests(&spec, &turn, 0, &mut looked).is_none());
+        assert!(!looked);
+        spec.transcript.conversation.messages.pop();
+        // A failure the run has fixed since under another line is stale:
+        // the command passes in a copy of the work now, so the project as
+        // it was is not run.
+        let narrow = Message {
+            role: "tool".into(),
+            name: "run_command".into(),
+            args: json!({"command": "sh check.sh narrow"}).to_string(),
+            content: "notes.txt lacks hello\n[exit code 1]".into(),
+            ..Default::default()
+        };
+        std::fs::write(project.join("notes.txt"), "hello\n").unwrap();
+        spec.transcript.conversation.messages.push(narrow);
+        assert!(broken_tests(&spec, &turn, 0, &mut looked).is_none());
+        assert!(!looked);
+        spec.transcript.conversation.messages.pop();
+        std::fs::write(project.join("notes.txt"), "bye\n").unwrap();
+        // A test that runs nothing on the project as it was, as a filter
+        // matching no test leaves it, proves nothing; the project as it was
+        // is not run again all the same.
+        let failing = std::fs::read_to_string(project.join("check.sh")).unwrap();
+        let vacuous = "echo 'test result: ok. 0 passed; 0 failed; 0 ignored'\n";
+        std::fs::write(project.join("check.sh"), vacuous).unwrap();
+        git(&["commit", "-q", "-a", "-m", "second"]);
+        std::fs::write(project.join("check.sh"), &failing).unwrap();
+        assert!(broken_tests(&spec, &turn, 0, &mut looked).is_none());
+        assert!(looked);
+        // One that fails on the project as it was too tells nothing of the
+        // change.
+        looked = false;
+        git(&["commit", "-q", "-a", "-m", "third"]);
+        assert!(broken_tests(&spec, &turn, 0, &mut looked).is_none());
+        assert!(looked);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_comparison_that_could_tell_nothing_of_the_change_is_not_made() {
+        let dir = scratch("broken-tests-moot");
+        let project = dir.join("project");
+        let _git = checked_project(&project);
+        std::fs::write(project.join("notes.txt"), "bye\n").unwrap();
+        let mut spec = own_run("http://127.0.0.1:1/v1".into(), &dir, AGENTS + 1_970);
+        spec.connection.workspace = Some(project.clone());
+        spec.decide = Some(Arc::new(|_, _| gate::Outcome::Run));
+        let ran = |args: Value| Message {
+            role: "tool".into(),
+            name: "run_command".into(),
+            args: args.to_string(),
+            content: "notes.txt lacks hello\n[exit code 1]".into(),
+            ..Default::default()
+        };
+        let turn = Turn::new(spec.connection.clone());
+        let mut looked = false;
+
+        // A folder outside the project is never run elsewhere.
+        for outside in ["/elsewhere", "../other"] {
+            let args = json!({"command": "sh check.sh", "workdir": outside});
+            spec.transcript.conversation.messages.push(ran(args));
+            assert!(broken_tests(&spec, &turn, 0, &mut looked).is_none());
+            assert!(!looked);
+            spec.transcript.conversation.messages.pop();
+        }
+        // Cargo builds the whole workspace again in each copy, so it is
+        // compared only with three suites' worth of time to spare.
+        spec.transcript
+            .conversation
+            .messages
+            .push(ran(json!({"command": "cargo test -p meta"})));
+        spec.connection.deadline = Some(Instant::now() + crate::spec_tests::TIMEOUT * 3);
+        assert!(broken_tests(&spec, &turn, 0, &mut looked).is_none());
+        assert!(!looked);
+        spec.connection.deadline = None;
+        spec.transcript.conversation.messages.pop();
+        // A store that points back into the project would have the project
+        // as it was run the work's code.
+        spec.transcript
+            .conversation
+            .messages
+            .push(ran(json!({"command": "sh check.sh"})));
+        std::fs::write(project.join(".gitignore"), "node_modules/\n.venv/\n").unwrap();
+        let site = project.join(".venv/lib/python3.12/site-packages");
+        std::fs::create_dir_all(&site).unwrap();
+        let editable = format!("{}/src\n", project.display());
+        std::fs::write(site.join("__editable__.own-0.1.pth"), editable).unwrap();
+        assert!(broken_tests(&spec, &turn, 0, &mut looked).is_none());
+        assert!(!looked);
+        // Without it, the comparison is made.
+        std::fs::remove_dir_all(project.join(".venv")).unwrap();
+        assert!(broken_tests(&spec, &turn, 0, &mut looked).is_some());
+        assert!(looked);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_test_the_change_broke_sends_the_run_back_once() {
+        let dir = scratch("broken-tests-run");
+        let project = dir.join("project");
+        let _git = checked_project(&project);
+        let (endpoint, provider) = provider(vec![
+            // Read first, as a file not yet read is not written.
+            reply("", &[read_notes()]),
+            reply(
+                "",
+                &[(
+                    "write_file",
+                    json!({"path": "notes.txt", "content": "bye\n"}),
+                )],
+            ),
+            reply("", &[("run_command", json!({"command": "sh check.sh"}))]),
+            reply("The notes now say bye.", &[]),
+            reply("The notes now say bye; the check expected hello.", &[]),
+        ]);
+        let mut spec = own_run(endpoint, &dir, AGENTS + 1_960);
+        spec.connection.workspace = Some(project.clone());
+        spec.decide = runs_everything();
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        // The run saw its test fail, and is sent back with its output.
+        let seen = results(&sent[3]);
+        assert!(seen.last().unwrap().contains("[exit code 1]"), "{seen:?}");
+        let sent_back = messages(&sent[4]).last().unwrap();
+        assert_eq!(sent_back["role"], "user");
+        let notice = sent_back["content"].as_str().unwrap();
+        assert!(
+            notice.contains(
+                "`sh check.sh` passes on the project as it was and fails with your change"
+            ),
+            "{notice}"
+        );
+        assert!(notice.contains("notes.txt lacks hello"), "{notice}");
+        // Once: the answer after it ends the run, and the project is as the
+        // run left it.
+        let told = (sent.iter().flat_map(messages))
+            .filter_map(|message| message["content"].as_str())
+            .filter(|content| content.contains("passes on the project as it was"))
+            .count();
+        assert_eq!(told, 1);
+        assert_eq!(
+            report.text,
+            "The notes now say bye; the check expected hello."
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+            "bye\n"
+        );
     }
 
     #[test]
