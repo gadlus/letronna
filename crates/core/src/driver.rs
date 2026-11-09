@@ -3014,6 +3014,12 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
     let copied = workspace
         .filter(|_| testing)
         .and_then(crate::spec_tests::copy);
+    // Where none could be, its files are in the project until they are
+    // kept, as they are before this returns, so no run's end sweeps them.
+    let _writing = (testing && copied.is_none())
+        .then_some(workspace)
+        .flatten()
+        .map(crate::spec_tests::writing_in);
     // With the project as it was to read how to call things, so it copies
     // nothing of the work, which is all its copy would otherwise show it.
     let before = workspace
