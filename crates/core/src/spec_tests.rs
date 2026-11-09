@@ -205,11 +205,14 @@ const FAILURE_LINE: usize = 200;
 /// jest's and vitest's `FAIL ` before a file, where Go's summary has a tab;
 /// pytest's `FAILED` and `E` lines; testify's `Error Trace:`; jest's `●`
 /// and the marks a list of tests puts by one that failed; jest's `Expected`
-/// and `Received`; cargo's `assertion`; rustc's `error:` and `error[`;
-/// rspec's `Failure/Error:`; PHPUnit's `Failed asserting that`; and a C
-/// or C++ `Assertion failed`. An assertion's error is read off the first
-/// word (`named`).
-const VERDICT_STARTS: [&str; 21] = [
+/// and `Received`; cargo's `assertion`, `error: test failed` and `error:
+/// could not compile`; rustc's `error[`; rspec's `Failure/Error:`;
+/// PHPUnit's `Failed asserting that`; and a C or C++ `Assertion failed`.
+/// An assertion's error is read off the first word (`named`). A bare
+/// `error:` is not here: a Node app logging through winston prints one on
+/// every negative test, thirty of which took a mocha run's whole room from
+/// its one `AssertionError`.
+const VERDICT_STARTS: [&str; 22] = [
     "--- FAIL",
     "panic:",
     "FAIL:",
@@ -226,7 +229,8 @@ const VERDICT_STARTS: [&str; 21] = [
     "Expected",
     "Received",
     "assertion",
-    "error:",
+    "error: test failed",
+    "error: could not compile",
     "error[",
     "Failure/Error:",
     "Failed asserting that",
@@ -1836,10 +1840,11 @@ fn named_lines(lines: &[&str]) -> Vec<Option<Named>> {
 /// test do, gives a Go file's line and column as a build error does, holds
 /// a TypeScript error's code, or opens with mocha's count of what is
 /// failing, a numbered failure as PHPUnit and mocha list them, or an
-/// assertion's error. As raised when it opens with `Traceback` or another
-/// word ending in `Error` or `Exception`. Never for a mere mention of an
-/// error, which a log prints on every line, as `SQL logic error` or
-/// `record not found`.
+/// assertion's error. As raised when it opens with `Traceback`, with a bare
+/// `error:`, as an app's logger prints on every line and rustc on a build
+/// error without a code, or with another word ending in `Error` or
+/// `Exception`. Never for a mere mention of an error, which a log prints on
+/// every line, as `SQL logic error` or `record not found`.
 fn named(line: &str) -> Option<Named> {
     let trimmed = line.trim_start();
     if trimmed.starts_with("● Console") {
@@ -1871,7 +1876,7 @@ fn named(line: &str) -> Option<Named> {
     if verdict {
         return Some(Named::Verdict);
     }
-    let raised = name.ends_with("Error") || name.ends_with("Exception");
+    let raised = name.ends_with("Error") || name.ends_with("Exception") || first == "error:";
     (raised || trimmed.starts_with("Traceback")).then_some(Named::Raised)
 }
 
@@ -3985,6 +3990,8 @@ mod tests {
             "test tests::b ... FAILED",
             "assertion `left == right` failed",
             "error[E0425]: cannot find value `x` in this scope",
+            "error: test failed, to rerun pass `--lib`",
+            "error: could not compile `cart` (lib test) due to 1 previous error",
             "FAIL: test_b (tests.test_a.T)",
             "ERROR: test_c (tests.test_a.T)",
             " FAIL  src/a.test.ts > adds",
@@ -4007,6 +4014,8 @@ mod tests {
             "        \tError:      \tNot equal: ",
             "java.lang.IllegalArgumentException: quantity must be positive",
             "Error: Not implemented: HTMLCanvasElement.prototype.getContext",
+            "error: GET /carts/3 failed with 404 {\"service\":\"carts\"}",
+            "error: aborting due to 2 previous errors",
         ] {
             assert_eq!(named(line), Some(Named::Raised), "{line}");
         }
@@ -4071,6 +4080,30 @@ mod tests {
         let raised = shown.matches("navigation (except hash changes)").count();
         assert!((1..=5).contains(&raised), "{shown}");
         assert!(shown.ends_with("Tests:       1 failed, 3 passed, 4 total\n[exit code 1]"));
+    }
+
+    #[test]
+    fn a_mocha_failure_is_shown_before_the_errors_an_apps_logger_printed() {
+        // A Node app logging through winston prints `error: ...` on every
+        // negative test, before and after the failure; only the assertion
+        // is the runner's own word.
+        let logged = "error: GET /carts/3 failed with 404 {\"service\":\"carts\",\"timestamp\":\
+                      \"2026-11-09T11:46:38.123Z\",\"level\":\"error\"}\n";
+        let failure = "  1 failing\n\n  1) Cart\n       totals the items:\n\n      \
+                       AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n\n      \
+                       3 !== 4\n\n      + expected - actual\n\n      -3\n      +4\n\n      at \
+                       Context.<anonymous> (test/cart_letronna_spec.test.js:42:12)\n";
+        let output = format!(
+            "\n  Cart\n    ✓ adds an item (12ms)\n{}\n{failure}{}[exit code 1]",
+            logged.repeat(30),
+            logged.repeat(30),
+        );
+        let shown = excerpt(&output);
+        assert!(shown.contains(failure), "{shown}");
+        assert!(shown.chars().count() <= SHOWN, "{}", shown.chars().count());
+        // The logger's lines take only what the verdicts leave.
+        assert!(shown.matches("error: GET /carts/3").count() < 30, "{shown}");
+        assert!(shown.ends_with("[exit code 1]"), "{shown}");
     }
 
     #[test]
