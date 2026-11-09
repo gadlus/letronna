@@ -1035,7 +1035,9 @@ fn briefing(
         "\n\nEnd your report with a table of one row per test, written {rows}. Then, on a \
          line of its own as the report's very last line, the one command that, from the \
          project's root, runs your tests and no others, with paths relative to it, written \
-         `Run: <command>`: one that names your test files or filters on a name all your tests share, \
+         `Run: <command>`, with any variable your own test commands needed, such as a module \
+         cache path, as `VAR=value` words before the command: one that names your test files \
+         or filters on a name all your tests share, \
          such as `go test -run LetronnaSpec ./pkg/`, never the project's whole suite, such as \
          `go test ./...`, since a test of the project's own that fails here says nothing of the \
          change; one that runs them once and exits rather than watching, installs nothing, and \
@@ -3950,6 +3952,15 @@ mod tests {
         );
         assert!(
             brief.contains("runs them once and exits rather than watching, installs nothing"),
+            "{brief}"
+        );
+        // With the set-up its own commands needed, since the driver runs the
+        // command in a copy that has the same.
+        assert!(
+            brief.contains(
+                "with any variable your own test commands needed, such as a module cache path, \
+                 as `VAR=value` words before the command"
+            ),
             "{brief}"
         );
         // Its own tests alone: a test of the project's own can fail where
