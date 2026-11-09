@@ -2873,6 +2873,25 @@ fn report(caller: &Caller, to: &str, offset: usize) -> Result<String, String> {
     page(&name, &said, offset, Some(REPORT_HEADER))
 }
 
+/// The commands helper `to` of `caller`'s asked `run_command` for, in order,
+/// whether or not each ran; None when no such helper is known or its
+/// conversation could not be read.
+pub(crate) fn commands_run(caller: &Caller, to: &str) -> Option<Vec<String>> {
+    let n = {
+        let registry = registry();
+        mine(&registry, caller, to).ok()?.n
+    };
+    let transcript = Transcript::open(caller.root, n)?;
+    let commands = (transcript.conversation.messages.iter())
+        .filter(|message| message.role == "tool" && message.name == "run_command")
+        .filter_map(|message| {
+            let args = crate::tools::parse_args_for(&message.name, &message.args).ok()?;
+            Some(args["command"].as_str()?.to_owned())
+        })
+        .collect();
+    Some(commands)
+}
+
 /// A page of `said`, the last thing `name` said, from character `offset` on,
 /// under `header` with every line indented when there is one, and ending with
 /// the call for the next page when there is more.

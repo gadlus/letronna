@@ -615,6 +615,17 @@ fn steps(
     let mut listed = false;
     let mut tabled = false;
     let mut tested = 0;
+    // Whether the last of those runs passed, which no second attempt is
+    // made after.
+    let mut passed = false;
+    let mut attempted = false;
+    // Before the first call, so the project as the run found it is known:
+    // the commit it was at, with nothing changed since, which a second
+    // attempt starts from; None where the tree already held changes, which
+    // no attempt could tell from the run's own.
+    let baseline = unwatched(spec)
+        .then(|| (spec.connection.workspace.as_deref()).and_then(crate::spec_tests::baseline))
+        .flatten();
     let mut twinned = false;
     // From the first request, since a run told of its time only near the
     // end has often thought most of it away by then.
@@ -994,11 +1005,15 @@ fn steps(
                 if runnable {
                     tested += 1;
                 }
-                let ran = runnable.then(|| tested_work(spec, turn)).flatten();
-                let content = match (late, ran) {
-                    (Some(told), Some(ran)) => Some(format!("{told}\n\n{}", ran.content)),
+                let ran = runnable.then(|| test_run(spec, turn));
+                if let Some(ran) = &ran {
+                    passed = matches!(ran, crate::spec_tests::Ran::Passed(_));
+                }
+                let sent = ran.and_then(|ran| tested_work(spec, ran));
+                let content = match (late, sent) {
+                    (Some(told), Some(sent)) => Some(format!("{told}\n\n{}", sent.content)),
                     (Some(told), None) if !runnable => Some(told),
-                    (None, Some(ran)) => Some(ran.content),
+                    (None, Some(sent)) => Some(sent.content),
                     _ => None,
                 };
                 if let Some(content) = content {
@@ -1010,6 +1025,27 @@ fn steps(
                         folded: true,
                         ..Default::default()
                     });
+                    save(&mut spec.transcript)?;
+                    continue;
+                }
+            }
+            // Sent back with the tests `RUNS` times, a run whose work still
+            // fails them has had its say: a helper makes a second attempt
+            // from the project as the run found it, and the tests choose
+            // between the two. Once, whatever comes of it, since another
+            // would start another helper; never after a run of the tests
+            // that passed; and with a round and budget left, as above.
+            if listed
+                && !attempted
+                && !passed
+                && tested >= crate::spec_tests::RUNS
+                && report.rounds < spec.rounds
+                && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
+                && let Some(head) = baseline.as_deref()
+            {
+                attempted = true;
+                if let Some(notice) = second_attempt(spec, turn, head) {
+                    spec.transcript.conversation.messages.push(notice);
                     save(&mut spec.transcript)?;
                     continue;
                 }
@@ -2505,16 +2541,58 @@ fn test_run(spec: &Spec, turn: &Turn) -> crate::spec_tests::Ran {
     let Some((kept, command)) = crate::spec_tests::to_run(spec.id) else {
         return Ran::Unrun("no test file was kept with a command that runs it".into());
     };
-    // A suite's worth of time, within half of what is left to the deadline,
-    // which does not cut a call the driver makes itself.
-    let limit = match spec.connection.deadline {
+    let limit = test_limit(spec);
+    let Some(ctx) = test_context(spec, &command, limit) else {
+        return Ran::Unrun(format!("the gate would not run `{command}` as it stands"));
+    };
+    crate::spec_tests::ran(&kept, &command, &ctx, limit)
+}
+
+/// The notice sending a session's own run nobody watches back with what
+/// failed when the driver ran the tester's kept tests against its work as it
+/// stands, which went as `ran` says (`test_run`); None when they passed,
+/// when they could not be run, which leaves them to the run as it was told,
+/// or when too little time is left after them for the fix.
+fn tested_work(spec: &Spec, ran: crate::spec_tests::Ran) -> Option<Message> {
+    let crate::spec_tests::Ran::Failed(content) = ran else {
+        return None;
+    };
+    // The tests may have taken the time the fix needed: then the run is
+    // left to end with its first version rather than a half-made fix. The
+    // fix alone needs less than a review and a fix did.
+    let left = (spec.connection.deadline)
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+    if left.is_some_and(|left| left < crate::requirements::REVIEW_TIME / 2) {
+        return None;
+    }
+    Some(Message {
+        role: "user".into(),
+        content,
+        notice: true,
+        // Folded into the run, so the window keeps the task it is for.
+        folded: true,
+        ..Default::default()
+    })
+}
+
+/// How long the driver gives the tester's tests: a suite's worth, within
+/// half of what is left to the deadline, which does not cut a call the
+/// driver makes itself.
+fn test_limit(spec: &Spec) -> Duration {
+    match spec.connection.deadline {
         Some(deadline) => {
             crate::spec_tests::TIMEOUT.min(deadline.saturating_duration_since(Instant::now()) / 2)
         }
         None => crate::spec_tests::TIMEOUT,
-    };
-    // Through the gate, as the tester's own call to it went: what it would
-    // put to the judge or the user is not run behind their back.
+    }
+}
+
+/// What the driver runs the tester's tests in with `command`, given `limit`:
+/// the run's own context, sandboxed when the gate says so. Through the gate,
+/// as the tester's own call to it went, so what it would put to the judge or
+/// the user is not run behind their back; None when it would ask or refuse,
+/// which leaves the tests to the run, as it was told.
+fn test_context(spec: &Spec, command: &str, limit: Duration) -> Option<ToolContext> {
     let call = ToolCall {
         id: "spec-tests".into(),
         name: "run_command".into(),
@@ -2536,34 +2614,154 @@ fn test_run(spec: &Spec, turn: &Turn) -> crate::spec_tests::Ran {
     let sandboxed = match outcome {
         gate::Outcome::Run => false,
         gate::Outcome::Sandboxed => true,
-        gate::Outcome::Ask | gate::Outcome::Refuse(_) => {
-            return Ran::Unrun(format!("the gate would not run `{command}` as it stands"));
-        }
+        gate::Outcome::Ask | gate::Outcome::Refuse(_) => return None,
     };
-    let ctx = ToolContext {
+    Some(ToolContext {
         sandboxed,
         ..context(spec)
-    };
-    crate::spec_tests::ran(&kept, &command, &ctx, limit)
+    })
 }
 
-/// The notice sending a session's own run nobody watches back with what
-/// failed when the driver ran the tester's kept tests against its work as it
-/// stands (`test_run`); None when they passed, when they could not be run,
-/// which leaves them to the run as it was told, or when too little time is
-/// left after them for the fix.
-fn tested_work(spec: &Spec, turn: &Turn) -> Option<Message> {
-    let crate::spec_tests::Ran::Failed(content) = test_run(spec, turn) else {
-        return None;
-    };
-    // The tests may have taken the time the fix needed: then the run is
-    // left to end with its first version rather than a half-made fix. The
-    // fix alone needs less than a review and a fix did.
-    let left = (spec.connection.deadline)
-        .map(|deadline| deadline.saturating_duration_since(Instant::now()));
-    if left.is_some_and(|left| left < crate::requirements::REVIEW_TIME / 2) {
+/// What came of a second attempt that the run is told of: the project holds
+/// its work, or it installed something from its folder, which stays.
+enum Verdict {
+    Adopted(crate::spec_tests::Adopted),
+    Installed(Vec<String>),
+}
+
+/// The notice telling a session's own run nobody watches what came of a
+/// second attempt at its task. Sent back `RUNS` times with the tester's
+/// tests, a run that says it is done while its work still fails them has
+/// had its say, and a fresh attempt at a task that failed passes about a
+/// third of the time: so a helper that has not seen the work makes the
+/// request again from scratch, in the project as it was at `head`, the
+/// commit the run began from, and its work takes the first's place when it
+/// passes the tests that the first, and the project as it was, do not. None,
+/// with the run's work kept and nothing said, when the first attempt passes
+/// after all, when the tests pass on the project as it was and so choose
+/// nothing, when the attempt's tests would import the first attempt's code,
+/// when the second attempt does not pass, ran no test or left the project as
+/// it was, when the helper could not start, when the run moved the commit
+/// or has not the time or tokens for an attempt, or when the gate would not
+/// let the tests run.
+fn second_attempt(spec: &Spec, turn: &Turn, head: &str) -> Option<Message> {
+    // A helper's work is its parent's to judge, a person reads a watched
+    // run's end, and past the round cap or in plan mode nothing can change.
+    if !unwatched(spec) || turn.capped().is_some() || !turn.runs_commands() {
         return None;
     }
+    if refused(spec, "run_command").is_some() || refused(spec, "agent").is_some() {
+        return None;
+    }
+    if !affords_attempt(spec) {
+        return None;
+    }
+    let workspace = spec.connection.workspace.as_deref()?;
+    // A commit the run made holds its work, which the attempt starts without.
+    if crate::spec_tests::head(workspace)? != head {
+        return None;
+    }
+    let own = (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
+    let request = own.iter().rfind(|message| chat::opens_turn(message))?;
+    // Mail, such as a job's output, is no request.
+    if request.notice {
+        return None;
+    }
+    let typed = crate::references::typed(&request.content);
+    let (kept, command) = crate::spec_tests::to_run(spec.id)?;
+    let limit = test_limit(spec);
+    let ctx = test_context(spec, &command, limit)?;
+    // The work as it stands after the last fix: one that passes now needs
+    // no second attempt.
+    let began = Instant::now();
+    let first = crate::spec_tests::outcome(&kept, &command, &ctx, limit)?;
+    let (ended, output) = crate::spec_tests::failure(&first)?;
+    let took = began.elapsed();
+    let base = crate::spec_tests::base(workspace)?;
+    let verdict = (|| {
+        // Tests that pass on the project as it was choose nothing: with
+        // them, an attempt that did little, or that never started, would
+        // stand in for the work.
+        let bare = crate::spec_tests::outcome_in(&kept, &command, &base, &ctx, limit)?;
+        crate::spec_tests::failure(&bare)?;
+        // An attempt whose tests would import the first attempt's code,
+        // through an editable install or a workspace link, tests the wrong
+        // work.
+        if crate::spec_tests::imports_elsewhere(workspace, &base).is_some() {
+            crate::diag::event(
+                "second_attempt_skipped",
+                &[("why", json!("imports_elsewhere"))],
+            );
+            return None;
+        }
+        // The attempt has all the time left but what the tests and the
+        // run's answer need after it, and at least `ATTEMPT_TIME` of its
+        // own; with less it would be stopped with nothing to test.
+        let left = (spec.connection.deadline)
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        let after = crate::spec_tests::AFTER_ATTEMPT + took;
+        if left.is_some_and(|left| left < crate::spec_tests::ATTEMPT_TIME + after) {
+            return None;
+        }
+        let mut helper_ctx = context(spec);
+        let parent = helper_ctx.caller.connection.clone()?;
+        helper_ctx.workspace = Some(base.clone());
+        helper_ctx.caller.connection = Some(Arc::new(Connection {
+            workspace: Some(base.clone()),
+            deadline: left.map(|left| Instant::now() + left.saturating_sub(after)),
+            ..(*parent).clone()
+        }));
+        let args = json!({
+            "description": "Second attempt at the request",
+            "name": "second-attempt",
+            "type": "general",
+            "background": false,
+            "prompt": crate::spec_tests::attempt(typed, &command, &ended, output),
+        });
+        // Its report is not read: its work is, by the tests, whatever it
+        // says of it. One that could not start made none.
+        let said = tools::Tool::run(&crate::agents::Agent, &args, &helper_ctx).ok()?;
+        // Named as the tool reports it, since another helper may have had
+        // the name first.
+        let name = said.split_whitespace().next().unwrap_or("second-attempt");
+        // Whatever it installed or linked from its folder, the project's
+        // own packages may now lead into that folder: nothing of it is
+        // taken, and the folder stays.
+        let installs: Vec<String> = (crate::agents::commands_run(&helper_ctx.caller, name))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|command| crate::spec_tests::installs(command))
+            .collect();
+        if !installs.is_empty() {
+            return Some(Verdict::Installed(installs));
+        }
+        // Within what is left, less the run's own answer after it; the
+        // deadline does not cut a call the driver makes itself.
+        let within = match spec.connection.deadline {
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                crate::spec_tests::TIMEOUT
+                    .min(left.saturating_sub(crate::spec_tests::AFTER_ATTEMPT / 2))
+            }
+            None => crate::spec_tests::TIMEOUT,
+        };
+        if within.is_zero() {
+            return None;
+        }
+        let second = crate::spec_tests::outcome_in(&kept, &command, &base, &ctx, within)?;
+        if !crate::spec_tests::passed(&second) {
+            return None;
+        }
+        let adopted = crate::spec_tests::adopt(workspace, &base, &kept.files).ok()?;
+        Some(Verdict::Adopted(adopted))
+    })();
+    if !matches!(verdict, Some(Verdict::Installed(_))) {
+        crate::spec_tests::discard(&base);
+    }
+    let content = match verdict? {
+        Verdict::Adopted(adopted) => crate::spec_tests::adopted(&command, &ended, &adopted),
+        Verdict::Installed(commands) => crate::spec_tests::installed(&base, &commands),
+    };
     Some(Message {
         role: "user".into(),
         content,
@@ -2572,6 +2770,19 @@ fn tested_work(spec: &Spec, turn: &Turn) -> Option<Message> {
         folded: true,
         ..Default::default()
     })
+}
+
+/// Whether a run has the time to its deadline and the tokens in its budget
+/// for a second attempt at its task and the choice after it: near either
+/// end, the attempt would be stopped with nothing to test.
+fn affords_attempt(spec: &Spec) -> bool {
+    let time = (spec.connection.deadline).is_none_or(|deadline| {
+        deadline.saturating_duration_since(Instant::now())
+            >= crate::spec_tests::ATTEMPT_TIME + crate::spec_tests::AFTER_ATTEMPT
+    });
+    let tokens = (spec.budget.as_ref())
+        .is_none_or(|budget| budget.left() >= crate::requirements::REVIEW_TOKENS);
+    time && tokens
 }
 
 /// What the latest review's table in `messages` leaves unchecked of the
@@ -7777,7 +7988,7 @@ pub(crate) mod tests {
         // Taken once; and the work meets the tests where the driver runs them.
         assert_eq!(late_tester(&spec), None);
         let turn = Turn::new(spec.connection.clone());
-        let notice = tested_work(&spec, &turn).unwrap();
+        let notice = tested_work(&spec, test_run(&spec, &turn)).unwrap();
         assert!(
             notice.content.contains("made.txt is missing"),
             "{}",
@@ -7947,7 +8158,7 @@ pub(crate) mod tests {
         .unwrap();
         let turn = Turn::new(spec.connection.clone());
 
-        let notice = tested_work(&spec, &turn).unwrap();
+        let notice = tested_work(&spec, test_run(&spec, &turn)).unwrap();
         assert!(notice.notice && notice.folded && notice.role == "user");
         assert!(
             notice
@@ -7965,16 +8176,322 @@ pub(crate) mod tests {
         // A watched run's work is the user's to judge, and a command the
         // session's gate would not run as it stands is left to the run.
         spec.connection.human = true;
-        assert!(tested_work(&spec, &turn).is_none());
+        assert!(matches!(
+            test_run(&spec, &turn),
+            crate::spec_tests::Ran::Unrun(_)
+        ));
         spec.connection.human = false;
         spec.decide = Some(Arc::new(|_, _| gate::Outcome::Refuse("Refused.".into())));
-        assert!(tested_work(&spec, &turn).is_none());
+        assert!(matches!(
+            test_run(&spec, &turn),
+            crate::spec_tests::Ran::Unrun(_)
+        ));
         spec.decide = Some(Arc::new(|_, _| gate::Outcome::Run));
         // Once the work passes them, nothing is said.
         std::fs::write(project.join("made.txt"), "made").unwrap();
-        assert!(tested_work(&spec, &turn).is_none());
+        let ran = test_run(&spec, &turn);
+        assert!(matches!(ran, crate::spec_tests::Ran::Passed(_)), "{ran:?}");
+        assert!(tested_work(&spec, ran).is_none());
         assert!(!project.join("letronna_spec_test.sh").exists());
         crate::spec_tests::tidy(spec.id);
+    }
+
+    /// Makes `dir` a git project with everything in it committed, as a
+    /// bench's rig leaves one before a run, the transcript and its lock the
+    /// tests' runs keep there ignored, and a `.venv`; the commit.
+    #[cfg(unix)]
+    fn committed(dir: &Path) -> String {
+        std::fs::write(dir.join(".gitignore"), "helper.*\n.venv/\n").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=user_a",
+            "-c",
+            "user.email=user_a@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "baseline",
+        ]);
+        git(&["rev-parse", "HEAD"])
+    }
+
+    /// Keeps a tester's test of `dir` for run `id`, with the command that
+    /// runs it: the work has to make `made.txt`.
+    #[cfg(unix)]
+    fn needs_made_txt(dir: &Path, id: AgentId) {
+        std::fs::write(
+            dir.join("letronna_spec_test.sh"),
+            "test -f made.txt || { echo 'made.txt is missing'; exit 1; }\n",
+        )
+        .unwrap();
+        let command = Some("sh letronna_spec_test.sh".to_owned());
+        crate::spec_tests::keep(id, dir, dir, command).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_second_attempt_that_passes_the_testers_tests_takes_the_place_of_a_first_that_does_not() {
+        let _data = data("second-attempt");
+        let dir = scratch("second-attempt");
+        let commit = committed(&dir);
+        let id = AGENTS + 1_920;
+        needs_made_txt(&dir, id);
+        let answers = vec![
+            // The run's first attempt, which makes made.rs and says it is done.
+            reply("", &[write_made()]),
+            reply("Added parse_range.", &[]),
+            // The review helper and the tester started for it, either first.
+            reply(PASSED, &[]),
+            reply(PASSED, &[]),
+            // Back with the reviews, the run says it is done; the tester's
+            // test fails its work, twice.
+            reply("Each requirement holds.", &[]),
+            reply("Fixed.", &[]),
+            reply("Fixed again.", &[]),
+            // The second attempt makes made.txt in its folder and reports.
+            reply(
+                "",
+                &[("write_file", json!({"path": "made.txt", "content": "made"}))],
+            ),
+            reply("Made made.txt.", &[]),
+            // The run, told the project holds the second attempt.
+            reply("The project holds the second attempt.", &[]),
+        ];
+        let (mut spec, provider) = specified(&dir, id, SPECIFIED, answers);
+        // So the helper's edit runs unasked, as the run's own do.
+        spec.connection.mode = crate::gate::Mode::AcceptEdits;
+        // Twenty-five minutes: too little for a tester to start ahead of the
+        // run and race it for the replies, enough for a second attempt.
+        spec.connection.deadline = Some(Instant::now() + Duration::from_secs(25 * 60));
+        let report = finished(spec);
+        let sent = provider.sent();
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "The project holds the second attempt.");
+        assert_eq!(sent.len(), 10);
+
+        // The helper's task: the request word for word, the failing output,
+        // the rule against installing, and nothing of the first attempt.
+        let task = (sent.iter().flat_map(messages))
+            .filter_map(|message| message["content"].as_str())
+            .find(|content| content.contains("did not pass the tests a tester wrote"))
+            .expect("no second attempt was started")
+            .to_owned();
+        assert!(task.contains("You are a helper (general)."), "{task}");
+        assert!(task.contains("The request, word for word:"), "{task}");
+        assert!(task.contains(STATED[2]), "{task}");
+        assert!(
+            task.contains("`sh letronna_spec_test.sh` exited with code 1"),
+            "{task}"
+        );
+        assert!(task.contains("made.txt is missing"), "{task}");
+        assert!(
+            task.contains("Install, link or re-install nothing"),
+            "{task}"
+        );
+        assert!(!task.contains("Added parse_range."), "{task}");
+        assert!(!task.contains("made.rs"), "{task}");
+        // The run is told what the project holds now, and where its own is kept.
+        let told = messages(sent.last().unwrap()).last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            told.contains(
+                "in place of yours: 1 written, `made.txt`; 1 of yours removed, `made.rs`."
+            ),
+            "{told}"
+        );
+        assert!(
+            told.contains("`sh letronna_spec_test.sh` exited with code 1"),
+            "{told}"
+        );
+        assert!(
+            told.ends_with(
+                "change nothing, and end with your whole answer again, describing the work as \
+                 the project holds it now."
+            ),
+            "{told}"
+        );
+        let kept = told.split("Yours is kept in `").nth(1).unwrap();
+        let kept = Path::new(kept.split('`').next().unwrap());
+        assert!(kept.join("first.patch").exists(), "{}", kept.display());
+        assert_eq!(
+            std::fs::read_to_string(kept.join("made.rs")).unwrap(),
+            "made"
+        );
+        let _ = std::fs::remove_dir_all(kept);
+        // The project holds the second attempt, the tester's test is gone
+        // from it, and its history is as it was.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("made.txt")).unwrap(),
+            "made"
+        );
+        assert!(!dir.join("made.rs").exists());
+        assert!(!dir.join("letronna_spec_test.sh").exists());
+        assert!(dir.join("notes.txt").exists());
+        assert_eq!(crate::spec_tests::head(&dir), Some(commit));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_second_attempt_that_installs_from_its_folder_is_not_taken_and_its_folder_stays() {
+        let _data = data("second-attempt-installs");
+        let dir = scratch("second-attempt-installs");
+        committed(&dir);
+        let id = AGENTS + 1_925;
+        needs_made_txt(&dir, id);
+        let answers = vec![
+            reply("", &[write_made()]),
+            reply("Added parse_range.", &[]),
+            reply(PASSED, &[]),
+            reply(PASSED, &[]),
+            reply("Each requirement holds.", &[]),
+            reply("Fixed.", &[]),
+            reply("Fixed again.", &[]),
+            // The second attempt installs, then makes made.txt and reports.
+            reply(
+                "",
+                &[("run_command", json!({"command": "echo npm install"}))],
+            ),
+            reply(
+                "",
+                &[("write_file", json!({"path": "made.txt", "content": "made"}))],
+            ),
+            reply("Installed and made it.", &[]),
+            // The run, told nothing of it was taken.
+            reply("My work stands.", &[]),
+        ];
+        // A helper of a run in Bypass runs in Auto, so its command goes to
+        // the judge, which allows it.
+        let (endpoint, provider) = judged(answers, Some("ALLOW"));
+        let mut spec = spec(endpoint, &dir, id);
+        spec.depth = 0;
+        spec.decide = runs_everything();
+        spec.transcript.conversation.messages[0].content = SPECIFIED.into();
+        spec.connection.mode = crate::gate::Mode::Bypass;
+        // As above: no tester ahead of the run, time for a second attempt.
+        spec.connection.deadline = Some(Instant::now() + Duration::from_secs(25 * 60));
+        let report = finished(spec);
+        let sent = provider.sent();
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "My work stands.");
+        // The eleven replies, and the judge's one request among them.
+        assert_eq!(sent.len(), 12);
+        assert_eq!(
+            sent.iter().filter(|body| body["stream"] == false).count(),
+            1
+        );
+
+        let told = messages(sent.last().unwrap()).last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(told.contains("ran `echo npm install` there"), "{told}");
+        assert!(told.contains("the folder is left where it is"), "{told}");
+        assert!(
+            told.ends_with("end with your whole answer again."),
+            "{told}"
+        );
+        // The attempt's folder stays, with its work in it, and the project
+        // keeps the first attempt.
+        let base = told.split("at the request in `").nth(1).unwrap();
+        let base = Path::new(base.split('`').next().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(base.join("made.txt")).unwrap(),
+            "made"
+        );
+        let _ = std::fs::remove_dir_all(base);
+        assert!(dir.join("made.rs").exists());
+        assert!(!dir.join("made.txt").exists());
+        assert!(!dir.join("letronna_spec_test.sh").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_second_attempt_is_made_for_a_watched_run_a_helper_a_moved_commit_or_a_passing_first() {
+        let dir = scratch("second-attempt-not");
+        let commit = committed(&dir);
+        let id = AGENTS + 1_930;
+        needs_made_txt(&dir, id);
+        // A provider nothing can reach: an attempt started would be a failure
+        // of the test, not of the run.
+        let mut spec = own_run("http://127.0.0.1:1/v1".into(), &dir, id);
+        spec.decide = Some(Arc::new(|_, _| gate::Outcome::Run));
+        std::fs::write(dir.join("made.rs"), "the first attempt").unwrap();
+        let turn = Turn::new(spec.connection.clone());
+        let time = crate::spec_tests::ATTEMPT_TIME;
+        let tokens = crate::requirements::REVIEW_TOKENS;
+
+        // A watched run's work is the user's to judge, and a helper's its
+        // parent's.
+        spec.connection.human = true;
+        assert!(second_attempt(&spec, &turn, &commit).is_none());
+        spec.connection.human = false;
+        spec.depth = 1;
+        assert!(second_attempt(&spec, &turn, &commit).is_none());
+        spec.depth = 0;
+        // Not without the time for the attempt and what follows it, or the
+        // tokens.
+        let short = time + crate::spec_tests::AFTER_ATTEMPT - Duration::from_secs(60);
+        spec.connection.deadline = Some(Instant::now() + short);
+        assert!(second_attempt(&spec, &turn, &commit).is_none());
+        spec.connection.deadline = None;
+        spec.budget = Some(Arc::new(Budget::new(tokens - 1, None)));
+        assert!(second_attempt(&spec, &turn, &commit).is_none());
+        spec.budget = None;
+        // Nor from a commit the run moved on from, whose tree would hold its work.
+        assert!(second_attempt(&spec, &turn, "0123456789abcdef0123456789abcdef01234567").is_none());
+        // Nor when the gate would not run the tests.
+        spec.decide = Some(Arc::new(|_, _| gate::Outcome::Refuse("Refused.".into())));
+        assert!(second_attempt(&spec, &turn, &commit).is_none());
+        spec.decide = Some(Arc::new(|_, _| gate::Outcome::Run));
+        // Nor when the attempt's tests would import the first attempt's
+        // code, through an editable install of the project.
+        let packages = dir.join(".venv/lib/python3.12/site-packages");
+        std::fs::create_dir_all(&packages).unwrap();
+        std::fs::write(
+            packages.join("__editable__.proj-0.1.pth"),
+            format!("{}/src\n", dir.display()),
+        )
+        .unwrap();
+        assert!(second_attempt(&spec, &turn, &commit).is_none());
+        std::fs::remove_dir_all(dir.join(".venv")).unwrap();
+        // Nor when the first attempt passes them after all.
+        std::fs::write(dir.join("made.txt"), "made").unwrap();
+        assert!(second_attempt(&spec, &turn, &commit).is_none());
+        std::fs::remove_file(dir.join("made.txt")).unwrap();
+        // Nor when the tests pass on the project as it was, since they
+        // would choose an attempt that did nothing.
+        crate::spec_tests::tidy(id);
+        std::fs::write(
+            dir.join("letronna_spec_bare.sh"),
+            "test ! -f made.rs || { echo 'made.rs is there'; exit 1; }\n",
+        )
+        .unwrap();
+        let bare = Some("sh letronna_spec_bare.sh".to_owned());
+        crate::spec_tests::keep(id, &dir, &dir, bare).unwrap();
+        assert!(second_attempt(&spec, &turn, &commit).is_none());
+        // Through all of which the project was left alone.
+        assert!(!dir.join("letronna_spec_test.sh").exists());
+        assert!(!dir.join("letronna_spec_bare.sh").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("made.rs")).unwrap(),
+            "the first attempt"
+        );
+        assert!(affords_attempt(&spec));
+        crate::spec_tests::tidy(id);
     }
 
     #[test]

@@ -38,9 +38,24 @@
 //! first done, waited for a while, or at a later done once it has answered;
 //! one still at work when the run ends is stopped and its folder deleted
 //! (`tidy`).
+//!
+//! A run sent back with them `RUNS` times whose work still fails them has
+//! had its say. A fresh attempt at a task that failed passes about a third
+//! of the time, so where the project was committed as the run found it and
+//! the time is left, a helper that has not seen the work makes the request
+//! again from scratch, in such a folder (`base`), and the tests choose:
+//! when its work passes them, ran some, and the first still does not pass,
+//! the project is made to hold it, the first kept aside as a patch, and the
+//! run is told to answer for the work as it stands. Tests that pass on the
+//! project as it was choose nothing, so no attempt is made on them; nor
+//! where the attempt's tests would import the first attempt's code through
+//! an editable install; and an attempt that installed anything from its
+//! folder is not taken, and its folder stays for what may lead into it.
 
 use crate::cancel::Cancel;
 use crate::tools::ToolContext;
+#[cfg(unix)]
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 #[cfg(any(unix, test))]
 use std::process::{Command, Stdio};
@@ -94,11 +109,27 @@ pub(crate) fn time_ahead(given: Duration) -> Duration {
 /// for: the round in which it is asked to answer with what it has.
 const GRACE: Duration = Duration::from_secs(2 * 60);
 
+/// The least time the helper making a second attempt is given to its
+/// deadline: a fresh attempt shorter than this rarely passes, and one
+/// longer rarely fits in what is left after two verifications. A run needs
+/// this, `AFTER_ATTEMPT` and the tests' own time left to start one.
+pub(crate) const ATTEMPT_TIME: Duration = Duration::from_secs(15 * 60);
+
+/// What a run keeps of its time past a second attempt's deadline: half for
+/// the attempt's last word and the tests run against its work, half for the
+/// run's own answer after them. The tests' time, as the first attempt's run
+/// of them took, is kept on top of it.
+pub(crate) const AFTER_ATTEMPT: Duration = Duration::from_secs(5 * 60);
+
+/// The file a kept first attempt's changes to the last commit's files are
+/// written to, beside the files it added.
+const FIRST_PATCH: &str = "first.patch";
+
 /// Folders of installed packages and build caches, by name, that a tester
-/// which must not see the work can have linked into the project as it was:
-/// what tests import from or build with, and nothing the work writes, as a
-/// `dist/` or `build/` it built, a `*.egg-info` it packaged or a
-/// `__pycache__` of its new modules would be.
+/// which must not see the work, or a second attempt, can have linked into
+/// the project as it was: what tests import from or build with, and nothing
+/// the work writes, as a `dist/` or `build/` it built, a `*.egg-info` it
+/// packaged or a `__pycache__` of its new modules would be.
 const STORES: [&str; 9] = [
     "node_modules",
     ".venv",
@@ -110,6 +141,27 @@ const STORES: [&str; 9] = [
     ".m2",
     ".cache",
 ];
+
+/// What a runner prints when it ran no test, in lower case: a pass that
+/// says one of these chose nothing.
+const VACUOUS: [&str; 9] = [
+    "no tests ran",
+    "0 passed",
+    "collected 0 items",
+    "no test files found",
+    "no tests found",
+    "no test files",
+    "ran 0 tests",
+    "0 tests completed",
+    "tests: 0 total",
+];
+
+/// Files under `site-packages` and the folder of its files read at most
+/// for a path into the project, which an editable install leaves there.
+const EDITABLE_READ: u64 = 64 * 1024;
+
+/// How deep under a linked store a `site-packages` folder is looked for.
+const STORE_DEPTH: usize = 5;
 
 /// Characters of the tests' output the run is shown at most, from its end,
 /// where a runner sums up what failed.
@@ -177,9 +229,19 @@ fn folder(what: &str) -> PathBuf {
 }
 
 /// What git printed in `dir` for `args`, split at each NUL or newline; None
-/// when it could not run or failed. It gets no input and may not prompt.
+/// when it could not run or failed.
 #[cfg(any(unix, test))]
 fn git(dir: &Path, args: &[&str]) -> Option<Vec<String>> {
+    let printed = git_bytes(dir, args)?;
+    let printed = String::from_utf8_lossy(&printed);
+    let lines = printed.split(['\0', '\n']).filter(|line| !line.is_empty());
+    Some(lines.map(str::to_owned).collect())
+}
+
+/// What git printed in `dir` for `args`, as it printed it; None when it
+/// could not run or failed. It gets no input and may not prompt.
+#[cfg(any(unix, test))]
+fn git_bytes(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -193,9 +255,7 @@ fn git(dir: &Path, args: &[&str]) -> Option<Vec<String>> {
         .stdin(Stdio::null())
         .output()
         .ok()?;
-    let printed = String::from_utf8_lossy(&output.stdout);
-    let lines = printed.split(['\0', '\n']).filter(|line| !line.is_empty());
-    (output.status.success()).then(|| lines.map(str::to_owned).collect())
+    (output.status.success()).then_some(output.stdout)
 }
 
 /// A copy of `workspace` for the tester to work in, so its tests never meet
@@ -368,14 +428,48 @@ pub(crate) fn before(_workspace: &Path) -> Option<PathBuf> {
     None
 }
 
+/// The commit the project in `workspace` is at while nothing in it is
+/// changed, added or deleted since, as a run finds a project committed
+/// before it: what a second attempt at the run's task starts from. None
+/// where `workspace` is not the top of a git project, has no commit yet, or
+/// holds changes that are not the run's, which no attempt could tell from
+/// its own.
+#[cfg(unix)]
+pub(crate) fn baseline(workspace: &Path) -> Option<String> {
+    top(workspace)?;
+    let changed = git(workspace, &["status", "--porcelain"])?;
+    changed.is_empty().then(|| head(workspace)).flatten()
+}
+
+/// No second attempt is made here, as `base` makes no folder for one.
+#[cfg(not(unix))]
+pub(crate) fn baseline(_workspace: &Path) -> Option<String> {
+    None
+}
+
+/// The commit the project in `workspace` is at; None without one.
+#[cfg(unix)]
+pub(crate) fn head(workspace: &Path) -> Option<String> {
+    git(workspace, &["rev-parse", "--verify", "HEAD"])?
+        .into_iter()
+        .next()
+}
+
+/// As `baseline`.
+#[cfg(not(unix))]
+pub(crate) fn head(_workspace: &Path) -> Option<String> {
+    None
+}
+
 /// The project in `workspace` as its last commit holds it, as `before`
 /// writes it out, with the package stores and build caches git ignores
 /// there linked in (`stores`): a folder for a tester started with the run
 /// to work in, which the work never reaches, where its tests can still be
 /// parsed and their imports of the project's own code and packages
-/// resolved. None where `workspace` is not the top of a git project, has no
-/// commit yet, ignores more than `COPIED` entries, or where the folder
-/// could not be made.
+/// resolved, and for a second attempt at the run's task to be made in, with
+/// nothing of the first in it. None where `workspace` is not the top of a
+/// git project, has no commit yet, ignores more than `COPIED` entries, or
+/// where the folder could not be made.
 #[cfg(unix)]
 pub(crate) fn base(workspace: &Path) -> Option<PathBuf> {
     top(workspace)?;
@@ -391,7 +485,8 @@ pub(crate) fn base(workspace: &Path) -> Option<PathBuf> {
     Some(to)
 }
 
-/// No tester starts with the run here, as `copy` makes no copy either.
+/// No tester starts with the run here, nor is a second attempt made, as
+/// `copy` makes no copy either.
 #[cfg(not(unix))]
 pub(crate) fn base(_workspace: &Path) -> Option<PathBuf> {
     None
@@ -545,7 +640,7 @@ const PROSE: [&str; 8] = [
 /// Installers a `Run:` command may not call: run in a copy whose packages
 /// and builds are links into the project, they would change the project's
 /// own.
-const INSTALLS: [&str; 23] = [
+const INSTALLS: [&str; 26] = [
     "pip install",
     "pip3 install",
     "uv pip install",
@@ -569,7 +664,16 @@ const INSTALLS: [&str; 23] = [
     "go get",
     "make install",
     "apt-get",
+    "npm link",
+    "yarn link",
+    "pnpm link",
 ];
+
+/// Whether `command` would install or link anything, by `INSTALLS`.
+pub(crate) fn installs(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    INSTALLS.iter().any(|verb| lower.contains(verb))
+}
 
 /// The command the tester's `report` gives to run all its tests, off its
 /// `Run:` line, the last where it wrote more than one, and the part in
@@ -598,7 +702,7 @@ pub(crate) fn command(report: &str) -> Option<String> {
     if PROSE.iter().any(|word| lower.starts_with(word)) {
         return None;
     }
-    if INSTALLS.iter().any(|verb| lower.contains(verb)) {
+    if installs(&given) {
         return None;
     }
     (given.len() <= LINE).then_some(given)
@@ -688,20 +792,14 @@ pub(crate) fn ran(kept: &Kept, command: &str, ctx: &ToolContext, limit: Duration
     let Some(copy) = copy(workspace) else {
         return Ran::Unrun("no copy of the project could be made to run them in".into());
     };
-    let placed = kept.files.iter().all(|file| {
-        let at = copy.join(file);
-        (at.parent()).is_some_and(|parent| std::fs::create_dir_all(parent).is_ok())
-            && std::fs::copy(kept.dir.join(file), &at).is_ok()
-    });
-    if !placed {
-        discard(&copy);
+    let outcome = outcome_in(kept, command, &copy, ctx, limit);
+    discard(&copy);
+    let Some(outcome) = outcome else {
         return Ran::Unrun(format!(
             "the test files kept in `{}` could not be put back in a copy of the project",
             kept.dir.display()
         ));
-    }
-    let outcome = run_command(command, &copy, ctx, limit);
-    discard(&copy);
+    };
     match failed(kept, command, &outcome) {
         Some(notice) => Ran::Failed(notice),
         None => Ran::Passed(command.to_owned()),
@@ -729,6 +827,58 @@ pub(crate) fn first_run(ran: &Ran) -> String {
     }
 }
 
+/// Whether `outcome`, what the tester's tests made of some work, is a pass
+/// that chose something: the command ended well and its output does not
+/// say that no test ran, which a bare project or a wrong path can bring.
+pub(crate) fn passed(outcome: &Result<String, String>) -> bool {
+    if failure(outcome).is_some() {
+        return false;
+    }
+    let lower = outcome.as_deref().unwrap_or_default().to_lowercase();
+    !VACUOUS.iter().any(|said| lower.contains(said))
+}
+
+/// What `command` made of the tester's tests `kept` run against the work in
+/// `ctx`'s project as it stands, within `limit`: in a fresh copy of the
+/// project with the kept files put back at their paths, as the tester's own
+/// did, so nothing is added to the project and no patch of it takes them.
+/// None when no copy could be made, or a file could not be placed.
+pub(crate) fn outcome(
+    kept: &Kept,
+    command: &str,
+    ctx: &ToolContext,
+    limit: Duration,
+) -> Option<Result<String, String>> {
+    let workspace = ctx.workspace.as_deref()?;
+    let copy = copy(workspace)?;
+    let outcome = outcome_in(kept, command, &copy, ctx, limit);
+    discard(&copy);
+    outcome
+}
+
+/// What `command` made of the tester's tests `kept` run against the work in
+/// `folder`, which holds it already, as a second attempt's does: the kept
+/// files are put at their paths there for the run and taken away after it.
+/// None when one could not be placed.
+pub(crate) fn outcome_in(
+    kept: &Kept,
+    command: &str,
+    folder: &Path,
+    ctx: &ToolContext,
+    limit: Duration,
+) -> Option<Result<String, String>> {
+    let placed = kept.files.iter().all(|file| {
+        let at = folder.join(file);
+        (at.parent()).is_some_and(|parent| std::fs::create_dir_all(parent).is_ok())
+            && std::fs::copy(kept.dir.join(file), &at).is_ok()
+    });
+    let outcome = placed.then(|| run_command(command, folder, ctx, limit));
+    for file in &kept.files {
+        let _ = std::fs::remove_file(folder.join(file));
+    }
+    outcome
+}
+
 /// What `run_command` made of `command` run in `copy` within `limit`, as
 /// `ctx` allows it and as any call of the tool goes, hooks and the
 /// scrubbing of its output included: with the copy as its project and for
@@ -754,24 +904,30 @@ fn run_command(
     crate::tools::run("run_command", &args.to_string(), &ctx)
 }
 
-/// The notice sending the run back with `outcome`, what `command` made of
-/// the tester's tests `kept` run against its work; None when they passed.
-fn failed(kept: &Kept, command: &str, outcome: &Result<String, String>) -> Option<String> {
-    let (ended, output) = match outcome {
+/// How `command` ended when `outcome`, what it made of the tester's tests,
+/// is a failure, and the output it printed; None when they passed.
+pub(crate) fn failure(outcome: &Result<String, String>) -> Option<(String, &str)> {
+    match outcome {
         // A command that passed has no exit code line; a note of where the
         // whole output went, or what the user's hooks said, can follow one.
         Ok(output) => {
             let code = (output.lines().rev()).find_map(|line| line.strip_prefix("[exit code "))?;
             let code = code.trim_end_matches(']');
-            (format!("exited with code {code}"), output.as_str())
+            Some((format!("exited with code {code}"), output.as_str()))
         }
         // Without the tool's advice to call it again with a longer timeout,
         // which is for a model that made the call.
         Err(why) => {
             let why = why.split(" If it only needs longer").next().unwrap_or(why);
-            ("did not finish".to_owned(), why)
+            Some(("did not finish".to_owned(), why))
         }
-    };
+    }
+}
+
+/// The notice sending the run back with `outcome`, what `command` made of
+/// the tester's tests `kept` run against its work; None when they passed.
+fn failed(kept: &Kept, command: &str, outcome: &Result<String, String>) -> Option<String> {
+    let (ended, output) = failure(outcome)?;
     Some(format!(
         "Your work as it stands was run against the tests a tester wrote from the request \
          alone, in a copy of the project with them put back at the paths they are kept from, \
@@ -798,6 +954,512 @@ fn tail(output: &str) -> String {
     let from = (output.char_indices().rev().nth(SHOWN - 1)).map_or(0, |(at, _)| at);
     let from = output[from..].find('\n').map_or(from, |at| from + at + 1);
     format!("…\n{}", &output[from..])
+}
+
+/// The task of the helper making a second attempt at `request` in a folder
+/// holding the project as it was: the request word for word, that a first
+/// attempt it is not shown did not pass the tests a tester wrote, which
+/// `command` runs, as `ended` with `output`, and that its own work is run
+/// against them the same way when it ends. Nothing of the first attempt's
+/// code, so it shares none of that attempt's reading of the request, and
+/// nothing of where the tests are or what they are called, so it builds to
+/// the request rather than to them.
+pub(crate) fn attempt(request: &str, command: &str, ended: &str, output: &str) -> String {
+    let mut text = format!(
+        "Make the change the request below asks for, from scratch, in the project in your \
+         working folder, which holds the project as it was before anyone began on it. Another \
+         agent's attempt at the same request did not pass the tests a tester wrote from the \
+         request's words alone: `{command}` {ended}, and its output ends:\n\n{}\n\n\
+         That attempt is not in your folder and not yours to look for or build on. Read the \
+         project as it is, take from the request's words what should happen in each case they \
+         name, and build it so that a caller of the project gets that, end to end, through the \
+         entry point a caller uses. Where the output above shows what the tests expect and the \
+         request's words agree, make that happen; where the words say otherwise, follow the \
+         words. The tester's tests are kept out of your folder: when you end, they are run with \
+         `{command}` against your work as you leave it, and your work is taken only if they \
+         pass. Install, link or re-install nothing, with no `pip install`, `npm install`, `npm \
+         link`, `go install`, `cargo install` or the like, and touch no file outside your folder: \
+         the packages and builds you find linked in it are the project's own, to use as they \
+         are. So before you end, run the project's own tests and a check of your own on each \
+         case the request names, and leave the folder as it should be handed over: nothing half \
+         done, no scratch files, and no file of yours whose name holds `{MARKER}`. The folder is \
+         not a git repository, so there is no history to read in it. End with what you changed \
+         and why.\n\n\
+         The request, word for word:\n",
+        tail(output)
+    );
+    text.push_str(request.trim());
+    text
+}
+
+/// What `adopt` did: the paths it wrote in the project and those it removed
+/// from it, each in order, those it could not, and the folder the first
+/// attempt is kept in.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Adopted {
+    pub written: Vec<String>,
+    pub removed: Vec<String>,
+    pub failed: Vec<String>,
+    pub kept: PathBuf,
+}
+
+/// Makes the project in `workspace` hold the work in `from`, a second
+/// attempt's folder made by `base`, in place of the first attempt's: each
+/// file that differs is written over or added, each file of the project the
+/// attempt has not is removed, the tester's files `excluded` and what git
+/// ignores are left as they are, and the first attempt is kept beforehand in
+/// a new folder of the temp folder, as `FIRST_PATCH`, its changes to the last
+/// commit's files, with the files it added beside it at their paths. Nothing
+/// under `.git` is touched, no link is followed and nothing is written
+/// outside the project. Err, with the project as it was, when the two hold
+/// the same files, the project's files could not be listed or the first
+/// attempt could not be kept.
+#[cfg(unix)]
+pub(crate) fn adopt(workspace: &Path, from: &Path, excluded: &[String]) -> Result<Adopted, String> {
+    let listed = "The project's files could not be listed.";
+    let tracked = git(workspace, &["ls-files", "-z", "--cached"]).ok_or(listed)?;
+    let untracked = git(
+        workspace,
+        &["ls-files", "-z", "--others", "--exclude-standard"],
+    )
+    .ok_or(listed)?;
+    let theirs = attempted(from, &tracked, excluded);
+    let ours: BTreeSet<String> = (tracked.iter().chain(&untracked))
+        .filter(|path| !excluded.contains(path))
+        .cloned()
+        .collect();
+    let written: Vec<String> = (theirs.iter())
+        .filter(|path| differs(&workspace.join(path), &from.join(path)))
+        .cloned()
+        .collect();
+    // Only a file or a link is removed: a folder standing where the project
+    // tracks a path, as a submodule's does, is left.
+    let removed: Vec<String> = (ours.iter())
+        .filter(|path| !theirs.contains(*path))
+        .filter(|path| {
+            std::fs::symlink_metadata(workspace.join(path)).is_ok_and(|kind| !kind.is_dir())
+        })
+        .cloned()
+        .collect();
+    if written.is_empty() && removed.is_empty() {
+        return Err("The second attempt left the project as it was.".into());
+    }
+    // Checked before anything is written, so a path that would reach
+    // outside the project leaves it as it was.
+    for path in written.iter().chain(&removed) {
+        if inside(workspace, path).is_none() {
+            return Err(format!("`{path}` would reach outside the project."));
+        }
+    }
+    let kept = keep_first(workspace, &untracked)?;
+    let mut failed = Vec::new();
+    // Removed before anything is written, so a file the attempt made a
+    // folder of has made way for the folder.
+    for path in &removed {
+        let Some(at) = inside(workspace, path) else {
+            continue;
+        };
+        if std::fs::remove_file(&at).is_err() {
+            failed.push(path.clone());
+        }
+    }
+    for path in &written {
+        let Some(at) = inside(workspace, path) else {
+            continue;
+        };
+        if !put(&from.join(path), &at) {
+            failed.push(path.clone());
+        }
+    }
+    Ok(Adopted {
+        written,
+        removed,
+        failed,
+        kept,
+    })
+}
+
+/// No second attempt is made here, so none is adopted.
+#[cfg(not(unix))]
+pub(crate) fn adopt(
+    _workspace: &Path,
+    _from: &Path,
+    _excluded: &[String],
+) -> Result<Adopted, String> {
+    Err("No second attempt is made here.".into())
+}
+
+/// The files of the second attempt in `from`, by their paths from there, in
+/// order: the files its walk finds, what the project's own rules ignore and
+/// the tester's `excluded` left out, and those `tracked` by the project that
+/// it still holds, however they are ignored, links among them. The walk
+/// takes no link, since those `base` made stand for what git ignores, and
+/// follows none, and `.git` is never entered.
+#[cfg(unix)]
+fn attempted(from: &Path, tracked: &[String], excluded: &[String]) -> BTreeSet<String> {
+    let held = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|kind| !kind.is_dir());
+    let mut walk = ignore::WalkBuilder::new(from);
+    walk.hidden(false)
+        .parents(false)
+        .git_global(false)
+        .git_exclude(false)
+        .require_git(false);
+    walk.filter_entry(|entry| !SKIPPED.iter().any(|skipped| entry.file_name() == *skipped));
+    let mut found: BTreeSet<String> = (walk.build().take(WALKED))
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+        .filter_map(|entry| Some(slashed(entry.path().strip_prefix(from).ok()?)))
+        .collect();
+    found.extend(
+        (tracked.iter())
+            .filter(|path| held(&from.join(path)))
+            .cloned(),
+    );
+    for path in excluded {
+        found.remove(path);
+    }
+    found
+}
+
+/// Whether what is at `theirs`, a file or a link, differs from what is at
+/// `ours`: nothing there, a file for a link or a link for a file, a link to
+/// somewhere else, other bytes or another mode.
+#[cfg(unix)]
+fn differs(ours: &Path, theirs: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let (Ok(mine), Ok(its)) = (
+        std::fs::symlink_metadata(ours),
+        std::fs::symlink_metadata(theirs),
+    ) else {
+        return true;
+    };
+    if mine.is_symlink() || its.is_symlink() {
+        let same = mine.is_symlink() && its.is_symlink();
+        return !same || std::fs::read_link(ours).ok() != std::fs::read_link(theirs).ok();
+    }
+    if !mine.is_file() || mine.len() != its.len() {
+        return true;
+    }
+    if (mine.permissions().mode() ^ its.permissions().mode()) & 0o111 != 0 {
+        return true;
+    }
+    match (std::fs::read(ours), std::fs::read(theirs)) {
+        (Ok(mine), Ok(its)) => mine != its,
+        _ => true,
+    }
+}
+
+/// Puts what is at `from`, a file or a link, at `at`, in place of what is
+/// there: a link is made again to where it leads, never written through,
+/// since that would carry the file outside the project.
+#[cfg(unix)]
+fn put(from: &Path, at: &Path) -> bool {
+    let Ok(kind) = std::fs::symlink_metadata(from) else {
+        return false;
+    };
+    let there = std::fs::symlink_metadata(at).ok();
+    let linked = there.as_ref().is_some_and(|there| there.is_symlink());
+    if (linked || (kind.is_symlink() && there.is_some())) && std::fs::remove_file(at).is_err() {
+        return false;
+    }
+    if !(at.parent()).is_some_and(|parent| std::fs::create_dir_all(parent).is_ok()) {
+        return false;
+    }
+    match kind.is_symlink() {
+        true => (std::fs::read_link(from))
+            .and_then(|to| std::os::unix::fs::symlink(to, at))
+            .is_ok(),
+        false => std::fs::copy(from, at).is_ok(),
+    }
+}
+
+/// `path` under `workspace`, when it names a place inside the project and
+/// nothing on the way to it there is a link: a write or a removal through
+/// one would reach outside the project. Never anything in a `.git` folder,
+/// at any depth.
+#[cfg(unix)]
+fn inside(workspace: &Path, path: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let relative = Path::new(path);
+    let mut parts = relative.components();
+    if !parts.all(|part| matches!(part, Component::Normal(name) if name != ".git")) {
+        return None;
+    }
+    let mut at = workspace.to_path_buf();
+    for part in relative.parent()?.components() {
+        at.push(part);
+        if std::fs::symlink_metadata(&at).is_ok_and(|kind| kind.is_symlink()) {
+            return None;
+        }
+    }
+    Some(workspace.join(relative))
+}
+
+/// Keeps the first attempt, the project in `workspace` as it stands, in a
+/// new folder of the temp folder: `FIRST_PATCH`, its changes to the last
+/// commit's files, and its `untracked` files beside it at their paths. The
+/// folder, or why it could not be kept.
+#[cfg(unix)]
+fn keep_first(workspace: &Path, untracked: &[String]) -> Result<PathBuf, String> {
+    let dir = folder("first");
+    let patch = git_bytes(workspace, &["diff", "--binary", "HEAD"])
+        .ok_or("The first attempt's changes could not be read.")?;
+    let kept = (|| {
+        std::fs::create_dir_all(&dir).ok()?;
+        std::fs::write(dir.join(FIRST_PATCH), patch).ok()?;
+        for path in untracked {
+            let from = workspace.join(path);
+            if !std::fs::symlink_metadata(&from).is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let at = dir.join(path);
+            std::fs::create_dir_all(at.parent()?).ok()?;
+            std::fs::copy(&from, &at).ok()?;
+        }
+        Some(())
+    })();
+    if kept.is_none() {
+        discard(&dir);
+        return Err("The first attempt could not be kept.".into());
+    }
+    Ok(dir)
+}
+
+/// What the run is told once the project holds a second attempt's work in
+/// place of its own, `adopted`: that its work, run once more with `command`,
+/// `ended` so, what was written and removed, where its own is kept, and to
+/// answer again for the work as it stands.
+pub(crate) fn adopted(command: &str, ended: &str, adopted: &Adopted) -> String {
+    let named = |paths: &[String]| {
+        let mut named: Vec<String> = (paths.iter().take(NAMED))
+            .map(|path| format!("`{path}`"))
+            .collect();
+        if paths.len() > NAMED {
+            named.push(format!("and {} more", paths.len() - NAMED));
+        }
+        named.join(", ")
+    };
+    let mut text = format!(
+        "Your work as it stands was run once more against the tests a tester wrote from the \
+         request alone, in a copy of the project, and `{command}` {ended}. Meanwhile a helper \
+         that had not seen your work made a second attempt at the request from scratch, in a \
+         copy of the project as it was before you began, and its work passes those tests. The \
+         project now holds the second attempt in place of yours",
+    );
+    if !adopted.written.is_empty() {
+        text.push_str(&format!(
+            ": {} written, {}",
+            adopted.written.len(),
+            named(&adopted.written)
+        ));
+    }
+    if !adopted.removed.is_empty() {
+        let join = if adopted.written.is_empty() { ":" } else { ";" };
+        text.push_str(&format!(
+            "{join} {} of yours removed, {}",
+            adopted.removed.len(),
+            named(&adopted.removed)
+        ));
+    }
+    text.push_str(&format!(
+        ". Yours is kept in `{}`: `{FIRST_PATCH}`, its changes to the last commit's files, and \
+         the files it added at their paths. Do not put it back or merge it in, since it did not \
+         pass.",
+        adopted.kept.display()
+    ));
+    if !adopted.failed.is_empty() {
+        text.push_str(&format!(
+            " {} could not be written or removed here: {}.",
+            adopted.failed.len(),
+            named(&adopted.failed)
+        ));
+    }
+    text.push_str(
+        " Read the project as it now stands, with `git status` and `git diff`, change nothing, \
+         and end with your whole answer again, describing the work as the project holds it now.",
+    );
+    text
+}
+
+/// What the run is told when the second attempt made in `base` ran
+/// `commands` that install or link something: nothing of it is taken, and
+/// the folder stays, since a package store linked from it may now lead into
+/// it.
+pub(crate) fn installed(base: &Path, commands: &[String]) -> String {
+    let named: Vec<String> = (commands.iter().take(3))
+        .map(|command| format!("`{command}`"))
+        .collect();
+    format!(
+        "A helper that had not seen your work made a second attempt at the request in `{}`, a \
+         copy of the project as it was before you began, and ran {} there, which may have \
+         installed or linked something from that folder into the project's own packages. So \
+         nothing of its work was taken, and the folder is left where it is, so that any such \
+         link keeps working. Your work stands as it is: end with your whole answer again.",
+        base.display(),
+        named.join(", ")
+    )
+}
+
+/// Why a second attempt made in `base` would test the first attempt's code
+/// rather than its own, when it would: the project installed as editable,
+/// by a `.pth`, `.egg-link` or `__editable__` file of a `site-packages`
+/// folder under a linked Python store that names `workspace`, or an entry
+/// of a linked `node_modules` that leads into `workspace` outside the
+/// store. None when nothing of the kind is found under the stores `base`
+/// links; a store elsewhere, such as the system's own `site-packages`, is
+/// not looked at.
+#[cfg(unix)]
+pub(crate) fn imports_elsewhere(workspace: &Path, base: &Path) -> Option<String> {
+    let real = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let spelt = [
+        workspace.to_string_lossy().into_owned(),
+        real.to_string_lossy().into_owned(),
+    ];
+    let mut stores = Vec::new();
+    linked_stores(base, 0, &mut stores);
+    for store in stores {
+        let name = store.file_name()?.to_string_lossy().into_owned();
+        if name == "node_modules" {
+            if let Some(entry) = leads_into(&store, &real) {
+                return Some(format!(
+                    "`{}` leads into the project, so the attempt's tests would import the \
+                     first attempt's code",
+                    entry.display()
+                ));
+            }
+            continue;
+        }
+        let mut found = Vec::new();
+        site_packages(&store, 0, &mut found);
+        for packages in found {
+            if let Some(file) = editable_in(&packages, &spelt) {
+                return Some(format!(
+                    "`{}` installs the project from where the first attempt is, so the \
+                     attempt's tests would import that code",
+                    file.display()
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// No store is linked here, so nothing leads elsewhere.
+#[cfg(not(unix))]
+pub(crate) fn imports_elsewhere(_workspace: &Path, _base: &Path) -> Option<String> {
+    None
+}
+
+/// The links under `folder`, `depth` down, that stand for Python stores and
+/// `node_modules`, as `base` makes them, added to `stores`; nothing under
+/// `.git` or past `STORE_DEPTH`.
+#[cfg(unix)]
+fn linked_stores(folder: &Path, depth: usize, stores: &mut Vec<PathBuf>) {
+    const PYTHON: [&str; 4] = [".venv", "venv", ".tox", "node_modules"];
+    if depth > STORE_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let name = entry.file_name();
+        if kind.is_symlink() {
+            if PYTHON.iter().any(|store| name == *store) {
+                stores.push(path);
+            }
+        } else if kind.is_dir() && name != ".git" {
+            linked_stores(&path, depth + 1, stores);
+        }
+    }
+}
+
+/// The `site-packages` folders under `store`, `depth` down, added to
+/// `found`; none past `STORE_DEPTH`.
+#[cfg(unix)]
+fn site_packages(store: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+    if depth > STORE_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(store) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if entry.file_name() == "site-packages" {
+            found.push(path);
+        } else {
+            site_packages(&path, depth + 1, found);
+        }
+    }
+}
+
+/// The first `.pth`, `.egg-link` or `__editable__` file of `packages`, a
+/// `site-packages` folder, whose text names the project by one of `spelt`,
+/// as an editable install of it does; None when none does.
+#[cfg(unix)]
+fn editable_in(packages: &Path, spelt: &[String]) -> Option<PathBuf> {
+    use std::io::Read;
+    let entries = std::fs::read_dir(packages).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let editable = name.ends_with(".pth")
+            || name.ends_with(".egg-link")
+            || name.starts_with("__editable__");
+        if !editable || !entry.path().is_file() {
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(entry.path()) else {
+            continue;
+        };
+        let mut text = String::new();
+        if file.take(EDITABLE_READ).read_to_string(&mut text).is_err() {
+            continue;
+        }
+        if spelt.iter().any(|path| text.contains(path.as_str())) {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
+/// The first entry of `modules`, a linked `node_modules`, or of a scope in
+/// it, that is a link leading into `real`, the project, outside the store
+/// itself, as a linked or workspace package does; None when none does.
+#[cfg(unix)]
+fn leads_into(modules: &Path, real: &Path) -> Option<PathBuf> {
+    let store = std::fs::canonicalize(modules).ok()?;
+    let entries = std::fs::read_dir(modules).ok()?;
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with('@')
+            && let Ok(scoped) = std::fs::read_dir(&path)
+        {
+            candidates.extend(scoped.flatten().map(|entry| entry.path()));
+        } else {
+            candidates.push(path);
+        }
+    }
+    candidates.into_iter().find(|path| {
+        let linked = std::fs::symlink_metadata(path).is_ok_and(|kind| kind.is_symlink());
+        linked
+            && std::fs::canonicalize(path)
+                .is_ok_and(|target| target.starts_with(real) && !target.starts_with(&store))
+    })
+}
+
+/// `inside`, a path under the project, with `/` between folders.
+fn slashed(inside: &Path) -> String {
+    let parts: Vec<_> = inside.iter().map(|part| part.to_string_lossy()).collect();
+    parts.join("/")
 }
 
 /// The tester's files under `from`, the copy it worked in or the project
@@ -1025,11 +1687,7 @@ fn left(workspace: &Path) -> Vec<String> {
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
         .filter(|entry| (entry.file_name().to_str()).is_some_and(|name| name.contains(MARKER)))
-        .filter_map(|entry| {
-            let inside = entry.path().strip_prefix(workspace).ok()?;
-            let parts: Vec<_> = inside.iter().map(|part| part.to_string_lossy()).collect();
-            Some(parts.join("/"))
-        })
+        .filter_map(|entry| Some(slashed(entry.path().strip_prefix(workspace).ok()?)))
         .collect();
     found.sort();
     found
@@ -2037,5 +2695,515 @@ mod tests {
         assert!(text.ends_with(report));
         let bare = told_ahead(report, None);
         assert!(!bare.contains("kept out of the project"), "{bare}");
+    }
+
+    /// Commits what is in `root`, as user_a.
+    #[cfg(unix)]
+    fn committed(root: &Path, message: &str) {
+        for args in [
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=user_a",
+                "-c",
+                "user.email=user_a@example.com",
+                "commit",
+                "-q",
+                "-m",
+                message,
+            ],
+        ] {
+            assert!(git(root, &args).is_some(), "git {args:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_second_attempt_starts_from_the_last_commit_with_what_git_ignores_linked() {
+        let root = Scratch::new("spec-tests-base");
+        // No project, then one with no commit: nothing to start from.
+        assert_eq!(baseline(&root), None);
+        assert!(git(&root, &["init", "-q"]).is_some());
+        assert_eq!(baseline(&root), None);
+        assert_eq!(head(&root), None);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(root.join("dist")).unwrap();
+        std::fs::create_dir_all(root.join("sub/.venv")).unwrap();
+        std::fs::write(root.join(".gitignore"), "node_modules/\ndist/\n.venv/\n").unwrap();
+        std::fs::write(root.join("src/lib.ts"), "export const a = 1;").unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), "a package").unwrap();
+        std::fs::write(root.join("dist/lib.js"), "built").unwrap();
+        std::fs::write(root.join("sub/.venv/pyvenv.cfg"), "a venv").unwrap();
+        // With files that are not committed yet, nor.
+        assert_eq!(baseline(&root), None);
+        committed(&root, "first");
+        let commit = baseline(&root).unwrap();
+        assert_eq!(commit.len(), 40, "{commit}");
+        assert_eq!(head(&root), Some(commit.clone()));
+        // A folder inside the project is not the top of it.
+        assert_eq!(baseline(&root.join("src")), None);
+        // The run's change and a new file of its: no baseline any more, but
+        // the commit is still the one.
+        std::fs::write(root.join("src/lib.ts"), "export const a = 2;").unwrap();
+        std::fs::write(root.join("src/new.ts"), "export const b = 3;").unwrap();
+        assert_eq!(baseline(&root), None);
+        assert_eq!(head(&root), Some(commit));
+
+        let base = base(&root).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(base.join("src/lib.ts")).unwrap(),
+            "export const a = 1;"
+        );
+        assert!(!base.join("src/new.ts").exists());
+        assert!(!base.join(".git").exists());
+        // The package store is linked, as it is; a build's output is not,
+        // nor a store whose folder is not there at HEAD.
+        assert!(
+            std::fs::symlink_metadata(base.join("node_modules"))
+                .unwrap()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("node_modules/pkg/index.js")).unwrap(),
+            "a package"
+        );
+        assert!(!base.join("dist").exists());
+        assert!(!base.join("sub").exists());
+        discard(&base);
+        assert!(!base.exists());
+        // The project is as the run left it.
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/lib.ts")).unwrap(),
+            "export const a = 2;"
+        );
+        assert!(root.join("src/new.ts").exists());
+        assert!(root.join("node_modules/pkg/index.js").exists());
+        assert!(root.join("dist/lib.js").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopting_the_second_attempt_makes_the_project_hold_its_files_and_keeps_the_first() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = Scratch::new("spec-tests-adopt");
+        assert!(git(&root, &["init", "-q"]).is_some());
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join(".gitignore"), "node_modules/\n*.log\n").unwrap();
+        std::fs::write(root.join("src/lib.ts"), "export const a = 1;").unwrap();
+        std::fs::write(root.join("src/old.ts"), "export const old = true;").unwrap();
+        std::fs::write(root.join("README"), "a project").unwrap();
+        std::fs::write(root.join("bin/run.sh"), "echo run").unwrap();
+        std::fs::set_permissions(root.join("bin/run.sh"), PermissionsExt::from_mode(0o644))
+            .unwrap();
+        std::os::unix::fs::symlink("src/lib.ts", root.join("lib-link")).unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), "a package").unwrap();
+        committed(&root, "first");
+        let commit = head(&root).unwrap();
+        // The first attempt: a change, a deletion, a new file, an ignored
+        // file, and the tester's test it put back and never deleted.
+        std::fs::write(root.join("src/lib.ts"), "export const a = 2; // first").unwrap();
+        std::fs::remove_file(root.join("README")).unwrap();
+        std::fs::write(root.join("src/first.ts"), "first attempt").unwrap();
+        std::fs::write(root.join("debug.log"), "noise").unwrap();
+        std::fs::write(root.join("src/letronna_spec.test.ts"), "test").unwrap();
+        // The second attempt, from the project as it was: another change,
+        // another deletion, a new file, a mode made executable, and an
+        // ignored file of its own.
+        let from = base(&root).unwrap();
+        std::fs::write(from.join("src/lib.ts"), "export const a = 3; // second").unwrap();
+        std::fs::remove_file(from.join("src/old.ts")).unwrap();
+        std::fs::write(from.join("src/second.ts"), "second attempt").unwrap();
+        std::fs::set_permissions(from.join("bin/run.sh"), PermissionsExt::from_mode(0o755))
+            .unwrap();
+        std::fs::write(from.join("notes.log"), "ignored").unwrap();
+
+        let excluded = ["src/letronna_spec.test.ts".to_owned()];
+        let adopted = adopt(&root, &from, &excluded).unwrap();
+        assert_eq!(
+            adopted.written,
+            ["README", "bin/run.sh", "src/lib.ts", "src/second.ts"]
+        );
+        assert_eq!(adopted.removed, ["src/first.ts", "src/old.ts"]);
+        assert!(adopted.failed.is_empty());
+        // The project holds the second attempt.
+        let read = |path: &str| std::fs::read_to_string(root.join(path)).unwrap();
+        assert_eq!(read("src/lib.ts"), "export const a = 3; // second");
+        assert_eq!(read("README"), "a project");
+        assert_eq!(read("src/second.ts"), "second attempt");
+        assert!(!root.join("src/first.ts").exists());
+        assert!(!root.join("src/old.ts").exists());
+        let mode = std::fs::metadata(root.join("bin/run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "{mode:o}");
+        // What git ignores, the tester's file, the link and the history
+        // are as they were.
+        assert_eq!(read("node_modules/pkg/index.js"), "a package");
+        assert_eq!(read("debug.log"), "noise");
+        assert!(!root.join("notes.log").exists());
+        assert_eq!(read("src/letronna_spec.test.ts"), "test");
+        assert!(
+            std::fs::symlink_metadata(root.join("lib-link"))
+                .unwrap()
+                .is_symlink()
+        );
+        assert_eq!(head(&root), Some(commit));
+        // The first attempt is kept: its changes to the committed files as
+        // a patch, and the file it added at its path.
+        assert!(adopted.kept.starts_with(std::env::temp_dir()));
+        let patch = std::fs::read_to_string(adopted.kept.join(FIRST_PATCH)).unwrap();
+        assert!(patch.contains("-export const a = 1;"), "{patch}");
+        assert!(patch.contains("+export const a = 2; // first"), "{patch}");
+        assert!(patch.contains("README"), "{patch}");
+        assert_eq!(
+            std::fs::read_to_string(adopted.kept.join("src/first.ts")).unwrap(),
+            "first attempt"
+        );
+        discard(&from);
+        discard(&adopted.kept);
+
+        // An attempt that holds what the project holds is nothing to adopt.
+        let same = copy(&root).unwrap();
+        assert!(adopt(&root, &same, &[]).is_err());
+        assert_eq!(read("src/lib.ts"), "export const a = 3; // second");
+        discard(&same);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nothing_is_adopted_through_a_link_or_under_git() {
+        let root = Scratch::new("spec-tests-adopt-links");
+        assert!(git(&root, &["init", "-q"]).is_some());
+        std::fs::write(root.join("README"), "a project").unwrap();
+        committed(&root, "first");
+        let from = base(&root).unwrap();
+        // The attempt made `.git` of its own, and a folder of files, which
+        // the project has as a link to somewhere else.
+        std::fs::create_dir_all(from.join(".git")).unwrap();
+        std::fs::write(from.join(".git/config"), "theirs").unwrap();
+        std::fs::create_dir_all(from.join("out")).unwrap();
+        std::fs::write(from.join("out/made.txt"), "made").unwrap();
+        let elsewhere = Scratch::new("spec-tests-adopt-elsewhere");
+        std::os::unix::fs::symlink(&*elsewhere, root.join("out")).unwrap();
+
+        let adopted = adopt(&root, &from, &[]);
+        assert!(
+            adopted
+                .as_ref()
+                .is_err_and(|why| why.contains("`out/made.txt`")),
+            "{adopted:?}"
+        );
+        assert!(!elsewhere.join("made.txt").exists());
+        let config = std::fs::read_to_string(root.join(".git/config")).unwrap();
+        assert!(!config.contains("theirs"), "{config}");
+        assert_eq!(inside(&root, "../escape"), None);
+        assert_eq!(inside(&root, "/etc/passwd"), None);
+        assert_eq!(inside(&root, ".git/HEAD"), None);
+        assert_eq!(inside(&root, "vendor/dep/.git/config"), None);
+        assert_eq!(inside(&root, "src/a.rs"), Some(root.join("src/a.rs")));
+        assert_eq!(
+            inside(&root, ".github/ci.yml"),
+            Some(root.join(".github/ci.yml"))
+        );
+        discard(&from);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adoption_leaves_export_ignored_tracked_files_alone() {
+        let root = Scratch::new("spec-tests-adopt-export-ignore");
+        assert!(git(&root, &["init", "-q"]).is_some());
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("tests/test_a.py"), "def test_a(): pass\n").unwrap();
+        std::fs::write(root.join(".gitattributes"), "tests/ export-ignore\n").unwrap();
+        std::fs::write(root.join("src.py"), "x = 1\n").unwrap();
+        committed(&root, "first");
+        std::fs::write(root.join("src.py"), "x = 2  # first\n").unwrap();
+        let from = base(&root).unwrap();
+        assert!(from.join("tests/test_a.py").exists());
+        std::fs::write(from.join("src.py"), "x = 3  # second\n").unwrap();
+
+        let adopted = adopt(&root, &from, &[]).unwrap();
+        assert_eq!(adopted.written, ["src.py"]);
+        assert!(adopted.removed.is_empty(), "{:?}", adopted.removed);
+        assert_eq!(
+            std::fs::read_to_string(root.join("tests/test_a.py")).unwrap(),
+            "def test_a(): pass\n"
+        );
+        discard(&from);
+        discard(&adopted.kept);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_made_a_folder_gives_way_and_a_folder_where_a_file_was_is_left() {
+        let root = Scratch::new("spec-tests-adopt-folders");
+        assert!(git(&root, &["init", "-q"]).is_some());
+        std::fs::write(root.join("plain"), "a file").unwrap();
+        std::fs::write(root.join("gone"), "another").unwrap();
+        committed(&root, "first");
+        // The first attempt made a folder where `gone` was, with a file in it.
+        std::fs::remove_file(root.join("gone")).unwrap();
+        std::fs::create_dir_all(root.join("gone")).unwrap();
+        std::fs::write(root.join("gone/inner"), "the first attempt's").unwrap();
+        // The second made a folder of `plain`, and deleted `gone`.
+        let from = base(&root).unwrap();
+        std::fs::remove_file(from.join("plain")).unwrap();
+        std::fs::create_dir_all(from.join("plain")).unwrap();
+        std::fs::write(from.join("plain/inner.txt"), "inside").unwrap();
+        std::fs::remove_file(from.join("gone")).unwrap();
+
+        let adopted = adopt(&root, &from, &[]).unwrap();
+        assert_eq!(adopted.written, ["plain/inner.txt"]);
+        assert_eq!(adopted.removed, ["gone/inner", "plain"]);
+        assert!(adopted.failed.is_empty(), "{:?}", adopted.failed);
+        assert_eq!(
+            std::fs::read_to_string(root.join("plain/inner.txt")).unwrap(),
+            "inside"
+        );
+        // The folder where `gone` was is left, its file gone with the rest
+        // of the first attempt's.
+        assert!(root.join("gone").is_dir());
+        assert!(!root.join("gone/inner").exists());
+        discard(&from);
+        discard(&adopted.kept);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_attempt_whose_tests_would_import_the_first_attempts_code_is_told() {
+        let root = Scratch::new("spec-tests-imports");
+        assert!(git(&root, &["init", "-q"]).is_some());
+        std::fs::write(root.join(".gitignore"), ".venv/\nnode_modules/\n").unwrap();
+        std::fs::write(root.join("README"), "a project").unwrap();
+        committed(&root, "first");
+        // Nothing linked, nothing elsewhere.
+        let from = base(&root).unwrap();
+        assert_eq!(imports_elsewhere(&root, &from), None);
+        discard(&from);
+        // A `.pth` for somewhere else is fine; an editable install of the
+        // project is not.
+        let packages = root.join(".venv/lib/python3.12/site-packages");
+        std::fs::create_dir_all(&packages).unwrap();
+        std::fs::write(packages.join("other.pth"), "/somewhere/else\n").unwrap();
+        let from = base(&root).unwrap();
+        assert_eq!(imports_elsewhere(&root, &from), None);
+        std::fs::write(
+            packages.join("__editable__.proj-1.0.pth"),
+            format!(
+                "import __editable___proj_finder  # {}/src\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        let why = imports_elsewhere(&root, &from).unwrap();
+        assert!(why.contains("__editable__.proj-1.0.pth"), "{why}");
+        discard(&from);
+        std::fs::remove_dir_all(root.join(".venv")).unwrap();
+        // A package linked within the store is fine; one leading into the
+        // project is not.
+        std::fs::create_dir_all(root.join("node_modules/plain")).unwrap();
+        std::fs::write(root.join("node_modules/plain/index.js"), "a package").unwrap();
+        std::fs::create_dir_all(root.join("node_modules/.pnpm/dep")).unwrap();
+        std::os::unix::fs::symlink("./.pnpm/dep", root.join("node_modules/dep")).unwrap();
+        let from = base(&root).unwrap();
+        assert_eq!(imports_elsewhere(&root, &from), None);
+        std::fs::create_dir_all(root.join("packages/mine")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/@scope")).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("packages/mine"),
+            root.join("node_modules/@scope/mine"),
+        )
+        .unwrap();
+        let why = imports_elsewhere(&root, &from).unwrap();
+        assert!(why.contains("node_modules/@scope/mine"), "{why}");
+        discard(&from);
+    }
+
+    #[test]
+    fn a_pass_that_ran_no_test_chooses_nothing() {
+        assert!(passed(&Ok("3 passed in 0.10s\n".into())));
+        assert!(!passed(&Ok(
+            "collected 0 items\n\nno tests ran in 0.01s\n".into()
+        )));
+        assert!(!passed(&Ok(
+            "No test files found, exiting with code 1\n".into()
+        )));
+        assert!(!passed(&Ok("Tests: 0 total\n".into())));
+        assert!(!passed(&Ok("1 failed, 2 passed\n[exit code 1]".into())));
+        assert!(!passed(&Err("Timed out after 1s".into())));
+    }
+
+    #[test]
+    fn commands_that_install_or_link_are_known() {
+        assert!(installs("npm link ../pkg"));
+        assert!(installs("pip install -e ."));
+        assert!(installs("cd src && PIP INSTALL ."));
+        assert!(installs("cargo install --path ."));
+        assert!(!installs("pytest -q tests"));
+        assert!(!installs("npm test"));
+        assert!(!installs("cargo build"));
+    }
+
+    #[test]
+    fn the_run_is_told_when_the_attempt_installed_something_and_its_folder_stays() {
+        let commands = ["pip install -e .".to_owned(), "npm link".to_owned()];
+        let text = installed(Path::new("/tmp/base"), &commands);
+        assert!(text.contains("at the request in `/tmp/base`"), "{text}");
+        assert!(
+            text.contains("ran `pip install -e .`, `npm link` there"),
+            "{text}"
+        );
+        assert!(text.contains("the folder is left where it is"), "{text}");
+        assert!(
+            text.ends_with("end with your whole answer again."),
+            "{text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_kept_tests_are_run_in_the_attempts_own_folder_and_taken_away_after() {
+        let root = Scratch::new("spec-tests-outcome-in");
+        assert!(git(&root, &["init", "-q"]).is_some());
+        std::fs::write(root.join("README"), "a project").unwrap();
+        committed(&root, "first");
+        std::fs::write(
+            root.join("letronna_spec_test.sh"),
+            "test -f made.txt || { echo 'made.txt is missing'; exit 1; }\n",
+        )
+        .unwrap();
+        let command = "sh letronna_spec_test.sh".to_owned();
+        let kept = keep(90, &root, &root, Some(command.clone())).unwrap();
+        let ctx = ToolContext::of(&crate::chat::Connection {
+            workspace: Some(root.to_path_buf()),
+            ..Default::default()
+        });
+        let from = base(&root).unwrap();
+        // Before the attempt's work is there, the tests fail, as `failure`
+        // says, and the folder is left without them.
+        let failing = outcome_in(&kept, &command, &from, &ctx, TIMEOUT).unwrap();
+        let (ended, output) = failure(&failing).unwrap();
+        assert_eq!(ended, "exited with code 1");
+        assert!(output.contains("made.txt is missing"), "{output}");
+        assert!(!from.join("letronna_spec_test.sh").exists());
+        // With it, they pass.
+        std::fs::write(from.join("made.txt"), "made").unwrap();
+        let passing = outcome_in(&kept, &command, &from, &ctx, TIMEOUT).unwrap();
+        assert_eq!(failure(&passing), None);
+        assert!(!from.join("letronna_spec_test.sh").exists());
+        // The project itself, which still lacks it, fails them in a copy.
+        let own = outcome(&kept, &command, &ctx, TIMEOUT).unwrap();
+        assert!(failure(&own).is_some());
+        assert!(!root.join("letronna_spec_test.sh").exists());
+        assert!(!root.join("made.txt").exists());
+        // One that did not finish is a failure too.
+        let slow = Err("Timed out after 1s".to_owned());
+        assert_eq!(
+            failure(&slow),
+            Some(("did not finish".to_owned(), "Timed out after 1s"))
+        );
+        discard(&from);
+        tidy(90);
+    }
+
+    #[test]
+    fn the_second_attempts_brief_gives_the_request_and_the_failing_output_and_nothing_else() {
+        let brief = attempt(
+            "  Make pairs work.\nPairs compose with Or.  ",
+            "npx vitest run tests",
+            "exited with code 1",
+            "FAIL pairs compose\nexpected [a, b] got []",
+        );
+        assert!(brief.starts_with("Make the change the request below asks for, from scratch"));
+        assert!(
+            brief
+                .ends_with("The request, word for word:\nMake pairs work.\nPairs compose with Or."),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("`npx vitest run tests` exited with code 1"),
+            "{brief}"
+        );
+        assert!(brief.contains("expected [a, b] got []"), "{brief}");
+        assert!(
+            brief.contains("not yours to look for or build on"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("your work is taken only if they pass"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("Install, link or re-install nothing"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("touch no file outside your folder"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains(&format!("whose name holds `{MARKER}`")),
+            "{brief}"
+        );
+        // Nothing of where the tests are kept or what they are called,
+        // which it must build to the request rather than to.
+        assert!(!brief.contains("letronna_spec.test.ts"), "{brief}");
+        assert!(!brief.contains("/tmp/kept"), "{brief}");
+    }
+
+    #[test]
+    fn the_run_is_told_the_project_holds_the_second_attempt_and_where_its_own_is_kept() {
+        let taken = Adopted {
+            written: vec!["src/lib.ts".to_owned(), "src/second.ts".to_owned()],
+            removed: vec!["src/first.ts".to_owned()],
+            failed: Vec::new(),
+            kept: PathBuf::from("/tmp/first"),
+        };
+        let text = adopted("sh letronna_spec_test.sh", "exited with code 1", &taken);
+        assert!(
+            text.contains("`sh letronna_spec_test.sh` exited with code 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("now holds the second attempt in place of yours: 2 written, `src/lib.ts`, `src/second.ts`; 1 of yours removed, `src/first.ts`."),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("kept in `/tmp/first`: `{FIRST_PATCH}`")),
+            "{text}"
+        );
+        assert!(text.contains("Do not put it back or merge it in"), "{text}");
+        assert!(!text.contains("could not be written"), "{text}");
+        // Only the answer is asked for: nothing checks a change after this.
+        assert!(
+            text.ends_with(
+                "change nothing, and end with your whole answer again, describing the work as \
+                 the project holds it now."
+            ),
+            "{text}"
+        );
+        // With only removals, and with a file that could not be written,
+        // which is reported and nothing more.
+        let partial = Adopted {
+            written: Vec::new(),
+            removed: vec!["a".to_owned()],
+            failed: vec!["b".to_owned()],
+            kept: PathBuf::from("/tmp/first"),
+        };
+        let text = adopted("make test", "did not finish", &partial);
+        assert!(
+            text.contains("in place of yours: 1 of yours removed, `a`."),
+            "{text}"
+        );
+        assert!(
+            text.contains("1 could not be written or removed here: `b`. Read"),
+            "{text}"
+        );
+        assert!(!text.contains("put them right"), "{text}");
     }
 }
