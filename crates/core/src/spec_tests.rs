@@ -215,32 +215,30 @@ pub(crate) fn copy(_workspace: &Path) -> Option<PathBuf> {
 pub(crate) fn before(workspace: &Path) -> Option<PathBuf> {
     let to = folder("before");
     std::fs::create_dir_all(&to).ok()?;
-    let written = (|| {
-        let mut archive = Command::new("git")
+    // Checked out of a throwaway index rather than archived: an archive
+    // leaves out what .gitattributes marks export-ignore, such as a tests
+    // folder, and rewrites export-subst files, so a folder made from one is
+    // not the project as it was.
+    let index = to.with_extension("index");
+    let git = |args: &[&str]| {
+        Command::new("git")
             .arg("-C")
             .arg(workspace)
-            .args(["archive", "--format=tar", "HEAD"])
+            .args(args)
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_INDEX_FILE", &index)
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        let unpacked = Command::new("tar")
-            .arg("-xf")
-            .arg("-")
-            .arg("-C")
-            .arg(&to)
-            .stdin(archive.stdout.take()?)
+            .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .ok()?;
-        (archive.wait().ok()?.success() && unpacked.success()).then_some(())
-    })();
-    if written.is_none() {
+            .is_ok_and(|status| status.success())
+    };
+    let prefix = format!("--prefix={}/", to.display());
+    let written = git(&["read-tree", "HEAD"]) && git(&["checkout-index", "-a", &prefix]);
+    let _ = std::fs::remove_file(&index);
+    if !written {
         discard(&to);
         return None;
     }
@@ -840,7 +838,16 @@ mod tests {
         // No commit yet, so nothing to write out.
         assert_eq!(before(&root), None);
         std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
         std::fs::write(root.join("src/lib.ts"), "export const a = 1;").unwrap();
+        // What an archive of the project would leave out or rewrite.
+        std::fs::write(root.join("tests/lib.test.ts"), "test('a', () => {});").unwrap();
+        std::fs::write(root.join("version.txt"), "$Format:%H$").unwrap();
+        std::fs::write(
+            root.join(".gitattributes"),
+            "tests/ export-ignore\nversion.txt export-subst\n",
+        )
+        .unwrap();
         repo(&["add", "."]);
         repo(&[
             "-c",
@@ -863,6 +870,13 @@ mod tests {
         );
         assert!(!was.join("src/new.ts").exists());
         assert!(!was.join(".git").exists());
+        // The tests folder is there and the placeholder is as committed.
+        assert!(was.join("tests/lib.test.ts").exists());
+        assert_eq!(
+            std::fs::read_to_string(was.join("version.txt")).unwrap(),
+            "$Format:%H$"
+        );
+        assert!(!was.with_extension("index").exists());
         discard(&was);
         assert!(!was.exists());
         // The project itself is as the run left it.
