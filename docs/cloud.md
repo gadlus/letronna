@@ -47,12 +47,23 @@ A web app gets its own address, `https://lc-<id>.letronna.si`.
 - It is awake at most eight hours a day.
 - You pay only while it is awake.
 
+## Containers
+
+A task can also run any public image, from Docker Hub, ghcr.io or quay.io. Ask for one ("host a Minecraft server for my friends", "run Postgres for this app") and the task sets it up and tests it.
+
+- **Ports.** A web port gets the app's address. A game or database port (tcp or udp) gets a public address such as `play.letronna.si:20001`, which the task's answer and the Cloud page show.
+- **Sleeping.** A container sleeps when nobody is connected and wakes on the first connection. A sleeping Minecraft server shows "Asleep. Join to wake it." in the server list, and the first player to join is asked to join again while it starts, in about 30 seconds. To keep one up all the time, ask for it to stay online. It's then billed by the hour like a service.
+- **Size.** Memory as for web apps and services, 0.25 to 2 CPUs, and up to 10 GB of disk for its files. A container that outgrows its disk is stopped, with a message saying so.
+- **Your files stay.** The thread's folder is the container's data folder (`/data`), so a world or a database is kept between sleeps. Its `.env` holds the container's settings.
+- **Isolation.** Each container runs in a sandbox with a kernel of its own (gVisor), never as root, and can't reach other containers or Letronna's servers.
+- **Known setups.** Minecraft Java (Paper or Fabric; you accept Minecraft's EULA first), open.mp and SA-MP servers, Postgres and Discord bots.
+
 ## Pricing
 
-Compute costs about $6 per GB-month, charged by the second. Model calls are billed like any hosted request. Every charge appears under Cloud on the [usage page](https://letronna.ai/dashboard/usage).
+Compute costs about $6 per GB-month, charged by the second. A container's files are free up to 1 GB; past that, storage is $0.10 per GB-month, charged by the hour. Model calls are billed like any hosted request. Every charge appears under Cloud on the [usage page](https://letronna.ai/dashboard/usage).
 
 ## Limits and data
 
-- **Not allowed**: mining, flooding and open ports. Only web traffic reaches the cloud. An abuse guard watches every container.
+- **Not allowed**: mining, flooding, sending mail, and attacking or scanning others. Only web traffic and a container's own public ports reach the cloud, with limits on connections per address. An abuse guard watches every container.
 - **Data**: a thread's data is deleted after 14 days unused, unless a worker in it is still running.
 - **Support access**: support can read a run only if you allow it with `letronna cloud support <run> on`, and every look is logged.
