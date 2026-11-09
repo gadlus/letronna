@@ -938,9 +938,9 @@ fn briefing(
     // set.
     text.push_str(&format!(
         "\n\nEnd your report with a table of one row per test, written {rows}. Then, on a \
-         line of its own as the report's very last line, the one command that runs your tests \
-         and no others from the project's root, with paths relative to it, written `Run: \
-         <command>`: one that names your test files or filters on a name all your tests share, \
+         line of its own as the report's very last line, the one command that, from the \
+         project's root, runs your tests and no others, with paths relative to it, written \
+         `Run: <command>`: one that names your test files or filters on a name all your tests share, \
          such as `go test -run LetronnaSpec ./pkg/`, never the project's whole suite, such as \
          `go test ./...`, since a test of the project's own that fails here says nothing of the \
          change; one that runs them once and exits rather than watching, installs nothing, and \
@@ -3691,7 +3691,9 @@ mod tests {
         let brief = brief("Save at /api/items/save.", &[], None, &[]);
         assert!(brief.contains("written `Run: <command>`"), "{brief}");
         assert!(
-            brief.contains("from the project's root, with paths relative to it"),
+            brief.contains(
+                "from the project's root, runs your tests and no others, with paths relative to it"
+            ),
             "{brief}"
         );
         assert!(
@@ -3701,7 +3703,7 @@ mod tests {
         // Its own tests alone: a test of the project's own can fail where
         // the driver runs the command for reasons of its own.
         assert!(
-            brief.contains("the one command that runs your tests and no others"),
+            brief.contains("the one command that, from the project's root, runs your tests"),
             "{brief}"
         );
         assert!(
