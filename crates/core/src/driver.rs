@@ -961,18 +961,22 @@ fn steps(
             }
             // Once the run has acted on the reports, the tester's tests are
             // run against its work by the driver itself, in a copy of the
-            // project, and what failed sent back; `RUNS` times at most, and
+            // project, and what failed sent back; `RUNS` times at most,
+            // counted whether they pass or fail, so the later checks that
+            // send the run back do not have them run again each time; and
             // with a round and budget left, as above.
             if listed
                 && tested < crate::spec_tests::RUNS
                 && report.rounds < spec.rounds
                 && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
-                && let Some(notice) = tested_work(spec, turn)
+                && crate::spec_tests::to_run(spec.id).is_some()
             {
                 tested += 1;
-                spec.transcript.conversation.messages.push(notice);
-                save(&mut spec.transcript)?;
-                continue;
+                if let Some(notice) = tested_work(spec, turn) {
+                    spec.transcript.conversation.messages.push(notice);
+                    save(&mut spec.transcript)?;
+                    continue;
+                }
             }
             // Before the Stop hooks, so they judge the answer that follows.
             if !verified && let Some(notice) = unchecked_edits(spec, turn, begun) {
@@ -2460,6 +2464,14 @@ fn tested_work(spec: &Spec, turn: &Turn) -> Option<Message> {
         return None;
     }
     let (kept, command) = crate::spec_tests::to_run(spec.id)?;
+    // A suite's worth of time, within half of what is left to the deadline,
+    // which does not cut a call the driver makes itself.
+    let limit = match spec.connection.deadline {
+        Some(deadline) => {
+            crate::spec_tests::TIMEOUT.min(deadline.saturating_duration_since(Instant::now()) / 2)
+        }
+        None => crate::spec_tests::TIMEOUT,
+    };
     // Through the gate, as the tester's own call to it went: what it would
     // put to the judge or the user is not run behind their back.
     let call = ToolCall {
@@ -2467,7 +2479,7 @@ fn tested_work(spec: &Spec, turn: &Turn) -> Option<Message> {
         name: "run_command".into(),
         arguments: json!({
             "command": command,
-            "timeout": crate::spec_tests::TIMEOUT.as_secs(),
+            "timeout": limit.as_secs(),
         })
         .to_string(),
     };
@@ -2489,7 +2501,12 @@ fn tested_work(spec: &Spec, turn: &Turn) -> Option<Message> {
         sandboxed,
         ..context(spec)
     };
-    let content = crate::spec_tests::ran(&kept, &command, &ctx)?;
+    let content = crate::spec_tests::ran(&kept, &command, &ctx, limit)?;
+    // The tests may have taken the time the fix needed: then the run is
+    // left to end with its first version rather than a half-made fix.
+    if !affords_review(spec) {
+        return None;
+    }
     Some(Message {
         role: "user".into(),
         content,
@@ -2614,8 +2631,19 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
     // Kept apart whatever the tester reported, so no patch of the project
     // takes them; the run puts them back to run them, and the driver runs
     // them against its work with the command the report gives.
+    // The command as the driver runs it elsewhere: the tester may have spelt
+    // out the folder it worked in.
+    let command = tested
+        .as_deref()
+        .and_then(crate::spec_tests::command)
+        .map(|command| {
+            let folders: Vec<&Path> = (copied.as_deref().into_iter()).chain(workspace).collect();
+            crate::spec_tests::relative(&command, &folders)
+        });
+    // Run against the work only where a copy of the project can be made,
+    // as one was for the tester.
+    let again = copied.is_some() && command.is_some();
     let kept = workspace.and_then(|workspace| {
-        let command = tested.as_deref().and_then(crate::spec_tests::command);
         let from = copied.as_deref().unwrap_or(workspace);
         crate::spec_tests::keep(spec.id, from, workspace, command)
     });
@@ -2626,8 +2654,8 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
     // run to run, where it kept any: a tester without the run's set-up wrote
     // them all the same.
     let tested = tested.and_then(|report| match crate::requirements::tabled(&report) {
-        true => Some(crate::spec_tests::told(&report, kept.as_ref())),
-        false => Some(crate::spec_tests::unrun(&report, kept.as_ref()?)),
+        true => Some(crate::spec_tests::told(&report, kept.as_ref(), again)),
+        false => Some(crate::spec_tests::unrun(&report, kept.as_ref()?, again)),
     });
     (reports, tested)
 }
