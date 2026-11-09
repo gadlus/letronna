@@ -2503,8 +2503,11 @@ fn tested_work(spec: &Spec, turn: &Turn) -> Option<Message> {
     };
     let content = crate::spec_tests::ran(&kept, &command, &ctx, limit)?;
     // The tests may have taken the time the fix needed: then the run is
-    // left to end with its first version rather than a half-made fix.
-    if !affords_review(spec) {
+    // left to end with its first version rather than a half-made fix. The
+    // fix alone needs less than a review and a fix did.
+    let left = (spec.connection.deadline)
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+    if left.is_some_and(|left| left < crate::requirements::REVIEW_TIME / 2) {
         return None;
     }
     Some(Message {

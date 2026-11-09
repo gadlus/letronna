@@ -57,8 +57,9 @@ const NAMED: usize = 10;
 /// quoted why they should not, or will not.
 pub(crate) const RUNS: usize = 2;
 
-/// How long the tester's tests may take when the driver runs them: a test
-/// suite's worth, cut sooner by the run's deadline as any command is.
+/// How long the tester's tests may take when the driver runs them at most:
+/// a test suite's worth; the driver gives less when less is left to the
+/// run's deadline, which does not cut a command run for no conversation.
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Characters of the tests' output the run is shown at most, from its end,
@@ -346,13 +347,18 @@ const PROSE: [&str; 8] = [
 /// Installers a `Run:` command may not call: run in a copy whose packages
 /// and builds are links into the project, they would change the project's
 /// own.
-const INSTALLS: [&str; 17] = [
+const INSTALLS: [&str; 23] = [
     "pip install",
     "pip3 install",
     "uv pip install",
     "uv sync",
+    "uv run",
+    "pipenv",
+    "conda ",
     "poetry install",
     "poetry add",
+    "setup.py develop",
+    "setup.py install",
     "npm install",
     "npm i ",
     "npm ci",
@@ -363,6 +369,7 @@ const INSTALLS: [&str; 17] = [
     "cargo install",
     "go install",
     "go get",
+    "make install",
     "apt-get",
 ];
 
@@ -375,12 +382,17 @@ pub(crate) fn command(report: &str) -> Option<String> {
     let given = report.lines().rev().find_map(|line| {
         let line = line.trim().trim_start_matches(['-', '*', '>', ' ']);
         let rest = line.strip_prefix("Run:")?.trim().trim_matches('*').trim();
-        let rest = match rest
-            .strip_prefix('`')
-            .and_then(|inner| inner.split_once('`'))
-        {
-            Some((inner, _)) => inner.trim(),
-            None => rest,
+        // One span of backticks holds the command, whatever follows it; a
+        // line with more than one is prose about commands, not one.
+        let rest = match rest.matches('`').count() {
+            0 => rest,
+            2 => rest
+                .trim_matches('`')
+                .split('`')
+                .next()
+                .unwrap_or_default()
+                .trim(),
+            _ => "",
         };
         (!rest.is_empty()).then(|| rest.to_owned())
     })?;
@@ -406,10 +418,43 @@ pub(crate) fn relative(command: &str, folders: &[&Path]) -> String {
         ];
         for path in spelt.into_iter().flatten() {
             let path = path.to_string_lossy();
-            text = text.replace(&format!("{path}/"), "./").replace(&*path, ".");
+            if path.len() > 1 {
+                text = folder_as_dot(&text, &path);
+            }
         }
     }
     text
+}
+
+/// `text` with `path` written as `.` wherever it stands as a whole path or
+/// the start of one: opening a word and followed by `/` or the word's end,
+/// so `/app` is rewritten in `/app/tests` and left in `src/app/tests` and
+/// `/apps`.
+fn folder_as_dot(text: &str, path: &str) -> String {
+    let opens = |before: &str| {
+        (before.chars().last())
+            .is_none_or(|c| c.is_whitespace() || matches!(c, '=' | '"' | '\'' | '(' | ':' | ','))
+    };
+    let ends = |after: &str| {
+        (after.chars().next()).is_none_or(|c| {
+            c == '/' || c.is_whitespace() || matches!(c, '"' | '\'' | ')' | ':' | ';' | ',')
+        })
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(path) {
+        let (before, from) = rest.split_at(at);
+        let after = &from[path.len()..];
+        out.push_str(before);
+        out.push_str(if opens(&out) && ends(after) {
+            "."
+        } else {
+            path
+        });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The tester's files kept for run `run` and the command that runs them,
@@ -475,11 +520,10 @@ fn run_command(
 /// the tester's tests `kept` run against its work; None when they passed.
 fn failed(kept: &Kept, command: &str, outcome: &Result<String, String>) -> Option<String> {
     let (ended, output) = match outcome {
-        // A command that passed ends its output with no exit code, which a
-        // note of where the whole output went can follow.
+        // A command that passed has no exit code line; a note of where the
+        // whole output went, or what the user's hooks said, can follow one.
         Ok(output) => {
-            let code =
-                (output.lines().rev().take(3)).find_map(|line| line.strip_prefix("[exit code "))?;
+            let code = (output.lines().rev()).find_map(|line| line.strip_prefix("[exit code "))?;
             let code = code.trim_end_matches(']');
             (format!("exited with code {code}"), output.as_str())
         }
@@ -1003,6 +1047,9 @@ mod tests {
         assert_eq!(command("Run: none, the tests could not run"), None);
         assert_eq!(command("Run: pip install -e . && pytest -q"), None);
         assert_eq!(command("Run: npm install && npx vitest run"), None);
+        assert_eq!(command("Run: uv run pytest -q"), None);
+        // More than one span of backticks is prose about commands.
+        assert_eq!(command("Run: `cd tests` then `pytest -q`"), None);
     }
 
     #[test]
@@ -1024,6 +1071,26 @@ mod tests {
             relative("npx vitest run", &[copy, project]),
             "npx vitest run"
         );
+        // Only where the folder stands as a path of its own: a project at
+        // `/app` leaves `src/app` and `/apps` alone.
+        let app = [Path::new("/app")];
+        assert_eq!(
+            relative("go test ./internal/app/...", &app),
+            "go test ./internal/app/..."
+        );
+        assert_eq!(
+            relative("pytest src/app/tests/t_letronna_spec.py", &app),
+            "pytest src/app/tests/t_letronna_spec.py"
+        );
+        assert_eq!(
+            relative("cd /apps/foo && pytest", &app),
+            "cd /apps/foo && pytest"
+        );
+        assert_eq!(
+            relative("pytest /app/tests/t.py --rootdir=/app", &app),
+            "pytest ./tests/t.py --rootdir=."
+        );
+        assert_eq!(relative("sh /app/app/run.sh", &app), "sh ./app/run.sh");
     }
 
     #[test]
