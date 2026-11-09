@@ -80,6 +80,7 @@ use crate::cancel::Cancel;
 use crate::tools::ToolContext;
 #[cfg(unix)]
 use std::collections::BTreeSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 #[cfg(any(unix, test))]
 use std::process::{Command, Stdio};
@@ -186,30 +187,34 @@ const SHOWN: usize = 3_000;
 /// the output always has a third.
 const FAILURES_SHOWN: usize = SHOWN * 2 / 3;
 
-/// Lines kept after each line naming a failure: an assertion's expected and
-/// actual values, or the frame that says where.
-const AFTER_FAILURE: usize = 4;
+/// Characters each failure's lines take at most, its own and those after
+/// it: an assertion's expected and actual values, a diff of a few lines, or
+/// the frame that says where.
+const FAILURE_SHOWN: usize = 600;
 
 /// Characters a line kept for a failure holds at most: a log line next to
 /// one can quote a whole SQL statement.
-const FAILURE_LINE: usize = 300;
+const FAILURE_LINE: usize = 200;
 
 /// What a line of a test runner's output starts with, past its indent, when
-/// it names a failure: Go's `--- FAIL` and `panic:`; unittest's `FAIL:`;
+/// it is the runner's word that a test failed or why (`Named::Verdict`):
+/// Go's `--- FAIL` and `panic:`; unittest's `FAIL:` and `ERROR: test`;
 /// jest's and vitest's `FAIL ` before a file, where Go's summary has a tab;
-/// pytest's `FAILED` and `E` lines, and Python's `Traceback`; jest's `●`
+/// pytest's `FAILED` and `E` lines; testify's `Error Trace:`; jest's `●`
 /// and the marks a list of tests puts by one that failed; jest's `Expected`
-/// and `Received`; cargo's `assertion`; rustc's `error:` and `error[`; and
-/// rspec's `Failure/Error:`. An exception's or testify's `Error` is read
-/// off the first word (`names_failure`).
-const FAILURE_STARTS: [&str; 18] = [
+/// and `Received`; cargo's `assertion`; rustc's `error:` and `error[`;
+/// rspec's `Failure/Error:`; PHPUnit's `Failed asserting that`; and a C
+/// or C++ `Assertion failed`. An assertion's error is read off the first
+/// word (`named`).
+const VERDICT_STARTS: [&str; 21] = [
     "--- FAIL",
     "panic:",
     "FAIL:",
+    "ERROR: test",
     "FAIL ",
     "FAILED",
     "E   ",
-    "Traceback",
+    "Error Trace:",
     "●",
     "✕",
     "×",
@@ -221,16 +226,24 @@ const FAILURE_STARTS: [&str; 18] = [
     "error:",
     "error[",
     "Failure/Error:",
+    "Failed asserting that",
+    "Assertion failed",
 ];
 
-/// What a line holds anywhere when it names a failure: cargo's `panicked
-/// at` and `... FAILED`, and Maven's `<<< FAILURE!`.
-const FAILURE_HOLDS: [&str; 3] = ["panicked at", " ... FAILED", "<<< FAILURE!"];
+/// What a runner's verdict line holds anywhere: cargo's `panicked at`,
+/// Maven's `<<< FAILURE!` and `<<< ERROR!`, and Go's `[build failed]`.
+const VERDICT_HOLDS: [&str; 4] = [
+    "panicked at",
+    "<<< FAILURE!",
+    "<<< ERROR!",
+    " [build failed]",
+];
 
-/// Bytes of a test command's output the driver reads at most, where a
-/// model's call keeps `tools::MAX_OUTPUT`: a long log is cut only past this,
-/// so the failures in its middle reach `excerpt`.
-const OUTPUT_READ: usize = 1024 * 1024;
+/// Bytes of a test command's output the driver reads at most: all that a
+/// run of it keeps (`tools::COMMAND_KEPT`), where a model's call keeps
+/// `tools::MAX_OUTPUT`, so the failures in a long log's middle reach
+/// `excerpt`. Past 4 MiB a pipe's middle is gone before anyone reads it.
+const OUTPUT_READ: usize = crate::tools::COMMAND_KEPT;
 
 /// Characters a `Run:` line's command may hold at most: one line of shell,
 /// not a script.
@@ -1328,11 +1341,12 @@ pub(crate) fn failure(outcome: &Result<String, String>) -> Option<(String, &str)
 /// the tester's tests `kept` run against its work; None when they passed.
 fn failed(kept: &Kept, command: &str, outcome: &Result<String, String>) -> Option<String> {
     let (ended, output) = failure(outcome)?;
+    let (shown, left_out) = quoted(output);
     Some(format!(
         "Your work as it stands was run against the tests a tester wrote from the request \
          alone, in a copy of the project with them put back at the paths they are kept from, \
-         so nothing in the project was touched: `{command}` {ended}. Its output, with `…` for \
-         lines left out:\n\n{}\n\nFix your work for each test that fails on what the \
+         so nothing in the project was touched: `{command}` {ended}. Its \
+         output{left_out}:\n\n{shown}\n\nFix your work for each test that fails on what the \
          request's words say, and run the tests again the same way. A test that expects what \
          the words do not say is answered by quoting them in your answer. One that calls the \
          code wrongly, such as with a name or import the request does not spell, or that \
@@ -1340,7 +1354,6 @@ fn failed(kept: &Kept, command: &str, outcome: &Result<String, String>) -> Optio
          fix where it is kept, in `{}`, since that is where it is run from; never something to \
          add to the project. If the command itself cannot run here, run the tests with the \
          set-up you found works. Then end with your whole answer again.",
-        excerpt(output),
         kept.dir.display()
     ))
 }
@@ -1360,17 +1373,17 @@ fn regressed(command: &str, ended: &str, output: &str, differ: &[String]) -> Str
         true => "none that a listing of the project shows".to_owned(),
         false => named.join(", "),
     };
+    let (shown, left_out) = quoted(output);
     format!(
         "Your first complete version, the work as it stood when you first said you were done, \
          passed `{command}`; what you ended with fails it. Both were run against the tests a \
          tester wrote from the request alone, each in a copy of the project with them put back \
          at the paths they are kept from, so nothing in the project was touched: your work as \
-         it stands {ended}. Its output, with `…` for lines left out:\n\n{}\n\nThe files that \
+         it stands {ended}. Its output{left_out}:\n\n{shown}\n\nThe files that \
          differ between that first version and your work as it stands: {changed}. Put back \
          what broke the test, unless the test expects what the request's words do not say: \
          then keep your change, and quote the words in your answer or say the request is \
-         silent on it. Then end with your whole answer again.",
-        excerpt(output)
+         silent on it. Then end with your whole answer again."
     )
 }
 
@@ -1518,73 +1531,120 @@ pub(crate) fn verdict(
 /// to run it once more, since a test can fail by chance, and that the test
 /// itself is not to go.
 pub(crate) fn broken(command: &str, output: &str) -> String {
+    let (shown, left_out) = quoted(output);
     format!(
-        "`{command}` passes on the project as it was and fails with your change. Its output, \
-         with `…` for lines left out:\n\n{}\n\nRun it once more first. If it still fails, \
+        "`{command}` passes on the project as it was and fails with your change. Its \
+         output{left_out}:\n\n{shown}\n\nRun it once more first. If it still fails, \
          then where the request's words change what that test expects, update the test's \
          expectation and quote the words in your answer; otherwise fix the code so it passes \
-         again. Do not delete, skip or weaken the test. Then end with your whole answer again.",
-        excerpt(output)
+         again. Do not delete, skip or weaken the test. Then end with your whole answer again."
     )
+}
+
+/// How a line of a test runner's output names a failure (`named`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Named {
+    /// The runner's own word that a test failed, or why.
+    Verdict,
+    /// An exception's name or a trace, which a test that passes can log
+    /// too, as a negative test or a page's script does.
+    Raised,
+}
+
+/// Lines jest heads what a test logged with: what follows, indented deeper
+/// or blank, is the test's own output and names no failure.
+const CONSOLE: [&str; 6] = [
+    "console.log",
+    "console.error",
+    "console.warn",
+    "console.info",
+    "console.debug",
+    "console.trace",
+];
+
+/// What a notice quotes of `output`, a test command's, as `excerpt` shows
+/// it, and the words saying that `…` stands for lines left out, where any
+/// were.
+fn quoted(output: &str) -> (String, &'static str) {
+    let shown = excerpt(output);
+    let note = match shown == output.trim_end() {
+        true => "",
+        false => ", with `…` for lines left out",
+    };
+    (shown, note)
 }
 
 /// What the run is shown of `output`, a test command's: all of it when it
 /// fits in `SHOWN` characters; otherwise, in their order, the lines naming
-/// a failure (`names_failure`), each with the `AFTER_FAILURE` lines after
-/// it, within `FAILURES_SHOWN`, and then as many whole lines of its end as
-/// the rest holds, with `…` for each run of lines left out. A runner's
-/// summary at the end names the failures but not why, and a log printed
-/// between the tests can push the why out of any tail.
+/// a failure (`named`), each with the lines after it up to `FAILURE_SHOWN`
+/// characters or `another_part` of the report, the runner's verdicts first and what was raised only in what
+/// they leave of `FAILURES_SHOWN`, and a failure's line shown once however
+/// often it repeats; then as many whole lines of its end as the rest holds, with `…`
+/// for each run of lines left out. A runner's summary at the end names the
+/// failures but not why, and a log printed between the tests can push the
+/// why out of any tail. A bare carriage return, as a progress bar prints,
+/// ends a line too.
 fn excerpt(output: &str) -> String {
     let output = output.trim_end();
     if output.chars().count() <= SHOWN {
         return output.to_owned();
     }
-    let lines: Vec<&str> = output.lines().collect();
+    let lines: Vec<&str> = (output.split('\n'))
+        .flat_map(|line| line.strip_suffix('\r').unwrap_or(line).split('\r'))
+        .collect();
+    let names = named_lines(&lines);
     let gap = "…\n".chars().count();
-    let mut picked: Vec<(usize, String)> = Vec::new();
+    let mut picked: BTreeMap<usize, String> = BTreeMap::new();
+    let mut seen = HashSet::new();
     let mut used = 0;
-    let mut until = None;
-    for (at, line) in lines.iter().enumerate() {
-        if names_failure(line) {
-            until = Some(at + AFTER_FAILURE);
+    for tier in [Named::Verdict, Named::Raised] {
+        for at in (0..lines.len()).filter(|at| names[*at] == Some(tier)) {
+            if picked.contains_key(&at) || seen.contains(lines[at].trim()) {
+                continue;
+            }
+            let mut block: Vec<(usize, String)> = Vec::new();
+            let mut size = 0;
+            for (next, line) in lines.iter().enumerate().skip(at) {
+                let shown = clipped(line);
+                let cost = shown.chars().count() + 1;
+                let over = size + cost > FAILURE_SHOWN || another_part(line);
+                if next > at && (over || picked.contains_key(&next)) {
+                    break;
+                }
+                size += cost;
+                block.push((next, shown));
+            }
+            if used + size + gap > FAILURES_SHOWN {
+                break;
+            }
+            used += size + gap;
+            for (next, _) in &block {
+                if names[*next].is_some() {
+                    seen.insert(lines[*next].trim());
+                }
+            }
+            picked.extend(block);
         }
-        if until.is_none_or(|until| at > until) {
-            continue;
-        }
-        let shown = match line.char_indices().nth(FAILURE_LINE) {
-            Some((cut, _)) => format!("{}…", &line[..cut]),
-            None => (*line).to_owned(),
-        };
-        let apart = picked.last().map_or(at > 0, |(last, _)| at > last + 1);
-        let cost = shown.chars().count() + 1 + if apart { gap } else { 0 };
-        if used + cost > FAILURES_SHOWN {
-            break;
-        }
-        used += cost;
-        picked.push((at, shown));
     }
     // The end, in whole lines, one `…` before it; a line picked already
     // costs nothing again. A last line too long for what is left shows its
-    // end.
+    // end, after a `…` of its own.
     let mut room = SHOWN.saturating_sub(used + gap);
-    let mut end: Vec<(usize, String)> = Vec::new();
     for at in (0..lines.len()).rev() {
-        if picked.iter().any(|(was, _)| *was == at) {
+        if picked.contains_key(&at) {
             continue;
         }
         let size = lines[at].chars().count() + 1;
         if size > room {
-            if at + 1 == lines.len() {
-                end.push((at, lines[at].chars().skip(size - room).collect()));
+            if at + 1 == lines.len() && room > 1 {
+                let end: String = lines[at].chars().skip(size - room + 1).collect();
+                picked.insert(at, format!("…{end}"));
             }
             break;
         }
         room -= size;
-        end.push((at, lines[at].to_owned()));
+        picked.insert(at, lines[at].to_owned());
     }
-    picked.extend(end);
-    picked.sort_by_key(|(at, _)| *at);
     let mut shown = String::new();
     let mut next = 0;
     for (at, line) in picked {
@@ -1599,28 +1659,112 @@ fn excerpt(output: &str) -> String {
     shown
 }
 
-/// Whether `line`, of a test runner's output, names a failure: it starts,
-/// past its indent, with one of `FAILURE_STARTS` other than jest's `●
-/// Console` heading a test's logs, holds one of `FAILURE_HOLDS`, or opens
-/// with a word ending in `Error` or `Exception`, as testify's `Error:` and
-/// an exception's name before its message do, or with mocha's count of
-/// what is failing. Never a mere mention of an error, which a log prints
-/// on every line, as `SQL logic error` or `record not found`.
-fn names_failure(line: &str) -> bool {
+/// Whether `line` starts another part of a runner's report, where a
+/// failure's lines end: another file's, as jest's and vitest's `PASS ` and
+/// `FAIL ` start one, or a test's logs, as jest's `● Console` and its
+/// `console.log` and the like do.
+fn another_part(line: &str) -> bool {
     let trimmed = line.trim_start();
-    if trimmed.starts_with("● Console") {
-        return false;
-    }
-    let mut words = trimmed.split_whitespace();
-    let first = words.next().unwrap_or_default().trim_end_matches(':');
-    let failing = first.parse::<u64>().is_ok() && words.next() == Some("failing");
-    FAILURE_STARTS
+    ["PASS ", "FAIL ", "● Console"]
         .iter()
         .any(|start| trimmed.starts_with(start))
-        || FAILURE_HOLDS.iter().any(|held| line.contains(held))
-        || first.ends_with("Error")
-        || first.ends_with("Exception")
-        || failing
+        || CONSOLE.contains(&trimmed.trim_end())
+}
+
+/// `line` cut to `FAILURE_LINE` characters, `…` marking the cut.
+fn clipped(line: &str) -> String {
+    match line.char_indices().nth(FAILURE_LINE) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line.to_owned(),
+    }
+}
+
+/// How each of `lines` names a failure, as `named` reads it, but none in a
+/// block jest heads with one of `CONSOLE`: the lines after the heading that
+/// are blank or indented deeper than it.
+fn named_lines(lines: &[&str]) -> Vec<Option<Named>> {
+    let mut console = None;
+    let mut names = Vec::with_capacity(lines.len());
+    for line in lines {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if console.is_some_and(|depth| trimmed.is_empty() || indent > depth) {
+            names.push(None);
+            continue;
+        }
+        console = CONSOLE.contains(&trimmed.trim_end()).then_some(indent);
+        names.push(console.is_none().then(|| named(line)).flatten());
+    }
+    names
+}
+
+/// How `line`, of a test runner's output, names a failure. As the runner's
+/// verdict when it starts, past its indent, with one of `VERDICT_STARTS`
+/// other than jest's `● Console` heading a test's logs, holds one of
+/// `VERDICT_HOLDS`, ends in ` FAILED` as cargo's and Gradle's lines for a
+/// test do, gives a Go file's line and column as a build error does, holds
+/// a TypeScript error's code, or opens with mocha's count of what is
+/// failing, a numbered failure as PHPUnit and mocha list them, or an
+/// assertion's error. As raised when it opens with `Traceback` or another
+/// word ending in `Error` or `Exception`. Never for a mere mention of an
+/// error, which a log prints on every line, as `SQL logic error` or
+/// `record not found`.
+fn named(line: &str) -> Option<Named> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("● Console") {
+        return None;
+    }
+    let mut words = trimmed.split_whitespace();
+    let first = words.next().unwrap_or_default();
+    let name = first.trim_end_matches(':');
+    let counted = name.parse::<u64>().is_ok() && words.next() == Some("failing");
+    let numbered = (first.strip_suffix(')'))
+        .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()));
+    let asserted = [
+        "AssertionError",
+        "AssertionFailedError",
+        "ComparisonFailure",
+    ]
+    .iter()
+    .any(|error| name.ends_with(error));
+    let verdict = VERDICT_STARTS
+        .iter()
+        .any(|start| trimmed.starts_with(start))
+        || VERDICT_HOLDS.iter().any(|held| line.contains(held))
+        || trimmed.trim_end().ends_with(" FAILED")
+        || go_position(trimmed)
+        || typescript_code(line)
+        || counted
+        || numbered
+        || asserted;
+    if verdict {
+        return Some(Named::Verdict);
+    }
+    let raised = name.ends_with("Error") || name.ends_with("Exception");
+    (raised || trimmed.starts_with("Traceback")).then_some(Named::Raised)
+}
+
+/// Whether `line` gives a Go file's line and column before a message, as
+/// `go build` and `go vet` print an error: `x_test.go:12:9: undefined: F`.
+/// A log's `x.go:406 record not found` gives no column.
+fn go_position(line: &str) -> bool {
+    let digits = |text: &str| (text.find(|c: char| !c.is_ascii_digit())).filter(|end| *end > 0);
+    line.match_indices(".go:").any(|(at, found)| {
+        let rest = &line[at + found.len()..];
+        let Some(row) = digits(rest) else {
+            return false;
+        };
+        let Some(rest) = rest[row..].strip_prefix(':') else {
+            return false;
+        };
+        digits(rest).is_some_and(|column| rest[column..].starts_with(": "))
+    })
+}
+
+/// Whether `line` holds a TypeScript compiler's error code, `error TS2304`.
+fn typescript_code(line: &str) -> bool {
+    (line.match_indices("error TS"))
+        .any(|(at, found)| line[at + found.len()..].starts_with(|c: char| c.is_ascii_digit()))
 }
 
 /// The task of the helper making a second attempt at `request` in a folder
@@ -1632,12 +1776,13 @@ fn names_failure(line: &str) -> bool {
 /// nothing of where the tests are or what they are called, so it builds to
 /// the request rather than to them.
 pub(crate) fn attempt(request: &str, command: &str, ended: &str, output: &str) -> String {
+    let (shown, left_out) = quoted(output);
     let mut text = format!(
         "Make the change the request below asks for, from scratch, in the project in your \
          working folder, which holds the project as it was before anyone began on it. Another \
          agent's attempt at the same request did not pass the tests a tester wrote from the \
-         request's words alone: `{command}` {ended}, and this is its output, with `…` for \
-         lines left out:\n\n{}\n\n\
+         request's words alone: `{command}` {ended}, and this is its \
+         output{left_out}:\n\n{shown}\n\n\
          That attempt is not in your folder and not yours to look for or build on. Read the \
          project as it is, take from the request's words what should happen in each case they \
          name, and build it so that a caller of the project gets that, end to end, through the \
@@ -1653,8 +1798,7 @@ pub(crate) fn attempt(request: &str, command: &str, ended: &str, output: &str) -
          done, no scratch files, and no file of yours whose name holds `{MARKER}`. The folder is \
          not a git repository, so there is no history to read in it. End with what you changed \
          and why.\n\n\
-         The request, word for word:\n",
-        excerpt(output)
+         The request, word for word:\n"
     );
     text.push_str(request.trim());
     text
@@ -3322,8 +3466,7 @@ mod tests {
         assert!(
             text.starts_with(
                 "`cargo test -p meta` passes on the project as it was and fails with your \
-                 change. Its output, with `…` for lines left out:\n\n\
-                 test parses ... FAILED\n\n[exit code 101]\n\n\
+                 change. Its output:\n\ntest parses ... FAILED\n\n[exit code 101]\n\n\
                  Run it once more first. If it still fails, then where the request's words \
                  change what that test expects, update the test's expectation and quote the \
                  words in your answer; otherwise fix the code so it passes again. Do not \
@@ -3458,7 +3601,7 @@ mod tests {
         // The session's opening and the logs past the failure's own few
         // lines are left out.
         assert!(!shown.contains("collected 30 items"), "{shown}");
-        assert!(!shown.contains("item 1,"), "{shown}");
+        assert!(!shown.contains("item 20,"), "{shown}");
         assert!(shown.chars().count() <= SHOWN, "{}", shown.chars().count());
     }
 
@@ -3530,40 +3673,214 @@ mod tests {
             "    --- FAIL: TestA/sub (0.00s)",
             "panic: runtime error: index out of range [recovered]",
             "        \tError Trace:\t/app/a_test.go:12",
-            "        \tError:      \tNot equal: ",
             "E       assert 3 == 4",
             "FAILED tests/test_a.py::test_b - assert 3 == 4",
-            "Traceback (most recent call last):",
-            "ValueError: bad input",
             "  ● sum › adds",
             "    ✕ adds (3 ms)",
             "  × adds 1ms",
             "    Expected: 4",
             "  2 failing",
             "     AssertionError [ERR_ASSERTION]: 3 == -1",
+            "org.opentest4j.AssertionFailedError: expected: <5> but was: <1>",
             "thread 'tests::b' panicked at src/lib.rs:10:9:",
             "test tests::b ... FAILED",
             "assertion `left == right` failed",
             "error[E0425]: cannot find value `x` in this scope",
             "FAIL: test_b (tests.test_a.T)",
+            "ERROR: test_c (tests.test_a.T)",
             " FAIL  src/a.test.ts > adds",
             "     Failure/Error: expect(x).to eq(1)",
+            "./drift_letronna_spec_test.go:12:9: undefined: NewDriftService",
+            "FAIL\tgithub.com/acme/backend [build failed]",
+            "CartTest > totalIsSum() FAILED",
+            "Failed asserting that 1 matches expected 5.",
+            "1) Tests\\CartTest::testTotal",
+            "[ERROR] totalIsSum(com.acme.CartTest)  Time elapsed: 0.01 s  <<< FAILURE!",
+            "[ERROR] loads(com.acme.CartTest)  Time elapsed: 0.01 s  <<< ERROR!",
+            "src/cart.ts(3,5): error TS2304: Cannot find name 'total'.",
         ] {
-            assert!(names_failure(line), "{line}");
+            assert_eq!(named(line), Some(Named::Verdict), "{line}");
+        }
+        // What a passing test can log too comes after the verdicts.
+        for line in [
+            "Traceback (most recent call last):",
+            "ValueError: bad input",
+            "        \tError:      \tNot equal: ",
+            "java.lang.IllegalArgumentException: quantity must be positive",
+            "Error: Not implemented: HTMLCanvasElement.prototype.getContext",
+        ] {
+            assert_eq!(named(line), Some(Named::Raised), "{line}");
         }
         for line in [
             "2026/11/09 11:46:38 /tmp/a.go:406 record not found",
             "2026/11/09 11:46:38 /tmp/a.go:88 SQL logic error: no such table (1)",
             "[0.915ms] [rows:0] SELECT * FROM `drifts`",
+            "    drift_test.go:45: a log line",
             "FAIL\tgithub.com/acme/backend\t2.309s",
             "  ● Console",
             "DEBUG    cart:cart.py:20 error budget 0",
             "test result: ok. 12 passed; 0 failed",
             "ok  \tgithub.com/acme/backend\t0.2s",
             "Errors: 0",
+            "[ERROR] Tests run: 3, Failures: 1, Errors: 0, Skipped: 0",
         ] {
-            assert!(!names_failure(line), "{line}");
+            assert_eq!(named(line), None, "{line}");
         }
+        // Nor does anything a test logged under jest's heading.
+        let logged = [
+            "  console.error",
+            "    Error: Not implemented",
+            "",
+            "  ● Chart › draws",
+        ];
+        assert_eq!(
+            named_lines(&logged),
+            [None, None, None, Some(Named::Verdict)]
+        );
+    }
+
+    /// `lines` of `filler` before and after `middle`, ending in `summary`.
+    fn amid(filler: &str, lines: usize, middle: &str, summary: &str) -> String {
+        let noise = format!("{filler}\n").repeat(lines);
+        format!("{noise}{middle}{noise}{summary}")
+    }
+
+    #[test]
+    fn a_jest_failure_is_shown_before_the_errors_a_page_logged() {
+        let console = "    console.error\n      Error: Not implemented: HTMLCanvasElement.prototype.\
+                       getContext (without installing the canvas npm package)\n          at \
+                       module.exports (node_modules/jsdom/lib/jsdom/browser/not-implemented.js:9:17)\n\n";
+        let raw = "Error: Not implemented: navigation (except hash changes)\n    at \
+                   module.exports (node_modules/jsdom/lib/jsdom/browser/not-implemented.js:9:17)\n";
+        let output = format!(
+            " FAIL  src/chart.letronna_spec.test.js\n  ● Console\n\n{}{}  ● Chart › draws the \
+             total\n\n    expect(received).toBe(expected) // Object.is equality\n\n    \
+             Expected: 42\n    Received: 0\n\n{}Tests:       1 failed, 3 passed, 4 total\n\
+             [exit code 1]",
+            console.repeat(20),
+            raw.repeat(20),
+            "  console.log\n    rendered the chart\n\n".repeat(60),
+        );
+        let shown = excerpt(&output);
+        assert!(shown.contains("  ● Chart › draws the total\n"), "{shown}");
+        assert!(
+            shown.contains("    Expected: 42\n    Received: 0\n"),
+            "{shown}"
+        );
+        // What a page logged is no failure, and what it raised shows once.
+        assert!(!shown.contains("HTMLCanvasElement"), "{shown}");
+        let raised = shown.matches("navigation (except hash changes)").count();
+        assert!((1..=5).contains(&raised), "{shown}");
+        assert!(shown.ends_with("Tests:       1 failed, 3 passed, 4 total\n[exit code 1]"));
+    }
+
+    #[test]
+    fn a_maven_failure_is_shown_before_the_exceptions_its_tests_logged() {
+        let logged = "java.lang.IllegalArgumentException: quantity must be positive\n\
+                      \tat com.acme.Cart.add(Cart.java:20)\n\
+                      \tat com.acme.CartTest.rejectsNegative(CartTest.java:30)\n";
+        let output = format!(
+            "{}[ERROR] Tests run: 3, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.05 s \
+             <<< FAILURE! - in com.acme.CartTest\n[ERROR] totalIsSum(com.acme.CartTest)  Time \
+             elapsed: 0.01 s  <<< FAILURE!\norg.opentest4j.AssertionFailedError: expected: <5> \
+             but was: <1>\n\tat com.acme.CartTest.totalIsSum(CartTest.java:12)\n{}[INFO] BUILD \
+             FAILURE\n[exit code 1]",
+            logged.repeat(40),
+            "[INFO] Downloading from central: https://repo.example/artifact.pom\n".repeat(60),
+        );
+        let shown = excerpt(&output);
+        assert!(
+            shown.contains("totalIsSum(com.acme.CartTest)  Time elapsed: 0.01 s  <<< FAILURE!\n"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("AssertionFailedError: expected: <5> but was: <1>"),
+            "{shown}"
+        );
+        assert!(
+            shown.ends_with("[INFO] BUILD FAILURE\n[exit code 1]"),
+            "{shown}"
+        );
+        assert!(shown.chars().count() <= SHOWN, "{}", shown.chars().count());
+    }
+
+    #[test]
+    fn a_diffs_values_are_shown_past_its_blank_lines() {
+        let failure = "  ● Cart › totals\n\n    expect(received).toEqual(expected) // deep \
+                       equality\n\n    - Expected  - 1\n    + Received  + 1\n\n      Object {\n\
+                       \x20   -   \"total\": 5,\n    +   \"total\": 1,\n      }\n\n";
+        let output = amid(
+            "    console.log at render",
+            200,
+            failure,
+            "Tests:       1 failed, 1 total\n[exit code 1]",
+        );
+        let shown = excerpt(&output);
+        assert!(
+            shown.contains("    -   \"total\": 5,\n    +   \"total\": 1,\n"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_go_build_error_is_shown_past_a_long_download_log() {
+        let shown = excerpt(&amid(
+            "go: downloading github.com/acme/orm v1.2.3",
+            100,
+            "# github.com/acme/backend/services\n\
+             ./drift_letronna_spec_test.go:12:9: undefined: NewDriftService\n",
+            "FAIL\tgithub.com/acme/backend/services [build failed]\n[exit code 1]",
+        ));
+        assert!(
+            shown.contains("\n./drift_letronna_spec_test.go:12:9: undefined: NewDriftService\n"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_long_last_line_and_a_progress_bar_are_cut_where_they_show() {
+        let last = format!("{}the end", "x".repeat(2 * SHOWN));
+        let shown = excerpt(&last);
+        assert!(shown.starts_with("…x"), "{shown}");
+        assert!(shown.ends_with("the end"), "{shown}");
+        assert!(shown.chars().count() <= SHOWN, "{}", shown.chars().count());
+        // Each redraw a carriage return makes is a line of its own.
+        let bars: String = (0..400).map(|at| format!("\rdownloading {at}%")).collect();
+        let output = format!("{bars}\n--- FAIL: TestA (0.00s)\n{bars}\nFAIL\n[exit code 1]");
+        let shown = excerpt(&output);
+        assert!(
+            shown.starts_with("…\n--- FAIL: TestA (0.00s)\n\ndownloading 0%\n"),
+            "{shown}"
+        );
+        assert!(
+            shown.ends_with("downloading 399%\nFAIL\n[exit code 1]"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn the_notice_says_lines_were_left_out_only_when_they_were() {
+        let short = Ok("--- FAIL: TestA (0.00s)\nFAIL\n[exit code 1]".to_owned());
+        let kept = Kept {
+            dir: PathBuf::from("/tmp/kept"),
+            files: vec!["a_letronna_spec_test.go".into()],
+        };
+        let whole = failed(&kept, "go test ./...", &short).unwrap();
+        assert!(
+            whole.contains("exited with code 1. Its output:\n\n--- FAIL"),
+            "{whole}"
+        );
+        let long = Ok(amid(
+            "log",
+            2000,
+            "--- FAIL: TestA (0.00s)\n",
+            "FAIL\n[exit code 1]",
+        ));
+        let cut = failed(&kept, "go test ./...", &long).unwrap();
+        assert!(
+            cut.contains("Its output, with `…` for lines left out:\n\n…\n--- FAIL"),
+            "{cut}"
+        );
     }
 
     #[cfg(unix)]
@@ -4351,6 +4668,40 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_failure_past_megabytes_of_log_reaches_the_notice() {
+        let root = Scratch::new("spec-tests-huge-log");
+        // Past the 4 MiB a pipe keeps, so the run itself leaves a gap, and
+        // the failure in the 3 MiB it keeps of the end.
+        let noise = |lines: usize| format!("yes 'record not found in drifts' | head -n {lines}");
+        std::fs::write(
+            root.join("letronna_spec_test.sh"),
+            format!(
+                "{}\necho '--- FAIL: TestDeep (0.00s)'\n{}\nexit 1\n",
+                noise(100_000),
+                noise(70_000)
+            ),
+        )
+        .unwrap();
+        let command = "sh letronna_spec_test.sh".to_owned();
+        let kept = keep(147, &root, &root, Some(command.clone())).unwrap();
+        let ctx = ToolContext::of(&crate::chat::Connection {
+            workspace: Some(root.to_path_buf()),
+            ..Default::default()
+        });
+        let ran = outcome_in(&kept, &command, &root, &ctx, TIMEOUT).unwrap();
+        let output = ran.as_deref().unwrap();
+        assert!(output.len() > 2 * 1024 * 1024, "{}", output.len());
+        assert!(output.contains(" left out]\n"));
+        let notice = failed(&kept, &command, &ran).unwrap();
+        assert!(
+            notice.contains("\n--- FAIL: TestDeep (0.00s)\n"),
+            "{notice}"
+        );
+        tidy(147);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn the_kept_tests_are_run_in_the_attempts_own_folder_and_taken_away_after() {
         let root = Scratch::new("spec-tests-outcome-in");
         assert!(git(&root, &["init", "-q"]).is_some());
@@ -4821,10 +5172,7 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains(&format!("src/f{DIFFERING:02}.rs")), "{text}");
-        assert!(
-            text.contains("Its output, with `…` for lines left out:\n\nboom\n\n"),
-            "{text}"
-        );
+        assert!(text.contains("Its output:\n\nboom\n\n"), "{text}");
         let none = regressed("sh t.sh", "did not finish", "", &[]);
         assert!(
             none.contains("as it stands: none that a listing of the project shows. Put back"),

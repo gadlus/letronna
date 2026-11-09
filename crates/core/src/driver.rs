@@ -9225,8 +9225,7 @@ pub(crate) mod tests {
         assert!(
             notice.content.starts_with(
                 "`sh check.sh` passes on the project as it was and fails with your change. Its \
-                 output, with `…` for lines left out:\n\nnotes.txt lacks hello\n\
-                 [exit code 1]\n\nRun it once more first. If it still fails, then where the \
+                 output:\n\nnotes.txt lacks hello\n[exit code 1]\n\nRun it once more first. If it still fails, then where the \
                  request's words change what that test expects, update the test's \
                  expectation and quote the words in your answer; otherwise fix the code so it \
                  passes again. Do not delete, skip or weaken the test."

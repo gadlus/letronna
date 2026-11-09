@@ -376,6 +376,10 @@ const SPILL_BYTES: usize = 4 * 1024 * 1024;
 /// command printing gigabytes keeps no more than 8 MiB for its two pipes.
 const KEEP_HEAD: usize = 1024 * 1024;
 const KEEP_TAIL: usize = 3 * 1024 * 1024;
+/// The most a command's result holds before any cut: what is kept of both
+/// its pipes, with room for the lines Letronna adds around them. A caller
+/// keeping this much (`Caller::keeps`) has all that the run kept.
+pub(crate) const COMMAND_KEPT: usize = 2 * (KEEP_HEAD + KEEP_TAIL) + 64 * 1024;
 /// A command's output that outgrows what is kept is saved to disk as it is
 /// read, up to this many bytes for its two pipes together: far past what a
 /// model pages through, while a command printing without end still costs
@@ -1079,9 +1083,13 @@ pub(crate) fn run_found(
     }
     out.push_str(&note);
     out.push_str(&heard);
-    let said = crate::hooks::after(hooks, tool.name(), &args, &out, ctx);
+    // A caller keeping more reads the output itself; the user's hooks and
+    // the plugins hear it as any call's is cut.
+    let command = tool.name() == "run_command";
+    let said = crate::hooks::after(hooks, tool.name(), &args, &as_cut(&out, ctx, command), ctx);
     out.push_str(&said);
-    let plugged = crate::plugins::code::after(tool.name(), &args, &out, took, ctx);
+    let seen = as_cut(&out, ctx, command);
+    let plugged = crate::plugins::code::after(tool.name(), &args, &seen, took, ctx);
     out.push_str(&plugged);
     Ok(out)
 }
@@ -1236,6 +1244,20 @@ fn fit(out: String, ctx: &ToolContext, command: bool) -> String {
         return keep_errors(out, max, &note);
     }
     keep_ends(out, max, &note)
+}
+
+/// `out` as a call made for a model holds it: cut to `MAX_OUTPUT` as `fit`
+/// cuts, `command`'s keeping the lines that look like errors, where `ctx`'s
+/// caller keeps more and it is longer. What the user's hooks and the
+/// plugins are given, whoever made the call.
+fn as_cut<'a>(out: &'a str, ctx: &ToolContext, command: bool) -> Cow<'a, str> {
+    if ctx.caller.keeps.is_none() || out.len() <= MAX_OUTPUT {
+        return Cow::Borrowed(out);
+    }
+    Cow::Owned(match command {
+        true => keep_errors(out.to_owned(), MAX_OUTPUT, ""),
+        false => keep_ends(out.to_owned(), MAX_OUTPUT, ""),
+    })
 }
 
 /// The most of a cut command output's room that lines from the part cut may
@@ -1407,17 +1429,24 @@ fn keep_ends_around(text: String, gaps: &[Gap], max: usize, note: &str) -> Strin
     let left = &text[head..tail];
     let lines = left.lines().count() + gaps.iter().map(|g| g.lines).sum::<usize>();
     let bytes = left.len() + gaps.iter().map(|g| g.bytes).sum::<usize>();
-    let unit = if lines == 1 { "line" } else { "lines" };
     let gap = if head == 0 || text[..head].ends_with('\n') {
         ""
     } else {
         "\n"
     };
     format!(
-        "{}{gap}… [{lines} {unit} ({bytes} bytes) left out{note}]\n{}",
+        "{}{gap}{}{}",
         &text[..head],
+        left_out(lines, bytes, note),
         &text[tail..]
     )
+}
+
+/// The line standing for `lines` lines and `bytes` bytes of output left out,
+/// ending in `note`.
+fn left_out(lines: usize, bytes: usize, note: &str) -> String {
+    let unit = if lines == 1 { "line" } else { "lines" };
+    format!("… [{lines} {unit} ({bytes} bytes) left out{note}]\n")
 }
 
 /// Where the last line that ends by `at` ends, or `at` itself on a line
@@ -2119,7 +2148,7 @@ fn run_shell(command: &str, cwd: Option<&Path>, cancel: &Cancel) -> Result<Strin
         shell(command, cwd),
         command,
         cancel,
-        None,
+        Keeping::default(),
         COMMAND_TIMEOUT,
         None,
         None,
@@ -2137,7 +2166,15 @@ pub(crate) fn run_shell_in(
 ) -> Result<String, String> {
     let cmd = shell(command, Some(cwd));
     let (owner, sooner) = (owner_at_limit(ctx), sooner(limit, ctx));
-    run_shell_saving(cmd, command, &ctx.cancel, None, limit, owner, sooner)
+    run_shell_saving(
+        cmd,
+        command,
+        &ctx.cancel,
+        Keeping::default(),
+        limit,
+        owner,
+        sooner,
+    )
 }
 
 /// The conversation a foreground command run in `ctx` becomes a job of when
@@ -2238,6 +2275,23 @@ struct SaveTo {
     cap: usize,
 }
 
+/// What a command's run keeps of its output: `max` bytes in its result,
+/// `MAX_OUTPUT` unless its caller keeps more (`Caller::keeps`), and a cut
+/// one saved whole to `save`, where there is one.
+struct Keeping {
+    max: usize,
+    save: Option<SaveTo>,
+}
+
+impl Default for Keeping {
+    fn default() -> Self {
+        Self {
+            max: MAX_OUTPUT,
+            save: None,
+        }
+    }
+}
+
 /// Runs `command` in `dir`, in the sandbox for `cwd`, the project, and the
 /// folders `added` beside it, as `run_shell_saving` runs any other, and says
 /// in the result that it did.
@@ -2249,12 +2303,12 @@ fn run_sandboxed(
     added: &[PathBuf],
     dir: &Path,
     cancel: &Cancel,
-    save: Option<SaveTo>,
+    keeping: Keeping,
     limit: Duration,
 ) -> Result<String, String> {
     let (policy, _scratch) = crate::sandbox::Policy::for_project(cwd, added)?;
     let wrapped = crate::sandbox::here().wrap(&shell(command, Some(dir)), &policy)?;
-    match run_shell_saving(wrapped, command, cancel, save, limit, None, None) {
+    match run_shell_saving(wrapped, command, cancel, keeping, limit, None, None) {
         Ok(text) => Ok(crate::sandbox::noted(&text)),
         Err(e) => Err(crate::sandbox::noted(&e)),
     }
@@ -2270,14 +2324,14 @@ fn run_shell_saving(
     cmd: std::process::Command,
     command: &str,
     cancel: &Cancel,
-    save: Option<SaveTo>,
+    keeping: Keeping,
     limit: Duration,
     owner: Option<u64>,
     sooner: Option<(Duration, Option<Cut>)>,
 ) -> Result<String, String> {
-    let result = run_shell_into(cmd, command, cancel, save.as_ref(), limit, owner, sooner);
+    let result = run_shell_into(cmd, command, cancel, &keeping, limit, owner, sooner);
     // What the pipes were streamed to only goes into the saved file.
-    if let Some(save) = &save {
+    if let Some(save) = &keeping.save {
         for pipe in PIPE_NAMES {
             let _ = std::fs::remove_file(save.path.with_extension(pipe));
         }
@@ -2299,12 +2353,13 @@ fn run_shell_into(
     mut cmd: std::process::Command,
     command: &str,
     cancel: &Cancel,
-    save: Option<&SaveTo>,
+    keeping: &Keeping,
     limit: Duration,
     owner: Option<u64>,
     sooner: Option<(Duration, Option<Cut>)>,
 ) -> Result<String, String> {
     use std::process::Stdio;
+    let save = keeping.save.as_ref();
     let _running = Running::start();
     // Grouped the way a job's shell is, so one moved to the background can
     // be stopped with everything it started.
@@ -2498,7 +2553,8 @@ fn run_shell_into(
         }
     }
     if let (Some(log), Some(owner), Some(tree)) = (log, owner, tree) {
-        let so_far = cut_around(text.clone(), &gaps, &note);
+        // For the job's log, which a model reads.
+        let so_far = cut_around(text.clone(), &gaps, &note, MAX_OUTPUT);
         // In the log before the job exists, so its exit notice cannot miss
         // it; what the readers added since the hand-over came after it.
         if let Ok(mut log) = log.lock() {
@@ -2552,7 +2608,7 @@ fn run_shell_into(
             gap.at += moved.len();
         }
     }
-    Ok(cut_around(text, &gaps, &note))
+    Ok(cut_around(text, &gaps, &note, keeping.max))
 }
 
 /// Whether `child`, not yet reaped, is stopped for reading from or setting up
@@ -2579,15 +2635,31 @@ fn stopped_at_terminal(child: &std::process::Child) -> bool {
         && matches!(unsafe { info.si_status() }, libc::SIGTTIN | libc::SIGTTOU)
 }
 
-/// `text` cut to `MAX_OUTPUT` around the output left out at `gaps`, with
-/// `note` on the marker, or as it is when nothing was.
-fn cut_around(text: String, gaps: &[Gap], note: &str) -> String {
+/// `text` cut to `max` around the output left out at `gaps`, with `note` on
+/// the marker, or as it is when nothing was. Where `text` and a marker at
+/// each gap fit in `max`, as for a caller keeping all a run kept, each gap
+/// is marked where it is and nothing more is cut, so the end of one pipe
+/// stays beside the start of the other.
+fn cut_around(text: String, gaps: &[Gap], note: &str, max: usize) -> String {
     if gaps.is_empty() {
+        return text;
+    }
+    if text.len() + gaps.len() * (MARKER_ROOM + note.len()) <= max {
+        let mut text = text;
+        for gap in gaps.iter().rev() {
+            let apart = if gap.at == 0 || text[..gap.at].ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            let line = left_out(gap.lines, gap.bytes, note);
+            text.insert_str(gap.at, &format!("{apart}{line}"));
+        }
         return text;
     }
     // Only the command's run knows where the gaps are, so it makes the cut,
     // and the one `run` makes then finds the result short enough.
-    keep_ends_around(text, gaps, MAX_OUTPUT, note)
+    keep_ends_around(text, gaps, max, note)
 }
 
 /// Puts a command's output together in `save` as the model would read it
@@ -3347,14 +3419,18 @@ impl Tool for RunCommand {
                 path,
                 cap: PIPE_SPILL_BYTES,
             });
+            let keeping = Keeping {
+                max: ctx.caller.keeps.unwrap_or(MAX_OUTPUT),
+                save,
+            };
             // Last before it runs, so as little as can be falls between.
             let watch = crate::snapshot::watch(command, &dir, cwd, ctx);
             let out = if ctx.sandboxed {
-                run_sandboxed(command, cwd, &ctx.added, &dir, &ctx.cancel, save, limit)
+                run_sandboxed(command, cwd, &ctx.added, &dir, &ctx.cancel, keeping, limit)
             } else {
                 let (owner, sooner) = (owner_at_limit(ctx), sooner(limit, ctx));
                 let cmd = shell(command, Some(&dir));
-                run_shell_saving(cmd, command, &ctx.cancel, save, limit, owner, sooner)
+                run_shell_saving(cmd, command, &ctx.cancel, keeping, limit, owner, sooner)
             };
             let first = out.as_ref().ok().and_then(|text| text.lines().next());
             let moved = first.is_some_and(|line| line.contains(MOVED));
@@ -7090,7 +7166,15 @@ mod tests {
     fn run_for(command: &str, limit: Duration, owner: Option<u64>) -> Result<String, String> {
         let dir = std::env::temp_dir();
         let cmd = shell(command, Some(&dir));
-        run_shell_saving(cmd, command, &Cancel::default(), None, limit, owner, None)
+        run_shell_saving(
+            cmd,
+            command,
+            &Cancel::default(),
+            Keeping::default(),
+            limit,
+            owner,
+            None,
+        )
     }
 
     /// The job a command moved to the background became, from what the
@@ -7773,7 +7857,7 @@ mod tests {
             shell(command, Some(&dir)),
             command,
             &cancel,
-            None,
+            Keeping::default(),
             COMMAND_TIMEOUT,
             Some(7_703),
             None,
@@ -7807,7 +7891,7 @@ mod tests {
             shell(command, Some(&dir)),
             command,
             &Cancel::default(),
-            None,
+            Keeping::default(),
             Duration::from_secs(20),
             Some(7_704),
             None,
@@ -8581,6 +8665,52 @@ mod tests {
     }
 
     #[test]
+    fn a_caller_keeping_all_a_run_kept_has_each_gap_marked_where_it_is() {
+        let text = "out start\nout end\n[stderr]\nerr start\nerr end\n".to_owned();
+        let gaps = [
+            Gap {
+                at: 10,
+                bytes: 100,
+                lines: 5,
+            },
+            Gap {
+                at: 37,
+                bytes: 50,
+                lines: 2,
+            },
+        ];
+        assert_eq!(
+            cut_around(text, &gaps, "", COMMAND_KEPT),
+            "out start\n… [5 lines (100 bytes) left out]\nout end\n[stderr]\nerr start\n\
+             … [2 lines (50 bytes) left out]\nerr end\n"
+        );
+        // Past what a model's call keeps, the two ends are kept around them.
+        let long = format!("{}{}", long_text(), long_text());
+        let gaps = [Gap {
+            at: long_text().len(),
+            bytes: 100,
+            lines: 5,
+        }];
+        let cut = cut_around(long, &gaps, "", MAX_OUTPUT);
+        assert!(cut.len() <= MAX_OUTPUT, "{}", cut.len());
+    }
+
+    #[test]
+    fn hooks_hear_a_long_output_as_a_models_call_would() {
+        let mut ctx = ToolContext::default();
+        let long = long_text();
+        assert!(matches!(as_cut(&long, &ctx, true), Cow::Borrowed(_)));
+        ctx.caller.keeps = Some(COMMAND_KEPT);
+        let heard = as_cut(&long, &ctx, true);
+        assert!(heard.len() <= MAX_OUTPUT, "{}", heard.len());
+        assert!(heard.contains(" left out]\n"), "{heard}");
+        assert!(matches!(
+            as_cut("short", &ctx, true),
+            Cow::Borrowed("short")
+        ));
+    }
+
+    #[test]
     fn only_a_commands_output_keeps_its_errors() {
         let (_turn, dir) = data_folder("errors");
         let ctx = in_conversation(8, &dir);
@@ -8771,7 +8901,10 @@ mod tests {
             cap,
         };
         let seq = "seq 1 999999";
-        let save = Some(save);
+        let save = Keeping {
+            save: Some(save),
+            ..Keeping::default()
+        };
         let out = run_shell_saving(
             shell(seq, None),
             seq,
