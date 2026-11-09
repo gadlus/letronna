@@ -1397,6 +1397,19 @@ pub(crate) fn failure(outcome: &Result<String, String>) -> Option<(String, &str)
     }
 }
 
+/// What every notice of a failing test tells the run before it changes what
+/// its work does for the test. On a benchmark smoke run a tester expected a
+/// cause sanitized that the request's `classFilter` kept out, and the run,
+/// sent back with that failure near its deadline, made its work sanitize
+/// every cause: a review's row had passed the behaviour the words set, and
+/// the hidden test failed on the change. The words for the exact case come
+/// first, and a narrower rule in them wins over a test that ignores it.
+const WORDS_FIRST: &str = "Before changing what your work does for a test, find the request's \
+                           words for that exact case: where they set a narrower rule the test \
+                           ignores, such as a filter, a condition or an exception, or a review's \
+                           row passed what your work does, keep it and answer the test by \
+                           quoting the words; where they are silent on it, say so.";
+
 /// The notice sending the run back with `outcome`, what `command` made of
 /// the tester's tests `kept` run against its work; None when they passed.
 /// Where the failures it names are all in tests the tester did not write
@@ -1419,9 +1432,8 @@ fn failed(kept: &Kept, command: &str, outcome: &Result<String, String>) -> Optio
          alone, in a copy of the project with them put back at the paths they are kept from, \
          so nothing in the project was touched: `{command}` {ended}. Its \
          output{left_out}:\n\n{shown}\n\n{others}Fix your work for each test that fails on what the \
-         request's words say, and run the tests again the same way. A test that expects what \
-         the words do not say is answered by quoting them in your answer. One that calls the \
-         code wrongly, such as with a name or import the request does not spell, or that \
+         request's words say, and run the tests again the same way. {WORDS_FIRST} One that \
+         calls the code wrongly, such as with a name or import the request does not spell, or that \
          fails for want of a fixture, helper or set-up the tester left out, is the tester's to \
          fix where it is kept, in `{}`, since that is where it is run from; never something to \
          add to the project. If the command itself cannot run here, run the tests with the \
@@ -1453,9 +1465,8 @@ fn regressed(command: &str, ended: &str, output: &str, differ: &[String]) -> Str
          at the paths they are kept from, so nothing in the project was touched: your work as \
          it stands {ended}. Its output{left_out}:\n\n{shown}\n\nThe files that \
          differ between that first version and your work as it stands: {changed}. Put back \
-         what broke the test, unless the test expects what the request's words do not say: \
-         then keep your change, and quote the words in your answer or say the request is \
-         silent on it. Then end with your whole answer again."
+         what broke the test, unless the request's words side with your change. {WORDS_FIRST} \
+         Then end with your whole answer again."
     )
 }
 
@@ -2781,8 +2792,8 @@ pub(crate) fn unrun(report: &str, kept: &Kept, again: bool) -> String {
          run them where it worked; its report follows. {} Run them with the project's own \
          runner and the set-up you found works, fix a test only where it calls the code wrongly, \
          such as a guessed name or import the request does not spell, and fix your work for \
-         each test that fails on what the request's words say. Then delete the copies, since \
-         they are not part of the task.{}\n\n{}",
+         each test that fails on what the request's words say. {WORDS_FIRST} Then delete the \
+         copies, since they are not part of the task.{}\n\n{}",
         where_kept(kept),
         run_again(again),
         report.trim()
@@ -2824,10 +2835,11 @@ fn where_kept(kept: &Kept) -> String {
 /// when it will (`again`).
 pub(crate) fn told(report: &str, kept: Option<&Kept>, again: bool) -> String {
     tell(
-        "A tester that hasn't seen your work wrote tests from the request alone and ran them; \
-         its report follows, ending with a table of its tests. Fix your work for each test \
-         that fails, unless the test expects something the request's words do not say: then \
-         quote the words that show it in your answer.",
+        &format!(
+            "A tester that hasn't seen your work wrote tests from the request alone and ran \
+             them; its report follows, ending with a table of its tests. Fix your work for each \
+             test that fails on what the request's words say. {WORDS_FIRST}"
+        ),
         report,
         kept,
         again,
@@ -2850,12 +2862,13 @@ pub(crate) fn told_ahead(report: &str, kept: Option<&Kept>) -> String {
         crate::requirements::AHEAD_CLOSES
     );
     tell(
-        "A tester that hasn't seen your work wrote tests from the request alone while you \
-         worked, in the project as it was before your change, where none could pass yet; its \
-         report follows, ending with a table of its tests, whose rows say NOT RUN or FAIL for \
-         want of your change, not what your work does. Make your work do what each test \
-         expects where the request's words say so; where a test expects something the words \
-         do not say, quote the words that show it in your answer.",
+        &format!(
+            "A tester that hasn't seen your work wrote tests from the request alone while you \
+             worked, in the project as it was before your change, where none could pass yet; \
+             its report follows, ending with a table of its tests, whose rows say NOT RUN or \
+             FAIL for want of your change, not what your work does. Make your work do what each \
+             test expects where the request's words say so. {WORDS_FIRST}"
+        ),
         &marked,
         kept,
         false,
@@ -4217,6 +4230,36 @@ mod tests {
     }
 
     #[test]
+    fn before_changing_behaviour_for_a_test_the_run_reads_the_words_for_that_case() {
+        let kept = Kept {
+            dir: PathBuf::from("/tmp/kept"),
+            files: vec!["tests/letronna_spec.test.ts".to_owned()],
+        };
+        assert!(
+            WORDS_FIRST
+                .contains("where they set a narrower rule the test ignores, such as a filter"),
+            "{WORDS_FIRST}"
+        );
+        assert!(
+            WORDS_FIRST.contains("or a review's row passed what your work does, keep it"),
+            "{WORDS_FIRST}"
+        );
+        let report = "R1 | adds | FAIL | npx vitest run x | got []\nRun: npx vitest run x";
+        let failing = Ok("FAIL tests/letronna_spec.test.ts\n[exit code 1]".to_owned());
+        let notices = [
+            failed(&kept, "npx vitest run x", &failing).unwrap(),
+            regressed("npx vitest run x", "exited with code 1", "FAIL", &[]),
+            told(report, Some(&kept), true),
+            told_ahead(report, Some(&kept)),
+            unrun(report, &kept, true),
+        ];
+        for text in notices {
+            assert!(text.contains(WORDS_FIRST), "{text}");
+            assert_eq!(text.matches(WORDS_FIRST).count(), 1, "{text}");
+        }
+    }
+
+    #[test]
     fn failures_in_tests_the_tester_did_not_write_are_said_to_be_such() {
         let kept = Kept {
             dir: PathBuf::from("/tmp/kept"),
@@ -5309,11 +5352,10 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.ends_with(
-                "unless the test expects what the request's words do not say: then keep your \
-                 change, and quote the words in your answer or say the request is silent on it. \
-                 Then end with your whole answer again."
-            ),
+            text.ends_with(&format!(
+                "Put back what broke the test, unless the request's words side with your \
+                 change. {WORDS_FIRST} Then end with your whole answer again."
+            )),
             "{text}"
         );
         // Nothing in the project changed: not the work, and no test was
