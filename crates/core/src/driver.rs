@@ -2545,7 +2545,48 @@ fn test_run(spec: &Spec, turn: &Turn) -> crate::spec_tests::Ran {
     let Some(ctx) = test_context(spec, &command, limit) else {
         return Ran::Unrun(format!("the gate would not run `{command}` as it stands"));
     };
-    crate::spec_tests::ran(&kept, &command, &ctx, limit)
+    // With the set-up the run's own passing command had, such as a module
+    // cache, which a tester that lacked it could not give its command; after
+    // the gate, which judges the command as the tester ran it.
+    let command = with_test_environment(spec, &command);
+    // Judged against the run's first complete version where the work fails
+    // them, while that version is kept.
+    let first = || crate::spec_tests::first(spec.id);
+    crate::spec_tests::ran(&kept, &command, &ctx, limit, first)
+}
+
+/// `command`, the tester's, with the variables the run's own last passing
+/// command of the same program set for it, as `spec_tests::environment`
+/// reads them off its line, exported ahead of it so they reach each program
+/// of its line: a tester that lacked the run's set-up, such as a module
+/// cache, still runs with it. As it is when no such command set any. A path
+/// into the project among the values is written as the folder the command
+/// runs in, which is a copy of the project, not the project.
+fn with_test_environment(spec: &Spec, command: &str) -> String {
+    let Some(workspace) = spec.connection.workspace.as_deref() else {
+        return command.to_owned();
+    };
+    // Only a command running the tester's program: a build's set-up can be
+    // against the tests.
+    let Some(program) = crate::spec_tests::program(command) else {
+        return command.to_owned();
+    };
+    let own = (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
+    let lent = (own.iter().rev())
+        .filter(|message| message.role == "tool" && message.name == "run_command")
+        .find_map(|result| {
+            let args = tools::parse_args_for(&result.name, &result.args).ok()?;
+            let line = args["command"].as_str()?;
+            let found = crate::spec_tests::environment(line, &program);
+            (!found.is_empty() && passed(result, &args, workspace)).then_some(found)
+        });
+    match lent {
+        Some(found) => crate::spec_tests::relative(
+            &format!("export {}; {command}", found.join(" ")),
+            &[workspace],
+        ),
+        None => command.to_owned(),
+    }
 }
 
 /// The notice sending a session's own run nobody watches back with what
@@ -2845,6 +2886,12 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
     let ahead = crate::spec_tests::ahead(spec.id);
     let testing = !ahead && crate::agents::at_once(ctx.caller.root) > shares.len();
     let workspace = spec.connection.workspace.as_deref();
+    // The work as it stands, kept as the run's first complete version: when
+    // the tester's tests later fail what the run ends with, they tell whether
+    // they passed what the reviews had it change.
+    if let Some(workspace) = workspace {
+        crate::spec_tests::snapshot(spec.id, workspace);
+    }
     // In a copy of the project where one can be made, so its tests, half
     // written or failing on purpose, never meet the reviews running the
     // project's suite.
@@ -7621,6 +7668,9 @@ pub(crate) mod tests {
         let (project, in_project) = (dir.to_path_buf(), Arc::new(AtomicBool::new(true)));
         let (seen, kept_then) = (in_project.clone(), Arc::new(std::sync::Mutex::new(None)));
         let read = kept_then.clone();
+        // Where the first complete version is kept while the run goes on.
+        let first_kept = Arc::new(std::sync::Mutex::new(None));
+        let first_seen = first_kept.clone();
         let test = (
             "write_file",
             json!({"path": "tests/letronna_spec_range.rs", "content": "#[test] fn reversed() {}"}),
@@ -7667,6 +7717,8 @@ pub(crate) mod tests {
                     if let Some(kept) = notice {
                         let test = Path::new(kept).join("tests/letronna_spec_range.rs");
                         *read.lock().unwrap() = std::fs::read_to_string(test).ok();
+                        *first_seen.lock().unwrap() =
+                            crate::spec_tests::snapshot_of(AGENTS + 1_798);
                     }
                     run.lock().unwrap().next().unwrap()
                 }
@@ -7745,6 +7797,16 @@ pub(crate) mod tests {
         );
         // And the folder it was kept in goes as the run ends.
         assert!(!kept.exists());
+        // The first complete version was kept as the reviews started, and
+        // goes as the run ends too.
+        let first = first_kept.lock().unwrap().clone();
+        let first: std::path::PathBuf = first.expect("no first complete version was kept");
+        assert!(
+            first.to_string_lossy().contains("-spec-copy-"),
+            "{}",
+            first.display()
+        );
+        assert!(!first.exists());
 
         // And a test of its that failed holds the run as a review's row does.
         let held = (sent.iter().flat_map(messages))
@@ -8194,6 +8256,112 @@ pub(crate) mod tests {
         assert!(tested_work(&spec, ran).is_none());
         assert!(!project.join("letronna_spec_test.sh").exists());
         crate::spec_tests::tidy(spec.id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_whose_first_version_passed_the_testers_tests_is_told_what_it_broke_since() {
+        let dir = scratch("refereed-work");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(project.join("README"), "a project").unwrap();
+        git(&["add", "."]);
+        let mut spec = own_run("http://127.0.0.1:1/v1".into(), &dir, AGENTS + 1_910);
+        spec.connection.workspace = Some(project.clone());
+        spec.decide = Some(Arc::new(|_, _| gate::Outcome::Run));
+        // The first complete version makes `made.txt`; its own test command
+        // passed after a `cd` with a variable set for it and a secret beside,
+        // and a build it ran later set one of its own.
+        std::fs::write(project.join("made.txt"), "made").unwrap();
+        crate::spec_tests::snapshot(spec.id, &project);
+        let first = crate::spec_tests::snapshot_of(spec.id).unwrap();
+        for command in [
+            "cd . && LETRONNA_SPEC_SETUP=lent LETRONNA_SPEC_TOKEN=hidden sh run_tests.sh",
+            "LETRONNA_SPEC_BUILD=1 go build ./...",
+        ] {
+            spec.transcript.conversation.messages.push(Message {
+                role: "tool".into(),
+                name: "run_command".into(),
+                args: json!({ "command": command }).to_string(),
+                content: "ok\n".into(),
+                ..Default::default()
+            });
+        }
+        // The tester's test needs that set-up, which its own run lacked, past
+        // the `cd` its command opens with, and checks for `made.txt`.
+        std::fs::write(
+            project.join("letronna_spec_test.sh"),
+            "test \"$LETRONNA_SPEC_SETUP\" = lent || { echo 'the set-up is missing'; exit 1; }\n\
+             test -z \"$LETRONNA_SPEC_TOKEN\" || { echo 'a secret was lent'; exit 1; }\n\
+             test -z \"$LETRONNA_SPEC_BUILD\" || { echo 'a build set-up was lent'; exit 1; }\n\
+             test -f made.txt || { echo 'made.txt is missing'; exit 1; }\n",
+        )
+        .unwrap();
+        crate::spec_tests::keep(
+            spec.id,
+            &project,
+            &project,
+            Some("cd . && sh letronna_spec_test.sh".into()),
+        )
+        .unwrap();
+        let turn = Turn::new(spec.connection.clone());
+
+        // With the set-up lent, the work as it stands passes.
+        let ran = test_run(&spec, &turn);
+        assert!(matches!(ran, crate::spec_tests::Ran::Passed(_)), "{ran:?}");
+        assert!(tested_work(&spec, ran).is_none());
+        // A review has it drop `made.txt` and reword the README: it hears
+        // that its first version passed, and what differs.
+        std::fs::remove_file(project.join("made.txt")).unwrap();
+        std::fs::write(project.join("README"), "a project, reviewed").unwrap();
+        let notice = tested_work(&spec, test_run(&spec, &turn)).unwrap();
+        assert!(notice.notice && notice.folded && notice.role == "user");
+        assert!(
+            notice.content.contains(
+                "passed `export LETRONNA_SPEC_SETUP=lent; cd . && sh letronna_spec_test.sh`; \
+                 what you ended with fails it."
+            ),
+            "{}",
+            notice.content
+        );
+        assert!(
+            notice.content.contains("made.txt is missing"),
+            "{}",
+            notice.content
+        );
+        assert!(
+            notice
+                .content
+                .contains("as it stands: `README`, `made.txt`. Put back"),
+            "{}",
+            notice.content
+        );
+        // Nothing in the project was put back or left: that is the run's to do.
+        assert!(!project.join("made.txt").exists());
+        assert!(!project.join("letronna_spec_test.sh").exists());
+        // Judged by once: the plain notice after, until the run fixes it.
+        let again = tested_work(&spec, test_run(&spec, &turn)).unwrap();
+        assert!(
+            again
+                .content
+                .starts_with("Your work as it stands was run against"),
+            "{}",
+            again.content
+        );
+        assert!(first.exists());
+        crate::spec_tests::tidy(spec.id);
+        assert!(!first.exists());
+        assert_eq!(crate::spec_tests::snapshot_of(spec.id), None);
     }
 
     /// Makes `dir` a git project with everything in it committed, as a

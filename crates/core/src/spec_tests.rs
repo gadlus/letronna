@@ -51,6 +51,17 @@
 //! where the attempt's tests would import the first attempt's code through
 //! an editable install; and an attempt that installed anything from its
 //! folder is not taken, and its folder stays for what may lead into it.
+//!
+//! A copy of the work as it stood when the run first said it was done is
+//! kept too, as its first complete version (`snapshot`): a review's row, or
+//! the run's own doubt, can have it change a version that was right. When
+//! the work the run ends with fails the tester's tests, they run in that
+//! copy as well, and a first version that passes them names the files
+//! changed since, for the run to put back what broke them. The tester's
+//! command runs with the variables the run's own passing command of the
+//! same program set, such as a module cache, so a tester that lacked the
+//! run's set-up gets it. All of it happens in copies in the temp folder,
+//! discarded as the run ends; nothing is written into the project.
 
 use crate::cancel::Cancel;
 use crate::tools::ToolContext;
@@ -171,6 +182,37 @@ const SHOWN: usize = 3_000;
 /// not a script.
 const LINE: usize = 400;
 
+/// Files that differ between a run's first complete version and its work as
+/// it stands that the notice names at most; the rest are counted.
+const DIFFERING: usize = 20;
+
+/// Folders a test run or a build leaves behind, which hold no work of the
+/// run's, so no file in them is one that differs.
+const CACHES: [&str; 10] = [
+    "__pycache__",
+    "htmlcov",
+    ".hypothesis",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".nox",
+    ".cache",
+    ".eggs",
+];
+
+/// Variables of the run's own set-up lent to the tester's command at most.
+const LENT: usize = 8;
+
+/// Words in a variable's name that mark its value as a secret, which is not
+/// lent: the command is written into a notice.
+const SECRETS: [&str; 6] = ["KEY", "TOKEN", "SECRET", "PASSW", "CREDENTIAL", "AUTH"];
+
+/// Variables never lent, as no `LD_*` or `*FLAGS` is: they say where
+/// programs and libraries are found, or how a build goes, which the run may
+/// have set for a build against what its tests need.
+const UNLENT: [&str; 5] = ["PATH", "HOME", "CGO_ENABLED", "NODE_ENV", "PYTHONHOME"];
+
 /// A tester's files kept for a run: its id, the project it puts them back
 /// in, where they are kept, and the command the tester gave to run them
 /// from the project's root, if it gave one.
@@ -215,6 +257,82 @@ fn pending() -> &'static (Mutex<Vec<Pending>>, Condvar) {
 pub(crate) struct Kept {
     pub dir: PathBuf,
     pub files: Vec<String>,
+}
+
+/// A run's first complete version: a copy of its work as it stood when it
+/// first said it was done, and whether the tester's tests have run in it.
+struct First {
+    run: u64,
+    dir: PathBuf,
+    compared: bool,
+}
+
+/// A run's first complete version as `first` hands it out: where it is, and
+/// whose it is, so a run of the tests in it can be marked.
+#[derive(Debug, PartialEq)]
+pub(crate) struct FirstVersion {
+    run: u64,
+    pub dir: PathBuf,
+}
+
+impl FirstVersion {
+    /// Marks the tests as run in it, so they are not run there again.
+    fn judged(&self) {
+        if let Ok(mut firsts) = firsts().lock()
+            && let Some(first) = firsts.iter_mut().find(|first| first.run == self.run)
+        {
+            first.compared = true;
+        }
+    }
+}
+
+/// Each run's first complete version, kept until `tidy` discards it.
+fn firsts() -> &'static Mutex<Vec<First>> {
+    static FIRSTS: OnceLock<Mutex<Vec<First>>> = OnceLock::new();
+    FIRSTS.get_or_init(Default::default)
+}
+
+/// Keeps a copy of run `run`'s work in `workspace` as it stands, the first
+/// complete version it is at when the reviews start, for the tester's tests
+/// to run in beside what the run ends with: a review's row, or the run's
+/// own doubt, can have it change a version that was right. Nothing where no
+/// copy can be made, or one is kept already.
+pub(crate) fn snapshot(run: u64, workspace: &Path) {
+    let kept = (firsts().lock()).is_ok_and(|firsts| firsts.iter().any(|first| first.run == run));
+    if kept {
+        return;
+    }
+    // Copied with no lock held: a big project takes a while.
+    let Some(dir) = copy(workspace) else {
+        return;
+    };
+    match firsts().lock() {
+        Ok(mut firsts) => firsts.push(First {
+            run,
+            dir,
+            compared: false,
+        }),
+        Err(_) => discard(&dir),
+    }
+}
+
+/// Run `run`'s first complete version, for the tester's tests to run in
+/// beside the work: None when none was kept, or they have run in it already,
+/// so they run there once at most.
+pub(crate) fn first(run: u64) -> Option<FirstVersion> {
+    let firsts = firsts().lock().ok()?;
+    let first = (firsts.iter()).find(|first| first.run == run && !first.compared)?;
+    Some(FirstVersion {
+        run,
+        dir: first.dir.clone(),
+    })
+}
+
+/// Where run `run`'s first complete version is kept, handed out or not.
+#[cfg(test)]
+pub(crate) fn snapshot_of(run: u64) -> Option<PathBuf> {
+    let firsts = firsts().lock().ok()?;
+    (firsts.iter().find(|first| first.run == run)).map(|first| first.dir.clone())
 }
 
 /// A new folder of the temp folder for `what`, named for this process.
@@ -267,16 +385,7 @@ fn git_bytes(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
 #[cfg(unix)]
 pub(crate) fn copy(workspace: &Path) -> Option<PathBuf> {
     top(workspace)?;
-    let files = git(
-        workspace,
-        &[
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-        ],
-    )?;
+    let files = listed(workspace)?;
     let ignored = ignored(workspace)?;
     if files.len() + ignored.len() > COPIED {
         return None;
@@ -308,6 +417,21 @@ pub(crate) fn copy(workspace: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(to)
+}
+
+/// The files of the project in `workspace` as `copy` takes them, the ones
+/// git tracks and the new ones it does not ignore, by their paths from
+/// there; None where git could not list them.
+#[cfg(unix)]
+fn listed(workspace: &Path) -> Option<Vec<String>> {
+    let args = [
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+    ];
+    git(workspace, &args)
 }
 
 /// Whether `workspace` is the top of a git project, which a folder made
@@ -759,6 +883,72 @@ fn folder_as_dot(text: &str, path: &str) -> String {
     out
 }
 
+/// The program `line`, a command of the run's, runs, as the tables name it:
+/// the first past the `cd`s, exports and assignments that only set it up;
+/// None when `line` only sets up.
+pub(crate) fn program(line: &str) -> Option<String> {
+    set_up(line).0
+}
+
+/// The variables `line`, a command of the run's, sets for `program`, as
+/// `VAR=value` words: those before the program, those `export`ed or set on
+/// their own before it, and those on a command after a `cd`, which only
+/// moves it. The tester's command runs with them, so a tester that lacked
+/// the run's set-up, such as a module cache, gets it. None when `line` runs
+/// another program, whose set-up may be a build's against the tests; only a
+/// value the shell reads as written, none whose name marks it as a secret or
+/// as `UNLENT`, and `LENT` at most.
+pub(crate) fn environment(line: &str, program: &str) -> Vec<String> {
+    let (runs, mut found) = set_up(line);
+    if runs.as_deref() != Some(program) {
+        return Vec::new();
+    }
+    found.truncate(LENT);
+    found
+}
+
+/// What `line` runs and sets up: the first program past the `cd`s, exports
+/// and assignments before it, if it reaches one, and the variables set on
+/// the way, as `plain` allows them.
+fn set_up(line: &str) -> (Option<String>, Vec<String>) {
+    let dialect = crate::command::Dialect::here();
+    let assessed = crate::command::assess(line, dialect, None);
+    let mut found = Vec::new();
+    for command in &assessed.commands {
+        let program = (command.argv.get(command.at)).map(|word| crate::command::name_of(word));
+        let sets = matches!(program.as_deref(), None | Some("export"));
+        let words = match sets {
+            true => &command.argv[..],
+            false => &command.argv[..command.at],
+        };
+        // A word made by running something, or holding a variable this does
+        // not know, is not what the shell read.
+        if command.spelled_out {
+            found.extend(words.iter().filter(|word| plain(word)).cloned());
+        }
+        if !sets && program.as_deref() != Some("cd") {
+            return (program, found);
+        }
+    }
+    (None, found)
+}
+
+/// Whether `word` sets a variable to a value with nothing in it for the
+/// shell to expand or to end the word at, under a name that marks it
+/// neither as a secret nor as one never lent.
+fn plain(word: &str) -> bool {
+    let Some((name, value)) = word.split_once('=') else {
+        return false;
+    };
+    let upper = name.to_ascii_uppercase();
+    crate::command::assignment(word)
+        && !SECRETS.iter().any(|secret| upper.contains(secret))
+        && !UNLENT.contains(&upper.as_str())
+        && !upper.starts_with("LD_")
+        && !upper.ends_with("FLAGS")
+        && (value.chars()).all(|c| c.is_ascii_alphanumeric() || "_-./:,+@%=".contains(c))
+}
+
 /// The tester's files kept for run `run` and the command that runs them,
 /// for the driver to run them against the work; None when none were kept,
 /// or the tester gave no command.
@@ -784,8 +974,18 @@ pub(crate) enum Ran {
 /// tester's tests `kept` with `command`, given `limit` to run. They run in
 /// a fresh copy of the project with the kept files put back at their paths,
 /// as the tester's own did, so nothing is added to the project and no patch
-/// of it takes them; where no copy can be made they are not run.
-pub(crate) fn ran(kept: &Kept, command: &str, ctx: &ToolContext, limit: Duration) -> Ran {
+/// of it takes them; where no copy can be made they are not run. When the
+/// work fails them, `first` is asked for the run's first complete version,
+/// and the tests run there too (`regression`): one that passes them makes
+/// the notice one of what the run changed since, for it to put back what
+/// broke them.
+pub(crate) fn ran(
+    kept: &Kept,
+    command: &str,
+    ctx: &ToolContext,
+    limit: Duration,
+    first: impl FnOnce() -> Option<FirstVersion>,
+) -> Ran {
     let Some(workspace) = ctx.workspace.as_deref() else {
         return Ran::Unrun("the run has no project folder".into());
     };
@@ -800,10 +1000,67 @@ pub(crate) fn ran(kept: &Kept, command: &str, ctx: &ToolContext, limit: Duration
             kept.dir.display()
         ));
     };
+    if let Some(notice) = regression(kept, command, workspace, ctx, limit, &outcome, first) {
+        return Ran::Failed(notice);
+    }
     match failed(kept, command, &outcome) {
         Some(notice) => Ran::Failed(notice),
         None => Ran::Passed(command.to_owned()),
     }
+}
+
+/// The notice telling the run that its first complete version passes the
+/// tester's tests `kept` with `command`, which its work in `workspace` as
+/// it stands fails, as `outcome` says. `first` is asked for that version
+/// only when the time to the deadline `ctx` carries holds its run within
+/// `limit` and half a review's for the fix after it, measured now that the
+/// work's own run has taken what it took, and its run is cut to leave that;
+/// the tests run in it only where files differ between the two, since the
+/// same files pass or fail alike. None otherwise, when the work passes, when
+/// none is kept, or when it fails them too.
+fn regression(
+    kept: &Kept,
+    command: &str,
+    workspace: &Path,
+    ctx: &ToolContext,
+    limit: Duration,
+    outcome: &Result<String, String>,
+    first: impl FnOnce() -> Option<FirstVersion>,
+) -> Option<String> {
+    let (how, output) = failure(outcome)?;
+    let fix = crate::requirements::REVIEW_TIME / 2;
+    let left = time_left(ctx);
+    let timely = left.is_none_or(|left| left >= fix + limit);
+    let first = timely.then(first).flatten()?;
+    let differ = differing(&first.dir, workspace);
+    if differ.is_empty() {
+        return None;
+    }
+    let again = left.map_or(limit, |left| limit.min(left.saturating_sub(fix)));
+    let outcome = outcome_in(kept, command, &first.dir, ctx, again)?;
+    // Judged by once the tests have run in it, whatever they said; not when
+    // they could not be started.
+    if happened(&outcome) {
+        first.judged();
+    }
+    (failure(&outcome).is_none()).then(|| regressed(command, &how, output, &differ))
+}
+
+/// Whether the tester's tests ran, for `outcome`, what `run_command` made
+/// of them: they did unless the tool could not start them; ones cut at
+/// their limit ran.
+fn happened(outcome: &Result<String, String>) -> bool {
+    match outcome {
+        Ok(_) => true,
+        Err(why) => why.contains("Timed out"),
+    }
+}
+
+/// How long the run making calls with `ctx` has to its deadline; None with
+/// no deadline.
+fn time_left(ctx: &ToolContext) -> Option<Duration> {
+    let deadline = ctx.caller.connection.as_deref()?.deadline?;
+    Some(deadline.saturating_duration_since(Instant::now()))
 }
 
 /// What the run is told, with the requirements notice, of the first run of
@@ -943,6 +1200,88 @@ fn failed(kept: &Kept, command: &str, outcome: &Result<String, String>) -> Optio
         tail(output),
         kept.dir.display()
     ))
+}
+
+/// The notice sending the run back when its first complete version passed
+/// the tester's tests with `command` and its work as it stands `ended` as
+/// it did with `output`: with the files that `differ` between the two, for
+/// it to put back what broke them.
+fn regressed(command: &str, ended: &str, output: &str, differ: &[String]) -> String {
+    let mut named: Vec<String> = (differ.iter().take(DIFFERING))
+        .map(|file| format!("`{file}`"))
+        .collect();
+    if differ.len() > DIFFERING {
+        named.push(format!("and {} more", differ.len() - DIFFERING));
+    }
+    let changed = match named.is_empty() {
+        true => "none that a listing of the project shows".to_owned(),
+        false => named.join(", "),
+    };
+    format!(
+        "Your first complete version, the work as it stood when you first said you were done, \
+         passed `{command}`; what you ended with fails it. Both were run against the tests a \
+         tester wrote from the request alone, each in a copy of the project with them put back \
+         at the paths they are kept from, so nothing in the project was touched: your work as \
+         it stands {ended}. Its output ends:\n\n{}\n\nThe files that differ between that first \
+         version and your work as it stands: {changed}. Put back what broke the test, unless \
+         the test expects what the request's words do not say: then keep your change, and quote \
+         the words in your answer or say the request is silent on it. Then end with your whole \
+         answer again.",
+        tail(output)
+    )
+}
+
+/// The paths of the files that differ between `first`, a run's first
+/// complete version, and its work as it stands in `workspace`: changed,
+/// added or deleted since, in order, the files in hidden folders last. The
+/// files git ignores are left out, as `copy` left them out of `first`, the
+/// tester's own, by their names, and what a test run or a build leaves
+/// behind, by `artefact`.
+#[cfg(unix)]
+fn differing(first: &Path, workspace: &Path) -> Vec<String> {
+    let Some(current) = listed(workspace) else {
+        return Vec::new();
+    };
+    let work = |path: &String| {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        !name.contains(MARKER)
+            && !(path.split('/')).any(|part| SKIPPED.contains(&part) || artefact(part))
+    };
+    let mut paths: Vec<String> = (current.into_iter().chain(files_under(first)))
+        .filter(work)
+        .collect();
+    // The work's own files first: a run's hidden folders, such as a tool's,
+    // would otherwise take the names.
+    paths.sort_by(|a, b| (hidden(a).cmp(&hidden(b))).then_with(|| a.cmp(b)));
+    paths.dedup();
+    paths.retain(|path| {
+        let (ours, theirs) = (first.join(path), workspace.join(path));
+        let there = |path: &Path| std::fs::symlink_metadata(path).is_ok();
+        (there(&ours) || there(&theirs)) && differs(&ours, &theirs)
+    });
+    paths
+}
+
+/// No copy is made here, so there is no first version to differ from.
+#[cfg(not(unix))]
+fn differing(_first: &Path, _workspace: &Path) -> Vec<String> {
+    Vec::new()
+}
+
+/// Whether `part`, a component of a path, names what a test run or a build
+/// leaves behind and no work of the run's: a cache, compiled Python,
+/// coverage, a package's egg-info.
+fn artefact(part: &str) -> bool {
+    CACHES.contains(&part)
+        || part.starts_with("coverage")
+        || part.starts_with(".coverage")
+        || part.ends_with(".pyc")
+        || part.ends_with(".egg-info")
+}
+
+/// Whether a component of `path` is hidden.
+fn hidden(path: &str) -> bool {
+    path.split('/').any(|part| part.starts_with('.'))
 }
 
 /// The end of `output`: `SHOWN` characters at most, from a line's start.
@@ -1645,8 +1984,17 @@ pub(crate) fn take_due(run: u64, most: Duration) -> Option<(PathBuf, Result<Stri
 /// stopped at its deadline never deletes them itself. A tester started with
 /// the run and not taken is abandoned: stopped, its report dropped, and its
 /// folder deleted, here and once more as it ends, since a stopped one can
-/// still be writing there. The paths it deleted from the project, in order.
+/// still be writing there. The run's first complete version goes too. The
+/// paths it deleted from the project, in order.
 pub(crate) fn tidy(run: u64) -> Vec<String> {
+    if let Ok(mut firsts) = firsts().lock() {
+        firsts.retain(|first| {
+            if first.run == run {
+                discard(&first.dir);
+            }
+            first.run != run
+        });
+    }
     if let Ok(mut pending) = pending().0.lock() {
         pending.retain(|tester| {
             if tester.run != run {
@@ -1680,14 +2028,22 @@ pub(crate) fn tidy(run: u64) -> Vec<String> {
 /// The files under `workspace` whose names hold `MARKER`, by their paths from
 /// there, in order.
 fn left(workspace: &Path) -> Vec<String> {
-    let mut walk = ignore::WalkBuilder::new(workspace);
+    (files_under(workspace).into_iter())
+        .filter(|path| (path.rsplit('/').next()).is_some_and(|name| name.contains(MARKER)))
+        .collect()
+}
+
+/// The files under `dir`, by their paths from there with `/` between
+/// folders, in order: `WALKED` entries at most, none in the folders
+/// `SKIPPED` names, and none a link leads to.
+fn files_under(dir: &Path) -> Vec<String> {
+    let mut walk = ignore::WalkBuilder::new(dir);
     walk.hidden(false);
     walk.filter_entry(|entry| !SKIPPED.iter().any(|skipped| entry.file_name() == *skipped));
     let mut found: Vec<String> = (walk.build().take(WALKED))
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
-        .filter(|entry| (entry.file_name().to_str()).is_some_and(|name| name.contains(MARKER)))
-        .filter_map(|entry| Some(slashed(entry.path().strip_prefix(workspace).ok()?)))
+        .filter_map(|entry| Some(slashed(entry.path().strip_prefix(dir).ok()?)))
         .collect();
     found.sort();
     found
@@ -2239,7 +2595,7 @@ mod tests {
         // Before the work is there the test fails, the run hears what the
         // runner printed and where the test is kept, and the project got
         // neither the test nor anything the test made.
-        let Ran::Failed(text) = ran(&kept, &command, &ctx, TIMEOUT) else {
+        let Ran::Failed(text) = ran(&kept, &command, &ctx, TIMEOUT, || None) else {
             panic!("the test did not fail");
         };
         assert!(
@@ -2258,7 +2614,7 @@ mod tests {
         // Once the work is there, they passed.
         std::fs::write(root.join("made.txt"), "made").unwrap();
         assert_eq!(
-            ran(&kept, &command, &ctx, TIMEOUT),
+            ran(&kept, &command, &ctx, TIMEOUT, || None),
             Ran::Passed(command.clone())
         );
         assert!(!root.join("letronna_spec_test.sh").exists());
@@ -2271,7 +2627,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(
-            ran(&kept, &command, &ctx, TIMEOUT),
+            ran(&kept, &command, &ctx, TIMEOUT, || None),
             Ran::Unrun("no copy of the project could be made to run them in".into())
         );
     }
@@ -2316,7 +2672,7 @@ mod tests {
             workspace: Some(root.to_path_buf()),
             ..Default::default()
         });
-        let Ran::Failed(text) = ran(&kept, &command, &ctx, Duration::from_secs(1)) else {
+        let Ran::Failed(text) = ran(&kept, &command, &ctx, Duration::from_secs(1), || None) else {
             panic!("the command finished");
         };
         assert!(
@@ -3205,5 +3561,392 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("put them right"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_first_complete_version_is_kept_once_and_goes_as_the_run_ends() {
+        let root = Scratch::new("spec-tests-first");
+        let repo = |args: &[&str]| assert!(git(&root, args).is_some(), "git {args:?}");
+        repo(&["init", "-q"]);
+        std::fs::write(root.join("README"), "a project").unwrap();
+        repo(&["add", "."]);
+        snapshot(21, &root);
+        let dir = snapshot_of(21).unwrap();
+        assert!(
+            dir.to_string_lossy().contains("-spec-copy-"),
+            "{}",
+            dir.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("README")).unwrap(),
+            "a project"
+        );
+        // Kept once, as the work stood then, and handed out until the tests
+        // have run in it.
+        std::fs::write(root.join("README"), "changed").unwrap();
+        snapshot(21, &root);
+        assert_eq!(snapshot_of(21), Some(dir.clone()));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("README")).unwrap(),
+            "a project"
+        );
+        let handed = first(21).unwrap();
+        assert_eq!(handed.dir, dir);
+        assert_eq!(first(21).map(|first| first.dir), Some(dir.clone()));
+        handed.judged();
+        assert_eq!(first(21), None);
+        assert!(dir.exists());
+        tidy(21);
+        assert!(!dir.exists());
+        assert_eq!(snapshot_of(21), None);
+        // Where no copy can be made, none is kept.
+        let plain = Scratch::new("spec-tests-first-plain");
+        snapshot(22, &plain);
+        assert_eq!(snapshot_of(22), None);
+        assert_eq!(first(22), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_first_version_that_passes_the_tests_the_work_fails_names_what_changed_since() {
+        let root = Scratch::new("spec-tests-referee");
+        let repo = |args: &[&str]| assert!(git(&root, args).is_some(), "git {args:?}");
+        repo(&["init", "-q"]);
+        std::fs::write(root.join("README"), "a project").unwrap();
+        std::fs::write(root.join("made.txt"), "made").unwrap();
+        repo(&["add", "."]);
+        // The first complete version makes `made.txt`, which the tester's
+        // test checks for.
+        snapshot(23, &root);
+        std::fs::write(
+            root.join("letronna_spec_test.sh"),
+            "test -f made.txt || { echo 'made.txt is missing'; exit 1; }\n",
+        )
+        .unwrap();
+        let command = "sh letronna_spec_test.sh".to_owned();
+        let kept = keep(23, &root, &root, Some(command.clone())).unwrap();
+        let ctx = ToolContext::of(&crate::chat::Connection {
+            workspace: Some(root.to_path_buf()),
+            ..Default::default()
+        });
+
+        // While the work passes, the first version is not asked for.
+        let asked = std::cell::Cell::new(false);
+        let peek = || {
+            asked.set(true);
+            first(23)
+        };
+        assert_eq!(
+            ran(&kept, &command, &ctx, TIMEOUT, peek),
+            Ran::Passed(command.clone())
+        );
+        assert!(!asked.get());
+
+        // A review has the run drop `made.txt`, reword the README and add a
+        // file: the run hears which version passed and what differs.
+        std::fs::remove_file(root.join("made.txt")).unwrap();
+        std::fs::write(root.join("README"), "a project, reviewed").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/new.txt"), "new").unwrap();
+        let Ran::Failed(text) = ran(&kept, &command, &ctx, TIMEOUT, || first(23)) else {
+            panic!("the work passed");
+        };
+        assert!(
+            text.starts_with(
+                "Your first complete version, the work as it stood when you first said you \
+                 were done, passed `sh letronna_spec_test.sh`; what you ended with fails it."
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("your work as it stands exited with code 1"),
+            "{text}"
+        );
+        assert!(text.contains("made.txt is missing"), "{text}");
+        assert!(
+            text.contains("as it stands: `README`, `made.txt`, `src/new.txt`. Put back"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(
+                "unless the test expects what the request's words do not say: then keep your \
+                 change, and quote the words in your answer or say the request is silent on it. \
+                 Then end with your whole answer again."
+            ),
+            "{text}"
+        );
+        // Nothing in the project changed: not the work, and no test was
+        // left in it, nor in the first version.
+        assert!(!root.join("made.txt").exists());
+        assert!(!root.join("letronna_spec_test.sh").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("README")).unwrap(),
+            "a project, reviewed"
+        );
+        let dir = snapshot_of(23).unwrap();
+        assert!(!dir.join("letronna_spec_test.sh").exists());
+        // The first version is judged by once: the plain notice after.
+        let Ran::Failed(text) = ran(&kept, &command, &ctx, TIMEOUT, || first(23)) else {
+            panic!("the work passed");
+        };
+        assert!(
+            text.starts_with("Your work as it stands was run against"),
+            "{text}"
+        );
+        tidy(23);
+        assert_eq!(to_run(23), None);
+        assert_eq!(snapshot_of(23), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_first_version_that_fails_the_tests_too_leaves_the_notice_as_it_was() {
+        let root = Scratch::new("spec-tests-referee-both");
+        let repo = |args: &[&str]| assert!(git(&root, args).is_some(), "git {args:?}");
+        repo(&["init", "-q"]);
+        std::fs::write(root.join("README"), "a project").unwrap();
+        repo(&["add", "."]);
+        // Kept without `made.txt`, so the first version fails the test as
+        // the work does.
+        snapshot(24, &root);
+        std::fs::write(
+            root.join("letronna_spec_test.sh"),
+            "test -f made.txt || { echo 'made.txt is missing'; exit 1; }\n",
+        )
+        .unwrap();
+        let command = "sh letronna_spec_test.sh".to_owned();
+        let kept = keep(24, &root, &root, Some(command.clone())).unwrap();
+        let ctx = ToolContext::of(&crate::chat::Connection {
+            workspace: Some(root.to_path_buf()),
+            ..Default::default()
+        });
+        // With the work as the first version is, the same files fail alike:
+        // the tests do not run there, and it is not judged by.
+        let Ran::Failed(text) = ran(&kept, &command, &ctx, TIMEOUT, || first(24)) else {
+            panic!("the work passed");
+        };
+        assert!(
+            text.starts_with("Your work as it stands was run against"),
+            "{text}"
+        );
+        assert!(first(24).is_some());
+        // Changed since, the first version runs them, fails them too, and
+        // the notice is the plain one; judged by all the same.
+        std::fs::write(root.join("README"), "a project, reviewed").unwrap();
+        let Ran::Failed(text) = ran(&kept, &command, &ctx, TIMEOUT, || first(24)) else {
+            panic!("the work passed");
+        };
+        assert!(
+            text.starts_with("Your work as it stands was run against"),
+            "{text}"
+        );
+        assert!(!text.contains("first complete version"), "{text}");
+        assert!(text.contains("made.txt is missing"), "{text}");
+        assert_eq!(first(24), None);
+        tidy(24);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_first_version_is_not_run_when_the_works_own_run_left_too_little_time() {
+        let root = Scratch::new("spec-tests-referee-late");
+        let repo = |args: &[&str]| assert!(git(&root, args).is_some(), "git {args:?}");
+        repo(&["init", "-q"]);
+        std::fs::write(root.join("README"), "a project").unwrap();
+        std::fs::write(root.join("made.txt"), "made").unwrap();
+        repo(&["add", "."]);
+        snapshot(25, &root);
+        std::fs::remove_file(root.join("made.txt")).unwrap();
+        // The test takes two seconds to fail.
+        std::fs::write(
+            root.join("letronna_spec_test.sh"),
+            "sleep 2\ntest -f made.txt || { echo 'made.txt is missing'; exit 1; }\n",
+        )
+        .unwrap();
+        let command = "sh letronna_spec_test.sh".to_owned();
+        let kept = keep(25, &root, &root, Some(command.clone())).unwrap();
+        // Before the work's own run there is just the time for a run of the
+        // first version within the limit and half a review's for the fix;
+        // after it there is not.
+        let fix = crate::requirements::REVIEW_TIME / 2;
+        let ctx = ToolContext::of(&crate::chat::Connection {
+            workspace: Some(root.to_path_buf()),
+            deadline: Some(Instant::now() + fix + TIMEOUT + Duration::from_secs(1)),
+            ..Default::default()
+        });
+        let asked = std::cell::Cell::new(false);
+        let peek = || {
+            asked.set(true);
+            first(25)
+        };
+        let Ran::Failed(text) = ran(&kept, &command, &ctx, TIMEOUT, peek) else {
+            panic!("the work passed");
+        };
+        assert!(
+            text.starts_with("Your work as it stands was run against"),
+            "{text}"
+        );
+        // Not asked for, so still kept for a round with the time.
+        assert!(!asked.get());
+        assert!(first(25).is_some());
+        tidy(25);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn what_a_test_run_leaves_behind_is_not_among_the_files_that_differ() {
+        let root = Scratch::new("spec-tests-differing");
+        let repo = |args: &[&str]| assert!(git(&root, args).is_some(), "git {args:?}");
+        repo(&["init", "-q"]);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".github")).unwrap();
+        std::fs::write(root.join("src/a.py"), "a").unwrap();
+        std::fs::write(root.join(".github/w.yml"), "w").unwrap();
+        repo(&["add", "."]);
+        let first = copy(&root).unwrap();
+        // The run changes a source file and a hidden one, its tests leave
+        // caches, compiled Python, coverage and an egg-info behind, and the
+        // tester's test is put back.
+        std::fs::write(root.join("src/a.py"), "b").unwrap();
+        std::fs::write(root.join(".github/w.yml"), "x").unwrap();
+        for file in [
+            "__pycache__/a.cpython-312.pyc",
+            ".hypothesis/unicode_data/x",
+            "pkg.egg-info/PKG-INFO",
+            "htmlcov/index.html",
+            ".pytest_cache/v/cache/nodeids",
+            "coverage/lcov.info",
+            "coverage.xml",
+            ".coverage",
+            ".coverage.host.1",
+            "tests/test_letronna_spec.py",
+        ] {
+            let at = root.join(file);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(at, "left").unwrap();
+        }
+        assert_eq!(differing(&first, &root), ["src/a.py", ".github/w.yml"]);
+        discard(&first);
+    }
+
+    #[test]
+    fn the_files_that_differ_are_named_up_to_a_cap() {
+        let files: Vec<String> = (0..DIFFERING + 5)
+            .map(|at| format!("src/f{at:02}.rs"))
+            .collect();
+        let text = regressed("sh t.sh", "exited with code 1", "boom", &files);
+        assert!(text.contains("`src/f00.rs`, `src/f01.rs`"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "`src/f{:02}.rs`, and 5 more. Put back",
+                DIFFERING - 1
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(&format!("src/f{DIFFERING:02}.rs")), "{text}");
+        assert!(text.contains("Its output ends:\n\nboom\n\n"), "{text}");
+        let none = regressed("sh t.sh", "did not finish", "", &[]);
+        assert!(
+            none.contains("as it stands: none that a listing of the project shows. Put back"),
+            "{none}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_set_up_of_the_runs_passing_command_is_read_off_its_line() {
+        assert_eq!(
+            environment(
+                "GOMODCACHE=/root/go/pkg/mod GOCACHE=/tmp/gocache go test ./...",
+                "go"
+            ),
+            ["GOMODCACHE=/root/go/pkg/mod", "GOCACHE=/tmp/gocache"]
+        );
+        // Exported or set on their own before the program, after a `cd`,
+        // through `env`, and quoted.
+        assert_eq!(
+            environment(
+                "export PYTHONPATH=src; CI=1; cd /app && env DJANGO_SETTINGS_MODULE=\"app.settings\" \
+                 pytest -q 2>&1 | tail -20",
+                "pytest"
+            ),
+            [
+                "PYTHONPATH=src",
+                "CI=1",
+                "DJANGO_SETTINGS_MODULE=app.settings"
+            ]
+        );
+        // Nothing after the first program, and nothing from a line that
+        // sets none.
+        assert_eq!(
+            environment("go test ./... && FOO=1 make check", "go"),
+            Vec::<String>::new()
+        );
+        assert_eq!(environment("pytest -q", "pytest"), Vec::<String>::new());
+        // A secret, or a value with a word's end in it, is not lent.
+        assert_eq!(
+            environment(
+                "API_KEY=x GITHUB_TOKEN=y CLIENT_SECRET=z DB_PASSWORD=w AUTH_HEADER=v C='a b' \
+                 D=1 go test",
+                "go"
+            ),
+            ["D=1"]
+        );
+        // Nor what says where programs and libraries are found, or how a
+        // build goes.
+        assert_eq!(
+            environment(
+                "PATH=/usr/local/go/bin HOME=/root LD_LIBRARY_PATH=/opt/lib GOFLAGS=-mod=mod \
+                 CGO_ENABLED=0 NODE_ENV=test PYTHONHOME=/py GOMODCACHE=/m go test",
+                "go"
+            ),
+            ["GOMODCACHE=/m"]
+        );
+        // Nor anything off a command running another program than the
+        // tester's, however it is reached.
+        assert_eq!(
+            environment("GOMODCACHE=/m go build ./...", "pytest"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            environment("cd /app && GOMODCACHE=/m go build ./...", "go"),
+            ["GOMODCACHE=/m"]
+        );
+        // Nor anything off a command with a word made by running something,
+        // or holding a variable this does not know.
+        assert_eq!(
+            environment("A=$(pwd) D=1 go test", "go"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            environment("B=$SOME_PLACE/x D=1 go test", "go"),
+            Vec::<String>::new()
+        );
+        // `LENT` at most.
+        let many: Vec<String> = (0..LENT + 2).map(|at| format!("V{at}={at}")).collect();
+        assert_eq!(
+            environment(&format!("{} go test", many.join(" ")), "go"),
+            many[..LENT]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_program_a_command_runs_is_read_past_its_set_up() {
+        assert_eq!(
+            program("cd /app && export X=1; Y=2 go test ./...").as_deref(),
+            Some("go")
+        );
+        assert_eq!(
+            program("env CI=1 pytest -q | tail -5").as_deref(),
+            Some("pytest")
+        );
+        assert_eq!(
+            program("./run_tests.sh --fast").as_deref(),
+            Some("run_tests.sh")
+        );
+        assert_eq!(program("export X=1"), None);
+        assert_eq!(program(""), None);
     }
 }
