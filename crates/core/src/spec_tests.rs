@@ -16,11 +16,20 @@
 //! otherwise leave them in a patch taken of it, where one that fails can fail
 //! a package's whole suite. The run is told where they are kept and puts them
 //! back to run them, and what it put back is deleted as it ends.
+//!
+//! Once the run has acted on the tester's report and says it is done, the
+//! driver itself runs those tests against the work as it stands, in a fresh
+//! copy of the project with the files put back, and sends the run back with
+//! what the runner printed: a report can be read and set aside, an output
+//! cannot, and a tester that could not run its tests where it worked still
+//! has them run.
 
+use crate::tools::ToolContext;
 use std::path::{Path, PathBuf};
 #[cfg(any(unix, test))]
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 /// What the name of each test file the tester writes holds.
 pub(crate) const MARKER: &str = "letronna_spec";
@@ -42,12 +51,32 @@ const COPIED: usize = 50_000;
 /// folder.
 const NAMED: usize = 10;
 
+/// How many times at most the driver runs the tester's tests against a run's
+/// work, each time the run says it is done after their report: the fix is
+/// checked once more, and a run that cannot make them pass by then has
+/// quoted why they should not, or will not.
+pub(crate) const RUNS: usize = 2;
+
+/// How long the tester's tests may take when the driver runs them: a test
+/// suite's worth, cut sooner by the run's deadline as any command is.
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Characters of the tests' output the run is shown at most, from its end,
+/// where a runner sums up what failed.
+const SHOWN: usize = 3_000;
+
+/// Characters a `Run:` line's command may hold at most: one line of shell,
+/// not a script.
+const LINE: usize = 400;
+
 /// A tester's files kept for a run: its id, the project it puts them back
-/// in, and where they are kept.
+/// in, where they are kept, and the command the tester gave to run them
+/// from the project's root, if it gave one.
 struct Moved {
     run: u64,
     workspace: PathBuf,
     kept: Kept,
+    command: Option<String>,
 }
 
 /// The tester's files kept for each run so far, so what the run puts back
@@ -290,19 +319,144 @@ pub(crate) fn brief(request: &str, sentences: &[String], before: Option<&Path>) 
         text.push_str(&format!("\n- R{}: {sentence}", at + 1));
     }
     text.push_str(
-        "\n\nEnd your report with a table of one row per test, written `R1 | what it checks | \
-         PASS` or `R1 | what it checks | FAIL | command that runs it | what it expected and \
-         what it got`.",
+        "\n\nEnd your report with the one command that runs all your tests from the project's \
+         root, with paths relative to it, on a line of its own written `Run: <command>`, and \
+         then a table of one row per test, written `R1 | what it checks | PASS` or `R1 | what \
+         it checks | FAIL | command that runs it | what it expected and what it got`.",
     );
     text
 }
 
+/// The command the tester's `report` gives to run all its tests, off its
+/// `Run:` line, the last where it wrote more than one; None when it gave
+/// none, or more than a line of shell.
+pub(crate) fn command(report: &str) -> Option<String> {
+    let given = report.lines().rev().find_map(|line| {
+        let line = line.trim().trim_start_matches(['-', '*', '>', ' ']);
+        let rest = line.strip_prefix("Run:")?;
+        let rest = rest
+            .trim()
+            .trim_matches('*')
+            .trim()
+            .trim_matches('`')
+            .trim();
+        (!rest.is_empty()).then(|| rest.to_owned())
+    })?;
+    (given.len() <= LINE).then_some(given)
+}
+
+/// The tester's files kept for run `run` and the command that runs them,
+/// for the driver to run them against the work; None when none were kept,
+/// or the tester gave no command.
+pub(crate) fn to_run(run: u64) -> Option<(Kept, String)> {
+    let moved = moved().lock().ok()?;
+    let kept = moved.iter().find(|kept| kept.run == run)?;
+    Some((kept.kept.clone(), kept.command.clone()?))
+}
+
+/// What failed when the work in `ctx`'s project, as it stands, was run
+/// against the tester's tests `kept` with `command`: the notice sending the
+/// run back with the output; None when they passed, or when they could not
+/// be run without touching the project. They run in a fresh copy of the
+/// project with the kept files put back at their paths, as the tester's
+/// own did, so nothing is added to the project and no patch of it takes
+/// them.
+pub(crate) fn ran(kept: &Kept, command: &str, ctx: &ToolContext) -> Option<String> {
+    run_in(kept, command, ctx, TIMEOUT)
+}
+
+/// `ran`, with `limit` on the command in place of `TIMEOUT`.
+fn run_in(kept: &Kept, command: &str, ctx: &ToolContext, limit: Duration) -> Option<String> {
+    let workspace = ctx.workspace.as_deref()?;
+    let copy = copy(workspace)?;
+    let placed = kept.files.iter().all(|file| {
+        let at = copy.join(file);
+        (at.parent()).is_some_and(|parent| std::fs::create_dir_all(parent).is_ok())
+            && std::fs::copy(kept.dir.join(file), &at).is_ok()
+    });
+    let outcome = placed.then(|| run_command(command, &copy, ctx, limit));
+    discard(&copy);
+    failed(kept, command, &outcome?)
+}
+
+/// What `run_command` made of `command` run in `copy` within `limit`, as
+/// `ctx` allows it: with the copy as its project and for no conversation,
+/// so one still running at the limit is stopped there rather than left
+/// running in the background.
+fn run_command(
+    command: &str,
+    copy: &Path,
+    ctx: &ToolContext,
+    limit: Duration,
+) -> Result<String, String> {
+    let tool = (crate::tools::all().into_iter())
+        .find(|tool| tool.name() == "run_command")
+        .ok_or("No run_command tool.")?;
+    let mut ctx = ctx.clone();
+    ctx.workspace = Some(copy.to_path_buf());
+    ctx.conversation = 0;
+    if let Some(parent) = ctx.caller.connection.as_deref() {
+        ctx.caller.connection = Some(Arc::new(crate::chat::Connection {
+            workspace: Some(copy.to_path_buf()),
+            ..parent.clone()
+        }));
+    }
+    let args = serde_json::json!({"command": command, "timeout": limit.as_secs()});
+    tool.run(&args, &ctx)
+}
+
+/// The notice sending the run back with `outcome`, what `command` made of
+/// the tester's tests `kept` run against its work; None when they passed.
+fn failed(kept: &Kept, command: &str, outcome: &Result<String, String>) -> Option<String> {
+    let (ended, output) = match outcome {
+        // A command that passed ends its output with no exit code, which a
+        // note of where the whole output went can follow.
+        Ok(output) => {
+            let code =
+                (output.lines().rev().take(3)).find_map(|line| line.strip_prefix("[exit code "))?;
+            let code = code.trim_end_matches(']');
+            (format!("exited with code {code}"), output.as_str())
+        }
+        Err(why) => ("did not finish".to_owned(), why.as_str()),
+    };
+    Some(format!(
+        "Your work as it stands was run against the tests a tester wrote from the request \
+         alone, in a copy of the project with them put back at the paths they are kept from, \
+         so nothing of yours was touched: `{command}` {ended}. Its output ends:\n\n{}\n\n\
+         Fix your work for each test that fails on what the request's words say, and run the \
+         tests again the same way. A test that expects what the words do not say is answered \
+         by quoting them in your answer; one that calls the code wrongly, such as with a name \
+         or import the request does not spell, is fixed where it is kept, in `{}`, since that \
+         is where it is run from; and if the command cannot run here, run the tests with the \
+         set-up you found works. Then end with your whole answer again.",
+        tail(output),
+        kept.dir.display()
+    ))
+}
+
+/// The end of `output`: `SHOWN` characters at most, from a line's start.
+fn tail(output: &str) -> String {
+    let output = output.trim_end();
+    if output.chars().count() <= SHOWN {
+        return output.to_owned();
+    }
+    let from = (output.char_indices().rev().nth(SHOWN - 1)).map_or(0, |(at, _)| at);
+    let from = output[from..].find('\n').map_or(from, |at| from + at + 1);
+    format!("…\n{}", &output[from..])
+}
+
 /// The tester's files under `from`, the copy it worked in or the project
 /// itself, moved into a new folder of the temp folder at the same paths,
-/// and kept for run `run` of `workspace`, so `tidy` deletes what it puts
-/// back; None when it left none. One that could not be kept is deleted all
-/// the same, so none stays where a patch would take it.
-pub(crate) fn keep(run: u64, from: &Path, workspace: &Path) -> Option<Kept> {
+/// and kept for run `run` of `workspace` with `command`, the one the tester
+/// gave to run them, so `tidy` deletes what it puts back and the driver can
+/// run them; None when it left none. One that could not be kept is deleted
+/// all the same, so none stays where a patch would take it.
+pub(crate) fn keep(
+    run: u64,
+    from: &Path,
+    workspace: &Path,
+    command: Option<String>,
+) -> Option<Kept> {
     let dir = folder("tests");
     let files: Vec<String> = (left(from).into_iter())
         .filter(|file| {
@@ -325,6 +479,7 @@ pub(crate) fn keep(run: u64, from: &Path, workspace: &Path) -> Option<Kept> {
             run,
             workspace: workspace.to_path_buf(),
             kept: kept.clone(),
+            command,
         });
     }
     Some(kept)
@@ -387,10 +542,24 @@ pub(crate) fn unrun(report: &str, kept: &Kept) -> String {
          runner and the set-up you found works, fix a test only where it calls the code wrongly, \
          such as a guessed name or import the request does not spell, and fix your work for \
          each test that fails on what the request's words say. Then delete the copies, since \
-         they are not part of the task.\n\n{}",
+         they are not part of the task.{}\n\n{}",
         where_kept(kept),
+        run_again(report),
         report.trim()
     )
+}
+
+/// What the run is told of the driver running the tester's tests against
+/// its work, when the tester's `report` gives the command to; nothing
+/// otherwise.
+fn run_again(report: &str) -> &'static str {
+    match command(report) {
+        Some(_) => {
+            " Once you say you are done, they are run against your work as it stands, and \
+             what fails comes back to you."
+        }
+        None => "",
+    }
 }
 
 /// Where the tester's tests are `kept`, and how to run them, as the run is
@@ -421,8 +590,9 @@ pub(crate) fn told(report: &str, kept: Option<&Kept>) -> String {
     );
     if let Some(kept) = kept {
         text.push_str(&format!(
-            " {} Delete the copies before you end, since they are not part of the task.",
-            where_kept(kept)
+            " {} Delete the copies before you end, since they are not part of the task.{}",
+            where_kept(kept),
+            run_again(report)
         ));
     }
     text.push_str(&format!("\n\n{}", report.trim()));
@@ -481,7 +651,7 @@ mod tests {
         )
         .unwrap();
 
-        let kept = keep(1, &root, &root).unwrap();
+        let kept = keep(1, &root, &root, None).unwrap();
         assert_eq!(
             kept.files,
             [
@@ -501,7 +671,7 @@ mod tests {
 
         // Once they are gone there is nothing more to keep, and the folder
         // they were kept in goes as the run ends.
-        assert_eq!(keep(1, &root, &root), None);
+        assert_eq!(keep(1, &root, &root, None), None);
         tidy(1);
         assert!(!kept.dir.exists());
     }
@@ -622,7 +792,7 @@ mod tests {
         // the copy.
         std::fs::write(copy.join("src/letronna_spec.test.ts"), "test").unwrap();
         std::fs::write(copy.join("src/lib.ts"), "changed").unwrap();
-        let kept = keep(2, &copy, &root).unwrap();
+        let kept = keep(2, &copy, &root, None).unwrap();
         assert_eq!(kept.files, ["src/letronna_spec.test.ts"]);
         discard(&copy);
         assert!(!copy.exists());
@@ -649,10 +819,10 @@ mod tests {
         let root = Scratch::new("spec-tests-tidied");
         std::fs::create_dir_all(root.join("tests")).unwrap();
         std::fs::write(root.join("tests/letronna_spec_a_test.go"), "test").unwrap();
-        let kept = keep(3, &root, &root).unwrap();
+        let kept = keep(3, &root, &root, None).unwrap();
         // Another run in the same folder has a tester of its own.
         std::fs::write(root.join("tests/letronna_spec_b_test.go"), "test").unwrap();
-        let other = keep(4, &root, &root).unwrap();
+        let other = keep(4, &root, &root, None).unwrap();
         // The run copies its test back, changes it, and makes one of its own,
         // and the other run copies its test back too.
         std::fs::write(root.join("tests/letronna_spec_a_test.go"), "changed").unwrap();
@@ -709,5 +879,157 @@ mod tests {
             "{text}"
         );
         assert!(text.ends_with(report));
+    }
+
+    #[test]
+    fn the_tester_is_asked_for_the_one_command_that_runs_its_tests() {
+        let brief = brief("Save at /api/items/save.", &[], None);
+        assert!(brief.contains("written `Run: <command>`"), "{brief}");
+        assert!(
+            brief.contains("from the project's root, with paths relative to it"),
+            "{brief}"
+        );
+        assert!(brief.ends_with("what it expected and what it got`."));
+    }
+
+    #[test]
+    fn the_command_is_read_off_the_reports_run_line() {
+        let report =
+            "Ran them.\nRun: `npx vitest run tests/letronna_spec.test.ts`\nR1 | adds | PASS";
+        assert_eq!(
+            command(report).as_deref(),
+            Some("npx vitest run tests/letronna_spec.test.ts")
+        );
+        let bold = "**Run:** pytest -q tests/test_letronna_spec.py\nR1 | x | FAIL | pytest | got 2";
+        assert_eq!(
+            command(bold).as_deref(),
+            Some("pytest -q tests/test_letronna_spec.py")
+        );
+        // The last where it gave more than one; none without the line, with
+        // nothing on it, or with a script's worth.
+        assert_eq!(
+            command("Run: go test ./a\nRun: go test ./...").as_deref(),
+            Some("go test ./...")
+        );
+        assert_eq!(command("R1 | x | PASS"), None);
+        assert_eq!(command("Run:\nR1 | x | PASS"), None);
+        assert_eq!(command(&format!("Run: {}", "x".repeat(LINE + 1))), None);
+    }
+
+    #[test]
+    fn the_run_hears_that_the_tests_are_run_against_its_work_when_the_report_says_how() {
+        let kept = Kept {
+            dir: PathBuf::from("/tmp/kept"),
+            files: vec!["tests/letronna_spec.test.ts".to_owned()],
+        };
+        let with = "Run: npx vitest run tests/letronna_spec.test.ts\nR1 | adds | FAIL | npx vitest run x | got []";
+        let without = "R1 | adds | FAIL | npx vitest run x | got []";
+        for (report, said) in [(with, true), (without, false)] {
+            let told = told(report, Some(&kept));
+            let unrun = unrun(report, &kept);
+            for text in [told, unrun] {
+                assert_eq!(
+                    text.contains("they are run against your work as it stands"),
+                    said,
+                    "{text}"
+                );
+                assert!(text.ends_with(report), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn with_no_command_there_is_nothing_for_the_driver_to_run() {
+        let root = Scratch::new("spec-tests-no-command");
+        std::fs::write(root.join("letronna_spec.txt"), "a test").unwrap();
+        assert!(keep(8, &root, &root, None).is_some());
+        assert_eq!(to_run(8), None);
+        tidy(8);
+        assert_eq!(to_run(8), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_work_as_it_stands_is_run_against_the_kept_tests_in_a_copy_of_the_project() {
+        let root = Scratch::new("spec-tests-run");
+        let repo = |args: &[&str]| assert!(git(&root, args).is_some(), "git {args:?}");
+        repo(&["init", "-q"]);
+        std::fs::write(root.join("README"), "a project").unwrap();
+        repo(&["add", "."]);
+        // The tester's test: the work has to make `made.txt`.
+        std::fs::write(
+            root.join("letronna_spec_test.sh"),
+            "test -f made.txt || { echo 'made.txt is missing'; exit 1; }\n",
+        )
+        .unwrap();
+        let command = "sh letronna_spec_test.sh".to_owned();
+        let kept = keep(6, &root, &root, Some(command.clone())).unwrap();
+        assert_eq!(to_run(6), Some((kept.clone(), command.clone())));
+        let ctx = ToolContext::of(&crate::chat::Connection {
+            workspace: Some(root.to_path_buf()),
+            ..Default::default()
+        });
+
+        // Before the work is there the test fails, the run hears what the
+        // runner printed and where the test is kept, and the project got
+        // neither the test nor anything the test made.
+        let text = ran(&kept, &command, &ctx).unwrap();
+        assert!(
+            text.contains("`sh letronna_spec_test.sh` exited with code 1"),
+            "{text}"
+        );
+        assert!(text.contains("made.txt is missing"), "{text}");
+        assert!(
+            text.contains(&format!("in `{}`", kept.dir.display())),
+            "{text}"
+        );
+        assert!(text.contains("Then end with your whole answer again."));
+        assert!(!root.join("letronna_spec_test.sh").exists());
+        assert!(root.join("README").exists());
+
+        // Once the work is there, nothing is said.
+        std::fs::write(root.join("made.txt"), "made").unwrap();
+        assert_eq!(ran(&kept, &command, &ctx), None);
+        assert!(!root.join("letronna_spec_test.sh").exists());
+        tidy(6);
+        assert_eq!(to_run(6), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_does_not_finish_is_reported_as_such() {
+        let root = Scratch::new("spec-tests-run-slow");
+        let repo = |args: &[&str]| assert!(git(&root, args).is_some(), "git {args:?}");
+        repo(&["init", "-q"]);
+        std::fs::write(root.join("README"), "a project").unwrap();
+        repo(&["add", "."]);
+        std::fs::write(root.join("letronna_spec_slow.sh"), "sleep 30\n").unwrap();
+        let command = "sh letronna_spec_slow.sh".to_owned();
+        let kept = keep(7, &root, &root, Some(command.clone())).unwrap();
+        let ctx = ToolContext::of(&crate::chat::Connection {
+            workspace: Some(root.to_path_buf()),
+            ..Default::default()
+        });
+        let text = run_in(&kept, &command, &ctx, Duration::from_secs(1)).unwrap();
+        assert!(
+            text.contains("`sh letronna_spec_slow.sh` did not finish"),
+            "{text}"
+        );
+        assert!(text.contains("Timed out after 1s"), "{text}");
+        tidy(7);
+    }
+
+    #[test]
+    fn the_output_shown_is_its_end_from_a_lines_start() {
+        let short = "a\nb";
+        assert_eq!(tail(short), "a\nb");
+        let lines: Vec<String> = (0..400)
+            .map(|at| format!("line {at:04} {}", "x".repeat(20)))
+            .collect();
+        let long = lines.join("\n");
+        let shown = tail(&long);
+        assert!(shown.starts_with("…\nline "), "{shown}");
+        assert!(shown.ends_with(lines.last().unwrap()), "{shown}");
+        assert!(shown.chars().count() <= SHOWN + 2, "{}", shown.len());
     }
 }

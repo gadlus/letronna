@@ -614,6 +614,7 @@ fn steps(
     let mut built = false;
     let mut listed = false;
     let mut tabled = false;
+    let mut tested = 0;
     let mut twinned = false;
     // From the first request, since a run told of its time only near the
     // end has often thought most of it away by then.
@@ -954,6 +955,21 @@ fn steps(
                 && let Some(notice) = review_rows(spec, turn)
             {
                 tabled = true;
+                spec.transcript.conversation.messages.push(notice);
+                save(&mut spec.transcript)?;
+                continue;
+            }
+            // Once the run has acted on the reports, the tester's tests are
+            // run against its work by the driver itself, in a copy of the
+            // project, and what failed sent back; `RUNS` times at most, and
+            // with a round and budget left, as above.
+            if listed
+                && tested < crate::spec_tests::RUNS
+                && report.rounds < spec.rounds
+                && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
+                && let Some(notice) = tested_work(spec, turn)
+            {
+                tested += 1;
                 spec.transcript.conversation.messages.push(notice);
                 save(&mut spec.transcript)?;
                 continue;
@@ -2425,6 +2441,65 @@ fn review_rows(spec: &Spec, turn: &Turn) -> Option<Message> {
     })
 }
 
+/// The notice sending a session's own run nobody watches back with what
+/// failed when the driver ran the tester's kept tests against its work as it
+/// stands, in a copy of the project; None when they passed, when none were
+/// kept with a command to run them, or when the gate would not let the
+/// command run as it stands, which leaves them to the run, as it was told.
+fn tested_work(spec: &Spec, turn: &Turn) -> Option<Message> {
+    if !unwatched(spec) || turn.capped().is_some() || !turn.runs_commands() {
+        return None;
+    }
+    if refused(spec, "run_command").is_some() {
+        return None;
+    }
+    // With the time and tokens for the fix after it: near either end, a run
+    // sent back would leave a fix half made, which is worse than its first
+    // version.
+    if !affords_review(spec) {
+        return None;
+    }
+    let (kept, command) = crate::spec_tests::to_run(spec.id)?;
+    // Through the gate, as the tester's own call to it went: what it would
+    // put to the judge or the user is not run behind their back.
+    let call = ToolCall {
+        id: "spec-tests".into(),
+        name: "run_command".into(),
+        arguments: json!({
+            "command": command,
+            "timeout": crate::spec_tests::TIMEOUT.as_secs(),
+        })
+        .to_string(),
+    };
+    // Decided as the run's own calls are: by its session's gate where it
+    // has one, else by the rules.
+    let outcome = match spec.decide.as_ref() {
+        Some(decide) if call_refusal(spec, &call).is_none() => decide(&call, &context(spec)),
+        _ => {
+            let rules = permissions::load(&permissions::user_file());
+            gated(spec, &call, &rules, false).0
+        }
+    };
+    let sandboxed = match outcome {
+        gate::Outcome::Run => false,
+        gate::Outcome::Sandboxed => true,
+        gate::Outcome::Ask | gate::Outcome::Refuse(_) => return None,
+    };
+    let ctx = ToolContext {
+        sandboxed,
+        ..context(spec)
+    };
+    let content = crate::spec_tests::ran(&kept, &command, &ctx)?;
+    Some(Message {
+        role: "user".into(),
+        content,
+        notice: true,
+        // Folded into the run, so the window keeps the task it is for.
+        folded: true,
+        ..Default::default()
+    })
+}
+
 /// What the latest review's table in `messages` leaves unchecked of the
 /// requirements the latest requirements notice numbers, as the notice that
 /// sends the run back says it; None with no such notice, no review with a
@@ -2537,9 +2612,12 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
         (reports, tested)
     });
     // Kept apart whatever the tester reported, so no patch of the project
-    // takes them; the run puts them back to run them.
+    // takes them; the run puts them back to run them, and the driver runs
+    // them against its work with the command the report gives.
     let kept = workspace.and_then(|workspace| {
-        crate::spec_tests::keep(spec.id, copied.as_deref().unwrap_or(workspace), workspace)
+        let command = tested.as_deref().and_then(crate::spec_tests::command);
+        let from = copied.as_deref().unwrap_or(workspace);
+        crate::spec_tests::keep(spec.id, from, workspace, command)
     });
     for folder in [&copied, &before].into_iter().flatten() {
         crate::spec_tests::discard(folder);
@@ -7263,6 +7341,72 @@ pub(crate) mod tests {
 
         assert!(dir.join("made.rs").exists());
         assert_eq!(report.text, "Added parse_range.");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_whose_work_fails_the_testers_tests_is_sent_back_with_the_output() {
+        let dir = scratch("tested-work");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(project.join("README"), "a project").unwrap();
+        git(&["add", "."]);
+        let mut spec = own_run("http://127.0.0.1:1/v1".into(), &dir, AGENTS + 1_900);
+        spec.connection.workspace = Some(project.clone());
+        spec.decide = Some(Arc::new(|_, _| gate::Outcome::Run));
+        // The tester's test, kept for the run with the command that runs it.
+        std::fs::write(
+            project.join("letronna_spec_test.sh"),
+            "test -f made.txt || { echo 'made.txt is missing'; exit 1; }\n",
+        )
+        .unwrap();
+        crate::spec_tests::keep(
+            spec.id,
+            &project,
+            &project,
+            Some("sh letronna_spec_test.sh".into()),
+        )
+        .unwrap();
+        let turn = Turn::new(spec.connection.clone());
+
+        let notice = tested_work(&spec, &turn).unwrap();
+        assert!(notice.notice && notice.folded && notice.role == "user");
+        assert!(
+            notice
+                .content
+                .contains("`sh letronna_spec_test.sh` exited with code 1"),
+            "{}",
+            notice.content
+        );
+        assert!(
+            notice.content.contains("made.txt is missing"),
+            "{}",
+            notice.content
+        );
+        assert!(!project.join("letronna_spec_test.sh").exists());
+        // A watched run's work is the user's to judge, and a command the
+        // session's gate would not run as it stands is left to the run.
+        spec.connection.human = true;
+        assert!(tested_work(&spec, &turn).is_none());
+        spec.connection.human = false;
+        spec.decide = Some(Arc::new(|_, _| gate::Outcome::Refuse("Refused.".into())));
+        assert!(tested_work(&spec, &turn).is_none());
+        spec.decide = Some(Arc::new(|_, _| gate::Outcome::Run));
+        // Once the work passes them, nothing is said.
+        std::fs::write(project.join("made.txt"), "made").unwrap();
+        assert!(tested_work(&spec, &turn).is_none());
+        assert!(!project.join("letronna_spec_test.sh").exists());
+        crate::spec_tests::tidy(spec.id);
     }
 
     #[test]
