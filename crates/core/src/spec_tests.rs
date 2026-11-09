@@ -892,15 +892,22 @@ fn briefing(
     }
     // The table and then the command, last: a long report is cut in the
     // middle before the driver reads it, and the command is read from the
-    // end, so what the cut keeps is what the driver needs.
+    // end, so what the cut keeps is what the driver needs. The command runs
+    // the tester's tests alone: the driver reads any failure in its run as
+    // the work's, and a test of the project's own can fail where the driver
+    // runs it for reasons of its own, such as a variable the run's commands
+    // set.
     text.push_str(&format!(
         "\n\nEnd your report with a table of one row per test, written {rows}. Then, on a \
-         line of its own as the report's very last line, the one command that runs all your \
-         tests from the project's root, with paths relative to it, written `Run: <command>`: \
-         one that runs them once and exits rather than watching, installs nothing, and needs \
-         no file beyond your test files, so any fixture or helper they need goes in a file \
-         named with `{MARKER}` too. A long report is cut in its middle before it is read, so \
-         what comes last is kept."
+         line of its own as the report's very last line, the one command that runs your tests \
+         and no others from the project's root, with paths relative to it, written `Run: \
+         <command>`: one that names your test files or filters on a name all your tests share, \
+         such as `go test -run LetronnaSpec ./pkg/`, never the project's whole suite, such as \
+         `go test ./...`, since a test of the project's own that fails here says nothing of the \
+         change; one that runs them once and exits rather than watching, installs nothing, and \
+         needs no file beyond your test files, so any fixture or helper they need goes in a \
+         file named with `{MARKER}` too. A long report is cut in its middle before it is read, \
+         so what comes last is kept."
     ));
     text
 }
@@ -3274,6 +3281,20 @@ mod tests {
         );
         assert!(
             brief.contains("runs them once and exits rather than watching, installs nothing"),
+            "{brief}"
+        );
+        // Its own tests alone: a test of the project's own can fail where
+        // the driver runs the command for reasons of its own.
+        assert!(
+            brief.contains("the one command that runs your tests and no others"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains(
+                "names your test files or filters on a name all your tests share, such as \
+                 `go test -run LetronnaSpec ./pkg/`, never the project's whole suite, such as \
+                 `go test ./...`"
+            ),
             "{brief}"
         );
         // The table first, and the command as the report's last line, where
