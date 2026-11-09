@@ -2766,7 +2766,8 @@ enum Verdict {
 /// passes the tests that the first, and the project as it was, do not. None,
 /// with the run's work kept and nothing said, when the first attempt passes
 /// after all, when the failures its output names are all in tests the
-/// tester did not write, when the tests pass on the project as it was and
+/// tester did not write and fail on the project as it was too, when the
+/// tests pass on the project as it was and
 /// so choose nothing, when the attempt's tests would import the first
 /// attempt's code, when the second attempt does not pass, ran no test or
 /// left the project as it was, when the helper could not start, when the
@@ -2815,13 +2816,7 @@ fn second_attempt(spec: &Spec, turn: &Turn, head: &str) -> Option<(Message, bool
         return None;
     }
     let (ended, output) = crate::spec_tests::failure(&first)?;
-    // Failures all in tests the tester did not write, such as the project's
-    // own under a command that runs its whole suite, say nothing of the
-    // work: a fresh attempt would fail them the same way.
-    if crate::spec_tests::own_failing(&command, output) == Some(false) {
-        crate::diag::event("second_attempt_skipped", &[("why", json!("others_tests"))]);
-        return None;
-    }
+    let own = crate::spec_tests::own_failing(&kept, &command, output);
     let took = began.elapsed();
     let base = crate::spec_tests::base(workspace)?;
     let verdict = (|| {
@@ -2834,7 +2829,16 @@ fn second_attempt(spec: &Spec, turn: &Turn, head: &str) -> Option<(Message, bool
         if crate::spec_tests::unfinished_build(&command, &bare) {
             return None;
         }
-        crate::spec_tests::failure(&bare)?;
+        let (_, before) = crate::spec_tests::failure(&bare)?;
+        // Failures all in tests the tester did not write, and all failing
+        // on the project as it was: the project's own, as under a command
+        // that runs its whole suite, which say nothing of the work, and a
+        // fresh attempt would fail them the same way. One the work caused
+        // in a test of the project's own still leads to an attempt.
+        if own == Some(false) && crate::spec_tests::already_failing(output, before) {
+            crate::diag::event("second_attempt_skipped", &[("why", json!("others_tests"))]);
+            return None;
+        }
         // An attempt whose tests would import the first attempt's code,
         // through an editable install or a workspace link, tests the wrong
         // work.
@@ -9161,6 +9165,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn no_second_attempt_is_made_when_only_tests_the_tester_did_not_write_fail() {
+        let _data = data("second-attempt-others");
         let dir = scratch("second-attempt-others");
         let commit = committed(&dir);
         let id = AGENTS + 1_935;
@@ -9184,6 +9189,21 @@ pub(crate) mod tests {
 
         assert!(second_attempt(&spec, &turn, &commit).is_none());
         assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert!(!dir.join("letronna_spec_test.sh").exists());
+        crate::spec_tests::tidy(id);
+        // The same set-up with the tester's own test failing: an attempt
+        // starts, and its model call reaches the provider, which turns it
+        // down, so nothing is adopted.
+        std::fs::write(
+            dir.join("letronna_spec_test.sh"),
+            "echo '--- FAIL: TestLetronnaSpecMade (0.00s)'; echo '    made_letronna_spec_test.go:9: \
+             made.txt is missing'; echo FAIL; exit 1\n",
+        )
+        .unwrap();
+        let command = Some("sh ./*_test.sh".to_owned());
+        crate::spec_tests::keep(id, &dir, &dir, command).unwrap();
+        assert!(second_attempt(&spec, &turn, &commit).is_none());
+        assert!(count.load(Ordering::SeqCst) >= 1, "no attempt was started");
         assert!(!dir.join("letronna_spec_test.sh").exists());
         crate::spec_tests::tidy(id);
         let _ = TcpStream::connect(address);

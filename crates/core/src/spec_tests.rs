@@ -1443,18 +1443,18 @@ const WORDS_FIRST: &str = "Before changing what your work does for a test, find 
 
 /// The notice sending the run back with `outcome`, what `command` made of
 /// the tester's tests `kept` run against its work; None when they passed.
-/// Where the failures it names are all in tests the tester did not write
-/// (`own_failing`), it says so: they may be the project's own as it was, or
-/// this environment's, and the run is to check before it changes anything
-/// for them.
+/// Where the failures it attributes appear to be all in tests the tester
+/// did not write (`own_failing`), it says so: they may be the project's own
+/// as it was, or this environment's, and the run is to check before it
+/// changes anything for them.
 fn failed(kept: &Kept, command: &str, outcome: &Result<String, String>) -> Option<String> {
     let (ended, output) = failure(outcome)?;
     let (shown, left_out) = quoted(output);
-    let others = match own_failing(command, output) {
+    let others = match own_failing(kept, command, output) {
         Some(false) => {
-            "The failures shown are in tests the tester did not write, and may be the \
-             project's own as it was or this environment's: check whether they fail on the \
-             project as it was too, and say so where they do. "
+            "The failures shown appear to be in tests the tester did not write, and may be \
+             the project's own as it was or this environment's: check whether they fail on \
+             the project as it was too, and say so where they do. "
         }
         _ => "",
     };
@@ -1779,38 +1779,194 @@ fn lines_of(output: &str) -> Vec<&str> {
         .collect()
 }
 
+/// What a line of a test runner's output starts with, past its indent,
+/// when it is the runner's verdict on a test or file it names
+/// (`attributed`): Go's `--- FAIL`; unittest's `FAIL:` and `ERROR: test`;
+/// jest's and vitest's `FAIL ` before a file; pytest's `FAILED` before a
+/// test's path; jest's `●` and the marks a list of tests puts by one that
+/// failed; and rspec's `Failure/Error:`.
+const ATTRIBUTED_STARTS: [&str; 11] = [
+    "--- FAIL",
+    "FAIL:",
+    "ERROR: test",
+    "FAIL ",
+    "FAILED",
+    "●",
+    "✕",
+    "×",
+    "✗",
+    "✘",
+    "Failure/Error:",
+];
+
+/// Characters after a line naming a failure within which a file or test
+/// the lines name is read as the failure's own: a Go panic's goroutine dump
+/// runs to a couple of thousand before the frame in the test that reached
+/// it, where `excerpt` shows far less of each failure.
+const OWN_WINDOW: usize = 4_000;
+
+/// Bytes read of each of the tester's Go files for its tests' names; a
+/// test file runs to far less.
+const TEST_FILE_READ: u64 = 256 * 1024;
+
 /// Whether the failures `output`, what `command` made of the tester's
-/// tests, names are the tester's own: Some(true) when `command` runs its
-/// tests alone, naming its files or a filter on their names (`names_own`),
-/// or when a failure's lines, as `excerpt` shows them, name one of its files
-/// or tests; Some(false) when the output names failures (`named`) and none
-/// of them is; None when it names none, as a runner this does not know
-/// prints, or as a command that did not finish leaves it. Under a command
-/// that runs the project's whole suite, a test of the project's own can fail
-/// for reasons of its own, such as a variable the run's commands set, and
-/// says nothing of the work.
-pub(crate) fn own_failing(command: &str, output: &str) -> Option<bool> {
+/// tests `kept`, names are the tester's own: Some(true) when `command` runs
+/// its tests alone, naming its files or a filter on their names
+/// (`names_own`), or when the lines of a failure, up to `OWN_WINDOW`
+/// characters and ending where another part of the report or a passing
+/// test's lines begin, name one of its files (`names_own`) or one of its
+/// Go tests (`test_names`); Some(false) when the runner attributes a
+/// failure to a test or file (`attributed`) and none of those is the
+/// tester's; None when it attributes none, as when only a build error, a
+/// panic, an assertion's values or a trace says that something failed,
+/// when a runner this does not know prints, or when the command did not
+/// finish. Under a command that runs the project's whole suite, a test of
+/// the project's own can fail for reasons of its own, such as a variable
+/// the run's commands set, and says nothing of the work.
+pub(crate) fn own_failing(kept: &Kept, command: &str, output: &str) -> Option<bool> {
     if names_own(command) {
         return Some(true);
     }
+    let tests = test_names(kept);
     let lines = lines_of(output);
     let names = named_lines(&lines);
-    let mut any = false;
+    let owns: Vec<bool> = (lines.iter())
+        .map(|line| names_own(line) || tests.iter().any(|test| line.contains(test.as_str())))
+        .collect();
+    let mut attributed_any = false;
     for at in (0..lines.len()).filter(|at| names[*at].is_some()) {
-        any = true;
+        attributed_any |= attributed(lines[at]);
         let mut size = 0;
         for (next, line) in lines.iter().enumerate().skip(at) {
-            let cost = clipped(line).chars().count() + 1;
-            if next > at && (size + cost > FAILURE_SHOWN || another_part(line)) {
+            if next > at && (size > OWN_WINDOW || another_part(line) || passing(line)) {
                 break;
             }
-            size += cost;
-            if names_own(line) {
+            size += line.chars().count() + 1;
+            if owns[next] {
                 return Some(true);
             }
         }
     }
-    any.then_some(false)
+    attributed_any.then_some(false)
+}
+
+/// Whether every failure `output`, a run of the tester's command against
+/// the work, attributes to a test or file (`attributed`) is attributed in
+/// `bare` too, its run on the project as it was, each line read with its
+/// digits left out (`undated`), since Go prints a test's time: then the
+/// failures are the project's own as it was, and the work caused none.
+/// False where `output` attributes none.
+pub(crate) fn already_failing(output: &str, bare: &str) -> bool {
+    let attributed_in = |text: &str| -> HashSet<String> {
+        let lines = lines_of(text);
+        let names = named_lines(&lines);
+        (0..lines.len())
+            .filter(|at| names[*at].is_some() && attributed(lines[*at]))
+            .map(|at| undated(lines[at]))
+            .collect()
+    };
+    let first = attributed_in(output);
+    !first.is_empty() && first.is_subset(&attributed_in(bare))
+}
+
+/// `line` trimmed, with its digits left out: a test's time, a count or a
+/// line number differs from one run to the next.
+fn undated(line: &str) -> String {
+    line.trim()
+        .chars()
+        .filter(|c| !c.is_ascii_digit())
+        .collect()
+}
+
+/// The names of the tests in the tester's Go files `kept`, `TestX` for each
+/// `func TestX(`: Go's `--- FAIL:` names the test and not its file, and the
+/// file named under it is a helper's where the test asserts through one
+/// without `t.Helper()`. Other runners name the file.
+fn test_names(kept: &Kept) -> Vec<String> {
+    use std::io::Read;
+    let mut names = Vec::new();
+    for file in (kept.files.iter()).filter(|file| file.ends_with("_test.go")) {
+        let Ok(opened) = std::fs::File::open(kept.dir.join(file)) else {
+            continue;
+        };
+        let mut text = String::new();
+        if opened
+            .take(TEST_FILE_READ)
+            .read_to_string(&mut text)
+            .is_err()
+        {
+            continue;
+        }
+        for line in text.lines() {
+            let Some(rest) = line.strip_prefix("func Test") else {
+                continue;
+            };
+            let name: String = (rest.chars())
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                names.push(format!("Test{name}"));
+            }
+        }
+    }
+    names
+}
+
+/// Whether `line`, of a test runner's output, is the runner's verdict on a
+/// test or file it names: it starts, past its indent, with one of
+/// `ATTRIBUTED_STARTS` other than jest's `● Console`, holds Maven's `<<<
+/// FAILURE!` or `<<< ERROR!`, ends in ` FAILED` as cargo's and Gradle's
+/// lines for a test do, or is a counted or numbered failure (`titled`). A
+/// build error, a panic, an assertion's values or a trace names a failure
+/// too (`named`), but not whose.
+fn attributed(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("● Console") {
+        return false;
+    }
+    ATTRIBUTED_STARTS
+        .iter()
+        .any(|start| trimmed.starts_with(start))
+        || ["<<< FAILURE!", "<<< ERROR!"]
+            .iter()
+            .any(|held| line.contains(held))
+        || trimmed.trim_end().ends_with(" FAILED")
+        || titled(trimmed)
+}
+
+/// Whether `trimmed`, a line past its indent, opens with mocha's count of
+/// what is failing, `2 failing`, or numbers a failure as PHPUnit and mocha
+/// list them, `1) Cart`.
+fn titled(trimmed: &str) -> bool {
+    let mut words = trimmed.split_whitespace();
+    let first = words.next().unwrap_or_default();
+    let counted = first.parse::<u64>().is_ok() && words.next() == Some("failing");
+    let numbered = (first.strip_suffix(')'))
+        .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()));
+    counted || numbered
+}
+
+/// Whether `line` is a runner's word on a test that passed or is starting,
+/// past which a failure's lines have ended: Go's `--- PASS`, `=== RUN` and
+/// `ok`, its `PASS` alone, jest's ticks and pytest's `PASSED`.
+fn passing(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let ended = trimmed.trim_end();
+    [
+        "--- PASS",
+        "=== RUN",
+        "=== PAUSE",
+        "=== CONT",
+        "ok ",
+        "ok\t",
+        "✓",
+        "√",
+        "✔",
+    ]
+    .iter()
+    .any(|start| trimmed.starts_with(start))
+        || ended == "PASS"
+        || ended.ends_with(" PASSED")
 }
 
 /// Whether `text` names one of the tester's files or tests: holds `MARKER`
@@ -1867,8 +2023,8 @@ fn named_lines(lines: &[&str]) -> Vec<Option<Named>> {
 /// `VERDICT_HOLDS`, ends in ` FAILED` as cargo's and Gradle's lines for a
 /// test do, gives a Go file's line and column as a build error does, holds
 /// a TypeScript error's code, or opens with mocha's count of what is
-/// failing, a numbered failure as PHPUnit and mocha list them, or an
-/// assertion's error. As raised when it opens with `Traceback`, with a bare
+/// failing or a numbered failure as PHPUnit and mocha list them (`titled`),
+/// or an assertion's error. As raised when it opens with `Traceback`, with a bare
 /// `error:`, as an app's logger prints on every line and rustc on a build
 /// error without a code, or with another word ending in `Error` or
 /// `Exception`. Never for a mere mention of an error, which a log prints on
@@ -1878,12 +2034,8 @@ fn named(line: &str) -> Option<Named> {
     if trimmed.starts_with("● Console") {
         return None;
     }
-    let mut words = trimmed.split_whitespace();
-    let first = words.next().unwrap_or_default();
+    let first = trimmed.split_whitespace().next().unwrap_or_default();
     let name = first.trim_end_matches(':');
-    let counted = name.parse::<u64>().is_ok() && words.next() == Some("failing");
-    let numbered = (first.strip_suffix(')'))
-        .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()));
     let asserted = [
         "AssertionError",
         "AssertionFailedError",
@@ -1898,8 +2050,7 @@ fn named(line: &str) -> Option<Named> {
         || trimmed.trim_end().ends_with(" FAILED")
         || go_position(trimmed)
         || typescript_code(line)
-        || counted
-        || numbered
+        || titled(trimmed)
         || asserted;
     if verdict {
         return Some(Named::Verdict);
@@ -4317,55 +4468,135 @@ mod tests {
 
     #[test]
     fn whose_tests_fail_is_read_off_the_failures_lines_or_the_command() {
+        let kept = Kept {
+            dir: PathBuf::from("/tmp/kept"),
+            files: vec!["color_letronna_spec_test.go".to_owned()],
+        };
+        let whose = |command: &str, output: &str| own_failing(&kept, command, output);
         // The project's whole suite, with a test of the project's own
         // failing: none of the tester's.
         let others = "--- FAIL: TestEnvNoColor (0.00s)\n    termenv_test.go:45: expected \
                       true\nFAIL\nFAIL\tgithub.com/acme/termenv\t0.4s\n[exit code 1]";
-        assert_eq!(own_failing("go test ./...", others), Some(false));
+        assert_eq!(whose("go test ./...", others), Some(false));
         // The tester's: by the test's name in any case, by its file among the
         // failure's lines, or by a command that runs its tests alone.
         let named = "--- FAIL: TestLetronnaSpecRestoresColor (0.00s)\n    x_test.go:9: wrong\nFAIL";
-        assert_eq!(own_failing("go test ./...", named), Some(true));
+        assert_eq!(whose("go test ./...", named), Some(true));
         let filed = "--- FAIL: TestRestoresColor (0.00s)\n    color_letronna_spec_test.go:9: \
                      wrong\nFAIL";
-        assert_eq!(own_failing("go test ./...", filed), Some(true));
+        assert_eq!(whose("go test ./...", filed), Some(true));
         assert_eq!(
-            own_failing("go test -run TestLetronnaSpec ./pkg/a/ ./pkg/b/", others),
+            whose("go test -run TestLetronnaSpec ./pkg/a/ ./pkg/b/", others),
             Some(true)
         );
         assert_eq!(
-            own_failing("pytest -q tests/test_letronna_spec.py", others),
+            whose("pytest -q tests/test_letronna_spec.py", others),
             Some(true)
         );
         // Other runners' summaries name the file.
         let pytest = "FAILED tests/test_other.py::test_y - assert 1 == 2\n[exit code 1]";
-        assert_eq!(own_failing("pytest -q", pytest), Some(false));
+        assert_eq!(whose("pytest -q", pytest), Some(false));
         let own = "FAILED tests/test_letronna_spec.py::test_y - assert 1 == 2\n[exit code 1]";
-        assert_eq!(own_failing("pytest -q", own), Some(true));
+        assert_eq!(whose("pytest -q", own), Some(true));
         let jest = " FAIL  src/other.test.ts\n  ● adds\n\n    Expected: 4\n    Received: 3\n";
-        assert_eq!(own_failing("npx jest", jest), Some(false));
+        assert_eq!(whose("npx jest", jest), Some(false));
         let hyphened = " FAIL  src/letronna-spec.test.ts\n  ● adds\n\n    Expected: 4\n";
-        assert_eq!(own_failing("npx jest", hyphened), Some(true));
+        assert_eq!(whose("npx jest", hyphened), Some(true));
         // The folder the command runs in, as a runner printing absolute
         // paths shows it, names nothing of the tester's.
         let traced = "--- FAIL: TestEnvNoColor (0.00s)\n    Error Trace:\t\
                       /tmp/letronna-harness-copy-4242-7/termenv_test.go:45\n    Error:      \t\
                       Should be true\n    Test:       \tTestEnvNoColor\nFAIL";
-        assert_eq!(own_failing("go test ./...", traced), Some(false));
+        assert_eq!(whose("go test ./...", traced), Some(false));
         // A mention of the tester's package well past a failure's lines is
         // no failure of its own.
         let apart = format!(
             "{others}\n{}ok  \tgithub.com/acme/letronna_spec\t0.1s",
             "    a log line\n".repeat(60)
         );
-        assert_eq!(own_failing("go test ./...", &apart), Some(false));
+        assert_eq!(whose("go test ./...", &apart), Some(false));
         // Output naming no failure, as a runner this does not know prints or
         // a command that did not finish leaves it, says nothing either way.
         assert_eq!(
-            own_failing("sh ./*_test.sh", "made.txt is missing\n[exit code 1]"),
+            whose("sh ./*_test.sh", "made.txt is missing\n[exit code 1]"),
             None
         );
-        assert_eq!(own_failing("go test ./...", "Timed out after 600s."), None);
+        assert_eq!(whose("go test ./...", "Timed out after 600s."), None);
+        // A build error, a panic or a logger's lines say that something
+        // failed, not whose: nothing either way.
+        let compile = "error[E0425]: cannot find value `total` in this scope\n --> src/lib.rs:3:5\n\n\
+                       error: could not compile `cart` (lib test) due to 1 previous error\n\
+                       [exit code 101]";
+        assert_eq!(whose("cargo test", compile), None);
+        let built = "# github.com/acme/pkg\n./cart.go:12:9: undefined: Total\nFAIL\tgithub.com/acme/pkg \
+                     [build failed]\n[exit code 1]";
+        assert_eq!(whose("go test ./pkg/", built), None);
+        let logged = format!(
+            "{}[exit code 1]",
+            "error: GET /carts/3 failed with 404\n".repeat(5)
+        );
+        assert_eq!(whose("npx mocha", &logged), None);
+        // A panic in the work reached from the tester's test: the frame in
+        // its file is far below the failure's line, past what the notice
+        // shows of a failure, and still within the window.
+        let frames =
+            "goroutine 7 [running]:\ntesting.tRunner.func1.2()\n\t/usr/local/go/src/testing/\
+                      testing.go:1632 +0x3fc\n"
+                .repeat(24);
+        assert!(frames.chars().count() > FAILURE_SHOWN && frames.chars().count() < OWN_WINDOW);
+        let panicked = format!(
+            "--- FAIL: TestTotal (0.00s)\npanic: runtime error: invalid memory address \
+             [recovered]\n{frames}github.com/acme/pkg.TestTotal(0xc000106340)\n\t\
+             /tmp/letronna-harness-copy-1-2/total_letronna_spec_test.go:9 +0x1d\nFAIL\t\
+             github.com/acme/pkg\t0.01s"
+        );
+        assert_eq!(whose("go test ./pkg/", &panicked), Some(true));
+        // But not past where a passing test's lines begin.
+        let passed = "--- FAIL: TestTotal (0.00s)\n    cart_test.go:9: wrong\n=== RUN   \
+                      TestLetronnaSpecEmpty\n--- PASS: TestLetronnaSpecEmpty (0.00s)\nFAIL";
+        assert_eq!(whose("go test ./pkg/", passed), Some(false));
+    }
+
+    #[test]
+    fn a_go_test_named_without_the_marker_is_known_by_its_kept_file() {
+        let dir = Scratch::new("spec-tests-go-names");
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        std::fs::write(
+            dir.join("pkg/total_letronna_spec_test.go"),
+            "package pkg\n\nimport \"testing\"\n\nfunc TestTotal(t *testing.T) {\n\tassertEqual(t, \
+             Total(), 4)\n}\n\nfunc TestEmpty(t *testing.T) {}\n",
+        )
+        .unwrap();
+        let kept = Kept {
+            dir: dir.to_path_buf(),
+            files: vec!["pkg/total_letronna_spec_test.go".to_owned()],
+        };
+        assert_eq!(test_names(&kept), ["TestTotal", "TestEmpty"]);
+        // Asserting through the project's helper without t.Helper(), the
+        // failure's line names the helper's file, and the test's name is
+        // all that says whose it is.
+        let helped = "--- FAIL: TestTotal (0.00s)\n    assert.go:45: expected 4, got 3\nFAIL\nFAIL\t\
+                      github.com/acme/pkg\t0.01s";
+        assert_eq!(own_failing(&kept, "go test ./pkg/", helped), Some(true));
+        let others = "--- FAIL: TestEnvNoColor (0.00s)\n    assert.go:45: expected true\nFAIL";
+        assert_eq!(own_failing(&kept, "go test ./pkg/", others), Some(false));
+    }
+
+    #[test]
+    fn failures_the_project_had_as_it_was_are_told_from_ones_the_work_caused() {
+        let bare = "--- FAIL: TestEnvNoColor (0.01s)\n    termenv_test.go:45: expected true\nFAIL\t\
+                    github.com/acme/termenv\t0.4s";
+        let same = "--- FAIL: TestEnvNoColor (0.00s)\n    termenv_test.go:45: expected true\nFAIL\t\
+                    github.com/acme/termenv\t0.3s";
+        assert!(already_failing(same, bare));
+        let more = format!(
+            "{same}\n--- FAIL: TestColorProfile (0.00s)\n    termenv_test.go:80: wrong\nFAIL"
+        );
+        assert!(!already_failing(&more, bare));
+        // Nothing attributed says nothing.
+        assert!(!already_failing("panic: boom\n[exit code 2]", bare));
+        let plain = "made.txt is missing\n[exit code 1]";
+        assert!(!already_failing(plain, plain));
     }
 
     #[test]
@@ -4404,9 +4635,9 @@ mod tests {
             dir: PathBuf::from("/tmp/kept"),
             files: vec!["color_letronna_spec_test.go".to_owned()],
         };
-        let said = "The failures shown are in tests the tester did not write, and may be the \
-                    project's own as it was or this environment's: check whether they fail on \
-                    the project as it was too, and say so where they do. Fix your work";
+        let said = "The failures shown appear to be in tests the tester did not write, and may \
+                    be the project's own as it was or this environment's: check whether they \
+                    fail on the project as it was too, and say so where they do. Fix your work";
         let others = Ok(
             "--- FAIL: TestEnvNoColor (0.00s)\n    termenv_test.go:45: expected \
                         true\nFAIL\n[exit code 1]"
