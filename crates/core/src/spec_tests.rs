@@ -60,8 +60,13 @@
 //! changed since, for the run to put back what broke them. The tester's
 //! command runs with the variables the run's own passing command of the
 //! same program set, such as a module cache, so a tester that lacked the
-//! run's set-up gets it. All of it happens in copies in the temp folder,
-//! discarded as the run ends; nothing is written into the project.
+//! run's set-up gets it, and a Python command runs with the copy first on
+//! the import path, so an editable install of the project does not have it
+//! test the project's code in place of the copy's (`with_import_path`). All
+//! of it happens in copies in the temp folder, discarded as the run ends;
+//! nothing is written into the project. The tester ends its report with
+//! the one command that runs its tests, after its table, since a long
+//! report is cut in the middle before the driver reads it.
 //!
 //! The project as it was serves one more check (`verdict`): a test command
 //! of the run's own that failed, still fails in a fresh copy of the work, and
@@ -301,6 +306,21 @@ impl FirstVersion {
 fn firsts() -> &'static Mutex<Vec<First>> {
     static FIRSTS: OnceLock<Mutex<Vec<First>>> = OnceLock::new();
     FIRSTS.get_or_init(Default::default)
+}
+
+/// The folders kept aside for each run, such as the first attempt a second
+/// took the place of, until `tidy` discards them.
+fn asides() -> &'static Mutex<Vec<(u64, PathBuf)>> {
+    static ASIDES: OnceLock<Mutex<Vec<(u64, PathBuf)>>> = OnceLock::new();
+    ASIDES.get_or_init(Default::default)
+}
+
+/// Keeps `dir`, a folder of the temp folder made for run `run`, until `tidy`
+/// deletes it with the run's other folders.
+pub(crate) fn aside(run: u64, dir: &Path) {
+    if let Ok(mut asides) = asides().lock() {
+        asides.push((run, dir.to_path_buf()));
+    }
 }
 
 /// Keeps a copy of run `run`'s work in `workspace` as it stands, the first
@@ -603,13 +623,15 @@ pub(crate) fn head(_workspace: &Path) -> Option<String> {
 /// parsed and their imports of the project's own code and packages
 /// resolved, and for a second attempt at the run's task to be made in, with
 /// nothing of the first in it. None where `workspace` is not the top of a
-/// git project, has no commit yet, ignores more than `COPIED` entries, or
-/// where the folder could not be made.
+/// git project, has no commit yet, holds more than `COPIED` entries with
+/// what it ignores, or where the folder could not be made.
 #[cfg(unix)]
 pub(crate) fn base(workspace: &Path) -> Option<PathBuf> {
     top(workspace)?;
     let ignored = ignored(workspace)?;
-    if ignored.len() > COPIED {
+    // Capped as `copy` is: tests written in a folder too big to copy could
+    // never be run by the driver.
+    if listed(workspace)?.len() + ignored.len() > COPIED {
         return None;
     }
     let to = before(workspace)?;
@@ -757,12 +779,17 @@ fn briefing(
     {
         text.push_str(&format!("\n- R{}: {sentence}", at + 1));
     }
+    // The table and then the command, last: a long report is cut in the
+    // middle before the driver reads it, and the command is read from the
+    // end, so what the cut keeps is what the driver needs.
     text.push_str(&format!(
-        "\n\nEnd your report with the one command that runs all your tests from the project's \
-         root, with paths relative to it, on a line of its own written `Run: <command>`: one \
-         that runs them once and exits rather than watching, installs nothing, and needs no \
-         file beyond your test files, so any fixture or helper they need goes in a file named \
-         with `{MARKER}` too. Then a table of one row per test, written {rows}."
+        "\n\nEnd your report with a table of one row per test, written {rows}. Then, on a \
+         line of its own as the report's very last line, the one command that runs all your \
+         tests from the project's root, with paths relative to it, written `Run: <command>`: \
+         one that runs them once and exits rather than watching, installs nothing, and needs \
+         no file beyond your test files, so any fixture or helper they need goes in a file \
+         named with `{MARKER}` too. A long report is cut in its middle before it is read, so \
+         what comes last is kept."
     ));
     text
 }
@@ -1019,6 +1046,11 @@ pub(crate) fn ran(
             kept.dir.display()
         ));
     };
+    // A build of the whole workspace that did not fit in the time says
+    // nothing of the work: it is not a failure to send the run back with.
+    if unfinished_build(command, &outcome) {
+        return Ran::Unrun("the build did not fit in the time".into());
+    }
     if let Some(notice) = regression(kept, command, workspace, ctx, limit, &outcome, first) {
         return Ran::Failed(notice);
     }
@@ -1051,6 +1083,14 @@ fn regression(
     let left = time_left(ctx);
     let timely = left.is_none_or(|left| left >= fix + limit);
     let first = timely.then(first).flatten()?;
+    // A store linked into the first version that leads back into the
+    // project would have the tests there run the work as it stands, so the
+    // two could only fail alike: the run in it is kept rather than spent. A
+    // Python command runs with the folder first on the import path
+    // (`with_import_path`), so only another language's link blinds it.
+    if !pythonic(command) && imports_elsewhere(workspace, &first.dir).is_some() {
+        return None;
+    }
     let differ = differing(&first.dir, workspace);
     if differ.is_empty() {
         return None;
@@ -1069,10 +1109,21 @@ fn regression(
 /// of them: they did unless the tool could not start them; ones cut at
 /// their limit ran.
 fn happened(outcome: &Result<String, String>) -> bool {
-    match outcome {
-        Ok(_) => true,
-        Err(why) => why.contains("Timed out"),
-    }
+    outcome.is_ok() || unfinished(outcome)
+}
+
+/// Whether `outcome`, what `run_command` made of a command, is one cut at
+/// its limit before it finished.
+fn unfinished(outcome: &Result<String, String>) -> bool {
+    matches!(outcome, Err(why) if why.contains("Timed out"))
+}
+
+/// Whether `outcome`, what `run_command` made of `command` in a copy of the
+/// project, is a build of the whole workspace (`rebuilds_all`) cut at its
+/// limit: minutes on a small machine, it may not fit in the time given, and
+/// then it says nothing of the work.
+pub(crate) fn unfinished_build(command: &str, outcome: &Result<String, String>) -> bool {
+    rebuilds_all(command) && unfinished(outcome)
 }
 
 /// How long the run making calls with `ctx` has to its deadline; None with
@@ -1176,8 +1227,32 @@ fn run_command(
             ..parent.clone()
         }));
     }
+    let command = with_import_path(command, copy);
     let args = serde_json::json!({"command": command, "timeout": limit.as_secs().max(1)});
     crate::tools::run("run_command", &args.to_string(), &ctx)
+}
+
+/// Whether `command` runs Python: `python`, `python3` and the like, `pytest`
+/// or `py.test`, past any set-up, or `-m pytest` anywhere on its line.
+fn pythonic(command: &str) -> bool {
+    let python = |name: &str| name.starts_with("python") || name == "pytest" || name == "py.test";
+    program(command).is_some_and(|name| python(&name)) || command.contains("-m pytest")
+}
+
+/// `command`, a Python command run in `folder`, a copy of the project, with
+/// `folder/src` and `folder` first on the import path, exported ahead of it:
+/// where the project is installed as editable, the install names the
+/// project's own folder, and a test run in a copy would otherwise import the
+/// project's code rather than the copy's. The standard finder reads sys.path
+/// first, PYTHONPATH ahead of site-packages, and setuptools appends its
+/// editable finder to sys.meta_path, so the copy's code wins. As it is for
+/// any other command.
+fn with_import_path(command: &str, folder: &Path) -> String {
+    if !pythonic(command) {
+        return command.to_owned();
+    }
+    let folder = folder.display();
+    format!("export PYTHONPATH=\"{folder}/src:{folder}${{PYTHONPATH:+:$PYTHONPATH}}\"; {command}")
 }
 
 /// How `command` ended when `outcome`, what it made of the tester's tests,
@@ -1717,9 +1792,9 @@ pub(crate) fn adopted(command: &str, ended: &str, adopted: &Adopted) -> String {
         ));
     }
     text.push_str(&format!(
-        ". Yours is kept in `{}`: `{FIRST_PATCH}`, its changes to the last commit's files, and \
-         the files it added at their paths. Do not put it back or merge it in, since it did not \
-         pass.",
+        ". Yours is kept until this run ends in `{}`: `{FIRST_PATCH}`, its changes to the last \
+         commit's files, and the files it added at their paths. Do not put it back or merge it \
+         in, since it did not pass.",
         adopted.kept.display()
     ));
     if !adopted.failed.is_empty() {
@@ -1749,7 +1824,10 @@ pub(crate) fn installed(base: &Path, commands: &[String]) -> String {
          copy of the project as it was before you began, and ran {} there, which may have \
          installed or linked something from that folder into the project's own packages. So \
          nothing of its work was taken, and the folder is left where it is, so that any such \
-         link keeps working. Your work stands as it is: end with your whole answer again.",
+         link keeps working. Your work stands as it is. Since the project's own install may \
+         now point at that folder, run your own install of the project again in the project \
+         folder, as you first found it set up, such as `pip install -e .` or `npm install`; \
+         then end with your whole answer again.",
         base.display(),
         named.join(", ")
     )
@@ -2100,9 +2178,19 @@ pub(crate) fn take_due(run: u64, most: Duration) -> Option<(PathBuf, Result<Stri
 /// stopped at its deadline never deletes them itself. A tester started with
 /// the run and not taken is abandoned: stopped, its report dropped, and its
 /// folder deleted, here and once more as it ends, since a stopped one can
-/// still be writing there. The run's first complete version goes too. The
-/// paths it deleted from the project, in order.
+/// still be writing there. The run's first complete version goes too, and
+/// the folders kept aside for it (`aside`); not the folder a second attempt
+/// installed from, since the project's packages may lead into it. The paths
+/// it deleted from the project, in order.
 pub(crate) fn tidy(run: u64) -> Vec<String> {
+    if let Ok(mut asides) = asides().lock() {
+        asides.retain(|(of, dir)| {
+            if *of == run {
+                discard(dir);
+            }
+            *of != run
+        });
+    }
     if let Ok(mut firsts) = firsts().lock() {
         firsts.retain(|first| {
             if first.run == run {
@@ -2235,6 +2323,14 @@ pub(crate) fn told(report: &str, kept: Option<&Kept>, again: bool) -> String {
 /// driver made of them against the work follows it (`first_run`), so it
 /// promises no run to come.
 pub(crate) fn told_ahead(report: &str, kept: Option<&Kept>) -> String {
+    // Between the lines that mark it as written before the work, so its rows
+    // hold the run to nothing (`requirements::rows`).
+    let marked = format!(
+        "{}\n{}\n{}",
+        crate::requirements::AHEAD_OPENS,
+        report.trim(),
+        crate::requirements::AHEAD_CLOSES
+    );
     tell(
         "A tester that hasn't seen your work wrote tests from the request alone while you \
          worked, in the project as it was before your change, where none could pass yet; its \
@@ -2242,7 +2338,7 @@ pub(crate) fn told_ahead(report: &str, kept: Option<&Kept>) -> String {
          want of your change, not what your work does. Make your work do what each test \
          expects where the request's words say so; where a test expects something the words \
          do not say, quote the words that show it in your answer.",
-        report,
+        &marked,
         kept,
         false,
     )
@@ -2299,7 +2395,7 @@ mod tests {
             "{brief}"
         );
         assert!(brief.contains("for the first time only after the change it should see"));
-        assert!(brief.ends_with("what it expected and what it got`."));
+        assert!(brief.ends_with("so what comes last is kept."), "{brief}");
     }
 
     #[test]
@@ -2580,7 +2676,46 @@ mod tests {
             brief.contains("runs them once and exits rather than watching, installs nothing"),
             "{brief}"
         );
-        assert!(brief.ends_with("what it expected and what it got`."));
+        // The table first, and the command as the report's last line, where
+        // the cut a long report takes keeps it.
+        let table = brief
+            .find("End your report with a table of one row per test")
+            .unwrap();
+        let run = brief.find("written `Run: <command>`").unwrap();
+        assert!(table < run, "{brief}");
+        assert!(brief.ends_with("so what comes last is kept."), "{brief}");
+    }
+
+    #[test]
+    fn the_command_survives_the_cut_a_long_report_takes() {
+        // A report longer than the agent tool quotes is cut in the middle,
+        // keeping both ends, and each line indented, as `agents::answer`
+        // quotes it: the command, written last, is kept and read; written
+        // before a long table, it would be lost.
+        let rows: Vec<String> = (1..=40)
+            .map(|n| {
+                format!(
+                    "R{n} | case {n} of the request, checked end to end | FAIL | pytest -q \
+                     tests/test_letronna_spec.py::test_{n} | not yet implemented"
+                )
+            })
+            .collect();
+        let table = rows.join("\n");
+        let prose = "Wrote the tests from the request. ".repeat(70);
+        let given = "python -m pytest -q tests/test_letronna_spec.py";
+        let quoted = |report: &str| -> String {
+            let cut = crate::chat::trim(report, crate::agents::MAX_REPORT);
+            assert!(cut.contains("[middle trimmed]"), "{cut}");
+            let lines: Vec<String> = cut.lines().map(|line| format!("    {line}")).collect();
+            lines.join("\n")
+        };
+        let last = format!("{prose}\n{table}\nRun: {given}");
+        assert_eq!(command(&quoted(&last)).as_deref(), Some(given));
+        let first = format!("{prose}\nRun: {given}\n{table}");
+        assert_eq!(command(&quoted(&first)), None);
+        // Blank lines or a stray row after it do not hide it.
+        let trailing = format!("{last}\n\nR41 | a late row | PASS\n\n");
+        assert_eq!(command(&trailing).as_deref(), Some(given));
     }
 
     #[test]
@@ -2804,7 +2939,59 @@ mod tests {
         assert!(text.contains("Timed out after 1s"), "{text}");
         // Without the tool's advice to a model to call it again.
         assert!(!text.contains("If it only needs longer"), "{text}");
+        // A build of the whole workspace cut at its limit says nothing of
+        // the work: not a failure to send the run back with.
+        let build = "sleep 30; cargo test".to_owned();
+        assert_eq!(
+            ran(&kept, &build, &ctx, Duration::from_secs(1), || None),
+            Ran::Unrun("the build did not fit in the time".into())
+        );
         tidy(7);
+    }
+
+    #[test]
+    fn a_python_command_runs_with_the_copy_first_on_the_import_path() {
+        let copy = Path::new("/tmp/letronna-spec-copy-7");
+        let prefix = "export PYTHONPATH=\"/tmp/letronna-spec-copy-7/src:/tmp/letronna-spec-copy-7\
+                      ${PYTHONPATH:+:$PYTHONPATH}\"; ";
+        for line in [
+            "python -m pytest -q tests/test_letronna_spec.py",
+            "pytest -q",
+            "cd . && python3 -m pytest",
+            "export A=1; python3.12 tests/letronna_spec_check.py",
+            "PYTHONPATH=. py.test tests",
+            "coverage run -m pytest tests",
+        ] {
+            assert_eq!(
+                with_import_path(line, copy),
+                format!("{prefix}{line}"),
+                "{line}"
+            );
+        }
+        // Another language's command, or one that only sets up, runs as it is.
+        for line in [
+            "npx vitest run",
+            "cargo test",
+            "sh letronna_spec_test.sh",
+            "export A=1",
+        ] {
+            assert_eq!(with_import_path(line, copy), line, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_folder_kept_aside_for_the_run_goes_as_it_ends() {
+        let dir = folder("aside");
+        std::fs::create_dir_all(&dir).unwrap();
+        aside(31, &dir);
+        let other = folder("aside-other");
+        std::fs::create_dir_all(&other).unwrap();
+        aside(32, &other);
+        tidy(31);
+        assert!(!dir.exists());
+        assert!(other.exists());
+        tidy(32);
+        assert!(!other.exists());
     }
 
     #[test]
@@ -3185,9 +3372,13 @@ mod tests {
         assert!(brief.contains("written `Run: <command>`"), "{brief}");
         assert!(brief.contains("`R1 | what it checks | NOT RUN`"), "{brief}");
         assert!(
-            brief.ends_with("not yet implemented`: none can pass before the change, and one that does tests nothing of it."),
+            brief.contains(
+                "not yet implemented`: none can pass before the change, and one that does \
+                 tests nothing of it. Then, on a line of its own as the report's very last line"
+            ),
             "{brief}"
         );
+        assert!(brief.ends_with("so what comes last is kept."), "{brief}");
         // Its folder first on the import path, so an installed copy of the
         // project, which may be the work, is not what its tests import.
         assert!(
@@ -3234,8 +3425,12 @@ mod tests {
             dir: PathBuf::from("/tmp/kept"),
             files: vec!["tests/letronna_spec.test.ts".to_owned()],
         };
-        let report = "Run: npx vitest run\nR1 | adds | FAIL | npx vitest run | not yet implemented";
+        // A row with a reason of its own in place of the placeholder, as a
+        // tester may write it: between the marks it holds the run to nothing.
+        let report =
+            "R1 | adds | FAIL | npx vitest run | adds is not exported yet\nRun: npx vitest run";
         let text = told_ahead(report, Some(&kept));
+        assert!(!crate::requirements::tabled(&text), "{text}");
         assert!(
             text.contains("while you worked, in the project as it was before your change"),
             "{text}"
@@ -3249,7 +3444,14 @@ mod tests {
         // What the driver made of the tests follows it, so it promises no
         // run to come.
         assert!(!text.contains("Once you say you are done"), "{text}");
-        assert!(text.ends_with(report));
+        assert!(
+            text.ends_with(&format!(
+                "{}\n{report}\n{}",
+                crate::requirements::AHEAD_OPENS,
+                crate::requirements::AHEAD_CLOSES
+            )),
+            "{text}"
+        );
         let bare = told_ahead(report, None);
         assert!(!bare.contains("kept out of the project"), "{bare}");
     }
@@ -3617,6 +3819,10 @@ mod tests {
         );
         assert!(text.contains("the folder is left where it is"), "{text}");
         assert!(
+            text.contains("run your own install of the project again in the project folder"),
+            "{text}"
+        );
+        assert!(
             text.ends_with("end with your whole answer again."),
             "{text}"
         );
@@ -3731,7 +3937,9 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains(&format!("kept in `/tmp/first`: `{FIRST_PATCH}`")),
+            text.contains(&format!(
+                "kept until this run ends in `/tmp/first`: `{FIRST_PATCH}`"
+            )),
             "{text}"
         );
         assert!(text.contains("Do not put it back or merge it in"), "{text}");
@@ -3946,6 +4154,52 @@ mod tests {
         assert!(text.contains("made.txt is missing"), "{text}");
         assert_eq!(first(24), None);
         tidy(24);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_first_version_is_not_run_where_a_store_in_it_leads_back_into_the_project() {
+        let root = Scratch::new("spec-tests-referee-editable");
+        let repo = |args: &[&str]| assert!(git(&root, args).is_some(), "git {args:?}");
+        repo(&["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), ".venv/\n").unwrap();
+        std::fs::write(root.join("README"), "a project").unwrap();
+        std::fs::write(root.join("made.txt"), "made").unwrap();
+        repo(&["add", "."]);
+        // The project is installed as editable from its own folder, and the
+        // store is linked into every copy: a command of another language
+        // than Python run in the first version would test the work as it
+        // stands, so the two could only fail alike.
+        let packages = root.join(".venv/lib/python3.12/site-packages");
+        std::fs::create_dir_all(&packages).unwrap();
+        std::fs::write(
+            packages.join("__editable__.proj-1.0.pth"),
+            format!("{}/src\n", root.display()),
+        )
+        .unwrap();
+        snapshot(26, &root);
+        std::fs::write(
+            root.join("letronna_spec_test.sh"),
+            "test -f made.txt || { echo 'made.txt is missing'; exit 1; }\n",
+        )
+        .unwrap();
+        let command = "sh letronna_spec_test.sh".to_owned();
+        let kept = keep(26, &root, &root, Some(command.clone())).unwrap();
+        let ctx = ToolContext::of(&crate::chat::Connection {
+            workspace: Some(root.to_path_buf()),
+            ..Default::default()
+        });
+        std::fs::remove_file(root.join("made.txt")).unwrap();
+        // The plain notice, and the first version kept rather than spent.
+        let Ran::Failed(text) = ran(&kept, &command, &ctx, TIMEOUT, || first(26)) else {
+            panic!("the work passed");
+        };
+        assert!(
+            text.starts_with("Your work as it stands was run against"),
+            "{text}"
+        );
+        assert!(first(26).is_some());
+        tidy(26);
     }
 
     #[cfg(unix)]

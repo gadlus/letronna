@@ -82,7 +82,7 @@ const FIRST_ID: AgentId = 1 << 40;
 /// About a page: a report's findings fit, and the reports of helpers running
 /// side by side share it, so together they cannot crowd out the conversation
 /// they come back to.
-const MAX_REPORT: usize = 4_000;
+pub(crate) const MAX_REPORT: usize = 4_000;
 /// Twice a session's 25 rounds, since a helper's whole task is one turn.
 const ROUNDS: usize = 50;
 /// Enough for a fan-out of searches, and few enough that one reply cannot

@@ -460,15 +460,36 @@ pub(crate) fn listed(text: &str) -> Option<usize> {
     text.lines().filter_map(numbered).max()
 }
 
+/// The line a notice opens a tester's report with when the tester wrote it
+/// ahead of the work, in the project as it was, and the line that closes
+/// it: the rows between judge nothing of the work, so `rows` skips them.
+pub(crate) const AHEAD_OPENS: &str =
+    "[The tester's report, written before your change; its rows judge nothing of your work]";
+pub(crate) const AHEAD_CLOSES: &str = "[End of the tester's report]";
+
 /// The rows of a review's table in `report`: each requirement's number,
 /// whether the case passed, and the row as written. A line is a row when a
 /// cell of it opens with `R` and a number and a later cell says PASS or
 /// FAIL, however the helper laid the table out; one whose last cell says
 /// the case waits on the work (`placeholder`) is no row, since it says
-/// nothing of the work once the work is there.
+/// nothing of the work once the work is there, nor is any line of a report
+/// written ahead of the work, between `AHEAD_OPENS` and `AHEAD_CLOSES`.
 fn rows(report: &str) -> Vec<(usize, bool, String)> {
     let mut found = Vec::new();
+    let mut ahead = false;
     for line in report.lines() {
+        match line.trim() {
+            AHEAD_OPENS => {
+                ahead = true;
+                continue;
+            }
+            AHEAD_CLOSES => {
+                ahead = false;
+                continue;
+            }
+            _ if ahead => continue,
+            _ => {}
+        }
         let cells = cells(line);
         let Some(first) = cells.first() else {
             continue;
@@ -1497,6 +1518,26 @@ mod tests {
             .map(|n| format!("R{n} | c | PASS\n"))
             .collect();
         assert!(cut_rows(&many, "").unwrap().ends_with("\nand 2 more rows"));
+    }
+
+    #[test]
+    fn rows_of_a_report_written_ahead_of_the_work_hold_the_run_to_nothing() {
+        let ahead = format!(
+            "{AHEAD_OPENS}\nR1 | a | FAIL | pytest | ImportError: no module a\nR2 | b | NOT RUN\n\
+             {AHEAD_CLOSES}"
+        );
+        assert!(!tabled(&ahead));
+        // Beside a review's rows, only the review's count.
+        let both = format!("{ahead}\nR1 | a | PASS\nR2 | b | FAIL | cargo test");
+        let text = unchecked(&both, 2).unwrap();
+        assert!(text.contains("- R2 | b | FAIL | cargo test"), "{text}");
+        assert!(!text.contains("ImportError"), "{text}");
+        assert!(!text.contains("has no row"), "{text}");
+        // Indented, as a notice quotes a report, the marks still hold.
+        let quoted = format!(
+            "    {AHEAD_OPENS}\n    R1 | a | FAIL | pytest | ImportError\n    {AHEAD_CLOSES}"
+        );
+        assert!(!tabled(&quoted));
     }
 
     #[test]
