@@ -654,6 +654,16 @@ pub(crate) fn at_head(folder: &Path, path: &str) -> Option<String> {
     Some(out)
 }
 
+/// Which of `paths`, each from `folder`, its repository tracks, as they are
+/// written; `None` where there is no repository or git could not say.
+pub(crate) fn tracked(folder: &Path, paths: &[String]) -> Option<Vec<String>> {
+    let mut args = vec!["ls-files", "-z", "--cached", "--"];
+    args.extend(paths.iter().map(String::as_str));
+    let (out, cut) = git(folder, &args, 1 << 20).ok()?;
+    let listed = out.split('\0').filter(|path| !path.is_empty());
+    (!cut).then(|| listed.map(str::to_owned).collect())
+}
+
 /// The paths of the files in the commit checked out in `folder`'s
 /// repository with a line that matches the extended regular expression
 /// `pattern`; none where nothing matches or there is no repository.
@@ -942,6 +952,22 @@ mod tests {
         setup(&folder, &["add", "a.txt"]);
         setup(&folder, &["commit", "-q", "-m", "first"]);
         folder
+    }
+
+    #[test]
+    fn only_the_paths_the_repository_tracks_are_named_tracked() {
+        let folder = repo("tracked");
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        std::fs::write(folder.join("sub/b[1].txt"), "staged\n").unwrap();
+        setup(&folder, &["add", "sub"]);
+        std::fs::write(folder.join("new.txt"), "fresh\n").unwrap();
+        let asked = ["a.txt", "new.txt", "sub/b[1].txt", "gone.txt"].map(String::from);
+        assert_eq!(tracked(&folder, &asked).unwrap(), ["a.txt", "sub/b[1].txt"]);
+        // Asked from a folder inside, the paths are from there.
+        let inside = ["b[1].txt".to_owned()];
+        assert_eq!(tracked(&folder.join("sub"), &inside).unwrap(), inside);
+        // Outside a repository git cannot say.
+        assert_eq!(tracked(&scratch("tracked-none"), &asked), None);
     }
 
     #[test]

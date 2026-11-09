@@ -15,7 +15,9 @@
 //! their own as soon as it answers: a run stopped at its deadline would
 //! otherwise leave them in a patch taken of it, where one that fails can fail
 //! a package's whole suite. The run is told where they are kept and puts them
-//! back to run them, and what it put back is deleted as it ends.
+//! back to run them, and what it put back is deleted as it ends: at the paths
+//! they are kept from, and in a git project wherever else git does not track
+//! a copy.
 //!
 //! Once the run has acted on the tester's report and says it is done, the
 //! driver itself runs those tests against the work as it stands, in a fresh
@@ -2322,15 +2324,16 @@ pub(crate) fn take_due(run: u64, most: Duration) -> Option<(PathBuf, Result<Stri
 }
 
 /// Deletes the tester's files run `run` put back in its project, at the paths
-/// `keep` kept them from, and the folder they were kept in, and forgets them:
-/// they are the tester's, by their names, and no part of the task, and a run
-/// stopped at its deadline never deletes them itself. A tester started with
-/// the run and not taken is abandoned: stopped, its report dropped, and its
-/// folder deleted, here and once more as it ends, since a stopped one can
-/// still be writing there. The run's first complete version goes too, and
-/// the folders kept aside for it (`aside`); not the folder a second attempt
-/// installed from, since the project's packages may lead into it. The paths
-/// it deleted from the project, in order.
+/// `keep` kept them from, and any other copy of them it left there that git
+/// does not track (`strays`), and the folder they were kept in, and forgets
+/// them: they are the tester's, by their names, and no part of the task, and
+/// a run stopped at its deadline never deletes them itself. A tester started
+/// with the run and not taken is abandoned: stopped, its report dropped, and
+/// its folder deleted, here and once more as it ends, since a stopped one
+/// can still be writing there. The run's first complete version goes too,
+/// and the folders kept aside for it (`aside`); not the folder a second
+/// attempt installed from, since the project's packages may lead into it.
+/// The paths it deleted from the project, in order.
 pub(crate) fn tidy(run: u64) -> Vec<String> {
     if let Ok(mut asides) = asides().lock() {
         asides.retain(|(of, dir)| {
@@ -2362,6 +2365,7 @@ pub(crate) fn tidy(run: u64) -> Vec<String> {
         return Vec::new();
     };
     let mut deleted = Vec::new();
+    let mut swept = Vec::new();
     moved.retain(|kept| {
         if kept.run != run {
             return true;
@@ -2372,10 +2376,43 @@ pub(crate) fn tidy(run: u64) -> Vec<String> {
             }
         }
         let _ = std::fs::remove_dir_all(&kept.kept.dir);
+        swept.push(kept.workspace.clone());
         false
     });
+    // Another run in the same folder may be running copies of its own
+    // tester's files, so the last run there to end is the one that sweeps.
+    swept.retain(|workspace| !moved.iter().any(|kept| kept.workspace == *workspace));
+    drop(moved);
+    swept.sort();
+    swept.dedup();
+    for workspace in &swept {
+        deleted.extend(strays(workspace));
+    }
     deleted.sort();
+    deleted.dedup();
     deleted
+}
+
+/// Deletes the tester's files under `workspace`, as `left` finds them, that
+/// git does not track there, and gives their paths: copies a run made of
+/// them somewhere other than where they are kept from, as a `cp -r` into
+/// the wrong folder makes, which a patch of the project would take. What
+/// git tracks is the project's own whatever its name, and what it ignores,
+/// or the folders `SKIPPED` names hold, the walk never reaches. Where git
+/// cannot say what it tracks, as outside a git project, none is deleted:
+/// there a file kept on purpose could not be got back.
+fn strays(workspace: &Path) -> Vec<String> {
+    let found = left(workspace);
+    if found.is_empty() {
+        return Vec::new();
+    }
+    let Some(tracked) = crate::git::tracked(workspace, &found) else {
+        return Vec::new();
+    };
+    (found.into_iter())
+        .filter(|file| !tracked.contains(file))
+        .filter(|file| std::fs::remove_file(workspace.join(file)).is_ok())
+        .collect()
 }
 
 /// The files under `workspace` whose names hold `MARKER`, by their paths from
@@ -2771,6 +2808,87 @@ mod tests {
         std::fs::write(root.join("tests/letronna_spec_a_test.go"), "again").unwrap();
         assert!(tidy(3).is_empty());
         assert_eq!(tidy(4), ["tests/letronna_spec_b_test.go"]);
+    }
+
+    /// Writes `file` under `at`, with the folders above it, holding its path.
+    fn written(at: &Path, file: &str) {
+        let path = at.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, file).unwrap();
+    }
+
+    #[test]
+    fn copies_the_run_left_elsewhere_go_as_it_ends_unless_git_tracks_them() {
+        let root = Scratch::new("spec-tests-strays");
+        let from = Scratch::new("spec-tests-strays-from");
+        assert!(git(&root, &["init", "-q"]).is_some());
+        // The project's own test, committed under a name that holds the marker.
+        written(&root, "backend/old_letronna_spec_test.go");
+        written(&root, "backend/main.go");
+        committed(&root, "first");
+        written(&from, "backend/drift_letronna_spec_test.go");
+        let kept = keep(140, &from, &root, None).unwrap();
+        // The run copies the folder into itself by mistake, then puts the
+        // test back where it is kept from; a package ships a file so named.
+        written(&root, "backend/backend/drift_letronna_spec_test.go");
+        written(&root, "backend/backend/old_letronna_spec_test.go");
+        written(&root, "backend/drift_letronna_spec_test.go");
+        written(&root, "node_modules/pkg/letronna_spec.js");
+
+        assert_eq!(
+            tidy(140),
+            [
+                "backend/backend/drift_letronna_spec_test.go",
+                "backend/backend/old_letronna_spec_test.go",
+                "backend/drift_letronna_spec_test.go",
+            ]
+        );
+        assert!(
+            !root
+                .join("backend/backend/drift_letronna_spec_test.go")
+                .exists()
+        );
+        assert!(root.join("backend/old_letronna_spec_test.go").exists());
+        assert!(root.join("backend/main.go").exists());
+        assert!(root.join("node_modules/pkg/letronna_spec.js").exists());
+        assert!(!kept.dir.exists());
+    }
+
+    #[test]
+    fn the_last_run_to_end_in_a_folder_sweeps_the_copies_left_there() {
+        let root = Scratch::new("spec-tests-strays-shared");
+        let from = Scratch::new("spec-tests-strays-shared-from");
+        assert!(git(&root, &["init", "-q"]).is_some());
+        written(&from, "a/one_letronna_spec_test.go");
+        keep(144, &from, &root, None).unwrap();
+        written(&from, "b/two_letronna_spec_test.go");
+        keep(145, &from, &root, None).unwrap();
+        written(&root, "a/a/one_letronna_spec_test.go");
+        written(&root, "b/b/two_letronna_spec_test.go");
+
+        // The other run may be running its copies still.
+        assert!(tidy(144).is_empty());
+        assert!(root.join("b/b/two_letronna_spec_test.go").exists());
+        assert_eq!(
+            tidy(145),
+            [
+                "a/a/one_letronna_spec_test.go",
+                "b/b/two_letronna_spec_test.go"
+            ]
+        );
+    }
+
+    #[test]
+    fn outside_git_only_the_paths_the_tests_were_kept_from_are_deleted() {
+        let root = Scratch::new("spec-tests-strays-no-git");
+        let from = Scratch::new("spec-tests-strays-no-git-from");
+        written(&from, "tests/letronna_spec_test.go");
+        keep(146, &from, &root, None).unwrap();
+        written(&root, "tests/letronna_spec_test.go");
+        written(&root, "tests/tests/letronna_spec_test.go");
+
+        assert_eq!(tidy(146), ["tests/letronna_spec_test.go"]);
+        assert!(root.join("tests/tests/letronna_spec_test.go").exists());
     }
 
     #[test]
@@ -3826,7 +3944,6 @@ mod tests {
     }
 
     /// Commits what is in `root`, as user_a.
-    #[cfg(unix)]
     fn committed(root: &Path, message: &str) {
         for args in [
             vec!["add", "."],
