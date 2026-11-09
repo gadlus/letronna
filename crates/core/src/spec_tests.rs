@@ -171,20 +171,6 @@ const STORES: [&str; 9] = [
     ".cache",
 ];
 
-/// What a runner prints when it ran no test, in lower case: a pass that
-/// says one of these chose nothing.
-const VACUOUS: [&str; 9] = [
-    "no tests ran",
-    "0 passed",
-    "collected 0 items",
-    "no test files found",
-    "no tests found",
-    "no test files",
-    "ran 0 tests",
-    "0 tests completed",
-    "tests: 0 total",
-];
-
 /// Files under `site-packages` and the folder of its files read at most
 /// for a path into the project, which an editable install leaves there.
 const EDITABLE_READ: u64 = 64 * 1024;
@@ -1218,13 +1204,10 @@ pub(crate) fn first_run(ran: &Ran) -> String {
 
 /// Whether `outcome`, what the tester's tests made of some work, is a pass
 /// that chose something: the command ended well and its output does not
-/// say that no test ran, which a bare project or a wrong path can bring.
+/// say that no test ran (`ran_nothing`), which a bare project or a wrong
+/// path can bring.
 pub(crate) fn passed(outcome: &Result<String, String>) -> bool {
-    if failure(outcome).is_some() {
-        return false;
-    }
-    let lower = outcome.as_deref().unwrap_or_default().to_lowercase();
-    !VACUOUS.iter().any(|said| lower.contains(said))
+    failure(outcome).is_none() && !ran_nothing(outcome.as_deref().unwrap_or_default())
 }
 
 /// What `command` made of the tester's tests `kept` run against the work in
@@ -1461,7 +1444,8 @@ pub(crate) fn rebuilds_all(command: &str) -> bool {
 }
 
 /// Words a runner's output holds when it ran no test at all, with the
-/// spaces between them squeezed to one.
+/// spaces between them squeezed to one, each where a word starts, so `0
+/// tests run` is not read in `10 tests run`.
 const NOTHING_RAN: [&str; 8] = [
     "no tests to run",
     "no test files",
@@ -1478,8 +1462,8 @@ const NOTHING_RAN: [&str; 8] = [
 /// where nothing ran, and says nothing ran only where every line is marked;
 /// jest counts `0 total` or finds no tests; cargo and mocha count `0 passed`
 /// or `0 passing`, cargo once per test binary, so only a count of 0 wherever
-/// one stands means nothing ran. Finer than `VACUOUS`, which a crate's
-/// doc-tests with `0 passed` beside its tests would trip.
+/// one stands means nothing ran, read as a number: `10 passed` is a run, and
+/// so are a crate's tests beside its doc-tests' `0 passed`.
 pub(crate) fn ran_nothing(output: &str) -> bool {
     let lower = output.to_lowercase();
     // A package with tests beside one without is a run all the same.
@@ -1492,7 +1476,10 @@ pub(crate) fn ran_nothing(output: &str) -> bool {
     }
     let words: Vec<&str> = lower.split_whitespace().collect();
     let squeezed = words.join(" ");
-    if NOTHING_RAN.iter().any(|said| squeezed.contains(said)) {
+    let starts_word =
+        |at: usize| !(squeezed[..at].chars().next_back()).is_some_and(char::is_alphanumeric);
+    let said = |words: &str| squeezed.match_indices(words).any(|(at, _)| starts_word(at));
+    if NOTHING_RAN.iter().any(|words| said(words)) {
         return true;
     }
     let counts: Vec<u64> = (words.windows(2))
@@ -3294,6 +3281,11 @@ mod tests {
         assert!(!ran_nothing("3 passed in 0.2s"));
         assert!(!ran_nothing("Ran 12 tests in 0.1s\n\nOK"));
         assert!(!ran_nothing("(no output)"));
+        // Words of a count are read where a word starts.
+        assert!(ran_nothing("0 tests run"));
+        assert!(!ran_nothing("10 tests run"));
+        assert!(!ran_nothing("Ran 10 tests in 0.1s"));
+        assert!(!ran_nothing("Tests:       10 total"));
     }
 
     #[test]
@@ -4272,6 +4264,17 @@ mod tests {
     #[test]
     fn a_pass_that_ran_no_test_chooses_nothing() {
         assert!(passed(&Ok("3 passed in 0.10s\n".into())));
+        // A count is read as a number, not as words ending in `0 passed`.
+        assert!(passed(&Ok("10 passed\n".into())));
+        assert!(passed(&Ok("====== 20 passed in 3.1s ======\n".into())));
+        assert!(passed(&Ok(
+            "running 12 tests\ntest result: ok. 12 passed; 0 failed; 0 ignored\n\n   \
+             Doc-tests cart\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed\n"
+                .into()
+        )));
+        assert!(!passed(&Ok("0 passed\n".into())));
+        assert!(!passed(&Ok("collected 0 items\n".into())));
+        assert!(!passed(&Ok("no tests ran in 0.01s\n".into())));
         assert!(!passed(&Ok(
             "collected 0 items\n\nno tests ran in 0.01s\n".into()
         )));
