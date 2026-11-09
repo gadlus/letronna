@@ -1593,14 +1593,16 @@ fn differing(first: &Path, workspace: &Path) -> Vec<String> {
     let Some(current) = listed(workspace) else {
         return Vec::new();
     };
+    // A repository inside the project, which git lists as a folder with
+    // `/` after it: its files are its own, and the first version holds a
+    // link to it where the project holds the folder.
+    let current = current.into_iter().filter(|path| !path.ends_with('/'));
     let work = |path: &String| {
         let name = path.rsplit('/').next().unwrap_or(path);
         !name.contains(MARKER)
             && !(path.split('/')).any(|part| SKIPPED.contains(&part) || artefact(part))
     };
-    let mut paths: Vec<String> = (current.into_iter().chain(files_under(first)))
-        .filter(work)
-        .collect();
+    let mut paths: Vec<String> = (current.chain(files_under(first))).filter(work).collect();
     // The work's own files first: a run's hidden folders, such as a tool's,
     // would otherwise take the names.
     paths.sort_by(|a, b| (hidden(a).cmp(&hidden(b))).then_with(|| a.cmp(b)));
@@ -3516,6 +3518,11 @@ mod tests {
         assert_eq!(std::fs::read_link(copy.join("nested")).unwrap(), nested);
         assert!(copy.join("nested/inner.txt").exists());
         assert!(copy.join("README").exists());
+        // Nor is the repository among the files that differ between the
+        // first version, which links to it, and the project.
+        assert_eq!(differing(&copy, &root), Vec::<String>::new());
+        std::fs::write(root.join("README"), "a project, changed").unwrap();
+        assert_eq!(differing(&copy, &root), ["README"]);
         discard(&copy);
     }
 
