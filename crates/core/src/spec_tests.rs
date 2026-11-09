@@ -1912,7 +1912,7 @@ pub(crate) fn own_failing(kept: &Kept, command: &str, output: &str) -> Option<bo
     let lines = lines_of(output);
     let names = named_lines(&lines);
     let owns: Vec<bool> = (lines.iter())
-        .map(|line| names_own(line) || tests.iter().any(|test| line.contains(test.as_str())))
+        .map(|line| names_own(line) || tests.iter().any(|test| names_test(line, test)))
         .collect();
     let mut attributed_any = false;
     for at in (0..lines.len()).filter(|at| names[*at].is_some()) {
@@ -1991,6 +1991,19 @@ fn test_names(kept: &Kept) -> Vec<String> {
         }
     }
     names
+}
+
+/// Whether `line` names the test `test` as a whole word, with no letter,
+/// digit or underscore before or after it: `TestTotal` is found in `---
+/// FAIL: TestTotal (0.00s)`, `TestTotal/sub` and `pkg.TestTotal(`, and not
+/// in `TestTotalRounding`, which may be the project's own.
+fn names_test(line: &str, test: &str) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    line.match_indices(test).any(|(at, found)| {
+        let before = (line[..at].chars().next_back()).is_none_or(|c| !word(c));
+        let after = (line[at + found.len()..].chars().next()).is_none_or(|c| !word(c));
+        before && after
+    })
 }
 
 /// Whether `line`, of a test runner's output, is the runner's verdict on a
@@ -4796,6 +4809,35 @@ mod tests {
         assert_eq!(own_failing(&kept, "go test ./pkg/", helped), Some(true));
         let others = "--- FAIL: TestEnvNoColor (0.00s)\n    assert.go:45: expected true\nFAIL";
         assert_eq!(own_failing(&kept, "go test ./pkg/", others), Some(false));
+        // A name that opens another test's is not that test's: the
+        // project's `TestEnvNoColor` is not the tester's `TestEnv`, nor its
+        // `TestTotalRounding` the tester's `TestTotal`.
+        std::fs::write(
+            dir.join("pkg/env_letronna_spec_test.go"),
+            "package pkg\n\nfunc TestEnv(t *testing.T) {}\n",
+        )
+        .unwrap();
+        let named = Kept {
+            dir: dir.to_path_buf(),
+            files: vec!["pkg/env_letronna_spec_test.go".to_owned()],
+        };
+        assert_eq!(test_names(&named), ["TestEnv"]);
+        assert_eq!(own_failing(&named, "go test ./pkg/", others), Some(false));
+        let rounding = "--- FAIL: TestTotalRounding (0.00s)\n    assert.go:45: wrong\nFAIL";
+        assert_eq!(own_failing(&kept, "go test ./pkg/", rounding), Some(false));
+        for line in [
+            "--- FAIL: TestTotal (0.00s)",
+            "    --- FAIL: TestTotal/sub (0.00s)",
+            "github.com/acme/pkg.TestTotal(0xc000106340)",
+        ] {
+            assert!(names_test(line, "TestTotal"), "{line}");
+        }
+        assert!(!names_test(
+            "--- FAIL: TestTotalRounding (0.00s)",
+            "TestTotal"
+        ));
+        assert!(!names_test("--- FAIL: TestEnvNoColor (0.00s)", "TestEnv"));
+        assert!(!names_test("MyTestTotal(t)", "TestTotal"));
     }
 
     #[test]
