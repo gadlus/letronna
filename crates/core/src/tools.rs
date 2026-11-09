@@ -89,6 +89,10 @@ pub(crate) struct Caller {
     /// as the script passes it on: a read there is not one the model saw,
     /// and the script's output is fenced and noted as a whole, not each result.
     pub script: bool,
+    /// Bytes of a result the call keeps at most, for a caller that reads the
+    /// output itself and shows the model only what it picks of it, as the
+    /// driver does of a test run's; None for `MAX_OUTPUT`.
+    pub keeps: Option<usize>,
 }
 
 impl ToolContext {
@@ -1206,13 +1210,15 @@ fn openings(paragraphs: &[String]) -> String {
     }
 }
 
-/// `out` as it is when it fits; otherwise cut, with the whole of it saved
+/// `out` as it is when it fits in what `ctx`'s caller keeps, `MAX_OUTPUT`
+/// unless it says otherwise; otherwise cut, with the whole of it saved
 /// where the model can page through it and the cut saying where. A
 /// `command`'s output also keeps the lines of the part cut that look like
 /// errors (`keep_errors`); no other tool's, a file read least of all, whose
 /// lines are worth only as much as the place they were in.
 fn fit(out: String, ctx: &ToolContext, command: bool) -> String {
-    if out.len() <= MAX_OUTPUT {
+    let max = ctx.caller.keeps.unwrap_or(MAX_OUTPUT);
+    if out.len() <= max {
         return out;
     }
     let note = match spill(&out, ctx) {
@@ -1227,9 +1233,9 @@ fn fit(out: String, ctx: &ToolContext, command: bool) -> String {
         None => String::new(),
     };
     if command {
-        return keep_errors(out, MAX_OUTPUT, &note);
+        return keep_errors(out, max, &note);
     }
-    keep_ends(out, MAX_OUTPUT, &note)
+    keep_ends(out, max, &note)
 }
 
 /// The most of a cut command output's room that lines from the part cut may
@@ -8558,6 +8564,20 @@ mod tests {
         assert!(kept.lines().count() <= ERROR_LINES, "{kept}");
         // A count of none is not an error.
         assert!(!looks_like_error("test result: ok. 12 passed; 0 failed"));
+    }
+
+    #[test]
+    fn a_caller_that_reads_the_output_itself_keeps_what_it_asks_for() {
+        let mut ctx = ToolContext::default();
+        ctx.caller.keeps = Some(64 * 1024);
+        assert_eq!(fit(long_text(), &ctx, true), long_text());
+        ctx.caller.keeps = Some(2 * MAX_OUTPUT);
+        let out = fit(long_text(), &ctx, true);
+        assert!(
+            out.len() > MAX_OUTPUT && out.len() <= 2 * MAX_OUTPUT,
+            "{}",
+            out.len()
+        );
     }
 
     #[test]

@@ -190,9 +190,59 @@ const EDITABLE_READ: u64 = 64 * 1024;
 /// How deep under a linked store a `site-packages` folder is looked for.
 const STORE_DEPTH: usize = 5;
 
-/// Characters of the tests' output the run is shown at most, from its end,
-/// where a runner sums up what failed.
+/// Characters of the tests' output the run is shown at most: the lines that
+/// name a failure (`excerpt`), then its end, where a runner sums up.
 const SHOWN: usize = 3_000;
+
+/// Of `SHOWN`, what the lines naming failures take at most, so the end of
+/// the output always has a third.
+const FAILURES_SHOWN: usize = SHOWN * 2 / 3;
+
+/// Lines kept after each line naming a failure: an assertion's expected and
+/// actual values, or the frame that says where.
+const AFTER_FAILURE: usize = 4;
+
+/// Characters a line kept for a failure holds at most: a log line next to
+/// one can quote a whole SQL statement.
+const FAILURE_LINE: usize = 300;
+
+/// What a line of a test runner's output starts with, past its indent, when
+/// it names a failure: Go's `--- FAIL` and `panic:`; unittest's `FAIL:`;
+/// jest's and vitest's `FAIL ` before a file, where Go's summary has a tab;
+/// pytest's `FAILED` and `E` lines, and Python's `Traceback`; jest's `●`
+/// and the marks a list of tests puts by one that failed; jest's `Expected`
+/// and `Received`; cargo's `assertion`; rustc's `error:` and `error[`; and
+/// rspec's `Failure/Error:`. An exception's or testify's `Error` is read
+/// off the first word (`names_failure`).
+const FAILURE_STARTS: [&str; 18] = [
+    "--- FAIL",
+    "panic:",
+    "FAIL:",
+    "FAIL ",
+    "FAILED",
+    "E   ",
+    "Traceback",
+    "●",
+    "✕",
+    "×",
+    "✗",
+    "✘",
+    "Expected",
+    "Received",
+    "assertion",
+    "error:",
+    "error[",
+    "Failure/Error:",
+];
+
+/// What a line holds anywhere when it names a failure: cargo's `panicked
+/// at` and `... FAILED`, and Maven's `<<< FAILURE!`.
+const FAILURE_HOLDS: [&str; 3] = ["panicked at", " ... FAILED", "<<< FAILURE!"];
+
+/// Bytes of a test command's output the driver reads at most, where a
+/// model's call keeps `tools::MAX_OUTPUT`: a long log is cut only past this,
+/// so the failures in its middle reach `excerpt`.
+const OUTPUT_READ: usize = 1024 * 1024;
 
 /// Characters a `Run:` line's command may hold at most: one line of shell,
 /// not a script.
@@ -1221,7 +1271,9 @@ pub(crate) fn outcome_in(
 /// scrubbing of its output included: with the copy as its project and for
 /// no conversation, so one still running at the limit is stopped there
 /// rather than left running in the background. The run's deadline does not
-/// cut a call made for no conversation, so `limit` has to fit in it.
+/// cut a call made for no conversation, so `limit` has to fit in it. Up to
+/// `OUTPUT_READ` bytes of its output are kept, not a model's cut of it, so
+/// the failures in a long log's middle are there for `excerpt` to find.
 fn run_command(
     command: &str,
     copy: &Path,
@@ -1231,6 +1283,7 @@ fn run_command(
     let mut ctx = ctx.clone();
     ctx.workspace = Some(copy.to_path_buf());
     ctx.conversation = 0;
+    ctx.caller.keeps = Some(OUTPUT_READ);
     if let Some(parent) = ctx.caller.connection.as_deref() {
         ctx.caller.connection = Some(Arc::new(crate::chat::Connection {
             workspace: Some(copy.to_path_buf()),
@@ -1293,16 +1346,16 @@ fn failed(kept: &Kept, command: &str, outcome: &Result<String, String>) -> Optio
     Some(format!(
         "Your work as it stands was run against the tests a tester wrote from the request \
          alone, in a copy of the project with them put back at the paths they are kept from, \
-         so nothing in the project was touched: `{command}` {ended}. Its output ends:\n\n{}\n\n\
-         Fix your work for each test that fails on what the request's words say, and run the \
-         tests again the same way. A test that expects what the words do not say is answered \
-         by quoting them in your answer. One that calls the code wrongly, such as with a name \
-         or import the request does not spell, or that fails for want of a fixture, helper or \
-         set-up the tester left out, is the tester's to fix where it is kept, in `{}`, since \
-         that is where it is run from; never something to add to the project. If the command \
-         itself cannot run here, run the tests with the set-up you found works. Then end with \
-         your whole answer again.",
-        tail(output),
+         so nothing in the project was touched: `{command}` {ended}. Its output, with `…` for \
+         lines left out:\n\n{}\n\nFix your work for each test that fails on what the \
+         request's words say, and run the tests again the same way. A test that expects what \
+         the words do not say is answered by quoting them in your answer. One that calls the \
+         code wrongly, such as with a name or import the request does not spell, or that \
+         fails for want of a fixture, helper or set-up the tester left out, is the tester's to \
+         fix where it is kept, in `{}`, since that is where it is run from; never something to \
+         add to the project. If the command itself cannot run here, run the tests with the \
+         set-up you found works. Then end with your whole answer again.",
+        excerpt(output),
         kept.dir.display()
     ))
 }
@@ -1327,12 +1380,12 @@ fn regressed(command: &str, ended: &str, output: &str, differ: &[String]) -> Str
          passed `{command}`; what you ended with fails it. Both were run against the tests a \
          tester wrote from the request alone, each in a copy of the project with them put back \
          at the paths they are kept from, so nothing in the project was touched: your work as \
-         it stands {ended}. Its output ends:\n\n{}\n\nThe files that differ between that first \
-         version and your work as it stands: {changed}. Put back what broke the test, unless \
-         the test expects what the request's words do not say: then keep your change, and quote \
-         the words in your answer or say the request is silent on it. Then end with your whole \
-         answer again.",
-        tail(output)
+         it stands {ended}. Its output, with `…` for lines left out:\n\n{}\n\nThe files that \
+         differ between that first version and your work as it stands: {changed}. Put back \
+         what broke the test, unless the test expects what the request's words do not say: \
+         then keep your change, and quote the words in your answer or say the request is \
+         silent on it. Then end with your whole answer again.",
+        excerpt(output)
     )
 }
 
@@ -1477,24 +1530,108 @@ pub(crate) fn verdict(
 /// itself is not to go.
 pub(crate) fn broken(command: &str, output: &str) -> String {
     format!(
-        "`{command}` passes on the project as it was and fails with your change. Its output \
-         ends:\n\n{}\n\nRun it once more first. If it still fails, then where the request's \
-         words change what that test expects, update the test's expectation and quote the \
-         words in your answer; otherwise fix the code so it passes again. Do not delete, skip \
-         or weaken the test. Then end with your whole answer again.",
-        tail(output)
+        "`{command}` passes on the project as it was and fails with your change. Its output, \
+         with `…` for lines left out:\n\n{}\n\nRun it once more first. If it still fails, \
+         then where the request's words change what that test expects, update the test's \
+         expectation and quote the words in your answer; otherwise fix the code so it passes \
+         again. Do not delete, skip or weaken the test. Then end with your whole answer again.",
+        excerpt(output)
     )
 }
 
-/// The end of `output`: `SHOWN` characters at most, from a line's start.
-fn tail(output: &str) -> String {
+/// What the run is shown of `output`, a test command's: all of it when it
+/// fits in `SHOWN` characters; otherwise, in their order, the lines naming
+/// a failure (`names_failure`), each with the `AFTER_FAILURE` lines after
+/// it, within `FAILURES_SHOWN`, and then as many whole lines of its end as
+/// the rest holds, with `…` for each run of lines left out. A runner's
+/// summary at the end names the failures but not why, and a log printed
+/// between the tests can push the why out of any tail.
+fn excerpt(output: &str) -> String {
     let output = output.trim_end();
     if output.chars().count() <= SHOWN {
         return output.to_owned();
     }
-    let from = (output.char_indices().rev().nth(SHOWN - 1)).map_or(0, |(at, _)| at);
-    let from = output[from..].find('\n').map_or(from, |at| from + at + 1);
-    format!("…\n{}", &output[from..])
+    let lines: Vec<&str> = output.lines().collect();
+    let gap = "…\n".chars().count();
+    let mut picked: Vec<(usize, String)> = Vec::new();
+    let mut used = 0;
+    let mut until = None;
+    for (at, line) in lines.iter().enumerate() {
+        if names_failure(line) {
+            until = Some(at + AFTER_FAILURE);
+        }
+        if until.is_none_or(|until| at > until) {
+            continue;
+        }
+        let shown = match line.char_indices().nth(FAILURE_LINE) {
+            Some((cut, _)) => format!("{}…", &line[..cut]),
+            None => (*line).to_owned(),
+        };
+        let apart = picked.last().map_or(at > 0, |(last, _)| at > last + 1);
+        let cost = shown.chars().count() + 1 + if apart { gap } else { 0 };
+        if used + cost > FAILURES_SHOWN {
+            break;
+        }
+        used += cost;
+        picked.push((at, shown));
+    }
+    // The end, in whole lines, one `…` before it; a line picked already
+    // costs nothing again. A last line too long for what is left shows its
+    // end.
+    let mut room = SHOWN.saturating_sub(used + gap);
+    let mut end: Vec<(usize, String)> = Vec::new();
+    for at in (0..lines.len()).rev() {
+        if picked.iter().any(|(was, _)| *was == at) {
+            continue;
+        }
+        let size = lines[at].chars().count() + 1;
+        if size > room {
+            if at + 1 == lines.len() {
+                end.push((at, lines[at].chars().skip(size - room).collect()));
+            }
+            break;
+        }
+        room -= size;
+        end.push((at, lines[at].to_owned()));
+    }
+    picked.extend(end);
+    picked.sort_by_key(|(at, _)| *at);
+    let mut shown = String::new();
+    let mut next = 0;
+    for (at, line) in picked {
+        if at != next {
+            shown.push_str("…\n");
+        }
+        shown.push_str(&line);
+        shown.push('\n');
+        next = at + 1;
+    }
+    shown.pop();
+    shown
+}
+
+/// Whether `line`, of a test runner's output, names a failure: it starts,
+/// past its indent, with one of `FAILURE_STARTS` other than jest's `●
+/// Console` heading a test's logs, holds one of `FAILURE_HOLDS`, or opens
+/// with a word ending in `Error` or `Exception`, as testify's `Error:` and
+/// an exception's name before its message do, or with mocha's count of
+/// what is failing. Never a mere mention of an error, which a log prints
+/// on every line, as `SQL logic error` or `record not found`.
+fn names_failure(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("● Console") {
+        return false;
+    }
+    let mut words = trimmed.split_whitespace();
+    let first = words.next().unwrap_or_default().trim_end_matches(':');
+    let failing = first.parse::<u64>().is_ok() && words.next() == Some("failing");
+    FAILURE_STARTS
+        .iter()
+        .any(|start| trimmed.starts_with(start))
+        || FAILURE_HOLDS.iter().any(|held| line.contains(held))
+        || first.ends_with("Error")
+        || first.ends_with("Exception")
+        || failing
 }
 
 /// The task of the helper making a second attempt at `request` in a folder
@@ -1510,7 +1647,8 @@ pub(crate) fn attempt(request: &str, command: &str, ended: &str, output: &str) -
         "Make the change the request below asks for, from scratch, in the project in your \
          working folder, which holds the project as it was before anyone began on it. Another \
          agent's attempt at the same request did not pass the tests a tester wrote from the \
-         request's words alone: `{command}` {ended}, and its output ends:\n\n{}\n\n\
+         request's words alone: `{command}` {ended}, and this is its output, with `…` for \
+         lines left out:\n\n{}\n\n\
          That attempt is not in your folder and not yours to look for or build on. Read the \
          project as it is, take from the request's words what should happen in each case they \
          name, and build it so that a caller of the project gets that, end to end, through the \
@@ -1527,7 +1665,7 @@ pub(crate) fn attempt(request: &str, command: &str, ended: &str, output: &str) -
          not a git repository, so there is no history to read in it. End with what you changed \
          and why.\n\n\
          The request, word for word:\n",
-        tail(output)
+        excerpt(output)
     );
     text.push_str(request.trim());
     text
@@ -3074,7 +3212,8 @@ mod tests {
         assert!(
             text.starts_with(
                 "`cargo test -p meta` passes on the project as it was and fails with your \
-                 change. Its output ends:\n\ntest parses ... FAILED\n\n[exit code 101]\n\n\
+                 change. Its output, with `…` for lines left out:\n\n\
+                 test parses ... FAILED\n\n[exit code 101]\n\n\
                  Run it once more first. If it still fails, then where the request's words \
                  change what that test expects, update the test's expectation and quote the \
                  words in your answer; otherwise fix the code so it passes again. Do not \
@@ -3086,17 +3225,235 @@ mod tests {
     }
 
     #[test]
-    fn the_output_shown_is_its_end_from_a_lines_start() {
-        let short = "a\nb";
-        assert_eq!(tail(short), "a\nb");
+    fn output_naming_no_failure_is_shown_from_a_lines_start_to_its_end() {
         let lines: Vec<String> = (0..400)
             .map(|at| format!("line {at:04} {}", "x".repeat(20)))
             .collect();
         let long = lines.join("\n");
-        let shown = tail(&long);
+        let shown = excerpt(&long);
         assert!(shown.starts_with("…\nline "), "{shown}");
         assert!(shown.ends_with(lines.last().unwrap()), "{shown}");
-        assert!(shown.chars().count() <= SHOWN + 2, "{}", shown.len());
+        assert_eq!(shown.matches('…').count(), 1, "{shown}");
+        assert!(shown.chars().count() <= SHOWN, "{}", shown.len());
+    }
+
+    #[test]
+    fn short_output_is_shown_as_it_is() {
+        assert_eq!(excerpt("a\nb"), "a\nb");
+        let failed = "--- FAIL: TestA (0.00s)\n    a_test.go:3: boom\nFAIL\n[exit code 1]";
+        assert_eq!(excerpt(&format!("{failed}\n\n")), failed);
+    }
+
+    /// One test's log lines as an ORM prints them, which mention errors
+    /// without any test failing.
+    fn orm_log(at: usize) -> String {
+        format!(
+            "2026/11/09 11:46:38 /tmp/build/drift_detection_service.go:406 record not found\n\
+             [0.915ms] [rows:0] SELECT * FROM `drifts` WHERE `drifts`.`id` = {at} ORDER BY \
+             `drifts`.`id` LIMIT 1\n"
+        )
+    }
+
+    #[test]
+    fn a_go_tests_failure_is_shown_past_the_log_lines_around_it() {
+        let mut output = String::new();
+        for at in 0..40 {
+            output.push_str(&orm_log(at));
+        }
+        output.push_str(
+            "2026/11/09 11:46:38 /tmp/build/baseline.go:88 SQL logic error: no such table (1)\n",
+        );
+        output.push_str(&orm_log(40));
+        output.push_str(
+            "--- FAIL: TestLetronnaSpecDriftScoreComputation (0.00s)\n\
+             \x20   drift_letronna_spec_test.go:45: \n\
+             \x20       \tError Trace:\t/app/backend/drift_letronna_spec_test.go:45\n\
+             \x20       \tError:      \tNot equal: \n\
+             \x20       \t            \texpected: 0.5\n\
+             \x20       \t            \tactual  : 0\n\
+             \x20       \tTest:       \tTestLetronnaSpecDriftScoreComputation\n",
+        );
+        let insert = format!(
+            "[1.204ms] [rows:1] INSERT INTO `drifts` VALUES {}",
+            "(1, 0.5), ".repeat(FAILURE_LINE / 5)
+        );
+        output.push_str(&format!("{insert}\n"));
+        for at in 41..80 {
+            output.push_str(&orm_log(at));
+        }
+        output.push_str("FAIL\nFAIL\tgithub.com/acme/backend/services\t2.309s\n[exit code 1]\n");
+
+        let shown = excerpt(&output);
+        assert!(
+            shown.starts_with(
+                "…\n--- FAIL: TestLetronnaSpecDriftScoreComputation (0.00s)\n    \
+                 drift_letronna_spec_test.go:45: \n"
+            ),
+            "{shown}"
+        );
+        assert!(shown.contains("\texpected: 0.5\n"), "{shown}");
+        assert!(shown.contains("\tactual  : 0\n"), "{shown}");
+        // A long line in a failure's wake is cut, and the log after it is
+        // left out up to the end.
+        let cut: String = insert.chars().take(FAILURE_LINE).collect();
+        assert!(shown.contains(&format!("\n{cut}…\n…\n")), "{shown}");
+        assert!(shown.ends_with("FAIL\tgithub.com/acme/backend/services\t2.309s\n[exit code 1]"));
+        assert!(!shown.contains("SQL logic error"), "{shown}");
+        assert!(shown.chars().count() <= SHOWN, "{}", shown.chars().count());
+    }
+
+    #[test]
+    fn pytests_assertion_is_shown_past_the_logs_it_captured() {
+        let mut output = String::from(
+            "============================= test session starts ==============================\n\
+             collected 30 items\n\n\
+             tests/test_letronna_spec_cart.py ..............F...............          [100%]\n\n\
+             =================================== FAILURES ===================================\n\
+             ___________________________ test_discount_is_capped ____________________________\n\n\
+             \x20   def test_discount_is_capped():\n\
+             \x20       cart = Cart()\n\
+             >       assert cart.total(discount=0.9) == 5\n\
+             E       AssertionError: assert 1.0 == 5\n\
+             E        +  where 1.0 = total(discount=0.9)\n\n\
+             tests/test_letronna_spec_cart.py:12: AssertionError\n\
+             ------------------------------ Captured log call -------------------------------\n",
+        );
+        for at in 0..80 {
+            output.push_str(&format!(
+                "DEBUG    cart:cart.py:20 total for item {at}, error budget 0\n"
+            ));
+        }
+        output.push_str(
+            "=========================== short test summary info ============================\n\
+             FAILED tests/test_letronna_spec_cart.py::test_discount_is_capped - AssertionError\n\
+             ========================= 1 failed, 29 passed in 0.31s =========================\n\
+             [exit code 1]",
+        );
+
+        let shown = excerpt(&output);
+        assert!(
+            shown.contains(
+                "…\nE       AssertionError: assert 1.0 == 5\nE        +  where 1.0 = \
+                 total(discount=0.9)\n\ntests/test_letronna_spec_cart.py:12: AssertionError\n"
+            ),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("\nFAILED tests/test_letronna_spec_cart.py::test_discount_is_capped")
+        );
+        assert!(
+            shown
+                .ends_with("1 failed, 29 passed in 0.31s =========================\n[exit code 1]")
+        );
+        // The session's opening and the logs past the failure's own few
+        // lines are left out.
+        assert!(!shown.contains("collected 30 items"), "{shown}");
+        assert!(!shown.contains("item 1,"), "{shown}");
+        assert!(shown.chars().count() <= SHOWN, "{}", shown.chars().count());
+    }
+
+    #[test]
+    fn jests_expected_and_received_are_shown_past_another_files_console() {
+        let mut output = String::from(
+            " FAIL  src/cart.letronna_spec.test.js\n\
+             \x20 Cart\n\
+             \x20   ✓ adds an item (3 ms)\n\
+             \x20   ✕ caps the discount (5 ms)\n\n\
+             \x20 ● Cart › caps the discount\n\n\
+             \x20   expect(received).toBe(expected) // Object.is equality\n\n\
+             \x20   Expected: 5\n\
+             \x20   Received: 1\n\n\
+             \x20     10 |   cart.add(\"book\", 10);\n\
+             \x20   > 11 |   expect(cart.total(0.9)).toBe(5);\n\n\
+             \x20PASS  src/order.test.js\n\
+             \x20 ● Console\n\n",
+        );
+        for at in 0..60 {
+            output.push_str(&format!(
+                "    console.log\n      order {at} saved with error margin 0\n\n"
+            ));
+        }
+        output.push_str(
+            "Test Suites: 1 failed, 1 passed, 2 total\n\
+             Tests:       1 failed, 61 passed, 62 total\n\
+             [exit code 1]",
+        );
+
+        let shown = excerpt(&output);
+        assert!(
+            shown.starts_with(" FAIL  src/cart.letronna_spec.test.js\n"),
+            "{shown}"
+        );
+        assert!(shown.contains("  ● Cart › caps the discount\n"), "{shown}");
+        assert!(
+            shown.contains("    Expected: 5\n    Received: 1\n"),
+            "{shown}"
+        );
+        assert!(shown.ends_with("Tests:       1 failed, 61 passed, 62 total\n[exit code 1]"));
+        // Another file's logs are no failure.
+        assert!(!shown.contains("● Console"), "{shown}");
+        assert!(!shown.contains("order 0 saved"), "{shown}");
+        assert!(shown.chars().count() <= SHOWN, "{}", shown.chars().count());
+    }
+
+    #[test]
+    fn many_failures_leave_the_end_a_third() {
+        let output: String = (0..300)
+            .map(|at| format!("--- FAIL: TestCase{at:03} (0.00s)\n    case_test.go:9: wrong\n"))
+            .chain(["FAIL\tgithub.com/acme/cases\t0.4s\n[exit code 1]".to_owned()])
+            .collect();
+        let shown = excerpt(&output);
+        assert!(
+            shown.starts_with("--- FAIL: TestCase000 (0.00s)\n"),
+            "{shown}"
+        );
+        assert!(shown.ends_with("FAIL\tgithub.com/acme/cases\t0.4s\n[exit code 1]"));
+        assert!(shown.chars().count() <= SHOWN, "{}", shown.chars().count());
+        let (first, _) = shown.split_once("\n…\n").unwrap();
+        assert!(first.chars().count() <= FAILURES_SHOWN, "{first}");
+    }
+
+    #[test]
+    fn a_line_names_a_failure_by_a_runners_own_words_not_by_mentioning_an_error() {
+        for line in [
+            "--- FAIL: TestA (0.01s)",
+            "    --- FAIL: TestA/sub (0.00s)",
+            "panic: runtime error: index out of range [recovered]",
+            "        \tError Trace:\t/app/a_test.go:12",
+            "        \tError:      \tNot equal: ",
+            "E       assert 3 == 4",
+            "FAILED tests/test_a.py::test_b - assert 3 == 4",
+            "Traceback (most recent call last):",
+            "ValueError: bad input",
+            "  ● sum › adds",
+            "    ✕ adds (3 ms)",
+            "  × adds 1ms",
+            "    Expected: 4",
+            "  2 failing",
+            "     AssertionError [ERR_ASSERTION]: 3 == -1",
+            "thread 'tests::b' panicked at src/lib.rs:10:9:",
+            "test tests::b ... FAILED",
+            "assertion `left == right` failed",
+            "error[E0425]: cannot find value `x` in this scope",
+            "FAIL: test_b (tests.test_a.T)",
+            " FAIL  src/a.test.ts > adds",
+            "     Failure/Error: expect(x).to eq(1)",
+        ] {
+            assert!(names_failure(line), "{line}");
+        }
+        for line in [
+            "2026/11/09 11:46:38 /tmp/a.go:406 record not found",
+            "2026/11/09 11:46:38 /tmp/a.go:88 SQL logic error: no such table (1)",
+            "[0.915ms] [rows:0] SELECT * FROM `drifts`",
+            "FAIL\tgithub.com/acme/backend\t2.309s",
+            "  ● Console",
+            "DEBUG    cart:cart.py:20 error budget 0",
+            "test result: ok. 12 passed; 0 failed",
+            "ok  \tgithub.com/acme/backend\t0.2s",
+            "Errors: 0",
+        ] {
+            assert!(!names_failure(line), "{line}");
+        }
     }
 
     #[cfg(unix)]
@@ -3842,6 +4199,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_failure_in_the_middle_of_a_long_log_reaches_the_notice() {
+        let root = Scratch::new("spec-tests-long-log");
+        let noise = "i=0; while [ $i -lt 3000 ]; do echo \"record $i not found\"; i=$((i+1)); done";
+        std::fs::write(
+            root.join("letronna_spec_test.sh"),
+            format!("{noise}\necho '--- FAIL: TestMiddle (0.00s)'\n{noise}\nexit 1\n"),
+        )
+        .unwrap();
+        let command = "sh letronna_spec_test.sh".to_owned();
+        let kept = keep(141, &root, &root, Some(command.clone())).unwrap();
+        let ctx = ToolContext::of(&crate::chat::Connection {
+            workspace: Some(root.to_path_buf()),
+            ..Default::default()
+        });
+        // Far past what a model's call keeps, and the line is none of those
+        // the tool keeps from what it cuts.
+        let ran = outcome_in(&kept, &command, &root, &ctx, TIMEOUT).unwrap();
+        assert!(ran.as_deref().unwrap().len() > 10 * crate::tools::MAX_OUTPUT);
+        let notice = failed(&kept, &command, &ran).unwrap();
+        assert!(
+            notice.contains("lines left out:\n\n…\n--- FAIL: TestMiddle (0.00s)\n"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("record 2999 not found\n\n[exit code 1]"),
+            "{notice}"
+        );
+        tidy(141);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn the_kept_tests_are_run_in_the_attempts_own_folder_and_taken_away_after() {
         let root = Scratch::new("spec-tests-outcome-in");
         assert!(git(&root, &["init", "-q"]).is_some());
@@ -4312,7 +4701,10 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains(&format!("src/f{DIFFERING:02}.rs")), "{text}");
-        assert!(text.contains("Its output ends:\n\nboom\n\n"), "{text}");
+        assert!(
+            text.contains("Its output, with `…` for lines left out:\n\nboom\n\n"),
+            "{text}"
+        );
         let none = regressed("sh t.sh", "did not finish", "", &[]);
         assert!(
             none.contains("as it stands: none that a listing of the project shows. Put back"),
