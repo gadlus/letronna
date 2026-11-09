@@ -638,8 +638,14 @@ pub(crate) fn discard(copy: &Path) {
 /// requirements `request` states. It is given the request word for word and
 /// nothing of the work, and told to keep it that way: anything the request
 /// spells out is used as it spells it, and code is read in `before`, the
-/// project as it was, where there is one.
-pub(crate) fn brief(request: &str, sentences: &[String], before: Option<&Path>) -> String {
+/// project as it was, where there is one, and each case the run weighed and
+/// set aside, `doubts`, to test.
+pub(crate) fn brief(
+    request: &str,
+    sentences: &[String],
+    before: Option<&Path>,
+    doubts: &[String],
+) -> String {
     let read_there = match before {
         Some(before) => format!(
             "The project as it was before the change is in `{}`: read code there, to learn how \
@@ -663,7 +669,9 @@ pub(crate) fn brief(request: &str, sentences: &[String], before: Option<&Path>) 
                    finding: keep it as it is, and do not make it pass.";
     let rows = "`R1 | what it checks | PASS` or `R1 | what it checks | FAIL | command that \
                 runs it | what it expected and what it got`";
-    briefing(request, sentences, &opening, unnamed, outcome, rows)
+    let mut text = briefing(request, sentences, &opening, unnamed, outcome, rows);
+    text.push_str(&crate::doubts::section(doubts));
+    text
 }
 
 /// The task of a tester started with a run, before the work exists, for
@@ -2270,6 +2278,7 @@ mod tests {
             "  Make pairs work.\nPairs compose with Or.  ",
             &sentences,
             None,
+            &[],
         );
         assert!(
             brief.contains(
@@ -2342,7 +2351,12 @@ mod tests {
 
     #[test]
     fn names_the_request_spells_are_used_as_it_spells_them() {
-        let brief = brief("Save at /api/items/save.", &[], Some(Path::new("/tmp/was")));
+        let brief = brief(
+            "Save at /api/items/save.",
+            &[],
+            Some(Path::new("/tmp/was")),
+            &[],
+        );
         assert!(
             brief.contains("as the request spells it, never as the code does"),
             "{brief}"
@@ -2364,7 +2378,7 @@ mod tests {
 
     #[test]
     fn with_nothing_from_before_the_brief_names_no_folder() {
-        let brief = brief("Save at /api/items/save.", &[], None);
+        let brief = brief("Save at /api/items/save.", &[], None, &[]);
         assert!(!brief.contains("before the change is in"), "{brief}");
         assert!(brief.contains("as the request spells it"), "{brief}");
     }
@@ -2556,7 +2570,7 @@ mod tests {
 
     #[test]
     fn the_tester_is_asked_for_the_one_command_that_runs_its_tests() {
-        let brief = brief("Save at /api/items/save.", &[], None);
+        let brief = brief("Save at /api/items/save.", &[], None, &[]);
         assert!(brief.contains("written `Run: <command>`"), "{brief}");
         assert!(
             brief.contains("from the project's root, with paths relative to it"),

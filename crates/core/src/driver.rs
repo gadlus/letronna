@@ -2921,6 +2921,10 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
     let before = workspace
         .filter(|_| copied.is_some())
         .and_then(crate::spec_tests::before);
+    // The cases the run weighed and set aside, without its reasons, so each
+    // helper checks them by the request's words.
+    let own = (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
+    let doubts = crate::doubts::doubts(own);
     let mut tester_ctx = ctx.clone();
     if let (Some(copy), Some(parent)) = (&copied, ctx.caller.connection.as_deref()) {
         let added: Arc<[std::path::PathBuf]> = (parent.added.iter().cloned())
@@ -2944,7 +2948,7 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
                     "name": format!("review-r{}", share.0),
                     "type": "review",
                     "background": false,
-                    "prompt": crate::requirements::brief(request, found, share),
+                    "prompt": crate::requirements::brief(request, found, share, &doubts),
                 });
                 scope.spawn(move || tools::Tool::run(&crate::agents::Agent, &args, &ctx))
             })
@@ -2955,7 +2959,7 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
                 "name": "tester",
                 "type": "tester",
                 "background": false,
-                "prompt": crate::spec_tests::brief(request, found, before.as_deref()),
+                "prompt": crate::spec_tests::brief(request, found, before.as_deref(), &doubts),
             });
             scope.spawn(move || tools::Tool::run(&crate::agents::Agent, &args, &tester_ctx))
         });
@@ -7623,6 +7627,40 @@ pub(crate) mod tests {
         );
         assert!(task.contains("Check each requirement. "), "{task}");
         assert!(!task.contains("Added parse_range."), "{task}");
+    }
+
+    #[test]
+    fn the_cases_a_run_set_aside_are_given_to_its_reviewer_and_tester_without_its_verdict() {
+        let name = "requirements-doubts";
+        let _data = data(name);
+        let dir = scratch(name);
+        let said = "Added parse_range. Open `a..` on empty input? Rare, leave it.";
+        let answers = vec![
+            reply("", &[write_made()]),
+            reply(said, &[]),
+            reply(PASSED, &[]),
+            reply(PASSED, &[]),
+            reply("Each requirement holds.", &[]),
+        ];
+        let (spec, provider) = specified(&dir, AGENTS + 1_745, SPECIFIED, answers);
+        assert_eq!(finished(spec).status, Outcome::Done);
+        let tasks: Vec<String> = (provider.sent().iter().flat_map(messages))
+            .filter_map(|message| message["content"].as_str())
+            .filter(|content| content.contains("You are a helper ("))
+            .map(String::from)
+            .collect();
+        // The task is quoted to the helper indented, so its lines are
+        // matched apart.
+        let heading = "weighed and set aside, with its reasons withheld; each needs a row \
+                       (and, for the tester, a test) of its own, judged by the request's words:";
+        for helper in ["review", "tester"] {
+            let task = (tasks.iter())
+                .find(|task| task.contains(&format!("You are a helper ({helper}).")))
+                .unwrap_or_else(|| panic!("no {helper} in {tasks:?}"));
+            assert!(task.contains(heading), "{task}");
+            assert!(task.contains("- Open `a..` on empty input?"), "{task}");
+            assert!(!task.contains("Rare, leave it"), "{task}");
+        }
     }
 
     #[test]

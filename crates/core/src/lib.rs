@@ -33,6 +33,7 @@ mod contract;
 pub mod crew;
 pub mod diag;
 mod docs;
+mod doubts;
 mod downloads;
 pub mod driver;
 mod dumps;

@@ -372,8 +372,14 @@ pub(crate) fn shares(count: usize) -> Vec<(usize, usize)> {
 /// `sentences`, the requirements `request` states. It is told what the run
 /// would leave out: the request word for word, how to find the change, and
 /// each case its table has a row for; and not the run's reasons for what it
-/// left out, which a reviewer tends to agree with.
-pub(crate) fn brief(request: &str, sentences: &[String], share: (usize, usize)) -> String {
+/// left out, which a reviewer tends to agree with, though each case it
+/// weighed and set aside, `doubts`, is listed for a row of its own.
+pub(crate) fn brief(
+    request: &str,
+    sentences: &[String],
+    share: (usize, usize),
+    doubts: &[String],
+) -> String {
     let mut text = String::from(
         "Review a change you have not seen, made to the project in your working folder, \
          against the request below. Its author's reasons are not given, so judge it by the \
@@ -405,6 +411,7 @@ pub(crate) fn brief(request: &str, sentences: &[String], share: (usize, usize)) 
          prescribe no fix.",
         cases!()
     ));
+    text.push_str(&crate::doubts::section(doubts));
     text
 }
 
@@ -805,7 +812,7 @@ fn blocks(request: &str) -> Vec<Block> {
 /// The sentences of `text`, split at a stop followed by a space or the end,
 /// outside a code span and not after an abbreviation or before a word in
 /// lower case.
-fn split(text: &str) -> Vec<&str> {
+pub(crate) fn split(text: &str) -> Vec<&str> {
     let bytes = text.as_bytes();
     let mut sentences = Vec::new();
     let (mut start, mut at) = (0, 0);
@@ -1312,7 +1319,7 @@ mod tests {
         let rules: Vec<String> = ["Ranges must be written as `a..b`.", "Open ranges default."]
             .map(String::from)
             .into();
-        let whole = brief(request, &rules, (1, 2));
+        let whole = brief(request, &rules, (1, 2), &[]);
         assert!(
             whole.contains(&format!("word for word:\n{request}\n")),
             "{whole}"
@@ -1322,7 +1329,7 @@ mod tests {
         assert!(whole.contains(cases!()));
         assert!(whole.contains("git diff"));
         assert!(!whole.contains("with why"));
-        let part = brief(request, &rules, (2, 2));
+        let part = brief(request, &rules, (2, 2), &[]);
         assert!(
             part.contains("Check R2 to R2; other helpers check the rest."),
             "{part}"
@@ -1384,7 +1391,7 @@ mod tests {
     #[test]
     fn a_review_is_asked_to_write_each_doubt_as_a_row() {
         let rules: Vec<String> = ["Dates must parse.".to_owned()].into();
-        let asked = brief("Dates must parse.", &rules, (1, 1));
+        let asked = brief("Dates must parse.", &rules, (1, 1), &[]);
         assert!(
             asked.contains("`R1 | case | UNCLEAR | what you doubt`"),
             "{asked}"
