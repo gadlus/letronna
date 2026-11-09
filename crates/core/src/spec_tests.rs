@@ -286,9 +286,9 @@ const SECRETS: [&str; 6] = ["KEY", "TOKEN", "SECRET", "PASSW", "CREDENTIAL", "AU
 /// Variables never lent, as no `LD_*` or `*FLAGS` is, but for `GOFLAGS`
 /// set to the flags of `GOFLAGS`: they say where programs and libraries
 /// are found, or how a build goes, which the run may have set for a build
-/// against what its tests need; nor the import path,
-/// which the copy is put first on for the run (`with_import_path`), and a
-/// lent one, exported after that, would undo.
+/// against what its tests need. Nor is the import path, which the copy is
+/// put first on for the run (`with_import_path`), since a lent one,
+/// exported after that, would undo it.
 const UNLENT: [&str; 7] = [
     "PATH",
     "HOME",
@@ -311,16 +311,20 @@ const GOFLAGS: [&str; 4] = [
 ];
 
 /// What a command's output holds when its program's set-up failed before
-/// anything of its own ran: Go's own line, and what Go, pip and npm print
-/// when a module or package they lack cannot be fetched, as none can be
-/// where the run has no network. A pipe into `tail` hides the exit code
-/// such a command ends with, so its output is read instead.
-const SET_UP_FAILED: [&str; 10] = [
+/// anything of its own ran: Go's own lines, and what Go, cargo, pip and
+/// npm print when a module or package they lack cannot be fetched, as none
+/// can be where the run has no network. A pipe into `tail` hides the exit
+/// code such a command ends with, so its output is read instead.
+const SET_UP_FAILED: [&str; 14] = [
     "[setup failed]",
+    "module lookup disabled by GOPROXY=off",
+    "inconsistent vendoring",
     "proxy.golang.org",
     "server misbehaving",
     "no such host",
     "network is unreachable",
+    "resolve host",
+    "failed to download",
     "Temporary failure in name resolution",
     "NewConnectionError",
     "No matching distribution found",
@@ -342,6 +346,10 @@ struct Moved {
     workspace: PathBuf,
     kept: Kept,
     command: Option<String>,
+    /// The variables the tester's own command that ran them set, as
+    /// `VAR=value` words, for the driver to export ahead of `command`
+    /// (`lend`); none where it set none.
+    set_up: Vec<String>,
     /// Written by a tester started with the run, in the project as it was,
     /// so they have never met the work.
     unmet: bool,
@@ -1195,40 +1203,40 @@ pub(crate) fn program(line: &str) -> Option<String> {
 }
 
 /// The variables `line`, a command of the run's, sets for `program`, as
-/// `VAR=value` words: those before the program on its own command, and
-/// those `export`ed or set on their own anywhere before it on the line,
-/// past the `cd`s and the other programs the line runs first, such as an
-/// `ls` or an `rm`, since the shell keeps them past `;` and `&&`; not one
-/// set before another program, as `FOO=1 make` does, which is gone once
-/// that program ends. The tester's command runs with them, so a tester that
-/// lacked the run's set-up, such as a module cache, gets it. None when
-/// `line` never runs `program`, as a build's set-up may be against the
-/// tests; only a value the shell reads as written, none whose name marks it
-/// as a secret or as `UNLENT`, and `LENT` at most.
-pub(crate) fn environment(line: &str, program: &str) -> Vec<String> {
+/// `VAR=value` words: those before the program on the last command of the
+/// line that runs it, and those `export`ed or set on their own anywhere
+/// before that command, past the `cd`s and the other programs the line
+/// runs first, such as an `ls` or an `rm`, since the shell keeps them past
+/// `;` and `&&`; not one set before another program, as `FOO=1 make` does,
+/// which is gone once that program ends. The tester's command runs with
+/// them, so a tester that lacked the run's set-up, such as a module cache,
+/// gets it. None when `line` never runs `program`, as a build's set-up may
+/// be against the tests, and empty when it runs it with none; only a value
+/// the shell reads as written, none whose name marks it as a secret or as
+/// `UNLENT`, and `LENT` at most.
+pub(crate) fn environment(line: &str, program: &str) -> Option<Vec<String>> {
     let dialect = crate::command::Dialect::here();
     let assessed = crate::command::assess(line, dialect, None);
-    let mut found = Vec::new();
+    // A word made by running something, or holding a variable this does
+    // not know, is not what the shell read.
+    let plain_words = |command: &crate::command::Command, words: &[String]| {
+        let words = words.iter().filter(|word| plain(word)).cloned();
+        command.spelled_out.then(|| words.collect::<Vec<_>>())
+    };
+    let mut exported = Vec::new();
+    let mut found = None;
     for command in &assessed.commands {
-        let reached = runs(command).as_deref() == Some(program);
-        let words: &[String] = if sets(command) {
-            &command.argv
-        } else if reached {
-            &command.argv[..command.at]
-        } else {
-            &[]
-        };
-        // A word made by running something, or holding a variable this does
-        // not know, is not what the shell read.
-        if command.spelled_out {
-            found.extend(words.iter().filter(|word| plain(word)).cloned());
-        }
-        if reached {
-            found.truncate(LENT);
-            return found;
+        if sets(command) {
+            exported.extend(plain_words(command, &command.argv).unwrap_or_default());
+        } else if runs(command).as_deref() == Some(program) {
+            let own = plain_words(command, &command.argv[..command.at]).unwrap_or_default();
+            found = Some([exported.clone(), own].concat());
         }
     }
-    Vec::new()
+    found.map(|mut found| {
+        found.truncate(LENT);
+        found
+    })
 }
 
 /// The program `command`, one of a line's, runs, as the tables name it;
@@ -1244,18 +1252,21 @@ fn sets(command: &crate::command::Command) -> bool {
 }
 
 /// Whether `word` sets a variable to a value with nothing in it for the
-/// shell to expand or to end the word at, under a name that marks it
-/// neither as a secret nor as one never lent.
+/// shell to expand or to end the word at, and no credentials in an address,
+/// under a name that marks it neither as a secret nor as one never lent.
 fn plain(word: &str) -> bool {
     let Some((name, value)) = word.split_once('=') else {
         return false;
     };
     let upper = name.to_ascii_uppercase();
+    // `https://user:token@host` carries a secret under any name.
+    let credentials = (value.split_once("://")).is_some_and(|(_, address)| address.contains('@'));
     crate::command::assignment(word)
         && !SECRETS.iter().any(|secret| upper.contains(secret))
         && !UNLENT.contains(&upper.as_str())
         && !upper.starts_with("LD_")
         && (!upper.ends_with("FLAGS") || go_flags(&upper, value))
+        && !credentials
         && (value.chars()).all(|c| c.is_ascii_alphanumeric() || "_-./:,+@%=".contains(c))
 }
 
@@ -2843,11 +2854,35 @@ pub(crate) fn keep(
             workspace: workspace.to_path_buf(),
             kept: kept.clone(),
             command,
+            set_up: Vec::new(),
             unmet: false,
             there,
         });
     }
     Some(kept)
+}
+
+/// Records `set_up`, the variables the tester's own command that ran its
+/// tests set, with the files last kept for run `run`, for the driver to
+/// export ahead of their command (`lent`): the module cache the tester's
+/// copy needed, the driver's copy needs too.
+pub(crate) fn lend(run: u64, set_up: Vec<String>) {
+    if let Ok(mut moved) = moved().lock()
+        && let Some(kept) = moved.iter_mut().rfind(|kept| kept.run == run)
+    {
+        kept.set_up = set_up;
+    }
+}
+
+/// The variables recorded with the tester's files `to_run` gives for run
+/// `run`, if any were.
+pub(crate) fn lent(run: u64) -> Vec<String> {
+    let Ok(moved) = moved().lock() else {
+        return Vec::new();
+    };
+    (moved.iter().find(|kept| kept.run == run))
+        .map(|kept| kept.set_up.clone())
+        .unwrap_or_default()
 }
 
 /// `keep`, for the files of a tester started with run `run`: written in the
@@ -6394,86 +6429,88 @@ mod tests {
         );
     }
 
+    /// `environment`, with the words it found joined by a space.
+    fn lent_words(line: &str, program: &str) -> Option<String> {
+        environment(line, program).map(|found| found.join(" "))
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_set_up_of_the_runs_passing_command_is_read_off_its_line() {
         assert_eq!(
-            environment(
+            lent_words(
                 "GOMODCACHE=/root/go/pkg/mod GOCACHE=/tmp/gocache go test ./...",
                 "go"
-            ),
-            ["GOMODCACHE=/root/go/pkg/mod", "GOCACHE=/tmp/gocache"]
+            )
+            .as_deref(),
+            Some("GOMODCACHE=/root/go/pkg/mod GOCACHE=/tmp/gocache")
         );
         // Exported or set on their own before the program, after a `cd`,
         // through `env`, and quoted.
         assert_eq!(
-            environment(
+            lent_words(
                 "export COVERAGE_FILE=.coverage; CI=1; cd /app && env \
                  DJANGO_SETTINGS_MODULE=\"app.settings\" pytest -q 2>&1 | tail -20",
                 "pytest"
-            ),
-            [
-                "COVERAGE_FILE=.coverage",
-                "CI=1",
-                "DJANGO_SETTINGS_MODULE=app.settings"
-            ]
+            )
+            .as_deref(),
+            Some("COVERAGE_FILE=.coverage CI=1 DJANGO_SETTINGS_MODULE=app.settings")
         );
-        // Nothing after the first program, and nothing from a line that
-        // sets none.
+        // Nothing after the program, and nothing from a line that sets
+        // none, though each runs it.
         assert_eq!(
-            environment("go test ./... && FOO=1 make check", "go"),
-            Vec::<String>::new()
+            lent_words("go test ./... && FOO=1 make check", "go").as_deref(),
+            Some("")
         );
-        assert_eq!(environment("pytest -q", "pytest"), Vec::<String>::new());
+        assert_eq!(lent_words("pytest -q", "pytest").as_deref(), Some(""));
         // A secret, or a value with a word's end in it, is not lent.
         assert_eq!(
-            environment(
+            lent_words(
                 "API_KEY=x GITHUB_TOKEN=y CLIENT_SECRET=z DB_PASSWORD=w AUTH_HEADER=v C='a b' \
                  D=1 go test",
                 "go"
-            ),
-            ["D=1"]
+            )
+            .as_deref(),
+            Some("D=1")
         );
         // Nor what says where programs and libraries are found, or how a
         // build goes.
         assert_eq!(
-            environment(
+            lent_words(
                 "PATH=/usr/local/go/bin HOME=/root LD_LIBRARY_PATH=/opt/lib GOFLAGS=-race \
                  CGO_ENABLED=0 NODE_ENV=test PYTHONHOME=/py GOMODCACHE=/m go test",
                 "go"
-            ),
-            ["GOMODCACHE=/m"]
+            )
+            .as_deref(),
+            Some("GOMODCACHE=/m")
         );
         // Nor the import path, which the copy is put first on for the run.
         assert_eq!(
-            environment("PYTHONPATH=/opt/x PYTHONSAFEPATH=1 D=1 pytest", "pytest"),
-            ["D=1"]
+            lent_words("PYTHONPATH=/opt/x PYTHONSAFEPATH=1 D=1 pytest", "pytest").as_deref(),
+            Some("D=1")
         );
-        // Nor anything off a command running another program than the
-        // tester's, however it is reached.
+        // Nothing at all off a line that never runs the tester's program,
+        // however that is reached on it.
+        assert_eq!(lent_words("GOMODCACHE=/m go build ./...", "pytest"), None);
         assert_eq!(
-            environment("GOMODCACHE=/m go build ./...", "pytest"),
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            environment("cd /app && GOMODCACHE=/m go build ./...", "go"),
-            ["GOMODCACHE=/m"]
+            lent_words("cd /app && GOMODCACHE=/m go build ./...", "go").as_deref(),
+            Some("GOMODCACHE=/m")
         );
         // Nor anything off a command with a word made by running something,
         // or holding a variable this does not know.
         assert_eq!(
-            environment("A=$(pwd) D=1 go test", "go"),
-            Vec::<String>::new()
+            lent_words("A=$(pwd) D=1 go test", "go").as_deref(),
+            Some("")
         );
         assert_eq!(
-            environment("B=$SOME_PLACE/x D=1 go test", "go"),
-            Vec::<String>::new()
+            lent_words("B=$SOME_PLACE/x D=1 go test", "go").as_deref(),
+            Some("")
         );
         // `LENT` at most.
         let many: Vec<String> = (0..LENT + 2).map(|at| format!("V{at}={at}")).collect();
         assert_eq!(
-            environment(&format!("{} go test", many.join(" ")), "go"),
-            many[..LENT]
+            lent_words(&format!("{} go test", many.join(" ")), "go"),
+            Some(many[..LENT].join(" "))
         );
     }
 
@@ -6502,52 +6539,100 @@ mod tests {
         // As a run writes it: a listing before the exports, and a pipe after
         // the program.
         assert_eq!(
-            environment(
+            lent_words(
                 "cd /app && ls zz_* 2>/dev/null; export GOMODCACHE=/root/go/pkg/mod \
                  GOFLAGS=-mod=mod && go test -tags analyze -run LetronnaSpec -v . 2>&1 | tail -40",
                 "go"
-            ),
-            ["GOMODCACHE=/root/go/pkg/mod", "GOFLAGS=-mod=mod"]
+            )
+            .as_deref(),
+            Some("GOMODCACHE=/root/go/pkg/mod GOFLAGS=-mod=mod")
         );
         // An export or a lone assignment stays set past the program before
         // it; a variable set before another program is gone with it.
         assert_eq!(
-            environment(
+            lent_words(
                 "rm -rf out; FOO=1 make; export BAR=2; BAZ=3; go test .",
                 "go"
-            ),
-            ["BAR=2", "BAZ=3"]
+            )
+            .as_deref(),
+            Some("BAR=2 BAZ=3")
+        );
+        // The last command of the program on the line, with what was
+        // exported before it; not what is exported after it.
+        assert_eq!(
+            lent_words(
+                "go build ./... && export X=1 && GOMODCACHE=/m go test .",
+                "go"
+            )
+            .as_deref(),
+            Some("X=1 GOMODCACHE=/m")
+        );
+        assert_eq!(
+            lent_words("go test .; export Y=2", "go").as_deref(),
+            Some("")
         );
         // Nothing from a line that never runs the program.
-        assert_eq!(
-            environment("export GOMODCACHE=/m; ls", "go"),
-            Vec::<String>::new()
-        );
+        assert_eq!(lent_words("export GOMODCACHE=/m; ls", "go"), None);
     }
 
     #[cfg(unix)]
     #[test]
     fn go_flags_saying_where_modules_come_from_are_lent_and_build_flags_are_not() {
         assert_eq!(
-            environment(
+            lent_words(
                 "CFLAGS=-O2 LDFLAGS=-s RUSTFLAGS=-Dwarnings GOFLAGS=-mod=mod go test",
                 "go"
-            ),
-            ["GOFLAGS=-mod=mod"]
+            )
+            .as_deref(),
+            Some("GOFLAGS=-mod=mod")
         );
         for flag in ["-mod=vendor", "-mod=readonly", "-buildvcs=false"] {
             assert_eq!(
-                environment(&format!("GOFLAGS={flag} go test"), "go"),
-                [format!("GOFLAGS={flag}")]
+                lent_words(&format!("GOFLAGS={flag} go test"), "go"),
+                Some(format!("GOFLAGS={flag}"))
             );
         }
         for value in ["-race", "-mod=mod,-race", "-ldflags=-s", ""] {
             assert_eq!(
-                environment(&format!("GOFLAGS={value} go test"), "go"),
-                Vec::<String>::new(),
+                lent_words(&format!("GOFLAGS={value} go test"), "go").as_deref(),
+                Some(""),
                 "{value}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_address_with_credentials_in_it_is_not_lent() {
+        assert_eq!(
+            lent_words(
+                "GOPROXY=https://user:tok@goproxy.corp,direct GONOSUMDB=corp.example go test",
+                "go"
+            )
+            .as_deref(),
+            Some("GONOSUMDB=corp.example")
+        );
+        assert_eq!(
+            lent_words(
+                "PIP_INDEX_URL=https://u:p@pypi.corp/simple pytest",
+                "pytest"
+            )
+            .as_deref(),
+            Some("")
+        );
+        // One without them is, with the `@` a value may hold elsewhere.
+        assert_eq!(
+            lent_words(
+                "GOPROXY=https://goproxy.corp,direct GOFLAGS=-mod=mod go test",
+                "go"
+            )
+            .as_deref(),
+            Some("GOPROXY=https://goproxy.corp,direct GOFLAGS=-mod=mod")
+        );
+        assert_eq!(
+            lent_words("MAIL=user@example.com go test", "go").as_deref(),
+            Some("MAIL=user@example.com")
+        );
     }
 
     #[test]
@@ -6556,6 +6641,14 @@ mod tests {
             "go: downloading github.com/x/y v1.2.3\ngo: github.com/x/y@v1.2.3: Get \
              \"https://proxy.golang.org/github.com/x/y/@v/v1.2.3.mod\": dial tcp: lookup \
              proxy.golang.org on 127.0.0.11:53: server misbehaving\nFAIL\tapp [setup failed]"
+        ));
+        assert!(set_up_failed(
+            "go: github.com/x/y@v1.2.3: module lookup disabled by GOPROXY=off"
+        ));
+        assert!(set_up_failed(
+            "    Updating crates.io index\nwarning: spurious network error (3 tries remaining): \
+             Could not resolve host: index.crates.io\nerror: failed to download from \
+             `https://index.crates.io/config.json`"
         ));
         assert!(set_up_failed(
             "WARNING: Retrying (Retry(total=0)) after connection broken by \
