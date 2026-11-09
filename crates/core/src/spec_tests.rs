@@ -574,6 +574,10 @@ pub(crate) fn copy(workspace: &Path) -> Option<PathBuf> {
     let to = folder("copy");
     let made = (|| {
         for file in &files {
+            // A folder, with `/` after it, is how git lists a repository
+            // inside the project that it does not track; joined as listed,
+            // the path could not be linked.
+            let file = file.trim_end_matches('/');
             let (from, at) = (workspace.join(file), to.join(file));
             // A file the run deleted, or a path listed twice.
             let Ok(kind) = std::fs::symlink_metadata(&from) else {
@@ -582,13 +586,11 @@ pub(crate) fn copy(workspace: &Path) -> Option<PathBuf> {
             if std::fs::symlink_metadata(&at).is_ok() {
                 continue;
             }
-            std::fs::create_dir_all(at.parent()?).ok()?;
-            match () {
-                _ if kind.is_symlink() => {
-                    std::os::unix::fs::symlink(std::fs::read_link(&from).ok()?, &at).ok()?
-                }
-                _ if kind.is_dir() => std::os::unix::fs::symlink(&from, &at).ok()?,
-                _ => drop(std::fs::copy(&from, &at).ok()?),
+            // A file left out could have the tests fail for the wrong
+            // reason, so none is: the copy fails, and the log says on what.
+            if let Err(error) = place(&from, &at, &kind.file_type()) {
+                unplaced("copy", file, &error);
+                return None;
             }
         }
         link(workspace, ignored.iter().map(String::as_str), &to)
@@ -598,6 +600,49 @@ pub(crate) fn copy(workspace: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(to)
+}
+
+/// Puts what is at `from` in the project, of `kind`, at `at` in a copy of
+/// it, making the folders above: a link as it is, a folder as a link to it,
+/// which a repository inside the project is, and a file by a copy.
+#[cfg(unix)]
+fn place(from: &Path, at: &Path, kind: &std::fs::FileType) -> std::io::Result<()> {
+    if let Some(parent) = at.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if kind.is_symlink() {
+        return std::os::unix::fs::symlink(std::fs::read_link(from)?, at);
+    }
+    if kind.is_dir() {
+        return std::os::unix::fs::symlink(from, at);
+    }
+    std::fs::copy(from, at).map(drop)
+}
+
+/// Notes in the log that `step`, `copy` or `link`, could not place `path`,
+/// a path from the project, for `error`: a run that lost the driver's run
+/// of the tester's tests to a copy that could not be made otherwise left
+/// nothing to say why.
+fn unplaced(step: &'static str, path: &str, error: &std::io::Error) {
+    crate::diag::event(
+        "spec_copy_failed",
+        &[
+            ("step", step.into()),
+            ("path", path.into()),
+            (crate::diag::ERROR, error.to_string().into()),
+        ],
+    );
+    #[cfg(test)]
+    if let Ok(mut noted) = noted().lock() {
+        noted.push((step, path.to_owned()));
+    }
+}
+
+/// What `unplaced` has noted so far, each step and path, for the tests.
+#[cfg(test)]
+fn noted() -> &'static Mutex<Vec<(&'static str, String)>> {
+    static NOTED: OnceLock<Mutex<Vec<(&'static str, String)>>> = OnceLock::new();
+    NOTED.get_or_init(Default::default)
 }
 
 /// The files of the project in `workspace` as `copy` takes them, the ones
@@ -646,6 +691,9 @@ fn ignored(workspace: &Path) -> Option<Vec<String>> {
 /// lists them, into `into`, a folder holding the project or the project as
 /// it was, at the same path, making the folders above it: tests there find
 /// the packages and builds they use as they are, without a copy of them.
+/// One whose path `into` holds already, as a path listed twice or a folder
+/// the copy has, is left as it is. None when one could not be linked, which
+/// the log says (`unplaced`).
 #[cfg(unix)]
 fn link<'a>(
     workspace: &Path,
@@ -655,8 +703,19 @@ fn link<'a>(
     for entry in entries {
         let entry = entry.trim_end_matches('/');
         let at = into.join(entry);
-        std::fs::create_dir_all(at.parent()?).ok()?;
-        std::os::unix::fs::symlink(workspace.join(entry), &at).ok()?;
+        if std::fs::symlink_metadata(&at).is_ok() {
+            continue;
+        }
+        let linked = (|| {
+            if let Some(parent) = at.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::os::unix::fs::symlink(workspace.join(entry), &at)
+        })();
+        if let Err(error) = linked {
+            unplaced("link", entry, &error);
+            return None;
+        }
     }
     Some(())
 }
@@ -3377,6 +3436,78 @@ mod tests {
         assert!(git(&root, &["init", "-q"]).is_some());
         std::fs::create_dir_all(root.join("inner")).unwrap();
         assert_eq!(copy(&root.join("inner")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repository_inside_the_project_is_copied_as_a_link_to_it() {
+        let root = Scratch::new("spec-tests-copy-nested");
+        assert!(git(&root, &["init", "-q"]).is_some());
+        std::fs::write(root.join("README"), "a project").unwrap();
+        committed(&root, "first");
+        // Git lists a repository it does not track as a folder, `nested/`.
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(git(&nested, &["init", "-q"]).is_some());
+        std::fs::write(nested.join("inner.txt"), "inner").unwrap();
+        assert!(listed(&root).unwrap().contains(&"nested/".to_owned()));
+
+        let copy = copy(&root).expect("the project was not copied");
+        assert_eq!(std::fs::read_link(copy.join("nested")).unwrap(), nested);
+        assert!(copy.join("nested/inner.txt").exists());
+        assert!(copy.join("README").exists());
+        discard(&copy);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ignored_entry_whose_path_the_copy_holds_already_is_skipped() {
+        let root = Scratch::new("spec-tests-copy-held");
+        for folder in ["build", "dist"] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+            std::fs::write(root.join(folder).join("out.txt"), "built").unwrap();
+        }
+        let into = Scratch::new("spec-tests-copy-held-into");
+        std::fs::create_dir_all(into.join("build")).unwrap();
+        std::fs::write(into.join("build/own.txt"), "the copy's").unwrap();
+        // Listed twice, and a path the copy holds as a folder of its own:
+        // neither fails the copy, and the folder stays as it is.
+        assert_eq!(link(&root, ["build/", "dist/", "dist/"], &into), Some(()));
+        assert!(into.join("build/own.txt").exists());
+        assert!(!into.join("build").is_symlink());
+        assert_eq!(
+            std::fs::read_link(into.join("dist")).unwrap(),
+            root.join("dist")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_copied_fails_the_copy_and_is_named() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = Scratch::new("spec-tests-copy-unreadable");
+        // Root reads anything, so the file would copy.
+        if std::fs::metadata(&root).unwrap().uid() == 0 {
+            return;
+        }
+        assert!(git(&root, &["init", "-q"]).is_some());
+        std::fs::write(root.join("README"), "a project").unwrap();
+        committed(&root, "first");
+        std::fs::write(root.join("secret.txt"), "unreadable").unwrap();
+        std::fs::set_permissions(
+            root.join("secret.txt"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        assert_eq!(copy(&root), None);
+        let noted = noted().lock().unwrap();
+        assert!(
+            noted
+                .iter()
+                .any(|(step, path)| *step == "copy" && path == "secret.txt"),
+            "{noted:?}"
+        );
     }
 
     #[test]
