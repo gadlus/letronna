@@ -642,6 +642,11 @@ fn steps(
     // What the last reply's request read, to tell when the history it sends
     // was cut.
     let mut read = 0;
+    // Before the first request, where a tester can work blind in the project
+    // as it was: it writes its tests while the run writes the change, with
+    // nothing of the work to shape them to, and has them ready when the run
+    // first says it is done, rather than taking the end of its time.
+    tester_ahead(spec, turn);
     loop {
         if spec.cancel.is_set() {
             return Ok(Outcome::Stopped);
@@ -938,9 +943,20 @@ fn steps(
             if !listed
                 && report.rounds < spec.rounds
                 && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
-                && let Some(notice) = requirements(spec, turn, &report.files, began)
+                && let Some(mut notice) = requirements(spec, turn, &report.files, began)
             {
                 listed = true;
+                // Tests written ahead of the work have never met it: they are
+                // run against it now, so the notice and what they make of
+                // the work, or why they could not be run, reach the run
+                // together, while it has the time to act on both; the first
+                // of its `RUNS`.
+                if tested < crate::spec_tests::RUNS && crate::spec_tests::unmet(spec.id) {
+                    tested += 1;
+                    let ran = test_run(spec, turn);
+                    notice.content.push_str("\n\n");
+                    notice.content.push_str(&crate::spec_tests::first_run(&ran));
+                }
                 spec.transcript.conversation.messages.push(notice);
                 save(&mut spec.transcript)?;
                 continue;
@@ -964,16 +980,36 @@ fn steps(
             // project, and what failed sent back; `RUNS` times at most,
             // counted whether they pass or fail, so the later checks that
             // send the run back do not have them run again each time; and
-            // with a round and budget left, as above.
+            // with a round and budget left, as above. A tester still at work
+            // when the run first said it was done is taken here once it has
+            // answered: its report goes with what its tests make of the work,
+            // or alone where it gave no command to run them.
             if listed
                 && tested < crate::spec_tests::RUNS
                 && report.rounds < spec.rounds
                 && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
-                && crate::spec_tests::to_run(spec.id).is_some()
             {
-                tested += 1;
-                if let Some(notice) = tested_work(spec, turn) {
-                    spec.transcript.conversation.messages.push(notice);
+                let late = late_tester(spec);
+                let runnable = crate::spec_tests::to_run(spec.id).is_some();
+                if runnable {
+                    tested += 1;
+                }
+                let ran = runnable.then(|| tested_work(spec, turn)).flatten();
+                let content = match (late, ran) {
+                    (Some(told), Some(ran)) => Some(format!("{told}\n\n{}", ran.content)),
+                    (Some(told), None) if !runnable => Some(told),
+                    (None, Some(ran)) => Some(ran.content),
+                    _ => None,
+                };
+                if let Some(content) = content {
+                    spec.transcript.conversation.messages.push(Message {
+                        role: "user".into(),
+                        content,
+                        notice: true,
+                        // Folded into the run, so the window keeps the task it is for.
+                        folded: true,
+                        ..Default::default()
+                    });
                     save(&mut spec.transcript)?;
                     continue;
                 }
@@ -2445,25 +2481,30 @@ fn review_rows(spec: &Spec, turn: &Turn) -> Option<Message> {
     })
 }
 
-/// The notice sending a session's own run nobody watches back with what
-/// failed when the driver ran the tester's kept tests against its work as it
-/// stands, in a copy of the project; None when they passed, when none were
-/// kept with a command to run them, or when the gate would not let the
-/// command run as it stands, which leaves them to the run, as it was told.
-fn tested_work(spec: &Spec, turn: &Turn) -> Option<Message> {
+/// What came of the tester's kept tests run by the driver against the work
+/// of a session's own run nobody watches, as it stands, in a copy of the
+/// project: `Ran::Unrun` with why where they could not be, as when none were
+/// kept with a command to run them, the gate would not let the command run
+/// as it stands, or the time or tokens for a fix after them are not there.
+fn test_run(spec: &Spec, turn: &Turn) -> crate::spec_tests::Ran {
+    use crate::spec_tests::Ran;
     if !unwatched(spec) || turn.capped().is_some() || !turn.runs_commands() {
-        return None;
+        return Ran::Unrun("this run can run no command now".into());
     }
-    if refused(spec, "run_command").is_some() {
-        return None;
+    if let Some(why) = refused(spec, "run_command") {
+        return Ran::Unrun(why);
     }
     // With the time and tokens for the fix after it: near either end, a run
     // sent back would leave a fix half made, which is worse than its first
     // version.
     if !affords_review(spec) {
-        return None;
+        return Ran::Unrun(
+            "too little time or too few tokens are left for a fix after them".into(),
+        );
     }
-    let (kept, command) = crate::spec_tests::to_run(spec.id)?;
+    let Some((kept, command)) = crate::spec_tests::to_run(spec.id) else {
+        return Ran::Unrun("no test file was kept with a command that runs it".into());
+    };
     // A suite's worth of time, within half of what is left to the deadline,
     // which does not cut a call the driver makes itself.
     let limit = match spec.connection.deadline {
@@ -2495,13 +2536,26 @@ fn tested_work(spec: &Spec, turn: &Turn) -> Option<Message> {
     let sandboxed = match outcome {
         gate::Outcome::Run => false,
         gate::Outcome::Sandboxed => true,
-        gate::Outcome::Ask | gate::Outcome::Refuse(_) => return None,
+        gate::Outcome::Ask | gate::Outcome::Refuse(_) => {
+            return Ran::Unrun(format!("the gate would not run `{command}` as it stands"));
+        }
     };
     let ctx = ToolContext {
         sandboxed,
         ..context(spec)
     };
-    let content = crate::spec_tests::ran(&kept, &command, &ctx, limit)?;
+    crate::spec_tests::ran(&kept, &command, &ctx, limit)
+}
+
+/// The notice sending a session's own run nobody watches back with what
+/// failed when the driver ran the tester's kept tests against its work as it
+/// stands (`test_run`); None when they passed, when they could not be run,
+/// which leaves them to the run as it was told, or when too little time is
+/// left after them for the fix.
+fn tested_work(spec: &Spec, turn: &Turn) -> Option<Message> {
+    let crate::spec_tests::Ran::Failed(content) = test_run(spec, turn) else {
+        return None;
+    };
     // The tests may have taken the time the fix needed: then the run is
     // left to end with its first version rather than a half-made fix. The
     // fix alone needs less than a review and a fix did.
@@ -2548,9 +2602,11 @@ fn unreviewed(messages: &[Message]) -> Option<String> {
 
 /// The reports of review helpers started side by side for a run nobody
 /// watches, each checking its share of `found`, the requirements `request`
-/// states, and beside them a tester's, writing tests from the request alone,
-/// all waited for: the reviews that came back with a table, and the tester's
-/// as the run is told it, with where its tests are kept, if it had one.
+/// states, and a tester's, writing tests from the request alone: the one
+/// started with the run, waited for, or else one started beside the
+/// reviews, all waited for. The reviews that came back with a table, and
+/// the tester's as the run is told it, with where its tests are kept, if it
+/// had one.
 fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option<String>) {
     let mut ctx = context(spec);
     // On a run with a deadline the review and the fix after it share the
@@ -2571,9 +2627,12 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
         (budget.left() / crate::requirements::REVIEW_TOKENS).max(1) as usize
     });
     let shares = crate::requirements::shares(found.len());
-    // A place of its own beside the reviews, or no tester: no review is
+    // A tester started with the run is taken here, finished or waited for,
+    // rather than a second one started; where none was, one starts beside
+    // the reviews, with a place of its own or not at all: no review is
     // refused for it.
-    let testing = crate::agents::at_once(ctx.caller.root) > shares.len();
+    let ahead = crate::spec_tests::ahead(spec.id);
+    let testing = !ahead && crate::agents::at_once(ctx.caller.root) > shares.len();
     let workspace = spec.connection.workspace.as_deref();
     // In a copy of the project where one can be made, so its tests, half
     // written or failing on purpose, never meet the reviews running the
@@ -2599,7 +2658,7 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
             ..parent.clone()
         }));
     }
-    let (reports, tested): (Vec<String>, Option<String>) = std::thread::scope(|scope| {
+    let (reports, tested, taken) = std::thread::scope(|scope| {
         let started: Vec<_> = (shares.into_iter())
             .take(afford)
             .map(|share| {
@@ -2624,13 +2683,34 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
             });
             scope.spawn(move || tools::Tool::run(&crate::agents::Agent, &args, &tester_ctx))
         });
+        // The tester started with the run is waited for while the reviews
+        // run, half the time a review needs at most, and once more as they
+        // end, until its deadline and a round after it, within another half;
+        // one still at work then is taken at a later done, once it has
+        // answered (`late_tester`).
+        let wait = crate::requirements::REVIEW_TIME / 2;
+        let mut taken = ahead
+            .then(|| crate::spec_tests::take(spec.id, wait))
+            .flatten();
         let reports = (started.into_iter())
             .filter_map(|helper| helper.join().ok()?.ok())
             .filter(|report| crate::requirements::tabled(report))
             .collect();
-        let tested = tester.and_then(|tester| tester.join().ok()?.ok());
-        (reports, tested)
+        if ahead && taken.is_none() {
+            taken = crate::spec_tests::take_due(spec.id, wait);
+        }
+        let tested: Option<String> = tester.and_then(|tester| tester.join().ok()?.ok());
+        (reports, tested, taken)
     });
+    // The tester started with the run: its tests kept from its own folder
+    // as ones that have not met the work, and its report as the run is told
+    // it, whatever its table says.
+    if let Some((folder, report)) = taken {
+        let report = report.ok();
+        let kept = kept_ahead(spec, &folder, report.as_deref());
+        let tested = report.map(|report| crate::spec_tests::told_ahead(&report, kept.as_ref()));
+        return (reports, tested);
+    }
     // Kept apart whatever the tester reported, so no patch of the project
     // takes them; the run puts them back to run them, and the driver runs
     // them against its work with the command the report gives.
@@ -2661,6 +2741,139 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
         false => Some(crate::spec_tests::unrun(&report, kept.as_ref()?, again)),
     });
     (reports, tested)
+}
+
+/// The tests of a tester started with the run kept from `folder`, where it
+/// worked, with the command its `report` gives, if any, made relative to
+/// the project, as tests that have not met the work (`keep_ahead`); the
+/// folder is deleted after. None when it left no test file.
+fn kept_ahead(spec: &Spec, folder: &Path, report: Option<&str>) -> Option<crate::spec_tests::Kept> {
+    let workspace = spec.connection.workspace.as_deref();
+    let command = report.and_then(crate::spec_tests::command).map(|command| {
+        let folders: Vec<&Path> = std::iter::once(folder).chain(workspace).collect();
+        crate::spec_tests::relative(&command, &folders)
+    });
+    let kept = workspace
+        .and_then(|workspace| crate::spec_tests::keep_ahead(spec.id, folder, workspace, command));
+    crate::spec_tests::discard(folder);
+    kept
+}
+
+/// The report of a tester started with the run that was still at work when
+/// the run first said it was done, once it has answered, as the run is told
+/// it (`spec_tests::told_ahead`), with its tests kept for the driver to run
+/// (`kept_ahead`). None while it is still at work, when none is pending, or
+/// when it ended with no report.
+fn late_tester(spec: &Spec) -> Option<String> {
+    if !crate::spec_tests::ahead(spec.id) {
+        return None;
+    }
+    let (folder, report) = crate::spec_tests::take(spec.id, Duration::ZERO)?;
+    let report = report.ok();
+    let kept = kept_ahead(spec, &folder, report.as_deref());
+    report.map(|report| crate::spec_tests::told_ahead(&report, kept.as_ref()))
+}
+
+/// Starts a tester with a session's own run nobody watches, blind to the
+/// work by where it works: the project as its last commit holds it, with its
+/// package stores and build caches linked in (`spec_tests::base`), which the
+/// work never reaches. Only where the run may start helpers and run
+/// commands, its request states enough requirements to be reviewed and
+/// names no files that are not code as its work, it has the time and tokens
+/// for a review and at least a review's time for the tester's share
+/// (`spec_tests::time_ahead`), a place is free beside the reviews it will
+/// run beside, and that folder can be made; otherwise the tester starts at
+/// the run's first done, as `reviews` starts it. On a run with a deadline it
+/// is given that share of the time left, and ends at its own deadline as a
+/// review does.
+fn tester_ahead(spec: &Spec, turn: &Turn) {
+    if !unwatched(spec) || turn.capped().is_some() || !turn.runs_commands() {
+        return;
+    }
+    if refused(spec, "agent").is_some() || refused(spec, "run_command").is_some() {
+        return;
+    }
+    if !affords_review(spec) {
+        return;
+    }
+    // A tester given less than a review's time would answer after the run
+    // was done, or not at all, for the tokens it spent.
+    let left = (spec.connection.deadline)
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+    let share = left.map(crate::spec_tests::time_ahead);
+    if share.is_some_and(|share| share < crate::requirements::REVIEW_TIME) {
+        return;
+    }
+    let Some((request, found)) = specified(spec) else {
+        return;
+    };
+    let shares = crate::requirements::shares(found.len());
+    if crate::agents::at_once(spec.root) <= shares.len() {
+        return;
+    }
+    let Some(workspace) = spec.connection.workspace.as_deref() else {
+        return;
+    };
+    let Some(folder) = crate::spec_tests::base(workspace) else {
+        return;
+    };
+    let mut ctx = context(spec);
+    let Some(parent) = ctx.caller.connection.as_deref() else {
+        crate::spec_tests::discard(&folder);
+        return;
+    };
+    let deadline = share.map(|share| Instant::now() + share);
+    // Stopped with the run, or alone once the run has ended without it.
+    let cancel = spec.cancel.child();
+    ctx.caller.connection = Some(Arc::new(Connection {
+        workspace: Some(folder.clone()),
+        deadline,
+        ..parent.clone()
+    }));
+    ctx.workspace = Some(folder.clone());
+    ctx.cancel = cancel.clone();
+    let args = json!({
+        "description": "Test from the request alone",
+        "name": "tester",
+        "type": "tester",
+        "background": false,
+        "prompt": crate::spec_tests::brief_ahead(request, &found),
+    });
+    crate::spec_tests::start(spec.id, folder, cancel, deadline, move || {
+        tools::Tool::run(&crate::agents::Agent, &args, &ctx)
+    });
+}
+
+/// The request a session's own run was given, as typed, with the
+/// requirement sentences it states, where it states `FEWEST` or more and
+/// its work is code; None for a run on mail, which is no request, on a
+/// request stating fewer, or on one whose work is files that are not code,
+/// such as a report or data, which are checked as outputs rather than
+/// reviewed (`requirements`): told by the data or document files it names
+/// that are not there yet, where it names no code.
+fn specified(spec: &Spec) -> Option<(&str, Vec<String>)> {
+    let own = (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
+    let request = own.iter().rfind(|message| chat::opens_turn(message))?;
+    if request.notice {
+        return None;
+    }
+    let typed = crate::references::typed(&request.content);
+    let found = crate::requirements::sentences(typed);
+    if found.len() < crate::requirements::FEWEST {
+        return None;
+    }
+    let workspace = spec.connection.workspace.as_deref()?;
+    let named = crate::requirements::named(typed);
+    let outputs = named.iter().any(|file| {
+        // Before looking, which on Windows signs in to a share it names.
+        data(file)
+            && crate::paths::unsafe_raw(file, Some(workspace)).is_none()
+            && !workspace.join(file).exists()
+    });
+    if outputs && !named.iter().any(|file| code(file)) {
+        return None;
+    }
+    Some((typed, found))
 }
 
 /// The notice telling a session's own run nobody watches where the project's
@@ -2875,6 +3088,24 @@ fn code(path: &str) -> bool {
         .and_then(|n| n.to_str())
         .unwrap_or_default();
     CODE.iter().any(|code| extension.eq_ignore_ascii_case(code)) || BUILDS.contains(&name)
+}
+
+/// Extensions of the data and document files a request names as outputs to
+/// write, rather than code to change: what a run is sent back to check, not
+/// to have reviewed. Not `json`, which a request names as often for a call
+/// on an object as for a file.
+const DATA: &[&str] = &[
+    "csv", "tsv", "xlsx", "xls", "md", "txt", "html", "htm", "pdf", "png", "jpg", "jpeg", "svg",
+    "xml", "yaml", "yml", "log", "parquet", "docx", "pptx",
+];
+
+/// Whether `path` is a data or document file by its extension (`DATA`).
+fn data(path: &str) -> bool {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    DATA.iter().any(|data| extension.eq_ignore_ascii_case(data))
 }
 
 /// Whether the project folder `workspace`, or a folder in it on the way to
@@ -7140,19 +7371,15 @@ pub(crate) mod tests {
         assert_eq!(review_due(&spec, &report, hour), None);
     }
 
-    // Off Unix the tester works in the project itself, as `spec_tests::copy`
-    // makes no copy there.
+    /// Makes `dir` a git project with its files staged, and committed when
+    /// `committed`: with a commit the project as it was can be written out
+    /// for a tester to start with the run; without one it cannot, and the
+    /// tester starts at the run's first done, in a copy of the project.
     #[cfg(unix)]
-    #[test]
-    fn a_tester_beside_the_reviews_tests_from_the_request_alone_and_its_tests_leave_the_project() {
-        let _data = data("requirements-tester");
-        let dir = scratch("requirements-tester");
-        // A git project with a commit, so the tester works in a copy of it
-        // and reads the project as it was.
-        for args in [
-            &["init", "-q"][..],
-            &["add", "-A"],
-            &[
+    fn git_project(dir: &Path, committed: bool) {
+        let mut steps = vec![&["init", "-q"][..], &["add", "-A"]];
+        if committed {
+            steps.push(&[
                 "-c",
                 "user.name=user_a",
                 "-c",
@@ -7161,12 +7388,25 @@ pub(crate) mod tests {
                 "-q",
                 "-m",
                 "first",
-            ],
-        ] {
+            ]);
+        }
+        for args in steps {
             let mut git = std::process::Command::new("git");
-            git.args(args).current_dir(&*dir);
+            git.args(args).current_dir(dir);
             assert!(git.status().unwrap().success(), "git {args:?}");
         }
+    }
+
+    // Off Unix the tester works in the project itself, as `spec_tests::copy`
+    // makes no copy there.
+    #[cfg(unix)]
+    #[test]
+    fn a_tester_beside_the_reviews_tests_from_the_request_alone_and_its_tests_leave_the_project() {
+        let _data = data("requirements-tester");
+        let dir = scratch("requirements-tester");
+        // A git project with no commit yet, so no tester can start with the
+        // run, and one starts at its first done, in a copy of the project.
+        git_project(&dir, false);
         let (project, in_project) = (dir.to_path_buf(), Arc::new(AtomicBool::new(true)));
         let (seen, kept_then) = (in_project.clone(), Arc::new(std::sync::Mutex::new(None)));
         let read = kept_then.clone();
@@ -7251,6 +7491,17 @@ pub(crate) mod tests {
             "{task}"
         );
         assert!(!task.contains("Added parse_range."), "{task}");
+        // Started at the run's first done, it is told not to look at the
+        // work, with no project as it was to read, there being no commit.
+        assert!(
+            task.contains("Do not look at what was changed or how"),
+            "{task}"
+        );
+        assert!(!task.contains("before the change is in `"), "{task}");
+        assert!(
+            !task.contains("holds the project as it was before the change"),
+            "{task}"
+        );
         // It wrote its test in a copy of the project, gone once it answered,
         // so the reviews beside it never met the test in the project.
         assert!(!in_project.load(Ordering::SeqCst));
@@ -7258,11 +7509,6 @@ pub(crate) mod tests {
         let copy = Path::new(copy.split('`').next().unwrap());
         assert!(copy.to_string_lossy().contains("-spec-copy-"), "{task}");
         assert!(!copy.exists());
-        // It was told where the project as it was is, gone once it answered too.
-        let was = task.split("before the change is in `").nth(1).unwrap();
-        let was = Path::new(was.split('`').next().unwrap());
-        assert!(was.to_string_lossy().contains("-spec-before-"), "{task}");
-        assert!(!was.exists());
 
         // Its test left the project, the copy the run put back is gone as
         // the run ends, and the run is told where it is kept.
@@ -7296,6 +7542,297 @@ pub(crate) mod tests {
                 content.contains("has these rows that failed:\n- R3 | b..a is rejected")
             });
         assert!(held);
+    }
+
+    // Off Unix no folder of the project as it was can be made, so the tester
+    // starts at the run's first done there.
+    #[cfg(unix)]
+    #[test]
+    fn a_tester_starts_with_the_run_in_the_project_as_it_was_and_its_tests_meet_the_work_at_its_first_done()
+     {
+        let _data = data("tester-ahead");
+        let dir = scratch("tester-ahead");
+        // A git project with a commit, so the project as it was can be
+        // written out for the tester to work in.
+        git_project(&dir, true);
+        let (project, in_project) = (dir.to_path_buf(), Arc::new(AtomicBool::new(false)));
+        let (seen, kept_then) = (in_project.clone(), Arc::new(std::sync::Mutex::new(None)));
+        let read = kept_then.clone();
+        // Its test: the work has to make `fixed.rs`, which where the tester
+        // works it never will.
+        let check = "test -f fixed.rs || { echo 'fixed.rs is missing'; exit 1; }\n";
+        let test = (
+            "write_file",
+            json!({"path": "tests/letronna_spec_range.sh", "content": check}),
+        );
+        let table = "Wrote one test; it cannot pass before the change.\n\
+                     Run: sh tests/letronna_spec_range.sh\n\
+                     R3 | b..a is rejected with `empty range` | FAIL | \
+                     sh tests/letronna_spec_range.sh | not yet implemented";
+        let fixed = (
+            "write_file",
+            json!({"path": "fixed.rs", "content": "fixed"}),
+        );
+        let run = std::sync::Mutex::new(
+            vec![
+                reply("", &[write_made()]),
+                reply("Added parse_range.", &[]),
+                // Sent back with the reviews, the tester's report and what
+                // its tests made of the work, it fixes the work.
+                reply("", &[fixed]),
+                // Its tests are then run against the work once more, and
+                // pass; the tester's placeholder rows hold it no longer.
+                reply("Fixed the empty range.", &[]),
+            ]
+            .into_iter(),
+        );
+        let (tests, wrote) = (reply("", &[test]), reply(table, &[]));
+        let (endpoint, provider) = provider_by(7, move |sent| {
+            let said = |what: &str| {
+                messages(sent)
+                    .iter()
+                    .any(|m| m["content"].as_str().is_some_and(|c| c.contains(what)))
+            };
+            match () {
+                // Once it has written its test, the call is in what it sends.
+                _ if said("You are a helper (tester).")
+                    && sent.to_string().contains("letronna_spec_range.sh") =>
+                {
+                    let written = project.join("tests/letronna_spec_range.sh");
+                    seen.fetch_or(written.exists(), Ordering::SeqCst);
+                    wrote.clone()
+                }
+                _ if said("You are a helper (tester).") => tests.clone(),
+                _ if said("You are a helper (review).") => reply(PASSED, &[]),
+                _ => {
+                    // What is kept while the run goes on.
+                    let notice = (messages(sent).iter())
+                        .filter_map(|message| message["content"].as_str())
+                        .find_map(|content| content.split("kept out of the project, in `").nth(1))
+                        .and_then(|rest| rest.split('`').next());
+                    if let Some(kept) = notice {
+                        let test = Path::new(kept).join("tests/letronna_spec_range.sh");
+                        *read.lock().unwrap() = std::fs::read_to_string(test).ok();
+                    }
+                    run.lock().unwrap().next().unwrap()
+                }
+            }
+        });
+        let mut spec = spec(endpoint, &dir, AGENTS + 1_799);
+        spec.depth = 0;
+        spec.decide = None;
+        spec.connection.mode = crate::gate::Mode::Bypass;
+        spec.transcript.conversation.messages[0].content = SPECIFIED.into();
+        let id = spec.id;
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "Fixed the empty range.");
+        let sent = provider.sent();
+
+        // One tester, and one only: its task is the request word for word,
+        // for a folder holding the project as it was, which it is told the
+        // change never reaches, and it names no other folder to read.
+        let said = |body: &Value| -> String {
+            let contents = messages(body).iter().filter_map(|m| m["content"].as_str());
+            contents.collect::<Vec<_>>().join("\n")
+        };
+        let testers: Vec<String> = (sent.iter().map(said))
+            .filter(|said| said.contains("You are a helper (tester)."))
+            .collect();
+        assert_eq!(testers.len(), 2, "{testers:#?}");
+        let task = &testers[0];
+        assert!(task.contains("The request, word for word:"), "{task}");
+        assert!(
+            task.contains(
+                "holds the project as it was before the change, and the change never reaches it"
+            ),
+            "{task}"
+        );
+        assert!(
+            task.contains("R3: A range whose start is past its end"),
+            "{task}"
+        );
+        assert!(!task.contains("before the change is in `"), "{task}");
+        assert!(!task.contains("Added parse_range."), "{task}");
+        let base = task.split("The project folder is `").nth(1).unwrap();
+        let base = Path::new(base.split('`').next().unwrap());
+        assert!(base.to_string_lossy().contains("-spec-before-"), "{task}");
+        // It wrote its test there, never in the project, and the folder is
+        // gone once its report was taken.
+        assert!(!in_project.load(Ordering::SeqCst));
+        assert!(!base.exists());
+        assert!(!dir.join("tests/letronna_spec_range.sh").exists());
+
+        // At the run's first done its report, with where its tests are kept,
+        // and what the tests made of the work reach the run in the one
+        // notice with the requirements and the reviews.
+        let notice = (sent.iter().flat_map(messages))
+            .filter_map(|message| message["content"].as_str())
+            .find(|content| content.contains("in the project as it was before your change"))
+            .unwrap()
+            .to_owned();
+        let plain = crate::requirements::notice(&STATED.map(String::from), false, &[]);
+        let (list, ending) = plain.rsplit_once('\n').unwrap();
+        assert!(notice.starts_with(list), "{notice}");
+        assert!(
+            notice.contains("Helpers that haven't seen your work reviewed it"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("`tests/letronna_spec_range.sh`"),
+            "{notice}"
+        );
+        let (told, ran) = notice
+            .split_once("Your work as it stands was run against the tests")
+            .unwrap();
+        assert!(told.trim_end().ends_with(ending), "{told}");
+        assert!(
+            ran.contains("`sh tests/letronna_spec_range.sh` exited with code 1"),
+            "{ran}"
+        );
+        assert!(ran.contains("fixed.rs is missing"), "{ran}");
+        // With the first run in the notice, no later run is promised there.
+        assert!(!told.contains("Once you say you are done"), "{told}");
+        // The kept test, read while the run went on, is the tester's, and
+        // the folder it was kept in goes as the run ends.
+        assert_eq!(kept_then.lock().unwrap().as_deref(), Some(check));
+        let kept = notice
+            .split("kept out of the project, in `")
+            .nth(1)
+            .unwrap();
+        let kept = Path::new(kept.split('`').next().unwrap());
+        assert!(!kept.exists());
+        // Its rows say nothing of the work, so they hold the run no longer
+        // once the reviews' rows pass.
+        let held = (sent.iter().flat_map(messages))
+            .filter_map(|message| message["content"].as_str())
+            .any(|content| content.contains("has these rows that failed"));
+        assert!(!held);
+        assert!(!crate::spec_tests::ahead(id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tester_that_answers_after_the_first_done_is_taken_at_a_later_one() {
+        let dir = scratch("tester-late");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("README"), "a project").unwrap();
+        git_project(&project, true);
+        let mut spec = own_run("http://127.0.0.1:1/v1".into(), &dir, AGENTS + 1_920);
+        spec.connection.workspace = Some(project.clone());
+        spec.decide = Some(Arc::new(|_, _| gate::Outcome::Run));
+        // Nothing pending: nothing to take.
+        assert_eq!(late_tester(&spec), None);
+        // The tester's folder with its test written there, and its report,
+        // spelling the folder out in its command.
+        let folder = crate::spec_tests::base(&project).unwrap();
+        std::fs::write(
+            folder.join("letronna_spec_test.sh"),
+            "test -f made.txt || { echo 'made.txt is missing'; exit 1; }\n",
+        )
+        .unwrap();
+        let command = format!("sh {}/letronna_spec_test.sh", folder.display());
+        let report = format!(
+            "Wrote one test.\nRun: {command}\nR1 | made.txt is made | FAIL | {command} | not yet implemented"
+        );
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let answer = report.clone();
+        let test = move || {
+            let _ = held.recv();
+            Ok(answer)
+        };
+        assert!(crate::spec_tests::start(
+            spec.id,
+            folder.clone(),
+            Cancel::default(),
+            None,
+            test
+        ));
+        // Still at work: nothing to take yet, and it stays pending.
+        assert_eq!(late_tester(&spec), None);
+        assert!(crate::spec_tests::ahead(spec.id));
+        release.send(()).unwrap();
+        let until = Instant::now() + WAIT;
+        let mut told = None;
+        while told.is_none() && Instant::now() < until {
+            told = late_tester(&spec);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let told = told.expect("the report was never taken");
+        assert!(
+            told.contains("in the project as it was before your change"),
+            "{told}"
+        );
+        assert!(told.contains("`letronna_spec_test.sh`"), "{told}");
+        assert!(told.ends_with(&report), "{told}");
+        // Its test is kept as one that has not met the work, its command
+        // made relative, and its folder is gone.
+        let (kept, command) = crate::spec_tests::to_run(spec.id).unwrap();
+        assert_eq!(kept.files, ["letronna_spec_test.sh"]);
+        assert_eq!(command, "sh ./letronna_spec_test.sh");
+        assert!(crate::spec_tests::unmet(spec.id));
+        assert!(!folder.exists());
+        assert!(!crate::spec_tests::ahead(spec.id));
+        // Taken once; and the work meets the tests where the driver runs them.
+        assert_eq!(late_tester(&spec), None);
+        let turn = Turn::new(spec.connection.clone());
+        let notice = tested_work(&spec, &turn).unwrap();
+        assert!(
+            notice.content.contains("made.txt is missing"),
+            "{}",
+            notice.content
+        );
+        crate::spec_tests::tidy(spec.id);
+        assert!(!kept.dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_tester_starts_with_a_run_that_is_watched_a_helper_short_of_requirements_or_uncommitted() {
+        let _data = data("tester-ahead-not");
+        let dir = scratch("tester-ahead-not");
+        git_project(&dir, false);
+        let mut spec = own_run("http://127.0.0.1:9".into(), &dir, AGENTS + 1_915);
+        spec.transcript.conversation.messages[0].content = SPECIFIED.into();
+        let turn = Turn::new(spec.connection.clone());
+        let none_ahead = |spec: &Spec| {
+            tester_ahead(spec, &turn);
+            !crate::spec_tests::ahead(spec.id)
+        };
+        // No commit yet, so no project as it was to work in.
+        assert!(none_ahead(&spec));
+        git_project(&dir, true);
+        // Nor for a run someone watches, a helper, one that may start no
+        // helper, one without the time for a review, or a request stating
+        // too few requirements.
+        spec.connection.human = true;
+        assert!(none_ahead(&spec));
+        spec.connection.human = false;
+        spec.depth = 1;
+        assert!(none_ahead(&spec));
+        spec.depth = 0;
+        let allow = std::mem::replace(
+            &mut spec.allow,
+            Allow::Only(vec!["write_file".into(), "run_command".into()]),
+        );
+        assert!(none_ahead(&spec));
+        spec.allow = allow;
+        let short = crate::requirements::REVIEW_TIME - Duration::from_secs(60);
+        spec.connection.deadline = Some(Instant::now() + short);
+        assert!(none_ahead(&spec));
+        spec.connection.deadline = None;
+        // Nor for one given less than three reviews' time, whose tester would
+        // have less than a review's.
+        let three = 3 * crate::requirements::REVIEW_TIME - Duration::from_secs(60);
+        spec.connection.deadline = Some(Instant::now() + three);
+        assert!(none_ahead(&spec));
+        spec.connection.deadline = None;
+        // Nor for a request whose work is files that are not code.
+        spec.transcript.conversation.messages[0].content = REPORTED.into();
+        assert!(none_ahead(&spec));
+        spec.transcript.conversation.messages[0].content = "Fix the typo in the readme.".into();
+        assert!(none_ahead(&spec));
     }
 
     #[test]

@@ -456,7 +456,9 @@ pub(crate) fn listed(text: &str) -> Option<usize> {
 /// The rows of a review's table in `report`: each requirement's number,
 /// whether the case passed, and the row as written. A line is a row when a
 /// cell of it opens with `R` and a number and a later cell says PASS or
-/// FAIL, however the helper laid the table out.
+/// FAIL, however the helper laid the table out; one whose last cell says
+/// the case waits on the work (`placeholder`) is no row, since it says
+/// nothing of the work once the work is there.
 fn rows(report: &str) -> Vec<(usize, bool, String)> {
     let mut found = Vec::new();
     for line in report.lines() {
@@ -470,11 +472,20 @@ fn rows(report: &str) -> Vec<(usize, bool, String)> {
         let Ok(number) = digits.parse::<usize>() else {
             continue;
         };
+        if cells.last().is_some_and(|cell| placeholder(cell)) {
+            continue;
+        }
         if let Some(passed) = cells[1..].iter().find_map(|cell| verdict(cell)) {
             found.push((number, passed, line.trim().to_owned()));
         }
     }
     found
+}
+
+/// Whether a table's `cell` only says that the case waits on the work, as
+/// a tester writing its tests ahead of the work marks each of its rows.
+fn placeholder(cell: &str) -> bool {
+    cell.to_ascii_lowercase().starts_with("not yet implemented")
 }
 
 /// The cells of a table's `line`, cut at each `|` and stripped of the marks
@@ -666,16 +677,8 @@ fn files(outputs: &[String]) -> String {
 /// path or a name is looked for in `workspace`, an absolute path where it
 /// points.
 pub(crate) fn outputs(request: &str, workspace: &Path, since: SystemTime) -> Vec<String> {
-    let mut looked: Vec<&str> = Vec::new();
     let mut found: Vec<(String, PathBuf)> = Vec::new();
-    for word in crate::inputs::words(request).filter(|word| filelike(word)) {
-        if looked.contains(&word) {
-            continue;
-        }
-        if looked.len() == LOOKED {
-            break;
-        }
-        looked.push(word);
+    for word in named(request) {
         // Before looking, which on Windows signs in to a share it names.
         if crate::paths::unsafe_raw(word, Some(workspace)).is_some() {
             continue;
@@ -694,6 +697,23 @@ pub(crate) fn outputs(request: &str, workspace: &Path, since: SystemTime) -> Vec
         }
     }
     found.into_iter().map(|(word, _)| word).collect()
+}
+
+/// The words of `request` that read as a file's path or name, each once and
+/// as the request first writes it, `LOOKED` at most: the files a run on it
+/// is to write or change, as far as its words say.
+pub(crate) fn named(request: &str) -> Vec<&str> {
+    let mut named: Vec<&str> = Vec::new();
+    for word in crate::inputs::words(request).filter(|word| filelike(word)) {
+        if named.contains(&word) {
+            continue;
+        }
+        if named.len() == LOOKED {
+            break;
+        }
+        named.push(word);
+    }
+    named
 }
 
 /// Whether `word` reads as a file's path or name, such as `out/a.csv` or
@@ -1499,6 +1519,39 @@ mod tests {
             short.starts_with("[Letronna check] The review's table has no row for R2 and R3. ")
         );
         assert!(!short.contains("failed"), "{short}");
+    }
+
+    #[test]
+    fn a_row_that_waits_on_the_work_is_no_row() {
+        // A tester writing tests ahead of the work marks each row so, and
+        // the row says nothing of the work once the work is there.
+        let ahead = "Run: pytest -q tests/test_letronna_spec.py\n\
+                     R1 | adds | FAIL | pytest -q tests/test_letronna_spec.py | not yet implemented\n\
+                     R2 | rejects | FAIL | pytest -q | Not yet implemented (parse_range is missing).";
+        assert!(!tabled(ahead));
+        let passed = format!("R1 | a | PASS\nR2 | b | PASS\n{ahead}");
+        assert_eq!(unchecked(&passed, 2), None);
+        // A row that failed on the work holds the run, whatever it says of why.
+        let failed = format!(
+            "{ahead}\nR2 | b | FAIL | pytest -q | got NotImplementedError: not yet implemented"
+        );
+        let text = unchecked(&failed, 2).unwrap();
+        assert!(
+            text.contains("- R2 | b | FAIL | pytest -q | got NotImplementedError"),
+            "{text}"
+        );
+        assert!(!text.contains("R1 | adds"), "{text}");
+        assert!(text.contains("has no row for R1"), "{text}");
+    }
+
+    #[test]
+    fn the_files_a_request_names_are_listed_once_each_as_written() {
+        let files = named(
+            "Write the orders to `report.csv`, then check report.csv against `in/orders.json`. \
+             See https://example.com/a.csv for the format, version 1.2 of it.",
+        );
+        assert_eq!(files, ["report.csv", "in/orders.json"]);
+        assert!(named("Fix the parser so that ranges work.").is_empty());
     }
 
     #[test]
