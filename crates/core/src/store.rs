@@ -468,7 +468,8 @@ pub struct Settings {
     #[serde(default)]
     pub helper_depth: u8,
     /// Tokens the helpers one agent call starts may spend between them; 0 for
-    /// the usual 500k.
+    /// the usual 500k. A helper's last request, for its report, may take it
+    /// up to a quarter past.
     #[serde(default)]
     pub helper_budget: u64,
     /// Tools never offered to the model nor run, by name, an MCP server's by

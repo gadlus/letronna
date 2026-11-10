@@ -33,6 +33,16 @@ const CACHED_SHARE: u64 = 10;
 /// uncached fits in, and little beside what was spent to get there.
 const SPARE_SHARE: u64 = 4;
 
+/// How the refusal of a spent budget begins, for whoever reads why a helper
+/// never started.
+pub(crate) const SPENT: &str = "The helper budget is spent";
+
+/// The most a helper given `limit` can spend with its last request: what a
+/// run that sets tokens aside for it counts.
+pub(crate) const fn with_spare(limit: u64) -> u64 {
+    limit.saturating_add(limit / SPARE_SHARE)
+}
+
 pub struct Budget {
     limit: u64,
     spent: AtomicU64,
@@ -82,7 +92,7 @@ impl Budget {
             let spent = budget.spent();
             if spent >= budget.limit {
                 return Err(format!(
-                    "The helper budget is spent ({} of {} tokens). Finish the work yourself.",
+                    "{SPENT} ({} of {} tokens). Finish the work yourself.",
                     short(spent),
                     short(budget.limit)
                 ));
@@ -92,13 +102,13 @@ impl Budget {
     }
 
     /// Whether one more request costing up to `tokens` may go out though
-    /// this budget is spent, for a helper's report: only while no budget
-    /// above it is spent, and while the request would leave this one no more
-    /// than a quarter past its limit.
+    /// this budget is spent, for a helper's report: only while every budget
+    /// above it has that much left, so the request takes none of them past
+    /// its limit, and while it would leave this one no more than a quarter
+    /// past its own.
     pub fn spares(&self, tokens: u64) -> bool {
-        let ceiling = self.limit.saturating_add(self.limit / SPARE_SHARE);
-        self.spent().saturating_add(tokens) <= ceiling
-            && (self.parent.as_deref()).is_none_or(|parent| parent.check().is_ok())
+        self.spent().saturating_add(tokens) <= with_spare(self.limit)
+            && (self.parent.as_deref()).is_none_or(|parent| parent.left() >= tokens)
     }
 }
 
@@ -208,10 +218,17 @@ mod tests {
         helper.charge(&reply(4_100, 0, 0));
         assert!(helper.spares(500));
 
+        // What is left above is the most the request may cost, so what the
+        // run kept for its own work is not spent on a helper's last word.
         let sibling = Budget::new(8_000, Some(root.clone()));
-        sibling.charge(&reply(6_000, 0, 0));
+        sibling.charge(&reply(5_500, 0, 0));
+        assert_eq!(root.left(), 400);
+        assert!(helper.spares(400));
+        assert!(!helper.spares(401));
+        sibling.charge(&reply(500, 0, 0));
         assert!(root.check().is_err());
-        assert!(!helper.spares(500));
+        assert!(!helper.spares(1));
+        assert_eq!(with_spare(1_000_000), 1_250_000);
     }
 
     #[test]

@@ -2140,9 +2140,11 @@ pub(crate) fn fresh_id() -> AgentId {
 const OUT_OF_BUDGET: &str = "stopped when the helper budget ran out";
 
 /// Whether `answer`, what the agent tool gave for a helper, says in its
-/// first line that the helper's budget stopped it.
+/// first line that the helper's budget stopped it, or that a spent budget
+/// kept it from starting.
 pub(crate) fn ran_out(answer: &str) -> bool {
-    (answer.lines().next()).is_some_and(|line| line.contains(OUT_OF_BUDGET))
+    (answer.lines().next())
+        .is_some_and(|line| line.contains(OUT_OF_BUDGET) || line.starts_with(crate::budget::SPENT))
 }
 
 /// What the agent that started a helper hears back: how it went, what it
@@ -2255,10 +2257,7 @@ fn ended(
         ),
         Outcome::OverBudget => (
             State::Failed("the helper budget ran out".into()),
-            format!(
-                "helper {name} stopped when the helper budget ran out ({about}); its partial \
-                 report:"
-            ),
+            format!("helper {name} {OUT_OF_BUDGET} ({about}); its partial report:"),
         ),
         Outcome::Failed(error) => (
             State::Failed(error.clone()),
@@ -3459,6 +3458,14 @@ mod tests {
         assert!(crate::requirements::tabled(&out), "{out}");
         assert!(out.contains("R2 | b | FAIL | cargo test"), "{out}");
         assert!(ran_out(&out));
+        // One a spent budget kept from starting counts as well.
+        let refused = Budget::new(1_000, None);
+        refused.charge(&Message {
+            prompt_tokens: 1_000,
+            ..Default::default()
+        });
+        assert!(ran_out(&refused.check().unwrap_err()));
+        assert!(!ran_out("Stopped."));
         // Only the first line says how it ended: a report may quote the words.
         let quoting = format!("It said: {OUT_OF_BUDGET}.");
         let done = answer(

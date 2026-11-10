@@ -31,7 +31,7 @@ Most of it is set in the window's Settings or with a slash command (`mode`, `eff
 - `computer_use`: `true` offers the computer tool, which sees and uses other apps' windows, asking once for each app.
 - `keys_in`: `"files"` keeps keys in `keys.json` and the other files instead of the Keychain or Credential Manager.
 - `disabled_tools`: tools never offered nor run, by name, an MCP server's as `mcp__server__tool`; the Tools and MCP tabs of Capabilities switch them too.
-- `helper_model`, `helpers_at_once` (8 unless set), `helper_depth` (2) and `helper_budget` (500k tokens) for helpers.
+- `helper_model`, `helpers_at_once` (8 unless set), `helper_depth` (2) and `helper_budget` (500k tokens; a helper stopped by it may make one last request for its report, up to a quarter past it) for helpers.
 
 ## Environment variables
 

@@ -680,6 +680,9 @@ fn steps(
     // What the last reply's request read, to tell when the history it sends
     // was cut.
     let mut read = 0;
+    // Whether a reply has come to the ask for a helper's report once its
+    // budget is spent, which ends the run.
+    let mut reported = false;
     // Before the first request, where a tester can work blind in the project
     // as it was: it writes its tests while the run writes the change, with
     // nothing of the work to shape them to, and has them ready when the run
@@ -696,13 +699,17 @@ fn steps(
         {
             // A helper stopped here mid-work has said nothing its parent can
             // use, so it is asked once for its report, with no tools; the
-            // reply to that ends it, whatever it holds.
-            if turn.spent() || !spared(spec, read) {
+            // reply to that ends it, whatever it holds. One stopped for
+            // thinking is no reply, and the ask stands for the request
+            // after it, as few as `STOPS_IN_A_ROW` allows.
+            if reported || !(turn.spent() || spared(spec, read)) {
                 return Ok(Outcome::OverBudget);
             }
-            let ask = turn.budget_spent();
-            spec.transcript.conversation.messages.push(ask);
-            save(&mut spec.transcript)?;
+            if !turn.spent() {
+                let ask = turn.budget_spent();
+                spec.transcript.conversation.messages.push(ask);
+                save(&mut spec.transcript)?;
+            }
         }
         if let Some(mut text) = time_warning(spec, &mut warned) {
             text.push_str(&still_to_make(&noted));
@@ -718,6 +725,7 @@ fn steps(
         let mut reply = match ask_in_line(spec, turn, stopped_in_a_row)? {
             Asked::Reply(reply) => {
                 stopped_in_a_row = 0;
+                reported |= turn.spent();
                 // Back before any call runs, so a helper it starts thinks
                 // as the run was set to. Not for a run stopped twice, or
                 // once past its time warning: it thinks past the time it
@@ -1262,7 +1270,11 @@ fn steps(
 /// while the request fits what `Budget::spares` allows past the limit. The
 /// request is counted as the last one's prompt read again in full, as on a
 /// provider whose cache serves none of it, with what was added since and the
-/// longest reply any request asks for.
+/// longest reply any request asks for, so a helper whose prompt is more than
+/// a quarter of its limit less those 32,000 tokens is refused even where its
+/// cache would have served it. Nor is one asked that had answered when mail
+/// or a time warning sent it on: its answer stands, where a second ask would
+/// get "as above" in its place.
 fn spared(spec: &Spec, read: u64) -> bool {
     if spec.depth == 0 || spec.schema.is_some() || read == 0 || spec.connection.wrap_up {
         return false;
@@ -1272,6 +1284,21 @@ fn spared(spec: &Spec, read: u64) -> bool {
         .iter()
         .rposition(|message| message.role == "assistant")
         .unwrap_or(messages.len());
+    // A reply with no call is an answer unless it was sent back as cut off
+    // or as stopping short of the work.
+    let sent_back = [
+        crate::agent::CONTINUE,
+        crate::agent::CALL_AGAIN,
+        crate::agent::CONTINUE_NOW,
+        crate::agent::NOTHING_RAN,
+        crate::agent::CALL_IT,
+    ];
+    let answered = (messages.get(replied)).is_some_and(|reply| reply.tool_calls.is_empty())
+        && !(messages[replied..].iter())
+            .any(|message| sent_back.contains(&message.content.as_str()));
+    if answered {
+        return false;
+    }
     // The reply by what the provider counted of it, which holds its calls.
     let since: usize = (messages[replied..].iter())
         .map(|message| chat::tokens(&message.content).max(message.tokens as usize))
@@ -2761,8 +2788,11 @@ fn requirements(
         true => reviews(spec, typed, &found),
         false => Default::default(),
     };
+    // Asked to start one itself only while its budget still has a review's
+    // tokens, where a budget stopped the ones started for it.
+    let ask = lost.is_none() || affords_review(spec);
     let content = match reports.is_empty() && tested.is_none() && lost.is_none() {
-        false => crate::requirements::reviewed(&found, &reports, tested.as_deref(), lost),
+        false => crate::requirements::reviewed(&found, &reports, tested.as_deref(), lost, ask),
         true => crate::requirements::notice(&found, review, &outputs),
     };
     Some(Message {
@@ -3330,11 +3360,12 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
             ..parent.clone()
         }));
     }
-    // Each helper spends up to a review's tokens, so only as many start as
-    // the budget leaves room for: the fix after them needs the rest.
-    let afford = (spec.budget.as_ref()).map_or(usize::MAX, |budget| {
-        (budget.left() / crate::requirements::REVIEW_TOKENS).max(1) as usize
-    });
+    // Each helper spends up to a review's tokens and what its last request,
+    // for its report, may take past them, so only as many start as the
+    // budget leaves room for: the fix after them needs the rest.
+    let each = crate::budget::with_spare(crate::requirements::REVIEW_TOKENS);
+    let afford =
+        (spec.budget.as_ref()).map_or(usize::MAX, |budget| (budget.left() / each).max(1) as usize);
     let shares = crate::requirements::shares(found.len());
     // A tester started with the run is taken here, finished or waited for,
     // rather than a second one started; where none was, one starts beside
@@ -3417,8 +3448,12 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
         let mut taken = ahead
             .then(|| crate::spec_tests::take(spec.id, wait))
             .flatten();
+        // A refusal is kept with the reports, to tell one the budget made.
         let answers: Vec<String> = (started.into_iter())
-            .map(|helper| helper.join().ok().and_then(Result::ok).unwrap_or_default())
+            .map(|helper| match helper.join() {
+                Ok(Ok(report)) | Ok(Err(report)) => report,
+                Err(_) => String::new(),
+            })
             .collect();
         let (reports, untabled): (Vec<String>, Vec<String>) =
             (answers.into_iter()).partition(|report| crate::requirements::tabled(report));
@@ -6715,8 +6750,13 @@ pub(crate) mod tests {
         // may be used, and the call made before the stop kept its result.
         assert_eq!(sent[0].get("tool_choice"), None);
         assert_eq!(sent[1]["tool_choice"], "none");
-        let offered = |body: &Value| body["tools"].as_array().map_or(0, Vec::len);
-        assert!(offered(&sent[1]) > 0);
+        // Not compared name for name with the request before: other tests
+        // running beside this one switch tools such as memory on and off.
+        let offered = |body: &Value, name: &str| {
+            let mut tools = body["tools"].as_array().unwrap().iter();
+            tools.any(|tool| tool["function"]["name"] == name)
+        };
+        assert!(offered(&sent[1], "read_file") && offered(&sent[1], "run_command"));
         assert_eq!(results(&sent[1]), ["1|hello from the notes"]);
         let asked = messages(&sent[1]).last().unwrap()["content"].to_string();
         assert!(
@@ -6724,6 +6764,7 @@ pub(crate) mod tests {
             "{asked}"
         );
         assert!(asked.contains("keep every row or finding"), "{asked}");
+        assert!(asked.contains("a row marked UNCLEAR"), "{asked}");
         // The request before, the 500 left, and the report's own request.
         assert_eq!(budget.spent(), 1_000_000 - 500 + 2 * 1_050);
     }
@@ -6734,10 +6775,10 @@ pub(crate) mod tests {
         // tool choice may send, and a report cut off at the output limit:
         // neither is followed by another request, which would find nobody.
         let replies = [
-            reply("Still reading.", &[read_notes()]),
-            cut("R1 | a | PASS", None),
+            (reply("Still reading.", &[read_notes()]), "Still reading."),
+            (cut("R1 | a | PASS", None), "R1 | a | PASS"),
         ];
-        for (at, last) in replies.into_iter().enumerate() {
+        for (at, (last, said)) in replies.into_iter().enumerate() {
             let dir = scratch("budget-last");
             let (endpoint, provider) =
                 provider(vec![reply("Reading first.", &[read_notes()]), last]);
@@ -6745,6 +6786,7 @@ pub(crate) mod tests {
             spec.budget = Some(nearly_spent(1_000_000));
             let report = finished(spec);
             assert_eq!(report.status, Outcome::OverBudget, "{at}");
+            assert_eq!(report.text, said);
             assert_eq!(provider.sent().len(), 2, "{at}");
             let kept = written(&dir.join("helper.jsonl"));
             let ran = kept.iter().filter(|message| message["role"] == "tool");
@@ -6789,6 +6831,42 @@ pub(crate) mod tests {
             assert_eq!(sent.len(), 1, "{at}");
             assert_eq!(sent[0].get("tool_choice"), None);
         }
+    }
+
+    #[test]
+    fn a_helper_that_had_answered_keeps_its_answer_when_mail_sends_it_on() {
+        let dir = scratch("budget-answered");
+        // Only one answer: asked again, it would find nobody and fail.
+        let (endpoint, provider) = provider(vec![reply(ROWS, &[])]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 2_080);
+        spec.budget = Some(nearly_spent(1_000_000));
+        // Mail read as it answers carries it on, into its spent budget.
+        inbox::push(spec.id, notice("lead", When::Next, "One more thing."));
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::OverBudget);
+        assert_eq!(report.text, ROWS);
+        assert_eq!(provider.sent().len(), 1);
+    }
+
+    #[test]
+    fn no_report_is_asked_for_with_what_the_budget_above_has_left_for_its_own_work() {
+        let dir = scratch("budget-above");
+        // Only one answer: a second call would find nobody and fail the run.
+        let (endpoint, provider) = provider(vec![reply("Reading first.", &[read_notes()])]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 2_090);
+        // The run's budget has 20,000 left once the helper's is spent, less
+        // than the request could cost.
+        let above = Arc::new(Budget::new(1_020_550, None));
+        let budget = Arc::new(Budget::new(1_000_000, Some(above.clone())));
+        budget.charge(&Message {
+            prompt_tokens: 999_500,
+            ..Default::default()
+        });
+        spec.budget = Some(budget);
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::OverBudget);
+        assert_eq!(provider.sent().len(), 1);
+        assert_eq!(above.left(), 20_000);
     }
 
     #[test]
@@ -11722,6 +11800,39 @@ pub(crate) mod tests {
         // not made, and three requests are all it takes.
         assert_eq!(efforts, [Some("high"), Some("low"), Some("low")]);
         assert!(carries(&sent[2], ACT_NOW));
+    }
+
+    #[test]
+    fn a_report_stopped_for_thinking_is_asked_for_again() {
+        let dir = scratch("budget-thinking");
+        // A call that spends the budget, a report that thinks past its cap
+        // and is stopped with nothing written, then the report itself.
+        let calls = json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call-0",
+            "function": {"name": "read_file", "arguments": "{\"path\": \"notes.txt\"}"}}]}}]});
+        let usage = json!({"choices": [],
+            "usage": {"prompt_tokens": 1_000, "completion_tokens": 50}});
+        let (endpoint, provider) = streaming(
+            vec![vec![calls, usage], thinking(400), vec![says(ROWS)]],
+            Duration::from_millis(20),
+        );
+        let mut spec = spec(endpoint, &dir, AGENTS + 2_100);
+        spec.connection.deadline = Some(Instant::now() + Duration::from_secs(5));
+        spec.budget = Some(nearly_spent(1_000_000));
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::OverBudget);
+        assert_eq!(report.text, ROWS);
+        let sent = provider.sent();
+        assert_eq!(sent.len(), 3);
+        // Asked for once, and still with no tool allowed the second time.
+        assert_eq!(sent[2]["tool_choice"], "none");
+        let asks = (messages(&sent[2]).iter())
+            .filter(|message| {
+                message["content"]
+                    .to_string()
+                    .contains("budget for this task")
+            })
+            .count();
+        assert_eq!(asks, 1);
     }
 
     #[test]

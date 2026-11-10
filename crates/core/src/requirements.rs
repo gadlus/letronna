@@ -418,7 +418,8 @@ pub(crate) fn brief(
 /// What the run is told when helpers that have not seen its work reviewed or
 /// tested it for the run: the numbered requirements, as `notice` lists them,
 /// the reviewers' `reports` with their tables, or with none the ask for a
-/// review as `notice` makes it, after what became of the reviews `lost`,
+/// review as `notice` makes it where the run can still `review`, after what
+/// became of the reviews `lost`,
 /// what it is told of the tester's report when there is one, `tested`, and
 /// the check to make after.
 pub(crate) fn reviewed(
@@ -426,12 +427,15 @@ pub(crate) fn reviewed(
     reports: &[String],
     tested: Option<&str>,
     lost: Option<(usize, usize)>,
+    review: bool,
 ) -> String {
-    // With no review's table the run still asks for a review itself.
-    let mut text = notice(sentences, reports.is_empty(), &[]);
+    // With no review's table the run still asks for a review itself, where
+    // it can `review`.
+    let mut text = notice(sentences, reports.is_empty() && review, &[]);
     let at = text.find(CHECK).unwrap_or(text.len());
     text.truncate(at);
-    if let (Some((started, spent)), Some(at)) = (lost, text.find(REVIEW)) {
+    if let Some((started, spent)) = lost {
+        let at = text.find(REVIEW).unwrap_or(text.len());
         text.insert_str(at, &unreported(started, spent));
     }
     if !reports.is_empty() {
@@ -1391,7 +1395,7 @@ mod tests {
             .map(String::from)
             .into();
         let reports = ["review-r1 finished: 3 rounds.\nR1 | iso | PASS\nR2 | utc | FAIL | t.sh"];
-        let text = reviewed(&rules, &reports.map(String::from), None, None);
+        let text = reviewed(&rules, &reports.map(String::from), None, None, true);
         assert!(text.starts_with(&notice(&rules, false, &[])[..60]));
         assert_eq!(listed(&text), Some(2));
         assert!(text.contains("Helpers that haven't seen your work reviewed it"));
@@ -1406,7 +1410,7 @@ mod tests {
             .map(String::from)
             .into();
         let tested = "A tester wrote tests.\nR1 | iso | FAIL | t.sh | got None";
-        let text = reviewed(&rules, &[], Some(tested), None);
+        let text = reviewed(&rules, &[], Some(tested), None, true);
         assert!(text.contains(REVIEW), "{text}");
         assert!(!text.contains("Helpers that haven't seen your work reviewed it"));
         assert!(text.contains(&format!("{tested}\n\n{CHECK}")), "{text}");
@@ -1418,7 +1422,7 @@ mod tests {
             .map(String::from)
             .into();
         let plain = notice(&rules, true, &[]);
-        let all = reviewed(&rules, &[], None, Some((2, 2)));
+        let all = reviewed(&rules, &[], None, Some((2, 2)), true);
         let said = "The 2 reviews started for you ran out of budget before reporting, so \
                     nothing is reviewed yet: that is not a pass. ";
         // Said once, just before the ask for a review, with the rest as it was.
@@ -1426,12 +1430,12 @@ mod tests {
         assert_eq!(listed(&all), Some(2));
         assert!(!tabled(&all));
 
-        let one = reviewed(&rules, &[], None, Some((1, 1)));
+        let one = reviewed(&rules, &[], None, Some((1, 1)), true);
         assert!(
             one.contains("\nThe review started for you ran out of budget before reporting, so"),
             "{one}"
         );
-        let some = reviewed(&rules, &[], None, Some((3, 1)));
+        let some = reviewed(&rules, &[], None, Some((3, 1)), true);
         assert!(
             some.contains(
                 "\n1 of the 3 reviews started for you ran out of budget before reporting, \
@@ -1441,7 +1445,12 @@ mod tests {
             "{some}"
         );
         // With nothing known of how they ended, the ask stands alone.
-        assert_eq!(reviewed(&rules, &[], None, None), plain);
+        assert_eq!(reviewed(&rules, &[], None, None, true), plain);
+        // A run with no tokens left for a review of its own is told what
+        // became of them, and not to start one that would be refused.
+        let spent = reviewed(&rules, &[], None, Some((2, 2)), false);
+        assert!(!spent.contains(REVIEW), "{spent}");
+        assert!(spent.ends_with(&format!("{said}{CHECK}")), "{spent}");
     }
 
     #[test]

@@ -3352,11 +3352,23 @@ fn where_kept(kept: &Kept) -> String {
 /// when it will (`again`).
 pub(crate) fn told(report: &str, kept: Option<&Kept>, again: bool) -> String {
     let words = words_first("say so in your answer");
+    // One its budget stopped reported what it had: not every test it meant
+    // to write, nor each one run.
+    let ran = match crate::agents::ran_out(report) {
+        true => {
+            "wrote tests from the request alone and ran out of budget before it was done; its \
+             report follows, with a table of the tests it got to, which may leave out some it \
+             never ran or wrote."
+        }
+        false => {
+            "wrote tests from the request alone and ran them; its report follows, ending with \
+             a table of its tests."
+        }
+    };
     tell(
         &format!(
-            "A tester that hasn't seen your work wrote tests from the request alone and ran \
-             them; its report follows, ending with a table of its tests. Fix your work for each \
-             test that fails on what the request's words say. {words}"
+            "A tester that hasn't seen your work {ran} Fix your work for each test that fails \
+             on what the request's words say. {words}"
         ),
         report,
         kept,
@@ -4005,6 +4017,15 @@ mod tests {
         assert!(text.contains("Delete the copies before you end"));
         assert!(text.ends_with("R1 | adds a pair | FAIL | npx vitest run x | got []"));
         assert!(!told("R1 | x | PASS", None, false).contains("kept out of the project"));
+        // One its budget stopped is not said to have run them all.
+        let spent = "tester stopped when the helper budget ran out; its partial report is \
+                     below.\nR1 | x | PASS";
+        let partial = told(spent, None, false);
+        assert!(
+            partial.contains("ran out of budget before it was done"),
+            "{partial}"
+        );
+        assert!(!partial.contains("and ran them"), "{partial}");
     }
 
     #[test]

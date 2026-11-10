@@ -33,7 +33,7 @@ pub(crate) const CONTINUE: &str =
     "Your last reply was cut off at the output limit; continue exactly where it stopped.";
 
 /// The notice for a reply cut off inside a tool call, which was not run.
-const CALL_AGAIN: &str = "Your last reply was cut off at the output limit in the middle \
+pub(crate) const CALL_AGAIN: &str = "Your last reply was cut off at the output limit in the middle \
     of a tool call, so the call was not run. Make it again with less in it, splitting the \
     work over several calls if it needs more room.";
 
@@ -191,13 +191,16 @@ const TIME_UP: &str = "Your time for this task is up. Give your answer now, in t
 /// report rather than a summary of what is done.
 const REPORT_NOW: &str = "You have reached the tool-round limit. Write your report now, in the \
     form the task asks for, from what you have found: keep every row or finding you have, and \
-    say what you did not get to rather than guess.";
+    where the task asks for a row per requirement or case, give each one you did not get to a \
+    row marked UNCLEAR that says it was not checked, rather than guess or leave it out.";
 
 /// The notice once a helper's token budget is spent, sent as at the round
 /// cap: the tools still offered and none allowed.
 const BUDGET_SPENT: &str = "Your token budget for this task is spent, so no more tools can be \
     called. Write your report now, in the form the task asks for, from what you have found: \
-    keep every row or finding you have, and say what you did not get to rather than guess.";
+    keep every row or finding you have, and where the task asks for a row per requirement or \
+    case, give each one you did not get to a row marked UNCLEAR that says it was not checked, \
+    rather than guess or leave it out.";
 
 /// The answer a call gets when the turn is stopped while it runs; the front
 /// end that stopped it records it before `Turn::stop`. The call may have
