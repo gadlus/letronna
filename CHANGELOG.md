@@ -13,6 +13,18 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.5.1] - 2026-11-11
+
+### Added
+- **All** — An MCP server's own tools can act on what that server said, once you list them. `actOnOwnReplies` in a server's entry in `mcp.json` names the tools let past the prompt-injection guard while that server wrote everything the session has read from outside, so a run nobody watches can, say, act on a quote its own server just gave. Read anything else in the session, a web page or another server's reply, and those calls are held as before. Only your own entry can set it, never a plugin's. See docs/extending.md, which says to leave out tools that send money or data to an address.
+- **macOS** — `curl -fsSL https://letronna.ai/install.sh | sh` installs Letronna on a Mac: the app in Applications and the terminal on your PATH, then opens it, with no "Apple could not verify" warning to click through. An open Letronna keeps running while its copy is swapped, and one macOS won't let go of is left whole, with what to allow.
+
+### Fixed
+- **All** — In the window and the terminal the model finds the tools left out of each request, the scheduler, the browser, helpers and background jobs, when it searches for them. Before, it found none and told you to add a scheduled job by hand.
+- **All** — A program a Python plugin starts no longer gets the pipe Letronna's messages come in on, so it can neither read them away nor sit waiting on it. On Windows, `git` started from a plugin's tool, as the git-status and test-gate examples do, no longer hangs.
+- **All** — A file a request says to leave unchanged is kept even when its path has a `~` inside a folder's name, such as Windows' short form `C:\Users\RUNNER~1\…`. Only a `~` at the start of a word is read as the home folder.
+- **Windows** — The local endpoint ends each reply's connection itself, so a client is no longer left waiting, then reset, when a program started at that moment holds a copy of the connection.
+
 ## [0.1.0-alpha.5] - 2026-11-05
 
 ### Added
