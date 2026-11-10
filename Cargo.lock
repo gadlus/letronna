@@ -4362,7 +4362,7 @@ checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
 name = "letronna-cli"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.5.1"
 dependencies = [
  "async-channel",
  "block2 0.6.2",
@@ -4380,7 +4380,7 @@ dependencies = [
 
 [[package]]
 name = "letronna-core"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.5.1"
 dependencies = [
  "ash",
  "async-channel",
@@ -4435,7 +4435,7 @@ dependencies = [
 
 [[package]]
 name = "letronna-gui"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.5.1"
 dependencies = [
  "async-channel",
  "block",
