@@ -431,6 +431,18 @@ pub struct Settings {
     /// sets it for one run. Edited by hand with Letronna closed.
     #[serde(default)]
     pub reasoning_replay: String,
+    /// Whether a helper of a run nobody watches is sent the tools its
+    /// session's own run is, less those it could never call, so the two
+    /// share the provider's cached prefix: on unless this says "off", which
+    /// `LETRONNA_HELPERS_SHARE_TOOLS` says for one run, to compare the two.
+    #[serde(default)]
+    pub helpers_share_tools: String,
+    /// Whether a run nobody watches runs at once the commands of one reply
+    /// that only read, as it runs its file reads: "on" turns it on. Off
+    /// until paired runs show it sound; `LETRONNA_PARALLEL_READ_COMMANDS`
+    /// sets it for one run.
+    #[serde(default)]
+    pub parallel_read_commands: String,
     /// The model helpers use when neither the call nor their type names one;
     /// empty for the model of the agent that starts them.
     #[serde(default)]
@@ -629,6 +641,8 @@ impl Default for Settings {
             context_window: 0,
             max_output: 0,
             reasoning_replay: String::new(),
+            helpers_share_tools: String::new(),
+            parallel_read_commands: String::new(),
             helper_model: String::new(),
             side_model: String::new(),
             auto_title: true,
@@ -3457,6 +3471,49 @@ fn chunks_reasoning(saved: &str, name: &str) -> bool {
         .unwrap_or_else(|| saved.to_owned())
         .trim()
         .eq_ignore_ascii_case("chunked")
+}
+
+/// Ways of working that paired benchmark runs have yet to settle, each a
+/// setting with a variable that says it for one run, as the adapters start
+/// Letronna with an empty data folder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Experiments {
+    /// `helpers_share_tools`: on unless it says "off".
+    pub helpers_share_tools: bool,
+    /// `parallel_read_commands` says "on".
+    pub parallel_read_commands: bool,
+}
+
+/// The experiments as the settings file and the environment had them when
+/// this process first asked: read once, since which tools a request holds
+/// and how its calls run must not change part way through a session.
+pub fn experiments() -> Experiments {
+    static READ: std::sync::OnceLock<Experiments> = std::sync::OnceLock::new();
+    *READ.get_or_init(|| experiments_of(&settings().0, |name| std::env::var(name).ok()))
+}
+
+/// The experiments `settings` turns on, with what `env` holds for each in
+/// place of the setting.
+fn experiments_of(settings: &Settings, env: impl Fn(&str) -> Option<String>) -> Experiments {
+    let word = |saved: &str, name: &str| {
+        let said = env(name).unwrap_or_else(|| saved.to_owned());
+        said.trim().to_ascii_lowercase()
+    };
+    let shares = word(
+        &settings.helpers_share_tools,
+        "LETRONNA_HELPERS_SHARE_TOOLS",
+    );
+    Experiments {
+        helpers_share_tools: !matches!(shares.as_str(), "off" | "0"),
+        parallel_read_commands: matches!(
+            word(
+                &settings.parallel_read_commands,
+                "LETRONNA_PARALLEL_READ_COMMANDS"
+            )
+            .as_str(),
+            "on" | "1"
+        ),
+    }
 }
 
 /// The tools the settings file switches off, read again each time so a hand
@@ -8657,6 +8714,37 @@ pub(crate) mod tests {
         unsafe { std::env::set_var(name, "128k") };
         assert_eq!(super::overridden(65_536, name), 65_536);
         unsafe { std::env::remove_var(name) };
+    }
+
+    #[test]
+    fn an_experiment_is_as_its_setting_says_unless_the_environment_says_otherwise() {
+        let none = |_: &str| None;
+        let default = super::experiments_of(&super::Settings::default(), none);
+        assert_eq!(
+            default,
+            super::Experiments {
+                helpers_share_tools: true,
+                parallel_read_commands: false,
+            }
+        );
+        let saved = br#"{"endpoint": "", "model": "", "helpers_share_tools": "Off",
+            "parallel_read_commands": "on"}"#;
+        let saved = super::read_settings(saved).unwrap();
+        assert_eq!(
+            super::experiments_of(&saved, none),
+            super::Experiments {
+                helpers_share_tools: false,
+                parallel_read_commands: true,
+            }
+        );
+        // For one run, the variable in place of the setting: an adapter
+        // starts with no settings file to write one in.
+        let env = |name: &str| match name {
+            "LETRONNA_HELPERS_SHARE_TOOLS" => Some("on".to_owned()),
+            "LETRONNA_PARALLEL_READ_COMMANDS" => Some("0".to_owned()),
+            _ => None,
+        };
+        assert_eq!(super::experiments_of(&saved, env), default);
     }
 
     #[test]

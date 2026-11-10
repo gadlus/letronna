@@ -146,6 +146,69 @@ pub(crate) fn made(ctx: &ToolContext, path: &Path) {
     }
 }
 
+/// Redirections of one command looked at for files it made. A line names a
+/// handful; past this the rest stay the user's, which only asks more.
+const FRESH: usize = 64;
+
+/// How far before a command started a file it made may say it was made. The
+/// system stamps a file from a coarser clock than the one read here, which
+/// can run a tick behind it: some milliseconds, sixteen on Windows.
+const CLOCK_SLACK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The places a command about to run sends its output to where nothing is
+/// yet, and when it started: what it leaves there is its own making.
+pub(crate) struct Fresh {
+    paths: Vec<PathBuf>,
+    since: SystemTime,
+}
+
+/// Of `targets`, the files a command about to run redirects its output to,
+/// those not there yet. A session's file tools were the only ones whose
+/// files counted as its own, so one it made with `echo > notes.txt` was the
+/// user's to the gate, and a session that had read a page could not write
+/// over, or delete, its own scratch file with nobody there to say yes.
+pub(crate) fn fresh(targets: Vec<PathBuf>) -> Fresh {
+    let paths = targets
+        .into_iter()
+        // Not `exists`, which follows links: a link to nowhere is there.
+        .filter(|path| path.symlink_metadata().is_err())
+        .take(FRESH)
+        .collect();
+    Fresh {
+        paths,
+        since: SystemTime::now(),
+    }
+}
+
+impl Fresh {
+    /// Notes as `ctx`'s session's own each of them the command left as a
+    /// plain file it made itself: not a link, nor a second name of a file
+    /// somewhere else, nor one older than the command, as a file moved
+    /// there is, which keeps the time it was made. Without that time, on a
+    /// disk that keeps none, it stays the user's.
+    pub(crate) fn made(self, ctx: &ToolContext) {
+        for path in &self.paths {
+            let young = born(path).is_some_and(|at| at + CLOCK_SLACK >= self.since);
+            if young && plain(path) {
+                made(ctx, path);
+            }
+        }
+    }
+}
+
+/// Whether `path` itself is a file with no other name: no link to follow,
+/// and no hard link that would make a file elsewhere the session's too.
+fn plain(path: &Path) -> bool {
+    let Ok(meta) = path.symlink_metadata() else {
+        return false;
+    };
+    #[cfg(unix)]
+    let alone = std::os::unix::fs::MetadataExt::nlink(&meta) == 1;
+    #[cfg(not(unix))]
+    let alone = true;
+    meta.file_type().is_file() && alone
+}
+
 /// Creates `folder` and any folder it is in that is missing, as a file tool
 /// does for the file it writes, noting each one it made as `ctx`'s
 /// session's own.

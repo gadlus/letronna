@@ -94,10 +94,10 @@ use crate::tasks::{self, Key};
 use crate::tools::{self, Caller, ToolContext};
 use crate::unchanged::{self, Unchanged};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Names an agent while it runs: its mailbox, and the conversation its
@@ -260,16 +260,33 @@ const THOUGHT_SO_FAR: &str = "What your stopped reply had thought, to go on from
                               start again:";
 
 /// The effort the reply in place of one stopped for thinking asks for, or the
-/// nearest the model offers: thinking that came to nothing is time better
-/// spent writing.
-const AFTER_STOPPED: &str = "low";
+/// nearest the model offers, by how many were stopped in a row: thinking
+/// that came to nothing is time better spent writing, and a reply stopped
+/// again at "low" is asked for less still.
+const AFTER_STOPPED: [&str; 3] = ["low", "minimal", "none"];
 
-/// The effort to ask for in place of `effort` after a reply stopped for
-/// thinking, if a lower one: never more than a run set to think little asks
-/// for. Automatic counts as more, since the model then thinks at its own
-/// default.
-fn lowered(effort: &str) -> Option<&'static str> {
-    (!matches!(effort, "none" | "minimal" | "low")).then_some(AFTER_STOPPED)
+/// How many replies in a row are stopped for thinking before the next is
+/// left to finish. Each stop takes its share of the time left, so three of
+/// them took two thirds of a run's last minutes and left nothing written:
+/// a model that thinks as long at a lower effort will not think less for
+/// being stopped a third time, and what it writes at the end of a long
+/// thought is still more than nothing.
+const STOPS_IN_A_ROW: u32 = 2;
+
+/// The effort to ask for in place of `effort` after `stopped` replies in a
+/// row were stopped for thinking, if a lower one: never more than a run set
+/// to think little asks for. Automatic counts as more, since the model then
+/// thinks at its own default.
+fn lowered(effort: &str, stopped: u32) -> Option<&'static str> {
+    let rank = |effort: &str| match effort {
+        "none" => 0,
+        "minimal" => 1,
+        "low" => 2,
+        _ => 3,
+    };
+    let at = (stopped.max(1) as usize - 1).min(AFTER_STOPPED.len() - 1);
+    let wanted = AFTER_STOPPED[at];
+    (rank(wanted) < rank(effort)).then_some(wanted)
 }
 
 /// What a run did, told as it happens to a frontend that shows the run live.
@@ -615,6 +632,7 @@ fn steps(
     let mut missed = false;
     let mut reworded = false;
     let mut swept = false;
+    let mut jobs_told = false;
     let mut built = false;
     let mut listed = false;
     let mut tabled = false;
@@ -655,6 +673,8 @@ fn steps(
     // The run's own effort while the reply after one stopped for thinking
     // asks for less.
     let mut lowered_from: Option<String> = None;
+    // Replies stopped for thinking: one after another, and in the whole run.
+    let (mut stopped_in_a_row, mut stopped) = (0u32, 0u32);
     // What the last reply's request read, to tell when the history it sends
     // was cut.
     let mut read = 0;
@@ -674,7 +694,8 @@ fn steps(
         {
             return Ok(Outcome::OverBudget);
         }
-        if let Some(text) = time_warning(spec, &mut warned) {
+        if let Some(mut text) = time_warning(spec, &mut warned) {
+            text.push_str(&still_to_make(&noted));
             deadline_notice(spec, text)?;
         }
         if !due
@@ -684,11 +705,17 @@ fn steps(
             due = true;
             deadline_notice(spec, text)?;
         }
-        let mut reply = match ask_in_line(spec, turn)? {
+        let mut reply = match ask_in_line(spec, turn, stopped_in_a_row)? {
             Asked::Reply(reply) => {
+                stopped_in_a_row = 0;
                 // Back before any call runs, so a helper it starts thinks
-                // as the run was set to.
-                if let Some(effort) = lowered_from.take() {
+                // as the run was set to. Not for a run stopped twice, or
+                // once past its time warning: it thinks past the time it
+                // has, and goes on at the lower effort to its end.
+                if stopped < 2
+                    && !past_warning(spec)
+                    && let Some(effort) = lowered_from.take()
+                {
                     turn.connection.effort = effort;
                 }
                 reply
@@ -707,6 +734,7 @@ fn steps(
                 if warning_due(spec, warned) {
                     notice.push_str(&format!(" Also {TIDY}."));
                 }
+                notice.push_str(&still_to_make(&noted));
                 warned |= past_warning(spec);
                 // Where an effort is what asks for thinking, an automatic
                 // run that was not thinking would start to, and go on.
@@ -716,8 +744,14 @@ fn steps(
                         &turn.connection,
                         &spec.transcript.conversation.messages,
                     );
-                if !not_thinking && let Some(low) = lowered(&turn.connection.effort) {
-                    lowered_from = Some(std::mem::replace(&mut turn.connection.effort, low.into()));
+                stopped_in_a_row += 1;
+                stopped += 1;
+                if !not_thinking
+                    && let Some(low) = lowered(&turn.connection.effort, stopped_in_a_row)
+                {
+                    let before = std::mem::replace(&mut turn.connection.effort, low.into());
+                    // What the run was set to, however far down it has gone.
+                    lowered_from.get_or_insert(before);
                 }
                 let mut texts = vec![notice];
                 if !thought.trim().is_empty() {
@@ -1110,6 +1144,18 @@ fn steps(
                 save(&mut spec.transcript)?;
                 continue;
             }
+            // Last of the checks that send it back, so what it is told of
+            // its jobs is the state it ends in; once, as above.
+            if !jobs_told
+                && report.rounds < spec.rounds
+                && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
+                && let Some(notice) = jobs_left(spec, turn)
+            {
+                jobs_told = true;
+                spec.transcript.conversation.messages.push(notice);
+                save(&mut spec.transcript)?;
+                continue;
+            }
             // A session's own agent, as `-p` runs it, hears its Stop hooks as a
             // turn in the terminal does; a helper's answer is its parent's to
             // judge, but the SubagentStop hooks the user set may send it back.
@@ -1251,7 +1297,10 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
             for call in &batch {
                 tell(spec, Step::Running(call.id.clone()));
             }
-            for (call, outcome) in batch.iter().zip(together(spec, &batch)) {
+            let began = Instant::now();
+            let outcomes = together(spec, &batch);
+            crate::timing::ran(spec.root, spec.depth > 0, batch.len(), began.elapsed());
+            for (call, outcome) in batch.iter().zip(outcomes) {
                 // One a stop kept from starting gets no result, as a lone call does.
                 if let Some(outcome) = outcome {
                     turn.finish_id(&call.id, outcome);
@@ -1442,7 +1491,9 @@ fn dispatch(
         files: kept_by(spec),
         ..context(spec)
     };
+    let began = Instant::now();
     let outcome = off_thread(call, &ctx);
+    crate::timing::ran(spec.root, spec.depth > 0, 1, began.elapsed());
     report.changes.extend(ctx.files.take());
     let outcome = outcome?;
     if outcome.is_ok() && matches!(call.name.as_str(), "write_file" | "edit_file") {
@@ -1587,8 +1638,11 @@ fn hidden(spec: &Spec) -> Vec<String> {
     // whole array, though an unwatched parent's is shorter: those are
     // refused at the call instead.
     let own = spec.depth == 0 || (spec.fork && spec.depth == 1);
-    if spec.connection.human || !own {
+    if spec.connection.human {
         return Vec::new();
+    }
+    if !own {
+        return shared(spec, crate::store::experiments().helpers_share_tools);
     }
     // A scheduled run keeps memory, as its job may ask it to keep something,
     // so a fork of one is offered it too, sharing its parent's prefix, and is
@@ -1604,12 +1658,46 @@ fn hidden(spec: &Spec) -> Vec<String> {
     let reaching = |name: &&str| {
         mcp && [crate::mcp_find::FIND_TOOLS, crate::mcp_find::CALL_MCP_TOOL].contains(name)
     };
-    tools::all()
+    let names: Vec<String> = tools::all()
         .iter()
         .map(|tool| tool.name())
         .filter(|name| !kept(name) && !reaching(name))
         .filter(|name| refused(spec, name).is_some())
         .map(str::to_owned)
+        .collect();
+    if spec.depth == 0 {
+        let mut left_out = left_out().lock().unwrap_or_else(PoisonError::into_inner);
+        left_out.insert(spec.root, names.clone());
+    }
+    names
+}
+
+/// What each session's own run nobody watches left out of its last request,
+/// for its helpers to leave out too (`shared`).
+fn left_out() -> &'static Mutex<HashMap<u64, Vec<String>>> {
+    static LEFT_OUT: OnceLock<Mutex<HashMap<u64, Vec<String>>>> = OnceLock::new();
+    LEFT_OUT.get_or_init(Default::default)
+}
+
+/// The tools a helper of a run nobody watches leaves out of its requests
+/// when helpers `share` their session's tools: those its session's own run
+/// left out that the helper may not call either. A helper was sent the
+/// whole array -- ask_user, memory and the rest, each refused at the call --
+/// so its tools differed from its session's by a handful it could never
+/// use, and where the tools lead the cached prefix, as on Anthropic's API,
+/// its first request read none of what the session had already paid to
+/// cache. Nothing a helper may call is left out by this.
+fn shared(spec: &Spec, share: bool) -> Vec<String> {
+    if !share {
+        return Vec::new();
+    }
+    let left_out = left_out().lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(names) = left_out.get(&spec.root) else {
+        return Vec::new();
+    };
+    (names.iter())
+        .filter(|name| refused(spec, name).is_some())
+        .cloned()
         .collect()
 }
 
@@ -1833,15 +1921,20 @@ enum Asked {
 
 /// Waits for a turn on the provider, then calls the model, asking again after
 /// a 429 once the provider has had its rest.
-fn ask_in_line(spec: &Spec, turn: &mut Turn) -> Result<Asked, String> {
+fn ask_in_line(spec: &Spec, turn: &mut Turn, stopped: u32) -> Result<Asked, String> {
     let gate = limits::gate(&spec.connection.endpoint);
     let mut retries = 0;
     loop {
+        let waited = Instant::now();
         let Some(permit) = gate.acquire(&spec.cancel) else {
             return Ok(Asked::Stopped);
         };
+        let queued = waited.elapsed();
         let throttled = gate.throttled();
-        let asked = ask(spec, turn, permit);
+        let (sent, mut first) = (Instant::now(), None);
+        let asked = ask(spec, turn, permit, &mut first, stopped);
+        // For the run's result line, which says where its time went.
+        crate::timing::asked(spec.root, spec.depth > 0, queued, first, sent.elapsed());
         // What streamed is in the reply's own count now, or went with it.
         spec.status.streamed.store(0, Ordering::Relaxed);
         let error = match asked {
@@ -1865,8 +1958,17 @@ fn ask_in_line(spec: &Spec, turn: &mut Turn) -> Result<Asked, String> {
 
 /// Calls the model with the conversation so far and reads the reply to its
 /// end, holding `permit` as long as the stream lasts, unless a stop or, on a
-/// run with a deadline, too long thinking ends it first.
-fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Asked, String> {
+/// run with a deadline, too long thinking ends it first, unless `stopped`
+/// replies before it in a row were ended that way (`STOPS_IN_A_ROW`).
+/// `first` is set to how long the reply took to begin, once it writes,
+/// thinks or starts a call.
+fn ask(
+    spec: &Spec,
+    turn: &mut Turn,
+    permit: Permit,
+    first: &mut Option<Duration>,
+    stopped: u32,
+) -> Result<Asked, String> {
     // The run's, through a child, so the thinking cap can end this one reply.
     let cancel = spec.cancel.child();
     let extra = Extra {
@@ -1903,7 +2005,11 @@ fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Asked, String> {
     let capped = Arc::new(AtomicBool::new(false));
     // Left to ring when the reply ends some other way: it then sets a token
     // nothing listens to any more.
-    let mut cap = spec.connection.deadline.map(|deadline| {
+    let capped_run = spec
+        .connection
+        .deadline
+        .filter(|_| stopped < STOPS_IN_A_ROW);
+    let mut cap = capped_run.map(|deadline| {
         let at = began + thinking_cap(deadline.saturating_duration_since(began));
         let (cancel, capped) = (cancel.clone(), capped.clone());
         crate::timers::at(
@@ -1923,6 +2029,10 @@ fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Asked, String> {
         };
         if writing && let Some(timer) = cap.take() {
             crate::timers::cancel(timer);
+        }
+        let thinking = matches!(&event, Event::Reasoning(text) if !text.trim().is_empty());
+        if (writing || thinking) && first.is_none() {
+            *first = Some(began.elapsed());
         }
         // Counted before it is told, so a watcher reads the count with it.
         if let Event::Delta(text) | Event::Reasoning(text) = &event {
@@ -2071,6 +2181,17 @@ fn time_warning(spec: &Spec, warned: &mut bool) -> Option<String> {
          for now, complete and valid, and {TIDY}; improve the outputs in place only after that.",
         left.as_secs()
     ))
+}
+
+/// What a run short of time is told of the files its request names that are
+/// not there yet. At its own end it is sent back for them (`missing`), but
+/// a run the clock stops never gets there: such runs were stopped with
+/// nothing written where the request had named the file to write.
+fn still_to_make(noted: &Missing) -> String {
+    match missing::unmade(noted).as_slice() {
+        [] => String::new(),
+        left => format!(" Not there yet: {}", left.join(" ")),
+    }
 }
 
 /// How long before its deadline a run still at work is told to end its first
@@ -2328,9 +2449,31 @@ fn forward_unread(spec: &Spec) {
 /// every piece of a reply that went on after being cut off at the output limit.
 pub fn last_said(messages: &[Message]) -> String {
     let said = |message: &Message| message.role == "assistant" && !message.content.is_empty();
-    let Some(last) = messages.iter().rposition(said) else {
+    let Some(mut last) = messages.iter().rposition(said) else {
         return String::new();
     };
+    // A run sent back for stopping short, or for a call written as text,
+    // that then called nothing again and said under half as much was sent
+    // back by mistake: what it said before the notice was its answer, and
+    // "Already done." is not. An answer of about the same length is the
+    // one the notice asked for, and stands. Sent back more than once, it
+    // is weighed against each reply before a notice in turn, so two short
+    // replies in a row do not hide the answer before them.
+    let sent_back = [
+        crate::agent::CONTINUE_NOW,
+        crate::agent::NOTHING_RAN,
+        crate::agent::CALL_IT,
+    ];
+    let mut at = last;
+    while let [.., before, notice] = &messages[..at]
+        && sent_back.contains(&notice.content.as_str())
+        && said(before)
+    {
+        at -= 2;
+        if messages[last].content.len() * 2 < before.content.len() {
+            last = at;
+        }
+    }
     // Each piece after the first follows the notice asking it to go on, and
     // takes up where the one before stopped, so they join as they are.
     let mut first = last;
@@ -2410,6 +2553,70 @@ fn echoed(spec: &Spec, turn: &Turn, written: &[String], began: SystemTime) -> Op
     Some(Message {
         role: "user".into(),
         content,
+        notice: true,
+        // Folded into the run, so the window keeps the task it is for.
+        folded: true,
+        ..Default::default()
+    })
+}
+
+/// The least of a run's time that must be left for it to be told of the jobs
+/// still running as it ends: about what starting a server again and seeing
+/// it answer takes.
+const RESTART_TIME: Duration = Duration::from_secs(60);
+
+/// The notice sending a session's own run nobody watches back once when
+/// jobs it started are still running as it ends, where the run stops them
+/// as it does. A job's start says so already, and runs still answered that
+/// a server or a virtual machine was up and ended, taking it down: on
+/// Terminal-Bench 2.0 a verifier then found no process and nothing on the
+/// port. Said again here, with the jobs by name, it is the last thing the
+/// run reads before it would end.
+fn jobs_left(spec: &Spec, turn: &Turn) -> Option<Message> {
+    // A helper's jobs pass to its owner, a person watching sees what runs,
+    // and past the round cap nothing can be started again.
+    if !unwatched(spec) || spec.watch.is_some() || turn.capped().is_some() {
+        return None;
+    }
+    // Nor with too little of its time left to start one again and see it
+    // answer: the reply would only turn a run that ended into one stopped.
+    let left = (spec.connection.deadline)
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+    if left.is_some_and(|left| left < RESTART_TIME) {
+        return None;
+    }
+    if !spec.connection.jobs_end_with_run {
+        return None;
+    }
+    if !turn.runs_commands() || refused(spec, "run_command").is_some() {
+        return None;
+    }
+    let running: Vec<String> = (tasks::list(spec.root).iter())
+        .filter_map(|task| match task.key {
+            Key::Job(id) if crate::jobs::running(id) == Ok(true) => Some(id),
+            _ => None,
+        })
+        .map(|id| {
+            let command = crate::jobs::command(id).unwrap_or_default();
+            let short: String = command.chars().take(120).collect();
+            format!("job #{id} (`{short}`)")
+        })
+        .collect();
+    if running.is_empty() {
+        return None;
+    }
+    Some(Message {
+        role: "user".into(),
+        content: format!(
+            "[Letronna check] Still running, and stopped when this run ends: {}. If what you \
+             were asked for needs one of them running after you finish, as a server or a \
+             virtual machine left up does, start it again detached, in a plain run_command \
+             and not as a job, as with `{}`, check that it answers, and stop the job. If \
+             none is needed then, change nothing. Only your last message is passed on as \
+             your answer, so end with your whole answer again.",
+            running.join(", "),
+            tools::DETACHED
+        ),
         notice: true,
         // Folded into the run, so the window keeps the task it is for.
         folded: true,
@@ -3699,8 +3906,9 @@ fn passed(result: &Message, args: &Value, workspace: &Path) -> bool {
     if result.is_error || crate::tool_runs::exit_code(result).is_some() {
         return false;
     }
-    // A job left running has proved nothing yet.
-    if args["background"].as_bool().unwrap_or(false) {
+    // A job left running has proved nothing yet, whether it was started as
+    // one or moved to the background at its time limit.
+    if args["background"].as_bool().unwrap_or(false) || crate::tool_runs::moved(result) {
         return false;
     }
     let line = args["command"].as_str().unwrap_or_default();
@@ -4492,12 +4700,20 @@ pub(crate) mod tests {
     fn ask_user_is_not_offered_to_a_run_nobody_watches() {
         let dir = scratch("unwatched");
         let offers = |names: &[String], name: &str| names.iter().any(|n| n == name);
-        let unwatched = first_offered(&dir, AGENTS + 710, |spec| spec.depth = 0);
+        // A session of this test's own, so no other test's run is the
+        // one its helper takes after.
+        let session = AGENTS + 735;
+        let unwatched = first_offered(&dir, AGENTS + 710, |spec| {
+            spec.depth = 0;
+            spec.root = session;
+        });
         let watched = first_offered(&dir, AGENTS + 720, |spec| {
             spec.depth = 0;
             spec.connection.human = true;
         });
-        let helper = first_offered(&dir, AGENTS + 730, |_| ());
+        let helper = first_offered(&dir, AGENTS + 730, |spec| spec.root = session);
+        // A helper of a session that sent nothing with nobody watching.
+        let alone = first_offered(&dir, AGENTS + 731, |spec| spec.root = AGENTS + 736);
 
         assert!(offers(&unwatched, "read_file"), "{unwatched:?}");
         for name in DENY {
@@ -4505,9 +4721,18 @@ pub(crate) mod tests {
         }
         // Someone is there to be asked, so it goes out as it always has.
         assert!(offers(&watched, tools::ASK_USER), "{watched:?}");
-        // A helper that is no fork is offered them all, refused at the call.
-        assert!(offers(&helper, tools::ASK_USER), "{helper:?}");
-        assert!(offers(&helper, "memory"), "{helper:?}");
+        // A helper that is no fork leaves out what its session's own run
+        // did and it could not call either, so its requests start as its
+        // session's do, tools first, and read what those left cached.
+        assert_eq!(helper, unwatched);
+        // With nothing of its session's to take after, or told not to
+        // share, it is offered them all, each refused at the call.
+        assert!(offers(&alone, tools::ASK_USER), "{alone:?}");
+        assert!(offers(&alone, "memory"), "{alone:?}");
+        let mut apart = spec(String::new(), &dir, AGENTS + 732);
+        apart.root = session;
+        assert!(!shared(&apart, true).is_empty());
+        assert_eq!(shared(&apart, false), Vec::<String>::new());
     }
 
     /// The tools and the system prompt of the first request of `spec`'s run
@@ -7387,6 +7612,47 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_run_sent_back_by_mistake_keeps_the_answer_it_had_given() {
+        let says = |role: &str, content: &str| Message {
+            role: role.into(),
+            content: content.into(),
+            notice: role == "user",
+            ..Default::default()
+        };
+        let whole = "The parser dropped the last token of a line: the loop stopped one short. \
+                     It reads them all now, and the suite passes. Running it again gives the same.";
+        // Told to continue, it had nothing to add: the answer is the one before.
+        let mistaken = [
+            says("assistant", whole),
+            says("user", crate::agent::CONTINUE_NOW),
+            says("assistant", "Already done."),
+            says("user", crate::agent::NOTHING_RAN),
+            says("assistant", "The work is finished."),
+        ];
+        assert_eq!(last_said(&mistaken), whole);
+        // What it says once sent back is the answer, when it is one.
+        let meant = [
+            says(
+                "assistant",
+                "The notes say hello. Now let me check the tests.",
+            ),
+            says("user", crate::agent::CONTINUE_NOW),
+            says("assistant", "The notes say hello, and there are no tests."),
+        ];
+        assert_eq!(
+            last_said(&meant),
+            "The notes say hello, and there are no tests."
+        );
+        // Only a reply to one of those notices is weighed against the one before.
+        let checked = [
+            says("assistant", whole),
+            says("user", "[Letronna check] Run the tests."),
+            says("assistant", "They pass."),
+        ];
+        assert_eq!(last_said(&checked), "They pass.");
+    }
+
+    #[test]
     fn a_short_answer_announcing_its_next_step_is_pushed_on_at_depth_zero() {
         let _data = data("pushed-on");
         let dir = scratch("pushed-on");
@@ -7623,8 +7889,11 @@ pub(crate) mod tests {
     fn a_project_file_named_like_a_dump_stays_the_users_after_it_read_untrusted_words() {
         let _data = data("dumps-steered-not");
         let dir = scratch("dumps-steered-not");
+        // Written by a program, not by the line's own redirection: a file
+        // a redirection made is the session's to delete (taint::fresh), and
+        // this one stands for a file nothing shows the session made.
         let (endpoint, provider) = provider(vec![
-            reply("", &[command("printf 'settings = 1' > app.core")]),
+            reply("", &[command("printf 'settings = 1' | tee app.core")]),
             reply("Fixed the rolling window.", &[]),
             reply("", &[command("rm app.core")]),
             reply("Fixed the rolling window.", &[]),
@@ -7645,6 +7914,97 @@ pub(crate) mod tests {
             "{refused}"
         );
         assert!(dir.join("app.core").exists());
+    }
+
+    #[test]
+    fn a_run_whose_jobs_would_stop_with_it_is_told_which_before_it_ends() {
+        let _data = data("jobs-left");
+        let dir = scratch("jobs-left");
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 30"
+        } else {
+            "sleep 30"
+        };
+        let (endpoint, provider) = provider(vec![
+            reply("The server is up.", &[]),
+            reply("The server is up.", &[]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 1_608);
+        spec.depth = 0;
+        spec.decide = None;
+        spec.connection.mode = crate::gate::Mode::Bypass;
+        spec.connection.jobs_end_with_run = true;
+        spec.root = spec.id;
+        let job = crate::jobs::start_for(command, &dir, spec.root).unwrap();
+        let report = finished(spec);
+        let _ = crate::jobs::stop(job);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        // Once: told, it ends as it chooses.
+        assert_eq!(sent.len(), 2);
+        let told = messages(&sent[1]).last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let begins = format!(
+            "[Letronna check] Still running, and stopped when this run ends: job #{job} \
+             (`{command}`)."
+        );
+        assert!(told.starts_with(&begins), "{told}");
+        assert!(told.contains(tools::DETACHED), "{told}");
+        assert!(
+            told.ends_with("end with your whole answer again."),
+            "{told}"
+        );
+    }
+
+    #[test]
+    fn a_run_with_under_a_minute_left_is_not_sent_back_for_its_jobs() {
+        let _data = data("jobs-late");
+        let dir = scratch("jobs-late");
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 30"
+        } else {
+            "sleep 30"
+        };
+        let (endpoint, provider) = provider(vec![reply("The server is up.", &[])]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 1_610);
+        spec.depth = 0;
+        spec.decide = None;
+        spec.connection.mode = crate::gate::Mode::Bypass;
+        spec.connection.jobs_end_with_run = true;
+        spec.connection.deadline = Some(Instant::now() + Duration::from_secs(40));
+        spec.root = spec.id;
+        let job = crate::jobs::start_for(command, &dir, spec.root).unwrap();
+        let report = finished(spec);
+        let _ = crate::jobs::stop(job);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(provider.sent().len(), 1);
+    }
+
+    #[test]
+    fn a_run_whose_jobs_outlive_it_or_that_has_none_is_not_sent_back_for_them() {
+        let _data = data("jobs-kept");
+        let dir = scratch("jobs-kept");
+        let (endpoint, provider) = provider(vec![reply("Done.", &[])]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 1_609);
+        spec.depth = 0;
+        spec.decide = None;
+        spec.connection.mode = crate::gate::Mode::Bypass;
+        // The window's and the terminal's jobs go on after a turn.
+        spec.connection.jobs_end_with_run = false;
+        spec.root = spec.id;
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 30"
+        } else {
+            "sleep 30"
+        };
+        let job = crate::jobs::start_for(command, &dir, spec.root).unwrap();
+        let report = finished(spec);
+        let _ = crate::jobs::stop(job);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(provider.sent().len(), 1);
     }
 
     #[test]
@@ -10646,7 +11006,20 @@ pub(crate) mod tests {
         messages.push(tool("run_command", pytest.clone(), "Timed out.", true));
         let job = json!({"command": "pytest", "background": true});
         messages.push(ran(job, "Started as job #3 (running)."));
+        // Nor does one still running at its time limit, moved to the
+        // background: it has no exit code because it has not ended, and
+        // "3 passed" among what it printed so far is not its end.
+        let moved = "Still running after 120s, so it carries on in the background as job #4 \
+                     instead of being stopped. A notice comes when it exits. Output so far:\n\
+                     3 passed";
+        messages.push(ran(pytest.clone(), moved));
         assert_eq!(unchecked(&messages, &dir), ["src/app.py"]);
+        // Words of its own that happen to say so are still its output.
+        let quoted = ran(
+            json!({"command": "pytest"}),
+            "so it carries on in the background as job #9",
+        );
+        assert!(!crate::tool_runs::moved(&quoted));
 
         // A test that passed does; notes and a failed edit after it are no source.
         messages.push(ran(pytest.clone(), "3 passed"));
@@ -11113,11 +11486,47 @@ pub(crate) mod tests {
     #[test]
     fn only_effort_above_low_is_lowered_after_a_stopped_reply() {
         for effort in ["", "medium", "high", "max"] {
-            assert_eq!(lowered(effort), Some("low"), "{effort}");
+            assert_eq!(lowered(effort, 1), Some("low"), "{effort}");
         }
         for effort in ["low", "minimal", "none"] {
-            assert_eq!(lowered(effort), None, "{effort}");
+            assert_eq!(lowered(effort, 1), None, "{effort}");
         }
+        // Stopped again at the lower effort, it is asked for less still.
+        assert_eq!(lowered("high", 2), Some("minimal"));
+        assert_eq!(lowered("low", 2), Some("minimal"));
+        assert_eq!(lowered("minimal", 2), None);
+        assert_eq!(lowered("minimal", 3), Some("none"));
+        assert_eq!(lowered("low", 9), Some("none"));
+        assert_eq!(lowered("none", 3), None);
+    }
+
+    #[test]
+    fn after_two_replies_stopped_in_a_row_the_next_is_left_to_finish_at_less_effort() {
+        let dir = scratch("thinking-twice");
+        // Two replies that think past their cap, then one that thinks for
+        // longer than a third cap would have let it and writes its answer.
+        let mut third = thinking(60);
+        third.push(says("Wrote it."));
+        let (endpoint, provider) = streaming(
+            vec![thinking(400), thinking(400), third],
+            Duration::from_millis(20),
+        );
+        let mut spec = spec(endpoint, &dir, AGENTS + 1503);
+        spec.connection.effort = "high".into();
+        spec.connection.deadline = Some(Instant::now() + Duration::from_secs(5));
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "Wrote it.");
+        let sent = provider.sent();
+        let efforts: Vec<Option<&str>> = (sent.iter())
+            .map(|body| body["reasoning_effort"].as_str())
+            .collect();
+        // Lower each time one is stopped, as far as this model offers
+        // (`lowered` steps on to minimal and none where a model has them);
+        // three stops took most of what was left of a run, so the third is
+        // not made, and three requests are all it takes.
+        assert_eq!(efforts, [Some("high"), Some("low"), Some("low")]);
+        assert!(carries(&sent[2], ACT_NOW));
     }
 
     #[test]
@@ -11335,6 +11744,33 @@ pub(crate) mod tests {
         let sent = provider.sent();
         assert_eq!(sent.len(), 2);
         assert!(last_notice(&sent).contains(WARNING));
+    }
+
+    #[test]
+    fn a_run_short_of_time_is_told_the_files_its_request_names_that_are_not_there() {
+        let dir = scratch("warned-unmade");
+        let noted = missing::from_request(
+            "Write the totals to out/report.csv and the log to out/run.log.",
+            &dir,
+            &Contract::default(),
+        );
+        // A run the clock stops never reaches the check that would send it
+        // back for them, so its time warning and the notice after a reply
+        // stopped for thinking end with this while there is time.
+        assert_eq!(
+            still_to_make(&noted),
+            " Not there yet: `out/report.csv` does not exist, though the request names it. \
+             `out/run.log` does not exist, though the request names it."
+        );
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        std::fs::write(dir.join("out/report.csv"), "a,b").unwrap();
+        assert_eq!(
+            still_to_make(&noted),
+            " Not there yet: `out/run.log` does not exist, though the request names it."
+        );
+        std::fs::write(dir.join("out/run.log"), "ok").unwrap();
+        assert_eq!(still_to_make(&noted), "");
+        assert_eq!(still_to_make(&Missing::default()), "");
     }
 
     #[test]

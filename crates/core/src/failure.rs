@@ -449,6 +449,15 @@ const PHRASES: &[(&str, FailureKind)] = &[
     ("not found", FailureKind::NotFound),
     ("unknown model", FailureKind::NotFound),
     ("not a valid model", FailureKind::NotFound),
+    // A gateway's own words for a reply its upstream broke off part way,
+    // as in "the upstream stream ended before the answer finished": the
+    // connection ending before the reply did, said by the one in between,
+    // and the same request may go through. With a code the table does not
+    // know it ended a run nobody watched that had half an hour left.
+    ("stream ended before", FailureKind::Network),
+    ("stream ended early", FailureKind::Network),
+    ("stream was interrupted", FailureKind::Network),
+    ("connection reset", FailureKind::Network),
 ];
 
 /// The kind the first of `PHRASES` found in the lowercase `text` names.
@@ -956,6 +965,30 @@ mod tests {
                 r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#
             ),
             FailureKind::Overloaded
+        );
+    }
+
+    #[test]
+    fn a_gateways_word_that_its_upstream_broke_off_the_reply_is_a_failed_connection() {
+        // As it came inside a stream already answered 200, with a code of
+        // the gateway's own that no table knows.
+        let broke = serde_json::json!({"error": {"code": "upstream_stream_error",
+            "message": "the upstream stream ended before the answer finished"}});
+        let failure = classify(None, &HeaderMap::new(), &broke);
+        assert_eq!(failure.kind, FailureKind::Network);
+        // So it is asked again, which a failure nobody can name is not.
+        assert!(crate::retry::passes(failure.kind));
+        let unnamed = serde_json::json!({"error": {"code": "weird", "message": "something else"}});
+        assert_eq!(
+            classify(None, &HeaderMap::new(), &unnamed).kind,
+            FailureKind::Unknown
+        );
+        // A status still says more than the words do.
+        let refused =
+            serde_json::json!({"error": {"message": "stream ended before it began: bad key"}});
+        assert_eq!(
+            classify(Some(401), &HeaderMap::new(), &refused).kind,
+            FailureKind::Auth
         );
     }
 

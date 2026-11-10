@@ -58,8 +58,8 @@ use letronna_core::driver::{self, Allow, Outcome, Report, Spec, Status};
 use letronna_core::gate::Mode;
 use letronna_core::store::Transcript;
 use letronna_core::{
-    agent, cache_miss, crew, hooks, inbox, prompt_rules, store, structured, tools, update, usage,
-    worktree,
+    agent, cache_miss, crew, hooks, inbox, prompt_rules, store, structured, timing, tools, update,
+    usage, worktree,
 };
 use serde_json::{Value, json};
 use session::Runner;
@@ -1137,6 +1137,11 @@ fn dump_config(args: &Args, settings: &store::Settings) -> Result<Value, String>
         "verify_edits": settings.verifies_edits(),
         "command_timeout_seconds": tools::COMMAND_TIMEOUT.as_secs(),
         "tool_output_bytes": tools::MAX_OUTPUT,
+        // What paired runs have yet to settle, as this run would have it.
+        "experiments": {
+            "helpers_share_tools": store::experiments().helpers_share_tools,
+            "parallel_read_commands": store::experiments().parallel_read_commands,
+        },
         // As a run whose answer is piped is told them.
         "prompt": prompt_rules::seen(&chat::Connection {
             tools: true,
@@ -1688,6 +1693,7 @@ fn as_json(report: &Report, extras: Option<&Extras>) -> Value {
             "lost_tokens": extras.cache_misses.lost_tokens,
         });
         out["history_rewrites"] = extras.history_rewrites.into();
+        out["timing"] = extras.timing.json();
     }
     if let Some(value) = &report.value {
         out["value"] = value.clone();
@@ -1720,6 +1726,9 @@ struct Extras {
     /// The run's replies whose cache miss an earlier message changing
     /// caused: old results cleared, or reasoning no longer sent back.
     history_rewrites: usize,
+    /// Where the run's time went: waiting on the model, how long its
+    /// replies took to begin, and its tool calls, its helpers' apart.
+    timing: timing::Timing,
 }
 
 impl Extras {
@@ -1746,6 +1755,7 @@ impl Extras {
             progress: agent::progress(own),
             cache_misses: cache_miss::drops(conversation.id),
             history_rewrites: history_rewrites(own),
+            timing: timing::take(conversation.id),
         }
     }
 }
@@ -2361,8 +2371,34 @@ mod tests {
                 lost_tokens: 7_100,
             },
             history_rewrites: 1,
+            timing: timing::Timing {
+                own: timing::Spent {
+                    requests: 6,
+                    model: std::time::Duration::from_millis(41_500),
+                    begun: 6,
+                    first: std::time::Duration::from_millis(9_000),
+                    slowest_first: std::time::Duration::from_millis(2_750),
+                    queued: std::time::Duration::ZERO,
+                    calls: 11,
+                    tools: std::time::Duration::from_millis(18_250),
+                },
+                helpers: timing::Spent::default(),
+            },
         };
         let out = as_json(&report(Outcome::Done), Some(&extras));
+        // Where the time went, beside how long it took in all: a run with
+        // no helpers names none.
+        assert_eq!(
+            out["timing"],
+            json!({
+                "requests": 6,
+                "model_seconds": 41.5,
+                "first_token": {"count": 6, "seconds": 9.0, "slowest_seconds": 2.75},
+                "queued_seconds": 0.0,
+                "tool_calls": 11,
+                "tool_seconds": 18.25,
+            })
+        );
         assert_eq!(
             (
                 &out["session"],
@@ -2627,6 +2663,10 @@ mod tests {
                 "verify_edits": true,
                 "command_timeout_seconds": 120,
                 "tool_output_bytes": 8_000,
+                "experiments": {
+                    "helpers_share_tools": true,
+                    "parallel_read_commands": false,
+                },
             })
         );
         // What would stop the run stops the dump, rather than it guessing.

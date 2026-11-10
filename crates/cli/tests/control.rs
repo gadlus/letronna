@@ -253,6 +253,20 @@ fn messages_run_as_turns_in_the_order_sent() {
         (&second["status"], &second["answer"]),
         (&json!("done"), &json!("Second."))
     );
+    // Each result says where its own turn's time went, not the run's so
+    // far: one request, whose reply began, and no tool call.
+    for result in [&first, &second] {
+        let timing = &result["timing"];
+        assert_eq!(
+            (
+                &timing["requests"],
+                &timing["first_token"]["count"],
+                &timing["tool_calls"]
+            ),
+            (&json!(1), &json!(1), &json!(0)),
+            "{result}"
+        );
+    }
     assert_eq!(run.close(), 0);
     let _ = bodies.recv_timeout(WAIT).unwrap();
     let later = said(&bodies.recv_timeout(WAIT).unwrap());

@@ -169,6 +169,7 @@ class AgentTests(unittest.TestCase):
                 "AGENT_DATA_DIR": "/installed-agent/letronna/data",
                 "LETRONNA_NO_LOGIN_ENV": "1",
                 "LETRONNA_DISPOSABLE": "1",
+                "LETRONNA_DISPOSABLE_FILES": "1",
             },
         )
         words = shlex.split(command.removeprefix("set -o pipefail; "))
@@ -196,6 +197,14 @@ class AgentTests(unittest.TestCase):
             ],
         )
         self.assertTrue(environment.ran("cp -R /installed-agent/letronna/data/"))
+
+    def test_streams_are_kept_with_the_trials_logs_only_when_asked_for(self):
+        streams = "/logs/agent/streams"
+        for asked, kept in (("1", streams), ("true", streams), ("0", None)):
+            environment = Environment()
+            asyncio.run(self.agent(streams=asked).run("Go.", environment, None))
+            [(_, env)] = environment.ran("drive.sh")
+            self.assertEqual(env.get("LETRONNA_DUMP_STREAMS"), kept, asked)
 
     def trial(self, timeout_sec, **config):
         """Writes the trial's config.json beside the logs, as Harbor does, for a task

@@ -1,0 +1,27 @@
+# A dozen Terminal-Bench 2.0 tasks for comparing two builds of Letronna
+# without a whole run (TB2_TASKS, pair.sh).
+#
+# Each is here because, on 19-20 October 2026, what Letronna did decided at
+# least one model's trial of it, not the model's work, while at least two of
+# the seven models passed it. None is among the eight tasks the reference
+# solution cannot pass on a host without KVM, nor the four whose images are
+# 6-9 GB. What decided each is in that run's failures.md files
+# (bench/terminal-bench/results/2026-10-19).
+#
+# The guard on a run that has read someone else's words:
+financial-document-processor   # refused the moves that are the task
+build-pov-ray                  # refused a command the solution runs
+# Tool calls that arrived with no arguments, and the loop stop after them:
+constraints-scheduling
+modernize-scientific-stack
+break-filter-js-from-html
+winning-avg-corewars
+# Replies stopped for thinking that took a run's last minutes:
+git-multibranch
+write-compressor
+dna-assembly
+# A reply that calls no tool ending the run, or a probe that changed its input:
+mailman
+db-wal-recovery
+# A server that must still be up when the run has ended:
+pypi-server

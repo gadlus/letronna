@@ -16,6 +16,8 @@ import json
 import sys
 from pathlib import Path
 
+from triage import result_line
+
 
 def trials(job_dirs: list[str]) -> list[dict]:
     rows = []
@@ -29,6 +31,11 @@ def trials(job_dirs: list[str]) -> list[dict]:
             error = data.get("exception_info") or {}
             agent = data.get("agent_result") or {}
             timing = data.get("agent_execution") or {}
+            # What Letronna itself says of the run in its result line, where
+            # Harbor's figures stop at tokens and the trial's whole time.
+            ran = result_line(result.parent)
+            spent = ran.get("timing") or {}
+            first = spent.get("first_token") or {}
             rows.append(
                 {
                     "task": data.get("task_name") or result.parent.name.rsplit("__", 1)[0],
@@ -40,6 +47,11 @@ def trials(job_dirs: list[str]) -> list[dict]:
                     "output": agent.get("n_output_tokens"),
                     "cost": agent.get("cost_usd"),
                     "seconds": seconds(timing),
+                    "rounds": ran.get("rounds"),
+                    "model_seconds": spent.get("model_seconds"),
+                    "tool_seconds": spent.get("tool_seconds"),
+                    "first_token": (first["seconds"] / first["count"]) if first.get("count") else None,
+                    "cache_misses": (ran.get("cache_misses") or {}).get("count"),
                 }
             )
     return rows
@@ -68,6 +80,10 @@ def mean(values):
     return sum(values) / len(values) if values else None
 
 
+def minutes(seconds):
+    return None if seconds is None else seconds / 60
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("jobs", nargs="+")
@@ -93,6 +109,11 @@ def main() -> None:
                 "output": mean(r["output"] for r in rs),
                 "cost": mean(r["cost"] for r in rs),
                 "minutes": (mean(r["seconds"] for r in rs) or 0) / 60,
+                "rounds": mean(r["rounds"] for r in rs),
+                "model_minutes": minutes(mean(r["model_seconds"] for r in rs)),
+                "tool_minutes": minutes(mean(r["tool_seconds"] for r in rs)),
+                "first_token_seconds": mean(r["first_token"] for r in rs),
+                "cache_misses": mean(r["cache_misses"] for r in rs),
             }
         )
     if a.csv:
@@ -121,13 +142,30 @@ def main() -> None:
     cost = sum(t["cost"] or 0 for t in table)
     print(f"Per task: {tokens / 1000:.0f}K tokens with cache reads, "
           f"{mean(t['minutes'] for t in table):.1f} min; cost ${cost:.2f} in all.\n")
-    print("| Task | Runs | Reward | Oracle | Error | Tokens | Minutes |")
-    print("|---|---|---|---|---|---|---|")
+    # Where the time went, for a build whose result line says: an older
+    # build's table is as it was.
+    timed = any(t["model_minutes"] is not None for t in table)
+    if timed:
+        waited = mean(t["first_token_seconds"] for t in table)
+        misses = sum(t["cache_misses"] or 0 for t in table)
+        print(f"Of that, per task: {mean(t['model_minutes'] for t in table):.1f} min waiting on "
+              f"the model ({waited or 0:.1f} s to a reply's first words) and "
+              f"{mean(t['tool_minutes'] for t in table) or 0:.1f} min in tools; "
+              f"{misses:.0f} cache misses in all.\n")
+    more = " Rounds | Model min | Tools min | First words s | Cache misses |" if timed else ""
+    print("| Task | Runs | Reward | Oracle | Error | Tokens | Minutes |" + more)
+    print("|---|---|---|---|---|---|---|" + ("---|---|---|---|---|" if timed else ""))
+    num = lambda v, f: "" if v is None else format(v, f)  # noqa: E731
     for t in table:
         tok = ((t["input"] or 0) + (t["output"] or 0)) / 1000
         orc = "" if t["oracle"] is None else f"{t['oracle']:.0f}"
+        more = ""
+        if timed:
+            more = (f" {num(t['rounds'], '.0f')} | {num(t['model_minutes'], '.1f')} "
+                    f"| {num(t['tool_minutes'], '.1f')} | {num(t['first_token_seconds'], '.1f')} "
+                    f"| {num(t['cache_misses'], '.0f')} |")
         print(f"| {t['task']} | {t['runs']} | {t['reward']:.2f} | {orc} | {t['errors']} "
-              f"| {tok:.0f}K | {t['minutes']:.1f} |")
+              f"| {tok:.0f}K | {t['minutes']:.1f} |" + more)
 
 
 if __name__ == "__main__":

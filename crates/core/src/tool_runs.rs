@@ -62,6 +62,17 @@ pub fn exit_code(message: &Message) -> Option<i32> {
     (code != 0 && (after.is_empty() || after.starts_with("\n\n["))).then_some(code)
 }
 
+/// Whether a command's result says it was still running at its limit and
+/// carries on as a background job. It has no exit code yet, so it is neither
+/// a failure nor proof that anything passed: a test suite moved this way
+/// used to count as one that ran clean, and a run that had changed files
+/// was let end with nothing checked.
+pub fn moved(message: &Message) -> bool {
+    message.name == "run_command"
+        && (message.content.split_once(tools::SO_FAR))
+            .is_some_and(|(said, _)| said.contains(tools::MOVED))
+}
+
 /// Whether a reply shows nothing between tool rows: it only asked for tools,
 /// with no words, and its thinking is hidden or empty.
 pub fn silent(message: &Message, thinking: bool) -> bool {

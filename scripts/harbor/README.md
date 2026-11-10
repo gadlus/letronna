@@ -36,6 +36,7 @@ container localhost is the container.
 | `max_rounds` | Tool rounds for the task, 250 by default as SWE-bench Pro's scaffold allows; `-p` alone stops at 25. |
 | `tools` | Only these tools, such as `read_file,list_dir,search,write_file,edit_file,apply_patch,run_command` for SWE tasks. |
 | `deadline_margin` | Seconds Letronna's deadline is set short of the trial's agent timeout, 120 by default; never more than half of it. |
+| `streams` | `1` keeps every request's body and its reply's stream as they came (`LETRONNA_DUMP_STREAMS`), for settling whether a tool call that arrived wrong was sent so. They hold all the model was sent and run to many megabytes a trial, so leave it off for a whole run. |
 
 The release's `letronna-linux-x64` is built on Ubuntu 22.04 against glibc
 2.35, so it does not start on images with an older glibc. Install then fails
@@ -75,6 +76,11 @@ refuses commands that are hard to take back, such as `rm -r`,
 `git reset --hard`, `sudo` or `curl ... | sh`, even with `--yes`; in a
 container thrown away after the trial that would fail tasks that need them,
 so `LETRONNA_DISPOSABLE=1` says the machine is thrown away and they run.
+`LETRONNA_DISPOSABLE_FILES=1` says its files are thrown away with it: once a
+run has read a web page or one of the task's own documents, Letronna holds
+back anything that deletes or writes over a file the run did not make,
+which in a task whose work is to move or fill in its inputs is the task.
+With it those run; nothing that sends data off the machine does.
 What Letronna never runs, it still refuses. `drive.sh` still allows any
 request for approval that does come.
 
@@ -86,6 +92,8 @@ The trial's `agent/` folder then holds:
   copied out after the run; the data folder itself stays behind, as it holds
   the key
 - `trajectory.json`: the session as ATIF v1.7, with token totals and cost
+- `streams/`, with `--ak streams=1`: one `.sse` file a request, its body
+  and then each line of the reply as the provider sent it, never a header
 
 ## The trajectory
 
@@ -143,7 +151,41 @@ overlay had no `UV_HTTP_TIMEOUT`, cannot be resumed by this one or by
 `harbor job resume`: finish it with the kit it began with, or start a new
 job name. `tb2/triage.py JOB` says, for each trial that lost points, how
 Letronna's run ended, the tests the verifier failed and the start of its
-answer.
+answer, and counts the signs of Letronna's own handling in its sessions:
+how often it was sent back for stopping short or for a call written as
+text, had a reply stopped for thinking, a call refused or arrive with no
+arguments, a command moved to the background, or was stopped going round
+in circles. `--signs OUT.csv` writes those counts for every trial, passed
+or not, so a run's failures sort into those worth reading for each. They
+are what Letronna did, not why the trial failed.
+
+From a build whose result line says where its time went, the report adds
+each task's rounds, minutes waiting on the model and in tools, seconds to
+a reply's first words and cache misses, and their means above the table.
+
+### Two builds on the same tasks
+
+`TB2_TASKS=<file>` runs only the tasks a file names, one a line with `#`
+for a comment; those among the four large ones still run alone. The tasks
+are part of the config Harbor locks a job to, so a job name already begun
+keeps the file it began with.
+`tb2/subsets/dev.txt` is a dozen tasks where, on 19-20 October, what
+Letronna did decided at least one model's trial while at least two models
+passed, and says of each which handling that was.
+
+```sh
+scripts/harbor/tb2/pair.sh guard-fix /path/to/letronna-before /path/to/letronna-after
+```
+
+`pair.sh` runs `run.sh` twice with the relay, the model and everything
+else the same, `NAME-base` then `NAME-candidate`, on `TB2_TASKS` or the
+dev subset, and ends with `tb2/pair.py`'s table: each task's reward,
+tokens and minutes under both builds, the tasks the candidate gained and
+lost, and `NAME-pair.csv`. `pair.py --base JOB... --candidate JOB...`
+pairs two runs already made. One trial a task says little: a task or two
+either way is noise, so read which tasks moved and their triage, and run
+each side more than once (`-k 3` after `--`) before believing a
+difference.
 
 All 89 images take 49 GB compressed, so `tb2/janitor.py` removes each
 task's image once its trial is done, and again after a rerun pulls it
@@ -218,6 +260,7 @@ cd scripts/harbor && python3 -m unittest discover -s tests
 `test_drive.py` runs `drive.sh` under `sh` against a stand-in for Letronna,
 `test_atif.py` converts session folders laid out as Letronna writes them,
 and `test_tb2.py` runs the relay against a stand-in provider and checks the
-janitor's bookkeeping, the spend, the trials set aside and the report.
+janitor's bookkeeping, the spend, the trials set aside, the report, the
+pairing of two runs and the signs triage counts.
 `test_agent.py`, and the converter's check against Harbor's own ATIF models,
 run only where `harbor` can be imported.

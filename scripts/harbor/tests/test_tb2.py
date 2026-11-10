@@ -541,6 +541,126 @@ class ReportTests(unittest.TestCase):
             self.assertIn("| gamma | 1 | 0.00 | 1 | AgentTimeoutError | 1K | 6.0 |", out)
             self.assertEqual(len((root / "out.csv").read_text().splitlines()), 4)
 
+    def test_a_build_that_says_where_its_time_went_has_it_in_the_table(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / "run" / "alpha__1"
+            (folder / "agent").mkdir(parents=True)
+            result = {
+                "task_name": "alpha",
+                "verifier_result": {"rewards": {"reward": 1.0}},
+                "agent_result": {"n_input_tokens": 1000, "n_output_tokens": 100},
+                "agent_execution": {
+                    "started_at": "2026-10-15T10:00:00+00:00",
+                    "finished_at": "2026-10-15T10:06:00+00:00",
+                },
+            }
+            (folder / "result.json").write_text(json.dumps(result))
+            line = {
+                "type": "result", "status": "done", "rounds": 12,
+                "cache_misses": {"count": 2, "lost_tokens": 9000},
+                "timing": {
+                    "requests": 13, "model_seconds": 180.0, "tool_seconds": 90.0,
+                    "first_token": {"count": 12, "seconds": 30.0, "slowest_seconds": 6.0},
+                },
+            }
+            (folder / "agent" / "letronna.jsonl").write_text(
+                json.dumps(line, separators=(",", ":")) + "\n"
+            )
+            out = subprocess.run(
+                [sys.executable, str(TB2 / "report.py"), str(Path(temp) / "run")],
+                capture_output=True, text=True, check=True,
+            ).stdout
+            self.assertIn(
+                "Of that, per task: 3.0 min waiting on the model (2.5 s to a reply's first "
+                "words) and 1.5 min in tools; 2 cache misses in all.", out)
+            self.assertIn("| alpha | 1 | 1.00 |  |  | 1K | 6.0 | 12 | 3.0 | 1.5 | 2.5 | 2 |", out)
+
+
+class PairTests(unittest.TestCase):
+    def test_two_builds_are_set_side_by_side_task_by_task(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+
+            def trial(job, task, reward, tokens):
+                folder = root / job / f"{task}__1"
+                folder.mkdir(parents=True)
+                result = {
+                    "task_name": task,
+                    "verifier_result": {"rewards": {"reward": reward}},
+                    "agent_result": {"n_input_tokens": tokens, "n_output_tokens": 0},
+                    "agent_execution": {
+                        "started_at": "2026-10-15T10:00:00+00:00",
+                        "finished_at": "2026-10-15T10:04:00+00:00",
+                    },
+                }
+                (folder / "result.json").write_text(json.dumps(result))
+
+            for task, base, candidate in (("alpha", 1.0, 1.0), ("beta", 0.0, 1.0), ("gamma", 1.0, 0.0)):
+                trial("base", task, base, 4000)
+                trial("cand", task, candidate, 2000)
+            trial("cand", "delta", 1.0, 2000)
+            out = subprocess.run(
+                [sys.executable, str(TB2 / "pair.py"), "--base", str(root / "base"),
+                 "--candidate", str(root / "cand"), "--csv", str(root / "pair.csv")],
+                capture_output=True, text=True, check=True,
+            ).stdout
+            self.assertIn("**3 tasks under both builds.** Passed: base 2, candidate 2.", out)
+            self.assertIn("Gained 1 (beta); lost 1 (gamma).", out)
+            self.assertIn("Per task, tokens with cache reads: base 4.0K, candidate 2.0K.", out)
+            self.assertIn("Under one build only, and left out of the above: delta.", out)
+            self.assertIn("| beta | 0.00 | 1.00 | gained | 4K/2K | 4.0/4.0 |", out)
+            self.assertIn("| delta |  | 1.00 | candidate only | K/2K | /4.0 |", out)
+            self.assertEqual(len((root / "pair.csv").read_text().splitlines()), 5)
+
+
+class TriageTests(unittest.TestCase):
+    def test_the_signs_of_letronnas_own_handling_are_counted_from_a_trials_sessions(self):
+        import triage
+
+        with tempfile.TemporaryDirectory() as temp:
+            trial = Path(temp) / "alpha__1"
+            sessions = trial / "agent" / "letronna" / "sessions"
+            sessions.mkdir(parents=True)
+            moved = ("Still running after 120s, so it carries on in the background as job #3 "
+                     "instead of being stopped. Output so far:\nbuilding")
+            records = [
+                {"role": "user", "content": "Fix the build."},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"function": {"name": "read_file", "arguments": ""}},
+                    {"function": {"name": "list_dir", "arguments": "{}"}},
+                    {"function": {"name": "run_command", "arguments": "{\"command\": \"make\"}"}},
+                ]},
+                {"role": "tool", "name": "read_file", "content":
+                    "The call's arguments arrived empty, so nothing ran: `path` is required."},
+                # A tool not known to need arguments is counted by its result.
+                {"role": "tool", "name": "apply_patch", "content":
+                    "The call's arguments arrived empty, so nothing ran: `patch` is required."},
+                {"role": "tool", "name": "run_command", "content": moved},
+                {"role": "tool", "name": "run_command", "content":
+                    "Refused: this session has read text someone other than the user may have written"},
+                # What a command printed is its own words, not Letronna's.
+                {"role": "tool", "name": "run_command", "content":
+                    "log: so it carries on in the background as job #9"},
+                {"role": "assistant", "content": "Found it \u2014 fixing it and re-checking"},
+                {"role": "user", "notice": True, "content": "Continue now."},
+                {"role": "user", "notice": True, "content":
+                    "Your last reply thought for 90 s without writing anything, so it was stopped"},
+                {"role": "user", "content": "Continue now."},
+            ]
+            (sessions / "1.jsonl").write_text("\n".join(json.dumps(r) for r in records) + "\nnot json\n")
+            self.assertEqual(triage.signs(trial), {
+                "sent back for stopping short": 1,
+                "calls written as text": 0,
+                "replies stopped for thinking": 1,
+                "calls refused by the gate": 1,
+                # read_file's once, at its call, though its result says so
+                # too; apply_patch's by its result.
+                "calls with empty arguments": 2,
+                "commands moved to the background": 1,
+                "stopped going round in circles": 0,
+            })
+            self.assertEqual(sum(triage.signs(Path(temp) / "none__1").values()), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

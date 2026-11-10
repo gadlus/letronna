@@ -629,7 +629,11 @@ pub(crate) const ALIASES: &[(&str, &str, &[&str])] = &[
     ("bash_id", "id", &["read_job"]),
     ("shell_id", "id", &["stop_job"]),
     ("job_id", "job", &["wait", "send_job"]),
-    ("id", "job", &["send_job"]),
+    ("id", "job", &["wait", "send_job"]),
+    // The job tools name the job two ways, `job` to wait for and type into
+    // and `id` to read and stop, and a run that leaves them to find_tools
+    // has only a job's start to go by: either name reaches each of them.
+    ("job", "id", &["read_job", "stop_job"]),
 ];
 
 /// Renames another agent's name for a parameter of tool `name` to Letronna's,
@@ -952,6 +956,33 @@ pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> 
     result
 }
 
+/// What a call to `tool` is told when its arguments arrived with nothing in
+/// them and the tool cannot do without some. Each tool then named the one
+/// field it looked for first, as it does for a call that left one out,
+/// which reads as a slip in that field: a model whose calls reach Letronna
+/// emptied, as one did in a quarter of the replies where it made several at
+/// once, sent the same call again. Said once for the whole call, it knows
+/// that nothing of what it wrote arrived.
+fn arrived_empty(tool: &dyn Tool, args: &Value) -> Option<String> {
+    if !args.as_object().is_some_and(|fields| fields.is_empty()) {
+        return None;
+    }
+    let schema = tool.parameters();
+    let required: Vec<String> = (schema["required"].as_array()?.iter())
+        .filter_map(Value::as_str)
+        .map(|name| format!("`{name}`"))
+        .collect();
+    let needs = match required.as_slice() {
+        [] => return None,
+        [one] => format!("{one} is required"),
+        [rest @ .., last] => format!("{} and {last} are required", rest.join(", ")),
+    };
+    Some(format!(
+        "The call's arguments arrived empty, so nothing ran: {needs}. Send the call again \
+         with its arguments."
+    ))
+}
+
 /// `run` for a tool already found: what every call goes through.
 pub(crate) fn run_found(
     tool: &dyn Tool,
@@ -979,6 +1010,10 @@ pub(crate) fn run_found(
     // The gate refuses these before any card, but a call can get here
     // without it; refuse again rather than trust the caller.
     if let Some(why) = crate::gate::refusal(tool, &args, ctx) {
+        return Err(why);
+    }
+    // After the gate, so a call it turns down is not asked for again.
+    if let Some(why) = arrived_empty(tool, &args) {
         return Err(why);
     }
     // After the gate, so a hook sees only a call that would run, and can
@@ -2344,10 +2379,10 @@ const PIPE_NAMES: [&str; 2] = ["stdout", "stderr"];
 
 /// What the first line of a command's result says, as `run_shell_into`
 /// words it, when the command carried on in the background at its limit.
-const MOVED: &str = "so it carries on in the background as job #";
+pub(crate) const MOVED: &str = "so it carries on in the background as job #";
 /// Where the result of a command moved to the background turns from what to
 /// do about the job to what the command printed.
-const SO_FAR: &str = " Output so far:\n";
+pub(crate) const SO_FAR: &str = " Output so far:\n";
 
 fn run_shell_into(
     mut cmd: std::process::Command,
@@ -2577,16 +2612,17 @@ fn run_shell_into(
             None => format!(
                 "Still running after {}s, so it carries on in the background as job \
                  #{id} instead of being stopped. A notice comes when it exits; call \
-                 wait with job {id} to wait for it, read_job to read what it \
-                 prints, or stop_job if you no longer need it.{SO_FAR}",
+                 wait with job {id} to wait for it, read_job with id {id} to read \
+                 what it prints, or stop_job with id {id} if you no longer need \
+                 it.{SO_FAR}",
                 limit.as_secs()
             ),
             // The user wants the turn to go on, so it is not waited for.
             Some(Cut::Asked) => format!(
                 "Still running after {:.0}s, {}, so it carries on in the background as \
                  job #{id}. Go on with the next step rather than wait for it: a notice \
-                 comes when it exits, read_job reads what it prints, and stop_job ends \
-                 it.{SO_FAR}",
+                 comes when it exits, read_job with id {id} reads what it prints, and \
+                 stop_job with id {id} ends it.{SO_FAR}",
                 started.elapsed().as_secs_f64(),
                 Cut::Asked.when()
             ),
@@ -2598,7 +2634,7 @@ fn run_shell_into(
             Some(cut) => format!(
                 "Still running after {:.0}s, {}, so it carries on in the background as \
                  job #{id} instead of being stopped. Call wait with job {id} if you need \
-                 what it makes, or stop_job {id} if not.{SO_FAR}",
+                 what it makes, or stop_job with id {id} if not.{SO_FAR}",
                 started.elapsed().as_secs_f64(),
                 cut.when()
             ),
@@ -3066,7 +3102,7 @@ impl Tool for WriteFile {
         format!("Write {}:\n{content}", path_arg(args))
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
-        let path = resolve_write_or_scratch(path_arg(args), ctx)?;
+        let path = resolve_write_or_scratch(named_path(args, "write")?, ctx)?;
         let content = args["content"].as_str().ok_or("`content` is required.")?;
         check_document(&path, content)?;
         let change = crate::filestate::overwrite(ctx.conversation, &path, path_arg(args))?;
@@ -3206,7 +3242,7 @@ impl Tool for EditFile {
         format!("Edit {}:\n{}", path_arg(args), self.preview(args, ctx))
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
-        let path = resolve_write_or_scratch(path_arg(args), ctx)?;
+        let path = resolve_write_or_scratch(named_path(args, "edit")?, ctx)?;
         let edits = edits(args)?;
         // A mistyped path is told apart from a new file before the error
         // sends the model to write_file for one.
@@ -3423,8 +3459,12 @@ impl Tool for RunCommand {
                 max: ctx.caller.keeps.unwrap_or(MAX_OUTPUT),
                 save,
             };
+            // What the line's own redirections are about to make, which is
+            // the session's to write over or delete afterwards (taint.rs).
+            let fresh = crate::taint::fresh(crate::gate::write_targets(args, ctx));
             // Last before it runs, so as little as can be falls between.
             let watch = crate::snapshot::watch(command, &dir, cwd, ctx);
+            let ran = Instant::now();
             let out = if ctx.sandboxed {
                 run_sandboxed(command, cwd, &ctx.added, &dir, &ctx.cancel, keeping, limit)
             } else {
@@ -3436,6 +3476,10 @@ impl Tool for RunCommand {
             let moved = first.is_some_and(|line| line.contains(MOVED));
             if let Some(watch) = watch {
                 watch.after(moved);
+            }
+            // One moved to the background is still writing: not told yet.
+            if !moved {
+                fresh.made(ctx);
             }
             let note = crate::filestate::note(ctx.conversation, before, cwd);
             // A note means a file moved while it ran, so nothing is sure.
@@ -3449,7 +3493,7 @@ impl Tool for RunCommand {
                     let ends = stopped_with_run(ctx) + SO_FAR;
                     Ok(note + &text.replacen(SO_FAR, &ends, 1))
                 }
-                Ok(text) => Ok(note + &text),
+                Ok(text) => Ok(note + &text + &time_left(ctx, ran.elapsed())),
                 Err(e) => Err(note + &e),
             };
         }
@@ -3502,7 +3546,7 @@ impl Tool for RunCommand {
 /// How a program is started so that it outlives the run, in the shell
 /// `run_command` runs. The run ends its jobs' process groups, or on Windows
 /// their Job Objects, as it ends, and no other command's.
-const DETACHED: &str = if cfg!(windows) {
+pub(crate) const DETACHED: &str = if cfg!(windows) {
     "Start-Process"
 } else if cfg!(target_os = "linux") {
     "setsid nohup CMD > LOG 2>&1 &"
@@ -3510,6 +3554,37 @@ const DETACHED: &str = if cfg!(windows) {
     // macOS has no setsid; run as a command rather than a job, this is enough.
     "nohup CMD > LOG 2>&1 &"
 };
+
+/// How long a command of a run with a deadline takes before its result
+/// says how much of the run's time is left.
+#[cfg(not(test))]
+const LONG_COMMAND: Duration = Duration::from_secs(60);
+/// A fraction of a second in tests, so one says it without a minute's wait.
+#[cfg(test)]
+const LONG_COMMAND: Duration = Duration::from_millis(300);
+
+/// What ends the result of a command that `took` a long while in a run with
+/// a deadline: how long it took and how much of the run is left. A run is
+/// told its time once, as it starts, and the warning comes at four fifths
+/// of it; in between it has only its own count, and runs gave up saying
+/// they were out of time with half an hour to go, or started a second long
+/// build with minutes left. In brackets after a blank line, where the exit
+/// code's line still reads as the command's last.
+fn time_left(ctx: &ToolContext, took: Duration) -> String {
+    let deadline = (ctx.caller.connection.as_deref()).and_then(|connection| connection.deadline);
+    let Some(deadline) = deadline.filter(|_| took >= LONG_COMMAND) else {
+        return String::new();
+    };
+    let left = deadline.saturating_duration_since(Instant::now()).as_secs();
+    let left = match left {
+        0..120 => format!("{left} s"),
+        _ => format!("{} minutes", left / 60),
+    };
+    format!(
+        "\n\n[It ran for {} s. About {left} of this run's time are left.]",
+        took.as_secs()
+    )
+}
 
 /// What a job started in `ctx` is told after it is said to run, when the run
 /// stops its jobs as it ends, as `-p` does: a server the task wants left up
@@ -4736,6 +4811,18 @@ pub(crate) fn path_arg(args: &Value) -> &str {
     args["path"].as_str().unwrap_or(".")
 }
 
+/// The file a tool is `to` read, write or edit, which it cannot do without.
+/// Left out, `path_arg` names the project folder, and read_file answered
+/// only that `.` is a folder: nothing in that says an argument was missing,
+/// and a model that sent the call with none sent it again, until the run
+/// was stopped for going round in circles.
+fn named_path<'a>(args: &'a Value, to: &str) -> Result<&'a str, String> {
+    args["path"]
+        .as_str()
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| format!("`path` is required: the file to {to}."))
+}
+
 struct ReadFile;
 impl Tool for ReadFile {
     fn name(&self) -> &'static str {
@@ -4758,7 +4845,7 @@ impl Tool for ReadFile {
         }, "required": ["path"]})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
-        let raw = path_arg(args);
+        let raw = named_path(args, "read")?;
         let path = resolve(raw, ctx).map_err(|e| e + &similar(raw, ctx))?;
         let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
         let limit = args["limit"].as_u64().unwrap_or(u64::MAX).max(1) as usize;
@@ -5837,6 +5924,38 @@ mod tests {
     }
 
     #[test]
+    fn a_file_tool_called_without_a_path_says_which_argument_is_missing() {
+        let dir = std::env::temp_dir().join(format!("letronna-no-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        // Not "`.` is a folder", which a model that left the path out read
+        // as a wrong path and answered with the same empty call.
+        for args in [json!({}), json!({"path": ""}), json!({"path": "  "})] {
+            assert_eq!(
+                ReadFile.run(&args, &ctx).unwrap_err(),
+                "`path` is required: the file to read.",
+                "{args}"
+            );
+        }
+        assert_eq!(
+            WriteFile.run(&json!({"content": "a"}), &ctx).unwrap_err(),
+            "`path` is required: the file to write."
+        );
+        assert_eq!(
+            EditFile
+                .run(&json!({"old": "a", "new": "b"}), &ctx)
+                .unwrap_err(),
+            "`path` is required: the file to edit."
+        );
+        // list_dir still lists the project when it names no folder.
+        assert!(ListDir.run(&json!({}), &ctx).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn listing_a_file_points_to_read_file() {
         let dir = std::env::temp_dir().join(format!("letronna-list-file-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -6890,6 +7009,45 @@ mod tests {
     }
 
     #[test]
+    fn a_job_tool_takes_the_job_by_either_of_its_names() {
+        // read_job and stop_job call it `id`, wait and send_job `job`, and a
+        // run that left them to find_tools has no schema to say which.
+        for (tool, sent, taken) in [
+            ("read_job", "job", "id"),
+            ("stop_job", "job", "id"),
+            ("wait", "id", "job"),
+            ("send_job", "id", "job"),
+        ] {
+            let mut args = json!({ sent: 3 });
+            rename_aliases(tool, &mut args);
+            assert_eq!(args, json!({ taken: 3 }), "{tool}");
+        }
+    }
+
+    #[test]
+    fn a_call_whose_arguments_arrived_empty_is_told_so_once_for_all_of_them() {
+        let ctx = ToolContext::default();
+        for sent in ["", "{}", "  "] {
+            assert_eq!(
+                run("write_file", sent, &ctx).unwrap_err(),
+                "The call's arguments arrived empty, so nothing ran: `path` and `content` \
+                 are required. Send the call again with its arguments.",
+                "{sent:?}"
+            );
+        }
+        assert_eq!(
+            run("read_file", "{}", &ctx).unwrap_err(),
+            "The call's arguments arrived empty, so nothing ran: `path` is required. Send the \
+             call again with its arguments."
+        );
+        // One that only left a field out is told which, as before, and a
+        // tool that needs none runs.
+        let partly = run("write_file", r#"{"path": "a.txt"}"#, &ctx).unwrap_err();
+        assert!(!partly.contains("arrived empty"), "{partly}");
+        assert!(arrived_empty(&ListDir, &json!({})).is_none());
+    }
+
+    #[test]
     fn every_alias_leads_from_a_name_its_tool_lacks_to_one_it_has() {
         for (theirs, ours, names) in ALIASES {
             for name in *names {
@@ -7210,7 +7368,10 @@ mod tests {
         assert_eq!(so_far.trim_end(), "before");
         // Named, as the jobs' tools are offered only on demand.
         assert!(
-            said.contains("or stop_job if you no longer need it."),
+            said.contains(&format!(
+                "read_job with id {id} to read what it prints, or stop_job with id {id} if \
+                 you no longer need it."
+            )),
             "{said}"
         );
 
@@ -7394,6 +7555,60 @@ mod tests {
     }
 
     #[test]
+    fn a_long_command_of_a_run_with_a_deadline_says_how_much_time_is_left() {
+        let (dir, mut ctx) = workspace_with("time-left", "x");
+        let timed = |seconds: u64| {
+            Some(Arc::new(Connection {
+                deadline: Some(Instant::now() + Duration::from_secs(seconds)),
+                ..Default::default()
+            }))
+        };
+        let slow = if cfg!(windows) {
+            "Start-Sleep -Milliseconds 500; echo done"
+        } else {
+            "sleep 0.5; echo done"
+        };
+        let slow = json!({ "command": slow }).to_string();
+        ctx.caller.connection = timed(1_800);
+        let out = run("run_command", &slow, &ctx).unwrap();
+        let (printed, note) = out.split_once("\n\n[").expect(&out);
+        assert_eq!(printed.trim_end(), "done");
+        assert!(
+            note.starts_with("It ran for 0 s. About 29 minutes of"),
+            "{note}"
+        );
+        // Seconds once there are few, and nothing after a quick command or
+        // in a run with no deadline.
+        ctx.caller.connection = timed(90);
+        let out = run("run_command", &slow, &ctx).unwrap();
+        assert!(out.contains(" s of this run's time are left.]"), "{out}");
+        let quick = json!({ "command": "echo done" }).to_string();
+        assert_eq!(run("run_command", &quick, &ctx).unwrap().trim_end(), "done");
+        ctx.caller.connection = None;
+        assert_eq!(run("run_command", &slow, &ctx).unwrap().trim_end(), "done");
+        // A failing command's code is still read as its last line.
+        ctx.caller.connection = timed(1_800);
+        let failing = if cfg!(windows) {
+            "Start-Sleep -Milliseconds 500; exit 3"
+        } else {
+            "sleep 0.5; exit 3"
+        };
+        let out = run(
+            "run_command",
+            &json!({ "command": failing }).to_string(),
+            &ctx,
+        )
+        .unwrap();
+        let result = crate::chat::Message {
+            name: "run_command".into(),
+            content: out,
+            ..Default::default()
+        };
+        assert_eq!(crate::tool_runs::exit_code(&result), Some(3));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_command_moved_to_the_background_in_a_print_run_says_the_run_stops_it() {
         let command = if cfg!(windows) {
             "Start-Sleep 30"
@@ -7402,14 +7617,15 @@ mod tests {
         };
         let args = json!({"command": command, "timeout": 1}).to_string();
         let said = run("run_command", &args, &in_run(7_705, true)).unwrap();
-        crate::jobs::stop(moved_job(&said, "1s").0).unwrap();
+        let id = moved_job(&said, "1s").0;
+        crate::jobs::stop(id).unwrap();
         let (told, _) = said.split_once(SO_FAR).unwrap();
         assert!(
             told.ends_with(&format!(
-                "or stop_job if you no longer need it. Background jobs are stopped when this \
-                 run ends; if it must keep running after that, start it detached instead, in a \
-                 plain run_command and not as a job, as with `{DETACHED}`, and check that it \
-                 answers."
+                "or stop_job with id {id} if you no longer need it. Background jobs are stopped \
+                 when this run ends; if it must keep running after that, start it detached \
+                 instead, in a plain run_command and not as a job, as with `{DETACHED}`, and \
+                 check that it answers."
             )),
             "{said}"
         );
@@ -7542,7 +7758,8 @@ mod tests {
         assert!(note.starts_with("Still running after "), "{note}");
         assert!(
             note.contains(&format!(
-                "Call wait with job {id} if you need what it makes, or stop_job {id} if not"
+                "Call wait with job {id} if you need what it makes, or stop_job with id {id} \
+                 if not"
             )),
             "{note}"
         );
@@ -7576,7 +7793,10 @@ mod tests {
             .unwrap_or_else(|| panic!("{said}"));
         crate::jobs::stop(id).unwrap();
         assert!(Instant::now() < now + Duration::from_secs(6), "{note}");
-        assert!(note.contains(&format!("or stop_job {id} if not")), "{note}");
+        assert!(
+            note.contains(&format!("or stop_job with id {id} if not")),
+            "{note}"
+        );
     }
 
     /// Where the exit notice of a job of `owner`'s comes from, once the job
@@ -7626,7 +7846,10 @@ mod tests {
             .and_then(|(id, _)| id.parse().ok())
             .unwrap_or_else(|| panic!("{said}"));
         crate::jobs::stop(id).unwrap();
-        assert!(note.contains(&format!("or stop_job {id} if not")), "{note}");
+        assert!(
+            note.contains(&format!("or stop_job with id {id} if not")),
+            "{note}"
+        );
         assert_eq!(so_far.trim_end(), "before");
         // Left for the turn to take once the call is over.
         let taken = crate::inbox::take(7_711, true);
@@ -7685,8 +7908,9 @@ mod tests {
             .and_then(|(id, _)| id.parse().ok())
             .unwrap_or_else(|| panic!("{said}"));
         crate::jobs::stop(id).unwrap();
-        let what_to_do =
-            format!("Call wait with job {id} if you need what it makes, or stop_job {id} if not.");
+        let what_to_do = format!(
+            "Call wait with job {id} if you need what it makes, or stop_job with id {id} if not."
+        );
         assert_eq!(told.matches(&what_to_do).count(), 1, "{said}");
         assert_eq!(
             told.matches("stopped when this run ends").count(),

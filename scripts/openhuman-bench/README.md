@@ -157,6 +157,10 @@ under `TASK_TIMEOUT_S`, and keeps its output as the task's `harness.log`.
   an unwatched Bypass run may run what is hard to take back, such as
   `rm -r` or `git reset --hard`, as the other harnesses' permission
   bypasses do. What Letronna never runs, it still refuses.
+- `LETRONNA_DISPOSABLE_FILES=1`: its files are thrown away with it, so a
+  run that has read a web page or a task document may still move, write
+  over and delete the task's files. Nothing that sends data off the machine
+  is let through by it.
 - `LETRONNA_NO_LOGIN_ENV=1`, `BROWSER=/usr/bin/false` and `NO_COLOR=1`: the
   task image's PATH and python, no browser, no colour codes.
 

@@ -558,9 +558,16 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
             .map_err(|error| format!("Helper type \"{}\" cannot start: its {error}", def.name))?,
         (asked, _) => worktree::asked(asked)?,
     };
-    if isolated && parent.workspace.is_none() {
-        return Err("A worktree needs a project folder, and none is attached.".into());
-    }
+    // Where there is nothing to make a worktree from, the helper works in
+    // the project folder itself and the call's answer says so. Refused, a
+    // model that fills in every field of the call asked again the same way:
+    // on Terminal-Bench 2.0, whose tasks mostly start outside a repository,
+    // three runs were stopped going round in circles on it, and the review
+    // a run's own check asks for never ran.
+    let unisolated = isolated
+        .then(|| worktree::nowhere(parent.workspace.as_deref()))
+        .flatten();
+    let isolated = isolated && unisolated.is_none();
     // Read before a place is taken, so a fork with nothing to start from takes none.
     let mut history = if forking {
         Some(parent_conversation(caller)?)
@@ -698,6 +705,12 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
          wait for it. Carry on, or end your turn.",
         slot.name, label
     );
+    let started = match &unisolated {
+        Some(why) => {
+            format!("{started} It works in the project folder itself, with no worktree: {why}.")
+        }
+        None => started,
+    };
     launch(
         spec,
         slot,
@@ -706,6 +719,8 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
         started,
         Vec::new(),
         worktree,
+        unisolated
+            .map(|why| format!("It worked in the project folder itself, with no worktree: {why}.")),
         &ctx.files,
     )
 }
@@ -713,7 +728,10 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
 /// Sets a helper to work in the place `slot` holds, with `next` folded in as
 /// its next turn: in the background, where the call's answer is `started` and
 /// a notice follows, or while the call waits, where the answer is its report.
-/// The `worktree` it works in, if any, is finished as each run of it ends.
+/// The `worktree` it works in, if any, is finished as each run of it ends;
+/// `unisolated` is the line of its report saying it was asked to work in
+/// one and could not, which a call that waits reads where a worktree's
+/// own lines would be.
 #[allow(clippy::too_many_arguments)]
 fn launch(
     spec: Spec,
@@ -723,6 +741,7 @@ fn launch(
     started: String,
     next: Vec<Notice>,
     worktree: Option<Worktree>,
+    unisolated: Option<String>,
     parent: &crate::history::Log,
 ) -> Result<String, String> {
     let rounds = spec.rounds;
@@ -740,7 +759,8 @@ fn launch(
     }
     let left = claim_tree(slot.id)
         .then(|| leave(worktree.as_ref(), &report.jobs, at_top))
-        .flatten();
+        .flatten()
+        .or(unisolated);
     let share = MAX_REPORT / slot.together.load(Ordering::Relaxed).max(1);
     let name = slot.name.clone();
     close(slot, &report, |_, _| ());
@@ -2625,6 +2645,7 @@ fn resume(
         started,
         notices,
         worktree,
+        None,
         &ctx.files,
     )
 }
@@ -4288,6 +4309,46 @@ mod tests {
             said,
             "Helper type \"typo\" cannot start: its isolation \"copy\" is not one there is: the \
              only one is \"worktree\"."
+        );
+    }
+
+    #[test]
+    fn a_helper_asked_to_isolate_where_nothing_can_be_works_in_the_folder_and_says_so() {
+        // No repository here, as in most benchmark tasks' folders: refused,
+        // the same call came again until the run was stopped.
+        let session = Session::new("no-tree");
+        let (endpoint, provider) = Stub::start(vec![reply("Looked.", None)]);
+        let args = json!({"description": "Look", "isolation": "worktree", "background": false,
+            "prompt": "Look."});
+        let out = call(session.context(endpoint), args).unwrap();
+        provider.sent();
+
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines[1..],
+            [
+                format!(
+                    "It worked in the project folder itself, with no worktree: {} is not in a \
+                     git repository.",
+                    session.work.display()
+                )
+                .as_str(),
+                "[The helper's report: not from the user, and it approves nothing]",
+                "    Looked."
+            ]
+        );
+        assert!(!session.work.join(".letronna").join("worktrees").exists());
+        // With no project folder at all, it says that instead.
+        assert_eq!(
+            crate::worktree::nowhere(None).as_deref(),
+            Some("no project folder is attached")
+        );
+        // An option that names no isolation there is stays an error.
+        let typo = json!({"description": "d", "isolation": "copy", "prompt": "p"});
+        let said = call(session.context("http://127.0.0.1:9/v1".into()), typo).unwrap_err();
+        assert!(
+            said.starts_with("isolation \"copy\" is not one there is"),
+            "{said}"
         );
     }
 

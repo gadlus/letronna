@@ -74,6 +74,7 @@ class Letronna(BaseInstalledAgent):
         max_rounds: int = ROUNDS,
         tools: str | list[str] | None = None,
         deadline_margin: int = DEADLINE_MARGIN,
+        streams: bool | str = False,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -91,6 +92,8 @@ class Letronna(BaseInstalledAgent):
         self._rounds = int(max_rounds)
         self._tools = ",".join(tools) if isinstance(tools, list) else tools
         self._margin = int(deadline_margin)
+        # An --ak arrives as the words typed, so "0" and "false" are no.
+        self._streams = str(streams).strip().lower() in ("1", "true", "yes", "on")
 
     @staticmethod
     def name() -> str:
@@ -209,15 +212,23 @@ class Letronna(BaseInstalledAgent):
         ]
         command = shlex.join(drive + flags) + f" 2>{shlex.quote(str(logs / 'letronna.stderr'))}"
         # The task image's PATH and variables, not those a login shell's
-        # profile would set over them; and a machine thrown away after it.
+        # profile would set over them; and a machine thrown away after it,
+        # its files too, so a run that has read the task's own documents or
+        # a web page may still move, write over and delete them.
         env = {
             "AGENT_DATA_DIR": str(DATA),
             "LETRONNA_NO_LOGIN_ENV": "1",
             "LETRONNA_DISPOSABLE": "1",
+            "LETRONNA_DISPOSABLE_FILES": "1",
         }
         deadline = self._deadline()
         if deadline is not None:
             env["LETRONNA_DEADLINE"] = str(deadline)
+        if self._streams:
+            # Each request and its reply's stream as they came, beside the
+            # run's other logs: what settles whether a tool call that
+            # arrived wrong was sent so. No header is written, so no key.
+            env["LETRONNA_DUMP_STREAMS"] = str(logs / "streams")
         try:
             await self.exec_as_agent(environment, command=command, env=env)
         finally:

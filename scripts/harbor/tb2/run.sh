@@ -23,6 +23,10 @@
 #                   charges reach them, and no more trials start
 #   TB2_RERUNS      how many times a task is run again when the infrastructure
 #                   cost its trial, as aside.py judges (2)
+#   TB2_TASKS       a file naming the tasks to run, one a line, with # for a
+#                   comment; unset, all of them. subsets/dev.txt is a dozen
+#                   that Letronna's own handling has decided, for comparing
+#                   two builds (pair.sh) without a whole run
 #
 # Running this again resumes both jobs, setting aside and rerunning their
 # cancelled trials; `harbor job resume -p TB2_WORK/jobs/JOB` resumes one.
@@ -144,6 +148,18 @@ trap 'exit 130' INT
 common=(-o "$work/jobs" --extra-docker-compose "$overlay" -q "${agent[@]}")
 skip=() only=()
 for t in "${alone[@]}"; do skip+=(-x "$t"); only+=(-i "$t"); done
+# Only the tasks a file names: those among `alone` still one at a time in
+# the second job, the rest in the first, and a job with none is not run.
+if [ -n "${TB2_TASKS:-}" ]; then
+  [ -r "$TB2_TASKS" ] || { echo "TB2_TASKS: cannot read $TB2_TASKS" >&2; exit 1; }
+  skip=() only=()
+  while IFS= read -r t || [ -n "$t" ]; do
+    t=$(printf '%s' "${t%%#*}" | tr -d '[:space:]')
+    [ -n "$t" ] || continue
+    if printf '%s\n' "${alone[@]}" | grep -qxF -- "$t"; then only+=(-i "$t"); else skip+=(-i "$t"); fi
+  done <"$TB2_TASKS"
+  [ $((${#skip[@]} + ${#only[@]})) -gt 0 ] || { echo "TB2_TASKS: $TB2_TASKS names no task" >&2; exit 1; }
+fi
 judged=()
 if [ "${TB2_AGENT:-}" != oracle ]; then
   for m in "${meters[@]}"; do judged+=(--meter "$m"); done
@@ -191,12 +207,23 @@ phase() {
   done
 }
 
-echo "$(date -u +%FT%TZ) $job: ${#alone[@]} tasks alone after the rest $n at a time"
-phase "$job" "${skip[@]}" -n "$n" "$@"
-phase "$job-alone" "${only[@]}" -n 1 --environment-build-timeout-multiplier "${TB2_ALONE_START:-4}" "$@"
+if [ -n "${TB2_TASKS:-}" ]; then
+  echo "$(date -u +%FT%TZ) $job: the $((${#skip[@]} / 2 + ${#only[@]} / 2)) tasks $TB2_TASKS names"
+else
+  echo "$(date -u +%FT%TZ) $job: ${#alone[@]} tasks alone after the rest $n at a time"
+fi
+reported=()
+if [ -z "${TB2_TASKS:-}" ] || [ ${#skip[@]} -gt 0 ]; then
+  phase "$job" "${skip[@]}" -n "$n" "$@"
+  reported+=("$work/jobs/$job")
+fi
+if [ -z "${TB2_TASKS:-}" ] || [ ${#only[@]} -gt 0 ]; then
+  phase "$job-alone" "${only[@]}" -n 1 --environment-build-timeout-multiplier "${TB2_ALONE_START:-4}" "$@"
+  reported+=("$work/jobs/$job-alone")
+fi
 echo "$(date -u +%FT%TZ) $job done"
 # A run halted before any trial ended has no report, but still its spend.
 status=0
-python3 "$here/report.py" "$work/jobs/$job" "$work/jobs/$job-alone" || status=$?
+python3 "$here/report.py" "${reported[@]}" || status=$?
 [ "${TB2_AGENT:-}" = oracle ] || python3 "$here/spend.py" "${meters[@]}"
 exit "$status"

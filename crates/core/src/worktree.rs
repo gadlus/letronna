@@ -150,6 +150,26 @@ pub fn asked(isolation: &Value) -> Result<bool, String> {
     }
 }
 
+/// Why no worktree can be made from `workspace` for want of anything to make
+/// one from: no project folder, a folder in no git repository (or no git to
+/// ask), or a repository with no commit yet. `None` when `create` can be
+/// tried, whose own refusals are of another kind: a repository whose main
+/// folder git does not name, too many worktrees left, a path too long.
+pub fn nowhere(workspace: Option<&Path>) -> Option<String> {
+    let Some(workspace) = workspace else {
+        return Some("no project folder is attached".into());
+    };
+    if git(workspace, &["rev-parse", "--git-dir"]).is_err() {
+        return Some(format!(
+            "{} is not in a git repository",
+            workspace.display()
+        ));
+    }
+    git(workspace, &["rev-parse", "--verify", "HEAD"])
+        .is_err()
+        .then(|| "its repository has no commit yet".to_owned())
+}
+
 /// Makes a worktree named for `name` in the repository `workspace` is in,
 /// from its HEAD and on a branch of its own; a name already taken gets the
 /// first free number after it.
