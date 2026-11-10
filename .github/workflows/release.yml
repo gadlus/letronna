@@ -42,7 +42,7 @@ jobs:
           - os: ubuntu-22.04
             target: linux-x64
             exe: ""
-          - os: macos-14
+          - os: macos-15
             target: macos-arm64
             exe: ""
     runs-on: ${{ matrix.os }}
