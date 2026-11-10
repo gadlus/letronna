@@ -507,7 +507,9 @@ pub fn run_keeping(mut spec: Spec) -> (Report, Transcript) {
     // Edits are checked by `unchecked_edits` as the run ends, which names
     // the files, rather than by the turn's own reminder: both would send a
     // run back twice for the same edits.
-    let mut turn = Turn::with_limit(spec.connection.clone(), spec.rounds).unattended();
+    let mut turn = Turn::with_limit(spec.connection.clone(), spec.rounds)
+        .unattended()
+        .for_helper(spec.depth > 0);
     let mut report = Report {
         status: Outcome::Done,
         text: String::new(),
@@ -692,7 +694,15 @@ fn steps(
             .as_ref()
             .is_some_and(|budget| budget.check().is_err())
         {
-            return Ok(Outcome::OverBudget);
+            // A helper stopped here mid-work has said nothing its parent can
+            // use, so it is asked once for its report, with no tools; the
+            // reply to that ends it, whatever it holds.
+            if turn.spent() || !spared(spec, read) {
+                return Ok(Outcome::OverBudget);
+            }
+            let ask = turn.budget_spent();
+            spec.transcript.conversation.messages.push(ask);
+            save(&mut spec.transcript)?;
         }
         if let Some(mut text) = time_warning(spec, &mut warned) {
             text.push_str(&still_to_make(&noted));
@@ -825,6 +835,9 @@ fn steps(
             // terminal: mail or a Stop hook sending it back would undo the
             // limit, and unread mail goes on to the owner. A run that starts
             // wrapped up, as a quick look does, never reached a cap.
+            if turn.spent() {
+                return Ok(Outcome::OverBudget);
+            }
             if turn.capped().is_some() && !spec.connection.wrap_up {
                 return Ok(Outcome::RoundLimit);
             }
@@ -1212,6 +1225,11 @@ fn steps(
         if spec.depth > 0 && (spec.connection.deadline).is_some_and(|at| Instant::now() >= at) {
             turn.time_up();
         }
+        // Calls made in place of the report asked for run no more than ones
+        // made in the wrap-up at the cap.
+        if turn.spent() {
+            return Ok(Outcome::OverBudget);
+        }
         if capped || !turn.begin(calls) {
             return at_limit(spec, report);
         }
@@ -1234,6 +1252,32 @@ fn steps(
             return Ok(Outcome::Failed(why.to_owned()));
         }
     }
+}
+
+/// Whether a helper whose budget is spent may make one more request, for its
+/// report: what it found is lost to the agent that started it otherwise,
+/// whoever watches the session, and that agent then does the work again. Not
+/// before its first request, `read` being what its last one read, when it has
+/// nothing to report; not with a schema, whose answer is a call; and only
+/// while the request fits what `Budget::spares` allows past the limit. The
+/// request is counted as the last one's prompt read again in full, as on a
+/// provider whose cache serves none of it, with what was added since and the
+/// longest reply any request asks for.
+fn spared(spec: &Spec, read: u64) -> bool {
+    if spec.depth == 0 || spec.schema.is_some() || read == 0 || spec.connection.wrap_up {
+        return false;
+    }
+    let messages = &spec.transcript.conversation.messages;
+    let replied = messages
+        .iter()
+        .rposition(|message| message.role == "assistant")
+        .unwrap_or(messages.len());
+    // The reply by what the provider counted of it, which holds its calls.
+    let since: usize = (messages[replied..].iter())
+        .map(|message| chat::tokens(&message.content).max(message.tokens as usize))
+        .sum();
+    let cost = read + since as u64 + chat::MAX_REPLY_TOKENS as u64;
+    (spec.budget.as_ref()).is_some_and(|budget| budget.spares(cost))
 }
 
 /// Runs the hooks at the start of a session's own run on its prompt, the
@@ -6622,6 +6666,146 @@ pub(crate) mod tests {
             (last["name"].as_str(), last["content"].as_str()),
             (Some("structured_output"), Some("Answer received."))
         );
+    }
+
+    /// A review's budget with all but 500 tokens of it spent, as the requests
+    /// before the ones a test's provider answers would have left it.
+    fn nearly_spent(limit: u64) -> Arc<Budget> {
+        let budget = Arc::new(Budget::new(limit, None));
+        budget.charge(&Message {
+            prompt_tokens: limit - 500,
+            ..Default::default()
+        });
+        budget
+    }
+
+    /// Rows as a review's report ends with them.
+    const ROWS: &str = "Checked two so far.\nR1 | a | PASS\nR2 | b | FAIL | cargo test";
+
+    #[test]
+    fn a_helper_out_of_budget_is_asked_once_for_its_report_with_no_tools() {
+        let dir = scratch("budget-report");
+        let (endpoint, provider) = provider(vec![
+            reply("Reading first.", &[read_notes()]),
+            reply(ROWS, &[]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 2_010);
+        let budget = nearly_spent(1_000_000);
+        spec.budget = Some(budget.clone());
+        let report = finished(spec);
+        let sent = provider.sent();
+
+        // Still told as out of budget, with the report its parent reads.
+        assert_eq!(report.status, Outcome::OverBudget);
+        assert_eq!(report.text, ROWS);
+        assert!(crate::requirements::tabled(&report.text));
+        assert_eq!(sent.len(), 2);
+        // The tools are still offered, so the cached prefix holds, but none
+        // may be used, and the call made before the stop kept its result.
+        assert_eq!(sent[0].get("tool_choice"), None);
+        assert_eq!(sent[1]["tool_choice"], "none");
+        let offered = |body: &Value| body["tools"].as_array().map_or(0, Vec::len);
+        assert!(offered(&sent[1]) > 0);
+        assert_eq!(results(&sent[1]), ["1|hello from the notes"]);
+        let asked = messages(&sent[1]).last().unwrap()["content"].to_string();
+        assert!(
+            asked.contains("Your token budget for this task is spent"),
+            "{asked}"
+        );
+        assert!(asked.contains("keep every row or finding"), "{asked}");
+        // The request before, the 500 left, and the report's own request.
+        assert_eq!(budget.spent(), 1_000_000 - 500 + 2 * 1_050);
+    }
+
+    #[test]
+    fn the_request_for_a_report_is_the_last_whatever_comes_back() {
+        // Calls in place of the report, which a server that ignores the
+        // tool choice may send, and a report cut off at the output limit:
+        // neither is followed by another request, which would find nobody.
+        let replies = [
+            reply("Still reading.", &[read_notes()]),
+            cut("R1 | a | PASS", None),
+        ];
+        for (at, last) in replies.into_iter().enumerate() {
+            let dir = scratch("budget-last");
+            let (endpoint, provider) =
+                provider(vec![reply("Reading first.", &[read_notes()]), last]);
+            let mut spec = spec(endpoint, &dir, AGENTS + 2_020 + at as u64);
+            spec.budget = Some(nearly_spent(1_000_000));
+            let report = finished(spec);
+            assert_eq!(report.status, Outcome::OverBudget, "{at}");
+            assert_eq!(provider.sent().len(), 2, "{at}");
+            let kept = written(&dir.join("helper.jsonl"));
+            let ran = kept.iter().filter(|message| message["role"] == "tool");
+            assert_eq!(ran.count(), 1, "{at}");
+        }
+    }
+
+    #[test]
+    fn no_report_is_asked_for_that_would_take_the_budget_far_past_its_limit() {
+        let dir = scratch("budget-bound");
+        // Only one answer: a second call would find nobody and fail the run.
+        let (endpoint, provider) = provider(vec![reply("Reading first.", &[read_notes()])]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 2_030);
+        // One more request may write 32,000 tokens, more than the quarter
+        // past its limit a budget of 100,000 spares.
+        let budget = nearly_spent(100_000);
+        spec.budget = Some(budget.clone());
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::OverBudget);
+        assert_eq!(report.text, "Reading first.");
+        assert_eq!(provider.sent().len(), 1);
+        assert_eq!(budget.spent(), 100_000 - 500 + 1_050);
+    }
+
+    #[test]
+    fn a_helper_that_reports_by_itself_is_asked_for_nothing_more() {
+        // With budget to spare, and with an answer that itself spends the
+        // last of it.
+        let budgets = [
+            Arc::new(Budget::new(1_000_000, None)),
+            nearly_spent(1_000_000),
+        ];
+        for (at, budget) in budgets.into_iter().enumerate() {
+            let dir = scratch("budget-reported");
+            let (endpoint, provider) = provider(vec![reply(ROWS, &[])]);
+            let mut spec = spec(endpoint, &dir, AGENTS + 2_040 + at as u64);
+            spec.budget = Some(budget);
+            let report = finished(spec);
+            let sent = provider.sent();
+            assert_eq!(report.status, Outcome::Done, "{at}");
+            assert_eq!(report.text, ROWS);
+            assert_eq!(sent.len(), 1, "{at}");
+            assert_eq!(sent[0].get("tool_choice"), None);
+        }
+    }
+
+    #[test]
+    fn a_sessions_own_run_out_of_budget_is_not_asked_for_a_report() {
+        let dir = scratch("budget-own");
+        let (endpoint, provider) = provider(vec![reply("Reading first.", &[read_notes()])]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 2_060);
+        spec.depth = 0;
+        spec.budget = Some(nearly_spent(1_000_000));
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::OverBudget);
+        assert_eq!(provider.sent().len(), 1);
+    }
+
+    #[test]
+    fn a_helper_at_its_round_cap_is_asked_for_its_report_and_a_session_for_a_summary() {
+        for (depth, words) in [(1, "Write your report now"), (0, "Summarize what is done")] {
+            let dir = scratch("cap-report");
+            let (endpoint, provider) = capped_after_one_round();
+            let mut spec = spec(endpoint, &dir, AGENTS + 2_070 + depth as u64);
+            spec.depth = depth;
+            spec.rounds = 1;
+            finished(spec);
+            let sent = provider.sent();
+            let asked = messages(&sent[2]).last().unwrap()["content"].to_string();
+            assert!(asked.contains("reached the tool-round limit"), "{asked}");
+            assert!(asked.contains(words), "{asked}");
+        }
     }
 
     /// A provider that makes the same call twice, then wraps up in prose.

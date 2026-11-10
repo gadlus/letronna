@@ -11,6 +11,14 @@
 //! since what a reply costs is only known once it has arrived; so a tree can
 //! finish a little past its limit, by at most one reply per agent still
 //! running, and the refusal says by how much.
+//!
+//! A request the provider read uncached is charged in full even where its
+//! prompt only grew since the one before, which a working cache would have
+//! served: the tokens were billed, and from here a cache that failed cannot
+//! be told from a provider that has none or an entry that ran out, for both
+//! of which a tenth would let a tree cost ten times its limit. A helper that
+//! such a day stops early is not left empty-handed instead: `spares` lets
+//! one last request through for its report.
 
 use crate::chat::Message;
 use std::sync::Arc;
@@ -19,6 +27,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Providers bill a prompt-cache hit at about a tenth of fresh input, so a
 /// cached token spends a tenth of one here.
 const CACHED_SHARE: u64 = 10;
+
+/// How far past its limit a helper's last request, for its report, may take
+/// its own budget: a quarter, which a long conversation read once more
+/// uncached fits in, and little beside what was spent to get there.
+const SPARE_SHARE: u64 = 4;
 
 pub struct Budget {
     limit: u64,
@@ -76,6 +89,16 @@ impl Budget {
             }
         }
         Ok(())
+    }
+
+    /// Whether one more request costing up to `tokens` may go out though
+    /// this budget is spent, for a helper's report: only while no budget
+    /// above it is spent, and while the request would leave this one no more
+    /// than a quarter past its limit.
+    pub fn spares(&self, tokens: u64) -> bool {
+        let ceiling = self.limit.saturating_add(self.limit / SPARE_SHARE);
+        self.spent().saturating_add(tokens) <= ceiling
+            && (self.parent.as_deref()).is_none_or(|parent| parent.check().is_ok())
     }
 }
 
@@ -146,6 +169,49 @@ mod tests {
         let counted_beside = Budget::new(1_000_000, None);
         counted_beside.charge(&reply(100, 1_830, 0));
         assert_eq!(counted_beside.spent(), 100 + 183);
+    }
+
+    #[test]
+    fn a_prompt_read_again_uncached_is_charged_in_full() {
+        // The second request sends the first again with a little more, and
+        // the provider serves none of it from its cache: billed in full, so
+        // charged in full, as a provider with no cache at all would be.
+        let budget = Budget::new(1_000_000, None);
+        budget.charge(&reply(40_000, 0, 500));
+        budget.charge(&reply(41_000, 0, 500));
+        assert_eq!(budget.spent(), 40_500 + 41_500);
+
+        let served = Budget::new(1_000_000, None);
+        served.charge(&reply(40_000, 0, 500));
+        served.charge(&reply(41_000, 40_000, 500));
+        assert_eq!(served.spent(), 40_500 + 1_000 + 4_000 + 500);
+    }
+
+    #[test]
+    fn a_last_request_is_spared_only_a_quarter_past_the_limit() {
+        let budget = Budget::new(1_000_000, None);
+        budget.charge(&reply(1_030_000, 0, 0));
+        assert!(budget.check().is_err());
+        assert!(budget.spares(100_000));
+        assert!(budget.spares(220_000));
+        assert!(!budget.spares(220_001));
+
+        // Once charged, the same request is not spared a second time.
+        budget.charge(&reply(150_000, 0, 0));
+        assert!(!budget.spares(100_000));
+    }
+
+    #[test]
+    fn nothing_is_spared_past_a_budget_above() {
+        let root = Arc::new(Budget::new(10_000, None));
+        let helper = Budget::new(4_000, Some(root.clone()));
+        helper.charge(&reply(4_100, 0, 0));
+        assert!(helper.spares(500));
+
+        let sibling = Budget::new(8_000, Some(root.clone()));
+        sibling.charge(&reply(6_000, 0, 0));
+        assert!(root.check().is_err());
+        assert!(!helper.spares(500));
     }
 
     #[test]

@@ -714,7 +714,7 @@ pub(crate) const REPLY_TOKENS: usize = 8_192;
 /// for the reply is room the window cannot use, and some gateways hold
 /// credit against all of it before the reply starts. 32,000 is a long file
 /// written in one call.
-const MAX_REPLY_TOKENS: usize = 32_000;
+pub(crate) const MAX_REPLY_TOKENS: usize = 32_000;
 
 /// How much of a conversation one request carries, in estimated tokens
 /// unless said otherwise.

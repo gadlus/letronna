@@ -186,6 +186,19 @@ const WRAP_UP: &str = "You have reached the tool-round limit. Summarize what is 
 const TIME_UP: &str = "Your time for this task is up. Give your answer now, in the form the \
     task asks for, from what you have found.";
 
+/// The notice at a helper's round cap in place of `WRAP_UP`: what it writes
+/// next is all the agent that started it reads, so it is asked for its
+/// report rather than a summary of what is done.
+const REPORT_NOW: &str = "You have reached the tool-round limit. Write your report now, in the \
+    form the task asks for, from what you have found: keep every row or finding you have, and \
+    say what you did not get to rather than guess.";
+
+/// The notice once a helper's token budget is spent, sent as at the round
+/// cap: the tools still offered and none allowed.
+const BUDGET_SPENT: &str = "Your token budget for this task is spent, so no more tools can be \
+    called. Write your report now, in the form the task asks for, from what you have found: \
+    keep every row or finding you have, and say what you did not get to rather than guess.";
+
 /// The answer a call gets when the turn is stopped while it runs; the front
 /// end that stopped it records it before `Turn::stop`. The call may have
 /// done part of its work, so the model is told to look first.
@@ -387,6 +400,11 @@ pub struct Turn {
     /// Its time is up, so the next round asks for the wrap-up as the round
     /// cap does.
     timed_out: bool,
+    /// Its budget is spent, and its report was asked for as at the round cap.
+    spent: bool,
+    /// A helper's turn, whose last word is its report to the agent that
+    /// started it.
+    helper: bool,
 }
 
 impl Turn {
@@ -423,12 +441,41 @@ impl Turn {
             one_at_a_time: !crate::store::parallel_tool_calls(),
             reads_together: crate::store::experiments().parallel_read_commands,
             timed_out: false,
+            spent: false,
+            helper: false,
         }
     }
 
     /// Ends the turn as the round cap does, at its next round: its time is up.
     pub fn time_up(&mut self) {
         self.timed_out = true;
+    }
+
+    /// Ends the turn as the round cap does, with its next request: its budget
+    /// is spent, and the notice handed back, to go after the conversation so
+    /// far, asks for its report with no tools.
+    pub fn budget_spent(&mut self) -> Message {
+        self.spent = true;
+        self.connection.wrap_up = true;
+        Message {
+            role: "user".into(),
+            content: BUDGET_SPENT.into(),
+            notice: true,
+            // It ends the turn it is in, as the notice at the round cap does.
+            folded: true,
+            ..Default::default()
+        }
+    }
+
+    /// Whether the turn was asked for its report because its budget is spent.
+    pub fn spent(&self) -> bool {
+        self.spent
+    }
+
+    /// The same turn as a helper's when `on`, asked at its round cap for its
+    /// report rather than a summary.
+    pub fn for_helper(self, on: bool) -> Self {
+        Self { helper: on, ..self }
     }
 
     /// The same turn, ended by a call it keeps repeating whatever its
@@ -751,7 +798,12 @@ impl Turn {
             }
             self.results.push(Message {
                 role: "user".into(),
-                content: (if self.timed_out { TIME_UP } else { WRAP_UP }).into(),
+                content: match (self.timed_out, self.helper) {
+                    (true, _) => TIME_UP,
+                    (false, true) => REPORT_NOW,
+                    (false, false) => WRAP_UP,
+                }
+                .into(),
                 notice: true,
                 // It ends the turn it is in, as a nudge goes on with one.
                 folded: true,
@@ -773,6 +825,7 @@ impl Turn {
     pub fn capped(&self) -> Option<String> {
         self.connection.wrap_up.then(|| match self.timed_out {
             true => "Stopped when its time was up.".to_owned(),
+            false if self.spent => "Stopped when its budget was spent.".to_owned(),
             false => format!(
                 "Stopped after {} rounds; send \"continue\" to keep going.",
                 self.limit
@@ -1847,6 +1900,47 @@ mod tests {
         // Unbroken, the repeats still end it.
         assert!(read(&mut turn).contains("Change your approach"));
         assert!(turn.looping().is_some());
+    }
+
+    #[test]
+    fn a_turn_whose_budget_is_spent_asks_for_the_report_as_at_the_cap() {
+        let mut turn = turn();
+        assert!(turn.begin(vec![call("read_file")]));
+        turn.finish_call(Ok("found".into()));
+        turn.take_results();
+        assert!(!turn.spent());
+        let ask = turn.budget_spent();
+        assert_eq!(
+            (ask.role.as_str(), ask.notice, ask.folded),
+            ("user", true, true)
+        );
+        assert_eq!(ask.content, BUDGET_SPENT);
+        assert!(turn.spent() && turn.connection.wrap_up);
+        assert_eq!(
+            turn.capped().as_deref(),
+            Some("Stopped when its budget was spent.")
+        );
+        // Calls in place of the report are dropped unrun, as in any wrap-up.
+        let mut report = answer(&mut turn, "R1 | a | PASS");
+        report.tool_calls = vec![call("read_file")];
+        assert_eq!(
+            turn.continuation(&mut report).map(|n| n.is_some()),
+            Ok(false)
+        );
+        assert!(report.tool_calls.is_empty());
+        assert!(!turn.begin(vec![call("read_file")]));
+    }
+
+    #[test]
+    fn a_helper_at_its_round_cap_is_asked_for_its_report() {
+        let mut turn = Turn::with_limit(turn().connection, 1).for_helper(true);
+        assert!(turn.begin(vec![call("read_file")]));
+        turn.finish_call(Ok("found".into()));
+        turn.take_results();
+        assert!(turn.begin(vec![call("read_file")]));
+        let sent = turn.take_results();
+        assert_eq!(sent[1].content, REPORT_NOW);
+        assert!(turn.connection.wrap_up && !turn.spent());
     }
 
     #[test]
