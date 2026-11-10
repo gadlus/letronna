@@ -418,13 +418,22 @@ pub(crate) fn brief(
 /// What the run is told when helpers that have not seen its work reviewed or
 /// tested it for the run: the numbered requirements, as `notice` lists them,
 /// the reviewers' `reports` with their tables, or with none the ask for a
-/// review as `notice` makes it, what it is told of the tester's report when
-/// there is one, `tested`, and the check to make after.
-pub(crate) fn reviewed(sentences: &[String], reports: &[String], tested: Option<&str>) -> String {
+/// review as `notice` makes it, after what became of the reviews `lost`,
+/// what it is told of the tester's report when there is one, `tested`, and
+/// the check to make after.
+pub(crate) fn reviewed(
+    sentences: &[String],
+    reports: &[String],
+    tested: Option<&str>,
+    lost: Option<(usize, usize)>,
+) -> String {
     // With no review's table the run still asks for a review itself.
     let mut text = notice(sentences, reports.is_empty(), &[]);
     let at = text.find(CHECK).unwrap_or(text.len());
     text.truncate(at);
+    if let (Some((started, spent)), Some(at)) = (lost, text.find(REVIEW)) {
+        text.insert_str(at, &unreported(started, spent));
+    }
     if !reports.is_empty() {
         text.push_str(
             "Helpers that haven't seen your work reviewed it against the request; their \
@@ -443,6 +452,24 @@ pub(crate) fn reviewed(sentences: &[String], reports: &[String], tested: Option<
     }
     text.push_str(CHECK);
     text
+}
+
+/// What a run is told before it is asked to start a review itself, when
+/// none of the `started` reviews begun for it came back with a table and
+/// their budget stopped `spent` of them: a review that ran out checked
+/// nothing to the end, which is not a review that found nothing wrong.
+fn unreported(started: usize, spent: usize) -> String {
+    let which = match (started, spent) {
+        (1, _) => "The review started for you ran out of budget before reporting".to_owned(),
+        (n, spent) if spent == n => {
+            format!("The {n} reviews started for you ran out of budget before reporting")
+        }
+        (n, spent) => format!(
+            "{spent} of the {n} reviews started for you ran out of budget before reporting, \
+             and the rest gave no table"
+        ),
+    };
+    format!("{which}, so nothing is reviewed yet: that is not a pass. ")
 }
 
 /// How many requirements `text` numbers, when it is the notice `notice`
@@ -1364,7 +1391,7 @@ mod tests {
             .map(String::from)
             .into();
         let reports = ["review-r1 finished: 3 rounds.\nR1 | iso | PASS\nR2 | utc | FAIL | t.sh"];
-        let text = reviewed(&rules, &reports.map(String::from), None);
+        let text = reviewed(&rules, &reports.map(String::from), None, None);
         assert!(text.starts_with(&notice(&rules, false, &[])[..60]));
         assert_eq!(listed(&text), Some(2));
         assert!(text.contains("Helpers that haven't seen your work reviewed it"));
@@ -1379,10 +1406,42 @@ mod tests {
             .map(String::from)
             .into();
         let tested = "A tester wrote tests.\nR1 | iso | FAIL | t.sh | got None";
-        let text = reviewed(&rules, &[], Some(tested));
+        let text = reviewed(&rules, &[], Some(tested), None);
         assert!(text.contains(REVIEW), "{text}");
         assert!(!text.contains("Helpers that haven't seen your work reviewed it"));
         assert!(text.contains(&format!("{tested}\n\n{CHECK}")), "{text}");
+    }
+
+    #[test]
+    fn reviews_that_ran_out_of_budget_are_not_told_as_reviews_that_found_nothing() {
+        let rules: Vec<String> = ["Dates must parse.", "Times must parse."]
+            .map(String::from)
+            .into();
+        let plain = notice(&rules, true, &[]);
+        let all = reviewed(&rules, &[], None, Some((2, 2)));
+        let said = "The 2 reviews started for you ran out of budget before reporting, so \
+                    nothing is reviewed yet: that is not a pass. ";
+        // Said once, just before the ask for a review, with the rest as it was.
+        assert_eq!(all, plain.replacen(REVIEW, &format!("{said}{REVIEW}"), 1));
+        assert_eq!(listed(&all), Some(2));
+        assert!(!tabled(&all));
+
+        let one = reviewed(&rules, &[], None, Some((1, 1)));
+        assert!(
+            one.contains("\nThe review started for you ran out of budget before reporting, so"),
+            "{one}"
+        );
+        let some = reviewed(&rules, &[], None, Some((3, 1)));
+        assert!(
+            some.contains(
+                "\n1 of the 3 reviews started for you ran out of budget before reporting, \
+                 and the rest gave no table, so nothing is reviewed yet: that is not a pass. \
+                 First ask a helper"
+            ),
+            "{some}"
+        );
+        // With nothing known of how they ended, the ask stands alone.
+        assert_eq!(reviewed(&rules, &[], None, None), plain);
     }
 
     #[test]

@@ -2757,12 +2757,12 @@ fn requirements(
     // Started for the run, so the brief holds what the run's own tends to
     // leave out and each helper is of the type that judges by the request;
     // the run asks for one itself only where none came back with a table.
-    let (reports, tested) = match review && outputs.is_empty() {
+    let (reports, tested, lost) = match review && outputs.is_empty() {
         true => reviews(spec, typed, &found),
         false => Default::default(),
     };
-    let content = match reports.is_empty() && tested.is_none() {
-        false => crate::requirements::reviewed(&found, &reports, tested.as_deref()),
+    let content = match reports.is_empty() && tested.is_none() && lost.is_none() {
+        false => crate::requirements::reviewed(&found, &reports, tested.as_deref(), lost),
         true => crate::requirements::notice(&found, review, &outputs),
     };
     Some(Message {
@@ -3305,14 +3305,18 @@ fn review_report(message: &Message) -> bool {
     message.role == "user" && message.notice && message.content.contains("(review ·")
 }
 
+/// What `reviews` gives: the reports, the tester's, and the reviews lost.
+type Reviewed = (Vec<String>, Option<String>, Option<(usize, usize)>);
+
 /// The reports of review helpers started side by side for a run nobody
 /// watches, each checking its share of `found`, the requirements `request`
 /// states, and a tester's, writing tests from the request alone: the one
 /// started with the run, waited for, or else one started beside the
-/// reviews, all waited for. The reviews that came back with a table, and
-/// the tester's as the run is told it, with where its tests are kept, if it
-/// had one.
-fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option<String>) {
+/// reviews, all waited for. The reviews that came back with a table, the
+/// tester's as the run is told it, with where its tests are kept, if it
+/// had one, and, when no review came back with a table and a budget stopped
+/// some, how many were started and how many of them it stopped.
+fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
     let mut ctx = context(spec);
     // On a run with a deadline the review and the fix after it share the
     // time left evenly: each helper gives its answer at its own deadline,
@@ -3379,7 +3383,7 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
             ..parent.clone()
         }));
     }
-    let (reports, tested, taken) = std::thread::scope(|scope| {
+    let (reports, tested, taken, lost) = std::thread::scope(|scope| {
         let started: Vec<_> = (shares.into_iter())
             .take(afford)
             .map(|share| {
@@ -3413,15 +3417,22 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
         let mut taken = ahead
             .then(|| crate::spec_tests::take(spec.id, wait))
             .flatten();
-        let reports = (started.into_iter())
-            .filter_map(|helper| helper.join().ok()?.ok())
-            .filter(|report| crate::requirements::tabled(report))
+        let answers: Vec<String> = (started.into_iter())
+            .map(|helper| helper.join().ok().and_then(Result::ok).unwrap_or_default())
             .collect();
+        let (reports, untabled): (Vec<String>, Vec<String>) =
+            (answers.into_iter()).partition(|report| crate::requirements::tabled(report));
+        // With no table at all the run is told when a budget was why,
+        // rather than left to think a review found nothing.
+        let spent = (untabled.iter())
+            .filter(|answer| crate::agents::ran_out(answer))
+            .count();
+        let lost = (reports.is_empty() && spent > 0).then_some((untabled.len(), spent));
         if ahead && taken.is_none() {
             taken = crate::spec_tests::take_due(spec.id, wait);
         }
         let tested: Option<String> = tester.and_then(|tester| tester.join().ok()?.ok());
-        (reports, tested, taken)
+        (reports, tested, taken, lost)
     });
     // The tester started with the run: its tests kept from its own folder
     // as ones that have not met the work, and its report as the run is told
@@ -3430,7 +3441,7 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
         let report = report.ok();
         let kept = kept_ahead(spec, &folder, report.as_deref());
         let tested = report.map(|report| crate::spec_tests::told_ahead(&report, kept.as_ref()));
-        return (reports, tested);
+        return (reports, tested, lost);
     }
     // Kept apart whatever the tester reported, so no patch of the project
     // takes them; the run puts them back to run them, and the driver runs
@@ -3468,7 +3479,7 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> (Vec<String>, Option
         true => Some(crate::spec_tests::told(&report, kept.as_ref(), again)),
         false => Some(crate::spec_tests::unrun(&report, kept.as_ref()?, again)),
     });
-    (reports, tested)
+    (reports, tested, lost)
 }
 
 /// The tests of a tester started with the run kept from `folder`, where it

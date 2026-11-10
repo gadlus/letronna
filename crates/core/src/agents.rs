@@ -2136,6 +2136,15 @@ pub(crate) fn fresh_id() -> AgentId {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// How the answer for a helper its budget stopped says so, after its name.
+const OUT_OF_BUDGET: &str = "stopped when the helper budget ran out";
+
+/// Whether `answer`, what the agent tool gave for a helper, says in its
+/// first line that the helper's budget stopped it.
+pub(crate) fn ran_out(answer: &str) -> bool {
+    (answer.lines().next()).is_some_and(|line| line.contains(OUT_OF_BUDGET))
+}
+
 /// What the agent that started a helper hears back: how it went, what it
 /// changed, what became of its worktree as `left` says, and its report quoted
 /// in `share` characters.
@@ -2151,9 +2160,7 @@ fn answer(
         Outcome::RoundLimit => {
             format!("{name} stopped at its {rounds}-round limit; its partial report is below.")
         }
-        Outcome::OverBudget => {
-            format!("{name} stopped when the helper budget ran out; its partial report is below.")
-        }
+        Outcome::OverBudget => format!("{name} {OUT_OF_BUDGET}; its partial report is below."),
         Outcome::Stopped => format!("{name} was stopped; its partial report is below."),
         Outcome::Failed(error) => format!("{name} failed: {error}"),
     };
@@ -3436,6 +3443,32 @@ mod tests {
             text.contains("R20 | the case for requirement 20 | FAIL | node r20.js"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_report_written_out_of_budget_reaches_the_parent_with_its_rows() {
+        let table = "Checked two.\nR1 | a | PASS\nR2 | b | FAIL | cargo test";
+        let spent = report(Outcome::OverBudget, table);
+        let out = answer("review-r1", &spent, ROUNDS, MAX_REPORT, None).unwrap();
+        assert!(
+            out.starts_with(
+                "review-r1 stopped when the helper budget ran out; its partial report is below."
+            ),
+            "{out}"
+        );
+        assert!(crate::requirements::tabled(&out), "{out}");
+        assert!(out.contains("R2 | b | FAIL | cargo test"), "{out}");
+        assert!(ran_out(&out));
+        // Only the first line says how it ended: a report may quote the words.
+        let quoting = format!("It said: {OUT_OF_BUDGET}.");
+        let done = answer(
+            "review-r1",
+            &report(Outcome::Done, &quoting),
+            ROUNDS,
+            MAX_REPORT,
+            None,
+        );
+        assert!(!ran_out(&done.unwrap()));
     }
 
     #[test]
