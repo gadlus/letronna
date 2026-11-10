@@ -701,8 +701,12 @@ fn steps(
             // use, so it is asked once for its report, with no tools; the
             // reply to that ends it, whatever it holds. One stopped for
             // thinking is no reply, and the ask stands for the request
-            // after it, as few as `STOPS_IN_A_ROW` allows.
-            if reported || !(turn.spent() || spared(spec, read)) {
+            // after it. Past `STOPS_IN_A_ROW` no reply is stopped at its
+            // thinking cap, but one can still think its output limit away,
+            // each time a whole prompt read and nothing charged: one more
+            // stop than that ends the run with what it had said.
+            let stalled = turn.spent() && stopped_in_a_row > STOPS_IN_A_ROW;
+            if reported || stalled || !(turn.spent() || spared(spec, read)) {
                 return Ok(Outcome::OverBudget);
             }
             if !turn.spent() {
@@ -3335,6 +3339,25 @@ fn review_report(message: &Message) -> bool {
     message.role == "user" && message.notice && message.content.contains("(review ·")
 }
 
+/// The reviews among `answers`, what the agent tool gave for each helper
+/// started, that hold a table, and with none, when a budget stopped some,
+/// how many were started and how many of them it stopped. A refusal counts
+/// with the answers, to tell one the budget made, and so does what a helper
+/// that failed or was stopped had said: rows it checked before then are
+/// rows checked, under the line saying how it ended.
+fn sorted_reviews(answers: Vec<Result<String, String>>) -> (Vec<String>, Option<(usize, usize)>) {
+    let (reports, untabled): (Vec<String>, Vec<String>) = (answers.into_iter())
+        .map(|answer| answer.unwrap_or_else(|said| said))
+        .partition(|report| crate::requirements::tabled(report));
+    // With no table at all the run is told when a budget was why, rather
+    // than left to think a review found nothing.
+    let spent = (untabled.iter())
+        .filter(|answer| crate::agents::ran_out(answer))
+        .count();
+    let lost = (reports.is_empty() && spent > 0).then_some((untabled.len(), spent));
+    (reports, lost)
+}
+
 /// What `reviews` gives: the reports, the tester's, and the reviews lost.
 type Reviewed = (Vec<String>, Option<String>, Option<(usize, usize)>);
 
@@ -3448,21 +3471,8 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
         let mut taken = ahead
             .then(|| crate::spec_tests::take(spec.id, wait))
             .flatten();
-        // A refusal is kept with the reports, to tell one the budget made.
-        let answers: Vec<String> = (started.into_iter())
-            .map(|helper| match helper.join() {
-                Ok(Ok(report)) | Ok(Err(report)) => report,
-                Err(_) => String::new(),
-            })
-            .collect();
-        let (reports, untabled): (Vec<String>, Vec<String>) =
-            (answers.into_iter()).partition(|report| crate::requirements::tabled(report));
-        // With no table at all the run is told when a budget was why,
-        // rather than left to think a review found nothing.
-        let spent = (untabled.iter())
-            .filter(|answer| crate::agents::ran_out(answer))
-            .count();
-        let lost = (reports.is_empty() && spent > 0).then_some((untabled.len(), spent));
+        let answers = started.into_iter().filter_map(|helper| helper.join().ok());
+        let (reports, lost) = sorted_reviews(answers.collect());
         if ahead && taken.is_none() {
             taken = crate::spec_tests::take_due(spec.id, wait);
         }
@@ -11812,11 +11822,13 @@ pub(crate) mod tests {
         let usage = json!({"choices": [],
             "usage": {"prompt_tokens": 1_000, "completion_tokens": 50}});
         let (endpoint, provider) = streaming(
-            vec![vec![calls, usage], thinking(400), vec![says(ROWS)]],
+            vec![vec![calls, usage], thinking(250), vec![says(ROWS)]],
             Duration::from_millis(20),
         );
         let mut spec = spec(endpoint, &dir, AGENTS + 2_100);
-        spec.connection.deadline = Some(Instant::now() + Duration::from_secs(5));
+        // A cap of 3 s for the stalled reply, which thinks for 5, and time
+        // enough after it that the report's own cap is seconds away.
+        spec.connection.deadline = Some(Instant::now() + Duration::from_secs(10));
         spec.budget = Some(nearly_spent(1_000_000));
         let report = finished(spec);
         assert_eq!(report.status, Outcome::OverBudget);
@@ -11833,6 +11845,69 @@ pub(crate) mod tests {
             })
             .count();
         assert_eq!(asks, 1);
+    }
+
+    #[test]
+    fn a_report_that_keeps_thinking_its_output_limit_away_is_given_up() {
+        let event = |event: Value| format!("data: {event}\n\n");
+        let thought_out = [
+            event(json!({"choices": [{"delta": {"reasoning_content": "Let me think"}}]})),
+            event(json!({"choices": [{"delta": {}, "finish_reason": "length"}]})),
+            "data: [DONE]\n\n".into(),
+        ]
+        .concat();
+        // Once, and the report after it is taken; every time, and the run
+        // ends after one more than `STOPS_IN_A_ROW`: a request after that
+        // would find nobody and fail it.
+        let stalls = [(1, Some(ROWS)), (STOPS_IN_A_ROW as usize + 1, None)];
+        for (at, (times, written)) in stalls.into_iter().enumerate() {
+            let dir = scratch("budget-out-of-room");
+            let mut replies = vec![reply("Reading first.", &[read_notes()])];
+            replies.extend(std::iter::repeat_n(thought_out.clone(), times));
+            replies.extend(written.map(|rows| reply(rows, &[])));
+            let asked = replies.len();
+            let (endpoint, provider) = provider(replies);
+            // A model that takes no longer reply, so none is sent in place
+            // of one that ran out of room.
+            let model = "reports-out-of-room";
+            crate::models::learn(&endpoint, model, crate::models::Limit::Output(4_096));
+            let mut spec = spec(endpoint, &dir, AGENTS + 2_110 + at as u64);
+            spec.connection.model = model.into();
+            // Long enough that no thinking cap comes first.
+            spec.connection.deadline = Some(Instant::now() + Duration::from_secs(10 * 60));
+            spec.budget = Some(nearly_spent(1_000_000));
+            let report = finished(spec);
+            assert_eq!(report.status, Outcome::OverBudget, "{times}");
+            assert_eq!(report.text, written.unwrap_or("Reading first."), "{times}");
+            let sent = provider.sent();
+            assert_eq!(sent.len(), asked, "{times}");
+            assert_eq!(sent[asked - 1]["tool_choice"], "none");
+        }
+    }
+
+    #[test]
+    fn a_failed_reviews_table_counts_and_a_refusal_for_budget_is_told() {
+        let table = "review-r1 failed: The model connection closed unexpectedly.\n\
+                     R1 | a | PASS\nR2 | b | FAIL | cargo test";
+        let refused = "The helper budget is spent (1.0M of 1.0M tokens). Finish the work yourself.";
+        // What a failed or stopped helper had tabled is a review all the same.
+        let (reports, lost) = sorted_reviews(vec![
+            Err(table.into()),
+            Err(refused.into()),
+            Ok("Fine.".into()),
+        ]);
+        assert_eq!((reports, lost), (vec![table.to_owned()], None));
+        // With no table, the ones a budget stopped or refused are counted.
+        let spent = "review-r2 stopped when the helper budget ran out; its partial report is \
+                     below.\n(no answer)";
+        let (reports, lost) = sorted_reviews(vec![
+            Ok(spent.into()),
+            Err(refused.into()),
+            Err("Stopped.".into()),
+        ]);
+        assert_eq!((reports, lost), (Vec::new(), Some((3, 2))));
+        // And with none of them a budget's doing, nothing is said.
+        assert_eq!(sorted_reviews(vec![Err("Stopped.".into())]).1, None);
     }
 
     #[test]
