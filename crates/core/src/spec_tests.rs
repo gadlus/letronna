@@ -1926,17 +1926,23 @@ const ROWS_STAND: &str = "To pass a test, do not take away or move something you
                           by quoting the words.";
 
 /// `words_first` as each notice of a tester's tests says it but the one of
-/// a first version that passed: where the words are silent the run says so,
-/// and `ROWS_STAND` follows.
+/// a first version that passed: `ONE_READING` ahead of it, so the first
+/// notice a run reads of the tests says what they are, and after it, where
+/// the words are silent the run says so, and `ROWS_STAND` follows.
 fn words_and_rows() -> String {
-    format!("{} {ROWS_STAND}", words_first("say so in your answer"))
+    let words = words_first("say so in your answer");
+    format!("{ONE_READING} {words} {ROWS_STAND}")
 }
 
 /// What a notice of a tester's tests tells the run of the tester itself. On
 /// a benchmark run the run took the tester's tests for what its work was
-/// graded by, and undid what a review had passed to suit one.
+/// graded by, and undid what a review had passed to suit one. It says what
+/// decides where the two disagree, not that the tests judge nothing: tests
+/// a run still fails after `RUNS` send-backs choose between its work and a
+/// second attempt.
 const ONE_READING: &str = "The tester can misread the request as you can: its tests are one \
-                           more reading of it, not what your work is judged by.";
+                           more reading of it, and where they and the request's words disagree \
+                           the words decide.";
 
 /// What the report of a tester started ahead of the work tells the run in
 /// place of `WORDS_FIRST`: its tests are read before the work exists, so
@@ -1970,12 +1976,12 @@ fn failed(kept: &Kept, command: &str, outcome: &Result<String, String>) -> Optio
          alone, in a copy of the project with them put back at the paths they are kept from, \
          so nothing in the project was touched: `{command}` {ended}. Its \
          output{left_out}:\n\n{shown}\n\n{others}Fix your work for each test that fails on what the \
-         request's words say, and run the tests again the same way. {ONE_READING} {words} One \
-         that calls the code wrongly, such as with a name or import the request does not spell, \
-         or that fails for want of a fixture, helper or set-up the tester left out, is the \
-         tester's to fix where it is kept, in `{}`, since that is where it is run from; never \
-         something to add to the project. If the command itself cannot run here, run the tests \
-         with the set-up you found works. Then end with your whole answer again.",
+         request's words say, and run the tests again the same way. {words} One that calls the \
+         code wrongly, such as with a name or import the request does not spell, or that fails \
+         for want of a fixture, helper or set-up the tester left out, is the tester's to fix \
+         where it is kept, in `{}`, since that is where it is run from; never something to add \
+         to the project. If the command itself cannot run here, run the tests with the set-up \
+         you found works. Then end with your whole answer again.",
         kept.dir.display()
     ))
 }
@@ -5933,11 +5939,14 @@ mod tests {
             dir: PathBuf::from("/tmp/kept"),
             files: vec!["tests/letronna_spec.test.ts".to_owned()],
         };
+        // The words decide where the two disagree; it does not say the tests
+        // judge nothing, since a second attempt is chosen by them.
         assert_eq!(
             ONE_READING,
             "The tester can misread the request as you can: its tests are one more reading of \
-             it, not what your work is judged by."
+             it, and where they and the request's words disagree the words decide."
         );
+        assert!(!ONE_READING.contains("judged"), "{ONE_READING}");
         assert_eq!(
             ROWS_STAND,
             "To pass a test, do not take away or move something your work does that a review's \
@@ -5946,26 +5955,30 @@ mod tests {
         );
         let report = "R1 | adds | FAIL | npx vitest run x | got []\nRun: npx vitest run x";
         let failing = Ok("FAIL tests/letronna_spec.test.ts\n[exit code 1]".to_owned());
-        // The run hears what the tester is where its tests failed its work,
-        // and where they reach it ahead of the work.
+        // The run hears what the tester is in every notice of its tests,
+        // the report that comes with the reviews first, ahead of the words
+        // rule: where its tests failed the work, where it ran them or could
+        // not, and where they were written ahead of the work.
         let failed = failed(&kept, "npx vitest run x", &failing).unwrap();
         let after = format!("and run the tests again the same way. {ONE_READING} {WORDS_FIRST}");
         assert!(failed.contains(&after), "{failed}");
+        let told = told(report, Some(&kept), true);
+        let after = format!("on what the request's words say. {ONE_READING} {WORDS_FIRST}");
+        assert!(told.contains(&after), "{told}");
+        let unrun = unrun(report, &kept, true);
+        assert!(unrun.contains(&after), "{unrun}");
         let ahead = told_ahead(report, Some(&kept));
         let after = format!("where the request's words say so. {ONE_READING} {WORDS_FIRST_AHEAD}");
         assert!(ahead.contains(&after), "{ahead}");
+        assert_eq!(ahead.matches(ONE_READING).count(), 1, "{ahead}");
         // What a review passed stays in each notice of tests run against the
         // work as a review saw it, after what silence asks.
         let silent = "Where the words are silent on the case, say so in your answer.";
         let stands = format!("{WORDS_FIRST} {silent} {ROWS_STAND}");
-        let notices = [
-            failed,
-            told(report, Some(&kept), true),
-            unrun(report, &kept, true),
-        ];
-        for text in notices {
+        for text in [failed, told, unrun] {
             assert!(text.contains(&stands), "{text}");
             assert_eq!(text.matches(ROWS_STAND).count(), 1, "{text}");
+            assert_eq!(text.matches(ONE_READING).count(), 1, "{text}");
         }
         // Not where a first version passed: there the run puts back what
         // broke the test, which a later review's row may have passed, and

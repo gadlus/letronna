@@ -964,6 +964,16 @@ pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
     if !failed.is_empty() || unclear.is_empty() {
         text.push_str("Fix what fails unless the request rules that case out. ");
     }
+    // A tester's rows are read with a review's where its report came with
+    // the reviews, and "fix the rule behind it" is then said of a test that
+    // may have misread the request, as the notices of its tests say.
+    if !failed.is_empty() {
+        text.push_str(
+            "A failed row that is a tester's test is one more reading of the request: to pass \
+             it, do not take away or move something another row passed, unless the request's \
+             words ask for that. ",
+        );
+    }
     if !unclear.is_empty() {
         text.push_str(
             "A row left unclear is a doubt its reviewer could not settle, not a failure: \
@@ -2452,6 +2462,17 @@ mod tests {
             failed.contains("Fix what fails unless the request rules"),
             "{failed}"
         );
+        // A tester's failed test may be among them, and what another row
+        // passed is not undone for it; rows only left unclear or missing
+        // are told nothing of it.
+        let testers = "Fix what fails unless the request rules that case out. A failed row that \
+                       is a tester's test is one more reading of the request: to pass it, do \
+                       not take away or move something another row passed, unless the request's \
+                       words ask for that. For each failed row you do not fix,";
+        assert!(failed.contains(testers), "{failed}");
+        assert!(!text.contains("a tester's test"), "{text}");
+        let missing = unchecked("R1 | iso | PASS", 2).unwrap();
+        assert!(!missing.contains("a tester's test"), "{missing}");
         assert!(left_open(&failed).is_empty());
         // And one with only rows missing for no line at all.
         let short = unchecked("R1 | a | PASS", 3).unwrap();
