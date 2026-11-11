@@ -32,6 +32,7 @@
 //! are looked up, never the folder walked, and only a file changed since the
 //! run began counts.
 
+use crate::chat::Message;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -753,6 +754,14 @@ const UNCLEAR: &str = "UNCLEAR";
 /// them the run reads the report it already has.
 const FAILED_SHOWN: usize = 10;
 
+/// Rows left unclear a follow-up quotes, counted apart from the failed
+/// ones: counted with them, a long table's doubts all fell under "more".
+const UNCLEAR_SHOWN: usize = 10;
+
+/// Fewest words a quote in a line that settles a row shares with the
+/// request: one word alone, such as "only", is found in most requests.
+const SETTLING: usize = 2;
+
 /// The longest row a follow-up quotes, in characters.
 const ROW_CHARS: usize = 300;
 
@@ -810,18 +819,20 @@ pub(crate) fn cut_rows(report: &str, quote: &str) -> Option<String> {
 
 /// What sends a run back once more when the review's table in `report`
 /// leaves some of the first `count` requirements without a row, or has rows
-/// that failed; None when it covers each and every row passed.
+/// that failed; None when it covers each and every row passed. The failed
+/// rows come first, then the ones left unclear, each kind with a count of
+/// its own, and the run is asked for a line of a set form for each row it
+/// decides rather than fixes, which `unresolved` then looks for.
 pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
     let rows = rows(report);
     let missing: Vec<String> = (1..=count)
         .filter(|number| !rows.iter().any(|(row, _, _)| row == number))
         .map(|number| format!("R{number}"))
         .collect();
-    let failed: Vec<&String> = (rows.iter())
+    let (unclear, failed): (Vec<_>, Vec<_>) = (rows.iter())
         .filter(|(number, passed, _)| !passed && *number <= count)
-        .map(|(_, _, row)| row)
-        .collect();
-    if missing.is_empty() && failed.is_empty() {
+        .partition(|(_, _, row)| left_unclear(row));
+    if missing.is_empty() && failed.is_empty() && unclear.is_empty() {
         return None;
     }
     let brand = crate::BRAND;
@@ -829,24 +840,34 @@ pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
     if !missing.is_empty() {
         text.push_str(&format!("has no row for {}", and_list(&missing)));
     }
-    if !failed.is_empty() {
-        if !missing.is_empty() {
-            text.push_str(", and ");
+    let mut said = !missing.is_empty();
+    let kinds = [
+        (&failed, FAILED_SHOWN, "that failed"),
+        (&unclear, UNCLEAR_SHOWN, "left unclear"),
+    ];
+    for (held, shown, kind) in kinds {
+        if held.is_empty() {
+            continue;
         }
-        let unclear = failed.iter().any(|row| left_unclear(row));
-        text.push_str(match unclear {
-            true => "has these rows that failed or were left unclear:",
-            false => "has these rows that failed:",
+        // The first list goes on from "has no row for"; a second from the
+        // first, which ends its line.
+        text.push_str(match (said, text.ends_with('\n')) {
+            (false, _) => "has these rows ",
+            (true, false) => ", and has these rows ",
+            (true, true) => "and these ",
         });
-        for row in failed.iter().take(FAILED_SHOWN) {
+        text.push_str(&format!("{kind}:"));
+        for (_, _, row) in held.iter().take(shown) {
             let row: String = row.chars().take(ROW_CHARS).collect();
             text.push_str(&format!("\n- {row}"));
         }
-        if failed.len() > FAILED_SHOWN {
-            text.push_str(&format!("\n- and {} more", failed.len() - FAILED_SHOWN));
+        if held.len() > shown {
+            text.push_str(&format!("\n- and {} more {kind}", held.len() - shown));
         }
         text.push('\n');
-    } else {
+        said = true;
+    }
+    if failed.is_empty() && unclear.is_empty() {
         text.push_str(". ");
     }
     if !missing.is_empty() {
@@ -855,7 +876,7 @@ pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
              uses, in every case the table asks for that applies to it. ",
         );
     }
-    if !failed.is_empty() {
+    if !failed.is_empty() || !unclear.is_empty() {
         text.push_str(
             "A failed row stands for its whole case, not only its example: fix the rule behind \
              it, then test one more input of that case written another way, such as one from \
@@ -865,18 +886,115 @@ pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
              and any tests a tester's report says are kept for you, and fix any that now fail. ",
         );
     }
-    if failed.iter().any(|row| left_unclear(row)) {
+    if !unclear.is_empty() {
         text.push_str(
             "A row left unclear is a doubt its reviewer could not settle: decide it by the \
-             request's words, quote them in your answer, and test the case; where they settle \
-             nothing, keep to the reading closest to them and say which you took. ",
+             request's words and test the case. ",
         );
     }
+    text.push_str("Fix what fails unless the request rules that case out. ");
+    if let Some((number, _, _)) = unclear.first().or(failed.first()) {
+        let which = match (unclear.is_empty(), failed.is_empty()) {
+            (false, true) => "each row left unclear above",
+            (false, false) => "each row left unclear above, and each failed row you do not fix",
+            (true, _) => "each failed row you do not fix",
+        };
+        text.push_str(&format!(
+            "For {which}, write one line in your answer, `R{number} | reading taken | \"the \
+             request's words for it\" | command run`, with the words quoted exactly as the \
+             request writes them and a command you ran that tests that reading. That the \
+             request does not say settles nothing: take the reading closest to its words and \
+             quote those. "
+        ));
+    }
     text.push_str(
-        "Fix what fails unless the request rules that case out. Only your last message is \
-         passed on as your answer, so end with your whole answer again, not only what changed.",
+        "Only your last message is passed on as your answer, so end with your whole answer \
+         again, not only what changed.",
     );
     Some(text)
+}
+
+/// The requirements whose rows `text` shows as left unclear, each once,
+/// when it is the notice `unchecked` writes; none for any other text.
+pub(crate) fn left_open(text: &str) -> Vec<usize> {
+    let opening = format!("[{} check] The review's table ", crate::BRAND);
+    if !text.starts_with(&opening) {
+        return Vec::new();
+    }
+    let mut open = Vec::new();
+    for line in text.lines().filter_map(|line| line.strip_prefix("- ")) {
+        for (number, _, row) in rows(line) {
+            if left_unclear(&row) && !open.contains(&number) {
+                open.push(number);
+            }
+        }
+    }
+    open
+}
+
+/// What sends a run back once more when its replies in `messages`, those
+/// after the notice that showed it `rows` left unclear, hold no line for
+/// one of them in the form that notice asked for: a line that opens with
+/// the requirement's number and quotes `SETTLING` or more words in a row
+/// of `request`. None when each has one. A check of words, with no model:
+/// it tells an answer that weighed the request from "unclear; leave".
+pub(crate) fn unresolved(messages: &[Message], request: &str, rows: &[usize]) -> Option<String> {
+    let request: Vec<String> = (crate::doubts::words(request).into_iter())
+        .map(|(_, word)| word)
+        .collect();
+    let lines: Vec<&str> = (messages.iter())
+        .filter(|message| message.role == "assistant")
+        .flat_map(|message| message.content.lines())
+        .collect();
+    let mut open: Vec<String> = Vec::new();
+    for &number in rows {
+        let name = format!("R{number}");
+        let settled = lines.iter().any(|line| settles(line, number, &request));
+        if !settled && !open.contains(&name) {
+            open.push(name);
+        }
+    }
+    let first = open.first()?.clone();
+    let (rows, each) = match open.len() {
+        1 => ("a row", "it"),
+        _ => ("rows", "each"),
+    };
+    Some(format!(
+        "[{} check] The review left {rows} of {} unclear, and your answer has no line for \
+         {each} that quotes the request. Write one line for {each}, `{first} | reading taken | \
+         \"the request's words for it\" | command run`, with the words quoted exactly as the \
+         request writes them and a command you ran that tests that reading; where those \
+         words ask for more than your work does, change the work. That the request does not \
+         say settles nothing: take the reading closest to its words and quote those. Only \
+         your last message is passed on as your answer, so end with your whole answer again, \
+         not only what changed.",
+        crate::BRAND,
+        and_list(&open)
+    ))
+}
+
+/// Whether `line` of an answer settles requirement `number`'s row: it opens
+/// with that number, after any marks of a list or a table, and quotes words
+/// found in a row in `request`, its words as `doubts::words` gives them.
+fn settles(line: &str, number: usize, request: &[String]) -> bool {
+    let marks = |c: char| matches!(c, '-' | '*' | '|' | '`' | '>' | ' ' | '\t');
+    let Some(rest) = line.trim_start_matches(marks).strip_prefix('R') else {
+        return false;
+    };
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.parse() != Ok(number) {
+        return false;
+    }
+    crate::doubts::literals(rest).into_iter().any(|range| {
+        // A code span is the command run, not the request's words.
+        let quote = &rest[range];
+        let said: Vec<String> = (crate::doubts::words(quote).into_iter())
+            .map(|(_, word)| word)
+            .collect();
+        !quote.starts_with('`')
+            && said.len() >= SETTLING
+            && request.windows(said.len()).any(|run| run == said)
+    })
 }
 
 /// `items` joined as a sentence lists them: "a", "a and b", "a, b and c".
@@ -1689,16 +1807,25 @@ mod tests {
             (8, true),
         ];
         assert_eq!(found, read);
-        // The run is held to them as to any row, a doubt as a doubt.
+        // The run is held to them as to any row, a doubt as a doubt: it
+        // is listed with the rows left unclear, and answered as one.
         let text = unchecked(report, 8).unwrap();
         assert!(
             text.starts_with(
-                "[Letronna check] The review's table has these rows that failed or were left \
-                 unclear:\n- | R1 | closed but never read | UNCLEAR — raises `Closed`; no rule \
-                 names it |\n- | R2 | values arrive"
+                "[Letronna check] The review's table has these rows that failed:\n\
+                 - | R2 | values arrive before the body ends | FAIL — `python lazy.py`: read \
+                 whole |\n- | R4 | empty input"
             ),
             "{text}"
         );
+        assert!(
+            text.contains(
+                "throws |\nand these left unclear:\n- | R1 | closed but never read | UNCLEAR — \
+                 raises `Closed`; no rule names it |\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(left_open(&text), [1]);
         assert!(left_unclear(
             "R1 | closed but never read | UNCLEAR — raises `Closed`"
         ));
@@ -2128,12 +2255,172 @@ mod tests {
                       R2 | scope first | UNCLEAR | parent singletons start too; the words may rule it out";
         assert!(tabled(report));
         let text = unchecked(report, 2).unwrap();
-        assert!(text.contains("has these rows that failed or were left unclear:\n- R2 | scope"));
+        assert!(text.contains("The review's table has these rows left unclear:\n- R2 | scope"));
         assert!(text.contains("decide it by the request's words"), "{text}");
-        // A table with only failed rows is told nothing of doubts.
+        // It is asked for a line that quotes the request, not for a shrug.
+        assert!(
+            text.contains(
+                "For each row left unclear above, write one line in your answer, `R2 | reading \
+                 taken | \"the request's words for it\" | command run`"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("That the request does not say settles nothing"),
+            "{text}"
+        );
+        assert!(text.ends_with("not only what changed."), "{text}");
+        // A table with only failed rows is told nothing of doubts, and is
+        // asked for the line only for a row it does not fix.
         let failed = unchecked("R1 | iso | PASS\nR2 | utc | FAIL | t.sh", 2).unwrap();
         assert!(failed.contains("has these rows that failed:\n- R2 | utc"));
         assert!(!failed.contains("left unclear"), "{failed}");
+        assert!(
+            failed.contains("For each failed row you do not fix, write one line in your answer"),
+            "{failed}"
+        );
+        assert!(left_open(&failed).is_empty());
+        // And one with only rows missing for no line at all.
+        let short = unchecked("R1 | a | PASS", 3).unwrap();
+        assert!(!short.contains("write one line"), "{short}");
+    }
+
+    #[test]
+    fn failed_rows_come_before_unclear_ones_and_each_kind_is_counted_apart() {
+        // Twelve doubts written before eleven failures, as a review that
+        // doubts early and fails late writes them.
+        let mut report = String::new();
+        for n in 1..=12 {
+            report.push_str(&format!(
+                "R{n} | doubt {n} | UNCLEAR | the words may mean either\n"
+            ));
+        }
+        for n in 13..=23 {
+            report.push_str(&format!("R{n} | case {n} | FAIL | t.sh {n}\n"));
+        }
+        report.push_str("R24 | fine | PASS\n");
+        let text = unchecked(&report, 24).unwrap();
+        let at = |words: &str| {
+            text.find(words)
+                .unwrap_or_else(|| panic!("{words}: {text}"))
+        };
+        assert!(
+            text.starts_with(
+                "[Letronna check] The review's table has these rows that failed:\n\
+                 - R13 | case 13 | FAIL | t.sh 13\n"
+            ),
+            "{text}"
+        );
+        // Ten of each are shown, and each kind says how many more it has.
+        assert!(at("- R22 | case 22") < at("- and 1 more that failed\nand these left unclear:\n"));
+        assert!(!text.contains("- R23 | case 23"), "{text}");
+        assert!(at("left unclear:\n- R1 | doubt 1 |") < at("- R10 | doubt 10"));
+        assert!(at("- R10 | doubt 10") < at("- and 2 more left unclear\n"));
+        assert!(!text.contains("- R11 | doubt 11"), "{text}");
+        assert!(
+            text.contains("For each row left unclear above, and each failed row you do not fix,"),
+            "{text}"
+        );
+        // The rows shown as unclear are the ones an answer is held to.
+        assert_eq!(left_open(&text), (1..=10).collect::<Vec<_>>());
+        // With rows missing too, the lists go on from them.
+        let both = unchecked("R1 | a | FAIL | t.sh\nR1 | b | UNCLEAR | which end", 2).unwrap();
+        assert!(
+            both.starts_with(
+                "[Letronna check] The review's table has no row for R2, and has these rows \
+                 that failed:\n- R1 | a | FAIL | t.sh\nand these left unclear:\n\
+                 - R1 | b | UNCLEAR | which end\nTest each requirement without a row"
+            ),
+            "{both}"
+        );
+        assert_eq!(left_open(&both), [1]);
+        // No other text holds a run to a line.
+        assert!(left_open("- R1 | b | UNCLEAR | which end").is_empty());
+        assert!(left_open(&notice(&["It must hold.".to_owned()], true, &[])).is_empty());
+    }
+
+    /// An assistant's reply saying `content`.
+    fn answered(content: &str) -> Message {
+        Message {
+            role: "assistant".into(),
+            content: content.into(),
+            ..Default::default()
+        }
+    }
+
+    /// A request whose fourth sentence leaves open which end is meant.
+    const OPEN: &str = "Add a `parse_range` function. Ranges must be written as `a..b`. \
+                        Open ranges such as `a..` default to the end of the input.";
+
+    #[test]
+    fn a_line_that_quotes_the_request_for_the_reading_taken_settles_a_row() {
+        let line = "R3 | the end of the whole input, not of the line | \"default to the end \
+                    of the input\" | `cargo test open_range`";
+        let answer = format!("Fixed R2.\n\n{line}\n\nAll rows pass now.");
+        assert_eq!(unresolved(&[answered(&answer)], OPEN, &[3]), None);
+        // Written as a list's item or a table's row, with other marks, in
+        // any reply after the notice, and with the request's emphasis or not.
+        let laid = [
+            "- R3 | whole input | \"end of the input\" | cargo test",
+            "| R3 | whole input | \u{201c}Open ranges such as a.. default\u{201d} | cargo test |",
+            "**R3** | whole input | 'the end of the input' | cargo test",
+            "R3: whole input, since it says \"to the end of the input\"; ran cargo test",
+        ];
+        for line in laid {
+            let replies = [answered(line), answered("Done.")];
+            assert_eq!(unresolved(&replies, OPEN, &[3]), None, "{line}");
+        }
+        // Nothing is asked with no row left unclear.
+        assert_eq!(unresolved(&[answered("Done.")], OPEN, &[]), None);
+    }
+
+    #[test]
+    fn a_row_shrugged_off_or_settled_by_words_the_request_lacks_is_listed() {
+        let listed = |answer: &str, rows: &[usize]| unresolved(&[answered(answer)], OPEN, rows);
+        let text = listed("R3: unclear; the request does not say. Leave.", &[3]).unwrap();
+        assert!(
+            text.starts_with(
+                "[Letronna check] The review left a row of R3 unclear, and your answer has no \
+                 line for it that quotes the request. Write one line for it, `R3 | reading \
+                 taken | \"the request's words for it\" | command run`"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("That the request does not say settles nothing"),
+            "{text}"
+        );
+        assert!(text.ends_with("not only what changed."), "{text}");
+        // A quote the request does not hold, one word of it, a code span,
+        // or the right words on another row's line settle nothing.
+        let unsettled = [
+            "R3 | whole input | \"defaults to the last byte\" | cargo test",
+            "R3 | whole input | \"input\" | cargo test",
+            "R3 | whole input | `end of the input` | cargo test",
+            "R2 | whole input | \"default to the end of the input\" | cargo test",
+            "R30 | whole input | \"default to the end of the input\" | cargo test",
+            "As for R3, \"default to the end of the input\" is clear enough.",
+            "Leave.",
+        ];
+        for answer in unsettled {
+            assert!(listed(answer, &[3]).is_some(), "{answer}");
+        }
+        // Each row without a line is named, once, and the settled ones are not.
+        let answer = "R2 | both ends given | \"must be written as `a..b`\" | cargo test\n\
+                      R1: unclear. Leave.";
+        let text = listed(answer, &[1, 2, 3, 3]).unwrap();
+        assert!(
+            text.contains("left rows of R1 and R3 unclear, and your answer has no line for each"),
+            "{text}"
+        );
+        assert!(text.contains("`R1 | reading taken | "), "{text}");
+        // Only the run's own replies are read.
+        let user = Message {
+            role: "user".into(),
+            content: "R3 | whole input | \"default to the end of the input\" | cargo test".into(),
+            ..Default::default()
+        };
+        assert!(unresolved(&[user], OPEN, &[3]).is_some());
     }
 
     #[test]

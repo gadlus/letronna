@@ -638,6 +638,7 @@ fn steps(
     let mut built = false;
     let mut listed = false;
     let mut tabled = false;
+    let mut quoted = false;
     let mut tested = 0;
     // Whether the last of those runs passed, which no second attempt is
     // made after.
@@ -1056,6 +1057,21 @@ fn steps(
                 && let Some(notice) = review_rows(spec, turn)
             {
                 tabled = true;
+                spec.transcript.conversation.messages.push(notice);
+                save(&mut spec.transcript)?;
+                continue;
+            }
+            // Once it has answered that, so a row the review left unclear is
+            // decided by the request's words rather than left; once, and
+            // with a round and budget left, as above. An answer with a line
+            // for each such row costs nothing.
+            if tabled
+                && !quoted
+                && report.rounds < spec.rounds
+                && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
+                && let Some(notice) = unsettled_rows(spec, turn)
+            {
+                quoted = true;
                 spec.transcript.conversation.messages.push(notice);
                 save(&mut spec.transcript)?;
                 continue;
@@ -2884,6 +2900,41 @@ fn review_rows(spec: &Spec, turn: &Turn) -> Option<Message> {
     }
     let own = (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
     let content = unreviewed(own)?;
+    Some(Message {
+        role: "user".into(),
+        content,
+        notice: true,
+        // Folded into the run, so the window keeps the task it is for.
+        folded: true,
+        ..Default::default()
+    })
+}
+
+/// The notice sending a session's own run nobody watches back once more
+/// when its answer to the review's rows has, for a row the review left
+/// unclear, no line that quotes the request for the reading it took.
+fn unsettled_rows(spec: &Spec, turn: &Turn) -> Option<Message> {
+    if !unwatched(spec) || turn.capped().is_some() || !turn.runs_commands() {
+        return None;
+    }
+    // With the time and tokens to test a reading and change the work for
+    // it: near either end, a run sent back would leave that half made.
+    if !affords_review(spec) {
+        return None;
+    }
+    let own = (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
+    let open = |message: &Message| match message.notice {
+        true => crate::requirements::left_open(&message.content),
+        false => Vec::new(),
+    };
+    let at = own.iter().rposition(|message| !open(message).is_empty())?;
+    let request = own.iter().rfind(|message| chat::opens_turn(message))?;
+    // Mail, such as a job's output, is no request.
+    if request.notice {
+        return None;
+    }
+    let typed = crate::references::typed(&request.content);
+    let content = crate::requirements::unresolved(&own[at + 1..], typed, &open(&own[at]))?;
     Some(Message {
         role: "user".into(),
         content,
@@ -8824,6 +8875,115 @@ pub(crate) mod tests {
         );
         assert!(told.contains(words), "{told}");
         assert!(told.contains("build that and test each reading"), "{told}");
+    }
+
+    /// A review helper's report on `SPECIFIED` that leaves a row unclear.
+    const DOUBTED: &str = "Checked each.\nR1 | a | PASS\nR2 | b | PASS\nR3 | c | PASS\n\
+                           R4 | which end an open range runs to | UNCLEAR | the input or the \
+                           line\nR5 | e | PASS";
+
+    /// The notices a run asked `SPECIFIED` in a folder `name` was sent after
+    /// a review left a row unclear, when it answers the rows with `answer`
+    /// and whatever follows with "Left as it is.".
+    fn sent_after_a_doubt(name: &str, id: AgentId, answer: &str, further: usize) -> Vec<String> {
+        let _data = data(name);
+        let dir = scratch(name);
+        let mut answers = vec![
+            reply("", &[write_made()]),
+            reply("Added parse_range.", &[]),
+            reply(DOUBTED, &[]),
+            reply(DOUBTED, &[]),
+            reply("Each requirement holds.", &[]),
+            reply(answer, &[]),
+        ];
+        answers.extend(std::iter::repeat_n(reply("Left as it is.", &[]), further));
+        let (spec, provider) = specified(&dir, id, SPECIFIED, answers);
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done, "{}", report.text);
+        let sent = provider.sent();
+        (messages(sent.last().unwrap()).iter())
+            .filter(|message| message["role"] == "user")
+            .filter_map(|message| message["content"].as_str())
+            .filter(|content| content.contains("check] The review"))
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn a_row_left_unclear_and_shrugged_off_sends_the_run_back_once_for_a_line_that_quotes_the_request()
+     {
+        // Shrugged off twice, it is asked once: the stub has no reply for a
+        // third notice, so one would fail the run.
+        let shrug = "R4: unclear; the request does not say. Leave.";
+        let sent = sent_after_a_doubt("requirements-shrug", AGENTS + 1_747, shrug, 1);
+        let [rows, line] = sent.as_slice() else {
+            panic!("{sent:?}");
+        };
+        assert!(
+            rows.contains("has these rows left unclear:\n- R4 | which end an open range"),
+            "{rows}"
+        );
+        assert!(
+            rows.contains("For each row left unclear above, write one line"),
+            "{rows}"
+        );
+        assert!(
+            line.contains("The review left a row of R4 unclear, and your answer has no line"),
+            "{line}"
+        );
+        // An answer with the line is sent back for nothing more.
+        let settled = "R4 | the end of the whole input | \"default to the end of the input\" | \
+                       cargo test open";
+        let sent = sent_after_a_doubt("requirements-settled", AGENTS + 1_748, settled, 0);
+        let [rows] = sent.as_slice() else {
+            panic!("{sent:?}");
+        };
+        assert!(rows.contains("has these rows left unclear:"), "{rows}");
+    }
+
+    #[test]
+    fn a_row_shrugged_off_is_left_where_the_run_cannot_act_on_it() {
+        let name = "requirements-shrug-guards";
+        let _data = data(name);
+        let dir = scratch(name);
+        let (mut spec, _provider) = specified(&dir, AGENTS + 1_749, SPECIFIED, Vec::new());
+        // A notice is folded into the run, as the driver sends it.
+        let said = |role: &str, content: &str, notice: bool| Message {
+            role: role.into(),
+            content: content.into(),
+            notice,
+            folded: notice,
+            ..Default::default()
+        };
+        let rows = crate::requirements::unchecked(DOUBTED, 5).unwrap();
+        let shrug = "R4: unclear; the request does not say. Leave.";
+        (spec.transcript.conversation.messages)
+            .extend([said("user", &rows, true), said("assistant", shrug, false)]);
+        let turn = Turn::new(spec.connection.clone());
+        let notice = unsettled_rows(&spec, &turn).unwrap();
+        assert!(notice.notice && notice.folded && notice.role == "user");
+        assert!(notice.content.contains("left a row of R4 unclear"));
+        // Short of the time or the tokens to test a reading and change the
+        // work for it, the run is left to end.
+        let (time, tokens) = (
+            crate::requirements::REVIEW_TIME,
+            crate::requirements::REVIEW_TOKENS,
+        );
+        spec.connection.deadline = Some(Instant::now() + time - Duration::from_secs(60));
+        assert!(unsettled_rows(&spec, &turn).is_none());
+        spec.connection.deadline = Some(Instant::now() + 2 * time);
+        assert!(unsettled_rows(&spec, &turn).is_some());
+        spec.budget = Some(Arc::new(Budget::new(tokens - 1, None)));
+        assert!(unsettled_rows(&spec, &turn).is_none());
+        spec.budget = None;
+        // A watched run's answer is the user's to judge.
+        spec.connection.human = true;
+        assert!(unsettled_rows(&spec, &turn).is_none());
+        spec.connection.human = false;
+        // And a line that quotes the request leaves nothing to ask.
+        let line = "R4 | whole input | \"default to the end of the input\" | cargo test";
+        (spec.transcript.conversation.messages).push(said("assistant", line, false));
+        assert!(unsettled_rows(&spec, &turn).is_none());
     }
 
     #[test]
