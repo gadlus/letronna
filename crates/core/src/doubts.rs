@@ -401,7 +401,10 @@ pub(crate) fn doubts(messages: &[Message]) -> Vec<String> {
 /// mentions, and closing it broke the project's own tests. The row that
 /// passes such a case needs nothing to show it, so it is kept from being
 /// the easy way out of a case: a rule that covers the case decides it as
-/// its name would, and the row is for a case the change left as it was.
+/// its name would. A doubt is only for what the project did before the
+/// change and does otherwise after: a case in code the change added was
+/// nothing before, and a doubt there sends the run back for what was never
+/// asked.
 pub(crate) fn section(doubts: &[String], tester: bool) -> String {
     if doubts.is_empty() {
         return String::new();
@@ -413,9 +416,9 @@ pub(crate) fn section(doubts: &[String], tester: bool) -> String {
         false => format!(
             "each needs a row of its own, judged by the request's words where they say what \
              should happen in it, by name or by a rule that covers it. Where they do not, \
-             write PASS, with `{}` in the cell after, only if the change left the case as it \
-             was, since a gap the project had before the change that the request does not ask \
-             to close is no failure, and UNCLEAR if it did not:",
+             write PASS, with `{}` in the cell after: a gap the request does not ask to close \
+             is no failure, in old code or new. Only where the project did one thing in the \
+             case before the change and does another after, write UNCLEAR, naming both:",
             crate::requirements::NOT_ASKED
         ),
     };
@@ -1217,20 +1220,23 @@ mod tests {
     fn a_case_set_aside_that_the_request_does_not_decide_asks_nothing_of_the_work() {
         let cases = ["Empty `name`?".to_owned()];
         // A review judges it where the words decide it, by its name or by a
-        // rule that covers it, and passes it in a set form only where they
-        // do not and the change left it alone: a gap the request leaves is
-        // no failure, and a case the change altered unasked is a doubt.
+        // rule that covers it, and passes it in a set form where they do
+        // not, in code the change added as in code it found: a gap the
+        // request leaves is no failure. Only what the project did before
+        // and does otherwise after, unasked, is a doubt.
         let review = section(&cases, false);
         assert!(
             review.contains(
                 "each needs a row of its own, judged by the request's words where they say \
                  what should happen in it, by name or by a rule that covers it. Where they do \
-                 not, write PASS, with `not asked` in the cell after, only if the change left \
-                 the case as it was, since a gap the project had before the change that the \
-                 request does not ask to close is no failure, and UNCLEAR if it did not:\n- "
+                 not, write PASS, with `not asked` in the cell after: a gap the request does \
+                 not ask to close is no failure, in old code or new. Only where the project \
+                 did one thing in the case before the change and does another after, write \
+                 UNCLEAR, naming both:\n- "
             ),
             "{review}"
         );
+        assert!(!review.contains("left the case as it was"), "{review}");
         assert!(review.contains(crate::requirements::NOT_ASKED), "{review}");
         assert!(!review.contains("test"), "{review}");
         // A tester writes a test only where the words decide the case.
