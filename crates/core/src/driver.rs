@@ -2856,10 +2856,15 @@ fn requirements(
     let ask = lost.is_none() || affords_review(spec);
     let tested = tested.as_deref();
     let nothing = reports.is_empty() && unread.is_empty() && tested.is_none() && lost.is_none();
-    let content = match nothing {
+    let mut content = match nothing {
         false => crate::requirements::reviewed(&found, &reports, &unread, tested, lost, ask),
         true => crate::requirements::notice(&found, review, &outputs),
     };
+    // Last, where it is read last: the words of a requirement its own notes
+    // read more than one way, which a change checked against the one
+    // reading it took would pass.
+    let readings = crate::doubts::readings(own, &found);
+    content.push_str(&crate::doubts::reading_notice(&readings));
     Some(Message {
         role: "user".into(),
         content,
@@ -3539,6 +3544,9 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
     // helper checks them by the request's words.
     let own = (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
     let doubts = crate::doubts::doubts(own);
+    // And the words of a requirement it read more than one way, without the
+    // reading it took, so each helper judges every reading.
+    let readings = crate::doubts::readings(own, found);
     let mut tester_ctx = ctx.clone();
     if let (Some(copy), Some(parent)) = (&copied, ctx.caller.connection.as_deref()) {
         let added: Arc<[std::path::PathBuf]> = (parent.added.iter().cloned())
@@ -3565,7 +3573,7 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
                     "name": format!("review-r{}", share.0),
                     "type": "review",
                     "background": false,
-                    "prompt": crate::requirements::brief(request, found, share, &doubts),
+                    "prompt": crate::requirements::brief(request, found, share, &doubts, &readings),
                 });
                 scope.spawn(move || tools::Tool::run(&crate::agents::Agent, &args, &ctx))
             })
@@ -3576,7 +3584,13 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
                 "name": "tester",
                 "type": "tester",
                 "background": false,
-                "prompt": crate::spec_tests::brief(request, found, before.as_deref(), &doubts),
+                "prompt": crate::spec_tests::brief(
+                    request,
+                    found,
+                    before.as_deref(),
+                    &doubts,
+                    &readings,
+                ),
             });
             scope.spawn(move || tools::Tool::run(&crate::agents::Agent, &args, &tester_ctx))
         });
@@ -8760,6 +8774,56 @@ pub(crate) mod tests {
             assert!(task.contains("- Open `a..` on empty input?"), "{task}");
             assert!(!task.contains("Rare, leave it"), "{task}");
         }
+    }
+
+    #[test]
+    fn words_a_run_read_two_ways_reach_its_helpers_and_the_run_without_the_reading_it_took() {
+        let name = "requirements-readings";
+        let _data = data(name);
+        let dir = scratch(name);
+        let said = "Added parse_range. \"default to the end of the input\" is ambiguous; \
+                    I read it as the last byte.";
+        let answers = vec![
+            reply("", &[write_made()]),
+            reply(said, &[]),
+            reply(PASSED, &[]),
+            reply(PASSED, &[]),
+            reply("Each requirement holds.", &[]),
+        ];
+        let (spec, provider) = specified(&dir, AGENTS + 1_746, SPECIFIED, answers);
+        assert_eq!(finished(spec).status, Outcome::Done);
+        let sent = provider.sent();
+        let tasks: Vec<String> = (sent.iter().flat_map(messages))
+            .filter_map(|message| message["content"].as_str())
+            .filter(|content| content.contains("You are a helper ("))
+            .map(String::from)
+            .collect();
+        let words = "- R4: \"default to the end of the input\"";
+        for (helper, asked) in [
+            ("review", "a row per reading"),
+            ("tester", "a test per reading"),
+        ] {
+            let task = (tasks.iter())
+                .find(|task| task.contains(&format!("You are a helper ({helper}).")))
+                .unwrap_or_else(|| panic!("no {helper} in {tasks:?}"));
+            assert!(task.contains("its choice is not shown:"), "{task}");
+            assert!(task.contains(words), "{task}");
+            assert!(task.contains(asked), "{task}");
+            assert!(!task.contains("last byte"), "{task}");
+        }
+        // The run is told last in its requirements notice, after the check.
+        let asked = messages(sent.last().unwrap()).last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        let plain = crate::requirements::notice(&STATED.map(String::from), false, &[]);
+        let (_, check) = plain.rsplit_once('\n').unwrap();
+        let (_, told) = asked.split_once(check).unwrap();
+        assert!(
+            told.starts_with("\n\nYour notes read these words of the request more than one way:"),
+            "{told}"
+        );
+        assert!(told.contains(words), "{told}");
+        assert!(told.contains("build that and test each reading"), "{told}");
     }
 
     #[test]

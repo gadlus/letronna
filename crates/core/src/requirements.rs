@@ -385,12 +385,14 @@ pub(crate) fn shares(count: usize) -> Vec<(usize, usize)> {
 /// would leave out: the request word for word, how to find the change, and
 /// each case its table has a row for; and not the run's reasons for what it
 /// left out, which a reviewer tends to agree with, though each case it
-/// weighed and set aside, `doubts`, is listed for a row of its own.
+/// weighed and set aside, `doubts`, is listed for a row of its own, and the
+/// words it read more than one way, `readings`, for a row per reading.
 pub(crate) fn brief(
     request: &str,
     sentences: &[String],
     share: (usize, usize),
     doubts: &[String],
+    readings: &[crate::doubts::Reading],
 ) -> String {
     let mut text = String::from(
         "Review a change you have not seen, made to the project in your working folder, \
@@ -425,6 +427,7 @@ pub(crate) fn brief(
         cases!()
     ));
     text.push_str(&crate::doubts::section(doubts));
+    text.push_str(&crate::doubts::reading_rows(readings));
     text
 }
 
@@ -1958,7 +1961,7 @@ mod tests {
         let rules: Vec<String> = ["Ranges must be written as `a..b`.", "Open ranges default."]
             .map(String::from)
             .into();
-        let whole = brief(request, &rules, (1, 2), &[]);
+        let whole = brief(request, &rules, (1, 2), &[], &[]);
         assert!(
             whole.contains(&format!("word for word:\n{request}\n")),
             "{whole}"
@@ -1968,7 +1971,7 @@ mod tests {
         assert!(whole.contains(cases!()));
         assert!(whole.contains("git diff"));
         assert!(!whole.contains("with why"));
-        let part = brief(request, &rules, (2, 2), &[]);
+        let part = brief(request, &rules, (2, 2), &[], &[]);
         assert!(
             part.contains("Check R2 to R2; other helpers check the rest."),
             "{part}"
@@ -1984,7 +1987,7 @@ mod tests {
                      cell and what shows it in the cell after, written `R1 | case | PASS` or \
                      `R1 | case | FAIL | command that shows it`, with a row for each";
         let rules: Vec<String> = ["Dates must parse.".to_owned()].into();
-        let asked = brief("Dates must parse.", &rules, (1, 1), &[]);
+        let asked = brief("Dates must parse.", &rules, (1, 1), &[], &[]);
         assert!(asked.contains(alone), "{asked}");
         // The run that starts a review itself asks its helper for the same.
         assert!(REVIEW.contains(alone), "{REVIEW}");
@@ -2043,6 +2046,31 @@ mod tests {
         );
         assert_eq!(listed(&none), Some(2));
         assert!(!tabled(&none));
+    }
+
+    #[test]
+    fn a_review_is_asked_for_a_row_for_each_reading_only_where_words_were_read_two_ways() {
+        let rules: Vec<String> = ["Dates must parse in any order.".to_owned()].into();
+        let plain = brief("Dates must parse.", &rules, (1, 1), &[], &[]);
+        assert!(!plain.contains("more than one way"), "{plain}");
+        let read = [crate::doubts::Reading {
+            number: 1,
+            words: "must parse in any order".into(),
+        }];
+        let asked = brief("Dates must parse.", &rules, (1, 1), &[], &read);
+        // After all else, so the brief is otherwise as it was.
+        let rows = asked.strip_prefix(plain.as_str()).unwrap();
+        assert!(
+            rows.starts_with(
+                "\n\nThe author read these words of the request more than one way; its choice \
+                 is not shown:\n- R1: \"must parse in any order\"\nFor each, name the plausible \
+                 readings and write a row per reading, `R1 | reading: "
+            ),
+            "{rows}"
+        );
+        // A row written as asked is read as any other row is.
+        let table = "R1 | reading: parts in any order | FAIL | t.sh";
+        assert!(unchecked(table, 1).unwrap().contains(table));
     }
 
     #[test]
@@ -2121,7 +2149,7 @@ mod tests {
     #[test]
     fn a_review_is_asked_to_write_each_doubt_as_a_row() {
         let rules: Vec<String> = ["Dates must parse.".to_owned()].into();
-        let asked = brief("Dates must parse.", &rules, (1, 1), &[]);
+        let asked = brief("Dates must parse.", &rules, (1, 1), &[], &[]);
         assert!(
             asked.contains("`R1 | case | UNCLEAR | what you doubt`"),
             "{asked}"

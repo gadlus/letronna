@@ -984,13 +984,15 @@ pub(crate) fn discard(copy: &Path) {
 /// requirements `request` states. It is given the request word for word and
 /// nothing of the work, and told to keep it that way: anything the request
 /// spells out is used as it spells it, and code is read in `before`, the
-/// project as it was, where there is one, and each case the run weighed and
-/// set aside, `doubts`, to test.
+/// project as it was, where there is one, each case the run weighed and
+/// set aside, `doubts`, to test, and the words it read more than one way,
+/// `readings`, to test in each reading.
 pub(crate) fn brief(
     request: &str,
     sentences: &[String],
     before: Option<&Path>,
     doubts: &[String],
+    readings: &[crate::doubts::Reading],
 ) -> String {
     let read_there = match before {
         Some(before) => format!(
@@ -1017,6 +1019,7 @@ pub(crate) fn brief(
                 runs it | what it expected and what it got`";
     let mut text = briefing(request, sentences, &opening, unnamed, outcome, rows);
     text.push_str(&crate::doubts::section(doubts));
+    text.push_str(&crate::doubts::reading_tests(readings));
     text
 }
 
@@ -3718,6 +3721,7 @@ mod tests {
             &sentences,
             None,
             &[],
+            &[],
         );
         assert!(
             brief.contains(
@@ -3795,6 +3799,7 @@ mod tests {
             &[],
             Some(Path::new("/tmp/was")),
             &[],
+            &[],
         );
         assert!(
             brief.contains("as the request spells it, never as the code does"),
@@ -3816,8 +3821,28 @@ mod tests {
     }
 
     #[test]
+    fn the_tester_is_asked_for_a_test_of_each_reading_only_where_words_were_read_two_ways() {
+        let plain = brief("Save at /api/items/save.", &[], None, &[], &[]);
+        assert!(!plain.contains("more than one way"), "{plain}");
+        let read = [crate::doubts::Reading {
+            number: 1,
+            words: "Save at /api/items/save".into(),
+        }];
+        let asked = brief("Save at /api/items/save.", &[], None, &[], &read);
+        let tests = asked.strip_prefix(plain.as_str()).unwrap();
+        assert!(
+            tests.contains("- R1: \"Save at /api/items/save\"\n"),
+            "{tests}"
+        );
+        assert!(
+            tests.contains("write a test per reading, named for the reading"),
+            "{tests}"
+        );
+    }
+
+    #[test]
     fn with_nothing_from_before_the_brief_names_no_folder() {
-        let brief = brief("Save at /api/items/save.", &[], None, &[]);
+        let brief = brief("Save at /api/items/save.", &[], None, &[], &[]);
         assert!(!brief.contains("before the change is in"), "{brief}");
         assert!(brief.contains("as the request spells it"), "{brief}");
     }
@@ -4334,7 +4359,7 @@ mod tests {
 
     #[test]
     fn the_tester_is_asked_for_the_one_command_that_runs_its_tests() {
-        let brief = brief("Save at /api/items/save.", &[], None, &[]);
+        let brief = brief("Save at /api/items/save.", &[], None, &[], &[]);
         assert!(brief.contains("written `Run: <command>`"), "{brief}");
         assert!(
             brief.contains(
