@@ -1061,21 +1061,6 @@ fn steps(
                 save(&mut spec.transcript)?;
                 continue;
             }
-            // Once it has answered that, so a row the review left unclear is
-            // decided by the request's words rather than left; once, and
-            // with a round and budget left, as above. An answer with a line
-            // for each such row costs nothing.
-            if tabled
-                && !quoted
-                && report.rounds < spec.rounds
-                && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
-                && let Some(notice) = unsettled_rows(spec, turn)
-            {
-                quoted = true;
-                spec.transcript.conversation.messages.push(notice);
-                save(&mut spec.transcript)?;
-                continue;
-            }
             // Once the run has acted on the reports, the tester's tests are
             // run against its work by the driver itself, in a copy of the
             // project, and what failed sent back; `RUNS` times at most,
@@ -1121,6 +1106,23 @@ fn steps(
                     save(&mut spec.transcript)?;
                     continue;
                 }
+            }
+            // Once it has answered the review's rows and the tests have been
+            // run against its work, so it is not asked before that evidence
+            // is in: a row the review left unclear is decided by the
+            // request's words rather than left; once, and with a round and
+            // budget left, as above. An answer with a line for each such
+            // row costs nothing.
+            if tabled
+                && !quoted
+                && report.rounds < spec.rounds
+                && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
+                && let Some(notice) = unsettled_rows(spec, turn)
+            {
+                quoted = true;
+                spec.transcript.conversation.messages.push(notice);
+                save(&mut spec.transcript)?;
+                continue;
             }
             // Sent back with the tests `RUNS` times, a run whose work still
             // fails them has had its say: a helper makes a second attempt
@@ -2879,7 +2881,8 @@ fn requirements(
     // Last, where it is read last: the words of a requirement its own notes
     // read more than one way, which a change checked against the one
     // reading it took would pass.
-    let readings = crate::doubts::readings(own, &found);
+    let noted = this_turn(own).map_or(own, |(_, noted)| noted);
+    let readings = crate::doubts::readings(noted, &found);
     content.push_str(&crate::doubts::reading_notice(&readings));
     Some(Message {
         role: "user".into(),
@@ -2912,27 +2915,32 @@ fn review_rows(spec: &Spec, turn: &Turn) -> Option<Message> {
 
 /// The notice sending a session's own run nobody watches back once more
 /// when its answer to the review's rows has, for a row the review left
-/// unclear, no line that quotes the request for the reading it took.
+/// unclear in this turn, no line that quotes the request for the reading
+/// it took.
 fn unsettled_rows(spec: &Spec, turn: &Turn) -> Option<Message> {
     if !unwatched(spec) || turn.capped().is_some() || !turn.runs_commands() {
         return None;
     }
-    // With the time and tokens to test a reading and change the work for
-    // it: near either end, a run sent back would leave that half made.
+    // The line names a command run, so not where none can be.
+    if refused(spec, "run_command").is_some() {
+        return None;
+    }
+    // With the time and tokens to test a reading: near either end, a run
+    // sent back would leave that half made.
     if !affords_review(spec) {
         return None;
     }
     let own = (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
+    let (request, own) = this_turn(own)?;
+    // Mail, such as a job's output, is no request.
+    if request.notice {
+        return None;
+    }
     let open = |message: &Message| match message.notice {
         true => crate::requirements::left_open(&message.content),
         false => Vec::new(),
     };
     let at = own.iter().rposition(|message| !open(message).is_empty())?;
-    let request = own.iter().rfind(|message| chat::opens_turn(message))?;
-    // Mail, such as a job's output, is no request.
-    if request.notice {
-        return None;
-    }
     let typed = crate::references::typed(&request.content);
     let content = crate::requirements::unresolved(&own[at + 1..], typed, &open(&own[at]))?;
     Some(Message {
@@ -2943,6 +2951,14 @@ fn unsettled_rows(spec: &Spec, turn: &Turn) -> Option<Message> {
         folded: true,
         ..Default::default()
     })
+}
+
+/// The message that opens the latest turn in `messages` and those after it:
+/// a session's own run holds its earlier turns too, whose notes weighed
+/// other requests and whose notices were answered then.
+fn this_turn(messages: &[Message]) -> Option<(&Message, &[Message])> {
+    let at = messages.iter().rposition(chat::opens_turn)?;
+    Some((&messages[at], &messages[at + 1..]))
 }
 
 /// What came of the tester's kept tests run by the driver against the work
@@ -3595,9 +3611,12 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
     // helper checks them by the request's words.
     let own = (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
     let doubts = crate::doubts::doubts(own);
-    // And the words of a requirement it read more than one way, without the
-    // reading it took, so each helper judges every reading.
-    let readings = crate::doubts::readings(own, found);
+    // And the words of a requirement it read more than one way in this
+    // turn, without the reading it took, so each helper judges every
+    // reading. A tester started with the run wrote its tests before any of
+    // this was weighed, so only one started here is given them.
+    let noted = this_turn(own).map_or(own, |(_, noted)| noted);
+    let readings = crate::doubts::readings(noted, found);
     let mut tester_ctx = ctx.clone();
     if let (Some(copy), Some(parent)) = (&copied, ctx.caller.connection.as_deref()) {
         let added: Arc<[std::path::PathBuf]> = (parent.added.iter().cloned())
@@ -8980,9 +8999,31 @@ pub(crate) mod tests {
         spec.connection.human = true;
         assert!(unsettled_rows(&spec, &turn).is_none());
         spec.connection.human = false;
+        // Nor is a run that may run no command asked for one it ran.
+        spec.allow = Allow::Only(vec!["write_file".into()]);
+        assert!(unsettled_rows(&spec, &turn).is_none());
+        spec.allow = Allow::All;
+        assert!(unsettled_rows(&spec, &turn).is_some());
         // And a line that quotes the request leaves nothing to ask.
         let line = "R4 | whole input | \"default to the end of the input\" | cargo test";
-        (spec.transcript.conversation.messages).push(said("assistant", line, false));
+        let messages = &mut spec.transcript.conversation.messages;
+        messages.push(said("assistant", line, false));
+        assert!(unsettled_rows(&spec, &turn).is_none());
+        // Rows an earlier turn left open are not this turn's to answer, and
+        // what that turn weighed is not read for this one's request.
+        let messages = &mut spec.transcript.conversation.messages;
+        messages.pop();
+        let weighed = "\"default to the end of the input\" is ambiguous.";
+        messages.push(said("assistant", weighed, false));
+        let stated = STATED.map(String::from);
+        let read = |messages: &[Message]| {
+            let noted = this_turn(messages).map_or(messages, |(_, noted)| noted);
+            crate::doubts::readings(noted, &stated).len()
+        };
+        assert_eq!(read(messages), 1);
+        messages.push(said("user", SPECIFIED, false));
+        assert_eq!(read(messages), 0);
+        messages.push(said("assistant", "Done.", false));
         assert!(unsettled_rows(&spec, &turn).is_none());
     }
 

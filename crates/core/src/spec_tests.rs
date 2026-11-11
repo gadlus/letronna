@@ -3838,6 +3838,10 @@ mod tests {
             tests.contains("write a test per reading, named for the reading"),
             "{tests}"
         );
+        // A tester started with the run writes its tests before the run has
+        // weighed anything, so its task holds no readings.
+        let ahead = brief_ahead("Save at /api/items/save.", &[]);
+        assert!(!ahead.contains("more than one way"), "{ahead}");
     }
 
     #[test]

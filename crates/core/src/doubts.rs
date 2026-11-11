@@ -28,10 +28,17 @@
 //! the run read more than one way (`readings`). A run most often names both
 //! readings of a sentence that leaves something open, takes one and builds
 //! only that, and what checks its work afterwards wanted the other. A
-//! sentence holding one of `READ` is such a weighing when it, or one of the
-//! `BACK` before it, quotes `QUOTED` or more words in a row of a requirement
-//! the request states. Only that requirement's number and those words are
-//! kept, never the reading the run took, so a helper is not led to it.
+//! sentence holding one of `READ` weighs a requirement when it, one of the
+//! `BACK` before it or the one after it quotes `QUOTED` or more words in a
+//! row of a requirement the request states. One of `AT_ODDS`, or a question
+//! that opens with which, says less, and counts only with the quote in its
+//! own sentence, or in the one before where it opens its own, as a verdict
+//! on that one does; the question may also have it in the one after. Each
+//! is matched as whole words, and none after a not.
+//! The requirements a marker of `READ` weighed come first, then those
+//! weighed most often, and only a requirement's number and its longest
+//! quote are kept, never the reading the run took, so a helper is not led
+//! to it.
 
 use crate::chat::Message;
 use std::ops::Range;
@@ -91,35 +98,53 @@ const MARKERS: &[&str] = &[
     "assume",
 ];
 
-/// Readings given at most, the latest; apart from `KEPT`, so no case set
-/// aside takes the place of one.
-const READ_KEPT: usize = 5;
+/// Readings given at most; apart from `KEPT`, so no case set aside takes
+/// the place of one. A long run weighs more requirements than this, most
+/// of them in passing, so the ones kept are chosen by how they were weighed.
+const READ_KEPT: usize = 8;
 
 /// Words in a row a quoted literal shares with a requirement to be a quote
 /// of it: fewer, such as "must fail", are found in many sentences.
 const QUOTED: usize = 4;
 
 /// Words and phrases that weigh what a sentence of the request means, in
-/// lower case, each matched where a word starts, so "conflict" finds
-/// "conflicts" and "conflicting" too; one with ` … ` in it matches its parts
-/// in that order within a sentence, as a question opening with which does.
+/// lower case, each matched as whole words.
 const READ: &[&str] = &[
     "ambiguous",
+    "ambiguously",
     "ambiguity",
+    "ambiguities",
     "interpretation",
+    "interpretations",
     "could mean",
     "might mean",
+    "may mean",
     "means either",
     "or it means",
-    "i read",
     "read as",
     "read it as",
+    "read this as",
     "hard to know",
-    "contradict",
-    "conflict",
-    "two ways",
-    "which … ?",
+    "two ways to read",
+    "read two ways",
 ];
+
+/// Words that set a sentence of the request against something, as whole
+/// words: said of the run's own design as often as of the request, so one
+/// counts only close to the quote.
+const AT_ODDS: &[&str] = &[
+    "conflict",
+    "conflicts",
+    "conflicting",
+    "contradict",
+    "contradicts",
+    "contradicting",
+    "contradiction",
+    "contradictory",
+];
+
+/// Words before a marker that turn it round, as "not ambiguous" does.
+const NOT: &[&str] = &["not", "no", "never", "isn't", "aren't", "wasn't", "nothing"];
 
 /// Words of a requirement the run read more than one way.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,39 +157,59 @@ pub(crate) struct Reading {
 
 /// The words of `sentences`, the numbered requirements of a request, that
 /// the assistant's replies in `messages` read more than one way, in the
-/// order they were last weighed, at most `READ_KEPT` of them and one for
-/// each requirement, without the reading the run took.
+/// requirements' order, one for each requirement with the longest quote of
+/// it, without the reading the run took; at most `READ_KEPT`, those a
+/// marker of `READ` weighed first, then those weighed most often, then last.
 pub(crate) fn readings(messages: &[Message], sentences: &[String]) -> Vec<Reading> {
     let listed: Vec<Vec<String>> = (sentences.iter())
         .take(crate::requirements::LISTED)
         .map(|sentence| words(sentence).into_iter().map(|(_, word)| word).collect())
         .collect();
-    let mut found: Vec<Reading> = Vec::new();
+    // Each requirement weighed: whether by a marker of `READ`, how often,
+    // where last, its longest quote in words, and the reading.
+    let mut found: Vec<(bool, usize, usize, usize, Reading)> = Vec::new();
+    let mut weighings = 0;
     let own = messages
         .iter()
         .filter(|message| message.role == "assistant");
     for text in own.flat_map(|message| [&message.reasoning, &message.content]) {
         let units = units(text);
         for (at, unit) in units.iter().enumerate() {
-            if !reads(&masked(unit)) {
+            let Some((strong, back, ahead)) = weighs(&masked(unit)) else {
                 continue;
-            }
-            let Some(reading) = (at.saturating_sub(BACK)..=at)
+            };
+            // Its own sentence first, then the nearest before, then after.
+            let near = (at.saturating_sub(back)..=at)
                 .rev()
-                .find_map(|before| quoted(&units[before], &listed))
+                .chain(at + 1..(at + 1 + ahead).min(units.len()));
+            let Some((len, reading)) = near.filter_map(|at| quoted(&units[at], &listed)).next()
             else {
                 continue;
             };
-            // Weighed again, a requirement stands where it was weighed last.
-            found.retain(|kept| kept.number != reading.number);
-            found.push(reading);
+            weighings += 1;
+            match (found.iter_mut()).find(|(.., kept)| kept.number == reading.number) {
+                Some(kept) => {
+                    kept.0 |= strong;
+                    kept.1 += 1;
+                    kept.2 = weighings;
+                    if len > kept.3 {
+                        (kept.3, kept.4) = (len, reading);
+                    }
+                }
+                None => found.push((strong, 1, weighings, len, reading)),
+            }
         }
     }
-    let first = found.len().saturating_sub(READ_KEPT);
-    found.drain(first..).collect()
+    found.sort_by_key(|&(strong, times, last, ..)| std::cmp::Reverse((strong, times, last)));
+    found.truncate(READ_KEPT);
+    found.sort_by_key(|(.., reading)| reading.number);
+    found.into_iter().map(|(.., reading)| reading).collect()
 }
 
-/// What a review helper's brief says of `readings`; empty with none.
+/// What a review helper's brief says of `readings`; empty with none. Only
+/// readings of what is accepted can fail a change for meeting one: where
+/// one reading does more than another, building both is as often the
+/// mistake, so that row is a doubt the request's words settle.
 pub(crate) fn reading_rows(readings: &[Reading]) -> String {
     let Some(first) = readings.first().map(|reading| reading.number) else {
         return String::new();
@@ -173,9 +218,14 @@ pub(crate) fn reading_rows(readings: &[Reading]) -> String {
         "\n\nThe author read these words of the request more than one way; its choice is not \
          shown:{}\nFor each, name the plausible readings and write a row per reading, \
          `R{first} | reading: what the words would mean | PASS`, or FAIL or UNCLEAR in its \
-         place. A change that meets only one reading where one implementation could meet \
-         every one is FAIL. Where the readings exclude each other the row is UNCLEAR, quoting \
-         the words that favour each.",
+         place. Where the readings differ only in what is accepted or allowed, such as two \
+         spellings or shapes of an input, and one implementation could take every one \
+         without breaking another requirement, a change that takes only one is FAIL. Where \
+         one reading does, emits or records more than another, or the readings exclude each \
+         other, the row is UNCLEAR, never FAIL: quote the words that favour each, and where \
+         the request sets a narrower rule for the exact case, such as a filter, a condition \
+         or an exception, say that the rule decides it. Where the words are silent on the \
+         case, say so in the row.",
         list(readings)
     )
 }
@@ -188,26 +238,32 @@ pub(crate) fn reading_tests(readings: &[Reading]) -> String {
     format!(
         "\n\nThe author read these words of the request more than one way; its choice is not \
          shown:{}\nFor each, name the plausible readings and write a test per reading, named \
-         for the reading, with a row of its own. Where the readings exclude each other, say \
-         so in each such row and quote the words that favour each.",
+         for the reading, with a row of its own. Where one reading does, emits or records \
+         more than another, or the readings exclude each other, say so in each such row and \
+         quote the words that favour each.",
         list(readings)
     )
 }
 
 /// What the requirements notice tells the run of `readings`, after its
-/// check; empty with none. A rule the request states for the exact case
-/// stays first, as a notice of a failing test says it.
+/// check; empty with none. It asks for every reading only of what is
+/// accepted, and never for the wider behaviour to be safe; a rule the
+/// request states for the exact case stays first, as a notice of a failing
+/// test says it.
 pub(crate) fn reading_notice(readings: &[Reading]) -> String {
     if readings.is_empty() {
         return String::new();
     }
     format!(
-        "\n\nYour notes read these words of the request more than one way:{}\nFor each, if one \
-         implementation can satisfy every reading without breaking another requirement, it \
-         must: build that and test each reading. Only where the readings exclude each other, \
-         take the one the request's words favour, quote them, and test that case. A narrower \
-         rule the request sets for the exact case, such as a filter, a condition or an \
-         exception, still comes before any wider reading.",
+        "\n\nYour notes read these words of the request more than one way:{}\nFor each, where \
+         the readings differ only in what is accepted or allowed, such as two spellings or \
+         shapes of an input, and one implementation can take every one without breaking \
+         another requirement, build that and test each reading. Where one reading does, \
+         emits or records more than another, or they exclude each other, do not build the \
+         wider one to be safe: take the reading the request's words favour, quote them, and \
+         test that case; where the words are silent, take the narrower reading, the one \
+         that does less. A narrower rule the request sets for the exact case, such as a \
+         filter, a condition or an exception, comes before any reading.",
         list(readings)
     )
 }
@@ -219,27 +275,34 @@ fn list(readings: &[Reading]) -> String {
         .collect()
 }
 
-/// Whether `prose`, as `masked` writes it, holds one of `READ`.
-fn reads(prose: &str) -> bool {
-    let inside = |c: char| c.is_alphanumeric() || c == '_' || c == '\'';
-    READ.iter().any(|marker| {
-        let mut parts = marker.split(" … ");
-        let Some(first) = parts.next() else {
-            return false;
-        };
-        let rest: Vec<&str> = parts.collect();
-        prose.match_indices(first).any(|(at, _)| {
-            let after = &prose[at + first.len()..];
-            !prose[..at].chars().next_back().is_some_and(inside)
-                && rest.iter().all(|part| after.contains(part))
-        })
-    })
+/// How `prose`, a sentence as `masked` writes it, weighs a requirement, if
+/// it does: whether by a marker of `READ`, and how many sentences before it
+/// and after it the quote it weighs may be in.
+fn weighs(prose: &str) -> Option<(bool, usize, usize)> {
+    let said = |marker: &&str| {
+        let at = (whole(prose, marker).into_iter()).find(|&at| {
+            let before = prose[..at].split_whitespace().next_back();
+            !before.is_some_and(|word| NOT.contains(&word))
+        });
+        at.map(|at| prose[..at].trim().is_empty())
+    };
+    if READ.iter().any(|marker| said(marker).is_some()) {
+        return Some((true, BACK, 1));
+    }
+    // A question that opens with which asks what the words before it cover.
+    if whole(prose, "which").first() == Some(&0) && prose.contains('?') {
+        return Some((false, 1, 1));
+    }
+    // Opening its sentence, it is a verdict on the one before.
+    let opens = AT_ODDS.iter().filter_map(said).max()?;
+    Some((false, usize::from(opens), 0))
 }
 
-/// The quote of a requirement in `unit`: among its literals, the longest
+/// The quote of a requirement in `unit`, with how many words it is: among
+/// its literals, the longest
 /// run of `QUOTED` or more words one shares with one of `listed`, the words
 /// of each numbered requirement.
-fn quoted(unit: &str, listed: &[Vec<String>]) -> Option<Reading> {
+fn quoted(unit: &str, listed: &[Vec<String>]) -> Option<(usize, Reading)> {
     let mut best: Option<(usize, Reading)> = None;
     for range in literals(unit) {
         let quote = words(&unit[range]);
@@ -259,7 +322,7 @@ fn quoted(unit: &str, listed: &[Vec<String>]) -> Option<Reading> {
             best = Some((len, Reading { number, words }));
         }
     }
-    best.map(|(_, reading)| reading)
+    best
 }
 
 /// The words of `text` as written, each beside itself in lower case without
@@ -276,7 +339,7 @@ pub(crate) fn words(text: &str) -> Vec<(&str, String)> {
 }
 
 /// The longest run of `said` that is found, word for word, in `sentence`.
-fn shared(said: &[&str], sentence: &[String]) -> Range<usize> {
+pub(crate) fn shared(said: &[&str], sentence: &[String]) -> Range<usize> {
     let mut best = 0..0;
     for from in 0..said.len() {
         for at in 0..sentence.len() {
@@ -788,48 +851,108 @@ mod tests {
     #[test]
     fn a_weighing_that_quotes_nothing_of_the_request_is_no_reading() {
         let sentences = ["Ranges must be written as `a..b` with both ends given."];
-        let none = |notes: &str| read(&[said(notes, "")], &sentences).is_empty();
-        assert!(none("This is ambiguous, and I read it as inclusive."));
+        let none = |notes: &str| {
+            let found = read(&[said(notes, "")], &sentences);
+            assert!(found.is_empty(), "{notes}: {found:?}");
+        };
+        none("This is ambiguous, and I read it as inclusive.");
         // Quoted, but not the request's words, or too few of them.
-        assert!(none(
-            "The error \"start is past its end here\" is ambiguous."
-        ));
-        assert!(none("\"must be written\" could mean either form."));
+        none("The error \"start is past its end here\" is ambiguous.");
+        none("\"must be written\" could mean either form.");
         // The request's words with no weighing of them.
-        assert!(none("It says \"must be written as `a..b`\". Do that."));
+        none("It says \"must be written as `a..b`\". Do that.");
         // Too far back to be what is weighed.
-        assert!(none(
+        none(
             "It says \"must be written as `a..b`\". Parse the start. Then parse the end. \
-             Then build the range. The naming is ambiguous."
-        ));
+             Then build the range. The naming is ambiguous.",
+        );
         // A marker inside a word, or itself quoted, weighs nothing.
-        assert!(none(
-            "It says \"must be written as `a..b`\", so I spread as needed."
-        ));
-        assert!(none(
-            "Print \"ambiguous\" for \"must be written as `a..b`\"."
-        ));
+        none("It says \"must be written as `a..b`\", so I spread as needed.");
+        none("Print \"ambiguous\" for \"must be written as `a..b`\".");
     }
 
     #[test]
-    fn at_most_a_few_readings_are_kept_one_for_each_requirement() {
-        let sentences: Vec<String> = (1..=8)
+    fn words_that_only_look_like_a_weighing_are_no_reading() {
+        let sentences = ["Ranges must be written as `a..b` with both ends given."];
+        let quote = "\"must be written as `a..b`\"";
+        let found = |notes: &str| read(&[said(&notes.replace("{q}", quote), "")], &sentences);
+        // Reading a file, a longer word, or a count of ways to build it.
+        for notes in [
+            "I read lib/range.js for {q}.",
+            "{q} is what the read assertions check.",
+            "{q} is not ambiguous.",
+            "There are two ways to implement {q}.",
+            "No ambiguity in {q} at all.",
+        ] {
+            assert!(found(notes).is_empty(), "{notes}: {:?}", found(notes));
+        }
+        // Set against the run's own design a sentence away, it is no
+        // reading; in the quote's own sentence, or opening the next as a
+        // verdict on it, it is.
+        let design = "The task says {q}. Reusing the old parser may contradict that design.";
+        assert!(found(design).is_empty(), "{:?}", found(design));
+        assert_eq!(found("{q} conflicts with the open form.").len(), 1);
+        assert_eq!(
+            found("It says {q}. Contradiction unless open forms count.").len(),
+            1
+        );
+        // A which that asks nothing of the words, mid-sentence or far off.
+        let aside = "It says {q}, which I did. Is that all?";
+        assert!(found(aside).is_empty(), "{:?}", found(aside));
+        let far = "It says {q}. Parse the start first. Which file holds the parser?";
+        assert!(found(far).is_empty(), "{:?}", found(far));
+        assert_eq!(
+            found("It says {q}. Which separators may come between?").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_quote_that_follows_its_weighing_is_found_and_the_longest_quote_is_kept() {
+        let sentences = [
+            "get_data_changes() returns DataChangeInfo records accumulated during the current \
+             macrostep, cleared at each macrostep boundary, with state_id and key attributes.",
+        ];
+        let notes = "Which behavior is more defensible? \"get_data_changes() returns \
+                     DataChangeInfo records accumulated during the current macrostep, cleared \
+                     at each macrostep boundary\". If I clear at the start, the changes go.";
+        let whole = "get_data_changes() returns DataChangeInfo records accumulated during the \
+                     current macrostep, cleared at each macrostep boundary";
+        assert_eq!(
+            read(&[said(notes, "")], &sentences),
+            [(1, whole.to_owned())]
+        );
+        // Quoted shorter before and after, the longest stands.
+        let short = "\"records accumulated during the current macrostep\" is ambiguous.";
+        let all = [said(short, ""), said(notes, ""), said("", short)];
+        assert_eq!(read(&all, &sentences), [(1, whole.to_owned())]);
+    }
+
+    /// Requirements about kinds, as many as `count`.
+    fn kinds(count: usize) -> Vec<String> {
+        (1..=count)
             .map(|n| format!("Kind {n} must be stored in its own table."))
-            .collect();
-        let notes: Vec<String> = (1..=8)
-            .map(|n| format!("\"Kind {n} must be stored in its own table\" could mean a file."))
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn the_readings_kept_are_the_ones_weighed_hardest_one_for_each_requirement() {
+        let sentences = kinds(12);
+        let quote = |n: usize| format!("\"Kind {n} must be stored in its own table\"");
+        // The first is called ambiguous early; the second is weighed three
+        // times; then ten are set against something in passing.
+        let mut notes = vec![
+            format!("{} is ambiguous.", quote(1)),
+            format!("{} could mean a file.", quote(2)),
+            format!("{} might mean a schema.", quote(2)),
+            format!("I read {} two ways.", quote(2)),
+        ];
+        notes.extend((3..=12).map(|n| format!("{} conflicts with the cache.", quote(n))));
         let found = readings(&[said(&notes.join("\n"), "")], &sentences);
         let numbers: Vec<usize> = found.iter().map(|reading| reading.number).collect();
-        assert_eq!(numbers, [4, 5, 6, 7, 8]);
-        // Weighed again, a requirement is listed once, where it was last.
-        let again = "\"Kind 5 must be stored in its own table\" is ambiguous. \
-                     \"Kind 5 must be stored\" – hmm.\n\
-                     I read \"Kind 2 must be stored in its own table\" as a file.\n\
-                     Two ways to take \"Kind 5 must be stored in\" then.";
-        let found = readings(&[said(again, "")], &sentences);
-        let numbers: Vec<usize> = found.iter().map(|reading| reading.number).collect();
-        assert_eq!(numbers, [2, 5]);
+        // Both stay, with the latest of the rest, in the requirements' order.
+        assert_eq!(numbers, [1, 2, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(found.len(), READ_KEPT);
         // The cases set aside are counted apart, so neither crowds the other out.
         let aside: Vec<String> = (1..=12)
             .map(|n| format!("Input `{n}` alone? Rare."))
@@ -837,6 +960,58 @@ mod tests {
         let both = [said(&aside.join("\n"), ""), said(&notes.join("\n"), "")];
         assert_eq!(doubts(&both).len(), KEPT);
         assert_eq!(readings(&both, &sentences).len(), READ_KEPT);
+    }
+
+    #[test]
+    fn a_long_runs_deciding_reading_outlasts_the_ones_it_weighed_in_passing() {
+        // A run's notes on a request of many sentences, in their order: the
+        // adapters' sentence weighed twice, and others quoted beside a
+        // question or the run's own design.
+        let sentences = [
+            "Add bail_on_test_failure to config defaults (default false) for early termination \
+             on test failure, where true means threshold one and a positive integer N means \
+             threshold N.",
+            "The Reporter constructor validates this config: invalid values (zero, negatives, \
+             floats, strings) log a warning via npmlog with bail_on_test_failure as prefix and \
+             default to false.",
+            "The Reporter, an EventEmitter, bails on the Nth non-skipped non-todo failure, \
+             recording the test name as bailReason, emitting test-failure with launcher name \
+             and result, and gating subsequent results from sub-reporters for finish output.",
+            "Runner abort is idempotent, Promise-returning, and suppresses all subsequent \
+             results and errors, with browser runners emitting abort-tests via socket.",
+            ADAPTERS,
+        ];
+        let early = "So all-test-results is signaled once regardless of aborted? That would \
+            violate \"suppressing events once aborted\" maybe not, since it's explicitly \
+            required. I'll allow all-test-results even when aborted, exactly once.\n\n\
+            Could hidden tests expect no all-test-results when aborted? Spec says \
+            \"suppressing events once aborted and signaling all-test-results once\" ambiguous \
+            but I read as signal once.";
+        let later = "Maybe \"signaling all-test-results once\" means when an adapter observes \
+            abort, it emits all-test-results immediately (once), allowing testem to finish. If \
+            hidden tests simulate abort by setting `Testem.aborted=true` then call `emit`, \
+            ours may only emit at done. Hard to know. I think adding \
+            `Testem.on('abort-tests', signalAllTestResults)` to adapters could be beneficial \
+            and matches \"signaling all-test-results once\". But \"guarding at every emission \
+            point ... suppressing events once aborted and signaling all-test-results once\" \
+            could mean exactly: when aborted, suppress all emissions except signal \
+            all-test-results once.";
+        let passing = "The task phrase \"bails on the Nth non-skipped non-todo failure\" \
+            suggests only when enabled. Hmm.\n\n\
+            Could hedge by only tracking if enabled, but hidden test for tracking with \
+            disabled would fail. Which test more likely? I think tests focus on enabled bail.";
+        let design = "Do I want to spend complexity? The task says \"The Reporter constructor \
+            validates this config\" implying reporters do not. Adding self-bail may contradict \
+            conceptual design but not externally visible.";
+        let notes = [
+            said(early, ""),
+            said(later, ""),
+            said(passing, ""),
+            said(design, ""),
+        ];
+        let found = read(&notes, &sentences);
+        let words = "suppressing events once aborted and signaling all-test-results once";
+        assert_eq!(found, [(5, words.to_owned())]);
     }
 
     #[test]
@@ -857,7 +1032,7 @@ mod tests {
             reading_notice(&found),
         ] {
             assert!(text.contains("- R1: \"Open ranges such as `a..` default to the end\""));
-            assert!(!text.contains("line"), "{text}");
+            assert!(!text.contains("of the line"), "{text}");
             assert!(!text.contains("clamp"), "{text}");
         }
     }
@@ -895,16 +1070,6 @@ mod tests {
             rows.contains("`R12 | reading: what the words would mean | PASS`"),
             "{rows}"
         );
-        assert!(
-            rows.contains(
-                "meets only one reading where one implementation could meet every one is FAIL"
-            ),
-            "{rows}"
-        );
-        assert!(
-            rows.ends_with("quoting the words that favour each."),
-            "{rows}"
-        );
         let tests = reading_tests(&found);
         assert!(tests.contains(listed), "{tests}");
         assert!(
@@ -915,21 +1080,58 @@ mod tests {
         assert!(
             told.starts_with(
                 "\n\nYour notes read these words of the request more than one way:\n\
-                 - R12: \"signaling all-test-results once\"\nFor each, if one implementation \
-                 can satisfy every reading without breaking another requirement, it must: \
-                 build that and test each reading."
+                 - R12: \"signaling all-test-results once\"\nFor each, where the readings \
+                 differ only in what is accepted or allowed"
             ),
             "{told}"
         );
+    }
+
+    #[test]
+    fn only_readings_of_what_is_accepted_ask_for_every_reading_to_be_met() {
+        let found = [Reading {
+            number: 3,
+            words: "records accumulated during the current macrostep".into(),
+        }];
+        // A reviewer fails a change for meeting one reading only there.
+        let rows = reading_rows(&found);
         assert!(
-            told.contains("Only where the readings exclude each other"),
+            rows.contains(
+                "Where the readings differ only in what is accepted or allowed, such as two \
+                 spellings or shapes of an input, and one implementation could take every one \
+                 without breaking another requirement, a change that takes only one is FAIL."
+            ),
+            "{rows}"
+        );
+        // Where one reading does more, the row is a doubt, with the rule
+        // the request sets for the case and its silence both said.
+        assert!(
+            rows.contains(
+                "Where one reading does, emits or records more than another, or the readings \
+                 exclude each other, the row is UNCLEAR, never FAIL"
+            ),
+            "{rows}"
+        );
+        assert!(rows.contains("say that the rule decides it"), "{rows}");
+        assert!(
+            rows.ends_with("Where the words are silent on the case, say so in the row."),
+            "{rows}"
+        );
+        // The run is not told to build the wider behaviour to be safe.
+        let told = reading_notice(&found);
+        assert!(
+            told.contains("do not build the wider one to be safe"),
             "{told}"
         );
-        // A rule the request sets for the exact case is not undone by it.
         assert!(
-            told.contains("still comes before any wider reading"),
+            told.contains("where the words are silent, take the narrower reading"),
             "{told}"
         );
+        assert!(
+            told.ends_with("or an exception, comes before any reading."),
+            "{told}"
+        );
+        assert!(!told.contains("satisfy every reading"), "{told}");
     }
 
     #[test]
