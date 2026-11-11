@@ -34,6 +34,14 @@ use tungstenite::{Message as Frame, WebSocket};
 
 /// How long one request may take before the browser is taken to be stuck.
 pub(crate) const CALL_TIME: Duration = Duration::from_secs(20);
+/// How long a site gets to begin answering when a page is opened: the
+/// browser answers `Page.navigate` only once the site has, and a slow site
+/// seen from a server far from it can take most of a minute. Twenty seconds
+/// read as a browser that was stuck, when it was the site that was slow.
+pub(crate) const NAVIGATE_TIME: Duration = Duration::from_secs(45);
+/// How much of what a browser printed as it started is kept, to say with
+/// why it did not start.
+const SAID_MOST: usize = 2000;
 /// How long a browser has to start and open its debugging port. The first
 /// start makes the profile, which is the slow part.
 const START_TIME: Duration = Duration::from_secs(20);
@@ -146,6 +154,83 @@ const LINUX: &[&str] = &[
 /// installed one.
 pub(crate) fn installed() -> Option<PathBuf> {
     first_existing(&candidates())
+}
+
+/// Whether `LETRONNA_DISPOSABLE` is 1: a machine made for one run and
+/// thrown away after, as a cloud run's container is, where nothing can be
+/// installed for the system and nobody is there to install it.
+pub(crate) fn thrown_away() -> bool {
+    std::env::var_os("LETRONNA_DISPOSABLE").is_some_and(|value| value == "1")
+}
+
+/// What is said when no browser is installed. On a machine thrown away
+/// after the run there is nobody to install one and no way to: the model
+/// is told so, where it was once told to install Chrome and spent its run
+/// trying.
+fn none_installed(thrown_away: bool) -> &'static str {
+    match thrown_away {
+        true => {
+            "No browser is installed on this machine, and none can be installed here. Say              that this needs a browser the machine does not have; do not try to install one."
+        }
+        false => {
+            "No Chromium browser was found: install Chrome, Edge or Brave, or set              LETRONNA_BROWSER to the path of one."
+        }
+    }
+}
+
+/// What a request the browser left unanswered is told as.
+pub(crate) fn unanswered(method: &str) -> String {
+    format!("The browser did not answer in time ({method}).")
+}
+
+/// Keep the last of what a browser prints on stderr while it runs, read
+/// off as it comes so the browser never waits on a full pipe. What it said
+/// as it failed to start is the only word on why: a library the machine
+/// lacks, a sandbox it cannot make, a profile it cannot write.
+fn keep_said(child: &mut Child) -> Arc<Mutex<String>> {
+    let said = Arc::new(Mutex::new(String::new()));
+    let Some(mut printed) = child.stderr.take() else {
+        return said;
+    };
+    let kept = said.clone();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut piece = [0u8; 4096];
+        while let Ok(read) = printed.read(&mut piece) {
+            if read == 0 {
+                break;
+            }
+            let Ok(mut kept) = kept.lock() else { break };
+            kept.push_str(&String::from_utf8_lossy(&piece[..read]));
+            if kept.len() > SAID_MOST {
+                let mut from = kept.len() - SAID_MOST;
+                while !kept.is_char_boundary(from) {
+                    from += 1;
+                }
+                kept.drain(..from);
+            }
+        }
+    });
+    said
+}
+
+/// The last lines a browser printed, to end a sentence on why it did not
+/// start; nothing when it printed nothing.
+fn last_said(said: &Mutex<String>) -> String {
+    let said = said.lock().map(|said| said.clone()).unwrap_or_default();
+    let lines: Vec<&str> = said
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let last = lines[lines.len().saturating_sub(3)..].join(" | ");
+    match last.is_empty() {
+        true => String::new(),
+        false => format!(
+            " It printed: {}",
+            last.chars().take(400).collect::<String>()
+        ),
+    }
 }
 
 fn first_existing(paths: &[PathBuf]) -> Option<PathBuf> {
@@ -342,10 +427,7 @@ impl Browser {
         if let Some((port, agent)) = found {
             return Ok(Browser::on(port, None, agent));
         }
-        let exe = installed().ok_or(
-            "No Chromium browser was found: install Chrome, Edge or Brave, or set \
-             LETRONNA_BROWSER to the path of one.",
-        )?;
+        let exe = installed().ok_or_else(|| none_installed(thrown_away()))?;
         std::fs::create_dir_all(profile)
             .map_err(|e| format!("Could not make the browser's profile folder: {e}"))?;
         // Left over from a browser that has since gone; the new one writes
@@ -360,7 +442,8 @@ impl Browser {
             .args(SWITCHES)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            // Read off as it comes, and its last lines kept (`keep_said`).
+            .stderr(Stdio::piped());
         if headless {
             command.args(["--headless=new", HIDDEN_WINDOW, NO_GPU, GPU_INSIDE]);
             if let Some(scale) = scale.filter(|scale| *scale > 1.) {
@@ -382,6 +465,7 @@ impl Browser {
         let mut child = command
             .spawn()
             .map_err(|e| format!("Could not start {name}: {e}"))?;
+        let said = keep_said(&mut child);
         let started = Instant::now();
         loop {
             if let Some((port, agent)) =
@@ -392,8 +476,9 @@ impl Browser {
             if started.elapsed() > START_TIME {
                 let _ = child.kill();
                 return Err(format!(
-                    "{name} did not open its debugging port within {} seconds.",
-                    START_TIME.as_secs()
+                    "{name} did not open its debugging port within {} seconds.{}",
+                    START_TIME.as_secs(),
+                    last_said(&said)
                 ));
             }
             // A second browser on the same profile hands over to the first
@@ -404,7 +489,8 @@ impl Browser {
             {
                 return Err(format!(
                     "{name} closed as soon as it started. If it is already open on \
-                     Letronna's profile, close that window and try again."
+                     Letronna's profile, close that window and try again.{}",
+                    last_said(&said)
                 ));
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -1100,7 +1186,7 @@ impl Tab {
                 if cancel.is_some() {
                     self.let_go.push(id);
                 }
-                return Err(format!("The browser did not answer in time ({method})."));
+                return Err(unanswered(method));
             };
             let envelope: Envelope = serde_json::from_str(&text)
                 .map_err(|_| "The browser sent something unreadable.".to_owned())?;
@@ -1675,6 +1761,61 @@ pub(crate) mod tests {
         // A folder where a browser should be is not one.
         assert_eq!(first_existing(std::slice::from_ref(&dir)), None);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_machine_that_can_install_nothing_is_not_told_to_install_a_browser() {
+        let here = none_installed(false);
+        assert!(here.contains("install Chrome") && here.contains("LETRONNA_BROWSER"));
+        let thrown_away = none_installed(true);
+        assert!(thrown_away.contains("none can be installed"), "{thrown_away}");
+        assert!(thrown_away.contains("do not try to install"), "{thrown_away}");
+        assert!(!thrown_away.contains("install Chrome"), "{thrown_away}");
+    }
+
+    #[test]
+    fn what_a_browser_said_as_it_failed_is_told_by_its_last_lines() {
+        let said = |text: &str| last_said(&Mutex::new(text.to_owned()));
+        assert_eq!(said(""), "");
+        assert_eq!(said("\n  \n"), "");
+        assert_eq!(
+            said("one\n\ntwo\n three \nfour\n"),
+            " It printed: two | three | four"
+        );
+        // Never more than a few lines' worth, however long a line is.
+        assert!(said(&"x".repeat(5000)).chars().count() <= 400 + " It printed: ".len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn what_a_browser_prints_is_read_off_and_its_end_kept() {
+        // More than a pipe holds: a browser that printed this much would
+        // wait on it for ever, were it not read as it comes.
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "i=0; while [ $i -lt 4000 ]; do echo \"line $i of what it printed\" >&2; i=$((i+1)); done; \
+                 echo 'error while loading shared libraries: libnss3.so' >&2",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let said = keep_said(&mut child);
+        assert!(child.wait().unwrap().success());
+        // Its reader ends a moment after the process does.
+        let started = Instant::now();
+        while !said.lock().unwrap().contains("libnss3.so") {
+            assert!(started.elapsed() < Duration::from_secs(5), "never read");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(said.lock().unwrap().len() <= SAID_MOST);
+        let last = last_said(&said);
+        assert!(
+            last.ends_with("error while loading shared libraries: libnss3.so"),
+            "{last}"
+        );
     }
 
     #[test]
