@@ -26,18 +26,20 @@
 //! the literal inside that clause, the case ends with that clause. So what
 //! the case is stays, and the verdict and the reasons after it go.
 //!
-//! A run that works for long weighs off several times `KEPT` cases, and the
-//! one its request's tests then check is as often an early one, so the ones
-//! given are chosen by how each was weighed, not by how late. First come
-//! those the run both predicted a check of, with a marker that opens with
-//! `CHECK`, and waved off with one of `WAVED`, the words that say a case
-//! will not come up or is not the work's to handle; then those weighed by
-//! either; then the rest; and last those weighed only by one of `PASSING`,
-//! words a run says as often of a document, a tool or its own next step as
-//! of what the work does. Among cases weighed alike, one that names
-//! something the request names comes first, since the request's words can
-//! judge it, and then the later one. A case is given once, as it was
-//! weighed hardest, and the ones given stay in the order the run named
+//! A run that works for long weighs off several times `KEPT` cases. The one
+//! its request's tests then check is sometimes an early one it weighed hard,
+//! and more often one of the last it named, so the ones given are chosen
+//! both ways. `RANKED` of them are the ones weighed hardest: first those
+//! the run both predicted a check of, with a marker that opens with `CHECK`,
+//! and waved off with one of `WAVED`, the words that say a case will not
+//! come up or is not the work's to handle; then those weighed by either;
+//! then the rest; and among cases weighed alike one that names something
+//! the request names, and then the later one. The others are the latest
+//! not yet taken, whatever weighed them, but for one weighed only by
+//! `PASSING`, words a run says as often of a document, a tool or its own
+//! next step as of what the work does: such a case is given only where
+//! fewer than `KEPT` others were set aside. A case is given once, as it
+//! was weighed hardest, and the ones given stay in the order the run named
 //! them.
 //!
 //! Apart from those, with a quota of their own, are the words of the request
@@ -59,10 +61,15 @@
 use crate::chat::Message;
 use std::ops::Range;
 
-/// Cases given at most: the ones weighed hardest, and among those weighed
-/// alike the latest, since a run's later notes are nearer to the work as it
-/// stands.
+/// Cases given at most.
 const KEPT: usize = 10;
+
+/// Of `KEPT`, the cases taken for how hard each was weighed. The rest are
+/// the latest, since a run's later notes are nearer to the work as it
+/// stands: with every place given by weight, the cases given came from
+/// far earlier in a run than its work then stood, and many of those it
+/// had since taken up.
+const RANKED: usize = 5;
 
 /// Characters a case is given in at most.
 const CHARS: usize = 200;
@@ -153,6 +160,9 @@ const PASSING: &[&str] = &["not needed", "doesn't matter", "leave it", "skip"];
 /// The weight of a case that a predicted check or one of `WAVED` weighed
 /// off, and not both.
 const STRONG: u8 = 2;
+
+/// The weight of a case that only words of `PASSING` weighed off.
+const PASSED: u8 = 0;
 
 /// Readings given at most; apart from `KEPT`, so no case set aside takes
 /// the place of one. A long run weighs more requirements than this, most
@@ -431,10 +441,12 @@ pub(crate) fn shared(said: &[&str], sentence: &[String]) -> Range<usize> {
 }
 
 /// The cases the assistant's replies in `messages` weighed and set aside,
-/// at most `KEPT` of them in the order they were named: the ones weighed
-/// hardest, among those the ones that name something `request` names, and
-/// then the latest. Each is given once by its first code span, or by its
-/// words where it has none, as it was weighed hardest.
+/// at most `KEPT` of them in the order they were named: `RANKED` by how
+/// hard each was weighed, among cases weighed alike one that names
+/// something `request` names and then the later one; then the latest not
+/// yet taken that a word not of `PASSING` weighed; then the latest of the
+/// rest. Each is given once by its first code span, or by its words where
+/// it has none, as it was weighed hardest.
 pub(crate) fn doubts(messages: &[Message], request: &str) -> Vec<String> {
     let request: Vec<String> = (words(request).into_iter()).map(|(_, word)| word).collect();
     let own = messages
@@ -460,7 +472,15 @@ pub(crate) fn doubts(messages: &[Message], request: &str) -> Vec<String> {
     }
     let mut kept: Vec<usize> = (0..found.len()).collect();
     kept.sort_by_key(|&at| std::cmp::Reverse((found[at].2, at)));
-    kept.truncate(KEPT);
+    kept.truncate(RANKED);
+    // Then the latest, those weighed only in passing after all the others.
+    for passing in [false, true] {
+        let latest: Vec<usize> = ((0..found.len()).rev())
+            .filter(|at| !kept.contains(at) && (passing || found[*at].2.0 > PASSED))
+            .take(KEPT.saturating_sub(kept.len()))
+            .collect();
+        kept.extend(latest);
+    }
     kept.sort_unstable();
     (kept.into_iter().map(|at| cut(&found[at].1))).collect()
 }
@@ -475,7 +495,8 @@ fn weight(markers: &[&str]) -> u8 {
     let passing = markers.iter().all(|marker| PASSING.contains(marker));
     match (checked, waved) {
         (true, true) => STRONG + 1,
-        (false, false) => STRONG - 1 - u8::from(passing),
+        (false, false) if passing => PASSED,
+        (false, false) => STRONG - 1,
         _ => STRONG,
     }
 }
@@ -910,6 +931,45 @@ mod tests {
     }
 
     #[test]
+    fn half_the_cases_given_are_the_latest_whatever_weighed_them() {
+        // Eight a strong word weighed, then twelve another did: the five
+        // weighed hardest, the latest of those, and then the latest five.
+        let mut notes = inputs(1..=8, "Rare.");
+        notes.extend(inputs(9..=20, "I'll keep it."));
+        let found = weighed(&notes.join("\n"));
+        let mut kept = alone(4..=8);
+        kept.extend(alone(16..=20));
+        assert_eq!(found, kept);
+        // As many as that weighed hard after the rest take the first five
+        // places and no more.
+        let mut notes = inputs(1..=12, "I'll keep it.");
+        notes.extend(inputs(13..=20, "Rare."));
+        assert_eq!(weighed(&notes.join("\n")), alone(11..=20));
+        let mut notes = inputs(1..=4, "I'll keep it.");
+        notes.extend(inputs(5..=12, "Rare."));
+        notes.extend(inputs(13..=20, "I'll keep it."));
+        let mut kept = alone(8..=12);
+        kept.extend(alone(16..=20));
+        assert_eq!(weighed(&notes.join("\n")), kept);
+    }
+
+    #[test]
+    fn cases_weighed_only_in_passing_fill_the_places_no_other_case_takes() {
+        // Three weighed hard, two by another word, twelve only in passing:
+        // every other case is given, and the latest of the twelve.
+        let mut notes = inputs(1..=3, "Rare.");
+        notes.extend(inputs(4..=5, "I'll keep it."));
+        notes.extend(inputs(6..=17, "Not needed."));
+        let mut kept = alone(1..=5);
+        kept.extend(alone(13..=17));
+        assert_eq!(weighed(&notes.join("\n")), kept);
+        // With ten others, none of them is, however late.
+        let mut notes = inputs(1..=10, "I'll keep it.");
+        notes.extend(inputs(11..=17, "Not needed."));
+        assert_eq!(weighed(&notes.join("\n")), alone(1..=10));
+    }
+
+    #[test]
     fn a_check_the_run_predicted_and_waved_off_is_kept_however_early() {
         // Predicted and waved off in one sentence with its verdict, or in
         // the next sentence, which weighs the same case.
@@ -980,6 +1040,14 @@ mod tests {
         assert_eq!(found.len(), KEPT);
         assert_eq!(found[2..9], alone(6..=12));
         assert_eq!(found[9], "Hidden tests might pass `13` twice.");
+        // What the request names takes no more than the five places given
+        // by weight: the latest five are given whatever they name.
+        let named = |n: usize| format!("Is \"no tags were given\" right for {n} of them?");
+        let mut notes: Vec<String> = (1..=8).map(|n| format!("{} Rare.", named(n))).collect();
+        notes.extend(inputs(9..=20, "Rare."));
+        let found = doubts(&[said(&notes.join("\n"), "")], request);
+        assert_eq!(found[..5], (4..=8).map(named).collect::<Vec<_>>());
+        assert_eq!(found[5..], alone(16..=20));
     }
 
     #[test]
