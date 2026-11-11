@@ -1857,7 +1857,8 @@ fn with_import_path(command: &str, folder: &Path) -> String {
 pub(crate) fn failure(outcome: &Result<String, String>) -> Option<(String, &str)> {
     match outcome {
         // A command that passed has no exit code line; a note of where the
-        // whole output went, or what the user's hooks said, can follow one.
+        // whole output went, of how long it ran and the time left, or of
+        // what the user's hooks said, can follow one.
         Ok(output) => {
             let code = (output.lines().rev()).find_map(|line| line.strip_prefix("[exit code "))?;
             let code = code.trim_end_matches(']');
@@ -2154,13 +2155,13 @@ fn quoted(output: &str) -> (String, &'static str) {
 /// What the run is shown of `output`, a test command's: all of it when it
 /// fits in `SHOWN` characters; otherwise, in their order, the lines naming
 /// a failure (`named`), each with the lines after it up to `FAILURE_SHOWN`
-/// characters or `another_part` of the report, the runner's verdicts first and what was raised only in what
-/// they leave of `FAILURES_SHOWN`, and a failure's line shown once however
-/// often it repeats; then as many whole lines of its end as the rest holds, with `…`
-/// for each run of lines left out. A runner's summary at the end names the
-/// failures but not why, and a log printed between the tests can push the
-/// why out of any tail. A bare carriage return, as a progress bar prints,
-/// ends a line too.
+/// characters or `another_part` of the report, the runner's verdicts first
+/// and what was raised only in what they leave of `FAILURES_SHOWN`, and a
+/// failure's line shown once however often it repeats; then as many whole
+/// lines of its end as the rest holds, with `…` for each run of lines left
+/// out. A runner's summary at the end names the failures but not why, and
+/// a log printed between the tests can push the why out of any tail. A bare
+/// carriage return, as a progress bar prints, ends a line too.
 fn excerpt(output: &str) -> String {
     let output = output.trim_end();
     if output.chars().count() <= SHOWN {
@@ -2605,6 +2606,21 @@ fn typescript_code(line: &str) -> bool {
         .any(|(at, found)| line[at + found.len()..].starts_with(|c: char| c.is_ascii_digit()))
 }
 
+/// `output`, a command's, without the note a long one's result ends with in
+/// a run with a deadline, of how long it ran and how much of the run's time
+/// is left: that time is the run's, and a helper it is quoted to has its own.
+fn without_time_left(output: &str) -> String {
+    let note = |line: &&str| line.starts_with("[It ran for ") && line.ends_with("time are left.]");
+    match output.lines().any(|line| note(&line)) {
+        true => (output.lines().filter(|line| !note(line)))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim_end()
+            .to_owned(),
+        false => output.to_owned(),
+    }
+}
+
 /// The task of the helper making a second attempt at `request` in a folder
 /// holding the project as it was: the request word for word, that a first
 /// attempt it is not shown did not pass the tests a tester wrote, which
@@ -2614,7 +2630,7 @@ fn typescript_code(line: &str) -> bool {
 /// nothing of where the tests are or what they are called, so it builds to
 /// the request rather than to them.
 pub(crate) fn attempt(request: &str, command: &str, ended: &str, output: &str) -> String {
-    let (shown, left_out) = quoted(output);
+    let (shown, left_out) = quoted(&without_time_left(output));
     let mut text = format!(
         "Make the change the request below asks for, from scratch, in the project in your \
          working folder, which holds the project as it was before anyone began on it. Another \
@@ -6680,9 +6696,16 @@ mod tests {
             "  Make pairs work.\nPairs compose with Or.  ",
             "npx vitest run tests",
             "exited with code 1",
-            "FAIL pairs compose\nexpected [a, b] got []",
+            "FAIL pairs compose\nexpected [a, b] got []\n[exit code 1]\n\n\
+             [It ran for 75 s. About 21 minutes of this run's time are left.]",
         );
         assert!(brief.starts_with("Make the change the request below asks for, from scratch"));
+        // The run's time is not the helper's: the note of it is left out.
+        assert!(
+            brief.contains("got []\n[exit code 1]\n\nThat attempt"),
+            "{brief}"
+        );
+        assert!(!brief.contains("It ran for"), "{brief}");
         assert!(
             brief
                 .ends_with("The request, word for word:\nMake pairs work.\nPairs compose with Or."),

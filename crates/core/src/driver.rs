@@ -690,6 +690,9 @@ fn steps(
     // as it was: it writes its tests while the run writes the change, with
     // nothing of the work to shape them to, and has them ready when the run
     // first says it is done, rather than taking the end of its time.
+    // After the run's own tools are listed once, so the tester's first
+    // request leaves out what the run's will (`shared`).
+    hidden(spec);
     tester_ahead(spec, turn);
     loop {
         if spec.cancel.is_set() {
@@ -1734,9 +1737,9 @@ fn hidden(spec: &Spec) -> Vec<String> {
     // A fork the agent tool starts begins with its parent's bytes and holds
     // its parent's Allow, so one of the session's own run leaves out what
     // that run does, and the two still share a cached prefix. A watched run
-    // is told to ask with ask_user, and any other helper is offered the
-    // whole array, though an unwatched parent's is shorter: those are
-    // refused at the call instead.
+    // is told to ask with ask_user, and any other helper leaves out what
+    // its session's own run did that it may not call either (`shared`), or
+    // nothing where helpers do not share their session's tools.
     let own = spec.depth == 0 || (spec.fork && spec.depth == 1);
     if spec.connection.human {
         return Vec::new();
@@ -2889,7 +2892,8 @@ fn review_rows(spec: &Spec, turn: &Turn) -> Option<Message> {
 /// project: `Ran::Unrun` with why where they could not be, as when none were
 /// kept with a command to run them, the gate would not let the command run
 /// as it stands, the time or tokens for a fix after them are not there, or
-/// a build of the whole workspace would not fit in it. Where the work fails
+/// a build of the whole workspace would not fit in it; `Ran::Broken` where
+/// the command ran and never got as far as a test. Where the work fails
 /// them and `refereed`, they run in the run's first complete version too;
 /// not at the first done, where that version is the work as it stands.
 fn test_run(spec: &Spec, turn: &Turn, refereed: bool) -> crate::spec_tests::Ran {
@@ -3201,14 +3205,13 @@ enum Verdict {
 /// after all, when the failures its output names are all in tests the
 /// tester did not write and fail on the project as it was too, when the
 /// command never got as far as a test (`spec_tests::unrunnable`), when the
-/// tests pass on the project as it was and
-/// so choose nothing, when the attempt's tests would import the first
-/// attempt's code, when the second attempt does not pass, ran no test or
-/// left the project as it was, when the helper could not start, when the
-/// run moved the commit or has not the time or tokens for an attempt, when
-/// the gate would not let the tests run, or when a build of the whole
-/// workspace would not fit in the time. With the notice, whether the
-/// project now holds the attempt.
+/// tests pass on the project as it was and so choose nothing, when the
+/// attempt's tests would import the first attempt's code, when the second
+/// attempt does not pass, ran no test or left the project as it was, when
+/// the helper could not start, when the run moved the commit or has not
+/// the time or tokens for an attempt, when the gate would not let the tests
+/// run, or when a build of the whole workspace would not fit in the time.
+/// With the notice, whether the project now holds the attempt.
 fn second_attempt(spec: &Spec, turn: &Turn, head: &str) -> Option<(Message, bool)> {
     // A helper's work is its parent's to judge, a person reads a watched
     // run's end, and past the round cap or in plan mode nothing can change.
