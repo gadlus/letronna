@@ -16,7 +16,9 @@
 //! a quoted literal. Fenced code is skipped, each line is split into
 //! sentences as a request is, and a sentence of `GLUED` words or fewer with
 //! nothing quoted, such as "Fine." or "Rare.", is a verdict on the one before
-//! and is joined to it.
+//! and is joined to it. One of `ALONE` weighs a case off only as such a
+//! verdict of one word, as "Skip." does after a question: inside a sentence
+//! it says what the work does.
 //!
 //! A case is its sentence through the clause that holds its last code span
 //! or quoted literal, and on through the clauses after it until one where a
@@ -30,7 +32,9 @@
 //! those the run both predicted a check of, with a marker that opens with
 //! `CHECK`, and waved off with one of `WAVED`, the words that say a case
 //! will not come up or is not the work's to handle; then those weighed by
-//! either; then the rest. Among cases weighed alike, one that names
+//! either; then the rest; and last those weighed only by one of `PASSING`,
+//! words a run says as often of a document, a tool or its own next step as
+//! of what the work does. Among cases weighed alike, one that names
 //! something the request names comes first, since the request's words can
 //! judge it, and then the later one. A case is given once, as it was
 //! weighed hardest, and the ones given stay in the order the run named
@@ -80,6 +84,8 @@ const GLUED: usize = 3;
 const MARKERS: &[&str] = &[
     "rare",
     "unlikely",
+    "not likely",
+    "probably not",
     "not needed",
     "not required",
     "no need to",
@@ -112,7 +118,13 @@ const MARKERS: &[&str] = &[
     "doesn't matter",
     "good enough",
     "assume",
+    "safest",
 ];
+
+/// Words that weigh a case off only as a sentence of their own, in lower
+/// case: each a verdict on the sentence before it, where inside a sentence
+/// it is what the work does, as in "skip the header".
+const ALONE: &[&str] = &["skip", "ignore", "acceptable", "edge", "keep"];
 
 /// The words every marker that predicts a check of a case opens with.
 const CHECK: &str = "hidden test";
@@ -123,13 +135,23 @@ const CHECK: &str = "hidden test";
 const WAVED: &[&str] = &[
     "rare",
     "unlikely",
+    "not likely",
+    "probably not",
     "either interpretation",
     "either way",
     "toss-up",
     "toss up",
     "out of scope",
     "edge case",
+    "edge",
+    "ignore",
+    "acceptable",
 ];
+
+/// The markers said in passing: in the notes of runs read, about half the
+/// cases one of them weighed off were a document, a command, a file to
+/// tidy or the order of the run's own code, not something the work does.
+const PASSING: &[&str] = &["not needed", "doesn't matter", "leave it", "skip"];
 
 /// The weight of a case that a predicted check or one of `WAVED` weighed
 /// off, and not both.
@@ -455,13 +477,15 @@ pub(crate) fn doubts(messages: &[Message], request: &str) -> Vec<String> {
 
 /// How hard `markers`, the words that weighed a case off, weigh it: most
 /// where one predicts a check of it and one of `WAVED` waves it off, then
-/// where one does either, then the rest.
+/// where one does either, then the rest, and least where each is one of
+/// `PASSING`.
 fn weight(markers: &[&str]) -> u8 {
     let checked = markers.iter().any(|marker| marker.starts_with(CHECK));
     let waved = markers.iter().any(|marker| WAVED.contains(marker));
+    let passing = markers.iter().all(|marker| PASSING.contains(marker));
     match (checked, waved) {
         (true, true) => STRONG + 1,
-        (false, false) => STRONG - 1,
+        (false, false) => STRONG - 1 - u8::from(passing),
         _ => STRONG,
     }
 }
@@ -679,7 +703,8 @@ fn masked(text: &str) -> String {
 }
 
 /// Each marker that `prose`, as `masked` writes it, holds, with where it
-/// starts, in their order.
+/// starts, in their order: those of `MARKERS`, and each of `ALONE` that is a
+/// sentence of its own.
 fn marks(prose: &str) -> Vec<(usize, &'static str)> {
     let mut found = Vec::new();
     for marker in MARKERS {
@@ -696,6 +721,19 @@ fn marks(prose: &str) -> Vec<(usize, &'static str)> {
             });
             if follows {
                 found.push((start, *marker));
+            }
+        }
+    }
+    // A verdict of one word: after a sentence's end, or first, and ended
+    // by its own stop or the sentence's end.
+    let stops = ['.', '?', '!'];
+    for word in ALONE {
+        for start in whole(prose, word) {
+            let (before, after) = (prose[..start].trim_end(), &prose[start + word.len()..]);
+            let rest = after.trim_start_matches(stops);
+            let ends = rest.is_empty() || (rest.len() < after.len() && rest.starts_with(' '));
+            if (before.is_empty() || before.ends_with(stops)) && ends {
+                found.push((start, *word));
             }
         }
     }
@@ -1074,9 +1112,136 @@ mod tests {
     }
 
     #[test]
+    fn a_verdict_of_one_word_weighs_a_case_off_only_as_a_sentence_of_its_own() {
+        for (notes, case) in [
+            ("Also handle `<option>`? Skip.", "Also handle `<option>`?"),
+            (
+                "A `limit` given as a float passes the check. Ignore.",
+                "A `limit` given as a float passes the check.",
+            ),
+            (
+                "An error part way leaves `stream` open. Acceptable.",
+                "An error part way leaves `stream` open.",
+            ),
+            (
+                "A `tail` wider than the width? Edge.",
+                "A `tail` wider than the width?",
+            ),
+            (
+                "Still write `val` for a format it does not know? Keep.",
+                "Still write `val` for a format it does not know?",
+            ),
+            // In lower case after a question, or asked in its turn.
+            ("A rest written `..._`? ignore.", "A rest written `..._`?"),
+            ("No test looks at `dist`. Skip?", "No test looks at `dist`."),
+        ] {
+            assert_eq!(weighed(notes), [case], "{notes}");
+        }
+        // Inside a sentence each says what the work does.
+        for notes in [
+            "Skip the header of `a.csv` and read on.",
+            "Here we ignore `None` and keep `0`.",
+            "Any finite cut of `cause` is acceptable there.",
+            "The edge of `grid` wraps round.",
+            "Blank lines we skip. Then `parse()` runs.",
+            "Skip it. Then `parse()` runs.",
+        ] {
+            assert!(weighed(notes).is_empty(), "{notes}: {:?}", weighed(notes));
+        }
+    }
+
+    #[test]
+    fn words_that_say_a_case_will_not_come_up_wave_it_off_as_unlikely_does() {
+        for (notes, case) in [
+            (
+                "Could a caller pass `indent` with a pipe? Probably not.",
+                "Could a caller pass `indent` with a pipe?",
+            ),
+            (
+                "A test that waits on `max_age` to pass. Not likely.",
+                "A test that waits on `max_age` to pass.",
+            ),
+            // Matched as whole words, "unlikely" covers this one.
+            (
+                "Would `context` hold the result too? Very unlikely.",
+                "Would `context` hold the result too?",
+            ),
+        ] {
+            // Each is kept before later cases weighed by another word.
+            let mut all = vec![notes.to_owned()];
+            all.extend(inputs(1..=12, "I'll keep it."));
+            let found = weighed(&all.join("\n"));
+            assert_eq!(found[0], case, "{notes}");
+            assert_eq!(found[1..], alone(4..=12), "{notes}");
+        }
+        // A verdict of one word that waves a case off ranks the same, and
+        // with a check the run predicted of the case, before all of them.
+        let mut all = vec![
+            "Hidden tests might pass `of` twice there. Ignore.".to_owned(),
+            "A `tail` wider than the width? Edge.".to_owned(),
+            "An error part way leaves `stream` open. Acceptable.".to_owned(),
+        ];
+        all.extend(inputs(1..=12, "Rare."));
+        let found = weighed(&all.join("\n"));
+        assert_eq!(found[0], "Hidden tests might pass `of` twice there.");
+        assert_eq!(found[1..], alone(4..=12));
+        // A cost called low is a case taken up, not set aside, and neither
+        // that nor a case called no real one is a weigh-off.
+        assert!(weighed("Also take `of` there? Low cost.").is_empty());
+        assert!(weighed("Their `of of y`? Not a real case.").is_empty());
+    }
+
+    #[test]
+    fn the_cautious_choice_and_a_bare_keep_weigh_a_case_off_as_any_choice_does() {
+        let safest = "The words say \"must include a cache section\", so always writing it is \
+                      safest.";
+        let case = "The words say \"must include a cache section\"";
+        assert_eq!(weighed(safest), [case]);
+        // Neither waves a case off: one that does is kept before them.
+        let mut all = vec![
+            safest.to_owned(),
+            "Still write `val` for a format it does not know? Keep.".to_owned(),
+        ];
+        all.extend(inputs(1..=10, "Rare."));
+        assert_eq!(weighed(&all.join("\n")), alone(1..=10));
+    }
+
+    #[test]
+    fn a_case_weighed_only_by_words_said_in_passing_is_kept_last() {
+        let passing = [
+            "Flush `out` first? Not needed.",
+            "The order of `keys`? It doesn't matter.",
+            "An empty `tag`? Leave it.",
+            "A second `--tag`? Skip.",
+        ];
+        let mut notes: Vec<String> = passing.iter().map(|note| (*note).to_owned()).collect();
+        notes.extend(inputs(1..=8, "I'll keep it."));
+        // The later two fill the places left by the eight weighed by a
+        // word that is not one of them, in the order named.
+        let mut kept = vec!["An empty `tag`?".to_owned(), "A second `--tag`?".to_owned()];
+        kept.extend(alone(1..=8));
+        assert_eq!(weighed(&notes.join("\n")), kept);
+        // With no other case, each is given.
+        assert_eq!(weighed(&passing.join("\n")).len(), passing.len());
+        // Another word beside one of them weighs the case as that word does.
+        notes.push("Flush `err` first? Not needed, and I'll keep it.".to_owned());
+        notes.push("Flush `log` first? Not needed, and rare.".to_owned());
+        let found = weighed(&notes.join("\n"));
+        assert_eq!(found[..8], alone(1..=8));
+        assert_eq!(found[8..], ["Flush `err` first?", "Flush `log` first?"]);
+    }
+
+    #[test]
     fn each_word_a_case_is_ranked_by_is_one_that_weighs_a_case_off() {
-        assert!(WAVED.iter().all(|word| MARKERS.contains(word)));
+        let weighs = |word: &&str| MARKERS.contains(word) || ALONE.contains(word);
+        assert!(WAVED.iter().chain(PASSING).all(weighs));
+        assert!(!WAVED.iter().any(|word| PASSING.contains(word)));
         assert!(MARKERS.iter().any(|marker| marker.starts_with(CHECK)));
+        assert!(!ALONE.iter().any(|word| MARKERS.contains(word)));
+        // The words of a choice the run made are not said in passing.
+        for word in ["i'll keep", "i'll leave", "assume", "no need to"] {
+            assert!(MARKERS.contains(&word) && !PASSING.contains(&word));
+        }
     }
 
     #[test]
