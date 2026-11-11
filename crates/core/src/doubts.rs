@@ -29,21 +29,25 @@
 //! A run that works for long weighs off several times `KEPT` cases. The one
 //! its request's tests then check is sometimes an early one it weighed hard,
 //! and more often one of the last it named, so the ones given are chosen
-//! both ways. `RANKED` of them are the ones weighed hardest: first those
-//! the run both predicted a check of, with a marker that opens with `CHECK`,
-//! and waved off with one of `WAVED`, the words that say a case will not
-//! come up or is not the work's to handle; then those weighed by either;
-//! then the rest; and among cases weighed alike one that names something
-//! the request names, and then the later one. A case names something of
-//! the request's by a code span that holds one of its identifiers of
-//! `NAMED` letters or more, or by `QUOTED` of its words quoted in a row.
-//! The others are the latest
-//! not yet taken, whatever weighed them, but for one weighed only by
-//! `PASSING`, words a run says as often of a document, a tool or its own
-//! next step as of what the work does: such a case is given only where
-//! fewer than `KEPT` others were set aside. A case is given once, as it
-//! was weighed hardest, and the ones given stay in the order the run named
-//! them.
+//! both ways. `RANKED` of them are the ones weighed hardest. First come
+//! those the run predicted a check of, with a marker that opens with
+//! `CHECK`, and weighed off again, by any other marker or with the
+//! request's own words, `QUOTED` of them quoted in a row. Then come those
+//! it predicted a check of, or waved off with one of `WAVED`, the words
+//! that say a case will not come up or is not the work's to handle, or
+//! weighed while quoting the request: that last is a reading of what was
+//! asked, which the request's words can judge. Then come the rest. The
+//! markers of two sentences count together only where the second quotes
+//! nothing and so weighs the first; one with a span or a quote of its own
+//! names its own case. Among cases weighed alike, one that names something
+//! the request names comes first, and then the later one: by a code span
+//! that holds one of the request's identifiers of `NAMED` letters or more,
+//! or by the quote. The others are the latest not yet taken, whatever
+//! weighed them, but for one weighed only by `PASSING`, words a run says
+//! as often of a document, a tool or its own next step as of what the
+//! work does: such a case is given only where fewer than `KEPT` others
+//! were set aside. A case is given once, as it was weighed hardest, and
+//! the ones given stay in the order the run named them.
 //!
 //! Apart from those, with a quota of their own, are the words of the request
 //! the run read more than one way (`readings`). A run most often names both
@@ -138,12 +142,13 @@ const CHECK: &str = "hidden test";
 
 /// The markers that say a case will not come up, is not the work's to
 /// handle, or could go either way: in the notes of runs read, nearly every
-/// case one of them weighed off was something the work does.
+/// case one of them weighed off was something the work does. Not among
+/// them are "probably not" and a bare "Acceptable.", of whose cases two
+/// readers found a sixth to a third to be none of the work's.
 const WAVED: &[&str] = &[
     "rare",
     "unlikely",
     "not likely",
-    "probably not",
     "either interpretation",
     "either way",
     "toss-up",
@@ -152,7 +157,6 @@ const WAVED: &[&str] = &[
     "edge case",
     "edge",
     "ignore",
-    "acceptable",
 ];
 
 /// The markers said in passing: in the notes of runs read, about half the
@@ -160,8 +164,8 @@ const WAVED: &[&str] = &[
 /// tidy or the order of the run's own code, not something the work does.
 const PASSING: &[&str] = &["not needed", "doesn't matter", "leave it", "skip"];
 
-/// The weight of a case that a predicted check or one of `WAVED` weighed
-/// off, and not both.
+/// The weight of a case the run predicted a check of, waved off with one
+/// of `WAVED` or weighed while quoting the request, and no more.
 const STRONG: u8 = 2;
 
 /// The weight of a case that only words of `PASSING` weighed off.
@@ -464,8 +468,10 @@ pub(crate) fn doubts(messages: &[Message], request: &str) -> Vec<String> {
     // was weighed, then whether the request names something it names.
     let mut found: Vec<(String, String, (u8, bool))> = Vec::new();
     for text in own.flat_map(|message| [&message.reasoning, &message.content]) {
-        for (case, weight) in cases(text) {
-            let (key, rank) = (key(&case), (weight, asked(&case, &said, &names)));
+        for (case, markers) in cases(text) {
+            let quoted = quotes(&case, &said);
+            let rank = (weight(&markers, quoted), quoted || named(&case, &names));
+            let key = key(&case);
             // Named again, a case stands as it was weighed hardest, and
             // where it was named last among those.
             let before = found.iter().position(|(kept, ..)| *kept == key);
@@ -493,34 +499,42 @@ pub(crate) fn doubts(messages: &[Message], request: &str) -> Vec<String> {
     (kept.into_iter().map(|at| cut(&found[at].1))).collect()
 }
 
-/// How hard `markers`, the words that weighed a case off, weigh it: most
-/// where one predicts a check of it and one of `WAVED` waves it off, then
-/// where one does either, then the rest, and least where each is one of
+/// How hard `markers`, the words that weighed a case off, weigh it, when
+/// `quoted` with the request's words quoted: most where one predicts a
+/// check of it and it was weighed again, by another marker or with the
+/// quote; then where one predicts a check, one of `WAVED` waves it off or
+/// the request is quoted; then the rest, and least where each is one of
 /// `PASSING`.
-fn weight(markers: &[&str]) -> u8 {
+fn weight(markers: &[&str], quoted: bool) -> u8 {
     let checked = markers.iter().any(|marker| marker.starts_with(CHECK));
+    let again = markers.iter().any(|marker| !marker.starts_with(CHECK));
     let waved = markers.iter().any(|marker| WAVED.contains(marker));
     let passing = markers.iter().all(|marker| PASSING.contains(marker));
-    match (checked, waved) {
-        (true, true) => STRONG + 1,
+    match (checked, waved || quoted) {
+        (true, _) if again || quoted => STRONG + 1,
         (false, false) if passing => PASSED,
         (false, false) => STRONG - 1,
         _ => STRONG,
     }
 }
 
-/// Whether `case` names something a request names: in a code span one of
-/// `names`, the request's identifiers, whatever else the span holds, or in
-/// a quoted literal `QUOTED` words in a row of `said`, the request's words.
-fn asked(case: &str, said: &[String], names: &[String]) -> bool {
+/// Whether `case` quotes a request: in a quoted literal, `QUOTED` words in
+/// a row of `said`, the request's words.
+fn quotes(case: &str, said: &[String]) -> bool {
     literals(case).into_iter().any(|range| {
         let literal = &case[range];
-        if literal.starts_with('`') {
-            return (identifiers(literal).iter()).any(|name| names.contains(name));
-        }
         let quote = words(literal);
         let quote: Vec<&str> = quote.iter().map(|(_, word)| word.as_str()).collect();
-        shared(&quote, said).len() >= QUOTED
+        !literal.starts_with('`') && shared(&quote, said).len() >= QUOTED
+    })
+}
+
+/// Whether `case` holds, in a code span, one of `names`, a request's
+/// identifiers, whatever else the span holds.
+fn named(case: &str, names: &[String]) -> bool {
+    literals(case).into_iter().any(|range| {
+        let literal = &case[range];
+        literal.starts_with('`') && (identifiers(literal).iter()).any(|name| names.contains(name))
     })
 }
 
@@ -571,11 +585,11 @@ pub(crate) fn section(doubts: &[String], tester: bool) -> String {
 }
 
 /// The cases `text` weighs off, in the order each was last weighed, each
-/// with its `weight` by all the markers that weighed it.
-fn cases(text: &str) -> Vec<(String, u8)> {
+/// with the markers of every sentence that weighed it.
+fn cases(text: &str) -> Vec<(String, Vec<&'static str>)> {
     let units = units(text);
     // Each sentence named as a case, with the markers that weighed it.
-    let mut named: Vec<(usize, Vec<&str>)> = Vec::new();
+    let mut named: Vec<(usize, Vec<&'static str>)> = Vec::new();
     for (at, unit) in units.iter().enumerate() {
         let marks = marks(&masked(unit));
         if marks.is_empty() {
@@ -587,7 +601,7 @@ fn cases(text: &str) -> Vec<(String, u8)> {
         else {
             continue;
         };
-        let mut markers: Vec<&str> = marks.into_iter().map(|(_, marker)| marker).collect();
+        let mut markers: Vec<_> = marks.into_iter().map(|(_, marker)| marker).collect();
         // Weighed again, a sentence stands where it was weighed last.
         if let Some(before) = named.iter().position(|(kept, _)| *kept == naming) {
             markers.extend(named.remove(before).1);
@@ -595,7 +609,7 @@ fn cases(text: &str) -> Vec<(String, u8)> {
         named.push((naming, markers));
     }
     (named.into_iter())
-        .map(|(naming, markers)| (case(&units[naming]), weight(&markers)))
+        .map(|(naming, markers)| (case(&units[naming]), markers))
         .collect()
 }
 
@@ -1002,15 +1016,80 @@ mod tests {
             assert!(found[0].contains("`open()` twice"), "{found:?}");
             assert_eq!(found[1..], alone(4..=12), "{early}");
         }
-        // One only predicted, or only waved off, is weighed as the rest are.
+        // One only predicted, or only waved off, is weighed as the rest are;
+        // so is one whose second sentence has a span of its own, which
+        // names another case.
         for early in [
             "Hidden tests might call `open()` twice.",
             "Calling `open()` twice? Unlikely.",
+            "Hidden tests might call `open()` twice.\nA second `open()` is rare in a caller.",
         ] {
             let mut notes = vec![early.to_owned()];
             notes.extend(inputs(1..=12, "Rare."));
             assert_eq!(weighed(&notes.join("\n")), alone(3..=12), "{early}");
         }
+    }
+
+    #[test]
+    fn a_check_the_run_predicted_and_weighed_again_in_any_words_is_kept_first() {
+        // By a word that waves nothing off alone, and by one said in
+        // passing: of a check the run predicted, each sets the case aside.
+        for again in [
+            "Probably not.",
+            "I'll keep it.",
+            "Acceptable.",
+            "Not needed.",
+        ] {
+            let mut notes = vec![format!("Hidden tests might call `open()` twice. {again}")];
+            notes.extend(inputs(1..=12, "Rare."));
+            let found = weighed(&notes.join("\n"));
+            assert_eq!(
+                found[0], "Hidden tests might call `open()` twice.",
+                "{again}"
+            );
+            assert_eq!(found[1..], alone(4..=12), "{again}");
+        }
+        // Two markers that each predict a check weigh it once.
+        let mut notes =
+            vec!["Hidden tests might call `open()` twice; a hidden test could.".to_owned()];
+        notes.extend(inputs(1..=12, "Rare."));
+        assert_eq!(weighed(&notes.join("\n")), alone(3..=12));
+    }
+
+    #[test]
+    fn a_case_weighed_with_the_requests_words_quoted_is_weighed_hard() {
+        let request = "Read at most the limit given, and keep what is left for later.";
+        let given = |early: &str, later: &str| {
+            let mut notes = vec![early.to_owned()];
+            notes.extend(inputs(1..=12, later));
+            doubts(&[said(&notes.join("\n"), "")], request)
+        };
+        // Weighed by any word, it is kept before later cases a word that
+        // waves nothing off weighed, as one of those words would keep it.
+        let reading = "Is \"at most the limit given\" bytes or lines? I'll keep bytes.";
+        let found = given(reading, "I'll keep it.");
+        assert_eq!(found[0], "Is \"at most the limit given\" bytes or lines?");
+        assert_eq!(found[1..], alone(4..=12));
+        // Fewer words of the request are no quote, and a code span it names
+        // only comes first among cases weighed alike.
+        let few = "Is \"the limit given\" bytes or lines? I'll keep bytes.";
+        assert_eq!(given(few, "I'll keep it."), alone(3..=12));
+        let span = "Is `limit` bytes or lines? I'll keep bytes.";
+        assert_eq!(
+            given(span, "I'll keep it.")[0],
+            "Is `limit` bytes or lines?"
+        );
+        assert_eq!(given(span, "Rare."), alone(3..=12));
+        // With a check predicted of it, it comes before the cases a strong
+        // word weighed.
+        let checked = "Hidden tests may read \"at most the limit given\" as lines.";
+        let found = given(checked, "Rare.");
+        assert_eq!(found[0], checked);
+        assert_eq!(found[1..], alone(4..=12));
+        assert_eq!(
+            given(reading, "Rare.")[0],
+            "Is \"at most the limit given\" bytes or lines?"
+        );
     }
 
     #[test]
@@ -1071,7 +1150,7 @@ mod tests {
     fn a_request_names_a_code_span_by_an_identifier_of_four_letters_or_more() {
         let names = |request: &str, case: &str| {
             let said: Vec<String> = (words(request).into_iter()).map(|(_, word)| word).collect();
-            asked(case, &said, &identifiers(request))
+            quotes(case, &said) || named(case, &identifiers(request))
         };
         let request = "Add `GetBaseline(ctx, baselineID)`, or put a default in a store.";
         assert_eq!(
@@ -1173,10 +1252,6 @@ mod tests {
     fn words_that_say_a_case_will_not_come_up_wave_it_off_as_unlikely_does() {
         for (notes, case) in [
             (
-                "Could a caller pass `indent` with a pipe? Probably not.",
-                "Could a caller pass `indent` with a pipe?",
-            ),
-            (
                 "A test that waits on `max_age` to pass. Not likely.",
                 "A test that waits on `max_age` to pass.",
             ),
@@ -1193,17 +1268,14 @@ mod tests {
             assert_eq!(found[0], case, "{notes}");
             assert_eq!(found[1..], alone(4..=12), "{notes}");
         }
-        // A verdict of one word that waves a case off ranks the same, and
-        // with a check the run predicted of the case, before all of them.
-        let mut all = vec![
-            "Hidden tests might pass `of` twice there. Ignore.".to_owned(),
-            "A `tail` wider than the width? Edge.".to_owned(),
-            "An error part way leaves `stream` open. Acceptable.".to_owned(),
-        ];
-        all.extend(inputs(1..=12, "Rare."));
-        let found = weighed(&all.join("\n"));
-        assert_eq!(found[0], "Hidden tests might pass `of` twice there.");
-        assert_eq!(found[1..], alone(4..=12));
+        // A verdict of one word that waves a case off ranks the same.
+        for verdict in ["Ignore.", "Edge."] {
+            let mut all = vec![format!("A `tail` wider than the width? {verdict}")];
+            all.extend(inputs(1..=12, "I'll keep it."));
+            let found = weighed(&all.join("\n"));
+            assert_eq!(found[0], "A `tail` wider than the width?", "{verdict}");
+            assert_eq!(found[1..], alone(4..=12), "{verdict}");
+        }
         // A cost called low is a case taken up, not set aside, and neither
         // that nor a case called no real one is a weigh-off.
         assert!(weighed("Also take `of` there? Low cost.").is_empty());
@@ -1216,13 +1288,21 @@ mod tests {
                       safest.";
         let case = "The words say \"must include a cache section\"";
         assert_eq!(weighed(safest), [case]);
-        // Neither waves a case off: one that does is kept before them.
+        // Neither waves a case off, nor do two words read as often of what
+        // is none of the work's: a case one of them weighed is given for
+        // being late, not before one a strong word weighed.
         let mut all = vec![
             safest.to_owned(),
             "Still write `val` for a format it does not know? Keep.".to_owned(),
+            "Could a caller pass `indent` with a pipe? Probably not.".to_owned(),
+            "An error part way leaves `stream` open. Acceptable.".to_owned(),
         ];
+        assert_eq!(weighed(&all.join("\n")).len(), all.len());
         all.extend(inputs(1..=10, "Rare."));
         assert_eq!(weighed(&all.join("\n")), alone(1..=10));
+        for word in ["probably not", "acceptable", "keep", "safest"] {
+            assert!(!WAVED.contains(&word) && !PASSING.contains(&word));
+        }
     }
 
     #[test]
