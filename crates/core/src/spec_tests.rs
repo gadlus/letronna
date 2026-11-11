@@ -1921,24 +1921,24 @@ fn words_first(silent: &str) -> String {
     format!("{WORDS_FIRST} Where the words are silent on the case, {silent}.")
 }
 
-/// What follows `words_first` in a notice of a tester's tests, of what a
-/// review passed. On a benchmark run a tester's tests expected a record
-/// where the project had no place for one, and the run took the record out
-/// of the place two of a review's rows had passed. The notice of a first
-/// version that passed (`regressed`) leaves it out: there the run puts back
-/// what broke the test, which a later review's row may have passed.
-const ROWS_STAND: &str = "To pass a test, do not take away or move something your work does \
-                          that a review's row passed, unless the request's words ask for that: \
-                          a test that wants it somewhere else or done another way is answered \
-                          by quoting the words.";
+/// What a notice of a tester's tests asks where the request's words are
+/// silent on a test's case: to say so, and to leave what a review passed.
+/// On a benchmark run a tester's tests expected a record where the project
+/// had no place for one, and the run took the record out of the place two
+/// of a review's rows had passed. Where the words do ask for what a test
+/// wants they are not silent, and the run follows them. The notice of a
+/// first version that passed (`regressed`) says another thing of silence:
+/// there the run puts back what broke the test, which a later review's row
+/// may have passed.
+const SILENT: &str = "say so in your answer, and do not take away or move something a \
+                      review's row passed to pass the test";
 
 /// `words_first` as each notice of a tester's tests says it but the one of
 /// a first version that passed: `ONE_READING` ahead of it, so the first
-/// notice a run reads of the tests says what they are, and after it, where
-/// the words are silent the run says so, and `ROWS_STAND` follows.
+/// notice a run reads of the tests says what they are, and `SILENT` where
+/// the words are silent.
 fn words_and_rows() -> String {
-    let words = words_first("say so in your answer");
-    format!("{ONE_READING} {words} {ROWS_STAND}")
+    format!("{ONE_READING} {}", words_first(SILENT))
 }
 
 /// What a notice of a tester's tests tells the run of the tester itself. On
@@ -1952,13 +1952,22 @@ const ONE_READING: &str = "The tester can misread the request as you can: its te
                            the words decide.";
 
 /// What the report of a tester started ahead of the work tells the run in
-/// place of `WORDS_FIRST`: its tests are read before the work exists, so
-/// the rule is about what to build, not what to keep.
+/// place of `WORDS_FIRST`: its table says nothing of the work, so its tests
+/// are read for what they expect, and the rule is about what to make the
+/// work do for one. `words_ahead` ends it.
 const WORDS_FIRST_AHEAD: &str = "Before making your work do what a test expects, find the \
                                  request's words for that exact case: where they set a narrower \
                                  rule the test ignores, such as a filter, a condition or an \
                                  exception, follow the words and answer the test by quoting \
-                                 them; where they are silent on the case, say so in your answer.";
+                                 them";
+
+/// `WORDS_FIRST_AHEAD`, then `SILENT`: the report was written ahead of the
+/// work but reaches the run when it says it is done, with the reviews of
+/// that work, so what a review's row passed stands there as in any other
+/// notice of the tester's tests.
+fn words_ahead() -> String {
+    format!("{WORDS_FIRST_AHEAD}; where they are silent on the case, {SILENT}.")
+}
 
 /// The notice sending the run back with `outcome`, what `command` made of
 /// the tester's tests `kept` run against its work; None when they passed.
@@ -3737,7 +3746,8 @@ pub(crate) fn told_ahead(report: &str, kept: Option<&Kept>) -> String {
              worked, in the project as it was before your change, where none could pass yet; \
              its report follows, ending with a table of its tests, whose rows say NOT RUN or \
              FAIL for want of your change, not what your work does. Make your work do what each \
-             test expects where the request's words say so. {ONE_READING} {WORDS_FIRST_AHEAD}"
+             test expects where the request's words say so. {ONE_READING} {}",
+            words_ahead()
         ),
         &marked,
         kept,
@@ -5917,7 +5927,8 @@ mod tests {
         );
         let report = "R1 | adds | FAIL | npx vitest run x | got []\nRun: npx vitest run x";
         let failing = Ok("FAIL tests/letronna_spec.test.ts\n[exit code 1]".to_owned());
-        let silent = "Where the words are silent on the case, say so in your answer.";
+        let silent = "Where the words are silent on the case, say so in your answer, and do \
+                      not take away or move something a review's row passed to pass the test.";
         let notices = [
             failed(&kept, "npx vitest run x", &failing).unwrap(),
             told(report, Some(&kept), true),
@@ -5937,7 +5948,8 @@ mod tests {
             ),
             "{regressed}"
         );
-        // Ahead of the work, the rule is about what to build.
+        // Of tests written ahead of the work, whose table says nothing of
+        // it, the rule is about what to make the work do for a test.
         let ahead = told_ahead(report, Some(&kept));
         assert!(ahead.contains(WORDS_FIRST_AHEAD), "{ahead}");
         assert!(!ahead.contains(WORDS_FIRST), "{ahead}");
@@ -5962,10 +5974,9 @@ mod tests {
         );
         assert!(!ONE_READING.contains("judged"), "{ONE_READING}");
         assert_eq!(
-            ROWS_STAND,
-            "To pass a test, do not take away or move something your work does that a review's \
-             row passed, unless the request's words ask for that: a test that wants it \
-             somewhere else or done another way is answered by quoting the words."
+            SILENT,
+            "say so in your answer, and do not take away or move something a review's row \
+             passed to pass the test"
         );
         let report = "R1 | adds | FAIL | npx vitest run x | got []\nRun: npx vitest run x";
         let failing = Ok("FAIL tests/letronna_spec.test.ts\n[exit code 1]".to_owned());
@@ -5985,23 +5996,25 @@ mod tests {
         let after = format!("where the request's words say so. {ONE_READING} {WORDS_FIRST_AHEAD}");
         assert!(ahead.contains(&after), "{ahead}");
         assert_eq!(ahead.matches(ONE_READING).count(), 1, "{ahead}");
-        // What a review passed stays in each notice of tests run against the
-        // work as a review saw it, after what silence asks.
-        let silent = "Where the words are silent on the case, say so in your answer.";
-        let stands = format!("{WORDS_FIRST} {silent} {ROWS_STAND}");
+        // What a review passed stays where the words are silent, in each
+        // notice of the tester's tests, said once.
+        let stands = format!("{WORDS_FIRST} Where the words are silent on the case, {SILENT}.");
         for text in [failed, told, unrun] {
             assert!(text.contains(&stands), "{text}");
-            assert_eq!(text.matches(ROWS_STAND).count(), 1, "{text}");
+            assert_eq!(text.matches(SILENT).count(), 1, "{text}");
             assert_eq!(text.matches(ONE_READING).count(), 1, "{text}");
         }
+        // The report written ahead of the work reaches the run with the
+        // reviews of that work, so it stays there too.
+        let stands = format!("{WORDS_FIRST_AHEAD}; where they are silent on the case, {SILENT}.");
+        assert!(ahead.contains(&stands), "{ahead}");
+        assert_eq!(ahead.matches(SILENT).count(), 1, "{ahead}");
         // Not where a first version passed: there the run puts back what
         // broke the test, which a later review's row may have passed, and
         // the two would pull against each other.
         let regressed = regressed("npx vitest run x", "exited with code 1", "FAIL", &[]);
-        assert!(!regressed.contains(ROWS_STAND), "{regressed}");
+        assert!(!regressed.contains(SILENT), "{regressed}");
         assert!(!regressed.contains("do not take away"), "{regressed}");
-        // Nor ahead of the work, which no review has seen.
-        assert!(!ahead.contains(ROWS_STAND), "{ahead}");
     }
 
     #[test]
