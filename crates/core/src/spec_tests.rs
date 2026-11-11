@@ -1114,9 +1114,9 @@ fn briefing(
          the change it should see. Set each test up the way those tests do, and make each \
          change before the first call or query, as a caller would, rather than calling once \
          beforehand to warm anything up. Where the project's data, docs or tests already spell \
-         an output, expect that spelling. Where the project's own tests already check the value \
-         a test of yours reads, such as what a stored record holds after the same call, expect \
-         the same of it unless the request's words change it.\n\n\
+         an output, expect that spelling, and where its tests already check a value yours read \
+         after the same call, such as what a stored record holds, expect the same unless the \
+         request's words change it.\n\n\
          Write the tests in the project's own test language and style, in new files whose \
          names hold `{MARKER}`, where its test runner finds them, such as beside its other \
          tests, and run them with that runner. Change no other file. {outcome}\n\n\
@@ -3932,9 +3932,10 @@ mod tests {
             // the request changes it.
             assert!(
                 brief.contains(
-                    "expect that spelling. Where the project's own tests already check the \
-                     value a test of yours reads, such as what a stored record holds after the \
-                     same call, expect the same of it unless the request's words change it.\n\n"
+                    "Where the project's data, docs or tests already spell an output, expect \
+                     that spelling, and where its tests already check a value yours read after \
+                     the same call, such as what a stored record holds, expect the same unless \
+                     the request's words change it.\n\n"
                 ),
                 "{brief}"
             );
