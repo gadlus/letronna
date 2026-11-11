@@ -3969,9 +3969,12 @@ fn failing_test(messages: &[Message], workspace: &Path) -> Option<(Value, String
                 return None;
             }
             let passed_since = results[at + 1..].iter().any(|(later, result)| {
+                // One moved to the background has no exit code yet, which
+                // is not a pass.
                 line(later) == key
                     && !result.is_error
                     && crate::tool_runs::exit_code(result).is_none()
+                    && !crate::tool_runs::moved(result)
             });
             (!passed_since).then(|| (args.clone(), result.content.clone()))
         })
@@ -4072,7 +4075,7 @@ fn ran_set_up(result: &Message, args: &Value) -> bool {
     if result.is_error || crate::tool_runs::exit_code(result).is_some() {
         return false;
     }
-    if args["background"].as_bool().unwrap_or(false) {
+    if args["background"].as_bool().unwrap_or(false) || crate::tool_runs::moved(result) {
         return false;
     }
     !crate::spec_tests::set_up_failed(&result.content)
@@ -10192,6 +10195,20 @@ pub(crate) mod tests {
         let job = json!({"command": "cargo test -p meta", "background": true});
         messages.push(tool(job, "Started as job #3 (running).", false));
         messages.push(failed("pip install -e ."));
+        assert_eq!(found(&messages).unwrap().0, "\"cargo test -p meta\"");
+        // Nor does the same line moved to the background at its time limit,
+        // which has not ended; nor has its set-up shown it lets the program
+        // run.
+        let moved = ran(
+            "cargo test -p meta",
+            "Still running after 120s, so it carries on in the background as job #4 instead of \
+             being stopped. A notice comes when it exits. Output so far:\n3 passed",
+        );
+        assert!(crate::tool_runs::moved(&moved));
+        let meta = json!({"command": "cargo test -p meta"});
+        assert!(!ran_set_up(&moved, &meta));
+        assert!(ran_set_up(&passed("cargo test -p meta"), &meta));
+        messages.push(moved);
         assert_eq!(found(&messages).unwrap().0, "\"cargo test -p meta\"");
         // The same line in another folder is another test.
         let elsewhere = json!({"command": "cargo test -p meta", "workdir": "crates/meta"});
