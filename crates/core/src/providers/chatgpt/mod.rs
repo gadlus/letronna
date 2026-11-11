@@ -4,7 +4,10 @@
 //! The sign-in is OpenAI's own, the one Codex uses, and only comes back to
 //! `localhost:1455`. The backend speaks the Responses API alone, streamed
 //! only and with nothing stored; what it needs beyond OpenAI's own API is
-//! added at the edge, in `wire::openai_responses`.
+//! added at the edge, in `wire::openai_responses`. Pictures have two routes
+//! of their own beside it, in `images`.
+
+pub(crate) mod images;
 
 use super::auth::OAuthSpec;
 use super::usage::{self, Usage, Window};

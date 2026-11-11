@@ -8,6 +8,16 @@
 //! gateway, since OpenAI and the servers copying it have the same route, and
 //! is offered signed out whenever that gateway is not Letronna.
 //!
+//! A ChatGPT plan makes pictures too, on routes of its own that the plan
+//! covers (`providers::chatgpt::images`). A chat on one has its pictures
+//! edited there, as on any chat's own gateway, and made there too, unless
+//! the user picked a hosted image model in the model menu and has an
+//! account to pay for it. The pick is the user's alone: nothing the model
+//! puts in a call moves a picture the plan covers to one that costs. With
+//! no account at all, a plan signed in to makes pictures for a chat on any
+//! gateway, so signing in with ChatGPT alone is enough for one. Speech,
+//! transcription and video stay Letronna's.
+//!
 //! What is made is saved as a file: in `media/` in the folder the session
 //! works in, its project or the fallback folder, or in Letronna's own data
 //! folder in a chat other people read and where there is no fallback folder,
@@ -21,8 +31,10 @@
 //! nothing into the project. The chat shows the newest few to the model.
 
 use crate::chat::Connection;
+use crate::providers::chatgpt::images;
 use crate::tools::{Tool, ToolContext};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -51,6 +63,9 @@ pub const PICTURE_BYTES: usize = 5 * 1024 * 1024 / 4 * 3;
 /// itself, and more than OpenAI keeps of it (768 on the short side).
 const LONG_SIDE: u32 = 1_568;
 
+/// What make_image says of itself where a ChatGPT plan makes the picture.
+const ON_PLAN: &str = "Make an image from a description on the user's ChatGPT plan, and save it as a file. The plan covers it, counted toward its image limit, so use it only when the user asks for an image. The plan's model picks the size itself, so say the shape wanted -- square, wide or tall -- in the prompt.";
+
 pub struct MakeImage;
 impl Tool for MakeImage {
     fn name(&self) -> &'static str {
@@ -66,20 +81,44 @@ impl Tool for MakeImage {
             "model": {"type": "string", "description": "A hosted image model's id. Left out, the one the user picked, or the cheapest working."}
         }, "required": ["prompt"]})
     }
+    // Said as the call will go, so the model promises no size a plan will
+    // not keep to and names no hosted model the plan would not use.
+    fn description_for(&self, connection: &Connection, _: &[&str]) -> Cow<'static, str> {
+        match plan_for(Some(connection)) {
+            Some(_) => ON_PLAN.into(),
+            None => self.description().into(),
+        }
+    }
+    fn parameters_for(&self, connection: &Connection) -> Value {
+        let mut parameters = self.parameters();
+        if plan_for(Some(connection)).is_some()
+            && let Some(properties) = parameters["properties"].as_object_mut()
+        {
+            properties.remove("size");
+            properties.remove("model");
+        }
+        parameters
+    }
     fn needs_approval(&self) -> bool {
         true
     }
+    // With an account, or with a ChatGPT plan signed in to: asked of the
+    // sign-in and not of the connection, as a call is checked again with
+    // one that names no gateway.
     fn offered(&self, _: &Connection) -> bool {
-        crate::auth::signed_in()
+        crate::auth::signed_in() || images::plan(None).is_some()
     }
     fn mutates(&self) -> bool {
         true
     }
-    fn preview(&self, args: &Value, _: &ToolContext) -> String {
+    fn preview(&self, args: &Value, ctx: &ToolContext) -> String {
         let mut what = format!(
             "An image of: {}",
             args["prompt"].as_str().unwrap_or_default()
         );
+        if plan_for(ctx.caller.connection.as_deref()).is_some() {
+            return format!("{what}\n\n{PLAN_CARD}");
+        }
         if let Some(size) = args["size"].as_str() {
             what.push_str(&format!("\nSize: {size}"));
         }
@@ -87,6 +126,9 @@ impl Tool for MakeImage {
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let prompt = required(args, "prompt")?;
+        if let Some(plan) = plan_for(ctx.caller.connection.as_deref()) {
+            return made_on(&plan, prompt, ctx);
+        }
         let token = token()?;
         let mut body = json!({"prompt": prompt, "n": 1});
         pass(args, &mut body, &["size"], "image");
@@ -133,6 +175,31 @@ impl Tool for EditImage {
             "model": {"type": "string", "description": "An image model that can edit. Left out, the one the user picked, or the gateway's own."}
         }, "required": ["images", "prompt"]})
     }
+    // A ChatGPT plan's route takes fewer pictures and no mask.
+    fn description_for(&self, connection: &Connection, _: &[&str]) -> Cow<'static, str> {
+        match images::chats_on(connection) {
+            true => EDIT_ON_PLAN.into(),
+            false => self.description().into(),
+        }
+    }
+    fn parameters_for(&self, connection: &Connection) -> Value {
+        let mut parameters = self.parameters();
+        if !images::chats_on(connection) {
+            return parameters;
+        }
+        let properties = &mut parameters["properties"];
+        properties["images"]["description"] = format!(
+            "The pictures to edit, relative to the workspace, or a path in Letronna's media folder as an earlier result named it. Up to {}.",
+            images::MOST
+        )
+        .into();
+        if let Some(properties) = properties.as_object_mut() {
+            for left_out in ["mask", "size", "model"] {
+                properties.remove(left_out);
+            }
+        }
+        parameters
+    }
     fn needs_approval(&self) -> bool {
         true
     }
@@ -152,18 +219,19 @@ impl Tool for EditImage {
             named.join(", "),
             args["prompt"].as_str().unwrap_or_default()
         );
+        // A plan's route takes no mask and picks the size, so its card
+        // promises neither.
+        let connection = ctx.caller.connection.as_deref();
+        if connection.is_some_and(images::chats_on) {
+            return format!("{what}\n\n{PLAN_CARD}");
+        }
         if let Some(mask) = args["mask"].as_str() {
             what.push_str(&format!("\nOnly where `{mask}` is transparent."));
         }
         if let Some(size) = args["size"].as_str() {
             what.push_str(&format!("\nSize: {size}"));
         }
-        let endpoint = ctx
-            .caller
-            .connection
-            .as_deref()
-            .map(|c| c.endpoint.clone())
-            .unwrap_or_default();
+        let endpoint = connection.map(|c| c.endpoint.clone()).unwrap_or_default();
         if hosted(&endpoint) {
             return card(what, args, "image");
         }
@@ -179,6 +247,12 @@ impl Tool for EditImage {
         let Some(connection) = ctx.caller.connection.as_deref() else {
             return Err("Pictures are edited on the chat's gateway, and none was given.".into());
         };
+        // A ChatGPT plan has a route of its own, which takes no form.
+        if images::chats_on(connection)
+            && let Some(plan) = images::plan(Some(connection))
+        {
+            return edited_on(&plan, args, prompt, ctx);
+        }
         let chat = crate::chat::validate(connection)?;
         let base = chat.strip_suffix("/chat/completions").unwrap_or(&chat);
         let on_letronna = hosted(base);
@@ -342,6 +416,93 @@ fn edit_rules(model: Option<&str>) -> EditRules {
             png: false,
             legacy,
         },
+    }
+}
+
+/// What edit_image says of itself in a chat on a ChatGPT plan.
+const EDIT_ON_PLAN: &str = "Change pictures as a description says -- edit one or combine several -- and save the result as a file. It is made on the user's ChatGPT plan, which covers it, counted toward its image limit. Say in the prompt which part to change: there is no mask, and the plan's model picks the size itself. Use it only when the user asks for a picture to be changed.";
+
+/// What a card says of a picture a ChatGPT plan makes, in place of a price.
+const PLAN_CARD: &str = "Made on your ChatGPT plan, counted toward its image limit.";
+
+/// The ChatGPT plan that makes a picture asked for over `connection`, or
+/// `None` for Letronna's hosted models: the plan the chat is on, unless
+/// the user picked a hosted image model in the model menu and has an
+/// account to pay for it; and with no account at all, a plan signed in to
+/// beside the chat, the only one there is to ask. A model the call itself
+/// names decides nothing here: which of the two is the user's choice, and
+/// only one of them costs.
+fn plan_for(connection: Option<&Connection>) -> Option<images::Plan> {
+    let plan = images::plan(connection)?;
+    if !crate::auth::signed_in() {
+        return Some(plan);
+    }
+    let on_plan = connection.is_some_and(images::chats_on);
+    (on_plan && !choices().contains_key("image")).then_some(plan)
+}
+
+/// Make the picture `prompt` describes on `plan`, and save it as any made
+/// image is.
+fn made_on(plan: &images::Plan, prompt: &str, ctx: &ToolContext) -> Result<String, String> {
+    let bytes = images::make(plan, prompt)?;
+    let path = save(ctx, prompt, image_extension(&bytes), &bytes)?;
+    Ok(format!(
+        "{SAVED}{}\n{}, made on the ChatGPT plan.",
+        path.display(),
+        measured(&bytes)
+    ))
+}
+
+/// Edit the pictures `args` names on `plan`, held to what its route takes
+/// before anything is sent.
+fn edited_on(
+    plan: &images::Plan,
+    args: &Value,
+    prompt: &str,
+    ctx: &ToolContext,
+) -> Result<String, String> {
+    if !args["mask"].is_null() {
+        return Err(
+            "A ChatGPT plan's image edits take no mask. Leave `mask` out, and say in the \
+             prompt which part to change."
+                .into(),
+        );
+    }
+    let raws = pictures(args);
+    if raws.is_empty() {
+        return Err("`images` is required: the pictures to edit.".into());
+    }
+    if raws.len() > images::MOST {
+        return Err(format!(
+            "{} pictures were given; an image edit on a ChatGPT plan takes at most {}.",
+            raws.len(),
+            images::MOST
+        ));
+    }
+    let mut sent = Vec::new();
+    for raw in &raws {
+        let path = crate::messaging::files::pick(raw, ctx)?;
+        let (_, bytes) = upload_ready(&path, raw, images::PICTURE_BYTES, false)?;
+        sent.push(as_data_url(&bytes));
+    }
+    let bytes = images::edit(plan, prompt, sent)?;
+    let path = save(ctx, prompt, image_extension(&bytes), &bytes)?;
+    let from: Vec<String> = raws.iter().map(|raw| format!("`{raw}`")).collect();
+    Ok(format!(
+        "{SAVED}{}\n{}, edited from {} on the ChatGPT plan.",
+        path.display(),
+        measured(&bytes),
+        from.join(", ")
+    ))
+}
+
+/// A made picture as its result names it: how many pixels, when its header
+/// says, and how large a file. A plan's model picks the size itself, so
+/// this is where the model learns what it got.
+fn measured(bytes: &[u8]) -> String {
+    match dimensions(bytes) {
+        Some((width, height)) => format!("A {width}x{height} image, {}", size(bytes.len())),
+        None => format!("A {} image", size(bytes.len())),
     }
 }
 
@@ -1407,6 +1568,17 @@ pub(crate) fn data_url(path: &Path) -> Option<String> {
     Some(format!("data:image/{kind};base64,{}", to_base64(&bytes)))
 }
 
+/// A picture `upload_ready` made ready as a `data:` address, which is how a
+/// ChatGPT plan's edits take one: a PNG, a JPEG or a WebP, typed as it is.
+fn as_data_url(bytes: &[u8]) -> String {
+    let kind = match picture_kind(bytes) {
+        Some("jpg") => "jpeg",
+        Some("webp") => "webp",
+        _ => "png",
+    };
+    format!("data:image/{kind};base64,{}", to_base64(bytes))
+}
+
 /// Standard base64 the other way, for pictures sent to a model.
 fn to_base64(bytes: &[u8]) -> String {
     const LETTERS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1630,6 +1802,8 @@ mod tests {
 
     #[test]
     fn every_media_tool_asks_first_and_stays_out_of_plan_mode() {
+        // Who makes a picture turns on what is signed in: nothing, here.
+        let (_vault, _held) = crate::providers::auth::tests::vault("media-asks-first");
         for name in [
             "make_image",
             "edit_image",
@@ -2334,6 +2508,319 @@ mod tests {
         assert!(card.ends_with("paid from your Letronna credit."), "{card}");
         assert!(!EditImage.offered(&letronna));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Sign the vault this test holds in to a ChatGPT plan, and hand back a
+    /// folder apart from its data folder, with a `project` in it.
+    fn on_a_plan(name: &str) -> crate::store::tests::Scratch {
+        crate::providers::tests::plugged_in("chatgpt");
+        crate::providers::auth::tests::keep(crate::providers::chatgpt::NAME, "access-1");
+        let around = crate::store::tests::Scratch::new(&format!("{name}-around"));
+        std::fs::create_dir_all(around.join("project")).unwrap();
+        around
+    }
+
+    /// Sign this test's data folder in to a Letronna account.
+    fn with_an_account(data: &Path) {
+        let account = crate::auth::Account {
+            token: "t-1".into(),
+            ..Default::default()
+        };
+        let account = serde_json::to_string(&account).unwrap();
+        std::fs::write(data.join("account.json"), account).unwrap();
+    }
+
+    #[test]
+    fn a_chat_signed_in_with_chatgpt_alone_is_offered_pictures_on_its_plan() {
+        let (_vault, _held) = crate::providers::auth::tests::vault("media-plan-offer");
+        let chat = images::tests::chat();
+        let elsewhere = Connection {
+            endpoint: "https://api.example.com/v1".into(),
+            ..Default::default()
+        };
+        // Signed in to nothing, there is nobody to make one.
+        assert!(!MakeImage.offered(&chat) && !MakeImage.offered(&elsewhere));
+        assert_eq!(
+            MakeImage.description_for(&elsewhere, &[]),
+            MakeImage.description()
+        );
+        assert_eq!(MakeImage.parameters_for(&elsewhere), MakeImage.parameters());
+        crate::providers::tests::plugged_in("chatgpt");
+        crate::providers::auth::tests::keep(crate::providers::chatgpt::NAME, "access-1");
+        // A call is checked again with a connection that names no gateway,
+        // and is offered there as it was to the chat.
+        assert!(MakeImage.offered(&chat) && MakeImage.offered(&Connection::default()));
+        // With no account the plan is all there is, for a chat anywhere.
+        for connection in [&chat, &elsewhere] {
+            assert_eq!(MakeImage.description_for(connection, &[]), ON_PLAN);
+        }
+        // Nothing is offered that the plan would not keep to.
+        let names = |parameters: Value| -> Vec<String> {
+            let properties = parameters["properties"].as_object().unwrap();
+            properties.keys().cloned().collect()
+        };
+        assert_eq!(names(MakeImage.parameters_for(&chat)), ["prompt"]);
+        // In the window and the terminal it is found on demand, and reads
+        // there as it will run.
+        let window = Connection {
+            tools: true,
+            rare_on_demand: true,
+            ..chat.clone()
+        };
+        let find = crate::tools::find(crate::mcp_find::FIND_TOOLS).unwrap();
+        let found = find
+            .run(&json!({"query": "make_image"}), &ToolContext::of(&window))
+            .unwrap();
+        let entry = found.split("\nmake_image: ").nth(1).unwrap_or(&found);
+        let entry = entry.split("\n\n").next().unwrap();
+        assert!(entry.starts_with(ON_PLAN), "{found}");
+        assert!(
+            entry.contains(r#""prompt""#) && !entry.contains(r#""size""#),
+            "{found}"
+        );
+        // Nor does its card promise the size or the model a call names.
+        let args = json!({"prompt": "a cat", "size": "1024x1024", "model": "flux.2-pro"});
+        let card = MakeImage.preview(&args, &ToolContext::of(&chat));
+        assert_eq!(card, format!("An image of: a cat\n\n{PLAN_CARD}"));
+        // Its edits go to the plan too, which takes fewer pictures and no mask.
+        assert!(EditImage.offered(&chat));
+        assert_eq!(EditImage.description_for(&chat, &[]), EDIT_ON_PLAN);
+        let edit = EditImage.parameters_for(&chat);
+        assert_eq!(names(edit.clone()), ["images", "prompt"]);
+        let pictures = edit["properties"]["images"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(pictures.ends_with("Up to 5."), "{pictures}");
+        assert_eq!(
+            EditImage.description_for(&elsewhere, &[]),
+            EditImage.description()
+        );
+        assert_eq!(EditImage.parameters_for(&elsewhere), EditImage.parameters());
+        let args = json!({"images": ["cat.png"], "mask": "m.png", "prompt": "a hat"});
+        let card = EditImage.preview(&args, &ToolContext::of(&chat));
+        assert_eq!(card, format!("Edit `cat.png`: a hat\n\n{PLAN_CARD}"));
+    }
+
+    #[test]
+    fn with_an_account_too_only_the_users_own_pick_moves_a_picture_off_the_chats_plan() {
+        let (_vault, held) = crate::providers::auth::tests::vault("media-plan-or-hosted");
+        let _around = on_a_plan("media-plan-or-hosted");
+        with_an_account(&held.1);
+        let chat = images::tests::chat();
+        let letronna = Connection {
+            endpoint: crate::auth::hosted_base(),
+            ..Default::default()
+        };
+        // The chat's own plan covers it, and a chat anywhere else is paid
+        // for as it always was.
+        assert!(plan_for(Some(&chat)).is_some());
+        assert!(plan_for(Some(&letronna)).is_none() && plan_for(None).is_none());
+        assert_eq!(MakeImage.description_for(&chat, &[]), ON_PLAN);
+        assert_eq!(
+            MakeImage.description_for(&letronna, &[]),
+            MakeImage.description()
+        );
+        assert_eq!(MakeImage.parameters_for(&letronna), MakeImage.parameters());
+        // A model the call names moves nothing: the plan's card still, and
+        // no hosted model's price.
+        let named = json!({"prompt": "a cat", "model": "flux.2-pro"});
+        let card = MakeImage.preview(&named, &ToolContext::of(&chat));
+        assert_eq!(card, format!("An image of: a cat\n\n{PLAN_CARD}"));
+        // The user's pick in the model menu does, and is said to be paid.
+        choose("image", Some("flux.2-pro")).unwrap();
+        assert!(plan_for(Some(&chat)).is_none());
+        assert_eq!(
+            MakeImage.description_for(&chat, &[]),
+            MakeImage.description()
+        );
+        assert_eq!(MakeImage.parameters_for(&chat), MakeImage.parameters());
+        let card = MakeImage.preview(&json!({"prompt": "a cat"}), &ToolContext::of(&chat));
+        assert!(
+            card.ends_with("Made by flux.2-pro, paid from your Letronna credit."),
+            "{card}"
+        );
+        // An edit stays on the chat's own gateway, as on any other.
+        let args = json!({"images": ["cat.png"], "prompt": "a hat"});
+        let card = EditImage.preview(&args, &ToolContext::of(&chat));
+        assert!(card.ends_with(PLAN_CARD), "{card}");
+        choose("image", None).unwrap();
+        assert!(plan_for(Some(&chat)).is_some());
+    }
+
+    #[test]
+    fn a_plan_makes_and_edits_pictures_on_its_own_routes_and_says_the_size_they_came_in() {
+        let (_vault, _held) = crate::providers::auth::tests::vault("media-plan-routes");
+        let around = on_a_plan("media-plan-routes");
+        let project = around.join("project");
+        let ctx = ToolContext::of(&Connection {
+            workspace: Some(project.clone()),
+            ..images::tests::chat()
+        });
+        let made = picture(3, 2, image::ImageFormat::Png);
+        let reply = json!({"data": [{"b64_json": to_base64(&made)}], "size": "3x2"}).to_string();
+        let (base, asked) = gateway("200 OK", &reply);
+        images::tests::stand_in(&base);
+        // A size and a model the call names are not sent: the plan picks.
+        let args = json!({"prompt": "a red kite", "size": "1024x1536", "model": "flux.2-pro"});
+        let out = MakeImage.run(&args, &ctx).unwrap();
+        let (head, body) = asked.join().unwrap();
+        assert!(head.starts_with("post /images/generations "), "{head}");
+        // Signed as the chat's requests are: the account's sign-in, and who
+        // is asking.
+        assert!(head.contains("authorization: bearer access-1"), "{head}");
+        assert!(head.contains("originator: letronna"), "{head}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"prompt": "a red kite", "model": "gpt-image-2", "quality": "auto", "size": "auto"})
+        );
+        let path = saved_by("make_image", &out).unwrap();
+        assert_eq!(path.parent().unwrap(), project.join("media"));
+        assert_eq!(std::fs::read(&path).unwrap(), made);
+        assert!(
+            out.ends_with("\nA 3x2 image, 1 KB, made on the ChatGPT plan."),
+            "{out}"
+        );
+
+        // An edit sends each picture in the body, one the route would not
+        // take as a PNG, and no form.
+        std::fs::write(
+            project.join("cat.jpg"),
+            picture(4, 4, image::ImageFormat::Png),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("hat.gif"),
+            picture(4, 4, image::ImageFormat::Gif),
+        )
+        .unwrap();
+        let (base, asked) = gateway("200 OK", &reply);
+        images::tests::stand_in(&base);
+        let args = json!({"images": ["cat.jpg", "hat.gif"], "prompt": "put the hat on the cat"});
+        let out = EditImage.run(&args, &ctx).unwrap();
+        let (head, body) = asked.join().unwrap();
+        assert!(head.starts_with("post /images/edits "), "{head}");
+        assert!(head.contains("content-type: application/json"), "{head}");
+        assert!(head.contains("authorization: bearer access-1"), "{head}");
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["prompt"], "put the hat on the cat");
+        let sent: Vec<&str> = (body["images"].as_array().unwrap().iter())
+            .map(|picture| picture["image_url"].as_str().unwrap())
+            .collect();
+        assert_eq!(sent.len(), 2);
+        for picture in sent {
+            let encoded = picture.strip_prefix("data:image/png;base64,").unwrap();
+            assert_eq!(picture_kind(&base64(encoded).unwrap()), Some("png"));
+        }
+        assert!(
+            out.ends_with(
+                "\nA 3x2 image, 1 KB, edited from `cat.jpg`, `hat.gif` on the ChatGPT plan."
+            ),
+            "{out}"
+        );
+        assert!(saved_by("edit_image", &out).is_some());
+    }
+
+    #[test]
+    fn with_no_account_a_plan_signed_in_to_makes_the_picture_for_a_chat_elsewhere() {
+        let (_vault, _held) = crate::providers::auth::tests::vault("media-plan-elsewhere");
+        let around = on_a_plan("media-plan-elsewhere");
+        let project = around.join("project");
+        let made = picture(2, 2, image::ImageFormat::Png);
+        let reply = json!({"data": [{"b64_json": to_base64(&made)}]}).to_string();
+        let (base, asked) = gateway("200 OK", &reply);
+        images::tests::stand_in(&base);
+        // The other gateway's key is not what the plan is asked with.
+        let ctx = on_gateway("https://api.example.com", &project);
+        let out = MakeImage
+            .run(&json!({"prompt": "a red kite"}), &ctx)
+            .unwrap();
+        let (head, _) = asked.join().unwrap();
+        assert!(head.starts_with("post /images/generations "), "{head}");
+        assert!(head.contains("authorization: bearer access-1"), "{head}");
+        assert!(!head.contains("test-key"), "{head}");
+        assert!(out.ends_with("made on the ChatGPT plan."), "{out}");
+    }
+
+    #[test]
+    fn an_edit_on_a_plan_is_held_to_what_its_route_takes_before_anything_is_sent() {
+        let (_vault, _held) = crate::providers::auth::tests::vault("media-plan-held");
+        let around = on_a_plan("media-plan-held");
+        let project = around.join("project");
+        std::fs::write(
+            around.join("away.png"),
+            picture(4, 4, image::ImageFormat::Png),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("cat.png"),
+            picture(4, 4, image::ImageFormat::Png),
+        )
+        .unwrap();
+        let ctx = ToolContext::of(&Connection {
+            workspace: Some(project.clone()),
+            ..images::tests::chat()
+        });
+        // Nothing listens here: each is refused before any request.
+        images::tests::stand_in("http://127.0.0.1:9");
+        for (args, expected) in [
+            (
+                json!({"images": ["cat.png"], "mask": "cat.png", "prompt": "a hat"}),
+                "take no mask",
+            ),
+            (
+                json!({"images": vec!["cat.png"; 6], "prompt": "a hat"}),
+                "6 pictures were given; an image edit on a ChatGPT plan takes at most 5.",
+            ),
+            (
+                json!({"images": [], "prompt": "a hat"}),
+                "`images` is required",
+            ),
+            (
+                json!({"images": ["../away.png"], "prompt": "a hat"}),
+                "is outside the",
+            ),
+        ] {
+            let refused = EditImage.run(&args, &ctx).unwrap_err();
+            assert!(refused.contains(expected), "{refused}");
+        }
+        // What the plan's backend says of a refusal reaches the model, and
+        // nothing is saved.
+        let turned_down = json!({"error": {"message": "Blocked by the safety system."}});
+        let (base, asked) = gateway("400 Bad Request", &turned_down.to_string());
+        images::tests::stand_in(&base);
+        assert_eq!(
+            MakeImage
+                .run(&json!({"prompt": "a cat"}), &ctx)
+                .unwrap_err(),
+            "ChatGPT turned the picture down: Blocked by the safety system."
+        );
+        asked.join().unwrap();
+        assert!(!project.join("media").exists());
+    }
+
+    #[test]
+    #[ignore = "makes two pictures on a real ChatGPT plan: sign in to Codex (~/.codex), then run with --ignored"]
+    fn a_chatgpt_plan_makes_a_picture_and_then_edits_it() {
+        let (_turn, dir) = scratch("plan-live");
+        // The Codex app's sign-in, which is only read: never renewed here,
+        // and never written.
+        crate::providers::save_switch(crate::providers::chatgpt::CODEX_SWITCH, true);
+        let ctx = ToolContext::of(&Connection {
+            workspace: Some(dir.join("project")),
+            ..images::tests::chat()
+        });
+        let made = MakeImage
+            .run(&json!({"prompt": "a small red lighthouse at dusk"}), &ctx)
+            .unwrap();
+        let path = saved_by("make_image", &made).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > 1000, "{made}");
+        println!("{made}");
+        let args =
+            json!({"images": [path.to_string_lossy()], "prompt": "make the lighthouse blue"});
+        let edited = EditImage.run(&args, &ctx).unwrap();
+        let path = saved_by("edit_image", &edited).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > 1000, "{edited}");
+        println!("{edited}");
     }
 
     #[test]
