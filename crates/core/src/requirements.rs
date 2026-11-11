@@ -513,10 +513,11 @@ pub(crate) const AHEAD_CLOSES: &str = "[End of the tester's report]";
 /// The rows of a review's table in `report`: each requirement's number,
 /// whether the case passed, and the row as written. A line is a row when a
 /// cell of it opens with `R` and a number and a later cell says PASS or
-/// FAIL, however the helper laid the table out; one whose last cell says
-/// the case waits on the work (`placeholder`) is no row, since it says
-/// nothing of the work once the work is there, nor is any line of a report
-/// written ahead of the work, between `AHEAD_OPENS` and `AHEAD_CLOSES`.
+/// FAIL, alone or ahead of what shows it (`judged`), however the helper
+/// laid the table out; one whose last cell says the case waits on the work
+/// (`placeholder`) is no row, since it says nothing of the work once the
+/// work is there, nor is any line of a report written ahead of the work,
+/// between `AHEAD_OPENS` and `AHEAD_CLOSES`.
 fn rows(report: &str) -> Vec<(usize, bool, String)> {
     let mut found = Vec::new();
     let mut ahead = false;
@@ -546,7 +547,7 @@ fn rows(report: &str) -> Vec<(usize, bool, String)> {
         if cells.last().is_some_and(|cell| placeholder(cell)) {
             continue;
         }
-        if let Some(passed) = cells[1..].iter().find_map(|cell| verdict(cell)) {
+        if let Some(passed) = judged(&cells).and_then(|(_, word)| verdict(word)) {
             found.push((number, passed, line.trim().to_owned()));
         }
     }
@@ -578,11 +579,56 @@ fn verdict(cell: &str) -> Option<bool> {
     }
 }
 
+/// The verdict's word a table's `cell` opens with and what the cell goes on
+/// to say, when it holds more than the word, as `PASS — what shows it`,
+/// `FAIL: why` and `PASS (3 cases)` do. Only a word in capitals with such a
+/// mark after it is one: a case that opens "fails when", "Fail fast" or
+/// "FAIL-fast" is prose.
+fn opens(cell: &str) -> Option<(&str, &str)> {
+    let letters = cell.bytes().take_while(u8::is_ascii_uppercase).count();
+    let (word, rest) = cell.split_at(letters);
+    verdict(word)?;
+    // What is left of the marks a word written in bold closes with.
+    let rest = rest.trim_start_matches(['*', '`']);
+    let said = rest.trim_start();
+    let mut after = said.chars();
+    let goes_on = match after.next()? {
+        '—' | '–' => true,
+        // A bracket holds what shows it, so it stays.
+        '(' => return Some((word, said)),
+        ':' | '.' => after.next().is_none_or(char::is_whitespace),
+        // Set off by a space, as no hyphen inside a word is.
+        '-' => said.len() < rest.len(),
+        // Before a bar escaped to keep the row in one column of a table,
+        // so what shows it is in the next cell.
+        '\\' => after.next().is_none(),
+        _ => false,
+    };
+    let said = said.trim_start_matches(['—', '–', ':', '.', '-', '\\']);
+    goes_on.then_some((word, said.trim_start()))
+}
+
+/// The cell of a row's `cells` that gives its verdict, and the word it
+/// gives. A cell that is the word alone wins, the first of them, as a
+/// review is asked to write it; with none, a cell that opens with the word
+/// and goes on (`opens`), and of several the first that does not say the
+/// case passed, since a failed row read as passed is the worse mistake.
+fn judged<'a>(cells: &[&'a str]) -> Option<(usize, &'a str)> {
+    let later = || cells.iter().copied().enumerate().skip(1);
+    if let Some(alone) = later().find(|(_, cell)| verdict(cell).is_some()) {
+        return Some(alone);
+    }
+    let said = |(at, cell)| opens(cell).map(|(word, _)| (at, word));
+    (later().filter_map(said))
+        .find(|(_, word)| verdict(word) == Some(false))
+        .or_else(|| later().find_map(said))
+}
+
 /// Whether a table's row `line` was left `UNCLEAR` rather than failed.
 fn left_unclear(line: &str) -> bool {
-    cells(line)
-        .iter()
-        .any(|cell| cell.eq_ignore_ascii_case(UNCLEAR))
+    let cells = cells(line);
+    let alone = cells.iter().any(|cell| cell.eq_ignore_ascii_case(UNCLEAR));
+    alone || judged(&cells).is_some_and(|(_, word)| word == UNCLEAR)
 }
 
 /// Whether `report` holds a review's table, with a row of at least one
@@ -619,11 +665,15 @@ pub(crate) fn cut_rows(report: &str, quote: &str) -> Option<String> {
         .filter(|(_, _, line)| !quote.contains(line.as_str()))
         .map(|(number, passed, line)| {
             let cells = cells(&line);
-            let at = (cells.iter().skip(1))
-                .position(|cell| verdict(cell).is_some())
-                .map_or(cells.len(), |at| at + 1);
+            let at = judged(&cells).map_or(cells.len(), |(at, _)| at);
             let case = cut(&cells[1..at].join(" | "), CASE_CHARS);
-            let shows = cut(&cells[(at + 1).min(cells.len())..].join(" | "), ROW_CHARS);
+            // What the verdict's own cell goes on to say shows it too.
+            let more = (cells.get(at).copied().and_then(opens)).map(|(_, more)| more);
+            let shows: Vec<&str> = (more.into_iter())
+                .chain(cells.iter().skip(at + 1).copied())
+                .filter(|said| !said.is_empty())
+                .collect();
+            let shows = cut(&shows.join(" | "), ROW_CHARS);
             let word = if left_unclear(&line) { UNCLEAR } else { "FAIL" };
             match (passed, shows.is_empty()) {
                 (true, _) => format!("R{number} | {case} | PASS"),
@@ -1497,6 +1547,108 @@ mod tests {
     }
 
     #[test]
+    fn a_verdict_with_its_evidence_in_the_same_cell_is_read() {
+        // As a review wrote its whole table, what shows each row after a
+        // dash, and the other ways a cell goes on past the word.
+        let report = "| Requirement | Case | Status / evidence |\n\
+                      |---|---|---|\n\
+                      | R1 | first character is no separator (`b'{}'`) | PASS — `DecodingError` |\n\
+                      | R1 | closed but never read | UNCLEAR — raises `Closed`; no rule names it |\n\
+                      | R2 | values arrive before the body ends | FAIL — `python lazy.py`: read whole |\n\
+                      | R3 | two forms in one call | PASS (3 cases) | `node both.js` |\n\
+                      | R4 | empty input | FAIL: got `[]` |\n\
+                      | R5 | later step first | PASS - both orders |\n\
+                      | R6 | exact message | **FAIL** — says `bad`, not `invalid` |\n\
+                      | R7 | wrapped value | FAIL. `node wrap.js` throws |\n\
+                      | R8 | plain value | PASSED: as written |";
+        let found: Vec<(usize, bool)> = (rows(report).into_iter())
+            .map(|(number, passed, _)| (number, passed))
+            .collect();
+        let read = [
+            (1, true),
+            (1, false),
+            (2, false),
+            (3, true),
+            (4, false),
+            (5, true),
+            (6, false),
+            (7, false),
+            (8, true),
+        ];
+        assert_eq!(found, read);
+        // The run is held to them as to any row, a doubt as a doubt.
+        let text = unchecked(report, 8).unwrap();
+        assert!(
+            text.starts_with(
+                "[Letronna check] The review's table has these rows that failed or were left \
+                 unclear:\n- | R1 | closed but never read | UNCLEAR — raises `Closed`; no rule \
+                 names it |\n- | R2 | values arrive"
+            ),
+            "{text}"
+        );
+        assert!(left_unclear(
+            "R1 | closed but never read | UNCLEAR — raises `Closed`"
+        ));
+        assert!(!left_unclear(
+            "R2 | read whole | FAIL — unclear why it waits"
+        ));
+    }
+
+    #[test]
+    fn a_row_kept_in_one_column_by_escaping_its_bars_is_read() {
+        let report = "| Req | Row |\n|---|---|\n\
+                      | R1 | pair branch only | FAIL \\| node m.ts gives 0 and 0 |\n\
+                      | R2 | same cache | UNCLEAR \\| identity cannot show it |\n\
+                      | R3 | trait branch | PASS |";
+        let found: Vec<(usize, bool)> = (rows(report).into_iter())
+            .map(|(number, passed, _)| (number, passed))
+            .collect();
+        assert_eq!(found, [(1, false), (2, false), (3, true)]);
+        let again = cut_rows(report, "| R3 | trait branch | PASS |").unwrap();
+        assert!(
+            again.ends_with(
+                "\nR1 | pair branch only | FAIL | node m.ts gives 0 and 0\nR2 | same cache | \
+                 UNCLEAR | identity cannot show it"
+            ),
+            "{again}"
+        );
+        // A bar escaped inside a case is no end of a verdict's cell: the
+        // word alone in its cell still wins.
+        let listed = "| R1 | prints one of `PASS \\| FAIL \\| SKIP` | PASS | node tap.js |";
+        assert!(rows(listed)[0].1);
+    }
+
+    #[test]
+    fn a_case_that_opens_with_a_verdicts_word_in_prose_is_no_verdict() {
+        for case in [
+            "fails when the input is empty",
+            "passes values through unchanged",
+            "Fail fast on the first error",
+            "FAIL-fast mode stops the run",
+            "PASS and FAIL are both counted",
+            "PASS/FAIL column is printed",
+            "FAIL.md is written beside the log",
+            "PASSING tests are listed first",
+            "Passed: 3 of 3 is printed last",
+            "unclear: which of the two wins",
+        ] {
+            assert!(!tabled(&format!("R1 | {case} | NOT RUN")), "{case}");
+            // Nor does it change what the row's own verdict says.
+            let passed = format!("R1 | {case} | PASS | node check.js");
+            assert!(rows(&passed)[0].1, "{case}");
+            assert!(!left_unclear(&passed), "{case}");
+        }
+        // A cell that is the word alone wins over one that goes on.
+        let alone = "R1 | FAIL: the line printed for a failing test | PASS | node tap.js";
+        assert!(rows(alone)[0].1);
+        // Of two that go on, no row is passed while one says otherwise.
+        let failed = "R1 | PASS: the line printed for a passing test | FAIL — not printed";
+        assert!(!rows(failed)[0].1);
+        let either = "R1 | FAIL: the line printed for a failing test | PASS — printed";
+        assert!(!rows(either)[0].1);
+    }
+
+    #[test]
     fn a_long_list_is_shared_between_review_helpers() {
         assert_eq!(shares(5), [(1, 5)]);
         assert_eq!(shares(10), [(1, 10)]);
@@ -1742,6 +1894,28 @@ mod tests {
             .map(|n| format!("R{n} | c | PASS\n"))
             .collect();
         assert!(cut_rows(&many, "").unwrap().ends_with("\nand 2 more rows"));
+    }
+
+    #[test]
+    fn a_row_written_again_keeps_what_its_verdicts_cell_went_on_to_say() {
+        let report = "| R1 | missing field | PASS — `KeyError` |\n\
+                      | R2 | plain value | FAIL — `node check.js` prints 2 | expected 3 |\n\
+                      | R3 | later step first | UNCLEAR (the request sets no order) |";
+        let again = cut_rows(report, "cut").unwrap();
+        assert_eq!(
+            again,
+            "\nRows of its table the quote above cut, written again:\nR1 | missing field | \
+             PASS\nR2 | plain value | FAIL | `node check.js` prints 2 | expected 3\nR3 | later \
+             step first | UNCLEAR | (the request sets no order)"
+        );
+        // Written again, they read as the rows they were.
+        let found: Vec<(usize, bool, bool)> = (rows(&again).into_iter())
+            .map(|(number, passed, row)| (number, passed, left_unclear(&row)))
+            .collect();
+        assert_eq!(
+            found,
+            [(1, true, false), (2, false, false), (3, false, true)]
+        );
     }
 
     #[test]
