@@ -642,6 +642,9 @@ fn steps(
     // Whether the last of those runs passed, which no second attempt is
     // made after.
     let mut passed = false;
+    // Whether the last of them never got as far as a test, which is told
+    // once and chooses nothing for a second attempt.
+    let mut broke = false;
     let mut attempted = false;
     // Before the first call, so the project as the run found it is known:
     // the commit it was at, with nothing changed since, which a second
@@ -1032,6 +1035,7 @@ fn steps(
                     // is the work as it stands: the reviews may have left
                     // files in the project that would set the two apart.
                     let ran = test_run(spec, turn, false);
+                    broke = matches!(ran, crate::spec_tests::Ran::Broken(_));
                     notice.content.push_str("\n\n");
                     notice.content.push_str(&crate::spec_tests::first_run(&ran));
                 }
@@ -1072,9 +1076,19 @@ fn steps(
                 if runnable {
                     tested += 1;
                 }
-                let ran = runnable.then(|| test_run(spec, turn, true));
+                let mut ran = runnable.then(|| test_run(spec, turn, true));
                 if let Some(ran) = &ran {
                     passed = matches!(ran, crate::spec_tests::Ran::Passed(_));
+                }
+                // A command that could not run is run once more, since a
+                // registry may answer again; one that could not twice in a
+                // row is not told a second time in the same words, and is
+                // not run again.
+                if broke_again(broke, ran.as_ref()) {
+                    tested = crate::spec_tests::RUNS;
+                    ran = None;
+                } else if let Some(ran) = &ran {
+                    broke = matches!(ran, crate::spec_tests::Ran::Broken(_));
                 }
                 if let Some(content) = tester_notice(spec, late, ran) {
                     spec.transcript.conversation.messages.push(Message {
@@ -1104,7 +1118,18 @@ fn steps(
                 && let Some(head) = baseline.as_deref()
             {
                 attempted = true;
-                if let Some((notice, adopted)) = second_attempt(spec, turn, head) {
+                // A command that never reached a test at its last run would
+                // choose nothing of an attempt, and is not run a third time
+                // to learn that.
+                let attempt = match broke {
+                    true => {
+                        let why = [("why", json!("unrunnable"))];
+                        crate::diag::event("second_attempt_skipped", &why);
+                        None
+                    }
+                    false => second_attempt(spec, turn, head),
+                };
+                if let Some((notice, adopted)) = attempt {
                     // Told to change nothing once the project holds the
                     // attempt's work, the run is not sent back after it to
                     // check, build or compare edits that are no longer its
@@ -2880,6 +2905,13 @@ fn test_run(spec: &Spec, turn: &Turn, refereed: bool) -> crate::spec_tests::Ran 
             .flatten()
     };
     crate::spec_tests::ran(&kept, &command, &ctx, limit, first)
+}
+
+/// Whether a run of the tester's tests that went as `ran` is the second in
+/// a row whose command never got as far as a test, the one before having
+/// done so when `broke`.
+fn broke_again(broke: bool, ran: Option<&crate::spec_tests::Ran>) -> bool {
+    broke && matches!(ran, Some(crate::spec_tests::Ran::Broken(_)))
 }
 
 /// Whether a run has more than `REBUILD_SPARE` suites' worth of time left
@@ -10092,6 +10124,10 @@ pub(crate) mod tests {
             // The driver's own run of them says the same, as no failure.
             let ran = test_run(&spec, &turn, true);
             assert!(matches!(ran, crate::spec_tests::Ran::Broken(_)), "{ran:?}");
+            // Told once: the same again after it is not, and one after a run
+            // that reached a test is.
+            assert!(broke_again(true, Some(&ran)) && !broke_again(false, Some(&ran)));
+            assert!(!broke_again(true, None));
             let told = tester_notice(&spec, None, Some(ran)).unwrap();
             assert!(
                 told.contains("could not be run against your work"),
