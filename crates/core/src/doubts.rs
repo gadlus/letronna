@@ -34,7 +34,10 @@
 //! and waved off with one of `WAVED`, the words that say a case will not
 //! come up or is not the work's to handle; then those weighed by either;
 //! then the rest; and among cases weighed alike one that names something
-//! the request names, and then the later one. The others are the latest
+//! the request names, and then the later one. A case names something of
+//! the request's by a code span that holds one of its identifiers of
+//! `NAMED` letters or more, or by `QUOTED` of its words quoted in a row.
+//! The others are the latest
 //! not yet taken, whatever weighed them, but for one weighed only by
 //! `PASSING`, words a run says as often of a document, a tool or its own
 //! next step as of what the work does: such a case is given only where
@@ -163,6 +166,10 @@ const STRONG: u8 = 2;
 
 /// The weight of a case that only words of `PASSING` weighed off.
 const PASSED: u8 = 0;
+
+/// Letters an identifier has at least for a request to name a case by it:
+/// a shorter one, such as `a`, `or` or `put`, is a word of most requests.
+const NAMED: usize = 4;
 
 /// Readings given at most; apart from `KEPT`, so no case set aside takes
 /// the place of one. A long run weighs more requirements than this, most
@@ -448,7 +455,8 @@ pub(crate) fn shared(said: &[&str], sentence: &[String]) -> Range<usize> {
 /// rest. Each is given once by its first code span, or by its words where
 /// it has none, as it was weighed hardest.
 pub(crate) fn doubts(messages: &[Message], request: &str) -> Vec<String> {
-    let request: Vec<String> = (words(request).into_iter()).map(|(_, word)| word).collect();
+    let said: Vec<String> = (words(request).into_iter()).map(|(_, word)| word).collect();
+    let names = identifiers(request);
     let own = messages
         .iter()
         .filter(|message| message.role == "assistant");
@@ -457,7 +465,7 @@ pub(crate) fn doubts(messages: &[Message], request: &str) -> Vec<String> {
     let mut found: Vec<(String, String, (u8, bool))> = Vec::new();
     for text in own.flat_map(|message| [&message.reasoning, &message.content]) {
         for (case, weight) in cases(text) {
-            let (key, rank) = (key(&case), (weight, asked(&case, &request)));
+            let (key, rank) = (key(&case), (weight, asked(&case, &said, &names)));
             // Named again, a case stands as it was weighed hardest, and
             // where it was named last among those.
             let before = found.iter().position(|(kept, ..)| *kept == key);
@@ -501,20 +509,29 @@ fn weight(markers: &[&str]) -> u8 {
     }
 }
 
-/// Whether `case` names something `request`, the words of one, names: a
-/// code span whose words are all found there in a row, or a quoted literal
-/// that shares `QUOTED` words in a row with it.
-fn asked(case: &str, request: &[String]) -> bool {
+/// Whether `case` names something a request names: in a code span one of
+/// `names`, the request's identifiers, whatever else the span holds, or in
+/// a quoted literal `QUOTED` words in a row of `said`, the request's words.
+fn asked(case: &str, said: &[String], names: &[String]) -> bool {
     literals(case).into_iter().any(|range| {
         let literal = &case[range];
-        let quote = words(literal);
-        let said: Vec<&str> = quote.iter().map(|(_, word)| word.as_str()).collect();
-        let found = shared(&said, request).len();
-        match literal.starts_with('`') {
-            true => found > 0 && found == said.len(),
-            false => found >= QUOTED,
+        if literal.starts_with('`') {
+            return (identifiers(literal).iter()).any(|name| names.contains(name));
         }
+        let quote = words(literal);
+        let quote: Vec<&str> = quote.iter().map(|(_, word)| word.as_str()).collect();
+        shared(&quote, said).len() >= QUOTED
     })
+}
+
+/// The identifiers of `text` of `NAMED` letters or more, in lower case:
+/// each a run of letters, digits and underscores that opens with no digit.
+fn identifiers(text: &str) -> Vec<String> {
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|name| name.chars().count() >= NAMED)
+        .filter(|name| !name.starts_with(|c: char| c.is_numeric()))
+        .map(str::to_lowercase)
+        .collect()
 }
 
 /// The section a helper's brief ends with for `doubts`, a review's or a
@@ -1017,19 +1034,19 @@ mod tests {
 
     #[test]
     fn among_cases_weighed_alike_one_the_request_names_is_kept_first() {
-        let request = "Add a `--tag` flag that may be repeated, and print \"no tags were \
+        let request = "Add a `--label` flag that may be repeated, and print \"no tags were \
                        given at all\" where there is none.";
         let mut notes = vec![
-            "Repeated `--tag` with the same value? Rare.".to_owned(),
+            "Repeated `--label` with the same value? Rare.".to_owned(),
             "Is \"no tags were given\" right for an empty list? Rare.".to_owned(),
-            // Words of the request, but too few of them or not in a row.
+            // Too few words of the request, and a name it does not hold.
             "Is \"no tags\" right for a list of blanks? Rare.".to_owned(),
-            "A `--tag list` that is long? Rare.".to_owned(),
+            "A `--key` in its place? Rare.".to_owned(),
         ];
         notes.extend(inputs(1..=12, "Rare."));
         let found = doubts(&[said(&notes.join("\n"), "")], request);
         let mut kept = vec![
-            "Repeated `--tag` with the same value?".to_owned(),
+            "Repeated `--label` with the same value?".to_owned(),
             "Is \"no tags were given\" right for an empty list?".to_owned(),
         ];
         kept.extend(alone(5..=12));
@@ -1048,6 +1065,47 @@ mod tests {
         let found = doubts(&[said(&notes.join("\n"), "")], request);
         assert_eq!(found[..5], (4..=8).map(named).collect::<Vec<_>>());
         assert_eq!(found[5..], alone(16..=20));
+    }
+
+    #[test]
+    fn a_request_names_a_code_span_by_an_identifier_of_four_letters_or_more() {
+        let names = |request: &str, case: &str| {
+            let said: Vec<String> = (words(request).into_iter()).map(|(_, word)| word).collect();
+            asked(case, &said, &identifiers(request))
+        };
+        let request = "Add `GetBaseline(ctx, baselineID)`, or put a default in a store.";
+        assert_eq!(
+            identifiers(request),
+            ["getbaseline", "baselineid", "default", "store"]
+        );
+        // Whatever else the span holds, and in whatever case it is written.
+        for case in [
+            "Does `GetBaseline(ctx, \"unknown\")` give nil?",
+            "A `baselineid` of nothing?",
+            "Call `cache.Store.Flush()` first?",
+        ] {
+            assert!(names(request, case), "{case}");
+        }
+        // A short word of the request names nothing, nor does a number.
+        let request = "Add a flag or put it in a 2048 byte store.";
+        for case in [
+            "Swap `a` and `b` there?",
+            "Then `x or y`?",
+            "A `put` of nothing?",
+            "Then `it.add(1)`?",
+            "A `2048` there?",
+            "Call `Flush(ctx)` first?",
+        ] {
+            assert!(!names(request, case), "{case}");
+        }
+        assert!(names(request, "A `byte` too many?"));
+        // A quoted literal names something by four of its words in a row.
+        assert!(names(
+            request,
+            "Is \"put it in a 2048 byte store\" a limit?"
+        ));
+        assert!(!names(request, "Is \"a flag\" enough?"));
+        assert!(!names(request, "Print \"store\" there?"));
     }
 
     #[test]
