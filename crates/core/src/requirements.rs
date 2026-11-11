@@ -83,7 +83,7 @@ macro_rules! cases {
 const REVIEW: &str = concat!(
     "First ask a helper that hasn't seen your work: with the agent tool, start a helper of type `review`, not general, and wait for its report. Give it the request word for word, the numbered requirements above, the files you changed or made and each case you chose not to handle, with why. Ask it to change no file, to work out each value it checks with code of its own, not your scripts or helpers, and to end its report with a table of one row per requirement and case, the verdict alone in its cell and what shows it in the cell after, written `R1 | case | PASS` or `R1 | case | FAIL | command that shows it`, with a row for each of these cases that applies: ",
     cases!(),
-    " and each case you chose not to handle, which fails when the request's words say what should happen in it, quoted in the row, whatever the reason it was set aside, and passes, written `R1 | case | PASS | not asked`, when they do not: a gap the project had before your change that the request does not ask to close is no failure. Ask it to write any doubt, caveat or problem it notices beyond those rows as a row of its own, `R1 | case | UNCLEAR | what it doubts`, never only prose, and the same for a row that can only pass by bending another requirement's words. Judge each row by what the request says should happen, not by what the code now does. Fix every row that fails by changing the work, not the case, unless the request rules that case out. A case it calls unclear is a doubt, not a failure: decide it by the request's words, and change the work for it only where those words ask for that. Change nothing for a row written `not asked`."
+    " and each case you chose not to handle, which fails when the request's words say what should happen in it, quoted in the row, whatever the reason it was set aside, and passes, written `R1 | case | PASS | not asked`, only when they do not and your change left the case as it was: a gap the project had before your change that the request does not ask to close is no failure. Ask it to write any doubt, caveat or problem it notices beyond those rows as a row of its own, `R1 | case | UNCLEAR | what it doubts`, never only prose, and the same for a row that can only pass by bending another requirement's words. Judge each row by what the request says should happen, not by what the code now does. Fix every row that fails by changing the work, not the case, unless the request rules that case out. A case it calls unclear is a doubt, not a failure: decide it by the request's words, and change the work for it only where those words ask for that. Change nothing for a row written `not asked`."
 );
 
 /// The least time a run with a deadline needs left to be asked for the
@@ -835,10 +835,10 @@ const SHRUG_WORDS: usize = 3;
 const NOT_STATED: &str = "not stated";
 
 /// What a review writes in the cell after PASS for a case the run set aside
-/// that the request's words do not decide. On a benchmark run a row made
-/// from such a case failed for a gap the project had before the change,
-/// which the request never mentions, and closing it broke the project's
-/// own tests.
+/// that the request's words do not decide and the change left as it was. On
+/// a benchmark run a row made from such a case failed for a gap the project
+/// had before the change, which the request never mentions, and closing it
+/// broke the project's own tests.
 pub(crate) const NOT_ASKED: &str = "not asked";
 
 /// The longest row a follow-up quotes, in characters.
@@ -2826,8 +2826,9 @@ mod tests {
         // word for it: a gap the request leaves open is no failure.
         let passes = format!(
             "whatever the reason it was set aside, and passes, written `R1 | case | PASS | \
-             {NOT_ASKED}`, when they do not: a gap the project had before your change that the \
-             request does not ask to close is no failure. Ask it to write any doubt"
+             {NOT_ASKED}`, only when they do not and your change left the case as it was: a gap \
+             the project had before your change that the request does not ask to close is no \
+             failure. Ask it to write any doubt"
         );
         assert!(REVIEW.contains(&passes), "{REVIEW}");
         // Only a row that fails is fixed: a doubt is decided by the words,
@@ -2865,7 +2866,7 @@ mod tests {
         let rules: Vec<String> = ["Names must parse.".to_owned()].into();
         let cases = ["Empty `name`?".to_owned()];
         let asked = brief("Names must parse.", &rules, (1, 1), &cases, &[]);
-        let word = format!("written PASS, with `{NOT_ASKED}` in the cell after");
+        let word = format!("write PASS, with `{NOT_ASKED}` in the cell after, only if");
         assert!(asked.contains(&word), "{asked}");
         // It is a review's word in its table, and `NOT_STATED` the run's in
         // a line of its answer: neither is asked for where the other is.

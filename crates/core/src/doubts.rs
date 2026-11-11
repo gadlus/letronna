@@ -398,7 +398,10 @@ pub(crate) fn doubts(messages: &[Message]) -> Vec<String> {
 /// `tester`'s; empty with none. Each is told where a case asks nothing of
 /// the work: on a benchmark run a review failed a row made from such a case
 /// for a gap the project had before the change, which the request never
-/// mentions, and closing it broke the project's own tests.
+/// mentions, and closing it broke the project's own tests. The row that
+/// passes such a case needs nothing to show it, so it is kept from being
+/// the easy way out of a case: a rule that covers the case decides it as
+/// its name would, and the row is for a case the change left as it was.
 pub(crate) fn section(doubts: &[String], tester: bool) -> String {
     if doubts.is_empty() {
         return String::new();
@@ -409,9 +412,10 @@ pub(crate) fn section(doubts: &[String], tester: bool) -> String {
             .to_owned(),
         false => format!(
             "each needs a row of its own, judged by the request's words where they say what \
-             should happen in it, and written PASS, with `{}` in the cell after, where they do \
-             not, since a gap the project had before the change that the request does not ask \
-             to close is no failure:",
+             should happen in it, by name or by a rule that covers it. Where they do not, \
+             write PASS, with `{}` in the cell after, only if the change left the case as it \
+             was, since a gap the project had before the change that the request does not ask \
+             to close is no failure, and UNCLEAR if it did not:",
             crate::requirements::NOT_ASKED
         ),
     };
@@ -1212,15 +1216,18 @@ mod tests {
     #[test]
     fn a_case_set_aside_that_the_request_does_not_decide_asks_nothing_of_the_work() {
         let cases = ["Empty `name`?".to_owned()];
-        // A review judges it where the words decide it, and passes it in a
-        // set form where they do not: a gap the request leaves is no failure.
+        // A review judges it where the words decide it, by its name or by a
+        // rule that covers it, and passes it in a set form only where they
+        // do not and the change left it alone: a gap the request leaves is
+        // no failure, and a case the change altered unasked is a doubt.
         let review = section(&cases, false);
         assert!(
             review.contains(
                 "each needs a row of its own, judged by the request's words where they say \
-                 what should happen in it, and written PASS, with `not asked` in the cell \
-                 after, where they do not, since a gap the project had before the change that \
-                 the request does not ask to close is no failure:\n- "
+                 what should happen in it, by name or by a rule that covers it. Where they do \
+                 not, write PASS, with `not asked` in the cell after, only if the change left \
+                 the case as it was, since a gap the project had before the change that the \
+                 request does not ask to close is no failure, and UNCLEAR if it did not:\n- "
             ),
             "{review}"
         );

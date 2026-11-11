@@ -8843,10 +8843,11 @@ pub(crate) mod tests {
             (
                 "review",
                 "weighed and set aside, with its reasons withheld; each needs a row of its own, \
-                 judged by the request's words where they say what should happen in it, and \
-                 written PASS, with `not asked` in the cell after, where they do not, since a \
-                 gap the project had before the change that the request does not ask to close \
-                 is no failure:",
+                 judged by the request's words where they say what should happen in it, by name \
+                 or by a rule that covers it. Where they do not, write PASS, with `not asked` \
+                 in the cell after, only if the change left the case as it was, since a gap the \
+                 project had before the change that the request does not ask to close is no \
+                 failure, and UNCLEAR if it did not:",
             ),
             (
                 "tester",
