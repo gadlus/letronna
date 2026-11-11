@@ -1070,7 +1070,12 @@ pub(crate) fn brief_ahead(request: &str, sentences: &[String]) -> String {
 /// project's own test of the same call shows it does not, and each sent
 /// back work that was right: so whose a name is comes from the project,
 /// each outcome the words allow is accepted, and what the project's tests
-/// already check of a value is expected until the request changes it.
+/// already check of a value is expected until the request changes it. Each
+/// is said narrowly, so no test is lost or emptied by it: a name nothing in
+/// the project has is tested by what the request says it does, a name is
+/// put on nothing the requirement is not about, and an input the words
+/// give the fallback gets a test that expects it, not one that accepts
+/// either outcome.
 fn briefing(
     request: &str,
     sentences: &[String],
@@ -1085,13 +1090,15 @@ fn briefing(
          command, is used in your tests as the request spells it, never as the code does: a \
          test that fails because the work spells it differently is a finding. Where the request \
          names nothing for something new, {unnamed}. Where the request names a field, option \
-         or place without saying whose it is, find where the project already has one of that \
-         name and use that one: write no test against one the project does not have, unless \
-         the request's words ask for a new one. What each test expects comes from the request's \
-         words; quote them in the test's name or a comment. Where those words allow more than \
-         one outcome for a case, such as a fallback they name with \"or\" or a value they call \
-         optional, the test accepts each of them: one that demands a single outcome fails work \
-         the request allows.\n\n\
+         or place without saying whose it is, search the project for that name first: where \
+         something the requirement is about already has it, test that one, and put it on no \
+         other by guess; where nothing has it, test what the request says it does through the \
+         entry point. What each test expects comes from the request's words; quote them in the \
+         test's name or a comment. Where those words allow more than one outcome for the same \
+         input, such as a fallback they name with \"or\" or a value they call optional, the test \
+         accepts each of them: one that demands a single outcome fails work the request allows. \
+         Where the words say which input gets the fallback and yours is plainly of that kind, \
+         such as a field left out, expect the fallback.\n\n\
          For each requirement, test the behaviour it states through the entry point a caller \
          of the project uses, end to end: each case it names, each form its input can be \
          written in, the side a limiting word such as only, unless, otherwise or and not keeps \
@@ -3884,23 +3891,30 @@ mod tests {
             brief(request, &[], None, &[], &[]),
             brief_ahead(request, &[]),
         ] {
-            // Whose a name is comes from the project, not from a guess.
+            // Whose a name is comes from the project, not from a guess: on
+            // what the requirement is about, never on another that happens
+            // to have the name, and a name nothing has is still tested.
             assert!(
                 brief.contains(
                     ". Where the request names a field, option or place without saying whose \
-                     it is, find where the project already has one of that name and use that \
-                     one: write no test against one the project does not have, unless the \
-                     request's words ask for a new one. What each test expects comes from"
+                     it is, search the project for that name first: where something the \
+                     requirement is about already has it, test that one, and put it on no \
+                     other by guess; where nothing has it, test what the request says it does \
+                     through the entry point. What each test expects comes from"
                 ),
                 "{brief}"
             );
-            // A fallback the words allow is not failed for being taken.
+            // A fallback the words allow is not failed for being taken, for
+            // the same input; one the words give to an input is expected of
+            // it, so no test accepts either outcome where they decide.
             assert!(
                 brief.contains(
                     "quote them in the test's name or a comment. Where those words allow more \
-                     than one outcome for a case, such as a fallback they name with \"or\" or \
-                     a value they call optional, the test accepts each of them: one that \
-                     demands a single outcome fails work the request allows.\n\n"
+                     than one outcome for the same input, such as a fallback they name with \
+                     \"or\" or a value they call optional, the test accepts each of them: one \
+                     that demands a single outcome fails work the request allows. Where the \
+                     words say which input gets the fallback and yours is plainly of that \
+                     kind, such as a field left out, expect the fallback.\n\n"
                 ),
                 "{brief}"
             );
