@@ -182,21 +182,24 @@ pub(crate) fn readings(messages: &[Message], sentences: &[String]) -> Vec<Readin
             let near = (at.saturating_sub(back)..=at)
                 .rev()
                 .chain(at + 1..(at + 1 + ahead).min(units.len()));
-            let Some((len, reading)) = near.filter_map(|at| quoted(&units[at], &listed)).next()
+            let Some(quotes) =
+                (near.map(|at| quoted(&units[at], &listed))).find(|quotes| !quotes.is_empty())
             else {
                 continue;
             };
             weighings += 1;
-            match (found.iter_mut()).find(|(.., kept)| kept.number == reading.number) {
-                Some(kept) => {
-                    kept.0 |= strong;
-                    kept.1 += 1;
-                    kept.2 = weighings;
-                    if len > kept.3 {
-                        (kept.3, kept.4) = (len, reading);
+            for (len, reading) in quotes {
+                match (found.iter_mut()).find(|(.., kept)| kept.number == reading.number) {
+                    Some(kept) => {
+                        kept.0 |= strong;
+                        kept.1 += 1;
+                        kept.2 = weighings;
+                        if len > kept.3 {
+                            (kept.3, kept.4) = (len, reading);
+                        }
                     }
+                    None => found.push((strong, 1, weighings, len, reading)),
                 }
-                None => found.push((strong, 1, weighings, len, reading)),
             }
         }
     }
@@ -247,7 +250,7 @@ pub(crate) fn reading_tests(readings: &[Reading]) -> String {
 
 /// What the requirements notice tells the run of `readings`, after its
 /// check; empty with none. It asks for every reading only of what is
-/// accepted, and never for the wider behaviour to be safe; a rule the
+/// accepted, and for no change on a guess, wider or narrower; a rule the
 /// request states for the exact case stays first, as a notice of a failing
 /// test says it.
 pub(crate) fn reading_notice(readings: &[Reading]) -> String {
@@ -261,9 +264,11 @@ pub(crate) fn reading_notice(readings: &[Reading]) -> String {
          another requirement, build that and test each reading. Where one reading does, \
          emits or records more than another, or they exclude each other, do not build the \
          wider one to be safe: take the reading the request's words favour, quote them, and \
-         test that case; where the words are silent, take the narrower reading, the one \
-         that does less. A narrower rule the request sets for the exact case, such as a \
-         filter, a condition or an exception, comes before any reading.",
+         test that case; where the words are silent, follow how the project already does \
+         the same thing elsewhere, or else keep the reading you took and say so, and change \
+         nothing on a guess in either direction. A narrower rule the request sets for the \
+         exact case, such as a filter, a condition or an exception, comes before any \
+         reading.",
         list(readings)
     )
 }
@@ -289,40 +294,55 @@ fn weighs(prose: &str) -> Option<(bool, usize, usize)> {
     if READ.iter().any(|marker| said(marker).is_some()) {
         return Some((true, BACK, 1));
     }
-    // A question that opens with which asks what the words before it cover.
-    if whole(prose, "which").first() == Some(&0) && prose.contains('?') {
-        return Some((false, 1, 1));
+    // A question that opens with which asks what the words beside it
+    // cover; one that follows a quote in its sentence asks it of that quote.
+    for at in whole(prose, "which") {
+        let stops = ['.', ',', ';', ':', '?', '!', ' '];
+        let follows = prose[..at].trim_end_matches(stops).ends_with('#');
+        // Its own question, not one glued on after its sentence ended.
+        let asks = prose[at..]
+            .find(['.', '?', '!'])
+            .map(|stop| &prose[at + stop..]);
+        if (at == 0 || follows) && asks.is_some_and(|stop| stop.starts_with('?')) {
+            let beside = usize::from(at == 0);
+            return Some((false, beside, beside));
+        }
     }
     // Opening its sentence, it is a verdict on the one before.
     let opens = AT_ODDS.iter().filter_map(said).max()?;
     Some((false, usize::from(opens), 0))
 }
 
-/// The quote of a requirement in `unit`, with how many words it is: among
-/// its literals, the longest
-/// run of `QUOTED` or more words one shares with one of `listed`, the words
-/// of each numbered requirement.
-fn quoted(unit: &str, listed: &[Vec<String>]) -> Option<(usize, Reading)> {
-    let mut best: Option<(usize, Reading)> = None;
+/// The quotes of requirements in `unit`, each with how many words it is:
+/// for each of its literals, the longest run of `QUOTED` or more words it
+/// shares with one of `listed`, the words of each numbered requirement, and
+/// for a requirement quoted twice the longer.
+fn quoted(unit: &str, listed: &[Vec<String>]) -> Vec<(usize, Reading)> {
+    let mut found: Vec<(usize, Reading)> = Vec::new();
     for range in literals(unit) {
         let quote = words(&unit[range]);
         let said: Vec<&str> = quote.iter().map(|(_, word)| word.as_str()).collect();
-        for (at, sentence) in listed.iter().enumerate() {
-            let run = shared(&said, sentence);
-            if run.len() < QUOTED || best.as_ref().is_some_and(|(len, _)| *len >= run.len()) {
-                continue;
-            }
-            let len = run.len();
-            let written: Vec<&str> = quote[run].iter().map(|(written, _)| *written).collect();
-            let marks = [
-                '"', '\'', '\u{201c}', '\u{201d}', ',', '.', ';', ':', '\u{2026}',
-            ];
-            let words = cut(written.join(" ").trim_matches(marks));
-            let number = at + 1;
-            best = Some((len, Reading { number, words }));
+        let runs = listed.iter().map(|sentence| shared(&said, sentence));
+        // The first of the longest, where `max_by_key` would give the last.
+        let Some((at, run)) = (runs.enumerate())
+            .filter(|(_, run)| run.len() >= QUOTED)
+            .min_by_key(|(_, run)| std::cmp::Reverse(run.len()))
+        else {
+            continue;
+        };
+        let len = run.len();
+        let written: Vec<&str> = quote[run].iter().map(|(written, _)| *written).collect();
+        let marks = [
+            '"', '\'', '\u{201c}', '\u{201d}', ',', '.', ';', ':', '\u{2026}',
+        ];
+        let words = cut(written.join(" ").trim_matches(marks));
+        let number = at + 1;
+        found.retain(|(kept, reading)| reading.number != number || *kept >= len);
+        if !found.iter().any(|(_, reading)| reading.number == number) {
+            found.push((len, Reading { number, words }));
         }
     }
-    best
+    found
 }
 
 /// The words of `text` as written, each beside itself in lower case without
@@ -816,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn two_requirements_a_run_found_in_conflict_are_a_reading_of_the_one_quoted_last() {
+    fn two_requirements_a_run_found_in_conflict_are_each_a_reading() {
         // The request writes its emphasis and code marks, the notes none.
         let notes = "Hmm: \"Even when hidden, parsing must succeed if the user explicitly \
             provides the dependent option while the dependency is unsatisfied and not \
@@ -837,15 +857,21 @@ mod tests {
              dependent option **must fail**.",
         ];
         let found = read(&[said(notes, "")], &sentences);
-        let [(number, words)] = found.as_slice() else {
+        let [(1, first), (2, second)] = found.as_slice() else {
             panic!("{found:?}");
         };
-        assert_eq!(*number, 2);
         assert!(
-            words.starts_with("If the dependee is explicitly"),
-            "{words}"
+            first.starts_with("Even when hidden, parsing must"),
+            "{first}"
         );
-        assert!(words.ends_with("the dependent option must fail"), "{words}");
+        assert!(
+            second.starts_with("If the dependee is explicitly"),
+            "{second}"
+        );
+        assert!(
+            second.ends_with("the dependent option must fail"),
+            "{second}"
+        );
     }
 
     #[test]
@@ -905,6 +931,8 @@ mod tests {
             found("It says {q}. Which separators may come between?").len(),
             1
         );
+        // Asked of the quote in its own sentence, however short the question.
+        assert_eq!(found("That would break {q}. Which wins?").len(), 1);
     }
 
     #[test]
@@ -921,6 +949,18 @@ mod tests {
         assert_eq!(
             read(&[said(notes, "")], &sentences),
             [(1, whole.to_owned())]
+        );
+        // A sentence that quotes two requirements weighs both.
+        let two = [
+            "Ranges must be written as `a..b` with both ends given.",
+            "Open ranges such as `a..` default to the end of the input.",
+        ];
+        let both = "\"must be written as `a..b`\" and \"Open ranges such as `a..` default\" \
+                    could mean either wins.";
+        let found = read(&[said(both, "")], &two);
+        assert_eq!(
+            found.iter().map(|(number, _)| *number).collect::<Vec<_>>(),
+            [1, 2]
         );
         // Quoted shorter before and after, the longest stands.
         let short = "\"records accumulated during the current macrostep\" is ambiguous.";
@@ -963,7 +1003,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_runs_deciding_reading_outlasts_the_ones_it_weighed_in_passing() {
+    fn a_requirement_quoted_beside_a_question_or_the_runs_own_design_is_not_harvested() {
         // A run's notes on a request of many sentences, in their order: the
         // adapters' sentence weighed twice, and others quoted beside a
         // question or the run's own design.
@@ -1123,14 +1163,18 @@ mod tests {
             told.contains("do not build the wider one to be safe"),
             "{told}"
         );
+        // Nor the narrower one: silence is settled by what the project does,
+        // or by saying which reading was taken.
         assert!(
-            told.contains("where the words are silent, take the narrower reading"),
+            told.contains(
+                "where the words are silent, follow how the project already does the same \
+                 thing elsewhere, or else keep the reading you took and say so, and change \
+                 nothing on a guess in either direction."
+            ),
             "{told}"
         );
-        assert!(
-            told.ends_with("or an exception, comes before any reading."),
-            "{told}"
-        );
+        assert!(!told.contains("narrower reading"), "{told}");
+        assert!(told.ends_with("comes before any reading."), "{told}");
         assert!(!told.contains("satisfy every reading"), "{told}");
     }
 

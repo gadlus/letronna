@@ -1112,9 +1112,12 @@ fn steps(
             // is in: a row the review left unclear is decided by the
             // request's words rather than left; once, and with a round and
             // budget left, as above. An answer with a line for each such
-            // row costs nothing.
+            // row costs nothing. Not where the tests still fail after their
+            // last run, since a second attempt comes next and the round is
+            // better left to it.
             if tabled
                 && !quoted
+                && (passed || tested < crate::spec_tests::RUNS)
                 && report.rounds < spec.rounds
                 && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
                 && let Some(notice) = unsettled_rows(spec, turn)

@@ -466,8 +466,10 @@ pub(crate) fn reviewed(
         text.push_str(
             "Helpers that haven't seen your work reviewed it against the request; their \
              reports follow, each ending with a table of its rows. Fix every row that fails by \
-             changing the work, not the case, and any case a report calls unclear or sets \
-             aside, unless the request rules that case out.",
+             changing the work, not the case, unless the request rules that case out. A case \
+             a report calls unclear or sets aside is a doubt, not a failure: decide it by the \
+             request's words, and change the work for it only where those words ask for \
+             that.",
         );
         for report in reports {
             text.push_str(&format!("\n\n{}", report.trim()));
@@ -767,8 +769,14 @@ const UNCLEAR_SHOWN: usize = 10;
 /// the request: one or two, such as "must not", are found in most requests.
 const SETTLING: usize = 3;
 
-/// The first word of a reading cell that takes no reading, in lower case.
+/// Words a reading cell that takes no reading is made of, in lower case.
 const SHRUGS: &[&str] = &[
+    "left",
+    "open",
+    "as",
+    "is",
+    "it",
+    "tbd",
     "unclear",
     "ambiguous",
     "unknown",
@@ -781,6 +789,9 @@ const SHRUGS: &[&str] = &[
     "?",
     "-",
 ];
+
+/// The most words a reading cell made only of `SHRUGS` has.
+const SHRUG_WORDS: usize = 3;
 
 /// The reading cell of a row the request states nothing on, which the run
 /// leaves as it is: silence is no ground for a late change of behaviour.
@@ -900,7 +911,7 @@ pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
              uses, in every case the table asks for that applies to it. ",
         );
     }
-    if !failed.is_empty() || !unclear.is_empty() {
+    if !failed.is_empty() {
         text.push_str(
             "A failed row stands for its whole case, not only its example: fix the rule behind \
              it, then test one more input of that case written another way, such as one from \
@@ -1027,10 +1038,11 @@ pub(crate) fn unresolved(messages: &[Message], request: &str, rows: &[usize]) ->
 /// Whether `line` of an answer settles requirement `number`'s row. It opens
 /// with that number, after any marks of a list, a heading or a table; it
 /// has a cell after that for the reading taken, which is no shrug such as
-/// "unclear" though it may be `NOT_STATED`; it quotes, in quote marks or a
+/// "unclear, leave" though it may be `NOT_STATED`; it quotes, in quote marks or a
 /// code span, `SETTLING` or more words found in a row in `request`, its
 /// words as `doubts::words` gives them, the quote's middle left out or not;
-/// and it is no row of the review's table copied back, with its verdict.
+/// and it is no row of the review's table copied back, left unclear or
+/// with its verdict where the review writes it.
 fn settles(line: &str, number: usize, request: &[String]) -> bool {
     let marks = |c: char| matches!(c, '-' | '*' | '|' | '`' | '>' | '#' | ' ' | '\t');
     let line = line.trim_start_matches(marks);
@@ -1047,11 +1059,18 @@ fn settles(line: &str, number: usize, request: &[String]) -> bool {
     if cells.len() < 3 || !numbers(head).contains(&number) {
         return false;
     }
+    // A shrug is a few words that are all of them shrugs, so a reading that
+    // opens with one, such as "unknown keys are rejected", is a reading.
     let reading = reading.to_lowercase();
-    let first = reading.split_whitespace().next().unwrap_or("?");
-    let first = first.trim_end_matches([',', ';', ':', '.']);
-    let shrugged = SHRUGS.contains(&first);
-    if shrugged || judged(&cells).is_some() {
+    let said: Vec<&str> = (reading.split_whitespace())
+        .map(|word| word.trim_end_matches([',', ';', ':', '.']))
+        .collect();
+    let shrugged = said.len() <= SHRUG_WORDS && said.iter().all(|word| SHRUGS.contains(word));
+    // The review writes its verdict third, alone in its cell or with what
+    // shows it (`carried`); a run may end its line with one.
+    let third = verdict(cells[2]).is_some() || carried(cells[2]).is_some();
+    let copied = left_unclear(line) || third;
+    if shrugged || copied {
         return false;
     }
     crate::doubts::literals(line).into_iter().any(|range| {
@@ -2476,6 +2495,12 @@ mod tests {
             "R3 | whole input | \"Open ranges \u{2026} default to the end\" | cargo test",
             "R3 | whole input | \"Open ranges such as [...] the end of the input.\" | ran it",
             "R3 | left end is inclusive | \"to the end of the input\" | cargo test",
+            "R3 | whole input | \"to the end of the input\" | cargo test | PASS",
+            "R3 | unknown ends are rejected | \"to the end of the input\" | cargo test",
+            "R3 | none are read past the end | \"to the end of the input\" | cargo test",
+            "R3 | leave existing values | \"to the end of the input\" | cargo test",
+            "R3 | skip hidden options | \"to the end of the input\" | cargo test",
+            "R3 | ambiguous matches raise | \"to the end of the input\" | cargo test",
         ];
         for line in laid {
             let replies = [answered(line), answered("Done.")];
@@ -2522,6 +2547,8 @@ mod tests {
             "R3 | unclear | \"end of the input\" is ambiguous; left",
             "R3 | Unclear, leave | \"default to the end of the input\" | none",
             "R3 | ? | \"default to the end of the input\" | -",
+            "R3 | left as is | \"default to the end of the input\" | none",
+            "R3 | whole input | PASS | \"default to the end of the input\"",
             "R3 | which end \"default to the end of the input\" means | UNCLEAR | input or line",
             "R3 | \"default to the end of the input\"",
             "R2 | whole input | \"default to the end of the input\" | cargo test",
