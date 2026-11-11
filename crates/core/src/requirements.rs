@@ -612,7 +612,8 @@ fn verdict(cell: &str) -> Option<bool> {
 /// to say, when it holds more than the word, as `PASS — what shows it`,
 /// `FAIL: why` and `PASS (3 cases)` do. Only a word in capitals with such a
 /// mark after it is one: a case that opens "fails when", "Fail fast" or
-/// "FAIL-fast" is prose.
+/// "FAIL-fast" is prose, and so is one that goes on past a bracket, as
+/// "`PASS (3)` is the summary line" does.
 fn opens(cell: &str) -> Option<(&str, &str)> {
     let letters = cell.bytes().take_while(u8::is_ascii_uppercase).count();
     let (word, rest) = cell.split_at(letters);
@@ -623,8 +624,8 @@ fn opens(cell: &str) -> Option<(&str, &str)> {
     let mut after = said.chars();
     let goes_on = match after.next()? {
         '—' | '–' => true,
-        // A bracket holds what shows it, so it stays.
-        '(' => return Some((word, said)),
+        // A bracket holds what shows it, so it stays, and ends the cell.
+        '(' => return said.ends_with(')').then_some((word, said)),
         ':' | '.' => after.next().is_none_or(char::is_whitespace),
         // Set off by a space, as no hyphen inside a word is.
         '-' => said.len() < rest.len(),
@@ -641,7 +642,9 @@ fn opens(cell: &str) -> Option<(&str, &str)> {
 /// any note in brackets after it, when the helper wrote the case and the
 /// verdict in one cell, as `case — PASS` and `case — UNCLEAR (what it
 /// doubts)` do. Only a word in capitals after a dash, with no more than
-/// such a note after it, is one: a case that mentions a verdict is prose.
+/// such a note after it, is one: a case that mentions a verdict is prose,
+/// and a cell that opens with one verdict's word and ends with another
+/// says both.
 fn closes(cell: &str) -> Option<(&str, &str, &str)> {
     let marks = ['*', '`'];
     cell.rmatch_indices(['—', '–', '-']).find_map(|(at, dash)| {
@@ -654,8 +657,9 @@ fn closes(cell: &str) -> Option<(&str, &str, &str)> {
         let note = note.trim_start_matches(marks).trim_start();
         let noted = note.is_empty() || (note.starts_with('(') && note.ends_with(')'));
         let case = case.trim_end();
-        (apart && noted && !case.is_empty() && verdict(word).is_some())
-            .then_some((case, word, note))
+        let leads = case.bytes().take_while(u8::is_ascii_uppercase).count();
+        let cased = !case.is_empty() && verdict(&case[..leads]).is_none();
+        (apart && noted && cased && verdict(word).is_some()).then_some((case, word, note))
     })
 }
 
@@ -672,17 +676,33 @@ fn carried(cell: &str) -> Option<(&str, &str, &str)> {
     (!both).then_some((case, word, shows))
 }
 
+/// Whether a table's `cell` says a test was not run, as a tester marks one
+/// it could not run, with or without the reason after it.
+fn unrun(cell: &str) -> bool {
+    let rest = cell.strip_prefix("NOT RUN");
+    rest.is_some_and(|rest| !rest.starts_with(char::is_alphabetic))
+}
+
 /// The cell of a row's `cells` that gives its verdict, and the word it
 /// gives. A cell that is the word alone wins, the first of them, as a
 /// review is asked to write it; with none, a cell that holds the word and
 /// more (`carried`), and of several the first that does not say the case
-/// passed, since a failed row read as passed is the worse mistake.
+/// passed, since a failed row read as passed is the worse mistake. The
+/// cell after the number is the case wherever more cells follow it, so
+/// whatever it quotes it gives a verdict only as the row's last, and a row
+/// a cell of which says the test was not run (`unrun`) has none to give.
 fn judged<'a>(cells: &[&'a str]) -> Option<(usize, &'a str)> {
     let later = || cells.iter().copied().enumerate().skip(1);
     if let Some(alone) = later().find(|(_, cell)| verdict(cell).is_some()) {
         return Some(alone);
     }
-    let said = |(at, cell)| carried(cell).map(|(_, word, _)| (at, word));
+    if later().any(|(_, cell)| unrun(cell)) {
+        return None;
+    }
+    let said = |(at, cell)| {
+        let case = at == 1 && cells.len() > 2;
+        (carried(cell).filter(|_| !case)).map(|(_, word, _)| (at, word))
+    };
     (later().filter_map(said))
         .find(|(_, word)| verdict(word) == Some(false))
         .or_else(|| later().find_map(said))
@@ -1713,8 +1733,9 @@ mod tests {
         // A cell that is the word alone wins over one that ends with it.
         let alone = "R1 | a failing test is marked — FAIL | PASS | node tap.js";
         assert!(rows(alone)[0].1);
-        // Of two that hold more, no row is passed while one says otherwise.
-        let failed = "R1 | a passing test is marked — PASS | FAIL — not marked";
+        // Of two that hold more after the case, no row is passed while one
+        // says otherwise.
+        let failed = "R1 | a passing test | its line is marked — PASS | FAIL — not `ok 1`";
         assert!(!rows(failed)[0].1);
     }
 
@@ -1789,11 +1810,48 @@ mod tests {
         // A cell that is the word alone wins over one that goes on.
         let alone = "R1 | FAIL: the line printed for a failing test | PASS | node tap.js";
         assert!(rows(alone)[0].1);
-        // Of two that go on, no row is passed while one says otherwise.
-        let failed = "R1 | PASS: the line printed for a passing test | FAIL — not printed";
+        // Of two that go on after the case, no row is passed while one
+        // says otherwise.
+        let failed = "R1 | a passing test | PASS: printed | FAIL — `ok 1` is missing";
         assert!(!rows(failed)[0].1);
-        let either = "R1 | FAIL: the line printed for a failing test | PASS — printed";
+        let either = "R1 | a failing test | FAIL: `not ok 1` is missing | PASS — printed";
         assert!(!rows(either)[0].1);
+    }
+
+    #[test]
+    fn a_case_that_quotes_a_verdict_gives_none_ahead_of_other_cells() {
+        // The cell after the number is the case: what it quotes of a
+        // summary line or a mark is no verdict where more cells follow.
+        for row in [
+            "R6 | `PASS (3)` is the summary line | \u{274c} | node tap.js",
+            "R1 | a good row is marked — PASS | Fail — marked ok",
+            "R1 | what it checks — PASS | NOT RUN",
+            "R1 | PASS: the line printed for a passing test | see the log",
+        ] {
+            assert!(!tabled(row), "{row}");
+        }
+        // The verdict in a later cell is then the row's, whatever the case
+        // quotes.
+        let passed = "R6 | `FAIL: <name>` printed for each failing test | PASS — `node tap.js` \
+                      shows it";
+        assert!(rows(passed)[0].1);
+        let failed = "R6 | `PASS (3)` is the summary line | FAIL — `node tap.js` prints 2";
+        assert!(!rows(failed)[0].1);
+        // As the row's last cell it still gives one, the case before it or
+        // none at all, but not where it goes on past a bracket.
+        assert!(rows("R1 | a good row is marked — PASS")[0].1);
+        assert!(!rows("R1 | FAIL: `not ok 1` is missing")[0].1);
+        assert!(!tabled("R6 | `PASS (3)` is the summary line"));
+        // A row that says its test was not run is no row, whatever a later
+        // cell says of why, unless a cell of it is a verdict alone.
+        for row in [
+            "R1 | adds | NOT RUN | import — FAILED (ImportError)",
+            "R1 | adds | NOT RUN — no seam for it | collection: FAILED (1 error)",
+        ] {
+            assert!(!tabled(row), "{row}");
+        }
+        assert!(!rows("R1 | adds | NOT RUN before the fix | FAIL | pytest -q")[0].1);
+        assert!(!rows("R1 | NOT RUNNING the hook leaves the file | FAIL — it is gone")[0].1);
     }
 
     #[test]
