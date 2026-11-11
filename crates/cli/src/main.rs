@@ -2383,6 +2383,7 @@ mod tests {
                     tools: std::time::Duration::from_millis(18_250),
                 },
                 helpers: timing::Spent::default(),
+                checks: std::time::Duration::from_millis(95_500),
             },
         };
         let out = as_json(&report(Outcome::Done), Some(&extras));
@@ -2397,6 +2398,7 @@ mod tests {
                 "queued_seconds": 0.0,
                 "tool_calls": 11,
                 "tool_seconds": 18.25,
+                "checks_seconds": 95.5,
             })
         );
         assert_eq!(

@@ -1034,7 +1034,7 @@ fn steps(
                     // Not judged against the first complete version, which
                     // is the work as it stands: the reviews may have left
                     // files in the project that would set the two apart.
-                    let ran = test_run(spec, turn, false);
+                    let ran = timed(spec, || test_run(spec, turn, false));
                     broke = matches!(ran, crate::spec_tests::Ran::Broken(_));
                     notice.content.push_str("\n\n");
                     notice.content.push_str(&crate::spec_tests::first_run(&ran));
@@ -1076,7 +1076,7 @@ fn steps(
                 if runnable {
                     tested += 1;
                 }
-                let mut ran = runnable.then(|| test_run(spec, turn, true));
+                let mut ran = runnable.then(|| timed(spec, || test_run(spec, turn, true)));
                 if let Some(ran) = &ran {
                     passed = matches!(ran, crate::spec_tests::Ran::Passed(_));
                 }
@@ -1127,7 +1127,7 @@ fn steps(
                         crate::diag::event("second_attempt_skipped", &why);
                         None
                     }
-                    false => second_attempt(spec, turn, head),
+                    false => timed(spec, || second_attempt(spec, turn, head)),
                 };
                 if let Some((notice, adopted)) = attempt {
                     // Told to change nothing once the project holds the
@@ -1175,7 +1175,7 @@ fn steps(
                 && !compared
                 && report.rounds < spec.rounds
                 && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
-                && let Some(notice) = broken_tests(spec, turn, begun, &mut compared)
+                && let Some(notice) = timed(spec, || broken_tests(spec, turn, begun, &mut compared))
             {
                 spec.transcript.conversation.messages.push(notice);
                 save(&mut spec.transcript)?;
@@ -2845,7 +2845,7 @@ fn requirements(
     // leave out and each helper is of the type that judges by the request;
     // the run asks for one itself only where none came back with a table.
     let (reports, tested, lost) = match review && outputs.is_empty() {
-        true => reviews(spec, typed, &found),
+        true => timed(spec, || reviews(spec, typed, &found)),
         false => Default::default(),
     };
     // Asked to start one itself only while its budget still has a review's
@@ -2936,6 +2936,16 @@ fn test_run(spec: &Spec, turn: &Turn, refereed: bool) -> crate::spec_tests::Ran 
             .flatten()
     };
     crate::spec_tests::ran(&kept, &command, &ctx, limit, first)
+}
+
+/// What `check`, one the driver makes itself, gives, with the time it took
+/// noted as the checks' (`timing::checked`): neither a request nor a tool
+/// call, it would otherwise be time the run's result cannot place.
+fn timed<T>(spec: &Spec, check: impl FnOnce() -> T) -> T {
+    let began = Instant::now();
+    let found = check();
+    crate::timing::checked(spec.root, began.elapsed());
+    found
 }
 
 /// Whether a run of the tester's tests that went as `ran` is the second in

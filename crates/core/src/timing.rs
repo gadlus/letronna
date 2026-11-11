@@ -1,10 +1,15 @@
-//! Where a run's time went: waiting on the model, and running tools.
+//! Where a run's time went: waiting on the model, running tools, and in the
+//! driver's own checks.
 //!
 //! A run's result said only how long it took in all, so nothing could tell a
 //! slow provider from slow tools, or say how long a reply took to begin.
 //! The driver notes each request and each call here as it ends, by the
 //! session the work is for, and the result line of a run nobody watches
-//! takes the totals with it.
+//! takes the totals with it. What the driver does itself between a run's
+//! replies is neither: the reviews it starts and waits for, the tester's
+//! tests it runs against the work, a second attempt, and the project's
+//! tests run as they were. Those are noted apart, so a run that spent ten
+//! minutes there does not read as ten minutes nobody can account for.
 
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -34,13 +39,16 @@ pub struct Spent {
     pub tools: Duration,
 }
 
-/// A run's time: its own agent's, and its helpers'. A helper the agent
-/// waited for is also inside the agent's own tool time, as the call that
-/// started it took that long.
+/// A run's time: its own agent's, its helpers', and the driver's checks. A
+/// helper the agent waited for is also inside the agent's own tool time, as
+/// the call that started it took that long; one the driver started for a
+/// check is inside the checks' time instead.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Timing {
     pub own: Spent,
     pub helpers: Spent,
+    /// The driver's own checks by the clock, from starting each to its end.
+    pub checks: Duration,
 }
 
 fn runs() -> &'static Mutex<HashMap<u64, Timing>> {
@@ -88,6 +96,12 @@ pub(crate) fn ran(root: u64, helper: bool, calls: usize, took: Duration) {
     });
 }
 
+/// A check the driver made itself for session `root` took `took`.
+pub(crate) fn checked(root: u64, took: Duration) {
+    let mut runs = runs().lock().unwrap_or_else(PoisonError::into_inner);
+    runs.entry(root).or_default().checks += took;
+}
+
 /// What session `root` has spent since this was last asked, which starts
 /// its count again: each result line says the time of the run it ends.
 pub fn take(root: u64) -> Timing {
@@ -119,9 +133,11 @@ impl Spent {
 
 impl Timing {
     /// As `--output json` says it under `timing`: the run's own figures,
-    /// and `helpers` with the same ones when it started any.
+    /// the seconds of the driver's checks, and `helpers` with the run's
+    /// figures for them when any started.
     pub fn json(&self) -> Value {
         let mut out = self.own.json();
+        out["checks_seconds"] = json!(seconds(self.checks));
         if self.helpers != Spent::default() {
             out["helpers"] = self.helpers.json();
         }
@@ -147,6 +163,8 @@ mod tests {
         ran(root, false, 1, MS(250));
         asked(root, true, MS(0), Some(MS(300)), MS(1_000));
         ran(root, true, 2, MS(100));
+        checked(root, MS(4_000));
+        checked(root, MS(2_500));
 
         let timing = take(root);
         assert_eq!(
@@ -163,6 +181,7 @@ mod tests {
             }
         );
         assert_eq!((timing.helpers.requests, timing.helpers.calls), (1, 2));
+        assert_eq!(timing.checks, MS(6_500));
         assert_eq!(
             timing.json(),
             json!({
@@ -172,6 +191,7 @@ mod tests {
                 "queued_seconds": 0.05,
                 "tool_calls": 4,
                 "tool_seconds": 1.0,
+                "checks_seconds": 6.5,
                 "helpers": {
                     "requests": 1,
                     "model_seconds": 1.0,
