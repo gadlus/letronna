@@ -17,7 +17,10 @@
 //! asked. A request the gateway could not take for a moment, dropped or
 //! answered with a status that passes by itself, is made once more after a
 //! short pause, within the run's deadline (`again`); a refusal or a bad
-//! request is not, since it would come back the same. The code is a fresh
+//! request is not, since it would come back the same. A provider too busy
+//! to answer, with a 429 or an overload, has not failed at judging: it is
+//! waited for and asked again for a while (`BUSY`), and counts toward no
+//! rest. The code is a fresh
 //! random nonce per call that wraps the call's text, so a web page or file
 //! that talked the agent into writing "ALLOW" into a command cannot write
 //! the verdict too.
@@ -76,11 +79,24 @@ const DENIALS_IN_ALL: u16 = 20;
 /// will come to lift the hold and every later call is judged as before.
 const HELD_UNWATCHED: u8 = 3;
 /// Judge calls that fail in a row before the judge rests, and how long it
-/// rests: three rules out one dropped request, and ten minutes lets a rate
-/// limit or an outage pass without every call meanwhile waiting out its
-/// timeout on an endpoint that cannot answer.
+/// rests: three rules out one dropped request, and ten minutes lets an
+/// outage pass without every call meanwhile waiting out its timeout on an
+/// endpoint that cannot answer.
 const FAILURES_IN_A_ROW: u8 = 3;
 const REST: Duration = Duration::from_secs(10 * 60);
+/// The rest in a run that must end by a deadline: nobody is there to decide
+/// the calls a resting judge leaves unanswered, so each is refused, and ten
+/// minutes of that took every command from a helper with only minutes to
+/// work in. Half a minute still spares an endpoint that is down most of the
+/// timeouts.
+const REST_TIMED: Duration = Duration::from_secs(30);
+/// How long in all one verdict waits on a provider too busy to answer,
+/// asking again, while someone may be watching and where nobody is: the
+/// first is the wait for an answer itself, since past it a person would
+/// rather be asked, and the second is as long as an overload has been seen
+/// to take to pass, since there the call is refused instead.
+const BUSY: Duration = WAIT;
+const BUSY_UNATTENDED: Duration = Duration::from_secs(2 * 60);
 
 /// What the facts add once the session has read words someone other than
 /// the user wrote: the words of the gate's own reason for a call it steers
@@ -193,8 +209,12 @@ impl Category {
 const HELD: &str = "auto mode blocked several actions in a row; review before continuing";
 /// Why the judge is not asked about a call the user stopped.
 const STOPPED: &str = "the user stopped this action; it waits for their yes";
-/// Why the judge is not asked while it rests after failing.
+/// Why the judge is not asked while it rests after failing, and the same
+/// in a run with a deadline, where the rest is `REST_TIMED`.
 const RESTING: &str = "the judge failed several times in a row and rests for a few minutes";
+const RESTING_BRIEFLY: &str = "the judge failed several times in a row and rests for half a minute";
+/// How the reason for a judge call that failed begins.
+const UNANSWERED: &str = "the judge could not answer";
 
 /// A call as the judge is shown it, and what its verdict is kept under.
 struct Case<'a> {
@@ -216,6 +236,8 @@ struct Case<'a> {
     facts: String,
     /// Whether nobody may be watching, and so nobody may lift a hold.
     unattended: bool,
+    /// Whether the run must end by a deadline, and so rests only briefly.
+    timed: bool,
     /// The session's mode, by name.
     mode: &'a str,
 }
@@ -278,6 +300,7 @@ pub fn judge(
         typed,
         facts: facts(ctx),
         unattended: connection.unattended,
+        timed: connection.deadline.is_some(),
         mode: mode.name(),
     };
     judge_in(memory(), &case, &nonce, |prompt| ask(connection, prompt))
@@ -288,6 +311,13 @@ pub fn judge(
 /// asks them, and a verdict on it still on its way is dropped.
 pub fn stop(call: &ToolCall, typed: &[String], conversation: u64) {
     stop_in(memory(), call, typed, conversation);
+}
+
+/// Whether `why`, an `Unsure` verdict's reason, says the call was never
+/// judged, the judge having failed or being at rest, rather than judged and
+/// left for a person.
+pub fn unjudged(why: &str) -> bool {
+    why.starts_with(UNANSWERED) || why == RESTING || why == RESTING_BRIEFLY
 }
 
 /// What the user typed in `messages`, oldest first, as the judge reads their
@@ -336,7 +366,7 @@ fn judge_in(
     memory: &Memory,
     case: &Case,
     nonce: &str,
-    ask: impl FnOnce(&str) -> Result<String, String>,
+    ask: impl FnOnce(&str) -> Result<String, Failure>,
 ) -> Verdict {
     // The shown input too, since it can hold more than the arguments: the
     // folder a command runs in, the page a click lands on. The mode and the
@@ -375,7 +405,8 @@ fn judge_in(
             return Verdict::Unsure(STOPPED.into());
         }
         if session.resting.is_some_and(|until| Instant::now() < until) {
-            return Verdict::Unsure(RESTING.into());
+            let why = if case.timed { RESTING_BRIEFLY } else { RESTING };
+            return Verdict::Unsure(why.into());
         }
         session.verdicts.get(&key).cloned()
     };
@@ -385,7 +416,11 @@ fn judge_in(
     let verdict = known.unwrap_or_else(|| {
         fresh(case, nonce, |prompt| {
             let reply = ask(prompt);
-            failed.set(Some(reply.is_err()));
+            // A provider too busy to answer says nothing of the judge, so
+            // it neither counts as a failure nor ends a run of them.
+            if !reply.as_ref().is_err_and(|failure| busy(failure.kind)) {
+                failed.set(Some(reply.is_err()));
+            }
             reply
         })
     });
@@ -394,7 +429,7 @@ fn judge_in(
     };
     let session = memory.entry(case.session).or_default();
     if let Some(failed) = failed.get() {
-        session.answered(failed);
+        session.answered(failed, case.timed);
     }
     // The user typed again while the judge was deciding, and what they said
     // may change what they want, so the verdict is neither kept nor used.
@@ -423,8 +458,8 @@ impl Session {
     }
 
     /// Counts a judge call that `failed` or answered; after a few failures in
-    /// a row the judge rests.
-    fn answered(&mut self, failed: bool) {
+    /// a row the judge rests, briefly in a run that is `timed`.
+    fn answered(&mut self, failed: bool, timed: bool) {
         if !failed {
             self.failures = 0;
             return;
@@ -432,7 +467,8 @@ impl Session {
         self.failures = self.failures.saturating_add(1);
         if self.failures >= FAILURES_IN_A_ROW {
             self.failures = 0;
-            self.resting = Instant::now().checked_add(REST);
+            let rest = if timed { REST_TIMED } else { REST };
+            self.resting = Instant::now().checked_add(rest);
         }
     }
 }
@@ -457,7 +493,7 @@ fn record(session: &mut Session, key: String, verdict: &Verdict) {
 
 /// A new verdict on `case` from `ask`, or `Unsure` without asking when the
 /// call's text could pass for the judge's own or is too long to read whole.
-fn fresh(case: &Case, nonce: &str, ask: impl FnOnce(&str) -> Result<String, String>) -> Verdict {
+fn fresh(case: &Case, nonce: &str, ask: impl FnOnce(&str) -> Result<String, Failure>) -> Verdict {
     if case.input.contains(nonce) {
         return Verdict::Unsure("the call contains the judge's code".into());
     }
@@ -470,7 +506,7 @@ fn fresh(case: &Case, nonce: &str, ask: impl FnOnce(&str) -> Result<String, Stri
     }
     match ask(&prompt(case, nonce)) {
         Ok(reply) => parse(&reply, nonce),
-        Err(error) => Verdict::Unsure(format!("the judge could not answer: {error}")),
+        Err(failure) => Verdict::Unsure(format!("{UNANSWERED}: {failure}")),
     }
 }
 
@@ -656,9 +692,10 @@ fn quoted(text: &str) -> String {
 /// ignore `reasoning_effort` (see `chat::body`), and one that does not
 /// think is told to answer in one line, so the extra tokens are mostly a
 /// cap rather than a cost.
-fn ask(connection: &Connection, prompt: &str) -> Result<String, String> {
-    let endpoint = crate::chat::validate(connection)?;
-    let reached = crate::on_device::reach::reach(connection, endpoint, false)?;
+fn ask(connection: &Connection, prompt: &str) -> Result<String, Failure> {
+    let unknown = |words: String| Failure::new(FailureKind::Unknown, words);
+    let endpoint = crate::chat::validate(connection).map_err(unknown)?;
+    let reached = crate::on_device::reach::reach(connection, endpoint, false).map_err(unknown)?;
     // As the session's own requests are sized, so a reply the model is
     // known not to take is not asked for.
     let sizing = crate::store::sizing();
@@ -668,24 +705,30 @@ fn ask(connection: &Connection, prompt: &str) -> Result<String, String> {
         sizing.window,
         sizing.output,
     );
-    let value = match send(connection, &reached, &limits, prompt) {
-        Err(failure) if again(connection, &failure) => send(connection, &reached, &limits, prompt),
-        sent => sent,
-    }
-    .map_err(|failure| failure.to_string())?;
+    let began = Instant::now();
+    let mut tried = 0;
+    let value = loop {
+        tried += 1;
+        match send(connection, &reached, &limits, prompt) {
+            Err(failure) if again(connection, &failure, tried, began) => {}
+            sent => break sent?,
+        }
+    };
     let value =
         crate::providers::wire::openai_responses::reply(crate::chat::as_chat(connection, value));
-    crate::chat::unwrap_response(&value)?
+    crate::chat::unwrap_response(&value)
+        .map_err(unknown)?
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| "No verdict came back.".to_owned())
+        .ok_or_else(|| unknown("No verdict came back.".to_owned()))
 }
 
 /// The judge's request for `prompt` over `connection`, once, to the server
 /// `reached`, given its model's `limits`: sized by `patience` for the time
 /// left now, and what came back, as JSON. A failure's kind says whether it
-/// passes by itself (`kind`); the words are the error's own.
+/// passes by itself (`kind`), or that the provider was too busy
+/// (`refused`); the words are the error's own.
 fn send(
     connection: &Connection,
     reached: &crate::on_device::reach::Reached,
@@ -717,16 +760,49 @@ fn send(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| Failure::new(FailureKind::Unknown, e.to_string()))?;
-    reached
+    let failed = |e: reqwest::Error| Failure::new(kind(&e), e.to_string());
+    let response = reached
         .sign(crate::chat::carrying(
             client.post(endpoint),
             connection,
             &body,
         ))
         .send()
-        .and_then(|r| r.error_for_status())
-        .and_then(crate::providers::wire::openai_responses::json)
-        .map_err(|e| Failure::new(kind(&e), e.to_string()))
+        .map_err(failed)?;
+    if let Err(error) = response.error_for_status_ref() {
+        return Err(refused(connection, response).unwrap_or_else(|| failed(error)));
+    }
+    crate::providers::wire::openai_responses::json(response).map_err(failed)
+}
+
+/// Whether a failure of `kind` is the provider being too busy to answer, a
+/// rate limit or an overload, which says nothing of the judge or the call.
+fn busy(kind: FailureKind) -> bool {
+    matches!(kind, FailureKind::RateLimit | FailureKind::Overloaded)
+}
+
+/// The failure in `response`, an error reply to the judge's request, when
+/// it says the provider is too busy: a 429 that is no spent quota, a status
+/// or an error code for an overload, or a gateway's passing status whose
+/// words say overloaded. It carries the reply's `Retry-After`, and a 429
+/// rests the provider's gate, so the session's other calls hold off as they
+/// do after one of their own.
+fn refused(connection: &Connection, response: reqwest::blocking::Response) -> Option<Failure> {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let raw = response.text().unwrap_or_default();
+    let body = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    let mut failure = crate::failure::classify_text(Some(status.as_u16()), &headers, &body, &raw);
+    if crate::chat::transient(status) && raw.to_lowercase().contains("overloaded") {
+        failure.kind = FailureKind::Overloaded;
+    }
+    if !busy(failure.kind) || failure.lasting {
+        return None;
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        crate::limits::backoff(&connection.endpoint, failure.retry_after);
+    }
+    Some(failure)
 }
 
 /// What kind of failure `e`, a failed request's error, is, as far as a
@@ -749,20 +825,38 @@ fn kind(e: &reqwest::Error) -> FailureKind {
     }
 }
 
-/// Whether the judge's request that failed with `failure` is made once
-/// more, having waited the short pause the session's own calls take before
-/// a second try (`retry::after`): when the failure passes by itself and the
-/// pause ends before the run's deadline. Once only, since a call stands
-/// waiting on the verdict, and a gateway down for longer rests the judge
-/// (`FAILURES_IN_A_ROW`).
-fn again(connection: &Connection, failure: &Failure) -> bool {
-    let Some(retry) = crate::retry::after(failure, 1, connection.unattended, connection.deadline)
+/// Whether the judge's request that failed with `failure`, the `tried`th
+/// for a verdict asked for since `began`, is made again, having waited the
+/// pause the session's own calls take before another try (`retry::after`):
+/// when the failure passes by itself and the pause ends before the run's
+/// deadline. A provider too busy to answer is asked again for as long as
+/// `BUSY` allows, waiting out its `Retry-After` and the rest its gate keeps
+/// for all its callers. Any other failure is tried once more only, since a
+/// call stands waiting on the verdict, and a gateway down for longer rests
+/// the judge (`FAILURES_IN_A_ROW`).
+fn again(connection: &Connection, failure: &Failure, tried: u32, began: Instant) -> bool {
+    let busy = busy(failure.kind);
+    if !busy && tried > 1 {
+        return false;
+    }
+    let Some(retry) =
+        crate::retry::after(failure, tried, connection.unattended, connection.deadline)
     else {
         return false;
     };
+    let rest = crate::limits::resting(&connection.endpoint).filter(|_| busy);
+    let wait = retry.wait.max(rest.unwrap_or_default());
     let left =
         (connection.deadline).map(|deadline| deadline.saturating_duration_since(Instant::now()));
-    if left.is_some_and(|left| left <= retry.wait) {
+    if left.is_some_and(|left| left <= wait) {
+        return false;
+    }
+    let patience = if connection.unattended {
+        BUSY_UNATTENDED
+    } else {
+        BUSY
+    };
+    if busy && began.elapsed() + wait > patience {
         return false;
     }
     crate::diag::event(
@@ -774,13 +868,11 @@ fn again(connection: &Connection, failure: &Failure) -> bool {
             ),
             (
                 "wait_ms",
-                u64::try_from(retry.wait.as_millis())
-                    .unwrap_or(u64::MAX)
-                    .into(),
+                u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).into(),
             ),
         ],
     );
-    crate::retry::pause(retry.wait, || false)
+    crate::retry::pause(wait, || false)
 }
 
 /// How long the judge is waited for over `connection` and how many tokens
@@ -840,8 +932,14 @@ mod tests {
             typed,
             facts: "macos computer, commands run in sh.".into(),
             unattended: false,
+            timed: false,
             mode: "auto",
         }
+    }
+
+    /// A judge call that failed with `words`, in no way that passes.
+    fn failed(words: &str) -> Failure {
+        Failure::new(FailureKind::Unknown, words)
     }
 
     /// The verdict `reply` gives on `cargo test`, with nothing kept before.
@@ -1131,8 +1229,8 @@ mod tests {
         let memory = Memory::default();
         let typed = typed(&["run the tests"]);
         let replies = [
-            Err("error sending request: operation timed out".to_owned()),
-            Err("HTTP status server error (502 Bad Gateway)".to_owned()),
+            Err("error sending request: operation timed out"),
+            Err("HTTP status server error (502 Bad Gateway)"),
             Ok(String::new()),
             Ok(" \n \n".to_owned()),
             Ok("Sure, running the tests looks fine to me.".to_owned()),
@@ -1141,7 +1239,7 @@ mod tests {
         ];
         for reply in replies {
             let verdict = judge_in(&memory, &case("cargo test", &typed), NONCE, |_| {
-                reply.clone()
+                reply.clone().map_err(failed)
             });
             assert!(
                 matches!(verdict, Verdict::Unsure(_)),
@@ -1152,7 +1250,7 @@ mod tests {
         let asked = Cell::new(false);
         judge_in(&memory, &case("cargo test", &typed), NONCE, |_| {
             asked.set(true);
-            Err("still down".into())
+            Err(failed("still down"))
         });
         assert!(asked.get());
     }
@@ -1237,7 +1335,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            ask(&late, "May it run?"),
+            ask(&late, "May it run?").map_err(|failure| failure.to_string()),
             Err("The run's time is up.".to_owned())
         );
     }
@@ -1299,6 +1397,11 @@ mod tests {
         }
     }
 
+    /// What `ask` gives over `connection`, a failure as its words.
+    fn asked(connection: &Connection) -> Result<String, String> {
+        ask(connection, "May it run?").map_err(|failure| failure.to_string())
+    }
+
     /// A whole reply with `status` and `body`.
     fn answered(status: &str, body: &str) -> String {
         format!(
@@ -1316,7 +1419,7 @@ mod tests {
         for first in [Some(answered("503 Service Unavailable", "")), None] {
             let (connection, address, worker) =
                 served(vec![first, Some(answered("200 OK", &verdict))]);
-            assert_eq!(ask(&connection, "May it run?"), Ok("ALLOW".to_owned()));
+            assert_eq!(asked(&connection), Ok("ALLOW".to_owned()));
             let _ = TcpStream::connect(address);
             assert_eq!(worker.join().unwrap(), 2);
         }
@@ -1329,7 +1432,7 @@ mod tests {
             Some(answered("400 Bad Request", &refused)),
             Some(answered("200 OK", "{}")),
         ]);
-        let verdict = ask(&connection, "May it run?");
+        let verdict = asked(&connection);
         assert!(
             matches!(&verdict, Err(why) if why.contains("400")),
             "{verdict:?}"
@@ -1348,7 +1451,7 @@ mod tests {
         // Less than the pause before a second request would take, and
         // enough for the first to be answered under load.
         connection.deadline = Some(Instant::now() + Duration::from_millis(450));
-        let verdict = ask(&connection, "May it run?");
+        let verdict = asked(&connection);
         assert!(
             matches!(&verdict, Err(why) if why.contains("503")),
             "{verdict:?}"
@@ -1357,12 +1460,178 @@ mod tests {
         assert_eq!(worker.join().unwrap(), 1);
     }
 
+    /// What OpenCode Go answers while its service is overloaded.
+    fn overloaded(headers: &str) -> String {
+        let body = json!({"error": {
+            "message": "The inference service is overloaded. Please try again later.",
+        }})
+        .to_string();
+        format!(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n{headers}\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn a_busy_provider_is_waited_for_and_counts_as_no_failure() {
+        let verdict = json!({"choices": [{"message": {"content": format!("{NONCE} ALLOW")}}]});
+        // Twice, which one more try alone would not get past; the wait the
+        // provider asks for is kept.
+        let (connection, address, worker) = served(vec![
+            Some(overloaded("Retry-After: 1\r\n")),
+            Some(overloaded("")),
+            Some(answered("200 OK", &verdict.to_string())),
+        ]);
+        let memory = Memory::default();
+        let typed = typed(&["run the tests"]);
+        // Two failures already, so one more would rest the judge.
+        for input in ["a", "b"] {
+            judge_in(&memory, &case(input, &typed), NONCE, |_| {
+                Err(failed("timed out"))
+            });
+        }
+        let began = Instant::now();
+        let allowed = judge_in(&memory, &case("cargo test", &typed), NONCE, |prompt| {
+            ask(&connection, prompt)
+        });
+        assert_eq!(allowed, Verdict::Allow);
+        assert!(
+            began.elapsed() >= Duration::from_secs(1),
+            "{:?}",
+            began.elapsed()
+        );
+        let _ = TcpStream::connect(address);
+        assert_eq!(worker.join().unwrap(), 3);
+        let memory = memory.lock().unwrap();
+        assert!(memory[&7].resting.is_none());
+        assert_eq!(memory[&7].failures, 0);
+    }
+
+    #[test]
+    fn a_provider_busy_past_the_deadline_leaves_the_call_unjudged_and_the_judge_unrested() {
+        let (mut connection, address, worker) = served(vec![Some(overloaded("")); 4]);
+        connection.unattended = true;
+        let memory = Memory::default();
+        let typed = typed(&["run the tests"]);
+        let timed = Case {
+            unattended: true,
+            timed: true,
+            ..case("cargo test", &typed)
+        };
+        for _ in 0..4 {
+            // Less than the pause before another request would take.
+            connection.deadline = Some(Instant::now() + Duration::from_millis(450));
+            let verdict = judge_in(&memory, &timed, NONCE, |prompt| ask(&connection, prompt));
+            let Verdict::Unsure(why) = verdict else {
+                panic!("{verdict:?}");
+            };
+            assert!(unjudged(&why) && why.contains("overloaded"), "{why}");
+        }
+        // Each was asked: four in a row rested nothing.
+        let _ = TcpStream::connect(address);
+        assert_eq!(worker.join().unwrap(), 4);
+        assert!(memory.lock().unwrap()[&7].resting.is_none());
+    }
+
+    #[test]
+    fn only_a_busy_provider_is_asked_more_than_twice_and_not_for_long() {
+        let connection = Connection {
+            endpoint: "http://127.0.0.1:9/v1".into(),
+            ..Default::default()
+        };
+        let mut busy = Failure::new(FailureKind::Overloaded, "Overloaded.");
+        let began = Instant::now();
+        assert!(again(&connection, &busy, 2, began));
+        // Not once the waits come to more than a watched verdict's own.
+        let long_ago = began.checked_sub(BUSY).unwrap();
+        assert!(!again(&connection, &busy, 2, long_ago));
+        let unwatched = Connection {
+            unattended: true,
+            ..connection.clone()
+        };
+        assert!(again(&unwatched, &busy, 2, long_ago));
+        // Nor for a wait asked for that is longer than that.
+        busy.retry_after = Some(BUSY * 2);
+        assert!(!again(&connection, &busy, 1, Instant::now()));
+        // A spent quota comes back the same however long it is waited for.
+        let spent = Failure::new(FailureKind::Quota, "No credit.");
+        assert!(!again(&connection, &spent, 1, Instant::now()));
+    }
+
+    #[test]
+    fn a_spent_quota_answered_as_429_is_a_failure_like_any_other() {
+        let spent = json!({"error": {"code": "insufficient_quota", "message": "No credit."}});
+        let (connection, address, worker) = served(vec![
+            Some(answered("429 Too Many Requests", &spent.to_string())),
+            Some(answered("200 OK", "{}")),
+        ]);
+        let failure = ask(&connection, "May it run?").unwrap_err();
+        assert!(!busy(failure.kind), "{:?}", failure.kind);
+        let _ = TcpStream::connect(address);
+        assert_eq!(worker.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_gateways_503_that_says_overloaded_is_a_busy_provider() {
+        let words = json!({"error": {"message": "The model is overloaded."}}).to_string();
+        let (mut connection, address, worker) =
+            served(vec![Some(answered("503 Service Unavailable", &words))]);
+        connection.deadline = Some(Instant::now() + Duration::from_millis(450));
+        let failure = ask(&connection, "May it run?").unwrap_err();
+        assert_eq!(failure.kind, FailureKind::Overloaded);
+        let _ = TcpStream::connect(address);
+        assert_eq!(worker.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn the_rest_is_short_in_a_run_with_a_deadline() {
+        let memory = Memory::default();
+        let typed = typed(&["run the tests"]);
+        let timed = Case {
+            unattended: true,
+            timed: true,
+            ..case("cargo test", &typed)
+        };
+        for _ in 0..FAILURES_IN_A_ROW {
+            judge_in(&memory, &timed, NONCE, |_| Err(failed("timed out")));
+        }
+        let resting = judge_in(&memory, &timed, NONCE, |_| {
+            panic!("the judge was asked while it rests")
+        });
+        assert_eq!(resting, Verdict::Unsure(RESTING_BRIEFLY.into()));
+        let until = memory.lock().unwrap()[&7].resting.unwrap();
+        let rest = until.saturating_duration_since(Instant::now());
+        assert!(rest <= REST_TIMED && REST_TIMED < REST / 10, "{rest:?}");
+    }
+
+    #[test]
+    fn a_call_is_unjudged_when_the_judge_failed_or_rests_and_not_otherwise() {
+        assert!(unjudged(RESTING) && unjudged(RESTING_BRIEFLY));
+        let typed = typed(&["run the tests"]);
+        let down = judge_in(&Memory::default(), &case("ls", &typed), NONCE, |_| {
+            Err(failed("timed out"))
+        });
+        assert!(
+            matches!(&down, Verdict::Unsure(why) if unjudged(why)),
+            "{down:?}"
+        );
+        // A judge that answered, and left it to a person, judged it.
+        for why in [HELD, STOPPED, "the judge could not tell"] {
+            assert!(!unjudged(why), "{why}");
+        }
+        let Verdict::Unsure(why) = verdict_of("Looks fine to me.") else {
+            panic!("no verdict was read");
+        };
+        assert!(!unjudged(&why), "{why}");
+    }
+
     #[test]
     fn only_a_failure_that_passes_by_itself_is_tried_again() {
         let connection = Connection::default();
         let passing = Failure::new(FailureKind::Network, "Dropped.");
         let began = Instant::now();
-        assert!(again(&connection, &passing));
+        assert!(again(&connection, &passing, 1, began));
         // After the short pause the session's own calls take.
         assert!(
             began.elapsed() >= Duration::from_millis(400),
@@ -1371,15 +1640,22 @@ mod tests {
         );
         assert!(again(
             &connection,
-            &Failure::new(FailureKind::Server, "503")
+            &Failure::new(FailureKind::Server, "503"),
+            1,
+            began
         ));
+        // Once only: a second failure of the kind is the verdict's.
+        assert!(!again(&connection, &passing, 2, began));
         for kind in [
             FailureKind::Unknown,
             FailureKind::BadRequest,
             FailureKind::Auth,
             FailureKind::Stopped,
         ] {
-            assert!(!again(&connection, &Failure::new(kind, "No.")), "{kind:?}");
+            assert!(
+                !again(&connection, &Failure::new(kind, "No."), 1, began),
+                "{kind:?}"
+            );
         }
     }
 
@@ -1602,7 +1878,7 @@ mod tests {
         let typed = typed(&["run the tests"]);
         for input in ["a", "b", "c"] {
             let failed = judge_in(&memory, &case(input, &typed), NONCE, |_| {
-                Err("timed out".into())
+                Err(failed("timed out"))
             });
             assert!(matches!(failed, Verdict::Unsure(_)), "{failed:?}");
         }
@@ -1633,9 +1909,7 @@ mod tests {
             Err("timed out"),
         ];
         for (at, reply) in replies.into_iter().enumerate() {
-            let reply = reply
-                .map(|word| format!("{NONCE} {word}"))
-                .map_err(str::to_owned);
+            let reply = reply.map(|word| format!("{NONCE} {word}")).map_err(failed);
             judge_in(&memory, &case(&format!("x{at}"), &typed), NONCE, |_| reply);
         }
         let asked = Cell::new(false);
@@ -2031,7 +2305,7 @@ mod tests {
             model: "bonsai-2-4b".into(),
             ..Default::default()
         };
-        assert_eq!(ask(&chat, "May it read notes.txt?").as_deref(), Ok("allow"));
+        assert_eq!(asked(&chat).as_deref(), Ok("allow"));
         let heard = heard.lock().unwrap();
         let (key, body) = &heard[0];
         assert_eq!(key, "Bearer k-live");

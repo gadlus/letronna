@@ -125,6 +125,13 @@ pub fn backoff(endpoint: &str, retry_after: Option<Duration>) {
     gate(endpoint).backoff(retry_after);
 }
 
+/// How long the provider at `endpoint` still rests after a 429, for a caller
+/// that takes no permit and would only be turned away meanwhile.
+pub fn resting(endpoint: &str) -> Option<Duration> {
+    let until = gate(endpoint).lock().until?;
+    Some(until.saturating_duration_since(Instant::now())).filter(|left| !left.is_zero())
+}
+
 /// The rest a response's `Retry-After` asks for; a date, which providers
 /// rarely send, gets the doubling rest instead.
 pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {

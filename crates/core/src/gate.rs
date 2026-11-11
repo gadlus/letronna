@@ -895,6 +895,12 @@ fn ruling(tool: &str, verdict: Verdict, human: bool) -> Outcome {
             category.meaning()
         )),
         Verdict::Unsure(_) if human => Outcome::Ask,
+        // Not a denial, and said so: a helper that read one into it stopped
+        // running commands for the rest of its work.
+        Verdict::Unsure(why) if judge::unjudged(&why) => Outcome::Refuse(format!(
+            "Not run: auto mode could not judge `{tool}` just now ({why}). That \
+             is no denial of the call, so try it again shortly."
+        )),
         Verdict::Unsure(why) => Outcome::Refuse(format!(
             "Refused: auto mode could not approve `{tool}` ({why}), and nobody is \
              here to decide. Carry on without it and say what was left undone."
@@ -2841,6 +2847,33 @@ mod tests {
         assert!(
             answer.starts_with("Nobody is available to answer"),
             "{answer}"
+        );
+    }
+
+    #[test]
+    fn a_call_the_judge_never_judged_is_not_told_as_a_denial() {
+        let down = "the judge could not answer: The inference service is overloaded.";
+        let unjudged = ruling("run_command", Verdict::Unsure(down.into()), false);
+        assert_eq!(
+            unjudged,
+            Outcome::Refuse(format!(
+                "Not run: auto mode could not judge `run_command` just now ({down}). \
+                 That is no denial of the call, so try it again shortly."
+            ))
+        );
+        // One it judged and could not settle is left undone, as before.
+        let unsure = Verdict::Unsure("the judge could not tell".into());
+        let Outcome::Refuse(why) = ruling("run_command", unsure, false) else {
+            panic!("a call its judge was unsure of ran with nobody to ask");
+        };
+        assert!(
+            why.starts_with("Refused: auto mode could not approve"),
+            "{why}"
+        );
+        // Someone watching is asked either way.
+        assert_eq!(
+            ruling("run_command", Verdict::Unsure(down.into()), true),
+            Outcome::Ask
         );
     }
 
