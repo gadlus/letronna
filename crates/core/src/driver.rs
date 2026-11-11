@@ -3552,6 +3552,9 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
         let from = copied.as_deref().unwrap_or(workspace);
         crate::spec_tests::keep(spec.id, from, workspace, command.clone())
     });
+    if let Some(kept) = &kept {
+        own_kept(spec, kept);
+    }
     // With the set-up the tester's own commands gave the program, which its
     // `Run:` line may lack, kept beside the command for the driver's run of
     // it (`with_test_environment`).
@@ -3572,6 +3575,21 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
     (reports, tested, lost)
 }
 
+/// Notes the tester's files `kept`, and the folders they are kept in, as the
+/// session's own: the run is told to fix a test of the tester's where it is
+/// kept, outside the project, where its file tools reach only what the
+/// session made.
+fn own_kept(spec: &Spec, kept: &crate::spec_tests::Kept) {
+    let ctx = context(spec);
+    crate::taint::made(&ctx, &kept.dir);
+    for file in &kept.files {
+        let path = kept.dir.join(file);
+        (path.ancestors())
+            .take_while(|at| *at != kept.dir)
+            .for_each(|at| crate::taint::made(&ctx, at));
+    }
+}
+
 /// The tests of a tester started with the run kept from `folder`, where it
 /// worked, with the command its `report` gives, if any, made relative to
 /// the project, and the set-up its own commands gave the program beside it
@@ -3586,6 +3604,9 @@ fn kept_ahead(spec: &Spec, folder: &Path, report: Option<&str>) -> Option<crate:
     let kept = workspace.and_then(|workspace| {
         crate::spec_tests::keep_ahead(spec.id, folder, workspace, command.clone())
     });
+    if let Some(kept) = &kept {
+        own_kept(spec, kept);
+    }
     if let (Some(kept), Some(command), Some(report)) = (&kept, &command, report) {
         let set_up = tester_set_up(spec, report, command, Some(folder));
         crate::spec_tests::lend(kept, set_up);
@@ -10395,6 +10416,11 @@ pub(crate) mod tests {
         assert!(report.starts_with("tester"), "{report}");
         let kept = kept_ahead(&spec, &folder, Some(&report)).unwrap();
         assert_eq!(kept.files, ["letronna_spec_test.sh"]);
+        // The run is told to fix a test of the tester's where it is kept,
+        // so the file, and the folder for a helper beside it, are its own.
+        let own = context(&spec);
+        assert!(crate::taint::own(&own, &kept.dir.join(&kept.files[0])));
+        assert!(crate::taint::own(&own, &kept.dir));
         // The command is kept as the tester gave it, with the set-up its
         // own command had beside it, less the cache in its folder, which is
         // gone.
