@@ -611,13 +611,27 @@ fn placeholder(cell: &str) -> bool {
     cell.to_ascii_lowercase().starts_with("not yet implemented")
 }
 
+/// A table's `cell` stripped of the marks a table is often written with.
+fn bare(cell: &str) -> &str {
+    cell.trim().trim_matches(|c| c == '*' || c == '`').trim()
+}
+
 /// The cells of a table's `line`, cut at each `|` and stripped of the marks
 /// a table is often written with.
 fn cells(line: &str) -> Vec<&str> {
     line.split('|')
-        .map(|cell| cell.trim().trim_matches(|c| c == '*' || c == '`').trim())
+        .map(bare)
         .filter(|cell| !cell.is_empty())
         .collect()
+}
+
+/// Whether a table's `cell`, as its line writes it between two bars, is one
+/// code span and nothing else.
+fn spanned(cell: &str) -> bool {
+    let Some(inner) = cell.strip_prefix('`') else {
+        return false;
+    };
+    (inner.strip_suffix('`')).is_some_and(|inner| !inner.contains('`'))
 }
 
 /// Whether a table's `cell` says a case passed or failed, if it says either;
@@ -721,6 +735,12 @@ fn numbered(cell: &str) -> bool {
         word == "and" || (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
     };
     words.peek().is_some() && words.all(names)
+}
+
+/// The verdict's word a table's `cell` gives with more (`carried`), or else
+/// the cell itself, which may be the word alone.
+fn given(cell: &str) -> &str {
+    carried(cell).map_or(cell, |(_, word, _)| word)
 }
 
 /// The cell of a row's `cells` that gives its verdict, and the word it
@@ -1061,8 +1081,12 @@ pub(crate) fn unresolved(messages: &[Message], request: &str, rows: &[usize]) ->
 /// "unclear, leave" though it may be `NOT_STATED`; it quotes, in quote marks or a
 /// code span, `SETTLING` or more words found in a row in `request`, its
 /// words as `doubts::words` gives them, the quote's middle left out or not;
-/// and it is no row of the review's table copied back, left unclear or
-/// with its verdict where the review writes it.
+/// and it is no row of the review's table copied back: no cell after the
+/// number says UNCLEAR, alone or with more (`carried`), and its third gives
+/// no verdict. The cells are read one by one, not as `judged` reads a row,
+/// which takes the cell after the number for the case and so would pass a
+/// doubt copied back in it; and a cell that is one code span and more than
+/// a verdict's word quotes, as one in quote marks does, so it gives none.
 fn settles(line: &str, number: usize, request: &[String]) -> bool {
     let marks = |c: char| matches!(c, '-' | '*' | '|' | '`' | '>' | '#' | ' ' | '\t');
     let line = line.trim_start_matches(marks);
@@ -1086,10 +1110,18 @@ fn settles(line: &str, number: usize, request: &[String]) -> bool {
         .map(|word| word.trim_end_matches([',', ';', ':', '.']))
         .collect();
     let shrugged = said.len() <= SHRUG_WORDS && said.iter().all(|word| SHRUGS.contains(word));
+    // What each cell says where a verdict is looked for: nothing where it
+    // quotes in a code span, as the request's own words may open with one.
+    let raw = (line.split('|').map(str::trim)).filter(|cell| !bare(cell).is_empty());
+    let quotes = |cell: &str, raw: &str| spanned(raw) && verdict(cell).is_none();
+    let said: Vec<&str> = (cells.iter().zip(raw))
+        .map(|(cell, raw)| if quotes(cell, raw) { "" } else { *cell })
+        .collect();
+    let doubted = (said[1..].iter()).any(|cell| given(cell).eq_ignore_ascii_case(UNCLEAR));
     // The review writes its verdict third, alone in its cell or with what
     // shows it (`carried`); a run may end its line with one.
-    let third = verdict(cells[2]).is_some() || carried(cells[2]).is_some();
-    let copied = left_unclear(line) || third;
+    let third = verdict(given(said[2])).is_some();
+    let copied = doubted || third;
     if shrugged || copied {
         return false;
     }
@@ -2615,6 +2647,49 @@ mod tests {
         let line = "R3 | the end of the whole input — not of the line | \"default to the end \
                     of the input\" | cargo test";
         assert_eq!(listed(line), None);
+        // A doubt copied back in the cell after the number, where a table's
+        // row has its case and gives no verdict, is no reading taken either.
+        for row in [
+            "R3 | which end — UNCLEAR | \"default to the end of the input\" | cargo test",
+            "R3 | UNCLEAR: which end | \"default to the end of the input\" | cargo test",
+            "R3 (open) | which end | \"default to the end of the input\" | UNCLEAR — still",
+        ] {
+            assert!(listed(row).is_some(), "{row}");
+        }
+        // In the review's table that cell is the case, so the row is the
+        // failure its later cell says, not a doubt.
+        let table = "R3 | `UNCLEAR: <range>` is printed for an open range | FAIL — nothing is";
+        let sent = unchecked(table, 3).unwrap();
+        assert!(sent.contains("these rows that failed:\n- R3 |"), "{sent}");
+        assert!(left_open(&sent).is_empty(), "{sent}");
+    }
+
+    #[test]
+    fn a_cell_that_quotes_a_verdicts_word_in_a_code_span_is_no_copied_row() {
+        // The request's own words may open or close with a verdict's.
+        let request = "Print one line per test. When every test passes, the last line must be \
+                       `PASS: all tests passed`. A failing test is printed as `FAIL: <name>`.";
+        let listed = |answer: &str| unresolved(&[answered(answer)], request, &[4]);
+        // Quoted in a code span they settle the row, as in quote marks.
+        for line in [
+            "R4 | the line is kept | \"PASS: all tests passed\" | node tap.js",
+            "R4 | the line is kept | `PASS: all tests passed` | node tap.js",
+            "R4 | the line is kept | `the last line must be — PASS` | node tap.js",
+            "| R4 | the line is kept | `PASS: all tests passed` | `node tap.js` |",
+        ] {
+            assert_eq!(listed(line), None, "{line}");
+        }
+        // A verdict alone in a span, one in bold or bare with what shows it,
+        // and one in a span of its own ahead of another are the review's.
+        for row in [
+            "R4 | the line is kept | `PASS` | \"PASS: all tests passed\"",
+            "R4 | the line is kept | **PASS:** `PASS: all tests passed` is printed | node tap.js",
+            "R4 | the line is kept | PASS: `all tests passed` is the last line | node tap.js",
+            "R4 | the line is kept | `PASS` — see `all tests passed` | node tap.js",
+            "R4 | the line is kept | `UNCLEAR` | \"PASS: all tests passed\"",
+        ] {
+            assert!(listed(row).is_some(), "{row}");
+        }
     }
 
     #[test]
