@@ -60,6 +60,57 @@ const SETTLE_MOST: Duration = Duration::from_secs(3);
 const QUIET_LOOK: Duration = Duration::from_millis(50);
 /// How long a page gets to load.
 const LOAD_TIME: Duration = Duration::from_secs(20);
+
+/// Ask `tab` to go to `url`, and give the site the time a slow one takes
+/// to begin answering (`cdp::NAVIGATE_TIME`): the browser answers only once
+/// the site has. One that has not by then is told as what it is, a site
+/// that did not answer, so the model does not take its browser for broken.
+fn navigate(tab: &mut Tab, url: &str) -> Result<Value, String> {
+    navigate_within(tab, url, cdp::NAVIGATE_TIME)
+}
+
+/// `navigate`, with the time the site gets.
+fn navigate_within(tab: &mut Tab, url: &str, limit: Duration) -> Result<Value, String> {
+    let asked = tab.call_within("Page.navigate", json!({"url": url}), limit);
+    asked.map_err(|why| match why == cdp::unanswered("Page.navigate") {
+        true => unanswering(url, limit),
+        false => why,
+    })
+}
+
+/// What the model is told of a site that did not begin to answer within
+/// `limit`: whose fault it is, and what is worth doing about it.
+fn unanswering(url: &str, limit: Duration) -> String {
+    let site = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| url.to_owned());
+    format!(
+        "{site} did not begin to answer within {} seconds. The browser is working: the site is \
+         slow, down, or does not answer this computer's address. `look` shows what has loaded \
+         since. Open it once more before giving up on it, and then say that it did not answer; \
+         another browser would fare no better.",
+        limit.as_secs()
+    )
+}
+
+/// Whether the browser tools are offered at all. On a machine thrown away
+/// after its run (`cdp::thrown_away`) with no browser on it and none to
+/// reach elsewhere, they are not: nothing there could ever install one, and
+/// a tool that can only fail sent the model looking for a browser to
+/// install. Anywhere else they are, and say what to install when called.
+fn offered_here() -> bool {
+    reachable(
+        cdp::thrown_away(),
+        cdp::installed().is_some(),
+        remote_address().is_some(),
+    )
+}
+
+/// `offered_here`, from what it goes by.
+fn reachable(thrown_away: bool, installed: bool, elsewhere: bool) -> bool {
+    !thrown_away || installed || elsewhere
+}
 /// After loading, how long to wait for the page's own requests to quieten,
 /// which is when a page drawn by script has usually drawn itself.
 const IDLE_TIME: Duration = Duration::from_secs(3);
@@ -486,6 +537,9 @@ impl Tool for Browse {
     fn needs_approval(&self) -> bool {
         true
     }
+    fn offered(&self, _: &crate::chat::Connection) -> bool {
+        offered_here()
+    }
     fn untrusted(&self) -> bool {
         true
     }
@@ -598,6 +652,9 @@ impl Tool for UsePage {
     }
     fn needs_approval(&self) -> bool {
         true
+    }
+    fn offered(&self, _: &crate::chat::Connection) -> bool {
+        offered_here()
     }
     fn mutates(&self) -> bool {
         true
@@ -3504,7 +3561,7 @@ impl Session {
 
     /// Start loading an address, without waiting for it to load.
     fn go_to(&mut self, url: &str) -> Result<(), String> {
-        let reply: Value = self.tab.call("Page.navigate", json!({"url": url}))?;
+        let reply = navigate(&mut self.tab, url)?;
         self.refs.forget();
         match reply["errorText"].as_str().filter(|e| !e.is_empty()) {
             Some(error) => Err(format!("Could not open {url}: {error}.")),
@@ -3524,7 +3581,7 @@ impl Session {
     fn open(&mut self, url: &str, saving: &Saving) -> Result<String, String> {
         self.tab.events.clear();
         let notes = self.downloading(saving, |session| {
-            let reply: Value = session.tab.call("Page.navigate", json!({"url": url}))?;
+            let reply = navigate(&mut session.tab, url)?;
             // A download ends the page's own loading as aborted, which is no
             // failure; it is said a moment after the answer, which comes
             // once the browser knows it is one.
@@ -5653,6 +5710,50 @@ fn console_line(event: &Event) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_site_that_does_not_answer_is_told_as_the_site_not_the_browser() {
+        // The browser answers a navigation only once the site has; this one never does.
+        let (address, _server) = cdp::tests::fake_browser(|method, _| match method {
+            "Page.navigate" => (Vec::new(), json!({"unanswered": true})),
+            _ => (Vec::new(), json!({})),
+        });
+        let mut tab = Tab::connect(&address, "T1").unwrap();
+        let limit = Duration::from_millis(200);
+        let why = navigate_within(&mut tab, "https://kulino.dinus.ac.id/login", limit).unwrap_err();
+        assert!(
+            why.starts_with("kulino.dinus.ac.id did not begin to answer within 0 seconds."),
+            "{why}"
+        );
+        assert!(why.contains("The browser is working"), "{why}");
+        // Nothing in it sends the model after another browser.
+        assert!(!why.contains("install"), "{why}");
+        // The tab is still good: the page may yet load, and `look` reads it.
+        assert!(!tab.broken);
+        assert!(cdp::NAVIGATE_TIME > cdp::CALL_TIME);
+        // Any other failure is told as it came.
+        let (address, _server) = cdp::tests::fake_browser(|_, _| {
+            (
+                Vec::new(),
+                json!({"error": {"message": "Cannot navigate to invalid URL"}}),
+            )
+        });
+        let mut tab = Tab::connect(&address, "T1").unwrap();
+        let why = navigate_within(&mut tab, "https://example.com", limit).unwrap_err();
+        assert!(why.contains("invalid URL"), "{why}");
+    }
+
+    #[test]
+    fn the_browser_tools_are_not_offered_where_there_can_never_be_a_browser() {
+        // A machine thrown away after its run, with no browser on it or elsewhere.
+        assert!(!reachable(true, false, false));
+        // One with a browser, or one to reach elsewhere, offers them.
+        assert!(reachable(true, true, false));
+        assert!(reachable(true, false, true));
+        // Someone's own computer always does: there they can install one.
+        assert!(reachable(false, false, false));
+        assert!(reachable(false, true, false));
+    }
 
     #[test]
     fn only_web_addresses_are_opened() {

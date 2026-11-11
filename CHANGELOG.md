@@ -13,6 +13,11 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ## [Unreleased]
 
+### Fixed
+- **All** — A page whose site is slow to answer gets 45 seconds to begin, not 20. When it still has not, Letronna says that the site did not answer, that its browser is working and that `look` shows what has loaded since, where it said only "The browser did not answer in time (Page.navigate)". A model that read that took its browser for broken and went looking for another one to install.
+- **All** — When the browser will not start, the error ends with the last lines it printed, such as a library the machine lacks or a profile it cannot write. They were thrown away before, so a start that failed said only that it had.
+- **Terminal** — On a machine made for one run and thrown away after (`LETRONNA_DISPOSABLE=1`, as a Letronna Cloud run's container is) with no browser on it, `browse` and `use_page` are not offered, and nothing there tells the model to install Chrome, which it could not.
+
 ## [0.1.0-alpha.5.1] - 2026-11-11
 
 ### Added
