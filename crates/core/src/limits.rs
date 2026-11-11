@@ -455,6 +455,20 @@ mod tests {
     }
 
     #[test]
+    fn a_rest_is_told_while_it_lasts_and_not_after() {
+        let endpoint = "http://resting.test:8080/v1";
+        assert_eq!(resting(endpoint), None);
+        backoff(endpoint, Some(Duration::from_millis(300)));
+        let left = resting(endpoint).unwrap();
+        assert!(left <= Duration::from_millis(300), "{left:?}");
+        // The same provider by another path, and no other.
+        assert!(resting("http://resting.test:8080/other").is_some());
+        assert_eq!(resting("http://resting.test:8081/v1"), None);
+        std::thread::sleep(Duration::from_millis(350));
+        assert_eq!(resting(endpoint), None);
+    }
+
+    #[test]
     fn the_foreground_never_waits_for_a_permit() {
         let server = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
