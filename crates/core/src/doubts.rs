@@ -33,12 +33,15 @@
 //! and more often one of the last it named, so the ones given are chosen
 //! both ways. `RANKED` of them are the ones weighed hardest. First come
 //! those the run predicted a check of, with a marker that opens with
-//! `CHECK`, and weighed off again, by any other marker or with the
-//! request's own words, `QUOTED` of them quoted in a row. Then come those
-//! it predicted a check of, or waved off with one of `WAVED`, the words
-//! that say a case will not come up or is not the work's to handle, or
-//! weighed while quoting the request: that last is a reading of what was
-//! asked, which the request's words can judge. Then come the rest. The
+//! `CHECK`, and weighed off again, by any other marker or with a
+//! requirement quoted, `QUOTED` of its words in a row. Then come those it
+//! predicted a check of, or waved off with one of `WAVED`, the words that
+//! say a case will not come up or is not the work's to handle, or weighed
+//! while quoting a requirement: that last is a reading of what was asked,
+//! which the request's words can judge. A requirement is one the request
+//! states, as the requirements notice numbers them: words quoted from the
+//! rest of it, such as how the work is to be handed in, are a reading of
+//! nothing the work must do, and weigh nothing. Then come the rest. The
 //! markers of two sentences count together only where the second quotes
 //! nothing and so weighs the first; one with a span or a quote of its own
 //! names its own case. Among cases weighed alike, one that names something
@@ -179,7 +182,7 @@ const WAVED: &[&str] = &[
 const PASSING: &[&str] = &["not needed", "doesn't matter", "leave it", "skip"];
 
 /// The weight of a case the run predicted a check of, waved off with one
-/// of `WAVED` or weighed while quoting the request, and no more.
+/// of `WAVED` or weighed while quoting a requirement, and no more.
 const STRONG: u8 = 2;
 
 /// The weight of a case that only words of `PASSING` weighed off.
@@ -467,14 +470,21 @@ pub(crate) fn shared(said: &[&str], sentence: &[String]) -> Range<usize> {
 
 /// The cases the assistant's replies in `messages` weighed and set aside,
 /// at most `KEPT` of them in the order they were named: `RANKED` by how
-/// hard each was weighed, among cases weighed alike one that names
-/// something `request` names and then the later one; then the latest not
-/// yet taken that a word not of `PASSING` weighed; then the latest of the
-/// rest. Each is given once by its first code span, or by its words where
+/// hard each was weighed, one that quotes one of `sentences`, the
+/// requirements `request` states, as a strong word weighs it, and among
+/// cases weighed alike one that names something `request` names and then
+/// the later one; then the latest not yet taken that a word not of
+/// `PASSING` weighed; then the latest of the rest. Each is given once by
+/// its first code span, or by its words where
 /// it has none: as it was last named, by a sentence the run does not tick
 /// off, and as hard as it was ever weighed.
-pub(crate) fn doubts(messages: &[Message], request: &str) -> Vec<String> {
-    let said: Vec<String> = (words(request).into_iter()).map(|(_, word)| word).collect();
+pub(crate) fn doubts(messages: &[Message], request: &str, sentences: &[String]) -> Vec<String> {
+    // The words of each requirement the notice numbers, and the names of
+    // the whole request, those in its code among them.
+    let listed: Vec<Vec<String>> = (sentences.iter())
+        .take(crate::requirements::LISTED)
+        .map(|sentence| words(sentence).into_iter().map(|(_, word)| word).collect())
+        .collect();
     let names = identifiers(request);
     let own = messages
         .iter()
@@ -491,7 +501,7 @@ pub(crate) fn doubts(messages: &[Message], request: &str) -> Vec<String> {
             }
             let key = key(&case);
             let before = found.iter().position(|(kept, ..)| *kept == key);
-            let quoted = quotes(&case, &said);
+            let quoted = quotes(&case, &listed);
             let mut rank = (weight(&markers, quoted), quoted || named(&case, &names));
             // Named again, a case takes the later words and place and
             // keeps the hardest it was weighed; a naming weighed only in
@@ -521,10 +531,10 @@ pub(crate) fn doubts(messages: &[Message], request: &str) -> Vec<String> {
 }
 
 /// How hard `markers`, the words that weighed a case off, weigh it, when
-/// `quoted` with the request's words quoted: most where one predicts a
+/// `quoted` with a requirement's words quoted: most where one predicts a
 /// check of it and it was weighed again, by another marker or with the
 /// quote; then where one predicts a check, one of `WAVED` waves it off or
-/// the request is quoted; then the rest, and least where each is one of
+/// a requirement is quoted; then the rest, and least where each is one of
 /// `PASSING`.
 fn weight(markers: &[&str], quoted: bool) -> u8 {
     let checked = markers.iter().any(|marker| marker.starts_with(CHECK));
@@ -539,14 +549,15 @@ fn weight(markers: &[&str], quoted: bool) -> u8 {
     }
 }
 
-/// Whether `case` quotes a request: in a quoted literal, `QUOTED` words in
-/// a row of `said`, the request's words.
-fn quotes(case: &str, said: &[String]) -> bool {
+/// Whether `case` quotes a requirement: in a quoted literal, `QUOTED`
+/// words in a row of one of `listed`, the words of each.
+fn quotes(case: &str, listed: &[Vec<String>]) -> bool {
     literals(case).into_iter().any(|range| {
         let literal = &case[range];
         let quote = words(literal);
         let quote: Vec<&str> = quote.iter().map(|(_, word)| word.as_str()).collect();
-        !literal.starts_with('`') && shared(&quote, said).len() >= QUOTED
+        let quoted = |sentence: &Vec<String>| shared(&quote, sentence).len() >= QUOTED;
+        !literal.starts_with('`') && listed.iter().any(quoted)
     })
 }
 
@@ -879,7 +890,7 @@ mod tests {
     }
 
     fn weighed(notes: &str) -> Vec<String> {
-        doubts(&[said(notes, "")], "")
+        doubts(&[said(notes, "")], "", &[])
     }
 
     #[test]
@@ -975,7 +986,7 @@ mod tests {
             said("`b..c` reversed? Out of scope, leave it.", ""),
             said("", "Open `a..` at the very end of input: edge case."),
         ];
-        let found = doubts(&notes, "");
+        let found = doubts(&notes, "", &[]);
         assert_eq!(
             found,
             ["`b..c` reversed?", "Open `a..` at the very end of input"]
@@ -1103,7 +1114,11 @@ mod tests {
         let given = |early: &str, later: &str| {
             let mut notes = vec![early.to_owned()];
             notes.extend(inputs(1..=12, later));
-            doubts(&[said(&notes.join("\n"), "")], request)
+            doubts(
+                &[said(&notes.join("\n"), "")],
+                request,
+                &[request.to_owned()],
+            )
         };
         // Weighed by any word, it is kept before later cases a word that
         // waves nothing off weighed, as one of those words would keep it.
@@ -1164,7 +1179,11 @@ mod tests {
             "A `--key` in its place? Rare.".to_owned(),
         ];
         notes.extend(inputs(1..=12, "Rare."));
-        let found = doubts(&[said(&notes.join("\n"), "")], request);
+        let found = doubts(
+            &[said(&notes.join("\n"), "")],
+            request,
+            &[request.to_owned()],
+        );
         let mut kept = vec![
             "Repeated `--label` with the same value?".to_owned(),
             "Is \"no tags were given\" right for an empty list?".to_owned(),
@@ -1173,7 +1192,11 @@ mod tests {
         assert_eq!(found, kept);
         // How hard a case was weighed comes before what the request names.
         notes.push("Hidden tests might pass `13` twice. Unlikely.".to_owned());
-        let found = doubts(&[said(&notes.join("\n"), "")], request);
+        let found = doubts(
+            &[said(&notes.join("\n"), "")],
+            request,
+            &[request.to_owned()],
+        );
         assert_eq!(found.len(), KEPT);
         assert_eq!(found[2..9], alone(6..=12));
         assert_eq!(found[9], "Hidden tests might pass `13` twice.");
@@ -1182,7 +1205,11 @@ mod tests {
         let named = |n: usize| format!("Is \"no tags were given\" right for {n} of them?");
         let mut notes: Vec<String> = (1..=8).map(|n| format!("{} Rare.", named(n))).collect();
         notes.extend(inputs(9..=20, "Rare."));
-        let found = doubts(&[said(&notes.join("\n"), "")], request);
+        let found = doubts(
+            &[said(&notes.join("\n"), "")],
+            request,
+            &[request.to_owned()],
+        );
         assert_eq!(found[..5], (4..=8).map(named).collect::<Vec<_>>());
         assert_eq!(found[5..], alone(16..=20));
     }
@@ -1191,7 +1218,7 @@ mod tests {
     fn a_request_names_a_code_span_by_an_identifier_of_four_letters_or_more() {
         let names = |request: &str, case: &str| {
             let said: Vec<String> = (words(request).into_iter()).map(|(_, word)| word).collect();
-            quotes(case, &said) || named(case, &identifiers(request))
+            quotes(case, &[said]) || named(case, &identifiers(request))
         };
         let request = "Add `GetBaseline(ctx, baselineID)`, or put a default in a store.";
         assert_eq!(
@@ -1231,7 +1258,7 @@ mod tests {
     /// What notes written one reply after another give, for no request.
     fn stands(notes: &[&str]) -> Vec<String> {
         let notes: Vec<Message> = notes.iter().map(|note| said(note, "")).collect();
-        doubts(&notes, "")
+        doubts(&notes, "", &[])
     }
 
     #[test]
@@ -1277,7 +1304,7 @@ mod tests {
         let request = "Read at most the limit given.";
         let mut notes = vec![said(asked, ""), said(plain, "")];
         notes.push(said(&inputs(1..=12, "I'll keep it.").join("\n"), ""));
-        let found = doubts(&notes, request);
+        let found = doubts(&notes, request, &[request.to_owned()]);
         assert_eq!(found[0], "A `cap` of zero?");
         assert_eq!(found[1..], alone(4..=12));
     }
@@ -1509,9 +1536,9 @@ mod tests {
             content: "Empty `name`? Rare.".into(),
             ..Default::default()
         };
-        assert!(doubts(&[user], "").is_empty());
+        assert!(doubts(&[user], "", &[]).is_empty());
         assert_eq!(
-            doubts(&[said("", "Empty `name`? Rare.")], ""),
+            doubts(&[said("", "Empty `name`? Rare.")], "", &[]),
             ["Empty `name`?"]
         );
     }
@@ -1731,7 +1758,7 @@ mod tests {
             .map(|n| format!("Input `{n}` alone? Rare."))
             .collect();
         let both = [said(&aside.join("\n"), ""), said(&notes.join("\n"), "")];
-        assert_eq!(doubts(&both, "").len(), KEPT);
+        assert_eq!(doubts(&both, "", &[]).len(), KEPT);
         assert_eq!(readings(&both, &sentences).len(), READ_KEPT);
     }
 
