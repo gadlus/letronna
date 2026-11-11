@@ -54,12 +54,13 @@
 //! and place, as nearer to the work as it stands, and keeps the hardest it
 //! was weighed; a later sentence weighed only by `PASSING` is most often
 //! about something else that holds the same code span, and leaves the case
-//! as it stood. A case the run ticks off after naming it, as "... gives
-//! `[]` ✓" does, it checked and did not set aside: it is no case, and any
-//! earlier naming of it goes with it. Only that mark is read so: a word
-//! such as "handled" or "added" says as often what the work does, and a
-//! tick in some later sentence that no marker weighs is as often about
-//! another matter.
+//! as it stood. A sentence the run ticks off after what it names, as
+//! "... gives `[]` ✓" does, says what it checked, not what it set aside,
+//! and names no case. It takes nothing with it: a doubt named before by
+//! the same code span is most often another doubt, and stands. Only that
+//! mark is read so: a word such as "handled" or "added" says as often what
+//! the work does, and a tick in some later sentence that no marker weighs
+//! is as often about another matter.
 //!
 //! Apart from those, with a quota of their own, are the words of the request
 //! the run read more than one way (`readings`). A run most often names both
@@ -470,8 +471,8 @@ pub(crate) fn shared(said: &[&str], sentence: &[String]) -> Range<usize> {
 /// something `request` names and then the later one; then the latest not
 /// yet taken that a word not of `PASSING` weighed; then the latest of the
 /// rest. Each is given once by its first code span, or by its words where
-/// it has none: as it was last named and as hard as it was ever weighed,
-/// and not at all once the run ticks it off.
+/// it has none: as it was last named, by a sentence the run does not tick
+/// off, and as hard as it was ever weighed.
 pub(crate) fn doubts(messages: &[Message], request: &str) -> Vec<String> {
     let said: Vec<String> = (words(request).into_iter()).map(|(_, word)| word).collect();
     let names = identifiers(request);
@@ -483,15 +484,13 @@ pub(crate) fn doubts(messages: &[Message], request: &str) -> Vec<String> {
     let mut found: Vec<(String, String, (u8, bool))> = Vec::new();
     for text in own.flat_map(|message| [&message.reasoning, &message.content]) {
         for (case, markers, ticked) in cases(text) {
-            let key = key(&case);
-            let before = found.iter().position(|(kept, ..)| *kept == key);
-            // Ticked off, a case was checked and is set aside no longer.
+            // Ticked off, a sentence says what the run checked: it names
+            // no case, and what the same span named before it stands.
             if ticked {
-                if let Some(at) = before {
-                    found.remove(at);
-                }
                 continue;
             }
+            let key = key(&case);
+            let before = found.iter().position(|(kept, ..)| *kept == key);
             let quoted = quotes(&case, &said);
             let mut rank = (weight(&markers, quoted), quoted || named(&case, &names));
             // Named again, a case takes the later words and place and
@@ -1284,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn a_case_the_run_ticks_off_after_naming_it_is_set_aside_no_longer() {
+    fn a_sentence_the_run_ticks_off_after_what_it_names_is_no_case() {
         for notes in [
             "Hidden tests may call `flush()` twice \u{2713}.",
             "Hidden tests may call `flush()` twice. \u{2713} 3.",
@@ -1292,13 +1291,15 @@ mod tests {
         ] {
             assert!(weighed(notes).is_empty(), "{notes}: {:?}", weighed(notes));
         }
-        // Named again and ticked off, it goes as it stood before.
+        // It takes nothing with it: what the span named before stands, as
+        // it was and where it was.
         let early = "An empty `name`? Rare.";
         let other = "A `width` below zero? Rare.";
         let done = "An empty `name` gives `[]` now, so the rare path is covered \u{2713}.";
-        assert_eq!(stands(&[early, other, done]), ["A `width` below zero?"]);
-        // And comes back if the run sets it aside after that.
-        assert_eq!(stands(&[early, done, early]), ["An empty `name`?"]);
+        assert_eq!(
+            stands(&[early, other, done]),
+            ["An empty `name`?", "A `width` below zero?"]
+        );
         // A tick before what the sentence names is on something else.
         assert_eq!(
             weighed("The parser is done \u{2713}; an empty `name` is rare."),
