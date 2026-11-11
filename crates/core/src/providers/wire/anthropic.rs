@@ -162,6 +162,8 @@ pub(crate) struct Thinking {
     pub allowed: bool,
     /// The route has not turned the binding beta down.
     pub bound: bool,
+    /// The route has not turned the thinking's summary down.
+    pub summarized: bool,
 }
 
 /// `chat`, a chat completion request, as a Messages request.
@@ -170,7 +172,9 @@ pub(crate) struct Thinking {
 /// user turn with the results first, as Anthropic requires. Thinking is asked
 /// for when the request sets an effort, or sends thinking back, which only a
 /// model that thinks unasked has given; a model that thinks only when asked
-/// is otherwise left to answer as it would.
+/// is otherwise left to answer as it would. A model that thinks unasked is
+/// asked for it in a streamed request too, so it can be asked for its
+/// summary.
 pub(crate) fn request(chat: &Value, thinking: Thinking) -> Value {
     let mut system = Vec::new();
     let mut turns: Vec<(&str, Vec<Value>)> = Vec::new();
@@ -231,13 +235,40 @@ pub(crate) fn request(chat: &Value, thinking: Thinking) -> Value {
     if let Some(level) = effort {
         body["output_config"] = json!({"effort": level});
     }
-    if thinking.allowed && (effort.is_some() || replays) {
+    let streamed = chat["stream"] == true;
+    let unasked = streamed && thinks_unasked(chat["model"].as_str().unwrap_or_default());
+    if thinking.allowed && (effort.is_some() || replays || unasked) {
         body["thinking"] = json!({"type": "adaptive"});
+        // Since Opus 4.7 a model's thinking comes back empty unless its
+        // summary is asked for, so a streamed reply showed nothing of it, and
+        // a long think looked like a stall. The summary costs nothing more:
+        // the thinking is billed the same either way.
+        if streamed && thinking.summarized {
+            body["thinking"]["display"] = "summarized".into();
+        }
         if thinking.bound {
             body["thinking"]["block_binding"] = json!({"prefix_mismatch_behavior": "drop_block"});
         }
     }
     body
+}
+
+/// Whether `model` thinks when a request names no thinking: Anthropic's from
+/// Opus, Sonnet and Haiku 5 on, and every Fable and Mythos.
+fn thinks_unasked(model: &str) -> bool {
+    let name = model.rsplit('/').next().unwrap_or(model).to_lowercase();
+    let Some(name) = name.strip_prefix("claude-") else {
+        return false;
+    };
+    if name.starts_with("fable") || name.starts_with("mythos") {
+        return true;
+    }
+    ["opus-", "sonnet-", "haiku-"].iter().any(|family| {
+        name.strip_prefix(family)
+            .and_then(|version| version.split(['-', '.']).next())
+            .and_then(|major| major.parse::<u32>().ok())
+            .is_some_and(|major| major >= 5)
+    })
 }
 
 /// Whether `posted`, a Messages request, sends thinking back.
@@ -620,6 +651,7 @@ mod tests {
     const ASKED: Thinking = Thinking {
         allowed: true,
         bound: true,
+        summarized: true,
     };
 
     /// A local server at `path` answering each request with the next of
@@ -883,10 +915,11 @@ mod tests {
         let (head, body) = &worker.join().unwrap()[0];
         assert!(head.starts_with("post /anthropic/v1/messages "), "{head}");
         assert!(head.contains("anthropic-version: 2023-06-01"), "{head}");
-        // Nothing asks a model to think before it has, without an effort.
-        assert!(!head.contains("anthropic-beta"), "{head}");
+        // Without an effort, a model that thinks unasked is still asked, for
+        // the summary of what it thinks.
         let body: Value = serde_json::from_str(body).unwrap();
-        assert!(body.get("thinking").is_none() && body.get("stream_options").is_none());
+        assert_eq!(body["thinking"]["display"], "summarized");
+        assert!(body.get("output_config").is_none() && body.get("stream_options").is_none());
         assert_eq!(body["stream"], true);
         assert_eq!(
             body["messages"],
@@ -961,7 +994,7 @@ mod tests {
         assert_eq!(body.to_string().matches("cache_control").count(), 3);
         assert_eq!(
             body["thinking"],
-            json!({"type": "adaptive",
+            json!({"type": "adaptive", "display": "summarized",
                 "block_binding": {"prefix_mismatch_behavior": "drop_block"}})
         );
         assert!(
@@ -1435,5 +1468,57 @@ mod tests {
                 "call toolu_03"
             ]
         );
+    }
+
+    #[test]
+    fn a_streamed_reply_asks_for_the_summary_of_its_thinking() {
+        let ask = |model: &str, extra: Value, thinking: Thinking| {
+            let mut chat = json!({"model": model, "stream": true,
+                "messages": [{"role": "user", "content": "Read a.rs."}]});
+            for (field, value) in extra.as_object().unwrap() {
+                chat[field] = value.clone();
+            }
+            request(&chat, thinking)["thinking"].clone()
+        };
+        let summed = json!({"type": "adaptive", "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"}});
+        // A model that thinks unasked is asked with no effort named.
+        for model in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-2",
+            "claude-mythos-5-2",
+            "anthropic/claude-sonnet-5.5",
+        ] {
+            assert_eq!(ask(model, json!({}), ASKED), summed, "{model}");
+        }
+        // One that thinks only when asked is not, but is with an effort.
+        for model in [
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+            "claude-3-5-haiku-latest",
+        ] {
+            assert_eq!(ask(model, json!({}), ASKED), Value::Null, "{model}");
+        }
+        let high = json!({"reasoning_effort": "high"});
+        assert_eq!(ask("claude-opus-4-8", high.clone(), ASKED), summed);
+        // Unstreamed, nobody sees it, so neither is asked for.
+        let unstreamed = json!({"stream": false});
+        assert_eq!(ask("claude-opus-5-5", unstreamed, ASKED), Value::Null);
+        let quiet = json!({"stream": false, "reasoning_effort": "high"});
+        assert!(
+            ask("claude-opus-5-5", quiet, ASKED)
+                .get("display")
+                .is_none()
+        );
+        // A route that turned the summary down is still asked to think.
+        let unsummed = Thinking {
+            summarized: false,
+            ..ASKED
+        };
+        let thinking = ask("claude-opus-5-5", high, unsummed);
+        assert_eq!(thinking["type"], "adaptive");
+        assert!(thinking.get("display").is_none());
     }
 }
