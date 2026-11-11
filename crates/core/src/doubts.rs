@@ -38,10 +38,7 @@
 //! something the request names comes first, since the request's words can
 //! judge it, and then the later one. A case is given once, as it was
 //! weighed hardest, and the ones given stay in the order the run named
-//! them. A case that names only a command the run itself ran, or another
-//! of the same program, as "`git stash` is arguably enough" does, is none
-//! of the work's, and is left out unless a predicted check or one of
-//! `WAVED` weighed it or the request names it.
+//! them.
 //!
 //! Apart from those, with a quota of their own, are the words of the request
 //! the run read more than one way (`readings`). A run most often names both
@@ -440,22 +437,15 @@ pub(crate) fn shared(said: &[&str], sentence: &[String]) -> Range<usize> {
 /// words where it has none, as it was weighed hardest.
 pub(crate) fn doubts(messages: &[Message], request: &str) -> Vec<String> {
     let request: Vec<String> = (words(request).into_iter()).map(|(_, word)| word).collect();
-    let own = || {
-        messages
-            .iter()
-            .filter(|message| message.role == "assistant")
-    };
-    let ran = programs(own());
+    let own = messages
+        .iter()
+        .filter(|message| message.role == "assistant");
     // Each case with what it is known by and where it ranks: how hard it
     // was weighed, then whether the request names something it names.
     let mut found: Vec<(String, String, (u8, bool))> = Vec::new();
-    for text in own().flat_map(|message| [&message.reasoning, &message.content]) {
+    for text in own.flat_map(|message| [&message.reasoning, &message.content]) {
         for (case, weight) in cases(text) {
-            let asked = asked(&case, &request);
-            if weight < STRONG && !asked && names_commands(&case, &ran) {
-                continue;
-            }
-            let (key, rank) = (key(&case), (weight, asked));
+            let (key, rank) = (key(&case), (weight, asked(&case, &request)));
             // Named again, a case stands as it was weighed hardest, and
             // where it was named last among those.
             let before = found.iter().position(|(kept, ..)| *kept == key);
@@ -504,51 +494,6 @@ fn asked(case: &str, request: &[String]) -> bool {
             false => found >= QUOTED,
         }
     })
-}
-
-/// The programs the commands that `replies` ran start, as
-/// `command::name_of` names them, each once.
-fn programs<'a>(replies: impl Iterator<Item = &'a Message>) -> Vec<String> {
-    let mut found = Vec::new();
-    for call in replies.flat_map(|reply| &reply.tool_calls) {
-        let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) else {
-            continue;
-        };
-        let Some(line) = args["command"].as_str() else {
-            continue;
-        };
-        let dialect = crate::command::Dialect::here();
-        for command in crate::command::assess(line, dialect, None).commands {
-            let Some(word) = command.argv.get(command.at) else {
-                continue;
-            };
-            let name = crate::command::name_of(word);
-            if !found.contains(&name) {
-                found.push(name);
-            }
-        }
-    }
-    found
-}
-
-/// Whether every literal of `case` is a code span that holds a command
-/// line: two words or more, the first a program of `ran`, and none of the
-/// brackets, quotes, commas and semicolons code is written with.
-fn names_commands(case: &str, ran: &[String]) -> bool {
-    let literals = literals(case);
-    !literals.is_empty()
-        && literals.into_iter().all(|range| {
-            let Some(line) = case[range].strip_prefix('`') else {
-                return false;
-            };
-            let line = line.trim_matches('`').trim();
-            let mut words = line.split_whitespace();
-            let program = words.next().map(crate::command::name_of);
-            let code = ['(', ')', '[', ']', '{', '}', '"', '\'', ',', ';'];
-            words.next().is_some()
-                && program.is_some_and(|program| ran.contains(&program))
-                && !line.contains(code)
-        })
 }
 
 /// The section a helper's brief ends with for `doubts`, a review's or a
@@ -1057,58 +1002,6 @@ mod tests {
             let found = doubts(&notes, request);
             assert_eq!(found, ["Is \"at most the limit given\" bytes for `cap`?"]);
         }
-    }
-
-    /// An assistant reply that ran `command`, with `notes` as its working notes.
-    fn ran(command: &str, notes: &str) -> Message {
-        let call = crate::chat::ToolCall {
-            id: "call".into(),
-            name: "run_command".into(),
-            arguments: serde_json::json!({ "command": command }).to_string(),
-        };
-        Message {
-            tool_calls: vec![call],
-            ..said(notes, "")
-        }
-    }
-
-    #[test]
-    fn a_case_that_names_only_a_command_the_run_ran_is_left_out() {
-        let found = |notes: &str, request: &str| {
-            doubts(
-                &[ran("cd /srv/app && git status --short | head -5", notes)],
-                request,
-            )
-        };
-        for notes in [
-            "Simpler: `git stash` is arguably enough.",
-            "Start from `cd /srv` instead? I'll keep it.",
-            "Both `git stash` and `head -1` again? I'll leave them.",
-        ] {
-            assert!(
-                found(notes, "").is_empty(),
-                "{notes}: {:?}",
-                found(notes, "")
-            );
-        }
-        for notes in [
-            // A strong word weighed it, or it names what is no command line:
-            // one word, another program's, code, or something quoted.
-            "Would `git stash` lose the index? Unlikely.",
-            "A bare `git` is arguably enough.",
-            "Simpler: `make stash` is arguably enough.",
-            "Simpler: `git.stash(all)` is arguably enough.",
-            "Simpler: `head [0]` is arguably enough.",
-            "Print \"git stash\" there? I'll keep it.",
-            "Both `git stash` and `pop()` again? I'll leave them.",
-        ] {
-            assert_eq!(found(notes, "").len(), 1, "{notes}");
-        }
-        // Or the request names it.
-        let notes = "Simpler: `git stash` is arguably enough.";
-        assert_eq!(found(notes, "Run `git stash` before each step.").len(), 1);
-        // A program the run never ran is no command of its own.
-        assert_eq!(doubts(&[said(notes, "")], "").len(), 1);
     }
 
     #[test]
