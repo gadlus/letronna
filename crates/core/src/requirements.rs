@@ -19,7 +19,8 @@
 //! is mostly code. Code blocks, indented code, console sessions, headings
 //! and tables are skipped whole; a list item is a sentence of its own, and a
 //! line broken inside a paragraph is joined to the next. A sentence ends at
-//! a stop outside a code span and not after an abbreviation such as "e.g.".
+//! a stop outside a code span and not after an abbreviation such as "e.g.",
+//! and a name from code opens one as a capital does, backticks or none.
 //! The bar is a few such sentences, so a short request or a bug report,
 //! which the notice to run a build or test covers, costs nothing.
 //!
@@ -284,9 +285,10 @@ pub(crate) fn sentences(request: &str) -> Vec<String> {
     for block in blocks(request) {
         for (at, sentence) in split(&block.text).into_iter().enumerate() {
             // One starting in lower case goes on from words cut off by code,
-            // as "returns" after a snippet does, unless it opens an item.
+            // as "returns" after a snippet does, unless it opens an item or
+            // with a name, as "state_data is injected" does.
             let lower = sentence.chars().next().is_some_and(char::is_lowercase);
-            if lower && !(block.item && at == 0) {
+            if lower && !(block.item && at == 0) && !namelike(first_word(sentence)) {
                 continue;
             }
             let states = states(sentence);
@@ -863,7 +865,8 @@ fn blocks(request: &str) -> Vec<Block> {
 
 /// The sentences of `text`, split at a stop followed by a space or the end,
 /// outside a code span and not after an abbreviation or before a word in
-/// lower case.
+/// lower case that is no name; a bang ends one only before a word that
+/// opens with a capital and is not all capitals, outside a quoted string.
 pub(crate) fn split(text: &str) -> Vec<&str> {
     let bytes = text.as_bytes();
     let mut sentences = Vec::new();
@@ -884,14 +887,22 @@ pub(crate) fn split(text: &str) -> Vec<&str> {
                 .last()
                 .unwrap_or_default();
             let last = last.trim_start_matches(['(', '"', '\'']).to_lowercase();
-            let next = text[at + 1..].trim_start().chars().next();
-            // After a bang, words in lower case or in brackets go on, as "and
-            // ! (complement)" does.
+            let word = first_word(&text[at + 1..]);
+            let next = word.chars().next();
             let goes_on = match c {
+                // A name in lower case opens a sentence as a capital does,
+                // as "isolate scopes. state_data is injected" shows.
                 b'.' => {
-                    ABBREVIATIONS.contains(&last.as_str()) || next.is_some_and(char::is_lowercase)
+                    ABBREVIATIONS.contains(&last.as_str())
+                        || (next.is_some_and(char::is_lowercase) && !namelike(word))
                 }
-                b'!' => next.is_some_and(|next| next.is_lowercase() || next == '('),
+                // A bang is as often part of what is written out, as in "and
+                // ! (complement)" or "emits Bail out! ERROR message".
+                b'!' => {
+                    next.is_some_and(|next| !next.is_uppercase())
+                        || shouted(word)
+                        || quoted(&text[start..at])
+                }
                 _ => false,
             };
             if !goes_on {
@@ -1018,6 +1029,41 @@ fn codelike(word: &str) -> bool {
         || word.contains([
             '=', '/', '\\', '"', '{', '}', '[', ']', '<', '>', '#', '@', '$', '|', '_',
         ])
+}
+
+/// The first word of `text`, as far as the next space.
+fn first_word(text: &str) -> &str {
+    text.split_whitespace().next().unwrap_or_default()
+}
+
+/// Whether `word`, outside a code span, reads as a name from code rather
+/// than a word of prose: one that is `codelike`, has a dot between letters,
+/// or a capital after a small letter, as `resetBailState` has, and is no
+/// abbreviation.
+fn namelike(word: &str) -> bool {
+    let name = word.trim_end_matches(['*', ',', '.', ';', ':', '!', '?']);
+    if ABBREVIATIONS.contains(&name.to_lowercase().as_str()) {
+        return false;
+    }
+    let letters: Vec<char> = name.chars().collect();
+    let dotted =
+        (letters.windows(3)).any(|w| w[1] == '.' && w[0].is_alphabetic() && w[2].is_alphabetic());
+    let humped = (letters.windows(2)).any(|w| w[0].is_lowercase() && w[1].is_uppercase());
+    codelike(name) || dotted || humped
+}
+
+/// Whether `word` is written all in capitals, two letters or more, as the
+/// `ERROR` of a message spelled out is.
+fn shouted(word: &str) -> bool {
+    let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+    word.chars().filter(|c| c.is_uppercase()).count() >= 2 && !word.contains(char::is_lowercase)
+}
+
+/// Whether `text` ends inside a quoted string: after a double quote not
+/// yet closed.
+fn quoted(text: &str) -> bool {
+    let plain = text.matches('"').count() % 2 == 1;
+    plain || text.matches('\u{201c}').count() > text.matches('\u{201d}').count()
 }
 
 /// Whether `line` opens a console session: a shell's or Python's prompt, or
@@ -1277,6 +1323,72 @@ mod tests {
                 "The operators | (union), & (intersection) and ! (complement) must combine rules.",
                 "Each rule must apply once.",
             ]
+        );
+    }
+
+    #[test]
+    fn a_sentence_that_opens_with_a_name_is_a_sentence_of_its_own() {
+        let request = "get_state_data(state) returns active data dict or None. \
+                       state_data_values property snapshots all active data by state identifier. \
+                       set_state_data(state, key, value) validates active state, declared key, \
+                       and DataVar type constraints, raising InvalidDefinition on violation. \
+                       get_data_changes() returns DataChangeInfo records accumulated during the \
+                       current macrostep, cleared at each macrostep boundary, with state_id, key, \
+                       old_value, new_value attributes.";
+        let split = split(request);
+        assert_eq!(split.len(), 4, "{split:?}");
+        assert_eq!(
+            split[1],
+            "state_data_values property snapshots all active data by state identifier."
+        );
+        assert!(split[3].starts_with("get_data_changes() returns DataChangeInfo records"));
+        let kept = sentences(request);
+        assert!(kept.contains(&split[0].to_owned()), "{kept:?}");
+        assert!(kept.contains(&split[3].to_owned()), "{kept:?}");
+        assert_eq!(
+            sentences("Parallel regions must isolate scopes. state_data is injected into each."),
+            [
+                "Parallel regions must isolate scopes.",
+                "state_data is injected into each.",
+            ]
+        );
+        assert_eq!(
+            super::split("Both expose bail state. resetBailState clears all bail state."),
+            [
+                "Both expose bail state.",
+                "resetBailState clears all bail state.",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_word_of_prose_in_lower_case_still_goes_on_from_the_stop_before_it() {
+        assert_eq!(
+            split(
+                "Use a marker, e.g. something short. Keep it, i.e. foo, as is. Call the \
+                 handler. then it returns."
+            ),
+            [
+                "Use a marker, e.g. something short.",
+                "Keep it, i.e. foo, as is.",
+                "Call the handler. then it returns.",
+            ]
+        );
+        let request = "The loader must accept tabs.\n\n```\nload()\n```\n\n\
+                       returns `None` when the file must not be read.\n\n\
+                       e.g. the cache must never be read twice.";
+        assert_eq!(sentences(request), ["The loader must accept tabs."]);
+    }
+
+    #[test]
+    fn a_bang_inside_a_message_written_out_ends_no_sentence() {
+        let request = "Teamcity emits Bail out! ERROR message, and a count of the tests.";
+        assert_eq!(split(request), [request]);
+        let request = "The reporter prints \"Bail out! Too many failures\" only once.";
+        assert_eq!(split(request), [request]);
+        assert_eq!(
+            split("Stop! Each rule must apply once."),
+            ["Stop!", "Each rule must apply once."]
         );
     }
 
