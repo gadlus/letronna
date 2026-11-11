@@ -1032,12 +1032,6 @@ fn steps(
                     // is the work as it stands: the reviews may have left
                     // files in the project that would set the two apart.
                     let ran = test_run(spec, turn, false);
-                    // A command that cannot run here would not the next
-                    // time either, and could judge no second attempt.
-                    if matches!(ran, crate::spec_tests::Ran::Broken(_)) {
-                        tested = crate::spec_tests::RUNS;
-                        attempted = true;
-                    }
                     notice.content.push_str("\n\n");
                     notice.content.push_str(&crate::spec_tests::first_run(&ran));
                 }
@@ -1081,11 +1075,6 @@ fn steps(
                 let ran = runnable.then(|| test_run(spec, turn, true));
                 if let Some(ran) = &ran {
                     passed = matches!(ran, crate::spec_tests::Ran::Passed(_));
-                    // As above: told once, and not run again.
-                    if matches!(ran, crate::spec_tests::Ran::Broken(_)) {
-                        tested = crate::spec_tests::RUNS;
-                        attempted = true;
-                    }
                 }
                 if let Some(content) = tester_notice(spec, late, ran) {
                     spec.transcript.conversation.messages.push(Message {
@@ -3193,7 +3182,7 @@ fn second_attempt(spec: &Spec, turn: &Turn, head: &str) -> Option<(Message, bool
     }
     // A command that never reached a test chose nothing between the work
     // and the project as it was, and would choose nothing of an attempt.
-    if crate::spec_tests::unrunnable(&first).is_some() {
+    if crate::spec_tests::unrunnable(&command, &first).is_some() {
         crate::diag::event("second_attempt_skipped", &[("why", json!("unrunnable"))]);
         return None;
     }
@@ -9119,6 +9108,97 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn tests_that_could_not_be_run_at_one_done_are_run_again_at_the_next() {
+        let _data = data("tester-unrunnable");
+        let dir = scratch("tester-unrunnable");
+        git_project(&dir, true);
+        // The tester's test cannot fetch what it needs until `net.ok` is
+        // there, as a registry out of reach for a while leaves a command;
+        // then the work has to make `fixed.rs`.
+        let check = "test -f net.ok || { echo 'curl: (6) Could not resolve host: example.org'; \
+                     exit 1; }\ntest -f fixed.rs || { echo 'fixed.rs is missing'; exit 1; }\n";
+        let test = (
+            "write_file",
+            json!({"path": "tests/letronna_spec_range.sh", "content": check}),
+        );
+        let table = "Wrote one test; it cannot pass before the change.\n\
+                     Run: sh tests/letronna_spec_range.sh\n\
+                     R3 | b..a is rejected with `empty range` | FAIL | \
+                     sh tests/letronna_spec_range.sh | not yet implemented";
+        let write = |path: &str| ("write_file", json!({"path": path, "content": "x"}));
+        let run = std::sync::Mutex::new(
+            vec![
+                reply("", &[write_made()]),
+                reply("Added parse_range.", &[]),
+                // Told the tests could not be run, and why, it does what
+                // lets them run, and says it is done.
+                reply("", &[write("net.ok")]),
+                reply("Ran them my own way.", &[]),
+                // They are run again, reach a test, and what fails comes
+                // back as a failure.
+                reply("", &[write("fixed.rs")]),
+                reply("Fixed the empty range.", &[]),
+            ]
+            .into_iter(),
+        );
+        let (tests, wrote) = (reply("", &[test]), reply(table, &[]));
+        let (endpoint, provider) = provider_by(9, move |sent| {
+            let said = |what: &str| {
+                messages(sent)
+                    .iter()
+                    .any(|m| m["content"].as_str().is_some_and(|c| c.contains(what)))
+            };
+            match () {
+                _ if said("You are a helper (tester).")
+                    && sent.to_string().contains("letronna_spec_range.sh") =>
+                {
+                    wrote.clone()
+                }
+                _ if said("You are a helper (tester).") => tests.clone(),
+                _ if said("You are a helper (review).") => reply(PASSED, &[]),
+                _ => run.lock().unwrap().next().unwrap(),
+            }
+        });
+        let mut spec = spec(endpoint, &dir, AGENTS + 1_798);
+        spec.depth = 0;
+        spec.decide = None;
+        spec.connection.mode = crate::gate::Mode::Bypass;
+        spec.transcript.conversation.messages[0].content = SPECIFIED.into();
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "Fixed the empty range.");
+        let sent = provider.sent();
+        let told = |what: &str| {
+            (sent.iter().flat_map(messages))
+                .filter_map(|message| message["content"].as_str())
+                .find(|content| content.contains(what))
+                .map(str::to_owned)
+        };
+        // At the first done: not run, of no fault of the work's, with the
+        // line that says why and no word of a failure.
+        let unrun = told("could not be run against your work as it stands").unwrap();
+        assert!(
+            unrun.contains(
+                "which says nothing of the work: `sh tests/letronna_spec_range.sh` did not get \
+                 as far as a test, since a package or a host it needs could not be reached \
+                 from here (`curl: (6) Could not resolve host: example.org`). Run them \
+                 yourself the way you found works"
+            ),
+            "{unrun}"
+        );
+        assert!(!unrun.contains("exited with code"), "{unrun}");
+        // At the next done they are run again, and now fail as tests do.
+        let failed = told("Your work as it stands was run against the tests").unwrap();
+        assert!(
+            failed.contains("`sh tests/letronna_spec_range.sh` exited with code 1"),
+            "{failed}"
+        );
+        assert!(failed.contains("fixed.rs is missing"), "{failed}");
+        assert!(!failed.contains("Could not resolve host"), "{failed}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_tester_that_answers_after_the_first_done_is_taken_at_a_later_one() {
         let dir = scratch("tester-late");
         let project = dir.join("project");
@@ -9993,13 +10073,19 @@ pub(crate) mod tests {
         let turn = Turn::new(spec.connection.clone());
         // The runner is not installed, then a registry does not answer:
         // the work and the project as it was fail alike, of neither's doing.
-        for script in [
-            "letronna-no-such-runner test made_letronna_spec.ts\n",
-            "echo ' ERR_PNPM_META_FETCH_FAIL  GET https://registry.npmjs.org/pnpm: \
-             getaddrinfo EAI_AGAIN registry.npmjs.org'; exit 1\n",
+        for (command, script) in [
+            (
+                "letronna-no-such-runner ./letronna_spec_test.sh",
+                "exit 0\n",
+            ),
+            (
+                "sh ./*_test.sh",
+                "echo ' ERR_PNPM_META_FETCH_FAIL  GET https://registry.npmjs.org/pnpm: \
+                 getaddrinfo EAI_AGAIN registry.npmjs.org'; exit 1\n",
+            ),
         ] {
             std::fs::write(dir.join("letronna_spec_test.sh"), script).unwrap();
-            let command = Some("sh ./*_test.sh".to_owned());
+            let command = Some(command.to_owned());
             crate::spec_tests::keep(id, &dir, &dir, command).unwrap();
             assert!(second_attempt(&spec, &turn, &commit).is_none());
             assert_eq!(count.load(Ordering::SeqCst), 0, "{script}");

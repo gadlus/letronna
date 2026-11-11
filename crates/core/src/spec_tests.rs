@@ -316,7 +316,7 @@ const GOFLAGS: [&str; 4] = [
 /// can be where the run has no network, pnpm's and npm's codes for a
 /// registry that did not answer among them. A pipe into `tail` hides the
 /// exit code such a command ends with, so its output is read instead.
-const SET_UP_FAILED: [&str; 18] = [
+const SET_UP_FAILED: [&str; 17] = [
     "[setup failed]",
     "module lookup disabled by GOPROXY=off",
     "inconsistent vendoring",
@@ -334,35 +334,73 @@ const SET_UP_FAILED: [&str; 18] = [
     "ERR_PNPM_META_FETCH_FAIL",
     "ERR_PNPM_FETCH_",
     "ERR_SOCKET_TIMEOUT",
-    "ECONNREFUSED",
 ];
 
-/// What a Unix shell prints when the program a command names is not there
-/// to run, bash's and zsh's words and dash's, and the exit code it ends
-/// with then; a program can print the words too, so both are asked for.
-const NOT_FOUND: [&str; 2] = ["command not found", ": not found"];
+/// How a line ends when a Unix shell, `env` or `timeout` found no program
+/// to run under the name before it: bash's words, dash's, and what each
+/// says of a path that leads nowhere. A program can print the words too, so
+/// the exit code such a shell ends with is asked for as well.
+const NOT_FOUND: [&str; 3] = [
+    ": command not found",
+    ": not found",
+    ": No such file or directory",
+];
 const NOT_FOUND_CODE: &str = "127";
 
-/// What cmd and PowerShell print for the same, which end with no code of
-/// their own for it.
+/// zsh's words for the same, which come before the name.
+const NOT_FOUND_ZSH: &str = "command not found: ";
+
+/// What cmd and PowerShell print for the same, after the name, and end
+/// with no code of their own for it.
 const NOT_RECOGNIZED: &str = "is not recognized as";
+
+/// What Python prints before the name of a module `-m` was given that is
+/// not installed, as `python -m pytest` does without pytest.
+const NO_MODULE: &str = "No module named ";
+
+/// Programs that run another the command need not name, such as the script
+/// a package gives for its tests, and the test runners such a script runs:
+/// one of these missing under one of those is the command's own runner.
+const WRAPPERS: [&str; 7] = ["npm", "pnpm", "yarn", "npx", "bun", "bunx", "make"];
+const RUNNERS: [&str; 14] = [
+    "jest",
+    "vitest",
+    "mocha",
+    "ava",
+    "tap",
+    "tsx",
+    "ts-node",
+    "playwright",
+    "jasmine",
+    "karma",
+    "node",
+    "deno",
+    "tsc",
+    "pytest",
+];
 
 /// What a line of a runner's output starts with, past its indent, once it
 /// has got as far as its tests, beyond what `passing` and a verdict's line
 /// (`named`) show: node's mark by a test that failed and TAP's, the counts
-/// jest, vitest, cargo, unittest and pytest print, and cargo's and Go's
-/// word that tests are starting.
-const TESTS_RAN: [&str; 9] = [
+/// jest, vitest and cargo print, and Go's word that a test is starting.
+const TESTS_RAN: [&str; 6] = [
     "✖",
     "not ok ",
     "Tests:",
     "Test Files",
     "test result:",
-    "Ran ",
-    "collected ",
-    "running ",
     "=== RUN",
 ];
+
+/// Words a runner's line opens with before a count of its tests: cargo's
+/// `running 3 tests`, unittest's `Ran 3 tests` and pytest's `collected 3
+/// items`. Only with the number, since a script's own `running tests...`
+/// says nothing ran.
+const TESTS_COUNTED: [&str; 3] = ["running", "Ran", "collected"];
+
+/// What a line holds when the host it could not reach is this computer,
+/// which is the work's own server and no registry.
+const LOOPBACK: [&str; 4] = ["127.0.0.1", "localhost", "::1", "0.0.0.0"];
 
 /// Whether `output`, a command's, says its program's set-up failed before
 /// anything of its own ran, by `SET_UP_FAILED`.
@@ -1418,8 +1456,13 @@ pub(crate) fn ran(
         return Ran::Unrun("the build did not fit in the time".into());
     }
     // Nor does a command that never reached a test: sent back with it as a
-    // failure, a run looked for a fault in its work that was not there.
-    if let Some(why) = unrunnable(&outcome) {
+    // failure, a run looked for a fault in its work that was not there. A
+    // fetch that fails on the work alone is the work's doing, a dependency
+    // it added or a lockfile it broke, and stays a failure.
+    let broken = missing(command, &outcome).or_else(|| {
+        unfetched(&outcome).filter(|_| !reaches_tests_before(kept, command, workspace, ctx, limit))
+    });
+    if let Some(why) = broken {
         return Ran::Broken(format!(
             "`{command}` did not get as far as a test, since {why}"
         ));
@@ -1499,43 +1542,149 @@ pub(crate) fn unfinished_build(command: &str, outcome: &Result<String, String>) 
     rebuilds_all(command) && unfinished(outcome)
 }
 
-/// Why `outcome`, what a test command made of some work, shows that the
-/// command did not get as far as a test, so that it says nothing of the
-/// work; None when it passed, did not finish, or failed any other way. Its
-/// program was not found, as a shell says with `NOT_FOUND` and, but for
-/// Windows' own words, exit code 127; or a package or a host it needed could
-/// not be fetched (`set_up_failed`). Only where no line of the output is a
-/// runner's word on a test, a verdict (`named`), a pass (`passing`) or one
-/// of `TESTS_RAN`: a test that failed after logging such words, or a suite
-/// that ran before a later step of the command went missing, is a failure
-/// like any other.
-pub(crate) fn unrunnable(outcome: &Result<String, String>) -> Option<String> {
+/// Why `outcome`, what the test command `command` made of some work, shows
+/// that the command did not get as far as a test, so that it says nothing
+/// of the work: its program is not installed (`missing`), or a package or a
+/// host it needed could not be fetched (`unfetched`). None when it passed,
+/// did not finish, or failed any other way.
+pub(crate) fn unrunnable(command: &str, outcome: &Result<String, String>) -> Option<String> {
+    missing(command, outcome).or_else(|| unfetched(outcome))
+}
+
+/// The lines of `outcome`, a test command's that ran to a failing end, and
+/// how it ended, where none of them is a runner's word on a test: a verdict
+/// (`named`), a pass (`passing`), one of `TESTS_RAN` or a count after one
+/// of `TESTS_COUNTED`. None otherwise: a test that failed after logging
+/// what a broken command prints, or a suite that ran before a later step of
+/// the command went missing, is a failure like any other.
+fn before_any_test(outcome: &Result<String, String>) -> Option<(String, Vec<&str>)> {
     let output = outcome.as_ref().ok()?;
     let (ended, _) = failure(outcome)?;
     let lines = lines_of(output);
     let reached = |line: &&str| {
         let trimmed = line.trim_start();
-        passing(line) || TESTS_RAN.iter().any(|start| trimmed.starts_with(start))
+        let mut words = trimmed.split_whitespace();
+        let counted = (words.next()).is_some_and(|word| TESTS_COUNTED.contains(&word))
+            && (words.next()).is_some_and(|word| word.parse::<u64>().is_ok());
+        counted || passing(line) || TESTS_RAN.iter().any(|start| trimmed.starts_with(start))
     };
     if named_lines(&lines).contains(&Some(Named::Verdict)) || lines.iter().any(reached) {
         return None;
     }
+    Some((ended, lines))
+}
+
+/// Why `outcome`, what `command` made of some work, shows that a program
+/// the command runs is not installed here, with the line that says so;
+/// None where it shows no such thing, or any test ran (`before_any_test`).
+/// Only for a program the command itself names (`runs_program`): a tester's
+/// script that calls the tool the work was to add fails the same way, and
+/// that is the work's failure.
+fn missing(command: &str, outcome: &Result<String, String>) -> Option<String> {
+    let (ended, lines) = before_any_test(outcome)?;
     let no_such = ended.ends_with(&format!(" {NOT_FOUND_CODE}"));
-    let missing = lines.iter().find(|line| {
-        line.contains(NOT_RECOGNIZED)
-            || (no_such && NOT_FOUND.iter().any(|words| line.contains(words)))
-    });
-    if let Some(line) = missing {
-        return Some(format!(
-            "its program is not installed here (`{}`)",
+    lines.iter().find_map(|line| {
+        let name = missing_program(line, no_such).filter(|name| runs_program(command, name))?;
+        Some(format!(
+            "its program `{name}` is not installed here (`{}`)",
             clipped(line.trim())
-        ));
-    }
-    let unfetched = lines.iter().find(|line| set_up_failed(line))?;
+        ))
+    })
+}
+
+/// Why `outcome`, a test command's, shows that a package or a host it
+/// needed could not be fetched (`set_up_failed`), with the line that says
+/// so; None where it shows no such thing, or any test ran
+/// (`before_any_test`). A line about this computer (`LOOPBACK`) is passed
+/// over: that is the work's own server not answering.
+fn unfetched(outcome: &Result<String, String>) -> Option<String> {
+    let (_, lines) = before_any_test(outcome)?;
+    let local = |line: &str| LOOPBACK.iter().any(|host| line.contains(host));
+    let line = (lines.iter()).find(|line| set_up_failed(line) && !local(line))?;
     Some(format!(
         "a package or a host it needs could not be reached from here (`{}`)",
-        clipped(unfetched.trim())
+        clipped(line.trim())
     ))
+}
+
+/// The name of the program `line`, of a command's output, says was not
+/// found: before one of `NOT_FOUND` or after zsh's words where the command
+/// ended as a shell does then (`no_such`), before cmd's and PowerShell's
+/// words, between the quotes of pnpm's and yarn's `Command "x" not found`,
+/// and after Python's `NO_MODULE` where one name ends the line. Without its
+/// folder and the quotes around it.
+fn missing_program(line: &str, no_such: bool) -> Option<String> {
+    let line = line.trim();
+    let first = |text: &str| text.split_whitespace().next().map(program_name);
+    let last = |text: &str| text.split_whitespace().next_back().map(program_name);
+    if let Some((_, name)) = line.split_once(NOT_FOUND_ZSH) {
+        return no_such.then(|| first(name)).flatten();
+    }
+    if let Some(head) = NOT_FOUND.iter().find_map(|end| line.strip_suffix(end)) {
+        return no_such.then(|| last(head)).flatten();
+    }
+    if let Some((head, _)) = line.split_once(NOT_RECOGNIZED) {
+        return last(head);
+    }
+    if let Some((_, rest)) = line.split_once("Command \"")
+        && let Some((name, after)) = rest.split_once('"')
+        && after.trim_start().starts_with("not found")
+    {
+        return Some(program_name(name));
+    }
+    let (_, name) = line.split_once(NO_MODULE)?;
+    (name.split_whitespace().count() == 1).then(|| program_name(name))
+}
+
+/// `word` as a program's name: without the quotes or the punctuation a
+/// message puts around it, and without its folder.
+fn program_name(word: &str) -> String {
+    let marks = |c: char| c.is_whitespace() || "'\"`‘’.,:".contains(c);
+    let word = word.trim_matches(marks);
+    word.rsplit(['/', '\\']).next().unwrap_or(word).to_owned()
+}
+
+/// Whether `command` runs the program `name`: as one of its words, bare or
+/// by a path from the root, or, where it runs one of `WRAPPERS`, as one of
+/// `RUNNERS`. A word that is a path inside the project is not counted, such
+/// as a script or a tool the work builds: it is missing only if the work
+/// did not make it.
+fn runs_program(command: &str, name: &str) -> bool {
+    let breaks = |c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '=');
+    let quotes = |c: char| matches!(c, '\'' | '"');
+    let words: Vec<String> = (command.split(breaks))
+        .map(|word| word.trim_matches(quotes))
+        .filter(|word| !word.contains('/') || word.starts_with('/'))
+        .map(program_name)
+        .collect();
+    let wrapped = || words.iter().any(|word| WRAPPERS.contains(&word.as_str()));
+    words.iter().any(|word| word == name) || (RUNNERS.contains(&name) && wrapped())
+}
+
+/// Whether `command` gets as far as a test on the project in `workspace`
+/// as it was, with the tester's tests `kept` put there, within `limit`:
+/// asked where it could not fetch what it needed on the work, to tell a
+/// registry out of reach from a dependency the work added. False where the
+/// project as it was cannot be written out, where the time to the deadline
+/// `ctx` carries does not hold the run and half a review's for a fix after
+/// it, and where the command could not be run there either.
+fn reaches_tests_before(
+    kept: &Kept,
+    command: &str,
+    workspace: &Path,
+    ctx: &ToolContext,
+    limit: Duration,
+) -> bool {
+    let fix = crate::requirements::REVIEW_TIME / 2;
+    if time_left(ctx).is_some_and(|left| left < fix + limit) {
+        return false;
+    }
+    let Some(base) = base(workspace) else {
+        return false;
+    };
+    let before = outcome_in(kept, command, &base, ctx, limit);
+    discard(&base);
+    before.is_some_and(|before| before.is_ok() && unrunnable(command, &before).is_none())
 }
 
 /// How long the run making calls with `ctx` has to its deadline; None with
@@ -4398,45 +4547,147 @@ mod tests {
 
     #[test]
     fn a_runner_that_is_not_installed_is_no_failing_test() {
+        let deno = "deno test --allow-read packages/core/src/letronna_spec_x.test.ts";
         let missing = exited(
             "\n[stderr]\n/usr/bin/bash: line 1: deno: command not found",
             127,
         );
         assert_eq!(
-            unrunnable(&missing).as_deref(),
+            unrunnable(deno, &missing).as_deref(),
             Some(
-                "its program is not installed here (`/usr/bin/bash: line 1: deno: command \
-                 not found`)"
+                "its program `deno` is not installed here (`/usr/bin/bash: line 1: deno: \
+                 command not found`)"
             )
         );
-        let dash = exited("sh: 1: vitest: not found", 127);
-        assert!(unrunnable(&dash).is_some_and(|why| why.contains("vitest: not found")));
-        let windows = exited(
-            "'deno' is not recognized as an internal or external command,\noperable program \
-             or batch file.",
-            1,
-        );
-        assert!(unrunnable(&windows).is_some_and(|why| why.contains("not installed here")));
-        // Those words with another exit code are something a program said.
-        assert_eq!(unrunnable(&exited("lint: command not found", 1)), None);
+        // Each shell's words, env's, timeout's, a wrapper's and Python's,
+        // for the program the command names; under a wrapper, for a runner
+        // its script names.
+        let found_missing = [
+            (
+                "export CI=1; deno test",
+                "sh: 1: deno: not found",
+                127,
+                "deno",
+            ),
+            ("deno test", "zsh:1: command not found: deno", 127, "deno"),
+            (
+                "env CI=1 deno test",
+                "env: ‘deno’: No such file or directory",
+                127,
+                "deno",
+            ),
+            (
+                "/opt/deno/bin/deno test",
+                "bash: line 1: /opt/deno/bin/deno: No such file or directory",
+                127,
+                "deno",
+            ),
+            (
+                "timeout 60 deno test",
+                "timeout: failed to run command ‘deno’: No such file or directory",
+                127,
+                "deno",
+            ),
+            (
+                "deno test",
+                "'deno' is not recognized as an internal or external command,\noperable program or batch file.",
+                1,
+                "deno",
+            ),
+            (
+                "deno test",
+                "deno : The term 'deno' is not recognized as the name of a cmdlet",
+                1,
+                "deno",
+            ),
+            (
+                "pnpm -F core exec vitest run",
+                " ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL  Command \"vitest\" not found",
+                1,
+                "vitest",
+            ),
+            ("yarn jest", "error Command \"jest\" not found.", 1, "jest"),
+            (
+                "python3 -m pytest -q tests",
+                "/usr/bin/python3: No module named pytest",
+                1,
+                "pytest",
+            ),
+            ("npm test", "sh: 1: jest: not found", 127, "jest"),
+        ];
+        for (command, output, code, name) in found_missing {
+            let why = unrunnable(command, &exited(output, code));
+            assert!(
+                why.as_deref()
+                    .is_some_and(|why| why.starts_with(&format!("its program `{name}` is"))),
+                "{command}: {output}: {why:?}"
+            );
+        }
+        // Not for a program the command does not name: a tester's script
+        // that calls the tool the work was to add fails the same way, and
+        // so does a command that runs the work's own tool by its path.
+        let not_missing = [
+            (
+                "sh tests/letronna_spec_cli.sh",
+                "tests/letronna_spec_cli.sh: 3: mytool: not found",
+                127,
+            ),
+            (
+                "sh tests/letronna_spec_cli.sh",
+                "tests/letronna_spec_cli.sh: line 3: ./bin/tool: No such file or directory",
+                127,
+            ),
+            ("./bin/tool --selftest", "sh: 1: ./bin/tool: not found", 127),
+            ("npm test", "sh: 1: mytool: not found", 127),
+            (
+                "python3 -m pytest",
+                "ModuleNotFoundError: No module named 'mytool'",
+                1,
+            ),
+            // Those words with another exit code are something a program said.
+            ("deno test", "deno: command not found", 1),
+        ];
+        for (command, output, code) in not_missing {
+            assert_eq!(
+                unrunnable(command, &exited(output, code)),
+                None,
+                "{command}: {output}"
+            );
+        }
         // A test that logged them and failed is a failing test, whatever
         // the runner's marks; so is a suite that ran before a later step
         // of the command went missing.
         for output in [
-            "--- FAIL: TestShell (0.00s)\n    shell_test.go:9: got \"sh: nope: command not found\"\nFAIL",
-            "✖ runs the hook (3ms)\n  sh: 1: nope: not found\nℹ fail 1",
-            "not ok 1 - runs the hook\n# sh: nope: command not found",
-            "test result: ok. 3 passed; 0 failed\nsh: line 1: report: command not found",
+            "--- FAIL: TestShell (0.00s)\n    shell_test.go:9: got \"sh: deno: command not found\"\nFAIL",
+            "✖ runs the hook (3ms)\n  sh: 1: deno: not found\nℹ fail 1",
+            "not ok 1 - runs the hook\n# sh: deno: command not found",
+            "test result: ok. 3 passed; 0 failed\nsh: line 1: deno: command not found",
+            "running 3 tests\nsh: line 1: deno: command not found",
+            "collected 2 items\nsh: line 1: deno: command not found",
         ] {
-            assert_eq!(unrunnable(&exited(output, 127)), None, "{output}");
+            assert_eq!(
+                unrunnable("deno test", &exited(output, 127)),
+                None,
+                "{output}"
+            );
         }
+        // A script's own word that it is running them is no test run.
+        let echoed = exited("running tests...\nsh: line 2: deno: command not found", 127);
+        assert!(unrunnable("deno test", &echoed).is_some());
         // Nor is one that passed or was cut at its limit.
-        assert_eq!(unrunnable(&Ok("deno: command not found".into())), None);
-        assert_eq!(unrunnable(&Err("Timed out after 600s.".into())), None);
+        assert_eq!(
+            unrunnable("deno test", &Ok("deno: command not found".into())),
+            None
+        );
+        assert_eq!(
+            unrunnable("deno test", &Err("Timed out after 600s.".into())),
+            None
+        );
     }
 
     #[test]
     fn a_fetch_that_failed_before_any_test_ran_is_no_failing_test() {
+        let command = "pnpm -F core exec vitest run predicate.letronna_spec";
         let pnpm = exited(
             " ERR_PNPM_META_FETCH_FAIL  GET https://registry.npmjs.org/pnpm: request to \
              https://registry.npmjs.org/pnpm failed, reason: getaddrinfo EAI_AGAIN \
@@ -4446,7 +4697,7 @@ mod tests {
              --loglevel=error\nFor help, run: pnpm help exec",
             1,
         );
-        let why = unrunnable(&pnpm).unwrap();
+        let why = unrunnable(command, &pnpm).unwrap();
         assert!(
             why.starts_with(
                 "a package or a host it needs could not be reached from here \
@@ -4460,17 +4711,85 @@ mod tests {
              https://registry.npmjs.org/vitest failed",
             "FAIL\texample.com/app [setup failed]",
         ] {
-            assert!(unrunnable(&exited(output, 1)).is_some(), "{output}");
+            assert!(
+                unrunnable(command, &exited(output, 1)).is_some(),
+                "{output}"
+            );
         }
-        // A test that could not reach a host failed, as its runner says.
+        // A test that could not reach a host failed, as its runner says;
+        // and the work's own server not answering is no registry.
         for output in [
             " FAIL  tests/fetch.test.ts > loads the page\nError: getaddrinfo EAI_AGAIN \
              example.com\n Test Files  1 failed (1)",
             "FAILED tests/test_fetch.py::test_loads - NewConnectionError\n1 failed in 0.20s",
             " ✓ parses (2ms)\n log: getaddrinfo ENOTFOUND example.com\nexit after hook",
+            "Error: connect ECONNREFUSED 127.0.0.1:3000",
+            "requests.exceptions.ConnectionError: NewConnectionError: localhost:8080 refused",
+            "dial tcp: lookup localhost: no such host",
         ] {
-            assert_eq!(unrunnable(&exited(output, 1)), None, "{output}");
+            assert_eq!(unrunnable(command, &exited(output, 1)), None, "{output}");
         }
+        // A refused connection is no sign of a set-up that failed, so a
+        // passing command that mentions one still lends its set-up.
+        assert!(!set_up_failed("ok: ECONNREFUSED is retried"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fetch_that_fails_on_the_work_alone_is_the_works_failure() {
+        let root = Scratch::new("spec-tests-run-fetch");
+        let repo = |args: &[&str]| assert!(git(&root, args).is_some(), "git {args:?}");
+        repo(&["init", "-q"]);
+        std::fs::write(root.join("README"), "a project").unwrap();
+        repo(&["add", "."]);
+        repo(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-qm",
+            "c",
+        ]);
+        // The registry is out of reach wherever `needs-net` is, as a
+        // dependency the work added would leave it.
+        std::fs::write(
+            root.join("letronna_spec_test.sh"),
+            "test -f needs-net && { echo 'npm error code ENOTFOUND'; exit 1; }\necho '--- FAIL: \
+             TestMade (0.00s)'; exit 1\n",
+        )
+        .unwrap();
+        let command = "sh letronna_spec_test.sh".to_owned();
+        let kept = keep(28, &root, &root, Some(command.clone())).unwrap();
+        let ctx = ToolContext::of(&crate::chat::Connection {
+            workspace: Some(root.to_path_buf()),
+            ..Default::default()
+        });
+        std::fs::write(root.join("needs-net"), "").unwrap();
+        // On the project as it was the command reaches its tests: a failure.
+        let ran_on_work = ran(&kept, &command, &ctx, TIMEOUT, || None);
+        let Ran::Failed(told) = &ran_on_work else {
+            panic!("{ran_on_work:?}");
+        };
+        assert!(told.contains("npm error code ENOTFOUND"), "{told}");
+        // Where the project as it was cannot reach it either, nothing is
+        // known of the work.
+        repo(&["add", "needs-net"]);
+        repo(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-qm",
+            "d",
+        ]);
+        let ran_before = ran(&kept, &command, &ctx, TIMEOUT, || None);
+        assert!(
+            matches!(&ran_before, Ran::Broken(why) if why.contains("ENOTFOUND")),
+            "{ran_before:?}"
+        );
+        tidy(28);
     }
 
     #[cfg(unix)]
@@ -4482,7 +4801,7 @@ mod tests {
         std::fs::write(root.join("README"), "a project").unwrap();
         repo(&["add", "."]);
         std::fs::write(root.join("letronna_spec_test.sh"), "exit 0\n").unwrap();
-        let command = "letronna-no-such-runner test letronna_spec_test.sh".to_owned();
+        let command = "letronna-no-such-runner test ./letronna_spec_test.sh".to_owned();
         let kept = keep(27, &root, &root, Some(command.clone())).unwrap();
         let ctx = ToolContext::of(&crate::chat::Connection {
             workspace: Some(root.to_path_buf()),
@@ -4501,8 +4820,8 @@ mod tests {
         };
         assert!(
             why.starts_with(&format!(
-                "`{command}` did not get as far as a test, since its program is not \
-                 installed here (`"
+                "`{command}` did not get as far as a test, since its program \
+                 `letronna-no-such-runner` is not installed here (`"
             )),
             "{why}"
         );
