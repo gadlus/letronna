@@ -18,7 +18,9 @@
 //! nothing quoted, such as "Fine." or "Rare.", is a verdict on the one before
 //! and is joined to it. One of `ALONE` weighs a case off only as such a
 //! verdict of one word, as "Skip." does after a question: inside a sentence
-//! it says what the work does.
+//! it says what the work does. It is a verdict on the sentence it follows,
+//! so it reaches one sentence fewer back than a marker does: two back, the
+//! sentence it was found with was most often another matter.
 //!
 //! A case is its sentence through the clause that holds its last code span
 //! or quoted literal, and on through the clauses after it until one where a
@@ -46,8 +48,18 @@
 //! weighed them, but for one weighed only by `PASSING`, words a run says
 //! as often of a document, a tool or its own next step as of what the
 //! work does: such a case is given only where fewer than `KEPT` others
-//! were set aside. A case is given once, as it was weighed hardest, and
-//! the ones given stay in the order the run named them.
+//! were set aside. The ones given stay in the order the run named them.
+//!
+//! A case is given once. Named again, it takes the later sentence's words
+//! and place, as nearer to the work as it stands, and keeps the hardest it
+//! was weighed; a later sentence weighed only by `PASSING` is most often
+//! about something else that holds the same code span, and leaves the case
+//! as it stood. A case the run ticks off after naming it, as "... gives
+//! `[]` ✓" does, it checked and did not set aside: it is no case, and any
+//! earlier naming of it goes with it. Only that mark is read so: a word
+//! such as "handled" or "added" says as often what the work does, and a
+//! tick in some later sentence that no marker weighs is as often about
+//! another matter.
 //!
 //! Apart from those, with a quota of their own, are the words of the request
 //! the run read more than one way (`readings`). A run most often names both
@@ -82,7 +94,8 @@ const RANKED: usize = 5;
 const CHARS: usize = 200;
 
 /// Sentences before a weigh-off its case may be named in, as "Could also
-/// set `x`? That would pollute it. I'll keep only y." names it two back.
+/// set `x`? That would pollute it. I'll keep only y." names it two back;
+/// one fewer for a verdict of `ALONE`.
 const BACK: usize = 2;
 
 /// Words in a sentence that, with nothing quoted, is a verdict on the one
@@ -457,7 +470,8 @@ pub(crate) fn shared(said: &[&str], sentence: &[String]) -> Range<usize> {
 /// something `request` names and then the later one; then the latest not
 /// yet taken that a word not of `PASSING` weighed; then the latest of the
 /// rest. Each is given once by its first code span, or by its words where
-/// it has none, as it was weighed hardest.
+/// it has none: as it was last named and as hard as it was ever weighed,
+/// and not at all once the run ticks it off.
 pub(crate) fn doubts(messages: &[Message], request: &str) -> Vec<String> {
     let said: Vec<String> = (words(request).into_iter()).map(|(_, word)| word).collect();
     let names = identifiers(request);
@@ -468,18 +482,26 @@ pub(crate) fn doubts(messages: &[Message], request: &str) -> Vec<String> {
     // was weighed, then whether the request names something it names.
     let mut found: Vec<(String, String, (u8, bool))> = Vec::new();
     for text in own.flat_map(|message| [&message.reasoning, &message.content]) {
-        for (case, markers) in cases(text) {
-            let quoted = quotes(&case, &said);
-            let rank = (weight(&markers, quoted), quoted || named(&case, &names));
+        for (case, markers, ticked) in cases(text) {
             let key = key(&case);
-            // Named again, a case stands as it was weighed hardest, and
-            // where it was named last among those.
             let before = found.iter().position(|(kept, ..)| *kept == key);
-            if before.is_some_and(|at| found[at].2 > rank) {
+            // Ticked off, a case was checked and is set aside no longer.
+            if ticked {
+                if let Some(at) = before {
+                    found.remove(at);
+                }
                 continue;
             }
+            let quoted = quotes(&case, &said);
+            let mut rank = (weight(&markers, quoted), quoted || named(&case, &names));
+            // Named again, a case takes the later words and place and
+            // keeps the hardest it was weighed; a naming weighed only in
+            // passing leaves one weighed otherwise as it stood.
             if let Some(at) = before {
-                found.remove(at);
+                if rank.0 == PASSED && found[at].2.0 > PASSED {
+                    continue;
+                }
+                rank = rank.max(found.remove(at).2);
             }
             found.push((key, case, rank));
         }
@@ -585,8 +607,9 @@ pub(crate) fn section(doubts: &[String], tester: bool) -> String {
 }
 
 /// The cases `text` weighs off, in the order each was last weighed, each
-/// with the markers of every sentence that weighed it.
-fn cases(text: &str) -> Vec<(String, Vec<&'static str>)> {
+/// with the markers of every sentence that weighed it and whether its own
+/// sentence ticks it off.
+fn cases(text: &str) -> Vec<(String, Vec<&'static str>, bool)> {
     let units = units(text);
     // Each sentence named as a case, with the markers that weighed it.
     let mut named: Vec<(usize, Vec<&'static str>)> = Vec::new();
@@ -601,7 +624,16 @@ fn cases(text: &str) -> Vec<(String, Vec<&'static str>)> {
         else {
             continue;
         };
-        let mut markers: Vec<_> = marks.into_iter().map(|(_, marker)| marker).collect();
+        // A verdict of one word is on the sentence it follows, or on the
+        // one before where that one names nothing: no further back.
+        let far = at - naming >= BACK;
+        let mut markers: Vec<_> = (marks.into_iter())
+            .map(|(_, marker)| marker)
+            .filter(|marker| !(far && ALONE.contains(marker)))
+            .collect();
+        if markers.is_empty() {
+            continue;
+        }
         // Weighed again, a sentence stands where it was weighed last.
         if let Some(before) = named.iter().position(|(kept, _)| *kept == naming) {
             markers.extend(named.remove(before).1);
@@ -609,8 +641,18 @@ fn cases(text: &str) -> Vec<(String, Vec<&'static str>)> {
         named.push((naming, markers));
     }
     (named.into_iter())
-        .map(|(naming, markers)| (case(&units[naming]), markers))
+        .map(|(naming, markers)| {
+            let unit = &units[naming];
+            (case(unit), markers, ticked(unit))
+        })
         .collect()
+}
+
+/// Whether `unit` ticks its case off: a check mark after its last literal,
+/// as in "... gives `[]` ✓", where the run says it checked what it named.
+fn ticked(unit: &str) -> bool {
+    let named = literals(unit).last().map_or(0, |range| range.end);
+    unit[named..].contains(['\u{2713}', '\u{2714}'])
 }
 
 /// The sentences of `text` outside fenced code, a verdict of a few words
@@ -1187,26 +1229,124 @@ mod tests {
         assert!(!names(request, "Print \"store\" there?"));
     }
 
+    /// What notes written one reply after another give, for no request.
+    fn stands(notes: &[&str]) -> Vec<String> {
+        let notes: Vec<Message> = notes.iter().map(|note| said(note, "")).collect();
+        doubts(&notes, "")
+    }
+
     #[test]
-    fn a_case_named_again_stands_as_it_was_weighed_hardest() {
+    fn a_case_named_again_takes_the_later_words_and_keeps_its_hardest_weight() {
         let hard = "Hidden tests might read `limit` as bytes. Unlikely.";
-        let soft = "Spell `limit` out in the message? I'll keep it short.";
-        let stands = |notes: &[&str]| {
-            let notes: Vec<Message> = notes.iter().map(|note| said(note, "")).collect();
-            doubts(&notes, "")
-        };
-        let kept = ["Hidden tests might read `limit` as bytes."];
-        assert_eq!(stands(&[hard, soft]), kept);
-        assert_eq!(stands(&[soft, hard]), kept);
-        // And where the request names what it names, among those weighed alike.
-        let asked = "Is \"at most the limit given\" bytes for `cap`? Rare.";
-        let plain = "A `cap` of zero? Rare.";
+        let soft = "Is `limit` counted before the header? I'll keep it so.";
+        assert_eq!(
+            stands(&[hard, soft]),
+            ["Is `limit` counted before the header?"]
+        );
+        assert_eq!(
+            stands(&[soft, hard]),
+            ["Hidden tests might read `limit` as bytes."]
+        );
+        // The later words stand where the earlier weight puts them: before
+        // twelve cases a strong word weighed after it.
+        let later = inputs(1..=12, "Rare.").join("\n");
+        let found = stands(&[hard, soft, &later]);
+        assert_eq!(found[0], "Is `limit` counted before the header?");
+        assert_eq!(found[1..], alone(4..=12));
+        assert_eq!(stands(&[soft, &later]), alone(3..=12));
+        // And in the later place: after a case named between the two.
+        let between = "An empty `name`? Rare.";
+        assert_eq!(
+            stands(&[hard, between, soft]),
+            ["An empty `name`?", "Is `limit` counted before the header?"]
+        );
+        // A naming weighed only in passing leaves the case as it stood,
+        // unless that is all that ever weighed it.
+        let passing = "Mention `limit` in the notes? Not needed.";
+        assert_eq!(
+            stands(&[hard, between, passing]),
+            [
+                "Hidden tests might read `limit` as bytes.",
+                "An empty `name`?"
+            ]
+        );
+        let again = "Bold `limit` there? It doesn't matter.";
+        assert_eq!(stands(&[passing, again]), ["Bold `limit` there?"]);
+        // What the request names stays with the case too.
+        let asked = "Is \"at most the limit given\" bytes for `cap`? I'll keep bytes.";
+        let plain = "A `cap` of zero? I'll keep it.";
         let request = "Read at most the limit given.";
-        for notes in [[asked, plain], [plain, asked]] {
-            let notes = notes.map(|note| said(note, ""));
-            let found = doubts(&notes, request);
-            assert_eq!(found, ["Is \"at most the limit given\" bytes for `cap`?"]);
+        let mut notes = vec![said(asked, ""), said(plain, "")];
+        notes.push(said(&inputs(1..=12, "I'll keep it.").join("\n"), ""));
+        let found = doubts(&notes, request);
+        assert_eq!(found[0], "A `cap` of zero?");
+        assert_eq!(found[1..], alone(4..=12));
+    }
+
+    #[test]
+    fn a_case_the_run_ticks_off_after_naming_it_is_set_aside_no_longer() {
+        for notes in [
+            "Hidden tests may call `flush()` twice \u{2713}.",
+            "Hidden tests may call `flush()` twice. \u{2713} 3.",
+            "Calling `flush()` twice is rare, and gives `[]` \u{2714} checked.",
+        ] {
+            assert!(weighed(notes).is_empty(), "{notes}: {:?}", weighed(notes));
         }
+        // Named again and ticked off, it goes as it stood before.
+        let early = "An empty `name`? Rare.";
+        let other = "A `width` below zero? Rare.";
+        let done = "An empty `name` gives `[]` now, so the rare path is covered \u{2713}.";
+        assert_eq!(stands(&[early, other, done]), ["A `width` below zero?"]);
+        // And comes back if the run sets it aside after that.
+        assert_eq!(stands(&[early, done, early]), ["An empty `name`?"]);
+        // A tick before what the sentence names is on something else.
+        assert_eq!(
+            weighed("The parser is done \u{2713}; an empty `name` is rare."),
+            ["The parser is done \u{2713}; an empty `name` is rare."]
+        );
+        // Only a sentence that weighs the case off is read, and only the
+        // mark: said in words, a case taken up is not told from one set aside.
+        let unweighed = "An empty `name` gives `[]` \u{2713}.";
+        assert_eq!(stands(&[early, unweighed]), ["An empty `name`?"]);
+        let worded = "An empty `name` is handled now, so the rare path is covered.";
+        assert_eq!(stands(&[early, worded]).len(), 1);
+    }
+
+    #[test]
+    fn a_verdict_of_one_word_reaches_one_sentence_back_and_no_further() {
+        // On the sentence it follows, or on the one before that where the
+        // one it follows names nothing.
+        assert_eq!(
+            weighed("A `tail` wider than the width? Skip."),
+            ["A `tail` wider than the width?"]
+        );
+        assert_eq!(
+            weighed("A `tail` wider than the width? It would be cut twice. Acceptable."),
+            ["A `tail` wider than the width?"]
+        );
+        // Two back, it is a verdict on another matter.
+        for verdict in ["Skip.", "Ignore.", "Acceptable.", "Edge.", "Keep."] {
+            let notes = format!(
+                "Parse `a..b` first. Then the table is built from it. Say so in the notes? \
+                 {verdict}"
+            );
+            assert!(
+                weighed(&notes).is_empty(),
+                "{verdict}: {:?}",
+                weighed(&notes)
+            );
+        }
+        // A marker of more than the one word still reaches there.
+        let notes = "Parse `a..b` first. Then the table is built from it. That is rare.";
+        assert_eq!(weighed(notes), ["Parse `a..b` first."]);
+        // And beside one, the verdict adds nothing: the case is weighed as
+        // the marker alone weighs it.
+        let mut notes = vec![
+            "Parse `a..b` first. Then the table is built from it. I'll keep that order. Edge."
+                .to_owned(),
+        ];
+        notes.extend(inputs(1..=12, "I'll keep it."));
+        assert_eq!(weighed(&notes.join("\n")), alone(3..=12));
     }
 
     #[test]
