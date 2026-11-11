@@ -2660,6 +2660,37 @@ fn echoed(spec: &Spec, turn: &Turn, written: &[String], began: SystemTime) -> Op
     })
 }
 
+/// The jobs still running that the run answers for itself: those it
+/// started, and those a helper of its that has ended left to it.
+fn own_jobs(spec: &Spec) -> Vec<u64> {
+    (tasks::list(spec.root).iter())
+        .filter(|task| task.owner == spec.id)
+        .filter_map(|task| match task.key {
+            Key::Job(id) if crate::jobs::running(id) == Ok(true) => Some(id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether job `id` runs in `folder` or below it.
+fn runs_in(id: u64, folder: &Path) -> bool {
+    (crate::jobs::list().iter())
+        .filter(|job| job.id == id)
+        .filter_map(|job| job.cwd.as_deref())
+        .any(|cwd| cwd.starts_with(folder))
+}
+
+/// Stops the jobs a helper the driver started left running, which passed to
+/// the run as the helper ended: those of the run's now that `left` picks.
+/// A review's, a tester's or a second attempt's job is not the run's to be
+/// told of as it ends (`jobs_left`), which would have it start a reviewer's
+/// server again as its own, in a folder that may be gone.
+fn stop_jobs_left(spec: &Spec, left: impl Fn(u64) -> bool) {
+    for id in own_jobs(spec).into_iter().filter(|id| left(*id)) {
+        let _ = crate::jobs::stop(id);
+    }
+}
+
 /// The least of a run's time that must be left for it to be told of the jobs
 /// still running as it ends: about what starting a server again and seeing
 /// it answer takes.
@@ -3278,7 +3309,11 @@ fn second_attempt(spec: &Spec, turn: &Turn, head: &str) -> Option<(Message, bool
         });
         // Its report is not read: its work is, by the tests, whatever it
         // says of it.
+        let jobs = own_jobs(spec);
         let said = tools::Tool::run(&crate::agents::Agent, &args, &helper_ctx);
+        // A job it left running is not the run's own, whatever comes of
+        // its work.
+        stop_jobs_left(spec, |id| !jobs.contains(&id));
         // Named as the tool reports it, however it ended, since another
         // helper may have had the name first.
         let told = said.as_deref().unwrap_or_else(|why| why.as_str());
@@ -3482,6 +3517,9 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
             ..parent.clone()
         }));
     }
+    // Taken before the helpers start, so what they leave running is told
+    // from the run's own jobs; the run itself starts none while it waits.
+    let jobs = own_jobs(spec);
     let (reports, tested, taken, lost) = std::thread::scope(|scope| {
         let started: Vec<_> = (shares.into_iter())
             .take(afford)
@@ -3524,6 +3562,7 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
         let tested: Option<String> = tester.and_then(|tester| tester.join().ok()?.ok());
         (reports, tested, taken, lost)
     });
+    stop_jobs_left(spec, |id| !jobs.contains(&id));
     // The tester started with the run: its tests kept from its own folder
     // as ones that have not met the work, and its report as the run is told
     // it, whatever its table says.
@@ -3611,6 +3650,9 @@ fn kept_ahead(spec: &Spec, folder: &Path, report: Option<&str>) -> Option<crate:
         let set_up = tester_set_up(spec, report, command, Some(folder));
         crate::spec_tests::lend(kept, set_up);
     }
+    // The tester worked beside the run, so its jobs are told from the run's
+    // by the folder they run in, which goes now.
+    stop_jobs_left(spec, |id| runs_in(id, folder));
     crate::spec_tests::discard(folder);
     kept
 }
@@ -8309,6 +8351,50 @@ pub(crate) mod tests {
             told.ends_with("end with your whole answer again."),
             "{told}"
         );
+    }
+
+    #[test]
+    fn jobs_a_helper_the_driver_started_left_are_stopped_and_the_runs_own_go_on() {
+        let _data = data("jobs-helpers");
+        let dir = scratch("jobs-helpers");
+        let folder = dir.join("copy");
+        std::fs::create_dir(&folder).unwrap();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 30"
+        } else {
+            "sleep 30"
+        };
+        let mut spec = spec("http://127.0.0.1:9".into(), &dir, AGENTS + 1_613);
+        spec.depth = 0;
+        spec.root = spec.id;
+        let own = crate::jobs::start_for(command, &dir, spec.id).unwrap();
+        let before = own_jobs(&spec);
+        assert_eq!(before, [own]);
+        // A review's job and a tester's, each handed to the run as its
+        // helper ended, and one of a helper still at work.
+        let reviews = crate::jobs::start_for(command, &dir, spec.id).unwrap();
+        let testers = crate::jobs::start_for(command, &folder, spec.id).unwrap();
+        let helper = spec.id + 1;
+        tasks::register(tasks::Task::new(
+            Key::Agent(helper),
+            spec.id,
+            None,
+            "tester",
+        ));
+        let working = crate::jobs::start_for(command, &folder, helper).unwrap();
+        let stopped = |id: u64| {
+            (crate::jobs::list().iter()).any(|job| job.id == id && (job.stopped || !job.running))
+        };
+        stop_jobs_left(&spec, |id| runs_in(id, &folder));
+        assert!(stopped(testers));
+        assert!(!stopped(reviews) && !stopped(working) && !stopped(own));
+        stop_jobs_left(&spec, |id| !before.contains(&id));
+        assert!(stopped(reviews));
+        assert!(!stopped(working) && !stopped(own));
+        for job in [own, working] {
+            let _ = crate::jobs::stop(job);
+        }
+        tasks::forget(spec.id);
     }
 
     #[test]
