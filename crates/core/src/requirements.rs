@@ -58,10 +58,13 @@ const RULES: usize = 8;
 /// their notes and wrote no row for it; so a row is asked for each input
 /// the change excepts from its own rule, which fails only where that rule
 /// gives a result and the change another, since a guard for an input the
-/// rule cannot take is no failure.
+/// rule cannot take is no failure. On another a review tested the other
+/// side of a condition the code never evaluated with an input that gives
+/// the same result with the condition and without, so the input is to be
+/// one the condition's words change the result for.
 macro_rules! cases {
     () => {
-        "a field, argument or part the requirement names left out, undefined or empty; a plain value as well as the same value wrapped, such as in an object or a parser's state, each also built by hand and passed straight to the method that reads it; each other way the same input can be written, such as its parts in another order or a spelling the project's docs or tests use, including any the parser might reject before the new check runs; an error the requirement names, matched by its exact words, not a generic error; two of something the requirement allows only once; the new form beside the existing form of the same thing in one call, where one applies and the other must not; each place in the code that records the event the requirement is about or changes that state, such as a demotion, a close or a removal, found by searching the code, not only the call the request names; the other side of a condition, such as what \"and is not ended\" or \"unless\" keeps out, with both sides in one input; steps the requirement sets in no order, in each order, such as the later one first; each category the requirement maps to an output, with an input from outside the project's own code, such as a caller's function or a returned error, that uses the requirement's own words for it; each input the change itself treats apart from its general rule, such as an early return on a zero, empty or boundary value or a form it exempts, found by reading the change, the row saying what the general rule would give for it: it fails only where that rule gives a result, the change gives another and the request's words do not ask for the exception, and passes for a guard where the rule would crash or has no defined result; and each case the project's own tests check of the existing feature nearest to it, done again for the new one in the same order of calls, with the same fixtures and through the same entry point, such as a query made for the first time only after the change it should see;"
+        "a field, argument or part the requirement names left out, undefined or empty; a plain value as well as the same value wrapped, such as in an object or a parser's state, each also built by hand and passed straight to the method that reads it; each other way the same input can be written, such as its parts in another order or a spelling the project's docs or tests use, including any the parser might reject before the new check runs; an error the requirement names, matched by its exact words, not a generic error; two of something the requirement allows only once; the new form beside the existing form of the same thing in one call, where one applies and the other must not; each place in the code that records the event the requirement is about or changes that state, such as a demotion, a close or a removal, found by searching the code, not only the call the request names; the other side of a condition, such as what \"and is not ended\" or \"unless\" keeps out, with both sides in one input chosen so that the result would differ if the condition's words were removed from the requirement; steps the requirement sets in no order, in each order, such as the later one first; each category the requirement maps to an output, with an input from outside the project's own code, such as a caller's function or a returned error, that uses the requirement's own words for it; each input the change itself treats apart from its general rule, such as an early return on a zero, empty or boundary value or a form it exempts, found by reading the change, the row saying what the general rule would give for it: it fails only where that rule gives a result, the change gives another and the request's words do not ask for the exception, and passes for a guard where the rule would crash or has no defined result; and each case the project's own tests check of the existing feature nearest to it, done again for the new one in the same order of calls, with the same fixtures and through the same entry point, such as a query made for the first time only after the change it should see;"
     };
 }
 
@@ -2712,6 +2715,19 @@ mod tests {
         // in the work.
         assert!(REVIEW.contains("each case you chose not to handle, with why"));
         assert!(REVIEW.contains("by changing the work, not the case"));
+    }
+
+    #[test]
+    fn the_other_side_of_a_condition_is_tested_with_an_input_the_condition_decides() {
+        // One both readings give the same result for shows nothing of it.
+        let case = "the other side of a condition, such as what \"and is not ended\" or \
+                    \"unless\" keeps out, with both sides in one input chosen so that the \
+                    result would differ if the condition's words were removed from the \
+                    requirement;";
+        assert!(REVIEW.contains(case), "{REVIEW}");
+        let rules: Vec<String> = ["Dates must parse.".to_owned()].into();
+        let asked = brief("Dates must parse.", &rules, (1, 1), &[], &[]);
+        assert!(asked.contains(case), "{asked}");
     }
 
     #[test]

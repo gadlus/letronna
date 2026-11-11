@@ -1061,7 +1061,10 @@ pub(crate) fn brief_ahead(request: &str, sentences: &[String]) -> String {
 /// the requirements `request` states: `opening` says what to test and where
 /// to read, `unnamed` what to do for something new the request names
 /// nothing for, `outcome` what to do with a test that fails, and `rows` how
-/// a row of the table is written.
+/// a row of the table is written. The input for the side a limiting word
+/// keeps out is to be one those words change the result for: on a benchmark
+/// run a condition the code never evaluated was tested with an input that
+/// gives the same result with it and without.
 fn briefing(
     request: &str,
     sentences: &[String],
@@ -1080,18 +1083,19 @@ fn briefing(
          For each requirement, test the behaviour it states through the entry point a caller \
          of the project uses, end to end: each case it names, each form its input can be \
          written in, the side a limiting word such as only, unless, otherwise or and not keeps \
-         out, with both sides in one input, steps it sets in no order in each order, such as the \
-         later one first, each category it maps to an output with an input from outside the \
-         project's own code that uses the request's words for it, and each other feature it is \
-         said to work with, used together with it in one call. Then find the project's own \
-         tests of the feature nearest to each new one, such as one it is said to work like or \
-         with, or one of the same kind in the same module, and write each of their cases again \
-         for the new one, in the same order of calls, with the same fixtures and through the \
-         same entry point, such as a query made for the first time only after the change it \
-         should see. Set each test up the way those tests do, and make each change before the \
-         first call or query, as a caller would, rather than calling once beforehand to warm \
-         anything up. Where the project's data, docs or tests already spell an output, expect \
-         that spelling.\n\n\
+         out, with both sides in one input chosen so that the result would differ if the \
+         limiting words were removed from the requirement, steps it sets in no order in each \
+         order, such as the later one first, each category it maps to an output with an input \
+         from outside the project's own code that uses the request's words for it, and each \
+         other feature it is said to work with, used together with it in one call. Then find \
+         the project's own tests of the feature nearest to each new one, such as one it is said \
+         to work like or with, or one of the same kind in the same module, and write each of \
+         their cases again for the new one, in the same order of calls, with the same fixtures \
+         and through the same entry point, such as a query made for the first time only after \
+         the change it should see. Set each test up the way those tests do, and make each \
+         change before the first call or query, as a caller would, rather than calling once \
+         beforehand to warm anything up. Where the project's data, docs or tests already spell \
+         an output, expect that spelling.\n\n\
          Write the tests in the project's own test language and style, in new files whose \
          names hold `{MARKER}`, where its test runner finds them, such as beside its other \
          tests, and run them with that runner. Change no other file. {outcome}\n\n\
@@ -3732,6 +3736,14 @@ mod tests {
         assert!(brief.contains("run no `git diff`"));
         assert!(brief.contains(&format!("names hold `{MARKER}`")));
         assert!(brief.contains("otherwise or and not keeps"), "{brief}");
+        // With an input the limit decides, as a review is asked for one.
+        assert!(
+            brief.contains(
+                "keeps out, with both sides in one input chosen so that the result would \
+                 differ if the limiting words were removed from the requirement, steps it sets"
+            ),
+            "{brief}"
+        );
         assert!(brief.contains("in each order"), "{brief}");
         assert!(brief.contains("uses the request's words for it"), "{brief}");
         // The nearest feature's own tests, done again for the new one.
@@ -6186,6 +6198,10 @@ mod tests {
         assert!(brief.contains("- R1: Pairs compose with Or."), "{brief}");
         assert!(brief.contains(&format!("names hold `{MARKER}`")), "{brief}");
         assert!(brief.contains("in each order"), "{brief}");
+        assert!(
+            brief.contains("if the limiting words were removed from the requirement"),
+            "{brief}"
+        );
         assert!(
             brief.contains("as the request spells it, never as the code does"),
             "{brief}"
