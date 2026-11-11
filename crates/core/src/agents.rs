@@ -2147,10 +2147,17 @@ pub(crate) fn ran_out(answer: &str) -> bool {
         .is_some_and(|line| line.contains(OUT_OF_BUDGET) || line.starts_with(crate::budget::SPENT))
 }
 
-/// Whether `answer`, what the agent tool gave for a helper, holds a report
-/// in the helper's own words, not only how it ended or why none started.
+/// How the answer for a helper that ran to its end says so, after its name.
+const FINISHED: &str = "finished:";
+
+/// Whether `answer`, what the agent tool gave for a helper, is of one that
+/// finished and holds its report in its own words: not what a helper had
+/// said when a limit, a stop or a failure cut it short, nor a refusal.
 pub(crate) fn reported(answer: &str) -> bool {
-    answer.lines().any(|line| line == REPORT_HEADER)
+    let finished = (answer.lines().next())
+        .and_then(|line| line.split_once(' '))
+        .is_some_and(|(_, how)| how.starts_with(FINISHED));
+    finished && answer.lines().any(|line| line == REPORT_HEADER)
 }
 
 /// What the agent that started a helper hears back: how it went, what it
@@ -2164,7 +2171,7 @@ fn answer(
     left: Option<&str>,
 ) -> Result<String, String> {
     let mut out = match &report.status {
-        Outcome::Done => format!("{name} finished: {}.", stats(report)),
+        Outcome::Done => format!("{name} {FINISHED} {}.", stats(report)),
         Outcome::RoundLimit => {
             format!("{name} stopped at its {rounds}-round limit; its partial report is below.")
         }
@@ -3519,6 +3526,20 @@ mod tests {
         // A helper that said nothing has nothing to quote.
         let silent = answer("a", &report(Outcome::Done, ""), 50, MAX_REPORT, None).unwrap();
         assert!(silent.ends_with("\n(no answer)") && !silent.contains(REPORT_HEADER));
+        // Only one that finished and said something has reported: what a
+        // helper cut short had said is a fragment.
+        assert!(reported(&out));
+        assert!(!reported(&silent));
+        for status in [
+            Outcome::RoundLimit,
+            Outcome::OverBudget,
+            Outcome::Stopped,
+            Outcome::Failed("The connection closed.".into()),
+        ] {
+            let cut = answer("a", &report(status, "So far."), 50, MAX_REPORT, None);
+            let cut = cut.unwrap_or_else(|said| said);
+            assert!(cut.contains(REPORT_HEADER) && !reported(&cut), "{cut}");
+        }
 
         // The indents count against the share, so short lines still fit it.
         let short = format!("Found:\n{}Open question: why?", "ok\n".repeat(2_000));

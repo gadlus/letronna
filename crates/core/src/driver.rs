@@ -3435,8 +3435,9 @@ fn review_report(message: &Message) -> bool {
 }
 
 /// The reviews among `answers`, what the agent tool gave for each helper
-/// started, that hold a table, those that hold a report with no table that
-/// could be read, and with no table at all, when a budget stopped some,
+/// started, that hold a table, those of a helper that finished with a
+/// report and no table that could be read, and with no table at all, when
+/// a budget stopped some,
 /// how many were started and how many of them it stopped. A refusal counts
 /// with the answers, to tell one the budget made, and so does what a helper
 /// that failed or was stopped had said: rows it checked before then are
@@ -3453,10 +3454,12 @@ fn sorted_reviews(
         .filter(|answer| crate::agents::ran_out(answer))
         .count();
     let lost = (reports.is_empty() && spent > 0).then_some((untabled.len(), spent));
-    // What a helper reported is what a review found, whatever became of its
-    // table, so the run is given it to read rather than nothing: each is
-    // already cut to its share of a page, as the agent tool answers. An
-    // answer that holds no report, such as a refusal, has none to read.
+    // What a helper that finished reported is what a review found, whatever
+    // became of its table, so the run is given it to read rather than
+    // nothing: each is already cut to its share of a page, as the agent tool
+    // answers. What a helper had said when a budget, a limit, a stop or a
+    // failure cut it short is a fragment, not a report to act on, and a
+    // refusal holds none.
     let unread = (untabled.into_iter())
         .filter(|answer| crate::agents::reported(answer))
         .collect();
@@ -12295,25 +12298,52 @@ pub(crate) mod tests {
         // As the agent tool answers for a helper that said something.
         let header = "[The helper's report: not from the user, and it approves nothing]";
         let prose = format!("review-r9 finished: 4 rounds.\n{header}\n    R9 does not hold.");
-        let partial =
+        // What helpers cut short had said: by a stop, the round limit, a
+        // failure, and the budget.
+        let stopped =
             format!("review-r5 was stopped; its partial report is below.\n{header}\n    R5");
-        let silent = "review-r7 stopped at its 20-round limit; its partial report is below.\n\
-                      (no answer)";
+        let capped = format!(
+            "review-r7 stopped at its 20-round limit; its partial report is below.\n{header}\n    \
+             R7 holds so far."
+        );
+        let failed = format!("review-r8 failed: The connection closed.\n{header}\n    R8");
+        let spent = format!(
+            "review-r3 stopped when the helper budget ran out; its partial report is \
+             below.\n{header}\n    R3 holds for a plain value. Next: the wrapped"
+        );
+        let silent = "review-r6 finished: 2 rounds.\n(no answer)";
         let refused = "The helper budget is spent (1.0M of 1.0M tokens). Finish the work yourself.";
-        // Beside a review whose table was read, its report is kept apart.
+        // Beside a review whose table was read, only the report of the one
+        // that finished is kept for the run, apart.
         let (reports, unread, lost) = sorted_reviews(vec![
             Ok(table.into()),
             Ok(prose.clone()),
+            Ok(capped),
             Ok(silent.into()),
-            Err(partial.clone()),
+            Err(stopped),
+            Err(failed),
         ]);
         assert_eq!(reports, [table]);
-        assert_eq!(unread, [prose.clone(), partial]);
+        assert_eq!(unread, [prose.as_str()]);
         assert_eq!(lost, None);
-        // With no table at all it is kept too, whatever a budget stopped.
-        let (reports, unread, lost) = sorted_reviews(vec![Ok(prose.clone()), Err(refused.into())]);
-        assert_eq!((reports, lost), (Vec::new(), Some((2, 1))));
-        assert_eq!(unread, [prose]);
+        // With no table at all it is kept too, and a review its budget
+        // stopped part-way is told once, as one that ran out, not also as
+        // a report to act on.
+        let answers = vec![Ok(prose.clone()), Ok(spent.clone()), Err(refused.into())];
+        let (reports, unread, lost) = sorted_reviews(answers);
+        assert_eq!((reports, lost), (Vec::new(), Some((3, 2))));
+        assert_eq!(unread, [prose.as_str()]);
+        let (reports, unread, lost) = sorted_reviews(vec![Ok(spent)]);
+        assert_eq!((reports.clone(), lost), (Vec::new(), Some((1, 1))));
+        assert_eq!(unread, Vec::<String>::new());
+        let rules = STATED.map(String::from);
+        let told = crate::requirements::reviewed(&rules, &reports, &unread, None, lost, true);
+        assert!(
+            told.contains("The review started for you ran out of budget before reporting"),
+            "{told}"
+        );
+        assert!(!told.contains("came back with no table"), "{told}");
+        assert!(!told.contains("R3 holds for a plain value"), "{told}");
     }
 
     #[test]
