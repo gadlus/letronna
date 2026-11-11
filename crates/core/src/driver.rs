@@ -1032,6 +1032,12 @@ fn steps(
                     // is the work as it stands: the reviews may have left
                     // files in the project that would set the two apart.
                     let ran = test_run(spec, turn, false);
+                    // A command that cannot run here would not the next
+                    // time either, and could judge no second attempt.
+                    if matches!(ran, crate::spec_tests::Ran::Broken(_)) {
+                        tested = crate::spec_tests::RUNS;
+                        attempted = true;
+                    }
                     notice.content.push_str("\n\n");
                     notice.content.push_str(&crate::spec_tests::first_run(&ran));
                 }
@@ -1075,6 +1081,11 @@ fn steps(
                 let ran = runnable.then(|| test_run(spec, turn, true));
                 if let Some(ran) = &ran {
                     passed = matches!(ran, crate::spec_tests::Ran::Passed(_));
+                    // As above: told once, and not run again.
+                    if matches!(ran, crate::spec_tests::Ran::Broken(_)) {
+                        tested = crate::spec_tests::RUNS;
+                        attempted = true;
+                    }
                 }
                 if let Some(content) = tester_notice(spec, late, ran) {
                     spec.transcript.conversation.messages.push(Message {
@@ -2897,8 +2908,10 @@ fn spare_for_rebuild(spec: &Spec) -> bool {
 /// where both are there; the report with how the tests went, where they
 /// passed or could not be run, so the run still learns of them and where
 /// they are kept, and that it is to answer again, since what it says next
-/// is its answer; or what failed alone. None with neither, and none of a
-/// failure the run has no time left to fix, as `tested_work` keeps it.
+/// is its answer; or what failed alone; or, alone too, that the command
+/// itself could not run here, which the run would otherwise never learn.
+/// None with neither, and none of a failure the run has no time left to
+/// fix, as `tested_work` keeps it.
 fn tester_notice(
     spec: &Spec,
     late: Option<String>,
@@ -2906,6 +2919,7 @@ fn tester_notice(
 ) -> Option<String> {
     use crate::spec_tests::Ran;
     let failed = matches!(ran, Some(Ran::Failed(_)));
+    let broken = matches!(ran, Some(Ran::Broken(_)));
     let went = match &ran {
         Some(ran) if !failed => Some(crate::spec_tests::first_run(ran)),
         _ => None,
@@ -2922,6 +2936,9 @@ fn tester_notice(
             })
         }
         (None, Some(sent)) => Some(sent.content),
+        (None, None) if broken => {
+            went.map(|went| format!("{went} Then end with your whole answer again."))
+        }
         (None, None) => None,
     }
 }
@@ -3121,6 +3138,7 @@ enum Verdict {
 /// with the run's work kept and nothing said, when the first attempt passes
 /// after all, when the failures its output names are all in tests the
 /// tester did not write and fail on the project as it was too, when the
+/// command never got as far as a test (`spec_tests::unrunnable`), when the
 /// tests pass on the project as it was and
 /// so choose nothing, when the attempt's tests would import the first
 /// attempt's code, when the second attempt does not pass, ran no test or
@@ -3171,6 +3189,12 @@ fn second_attempt(spec: &Spec, turn: &Turn, head: &str) -> Option<(Message, bool
     let began = Instant::now();
     let first = crate::spec_tests::outcome(&kept, &command, &ctx, limit)?;
     if crate::spec_tests::unfinished_build(&command, &first) {
+        return None;
+    }
+    // A command that never reached a test chose nothing between the work
+    // and the project as it was, and would choose nothing of an attempt.
+    if crate::spec_tests::unrunnable(&first).is_some() {
+        crate::diag::event("second_attempt_skipped", &[("why", json!("unrunnable"))]);
         return None;
     }
     let (ended, output) = crate::spec_tests::failure(&first)?;
@@ -9951,6 +9975,48 @@ pub(crate) mod tests {
         assert!(count.load(Ordering::SeqCst) >= 1, "no attempt was started");
         assert!(!dir.join("letronna_spec_test.sh").exists());
         crate::spec_tests::tidy(id);
+        let _ = TcpStream::connect(address);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_second_attempt_is_made_over_a_test_command_that_could_not_run() {
+        let _data = data("second-attempt-unrunnable");
+        let dir = scratch("second-attempt-unrunnable");
+        let commit = committed(&dir);
+        let id = AGENTS + 1_936;
+        // Were an attempt started, its model call would reach this and be
+        // turned down at once, counted.
+        let (endpoint, address, count) = refusing();
+        let mut spec = own_run(endpoint, &dir, id);
+        spec.decide = Some(Arc::new(|_, _| gate::Outcome::Run));
+        let turn = Turn::new(spec.connection.clone());
+        // The runner is not installed, then a registry does not answer:
+        // the work and the project as it was fail alike, of neither's doing.
+        for script in [
+            "letronna-no-such-runner test made_letronna_spec.ts\n",
+            "echo ' ERR_PNPM_META_FETCH_FAIL  GET https://registry.npmjs.org/pnpm: \
+             getaddrinfo EAI_AGAIN registry.npmjs.org'; exit 1\n",
+        ] {
+            std::fs::write(dir.join("letronna_spec_test.sh"), script).unwrap();
+            let command = Some("sh ./*_test.sh".to_owned());
+            crate::spec_tests::keep(id, &dir, &dir, command).unwrap();
+            assert!(second_attempt(&spec, &turn, &commit).is_none());
+            assert_eq!(count.load(Ordering::SeqCst), 0, "{script}");
+            // The driver's own run of them says the same, as no failure.
+            let ran = test_run(&spec, &turn, true);
+            assert!(matches!(ran, crate::spec_tests::Ran::Broken(_)), "{ran:?}");
+            let told = tester_notice(&spec, None, Some(ran)).unwrap();
+            assert!(
+                told.contains("could not be run against your work"),
+                "{told}"
+            );
+            assert!(
+                told.ends_with("Then end with your whole answer again."),
+                "{told}"
+            );
+            crate::spec_tests::tidy(id);
+        }
         let _ = TcpStream::connect(address);
     }
 
