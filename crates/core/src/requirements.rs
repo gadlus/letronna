@@ -687,6 +687,20 @@ fn unrun(cell: &str) -> bool {
     rest.is_some_and(|rest| !rest.starts_with(char::is_alphabetic))
 }
 
+/// Whether a row's first `cell` names requirements and nothing else, as
+/// `R4`, `R4/R5` and `R4 and R5` do, where a sentence that opens with a
+/// requirement's number goes on in other words.
+fn numbered(cell: &str) -> bool {
+    let mut words = (cell.split(|c: char| !c.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .peekable();
+    let names = |word: &str| {
+        let digits = word.strip_prefix('R').unwrap_or_default();
+        word == "and" || (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    };
+    words.peek().is_some() && words.all(names)
+}
+
 /// The cell of a row's `cells` that gives its verdict, and the word it
 /// gives. A cell that is the word alone wins, the first of them, as a
 /// review is asked to write it; with none, a cell that holds the word and
@@ -694,13 +708,16 @@ fn unrun(cell: &str) -> bool {
 /// passed, since a failed row read as passed is the worse mistake. The
 /// cell after the number is the case wherever more cells follow it, so
 /// whatever it quotes it gives a verdict only as the row's last, and a row
-/// a cell of which says the test was not run (`unrun`) has none to give.
+/// a cell of which says the test was not run (`unrun`) has none to give,
+/// nor has a line whose first cell holds more than requirements' numbers
+/// (`numbered`), which is a sentence a bar in its code happened to cut.
 fn judged<'a>(cells: &[&'a str]) -> Option<(usize, &'a str)> {
     let later = || cells.iter().copied().enumerate().skip(1);
     if let Some(alone) = later().find(|(_, cell)| verdict(cell).is_some()) {
         return Some(alone);
     }
-    if later().any(|(_, cell)| unrun(cell)) {
+    let row = cells.first().is_some_and(|cell| numbered(cell));
+    if !row || later().any(|(_, cell)| unrun(cell)) {
         return None;
     }
     let said = |(at, cell)| {
@@ -1798,6 +1815,39 @@ mod tests {
         assert!(!tabled(
             "R1 | exact count | FAIL:**2** rows where 3 were asked for"
         ));
+    }
+
+    #[test]
+    fn a_sentence_that_opens_with_a_requirements_number_is_no_row() {
+        // A bar inside a code span cuts a cell as any bar does, so a
+        // sentence of the report can end in what looks like a verdict's cell.
+        for prose in [
+            "R1: handles `a | b` — FAIL",
+            "R3 is right but for `a | b`, where the summary line reads — PASS (3)",
+            "R2 holds for a plain value, and for `a | b` too — PASS",
+        ] {
+            assert!(!tabled(prose), "{prose}");
+        }
+        // A row's first cell names requirements alone, however many.
+        let read = |row: &str| {
+            rows(row)
+                .first()
+                .map(|(number, passed, _)| (*number, *passed))
+        };
+        assert_eq!(read("R1 | handles `a | b` — FAIL"), Some((1, false)));
+        assert_eq!(
+            read("| **R4** / R5 | both ends | PASS — `t.sh` |"),
+            Some((4, true))
+        );
+        assert_eq!(read("R4 and R5 | both ends — PASS"), Some((4, true)));
+        // The bar inside a span still cuts: a row written whole in one, as
+        // the brief shows a row, is read, and so is one whose first cell
+        // says more beside a verdict alone in its cell.
+        assert_eq!(read("`R1 | case | FAIL | node check.js`"), Some((1, false)));
+        assert_eq!(
+            read("R2 `test_iter` | it is an iterator | FAIL"),
+            Some((2, false))
+        );
     }
 
     #[test]
