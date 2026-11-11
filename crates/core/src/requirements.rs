@@ -661,9 +661,15 @@ fn closes(cell: &str) -> Option<(&str, &str, &str)> {
 
 /// What a table's `cell` holds when it gives a verdict and more: the case
 /// before the word, the word, and what shows it after (`opens`, `closes`).
+/// One that says PASS and goes on to say FAIL or UNCLEAR in capitals says
+/// both, so it gives no verdict rather than a wrong one.
 fn carried(cell: &str) -> Option<(&str, &str, &str)> {
     let opened = opens(cell).map(|(word, shows)| ("", word, shows));
-    opened.or_else(|| closes(cell))
+    let (case, word, shows) = opened.or_else(|| closes(cell))?;
+    let denies = |said: &str| verdict(said) == Some(false) && !said.contains(char::is_lowercase);
+    let both = verdict(word) == Some(true)
+        && (shows.split(|c: char| !c.is_ascii_alphabetic())).any(denies);
+    (!both).then_some((case, word, shows))
 }
 
 /// The cell of a row's `cells` that gives its verdict, and the word it
@@ -1710,6 +1716,30 @@ mod tests {
         // Of two that hold more, no row is passed while one says otherwise.
         let failed = "R1 | a passing test is marked — PASS | FAIL — not marked";
         assert!(!rows(failed)[0].1);
+    }
+
+    #[test]
+    fn a_cell_that_passes_a_case_and_then_doubts_or_fails_it_gives_no_verdict() {
+        // As a review wrote one: the pass, then a doubt it had beside it.
+        for both in [
+            "R1 | set once | PASS (stays on the second hop); other keys untested — UNCLEAR",
+            "R1 | the exit code | PASS — though the summary line FAILS to print",
+            "R1 | the count is kept — PASS (UNCLEAR for a count of 0)",
+        ] {
+            assert!(!tabled(both), "{both}");
+        }
+        // A word of prose is no second verdict, and a row that fails or is
+        // left unclear stays so whatever it says of passing.
+        let read = |row: &str| (rows(row)[0].1, left_unclear(row));
+        let passed = "R1 | the exit code | PASS — fails before the change, as it should";
+        assert_eq!(read(passed), (true, false));
+        let failed = "R1 | the exit code | FAIL — the line reads PASS where it should not";
+        assert_eq!(read(failed), (false, false));
+        let doubted = "R1 | which end | UNCLEAR — PASS on one reading, FAIL on the other";
+        assert_eq!(read(doubted), (false, true));
+        // Alone in its cell the word is the verdict, whatever shows it says.
+        let alone = "R1 | a failing test | PASS | prints `FAIL: 1` for it";
+        assert_eq!(read(alone), (true, false));
     }
 
     #[test]
