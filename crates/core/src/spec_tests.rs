@@ -985,8 +985,8 @@ pub(crate) fn discard(copy: &Path) {
 /// nothing of the work, and told to keep it that way: anything the request
 /// spells out is used as it spells it, and code is read in `before`, the
 /// project as it was, where there is one, each case the run weighed and
-/// set aside, `doubts`, to test, and the words it read more than one way,
-/// `readings`, to test in each reading.
+/// set aside, `doubts`, to test where the request's words decide it, and
+/// the words it read more than one way, `readings`, to test in each reading.
 pub(crate) fn brief(
     request: &str,
     sentences: &[String],
@@ -1018,7 +1018,7 @@ pub(crate) fn brief(
     let rows = "`R1 | what it checks | PASS` or `R1 | what it checks | FAIL | command that \
                 runs it | what it expected and what it got`";
     let mut text = briefing(request, sentences, &opening, unnamed, outcome, rows);
-    text.push_str(&crate::doubts::section(doubts));
+    text.push_str(&crate::doubts::section(doubts, true));
     text.push_str(&crate::doubts::reading_tests(readings));
     text
 }

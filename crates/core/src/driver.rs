@@ -8837,9 +8837,25 @@ pub(crate) mod tests {
             .collect();
         // The task is quoted to the helper indented, so its lines are
         // matched apart.
-        let heading = "weighed and set aside, with its reasons withheld; each needs a row \
-                       (and, for the tester, a test) of its own, judged by the request's words:";
-        for helper in ["review", "tester"] {
+        // Each is told what a case the request does not decide asks of it:
+        // a row that passes of a review, and no test of a tester.
+        let headings = [
+            (
+                "review",
+                "weighed and set aside, with its reasons withheld; each needs a row of its own, \
+                 judged by the request's words where they say what should happen in it, and \
+                 written PASS, with `not asked` in the cell after, where they do not, since a \
+                 gap the project had before the change that the request does not ask to close \
+                 is no failure:",
+            ),
+            (
+                "tester",
+                "weighed and set aside, with its reasons withheld; each needs a test of its \
+                 own, with its row, where the request's words say what should happen in it, \
+                 and no test where they do not:",
+            ),
+        ];
+        for (helper, heading) in headings {
             let task = (tasks.iter())
                 .find(|task| task.contains(&format!("You are a helper ({helper}).")))
                 .unwrap_or_else(|| panic!("no {helper} in {tasks:?}"));

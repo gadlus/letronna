@@ -394,15 +394,29 @@ pub(crate) fn doubts(messages: &[Message]) -> Vec<String> {
     found.drain(first..).map(|(_, case)| cut(&case)).collect()
 }
 
-/// The section a helper's brief ends with for `doubts`; empty with none.
-pub(crate) fn section(doubts: &[String]) -> String {
+/// The section a helper's brief ends with for `doubts`, a review's or a
+/// `tester`'s; empty with none. Each is told where a case asks nothing of
+/// the work: on a benchmark run a review failed a row made from such a case
+/// for a gap the project had before the change, which the request never
+/// mentions, and closing it broke the project's own tests.
+pub(crate) fn section(doubts: &[String], tester: bool) -> String {
     if doubts.is_empty() {
         return String::new();
     }
-    let mut text = String::from(
-        "\n\nCases the author weighed and set aside, with its reasons withheld; each needs a \
-         row (and, for the tester, a test) of its own, judged by the request's words:",
-    );
+    let asked = match tester {
+        true => "each needs a test of its own, with its row, where the request's words say \
+                 what should happen in it, and no test where they do not:"
+            .to_owned(),
+        false => format!(
+            "each needs a row of its own, judged by the request's words where they say what \
+             should happen in it, and written PASS, with `{}` in the cell after, where they do \
+             not, since a gap the project had before the change that the request does not ask \
+             to close is no failure:",
+            crate::requirements::NOT_ASKED
+        ),
+    };
+    let mut text =
+        format!("\n\nCases the author weighed and set aside, with its reasons withheld; {asked}");
     for doubt in doubts {
         text.push_str(&format!("\n- {doubt}"));
     }
@@ -1180,15 +1194,47 @@ mod tests {
 
     #[test]
     fn the_section_lists_each_case_and_is_empty_without_one() {
-        assert_eq!(section(&[]), "");
-        let text = section(&["Empty `name`?".to_owned()]);
+        let cases = ["Empty `name`?".to_owned()];
+        for tester in [false, true] {
+            assert_eq!(section(&[], tester), "");
+            let text = section(&cases, tester);
+            assert!(
+                text.starts_with(
+                    "\n\nCases the author weighed and set aside, with its reasons withheld; \
+                     each needs a "
+                ),
+                "{text}"
+            );
+            assert!(text.ends_with(":\n- Empty `name`?"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_case_set_aside_that_the_request_does_not_decide_asks_nothing_of_the_work() {
+        let cases = ["Empty `name`?".to_owned()];
+        // A review judges it where the words decide it, and passes it in a
+        // set form where they do not: a gap the request leaves is no failure.
+        let review = section(&cases, false);
         assert!(
-            text.starts_with("\n\nCases the author weighed and set aside"),
-            "{text}"
+            review.contains(
+                "each needs a row of its own, judged by the request's words where they say \
+                 what should happen in it, and written PASS, with `not asked` in the cell \
+                 after, where they do not, since a gap the project had before the change that \
+                 the request does not ask to close is no failure:\n- "
+            ),
+            "{review}"
         );
+        assert!(review.contains(crate::requirements::NOT_ASKED), "{review}");
+        assert!(!review.contains("test"), "{review}");
+        // A tester writes a test only where the words decide the case.
+        let tester = section(&cases, true);
         assert!(
-            text.ends_with("judged by the request's words:\n- Empty `name`?"),
-            "{text}"
+            tester.contains(
+                "each needs a test of its own, with its row, where the request's words say \
+                 what should happen in it, and no test where they do not:\n- "
+            ),
+            "{tester}"
         );
+        assert!(!tester.contains("PASS"), "{tester}");
     }
 }

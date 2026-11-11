@@ -73,11 +73,13 @@ macro_rules! cases {
 /// run itself tends to check only the paths it built, with its own code. Its
 /// table, a row per numbered requirement and case, is what `unchecked`
 /// holds the run to afterwards: a helper asked only for what fails samples
-/// cases, and files the ones it is unsure of as asides.
+/// cases, and files the ones it is unsure of as asides. A case the run set
+/// aside fails only where the request's words decide it, and passes with
+/// `NOT_ASKED` where they do not.
 const REVIEW: &str = concat!(
     "First ask a helper that hasn't seen your work: with the agent tool, start a helper of type `review`, not general, and wait for its report. Give it the request word for word, the numbered requirements above, the files you changed or made and each case you chose not to handle, with why. Ask it to change no file, to work out each value it checks with code of its own, not your scripts or helpers, and to end its report with a table of one row per requirement and case, the verdict alone in its cell and what shows it in the cell after, written `R1 | case | PASS` or `R1 | case | FAIL | command that shows it`, with a row for each of these cases that applies: ",
     cases!(),
-    " and each case you chose not to handle, which fails when the request's words say what should happen in it, quoted in the row, whatever the reason it was set aside. Ask it to write any doubt, caveat or problem it notices beyond those rows as a row of its own, `R1 | case | UNCLEAR | what it doubts`, never only prose, and the same for a row that can only pass by bending another requirement's words. Judge each row by what the request says should happen, not by what the code now does. Fix every row that fails by changing the work, not the case, and any case it calls unclear or sets aside, unless the request rules that case out."
+    " and each case you chose not to handle, which fails when the request's words say what should happen in it, quoted in the row, whatever the reason it was set aside, and passes, written `R1 | case | PASS | not asked`, when they do not: a gap the project had before your change that the request does not ask to close is no failure. Ask it to write any doubt, caveat or problem it notices beyond those rows as a row of its own, `R1 | case | UNCLEAR | what it doubts`, never only prose, and the same for a row that can only pass by bending another requirement's words. Judge each row by what the request says should happen, not by what the code now does. Fix every row that fails by changing the work, not the case, and any case it calls unclear or sets aside, unless the request rules that case out."
 );
 
 /// The least time a run with a deadline needs left to be asked for the
@@ -436,7 +438,7 @@ pub(crate) fn brief(
          prescribe no fix.",
         cases!()
     ));
-    text.push_str(&crate::doubts::section(doubts));
+    text.push_str(&crate::doubts::section(doubts, false));
     // Only the readings of its own rows, as the requirements are shared.
     let own: Vec<_> = (readings.iter())
         .filter(|reading| whole || (first..=last).contains(&reading.number))
@@ -802,9 +804,18 @@ const SHRUGS: &[&str] = &[
 /// The most words a reading cell made only of `SHRUGS` has.
 const SHRUG_WORDS: usize = 3;
 
-/// The reading cell of a row the request states nothing on, which the run
-/// leaves as it is: silence is no ground for a late change of behaviour.
+/// The reading cell of the line a run answers a row with when the request
+/// states nothing on it and the run leaves it as it is: silence is no ground
+/// for a late change of behaviour. It is the run's word in its own answer,
+/// where `NOT_ASKED` is a review's in its table.
 const NOT_STATED: &str = "not stated";
+
+/// What a review writes in the cell after PASS for a case the run set aside
+/// that the request's words do not decide. On a benchmark run a row made
+/// from such a case failed for a gap the project had before the change,
+/// which the request never mentions, and closing it broke the project's
+/// own tests.
+pub(crate) const NOT_ASKED: &str = "not asked";
 
 /// The longest row a follow-up quotes, in characters.
 const ROW_CHARS: usize = 300;
@@ -2711,10 +2722,40 @@ mod tests {
         // and each row is judged by the request rather than by the code.
         assert!(REVIEW.contains("fails when the request's words say what should happen in it"));
         assert!(REVIEW.contains("not by what the code now does"));
+        // One the request's words do not decide passes, in a review's own
+        // word for it: a gap the request leaves open is no failure.
+        let passes = format!(
+            "whatever the reason it was set aside, and passes, written `R1 | case | PASS | \
+             {NOT_ASKED}`, when they do not: a gap the project had before your change that the \
+             request does not ask to close is no failure. Ask it to write any doubt"
+        );
+        assert!(REVIEW.contains(&passes), "{REVIEW}");
         // What the run set aside goes to the helper, and a failed row is fixed
         // in the work.
         assert!(REVIEW.contains("each case you chose not to handle, with why"));
         assert!(REVIEW.contains("by changing the work, not the case"));
+    }
+
+    #[test]
+    fn a_case_set_aside_that_the_request_does_not_ask_for_is_a_row_that_passed() {
+        let row = format!("R3 | a name with nothing in it | PASS | {NOT_ASKED}");
+        assert_eq!(rows(&row), [(3, true, row.clone())]);
+        // It holds the run to nothing, laid out with bars or without.
+        let table = format!("R1 | plain | PASS\n| R2 | wrapped | PASS |\n| {row} |");
+        assert_eq!(unchecked(&table, 3), None);
+        // A review started for the run is asked for it in the same word.
+        let rules: Vec<String> = ["Names must parse.".to_owned()].into();
+        let cases = ["Empty `name`?".to_owned()];
+        let asked = brief("Names must parse.", &rules, (1, 1), &cases, &[]);
+        let word = format!("written PASS, with `{NOT_ASKED}` in the cell after");
+        assert!(asked.contains(&word), "{asked}");
+        // It is a review's word in its table, and `NOT_STATED` the run's in
+        // a line of its answer: neither is asked for where the other is.
+        assert!(!REVIEW.contains(NOT_STATED), "{REVIEW}");
+        assert!(!asked.contains(NOT_STATED), "{asked}");
+        let sent = unchecked("R1 | plain | UNCLEAR | which end", 1).unwrap();
+        assert!(sent.contains(NOT_STATED), "{sent}");
+        assert!(!sent.contains(NOT_ASKED), "{sent}");
     }
 
     #[test]
