@@ -255,7 +255,17 @@ const PAST: &[&str] = &["was", "were", "previously"];
 /// Words, in lower case and without their stop, after which a stop ends no
 /// sentence.
 const ABBREVIATIONS: &[&str] = &[
-    "e.g", "i.e", "eg", "ie", "etc", "vs", "cf", "approx", "incl", "esp", "resp", "no", "fig", "al",
+    "e.g", "i.e", "eg", "ie", "etc", "vs", "cf", "approx", "incl", "esp", "resp", "no", "fig",
+    "al", "a.k.a", "aka", "w.r.t", "wrt", "viz",
+];
+
+/// Words, in lower case and without their stop, that are as often a whole
+/// word ending a sentence as a short form, as "max" is: a stop after one
+/// ends no sentence before a word in lower case, name or not, as in "The
+/// min. chunk_size must be 4 bytes."
+const SHORTENED: &[&str] = &[
+    "min", "max", "ver", "ex", "excl", "eq", "sec", "ref", "est", "avg", "num", "pos", "neg",
+    "temp", "misc",
 ];
 
 /// What a code span stands as while a sentence's words are weighed: one word
@@ -894,7 +904,8 @@ pub(crate) fn split(text: &str) -> Vec<&str> {
                 // as "isolate scopes. state_data is injected" shows.
                 b'.' => {
                     ABBREVIATIONS.contains(&last.as_str())
-                        || (next.is_some_and(char::is_lowercase) && !namelike(word))
+                        || (next.is_some_and(char::is_lowercase)
+                            && (!namelike(word) || SHORTENED.contains(&last.as_str())))
                 }
                 // A bang is as often part of what is written out, as in "and
                 // ! (complement)" or "emits Bail out! ERROR message".
@@ -1378,6 +1389,25 @@ mod tests {
                        returns `None` when the file must not be read.\n\n\
                        e.g. the cache must never be read twice.";
         assert_eq!(sentences(request), ["The loader must accept tabs."]);
+    }
+
+    #[test]
+    fn a_short_form_before_a_name_ends_no_sentence() {
+        for request in [
+            "The min. chunk_size must be 4 bytes.",
+            "Up to the max. retry_count is allowed, a.k.a. maxRetries in the config.",
+            "Compare it w.r.t. base_url only, as in ver. v2_schema and ex. get_user().",
+        ] {
+            assert_eq!(split(request), [request]);
+        }
+        // As a whole word one still ends a sentence before a capital.
+        assert_eq!(
+            split("Each value is capped at the max. Values above it must be rejected."),
+            [
+                "Each value is capped at the max.",
+                "Values above it must be rejected.",
+            ]
+        );
     }
 
     #[test]

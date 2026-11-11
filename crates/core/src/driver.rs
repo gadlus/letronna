@@ -10516,7 +10516,8 @@ pub(crate) mod tests {
         let kept = kept_ahead(&spec, &folder, Some(&report)).unwrap();
         assert_eq!(kept.files, ["letronna_spec_test.sh"]);
         // The run is told to fix a test of the tester's where it is kept,
-        // so the file, and the folder for a helper beside it, are its own.
+        // so the file and its folder are its own to write in. Only the
+        // files listed as they were kept are put back to run.
         let own = context(&spec);
         assert!(crate::taint::own(&own, &kept.dir.join(&kept.files[0])));
         assert!(crate::taint::own(&own, &kept.dir));
