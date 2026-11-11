@@ -626,7 +626,11 @@ fn opens(cell: &str) -> Option<(&str, &str)> {
         '—' | '–' => true,
         // A bracket holds what shows it, so it stays, and ends the cell.
         '(' => return said.ends_with(')').then_some((word, said)),
-        ':' | '.' => after.next().is_none_or(char::is_whitespace),
+        // Bold may close after the mark, as in `**FAIL:** why`.
+        ':' | '.' => {
+            let next = after.as_str().trim_start_matches('*').chars().next();
+            next.is_none_or(char::is_whitespace)
+        }
         // Set off by a space, as no hyphen inside a word is.
         '-' => said.len() < rest.len(),
         // Before a bar escaped to keep the row in one column of a table,
@@ -635,7 +639,7 @@ fn opens(cell: &str) -> Option<(&str, &str)> {
         _ => false,
     };
     let said = said.trim_start_matches(['—', '–', ':', '.', '-', '\\']);
-    goes_on.then_some((word, said.trim_start()))
+    goes_on.then_some((word, said.trim_start_matches('*').trim_start()))
 }
 
 /// The verdict's word a table's `cell` ends with, the case before it and
@@ -1761,6 +1765,39 @@ mod tests {
         // Alone in its cell the word is the verdict, whatever shows it says.
         let alone = "R1 | a failing test | PASS | prints `FAIL: 1` for it";
         assert_eq!(read(alone), (true, false));
+    }
+
+    #[test]
+    fn a_verdict_in_bold_that_closes_after_its_mark_is_read() {
+        let report = "| R1 | exact count | **FAIL:** got 2 |\n\
+                      | R2 | empty input | **PASS —** `[]` |\n\
+                      | R3 | later step first | *UNCLEAR.* The request sets no order |\n\
+                      | R4 | exact message | FAIL — **not** the one asked for |";
+        let found: Vec<(usize, bool, bool)> = (rows(report).into_iter())
+            .map(|(number, passed, row)| (number, passed, left_unclear(&row)))
+            .collect();
+        let read = [
+            (1, false, false),
+            (2, true, false),
+            (3, false, true),
+            (4, false, false),
+        ];
+        assert_eq!(found, read);
+        // Written again, what shows it comes without the verdict's marks
+        // and with its own.
+        let again = cut_rows(report, "cut").unwrap();
+        assert!(
+            again.ends_with(
+                "\nR1 | exact count | FAIL | got 2\nR2 | empty input | PASS\n\
+                 R3 | later step first | UNCLEAR | The request sets no order\n\
+                 R4 | exact message | FAIL | **not** the one asked for"
+            ),
+            "{again}"
+        );
+        // A colon run into bold words is no mark after a verdict.
+        assert!(!tabled(
+            "R1 | exact count | FAIL:**2** rows where 3 were asked for"
+        ));
     }
 
     #[test]
