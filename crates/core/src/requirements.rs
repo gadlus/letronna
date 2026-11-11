@@ -65,7 +65,7 @@ macro_rules! cases {
 /// holds the run to afterwards: a helper asked only for what fails samples
 /// cases, and files the ones it is unsure of as asides.
 const REVIEW: &str = concat!(
-    "First ask a helper that hasn't seen your work: with the agent tool, start a helper of type `review`, not general, and wait for its report. Give it the request word for word, the numbered requirements above, the files you changed or made and each case you chose not to handle, with why. Ask it to change no file, to work out each value it checks with code of its own, not your scripts or helpers, and to end its report with a table of one row per requirement and case, written `R1 | case | PASS` or `R1 | case | FAIL | command that shows it`, with a row for each of these cases that applies: ",
+    "First ask a helper that hasn't seen your work: with the agent tool, start a helper of type `review`, not general, and wait for its report. Give it the request word for word, the numbered requirements above, the files you changed or made and each case you chose not to handle, with why. Ask it to change no file, to work out each value it checks with code of its own, not your scripts or helpers, and to end its report with a table of one row per requirement and case, the verdict alone in its cell and what shows it in the cell after, written `R1 | case | PASS` or `R1 | case | FAIL | command that shows it`, with a row for each of these cases that applies: ",
     cases!(),
     " and each case you chose not to handle, which fails when the request's words say what should happen in it, quoted in the row, whatever the reason it was set aside. Ask it to write any doubt, caveat or problem it notices beyond those rows as a row of its own, `R1 | case | UNCLEAR | what it doubts`, never only prose, and the same for a row that can only pass by bending another requirement's words. Judge each row by what the request says should happen, not by what the code now does. Fix every row that fails by changing the work, not the case, and any case it calls unclear or sets aside, unless the request rules that case out."
 );
@@ -412,7 +412,8 @@ pub(crate) fn brief(
     };
     text.push_str(&format!(
         "\n\nCheck {rows}. End your report with a table of one row per requirement and \
-         case, written `R{first} | case | PASS` or `R{first} | case | FAIL | command that \
+         case, the verdict alone in its cell and what shows it in the cell after, written \
+         `R{first} | case | PASS` or `R{first} | case | FAIL | command that \
          shows it`, with a row for each of these cases that applies: {} and each case the \
          change leaves out or handles more narrowly than the request's words, which fails \
          when those words say what should happen in it, quoted in the row. Any doubt about a \
@@ -1798,6 +1799,20 @@ mod tests {
             "{part}"
         );
         assert!(part.contains("written `R2 | case | PASS`"), "{part}");
+    }
+
+    #[test]
+    fn a_review_is_asked_for_the_verdict_alone_in_its_cell() {
+        // What shows a row goes in the cell after, where a helper left to
+        // itself writes it on after the verdict, as `PASS — what shows it`.
+        let alone = "a table of one row per requirement and case, the verdict alone in its \
+                     cell and what shows it in the cell after, written `R1 | case | PASS` or \
+                     `R1 | case | FAIL | command that shows it`, with a row for each";
+        let rules: Vec<String> = ["Dates must parse.".to_owned()].into();
+        let asked = brief("Dates must parse.", &rules, (1, 1), &[]);
+        assert!(asked.contains(alone), "{asked}");
+        // The run that starts a review itself asks its helper for the same.
+        assert!(REVIEW.contains(alone), "{REVIEW}");
     }
 
     #[test]

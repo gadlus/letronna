@@ -1111,7 +1111,8 @@ fn briefing(
     // runs it for reasons of its own, such as a variable the run's commands
     // set.
     text.push_str(&format!(
-        "\n\nEnd your report with a table of one row per test, written {rows}. Then, on a \
+        "\n\nEnd your report with a table of one row per test, the verdict alone in its \
+         cell, written {rows}. Then, on a \
          line of its own as the report's very last line, the one command that, from the \
          project's root, runs your tests and no others, with paths relative to it, written \
          `Run: <command>`, with any variable your own test commands needed, such as a module \
@@ -4373,6 +4374,14 @@ mod tests {
         let table = brief
             .find("End your report with a table of one row per test")
             .unwrap();
+        // With each verdict alone in its cell, as the driver reads it.
+        assert!(
+            brief.contains(
+                "a table of one row per test, the verdict alone in its cell, written `R1 | \
+                 what it checks | PASS` or `R1 | what it checks | FAIL | command that runs it"
+            ),
+            "{brief}"
+        );
         let run = brief.find("written `Run: <command>`").unwrap();
         assert!(table < run, "{brief}");
         assert!(brief.ends_with("so what comes last is kept."), "{brief}");
@@ -6110,7 +6119,11 @@ mod tests {
             "{brief}"
         );
         assert!(brief.contains("written `Run: <command>`"), "{brief}");
-        assert!(brief.contains("`R1 | what it checks | NOT RUN`"), "{brief}");
+        assert!(
+            brief
+                .contains("the verdict alone in its cell, written `R1 | what it checks | NOT RUN`"),
+            "{brief}"
+        );
         assert!(
             brief.contains(
                 "not yet implemented`: none can pass before the change, and one that does \
