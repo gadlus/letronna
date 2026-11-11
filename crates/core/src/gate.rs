@@ -590,6 +590,18 @@ fn ladder(
             Outcome::Run
         };
     }
+    // A page handed to the user (browse's hand_over) is a wait for them at
+    // what only they can do there, a password or a check that they are
+    // human: their yes says they are done, so no mode, grant or judge gives
+    // it for them. With nobody there, or no way for them to reach the page,
+    // the tool says so and the run goes on without it.
+    if crate::browser::hands_over(tool.name(), &args) {
+        return if gate.human && crate::browser::can_hand_over() {
+            Outcome::Ask
+        } else {
+            Outcome::Run
+        };
+    }
     // A workflow sets many helpers off at once, so a person looks at its
     // card in every mode: no setting, grant, rule or judge starts one.
     if tool.name() == "workflow" {
@@ -2718,6 +2730,43 @@ mod tests {
                 queued.name
             );
         }
+    }
+
+    #[test]
+    fn a_page_handed_over_is_put_to_whoever_can_take_it_in_every_mode() {
+        let ctx = ToolContext::default();
+        let none = Grants::new();
+        let granted = Grants::from([(0, HashSet::from(["browse".to_owned()]))]);
+        let hand = call(
+            "browse",
+            serde_json::json!({ "action": "hand_over", "why": "sign in to your account" }),
+        );
+        let decided = |skip_approvals: bool, grants: &Grants, human: bool| {
+            let gate = Gate {
+                ctx: &ctx,
+                mode: if skip_approvals {
+                    Mode::Bypass
+                } else {
+                    Mode::Default
+                },
+                grants,
+                human,
+                rules: &[],
+                broken: None,
+            };
+            decide(&hand, &gate)
+        };
+        // Where the user's hands reach the page: asked, whatever the mode
+        // and whatever was allowed, since their yes says they are done.
+        crate::browser::HANDS_PASSED_ON.set(true);
+        assert_eq!(decided(true, &none, true), Outcome::Ask);
+        assert_eq!(decided(false, &granted, true), Outcome::Ask);
+        assert_eq!(decided(true, &granted, true), Outcome::Ask);
+        // With nobody there it runs, and the tool says nobody took the page.
+        assert_eq!(decided(true, &none, false), Outcome::Run);
+        // A browser nobody can reach is not put to anyone either.
+        crate::browser::HANDS_PASSED_ON.set(false);
+        assert_eq!(decided(true, &none, true), Outcome::Run);
     }
 
     #[test]
