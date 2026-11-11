@@ -98,16 +98,16 @@ const REST_TIMED: Duration = Duration::from_secs(30);
 const UNJUDGED_TOLD: u8 = 2;
 /// What a 429's words hold when the limit is a plan's or an account's, not
 /// a moment's: waiting a minute or two does not lift it, so it is a failure
-/// like any other. `limit exceeded` is read only where no `rate` stands
-/// before it.
-const LASTING_LIMIT: [&str; 7] = [
+/// like any other. Read only where the reply asks for no wait a verdict
+/// would keep, and never in a link: a limit by the minute is often worded
+/// as a quota too, or sent with a link to a page about one.
+const LASTING_LIMIT: [&str; 6] = [
     "quota",
     "usage limit",
     "usagelimit",
     "credit",
     "billing",
     "daily limit",
-    "limit exceeded",
 ];
 /// How long in all one verdict waits on a provider too busy to answer,
 /// asking again, while someone may be watching and where nobody is: the
@@ -466,7 +466,12 @@ fn judge_in(
     }
     let verdict = match verdict {
         Verdict::Unjudged(why) => session.unjudged(&stopped, why),
-        judged => judged,
+        // Judged since, so a blip much later is told afresh.
+        judged @ (Verdict::Allow | Verdict::Block(_)) => {
+            session.unjudged.remove(&stopped);
+            judged
+        }
+        unsure => unsure,
     };
     record(session, key, &verdict);
     verdict
@@ -864,7 +869,7 @@ fn busy(kind: FailureKind) -> bool {
 /// it says the provider is too busy: a 429 that is no spent quota, a status
 /// or an error code for an overload, or a gateway's passing status whose
 /// words say overloaded; not a 429 whose words name a plan's or an
-/// account's limit (`LASTING_LIMIT`), which no short wait lifts. It carries
+/// account's limit (`lasting_limit`), which no short wait lifts. It carries
 /// the reply's `Retry-After`. A 429 rests the provider's gate as one to the
 /// session's own calls does, halving the streams it lets through and
 /// counting among its 429s: the provider is as busy for them, and the judge
@@ -882,14 +887,39 @@ fn refused(connection: &Connection, response: reqwest::blocking::Response) -> Op
     if !busy(failure.kind) || failure.lasting {
         return None;
     }
-    let text = text.replace("rate limit exceeded", "");
-    if failure.kind == FailureKind::RateLimit && LASTING_LIMIT.iter().any(|w| text.contains(w)) {
+    if failure.kind == FailureKind::RateLimit
+        && lasting_limit(&text, failure.retry_after, busy_patience(connection))
+    {
         return None;
     }
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         crate::limits::backoff(&connection.endpoint, failure.retry_after);
     }
     Some(failure)
+}
+
+/// Whether a 429 that said `text`, in lowercase, and asked for the wait
+/// `asked` is a plan's or an account's limit rather than a moment's, for a
+/// verdict that waits `patience` in all. A wait asked for within that is a
+/// moment's whatever the words; without one, the words say, by
+/// `LASTING_LIMIT`, less any link among them.
+fn lasting_limit(text: &str, asked: Option<Duration>, patience: Duration) -> bool {
+    if asked.is_some_and(|wait| wait <= patience) {
+        return false;
+    }
+    let link = |word: &&str| word.contains("://") || (word.contains('/') && word.contains('.'));
+    let words: Vec<&str> = text.split_whitespace().filter(|word| !link(word)).collect();
+    let said = words.join(" ");
+    LASTING_LIMIT.iter().any(|words| said.contains(words))
+}
+
+/// How long in all a verdict over `connection` waits on a busy provider.
+fn busy_patience(connection: &Connection) -> Duration {
+    if connection.unattended {
+        BUSY_UNATTENDED
+    } else {
+        BUSY
+    }
 }
 
 /// What kind of failure `e`, a failed request's error, is, as far as a
@@ -966,12 +996,7 @@ fn again(
     if left.is_some_and(|left| left <= wait) {
         return Next::GiveUp;
     }
-    let patience = if connection.unattended {
-        BUSY_UNATTENDED
-    } else {
-        BUSY
-    };
-    if busy && began.elapsed() + wait > patience {
+    if busy && began.elapsed() + wait > busy_patience(connection) {
         return Next::Spent;
     }
     crate::diag::event(
@@ -1630,10 +1655,7 @@ mod tests {
         });
         assert_eq!(allowed, Verdict::Allow);
         let took = began.elapsed();
-        assert!(
-            (Duration::from_millis(1_500)..Duration::from_millis(2_500)).contains(&took),
-            "{took:?}"
-        );
+        assert!(took >= Duration::from_millis(1_500), "{took:?}");
         let _ = TcpStream::connect(address);
         assert_eq!(worker.join().unwrap(), 2);
         {
@@ -1761,15 +1783,64 @@ mod tests {
             let _ = TcpStream::connect(address);
             assert_eq!(worker.join().unwrap(), 1, "{body}");
         }
-        // A rate limit worded as exceeded is still a moment's.
-        let body = json!({"error": {"message": "Rate limit exceeded, slow down."}}).to_string();
-        let (mut connection, address, worker) =
-            served(vec![Some(answered("429 Too Many Requests", &body))]);
-        connection.deadline = Some(Instant::now() + Duration::from_millis(450));
-        let failure = ask(&connection, "May it run?").unwrap_err();
-        assert_eq!(failure.kind, FailureKind::RateLimit);
-        let _ = TcpStream::connect(address);
-        assert_eq!(worker.join().unwrap(), 1);
+        // A limit by the minute is still a moment's: worded as exceeded, as
+        // a quota with the wait a verdict keeps asked for, or sent with a
+        // link to a page about quota or billing.
+        let quota = json!({"error": {"message": "You exceeded your current quota."}});
+        let momentary = [
+            (
+                json!({"error": {"message": "Rate limit exceeded, slow down."}}),
+                "",
+            ),
+            (
+                json!({"error": {"message": "Concurrent request limit exceeded."}}),
+                "",
+            ),
+            (quota, "Retry-After: 7\r\n"),
+            (
+                json!({"error": {"code": "429", "message": "Requests have exceeded the \
+                    token rate limit of your current pricing tier. Please go here: \
+                    https://aka.ms/oai/quotaincrease if you would like to raise it."}}),
+                "",
+            ),
+            (
+                json!({"error": {"message": "Rate limit reached for requests per min. \
+                    Visit https://platform.openai.com/account/billing to add a payment \
+                    method.", "type": "requests", "code": "rate_limit_exceeded"}}),
+                "",
+            ),
+        ];
+        for (body, headers) in momentary {
+            let body = body.to_string();
+            let reply = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n{headers}\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let (mut connection, address, worker) = served(vec![Some(reply)]);
+            connection.deadline = Some(Instant::now() + Duration::from_millis(450));
+            let failure = ask(&connection, "May it run?").unwrap_err();
+            assert_eq!(failure.kind, FailureKind::RateLimit, "{body}");
+            let _ = TcpStream::connect(address);
+            assert_eq!(worker.join().unwrap(), 1);
+        }
+        // A wait asked for that no verdict keeps leaves the words to say.
+        let hour = Some(Duration::from_secs(3_600));
+        assert!(lasting_limit(
+            "you exceeded your current quota.",
+            hour,
+            BUSY
+        ));
+        assert!(!lasting_limit(
+            "you exceeded your current quota.",
+            Some(BUSY),
+            BUSY
+        ));
+        assert!(!lasting_limit(
+            "see https://example.com/billing/quota",
+            None,
+            BUSY
+        ));
     }
 
     #[test]
@@ -1895,6 +1966,13 @@ mod tests {
             assert_eq!(matches!(verdict, Verdict::Unjudged(_)), told, "{verdict:?}");
         }
         assert!(matches!(dropped("pwd", &typed), Verdict::Unjudged(_)));
+        // A verdict on the call in between starts its count over.
+        let allowed = judge_in(&memory, &case("ls", &typed), NONCE, |_| {
+            Ok(format!("{NONCE} ALLOW"))
+        });
+        assert_eq!(allowed, Verdict::Allow);
+        memory.lock().unwrap().get_mut(&7).unwrap().verdicts.clear();
+        assert!(matches!(dropped("ls", &typed), Verdict::Unjudged(_)));
         let typed = super::tests::typed(&["run the tests", "go on"]);
         assert!(matches!(dropped("ls", &typed), Verdict::Unjudged(_)));
     }

@@ -361,7 +361,7 @@ const NO_MODULE: &str = "No module named ";
 /// Programs that run another the command need not name, such as the script
 /// a package gives for its tests, and the test runners such a script runs:
 /// one of these missing under one of those is the command's own runner.
-const WRAPPERS: [&str; 7] = ["npm", "pnpm", "yarn", "npx", "bun", "bunx", "make"];
+const WRAPPERS: [&str; 6] = ["npm", "pnpm", "yarn", "npx", "bun", "bunx"];
 const RUNNERS: [&str; 14] = [
     "jest",
     "vitest",
@@ -399,8 +399,9 @@ const TESTS_RAN: [&str; 6] = [
 const TESTS_COUNTED: [&str; 3] = ["running", "Ran", "collected"];
 
 /// What a line holds when the host it could not reach is this computer,
-/// which is the work's own server and no registry.
-const LOOPBACK: [&str; 4] = ["127.0.0.1", "localhost", "::1", "0.0.0.0"];
+/// which is the work's own server and no registry; `::1` is another
+/// (`loopback`).
+const LOOPBACK: [&str; 3] = ["127.0.0.1", "localhost", "0.0.0.0"];
 
 /// Whether `output`, a command's, says its program's set-up failed before
 /// anything of its own ran, by `SET_UP_FAILED`.
@@ -1458,10 +1459,20 @@ pub(crate) fn ran(
     // Nor does a command that never reached a test: sent back with it as a
     // failure, a run looked for a fault in its work that was not there. A
     // fetch that fails on the work alone is the work's doing, a dependency
-    // it added or a lockfile it broke, and stays a failure.
-    let broken = missing(command, &outcome).or_else(|| {
-        unfetched(&outcome).filter(|_| !reaches_tests_before(kept, command, workspace, ctx, limit))
-    });
+    // it added or a lockfile it broke, and stays a failure: but only once
+    // it has failed there twice, since the first may have met a registry
+    // that was out of reach for a moment, and what the second makes of the
+    // tests is then what came of them.
+    let mut outcome = outcome;
+    let mut broken = missing(command, &outcome);
+    if broken.is_none()
+        && let Some(why) = unfetched(&outcome)
+    {
+        match reaches_tests_before(kept, command, workspace, ctx, limit) {
+            true => outcome = self::outcome(kept, command, ctx, limit).unwrap_or(outcome),
+            false => broken = Some(why),
+        }
+    }
     if let Some(why) = broken {
         return Ran::Broken(format!(
             "`{command}` did not get as far as a test, since {why}"
@@ -1599,12 +1610,23 @@ fn missing(command: &str, outcome: &Result<String, String>) -> Option<String> {
 /// over: that is the work's own server not answering.
 fn unfetched(outcome: &Result<String, String>) -> Option<String> {
     let (_, lines) = before_any_test(outcome)?;
-    let local = |line: &str| LOOPBACK.iter().any(|host| line.contains(host));
-    let line = (lines.iter()).find(|line| set_up_failed(line) && !local(line))?;
+    let line = (lines.iter()).find(|line| set_up_failed(line) && !loopback(line))?;
     Some(format!(
         "a package or a host it needs could not be reached from here (`{}`)",
         clipped(line.trim())
     ))
+}
+
+/// Whether `line` names this computer as a host: by one of `LOOPBACK`, or
+/// by `::1` standing as a whole address, as in `[::1]:3000` and `::1:3000`,
+/// not as the end of another, as in `2001:db8::1`.
+fn loopback(line: &str) -> bool {
+    let part = |c: char| c.is_ascii_hexdigit() || c == ':';
+    let whole = |(at, found): (usize, &str)| {
+        !line[..at].ends_with(part)
+            && !(line[at + found.len()..].chars().next()).is_some_and(|c| c.is_ascii_hexdigit())
+    };
+    LOOPBACK.iter().any(|host| line.contains(host)) || line.match_indices("::1").any(whole)
 }
 
 /// The name of the program `line`, of a command's output, says was not
@@ -1665,9 +1687,10 @@ fn runs_program(command: &str, name: &str) -> bool {
 /// as it was, with the tester's tests `kept` put there, within `limit`:
 /// asked where it could not fetch what it needed on the work, to tell a
 /// registry out of reach from a dependency the work added. False where the
-/// project as it was cannot be written out, where the time to the deadline
-/// `ctx` carries does not hold the run and half a review's for a fix after
-/// it, and where the command could not be run there either.
+/// project as it was cannot be written out, where it is the work, the run
+/// having committed all of it, where the time to the deadline `ctx` carries
+/// does not hold two runs and half a review's for a fix after them, and
+/// where the command could not be run there either.
 fn reaches_tests_before(
     kept: &Kept,
     command: &str,
@@ -1676,7 +1699,11 @@ fn reaches_tests_before(
     limit: Duration,
 ) -> bool {
     let fix = crate::requirements::REVIEW_TIME / 2;
-    if time_left(ctx).is_some_and(|left| left < fix + limit) {
+    if time_left(ctx).is_some_and(|left| left < fix + limit * 2) {
+        return false;
+    }
+    // Nothing changed since the last commit: the two would fail alike.
+    if baseline(workspace).is_some() {
         return false;
     }
     let Some(base) = base(workspace) else {
@@ -4724,11 +4751,25 @@ mod tests {
             "FAILED tests/test_fetch.py::test_loads - NewConnectionError\n1 failed in 0.20s",
             " ✓ parses (2ms)\n log: getaddrinfo ENOTFOUND example.com\nexit after hook",
             "Error: connect ECONNREFUSED 127.0.0.1:3000",
+            "getaddrinfo ENOTFOUND for [::1]:3000",
+            "curl: (6) Could not resolve host: ::1",
             "requests.exceptions.ConnectionError: NewConnectionError: localhost:8080 refused",
             "dial tcp: lookup localhost: no such host",
         ] {
             assert_eq!(unrunnable(command, &exited(output, 1)), None, "{output}");
         }
+        // An address that only ends as this computer's does is another's.
+        let far = exited(
+            "npm error network request to 2001:db8::1 failed, ENOTFOUND",
+            1,
+        );
+        assert!(unrunnable(command, &far).is_some());
+        // make ends with its own code, so the shell's is never seen under it.
+        let made = exited(
+            "/bin/sh: jest: command not found\nmake: *** [test] Error 127",
+            2,
+        );
+        assert_eq!(unrunnable("make test", &made), None);
         // A refused connection is no sign of a set-up that failed, so a
         // passing command that mentions one still lends its set-up.
         assert!(!set_up_failed("ok: ECONNREFUSED is retried"));
@@ -4772,8 +4813,31 @@ mod tests {
             panic!("{ran_on_work:?}");
         };
         assert!(told.contains("npm error code ENOTFOUND"), "{told}");
-        // Where the project as it was cannot reach it either, nothing is
-        // known of the work.
+        // A fetch that failed once and then reached the tests was a blip:
+        // what the second run made of them is what came of them.
+        let mark = root.join("blipped");
+        std::fs::write(
+            kept.dir.join("letronna_spec_test.sh"),
+            format!(
+                "test -f needs-net && ! test -f {mark} && {{ touch {mark}; echo 'npm error code \
+                 ENOTFOUND'; exit 1; }}\ntest -f needs-net || {{ echo '--- FAIL: TestMade'; exit \
+                 1; }}\n",
+                mark = mark.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            ran(&kept, &command, &ctx, TIMEOUT, || None),
+            Ran::Passed(command.clone())
+        );
+        std::fs::remove_file(&mark).unwrap();
+        std::fs::write(
+            kept.dir.join("letronna_spec_test.sh"),
+            "test -f needs-net && { echo 'npm error code ENOTFOUND'; exit 1; }\nexit 1\n",
+        )
+        .unwrap();
+        // Where the project as it was is the work, or cannot reach it
+        // either, nothing is known of the work.
         repo(&["add", "needs-net"]);
         repo(&[
             "-c",
