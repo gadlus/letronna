@@ -263,6 +263,13 @@ fn waiting_line(session: u64, waiting: &Waiting) -> serde_json::Value {
             "preview": asking.preview.chars().take(CARD_CHARS).collect::<String>(),
             "why": asking.why,
             "for_run": asking.for_run,
+            // A page handed to the user is not a yes or a no: whoever shows
+            // the card lets them act on the page, and their answer says
+            // they are done (browse's hand_over).
+            "kind": match letronna_core::browser::handed_over(&asking.call) {
+                true => "page",
+                false => "call",
+            },
         }),
         Waiting::Answered(call) => {
             serde_json::json!({ "type": "answered", "session": session, "call": call })
@@ -675,10 +682,26 @@ mod tests {
         assert_eq!(asked["call"], "call_7");
         assert_eq!(asked["tool"], "run_command");
         assert_eq!(asked["why"], "It deletes files.");
+        assert_eq!(asked["kind"], "call");
         assert_eq!(
             asked["preview"].as_str().unwrap().chars().count(),
             CARD_CHARS
         );
+        // A page handed to the user says so, for whoever shows the card to
+        // let them act on the page rather than say yes or no to a call.
+        let handing = Asking {
+            call: letronna_core::chat::ToolCall {
+                id: "call_8".into(),
+                name: "browse".into(),
+                arguments: r#"{"action":"hand_over","why":"sign in to your account"}"#.into(),
+            },
+            preview: "Hand the page over to you: sign in to your account".into(),
+            ..Default::default()
+        };
+        let handed = waiting_line(42, &Waiting::Asked(&handing));
+        assert_eq!(handed["kind"], "page");
+        assert_eq!(handed["tool"], "browse");
+        assert_eq!(handed["for_run"], serde_json::Value::Null);
         let answered = waiting_line(42, &Waiting::Answered("call_7"));
         assert_eq!(
             answered,
