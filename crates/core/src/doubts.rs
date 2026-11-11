@@ -1341,6 +1341,80 @@ mod tests {
     }
 
     #[test]
+    fn a_doubt_set_aside_after_a_tick_on_its_span_is_still_a_case() {
+        let done = "An empty `name` gives `[]` now, so the rare path is covered \u{2713}.";
+        let fresh = "A `name` of spaces alone? Out of scope.";
+        assert_eq!(stands(&[done, fresh]), ["A `name` of spaces alone?"]);
+        // With a doubt before the tick too, it takes that one's place as
+        // any later naming does, and the tick between them changes nothing.
+        let early = "An empty `name`? Rare.";
+        let other = "A `width` below zero? Rare.";
+        assert_eq!(
+            stands(&[early, other, done, fresh]),
+            ["A `width` below zero?", "A `name` of spaces alone?"]
+        );
+        assert_eq!(
+            stands(&[early, other, done, fresh]),
+            stands(&[early, other, fresh])
+        );
+    }
+
+    #[test]
+    fn a_tick_on_one_doubt_leaves_another_of_the_same_span_as_it_was() {
+        // The run checks one thing about `limit`; what it set aside about
+        // it elsewhere keeps its words, its place and its weight.
+        let hard = "Hidden tests might read `limit` as bytes. Unlikely.";
+        let other = "A `width` below zero? Rare.";
+        let ticked = "A `limit` of zero is rare, and gives `[]` \u{2713}.";
+        assert_eq!(
+            stands(&[hard, other, ticked]),
+            [
+                "Hidden tests might read `limit` as bytes.",
+                "A `width` below zero?"
+            ]
+        );
+        let later = inputs(1..=12, "Rare.").join("\n");
+        for notes in [[hard, ticked, &later], [ticked, hard, &later]] {
+            let found = stands(&notes);
+            assert_eq!(found[0], "Hidden tests might read `limit` as bytes.");
+            assert_eq!(found[1..], alone(4..=12));
+        }
+    }
+
+    #[test]
+    fn words_quoted_from_a_request_that_no_requirement_holds_weigh_as_unquoted() {
+        // A request says how to work and then what the work must do; only
+        // the second is a requirement.
+        let preamble = "Do not modify or add test files unless the task requires it.";
+        let requirements = [
+            "Read at most the limit given.".to_owned(),
+            "Keep what is left for the call after.".to_owned(),
+        ];
+        let request = format!("{preamble}\n\n{}", requirements.join(" "));
+        let given = |early: &str| {
+            let mut notes = vec![early.to_owned()];
+            notes.extend(inputs(1..=12, "I'll keep it."));
+            doubts(&[said(&notes.join("\n"), "")], &request, &requirements)
+        };
+        let found = given("Is \"at most the limit given\" bytes or lines? I'll keep bytes.");
+        assert_eq!(found[0], "Is \"at most the limit given\" bytes or lines?");
+        assert_eq!(found[1..], alone(4..=12));
+        for early in [
+            // Words of the request that are no requirement of it.
+            "It says \"Do not modify or add test files\", so the fixture stays. I'll keep it.",
+            // Words that run from one requirement into the next.
+            "Is \"the limit given keep what is\" one rule? I'll keep them apart.",
+        ] {
+            assert_eq!(given(early), alone(3..=12), "{early}");
+        }
+        // With no requirement stated, nothing is quoted from one.
+        let mut notes = vec!["Is \"at most the limit given\" bytes? I'll keep bytes.".to_owned()];
+        notes.extend(inputs(1..=12, "I'll keep it."));
+        let found = doubts(&[said(&notes.join("\n"), "")], &request, &[]);
+        assert_eq!(found, alone(3..=12));
+    }
+
+    #[test]
     fn a_verdict_of_one_word_reaches_one_sentence_back_and_no_further() {
         // On the sentence it follows, or on the one before that where the
         // one it follows names nothing.
