@@ -1922,16 +1922,17 @@ fn words_first(silent: &str) -> String {
 }
 
 /// What a notice of a tester's tests asks where the request's words are
-/// silent on a test's case: to say so, and to leave what a review passed.
-/// On a benchmark run a tester's tests expected a record where the project
-/// had no place for one, and the run took the record out of the place two
-/// of a review's rows had passed. Where the words do ask for what a test
-/// wants they are not silent, and the run follows them. The notice of a
-/// first version that passed (`regressed`) says another thing of silence:
-/// there the run puts back what broke the test, which a later review's row
-/// may have passed.
-const SILENT: &str = "say so in your answer, and do not take away or move something a \
-                      review's row passed to pass the test";
+/// silent on a test's case, to say so, and after it, silent or not, to
+/// leave what a review passed unless the words ask otherwise. On a
+/// benchmark run a tester's tests expected a record where the project had
+/// no place for one, and the run took the record out of the place two of a
+/// review's rows had passed: the request named the place without saying
+/// whose, which is not silence, so the rule does not hang on it. The notice
+/// of a first version that passed (`regressed`) says another thing of
+/// silence: there the run puts back what broke the test, which a later
+/// review's row may have passed.
+const SILENT: &str = "say so in your answer; and unless the request's words ask for it, do \
+                      not take away or move something a review's row passed to pass a test";
 
 /// `words_first` as each notice of a tester's tests says it but the one of
 /// a first version that passed: `ONE_READING` ahead of it, so the first
@@ -1961,12 +1962,13 @@ const WORDS_FIRST_AHEAD: &str = "Before making your work do what a test expects,
                                  exception, follow the words and answer the test by quoting \
                                  them";
 
-/// `WORDS_FIRST_AHEAD`, then `SILENT`: the report was written ahead of the
-/// work but reaches the run when it says it is done, with the reviews of
-/// that work, so what a review's row passed stands there as in any other
-/// notice of the tester's tests.
+/// `WORDS_FIRST_AHEAD`, then `SILENT` in a sentence of its own, as
+/// `words_first` writes it: the report was written ahead of the work but
+/// reaches the run when it says it is done, with the reviews of that work,
+/// so what a review's row passed stands there as in any other notice of the
+/// tester's tests.
 fn words_ahead() -> String {
-    format!("{WORDS_FIRST_AHEAD}; where they are silent on the case, {SILENT}.")
+    format!("{WORDS_FIRST_AHEAD}. Where they are silent on the case, {SILENT}.")
 }
 
 /// The notice sending the run back with `outcome`, what `command` made of
@@ -5928,8 +5930,9 @@ mod tests {
         );
         let report = "R1 | adds | FAIL | npx vitest run x | got []\nRun: npx vitest run x";
         let failing = Ok("FAIL tests/letronna_spec.test.ts\n[exit code 1]".to_owned());
-        let silent = "Where the words are silent on the case, say so in your answer, and do \
-                      not take away or move something a review's row passed to pass the test.";
+        let silent = "Where the words are silent on the case, say so in your answer; and unless \
+                      the request's words ask for it, do not take away or move something a \
+                      review's row passed to pass a test.";
         let notices = [
             failed(&kept, "npx vitest run x", &failing).unwrap(),
             told(report, Some(&kept), true),
@@ -5974,10 +5977,13 @@ mod tests {
              it, and where they and the request's words disagree the words decide."
         );
         assert!(!ONE_READING.contains("judged"), "{ONE_READING}");
+        // What a review passed stays whether the words are silent or not,
+        // unless they ask for the change: words that name a place without
+        // saying whose are not silent, and ask for no move.
         assert_eq!(
             SILENT,
-            "say so in your answer, and do not take away or move something a review's row \
-             passed to pass the test"
+            "say so in your answer; and unless the request's words ask for it, do not take \
+             away or move something a review's row passed to pass a test"
         );
         let report = "R1 | adds | FAIL | npx vitest run x | got []\nRun: npx vitest run x";
         let failing = Ok("FAIL tests/letronna_spec.test.ts\n[exit code 1]".to_owned());
@@ -5997,8 +6003,8 @@ mod tests {
         let after = format!("where the request's words say so. {ONE_READING} {WORDS_FIRST_AHEAD}");
         assert!(ahead.contains(&after), "{ahead}");
         assert_eq!(ahead.matches(ONE_READING).count(), 1, "{ahead}");
-        // What a review passed stays where the words are silent, in each
-        // notice of the tester's tests, said once.
+        // It ends the words rule in each notice of the tester's tests, said
+        // once, in a sentence that opens with what silence asks.
         let stands = format!("{WORDS_FIRST} Where the words are silent on the case, {SILENT}.");
         for text in [failed, told, unrun] {
             assert!(text.contains(&stands), "{text}");
@@ -6007,8 +6013,15 @@ mod tests {
         }
         // The report written ahead of the work reaches the run with the
         // reviews of that work, so it stays there too.
-        let stands = format!("{WORDS_FIRST_AHEAD}; where they are silent on the case, {SILENT}.");
+        let stands = format!("{WORDS_FIRST_AHEAD}. Where they are silent on the case, {SILENT}.");
         assert!(ahead.contains(&stands), "{ahead}");
+        assert!(
+            ahead.contains(
+                "answer the test by quoting them. Where they are silent on the case, say so in \
+                 your answer; and unless the request's words ask for it, do not take away"
+            ),
+            "{ahead}"
+        );
         assert_eq!(ahead.matches(SILENT).count(), 1, "{ahead}");
         // Not where a first version passed: there the run puts back what
         // broke the test, which a later review's row may have passed, and
