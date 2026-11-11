@@ -1914,6 +1914,30 @@ fn words_first(silent: &str) -> String {
     format!("{WORDS_FIRST} Where the words are silent on the case, {silent}.")
 }
 
+/// What follows `words_first` in a notice of a tester's tests, of what a
+/// review passed. On a benchmark run a tester's tests expected a record
+/// where the project had no place for one, and the run took the record out
+/// of the place two of a review's rows had passed. The notice of a first
+/// version that passed (`regressed`) leaves it out: there the run puts back
+/// what broke the test, which a later review's row may have passed.
+const ROWS_STAND: &str = "To pass a test, do not take away or move something your work does \
+                          that a review's row passed, unless the request's words ask for that: \
+                          a test that wants it somewhere else or done another way is answered \
+                          by quoting the words.";
+
+/// `words_first` as each notice of a tester's tests says it but the one of
+/// a first version that passed: where the words are silent the run says so,
+/// and `ROWS_STAND` follows.
+fn words_and_rows() -> String {
+    format!("{} {ROWS_STAND}", words_first("say so in your answer"))
+}
+
+/// What a notice of a tester's tests tells the run of the tester itself. On
+/// a benchmark run the run took the tester's tests for what its work was
+/// graded by, and undid what a review had passed to suit one.
+const ONE_READING: &str = "The tester can misread the request as you can: its tests are one \
+                           more reading of it, not what your work is judged by.";
+
 /// What the report of a tester started ahead of the work tells the run in
 /// place of `WORDS_FIRST`: its tests are read before the work exists, so
 /// the rule is about what to build, not what to keep.
@@ -1940,18 +1964,18 @@ fn failed(kept: &Kept, command: &str, outcome: &Result<String, String>) -> Optio
         }
         _ => "",
     };
-    let words = words_first("say so in your answer");
+    let words = words_and_rows();
     Some(format!(
         "Your work as it stands was run against the tests a tester wrote from the request \
          alone, in a copy of the project with them put back at the paths they are kept from, \
          so nothing in the project was touched: `{command}` {ended}. Its \
          output{left_out}:\n\n{shown}\n\n{others}Fix your work for each test that fails on what the \
-         request's words say, and run the tests again the same way. {words} One that \
-         calls the code wrongly, such as with a name or import the request does not spell, or that \
-         fails for want of a fixture, helper or set-up the tester left out, is the tester's to \
-         fix where it is kept, in `{}`, since that is where it is run from; never something to \
-         add to the project. If the command itself cannot run here, run the tests with the \
-         set-up you found works. Then end with your whole answer again.",
+         request's words say, and run the tests again the same way. {ONE_READING} {words} One \
+         that calls the code wrongly, such as with a name or import the request does not spell, \
+         or that fails for want of a fixture, helper or set-up the tester left out, is the \
+         tester's to fix where it is kept, in `{}`, since that is where it is run from; never \
+         something to add to the project. If the command itself cannot run here, run the tests \
+         with the set-up you found works. Then end with your whole answer again.",
         kept.dir.display()
     ))
 }
@@ -3606,7 +3630,7 @@ fn files_under(dir: &Path) -> Vec<String> {
 /// them in its copy, such as one without the toolchain or set-up the run
 /// found, still wrote each from the request, so the run runs them itself.
 pub(crate) fn unrun(report: &str, kept: &Kept, again: bool) -> String {
-    let words = words_first("say so in your answer");
+    let words = words_and_rows();
     format!(
         "A tester that hasn't seen your work wrote tests from the request alone but could not \
          run them where it worked; its report follows. {} Run them with the project's own \
@@ -3654,7 +3678,7 @@ fn where_kept(kept: &Kept) -> String {
 /// its tests are `kept`, and that the driver runs them against its work,
 /// when it will (`again`).
 pub(crate) fn told(report: &str, kept: Option<&Kept>, again: bool) -> String {
-    let words = words_first("say so in your answer");
+    let words = words_and_rows();
     // One its budget stopped reported what it had: not every test it meant
     // to write, nor each one run.
     let ran = match crate::agents::ran_out(report) {
@@ -3700,7 +3724,7 @@ pub(crate) fn told_ahead(report: &str, kept: Option<&Kept>) -> String {
              worked, in the project as it was before your change, where none could pass yet; \
              its report follows, ending with a table of its tests, whose rows say NOT RUN or \
              FAIL for want of your change, not what your work does. Make your work do what each \
-             test expects where the request's words say so. {WORDS_FIRST_AHEAD}"
+             test expects where the request's words say so. {ONE_READING} {WORDS_FIRST_AHEAD}"
         ),
         &marked,
         kept,
@@ -5901,6 +5925,56 @@ mod tests {
             WORDS_FIRST_AHEAD.starts_with("Before making your work do what a test expects"),
             "{WORDS_FIRST_AHEAD}"
         );
+    }
+
+    #[test]
+    fn a_testers_tests_are_one_more_reading_and_what_a_review_passed_stays() {
+        let kept = Kept {
+            dir: PathBuf::from("/tmp/kept"),
+            files: vec!["tests/letronna_spec.test.ts".to_owned()],
+        };
+        assert_eq!(
+            ONE_READING,
+            "The tester can misread the request as you can: its tests are one more reading of \
+             it, not what your work is judged by."
+        );
+        assert_eq!(
+            ROWS_STAND,
+            "To pass a test, do not take away or move something your work does that a review's \
+             row passed, unless the request's words ask for that: a test that wants it \
+             somewhere else or done another way is answered by quoting the words."
+        );
+        let report = "R1 | adds | FAIL | npx vitest run x | got []\nRun: npx vitest run x";
+        let failing = Ok("FAIL tests/letronna_spec.test.ts\n[exit code 1]".to_owned());
+        // The run hears what the tester is where its tests failed its work,
+        // and where they reach it ahead of the work.
+        let failed = failed(&kept, "npx vitest run x", &failing).unwrap();
+        let after = format!("and run the tests again the same way. {ONE_READING} {WORDS_FIRST}");
+        assert!(failed.contains(&after), "{failed}");
+        let ahead = told_ahead(report, Some(&kept));
+        let after = format!("where the request's words say so. {ONE_READING} {WORDS_FIRST_AHEAD}");
+        assert!(ahead.contains(&after), "{ahead}");
+        // What a review passed stays in each notice of tests run against the
+        // work as a review saw it, after what silence asks.
+        let silent = "Where the words are silent on the case, say so in your answer.";
+        let stands = format!("{WORDS_FIRST} {silent} {ROWS_STAND}");
+        let notices = [
+            failed,
+            told(report, Some(&kept), true),
+            unrun(report, &kept, true),
+        ];
+        for text in notices {
+            assert!(text.contains(&stands), "{text}");
+            assert_eq!(text.matches(ROWS_STAND).count(), 1, "{text}");
+        }
+        // Not where a first version passed: there the run puts back what
+        // broke the test, which a later review's row may have passed, and
+        // the two would pull against each other.
+        let regressed = regressed("npx vitest run x", "exited with code 1", "FAIL", &[]);
+        assert!(!regressed.contains(ROWS_STAND), "{regressed}");
+        assert!(!regressed.contains("do not take away"), "{regressed}");
+        // Nor ahead of the work, which no review has seen.
+        assert!(!ahead.contains(ROWS_STAND), "{ahead}");
     }
 
     #[test]
