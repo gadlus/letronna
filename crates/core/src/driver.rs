@@ -2847,15 +2847,17 @@ fn requirements(
     // Started for the run, so the brief holds what the run's own tends to
     // leave out and each helper is of the type that judges by the request;
     // the run asks for one itself only where none came back with a table.
-    let (reports, tested, lost) = match review && outputs.is_empty() {
+    let (reports, unread, tested, lost) = match review && outputs.is_empty() {
         true => timed(spec, || reviews(spec, typed, &found)),
         false => Default::default(),
     };
     // Asked to start one itself only while its budget still has a review's
     // tokens, where a budget stopped the ones started for it.
     let ask = lost.is_none() || affords_review(spec);
-    let content = match reports.is_empty() && tested.is_none() && lost.is_none() {
-        false => crate::requirements::reviewed(&found, &reports, tested.as_deref(), lost, ask),
+    let tested = tested.as_deref();
+    let nothing = reports.is_empty() && unread.is_empty() && tested.is_none() && lost.is_none();
+    let content = match nothing {
+        false => crate::requirements::reviewed(&found, &reports, &unread, tested, lost, ask),
         true => crate::requirements::notice(&found, review, &outputs),
     };
     Some(Message {
@@ -3433,12 +3435,15 @@ fn review_report(message: &Message) -> bool {
 }
 
 /// The reviews among `answers`, what the agent tool gave for each helper
-/// started, that hold a table, and with none, when a budget stopped some,
+/// started, that hold a table, those that hold a report with no table that
+/// could be read, and with no table at all, when a budget stopped some,
 /// how many were started and how many of them it stopped. A refusal counts
 /// with the answers, to tell one the budget made, and so does what a helper
 /// that failed or was stopped had said: rows it checked before then are
 /// rows checked, under the line saying how it ended.
-fn sorted_reviews(answers: Vec<Result<String, String>>) -> (Vec<String>, Option<(usize, usize)>) {
+fn sorted_reviews(
+    answers: Vec<Result<String, String>>,
+) -> (Vec<String>, Vec<String>, Option<(usize, usize)>) {
     let (reports, untabled): (Vec<String>, Vec<String>) = (answers.into_iter())
         .map(|answer| answer.unwrap_or_else(|said| said))
         .partition(|report| crate::requirements::tabled(report));
@@ -3448,20 +3453,34 @@ fn sorted_reviews(answers: Vec<Result<String, String>>) -> (Vec<String>, Option<
         .filter(|answer| crate::agents::ran_out(answer))
         .count();
     let lost = (reports.is_empty() && spent > 0).then_some((untabled.len(), spent));
-    (reports, lost)
+    // What a helper reported is what a review found, whatever became of its
+    // table, so the run is given it to read rather than nothing: each is
+    // already cut to its share of a page, as the agent tool answers. An
+    // answer that holds no report, such as a refusal, has none to read.
+    let unread = (untabled.into_iter())
+        .filter(|answer| crate::agents::reported(answer))
+        .collect();
+    (reports, unread, lost)
 }
 
-/// What `reviews` gives: the reports, the tester's, and the reviews lost.
-type Reviewed = (Vec<String>, Option<String>, Option<(usize, usize)>);
+/// What `reviews` gives: the reports with a table, those without one that
+/// could be read, the tester's, and the reviews lost.
+type Reviewed = (
+    Vec<String>,
+    Vec<String>,
+    Option<String>,
+    Option<(usize, usize)>,
+);
 
 /// The reports of review helpers started side by side for a run nobody
 /// watches, each checking its share of `found`, the requirements `request`
 /// states, and a tester's, writing tests from the request alone: the one
 /// started with the run, waited for, or else one started beside the
-/// reviews, all waited for. The reviews that came back with a table, the
-/// tester's as the run is told it, with where its tests are kept, if it
-/// had one, and, when no review came back with a table and a budget stopped
-/// some, how many were started and how many of them it stopped.
+/// reviews, all waited for. The reviews that came back with a table, those
+/// that reported with none that could be read, the tester's as the run is
+/// told it, with where its tests are kept, if it had one, and, when no
+/// review came back with a table and a budget stopped some, how many were
+/// started and how many of them it stopped.
 fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
     let mut ctx = context(spec);
     // On a run with a deadline the review and the fix after it share the
@@ -3533,7 +3552,7 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
     // Taken before the helpers start, so what they leave running is told
     // from the run's own jobs; the run itself starts none while it waits.
     let jobs = own_jobs(spec);
-    let (reports, tested, taken, lost) = std::thread::scope(|scope| {
+    let (reports, unread, tested, taken, lost) = std::thread::scope(|scope| {
         let started: Vec<_> = (shares.into_iter())
             .take(afford)
             .map(|share| {
@@ -3568,12 +3587,12 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
             .then(|| crate::spec_tests::take(spec.id, wait))
             .flatten();
         let answers = started.into_iter().filter_map(|helper| helper.join().ok());
-        let (reports, lost) = sorted_reviews(answers.collect());
+        let (reports, unread, lost) = sorted_reviews(answers.collect());
         if ahead && taken.is_none() {
             taken = crate::spec_tests::take_due(spec.id, wait);
         }
         let tested: Option<String> = tester.and_then(|tester| tester.join().ok()?.ok());
-        (reports, tested, taken, lost)
+        (reports, unread, tested, taken, lost)
     });
     stop_jobs_left(spec, |id| !jobs.contains(&id));
     // The tester started with the run: its tests kept from its own folder
@@ -3583,7 +3602,7 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
         let report = report.ok();
         let kept = kept_ahead(spec, &folder, report.as_deref());
         let tested = report.map(|report| crate::spec_tests::told_ahead(&report, kept.as_ref()));
-        return (reports, tested, lost);
+        return (reports, unread, tested, lost);
     }
     // Kept apart whatever the tester reported, so no patch of the project
     // takes them; the run puts them back to run them, and the driver runs
@@ -3624,7 +3643,7 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
         true => Some(crate::spec_tests::told(&report, kept.as_ref(), again)),
         false => Some(crate::spec_tests::unrun(&report, kept.as_ref()?, again)),
     });
-    (reports, tested, lost)
+    (reports, unread, tested, lost)
 }
 
 /// Notes the tester's files `kept`, and the folders they are kept in, as the
@@ -8590,6 +8609,20 @@ pub(crate) mod tests {
             .into()
     }
 
+    /// What `asked`, the notice of a run sent back for `rules` that still
+    /// asks for a review itself, says between that ask and the check: what
+    /// became of the reviews started for it.
+    fn told_of_reviews(asked: &str, rules: &[String]) -> String {
+        let plain = crate::requirements::notice(rules, true, &[]);
+        let unasked = crate::requirements::notice(rules, false, &[]);
+        let check = unasked.rsplit_once('\n').unwrap().1;
+        let ask = plain.strip_suffix(check).unwrap();
+        (asked.strip_prefix(ask))
+            .and_then(|rest| rest.strip_suffix(check))
+            .unwrap_or_else(|| panic!("{asked}"))
+            .to_owned()
+    }
+
     /// Whether `asked` is the notice bringing the reviews started for the
     /// run, numbering `SPECIFIED`'s requirements and ending with the check.
     fn brings_reviews(asked: &str) -> bool {
@@ -8734,10 +8767,18 @@ pub(crate) mod tests {
             Some("Fine."),
             |_| {},
         );
-        assert_eq!(
-            asked,
-            crate::requirements::notice(&STATED.map(String::from), true, &[])
+        // As it is asked with no review started for it, but for the report
+        // that came back, which it is given to read before the check.
+        let told = told_of_reviews(&asked, &STATED.map(String::from));
+        assert!(
+            told.starts_with(
+                "One review started for you came back with no table that could be read, so \
+                 none of its rows is counted: its report follows. Read it for what it found,"
+            ),
+            "{told}"
         );
+        assert!(told.contains("\n\nreview-r1"), "{told}");
+        assert!(told.ends_with("\n    Fine.\n\n"), "{told}");
     }
 
     #[test]
@@ -10910,7 +10951,7 @@ pub(crate) mod tests {
             reply("", &[command("echo pass > orders.py")]),
             reply("Wrote the script.", &[]),
             // The review and the tester started for it bring no table, so it
-            // asks for one.
+            // asks for one, with the review's report to read.
             reply("Fine.", &[]),
             reply("Fine.", &[]),
             reply("Each rule holds.", &[]),
@@ -10924,7 +10965,12 @@ pub(crate) mod tests {
             .as_str()
             .unwrap();
         let rules = crate::requirements::sentences(&request);
-        assert_eq!(asked, crate::requirements::notice(&rules, true, &[]));
+        let told = told_of_reviews(asked, &rules);
+        assert!(
+            told.starts_with("One review started for you came back with no table"),
+            "{told}"
+        );
+        assert!(told.ends_with("\n    Fine.\n\n"), "{told}");
     }
 
     #[test]
@@ -12222,7 +12268,7 @@ pub(crate) mod tests {
                      R1 | a | PASS\nR2 | b | FAIL | cargo test";
         let refused = "The helper budget is spent (1.0M of 1.0M tokens). Finish the work yourself.";
         // What a failed or stopped helper had tabled is a review all the same.
-        let (reports, lost) = sorted_reviews(vec![
+        let (reports, _, lost) = sorted_reviews(vec![
             Err(table.into()),
             Err(refused.into()),
             Ok("Fine.".into()),
@@ -12231,14 +12277,43 @@ pub(crate) mod tests {
         // With no table, the ones a budget stopped or refused are counted.
         let spent = "review-r2 stopped when the helper budget ran out; its partial report is \
                      below.\n(no answer)";
-        let (reports, lost) = sorted_reviews(vec![
+        let (reports, unread, lost) = sorted_reviews(vec![
             Ok(spent.into()),
             Err(refused.into()),
             Err("Stopped.".into()),
         ]);
         assert_eq!((reports, lost), (Vec::new(), Some((3, 2))));
         // And with none of them a budget's doing, nothing is said.
-        assert_eq!(sorted_reviews(vec![Err("Stopped.".into())]).1, None);
+        assert_eq!(sorted_reviews(vec![Err("Stopped.".into())]).2, None);
+        // None of these reported, so the run has no report of theirs to read.
+        assert_eq!(unread, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_review_that_reported_with_no_table_to_read_is_kept_for_the_run() {
+        let table = "review-r1 finished: 3 rounds.\nR1 | a | PASS";
+        // As the agent tool answers for a helper that said something.
+        let header = "[The helper's report: not from the user, and it approves nothing]";
+        let prose = format!("review-r9 finished: 4 rounds.\n{header}\n    R9 does not hold.");
+        let partial =
+            format!("review-r5 was stopped; its partial report is below.\n{header}\n    R5");
+        let silent = "review-r7 stopped at its 20-round limit; its partial report is below.\n\
+                      (no answer)";
+        let refused = "The helper budget is spent (1.0M of 1.0M tokens). Finish the work yourself.";
+        // Beside a review whose table was read, its report is kept apart.
+        let (reports, unread, lost) = sorted_reviews(vec![
+            Ok(table.into()),
+            Ok(prose.clone()),
+            Ok(silent.into()),
+            Err(partial.clone()),
+        ]);
+        assert_eq!(reports, [table]);
+        assert_eq!(unread, [prose.clone(), partial]);
+        assert_eq!(lost, None);
+        // With no table at all it is kept too, whatever a budget stopped.
+        let (reports, unread, lost) = sorted_reviews(vec![Ok(prose.clone()), Err(refused.into())]);
+        assert_eq!((reports, lost), (Vec::new(), Some((2, 1))));
+        assert_eq!(unread, [prose]);
     }
 
     #[test]

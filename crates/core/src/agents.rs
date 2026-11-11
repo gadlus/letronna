@@ -2147,6 +2147,12 @@ pub(crate) fn ran_out(answer: &str) -> bool {
         .is_some_and(|line| line.contains(OUT_OF_BUDGET) || line.starts_with(crate::budget::SPENT))
 }
 
+/// Whether `answer`, what the agent tool gave for a helper, holds a report
+/// in the helper's own words, not only how it ended or why none started.
+pub(crate) fn reported(answer: &str) -> bool {
+    answer.lines().any(|line| line == REPORT_HEADER)
+}
+
 /// What the agent that started a helper hears back: how it went, what it
 /// changed, what became of its worktree as `left` says, and its report quoted
 /// in `share` characters.

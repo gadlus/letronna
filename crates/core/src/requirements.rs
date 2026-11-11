@@ -432,11 +432,13 @@ pub(crate) fn brief(
 /// the reviewers' `reports` with their tables, or with none the ask for a
 /// review as `notice` makes it where the run can still `review`, after what
 /// became of the reviews `lost`,
+/// the reports that came back with no table that could be read, `unread`,
 /// what it is told of the tester's report when there is one, `tested`, and
 /// the check to make after.
 pub(crate) fn reviewed(
     sentences: &[String],
     reports: &[String],
+    unread: &[String],
     tested: Option<&str>,
     lost: Option<(usize, usize)>,
     review: bool,
@@ -458,6 +460,13 @@ pub(crate) fn reviewed(
              aside, unless the request rules that case out.",
         );
         for report in reports {
+            text.push_str(&format!("\n\n{}", report.trim()));
+        }
+        text.push_str("\n\n");
+    }
+    if !unread.is_empty() {
+        text.push_str(&untabled(unread.len()));
+        for report in unread {
             text.push_str(&format!("\n\n{}", report.trim()));
         }
         text.push_str("\n\n");
@@ -486,6 +495,25 @@ fn unreported(started: usize, spent: usize) -> String {
         ),
     };
     format!("{which}, so nothing is reviewed yet: that is not a pass. ")
+}
+
+/// What a run is told ahead of the reports of the `count` reviews started
+/// for it that came back with no table that could be read: none of their
+/// rows holds the run, so what they found is its own to read, where a
+/// report dropped without a word passed for a review that found nothing.
+fn untabled(count: usize) -> String {
+    let which = match count {
+        1 => "One review started for you came back with no table that could be read, so none \
+              of its rows is counted: its report follows. Read it for what it found, and fix \
+              what it says fails"
+            .to_owned(),
+        n => format!(
+            "{n} reviews started for you came back with no table that could be read, so none \
+             of their rows is counted: their reports follow. Read them for what they found, \
+             and fix what they say fails"
+        ),
+    };
+    format!("{which} by changing the work, not the case, unless the request rules that case out.")
 }
 
 /// How many requirements `text` numbers, when it is the notice `notice`
@@ -1778,7 +1806,7 @@ mod tests {
             .map(String::from)
             .into();
         let reports = ["review-r1 finished: 3 rounds.\nR1 | iso | PASS\nR2 | utc | FAIL | t.sh"];
-        let text = reviewed(&rules, &reports.map(String::from), None, None, true);
+        let text = reviewed(&rules, &reports.map(String::from), &[], None, None, true);
         assert!(text.starts_with(&notice(&rules, false, &[])[..60]));
         assert_eq!(listed(&text), Some(2));
         assert!(text.contains("Helpers that haven't seen your work reviewed it"));
@@ -1788,12 +1816,52 @@ mod tests {
     }
 
     #[test]
+    fn a_review_with_no_table_that_could_be_read_is_told_with_its_report() {
+        let rules: Vec<String> = ["Dates must parse.", "Times must parse."]
+            .map(String::from)
+            .into();
+        let read = "review-r1 finished: 3 rounds.\nR1 | iso | PASS".to_owned();
+        let prose = "review-r2 finished: 4 rounds.\n    R2 does not hold: `t.sh` prints 1.";
+        // Beside a review whose table was read, after it.
+        let text = reviewed(&rules, &[read], &[prose.into()], None, None, true);
+        let said = "One review started for you came back with no table that could be read, so \
+                    none of its rows is counted: its report follows. Read it for what it found, \
+                    and fix what it says fails by changing the work, not the case, unless the \
+                    request rules that case out.";
+        assert!(
+            text.contains(&format!("R1 | iso | PASS\n\n{said}\n\n{prose}\n\n{CHECK}")),
+            "{text}"
+        );
+        assert!(!text.contains(REVIEW), "{text}");
+        // It adds no row, so the run is still told R2 has none.
+        assert_eq!(rows(&text).len(), 1);
+        assert!(unchecked(&text, 2).unwrap().contains("has no row for R2."));
+        // With no table read at all the run still asks for a review itself,
+        // and reads what came back all the same.
+        let both = [prose.to_owned(), prose.replace("r2", "r1")];
+        let none = reviewed(&rules, &[], &both, None, None, true);
+        let said = "2 reviews started for you came back with no table that could be read, so \
+                    none of their rows is counted: their reports follow. Read them for what \
+                    they found, and fix what they say fails by changing the work, not the case, \
+                    unless the request rules that case out.";
+        assert!(
+            none.contains(&format!(
+                "{REVIEW} {said}\n\n{}\n\n{}\n\n{CHECK}",
+                both[0], both[1]
+            )),
+            "{none}"
+        );
+        assert_eq!(listed(&none), Some(2));
+        assert!(!tabled(&none));
+    }
+
+    #[test]
     fn with_only_the_testers_table_the_run_still_asks_for_a_review() {
         let rules: Vec<String> = ["Dates must parse.", "Times must parse."]
             .map(String::from)
             .into();
         let tested = "A tester wrote tests.\nR1 | iso | FAIL | t.sh | got None";
-        let text = reviewed(&rules, &[], Some(tested), None, true);
+        let text = reviewed(&rules, &[], &[], Some(tested), None, true);
         assert!(text.contains(REVIEW), "{text}");
         assert!(!text.contains("Helpers that haven't seen your work reviewed it"));
         assert!(text.contains(&format!("{tested}\n\n{CHECK}")), "{text}");
@@ -1805,7 +1873,7 @@ mod tests {
             .map(String::from)
             .into();
         let plain = notice(&rules, true, &[]);
-        let all = reviewed(&rules, &[], None, Some((2, 2)), true);
+        let all = reviewed(&rules, &[], &[], None, Some((2, 2)), true);
         let said = "The 2 reviews started for you ran out of budget before reporting, so \
                     nothing is reviewed yet: that is not a pass. ";
         // Said once, just before the ask for a review, with the rest as it was.
@@ -1813,12 +1881,12 @@ mod tests {
         assert_eq!(listed(&all), Some(2));
         assert!(!tabled(&all));
 
-        let one = reviewed(&rules, &[], None, Some((1, 1)), true);
+        let one = reviewed(&rules, &[], &[], None, Some((1, 1)), true);
         assert!(
             one.contains("\nThe review started for you ran out of budget before reporting, so"),
             "{one}"
         );
-        let some = reviewed(&rules, &[], None, Some((3, 1)), true);
+        let some = reviewed(&rules, &[], &[], None, Some((3, 1)), true);
         assert!(
             some.contains(
                 "\n1 of the 3 reviews started for you ran out of budget before reporting, \
@@ -1828,10 +1896,10 @@ mod tests {
             "{some}"
         );
         // With nothing known of how they ended, the ask stands alone.
-        assert_eq!(reviewed(&rules, &[], None, None, true), plain);
+        assert_eq!(reviewed(&rules, &[], &[], None, None, true), plain);
         // A run with no tokens left for a review of its own is told what
         // became of them, and not to start one that would be refused.
-        let spent = reviewed(&rules, &[], None, Some((2, 2)), false);
+        let spent = reviewed(&rules, &[], &[], None, Some((2, 2)), false);
         assert!(!spent.contains(REVIEW), "{spent}");
         assert!(spent.ends_with(&format!("{said}{CHECK}")), "{spent}");
     }
@@ -1915,8 +1983,15 @@ mod tests {
         let stated = ["It must hold.".to_owned()];
         assert!(notice(&stated, false, &[]).contains("on a guess"));
         assert!(
-            reviewed(&stated, &["R1 | plain | PASS".to_owned()], None, None, true)
-                .contains("on a guess")
+            reviewed(
+                &stated,
+                &["R1 | plain | PASS".to_owned()],
+                &[],
+                None,
+                None,
+                true
+            )
+            .contains("on a guess")
         );
         assert!(!CHECK_OUTPUT.contains("on a guess"));
     }
