@@ -1064,7 +1064,13 @@ pub(crate) fn brief_ahead(request: &str, sentences: &[String]) -> String {
 /// a row of the table is written. The input for the side a limiting word
 /// keeps out is to be one those words change the result for: on a benchmark
 /// run a condition the code never evaluated was tested with an input that
-/// gives the same result with it and without.
+/// gives the same result with it and without. On others a tester expected
+/// a field where the project has none of that name, a value where the
+/// request allowed a fallback as well, and a stored record to hold what the
+/// project's own test of the same call shows it does not, and each sent
+/// back work that was right: so whose a name is comes from the project,
+/// each outcome the words allow is accepted, and what the project's tests
+/// already check of a value is expected until the request changes it.
 fn briefing(
     request: &str,
     sentences: &[String],
@@ -1078,8 +1084,14 @@ fn briefing(
          Every name the request spells out, such as a path, route, field, flag, key or \
          command, is used in your tests as the request spells it, never as the code does: a \
          test that fails because the work spells it differently is a finding. Where the request \
-         names nothing for something new, {unnamed}. What each test expects comes from the \
-         request's words; quote them in the test's name or a comment.\n\n\
+         names nothing for something new, {unnamed}. Where the request names a field, option \
+         or place without saying whose it is, find where the project already has one of that \
+         name and use that one: write no test against one the project does not have, unless \
+         the request's words ask for a new one. What each test expects comes from the request's \
+         words; quote them in the test's name or a comment. Where those words allow more than \
+         one outcome for a case, such as a fallback they name with \"or\" or a value they call \
+         optional, the test accepts each of them: one that demands a single outcome fails work \
+         the request allows.\n\n\
          For each requirement, test the behaviour it states through the entry point a caller \
          of the project uses, end to end: each case it names, each form its input can be \
          written in, the side a limiting word such as only, unless, otherwise or and not keeps \
@@ -1095,7 +1107,9 @@ fn briefing(
          the change it should see. Set each test up the way those tests do, and make each \
          change before the first call or query, as a caller would, rather than calling once \
          beforehand to warm anything up. Where the project's data, docs or tests already spell \
-         an output, expect that spelling.\n\n\
+         an output, expect that spelling. Where the project's own tests already check the value \
+         a test of yours reads, such as what a stored record holds after the same call, expect \
+         the same of it unless the request's words change it.\n\n\
          Write the tests in the project's own test language and style, in new files whose \
          names hold `{MARKER}`, where its test runner finds them, such as beside its other \
          tests, and run them with that runner. Change no other file. {outcome}\n\n\
@@ -3830,6 +3844,47 @@ mod tests {
             "{brief}"
         );
         assert!(brief.contains("only where your tests run"), "{brief}");
+    }
+
+    #[test]
+    fn a_test_asks_no_more_of_the_work_than_the_request_and_the_project_do() {
+        let request = "Save at /api/items/save.";
+        // A tester started at the run's end and one started with it alike.
+        for brief in [
+            brief(request, &[], None, &[], &[]),
+            brief_ahead(request, &[]),
+        ] {
+            // Whose a name is comes from the project, not from a guess.
+            assert!(
+                brief.contains(
+                    ". Where the request names a field, option or place without saying whose \
+                     it is, find where the project already has one of that name and use that \
+                     one: write no test against one the project does not have, unless the \
+                     request's words ask for a new one. What each test expects comes from"
+                ),
+                "{brief}"
+            );
+            // A fallback the words allow is not failed for being taken.
+            assert!(
+                brief.contains(
+                    "quote them in the test's name or a comment. Where those words allow more \
+                     than one outcome for a case, such as a fallback they name with \"or\" or \
+                     a value they call optional, the test accepts each of them: one that \
+                     demands a single outcome fails work the request allows.\n\n"
+                ),
+                "{brief}"
+            );
+            // What the project's own tests check of a value stands until
+            // the request changes it.
+            assert!(
+                brief.contains(
+                    "expect that spelling. Where the project's own tests already check the \
+                     value a test of yours reads, such as what a stored record holds after the \
+                     same call, expect the same of it unless the request's words change it.\n\n"
+                ),
+                "{brief}"
+            );
+        }
     }
 
     #[test]
