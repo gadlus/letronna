@@ -75,11 +75,15 @@ macro_rules! cases {
 /// holds the run to afterwards: a helper asked only for what fails samples
 /// cases, and files the ones it is unsure of as asides. A case the run set
 /// aside fails only where the request's words decide it, and passes with
-/// `NOT_ASKED` where they do not.
+/// `NOT_ASKED` where they do not. Only a row that fails is fixed: told to
+/// fix any case its helper "calls unclear or sets aside" as well, a run
+/// would build what a row written `NOT_ASKED` had just passed, so a doubt
+/// is decided by the request's words, as the notices of a review's rows
+/// say, and such a row asks for nothing.
 const REVIEW: &str = concat!(
     "First ask a helper that hasn't seen your work: with the agent tool, start a helper of type `review`, not general, and wait for its report. Give it the request word for word, the numbered requirements above, the files you changed or made and each case you chose not to handle, with why. Ask it to change no file, to work out each value it checks with code of its own, not your scripts or helpers, and to end its report with a table of one row per requirement and case, the verdict alone in its cell and what shows it in the cell after, written `R1 | case | PASS` or `R1 | case | FAIL | command that shows it`, with a row for each of these cases that applies: ",
     cases!(),
-    " and each case you chose not to handle, which fails when the request's words say what should happen in it, quoted in the row, whatever the reason it was set aside, and passes, written `R1 | case | PASS | not asked`, when they do not: a gap the project had before your change that the request does not ask to close is no failure. Ask it to write any doubt, caveat or problem it notices beyond those rows as a row of its own, `R1 | case | UNCLEAR | what it doubts`, never only prose, and the same for a row that can only pass by bending another requirement's words. Judge each row by what the request says should happen, not by what the code now does. Fix every row that fails by changing the work, not the case, and any case it calls unclear or sets aside, unless the request rules that case out."
+    " and each case you chose not to handle, which fails when the request's words say what should happen in it, quoted in the row, whatever the reason it was set aside, and passes, written `R1 | case | PASS | not asked`, when they do not: a gap the project had before your change that the request does not ask to close is no failure. Ask it to write any doubt, caveat or problem it notices beyond those rows as a row of its own, `R1 | case | UNCLEAR | what it doubts`, never only prose, and the same for a row that can only pass by bending another requirement's words. Judge each row by what the request says should happen, not by what the code now does. Fix every row that fails by changing the work, not the case, unless the request rules that case out. A case it calls unclear is a doubt, not a failure: decide it by the request's words, and change the work for it only where those words ask for that. Change nothing for a row written `not asked`."
 );
 
 /// The least time a run with a deadline needs left to be asked for the
@@ -2826,6 +2830,24 @@ mod tests {
              request does not ask to close is no failure. Ask it to write any doubt"
         );
         assert!(REVIEW.contains(&passes), "{REVIEW}");
+        // Only a row that fails is fixed: a doubt is decided by the words,
+        // as the notice that brings a review's reports says it, and a row
+        // the review passed as not asked for changes nothing.
+        let ending = format!(
+            "Fix every row that fails by changing the work, not the case, unless the request \
+             rules that case out. A case it calls unclear is a doubt, not a failure: decide it \
+             by the request's words, and change the work for it only where those words ask for \
+             that. Change nothing for a row written `{NOT_ASKED}`."
+        );
+        assert!(REVIEW.ends_with(&ending), "{REVIEW}");
+        assert!(!REVIEW.contains("sets aside"), "{REVIEW}");
+        let rules = ["It must hold.".to_owned()];
+        let reports = ["R1 | plain | PASS".to_owned()];
+        let brought = reviewed(&rules, &reports, &[], None, None, true);
+        let doubt = "is a doubt, not a failure: decide it by the request's words, and change the \
+                     work for it only where those words ask for that.";
+        assert!(brought.contains(doubt), "{brought}");
+        assert!(REVIEW.contains(doubt), "{REVIEW}");
         // What the run set aside goes to the helper, and a failed row is fixed
         // in the work.
         assert!(REVIEW.contains("each case you chose not to handle, with why"));
