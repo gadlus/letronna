@@ -24,6 +24,21 @@
 //! the literal inside that clause, the case ends with that clause. So what
 //! the case is stays, and the verdict and the reasons after it go.
 //!
+//! A run that works for long weighs off several times `KEPT` cases, and the
+//! one its request's tests then check is as often an early one, so the ones
+//! given are chosen by how each was weighed, not by how late. First come
+//! those the run both predicted a check of, with a marker that opens with
+//! `CHECK`, and waved off with one of `WAVED`, the words that say a case
+//! will not come up or is not the work's to handle; then those weighed by
+//! either; then the rest. Among cases weighed alike, one that names
+//! something the request names comes first, since the request's words can
+//! judge it, and then the later one. A case is given once, as it was
+//! weighed hardest, and the ones given stay in the order the run named
+//! them. A case that names only a command the run itself ran, or another
+//! of the same program, as "`git stash` is arguably enough" does, is none
+//! of the work's, and is left out unless a predicted check or one of
+//! `WAVED` weighed it or the request names it.
+//!
 //! Apart from those, with a quota of their own, are the words of the request
 //! the run read more than one way (`readings`). A run most often names both
 //! readings of a sentence that leaves something open, takes one and builds
@@ -43,8 +58,9 @@
 use crate::chat::Message;
 use std::ops::Range;
 
-/// Cases given at most: the latest, since a run's later notes are nearer
-/// to the work as it stands.
+/// Cases given at most: the ones weighed hardest, and among those weighed
+/// alike the latest, since a run's later notes are nearer to the work as it
+/// stands.
 const KEPT: usize = 10;
 
 /// Characters a case is given in at most.
@@ -97,6 +113,27 @@ const MARKERS: &[&str] = &[
     "good enough",
     "assume",
 ];
+
+/// The words every marker that predicts a check of a case opens with.
+const CHECK: &str = "hidden test";
+
+/// The markers that say a case will not come up, is not the work's to
+/// handle, or could go either way: in the notes of runs read, nearly every
+/// case one of them weighed off was something the work does.
+const WAVED: &[&str] = &[
+    "rare",
+    "unlikely",
+    "either interpretation",
+    "either way",
+    "toss-up",
+    "toss up",
+    "out of scope",
+    "edge case",
+];
+
+/// The weight of a case that a predicted check or one of `WAVED` weighed
+/// off, and not both.
+const STRONG: u8 = 2;
 
 /// Readings given at most; apart from `KEPT`, so no case set aside takes
 /// the place of one. A long run weighs more requirements than this, most
@@ -375,23 +412,119 @@ pub(crate) fn shared(said: &[&str], sentence: &[String]) -> Range<usize> {
 }
 
 /// The cases the assistant's replies in `messages` weighed and set aside,
-/// in the order they were last named, at most `KEPT` of them, each once by
-/// its first code span, or by its words where it has none.
-pub(crate) fn doubts(messages: &[Message]) -> Vec<String> {
-    let mut found: Vec<(String, String)> = Vec::new();
-    let own = messages
-        .iter()
-        .filter(|message| message.role == "assistant");
-    for text in own.flat_map(|message| [&message.reasoning, &message.content]) {
-        for case in cases(text) {
-            let key = key(&case);
-            // Named again, a case stands where it was named last.
-            found.retain(|(kept, _)| *kept != key);
-            found.push((key, case));
+/// at most `KEPT` of them in the order they were named: the ones weighed
+/// hardest, among those the ones that name something `request` names, and
+/// then the latest. Each is given once by its first code span, or by its
+/// words where it has none, as it was weighed hardest.
+pub(crate) fn doubts(messages: &[Message], request: &str) -> Vec<String> {
+    let request: Vec<String> = (words(request).into_iter()).map(|(_, word)| word).collect();
+    let own = || {
+        messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+    };
+    let ran = programs(own());
+    // Each case with what it is known by and where it ranks: how hard it
+    // was weighed, then whether the request names something it names.
+    let mut found: Vec<(String, String, (u8, bool))> = Vec::new();
+    for text in own().flat_map(|message| [&message.reasoning, &message.content]) {
+        for (case, weight) in cases(text) {
+            let asked = asked(&case, &request);
+            if weight < STRONG && !asked && names_commands(&case, &ran) {
+                continue;
+            }
+            let (key, rank) = (key(&case), (weight, asked));
+            // Named again, a case stands as it was weighed hardest, and
+            // where it was named last among those.
+            let before = found.iter().position(|(kept, ..)| *kept == key);
+            if before.is_some_and(|at| found[at].2 > rank) {
+                continue;
+            }
+            if let Some(at) = before {
+                found.remove(at);
+            }
+            found.push((key, case, rank));
         }
     }
-    let first = found.len().saturating_sub(KEPT);
-    found.drain(first..).map(|(_, case)| cut(&case)).collect()
+    let mut kept: Vec<usize> = (0..found.len()).collect();
+    kept.sort_by_key(|&at| std::cmp::Reverse((found[at].2, at)));
+    kept.truncate(KEPT);
+    kept.sort_unstable();
+    (kept.into_iter().map(|at| cut(&found[at].1))).collect()
+}
+
+/// How hard `markers`, the words that weighed a case off, weigh it: most
+/// where one predicts a check of it and one of `WAVED` waves it off, then
+/// where one does either, then the rest.
+fn weight(markers: &[&str]) -> u8 {
+    let checked = markers.iter().any(|marker| marker.starts_with(CHECK));
+    let waved = markers.iter().any(|marker| WAVED.contains(marker));
+    match (checked, waved) {
+        (true, true) => STRONG + 1,
+        (false, false) => STRONG - 1,
+        _ => STRONG,
+    }
+}
+
+/// Whether `case` names something `request`, the words of one, names: a
+/// code span whose words are all found there in a row, or a quoted literal
+/// that shares `QUOTED` words in a row with it.
+fn asked(case: &str, request: &[String]) -> bool {
+    literals(case).into_iter().any(|range| {
+        let literal = &case[range];
+        let quote = words(literal);
+        let said: Vec<&str> = quote.iter().map(|(_, word)| word.as_str()).collect();
+        let found = shared(&said, request).len();
+        match literal.starts_with('`') {
+            true => found > 0 && found == said.len(),
+            false => found >= QUOTED,
+        }
+    })
+}
+
+/// The programs the commands that `replies` ran start, as
+/// `command::name_of` names them, each once.
+fn programs<'a>(replies: impl Iterator<Item = &'a Message>) -> Vec<String> {
+    let mut found = Vec::new();
+    for call in replies.flat_map(|reply| &reply.tool_calls) {
+        let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) else {
+            continue;
+        };
+        let Some(line) = args["command"].as_str() else {
+            continue;
+        };
+        let dialect = crate::command::Dialect::here();
+        for command in crate::command::assess(line, dialect, None).commands {
+            let Some(word) = command.argv.get(command.at) else {
+                continue;
+            };
+            let name = crate::command::name_of(word);
+            if !found.contains(&name) {
+                found.push(name);
+            }
+        }
+    }
+    found
+}
+
+/// Whether every literal of `case` is a code span that holds a command
+/// line: two words or more, the first a program of `ran`, and none of the
+/// brackets, quotes, commas and semicolons code is written with.
+fn names_commands(case: &str, ran: &[String]) -> bool {
+    let literals = literals(case);
+    !literals.is_empty()
+        && literals.into_iter().all(|range| {
+            let Some(line) = case[range].strip_prefix('`') else {
+                return false;
+            };
+            let line = line.trim_matches('`').trim();
+            let mut words = line.split_whitespace();
+            let program = words.next().map(crate::command::name_of);
+            let code = ['(', ')', '[', ']', '{', '}', '"', '\'', ',', ';'];
+            words.next().is_some()
+                && program.is_some_and(|program| ran.contains(&program))
+                && !line.contains(code)
+        })
 }
 
 /// The section a helper's brief ends with for `doubts`, a review's or a
@@ -430,23 +563,33 @@ pub(crate) fn section(doubts: &[String], tester: bool) -> String {
     text
 }
 
-/// The cases `text` weighs off, in its order.
-fn cases(text: &str) -> Vec<String> {
+/// The cases `text` weighs off, in the order each was last weighed, each
+/// with its `weight` by all the markers that weighed it.
+fn cases(text: &str) -> Vec<(String, u8)> {
     let units = units(text);
-    let mut cases = Vec::new();
+    // Each sentence named as a case, with the markers that weighed it.
+    let mut named: Vec<(usize, Vec<&str>)> = Vec::new();
     for (at, unit) in units.iter().enumerate() {
-        if marks(&masked(unit)).is_empty() {
+        let marks = marks(&masked(unit));
+        if marks.is_empty() {
             continue;
         }
-        let Some(named) = (at.saturating_sub(BACK)..=at)
+        let Some(naming) = (at.saturating_sub(BACK)..=at)
             .rev()
             .find(|&before| !literals(&units[before]).is_empty())
         else {
             continue;
         };
-        cases.push(case(&units[named]));
+        let mut markers: Vec<&str> = marks.into_iter().map(|(_, marker)| marker).collect();
+        // Weighed again, a sentence stands where it was weighed last.
+        if let Some(before) = named.iter().position(|(kept, _)| *kept == naming) {
+            markers.extend(named.remove(before).1);
+        }
+        named.push((naming, markers));
     }
-    cases
+    (named.into_iter())
+        .map(|(naming, markers)| (case(&units[naming]), weight(&markers)))
+        .collect()
 }
 
 /// The sentences of `text` outside fenced code, a verdict of a few words
@@ -535,9 +678,10 @@ fn masked(text: &str) -> String {
     String::from_utf8(bytes).unwrap_or_default()
 }
 
-/// Where each marker that `prose`, as `masked` writes it, holds starts.
-fn marks(prose: &str) -> Vec<usize> {
-    let mut starts = Vec::new();
+/// Each marker that `prose`, as `masked` writes it, holds, with where it
+/// starts, in their order.
+fn marks(prose: &str) -> Vec<(usize, &'static str)> {
+    let mut found = Vec::new();
     for marker in MARKERS {
         let mut parts = marker.split(" … ");
         let Some(first) = parts.next() else {
@@ -551,12 +695,12 @@ fn marks(prose: &str) -> Vec<usize> {
                 next.inspect(|&at| from = at + part.len()).is_some()
             });
             if follows {
-                starts.push(start);
+                found.push((start, *marker));
             }
         }
     }
-    starts.sort_unstable();
-    starts
+    found.sort_unstable();
+    found
 }
 
 /// Where `phrase` starts in `text` as whole words.
@@ -608,7 +752,7 @@ fn case(unit: &str) -> String {
         .position(|clause| clause.end >= quoted)
         .unwrap_or(clauses.len().saturating_sub(1));
     let marked = |range: &Range<usize>, from: usize| {
-        (marks.iter()).any(|&at| at >= from && at >= range.start && at < range.end)
+        (marks.iter()).any(|&(at, _)| at >= from && at >= range.start && at < range.end)
     };
     let end = match clauses.get(held) {
         Some(own) if marked(own, quoted) => own.end,
@@ -659,7 +803,7 @@ mod tests {
     }
 
     fn weighed(notes: &str) -> Vec<String> {
-        doubts(&[said(notes, "")])
+        doubts(&[said(notes, "")], "")
     }
 
     #[test]
@@ -749,27 +893,190 @@ mod tests {
     }
 
     #[test]
-    fn a_case_named_twice_stands_where_it_was_named_last() {
-        let found = doubts(&[
+    fn a_case_named_twice_and_weighed_alike_stands_where_it_was_named_last() {
+        let notes = [
             said("`a..` at the end? Rare.", ""),
             said("`b..c` reversed? Out of scope, leave it.", ""),
             said("", "Open `a..` at the very end of input: edge case."),
-        ]);
+        ];
+        let found = doubts(&notes, "");
         assert_eq!(
             found,
             ["`b..c` reversed?", "Open `a..` at the very end of input"]
         );
     }
 
+    /// Notes that set the inputs `numbers` aside one by one, each in the
+    /// words of `verdict`.
+    fn inputs(numbers: std::ops::RangeInclusive<usize>, verdict: &str) -> Vec<String> {
+        numbers
+            .map(|n| format!("Input `{n}` alone? {verdict}"))
+            .collect()
+    }
+
+    /// The inputs `numbers` as `inputs` names them.
+    fn alone(numbers: std::ops::RangeInclusive<usize>) -> Vec<String> {
+        numbers.map(|n| format!("Input `{n}` alone?")).collect()
+    }
+
     #[test]
-    fn only_the_latest_cases_are_kept_in_order() {
-        let notes: Vec<String> = (1..=12)
-            .map(|n| format!("Input `{n}` alone? Rare."))
-            .collect();
-        let found = weighed(&notes.join("\n"));
+    fn of_cases_weighed_alike_the_latest_are_kept_in_order() {
+        let found = weighed(&inputs(1..=12, "Rare.").join("\n"));
+        assert_eq!(found, alone(3..=12));
         assert_eq!(found.len(), KEPT);
-        assert_eq!(found.first().map(String::as_str), Some("Input `3` alone?"));
-        assert_eq!(found.last().map(String::as_str), Some("Input `12` alone?"));
+    }
+
+    #[test]
+    fn a_check_the_run_predicted_and_waved_off_is_kept_however_early() {
+        // Predicted and waved off in one sentence with its verdict, or in
+        // the next sentence, which weighs the same case.
+        for early in [
+            "Hidden tests might call `open()` twice. Unlikely.",
+            "Hidden tests might call `open()` twice.\nThat would be rare in a real caller.",
+            "Calling `open()` twice is an edge case.\nA hidden test could do it, though.",
+        ] {
+            let mut notes = vec![early.to_owned()];
+            notes.extend(inputs(1..=12, "Rare."));
+            let found = weighed(&notes.join("\n"));
+            assert_eq!(found.len(), KEPT, "{found:?}");
+            assert!(found[0].contains("`open()` twice"), "{found:?}");
+            assert_eq!(found[1..], alone(4..=12), "{early}");
+        }
+        // One only predicted, or only waved off, is weighed as the rest are.
+        for early in [
+            "Hidden tests might call `open()` twice.",
+            "Calling `open()` twice? Unlikely.",
+        ] {
+            let mut notes = vec![early.to_owned()];
+            notes.extend(inputs(1..=12, "Rare."));
+            assert_eq!(weighed(&notes.join("\n")), alone(3..=12), "{early}");
+        }
+    }
+
+    #[test]
+    fn a_case_a_strong_word_weighed_off_is_kept_before_one_weighed_by_another() {
+        let mut notes = vec![
+            "Empty `name`? Out of scope.".to_owned(),
+            "Sort by `id` or by `date`? I'll keep the first.".to_owned(),
+            "Hidden tests may pass `null` for it.".to_owned(),
+            "A `width` below zero? It could go either way.".to_owned(),
+        ];
+        notes.extend(inputs(1..=12, "I'll keep it."));
+        let found = weighed(&notes.join("\n"));
+        let mut kept = vec![
+            "Empty `name`?".to_owned(),
+            "Hidden tests may pass `null` for it.".to_owned(),
+            "A `width` below zero?".to_owned(),
+        ];
+        kept.extend(alone(6..=12));
+        assert_eq!(found, kept);
+    }
+
+    #[test]
+    fn among_cases_weighed_alike_one_the_request_names_is_kept_first() {
+        let request = "Add a `--tag` flag that may be repeated, and print \"no tags were \
+                       given at all\" where there is none.";
+        let mut notes = vec![
+            "Repeated `--tag` with the same value? Rare.".to_owned(),
+            "Is \"no tags were given\" right for an empty list? Rare.".to_owned(),
+            // Words of the request, but too few of them or not in a row.
+            "Is \"no tags\" right for a list of blanks? Rare.".to_owned(),
+            "A `--tag list` that is long? Rare.".to_owned(),
+        ];
+        notes.extend(inputs(1..=12, "Rare."));
+        let found = doubts(&[said(&notes.join("\n"), "")], request);
+        let mut kept = vec![
+            "Repeated `--tag` with the same value?".to_owned(),
+            "Is \"no tags were given\" right for an empty list?".to_owned(),
+        ];
+        kept.extend(alone(5..=12));
+        assert_eq!(found, kept);
+        // How hard a case was weighed comes before what the request names.
+        notes.push("Hidden tests might pass `13` twice. Unlikely.".to_owned());
+        let found = doubts(&[said(&notes.join("\n"), "")], request);
+        assert_eq!(found.len(), KEPT);
+        assert_eq!(found[2..9], alone(6..=12));
+        assert_eq!(found[9], "Hidden tests might pass `13` twice.");
+    }
+
+    #[test]
+    fn a_case_named_again_stands_as_it_was_weighed_hardest() {
+        let hard = "Hidden tests might read `limit` as bytes. Unlikely.";
+        let soft = "Spell `limit` out in the message? I'll keep it short.";
+        let stands = |notes: &[&str]| {
+            let notes: Vec<Message> = notes.iter().map(|note| said(note, "")).collect();
+            doubts(&notes, "")
+        };
+        let kept = ["Hidden tests might read `limit` as bytes."];
+        assert_eq!(stands(&[hard, soft]), kept);
+        assert_eq!(stands(&[soft, hard]), kept);
+        // And where the request names what it names, among those weighed alike.
+        let asked = "Is \"at most the limit given\" bytes for `cap`? Rare.";
+        let plain = "A `cap` of zero? Rare.";
+        let request = "Read at most the limit given.";
+        for notes in [[asked, plain], [plain, asked]] {
+            let notes = notes.map(|note| said(note, ""));
+            let found = doubts(&notes, request);
+            assert_eq!(found, ["Is \"at most the limit given\" bytes for `cap`?"]);
+        }
+    }
+
+    /// An assistant reply that ran `command`, with `notes` as its working notes.
+    fn ran(command: &str, notes: &str) -> Message {
+        let call = crate::chat::ToolCall {
+            id: "call".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({ "command": command }).to_string(),
+        };
+        Message {
+            tool_calls: vec![call],
+            ..said(notes, "")
+        }
+    }
+
+    #[test]
+    fn a_case_that_names_only_a_command_the_run_ran_is_left_out() {
+        let found = |notes: &str, request: &str| {
+            doubts(
+                &[ran("cd /srv/app && git status --short | head -5", notes)],
+                request,
+            )
+        };
+        for notes in [
+            "Simpler: `git stash` is arguably enough.",
+            "Start from `cd /srv` instead? I'll keep it.",
+            "Both `git stash` and `head -1` again? I'll leave them.",
+        ] {
+            assert!(
+                found(notes, "").is_empty(),
+                "{notes}: {:?}",
+                found(notes, "")
+            );
+        }
+        for notes in [
+            // A strong word weighed it, or it names what is no command line:
+            // one word, another program's, code, or something quoted.
+            "Would `git stash` lose the index? Unlikely.",
+            "A bare `git` is arguably enough.",
+            "Simpler: `make stash` is arguably enough.",
+            "Simpler: `git.stash(all)` is arguably enough.",
+            "Simpler: `head [0]` is arguably enough.",
+            "Print \"git stash\" there? I'll keep it.",
+            "Both `git stash` and `pop()` again? I'll leave them.",
+        ] {
+            assert_eq!(found(notes, "").len(), 1, "{notes}");
+        }
+        // Or the request names it.
+        let notes = "Simpler: `git stash` is arguably enough.";
+        assert_eq!(found(notes, "Run `git stash` before each step.").len(), 1);
+        // A program the run never ran is no command of its own.
+        assert_eq!(doubts(&[said(notes, "")], "").len(), 1);
+    }
+
+    #[test]
+    fn each_word_a_case_is_ranked_by_is_one_that_weighs_a_case_off() {
+        assert!(WAVED.iter().all(|word| MARKERS.contains(word)));
+        assert!(MARKERS.iter().any(|marker| marker.starts_with(CHECK)));
     }
 
     #[test]
@@ -797,9 +1104,9 @@ mod tests {
             content: "Empty `name`? Rare.".into(),
             ..Default::default()
         };
-        assert!(doubts(&[user]).is_empty());
+        assert!(doubts(&[user], "").is_empty());
         assert_eq!(
-            doubts(&[said("", "Empty `name`? Rare.")]),
+            doubts(&[said("", "Empty `name`? Rare.")], ""),
             ["Empty `name`?"]
         );
     }
@@ -1019,7 +1326,7 @@ mod tests {
             .map(|n| format!("Input `{n}` alone? Rare."))
             .collect();
         let both = [said(&aside.join("\n"), ""), said(&notes.join("\n"), "")];
-        assert_eq!(doubts(&both).len(), KEPT);
+        assert_eq!(doubts(&both, "").len(), KEPT);
         assert_eq!(readings(&both, &sentences).len(), READ_KEPT);
     }
 

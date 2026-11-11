@@ -3613,7 +3613,7 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
     // The cases the run weighed and set aside, without its reasons, so each
     // helper checks them by the request's words.
     let own = (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
-    let doubts = crate::doubts::doubts(own);
+    let doubts = crate::doubts::doubts(own, request);
     // And the words of a requirement it read more than one way in this
     // turn, without the reading it took, so each helper judges every
     // reading. A tester started with the run wrote its tests before any of
