@@ -72,17 +72,19 @@ const RULES: usize = 8;
 /// exception at all; and one for input that is there fails only by a
 /// sentence of the request that says what happens for that input, quoted
 /// in the row. Such a sentence outranks an exception the project shares.
-/// With none the row is a doubt, whatever the project's own code does with
-/// the input, since a review's own prompt would fail a difference from the
-/// project's feature of the same kind: it names both results and the
-/// command that shows them, for the run to run and decide by. On
+/// With none, a guard the project's own code of the same kind makes too
+/// passes, that code named in the row: left a doubt, every guard the
+/// project plainly shares sent its run back. Any other is a doubt, never
+/// a failure, also where it differs from the project's code, which a
+/// review's own prompt would fail: it names both results and the command
+/// that shows them, for the run to run and decide by. On
 /// another a review tested the other side of a condition the code never
 /// evaluated with an input that gives the same result with the condition
 /// and without, so the input is to be one the condition's words change the
 /// result for, and the row names both results to show it is.
 macro_rules! cases {
     () => {
-        "a field, argument or part the requirement names left out, undefined or empty; a plain value as well as the same value wrapped, such as in an object or a parser's state, each also built by hand and passed straight to the method that reads it; each other way the same input can be written, such as its parts in another order or a spelling the project's docs or tests use, including any the parser might reject before the new check runs; an error the requirement names, matched by its exact words, not a generic error; two of something the requirement allows only once; the new form beside the existing form of the same thing in one call, where one applies and the other must not; each place in the code that records the event the requirement is about or changes that state, such as a demotion, a close or a removal, found by searching the code, not only the call the request names; the other side of a condition, such as what \"and is not ended\" or \"unless\" keeps out, with both sides in one input chosen so that the result would differ if the condition's words were removed from the requirement, the row naming both results; steps the requirement sets in no order, in each order, such as the later one first; each category the requirement maps to an output, with an input from outside the project's own code, such as a caller's function or a returned error, that uses the requirement's own words for it; each input the change itself treats apart from its general path, such as an early return on a zero, empty or boundary value or a form it exempts, found by reading the change, the row saying what the general path gives when run on that input (the guard passes where that path crashes or does not end, and where the input is absent, the file, section, collection or value the rule reads not being there at all, unless the request says what happens then; for input that is there, such as a zero or an empty value, the guard passes where both results are the same; where they differ the row is FAIL only where it quotes a sentence of the request that says what happens for that input, by name or by a rule that covers it, and the change gives another result, even where the project's own code of the same kind makes the same exception; where no sentence does, it is UNCLEAR, naming both results and the command that shows them, never FAIL, whatever the project's own code of the same kind does with that input); and each case the project's own tests check of the existing feature nearest to it, done again for the new one in the same order of calls, with the same fixtures and through the same entry point, such as a query made for the first time only after the change it should see;"
+        "a field, argument or part the requirement names left out, undefined or empty; a plain value as well as the same value wrapped, such as in an object or a parser's state, each also built by hand and passed straight to the method that reads it; each other way the same input can be written, such as its parts in another order or a spelling the project's docs or tests use, including any the parser might reject before the new check runs; an error the requirement names, matched by its exact words, not a generic error; two of something the requirement allows only once; the new form beside the existing form of the same thing in one call, where one applies and the other must not; each place in the code that records the event the requirement is about or changes that state, such as a demotion, a close or a removal, found by searching the code, not only the call the request names; the other side of a condition, such as what \"and is not ended\" or \"unless\" keeps out, with both sides in one input chosen so that the result would differ if the condition's words were removed from the requirement, the row naming both results; steps the requirement sets in no order, in each order, such as the later one first; each category the requirement maps to an output, with an input from outside the project's own code, such as a caller's function or a returned error, that uses the requirement's own words for it; each input the change itself treats apart from its general path, such as an early return on a zero, empty or boundary value or a form it exempts, found by reading the change, the row saying what the general path gives when run on that input (the guard passes where that path crashes or does not end, and where the input is absent, the file, section, collection or value the rule reads not being there at all, unless the request says what happens then; for input that is there, such as a zero or an empty value, the guard passes where both results are the same; where they differ the row is FAIL only where it quotes a sentence of the request that says what happens for that input, by name or by a rule that covers it, and the change gives another result, even where the project's own code of the same kind makes the same exception; where no sentence does, the guard passes where the project's own code of the same kind, named in the row, makes the same exception, and is otherwise UNCLEAR, naming both results and the command that shows them, never FAIL); and each case the project's own tests check of the existing feature nearest to it, done again for the new one in the same order of calls, with the same fixtures and through the same entry point, such as a query made for the first time only after the change it should see;"
     };
 }
 
@@ -3889,9 +3891,10 @@ mod tests {
                     only where it quotes a sentence of the request that says what happens for \
                     that input, by name or by a rule that covers it, and the change gives \
                     another result, even where the project's own code of the same kind makes \
-                    the same exception; where no sentence does, it is UNCLEAR, naming both \
-                    results and the command that shows them, never FAIL, whatever the project's \
-                    own code of the same kind does with that input);";
+                    the same exception; where no sentence does, the guard passes where the \
+                    project's own code of the same kind, named in the row, makes the same \
+                    exception, and is otherwise UNCLEAR, naming both results and the command \
+                    that shows them, never FAIL);";
         // A guard for what is not there at all passes, unless the request
         // says what happens then.
         assert!(
@@ -3915,15 +3918,21 @@ mod tests {
              that input, by name or by a rule that covers it, and the change gives another \
              result, even where the project's own code of the same kind makes the same exception"
         ));
-        // With no such sentence it is a doubt, also where the guard differs
-        // from the project's own code, and gives the run a command to run.
-        assert!(case.contains(
-            "where no sentence does, it is UNCLEAR, naming both results and the command that \
-             shows them, never FAIL, whatever the project's own code of the same kind does"
-        ));
-        // A guard the project's own code of the same kind has is the
-        // project's way, which the check asks a change to follow.
+        // With no such sentence a guard the project's own code of the same
+        // kind makes too is the project's way, which the check asks a
+        // change to follow, so it passes, the code named in the row.
         assert!(CHECK.contains("do it the same way"), "{CHECK}");
+        assert!(case.contains(
+            "where no sentence does, the guard passes where the project's own code of the same \
+             kind, named in the row, makes the same exception"
+        ));
+        // Any other is a doubt, never a failure, and gives the run a
+        // command to run.
+        assert!(case.ends_with(
+            "and is otherwise UNCLEAR, naming both results and the command that shows them, \
+             never FAIL);"
+        ));
+        assert!(!case.contains("whatever the project's own code"), "{case}");
         // What the path does when run decides, not whether a reviewer
         // thinks the input has a result at all.
         assert!(!case.contains("defined result"), "{case}");
