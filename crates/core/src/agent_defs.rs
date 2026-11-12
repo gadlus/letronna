@@ -286,6 +286,13 @@ fn built_ins() -> Vec<AgentDef> {
             // refuses commands.
             plan: false,
             rounds: Some(REVIEW_ROUNDS),
+            // A doubt is told apart from a failure here, where every review
+            // reads it: a run may answer a row left unclear by leaving its
+            // work as it is, and reviews filed there a difference their own
+            // run had shown, from what the requirement's sentence covers or
+            // from what the project's feature of the same kind does. A rule
+            // the task has for a case, such as a guard's or a reading's,
+            // still decides that case.
             prompt: "Look for what is wrong with the work you are pointed at. Verify by running \
                      tests. Where the work does less than its request's words allow, or two of \
                      its parts disagree about the same thing, that is wrong, not an open question \
@@ -296,7 +303,12 @@ fn built_ins() -> Vec<AgentDef> {
                      assumption is wrong when they say what should happen in it, even through a \
                      rule stated for another path to the same event. Say each doubt, caveat or \
                      problem you notice in your verdict as something to settle, and in a table \
-                     if you were asked for one as a row of its own, not as an aside. Put any \
+                     if you were asked for one as a row of its own, not as an aside. A doubt is \
+                     only what no run of yours could settle: where your own run shows the work \
+                     giving another result than a sentence of the request covers, or, in a case \
+                     none covers, than the project's own feature of the same kind gives for the \
+                     same call, the row is FAIL with that command, not UNCLEAR, unless your task \
+                     says otherwise of that case. Put any \
                      script or file you check with in the temp folder, never in the project, and keep each command \
                      you run short: a long script goes into its file in parts. End with a \
                      verdict: whether it is right, and what has to change if not."
@@ -503,6 +515,26 @@ mod tests {
             review
                 .prompt
                 .contains("set aside or filed as an assumption is wrong when")
+        );
+        // A difference its own run shows is a failure, not a doubt: from the
+        // request's sentence, or where none covers the case from what the
+        // project's feature of the same kind does.
+        assert!(
+            review.prompt.contains(
+                "A doubt is only what no run of yours could settle: where your own run shows \
+                 the work giving another result than a sentence of the request covers, or, in \
+                 a case none covers, than the project's own feature of the same kind gives for \
+                 the same call, the row is FAIL with that command, not UNCLEAR"
+            ),
+            "{}",
+            review.prompt
+        );
+        // A case the task has a rule for, as a guard's row or a reading's
+        // has, is still decided by that rule.
+        assert!(
+            review
+                .prompt
+                .contains("not UNCLEAR, unless your task says otherwise of that case.")
         );
     }
 

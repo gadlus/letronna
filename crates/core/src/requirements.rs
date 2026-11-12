@@ -1108,7 +1108,10 @@ fn counted(count: usize, what: &str) -> String {
 /// that failed; None when it covers each and every row passed. The failed
 /// rows come first, then the ones left unclear, each kind with a count of
 /// its own, and the run is asked for a line of a set form for each row it
-/// decides rather than fixes, which `unresolved` then looks for.
+/// decides rather than fixes, which `unresolved` then looks for. A row left
+/// unclear that names two results is decided by running its own command:
+/// a run answered one as not stated after a probe of something else, and
+/// the difference the row had shown was the one that counted.
 pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
     let rows = rows(report);
     let missing: Vec<String> = (1..=count)
@@ -1205,6 +1208,15 @@ pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
              does not say\" settles nothing: where it states nothing on the case, write \
              `R{number} | {NOT_STATED} | \"the nearest words it does have\" | left as is`, \
              and change nothing for that row on a guess. "
+        ));
+    }
+    // A probe of the run's own, of something else, let it answer so a row
+    // whose command had shown the work differ.
+    if !unclear.is_empty() {
+        text.push_str(&format!(
+            "A row that names two results that differ is not answered by `{NOT_STATED}`: run \
+             that row's own command and say in your line which result the request's words, or \
+             the project's own feature of the same kind, call for, or that neither does. "
         ));
     }
     text.push_str(
@@ -2864,6 +2876,13 @@ mod tests {
         assert!(text.contains("not a failure"), "{text}");
         assert!(!text.contains("Fix what fails"), "{text}");
         assert!(text.ends_with("not only what changed."), "{text}");
+        // A row that names two results is not waved off so: its own
+        // command is run, and the line says which result is called for.
+        let shown = "on a guess. A row that names two results that differ is not answered by \
+                     `not stated`: run that row's own command and say in your line which result \
+                     the request's words, or the project's own feature of the same kind, call \
+                     for, or that neither does. Only your last message";
+        assert!(text.contains(shown), "{text}");
         // A failed row that says unclear of why is a failed row, and a row
         // too long to show its verdict is still told by its list.
         let why = unchecked("R1 | iso | FAIL | t.sh | unclear | why", 1).unwrap();
@@ -2885,6 +2904,7 @@ mod tests {
             failed.contains("For each failed row you do not fix, write one line in your answer"),
             "{failed}"
         );
+        assert!(!failed.contains("two results that differ"), "{failed}");
         assert!(
             failed.contains("Fix what fails unless the request rules"),
             "{failed}"
