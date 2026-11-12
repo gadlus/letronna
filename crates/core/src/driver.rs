@@ -11801,9 +11801,12 @@ pub(crate) mod tests {
             notice.content,
             "`sh zz_probe_test.sh` still fails on your work as it stands, and it runs tests you \
              added (`zz_probe_test.sh`). Its output:\n\nprobe: expected 2, got 3\n[exit code \
-             1]\n\nFix your work where the request's words ask for what the test checks; \
-             otherwise fix the test, or remove it unless the task asks for it: a failing test \
-             you added is not left behind. Then end with your whole answer again."
+             1]\n\nRun it once more first. If it still fails: where a test the project already \
+             had fails, fix your work and leave that test as it is, unless the request's words \
+             change what it expects; where a test you added fails, fix your work where the \
+             request's words ask for what the test checks, otherwise fix the test, or remove it \
+             unless the task asks for it. A failing test you added is not left behind, unless \
+             the task asks for it to fail. Then end with your whole answer again."
         );
         // Run in a folder of the project, it is named by its path from the
         // project.
@@ -11870,11 +11873,35 @@ pub(crate) mod tests {
             assert!(looked, "{line}");
             spec.transcript.conversation.messages.pop();
         }
+        // A line that runs a test the project had and one the run added,
+        // where the run's change broke the first: the project as it was
+        // lacks the second, so the line fails there too, and the notice
+        // must not have the run fix or remove the test that was there.
+        std::fs::write(project.join("notes.txt"), "bye\n").unwrap();
+        added("zz_new_test.sh");
+        std::fs::write(project.join("zz_new_test.sh"), passing).unwrap();
+        let both = ran(
+            json!({"command": "sh check.sh && sh zz_new_test.sh"}),
+            "notes.txt lacks hello\n[exit code 1]",
+        );
+        spec.transcript.conversation.messages.push(both);
+        let notice = broken_tests(&spec, &turn, 0, began, &mut looked).unwrap();
+        let notice = notice.content;
+        assert!(
+            notice.starts_with(
+                "`sh check.sh && sh zz_new_test.sh` still fails on your work as it stands, and \
+                 it runs tests you added (`zz_new_test.sh`). Its output:\n\nnotes.txt lacks hello"
+            ),
+            "{notice}"
+        );
+        let old = "where a test the project already had fails, fix your work and leave that \
+                   test as it is, unless the request's words change what it expects";
+        assert!(notice.contains(old), "{notice}");
+        spec.transcript.conversation.messages.pop();
         // A failing line of the project's own tests that fails on the
         // project as it was too is left alone as before, whatever the run
         // added beside it.
         looked = false;
-        std::fs::write(project.join("notes.txt"), "bye\n").unwrap();
         git(&["commit", "-q", "-a", "-m", "second"]);
         let checked = ran(
             json!({"command": "sh check.sh"}),

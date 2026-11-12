@@ -2536,7 +2536,13 @@ pub(crate) fn broken(command: &str, output: &str) -> String {
 /// cannot say whether the change broke anything, but a test the run added
 /// that fails on its own work is the run's to settle, by the work where the
 /// request asks for what it checks and by the test otherwise. Left as it
-/// was, it fails the project's own suite for whoever runs that next.
+/// was, it fails the project's own suite for whoever runs that next. The
+/// line may run tests the project already had beside them, and which test
+/// failed is not read from its output, so the notice says what to do for
+/// each: told only to fix or remove "the test", a run could take that for
+/// an old test its change broke. It is told to run the line once more
+/// first, as `broken` tells it, since a test can fail by chance, and a test
+/// the task asks to fail, as a reproduction does, is left failing.
 pub(crate) fn added_failing(command: &str, added: &[String], output: &str) -> String {
     let (shown, left_out) = quoted(output);
     let mut named: Vec<String> = (added.iter().take(NAMED))
@@ -2547,9 +2553,12 @@ pub(crate) fn added_failing(command: &str, added: &[String], output: &str) -> St
     }
     format!(
         "`{command}` still fails on your work as it stands, and it runs tests you added ({}). \
-         Its output{left_out}:\n\n{shown}\n\nFix your work where the request's words ask for \
-         what the test checks; otherwise fix the test, or remove it unless the task asks for it: \
-         a failing test you added is not left behind. Then end with your whole answer again.",
+         Its output{left_out}:\n\n{shown}\n\nRun it once more first. If it still fails: where \
+         a test the project already had fails, fix your work and leave that test as it is, \
+         unless the request's words change what it expects; where a test you added fails, fix \
+         your work where the request's words ask for what the test checks, otherwise fix the \
+         test, or remove it unless the task asks for it. A failing test you added is not left \
+         behind, unless the task asks for it to fail. Then end with your whole answer again.",
         named.join(", ")
     )
 }
