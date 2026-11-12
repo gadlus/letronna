@@ -74,10 +74,10 @@
 //! A run is told once when a tenth of its tool rounds are left, as it is of
 //! its time: a session's own run to write what it owes and take out what it
 //! made only to test, a helper to finish its checks and write its report.
-//! At its round cap, a run nobody watches that made files new to its project
-//! and still there is given five more rounds, in which only commands run, to
-//! take out those it made only to test; the wrap-up that ends it follows
-//! them.
+//! At a round cap of 50 or more, a run nobody watches that made files new to
+//! its project and still there is given five more rounds, in which only
+//! commands run, to take out those it made only to test; the wrap-up that
+//! ends it follows them.
 //!
 //! Nothing here polls. Each wait -- for the model, for a tool, for an
 //! approval -- is a blocking receive that a stop closes, so a stop is heard at
@@ -2522,11 +2522,14 @@ const TIDY_ONLY: &str = "Not run: only removing what you made to test is left.";
 /// one with a schema, which ends at its cap with the answer it has; where no
 /// command may run; and with too little time or budget left for them, the
 /// rounds and the summary each counted as `read`, what the last request
-/// read, read again in full, as where no cache serves it.
+/// read, read again in full, as where no cache serves it. Nor at a cap too
+/// small to be warned of (`warned_rounds`): five rounds more are most of
+/// another such run, where the cap was set to keep it short.
 fn tidy_rounds(spec: &Spec, turn: &Turn, began: SystemTime, read: u64) -> Option<String> {
     if !turn.at_cap() || !unwatched(spec) || spec.watch.is_some() || spec.schema.is_some() {
         return None;
     }
+    warned_rounds(spec.rounds)?;
     if !turn.runs_commands() || refused(spec, "run_command").is_some() {
         return None;
     }
@@ -13624,12 +13627,17 @@ pub(crate) mod tests {
         dir
     }
 
-    /// A provider whose first `rounds` replies each read the notes from
-    /// another line, so no two calls are alike, and whose last says it is
-    /// done.
-    fn reading(rounds: usize) -> (String, Stub) {
+    /// A reply for each of `lines` that reads the notes from it, so no two
+    /// calls are alike: rounds that change nothing, on the way to a cap.
+    fn reads(lines: std::ops::RangeInclusive<usize>) -> Vec<String> {
         let read = |line: usize| ("read_file", json!({"path": "notes.txt", "offset": line}));
-        let mut replies: Vec<String> = (1..=rounds).map(|line| reply("", &[read(line)])).collect();
+        lines.map(|line| reply("", &[read(line)])).collect()
+    }
+
+    /// A provider whose first `rounds` replies are `reads`, and whose last
+    /// says it is done.
+    fn reading(rounds: usize) -> (String, Stub) {
+        let mut replies = reads(1..=rounds);
         replies.push(reply("Done.", &[]));
         provider(replies)
     }
@@ -13801,13 +13809,16 @@ pub(crate) mod tests {
     #[test]
     fn a_run_at_its_round_cap_is_given_rounds_to_take_out_the_files_it_made_only_to_test() {
         let _data = data("tidy-rounds");
-        let dir = scratch("tidy-rounds");
+        let dir = long_notes("tidy-rounds");
         git_project(&dir, true);
         // A new file of the user's, which the run did not make.
         std::fs::write(dir.join("draft.txt"), "the user's").unwrap();
-        let (endpoint, provider) = provider(vec![
+        let mut replies = vec![
             reply("", &[probe("probe_test.txt")]),
             reply("", &[command("echo probing > probe.log")]),
+        ];
+        replies.extend(reads(1..=48));
+        replies.extend([
             // Turned away at the cap, where the rounds to tidy in are asked for.
             reply("", &[read_notes()]),
             // In them an edit is refused and a removal runs.
@@ -13819,21 +13830,23 @@ pub(crate) mod tests {
             reply("Both are gone.", &[]),
             reply("The notes were read; the probes are removed.", &[]),
         ]);
-        let mut spec = own(endpoint, &dir, AGENTS + 2_300);
-        spec.rounds = 2;
+        let (endpoint, provider) = provider(replies);
+        let spec = own(endpoint, &dir, AGENTS + 2_300);
         let status = spec.status.clone();
         let report = finished(spec);
-        let sent = provider.sent();
-        assert_eq!(sent.len(), 6);
+        // Its fifty rounds, then the reply turned away, the round it tidied
+        // in, the reply with no call and the wrap-up.
+        let sent = &provider.sent()[50..];
+        assert_eq!(sent.len(), 4);
 
         // At the cap the calls are answered as not run, as ever, and what
         // follows them names the run's own new files, by a file tool or a
         // redirection, and neither the user's nor the run's own transcript.
         assert_eq!(
-            results(&sent[3]).last(),
-            Some(&"Not run: the tool-round limit (2) was reached.")
+            results(&sent[1]).last(),
+            Some(&"Not run: the tool-round limit (50) was reached.")
         );
-        let asked = messages(&sent[3]).last().unwrap()["content"]
+        let asked = messages(&sent[1]).last().unwrap()["content"]
             .as_str()
             .unwrap();
         assert_eq!(
@@ -13845,10 +13858,10 @@ pub(crate) mod tests {
         );
         // The tools are offered as before, so the cached prefix holds, and
         // may be called.
-        assert_eq!(sent[3].get("tool_choice"), None);
-        assert_eq!(sent[3]["tools"], sent[2]["tools"]);
+        assert_eq!(sent[1].get("tool_choice"), None);
+        assert_eq!(sent[1]["tools"], sent[0]["tools"]);
         // The edit did not run, the removal did.
-        let ran = results(&sent[4]);
+        let ran = results(&sent[2]);
         assert_eq!(ran[ran.len() - 2], TIDY_ONLY);
         assert!(!ran[ran.len() - 1].starts_with("Not run"), "{ran:?}");
         for gone in ["probe_test.txt", "probe.log", "more.txt"] {
@@ -13856,47 +13869,45 @@ pub(crate) mod tests {
         }
         assert!(dir.join("draft.txt").exists());
         // Then the wrap-up, with the tools still offered and none allowed.
-        let asked = messages(&sent[5]).last().unwrap()["content"].to_string();
+        let asked = messages(&sent[3]).last().unwrap()["content"].to_string();
         assert!(asked.contains(SUMMARY), "{asked}");
-        assert_eq!(sent[5]["tool_choice"], "none");
-        assert_eq!(sent[5]["tools"], sent[2]["tools"]);
+        assert_eq!(sent[3]["tool_choice"], "none");
+        assert_eq!(sent[3]["tools"], sent[0]["tools"]);
         // It ended at its limit, and the round it tidied in is counted.
         assert_eq!(report.status, Outcome::RoundLimit);
         assert_eq!(report.text, "The notes were read; the probes are removed.");
-        assert_eq!(report.rounds, 3);
-        assert_eq!(status.rounds.load(Ordering::Relaxed), 3);
+        assert_eq!(report.rounds, 51);
+        assert_eq!(status.rounds.load(Ordering::Relaxed), 51);
     }
 
     #[cfg(unix)]
     #[test]
     fn the_rounds_to_tidy_in_are_five_and_the_wrap_up_follows_the_last_of_them() {
         let _data = data("tidy-rounds-used");
-        let dir = scratch("tidy-rounds-used");
+        let dir = long_notes("tidy-rounds-used");
         git_project(&dir, true);
-        let mut replies = vec![
-            reply("", &[probe("probe_test.txt")]),
-            reply("", &[read_notes()]),
-        ];
+        let mut replies = vec![reply("", &[probe("probe_test.txt")])];
+        replies.extend(reads(1..=49));
+        replies.push(reply("", &[read_notes()]));
         replies.extend((1..=5).map(|look| reply("", &[command(&format!("echo look {look}"))])));
         replies.push(reply("The probe is still there.", &[]));
         let (endpoint, provider) = provider(replies);
-        let mut spec = own(endpoint, &dir, AGENTS + 2_301);
-        spec.rounds = 1;
-        let report = finished(spec);
-        let sent = provider.sent();
+        let report = finished(own(endpoint, &dir, AGENTS + 2_301));
+        let sent = &provider.sent()[50..];
 
-        // Its one round, the reply turned away, five rounds and the wrap-up:
-        // no reply is asked for between the last of the five and the wrap-up.
-        assert_eq!(sent.len(), 8);
-        assert_eq!(sent[6].get("tool_choice"), None);
-        assert_eq!(sent[7]["tool_choice"], "none");
-        let asked = messages(&sent[7]).last().unwrap()["content"].to_string();
+        // After its fifty rounds: the reply turned away, five rounds and the
+        // wrap-up, with no reply asked for between the last of the five and
+        // the wrap-up.
+        assert_eq!(sent.len(), 7);
+        assert_eq!(sent[5].get("tool_choice"), None);
+        assert_eq!(sent[6]["tool_choice"], "none");
+        let asked = messages(&sent[6]).last().unwrap()["content"].to_string();
         assert!(asked.contains(SUMMARY), "{asked}");
-        let turned_away = (results(&sent[7]).iter())
+        let turned_away = (results(&sent[6]).iter())
             .filter(|result| result.starts_with("Not run"))
             .count();
         assert_eq!(turned_away, 1);
-        assert_eq!((report.status, report.rounds), (Outcome::RoundLimit, 6));
+        assert_eq!((report.status, report.rounds), (Outcome::RoundLimit, 55));
         assert_eq!(report.text, "The probe is still there.");
     }
 
@@ -13904,11 +13915,12 @@ pub(crate) mod tests {
     #[test]
     fn a_call_repeated_in_the_rounds_to_tidy_in_ends_them_and_the_run_still_ends_at_its_limit() {
         let _data = data("tidy-rounds-loop");
-        let dir = scratch("tidy-rounds-loop");
+        let dir = long_notes("tidy-rounds-loop");
         git_project(&dir, true);
         let same = || reply("", &[command("echo same")]);
-        let (endpoint, provider) = provider(vec![
-            reply("", &[probe("probe_test.txt")]),
+        let mut replies = vec![reply("", &[probe("probe_test.txt")])];
+        replies.extend(reads(1..=47));
+        replies.extend([
             same(),
             same(),
             reply("", &[read_notes()]),
@@ -13920,15 +13932,14 @@ pub(crate) mod tests {
             same(),
             reply("Nothing was removed.", &[]),
         ]);
-        let mut spec = own(endpoint, &dir, AGENTS + 2_307);
-        spec.rounds = 3;
-        let report = finished(spec);
-        let sent = provider.sent();
-        assert_eq!(sent.len(), 8);
-        assert_eq!(sent[7]["tool_choice"], "none");
-        let asked = messages(&sent[7]).last().unwrap()["content"].to_string();
+        let (endpoint, provider) = provider(replies);
+        let report = finished(own(endpoint, &dir, AGENTS + 2_307));
+        let sent = &provider.sent()[50..];
+        assert_eq!(sent.len(), 5);
+        assert_eq!(sent[4]["tool_choice"], "none");
+        let asked = messages(&sent[4]).last().unwrap()["content"].to_string();
         assert!(asked.contains(SUMMARY), "{asked}");
-        assert_eq!((report.status, report.rounds), (Outcome::RoundLimit, 6));
+        assert_eq!((report.status, report.rounds), (Outcome::RoundLimit, 53));
         assert_eq!(report.text, "Nothing was removed.");
     }
 
@@ -13952,30 +13963,58 @@ pub(crate) mod tests {
             ),
         ];
         for (at, (first, change, wrap_up)) in cases.into_iter().enumerate() {
-            let dir = scratch("tidy-rounds-none");
+            let dir = long_notes("tidy-rounds-none");
             git_project(&dir, true);
             std::fs::write(dir.join("draft.txt"), "the user's").unwrap();
-            let (endpoint, provider) = provider(vec![
-                reply("", &[first]),
-                reply("", &[read_notes()]),
-                reply("That is all.", &[]),
-            ]);
+            let mut replies = vec![reply("", &[first])];
+            replies.extend(reads(1..=49));
+            replies.extend([reply("", &[read_notes()]), reply("That is all.", &[])]);
+            let (endpoint, provider) = provider(replies);
             let mut spec = own(endpoint, &dir, AGENTS + 2_302 + at as u64);
-            spec.rounds = 1;
             change(&mut spec);
             let report = finished(spec);
-            let sent = provider.sent();
+            let sent = &provider.sent()[50..];
             // The wrap-up comes at once, as it did.
-            assert_eq!(sent.len(), 3, "{at}");
-            assert_eq!(sent[2]["tool_choice"], "none", "{at}");
-            let asked = messages(&sent[2]).last().unwrap()["content"].to_string();
+            assert_eq!(sent.len(), 2, "{at}");
+            assert_eq!(sent[1]["tool_choice"], "none", "{at}");
+            let asked = messages(&sent[1]).last().unwrap()["content"].to_string();
             assert!(asked.contains(wrap_up), "{at}: {asked}");
-            assert!(!carries(&sent[2], "more rounds"), "{at}");
+            assert!(!carries(&sent[1], "more rounds"), "{at}");
             assert_eq!(
                 (report.status, report.rounds),
-                (Outcome::RoundLimit, 1),
+                (Outcome::RoundLimit, 50),
                 "{at}"
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_whose_cap_is_too_small_to_be_warned_of_gets_no_rounds_to_tidy_in() {
+        let _data = data("tidy-rounds-small");
+        // A cap of one, as `--max-rounds 1` sets, and the 25 of a turn that a
+        // schedule or a server runs: each ends at its cap, with what it made
+        // still there.
+        for (at, cap) in [1, 25].into_iter().enumerate() {
+            let dir = long_notes("tidy-rounds-small");
+            git_project(&dir, true);
+            let mut replies = vec![reply("", &[probe("probe_test.txt")])];
+            replies.extend(reads(1..=cap - 1));
+            replies.extend([reply("", &[read_notes()]), reply("That is all.", &[])]);
+            let (endpoint, provider) = provider(replies);
+            let mut spec = own(endpoint, &dir, AGENTS + 2_310 + at as u64);
+            spec.rounds = cap;
+            let report = finished(spec);
+            let sent = provider.sent();
+            assert_eq!(sent.len(), cap + 2, "{cap}");
+            assert_eq!(sent[cap + 1]["tool_choice"], "none", "{cap}");
+            assert!(!carries(&sent[cap + 1], "more rounds"), "{cap}");
+            assert_eq!(
+                (report.status, report.rounds),
+                (Outcome::RoundLimit, cap),
+                "{cap}"
+            );
+            assert!(dir.join("probe_test.txt").exists(), "{cap}");
         }
     }
 
@@ -13984,25 +14023,23 @@ pub(crate) mod tests {
     fn rounds_to_tidy_in_are_given_only_where_a_run_nobody_watches_can_use_them() {
         let dir = scratch("tidy-rounds-guards");
         git_project(&dir, true);
-        let own_run = || {
-            let mut spec = own("http://127.0.0.1:9/v1".into(), &dir, AGENTS + 2_308);
-            spec.rounds = 1;
-            spec
-        };
+        let own_run = || own("http://127.0.0.1:9/v1".into(), &dir, AGENTS + 2_308);
         std::fs::write(dir.join("probe.py"), "made").unwrap();
         crate::taint::made(&context(&own_run()), &dir.join("probe.py"));
         let began = SystemTime::UNIX_EPOCH;
-        // Its turn, with its one round run.
+        // Its turn, with every round of its cap run.
         let at_cap = |spec: &Spec| {
             let mut turn = Turn::with_limit(spec.connection.clone(), spec.rounds);
-            let read = ToolCall {
-                id: "call-0".into(),
-                name: "read_file".into(),
-                arguments: "{}".into(),
-            };
-            assert!(turn.begin(vec![read]));
-            turn.finish_call(Ok("read".into()));
-            turn.take_results();
+            for round in 0..spec.rounds {
+                let read = ToolCall {
+                    id: "call-0".into(),
+                    name: "read_file".into(),
+                    arguments: json!({ "offset": round }).to_string(),
+                };
+                assert!(turn.begin(vec![read]));
+                turn.finish_call(Ok(format!("read {round}")));
+                turn.take_results();
+            }
             turn
         };
         // Its last request read 1,000 tokens.
@@ -14013,15 +14050,17 @@ pub(crate) mod tests {
         let fresh = Turn::with_limit(spec.connection.clone(), spec.rounds);
         assert!(tidy_rounds(&spec, &fresh, began, 1_000).is_none());
         // Not where a frontend shows the run, with a schema, where no command
-        // may run, with under six requests' tokens left, or under two minutes.
+        // may run, with under six requests' tokens left, or under two
+        // minutes, nor at a cap too small to be warned of.
         type Change = fn(&mut Spec);
-        let changes: [Change; 6] = [
+        let changes: [Change; 7] = [
             |spec| spec.watch = Some(Arc::new(|_| ())),
             |spec| spec.schema = Some(json!({"type": "object"})),
             |spec| spec.connection.plan = true,
             |spec| spec.allow = Allow::Only(vec!["read_file".into()]),
             |spec| spec.budget = Some(nearly_spent(1_000_000)),
             |spec| spec.connection.deadline = Some(Instant::now() + Duration::from_secs(60)),
+            |spec| spec.rounds = 49,
         ];
         for (at, change) in changes.into_iter().enumerate() {
             let mut spec = own_run();
