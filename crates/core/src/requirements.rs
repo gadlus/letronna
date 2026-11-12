@@ -20,7 +20,10 @@
 //! and tables are skipped whole; a list item is a sentence of its own, and a
 //! line broken inside a paragraph is joined to the next. A sentence ends at
 //! a stop outside a code span and not after an abbreviation such as "e.g.",
-//! and a name from code opens one as a capital does, backticks or none.
+//! and a name from code opens one as a capital does, backticks or none. One
+//! that joins clauses with a dash set off by spaces or a semicolon is cut
+//! there where each side states a requirement of its own and stands alone,
+//! so a request written as one long sentence is read as the several it is.
 //! The bar is a few such sentences, so a short request or a bug report,
 //! which the notice to run a build or test covers, costs nothing.
 //!
@@ -300,6 +303,51 @@ const SHORTENED: &[&str] = &[
 /// that is neither a marker nor code.
 const SPAN: &str = "\u{2026}";
 
+/// Marks that join two clauses in one sentence: a dash set off by spaces,
+/// and a semicolon before a space.
+const JOINTS: &[&str] = &[" -- ", " \u{2014} ", " \u{2013} ", "; "];
+
+/// Fewest words, a code span counted as one, that make a side of a joint a
+/// clause of its own: with fewer it is a label, an item of a list or an
+/// aside, whose verb or subject is on the other side.
+const CLAUSE: usize = 6;
+
+/// First words of a clause that goes on from the one before its joint.
+const GOES_ON: &[&str] = &[
+    "otherwise",
+    "else",
+    "then",
+    "and",
+    "or",
+    "but",
+    "so",
+    "nor",
+    "not",
+    "which",
+    "whereas",
+    "also",
+    "instead",
+    "except",
+    "e.g",
+    "i.e",
+    "eg",
+    "ie",
+];
+
+/// First words that, with a comma after them, say where or when what
+/// follows applies, as those of `CONDITIONS` do.
+const SETTINGS: &[&str] = &[
+    "in", "for", "on", "with", "without", "under", "during", "after", "before", "while", "where",
+    "within", "given",
+];
+
+/// First words of a clause whose subject is on the other side of its
+/// joint, as "must also return true" has it, beside the first word of any
+/// of `MARKERS` that ends in "s", as "returns" does.
+const SUBJECTLESS: &[&str] = &[
+    "must", "should", "shall", "cannot", "can't", "can", "may", "will", "doesn't",
+];
+
 /// A run of lines that may hold sentences, and whether it is a list's item,
 /// whose first sentence may start in lower case.
 struct Block {
@@ -312,8 +360,29 @@ struct Block {
 /// wording, or one does and `RULES` or more do with the plain ones counted,
 /// the request is a specification, whose plain sentences state one too,
 /// such as "Keys are matched without case": then each sentence is kept but
-/// a question, a story, how to work or code.
+/// a question, a story, how to work or code. A sentence that joins clauses
+/// which each state one is cut into them (`clauses`), with two limits. The
+/// cuts alone take a request to `FEWEST` only where one sentence joins that
+/// many clauses, as a specification written as one sentence does: a bug
+/// report's sentence joins two asks, and is no more of one for it. And no
+/// cut takes the list past `LISTED`, where it would cost a later sentence
+/// its number.
 pub(crate) fn sentences(request: &str) -> Vec<String> {
+    let (whole, cut) = (read(request, false), read(request, true));
+    let over = whole.len() < FEWEST && cut.len() >= FEWEST;
+    let joined = || {
+        let mut all = blocks(request).into_iter();
+        all.any(|block| (split(&block.text).into_iter()).any(|one| clauses(one).len() >= FEWEST))
+    };
+    match cut.len() > LISTED || (over && !joined()) {
+        true => whole,
+        false => cut,
+    }
+}
+
+/// The requirement sentences of `request` as `sentences` gives them, each
+/// sentence `cut` into its clauses or left whole.
+fn read(request: &str, cut: bool) -> Vec<String> {
     let (mut stated, mut specified): (Vec<String>, Vec<String>) = Default::default();
     let keep = |found: &mut Vec<String>, sentence: &str| {
         if !found.iter().any(|kept| kept == sentence) {
@@ -329,12 +398,18 @@ pub(crate) fn sentences(request: &str) -> Vec<String> {
             if lower && !(block.item && at == 0) && !namelike(first_word(sentence)) {
                 continue;
             }
-            let states = states(sentence);
-            if states {
-                keep(&mut stated, sentence);
-            }
-            if states || specifies(sentence) {
-                keep(&mut specified, sentence);
+            let parts = match cut {
+                true => clauses(sentence),
+                false => vec![sentence],
+            };
+            for part in parts {
+                let states = states(part);
+                if states {
+                    keep(&mut stated, part);
+                }
+                if states || specifies(part) {
+                    keep(&mut specified, part);
+                }
             }
         }
     }
@@ -1579,6 +1654,136 @@ pub(crate) fn split(text: &str) -> Vec<&str> {
     sentences
 }
 
+/// The clauses of `sentence`, cut at each of its `joints` that plainly
+/// sets two requirements apart: a request written as one long sentence,
+/// its requirements joined by dashes, counted as stating one and so got no
+/// review. The words since the cut before are a clause of their own
+/// (`clause`) and so are the words up to the next joint, which also stand
+/// alone after it (`follows`); no colon before the joint opens a list
+/// (`lists`), whose items share the words before it; and where the words
+/// before open by saying when they apply (`conditional`), which may hold
+/// for both sides, so do the words after. A side that is no clause stays
+/// with the words before it, and no cut leaves words that state nothing.
+fn clauses(sentence: &str) -> Vec<&str> {
+    let joints = joints(sentence);
+    let mut cuts: Vec<std::ops::Range<usize>> = Vec::new();
+    for (at, joint) in joints.iter().enumerate() {
+        let start = cuts.last().map_or(0, |cut| cut.end);
+        let next = joints.get(at + 1).map_or(sentence.len(), |next| next.start);
+        let (left, right) = (&sentence[start..joint.start], &sentence[joint.end..next]);
+        let shared = lists(left) || (conditional(left) && !conditional(right));
+        if clause(left) && follows(right) && !shared {
+            cuts.push(joint.clone());
+        }
+    }
+    while (cuts.last()).is_some_and(|cut| !states(&sentence[cut.end..])) {
+        cuts.pop();
+    }
+    let mut found = Vec::new();
+    let mut start = 0;
+    for cut in cuts {
+        found.push(sentence[start..cut.start].trim());
+        start = cut.end;
+    }
+    found.push(sentence[start..].trim());
+    found
+}
+
+/// Where `sentence` could be cut between two clauses: each of `JOINTS`
+/// outside a code span, a quoted string and brackets, but for a semicolon
+/// that ends a web address or an entity such as `&amp;`.
+fn joints(sentence: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = sentence.as_bytes();
+    let mut found = Vec::new();
+    let (mut at, mut depth) = (0, 0usize);
+    while at < bytes.len() {
+        match bytes[at] {
+            b'`' => {
+                let run = bytes[at..].iter().take_while(|&&b| b == b'`').count();
+                let ticks = &sentence[at..at + run];
+                // A span never closed is plain text from its ticks on.
+                at += run + sentence[at + run..].find(ticks).map_or(0, |end| end + run);
+                continue;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        let mark = (JOINTS.iter()).find(|mark| bytes[at..].starts_with(mark.as_bytes()));
+        if let Some(mark) = mark.filter(|_| depth == 0) {
+            let before = &sentence[..at];
+            let word = before.rsplit(' ').next().unwrap_or_default();
+            let address = mark.starts_with(';') && (word.contains("://") || word.starts_with('&'));
+            if !address && !quoted(before) && !single_quoted(before) {
+                found.push(at..at + mark.len());
+            }
+        }
+        at += 1;
+    }
+    found
+}
+
+/// Whether `text` ends inside a string in single quotes: after a quote
+/// that opens a word and before one that closes a word, an apostrophe
+/// inside a word being neither.
+fn single_quoted(text: &str) -> bool {
+    let mut open = false;
+    let mut before = ' ';
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}') {
+            let after = chars.peek().copied().unwrap_or(' ');
+            let opens = before.is_whitespace() || matches!(before, '(' | '[' | '{');
+            match (opens && !after.is_whitespace(), !after.is_alphanumeric()) {
+                (true, _) => open = true,
+                (false, true) => open = false,
+                (false, false) => {}
+            }
+        }
+        before = c;
+    }
+    open
+}
+
+/// Whether `side` of a joint is a clause of its own: it states a
+/// requirement by its own words (`states`), in `CLAUSE` words or more.
+fn clause(side: &str) -> bool {
+    states(side) && outside_code(side).split_whitespace().count() >= CLAUSE
+}
+
+/// Whether `side` is a clause of its own (`clause`) that stands alone
+/// after a joint: it opens with no word of `GOES_ON` and no verb whose
+/// subject the cut would take from it (`SUBJECTLESS`), and does not end on
+/// "not", its verb left on the other side, as "the second does not." ends.
+fn follows(side: &str) -> bool {
+    let prose = outside_code(side).to_lowercase().replace('\u{2019}', "'");
+    let bare = |word: &str| -> String {
+        let kept = |c: char| c.is_alphanumeric() || c == '\'';
+        word.trim_matches(|c: char| !kept(c)).to_owned()
+    };
+    let first = bare(first_word(&prose));
+    let marker = (MARKERS.iter()).any(|marker| marker.split(' ').next() == Some(first.as_str()));
+    let subjectless = SUBJECTLESS.contains(&first.as_str()) || (first.ends_with('s') && marker);
+    let last = bare(prose.split_whitespace().next_back().unwrap_or_default());
+    let elided = last == "not" || last == "cannot" || last.ends_with("n't");
+    clause(side) && !GOES_ON.contains(&first.as_str()) && !subjectless && !elided
+}
+
+/// Whether `side` holds a colon that opens a list, whose items the joints
+/// after it set apart: cut off, an item would lose what the words before
+/// the colon say of each.
+fn lists(side: &str) -> bool {
+    outside_code(side).contains(": ")
+}
+
+/// Whether `side` opens by saying when it applies: with one of `CONDITIONS`
+/// or `SETTINGS`, and a comma after it.
+fn conditional(side: &str) -> bool {
+    let prose = outside_code(side).to_lowercase();
+    let first = first_word(&prose).trim_matches(|c: char| !c.is_alphanumeric());
+    (CONDITIONS.contains(&first) || SETTINGS.contains(&first)) && prose.contains(',')
+}
+
 /// Whether `sentence` states something the change must do, rather than how
 /// to work, a question, a story or code.
 fn states(sentence: &str) -> bool {
@@ -2083,6 +2288,162 @@ mod tests {
     fn a_sentence_said_twice_is_listed_once() {
         let request = "The flag must default to off.\n\nThe flag must default to off.";
         assert_eq!(sentences(request), ["The flag must default to off."]);
+    }
+
+    #[test]
+    fn a_request_written_as_one_long_sentence_is_cut_where_its_clauses_join() {
+        let request = "The exporter should write one file per table -- column names are taken \
+                       from the first row -- empty cells must be written as two quotes \u{2014} \
+                       each row ends with a line feed and nothing after it \u{2013} the header \
+                       is left out when `--bare` is given, and a table with no rows returns an \
+                       error.";
+        let found = sentences(request);
+        // A clause no word marks as a requirement stays with the one before.
+        assert_eq!(
+            found,
+            [
+                "The exporter should write one file per table -- column names are taken from \
+                 the first row",
+                "empty cells must be written as two quotes",
+                "each row ends with a line feed and nothing after it",
+                "the header is left out when `--bare` is given, and a table with no rows \
+                 returns an error.",
+            ]
+        );
+        assert!(found.len() >= FEWEST);
+        // A semicolon between two requirements cuts as a dash does.
+        assert_eq!(
+            sentences(
+                "Keys must be unique within one section; a key repeated in another section \
+                 is accepted as its own."
+            ),
+            [
+                "Keys must be unique within one section",
+                "a key repeated in another section is accepted as its own.",
+            ]
+        );
+        // Sentences are split at their stops as before, for the notes of a
+        // run too, which are read by them.
+        let joined = "Keys must be unique within one section -- a second one must be refused.";
+        assert_eq!(split(joined), [joined]);
+    }
+
+    #[test]
+    fn a_joint_inside_code_a_quote_brackets_or_an_address_cuts_nothing() {
+        for request in [
+            "The header line must read `a; every b -- c` and the body must follow it on the \
+             next line.",
+            "The error message must read \"no such key; the name must be one of the listed \
+             keys\" in every case.",
+            "The error message must read 'no such key; the name must be one of the listed \
+             keys' in every case.",
+            "The reader must accept both forms (the short one must come first; the long one \
+             must follow it on its own line) in any file.",
+            "The client must fetch the page at https://example.com/a;b=1; the reply must be \
+             kept for an hour at most.",
+            "Every attribute value must keep a literal &amp; the writer must never decode it \
+             a second time.",
+        ] {
+            assert_eq!(sentences(request), [request], "{request}");
+        }
+        // An apostrophe opens no quote.
+        assert_eq!(
+            sentences(
+                "The reader's cache must hold every page it has read; the writer's cache \
+                 must hold none of them."
+            )
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_side_that_does_not_stand_alone_stays_with_the_words_before_it() {
+        for request in [
+            // A label, an aside and a few words with no verb are no clause.
+            "`strict` -- unknown keys must be rejected with an error that names each of them.",
+            "The error should carry a dump of the stack -- raw bytes a debugger can load.",
+            "The channel must expose four handles of its own -- each a pair of numbers.",
+            // What goes on from the words before it, or leaves its subject
+            // or its verb there.
+            "The merge must fast-forward when the branch has no commits of its own; \
+             otherwise it must create a commit with two parents.",
+            "`is_enabled` reads the setting and returns true by default; must also return \
+             true when no settings are given at all.",
+            "The reader returns the head and the body as two keys; returns an empty map \
+             when the document has neither of them.",
+            "Only the first form marks an endpoint as a stream; applying the second form to \
+             a schema does not.",
+            // The items of a list share the words before its colon.
+            "Add two methods to the reader: `open` must return a handle for the file; \
+             `close` must release it and return nothing at all.",
+            // A condition that opens a sentence may hold for all of it.
+            "If the body is still streaming, reading it twice must raise an error; a second \
+             pass over its parts raises the same error.",
+        ] {
+            assert_eq!(sentences(request), [request], "{request}");
+        }
+        // Each side with a condition of its own stands alone.
+        assert_eq!(
+            sentences(
+                "When the flag is set, the reader must raise an error; when it is not set, \
+                 the reader must return the errors as a list."
+            ),
+            [
+                "When the flag is set, the reader must raise an error",
+                "when it is not set, the reader must return the errors as a list.",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bug_report_with_dashes_and_semicolons_still_states_too_little_for_a_review() {
+        let report = "Export should keep empty rows\n\
+                      Our nightly report has gaps -- the export seems to skip any row with no \
+                      values; I think it should have kept them, and it was fine before the \
+                      last release. The export should keep every row that has no values; it \
+                      must not drop the header row of the sheet either.";
+        let found = sentences(report);
+        assert_eq!(
+            found,
+            [
+                "Export should keep empty rows",
+                "The export should keep every row that has no values",
+                "it must not drop the header row of the sheet either.",
+            ]
+        );
+        assert!(found.len() < FEWEST);
+        // One more ask, and its sentences still count as they did: only a
+        // sentence that joins `FEWEST` clauses takes a request to the bar.
+        let asked = format!("{report} Empty cells must be written as two quotes.");
+        assert_eq!(
+            sentences(&asked),
+            [
+                "Export should keep empty rows",
+                "The export should keep every row that has no values; it must not drop the \
+                 header row of the sheet either.",
+                "Empty cells must be written as two quotes.",
+            ]
+        );
+        // A request that states enough without its cuts has them all.
+        let stated = format!("{asked} Each row must end with a line feed.");
+        assert_eq!(sentences(&stated).len(), 5);
+    }
+
+    #[test]
+    fn a_cut_that_takes_the_list_past_its_length_is_not_made() {
+        let rules: String = (1..=LISTED - 1)
+            .map(|at| format!("Rule {at} must hold. "))
+            .collect();
+        let joined = "Keys must be unique within one section; a key repeated in another \
+                      section is accepted as its own.";
+        // With room for both halves the last sentence is cut in two.
+        let short = rules.replacen("Rule 1 must hold. ", "", 1);
+        assert_eq!(sentences(&format!("{short}{joined}")).len(), LISTED);
+        // Cut here, it would leave its second half without a number.
+        let found = sentences(&format!("{rules}{joined}"));
+        assert_eq!(found.len(), LISTED);
+        assert_eq!(found.last().map(String::as_str), Some(joined));
     }
 
     #[test]
