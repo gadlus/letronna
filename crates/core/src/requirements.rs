@@ -1755,8 +1755,10 @@ fn clauses(sentence: &str) -> Vec<&str> {
 /// Where `sentence` could be cut between two clauses: each of `JOINTS`
 /// outside a code span, a quoted string and brackets, but for a semicolon
 /// that ends a web address or an entity such as `&amp;`, a dash beside a
-/// number, which is a range or a minus as in "0 – 255", and a
-/// double hyphen before an option, which a command line is written with.
+/// number, which is a range or a minus as in "0 – 255", a double hyphen
+/// before an option, which a command line is written with, and either
+/// mark before a number, which goes on with one more value, as "; 0 only
+/// when every check has passed" does after what gives 1.
 fn joints(sentence: &str) -> Vec<std::ops::Range<usize>> {
     let bytes = sentence.as_bytes();
     let mut found = Vec::new();
@@ -1782,8 +1784,11 @@ fn joints(sentence: &str) -> Vec<std::ops::Range<usize>> {
             let address = semicolon && (word.contains("://") || word.starts_with('&'));
             let rest = &sentence[at + mark.len()..];
             let digit = |c: Option<char>| c.is_some_and(|c| c.is_ascii_digit());
-            let number = digit(before.chars().next_back()) || digit(rest.chars().next());
-            let written = !semicolon && (number || rest.starts_with('-'));
+            let (behind, ahead) = (
+                digit(before.chars().next_back()),
+                digit(rest.chars().next()),
+            );
+            let written = ahead || (!semicolon && (behind || rest.starts_with('-')));
             if !address && !written && !quoted(before) && !single_quoted(before) {
                 found.push(at..at + mark.len());
             }
@@ -2488,7 +2493,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dash_that_joins_no_clauses_cuts_nothing() {
+    fn a_mark_that_joins_no_clauses_cuts_nothing() {
         for request in [
             // A range, and a minus.
             "The value must lie in the range 0 \u{2013} 255 and the reader must reject \
@@ -2504,9 +2509,16 @@ mod tests {
             // Two dashes that set off an aside.
             "The reader must keep the file open -- it should never buffer more than one \
              page -- until the caller has closed it.",
+            // One more value of what the words before a semicolon give.
+            "The command must exit with 1 when any check has failed; 0 only when every \
+             check has passed.",
         ] {
             assert_eq!(sentences(request), [request], "{request}");
         }
+        // A number that ends the words before a semicolon ends a clause.
+        let counted = "The reader must retry a failed read at most 3; the writer must never \
+                       retry a write at all.";
+        assert_eq!(sentences(counted).len(), 2);
         // Two dashes between three clauses still cut them apart.
         let joined = "The reader must keep the file open -- it should never buffer more than \
                       one page -- the caller must close it when it is done.";
