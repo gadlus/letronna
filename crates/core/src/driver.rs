@@ -699,6 +699,8 @@ fn steps(
     let mut warned = past_warning(spec);
     // Whether it has been told how few of its tool rounds are left.
     let mut counted = false;
+    // Whether it was given rounds past its cap to tidy in.
+    let mut tidying = false;
     // The time the run was given, to tell a run long enough to end early for
     // its review from one whose whole time is about that long.
     let given = (spec.connection.deadline)
@@ -750,6 +752,12 @@ fn steps(
                 save(&mut spec.transcript)?;
             }
         }
+        // In the rounds given to tidy in only a command runs, and in the
+        // summary after them nothing does, so a warning to write what is
+        // owed has nothing to act on: one that comes due there is not told.
+        if tidying {
+            warned |= past_warning(spec);
+        }
         if let Some(mut text) = time_warning(spec, &mut warned) {
             text.push_str(&still_to_make(&noted));
             deadline_notice(spec, text)?;
@@ -760,8 +768,10 @@ fn steps(
             text.push_str(&still_to_make(&noted));
             deadline_notice(spec, text)?;
         }
+        // Nor, there, is a run told to finish its change for a review.
         if !due
             && !listed
+            && !tidying
             && let Some(text) = review_due(spec, report, given)
         {
             due = true;
@@ -1355,6 +1365,7 @@ fn steps(
         // test, asked for in place of the wrap-up, which follows them.
         if let Some(notice) = tidy_rounds(spec, turn, began, read) {
             turn.tidy_at_cap(TIDY_ROUNDS, notice);
+            tidying = true;
         }
         if capped || !turn.begin(calls) {
             return at_limit(spec, report);
@@ -1373,12 +1384,14 @@ fn steps(
         if let Some(outcome) = settled(spec, report) {
             return Ok(outcome);
         }
-        // The rounds given to tidy in end with the last of them, or with a
-        // call repeated without end, and the wrap-up follows as at the cap,
-        // so the run still ends at its limit; not after a stop, whose calls
-        // are yet to be answered.
+        // The rounds given to tidy in end with the last of them, with a call
+        // repeated without end, or with too little of the run's time left
+        // for another, and the wrap-up follows as at the cap, so the run
+        // still ends at its limit; not after a stop, whose calls are yet to
+        // be answered.
+        let over = turn.looping().is_some() || short_of_time(spec, TIDY_LEAST);
         if !spec.cancel.is_set()
-            && let Some(ask) = turn.tidied(turn.looping().is_some())
+            && let Some(ask) = turn.tidied(over)
         {
             spec.transcript.conversation.messages.push(ask);
             save(&mut spec.transcript)?;
@@ -2504,6 +2517,18 @@ const LEFT_NAMED: usize = 20;
 /// stops in them would end with no summary at all.
 const TIDY_TIME: Duration = Duration::from_secs(2 * 60);
 
+/// The least of it that must be left for another of them once they are
+/// under way, about what one slow reply and the summary take: with less,
+/// the summary is asked for at once, since rounds that ran long would have
+/// the deadline stop a run that, before it was given them, ended with one.
+const TIDY_LEAST: Duration = Duration::from_secs(60);
+
+/// Whether a run with a deadline has under `least` of its time left.
+fn short_of_time(spec: &Spec, least: Duration) -> bool {
+    (spec.connection.deadline)
+        .is_some_and(|deadline| deadline.saturating_duration_since(Instant::now()) < least)
+}
+
 /// What a call that is no command is answered in the rounds a run is given
 /// past its cap, so they are not used to go on with the work.
 const TIDY_ONLY: &str = "Not run: only removing what you made to test is left.";
@@ -2539,9 +2564,7 @@ fn tidy_rounds(spec: &Spec, turn: &Turn, began: SystemTime, read: u64) -> Option
     if spec.budget.as_ref().is_some_and(short) {
         return None;
     }
-    let left = (spec.connection.deadline)
-        .map(|deadline| deadline.saturating_duration_since(Instant::now()));
-    if left.is_some_and(|left| left < TIDY_TIME) {
+    if short_of_time(spec, TIDY_TIME) {
         return None;
     }
     let left = left_behind(spec, spec.connection.workspace.as_deref()?, began);
@@ -14040,9 +14063,16 @@ pub(crate) mod tests {
             )
         );
         // The tools are offered as before, so the cached prefix holds, and
-        // may be called.
+        // may be called. Not compared name for name with the request before:
+        // other tests running beside this one switch tools on and off.
+        let offered = |body: &Value| {
+            let tools = body["tools"].as_array().unwrap();
+            ["read_file", "write_file", "run_command"]
+                .iter()
+                .all(|name| tools.iter().any(|tool| tool["function"]["name"] == *name))
+        };
         assert_eq!(sent[1].get("tool_choice"), None);
-        assert_eq!(sent[1]["tools"], sent[0]["tools"]);
+        assert!(offered(&sent[1]));
         // The edit did not run, the removal did.
         let ran = results(&sent[2]);
         assert_eq!(ran[ran.len() - 2], TIDY_ONLY);
@@ -14058,7 +14088,7 @@ pub(crate) mod tests {
         let asked = messages(&sent[3]).last().unwrap()["content"].to_string();
         assert!(asked.contains(SUMMARY), "{asked}");
         assert_eq!(sent[3]["tool_choice"], "none");
-        assert_eq!(sent[3]["tools"], sent[0]["tools"]);
+        assert!(offered(&sent[3]));
         // It ended at its limit, and the round it tidied in is counted.
         assert_eq!(report.status, Outcome::RoundLimit);
         assert_eq!(report.text, "The notes were read; the probes are removed.");
@@ -14198,6 +14228,67 @@ pub(crate) mod tests {
             );
             assert!(dir.join("probe_test.txt").exists(), "{cap}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_time_warning_that_comes_due_in_the_rounds_to_tidy_in_is_not_told() {
+        let _data = data("tidy-rounds-warning");
+        let dir = tidy_project("tidy-rounds-warning");
+        let mut replies = vec![reply("", &[probe("probe_test.txt")])];
+        replies.extend(reads(1..=49));
+        replies.extend([
+            reply("", &[read_notes()]),
+            reply("", &[command("rm probe_test.txt")]),
+            reply("It is gone.", &[]),
+            reply("The notes were read; the probe is removed.", &[]),
+        ]);
+        // The first reply in the rounds to tidy in comes only once the
+        // warning is due, so the round after it would be told of it.
+        let warn_at = Instant::now() + Duration::from_secs(2);
+        let asked = AtomicUsize::new(0);
+        let (endpoint, provider) = provider_by(replies.len(), move |_| {
+            let at = asked.fetch_add(1, Ordering::SeqCst);
+            if at == 51 {
+                let wait = warn_at.saturating_duration_since(Instant::now());
+                std::thread::sleep(wait + Duration::from_millis(100));
+            }
+            replies[at].clone()
+        });
+        let mut spec = own(endpoint, &dir, AGENTS + 2_312);
+        spec.connection.deadline = Some(Instant::now() + Duration::from_secs(10 * 60));
+        spec.connection.warn_at = Some(warn_at);
+        let report = finished(spec);
+        assert_eq!((report.status, report.rounds), (Outcome::RoundLimit, 51));
+        let sent = provider.sent();
+        assert_eq!(sent.len(), 54);
+        // Nothing after the notice that gave the rounds tells it to write
+        // what it owes: not in the rounds, where only a command runs, nor
+        // with the summary, where nothing does.
+        let said = messages(&sent[53]);
+        let told = |message: &Value, words: &str| {
+            let content = message["content"].as_str();
+            content.is_some_and(|content| content.contains(words))
+        };
+        let given = said.iter().position(|message| told(message, "more rounds"));
+        let after = &said[given.expect("the rounds to tidy in")..];
+        assert!(after.iter().all(|message| !told(message, WARNING)));
+        assert!(!dir.join("probe_test.txt").exists());
+    }
+
+    #[test]
+    fn a_run_is_short_of_time_only_with_a_deadline_nearer_than_what_is_asked() {
+        let dir = scratch("short-of-time");
+        let mut spec = own("http://127.0.0.1:9/v1".into(), &dir, AGENTS + 2_313);
+        // The rounds to tidy in are given with two minutes left, and go on
+        // while a minute is.
+        assert!(!short_of_time(&spec, TIDY_TIME));
+        spec.connection.deadline = Some(Instant::now() + Duration::from_secs(90));
+        assert!(short_of_time(&spec, TIDY_TIME) && !short_of_time(&spec, TIDY_LEAST));
+        spec.connection.deadline = Some(Instant::now() + Duration::from_secs(30));
+        assert!(short_of_time(&spec, TIDY_LEAST));
+        spec.connection.deadline = Some(Instant::now() + Duration::from_secs(10 * 60));
+        assert!(!short_of_time(&spec, TIDY_TIME));
     }
 
     #[cfg(unix)]
