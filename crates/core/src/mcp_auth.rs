@@ -1454,7 +1454,10 @@ impl Tool for Authenticate {
     }
     fn run(&self, _: &Value, ctx: &ToolContext) -> Result<String, String> {
         let server = &self.server;
-        let how = format!("`/mcp login {server}` in the terminal or Sign in under Settings › MCP");
+        let how = format!(
+            "`/mcp login {server}` in the terminal or Sign in on its row under Capabilities › MCP \
+             in the window"
+        );
         // What went wrong may quote the server, so it is fenced as its words.
         let before = last_failure(server)
             .map(|why| {

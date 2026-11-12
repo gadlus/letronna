@@ -34,6 +34,10 @@ Run the app and look at the change. `scripts/shot.ps1` captures the terminal win
 
 Icons are Phosphor Light. `scripts/icons.sh` re-syncs them from npm.
 
+## Fonts
+
+The window brings its type: Inter, JetBrains Mono and Newsreader, in `crates/gui/assets/fonts`. `scripts/fonts.sh` fetches them again and cuts them down; it needs `fonttools`.
+
 ## Releases
 
 Releases are tagged `vX.Y.Z`. CI builds every platform into a draft. `scripts/release.ps1 sign <tag>` signs `latest.json` with an offline release key and publishes it. The full steps are in [CONTRIBUTING.md](../CONTRIBUTING.md#releasing).

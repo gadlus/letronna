@@ -114,4 +114,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Small, focused pull requests are welcome
 
 ## License
 
-MIT, © 2026 [Gadlus LLC](https://gadl.us). GPUI and GPUI Kit are Apache-2.0. Phosphor Icons are MIT.
+MIT, © 2026 [Gadlus LLC](https://gadl.us). GPUI and GPUI Kit are Apache-2.0. Phosphor Icons are MIT. Inter, JetBrains Mono and Newsreader, the type the window brings, are under the SIL Open Font License.

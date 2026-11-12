@@ -864,6 +864,19 @@ pub fn ready(limit: Duration) {
     wait_started(limit);
 }
 
+/// How many servers wait for the user, to sign in or to look at why one
+/// failed. It reads no log and starts nothing, so a window can ask it every
+/// time it draws.
+pub fn needing_user() -> usize {
+    let Ok(slots) = slots().lock() else {
+        return 0;
+    };
+    slots
+        .values()
+        .filter(|slot| matches!(slot.state, State::NeedsAuth | State::Failed))
+        .count()
+}
+
 /// Every configured server, in name order.
 pub fn status() -> Vec<ServerStatus> {
     start();
@@ -1930,7 +1943,7 @@ impl Link {
                 let name = &self.name;
                 let why = format!(
                     "{name} wants a sign-in (HTTP 401): `/mcp login {name}` in the terminal, \
-                     or Sign in under Settings › MCP."
+                     or Sign in on its row under Capabilities › MCP in the window."
                 );
                 needs_sign_in(name, self.run, &why);
                 why
@@ -1979,7 +1992,8 @@ impl Link {
         let name = &self.name;
         Some(Failed::Said(format!(
             "{name} wants more access for this ({scope}): the user can grant it with \
-             `/mcp login {name}` in the terminal, or Sign in under Settings › MCP."
+             `/mcp login {name}` in the terminal, or Sign in again under its row in \
+             Capabilities › MCP in the window."
         )))
     }
 

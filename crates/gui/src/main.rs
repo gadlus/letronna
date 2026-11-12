@@ -836,6 +836,11 @@ fn main() {
     app.run(|cx| {
         letronna_core::diag::mark("app");
         gpui_component::init(cx);
+        // Before the first frame asks for a family by name. Left out, the
+        // text falls back to the system's own faces, so nothing stops here.
+        if let Err(why) = cx.text_system().add_fonts(assets::fonts()) {
+            eprintln!("letronna: the bundled fonts did not load: {why}");
+        }
         highlight::register();
         plugins::init(
             cx,

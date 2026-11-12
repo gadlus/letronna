@@ -103,6 +103,28 @@ impl AssetSource for Assets {
     }
 }
 
+/// The faces the window is set in, for the text system: Inter for what is
+/// read and pressed, JetBrains Mono without ligatures for code, and
+/// Newsreader's one weight for the masthead. `scripts/fonts.sh` brings them,
+/// cut down to the scripts the window's own words use; text in any other
+/// falls back to the system's.
+pub(crate) fn fonts() -> Vec<Cow<'static, [u8]>> {
+    macro_rules! faces { ($($face:literal),*) => { vec![
+        $(Cow::Borrowed(&include_bytes!(concat!("../assets/fonts/", $face, ".ttf"))[..])),*
+    ] } }
+    faces!(
+        "Inter-Regular",
+        "Inter-Italic",
+        "Inter-Medium",
+        "Inter-SemiBold",
+        "Inter-Bold",
+        "JetBrainsMonoNL-Regular",
+        "JetBrainsMonoNL-Italic",
+        "JetBrainsMonoNL-Bold",
+        "Newsreader-Medium"
+    )
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum AppIcon {
     Mic,

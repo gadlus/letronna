@@ -29,6 +29,7 @@ pub(crate) mod on_device;
 pub(crate) mod pace;
 pub(crate) mod palette;
 pub(crate) mod panel;
+pub(crate) mod parts;
 pub(crate) mod permissions;
 pub(crate) mod phone;
 pub(crate) mod pictures;
@@ -127,9 +128,11 @@ pub(crate) fn page_header(
                         .flex_1()
                         .min_w_0()
                         .truncate()
-                        .text_xl()
-                        .font_family(HEADING_FONT)
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_2xl()
+                        // The masthead's one weight; the serif needs the
+                        // size up from the sans it took over from.
+                        .font_family(WORDMARK_FONT)
+                        .font_weight(FontWeight::MEDIUM)
                         .child(title.into()),
                 )
                 .child(

@@ -3,28 +3,16 @@ use gpui_component::highlighter::HighlightTheme;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-// A family the system cannot resolve drops every glyph to Helvetica without
-// warning, so each platform names fonts it actually ships. gpui turns
-// ".SystemUIFont" into the platform's own UI face, but on Linux it matches
-// other names literally and never expands fontconfig generics like
-// "monospace", so Linux names DejaVu Sans Mono, gpui-component's own default.
-#[cfg(target_os = "macos")]
-pub(crate) const HEADING_FONT: &str = ".SystemUIFont";
-#[cfg(target_os = "macos")]
-pub(crate) const BODY_FONT: &str = ".SystemUIFont";
-#[cfg(target_os = "macos")]
-pub(crate) const MONO_FONT: &str = "Menlo";
-
-#[cfg(not(target_os = "macos"))]
-pub(crate) const HEADING_FONT: &str = "Segoe UI Variable Display";
-#[cfg(not(target_os = "macos"))]
-pub(crate) const BODY_FONT: &str = "Segoe UI Variable Text";
-#[cfg(windows)]
-pub(crate) const MONO_FONT: &str = "Cascadia Mono";
-#[cfg(not(any(windows, target_os = "macos")))]
-pub(crate) const MONO_FONT: &str = "DejaVu Sans Mono";
-
-pub(crate) const WORDMARK_FONT: &str = "Georgia";
+// The three families the window is set in, bundled in the binary and handed
+// to the text system at start-up (`assets::fonts`), so Windows, macOS and
+// Linux draw the same letters. Naming what each system ships left Linux,
+// which has neither Segoe UI nor Georgia, with whatever it found; and a family
+// the system cannot resolve drops every glyph to Helvetica without warning.
+pub(crate) const HEADING_FONT: &str = "Inter";
+pub(crate) const BODY_FONT: &str = "Inter";
+pub(crate) const MONO_FONT: &str = "JetBrains Mono NL";
+/// The masthead: the wordmark, and the title of a page or a sheet.
+pub(crate) const WORDMARK_FONT: &str = "Newsreader";
 
 // letronna.ai's Night palette, Paper turned over: Paper lays a little blue
 // over its page for the frame, and Night frames a dark ink page in the
@@ -66,6 +54,11 @@ const DANGER: u32 = 0xff6b7a;
 const DANGER_PRESSED: u32 = 0xcc5662;
 /// Success, gpui-component's own dark green, named so a palette can carry it.
 const GREEN: u32 = 0x22c55e;
+/// What waits for the user, a server to sign in to or a plugin to allow:
+/// 9.9:1 on night.
+const AMBER: u32 = 0xf0b429;
+/// How much signal a pressable row lays over its surface under the pointer.
+const HOVER: f32 = 0.09;
 
 // Paper, the light palette: the site's ink on its paper. The frame stays
 // light too, blue laid thinly over paper, because the sidebar and title bar
@@ -98,8 +91,11 @@ const CRIMSON_PRESSED: u32 = 0x8d001a;
 /// Success on paper, where gpui-component's light green reads at 2:1; this reads at 6.4:1.
 const FOREST: u32 = 0x166534;
 /// Attributes in Paper's code, gpui-component's gold darkened from 3.4:1 to
-/// 5.3:1 on a code block.
+/// 5.3:1 on a code block; and what waits for the user, at 5.7:1 on paper.
 const OCHRE: u32 = 0x735c23;
+/// How much blue a pressable row lays over paper under the pointer: less
+/// than night's, as blue is the stronger of the two.
+const PAPER_HOVER: f32 = 0.07;
 
 /// gpui-component's light syntax colours that read under 4.5:1 on a Paper
 /// code block, each with the Paper colour drawn in its place.
@@ -132,6 +128,7 @@ struct Palette {
     danger_pressed: u32,
     on_danger: u32,
     green: u32,
+    amber: u32,
 }
 
 const NIGHT_PALETTE: Palette = Palette {
@@ -152,6 +149,7 @@ const NIGHT_PALETTE: Palette = Palette {
     danger_pressed: DANGER_PRESSED,
     on_danger: MIDNIGHT,
     green: GREEN,
+    amber: AMBER,
 };
 
 const PAPER_PALETTE: Palette = Palette {
@@ -174,6 +172,7 @@ const PAPER_PALETTE: Palette = Palette {
     danger_pressed: CRIMSON_PRESSED,
     on_danger: PAPER,
     green: FOREST,
+    amber: OCHRE,
 };
 
 /// The palette a setting asks for: "paper", "system" to match the
@@ -269,6 +268,14 @@ pub(crate) fn reply_text_style(theme: &Theme) -> gpui_base::TextViewStyle {
         })
         .with_dark(theme.is_dark())
         .with_heading(|_| StyleRefinement::default().pb(rems(1.)))
+}
+
+/// What a row that can be pressed lays over its surface while the pointer is
+/// on it: the colour of a link, thinly, so it reads on the page and on the
+/// frame alike. It comes and goes at once; nothing under the pointer moves.
+pub(crate) fn hover(theme: &Theme) -> Hsla {
+    let share = if theme.is_dark() { HOVER } else { PAPER_HOVER };
+    theme.link.opacity(share)
 }
 
 /// The window's text, and so its rem, at the usual size, and its code's.
@@ -374,6 +381,10 @@ fn paint(t: &mut Theme, p: &Palette) {
     // paper does on crimson.
     t.danger_foreground = rgb(p.on_danger).into();
     t.green = rgb(p.green).into();
+    // gpui-component's own light warning is a yellow that reads at 2.4:1 on
+    // paper.
+    t.warning = rgb(p.amber).into();
+    t.warning_hover = t.warning;
     // A hover colour equal to its base draws no hover: list rows and blue
     // and red buttons stay still under the pointer, and a scrollbar's thumb
     // keeps its colour, though gpui-component still widens it and fills its
@@ -425,9 +436,9 @@ mod tests {
     // Deliberately not `use super::*`: the prelude re-exports gpui, whose own
     // `test` macro would shadow the built-in attribute here.
     use super::{
-        BLUE, BLUE_PRESSED, DANGER, DANGER_PRESSED, GREEN, MIDNIGHT, MUTED, NIGHT, NIGHT_PALETTE,
-        ON_BLUE, PAPER_PALETTE, RAISED, SELECTED, SIDEBAR_ON, SIDEBAR_TEXT, SIGNAL, TEXT,
-        follows_system, palette_for, paper_highlight, pinned_dark,
+        AMBER, BLUE, BLUE_PRESSED, DANGER, DANGER_PRESSED, GREEN, HOVER, MIDNIGHT, MUTED, NIGHT,
+        NIGHT_PALETTE, ON_BLUE, PAPER_HOVER, PAPER_PALETTE, RAISED, SELECTED, SIDEBAR_ON,
+        SIDEBAR_TEXT, SIGNAL, TEXT, follows_system, palette_for, paper_highlight, pinned_dark,
     };
     use gpui::{Rgba, WindowAppearance};
     use gpui_component::highlighter::HighlightTheme;
@@ -477,6 +488,22 @@ mod tests {
             ("green on raised", GREEN, RAISED),
             ("midnight on danger", MIDNIGHT, DANGER),
             ("midnight on pressed danger", MIDNIGHT, DANGER_PRESSED),
+            // What a row says while it waits for the user.
+            ("amber on night", AMBER, NIGHT),
+            ("amber on raised", AMBER, RAISED),
+            // A row under the pointer, on the page and in the sidebar.
+            ("text on a hovered row", TEXT, over(SIGNAL, NIGHT, HOVER)),
+            ("muted on a hovered row", MUTED, over(SIGNAL, NIGHT, HOVER)),
+            (
+                "sidebar text on its hovered row",
+                SIDEBAR_TEXT,
+                over(SIGNAL, MIDNIGHT, HOVER),
+            ),
+            (
+                "muted on the hovered sidebar row",
+                MUTED,
+                over(SIGNAL, MIDNIGHT, HOVER),
+            ),
         ];
         for (what, text, surface) in pairs {
             let ratio = contrast(text, surface);
@@ -525,6 +552,23 @@ mod tests {
             ("paper on pressed crimson", p.on_danger, p.danger_pressed),
             ("green on paper", p.green, p.page),
             ("green on raised", p.green, p.raised),
+            ("ochre on paper", p.amber, p.page),
+            ("ochre on raised", p.amber, p.raised),
+            (
+                "ink on a hovered row",
+                p.text,
+                over(BLUE, p.page, PAPER_HOVER),
+            ),
+            (
+                "ink-mute on a hovered row",
+                p.muted,
+                over(BLUE, p.page, PAPER_HOVER),
+            ),
+            (
+                "ink-mute on the hovered frame row",
+                p.muted,
+                over(BLUE, p.frame, PAPER_HOVER),
+            ),
         ];
         for (what, text, surface) in pairs {
             let ratio = contrast(text, surface);
@@ -544,6 +588,15 @@ mod tests {
             ("blue on the paper frame", p.link, p.frame),
             ("blue on the paper frame's selected row", p.link, p.frame_on),
             ("blue on a picked paper filter", p.link, p.selected),
+            // The mark beside a page's row while something on it waits.
+            ("amber on midnight", AMBER, MIDNIGHT),
+            ("amber on the selected sidebar row", AMBER, SIDEBAR_ON),
+            ("ochre on the paper frame", p.amber, p.frame),
+            (
+                "ochre on the paper frame's selected row",
+                p.amber,
+                p.frame_on,
+            ),
         ];
         for (what, mark, surface) in pairs {
             let ratio = contrast(mark, surface);

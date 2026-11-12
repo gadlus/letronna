@@ -1,7 +1,7 @@
 //! The Capabilities page: what Letronna can reach, in three tabs. Skills are
 //! saved instructions; Tools are Letronna's own tools by family, each with a
 //! switch, what it still needs and how often it was called; MCP is each
-//! server with its tools, and a box that adds one from its README.
+//! server with its tools, and a sheet that adds one from its README.
 //!
 //! A switch here is a permission rule in core, so the terminal and helpers
 //! keep to it too. What the page shows is read when a tab opens and after a
@@ -259,16 +259,39 @@ impl Chat {
         };
         let added = mcp_paste::add(&draft);
         if added.is_ok() {
+            // The sheet goes and the list behind it shows the server
+            // starting; a failure stays in the sheet, to be put right there.
+            window.close_dialog(cx);
             self.set_server_fields(&Draft::default(), window, cx);
-            // Left with the focus, the box's cursor stops blinking once it
-            // is left, as a set box without the focus never would.
-            self.capabilities.paste.update(cx, |input, cx| {
-                input.set_value("", window, cx);
-                input.focus(window, cx);
-            });
+            self.capabilities
+                .paste
+                .update(cx, |input, cx| input.set_value("", window, cx));
         }
         self.capabilities.server_note =
-            Some(added.map(|name| format!("Added {name}; it is starting below.")));
+            Some(added.map(|name| format!("Added {name}. It is starting in the list.")));
+        cx.notify();
+    }
+
+    /// Open the sheet that adds a server, with the keys in its paste box.
+    pub(crate) fn open_server_adder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // What the last add came to is said once, not over a new one.
+        self.capabilities.server_note = None;
+        let chat = cx.entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            dialog
+                .title(
+                    div()
+                        .font_family(WORDMARK_FONT)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_xl()
+                        .child("Add an MCP server"),
+                )
+                .w(px(560.))
+                .child(server_adder(&chat, cx))
+        });
+        // After opening, which takes the focus for the sheet itself.
+        let paste = self.capabilities.paste.clone();
+        paste.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
     }
 
@@ -444,83 +467,98 @@ impl Chat {
 
     fn mcp_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let chat = cx.entity();
-        v_flex()
-            .gap_6()
-            .child(self.server_adder(cx))
-            .child(super::mcp::mcp_page(
-                &chat,
-                &self.capabilities.off,
-                window,
-                cx,
-            ))
+        // What the last add came to; why one failed is said in the sheet.
+        let added = match &self.capabilities.server_note {
+            Some(Ok(added)) => Some(added.clone()),
+            _ => None,
+        };
+        super::mcp::mcp_page(&chat, &self.capabilities.off, added, window, cx)
     }
+}
 
-    /// The paste box, and the fields it fills in to be checked before Add.
-    fn server_adder(&self, cx: &mut Context<Self>) -> Div {
-        let state = &self.capabilities;
-        let note = state.server_note.as_ref().map(|note| {
-            let (text, colour) = match note {
-                Ok(text) => (text.clone(), cx.theme().muted_foreground),
-                Err(why) => (why.clone(), cx.theme().danger),
-            };
-            div().text_sm().text_color(colour).child(text)
-        });
-        let field = |label: &'static str, input: &Entity<InputState>| {
+/// What the sheet that adds a server holds: the paste box, the fields it
+/// fills in to be checked, and Add. Nothing starts until Add is pressed.
+fn server_adder(chat: &Entity<Chat>, cx: &App) -> Div {
+    let state = &chat.read(cx).capabilities;
+    let failed = match &state.server_note {
+        Some(Err(why)) => Some(why.clone()),
+        _ => None,
+    };
+    let field = |label: &'static str, input: &Entity<InputState>| {
+        v_flex()
+            .gap_1p5()
+            .child(super::settings::label(label, cx))
+            .child(Input::new(input).small().w_full())
+    };
+    let add = {
+        let chat = chat.clone();
+        Button::new("add-server")
+            .primary()
+            .small()
+            .icon(Icon::new(AppIcon::PlugsConnected))
+            .label("Add and connect")
+            .on_click(move |_, window, cx| {
+                chat.update(cx, |this, cx| this.add_server(window, cx));
+            })
+    };
+    let cancel = Button::new("add-server-cancel")
+        .framed(cx)
+        .small()
+        .label("Cancel")
+        .on_click(|_, window, cx| window.close_dialog(cx));
+    v_flex()
+        .gap_3()
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(
+                    "Paste what its README gives, a JSON block or an npx line, and check the \
+                     fields it fills in.",
+                ),
+        )
+        .child(Textarea::new(&state.paste).small().w_full())
+        .child(
+            h_flex()
+                .gap_3()
+                .items_end()
+                .child(
+                    field("Name", &state.server_name)
+                        .w(px(160.))
+                        .flex_shrink_0(),
+                )
+                .child(
+                    field("Command or address", &state.server_target)
+                        .flex_1()
+                        .min_w_0(),
+                ),
+        )
+        .child(
             v_flex()
                 .gap_1p5()
-                .child(super::settings::label(label, cx))
-                .child(Input::new(input).small().w_full())
-        };
-        v_flex()
-            .gap_3()
-            .child(super::settings::heading(
-                "Add a server",
-                "Paste what its README gives, a JSON block or an npx line, and check the \
-                 fields it fills in.",
-                cx,
-            ))
-            .child(Textarea::new(&state.paste).small().w_full())
-            .child(
-                h_flex()
-                    .gap_3()
-                    .items_end()
-                    .child(
-                        field("Name", &state.server_name)
-                            .w(px(160.))
-                            .flex_shrink_0(),
-                    )
-                    .child(
-                        field("Command or address", &state.server_target)
-                            .flex_1()
-                            .min_w_0(),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .gap_1p5()
-                    .child(super::settings::label(
-                        "Variables or headers, one a line",
-                        cx,
-                    ))
-                    .child(Textarea::new(&state.server_extras).small().w_full()),
-            )
-            .child(
-                h_flex()
-                    .gap_3()
-                    .items_center()
-                    .child(
-                        Button::new("add-server")
-                            .primary()
-                            .small()
-                            .icon(Icon::new(AppIcon::PlugsConnected))
-                            .label("Add")
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.add_server(window, cx)),
-                            ),
-                    )
-                    .children(note),
-            )
-    }
+                .child(super::settings::label(
+                    "Variables or headers, one a line",
+                    cx,
+                ))
+                .child(Textarea::new(&state.server_extras).small().w_full()),
+        )
+        .children(failed.map(|why| div().text_sm().text_color(cx.theme().danger).child(why)))
+        .child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .pt_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("A key stays in mcp.json on this computer."),
+                )
+                .child(cancel)
+                .child(add),
+        )
 }
 
 /// The add form's name, command and variables fields, holding `draft`.
