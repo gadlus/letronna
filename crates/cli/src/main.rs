@@ -1141,6 +1141,7 @@ fn dump_config(args: &Args, settings: &store::Settings) -> Result<Value, String>
         "experiments": {
             "helpers_share_tools": store::experiments().helpers_share_tools,
             "parallel_read_commands": store::experiments().parallel_read_commands,
+            "second_attempt": store::experiments().second_attempt,
         },
         // As a run whose answer is piped is told them.
         "prompt": prompt_rules::seen(&chat::Connection {
@@ -2668,6 +2669,7 @@ mod tests {
                 "experiments": {
                     "helpers_share_tools": true,
                     "parallel_read_commands": false,
+                    "second_attempt": false,
                 },
             })
         );

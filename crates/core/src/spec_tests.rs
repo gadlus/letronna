@@ -1954,7 +1954,7 @@ fn words_and_rows() -> String {
 /// graded by, and undid what a review had passed to suit one. It says what
 /// decides where the two disagree, not that the tests judge nothing: tests
 /// a run still fails after `RUNS` send-backs choose between its work and a
-/// second attempt.
+/// second attempt, where that experiment is on.
 const ONE_READING: &str = "The tester can misread the request as you can: its tests are one \
                            more reading of it, and where they and the request's words disagree \
                            the words decide.";

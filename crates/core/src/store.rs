@@ -443,6 +443,16 @@ pub struct Settings {
     /// sets it for one run.
     #[serde(default)]
     pub parallel_read_commands: String,
+    /// Whether a run nobody watches whose work still fails a tester's tests
+    /// after their last run has a helper make the change again from
+    /// scratch, to take the work's place where it passes them: "on" turns
+    /// it on. Off until paired runs show it worth its time: over some
+    /// seventy benchmark runs it started about eight times, a quarter of an
+    /// hour each, and was taken in none, and the tests that judge it are
+    /// one more reading of the request. `LETRONNA_SECOND_ATTEMPT` sets it
+    /// for one run.
+    #[serde(default)]
+    pub second_attempt: String,
     /// The model helpers use when neither the call nor their type names one;
     /// empty for the model of the agent that starts them.
     #[serde(default)]
@@ -644,6 +654,7 @@ impl Default for Settings {
             reasoning_replay: String::new(),
             helpers_share_tools: String::new(),
             parallel_read_commands: String::new(),
+            second_attempt: String::new(),
             helper_model: String::new(),
             side_model: String::new(),
             auto_title: true,
@@ -3483,6 +3494,8 @@ pub struct Experiments {
     pub helpers_share_tools: bool,
     /// `parallel_read_commands` says "on".
     pub parallel_read_commands: bool,
+    /// `second_attempt` says "on".
+    pub second_attempt: bool,
 }
 
 /// The experiments as the settings file and the environment had them when
@@ -3512,6 +3525,10 @@ fn experiments_of(settings: &Settings, env: impl Fn(&str) -> Option<String>) -> 
                 "LETRONNA_PARALLEL_READ_COMMANDS"
             )
             .as_str(),
+            "on" | "1"
+        ),
+        second_attempt: matches!(
+            word(&settings.second_attempt, "LETRONNA_SECOND_ATTEMPT").as_str(),
             "on" | "1"
         ),
     }
@@ -8726,16 +8743,18 @@ pub(crate) mod tests {
             super::Experiments {
                 helpers_share_tools: true,
                 parallel_read_commands: false,
+                second_attempt: false,
             }
         );
         let saved = br#"{"endpoint": "", "model": "", "helpers_share_tools": "Off",
-            "parallel_read_commands": "on"}"#;
+            "parallel_read_commands": "on", "second_attempt": " On "}"#;
         let saved = super::read_settings(saved).unwrap();
         assert_eq!(
             super::experiments_of(&saved, none),
             super::Experiments {
                 helpers_share_tools: false,
                 parallel_read_commands: true,
+                second_attempt: true,
             }
         );
         // For one run, the variable in place of the setting: an adapter
@@ -8743,6 +8762,7 @@ pub(crate) mod tests {
         let env = |name: &str| match name {
             "LETRONNA_HELPERS_SHARE_TOOLS" => Some("on".to_owned()),
             "LETRONNA_PARALLEL_READ_COMMANDS" => Some("0".to_owned()),
+            "LETRONNA_SECOND_ATTEMPT" => Some("off".to_owned()),
             _ => None,
         };
         assert_eq!(super::experiments_of(&saved, env), default);

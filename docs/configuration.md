@@ -51,6 +51,7 @@ Most settings are in the window's Settings and in `/` commands. Both are stored 
 | `LETRONNA_HELPERS_SHARE_TOOLS=off` | Sends a helper of a run nobody watches every tool, as before, where it is now sent the tools its session's own run is, so the two share the provider's cached prefix. For comparing the two; the `helpers_share_tools` setting says the same for every run. |
 | `LETRONNA_PARALLEL_READ_COMMANDS=on` | In a run nobody watches, runs at once the commands of one reply that only read (`ls`, `git log`, `cat`), as its file reads run. Off until paired runs show it sound; the `parallel_read_commands` setting says the same for every run. |
 | `LETRONNA_PROGRESS_NOTE_ROUNDS` | Rounds a run nobody watches may go without changing the project before it is asked to say, in one line, what it has established and its next step (default 12; again at twice and three times that; 0 never asks). |
+| `LETRONNA_SECOND_ATTEMPT=on` | In a run nobody watches whose work still fails a tester's tests after their last run, has a second helper make the change again from scratch in the project as it was, and puts its work in the first's place where it passes those tests and the first does not. Off until paired runs show it worth the quarter of an hour it takes; the `second_attempt` setting says the same for every run. |
 
 Even without `LETRONNA_DISPOSABLE`, an unattended Bypass run on macOS and Linux may delete folders strictly inside its project. It still refuses:
 

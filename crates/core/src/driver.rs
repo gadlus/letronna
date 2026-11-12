@@ -488,7 +488,16 @@ pub fn run(spec: Spec) -> Report {
 
 /// Runs the agent as `run` does and hands back its transcript too, for a
 /// caller that carries on the same conversation with the next prompt.
-pub fn run_keeping(mut spec: Spec) -> (Report, Transcript) {
+pub fn run_keeping(spec: Spec) -> (Report, Transcript) {
+    run_attempting(spec, crate::store::experiments().second_attempt)
+}
+
+/// `run_keeping`, where `attempts` says whether a run nobody watches whose
+/// work still fails a tester's tests after their last run is given a second
+/// attempt (`second_attempt`): the experiment of that name, off unless a
+/// setting turns it on, since the attempts made on benchmark runs took a
+/// quarter of an hour each and none was taken.
+fn run_attempting(mut spec: Spec, attempts: bool) -> (Report, Transcript) {
     let started = Instant::now();
     crate::hooks::new_turn(spec.connection.conversation);
     // A helper's requests load the memory of the session it works for, which
@@ -530,7 +539,7 @@ pub fn run_keeping(mut spec: Spec) -> (Report, Transcript) {
     let blocked = (spec.depth == 0).then(|| opened(&mut spec)).flatten();
     let status = match blocked {
         Some(why) => Ok(Outcome::Failed(why)),
-        None => steps(&mut spec, &mut turn, &mut report, &contract),
+        None => steps(&mut spec, &mut turn, &mut report, &contract, attempts),
     };
     let status = status
         .and_then(|status| {
@@ -589,12 +598,15 @@ pub fn spawn(spec: Spec, then: impl FnOnce(&Report) + Send + 'static) -> Result<
 }
 
 /// Calls the model and works through what it asks for, round after round,
-/// until the run ends, sending it back once while `contract` is not met.
+/// until the run ends, sending it back once while `contract` is not met;
+/// with a second attempt for work that still fails a tester's tests only
+/// where `attempts` (`run_attempting`).
 fn steps(
     spec: &mut Spec,
     turn: &mut Turn,
     report: &mut Report,
     contract: &Contract,
+    attempts: bool,
 ) -> Result<Outcome, String> {
     let mut sent_back = 0;
     // Before any call, since a schema that strays turns down every answer
@@ -1113,8 +1125,10 @@ fn steps(
             // request's words rather than left; once, and with a round and
             // budget left, as above. An answer with a line for each such
             // row costs nothing. Not where the tests still fail after their
-            // last run, since a second attempt comes next and the round is
-            // better left to it.
+            // last run: a second attempt comes next where that experiment
+            // is on, and the round is better left to it; with it off the
+            // run is left as it was then too, so that turning the
+            // experiment off changes nothing else.
             if tabled
                 && !quoted
                 && (passed || tested < crate::spec_tests::RUNS)
@@ -1128,11 +1142,12 @@ fn steps(
                 continue;
             }
             // Sent back with the tests `RUNS` times, a run whose work still
-            // fails them has had its say: a helper makes a second attempt
-            // from the project as the run found it, and the tests choose
-            // between the two. Once, whatever comes of it, since another
-            // would start another helper; never after a run of the tests
-            // that passed; and with a round and budget left, as above.
+            // fails them has had its say: where the `second_attempt`
+            // experiment is on, a helper makes a second attempt from the
+            // project as the run found it, and the tests choose between the
+            // two. Once, whatever comes of it, since another would start
+            // another helper; never after a run of the tests that passed;
+            // and with a round and budget left, as above.
             if listed
                 && !attempted
                 && !passed
@@ -1144,14 +1159,20 @@ fn steps(
                 attempted = true;
                 // A command that never reached a test at its last run would
                 // choose nothing of an attempt, and is not run a third time
-                // to learn that.
-                let attempt = match broke {
-                    true => {
+                // to learn that. With the experiment off none is made, and
+                // the log says where one would have been, for the count.
+                let attempt = match (attempts, broke) {
+                    (false, _) => {
+                        let why = [("why", json!("experiment_off"))];
+                        crate::diag::event("second_attempt_skipped", &why);
+                        None
+                    }
+                    (true, true) => {
                         let why = [("why", json!("unrunnable"))];
                         crate::diag::event("second_attempt_skipped", &why);
                         None
                     }
-                    false => timed(spec, || second_attempt(spec, turn, head)),
+                    (true, false) => timed(spec, || second_attempt(spec, turn, head)),
                 };
                 if let Some((notice, adopted)) = attempt {
                     // Told to change nothing once the project holds the
@@ -3271,7 +3292,8 @@ enum Verdict {
 }
 
 /// The notice telling a session's own run nobody watches what came of a
-/// second attempt at its task. Sent back `RUNS` times with the tester's
+/// second attempt at its task, made only where the experiment of that name
+/// is on (`run_attempting`). Sent back `RUNS` times with the tester's
 /// tests, a run that says it is done while its work still fails them has
 /// had its say, and a fresh attempt at a task that failed passes about a
 /// third of the time: so a helper that has not seen the work makes the
@@ -4718,6 +4740,19 @@ pub(crate) mod tests {
             let _ = tx.send(handle.join());
         });
         rx.recv_timeout(WAIT).expect("the run never ended").unwrap()
+    }
+
+    /// `finished`, with the `second_attempt` experiment as `attempts` says
+    /// for this run, set here rather than saved.
+    fn finished_attempting(spec: Spec, attempts: bool) -> Report {
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name(format!("agent-{}", spec.id))
+            .spawn(move || {
+                let _ = tx.send(run_attempting(spec, attempts).0);
+            })
+            .unwrap();
+        rx.recv_timeout(WAIT).expect("the run never ended")
     }
 
     /// The conversation a request sent.
@@ -10233,7 +10268,8 @@ pub(crate) mod tests {
         // Twenty-five minutes: too little for a tester to start ahead of the
         // run and race it for the replies, enough for a second attempt.
         spec.connection.deadline = Some(Instant::now() + Duration::from_secs(25 * 60));
-        let report = finished(spec);
+        // With the experiment on, which it is not unless a setting says so.
+        let report = finished_attempting(spec, true);
         let sent = provider.sent();
         assert_eq!(report.status, Outcome::Done);
         assert_eq!(report.text, "The project holds the second attempt.");
@@ -10344,9 +10380,10 @@ pub(crate) mod tests {
         spec.decide = runs_everything();
         spec.transcript.conversation.messages[0].content = SPECIFIED.into();
         spec.connection.mode = crate::gate::Mode::Bypass;
-        // As above: no tester ahead of the run, time for a second attempt.
+        // As above: no tester ahead of the run, time for a second attempt,
+        // and the experiment on.
         spec.connection.deadline = Some(Instant::now() + Duration::from_secs(25 * 60));
-        let report = finished(spec);
+        let report = finished_attempting(spec, true);
         let sent = provider.sent();
         assert_eq!(report.status, Outcome::Done);
         assert_eq!(report.text, "My work stands.");
@@ -10376,6 +10413,56 @@ pub(crate) mod tests {
             "made"
         );
         let _ = std::fs::remove_dir_all(base);
+        assert!(dir.join("made.rs").exists());
+        assert!(!dir.join("made.txt").exists());
+        assert!(!dir.join("letronna_spec_test.sh").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_second_attempt_is_made_unless_the_experiment_is_on() {
+        let _data = data("second-attempt-off");
+        let dir = scratch("second-attempt-off");
+        committed(&dir);
+        let id = AGENTS + 1_926;
+        needs_made_txt(&dir, id);
+        // What the run above is sent, as far as its second failing run of
+        // the tester's test: no reply is there for a helper to take.
+        let answers = vec![
+            reply("", &[write_made()]),
+            reply("Added parse_range.", &[]),
+            reply(PASSED, &[]),
+            reply(PASSED, &[]),
+            reply("Each requirement holds.", &[]),
+            reply("Fixed.", &[]),
+            reply("Fixed again.", &[]),
+        ];
+        let (mut spec, provider) = specified(&dir, id, SPECIFIED, answers);
+        spec.connection.mode = crate::gate::Mode::AcceptEdits;
+        // The time a second attempt needs, so only the experiment keeps one
+        // from being made.
+        spec.connection.deadline = Some(Instant::now() + Duration::from_secs(25 * 60));
+        let report = finished_attempting(spec, false);
+        let sent = provider.sent();
+        assert_eq!(report.status, Outcome::Done);
+        // The run's own answer ends it, with its work as it left it.
+        assert_eq!(report.text, "Fixed again.");
+        assert_eq!(sent.len(), 7);
+        let said = |words: &str| {
+            (sent.iter().flat_map(messages))
+                .filter_map(|message| message["content"].as_str())
+                .any(|content| content.contains(words))
+        };
+        assert!(!said("did not pass the tests a tester wrote"));
+        assert!(!said("made a second attempt"));
+        // The tester's test was still run against its work, both times,
+        // and told the second time as the same failure.
+        assert!(said(
+            "`sh letronna_spec_test.sh` exited with code 1. Its output"
+        ));
+        assert!(said(
+            "it fails nothing but what it failed at the run before"
+        ));
         assert!(dir.join("made.rs").exists());
         assert!(!dir.join("made.txt").exists());
         assert!(!dir.join("letronna_spec_test.sh").exists());
