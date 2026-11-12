@@ -2437,13 +2437,15 @@ fn warned_rounds(rounds: usize) -> Option<usize> {
 
 /// What a session's own run nobody watches is told to take out near its
 /// round cap, in the words of the round warning: what `TIDY` names, wherever
-/// in the project it is, and the tests it added only to probe, which a run
-/// of the project's own tests would pick up, by the rule of the requirements
-/// check, which spares a test the task asks for. Its instructions already
-/// told it to tidy up before ending; a run someone watches hears `TIDY`.
+/// in the project it is, and the throwaway tests it wrote only to probe,
+/// which a run of the project's own tests would pick up. It says which tests
+/// stay, those that belong with the change and those the task asks for:
+/// told only to spare what the task asks for, a run could take out the tests
+/// of its own change, which belong in it. Its instructions already told it
+/// to tidy up before ending; a run someone watches hears `TIDY`.
 const TIDY_ADDED: &str = "remove from the project the scripts, logs and binaries you made only \
-                          to test and any test you added only to probe or check, unless the task \
-                          asks for tests";
+                          to test and any throwaway test you wrote only to probe; keep tests \
+                          that belong with your change or that the task asks for";
 
 /// What a helper that may run commands is told to take out near its round
 /// cap: only what it checked with, and in so many words no file its task
@@ -13843,9 +13845,9 @@ pub(crate) mod tests {
         assert!(!carries(&sent[44], ROUNDS_LEFT));
         let told = "About 5 tool rounds are left before this run is stopped: write every output \
                     the task asks for now, complete and valid, and remove from the project the \
-                    scripts, logs and binaries you made only to test and any test you added only \
-                    to probe or check, unless the task asks for tests; improve the outputs in \
-                    place only after that.";
+                    scripts, logs and binaries you made only to test and any throwaway test you \
+                    wrote only to probe; keep tests that belong with your change or that the \
+                    task asks for; improve the outputs in place only after that.";
         let last = messages(&sent[45]).last().unwrap();
         assert_eq!(last["role"], "user");
         let notice = last["content"].as_str().unwrap();
