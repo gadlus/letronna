@@ -1,9 +1,10 @@
 # UI redesign: Capabilities, MCP servers and Plugins
 
-A proposal, not yet built. It comes from running 0.1.0-alpha.5.1 on Linux with
-five MCP servers and the four example plugins, and reading what the window drew.
-The design canvas that goes with it holds a working prototype, the motion
-moves, the annotated screenshots and the brand sheet.
+A proposal, part built: steps 1 and 2 of the order of work below, and the
+sidebar, are in. It comes from running 0.1.0-alpha.5.1 on Linux with five MCP
+servers and the four example plugins, and reading what the window drew. The
+design canvas that goes with it holds a working prototype, the motion moves,
+the annotated screenshots and the brand sheet.
 
 Nothing here replaces the brand in `theme.rs` or the motion in `ui/motion.rs`.
 The plan names what is already there, fills three gaps, and rearranges two
@@ -117,9 +118,10 @@ Added:
   everything read and pressed (Inter), and a mono (JetBrains Mono). Today
   `HEADING_FONT` and `BODY_FONT` name Segoe UI Variable off macOS and
   `WORDMARK_FONT` names Georgia; Linux has neither.
-- **A named amber.** "Needs you" is drawn with gpui-component's default
-  `warning`. Give it a number in each palette (`#f0b429` on Night, the
-  existing `OCHRE` on Paper) and add both to the contrast tests.
+- **A named amber.** "Needs you" was drawn with gpui-component's default
+  `warning`, a yellow that reads at 2.4:1 on Paper. It has a number in each
+  palette now (`#f0b429` on Night, the existing `OCHRE` on Paper), both in the
+  contrast tests.
 - **A status language.** Circle and green for connected, triangle and amber
   for needs you, square and red for failed, a pulsing Signal dot for working,
   a ring for off. Always with the word.
@@ -146,14 +148,35 @@ Every move uses what `ui/motion.rs` already defines.
 
 All of it draws its end state at once while motion is reduced, as now.
 
+## The sidebar
+
+Eight rows of the same weight read as one list, with the thing done most,
+New session, drawn as a page like the rest. Built:
+
+- **New session is edged as a button.** It is the one row that does something
+  rather than goes somewhere.
+- **Two groups, a gap apart.** What Letronna is doing and has made (Activity,
+  Scheduled jobs, Workflows while there are runs, Artifacts), then what it can
+  reach (Capabilities, Plugins, Messaging, Wallet). No labels: the gap says it
+  and costs 8 px, where two more headings would push the sessions down.
+- **What waits is said on the row.** A triangle and a count at the end of
+  Capabilities while servers want a sign-in or have failed, and of Plugins
+  while plugins wait to be allowed, so neither page has to be opened to find
+  out.
+- **Rows answer the pointer.** A tint on a page or session row under the
+  pointer, at once and without movement.
+- **A picked session filter is named.** The four glyphs kept their tooltips;
+  the one that is hiding the other sessions now says which it is.
+
 ## Order of work
 
-1. **Shared parts.** A `ui/parts.rs` with the row, status mark, tag, chip,
-   segments and empty state; the amber and the hover tint in `theme.rs`; the
-   bundled fonts in `assets.rs`.
-2. **MCP list.** In `capabilities.rs::mcp_tab` put the list first and move the
-   adder into a sheet. In `mcp.rs` group the rows, give each one fix, and
-   rewrite the three error strings in core.
+1. **Shared parts.** Done. `ui/parts.rs` has the row, status mark, tag, chip,
+   segments and empty state; `theme.rs` has the amber and the hover tint; the
+   three families are bundled, brought by `scripts/fonts.sh` and loaded in
+   `assets.rs`.
+2. **MCP list.** Done. `mcp.rs` lists the servers first, grouped, each row with
+   one line and one fix; the adder is a sheet from Add server; the three
+   strings in core name the place the window has.
 3. **Server details.** A panel tab for a server (`PanelTab` in `ui/panel.rs`),
    the filter and segments, the three-way group switch. In core, say whether a
    tool's kind came from the server or was read from its name.
@@ -164,6 +187,21 @@ All of it draws its end state at once while motion is reduced, as now.
    `ui/motion.rs`.
 
 Steps 1 and 2 stand alone and remove findings 1 to 5.
+
+What steps 1 and 2 left as it was, for the steps after them:
+
+- A row opens in place, under itself, until step 3 gives it a panel. Tools and
+  Log are segments there, and Reconnect and Sign out sit beside them.
+- An opened server's tools are still one group of switches when the server
+  gives no hints (findings 6 and 7): the grouping and the filter are step 3.
+- Adding a server is one sheet, not three steps. Once it is added the sheet
+  goes and the list shows the server starting.
+- The tint under the pointer is on rows only. Buttons keep the stillness
+  `ui::NoHover` gives them; changing every button in the window is a decision
+  of its own.
+- The three families are used on every system. `HEADING_FONT`, `BODY_FONT` and
+  `MONO_FONT` in `theme.rs` are the one place to name a system's own faces
+  again; the bundled files add 1.7 MB to the window's binary.
 
 ## Open questions
 

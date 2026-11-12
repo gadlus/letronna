@@ -13,6 +13,17 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ## [Unreleased]
 
+### Changed
+- **App** — Capabilities › MCP lists your servers first, grouped by who has to do something about them: those that need you, those starting, those connected and those switched off. A row says how its server is doing in one line and has one button when something is wrong with it, Sign in or Retry; what it runs, its tools, its log, Reconnect and Sign out are under the row once you press it. A line over the list says how many tools are on offer and about how many tokens they add to every request. Before, the form that adds a server came first and each row carried up to five buttons of the same weight.
+- **App** — A server is added from a sheet, which Add server opens, in place of the form above the list. Paste what its README gives, check the fields it fills in, and the sheet goes as the server starts in the list behind it.
+- **App** — A server that failed says why on its row. One that only "stopped" adds what it printed about the reason, the line that names the error rather than the stack trace after it.
+- **App** — The sidebar draws New session as a button, since it is the one row that does something rather than goes somewhere, and lists the pages in two groups: what Letronna is doing and has made, then what it can reach. Capabilities and Plugins show a mark and a count while a server wants a sign-in or has failed, or a plugin waits to be allowed. A row under the pointer is tinted, and a session filter that is picked says its name beside its glyph.
+- **App** — The window brings its own type: Inter for what is read and pressed, JetBrains Mono for code, and Newsreader for the wordmark and a page's title. Every system now draws the same letters; before, Linux, which has neither Segoe UI nor Georgia, drew whatever it found.
+
+### Fixed
+- **All** — A server that wants a sign-in no longer sends you to "Settings › MCP", a place the window does not have. It names the row under Capabilities › MCP.
+- **App** — What waits for you, a server to sign in to or a plugin to allow, is drawn in an amber that reads on Paper. Before it was a yellow that read at 2.4:1 on the page.
+
 ## [0.1.0-alpha.5.1] - 2026-11-11
 
 ### Added
