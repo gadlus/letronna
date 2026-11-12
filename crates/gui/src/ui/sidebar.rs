@@ -5,17 +5,16 @@ use crate::prelude::*;
 /// sized from.
 pub(crate) const SIDEBAR_WIDTH: Pixels = px(250.);
 
-/// The sidebar's pages after New session, in the order it lists them, every
-/// one a row of its own; Workflows only while there is a run to show.
-const PAGES: [Page; 8] = [
+/// The sidebar's pages after New session, in two groups a gap apart, so
+/// eight rows are not read as one list: what Letronna is doing and has made,
+/// then what it can reach. Every one is a row of its own; Workflows only
+/// while there is a run to show.
+const WORK: [Page; 4] = [Page::Activity, Page::Jobs, Page::Workflows, Page::Artifacts];
+const REACH: [Page; 4] = [
     Page::Capabilities,
-    Page::Activity,
     Page::Plugins,
     Page::Messaging,
-    Page::Artifacts,
-    Page::Jobs,
     Page::Wallet,
-    Page::Workflows,
 ];
 
 /// A row of the sidebar's page list.
@@ -54,28 +53,40 @@ fn page_icon(page: Page) -> AppIcon {
 fn nav_rows(workflows: bool) -> Vec<Nav> {
     std::iter::once(Nav::New)
         .chain(
-            PAGES
-                .into_iter()
+            WORK.into_iter()
+                .chain(REACH)
                 .filter(|&page| page != Page::Workflows || workflows)
                 .map(Nav::Page),
         )
         .collect()
 }
 
+/// Whether `nav` is the first row of its group, which the gap goes above.
+fn leads_group(nav: Nav) -> bool {
+    matches!(nav, Nav::Page(page) if page == WORK[0] || page == REACH[0])
+}
+
 impl Chat {
     /// A row of the sidebar's page list, the `at`th of `handles`: Tab
     /// reaches it and Enter opens it as a click does, and Up and Down go on
     /// to the row above or below, from the last into the sessions.
+    ///
+    /// New session is what the sidebar is for most often and the one row
+    /// that does something rather than goes somewhere, so it is edged as a
+    /// button is. `waiting` is how many things on a page wait for the user,
+    /// said at the row's end, so they are seen without opening the page.
     fn nav_item(
         &self,
         nav: Nav,
         at: usize,
+        waiting: usize,
         handles: &std::rc::Rc<[FocusHandle]>,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let active = matches!(nav, Nav::Page(page) if page == self.page);
         let theme = cx.theme();
         let (muted, ring, accent) = (theme.muted_foreground, theme.ring, theme.sidebar_accent);
+        let (edge, amber, hover) = (theme.border, theme.warning, crate::theme::hover(theme));
         let (icon, label) = match nav {
             Nav::New => (Icon::new(AppIcon::SquarePen), "New session"),
             Nav::Page(page) => (Icon::new(page_icon(page)), page.title()),
@@ -97,11 +108,30 @@ impl Chat {
             .font_family(HEADING_FONT)
             .font_weight(FontWeight::MEDIUM)
             .text_color(theme.sidebar_foreground)
+            .when(nav == Nav::New, |this| {
+                this.h(px(30.)).mb_1().border_color(edge)
+            })
+            .when(leads_group(nav), |this| this.mt_2())
             .when(active, |this| this.bg(accent))
+            // Colour answers the pointer at once; nothing under it moves.
+            .when(!active, |this| this.hover(|s| s.bg(hover)))
             .focus(|s| s.border_color(ring))
             .active(|s| s.bg(accent.opacity(0.6)))
             .child(icon.size_4().text_color(muted))
             .child(div().flex_1().min_w_0().truncate().child(label))
+            // The shape says it waits and the number how many: amber alone
+            // would not, and reads under 4.5:1 on Paper's selected row.
+            .when(waiting > 0, |this| {
+                this.child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .gap_1()
+                        .items_center()
+                        .text_xs()
+                        .child(Icon::new(AppIcon::Alert).size_3().text_color(amber))
+                        .child(waiting.to_string()),
+                )
+            })
             .when(nav == Nav::New, |this| {
                 this.children(
                     crate::ui::keys::bound_key(&NewSession, cx).map(|key| Kbd::new(key).text_xs()),
@@ -244,6 +274,9 @@ impl Chat {
             .text_sm()
             .when(active || selected, |this| {
                 this.bg(cx.theme().sidebar_accent)
+            })
+            .when(!(active || selected), |this| {
+                this.hover(|s| s.bg(crate::theme::hover(cx.theme())))
             })
             .active(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
             .when(selecting, |this| this.child(check_box(selected, cx)))
@@ -544,9 +577,19 @@ impl Chat {
                     .clone()
             })
             .collect();
+        // What waits for the user on a page, for the mark at its row's end.
+        let servers = letronna_core::mcp::needing_user();
+        let plugins = (self.plugins.list.iter())
+            .filter(|plugin| plugin.enabled && super::plugin_page::waits_for_consent(plugin))
+            .count();
         let mut nav = v_flex().px_2().pt_2().gap_0p5();
         for (at, &row) in rows.iter().enumerate() {
-            nav = nav.child(self.nav_item(row, at, &handles, cx));
+            let waiting = match row {
+                Nav::Page(Page::Capabilities) => servers,
+                Nav::Page(Page::Plugins) => plugins,
+                _ => 0,
+            };
+            nav = nav.child(self.nav_item(row, at, waiting, &handles, cx));
         }
         let visible = self.visible_sessions(cx);
         let keyed = self
@@ -822,7 +865,7 @@ fn move_in(listed: &[usize], picked: Option<usize>, down: bool) -> Option<usize>
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{Nav, drawn_order, move_in, nav_rows};
+    use super::{Nav, drawn_order, leads_group, move_in, nav_rows};
     use letronna_core::store::Conversation;
     use std::path::PathBuf;
 
@@ -840,17 +883,29 @@ mod tests {
     fn every_page_has_a_row_with_workflows_only_while_runs_show() {
         let mut all = vec![
             "New session",
-            "Capabilities",
             "Activity",
+            "Scheduled jobs",
+            "Artifacts",
+            "Capabilities",
             "Plugins",
             "Messaging",
-            "Artifacts",
-            "Scheduled jobs",
             "Wallet",
         ];
         assert_eq!(names(&nav_rows(false)), all);
-        all.push("Workflows");
+        // With its runs, beside the jobs.
+        all.insert(3, "Workflows");
         assert_eq!(names(&nav_rows(true)), all);
+    }
+
+    #[test]
+    fn a_gap_goes_above_what_it_does_and_above_what_it_reaches() {
+        let led: Vec<&str> = names(
+            &nav_rows(true)
+                .into_iter()
+                .filter(|&row| leads_group(row))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(led, ["Activity", "Capabilities"]);
     }
 
     #[test]

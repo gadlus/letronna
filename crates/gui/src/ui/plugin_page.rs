@@ -713,7 +713,7 @@ fn capitalised(line: &str) -> String {
 
 /// Whether the plugin has servers or code that wait to be allowed. One
 /// whose manifest does not read is not allowed either, but has none to show.
-fn waits_for_consent(plugin: &Plugin) -> bool {
+pub(crate) fn waits_for_consent(plugin: &Plugin) -> bool {
     !plugin.allowed
         && !(plugin.servers.is_empty() && plugin.providers.is_empty() && plugin.code.is_none())
 }

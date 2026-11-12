@@ -1254,6 +1254,9 @@ impl Chat {
             } else {
                 cx.theme().muted_foreground
             }))
+            // Named while it is the one picked: four small glyphs do not
+            // say which of them is hiding the other sessions.
+            .when(on, |this| this.label(filter.label()))
             .tooltip(filter.label())
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_session_filter(filter, cx)))
     }
