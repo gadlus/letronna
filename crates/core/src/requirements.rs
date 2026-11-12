@@ -929,11 +929,18 @@ fn given(cell: &str) -> &str {
 /// a cell of which says the test was not run (`unrun`) has none to give,
 /// nor has a line whose first cell holds more than requirements' numbers
 /// (`numbered`), which is a sentence a bar in its code happened to cut.
+/// A word alone in a cell after one that says only that the test was not
+/// run is why it was not, and no verdict: a tester's row for a reading it
+/// wrote no test of may end `NOT RUN | unclear`, and read as a row left
+/// unclear it held the run to a doubt nobody had.
 /// The third cell, the verdict's own column, also gives one where it
 /// passes the case in plain words (`passes`).
 fn judged<'a>(cells: &[&'a str]) -> Option<(usize, &'a str)> {
     let later = || cells.iter().copied().enumerate().skip(1);
-    if let Some(alone) = later().find(|(_, cell)| verdict(cell).is_some()) {
+    // What follows a cell that says only that the test was not run says why.
+    let not_run = later().find(|(_, cell)| *cell == "NOT RUN");
+    let judges = |at: usize| not_run.is_none_or(|(not_run, _)| at < not_run);
+    if let Some(alone) = later().find(|(at, cell)| judges(*at) && verdict(cell).is_some()) {
         return Some(alone);
     }
     let row = cells.first().is_some_and(|cell| numbered(cell));
@@ -3023,6 +3030,26 @@ mod tests {
             assert!(!tabled(row), "{row}");
         }
         assert!(!rows("R1 | adds | NOT RUN before the fix | FAIL | pytest -q")[0].1);
+        // A word alone after a cell that says only that a test was not run
+        // is why it was not, as a tester writes of a reading it wrote no
+        // test of; one before that cell is still the row's verdict.
+        for row in [
+            "R12 | reading: … | NOT RUN | unclear",
+            "R12 | reading: once for each run | NOT RUN | UNCLEAR",
+            "| R12 | reading: once for each run | NOT RUN | **unclear** |",
+            "R12 | reading: once for each run | NOT RUN | fail",
+            "R12 | reading: once for each run | NOT RUN | none",
+        ] {
+            assert!(!tabled(row), "{row}");
+            assert!(!left_unclear(row), "{row}");
+            let passed: String = (1..=12)
+                .map(|at| format!("R{at} | plain | PASS\n"))
+                .collect();
+            assert_eq!(unchecked(&format!("{passed}{row}"), 12), None, "{row}");
+        }
+        let failed = rows("R1 | adds | FAIL | NOT RUN | the import raised");
+        assert_eq!(failed.len(), 1);
+        assert!(!failed[0].1);
         assert!(!rows("R1 | NOT RUNNING the hook leaves the file | FAIL — it is gone")[0].1);
     }
 

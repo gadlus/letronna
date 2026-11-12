@@ -4301,16 +4301,19 @@ mod tests {
             tests.contains("write a test per reading, named for the reading"),
             "{tests}"
         );
-        // Readings that exclude each other get a row each and no test.
+        // Of readings that exclude each other only one the words favour
+        // has a test of its own; the others get a row each.
         assert!(
             tests.contains("only where one implementation could pass them all"),
             "{tests}"
         );
         assert!(
             tests.ends_with(
-                "write no test for either: one of them would fail whatever the work does. \
-                 Give each such reading a row instead, written `R1 | reading: what the words \
-                 would mean | NOT RUN | the words that favour it`."
+                "write no test that only one of those readings would pass, unless the \
+                 request's words favour that reading, and still test what they share. Give \
+                 each reading left without a test of its own a row instead, written `R1 | \
+                 reading: what the words would mean | NOT RUN | \"the words that favour it\", \
+                 or none`."
             ),
             "{tests}"
         );
