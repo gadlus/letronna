@@ -424,6 +424,10 @@ struct Moved {
     /// Written by a tester started with the run, in the project as it was,
     /// so they have never met the work.
     unmet: bool,
+    /// What the driver's last run of them against the work failed, where it
+    /// failed (`failing`), so a run after it that fails the same is not
+    /// told as if it were new (`failed_before`).
+    failed: Option<Failing>,
     /// The files whose names hold `MARKER` that git neither tracked nor
     /// ignored in the project as they were kept (`marked`), which no sweep
     /// deletes; None where git could not say, and then nothing is swept.
@@ -1507,10 +1511,13 @@ pub(crate) fn ran(
             "`{command}` did not get as far as a test, since {why}"
         ));
     }
+    // What failed is kept with the tests in place of what the run before
+    // this one failed, which this one's is then told from.
+    let before = failed_before(kept, failure(&outcome).map(|(_, output)| failing(output)));
     if let Some(notice) = regression(kept, command, workspace, ctx, limit, &outcome, first) {
         return Ran::Failed(notice);
     }
-    match failed(kept, command, &outcome) {
+    match failed(kept, command, &outcome, before.as_ref()) {
         Some(notice) => Ran::Failed(notice),
         None => Ran::Passed(command.to_owned()),
     }
@@ -1976,9 +1983,33 @@ fn words_ahead() -> String {
 /// Where the failures it attributes appear to be all in tests the tester
 /// did not write (`own_failing`), it says so: they may be the project's own
 /// as it was, or this environment's, and the run is to check before it
-/// changes anything for them.
-fn failed(kept: &Kept, command: &str, outcome: &Result<String, String>) -> Option<String> {
+/// changes anything for them. Where the driver's run `before` this one
+/// failed them too, what failed then is not told again as if it were new:
+/// with nothing new failing the notice is `failed_again`'s, and with some
+/// of it new the new is named (`newly`).
+fn failed(
+    kept: &Kept,
+    command: &str,
+    outcome: &Result<String, String>,
+    before: Option<&Failing>,
+) -> Option<String> {
     let (ended, output) = failure(outcome)?;
+    let mut new = String::new();
+    match (before, before.map(|_| failing(output))) {
+        (Some(Failing::Named(before)), Some(Failing::Named(now))) => {
+            let fresh: Vec<&String> = now.iter().filter(|name| !before.contains(name)).collect();
+            if fresh.is_empty() {
+                return Some(failed_again(command, &ended, &now));
+            }
+            if fresh.len() < now.len() {
+                new = newly(&fresh);
+            }
+        }
+        (Some(before), Some(now)) if *before == now => {
+            return Some(failed_again(command, &ended, &[]));
+        }
+        _ => {}
+    }
     let (shown, left_out) = quoted(output);
     let others = match own_failing(kept, command, output) {
         Some(false) => {
@@ -1993,7 +2024,7 @@ fn failed(kept: &Kept, command: &str, outcome: &Result<String, String>) -> Optio
         "Your work as it stands was run against the tests a tester wrote from the request \
          alone, in a copy of the project with them put back at the paths they are kept from, \
          so nothing in the project was touched: `{command}` {ended}. Its \
-         output{left_out}:\n\n{shown}\n\n{others}Fix your work for each test that fails on what the \
+         output{left_out}:\n\n{shown}\n\n{others}{new}Fix your work for each test that fails on what the \
          request's words say, and run the tests again the same way. {words} One that calls the \
          code wrongly, such as with a name or import the request does not spell, or that fails \
          for want of a fixture, helper or set-up the tester left out, is the tester's to fix \
@@ -2002,6 +2033,138 @@ fn failed(kept: &Kept, command: &str, outcome: &Result<String, String>) -> Optio
          you found works. Then end with your whole answer again.",
         kept.dir.display()
     ))
+}
+
+/// Failures a notice of a run after the first names at most, one by one;
+/// the rest are counted.
+const AGAIN_NAMED: usize = 20;
+
+/// What a test's answer by the request's words is worth once the same test
+/// fails again, as each notice of a later run says it. On benchmark runs
+/// the driver's second run failed exactly the tests the run had answered by
+/// quoting the request, the notice came again word for word, and one run
+/// took the repeat for an order: it made the tests pass with changes the
+/// request never asked for.
+const ANSWER_STANDS: &str = "where you answered a test by quoting the request's words, that \
+                             answer stands, and nothing more is to change for it";
+
+/// The notice sending the run back when `command`, run against its work
+/// once more, `ended` failing nothing but what the driver's run before it
+/// failed, `named` by the lines its runner gave them where it gave any: a
+/// short one in place of `failed`'s, since the output was shown then, with
+/// the same rule on the request's words (`words_and_rows`).
+fn failed_again(command: &str, ended: &str, named: &[String]) -> String {
+    let which = match named.is_empty() {
+        true => ", with the output it had then. ".to_owned(),
+        false => format!(":\n\n{}\n\n", listed_lines(named.iter())),
+    };
+    let words = words_and_rows();
+    format!(
+        "Your work as it stands was run once more against the tests a tester wrote from the \
+         request alone, the same way: `{command}` {ended}, and it fails nothing but what it \
+         failed at the run before{which}That is the same result told again, not a second \
+         demand to make them pass: {ANSWER_STANDS}. Fix your work only for a test you have not \
+         answered so, on what the request's words say. {words} Then end with your whole answer \
+         again."
+    )
+}
+
+/// What `failed`'s notice says of the failures `fresh`, the lines a later
+/// run's runner gave a failing test or file that its run before did not
+/// print, where others it names failed then too: the new ones are named
+/// and to be fixed, and an answer to one of the others stands.
+fn newly(fresh: &[&String]) -> String {
+    format!(
+        "Of the failures it names, the run before did not have these:\n\n{}\n\nWhat they name \
+         is new, and is to be fixed. The others failed then too: {ANSWER_STANDS}. ",
+        listed_lines(fresh.iter().copied())
+    )
+}
+
+/// `lines`, each a line a runner gave a failing test or file, as a notice
+/// lists them: the first `AGAIN_NAMED`, one to a line and cut as `clipped`
+/// cuts, and how many more there are.
+fn listed_lines<'a>(lines: impl ExactSizeIterator<Item = &'a String>) -> String {
+    let more = lines.len().saturating_sub(AGAIN_NAMED);
+    let mut listed: Vec<String> = (lines.take(AGAIN_NAMED))
+        .map(|line| format!("- `{}`", clipped(line)))
+        .collect();
+    if more > 0 {
+        listed.push(format!("- and {more} more"));
+    }
+    listed.join("\n")
+}
+
+/// What a run of the tester's tests failed, to tell a later run that fails
+/// the same from one that fails anew: the lines its runner gave a failing
+/// test or file (`attributed`), each once, or with none of those what a
+/// notice shows of its output (`excerpt`); either as it reads at every run
+/// (`steady`).
+#[derive(Clone, Debug, PartialEq)]
+enum Failing {
+    Named(Vec<String>),
+    Shown(String),
+}
+
+/// What `output`, a run of the tester's tests that failed, failed.
+fn failing(output: &str) -> Failing {
+    let lines = lines_of(output);
+    let names = named_lines(&lines);
+    let mut named: Vec<String> = Vec::new();
+    for at in (0..lines.len()).filter(|at| names[*at].is_some() && attributed(lines[*at])) {
+        let line = steady(lines[at]);
+        if !named.contains(&line) {
+            named.push(line);
+        }
+    }
+    if named.is_empty() {
+        let shown: Vec<String> = excerpt(output).lines().map(steady).collect();
+        return Failing::Shown(shown.join("\n"));
+    }
+    Failing::Named(named)
+}
+
+/// Digits in a row that `steady` takes for a number that differs from one
+/// run of the same tests to the next: fewer are a count, a line or a value
+/// a test compares, which tell one failure from another.
+const VARYING: usize = 5;
+
+/// `line`, of a test command's output, as it reads at every run of the same
+/// tests: with its timings left out (`untimed`), and `#` for each number of
+/// `VARYING` digits or more and each one in hex after `0x`, as an address,
+/// a port, a clock's reading and the stamp in the name of a folder made
+/// for one run of them (`folder`) are. On a benchmark run the one test that
+/// failed twice printed an object's address in its message, another each
+/// time.
+fn steady(line: &str) -> String {
+    let line = untimed(line);
+    let mut read = String::with_capacity(line.len());
+    let mut rest = line.as_str();
+    while let Some(at) = rest.find(|c: char| c.is_ascii_digit()) {
+        read.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let hex = rest.starts_with("0x");
+        let from = if hex { 2 } else { 0 };
+        let digit = |c: char| c.is_ascii_digit() || (hex && c.is_ascii_hexdigit());
+        let long = (rest[from..].find(|c| !digit(c))).unwrap_or(rest.len() - from);
+        let end = from + long;
+        match (hex && long > 0) || long >= VARYING {
+            true => read.push('#'),
+            false => read.push_str(&rest[..end]),
+        }
+        rest = &rest[end..];
+    }
+    read.push_str(rest);
+    read
+}
+
+/// Records `now`, what the driver's run of the tester's tests `kept` failed
+/// just now, with them, None where it failed nothing, and gives what was
+/// recorded there before: what its run before this one failed, if it did.
+fn failed_before(kept: &Kept, now: Option<Failing>) -> Option<Failing> {
+    let mut moved = moved().lock().ok()?;
+    let entry = (moved.iter_mut()).find(|entry| entry.kept.dir == kept.dir)?;
+    std::mem::replace(&mut entry.failed, now)
 }
 
 /// The notice sending the run back when its first complete version passed
@@ -3255,6 +3418,7 @@ pub(crate) fn keep(
             command,
             set_up: Vec::new(),
             unmet: false,
+            failed: None,
             there,
         });
     }
@@ -5688,7 +5852,7 @@ mod tests {
             dir: PathBuf::from("/tmp/kept"),
             files: vec!["a_letronna_spec_test.go".into()],
         };
-        let whole = failed(&kept, "go test ./...", &short).unwrap();
+        let whole = failed(&kept, "go test ./...", &short, None).unwrap();
         assert!(
             whole.contains("exited with code 1. Its output:\n\n--- FAIL"),
             "{whole}"
@@ -5699,7 +5863,7 @@ mod tests {
             "--- FAIL: TestA (0.00s)\n",
             "FAIL\n[exit code 1]",
         ));
-        let cut = failed(&kept, "go test ./...", &long).unwrap();
+        let cut = failed(&kept, "go test ./...", &long, None).unwrap();
         assert!(
             cut.contains("Its output, with `…` for lines left out:\n\n…\n--- FAIL"),
             "{cut}"
@@ -5934,7 +6098,7 @@ mod tests {
                       the request's words ask for it, do not take away or move something a \
                       review's row passed to pass a test.";
         let notices = [
-            failed(&kept, "npx vitest run x", &failing).unwrap(),
+            failed(&kept, "npx vitest run x", &failing, None).unwrap(),
             told(report, Some(&kept), true),
             unrun(report, &kept, true),
         ];
@@ -5991,7 +6155,7 @@ mod tests {
         // the report that comes with the reviews first, ahead of the words
         // rule: where its tests failed the work, where it ran them or could
         // not, and where they were written ahead of the work.
-        let failed = failed(&kept, "npx vitest run x", &failing).unwrap();
+        let failed = failed(&kept, "npx vitest run x", &failing, None).unwrap();
         let after = format!("and run the tests again the same way. {ONE_READING} {WORDS_FIRST}");
         assert!(failed.contains(&after), "{failed}");
         let told = told(report, Some(&kept), true);
@@ -6045,16 +6209,250 @@ mod tests {
                         true\nFAIL\n[exit code 1]"
                 .to_owned(),
         );
-        let text = failed(&kept, "go test ./...", &others).unwrap();
+        let text = failed(&kept, "go test ./...", &others, None).unwrap();
         assert!(text.contains(said), "{text}");
         // Not of the tester's own failing, nor of output naming no failure.
         let own =
             Ok("--- FAIL: TestLetronnaSpecRestoresColor (0.00s)\nFAIL\n[exit code 1]".to_owned());
-        let text = failed(&kept, "go test ./...", &own).unwrap();
+        let text = failed(&kept, "go test ./...", &own, None).unwrap();
         assert!(!text.contains("the tester did not write"), "{text}");
         let plain = Ok("made.txt is missing\n[exit code 1]".to_owned());
-        let text = failed(&kept, "sh ./*_test.sh", &plain).unwrap();
+        let text = failed(&kept, "sh ./*_test.sh", &plain, None).unwrap();
         assert!(!text.contains("the tester did not write"), "{text}");
+    }
+
+    #[test]
+    fn a_run_that_fails_what_the_run_before_failed_is_told_so_in_short() {
+        let kept = Kept {
+            dir: PathBuf::from("/tmp/kept"),
+            files: vec!["parse_letronna_spec_test.go".to_owned()],
+        };
+        let run = |output: &str| -> Result<String, String> { Ok(output.to_owned()) };
+        let first = run(
+            "=== RUN   TestLetronnaSpecParse\n    parse_letronna_spec_test.go:12: \
+                         got 2, want 3\n--- FAIL: TestLetronnaSpecParse (0.00s)\n--- FAIL: \
+                         TestLetronnaSpecEmpty (0.01s)\nFAIL\nFAIL\texample.com/x\t0.412s\n[exit \
+                         code 1]",
+        );
+        let before = failing(first.as_deref().unwrap());
+        let names = [
+            "--- FAIL: TestLetronnaSpecParse",
+            "--- FAIL: TestLetronnaSpecEmpty",
+        ];
+        assert_eq!(before, Failing::Named(names.map(String::from).into()));
+        // The same tests, at other times and in another order: the short
+        // notice, with their names and none of the output.
+        let again = run("--- FAIL: TestLetronnaSpecEmpty (0.03s)\n    \
+                         parse_letronna_spec_test.go:12: got 2, want 3\n--- FAIL: \
+                         TestLetronnaSpecParse (0.02s)\nFAIL\nFAIL\texample.com/x\t0.398s\n[exit \
+                         code 1]");
+        let text = failed(&kept, "go test ./...", &again, Some(&before)).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "Your work as it stands was run once more against the tests a tester wrote \
+                 from the request alone, the same way: `go test ./...` exited with code 1, and \
+                 it fails nothing but what it failed at the run before:\n\n- `--- FAIL: \
+                 TestLetronnaSpecEmpty`\n- `--- FAIL: TestLetronnaSpecParse`\n\nThat is the \
+                 same result told again, not a second demand to make them pass: where you \
+                 answered a test by quoting the request's words, that answer stands, and \
+                 nothing more is to change for it. Fix your work only for a test you have not \
+                 answered so, on what the request's words say. {} Then end with your whole \
+                 answer again.",
+                words_and_rows()
+            )
+        );
+        assert!(!text.contains("got 2, want 3"), "{text}");
+        // Nor is the same test new for printing another address or port
+        // in its message, where another value compared is another failure.
+        let id = |address: &str, got: u32| {
+            run(&format!(
+                "FAILED tests/test_letronna_spec.py::test_diff - AssertionError: assert {got} in \
+                 ['{address}']\n[exit code 1]"
+            ))
+        };
+        let before_id = failing(id("140737416943296", 3).as_deref().unwrap());
+        let moved = failed(
+            &kept,
+            "pytest -q",
+            &id("140737416943488", 3),
+            Some(&before_id),
+        );
+        assert!(
+            moved
+                .unwrap()
+                .contains("the run before:\n\n- `FAILED tests/")
+        );
+        let other = failed(
+            &kept,
+            "pytest -q",
+            &id("140737416943488", 4),
+            Some(&before_id),
+        );
+        assert!(!other.unwrap().contains("run before"));
+        // Fewer of them is nothing new either.
+        let fewer = run("--- FAIL: TestLetronnaSpecEmpty (0.03s)\nFAIL\n[exit code 1]");
+        let text = failed(&kept, "go test ./...", &fewer, Some(&before)).unwrap();
+        assert!(text.contains("the run before:\n\n- `--- FAIL: TestLetronnaSpecEmpty`\n\nThat"));
+        // With no run before it, the whole notice, as it was.
+        let whole = failed(&kept, "go test ./...", &again, None).unwrap();
+        assert!(
+            whole.starts_with("Your work as it stands was run against the tests"),
+            "{whole}"
+        );
+        assert!(whole.contains("got 2, want 3\n"), "{whole}");
+        assert!(!whole.contains("run before"), "{whole}");
+    }
+
+    #[test]
+    fn a_failure_the_run_before_did_not_have_is_named_as_new_in_the_whole_notice() {
+        let kept = Kept {
+            dir: PathBuf::from("/tmp/kept"),
+            files: vec!["parse_letronna_spec_test.go".to_owned()],
+        };
+        let before = failing("--- FAIL: TestLetronnaSpecParse (0.00s)\nFAIL\n[exit code 1]");
+        let now = Ok(
+            "--- FAIL: TestLetronnaSpecParse (0.00s)\n    x.go:3: got 2\n--- FAIL: \
+             TestLetronnaSpecRound (0.00s)\n    x.go:9: got 1.5\nFAIL\n[exit code 1]"
+                .to_owned(),
+        );
+        let text = failed(&kept, "go test ./...", &now, Some(&before)).unwrap();
+        // The output is shown, since the new failure's is needed, and the
+        // new one is told from the one answered already.
+        assert!(
+            text.starts_with("Your work as it stands was run against the tests"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "x.go:9: got 1.5\nFAIL\n[exit code 1]\n\nOf the failures it names, the run \
+                 before did not have these:\n\n- `--- FAIL: TestLetronnaSpecRound`\n\nWhat \
+                 they name is new, and is to be fixed. The others failed then too: where you \
+                 answered a test by quoting the request's words, that answer stands, and \
+                 nothing more is to change for it. Fix your work for each test that fails"
+            ),
+            "{text}"
+        );
+        // Where every failure is new, the notice is the first run's.
+        let other = Ok("--- FAIL: TestLetronnaSpecRound (0.00s)\nFAIL\n[exit code 1]".to_owned());
+        assert_eq!(
+            failed(&kept, "go test ./...", &other, Some(&before)),
+            failed(&kept, "go test ./...", &other, None)
+        );
+    }
+
+    #[test]
+    fn output_that_names_no_test_is_the_same_when_what_is_shown_of_it_is() {
+        let kept = Kept {
+            dir: PathBuf::from("/tmp/kept"),
+            files: vec!["letronna_spec_test.sh".to_owned()],
+        };
+        let folder = |stamp: &str| format!("/tmp/letronna-harness-copy-71-{stamp}/src/app.py");
+        let run = |stamp: &str, took: &str, line: u32| -> Result<String, String> {
+            Ok(format!(
+                "made.txt is missing\n  File \"{}\", line {line}\n<Task at 0x7f{stamp}>\n\
+                 finished in {took}\n[exit code 1]",
+                folder(stamp)
+            ))
+        };
+        let first = run("1699000000001", "0.42s", 3);
+        let before = failing(first.as_deref().unwrap());
+        assert_eq!(
+            before,
+            Failing::Shown(
+                "made.txt is missing\nFile \"/tmp/letronna-harness-copy-71-#/src/app.py\", line \
+                 3\n<Task at #>\nfinished\n[exit code 1]"
+                    .to_owned()
+            )
+        );
+        // Another copy's folder, another address and another time are no
+        // other failure.
+        let again = run("1699000000977", "0.57s", 3);
+        let text = failed(&kept, "sh letronna_spec_test.sh", &again, Some(&before)).unwrap();
+        assert!(
+            text.contains(
+                "`sh letronna_spec_test.sh` exited with code 1, and it fails nothing but what \
+                 it failed at the run before, with the output it had then. That is the same \
+                 result told again"
+            ),
+            "{text}"
+        );
+        // Other output is another failure, told whole.
+        let other = run("1699000001409", "0.57s", 8);
+        let text = failed(&kept, "sh letronna_spec_test.sh", &other, Some(&before)).unwrap();
+        assert!(
+            text.starts_with("Your work as it stands was run against"),
+            "{text}"
+        );
+        assert!(!text.contains("run before"), "{text}");
+        // Nor is output that names its tests the same as output that names
+        // none, whatever each says.
+        let named = failing("--- FAIL: TestLetronnaSpecParse (0.00s)\n[exit code 1]");
+        let text = failed(&kept, "sh letronna_spec_test.sh", &again, Some(&named)).unwrap();
+        assert!(!text.contains("run before"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_drivers_second_run_of_the_same_failing_tests_is_not_told_as_new() {
+        let root = Scratch::new("spec-tests-again");
+        let repo = |args: &[&str]| assert!(git(&root, args).is_some(), "git {args:?}");
+        repo(&["init", "-q"]);
+        std::fs::write(root.join("README"), "a project").unwrap();
+        repo(&["add", "."]);
+        std::fs::write(
+            root.join("letronna_spec_test.sh"),
+            "test -f made.txt || { echo '--- FAIL: TestLetronnaSpecMade (0.00s)'; exit 1; }\n\
+             test -f more.txt || { echo '--- FAIL: TestLetronnaSpecMore (0.00s)'; exit 1; }\n",
+        )
+        .unwrap();
+        let command = "sh letronna_spec_test.sh".to_owned();
+        let kept = keep(159, &root, &root, Some(command.clone())).unwrap();
+        let ctx = ToolContext::of(&crate::chat::Connection {
+            workspace: Some(root.to_path_buf()),
+            ..Default::default()
+        });
+        let told = || match ran(&kept, &command, &ctx, TIMEOUT, || None) {
+            Ran::Failed(text) => text,
+            other => panic!("the tests did not fail: {other:?}"),
+        };
+        // The first run's failure is told whole, the same one after it in
+        // short.
+        let whole = told();
+        assert!(
+            whole.starts_with("Your work as it stands was run against"),
+            "{whole}"
+        );
+        let short = told();
+        assert!(
+            short.starts_with("Your work as it stands was run once more against"),
+            "{short}"
+        );
+        assert!(
+            short.contains("the run before:\n\n- `--- FAIL: TestLetronnaSpecMade`\n\nThat is"),
+            "{short}"
+        );
+        // Another test failing in its place is new, and told whole.
+        std::fs::write(root.join("made.txt"), "made").unwrap();
+        let other = told();
+        assert!(
+            other.starts_with("Your work as it stands was run against"),
+            "{other}"
+        );
+        assert!(other.contains("TestLetronnaSpecMore"), "{other}");
+        // A run that passes leaves nothing to tell a later failure from.
+        std::fs::write(root.join("more.txt"), "more").unwrap();
+        assert_eq!(
+            ran(&kept, &command, &ctx, TIMEOUT, || None),
+            Ran::Passed(command.clone())
+        );
+        std::fs::remove_file(root.join("more.txt")).unwrap();
+        let after = told();
+        assert!(
+            after.starts_with("Your work as it stands was run against"),
+            "{after}"
+        );
+        tidy(159);
     }
 
     #[cfg(unix)]
@@ -6839,7 +7237,7 @@ mod tests {
         // the tool keeps from what it cuts.
         let ran = outcome_in(&kept, &command, &root, &ctx, TIMEOUT).unwrap();
         assert!(ran.as_deref().unwrap().len() > 10 * crate::tools::MAX_OUTPUT);
-        let notice = failed(&kept, &command, &ran).unwrap();
+        let notice = failed(&kept, &command, &ran, None).unwrap();
         assert!(
             notice.contains("lines left out:\n\n…\n--- FAIL: TestMiddle (0.00s)\n"),
             "{notice}"
@@ -6877,7 +7275,7 @@ mod tests {
         let output = ran.as_deref().unwrap();
         assert!(output.len() > 2 * 1024 * 1024, "{}", output.len());
         assert!(output.contains(" left out]\n"));
-        let notice = failed(&kept, &command, &ran).unwrap();
+        let notice = failed(&kept, &command, &ran, None).unwrap();
         assert!(
             notice.contains("\n--- FAIL: TestDeep (0.00s)\n"),
             "{notice}"
@@ -7159,14 +7557,16 @@ mod tests {
         );
         let dir = snapshot_of(23).unwrap();
         assert!(!dir.join("letronna_spec_test.sh").exists());
-        // The first version is judged by once: the plain notice after.
+        // The first version is judged by once: after it the notice is of
+        // the work alone, and of a failure the run was told already.
         let Ran::Failed(text) = ran(&kept, &command, &ctx, TIMEOUT, || first(23)) else {
             panic!("the work passed");
         };
         assert!(
-            text.starts_with("Your work as it stands was run against"),
+            text.starts_with("Your work as it stands was run once more against"),
             "{text}"
         );
+        assert!(!text.contains("first complete version"), "{text}");
         tidy(23);
         assert_eq!(to_run(23), None);
         assert_eq!(snapshot_of(23), None);
@@ -7205,17 +7605,17 @@ mod tests {
         );
         assert!(first(24).is_some());
         // Changed since, the first version runs them, fails them too, and
-        // the notice is the plain one; judged by all the same.
+        // the notice is of the work alone, the failure being one the run
+        // was told; judged by all the same.
         std::fs::write(root.join("README"), "a project, reviewed").unwrap();
         let Ran::Failed(text) = ran(&kept, &command, &ctx, TIMEOUT, || first(24)) else {
             panic!("the work passed");
         };
         assert!(
-            text.starts_with("Your work as it stands was run against"),
+            text.starts_with("Your work as it stands was run once more against"),
             "{text}"
         );
         assert!(!text.contains("first complete version"), "{text}");
-        assert!(text.contains("made.txt is missing"), "{text}");
         assert_eq!(first(24), None);
         tidy(24);
     }

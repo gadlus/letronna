@@ -10126,12 +10126,18 @@ pub(crate) mod tests {
         // Nothing in the project was put back or left: that is the run's to do.
         assert!(!project.join("made.txt").exists());
         assert!(!project.join("letronna_spec_test.sh").exists());
-        // Judged by once: the plain notice after, until the run fixes it.
+        // Judged by once: after it the notice is of the work alone, and of
+        // a failure the run was told already, until the run fixes it.
         let again = tested_work(&spec, test_run(&spec, &turn, true)).unwrap();
         assert!(
             again
                 .content
-                .starts_with("Your work as it stands was run against"),
+                .starts_with("Your work as it stands was run once more against"),
+            "{}",
+            again.content
+        );
+        assert!(
+            !again.content.contains("first complete version"),
             "{}",
             again.content
         );
