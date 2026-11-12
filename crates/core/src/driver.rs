@@ -14112,6 +14112,7 @@ pub(crate) mod tests {
     }
 
     /// What asks for the rounds to tidy in, after what it names.
+    #[cfg(unix)]
     const TIDY_FIRST: &str = "What is named here may not be all of it. In at most 5 more rounds, \
                               remove by name those you made only to test or probe (scripts, \
                               logs, binaries, throwaway tests); keep every file of your change, \
@@ -14131,9 +14132,11 @@ pub(crate) mod tests {
     }
 
     /// What the wrap-up at the round cap asks for.
+    #[cfg(unix)]
     const SUMMARY: &str = "Summarize what is done and what remains, then stop.";
 
     /// A call that makes `path`, a file of the run's own.
+    #[cfg(unix)]
     fn probe(path: &str) -> (&'static str, Value) {
         ("write_file", json!({"path": path, "content": "probing\n"}))
     }
@@ -14455,6 +14458,7 @@ pub(crate) mod tests {
     }
 
     /// The turn of `spec`'s run with every round of its cap run.
+    #[cfg(unix)]
     fn at_cap(spec: &Spec) -> Turn {
         let mut turn = Turn::with_limit(spec.connection.clone(), spec.rounds);
         for round in 0..spec.rounds {
