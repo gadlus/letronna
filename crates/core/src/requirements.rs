@@ -857,13 +857,29 @@ const CASE_CHARS: usize = 120;
 /// read in the helper's whole report.
 const CUT_SHOWN: usize = 60;
 
+/// The verdicts the rows a quote cut are written again under, in the order
+/// they are written, each with what a count of the ones left out calls it.
+/// What holds the run comes first: only `CUT_SHOWN` rows are written, and
+/// taken in the table's order a failed row far down a long table reached
+/// the run as one of "more rows".
+const CUT_ORDER: [(&str, &str); 3] = [
+    ("FAIL", "that failed"),
+    (UNCLEAR, "left unclear"),
+    ("PASS", "that passed"),
+];
+
 /// The rows of a review's table in `report` that `quote`, the report as cut
 /// to fit, lost, to go after it so the run is held to the whole table: each
 /// failed row with what shows it, and each passed one by its requirement and
-/// case. None when the quote kept every row.
+/// case, the failed ones first, then those left unclear, then those that
+/// passed (`CUT_ORDER`), with a count of each kind left out past
+/// `CUT_SHOWN`. Of the passed ones, a row of a requirement that is left no
+/// other is written before a second row of one that has its own, so
+/// `unchecked` finds no requirement without a row that its review gave one.
+/// None when the quote kept every row.
 pub(crate) fn cut_rows(report: &str, quote: &str) -> Option<String> {
     let cut = |text: &str, most: usize| -> String { text.chars().take(most).collect() };
-    let lost: Vec<String> = (rows(report).into_iter())
+    let lost: Vec<(usize, &str, String)> = (rows(report).into_iter())
         .filter(|(_, _, line)| !quote.contains(line.as_str()))
         .map(|(number, passed, line)| {
             let cells = cells(&line);
@@ -881,23 +897,55 @@ pub(crate) fn cut_rows(report: &str, quote: &str) -> Option<String> {
             let case = cut(&joined(&cells[1..at], &[before]), CASE_CHARS);
             let rest = &cells[(at + 1).min(cells.len())..];
             let shows = cut(&joined(&[after], rest), ROW_CHARS);
-            let word = if left_unclear(&line) { UNCLEAR } else { "FAIL" };
-            match (passed, shows.is_empty()) {
-                (true, _) => format!("R{number} | {case} | PASS"),
-                (false, true) => format!("R{number} | {case} | {word}"),
+            let word = match (passed, left_unclear(&line)) {
+                (true, _) => "PASS",
+                (false, true) => UNCLEAR,
+                (false, false) => "FAIL",
+            };
+            let row = match (passed, shows.is_empty()) {
+                (true, _) | (false, true) => format!("R{number} | {case} | {word}"),
                 (false, false) => format!("R{number} | {case} | {word} | {shows}"),
-            }
+            };
+            (number, word, row)
         })
         .collect();
     if lost.is_empty() {
         return None;
     }
+    let lost = lost.as_slice();
+    let of = |kind: &'static str| (0..lost.len()).filter(move |at| lost[*at].1 == kind);
+    let [(failed, _), (unclear, _), (passed, _)] = CUT_ORDER;
+    let mut shown: Vec<usize> = of(failed).chain(of(unclear)).take(CUT_SHOWN).collect();
+    // The requirements that have a row already, in what the quote kept or
+    // among the rows taken so far: a passed row of any other goes first.
+    let mut rowed: Vec<usize> = (rows(quote).iter().map(|(number, _, _)| *number))
+        .chain(shown.iter().map(|at| lost[*at].0))
+        .collect();
+    let (only, others): (Vec<usize>, Vec<usize>) = of(passed).partition(|at| {
+        let new = !rowed.contains(&lost[*at].0);
+        rowed.extend(new.then_some(lost[*at].0));
+        new
+    });
+    let room = CUT_SHOWN - shown.len();
+    let mut kept: Vec<usize> = only.into_iter().chain(others).take(room).collect();
+    // In the table's order again, whichever were taken first.
+    kept.sort_unstable();
+    shown.extend(kept);
     let mut text = String::from("\nRows of its table the quote above cut, written again:");
-    for row in lost.iter().take(CUT_SHOWN) {
-        text.push_str(&format!("\n{row}"));
+    for at in &shown {
+        text.push_str(&format!("\n{}", lost[*at].2));
     }
-    if lost.len() > CUT_SHOWN {
-        text.push_str(&format!("\nand {} more rows", lost.len() - CUT_SHOWN));
+    let more: Vec<String> = (CUT_ORDER.iter())
+        .map(|(kind, said)| (of(kind).filter(|at| !shown.contains(at)).count(), said))
+        .filter(|(count, _)| *count > 0)
+        .enumerate()
+        .map(|(at, (count, said))| match at {
+            0 => format!("{count} more rows {said}"),
+            _ => format!("{count} more {said}"),
+        })
+        .collect();
+    if !more.is_empty() {
+        text.push_str(&format!("\nand {}", and_list(&more)));
     }
     Some(text)
 }
@@ -2010,20 +2058,22 @@ mod tests {
         ];
         assert_eq!(found, read);
         // Written again after a cut, the case and what shows it part at
-        // the verdict, and read as the rows they were.
+        // the verdict, and read as the rows they were, the ones that hold
+        // the run first.
         let again = cut_rows(report, "cut").unwrap();
         assert_eq!(
             again,
             "\nRows of its table the quote above cut, written again:\n\
-             R1 | skipped results before the threshold do not count | PASS\n\
-             R1 | failures are listed by name (threshold 2) | PASS\n\
-             R2 | an empty name gives an empty reason | UNCLEAR | (\"the test's name\")\n\
              R3 | the summary line is printed once | FAIL\n\
-             R4 | the count includes the last test | FAIL | (`node count.js`: 2)"
+             R4 | the count includes the last test | FAIL | (`node count.js`: 2)\n\
+             R2 | an empty name gives an empty reason | UNCLEAR | (\"the test's name\")\n\
+             R1 | skipped results before the threshold do not count | PASS\n\
+             R1 | failures are listed by name (threshold 2) | PASS"
         );
-        let found: Vec<(usize, bool, bool)> = (rows(&again).into_iter())
+        let mut found: Vec<(usize, bool, bool)> = (rows(&again).into_iter())
             .map(|(number, passed, row)| (number, passed, left_unclear(&row)))
             .collect();
+        found.sort_unstable();
         assert_eq!(found, read);
         // A case that only mentions a verdict is no row.
         for case in [
@@ -2090,9 +2140,10 @@ mod tests {
         let again = cut_rows(report, "cut").unwrap();
         assert!(
             again.ends_with(
-                "\nR1 | exact count | FAIL | got 2\nR2 | empty input | PASS\n\
+                "\nR1 | exact count | FAIL | got 2\n\
+                 R4 | exact message | FAIL | **not** the one asked for\n\
                  R3 | later step first | UNCLEAR | The request sets no order\n\
-                 R4 | exact message | FAIL | **not** the one asked for"
+                 R2 | empty input | PASS"
             ),
             "{again}"
         );
@@ -2952,7 +3003,73 @@ mod tests {
         let many: String = (1..=CUT_SHOWN + 2)
             .map(|n| format!("R{n} | c | PASS\n"))
             .collect();
-        assert!(cut_rows(&many, "").unwrap().ends_with("\nand 2 more rows"));
+        let again = cut_rows(&many, "").unwrap();
+        assert!(again.ends_with("\nand 2 more rows that passed"), "{again}");
+    }
+
+    #[test]
+    fn of_more_rows_than_are_written_again_the_ones_that_hold_the_run_are_kept() {
+        // A long table whose doubts and whose one failure come last, past
+        // where the rows written again stop.
+        let mut table: String = (1..=CUT_SHOWN + 20)
+            .map(|n| format!("| R{} | case {n} | PASS | t{n}.sh |\n", n.div_ceil(4)))
+            .collect();
+        table.push_str("| R21 | which end | UNCLEAR | the request names neither |\n");
+        table.push_str("| R22 | empty input | UNCLEAR |\n");
+        table.push_str("| R23 | exact message | FAIL | node check.js prints 2 |\n");
+        let again = cut_rows(&table, "cut").unwrap();
+        let written: Vec<&str> = again.lines().skip(2).collect();
+        assert_eq!(written.len(), CUT_SHOWN + 1, "{again}");
+        // The failed row first, then the doubts, then the ones that passed.
+        assert_eq!(
+            written[0],
+            "R23 | exact message | FAIL | node check.js prints 2"
+        );
+        assert_eq!(
+            written[1],
+            "R21 | which end | UNCLEAR | the request names neither"
+        );
+        assert_eq!(written[2], "R22 | empty input | UNCLEAR");
+        assert_eq!(written[3], "R1 | case 1 | PASS");
+        // Only rows that passed are left out, and the count says so.
+        assert_eq!(written[CUT_SHOWN], "and 23 more rows that passed");
+        // Every requirement the table has a row for still has one, where
+        // the first rows in the table's order stop at R15, so the run is
+        // sent back for what failed and is in doubt and for nothing else.
+        let text = unchecked(&again, 23).unwrap();
+        assert!(!text.contains("has no row"), "{text}");
+        assert!(text.contains("- R23 | exact message | FAIL"), "{text}");
+        assert_eq!(left_open(&text), [21, 22]);
+        // The passed rows kept are in the table's order, each requirement's
+        // first among them.
+        let kept: Vec<usize> = (rows(&again).iter())
+            .filter(|(_, passed, _)| *passed)
+            .map(|(number, _, _)| *number)
+            .collect();
+        assert!(kept.is_sorted(), "{kept:?}");
+        assert!((1..=20).all(|number| kept.contains(&number)), "{kept:?}");
+        // A requirement with a row the quote kept needs none of them.
+        let quote = "    | R20 | case 80 | PASS | t80.sh |";
+        let again = cut_rows(&table, quote).unwrap();
+        assert!(!again.contains("\nR20 |"), "{again}");
+        assert!(again.ends_with("\nand 22 more rows that passed"), "{again}");
+    }
+
+    #[test]
+    fn rows_that_hold_the_run_left_out_past_the_cap_are_counted_by_kind() {
+        let table: String = (1..=CUT_SHOWN + 3)
+            .map(|n| format!("R{n} | case {n} | FAIL | t{n}.sh\n"))
+            .chain(["R70 | which end | UNCLEAR\n".to_owned()])
+            .chain((71..=75).map(|n| format!("R{n} | case {n} | PASS\n")))
+            .collect();
+        let again = cut_rows(&table, "cut").unwrap();
+        assert_eq!(again.lines().count(), CUT_SHOWN + 3, "{again}");
+        assert!(
+            again.ends_with(
+                "\nand 3 more rows that failed, 1 more left unclear and 5 more that passed"
+            ),
+            "{again}"
+        );
     }
 
     #[test]
@@ -2963,9 +3080,9 @@ mod tests {
         let again = cut_rows(report, "cut").unwrap();
         assert_eq!(
             again,
-            "\nRows of its table the quote above cut, written again:\nR1 | missing field | \
-             PASS\nR2 | plain value | FAIL | `node check.js` prints 2 | expected 3\nR3 | later \
-             step first | UNCLEAR | (the request sets no order)"
+            "\nRows of its table the quote above cut, written again:\nR2 | plain value | FAIL \
+             | `node check.js` prints 2 | expected 3\nR3 | later step first | UNCLEAR | (the \
+             request sets no order)\nR1 | missing field | PASS"
         );
         // Written again, they read as the rows they were.
         let found: Vec<(usize, bool, bool)> = (rows(&again).into_iter())
@@ -2973,7 +3090,7 @@ mod tests {
             .collect();
         assert_eq!(
             found,
-            [(1, true, false), (2, false, false), (3, false, true)]
+            [(2, false, false), (3, false, true), (1, true, false)]
         );
     }
 
