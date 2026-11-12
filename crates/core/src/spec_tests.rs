@@ -358,55 +358,80 @@ const NOT_RECOGNIZED: &str = "is not recognized as";
 /// not installed, as `python -m pytest` does without pytest.
 const NO_MODULE: &str = "No module named ";
 
+/// How a toolchain, a runtime or a package manager says it will not start
+/// because its version here is not one the project accepts: what its line
+/// opens with, past its indent, one of the first, and what the line holds
+/// besides, each of the second. The opening is the tool's own mark of an
+/// error: the same words after `info` or `warning`, in a test's log or in
+/// a sentence about them stop nothing.
+type Refusal = (&'static [&'static str], &'static [&'static str]);
+
 /// What Go prints, after the file or module that asks, when the Go here is
 /// older than the project requires and it may not fetch a newer one, as
-/// under `GOTOOLCHAIN=local` or with no network: `go.work requires go >=
-/// 1.26.0 (running go 1.25.5; GOTOOLCHAIN=local)`, both parts on one line.
-/// It builds and runs nothing then.
-const GO_TOO_OLD: [&str; 2] = [" requires go >= ", "(running go "];
+/// under `GOTOOLCHAIN=local`: `go: go.work requires go >= 1.26.0 (running
+/// go 1.25.5; GOTOOLCHAIN=local)`. It builds and runs nothing then.
+const GO_TOO_OLD: Refusal = (&["go: "], &[" requires go >= ", "(running go "]);
+
+/// What Go prints where it may fetch the newer Go and cannot, as with no
+/// network: `go: download go1.26.0 for linux/amd64: toolchain not
+/// available`.
+const GO_NOT_FETCHED: Refusal = (&["go: download go"], &[": toolchain not available"]);
 
 /// npm's code where a package's `engines` rule out the Node or npm here and
-/// `engine-strict` makes that an error; its warning of the same has no
-/// `code` before the word, and stops nothing.
-const NPM_ENGINE: [&str; 1] = ["code EBADENGINE"];
+/// `engine-strict` makes that an error, in either spelling of its error
+/// lines; its warning of the same opens with `npm warn`, and stops nothing.
+const NPM_ENGINE: Refusal = (&["npm error ", "npm ERR! "], &["code EBADENGINE"]);
 
-/// pnpm's code for an `engines` rule the Node or pnpm here does not meet.
-const PNPM_ENGINE: [&str; 1] = ["ERR_PNPM_UNSUPPORTED_ENGINE"];
+/// pnpm's code for an `engines` rule the Node or pnpm here does not meet,
+/// which opens its line.
+const PNPM_ENGINE: Refusal = (&["ERR_PNPM_UNSUPPORTED_ENGINE"], &[]);
 
-/// Yarn's words for an `engines` rule the Node here does not meet.
-const YARN_ENGINE: [&str; 1] = ["The engine \"node\" is incompatible with this module"];
+/// Yarn's words for an `engines` rule the Node here does not meet, on its
+/// `error` line: after `info`, for a dependency it may leave out, it goes
+/// on to install the rest.
+const YARN_ENGINE: Refusal = (
+    &["error "],
+    &["The engine \"node\" is incompatible with this module"],
+);
 
 /// pip's words for a package whose `Requires-Python` leaves out the Python
 /// here, with both versions after them.
-const PIP_PYTHON: [&str; 1] = ["requires a different Python:"];
+const PIP_PYTHON: Refusal = (&["ERROR: Package "], &["requires a different Python:"]);
 
-/// cargo's words for a package whose `rust-version` is newer than the rustc
-/// here, between the package and the two versions.
-const CARGO_RUSTC: [&str; 1] = ["cannot be built because it requires rustc"];
+/// cargo's words where the rustc here is older than the `rust-version` of
+/// packages it would build, which it lists on the lines after.
+const CARGO_RUSTC: Refusal = (
+    &["error: rustc "],
+    &[" is not supported by the following package"],
+);
 
 /// Bundler's words where the Ruby here is not the one the Gemfile names,
-/// around the two versions on one line.
-const BUNDLER_RUBY: [&str; 2] = ["Your Ruby version is ", ", but your Gemfile specified "];
+/// around the two versions.
+const BUNDLER_RUBY: Refusal = (
+    &["Your Ruby version is "],
+    &[", but your Gemfile specified "],
+);
 
 /// Composer's check, as each of a project's PHP commands starts, where the
-/// PHP here is older than its installed packages require.
-const COMPOSER_PHP: [&str; 1] = ["Your Composer dependencies require a PHP version"];
+/// PHP here is older than its installed packages require: a line of its
+/// own that opens so.
+const COMPOSER_PHP: Refusal = (&["Your Composer dependencies require a PHP version "], &[]);
 
-/// What a toolchain, a runtime or a package manager prints when it will not
-/// start because its version here is not one the project accepts, each the
-/// parts one line holds. A command that ends so ran nothing of the project,
-/// as one whose program is missing did not: on a benchmark run Go's line
-/// was told as failing tests, with its exit code, where the run and the
-/// tester had both found another way to run them.
-const REFUSED: [&[&str]; 8] = [
-    &GO_TOO_OLD,
-    &NPM_ENGINE,
-    &PNPM_ENGINE,
-    &YARN_ENGINE,
-    &PIP_PYTHON,
-    &CARGO_RUSTC,
-    &BUNDLER_RUBY,
-    &COMPOSER_PHP,
+/// Each way a toolchain, a runtime or a package manager refuses its
+/// version here that is known. A command that ends so ran nothing of the
+/// project, as one whose program is missing did not: on a benchmark run
+/// Go's line was told as failing tests, with its exit code, where the run
+/// and the tester had both found another way to run them.
+const REFUSED: [Refusal; 9] = [
+    GO_TOO_OLD,
+    GO_NOT_FETCHED,
+    NPM_ENGINE,
+    PNPM_ENGINE,
+    YARN_ENGINE,
+    PIP_PYTHON,
+    CARGO_RUSTC,
+    BUNDLER_RUBY,
+    COMPOSER_PHP,
 ];
 
 /// Programs that run another the command need not name, such as the script
@@ -469,9 +494,14 @@ fn could_not_fetch(text: &str) -> bool {
 
 /// Whether `line`, of a command's output, is a toolchain's, a runtime's or
 /// a package manager's word that it will not start with the version here:
-/// it holds every part of one of `REFUSED`.
+/// one of `REFUSED` opens it, past its indent, and it holds the rest of
+/// that one.
 fn refuses(line: &str) -> bool {
-    (REFUSED.iter()).any(|parts| parts.iter().all(|part| line.contains(part)))
+    let line = line.trim_start();
+    REFUSED.iter().any(|(opens, holds)| {
+        opens.iter().any(|open| line.starts_with(open))
+            && holds.iter().all(|held| line.contains(held))
+    })
 }
 
 /// A tester's files kept for a run: its id, the project it puts them back
@@ -1725,14 +1755,19 @@ fn unfetched(outcome: &Result<String, String>) -> Option<String> {
 
 /// Why `outcome`, a test command's, shows that a toolchain, a runtime or a
 /// package manager it runs would not start at the version here (`refuses`),
-/// with the line that says so; None where it shows no such thing, or any
-/// test ran (`before_any_test`).
+/// with the line that says so; None where it shows no such thing, where any
+/// test ran (`before_any_test`), or where a line after it names a failure
+/// (`named`): the command went on past the refusal then, as after an
+/// install it did not need, and what failed is what it ran.
 fn refused(outcome: &Result<String, String>) -> Option<String> {
     let (_, lines) = before_any_test(outcome)?;
-    let line = lines.iter().find(|line| refuses(line))?;
+    let at = lines.iter().rposition(|line| refuses(line))?;
+    if named_lines(&lines[at + 1..]).iter().any(Option::is_some) {
+        return None;
+    }
     Some(format!(
         "a toolchain it runs will not start at the version installed here (`{}`)",
-        clipped(line.trim())
+        clipped(lines[at].trim())
     ))
 }
 
@@ -5214,54 +5249,110 @@ mod tests {
                  requires go >= 1.26.0 (running go 1.25.5; GOTOOLCHAIN=local)`)"
             )
         );
-        // Each marker, in the line its tool prints it in.
-        let lines: [(&[&str], &str); 8] = [
+        // Each marker, in the lines its tool prints it among.
+        let said: [(Refusal, &str); 9] = [
             (
-                &GO_TOO_OLD,
+                GO_TOO_OLD,
                 "go: example.com/tool@v0.20.0 requires go >= 1.22 (running go 1.21.0)",
             ),
-            (&NPM_ENGINE, "npm error code EBADENGINE"),
             (
-                &PNPM_ENGINE,
+                GO_NOT_FETCHED,
+                "go: downloading go1.26.0 (linux/amd64)\ngo: download go1.26.0 for linux/amd64: \
+                 toolchain not available",
+            ),
+            (
+                NPM_ENGINE,
+                "npm error code EBADENGINE\nnpm error engine Unsupported engine\nnpm error \
+                 notsup Required: {\"node\":\">=20\"}",
+            ),
+            (
+                PNPM_ENGINE,
                 " ERR_PNPM_UNSUPPORTED_ENGINE  Unsupported environment (bad pnpm and/or Node.js \
-                 version)",
+                 version)\n\nYour Node version is incompatible with \"/app\".",
             ),
             (
-                &YARN_ENGINE,
+                YARN_ENGINE,
                 "error app@1.0.0: The engine \"node\" is incompatible with this module. Expected \
-                 version \">=20\". Got \"18.17.0\"",
+                 version \">=20\". Got \"18.17.0\"\nerror Found incompatible module.",
             ),
             (
-                &PIP_PYTHON,
+                PIP_PYTHON,
                 "ERROR: Package 'app' requires a different Python: 3.8.10 not in '>=3.9'",
             ),
             (
-                &CARGO_RUSTC,
-                "error: package `app v0.1.0 (/app)` cannot be built because it requires rustc \
-                 1.80 or newer, while the currently active rustc version is 1.75.0",
+                CARGO_RUSTC,
+                "error: rustc 1.92.0 is not supported by the following packages:\n  \
+                 cargo-util@0.2.28 requires rustc 1.93\nEither upgrade rustc or select \
+                 compatible dependency versions with\n`cargo update <name>@<current-ver> \
+                 --precise <compatible-ver>`",
             ),
             (
-                &BUNDLER_RUBY,
+                BUNDLER_RUBY,
                 "Your Ruby version is 3.0.2, but your Gemfile specified 3.2.2",
             ),
             (
-                &COMPOSER_PHP,
-                "Composer detected issues in your platform: Your Composer dependencies require \
-                 a PHP version \">= 8.1.0\". You are running 7.4.33.",
+                COMPOSER_PHP,
+                "Composer detected issues in your platform:\n\nYour Composer dependencies \
+                 require a PHP version \">= 8.1.0\". You are running 7.4.33.",
             ),
         ];
-        assert_eq!(lines.len(), REFUSED.len());
-        for (marker, line) in lines {
-            assert!(REFUSED.contains(&marker), "{line}");
-            assert!(marker.iter().all(|part| line.contains(part)), "{line}");
-            let why = unrunnable("make test", &exited(line, 1));
+        assert_eq!(said.len(), REFUSED.len());
+        for (marker, output) in said {
+            assert!(REFUSED.contains(&marker), "{output}");
+            let why = unrunnable("make test", &exited(output, 1));
             assert!(
                 why.as_deref()
                     .is_some_and(|why| why.starts_with("a toolchain it runs will not start")),
-                "{line}: {why:?}"
+                "{output}: {why:?}"
             );
             // A command that printed it lent no set-up that let it run.
-            assert!(set_up_failed(line), "{line}");
+            assert!(set_up_failed(output), "{output}");
+        }
+        // npm's older spelling of its error lines.
+        assert!(refuses("npm ERR! code EBADENGINE"));
+        // The same words where the tool's own error does not open the
+        // line stop nothing: Yarn's and npm's for a dependency they may
+        // leave out, a note, a sentence, a log, or half a marker.
+        for line in [
+            "info fsevents@2.3.2: The engine \"node\" is incompatible with this module.",
+            "warning app@1.0.0: The engine \"node\" is incompatible with this module.",
+            "npm warn EBADENGINE Unsupported engine {",
+            "npm warn code EBADENGINE",
+            "note: go.mod requires go >= 1.26 (running go 1.25.5)",
+            "log: go: go.mod requires go >= 1.26 (running go 1.25.5)",
+            "go: updates to go.mod needed; this module requires go >= 1.22",
+            "go: downloading go1.26.0 (linux/amd64)",
+            "see ERR_PNPM_UNSUPPORTED_ENGINE in the docs",
+            "WARNING: Package 'app' requires a different Python: 3.8.10 not in '>=3.9'",
+            "error: package `app v0.1.0` cannot be built because it requires rustc 1.80",
+            "warning: rustc 1.92.0 is not supported by the following packages:",
+            "Your Ruby version is 3.0.2",
+            "PHP Fatal error: Your Composer dependencies require a PHP version \">= 8.1.0\".",
+        ] {
+            assert!(!refuses(line), "{line}");
+            assert_eq!(unrunnable("make test", &exited(line, 1)), None, "{line}");
+            assert!(!set_up_failed(line), "{line}");
+        }
+        // A command that went on past the refusal and then failed ran
+        // something, and what it ran is what failed: an install the tests
+        // did not need, and then a crash.
+        for output in [
+            "info fsevents@2.3.2: The engine \"node\" is incompatible with this \
+             module.\n/app/tests/run.js:3\n    throw new TypeError('boom');\nTypeError: boom\n    \
+             at Object.<anonymous> (/app/tests/run.js:3:11)",
+            "ERROR: Package 'extra' requires a different Python: 3.8.10 not in \
+             '>=3.9'\nTraceback (most recent call last):\n  File \"tests/run.py\", line 4, in \
+             <module>\nKeyError: 'total'",
+            "error app@1.0.0: The engine \"node\" is incompatible with this module. Expected \
+             version \">=20\". Got \"18.17.0\"\nAssertionError: expected 2 to equal 3",
+            "go: go.mod requires go >= 1.26 (running go 1.25.5; GOTOOLCHAIN=local)\npanic: \
+             runtime error: index out of range [3] with length 3",
+        ] {
+            assert_eq!(
+                unrunnable("make test", &exited(output, 1)),
+                None,
+                "{output}"
+            );
         }
         // A test that logged such a line and failed is a failing test, and
         // so is a suite that ran before a later step was refused.
@@ -5271,26 +5362,13 @@ mod tests {
             "FAILED tests/test_pip.py::test_old - AssertionError: Package 'app' requires a \
              different Python: 3.8.10 not in '>=3.9'\n1 failed in 0.20s",
             "running 3 tests\ntest result: ok. 3 passed; 0 failed\nnpm error code EBADENGINE",
+            "--- FAIL: TestRun (0.00s)\ngo: go.mod requires go >= 1.26 (running go 1.25.5)",
         ] {
             assert_eq!(
                 unrunnable("make test", &exited(output, 1)),
                 None,
                 "{output}"
             );
-        }
-        // Part of a marker is not it: a warning stops nothing, and a file
-        // can ask for a version in other words.
-        for output in [
-            "npm warn EBADENGINE Unsupported engine {",
-            "go: updates to go.mod needed; this module requires go >= 1.22",
-            "Your Ruby version is 3.0.2",
-        ] {
-            assert_eq!(
-                unrunnable("make test", &exited(output, 1)),
-                None,
-                "{output}"
-            );
-            assert!(!set_up_failed(output), "{output}");
         }
         // Nor is a command that passed, or was cut at its limit.
         let line = "go: go.mod requires go >= 1.26 (running go 1.25.5; GOTOOLCHAIN=local)";
