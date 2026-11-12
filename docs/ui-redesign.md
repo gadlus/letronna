@@ -6,6 +6,11 @@ servers and the four example plugins, and reading what the window drew. The
 design canvas that goes with it holds a working prototype, the motion moves,
 the annotated screenshots and the brand sheet.
 
+From here on the plan, the system the screens are built from, the captures of
+each step and the checklist a UI change passes are kept in
+[gadlus/letronna-design-v1](https://github.com/gadlus/letronna-design-v1). This
+page is what the plan started as, with what was built of it.
+
 Nothing here replaces the brand in `theme.rs` or the motion in `ui/motion.rs`.
 The plan names what is already there, fills three gaps, and rearranges two
 screens.
