@@ -2104,7 +2104,7 @@ fn words_ahead() -> String {
 /// changes anything for them. Where the driver's run `before` this one
 /// failed them too, what failed then is not told again as if it were new:
 /// with nothing new failing the notice is `failed_again`'s, and with some
-/// of it new the new is named (`newly`).
+/// of it new the new lines are named as the ones to fix (`newly`).
 fn failed(
     kept: &Kept,
     command: &str,
@@ -2112,7 +2112,11 @@ fn failed(
     before: Option<&Failing>,
 ) -> Option<String> {
     let (ended, output) = failure(outcome)?;
-    let mut new = String::new();
+    // What the run is to do for the tests that fail: each of them, or
+    // where some failed at the run before too, the new ones.
+    let mut fix = "Fix your work for each test that fails on what the request's words say, and \
+                   run the tests again the same way."
+        .to_owned();
     match (before, before.map(|_| failing(output))) {
         (Some(Failing::Named(before)), Some(Failing::Named(now))) => {
             let fresh: Vec<&String> = now.iter().filter(|name| !before.contains(name)).collect();
@@ -2120,7 +2124,7 @@ fn failed(
                 return Some(failed_again(command, &ended, &now));
             }
             if fresh.len() < now.len() {
-                new = newly(&fresh);
+                fix = newly(&fresh);
             }
         }
         (Some(before), Some(now)) if *before == now => {
@@ -2142,8 +2146,7 @@ fn failed(
         "Your work as it stands was run against the tests a tester wrote from the request \
          alone, in a copy of the project with them put back at the paths they are kept from, \
          so nothing in the project was touched: `{command}` {ended}. Its \
-         output{left_out}:\n\n{shown}\n\n{others}{new}Fix your work for each test that fails on what the \
-         request's words say, and run the tests again the same way. {words} One that calls the \
+         output{left_out}:\n\n{shown}\n\n{others}{fix} {words} One that calls the \
          code wrongly, such as with a name or import the request does not spell, or that fails \
          for want of a fixture, helper or set-up the tester left out, is the tester's to fix \
          where it is kept, in `{}`, since that is where it is run from; never something to add \
@@ -2187,14 +2190,15 @@ fn failed_again(command: &str, ended: &str, named: &[String]) -> String {
     )
 }
 
-/// What `failed`'s notice says of the failures `fresh`, the lines a later
-/// run's runner gave a failing test or file that its run before did not
-/// print, where others it names failed then too: the new ones are named
-/// and to be fixed, and an answer to one of the others stands.
+/// What `failed`'s notice asks of the run where the lines `fresh`, which
+/// name a failure in a later run's output (`failing`), were not in its run
+/// before's and others were: the new ones are listed as the ones to fix,
+/// and the rest are told as `failed_again` tells them.
 fn newly(fresh: &[&String]) -> String {
     format!(
-        "Of the failures it names, the run before did not have these:\n\n{}\n\nWhat they name \
-         is new, and is to be fixed. The others failed then too: {ANSWER_STANDS}. ",
+        "These lines were not in the run before's output: fix your work for each on what the \
+         request's words say.\n\n{}\n\nThe rest failed then too: {ANSWER_STANDS}. Run the \
+         tests again the same way.",
         listed_lines(fresh.iter().copied())
     )
 }
@@ -2214,10 +2218,10 @@ fn listed_lines<'a>(lines: impl ExactSizeIterator<Item = &'a String>) -> String 
 }
 
 /// What a run of the tester's tests failed, to tell a later run that fails
-/// the same from one that fails anew: the lines its runner gave a failing
-/// test or file (`attributed`), each once, or with none of those what a
-/// notice shows of its output (`excerpt`); either as it reads at every run
-/// (`steady`).
+/// the same from one that fails anew: the lines of its output that name a
+/// failure by a test, a file or a package (`failure_line`), each once, or
+/// with none of those what a notice shows of its output (`excerpt`);
+/// either as it reads at every run (`steady`).
 #[derive(Clone, Debug, PartialEq)]
 enum Failing {
     Named(Vec<String>),
@@ -2229,8 +2233,10 @@ fn failing(output: &str) -> Failing {
     let lines = lines_of(output);
     let names = named_lines(&lines);
     let mut named: Vec<String> = Vec::new();
-    for at in (0..lines.len()).filter(|at| names[*at].is_some() && attributed(lines[*at])) {
-        let line = steady(lines[at]);
+    for at in 0..lines.len() {
+        let Some(line) = failure_line(lines[at], names[at]) else {
+            continue;
+        };
         if !named.contains(&line) {
             named.push(line);
         }
@@ -2240,6 +2246,53 @@ fn failing(output: &str) -> Failing {
         return Failing::Shown(shown.join("\n"));
     }
     Failing::Named(named)
+}
+
+/// `line`, of a test command's output and named as `name` says (`named`),
+/// as one run's failures are told from another's by it, if they are: the
+/// runner's verdict on a test or file (`attributed`), or a failure no test
+/// owns (`unowned`), read `steady` and without the number a list of
+/// failures gives it, as mocha's `2) Cart totals` is `1)` once the failure
+/// before it is fixed. None for any other line, and for a count of what
+/// failed, mocha's `2 failing` and unittest's `FAILED (failures=2)`: with
+/// one test fixed the count is another, and no failure is new.
+fn failure_line(line: &str, name: Option<Named>) -> Option<String> {
+    let trimmed = line.trim_start();
+    let mut words = trimmed.split_whitespace();
+    let first = words.next().unwrap_or_default();
+    let count = (first.parse::<u64>().is_ok() && words.next() == Some("failing"))
+        || trimmed.starts_with("FAILED (");
+    let told = (name.is_some() && attributed(line)) || unowned(line);
+    if count || !told {
+        return None;
+    }
+    let numbered = (first.strip_suffix(')'))
+        .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()));
+    Some(steady(match numbered {
+        true => &trimmed[first.len()..],
+        false => line,
+    }))
+}
+
+/// Whether `line`, of a test command's output, names a failure that no
+/// test of the run before need have had: a build's error, as Go's file,
+/// line and column, a TypeScript code, rustc's `error[`, cargo's `error:
+/// could not compile` and Go's `[build failed]` are; Go's line for a
+/// package that failed, `FAIL` and a tab, and its `panic:`; and pytest's
+/// `ERROR` before a path, for a file it could not collect or a fixture
+/// that raised. With one of these new, a run that fails the tests it failed
+/// before has still failed something else.
+fn unowned(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let built = go_position(trimmed)
+        || typescript_code(line)
+        || trimmed.starts_with("error[")
+        || trimmed.starts_with("error: could not compile")
+        || line.contains(" [build failed]");
+    let collected = (trimmed.strip_prefix("ERROR "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .is_some_and(|path| path.contains('/') || path.contains("::") || path.contains(".py"));
+    built || collected || trimmed.starts_with("FAIL\t") || trimmed.starts_with("panic:")
 }
 
 /// Digits in a row that `steady` takes for a number that differs from one
@@ -6558,6 +6611,7 @@ mod tests {
         let names = [
             "--- FAIL: TestLetronnaSpecParse",
             "--- FAIL: TestLetronnaSpecEmpty",
+            "FAIL example.com/x",
         ];
         assert_eq!(before, Failing::Named(names.map(String::from).into()));
         // The same tests, at other times and in another order: the short
@@ -6573,12 +6627,12 @@ mod tests {
                 "Your work as it stands was run once more against the tests a tester wrote \
                  from the request alone, the same way: `go test ./...` exited with code 1, and \
                  it fails nothing but what it failed at the run before:\n\n- `--- FAIL: \
-                 TestLetronnaSpecEmpty`\n- `--- FAIL: TestLetronnaSpecParse`\n\nThat is the \
-                 same result told again, not a second demand to make them pass: where you \
-                 answered a test by quoting the request's words, that answer stands, and \
-                 nothing more is to change for it. Fix your work only for a test you have not \
-                 answered so, on what the request's words say. {} Then end with your whole \
-                 answer again.",
+                 TestLetronnaSpecEmpty`\n- `--- FAIL: TestLetronnaSpecParse`\n- `FAIL \
+                 example.com/x`\n\nThat is the same result told again, not a second demand to \
+                 make them pass: where you answered a test by quoting the request's words, \
+                 that answer stands, and nothing more is to change for it. Fix your work only \
+                 for a test you have not answered so, on what the request's words say. {} Then \
+                 end with your whole answer again.",
                 words_and_rows()
             )
         );
@@ -6621,6 +6675,13 @@ mod tests {
             "{whole}"
         );
         assert!(whole.contains("got 2, want 3\n"), "{whole}");
+        assert!(
+            whole.contains(
+                "[exit code 1]\n\nFix your work for each test that fails on what the request's \
+                 words say, and run the tests again the same way. The tester can misread"
+            ),
+            "{whole}"
+        );
         assert!(!whole.contains("run before"), "{whole}");
     }
 
@@ -6638,19 +6699,25 @@ mod tests {
         );
         let text = failed(&kept, "go test ./...", &now, Some(&before)).unwrap();
         // The output is shown, since the new failure's is needed, and the
-        // new one is told from the one answered already.
+        // new line is told from the one answered already.
         assert!(
             text.starts_with("Your work as it stands was run against the tests"),
             "{text}"
         );
         assert!(
-            text.contains(
-                "x.go:9: got 1.5\nFAIL\n[exit code 1]\n\nOf the failures it names, the run \
-                 before did not have these:\n\n- `--- FAIL: TestLetronnaSpecRound`\n\nWhat \
-                 they name is new, and is to be fixed. The others failed then too: where you \
-                 answered a test by quoting the request's words, that answer stands, and \
-                 nothing more is to change for it. Fix your work for each test that fails"
-            ),
+            text.contains(&format!(
+                "x.go:9: got 1.5\nFAIL\n[exit code 1]\n\nThese lines were not in the run \
+                 before's output: fix your work for each on what the request's words \
+                 say.\n\n- `--- FAIL: TestLetronnaSpecRound`\n\nThe rest failed then too: \
+                 where you answered a test by quoting the request's words, that answer stands, \
+                 and nothing more is to change for it. Run the tests again the same way. {} \
+                 One that calls",
+                words_and_rows()
+            )),
+            "{text}"
+        );
+        assert!(
+            !text.contains("Fix your work for each test that fails"),
             "{text}"
         );
         // Where every failure is new, the notice is the first run's.
@@ -6659,6 +6726,152 @@ mod tests {
             failed(&kept, "go test ./...", &other, Some(&before)),
             failed(&kept, "go test ./...", &other, None)
         );
+    }
+
+    #[test]
+    fn a_failure_no_test_owns_is_new_beside_the_tests_that_failed_before() {
+        let kept = Kept {
+            dir: PathBuf::from("/tmp/kept"),
+            files: vec!["parse_letronna_spec_test.go".to_owned()],
+        };
+        let told = |before: &str, now: &str| {
+            let before = failing(before);
+            failed(&kept, "the command", &Ok(now.to_owned()), Some(&before)).unwrap()
+        };
+        let fresh = |text: &str, line: &str| {
+            assert!(
+                text.starts_with("Your work as it stands was run against the tests"),
+                "{text}"
+            );
+            let named = format!("request's words say.\n\n- `{line}`\n\nThe rest failed then too");
+            assert!(text.contains(&named), "{line}: {text}");
+        };
+        // The test that failed before, and now a package that does not
+        // build, a panic in another, a file that does not compile.
+        let old = "--- FAIL: TestLetronnaSpecParse (0.00s)\nFAIL\nFAIL\texample.com/x\t0.4s\n[exit \
+                   code 1]";
+        let unbuilt = format!("FAIL\texample.com/y [build failed]\n{old}");
+        fresh(&told(old, &unbuilt), "FAIL example.com/y [build failed]");
+        let panicked = format!(
+            "panic: runtime error: index out of range [3] with length \
+             3\nFAIL\texample.com/z\t0.01s\n{old}"
+        );
+        let text = told(old, &panicked);
+        assert!(
+            text.contains(
+                "- `panic: runtime error: index out of range [3] with length 3`\n- `FAIL \
+                 example.com/z`\n\nThe rest"
+            ),
+            "{text}"
+        );
+        let uncompiled = format!("./parse.go:12:9: undefined: Round\n{old}");
+        fresh(&told(old, &uncompiled), "./parse.go:12:9: undefined: Round");
+        // pytest's line for a file it could not collect, beside its line
+        // for a test that failed before; and a TypeScript error, and
+        // rustc's, beside a runner's.
+        let failed_before = "FAILED tests/test_letronna_spec.py::test_total - assert 2 == 3\n1 \
+                             failed in 0.20s\n[exit code 1]";
+        let collected = format!(
+            "ERROR tests/test_letronna_spec_more.py - ImportError: cannot import name \
+             'round_up'\n{failed_before}"
+        );
+        fresh(
+            &told(failed_before, &collected),
+            "ERROR tests/test_letronna_spec_more.py - ImportError: cannot import name 'round_up'",
+        );
+        let vitest = " FAIL  src/letronna_spec.test.ts > totals > adds\n[exit code 1]";
+        let typed =
+            format!("src/total.ts(3,7): error TS2322: Type 'string' is not assignable.\n{vitest}");
+        fresh(
+            &told(vitest, &typed),
+            "src/total.ts(3,7): error TS2322: Type 'string' is not assignable.",
+        );
+        let cargo = "test letronna_spec::totals ... FAILED\n[exit code 101]";
+        let rustc = format!("error[E0425]: cannot find function `round_up` in this scope\n{cargo}");
+        fresh(
+            &told(cargo, &rustc),
+            "error[E0425]: cannot find function `round_up` in this scope",
+        );
+        // The same of each at the run before is nothing new.
+        for output in [&unbuilt, &panicked, &uncompiled, &collected, &typed, &rustc] {
+            let text = told(output, output);
+            assert!(
+                text.starts_with("Your work as it stands was run once more"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_count_or_a_number_that_changed_with_a_test_fixed_is_no_new_failure() {
+        let kept = Kept {
+            dir: PathBuf::from("/tmp/kept"),
+            files: vec!["letronna_spec.test.js".to_owned()],
+        };
+        let told = |before: &str, now: &str| {
+            let before = failing(before);
+            failed(&kept, "the command", &Ok(now.to_owned()), Some(&before)).unwrap()
+        };
+        // mocha, with the first of two failures fixed: the count is one
+        // less, and the failure left is numbered 1 where it was 2.
+        let two = "  Cart\n    1) adds an item\n    2) totals the items\n\n  2 failing\n\n  1) \
+                   Cart\n       adds an item:\n     AssertionError: expected 1 to equal 2\n\n  \
+                   2) Cart\n       totals the items:\n     AssertionError: expected 3 to equal \
+                   4\n[exit code 2]";
+        let one = "  Cart\n    ✓ adds an item\n    1) totals the items\n\n  1 failing\n\n  1) \
+                   Cart\n       totals the items:\n     AssertionError: expected 3 to equal \
+                   4\n[exit code 1]";
+        assert_eq!(
+            failing(two),
+            Failing::Named(
+                ["adds an item", "totals the items", "Cart"]
+                    .map(String::from)
+                    .into()
+            )
+        );
+        let text = told(two, one);
+        assert!(
+            text.contains(
+                "it fails nothing but what it failed at the run before:\n\n- `totals the \
+                 items`\n- `Cart`\n\nThat is the same result"
+            ),
+            "{text}"
+        );
+        // unittest, the same way: its count of failures is no test.
+        let failures = |tests: &[&str]| {
+            let named: String = (tests.iter())
+                .map(|test| format!("FAIL: {test} (tests.test_letronna_spec.Totals.{test})\n"))
+                .collect();
+            format!(
+                "{named}Ran 5 tests in 0.004s\n\nFAILED (failures={})\n[exit code 1]",
+                tests.len()
+            )
+        };
+        let text = told(
+            &failures(&["test_adds", "test_totals"]),
+            &failures(&["test_totals"]),
+        );
+        assert!(
+            text.contains(
+                "the run before:\n\n- `FAIL: test_totals \
+                 (tests.test_letronna_spec.Totals.test_totals)`\n\nThat is the same result"
+            ),
+            "{text}"
+        );
+        // A test that fails where another did is new, whatever its number
+        // and whatever the count.
+        let other = "  Cart\n    ✓ adds an item\n    1) removes an item\n\n  1 failing\n\n  1) \
+                     Cart\n       removes an item:\n     AssertionError: expected 0 to equal \
+                     1\n[exit code 1]";
+        let text = told(two, other);
+        assert!(
+            text.contains("request's words say.\n\n- `removes an item`\n\nThe rest failed then"),
+            "{text}"
+        );
+        // Output that only counts its failures names none: it is told by
+        // what is shown of it.
+        let counted = failing("FAILED (failures=2)\n[exit code 1]");
+        assert!(matches!(counted, Failing::Shown(_)), "{counted:?}");
     }
 
     #[test]
