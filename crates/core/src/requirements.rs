@@ -580,6 +580,17 @@ pub(crate) const AHEAD_CLOSES: &str = "[End of the tester's report]";
 /// work is there, nor is any line of a report written ahead of the work,
 /// between `AHEAD_OPENS` and `AHEAD_CLOSES`.
 fn rows(report: &str) -> Vec<(usize, bool, String)> {
+    (written(report).into_iter())
+        .filter_map(|(number, passed, line)| Some((number, passed?, line)))
+        .collect()
+}
+
+/// The lines of `report` written as rows of a review's table, as `rows`
+/// reads them, each with whether its case passed; and with None, those
+/// that open as a row does, requirements' numbers alone in the first of
+/// three cells or more (`numbered`), and give no verdict that can be read:
+/// a row the reading could not make out, or one whose test was not run.
+fn written(report: &str) -> Vec<(usize, Option<bool>, String)> {
     let mut found = Vec::new();
     let mut ahead = false;
     for line in report.lines() {
@@ -608,7 +619,8 @@ fn rows(report: &str) -> Vec<(usize, bool, String)> {
         if cells.last().is_some_and(|cell| placeholder(cell)) {
             continue;
         }
-        if let Some(passed) = judged(&cells).and_then(|(_, word)| verdict(word)) {
+        let passed = judged(&cells).and_then(|(_, word)| verdict(word));
+        if passed.is_some() || (cells.len() > 2 && numbered(first)) {
             found.push((number, passed, line.trim().to_owned()));
         }
     }
@@ -949,27 +961,73 @@ const CUT_ORDER: [(&str, &str); 3] = [
 /// `CUT_SHOWN`. Of the passed ones, a row of a requirement that is left no
 /// other is written before a second row of one that has its own, so
 /// `unchecked` finds no requirement without a row that its review gave one.
-/// None when the quote kept every row.
+/// The rows it lost that give no verdict that can be read (`written`) are
+/// counted too, since they hold the run to nothing and it is not told of
+/// them otherwise. None when the quote kept every row.
 pub(crate) fn cut_rows(report: &str, quote: &str) -> Option<String> {
     let cut = |text: &str, most: usize| -> String { text.chars().take(most).collect() };
-    let lost: Vec<(usize, &str, String)> = (rows(report).into_iter())
+    let (read, unread): (Vec<_>, Vec<_>) = (written(report).into_iter())
         .filter(|(_, _, line)| !quote.contains(line.as_str()))
+        .partition(|(_, passed, _)| passed.is_some());
+    let unread = match unread.len() {
+        0 => None,
+        count => Some(format!(
+            "{} with no verdict that could be read",
+            counted(count, "more")
+        )),
+    };
+    let lost: Vec<(usize, &str, String)> = (read.into_iter())
+        .filter_map(|(number, passed, line)| Some((number, passed?, line)))
         .map(|(number, passed, line)| {
             let cells = cells(&line);
+            // Each cell as written, less the marks of bold: `cells` takes a
+            // code span's mark from a cell's edge, which would leave the
+            // span half open in the row written again. But for the mark
+            // that closes a row written whole in one span, which opened
+            // before the number.
+            let raw: Vec<&str> = (line.split('|'))
+                .map(|cell| cell.trim().trim_matches('*').trim())
+                .filter(|cell| !bare(cell).is_empty())
+                .collect();
+            let halved = |text: &str| text.matches('`').count() % 2 == 1;
+            let last = raw.len().saturating_sub(1);
+            let wrapped = last > 0
+                && (raw[0].starts_with('`') && halved(raw[0]))
+                && (raw[last].ends_with('`') && halved(raw[last]));
+            let whole = |at: usize| match raw.get(at) {
+                Some(cell) if raw.len() != cells.len() => cells.get(at).unwrap_or(cell),
+                Some(cell) if wrapped && at == last => cell.strip_suffix('`').unwrap_or(cell),
+                Some(cell) => cell,
+                None => cells[at],
+            };
             let at = judged(&cells).map_or(cells.len(), |(at, _)| at);
             // What the verdict's own cell says besides the word is the
-            // end of the case before it and shows it after.
+            // end of the case before it and shows it after, each with the
+            // span's mark its edge of the cell lost.
             let (before, after) = (cells.get(at).copied().and_then(carried))
                 .map_or(("", ""), |(case, _, shows)| (case, shows));
-            let joined = |cells: &[&str], more: &[&str]| -> String {
-                let said: Vec<&str> = (cells.iter().chain(more).copied())
-                    .filter(|said| !said.is_empty())
-                    .collect();
+            let edge = match at < cells.len() {
+                true => whole(at),
+                false => "",
+            };
+            let before = match halved(before) && edge.starts_with('`') {
+                true => format!("`{before}"),
+                false => before.to_owned(),
+            };
+            let after = match halved(after) && edge.ends_with('`') {
+                true => format!("{after}`"),
+                false => after.to_owned(),
+            };
+            let joined = |said: Vec<&str>| -> String {
+                let said: Vec<&str> = said.into_iter().filter(|said| !said.is_empty()).collect();
                 said.join(" | ")
             };
-            let case = cut(&joined(&cells[1..at], &[before]), CASE_CHARS);
-            let rest = &cells[(at + 1).min(cells.len())..];
-            let shows = cut(&joined(&[after], rest), ROW_CHARS);
+            let mut case: Vec<&str> = (1..at).map(whole).collect();
+            case.push(&before);
+            let case = cut(&joined(case), CASE_CHARS);
+            let mut shows = vec![after.as_str()];
+            shows.extend(((at + 1).min(cells.len())..cells.len()).map(whole));
+            let shows = cut(&joined(shows), ROW_CHARS);
             let word = match (passed, left_unclear(&line)) {
                 (true, _) => "PASS",
                 (false, true) => UNCLEAR,
@@ -983,7 +1041,11 @@ pub(crate) fn cut_rows(report: &str, quote: &str) -> Option<String> {
         })
         .collect();
     if lost.is_empty() {
-        return None;
+        // Nothing to write again, and still rows the run is not held to.
+        return unread.map(|unread| {
+            let unread = unread.replacen(" more", "", 1);
+            format!("\nThe quote above cut {unread} from its table.")
+        });
     }
     let lost = lost.as_slice();
     let of = |kind: &'static str| (0..lost.len()).filter(move |at| lost[*at].1 == kind);
@@ -1011,16 +1073,28 @@ pub(crate) fn cut_rows(report: &str, quote: &str) -> Option<String> {
     let more: Vec<String> = (CUT_ORDER.iter())
         .map(|(kind, said)| (of(kind).filter(|at| !shown.contains(at)).count(), said))
         .filter(|(count, _)| *count > 0)
+        .map(|(count, said)| format!("{} {said}", counted(count, "more")))
+        .chain(unread)
         .enumerate()
-        .map(|(at, (count, said))| match at {
-            0 => format!("{count} more rows {said}"),
-            _ => format!("{count} more {said}"),
+        // Only the first says what is counted.
+        .map(|(at, said)| match at {
+            0 => said,
+            _ => said.replacen(" rows", "", 1).replacen(" row", "", 1),
         })
         .collect();
     if !more.is_empty() {
         text.push_str(&format!("\nand {}", and_list(&more)));
     }
     Some(text)
+}
+
+/// `count` rows as a count of them is written, with `what` before the
+/// word: "1 more row", "3 more rows".
+fn counted(count: usize, what: &str) -> String {
+    match count {
+        1 => format!("1 {what} row"),
+        count => format!("{count} {what} rows"),
+    }
 }
 
 /// What sends a run back once more when the review's table in `report`
@@ -3272,7 +3346,7 @@ mod tests {
             cut_rows(report, quote).as_deref(),
             Some(
                 "\nRows of its table the quote above cut, written again:\nR2 | plain value | \
-                 FAIL | node check.js\nR3 | two rests | FAIL"
+                 FAIL | `node check.js`\nR3 | two rests | FAIL"
             )
         );
         // Written again, they read as the rows they were.
@@ -3340,6 +3414,84 @@ mod tests {
         let again = cut_rows(&table, quote).unwrap();
         assert!(!again.contains("\nR20 |"), "{again}");
         assert!(again.ends_with("\nand 22 more rows that passed"), "{again}");
+    }
+
+    #[test]
+    fn a_row_written_again_keeps_its_code_spans_whole() {
+        // A span that opens or closes a cell, in the case, in what shows
+        // the row, and in the verdict's own cell on either side of it.
+        let report = "| R1 | `core` holds the name | PASS | `python parse.py` |\n\
+                      | R2 | `a` then `b` | **FAIL** | `sh order.sh` prints `b` |\n\
+                      | R3 | the ref suggested | FAIL — `go test`: `v4` for `v4` |\n\
+                      | R4 | `total` is kept — UNCLEAR (for `0`) |\n\
+                      `R5 | the count | FAIL | node count.js`\n\
+                      | R6 | handles `x | y` | FAIL | prints `x` |";
+        let again = cut_rows(report, "cut").unwrap();
+        assert_eq!(
+            again,
+            "\nRows of its table the quote above cut, written again:\n\
+             R2 | `a` then `b` | FAIL | `sh order.sh` prints `b`\n\
+             R3 | the ref suggested | FAIL | `go test`: `v4` for `v4`\n\
+             R5 | the count | FAIL | node count.js\n\
+             R6 | handles `x | y` | FAIL | prints `x`\n\
+             R4 | `total` is kept | UNCLEAR | (for `0`)\n\
+             R1 | `core` holds the name | PASS"
+        );
+        // And reads as the rows it was.
+        let found: Vec<(usize, bool)> = (rows(&again).into_iter())
+            .map(|(number, passed, _)| (number, passed))
+            .collect();
+        let read = [
+            (2, false),
+            (3, false),
+            (5, false),
+            (6, false),
+            (4, false),
+            (1, true),
+        ];
+        assert_eq!(found, read);
+    }
+
+    #[test]
+    fn rows_a_cut_lost_that_gave_no_verdict_are_counted_and_one_row_is_a_row() {
+        // One row past the rows written again.
+        let many: String = (1..=CUT_SHOWN + 1)
+            .map(|n| format!("R{n} | c | PASS\n"))
+            .collect();
+        let again = cut_rows(&many, "").unwrap();
+        assert!(again.ends_with("\nand 1 more row that passed"), "{again}");
+        // Rows that open as a row does and give no verdict that is read
+        // are neither written again nor counted with those that are: the
+        // run is told how many there were.
+        let unread = "R1 | a | PASS\nR2 | b | passes, by the look of it\nR3 | c | NOT RUN\n\
+                      R4 | d | not yet implemented\nR5 said more | e | f\nR6 | g";
+        assert_eq!(
+            cut_rows(unread, "cut").as_deref(),
+            Some(
+                "\nRows of its table the quote above cut, written again:\nR1 | a | PASS\nand 2 \
+                 more rows with no verdict that could be read"
+            )
+        );
+        let both = format!("{many}R70 | x | maybe\n");
+        let again = cut_rows(&both, "").unwrap();
+        assert!(
+            again.ends_with(
+                "\nand 1 more row that passed and 1 more with no verdict that could be read"
+            ),
+            "{again}"
+        );
+        // With none to write again, the count alone; with none cut, nothing.
+        assert_eq!(
+            cut_rows("R2 | b | maybe\nR3 | c | NOT RUN", "cut").as_deref(),
+            Some("\nThe quote above cut 2 rows with no verdict that could be read from its table.")
+        );
+        assert_eq!(
+            cut_rows("R2 | b | maybe", "cut").as_deref(),
+            Some("\nThe quote above cut 1 row with no verdict that could be read from its table.")
+        );
+        assert_eq!(cut_rows("R2 | b | maybe", "    R2 | b | maybe"), None);
+        // No row for the run to be held to is made of them.
+        assert!(!tabled(unread.split_once('\n').unwrap().1));
     }
 
     #[test]
