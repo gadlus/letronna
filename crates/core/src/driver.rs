@@ -686,6 +686,8 @@ fn steps(
     // One begun past its warning, as a later turn over stdin can be, has
     // just been told how little time it has.
     let mut warned = past_warning(spec);
+    // Whether it has been told how few of its tool rounds are left.
+    let mut counted = false;
     // The time the run was given, to tell a run long enough to end early for
     // its review from one whose whole time is about that long.
     let given = (spec.connection.deadline)
@@ -738,6 +740,12 @@ fn steps(
             }
         }
         if let Some(mut text) = time_warning(spec, &mut warned) {
+            text.push_str(&still_to_make(&noted));
+            deadline_notice(spec, text)?;
+        }
+        // Its rounds run out as its time does, and a run the cap stops never
+        // reaches the check that would send it back for those files either.
+        if let Some(mut text) = round_warning(spec, turn, report.rounds, &mut counted) {
             text.push_str(&still_to_make(&noted));
             deadline_notice(spec, text)?;
         }
@@ -2308,7 +2316,8 @@ fn past_warning(spec: &Spec) -> bool {
 /// it would take out what it made only to test. A run someone watches is
 /// told this too, without the rule that qualifies it, so it names only
 /// scratch files, logs and binaries, not a test added to the project, and
-/// spares what the project's build keeps.
+/// spares what the project's build keeps; near its round cap such a run is
+/// told the same (`round_warning`).
 const TIDY: &str = "remove scratch files, logs and binaries you made only to test from the \
                     outputs' folders, unless the project's build keeps them there";
 
@@ -2347,6 +2356,88 @@ fn still_to_make(noted: &Missing) -> String {
         [] => String::new(),
         left => format!(" Not there yet: {}", left.join(" ")),
     }
+}
+
+/// The most tool rounds before its cap a run is told how few are left: room
+/// to write what it owes, take out what it made only to test and check once
+/// more, where more would cut short work a long run still has the rounds for.
+const ROUNDS_WARNED: usize = 30;
+
+/// The fewest such a warning is worth, a tenth of a helper's usual 50: with
+/// fewer left the cap is as good as reached, and what is said there says it.
+const FEWEST_WARNED: usize = 5;
+
+/// How many tool rounds before its cap of `rounds` a run is told how few are
+/// left: a tenth of them, `ROUNDS_WARNED` at most, and None for a cap whose
+/// tenth is under `FEWEST_WARNED`, so a turn of 25 rounds or a memory
+/// review's four is not told as good as at once.
+fn warned_rounds(rounds: usize) -> Option<usize> {
+    let left = (rounds / 10).min(ROUNDS_WARNED);
+    (left >= FEWEST_WARNED).then_some(left)
+}
+
+/// What a session's own run nobody watches is told to take out near its
+/// round cap, in the words of the round warning: what `TIDY` names, wherever
+/// in the project it is, and the tests it added only to probe, which a run
+/// of the project's own tests would pick up, by the rule of the requirements
+/// check, which spares a test the task asks for. Its instructions already
+/// told it to tidy up before ending; a run someone watches hears `TIDY`.
+const TIDY_ADDED: &str = "remove from the project the scripts, logs and binaries you made only \
+                          to test and any test you added only to probe or check, unless the task \
+                          asks for tests";
+
+/// What a helper that may run commands is told to take out near its round
+/// cap: only what it checked with, and in so many words no file its task
+/// asks for, since the tests a tester writes are files it checks with too.
+const TIDY_CHECKS: &str = "take out of the project any scratch file, log or binary you made \
+                           only to check with, but no file your task asks for";
+
+/// What a run that has `used` all but a tenth of its tool rounds is told,
+/// once: a session's own run what its time warning says, to write what it
+/// owes and take out what it made only to test, and a helper, whose report
+/// is all the agent that started it reads, to finish its checks and write
+/// that; neither is told to take anything out where it may run no command
+/// to do it with. Only a run's time was counted down for it, so one still
+/// probing at its round cap left its probe files in the project, and a
+/// helper its table half checked. A run someone watches is told too, as it
+/// is of its time, and in that warning's own words for what to take out.
+fn round_warning(spec: &Spec, turn: &Turn, used: usize, warned: &mut bool) -> Option<String> {
+    if *warned || turn.capped().is_some() {
+        return None;
+    }
+    let left = spec.rounds.saturating_sub(used);
+    if left == 0 || left > warned_rounds(spec.rounds)? {
+        return None;
+    }
+    *warned = true;
+    let removes = turn.runs_commands() && refused(spec, "run_command").is_none();
+    Some(match spec.depth {
+        0 => {
+            let tidy = match (removes, unwatched(spec)) {
+                (false, _) => String::new(),
+                (true, true) => format!(", and {TIDY_ADDED}"),
+                (true, false) => format!(", and {TIDY}"),
+            };
+            format!(
+                "About {left} tool rounds are left before this run is stopped: write every \
+                 output the task asks for now, complete and valid{tidy}; improve the outputs in \
+                 place only after that."
+            )
+        }
+        _ => {
+            let tidy = match removes {
+                true => format!(" {TIDY_CHECKS},"),
+                false => String::new(),
+            };
+            format!(
+                "About {left} tool rounds are left of your {}: finish the checks you have under \
+                 way, the ones your report most needs first,{tidy} then write your whole report, \
+                 with its table if you were asked for one, while you can still check what it \
+                 says.",
+                spec.rounds
+            )
+        }
+    })
 }
 
 /// How long before its deadline a run still at work is told to end its first
@@ -2405,8 +2496,8 @@ fn time_given(left: Duration) -> String {
     )
 }
 
-/// Puts `text` on the run's transcript as a notice from its deadline, folded
-/// so it opens no turn of its own.
+/// Puts `text` on the run's transcript as a notice from its deadline, or
+/// from its round cap, folded so it opens no turn of its own.
 fn deadline_notice(spec: &mut Spec, text: String) -> Result<(), String> {
     deadline_notices(spec, vec![text])
 }
@@ -13141,5 +13232,170 @@ pub(crate) mod tests {
         let tidy = "Before it is stopped, remove scratch files, logs and binaries";
         assert!(carries(&sent[1], tidy));
         assert!(!carries(&sent[0], tidy));
+    }
+
+    /// A workspace whose notes run to sixty lines, for `reading`.
+    fn long_notes(name: &str) -> Scratch {
+        let dir = scratch(name);
+        let lines: Vec<String> = (1..=60).map(|line| format!("line {line}")).collect();
+        std::fs::write(dir.join("notes.txt"), lines.join("\n")).unwrap();
+        dir
+    }
+
+    /// A provider whose first `rounds` replies each read the notes from
+    /// another line, so no two calls are alike, and whose last says it is
+    /// done.
+    fn reading(rounds: usize) -> (String, Stub) {
+        let read = |line: usize| ("read_file", json!({"path": "notes.txt", "offset": line}));
+        let mut replies: Vec<String> = (1..=rounds).map(|line| reply("", &[read(line)])).collect();
+        replies.push(reply("Done.", &[]));
+        provider(replies)
+    }
+
+    /// How many of the messages a request sent hold `words`.
+    fn times_told(body: &Value, words: &str) -> usize {
+        (messages(body).iter())
+            .filter_map(|message| message["content"].as_str())
+            .filter(|content| content.contains(words))
+            .count()
+    }
+
+    /// What the round warning says to any run, whatever the rounds in it.
+    const ROUNDS_LEFT: &str = "tool rounds are left";
+
+    #[test]
+    fn a_run_nobody_watches_is_told_once_when_a_tenth_of_its_rounds_are_left() {
+        let _data = data("round-warning");
+        let dir = long_notes("round-warning");
+        let (endpoint, provider) = reading(47);
+        let report = finished(own(endpoint, &dir, AGENTS + 2_200));
+        assert_eq!((report.status, report.rounds), (Outcome::Done, 47));
+        let sent = provider.sent();
+        assert_eq!(sent.len(), 48);
+        // With 45 of its 50 rounds run, and not before.
+        assert!(!carries(&sent[44], ROUNDS_LEFT));
+        let told = "About 5 tool rounds are left before this run is stopped: write every output \
+                    the task asks for now, complete and valid, and remove from the project the \
+                    scripts, logs and binaries you made only to test and any test you added only \
+                    to probe or check, unless the task asks for tests; improve the outputs in \
+                    place only after that.";
+        let last = messages(&sent[45]).last().unwrap();
+        assert_eq!(last["role"], "user");
+        let notice = last["content"].as_str().unwrap();
+        assert!(notice.starts_with("[Letronna notice"), "{notice}");
+        assert!(notice.ends_with(told), "{notice}");
+        // Once: the rounds after it bring no second one.
+        assert_eq!(times_told(&sent[47], ROUNDS_LEFT), 1);
+    }
+
+    #[test]
+    fn a_helper_near_its_round_cap_is_told_to_finish_its_checks_and_write_its_report() {
+        let dir = long_notes("round-warning-helper");
+        let (endpoint, provider) = reading(46);
+        let report = finished(spec(endpoint, &dir, AGENTS + 2_201));
+        assert_eq!((report.status, report.rounds), (Outcome::Done, 46));
+        let sent = provider.sent();
+        assert!(!carries(&sent[44], ROUNDS_LEFT));
+        // Its report is what it is for, so it is not told to write outputs,
+        // and of what it made only what it checked with is to go.
+        let told = "About 5 tool rounds are left of your 50: finish the checks you have under \
+                    way, the ones your report most needs first, take out of the project any \
+                    scratch file, log or binary you made only to check with, but no file your \
+                    task asks for, then write your whole report, with its table if you were \
+                    asked for one, while you can still check what it says.";
+        let notice = messages(&sent[45]).last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(notice.ends_with(told), "{notice}");
+        assert_eq!(times_told(&sent[46], ROUNDS_LEFT), 1);
+    }
+
+    #[test]
+    fn a_run_that_may_run_no_command_is_not_told_to_take_anything_out() {
+        let dir = scratch("round-warning-reads");
+        let turn = |spec: &Spec| Turn::with_limit(spec.connection.clone(), spec.rounds);
+        let told = |spec: &Spec| round_warning(spec, &turn(spec), 45, &mut false).unwrap();
+        // A helper that only looks, as one in plan mode does.
+        let mut looks = spec("http://127.0.0.1:9/v1".into(), &dir, AGENTS + 2_202);
+        looks.connection.plan = true;
+        assert_eq!(
+            told(&looks),
+            "About 5 tool rounds are left of your 50: finish the checks you have under way, the \
+             ones your report most needs first, then write your whole report, with its table if \
+             you were asked for one, while you can still check what it says."
+        );
+        // A session's own run held to tools that run no command.
+        let mut reads = own("http://127.0.0.1:9/v1".into(), &dir, AGENTS + 2_203);
+        reads.allow = Allow::Only(vec!["read_file".into(), "write_file".into()]);
+        assert_eq!(
+            told(&reads),
+            "About 5 tool rounds are left before this run is stopped: write every output the \
+             task asks for now, complete and valid; improve the outputs in place only after that."
+        );
+    }
+
+    #[test]
+    fn a_tenth_of_its_rounds_is_what_a_run_is_warned_at_and_a_small_cap_gets_no_warning() {
+        // The caps there are: a memory review's, a turn's, a helper's, a
+        // review's and a print run's, the most a definition gives, and more.
+        assert_eq!([0, 1, 4, 25, 49].map(warned_rounds), [None; 5]);
+        let warned = [50, 100, 200, 300, 1_000].map(warned_rounds);
+        assert_eq!(warned, [5, 10, 20, 30, 30].map(Some));
+        // Told only once that few are left, and never at the cap itself,
+        // where the notice there says what is left to do.
+        let dir = scratch("round-warning-when");
+        let helper = spec("http://127.0.0.1:9/v1".into(), &dir, AGENTS + 2_204);
+        let turn = Turn::with_limit(helper.connection.clone(), helper.rounds);
+        let told = |used: usize, mut warned: bool| {
+            let said = round_warning(&helper, &turn, used, &mut warned);
+            (said.is_some(), warned)
+        };
+        assert_eq!(told(44, false), (false, false));
+        assert_eq!(told(45, false), (true, true));
+        assert_eq!(told(46, true), (false, true));
+        assert_eq!(told(49, false), (true, true));
+        assert_eq!(told(50, false), (false, false));
+        // Nor once it is asked for its report, as when its budget is spent.
+        let mut ending = Turn::with_limit(helper.connection.clone(), helper.rounds);
+        ending.budget_spent();
+        assert!(round_warning(&helper, &ending, 45, &mut false).is_none());
+    }
+
+    #[test]
+    fn a_run_with_a_small_cap_is_told_nothing_of_its_rounds() {
+        let _data = data("round-warning-small");
+        // Nine of ten rounds: a tenth of so few is no warning at all.
+        let dir = long_notes("round-warning-small");
+        let (endpoint, provider) = reading(9);
+        let mut small = own(endpoint, &dir, AGENTS + 2_205);
+        small.rounds = 10;
+        assert_eq!(finished(small).status, Outcome::Done);
+        let sent = provider.sent();
+        assert!(sent.iter().all(|body| !carries(body, ROUNDS_LEFT)));
+    }
+
+    #[test]
+    fn a_run_someone_watches_is_told_of_its_rounds_in_the_words_of_its_time_warning() {
+        let _data = data("round-warning-watched");
+        let dir = long_notes("round-warning-watched");
+        let (endpoint, provider) = reading(47);
+        let mut watched = own(endpoint, &dir, AGENTS + 2_206);
+        watched.connection.human = true;
+        let report = finished(watched);
+        assert_eq!((report.status, report.rounds), (Outcome::Done, 47));
+        let sent = provider.sent();
+        assert!(!carries(&sent[44], ROUNDS_LEFT));
+        // It was never given the rule that spares a test the task asks for,
+        // so it is told of scratch files, logs and binaries alone.
+        let told = "About 5 tool rounds are left before this run is stopped: write every output \
+                    the task asks for now, complete and valid, and remove scratch files, logs \
+                    and binaries you made only to test from the outputs' folders, unless the \
+                    project's build keeps them there; improve the outputs in place only after \
+                    that.";
+        let notice = messages(&sent[45]).last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(notice.ends_with(told), "{notice}");
+        assert_eq!(times_told(&sent[47], ROUNDS_LEFT), 1);
     }
 }
