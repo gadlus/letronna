@@ -2228,8 +2228,11 @@ enum Failing {
     Shown(String),
 }
 
-/// What `output`, a run of the tester's tests that failed, failed.
+/// What `output`, a run of the tester's tests that failed, failed, read
+/// without the note of the time the run has left (`without_time_left`),
+/// which is another at each run of them.
 fn failing(output: &str) -> Failing {
+    let output = &without_time_left(output);
     let lines = lines_of(output);
     let names = named_lines(&lines);
     let mut named: Vec<String> = Vec::new();
@@ -6909,6 +6912,23 @@ mod tests {
             ),
             "{text}"
         );
+        // Nor is the note a command's result ends with in a run with a
+        // deadline, which gives another time at each run.
+        let noted = |left: u32| -> Result<String, String> {
+            let ran = run("1699000000977", "0.57s", 3).unwrap();
+            Ok(format!(
+                "{ran}\n\n[It ran for 61 s. About {left} minutes of this run's time are left.]"
+            ))
+        };
+        let before_noted = failing(noted(24).as_deref().unwrap());
+        assert_eq!(before_noted, before);
+        let text = failed(
+            &kept,
+            "sh letronna_spec_test.sh",
+            &noted(9),
+            Some(&before_noted),
+        );
+        assert!(text.unwrap().contains("with the output it had then."));
         // Other output is another failure, told whole.
         let other = run("1699000001409", "0.57s", 8);
         let text = failed(&kept, "sh letronna_spec_test.sh", &other, Some(&before)).unwrap();
