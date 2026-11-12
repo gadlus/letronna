@@ -332,10 +332,40 @@ const GOES_ON: &[&str] = &[
     "also",
     "instead",
     "except",
+    "to",
+    "as",
+    "of",
+    "by",
+    "from",
+    "into",
+    "than",
+    "that",
     "e.g",
     "i.e",
     "eg",
     "ie",
+];
+
+/// Last words that leave the words before a joint unfinished: an article,
+/// or a word that takes what follows it, as "everything after -- to the
+/// child" has on both sides of a mark that is no joint.
+const HANGING: &[&str] = &[
+    "a", "an", "the", "to", "of", "by", "from", "into", "with", "without", "for", "in", "on", "at",
+    "as", "than", "that", "and", "or", "but", "after", "before", "between", "via", "per", "until",
+    "through",
+];
+
+/// Words of a clause that says how things were, as a bug report joins one
+/// to its asks in "each of these worked in 1.2": a side that holds one, or
+/// a version's number, is no clause, so it takes no request to `FEWEST`.
+const EARLIER: &[&str] = &[
+    "worked",
+    "used to",
+    "regression",
+    "regressed",
+    "broke",
+    "broken",
+    "anymore",
 ];
 
 /// First words that, with a comma after them, say where or when what
@@ -1677,19 +1707,33 @@ pub(crate) fn split(text: &str) -> Vec<&str> {
 /// review. The words since the cut before are a clause of their own
 /// (`clause`) and so are the words up to the next joint, which also stand
 /// alone after it (`follows`); no colon before the joint opens a list
-/// (`lists`), whose items share the words before it; and where the words
+/// (`lists`), whose items share the words before it; where the words
 /// before open by saying when they apply (`conditional`), which may hold
-/// for both sides, so do the words after. A side that is no clause stays
-/// with the words before it, and no cut leaves words that state nothing.
+/// for both sides, so do the words after; and the words before end on no
+/// word that leaves them unfinished (`hangs`). Two dashes that set off an
+/// aside cut nothing. A side that is no clause stays with the words before
+/// it, and no cut leaves words that state nothing.
 fn clauses(sentence: &str) -> Vec<&str> {
     let joints = joints(sentence);
+    let after = |at: usize| {
+        let next = joints.get(at + 1).map_or(sentence.len(), |next| next.start);
+        &sentence[joints[at].end..next]
+    };
+    // Two dashes and no more set off an aside where the words after the
+    // second go on from those before the first.
+    let dashes: Vec<usize> = (0..joints.len())
+        .filter(|at| !sentence[joints[*at].clone()].starts_with(';'))
+        .collect();
+    let aside = matches!(dashes.as_slice(), [_, second] if !follows(after(*second)));
     let mut cuts: Vec<std::ops::Range<usize>> = Vec::new();
     for (at, joint) in joints.iter().enumerate() {
+        if aside && dashes.contains(&at) {
+            continue;
+        }
         let start = cuts.last().map_or(0, |cut| cut.end);
-        let next = joints.get(at + 1).map_or(sentence.len(), |next| next.start);
-        let (left, right) = (&sentence[start..joint.start], &sentence[joint.end..next]);
+        let (left, right) = (&sentence[start..joint.start], after(at));
         let shared = lists(left) || (conditional(left) && !conditional(right));
-        if clause(left) && follows(right) && !shared {
+        if clause(left) && !hangs(left) && follows(right) && !shared {
             cuts.push(joint.clone());
         }
     }
@@ -1708,7 +1752,9 @@ fn clauses(sentence: &str) -> Vec<&str> {
 
 /// Where `sentence` could be cut between two clauses: each of `JOINTS`
 /// outside a code span, a quoted string and brackets, but for a semicolon
-/// that ends a web address or an entity such as `&amp;`.
+/// that ends a web address or an entity such as `&amp;`, a dash beside a
+/// number, which is a range or a minus as in "0 – 255", and a
+/// double hyphen before an option, which a command line is written with.
 fn joints(sentence: &str) -> Vec<std::ops::Range<usize>> {
     let bytes = sentence.as_bytes();
     let mut found = Vec::new();
@@ -1730,8 +1776,13 @@ fn joints(sentence: &str) -> Vec<std::ops::Range<usize>> {
         if let Some(mark) = mark.filter(|_| depth == 0) {
             let before = &sentence[..at];
             let word = before.rsplit(' ').next().unwrap_or_default();
-            let address = mark.starts_with(';') && (word.contains("://") || word.starts_with('&'));
-            if !address && !quoted(before) && !single_quoted(before) {
+            let semicolon = mark.starts_with(';');
+            let address = semicolon && (word.contains("://") || word.starts_with('&'));
+            let rest = &sentence[at + mark.len()..];
+            let digit = |c: Option<char>| c.is_some_and(|c| c.is_ascii_digit());
+            let number = digit(before.chars().next_back()) || digit(rest.chars().next());
+            let written = !semicolon && (number || rest.starts_with('-'));
+            if !address && !written && !quoted(before) && !single_quoted(before) {
                 found.push(at..at + mark.len());
             }
         }
@@ -1763,9 +1814,30 @@ fn single_quoted(text: &str) -> bool {
 }
 
 /// Whether `side` of a joint is a clause of its own: it states a
-/// requirement by its own words (`states`), in `CLAUSE` words or more.
+/// requirement by its own words (`states`), in `CLAUSE` words or more, and
+/// does not say how things were (`earlier`).
 fn clause(side: &str) -> bool {
-    states(side) && outside_code(side).split_whitespace().count() >= CLAUSE
+    states(side) && outside_code(side).split_whitespace().count() >= CLAUSE && !earlier(side)
+}
+
+/// Whether `side` says how things were rather than what is asked: it holds
+/// one of `EARLIER`, or a version's number such as "1.2" or "v2.0.1".
+fn earlier(side: &str) -> bool {
+    let prose = outside_code(side).to_lowercase();
+    let version = |word: &str| {
+        let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+        let mut parts = word.strip_prefix('v').unwrap_or(word).split('.');
+        let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+        parts.next().is_some_and(digits) && parts.next().is_some_and(digits)
+    };
+    EARLIER.iter().any(|word| holds(&prose, word)) || prose.split_whitespace().any(version)
+}
+
+/// Whether `side` ends on a word that leaves it unfinished (`HANGING`).
+fn hangs(side: &str) -> bool {
+    let prose = outside_code(side).to_lowercase();
+    let last = prose.split_whitespace().next_back().unwrap_or_default();
+    HANGING.contains(&last.trim_matches(|c: char| !c.is_alphanumeric()))
 }
 
 /// Whether `side` is a clause of its own (`clause`) that stands alone
@@ -2411,6 +2483,52 @@ mod tests {
                 "when it is not set, the reader must return the errors as a list.",
             ]
         );
+    }
+
+    #[test]
+    fn a_dash_that_joins_no_clauses_cuts_nothing() {
+        for request in [
+            // A range, and a minus.
+            "The value must lie in the range 0 \u{2013} 255 and the reader must reject \
+             anything outside of it.",
+            // Words left unfinished before the mark, or that go on after it.
+            "The parser must stop reading options at -- the words after it must go to the \
+             child unchanged.",
+            "The runner must pass every word it reads -- to the child it starts, which must \
+             read them unchanged.",
+            // A command line as it is written.
+            "The runner must start the child with every flag -- --quiet must be among them \
+             in each case.",
+            // Two dashes that set off an aside.
+            "The reader must keep the file open -- it should never buffer more than one \
+             page -- until the caller has closed it.",
+        ] {
+            assert_eq!(sentences(request), [request], "{request}");
+        }
+        // Two dashes between three clauses still cut them apart.
+        let joined = "The reader must keep the file open -- it should never buffer more than \
+                      one page -- the caller must close it when it is done.";
+        assert_eq!(sentences(joined).len(), 3);
+    }
+
+    #[test]
+    fn a_clause_that_says_how_things_were_takes_no_request_to_the_bar() {
+        let asks = "The export should keep every row that has no values -- it must not drop \
+                    the header row of the sheet -- empty cells must be written as two quotes";
+        // By the word, by the version, and by both.
+        for told in [
+            "each of these worked before the last release.",
+            "each of these passes on 1.2 as it stands.",
+            "each of these worked in 1.2.",
+        ] {
+            let found = sentences(&format!("{asks} -- {told}"));
+            assert_eq!(found.len(), 3, "{found:?}");
+            assert!(found.len() < FEWEST);
+            assert!(found[2].ends_with(told), "{found:?}");
+        }
+        // A fourth ask joined the same way is a fourth requirement.
+        let asked = format!("{asks} -- each row must end with a line feed.");
+        assert_eq!(sentences(&asked).len(), FEWEST);
     }
 
     #[test]
