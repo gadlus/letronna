@@ -2160,14 +2160,16 @@ fn failed(
 /// the rest are counted.
 const AGAIN_NAMED: usize = 20;
 
-/// What a test's answer by the request's words is worth once the same test
-/// fails again, as each notice of a later run says it. On benchmark runs
-/// the driver's second run failed exactly the tests the run had answered by
-/// quoting the request, the notice came again word for word, and one run
-/// took the repeat for an order: it made the tests pass with changes the
-/// request never asked for.
-const ANSWER_STANDS: &str = "where you answered a test by quoting the request's words, that \
-                             answer stands, and nothing more is to change for it";
+/// What a notice of a later run says of the tests that failed at the run
+/// before it too. On benchmark runs the driver's second run failed exactly
+/// the tests the run had answered by quoting the request, the notice came
+/// again word for word, and one run took the repeat for an order: it made
+/// the tests pass with changes the request never asked for. A run that had
+/// answered nothing is not let off by it: a test it neither fixed nor
+/// answered is named as still its own.
+const SAME_AGAIN: &str = "A test you answered by quoting the request's words needs nothing \
+                          more. One you neither fixed nor answered is still yours: fix your work \
+                          for it, or quote the words it ignores.";
 
 /// The notice sending the run back when `command`, run against its work
 /// once more, `ended` failing nothing but what the driver's run before it
@@ -2183,10 +2185,8 @@ fn failed_again(command: &str, ended: &str, named: &[String]) -> String {
     format!(
         "Your work as it stands was run once more against the tests a tester wrote from the \
          request alone, the same way: `{command}` {ended}, and it fails nothing but what it \
-         failed at the run before{which}That is the same result told again, not a second \
-         demand to make them pass: {ANSWER_STANDS}. Fix your work only for a test you have not \
-         answered so, on what the request's words say. {words} Then end with your whole answer \
-         again."
+         failed at the run before{which}This is the same result, not a new one. {SAME_AGAIN} \
+         {words} Then end with your whole answer again."
     )
 }
 
@@ -2197,8 +2197,8 @@ fn failed_again(command: &str, ended: &str, named: &[String]) -> String {
 fn newly(fresh: &[&String]) -> String {
     format!(
         "These lines were not in the run before's output: fix your work for each on what the \
-         request's words say.\n\n{}\n\nThe rest failed then too: {ANSWER_STANDS}. Run the \
-         tests again the same way.",
+         request's words say.\n\n{}\n\nThe rest failed then too. {SAME_AGAIN} Run the tests \
+         again the same way.",
         listed_lines(fresh.iter().copied())
     )
 }
@@ -6628,11 +6628,10 @@ mod tests {
                  from the request alone, the same way: `go test ./...` exited with code 1, and \
                  it fails nothing but what it failed at the run before:\n\n- `--- FAIL: \
                  TestLetronnaSpecEmpty`\n- `--- FAIL: TestLetronnaSpecParse`\n- `FAIL \
-                 example.com/x`\n\nThat is the same result told again, not a second demand to \
-                 make them pass: where you answered a test by quoting the request's words, \
-                 that answer stands, and nothing more is to change for it. Fix your work only \
-                 for a test you have not answered so, on what the request's words say. {} Then \
-                 end with your whole answer again.",
+                 example.com/x`\n\nThis is the same result, not a new one. A test you answered \
+                 by quoting the request's words needs nothing more. One you neither fixed nor \
+                 answered is still yours: fix your work for it, or quote the words it ignores. \
+                 {} Then end with your whole answer again.",
                 words_and_rows()
             )
         );
@@ -6667,7 +6666,7 @@ mod tests {
         // Fewer of them is nothing new either.
         let fewer = run("--- FAIL: TestLetronnaSpecEmpty (0.03s)\nFAIL\n[exit code 1]");
         let text = failed(&kept, "go test ./...", &fewer, Some(&before)).unwrap();
-        assert!(text.contains("the run before:\n\n- `--- FAIL: TestLetronnaSpecEmpty`\n\nThat"));
+        assert!(text.contains("the run before:\n\n- `--- FAIL: TestLetronnaSpecEmpty`\n\nThis"));
         // With no run before it, the whole notice, as it was.
         let whole = failed(&kept, "go test ./...", &again, None).unwrap();
         assert!(
@@ -6708,10 +6707,10 @@ mod tests {
             text.contains(&format!(
                 "x.go:9: got 1.5\nFAIL\n[exit code 1]\n\nThese lines were not in the run \
                  before's output: fix your work for each on what the request's words \
-                 say.\n\n- `--- FAIL: TestLetronnaSpecRound`\n\nThe rest failed then too: \
-                 where you answered a test by quoting the request's words, that answer stands, \
-                 and nothing more is to change for it. Run the tests again the same way. {} \
-                 One that calls",
+                 say.\n\n- `--- FAIL: TestLetronnaSpecRound`\n\nThe rest failed then too. A \
+                 test you answered by quoting the request's words needs nothing more. One you \
+                 neither fixed nor answered is still yours: fix your work for it, or quote the \
+                 words it ignores. Run the tests again the same way. {} One that calls",
                 words_and_rows()
             )),
             "{text}"
@@ -6833,7 +6832,7 @@ mod tests {
         assert!(
             text.contains(
                 "it fails nothing but what it failed at the run before:\n\n- `totals the \
-                 items`\n- `Cart`\n\nThat is the same result"
+                 items`\n- `Cart`\n\nThis is the same result"
             ),
             "{text}"
         );
@@ -6854,7 +6853,7 @@ mod tests {
         assert!(
             text.contains(
                 "the run before:\n\n- `FAIL: test_totals \
-                 (tests.test_letronna_spec.Totals.test_totals)`\n\nThat is the same result"
+                 (tests.test_letronna_spec.Totals.test_totals)`\n\nThis is the same result"
             ),
             "{text}"
         );
@@ -6905,8 +6904,8 @@ mod tests {
         assert!(
             text.contains(
                 "`sh letronna_spec_test.sh` exited with code 1, and it fails nothing but what \
-                 it failed at the run before, with the output it had then. That is the same \
-                 result told again"
+                 it failed at the run before, with the output it had then. This is the same \
+                 result, not a new one. A test you answered"
             ),
             "{text}"
         );
@@ -6962,7 +6961,7 @@ mod tests {
             "{short}"
         );
         assert!(
-            short.contains("the run before:\n\n- `--- FAIL: TestLetronnaSpecMade`\n\nThat is"),
+            short.contains("the run before:\n\n- `--- FAIL: TestLetronnaSpecMade`\n\nThis is"),
             "{short}"
         );
         // Another test failing in its place is new, and told whole.
