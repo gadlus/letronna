@@ -102,7 +102,7 @@ macro_rules! cases {
 const REVIEW: &str = concat!(
     "First ask a helper that hasn't seen your work: with the agent tool, start a helper of type `review`, not general, and wait for its report. Give it the request word for word, the numbered requirements above, the files you changed or made and each case you chose not to handle, with why. Ask it to change no file, to work out each value it checks with code of its own, not your scripts or helpers, and to end its report with a table of one row per requirement and case, the verdict alone in its cell and what shows it in the cell after, written `R1 | case | PASS` or `R1 | case | FAIL | command that shows it`, with a row for each of these cases that applies: ",
     cases!(),
-    " and each case you chose not to handle, which fails when the request's words say what should happen in it, quoted in the row, whatever the reason it was set aside, and passes, written `R1 | case | PASS | not asked`, when they do not, or is UNCLEAR where your change made the project do another thing in it than before: a gap the request does not ask to close is no failure. Ask it to write any doubt, caveat or problem it notices beyond those rows as a row of its own, `R1 | case | UNCLEAR | what it doubts`, never only prose, and the same for a row that can only pass by bending another requirement's words. Judge each row by what the request says should happen, not by what the code now does. Fix every row that fails by changing the work, not the case, unless the request rules that case out. A case it calls unclear is a doubt, not a failure: decide it by the request's words, and change the work for it only where those words ask for that. Change nothing for a row written `not asked`."
+    " and each case you chose not to handle, which fails when the request's words say what should happen in it, quoted in the row, whatever the reason it was set aside, and passes, written `R1 | case | PASS | not asked`, when they do not, or is UNCLEAR where your change made the project do another thing in it than before: a gap the request does not ask to close is no failure. Ask it to write any doubt, caveat or problem it notices beyond those rows as a row of its own, FAIL with its command where a run of its own shows it, otherwise `R1 | case | UNCLEAR | what it doubts`, never only prose, and to leave UNCLEAR a row that can only pass by bending another requirement's words. Judge each row by what the request says should happen, not by what the code now does. Fix every row that fails by changing the work, not the case, unless the request rules that case out. A case it calls unclear is a doubt, not a failure: decide it by the request's words, and change the work for it only where those words ask for that. Change nothing for a row written `not asked`."
 );
 
 /// The least time a run with a deadline needs left to be asked for the
@@ -527,7 +527,8 @@ pub(crate) fn brief(
          change leaves out or handles more narrowly than the request's words, which fails \
          when those words say what should happen in it, quoted in the row. Any doubt about a \
          case, any caveat to a row, and anything wrong you notice beyond the rows asked for \
-         gets a row of its own, written `R{first} | case | UNCLEAR | what you doubt`, never \
+         gets a row of its own, FAIL with its command where a run of yours shows it, \
+         otherwise `R{first} | case | UNCLEAR | what you doubt`, never \
          only prose, since prose may be cut before the change's author reads it. A row that \
          can only pass by bending another requirement's words is UNCLEAR too: quote both, and \
          prescribe no fix.",
@@ -3550,6 +3551,25 @@ mod tests {
             "{asked}"
         );
         assert!(REVIEW.contains("`R1 | case | UNCLEAR | what it doubts`"));
+        // What a run of the review's own shows wrong is a failed row, in
+        // each text: filed as a doubt, the run may answer it by leaving
+        // its work as it is.
+        assert!(
+            asked.contains(
+                "anything wrong you notice beyond the rows asked for gets a row of its own, \
+                 FAIL with its command where a run of yours shows it, otherwise `R1 | case | \
+                 UNCLEAR | what you doubt`, never only prose"
+            ),
+            "{asked}"
+        );
+        assert!(
+            REVIEW.contains(
+                "as a row of its own, FAIL with its command where a run of its own shows it, \
+                 otherwise `R1 | case | UNCLEAR | what it doubts`, never only prose, and to \
+                 leave UNCLEAR a row that can only pass by bending another requirement's words."
+            ),
+            "{REVIEW}"
+        );
     }
 
     #[test]

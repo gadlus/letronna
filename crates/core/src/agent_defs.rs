@@ -291,8 +291,10 @@ fn built_ins() -> Vec<AgentDef> {
             // work as it is, and reviews filed there a difference their own
             // run had shown, from what the requirement's sentence covers or
             // from what the project's feature of the same kind does. A rule
-            // the task has for a case, such as a guard's or a reading's,
-            // still decides that case.
+            // the task has for a kind of case still decides it, and the
+            // kinds are named: left as "unless your task says otherwise", a
+            // task's line that files anything else it notices as a doubt
+            // read as saying otherwise of every case.
             prompt: "Look for what is wrong with the work you are pointed at. Verify by running \
                      tests. Where the work does less than its request's words allow, or two of \
                      its parts disagree about the same thing, that is wrong, not an open question \
@@ -308,7 +310,8 @@ fn built_ins() -> Vec<AgentDef> {
                      giving another result than a sentence of the request covers, or, in a case \
                      none covers, than the project's own feature of the same kind gives for the \
                      same call, the row is FAIL with that command, not UNCLEAR, unless your task \
-                     says otherwise of that case. Put any \
+                     has a rule of its own for that kind of case, as for a guard, a case set \
+                     aside or readings. Put any \
                      script or file you check with in the temp folder, never in the project, and keep each command \
                      you run short: a long script goes into its file in parts. End with a \
                      verdict: whether it is right, and what has to change if not."
@@ -529,13 +532,14 @@ mod tests {
             "{}",
             review.prompt
         );
-        // A case the task has a rule for, as a guard's row or a reading's
-        // has, is still decided by that rule.
-        assert!(
-            review
-                .prompt
-                .contains("not UNCLEAR, unless your task says otherwise of that case.")
-        );
+        // A kind of case the task has a rule for is still decided by that
+        // rule, and the kinds are named, so no other line of a task reads
+        // as leave to file a failure as a doubt.
+        assert!(review.prompt.contains(
+            "not UNCLEAR, unless your task has a rule of its own for that kind of case, as for \
+             a guard, a case set aside or readings."
+        ));
+        assert!(!review.prompt.contains("says otherwise"));
     }
 
     #[test]
