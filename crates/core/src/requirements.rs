@@ -660,7 +660,11 @@ fn verdict(cell: &str) -> Option<bool> {
 /// capitals with such a mark after it is one: a case that opens "fails
 /// when", "Fail fast" or "FAIL-fast" is prose, and so is one that runs on
 /// from a bracket with nothing to set it off (`set_off`), as "`PASS (3)` is
-/// the summary line" does.
+/// the summary line" does. UNCLEAR needs no mark: whatever follows it after
+/// a space or a comma is the doubt, as in `UNCLEAR not exercised`, where
+/// the words after PASS or FAIL may be a sentence about the word. In the
+/// benchmark runs read, twelve doubts were written so, and ten of them
+/// reached no run.
 fn opens(cell: &str) -> Option<(&str, &str)> {
     let letters = cell.bytes().take_while(u8::is_ascii_uppercase).count();
     let (word, rest) = cell.split_at(letters);
@@ -686,9 +690,11 @@ fn opens(cell: &str) -> Option<(&str, &str)> {
         // Before a bar escaped to keep the row in one column of a table,
         // so what shows it is in the next cell.
         '\\' => after.next().is_none(),
-        _ => false,
+        // A doubt goes on in any words.
+        ',' => word == UNCLEAR,
+        _ => word == UNCLEAR && said.len() < rest.len(),
     };
-    let said = said.trim_start_matches(['—', '–', ':', '.', '-', '\\']);
+    let said = said.trim_start_matches(['—', '–', ':', '.', '-', '\\', ',']);
     goes_on.then_some((word, said.trim_start_matches('*').trim_start()))
 }
 
@@ -752,10 +758,36 @@ fn closes(cell: &str) -> Option<(&str, &str, &str)> {
 fn carried(cell: &str) -> Option<(&str, &str, &str)> {
     let opened = opens(cell).map(|(word, shows)| ("", word, shows));
     let (case, word, shows) = opened.or_else(|| closes(cell))?;
-    let denies = |said: &str| verdict(said) == Some(false) && !said.contains(char::is_lowercase);
-    let both = verdict(word) == Some(true)
-        && (shows.split(|c: char| !c.is_ascii_alphabetic())).any(denies);
+    let both = verdict(word) == Some(true) && denied(shows);
     (!both).then_some((case, word, shows))
+}
+
+/// Whether `shows`, what a cell goes on to say after a word that passes,
+/// says FAIL or UNCLEAR in capitals, so that the cell says both.
+fn denied(shows: &str) -> bool {
+    let denies = |said: &str| verdict(said) == Some(false) && !said.contains(char::is_lowercase);
+    (shows.split(|c: char| !c.is_ascii_alphabetic())).any(denies)
+}
+
+/// Words that make a sentence about the word PASS when they follow it, as
+/// "PASS is printed last" is of a line a program prints, in lower case.
+const OF_THE_WORD: [&str; 6] = ["is", "are", "was", "were", "and", "or"];
+
+/// The word a row's verdict column `cell` gives when it opens with one
+/// that passes, in capitals, and goes on in plain words after a space, as
+/// `PASS by reading the branch` and `PASS always 0` do. Read only there,
+/// in the row's third cell (`judged`): in any other the same words may be
+/// what a program printed. No verdict where the words are about the word
+/// (`OF_THE_WORD`), or go on to say FAIL or UNCLEAR (`denied`).
+fn passes(cell: &str) -> Option<&str> {
+    let letters = cell.bytes().take_while(u8::is_ascii_uppercase).count();
+    let (word, rest) = cell.split_at(letters);
+    let rest = rest.trim_start_matches(['*', '`']);
+    let said = rest.strip_prefix(' ')?.trim_start();
+    let first = said.split(|c: char| !c.is_alphanumeric()).next()?;
+    let plain = said.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && !OF_THE_WORD.contains(&first.to_ascii_lowercase().as_str());
+    (verdict(word) == Some(true) && plain && !denied(said)).then_some(word)
 }
 
 /// Whether a table's `cell` says a test was not run, as a tester marks one
@@ -767,8 +799,12 @@ fn unrun(cell: &str) -> bool {
 
 /// Whether a row's first `cell` names requirements and nothing else, as
 /// `R4`, `R4/R5` and `R4 and R5` do, where a sentence that opens with a
-/// requirement's number goes on in other words.
+/// requirement's number goes on in other words. A note in brackets may
+/// close it, as in `R4 (set aside)`: a review marks so the rows it was
+/// asked for of the cases a run set aside, and none of them was read.
 fn numbered(cell: &str) -> bool {
+    let noted = (cell.trim_end().strip_suffix(')')).and_then(|cell| cell.rfind('('));
+    let cell = noted.map_or(cell, |open| &cell[..open]);
     let mut words = (cell.split(|c: char| !c.is_alphanumeric()))
         .filter(|word| !word.is_empty())
         .peekable();
@@ -795,6 +831,8 @@ fn given(cell: &str) -> &str {
 /// a cell of which says the test was not run (`unrun`) has none to give,
 /// nor has a line whose first cell holds more than requirements' numbers
 /// (`numbered`), which is a sentence a bar in its code happened to cut.
+/// The third cell, the verdict's own column, also gives one where it
+/// passes the case in plain words (`passes`).
 fn judged<'a>(cells: &[&'a str]) -> Option<(usize, &'a str)> {
     let later = || cells.iter().copied().enumerate().skip(1);
     if let Some(alone) = later().find(|(_, cell)| verdict(cell).is_some()) {
@@ -806,7 +844,10 @@ fn judged<'a>(cells: &[&'a str]) -> Option<(usize, &'a str)> {
     }
     let said = |(at, cell)| {
         let case = at == 1 && cells.len() > 2;
-        (carried(cell).filter(|_| !case)).map(|(_, word, _)| (at, word))
+        let carried = (carried(cell).filter(|_| !case)).map(|(_, word, _)| word);
+        // The third cell is the verdict's own column.
+        let column = || (at == 2).then(|| passes(cell)).flatten();
+        carried.or_else(column).map(|word| (at, word))
     };
     (later().filter_map(said))
         .find(|(_, word)| verdict(word) == Some(false))
@@ -2195,7 +2236,6 @@ mod tests {
         for row in [
             "R1 | PASS `ok 1` is printed for a passing test | see the log",
             "R1 | PASS (3) — the summary line | see the log",
-            "R1 (set aside) | the indent | PASS `task --list` prints two spaces",
             "R1 holds for `a | b` too | PASS (3) — `node tap.js`",
             "R1 | set once | PASS `python hop.py` for one key; another is UNCLEAR",
             "R1 | set once | PASS (one key) — the other FAILS",
@@ -2209,6 +2249,136 @@ mod tests {
         assert_eq!(read(failed), [(1, false, false)]);
         let doubted = "R1 | which end | UNCLEAR (PASS on one reading) — FAIL on the other";
         assert_eq!(read(doubted), [(1, false, true)]);
+    }
+
+    #[test]
+    fn a_doubt_in_plain_words_and_a_pass_in_the_verdicts_column_are_read() {
+        let read = |text: &str| -> Vec<(usize, bool, bool)> {
+            (rows(text).into_iter())
+                .map(|(number, passed, row)| (number, passed, left_unclear(&row)))
+                .collect()
+        };
+        // As a review wrote its doubts, the word and then what it doubts
+        // with no mark between, a comma, or the request's words in quotes.
+        let report = "| Requirement | case | verdict |\n|---|---|---|\n\
+                      | R1 | a read started after close | UNCLEAR not exercised separately; \
+                      it shares the path above |\n\
+                      | R2 | a rule that fails | UNCLEAR, unverified: it depends on the tracer |\n\
+                      | R3 | a buffered read after close | UNCLEAR \"should remain readable\" \
+                      does not say |\n\
+                      | R4 | the default name | PASS not exercised directly; the default is \
+                      an empty string |\n\
+                      | R5 | the offset | PASS always 0; the change says why |\n\
+                      | R6 | one section | **PASS** by reading (`if` and `else if`) |\n\
+                      | R7 | a column named `check` | PASS for layout | `sh t.sh` prints both |";
+        let found = [
+            (1, false, true),
+            (2, false, true),
+            (3, false, true),
+            (4, true, false),
+            (5, true, false),
+            (6, true, false),
+            (7, true, false),
+        ];
+        assert_eq!(read(report), found);
+        // Written again after a cut, a doubt keeps what it doubts.
+        let again = cut_rows(report, "cut").unwrap();
+        assert!(
+            again.starts_with(
+                "\nRows of its table the quote above cut, written again:\n\
+                 R1 | a read started after close | UNCLEAR | not exercised separately; it \
+                 shares the path above\n\
+                 R2 | a rule that fails | UNCLEAR | unverified: it depends on the tracer\n\
+                 R3 | a buffered read after close | UNCLEAR | \"should remain readable\" does \
+                 not say\n\
+                 R4 | the default name | PASS\n"
+            ),
+            "{again}"
+        );
+        assert_eq!(read(&again), found);
+        // A doubt holds the run from any cell but the case, and beside a
+        // failure the row is what its first such cell says, as before.
+        assert_eq!(
+            read("R1 | which end | see the log | UNCLEAR whether the input or the line"),
+            [(1, false, true)]
+        );
+        assert_eq!(
+            read("R1 | which end | FAIL — it prints the line's | UNCLEAR whether that is asked"),
+            [(1, false, false)]
+        );
+        // A pass in plain words is read in the verdict's column alone: in
+        // a later cell, or the row's second of two, the words may be what
+        // a program printed.
+        for row in [
+            "R1 | the summary line | see the log | PASS by the last line",
+            "R1 | PASS by default for an empty suite",
+            "R1 | the summary line | — | PASS for each test, then the total",
+        ] {
+            assert!(!tabled(row), "{row}");
+        }
+        // Nor there where the words are about the word, where they go on
+        // to doubt or fail the case, or where the word is no verdict's.
+        for row in [
+            "R1 | the summary line | PASS is printed last",
+            "R1 | the summary line | PASS and the count are printed",
+            "R1 | the summary line | PASS was missing from the output",
+            "R1 | set once | PASS for one key, UNCLEAR for another",
+            "R1 | set once | PASS on the first hop but FAILS on the second",
+            "R1 | the mode | Pass the flag through",
+            "R1 | the mode | PASSING tests are listed first",
+            "R1 | the mode | PASS/FAIL column is printed",
+            "R1 | the mode | FAIL by one byte",
+            "R1 | adds | PASS by reading | NOT RUN",
+        ] {
+            assert!(!tabled(row), "{row}");
+        }
+        // The case gives no doubt ahead of other cells either, and a
+        // verdict alone in its cell still wins.
+        assert!(!tabled("R1 | UNCLEAR whether it is kept | see the log"));
+        let alone = "R1 | UNCLEAR is printed for an open range | PASS | node range.js";
+        assert_eq!(read(alone), [(1, true, false)]);
+        let failed = "R1 | the count | PASS by reading | FAIL | node count.js prints 2";
+        assert_eq!(read(failed), [(1, false, false)]);
+    }
+
+    #[test]
+    fn a_row_whose_number_carries_a_note_in_brackets_is_read() {
+        // As reviews mark the rows asked of them for a case set aside.
+        let report = "| R17/R2 (set aside) | the indent of the output | PASS (two spaces, as \
+                      the listing has) |\n\
+                      | R13 (set-aside) | the recorded shell | UNCLEAR — not testable here |\n\
+                      | R1–R7 (caveat) | a trailing comma | PASS (not a defect) | the parser \
+                      rejects it the same way |\n\
+                      | R10 (spot check) | the world's own entity is left out | PASS — `len=1` |\n\
+                      | R4 (set aside) | which end | FAIL | `sh range.sh` prints the line's |";
+        let found: Vec<(usize, bool, bool)> = (rows(report).into_iter())
+            .map(|(number, passed, row)| (number, passed, left_unclear(&row)))
+            .collect();
+        let read = [
+            (17, true, false),
+            (13, false, true),
+            (1, true, false),
+            (10, true, false),
+            (4, false, false),
+        ];
+        assert_eq!(found, read);
+        // The run is held to them by their numbers, as to any row.
+        let text = unchecked(report, 17).unwrap();
+        assert!(
+            text.contains("that failed:\n- | R4 (set aside) | which end"),
+            "{text}"
+        );
+        assert_eq!(left_open(&text), [13]);
+        // A sentence that opens with a number and a bracket is still none,
+        // nor is a note with no number before it.
+        for prose in [
+            "R3 (see below) is right but for `a | b` — PASS",
+            "R3 (set aside) and more | which end — PASS",
+            "(set aside) | which end | PASS — `sh t.sh`",
+            "R3 (set aside | which end — PASS",
+        ] {
+            assert!(!tabled(prose), "{prose}");
+        }
     }
 
     #[test]
