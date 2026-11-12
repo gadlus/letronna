@@ -2517,10 +2517,14 @@ const TIDY_ROUNDS: usize = 5;
 /// the rest are.
 const LEFT_NAMED: usize = 20;
 
-/// The least of a run's time that must be left for those rounds, about what
-/// five short replies and the summary after them take: a run the deadline
-/// stops in them would end with no summary at all.
-const TIDY_TIME: Duration = Duration::from_secs(2 * 60);
+/// The least of a run's time that must be left for those rounds to be
+/// given: a run the deadline stops in them ends with no summary at all,
+/// where before it was given them it ended with one. Its time is looked at
+/// only between rounds, so nothing stops a reply that outlasts what is
+/// left: given with two minutes left, the rounds had one slow reply run
+/// past the deadline. Five minutes are what five replies and the summary
+/// after them take even where one of them is slow.
+const TIDY_TIME: Duration = Duration::from_secs(5 * 60);
 
 /// The least of it that must be left for another of them once they are
 /// under way, about what one slow reply and the summary take: with less,
@@ -14438,10 +14442,11 @@ pub(crate) mod tests {
     fn a_run_is_short_of_time_only_with_a_deadline_nearer_than_what_is_asked() {
         let dir = scratch("short-of-time");
         let mut spec = own("http://127.0.0.1:9/v1".into(), &dir, AGENTS + 2_313);
-        // The rounds to tidy in are given with two minutes left, and go on
+        // The rounds to tidy in are given with five minutes left, and go on
         // while a minute is.
+        assert_eq!(TIDY_TIME, Duration::from_secs(5 * 60));
         assert!(!short_of_time(&spec, TIDY_TIME));
-        spec.connection.deadline = Some(Instant::now() + Duration::from_secs(90));
+        spec.connection.deadline = Some(Instant::now() + Duration::from_secs(4 * 60));
         assert!(short_of_time(&spec, TIDY_TIME) && !short_of_time(&spec, TIDY_LEAST));
         spec.connection.deadline = Some(Instant::now() + Duration::from_secs(30));
         assert!(short_of_time(&spec, TIDY_LEAST));
@@ -14482,8 +14487,9 @@ pub(crate) mod tests {
         let fresh = Turn::with_limit(spec.connection.clone(), spec.rounds);
         assert!(tidy_rounds(&spec, &fresh, began, None, 1_000).is_none());
         // Not where a frontend shows the run, with a schema, where no command
-        // may run, with under six requests' tokens left, or under two
-        // minutes, nor at a cap too small to be warned of.
+        // may run, with under six requests' tokens left, or under five
+        // minutes, where one slow reply would outlast the deadline, nor at
+        // a cap too small to be warned of.
         type Change = fn(&mut Spec);
         let changes: [Change; 7] = [
             |spec| spec.watch = Some(Arc::new(|_| ())),
@@ -14491,7 +14497,7 @@ pub(crate) mod tests {
             |spec| spec.connection.plan = true,
             |spec| spec.allow = Allow::Only(vec!["read_file".into()]),
             |spec| spec.budget = Some(nearly_spent(1_000_000)),
-            |spec| spec.connection.deadline = Some(Instant::now() + Duration::from_secs(60)),
+            |spec| spec.connection.deadline = Some(Instant::now() + Duration::from_secs(4 * 60)),
             |spec| spec.rounds = 49,
         ];
         for (at, change) in changes.into_iter().enumerate() {
