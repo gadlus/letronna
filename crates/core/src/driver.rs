@@ -659,6 +659,9 @@ fn steps(
     // once and chooses nothing for a second attempt.
     let mut broke = false;
     let mut attempted = false;
+    // Whether the project holds a second attempt's work in place of the
+    // run's own, whose unclear rows are then no longer the run's to answer.
+    let mut adopted = false;
     // Before the first call, so the project as the run found it is known:
     // the commit it was at, with nothing changed since, which a second
     // attempt starts from; None where the tree already held changes, which
@@ -1119,28 +1122,6 @@ fn steps(
                     continue;
                 }
             }
-            // Once it has answered the review's rows and the tests have been
-            // run against its work, so it is not asked before that evidence
-            // is in: a row the review left unclear is decided by the
-            // request's words rather than left; once, and with a round and
-            // budget left, as above. An answer with a line for each such
-            // row costs nothing. Not where the tests still fail after their
-            // last run: a second attempt comes next where that experiment
-            // is on, and the round is better left to it; with it off the
-            // run is left as it was then too, so that turning the
-            // experiment off changes nothing else.
-            if tabled
-                && !quoted
-                && (passed || tested < crate::spec_tests::RUNS)
-                && report.rounds < spec.rounds
-                && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
-                && let Some(notice) = unsettled_rows(spec, turn)
-            {
-                quoted = true;
-                spec.transcript.conversation.messages.push(notice);
-                save(&mut spec.transcript)?;
-                continue;
-            }
             // Sent back with the tests `RUNS` times, a run whose work still
             // fails them has had its say: where the `second_attempt`
             // experiment is on, a helper makes a second attempt from the
@@ -1174,11 +1155,12 @@ fn steps(
                     }
                     (true, false) => timed(spec, || second_attempt(spec, turn, head)),
                 };
-                if let Some((notice, adopted)) = attempt {
+                if let Some((notice, taken)) = attempt {
                     // Told to change nothing once the project holds the
                     // attempt's work, the run is not sent back after it to
                     // check, build or compare edits that are no longer its
                     // own.
+                    adopted = taken;
                     if adopted {
                         verified = true;
                         built = true;
@@ -1188,6 +1170,34 @@ fn steps(
                     save(&mut spec.transcript)?;
                     continue;
                 }
+            }
+            // Once it has answered the review's rows and the tests have been
+            // run against its work, so it is not asked before that evidence
+            // is in: a row the review left unclear is decided by the
+            // request's words rather than left; once, and with a round and
+            // budget left, as above. An answer with a line for each such
+            // row costs nothing. Where the tests still fail after their
+            // last run, only once no second attempt is still to come, the
+            // round being better left to one: the experiment is off, or
+            // one was made, or passed over, and the work is still the
+            // run's own. After the attempt above, so a run it left with its
+            // own work is asked at this same done. Before, such a run was
+            // never asked: its doubts ended with tests that may have been
+            // wrong.
+            if tabled
+                && !quoted
+                && (passed
+                    || tested < crate::spec_tests::RUNS
+                    || !attempts
+                    || (attempted && !adopted))
+                && report.rounds < spec.rounds
+                && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
+                && let Some(notice) = unsettled_rows(spec, turn)
+            {
+                quoted = true;
+                spec.transcript.conversation.messages.push(notice);
+                save(&mut spec.transcript)?;
+                continue;
             }
             // Before the Stop hooks, so they judge the answer that follows.
             if !verified && let Some(notice) = unchecked_edits(spec, turn, begun) {
@@ -10466,6 +10476,85 @@ pub(crate) mod tests {
         assert!(dir.join("made.rs").exists());
         assert!(!dir.join("made.txt").exists());
         assert!(!dir.join("letronna_spec_test.sh").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_whose_tests_still_fail_is_asked_for_its_unclear_rows_once_no_attempt_is_to_come() {
+        // The notices a run is sent whose review left a row unclear, which
+        // it shrugs off, and whose work fails the tester's test at both of
+        // its runs, with the experiment as `attempts` says and `after` as
+        // the replies that follow its answer to the second of them.
+        let sent = |name: &str, id: AgentId, attempts: bool, after: Vec<String>| {
+            let _data = data(name);
+            let dir = scratch(name);
+            committed(&dir);
+            needs_made_txt(&dir, id);
+            let mut answers = vec![
+                reply("", &[write_made()]),
+                reply("Added parse_range.", &[]),
+                reply(DOUBTED, &[]),
+                reply(DOUBTED, &[]),
+                reply("Each requirement holds.", &[]),
+                reply("R4: unclear; the request does not say. Leave.", &[]),
+                reply("Fixed.", &[]),
+                reply("Fixed again.", &[]),
+            ];
+            let last = after.len() + answers.len();
+            answers.extend(after);
+            let (mut spec, provider) = specified(&dir, id, SPECIFIED, answers);
+            spec.connection.mode = crate::gate::Mode::AcceptEdits;
+            // No tester ahead of the run, and the time for an attempt.
+            spec.connection.deadline = Some(Instant::now() + Duration::from_secs(25 * 60));
+            let report = finished_attempting(spec, attempts);
+            // Each reply was asked for and no more: a notice with no
+            // reply left for it would fail the run.
+            assert_eq!(report.status, Outcome::Done, "{}", report.text);
+            let sent = provider.sent();
+            assert_eq!(sent.len(), last, "{name}");
+            let notices: Vec<String> = (messages(sent.last().unwrap()).iter())
+                .filter(|message| message["role"] == "user")
+                .filter_map(|message| message["content"].as_str())
+                .map(String::from)
+                .collect();
+            (report.text, notices)
+        };
+        let asked = "The review left a row of R4 unclear, and your answer has no line";
+        let again = "it fails nothing but what it failed at the run before";
+        let asks = |notices: &[String]| notices.iter().filter(|n| n.contains(asked)).count();
+        // With the experiment off no attempt is to come: asked once the
+        // tests have failed their last run, after that run is told.
+        let line = vec![reply("Left as it is.", &[])];
+        let (text, off) = sent("unclear-rows-attempt-off", AGENTS + 1_927, false, line);
+        assert_eq!(text, "Left as it is.");
+        let told = off.iter().position(|notice| notice.contains(again));
+        let line = off.iter().position(|notice| notice.contains(asked));
+        assert!(told.is_some() && told < line, "{off:?}");
+        assert_eq!(asks(&off), 1, "{off:?}");
+        // With it on, an attempt that changes nothing is not taken, and
+        // says nothing: the run is asked at that same done.
+        let untaken = vec![reply("Nothing to add.", &[]), reply("Left as it is.", &[])];
+        let (text, on) = sent("unclear-rows-attempt-none", AGENTS + 1_928, true, untaken);
+        assert_eq!(text, "Left as it is.");
+        assert_eq!(asks(&on), 1, "{on:?}");
+        assert!(!on.iter().any(|n| n.contains("second attempt")), "{on:?}");
+        // One that is taken leaves the run no work of its own to answer
+        // for: told the project holds the attempt, it is not asked.
+        let taken = vec![
+            reply(
+                "",
+                &[("write_file", json!({"path": "made.txt", "content": "made"}))],
+            ),
+            reply("Made made.txt.", &[]),
+            reply("The project holds the second attempt.", &[]),
+        ];
+        let (text, adopted) = sent("unclear-rows-attempt-taken", AGENTS + 1_929, true, taken);
+        assert_eq!(text, "The project holds the second attempt.");
+        assert!(
+            adopted.iter().any(|n| n.contains("in place of yours")),
+            "{adopted:?}"
+        );
+        assert_eq!(asks(&adopted), 0, "{adopted:?}");
     }
 
     #[cfg(unix)]
