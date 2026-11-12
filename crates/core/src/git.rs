@@ -676,6 +676,33 @@ pub(crate) fn untracked(folder: &Path, pattern: &str) -> Option<Vec<String>> {
     (!cut).then(|| listed.map(str::to_owned).collect())
 }
 
+/// The files below `folder` its repository neither tracks nor ignores, by
+/// their paths from there, with a folder that holds nothing it tracks named
+/// once, `/` after it, in place of all that is in it, and one that holds
+/// nothing at all left out; `None` where there is no repository or git could
+/// not say. A folder of thousands of files costs one name so, and a listing
+/// still too long to keep ends early rather than not being given. Where
+/// `folder` itself holds nothing the repository tracks, git names it alone,
+/// which says nothing of what is in it: its files are then listed one by
+/// one, as `untracked` lists them.
+pub(crate) fn untracked_folded(folder: &Path) -> Option<Vec<String>> {
+    let args = [
+        "ls-files",
+        "-z",
+        "--others",
+        "--exclude-standard",
+        "--directory",
+        "--no-empty-directory",
+    ];
+    let (out, _) = git(folder, &args, 1 << 20).ok()?;
+    let mut listed = out.split('\0').filter(|path| !path.is_empty());
+    if listed.any(|path| path == "./") {
+        return untracked(folder, ".");
+    }
+    let listed = out.split('\0').filter(|path| !path.is_empty());
+    Some(listed.map(str::to_owned).collect())
+}
+
 /// Whether `folder` is the top of a repository's working tree, not a folder
 /// inside one.
 pub(crate) fn is_top(folder: &Path) -> bool {
@@ -1025,6 +1052,41 @@ mod tests {
         let none = scratch("untracked-none");
         assert_eq!(untracked(&none, "*_spec*"), None);
         assert!(!is_top(&none));
+    }
+
+    #[test]
+    fn a_folder_that_holds_nothing_tracked_is_listed_once_in_place_of_what_is_in_it() {
+        let folder = repo("untracked-folded");
+        for dir in ["src", "new/deep", "built", "empty", "logs"] {
+            std::fs::create_dir_all(folder.join(dir)).unwrap();
+        }
+        std::fs::write(folder.join(".gitignore"), "built/\n*.log\n").unwrap();
+        std::fs::write(folder.join("src/lib.txt"), "x").unwrap();
+        setup(&folder, &["add", ".gitignore", "src/lib.txt"]);
+        setup(&folder, &["commit", "-q", "-m", "second"]);
+        for file in [
+            "src/probe.txt",
+            "new/a.txt",
+            "new/deep/b.txt",
+            "built/c.txt",
+            "logs/run.log",
+            "top.txt",
+        ] {
+            std::fs::write(folder.join(file), "x").unwrap();
+        }
+        // A file beside tracked ones by its path, a wholly new folder once,
+        // and neither a folder git ignores, one that holds only what it
+        // ignores, nor an empty one.
+        assert_eq!(
+            untracked_folded(&folder).unwrap(),
+            ["new/", "src/probe.txt", "top.txt"]
+        );
+        // Asked of a folder that itself holds nothing tracked, its files.
+        assert_eq!(
+            untracked_folded(&folder.join("new")).unwrap(),
+            ["a.txt", "deep/b.txt"]
+        );
+        assert_eq!(untracked_folded(&scratch("untracked-folded-none")), None);
     }
 
     #[test]

@@ -3124,8 +3124,9 @@ impl Tool for WriteFile {
         let lsp = crate::lsp::before_write(ctx, &path, change.before());
         let new = change.before().is_none();
         change.write(text.as_bytes(), &ctx.files)?;
-        if new {
-            crate::taint::made(ctx, &path);
+        match new {
+            true => crate::taint::made(ctx, &path),
+            false => crate::taint::rewrote(ctx, &path),
         }
         let text = match crate::formatter::after_write(ctx, &path, path_arg(args), &text) {
             Some((now, said)) => {
@@ -3273,6 +3274,7 @@ impl Tool for EditFile {
         ));
         let lsp = crate::lsp::before_write(ctx, &path, Some(text));
         change.write(done.text.as_bytes(), &ctx.files)?;
+        crate::taint::rewrote(ctx, &path);
         let raw = path_arg(args);
         let after = match crate::formatter::after_write(ctx, &path, raw, &done.text) {
             Some((now, said)) => {

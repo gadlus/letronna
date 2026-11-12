@@ -1,7 +1,8 @@
 //! Which sessions have read words someone other than the user wrote, and
-//! which files each one's tools made, for the gate's check on what such a
-//! session does next; and the words of any instruction planted in what each
-//! read, for `echo` to find in what it writes.
+//! which files each one's tools made, and when, or wrote over, for the
+//! gate's check on what such a session does next and for a run to be told
+//! what it left in its project; and the words of any instruction planted in
+//! what each read, for `echo` to find in what it writes.
 //!
 //! A page or a server's reply reaches the model fenced, as data, but a model
 //! can still be talked into acting on it, and with approvals skipped --
@@ -58,8 +59,14 @@ struct Session {
     /// The one MCP server every such word came from, while there is one;
     /// `None` once it read any from anywhere else.
     only_from: Option<String>,
-    /// The files its file tools created, by real path.
-    made: HashSet<PathBuf>,
+    /// The files its file tools created, by real path, with when each was
+    /// made: a file tool writes by rename, so an edit since gives the file a
+    /// new time of making on disk and leaves this one as it was.
+    made: HashMap<PathBuf, SystemTime>,
+    /// The files its file tools wrote where one was already, or moved one
+    /// to, by real path: none of them new, though the disk says each was
+    /// made as it was written.
+    rewrote: HashSet<PathBuf>,
     /// The folders its file tools created for them, by real path, with when
     /// the system says each was made, to tell what arrived in it later.
     folders: HashMap<PathBuf, SystemTime>,
@@ -134,16 +141,65 @@ pub(crate) fn read_only_from(ctx: &ToolContext, server: &str) -> bool {
     })
 }
 
-/// Notes that a file tool created `path` in `ctx`'s session.
+/// Notes that a file tool created `path` in `ctx`'s session, now.
 pub(crate) fn made(ctx: &ToolContext, path: &Path) {
     let (Some(id), Ok(path)) = (session(ctx), std::fs::canonicalize(path)) else {
         return;
     };
     let mut sessions = sessions();
     let made = &mut sessions.entry(id).or_default().made;
-    if made.len() < MADE {
-        made.insert(path);
+    // One made again, where the first was deleted, is as new as it is.
+    if made.len() < MADE || made.contains_key(&path) {
+        made.insert(path, SystemTime::now());
     }
+}
+
+/// Notes that a file tool of `ctx`'s session wrote `path` without making it:
+/// over a file that was there, as an edit does, or with a file it moved
+/// there. The disk says such a file was made as it was written, so without
+/// this note a user's file the session edited would look new since.
+pub(crate) fn rewrote(ctx: &ToolContext, path: &Path) {
+    let (Some(id), Ok(path)) = (session(ctx), std::fs::canonicalize(path)) else {
+        return;
+    };
+    let mut sessions = sessions();
+    let rewrote = &mut sessions.entry(id).or_default().rewrote;
+    if rewrote.len() < MADE {
+        rewrote.insert(path);
+    }
+}
+
+/// The files a file tool or a command's own redirection created in `ctx`'s
+/// session at `since` or later, by real path, in order: what a run that
+/// began then made, and nothing an earlier turn of its session did, whatever
+/// has been written in that since.
+pub(crate) fn made_from(ctx: &ToolContext, since: SystemTime) -> Vec<PathBuf> {
+    let Some(id) = session(ctx) else {
+        return Vec::new();
+    };
+    let sessions = sessions();
+    let made = sessions.get(&id).map(|session| &session.made);
+    let mut paths: Vec<PathBuf> = (made.into_iter().flatten())
+        .filter(|(_, at)| **at >= since)
+        .map(|(path, _)| path.clone())
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Whether a file tool of `ctx`'s session wrote what is at `path`, at any
+/// time: made it, as a file or as a folder for one, wrote over it or moved a
+/// file there. However new the disk says it is, it is then no file a program
+/// or anyone else newly left there.
+pub(crate) fn wrote(ctx: &ToolContext, path: &Path) -> bool {
+    let (Some(id), Ok(path)) = (session(ctx), std::fs::canonicalize(path)) else {
+        return false;
+    };
+    sessions().get(&id).is_some_and(|session| {
+        session.made.contains_key(&path)
+            || session.rewrote.contains(&path)
+            || session.folders.contains_key(&path)
+    })
 }
 
 /// Redirections of one command looked at for files it made. A line names a
@@ -257,7 +313,7 @@ pub(crate) fn own(ctx: &ToolContext, path: &Path) -> bool {
         let Some(session) = sessions.get(&id) else {
             return false;
         };
-        if session.made.contains(&path) {
+        if session.made.contains_key(&path) {
             return true;
         }
         match session.folders.get(&path) {
@@ -561,6 +617,10 @@ mod tests {
         crate::filestate::asked(731_021, 1, 0, 0);
         tools::run("write_file", &write("theirs.txt"), &ctx).unwrap();
         assert!(!own(&ctx, &dir.join("theirs.txt")));
+        // Noted as written all the same, so the disk's new time for it does
+        // not read as a file newly left there.
+        assert!(wrote(&ctx, &dir.join("theirs.txt")));
+        assert!(!wrote(&ctx, &dir.join("unwritten.txt")));
         // A file the patch moves is still the user's under its new name.
         let patch = "*** Begin Patch\n*** Add File: added.txt\n+x\n\
                      *** Update File: theirs.txt\n*** Move to: moved.txt\n*** End Patch";
@@ -571,6 +631,62 @@ mod tests {
         assert!(!own(&ctx, &dir.join("moved.txt")));
         assert!(!own(&in_session(731_022), &dir.join("new.txt")));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_is_made_when_its_tool_created_it_whatever_is_written_in_it_since() {
+        let dir = crate::store::tests::Scratch::new("taint-made-since");
+        std::fs::write(dir.join("theirs.txt"), "the user's").unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.to_path_buf()),
+            ..in_session(731_091)
+        };
+        let real = |name: &str| std::fs::canonicalize(dir.join(name)).unwrap();
+        let before = SystemTime::now();
+        let write = |path: &str| json!({ "path": path, "content": "x" }).to_string();
+        tools::run("write_file", &write("first.txt"), &ctx).unwrap();
+        assert_eq!(made_from(&ctx, before), [real("first.txt")]);
+        assert!(wrote(&ctx, &dir.join("first.txt")));
+        assert!(!wrote(&ctx, &dir.join("theirs.txt")));
+        // A later turn begins, and edits what the first made and what the
+        // user had: the rename gives each a new time of making on disk.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let later = SystemTime::now();
+        for path in ["first.txt", "theirs.txt"] {
+            let read = json!({ "path": path }).to_string();
+            tools::run("read_file", &read, &ctx).unwrap();
+        }
+        // The edits come in the next reply, after the reads were seen.
+        crate::filestate::asked(731_091, 1, 0, 0);
+        for (path, old) in [("first.txt", "x"), ("theirs.txt", "the user's")] {
+            let edit = json!({ "path": path, "old": old, "new": "edited" }).to_string();
+            tools::run("edit_file", &edit, &ctx).unwrap();
+        }
+        tools::run("write_file", &write("second.txt"), &ctx).unwrap();
+        // Only what the later turn created is made since it began.
+        assert_eq!(made_from(&ctx, later), [real("second.txt")]);
+        assert_eq!(
+            made_from(&ctx, before),
+            [real("first.txt"), real("second.txt")]
+        );
+        // And the user's file it edited is noted as written, not as made.
+        assert!(wrote(&ctx, &dir.join("theirs.txt")));
+        assert!(!own(&ctx, &dir.join("theirs.txt")));
+        // A patch makes what it adds, and only writes what it updates or
+        // moves.
+        let patch = "*** Begin Patch\n*** Add File: added.txt\n+x\n\
+                     *** Update File: theirs.txt\n*** Move to: moved.txt\n*** End Patch";
+        let patch = json!({ "patch": patch }).to_string();
+        tools::run(crate::patch::APPLY_PATCH, &patch, &ctx).unwrap();
+        assert_eq!(
+            made_from(&ctx, later),
+            [real("added.txt"), real("second.txt")]
+        );
+        assert!(wrote(&ctx, &dir.join("moved.txt")));
+        assert!(!own(&ctx, &dir.join("moved.txt")));
+        // Another session made none of them.
+        assert!(made_from(&in_session(731_092), before).is_empty());
+        assert!(!wrote(&in_session(731_092), &dir.join("first.txt")));
     }
 
     #[test]

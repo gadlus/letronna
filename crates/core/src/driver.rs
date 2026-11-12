@@ -74,10 +74,10 @@
 //! A run is told once when a tenth of its tool rounds are left, as it is of
 //! its time: a session's own run to write what it owes and take out what it
 //! made only to test, a helper to finish its checks and write its report.
-//! At a round cap of 50 or more, a run nobody watches that made files new to
-//! its project and still there is given five more rounds, in which only
-//! commands run, to take out those it made only to test; the wrap-up that
-//! ends it follows them.
+//! At a round cap of 50 or more, a run nobody watches that left files new to
+//! its project, made by its tools or by what it ran, is given five more
+//! rounds, in which only commands run, to take out those it made only to
+//! test; the wrap-up that ends it follows them.
 //!
 //! Nothing here polls. Each wait -- for the model, for a tool, for an
 //! approval -- is a blocking receive that a stop closes, so a stop is heard at
@@ -2494,8 +2494,9 @@ fn round_warning(spec: &Spec, turn: &Turn, used: usize, warned: &mut bool) -> Op
 /// tests picked them up.
 const TIDY_ROUNDS: usize = 5;
 
-/// Files of its own that notice names at most: a run's probes are a handful,
-/// and a longer list says no more about where the rest are.
+/// Files and folders that notice names at most, the run's own first: a
+/// run's probes are a handful, and a longer list says no more about where
+/// the rest are.
 const LEFT_NAMED: usize = 20;
 
 /// The least of a run's time that must be left for those rounds, about what
@@ -2503,28 +2504,27 @@ const LEFT_NAMED: usize = 20;
 /// stops in them would end with no summary at all.
 const TIDY_TIME: Duration = Duration::from_secs(2 * 60);
 
-/// How long before a run began a file may say it was last written and still
-/// count as written in it: a disk that keeps times to the second, or to two,
-/// puts a file written at once a little before.
-const WRITTEN_SLACK: Duration = Duration::from_secs(2);
-
 /// What a call that is no command is answered in the rounds a run is given
 /// past its cap, so they are not used to go on with the work.
 const TIDY_ONLY: &str = "Not run: only removing what you made to test is left.";
 
 /// The notice giving a session's own run nobody watches `TIDY_ROUNDS` more
 /// rounds as its turn reaches the round cap, in place of the wrap-up there,
-/// which follows them: it names the files the run made that are still in the
-/// project (`made_and_left`), for it to take out those it made only to test,
-/// by the rule of the round warning. None, and the wrap-up comes at once as
-/// it did, where the run made no such file; for a helper, whose files are its
-/// parent's to tidy; for a run a person watches, who says what stays; for
-/// one with a schema, which ends at its cap with the answer it has; where no
-/// command may run; and with too little time or budget left for them, the
-/// rounds and the summary each counted as `read`, what the last request
-/// read, read again in full, as where no cache serves it. Nor at a cap too
-/// small to be warned of (`warned_rounds`): five rounds more are most of
-/// another such run, where the cap was set to keep it short.
+/// which follows them: it names what the run left in the project that is
+/// new to it (`left_behind`), its own files first and then what else is new
+/// since it began, said as that and not as its own, for it to take out what
+/// it made only to test and nothing it did not make. It says that what it
+/// names may not be all, since neither list sees everything, and tells a
+/// throwaway test from one that belongs with the change, which a list of
+/// new files cannot. None, and the wrap-up comes at once as it did, where
+/// nothing new is left; for a helper, whose files are its parent's to tidy;
+/// for a run a person watches, who says what stays; for one with a schema,
+/// which ends at its cap with the answer it has; where no command may run;
+/// and with too little time or budget left for them, the rounds and the
+/// summary each counted as `read`, what the last request read, read again
+/// in full, as where no cache serves it. Nor at a cap too small to be warned
+/// of (`warned_rounds`): five rounds more are most of another such run,
+/// where the cap was set to keep it short.
 fn tidy_rounds(spec: &Spec, turn: &Turn, began: SystemTime, read: u64) -> Option<String> {
     if !turn.at_cap() || !unwatched(spec) || spec.watch.is_some() || spec.schema.is_some() {
         return None;
@@ -2544,61 +2544,152 @@ fn tidy_rounds(spec: &Spec, turn: &Turn, began: SystemTime, read: u64) -> Option
     if left.is_some_and(|left| left < TIDY_TIME) {
         return None;
     }
-    let files = made_and_left(spec, spec.connection.workspace.as_deref()?, began);
-    if files.is_empty() {
+    let left = left_behind(spec, spec.connection.workspace.as_deref()?, began);
+    if left.own.is_empty() && left.new.is_empty() {
         return None;
     }
-    let mut named: Vec<String> = (files.iter().take(LEFT_NAMED))
-        .map(|file| format!("`{file}`"))
-        .collect();
-    if files.len() > LEFT_NAMED {
-        named.push(format!("and {} more", files.len() - LEFT_NAMED));
+    let mut text = String::from("You have reached the tool-round limit.");
+    if !left.own.is_empty() {
+        let named = named_first(&left.own, LEFT_NAMED);
+        text.push_str(&format!(
+            " These new files of yours are in the project: {named}."
+        ));
     }
-    // What stays is said too: the list cannot tell a probe from a file the
-    // task asked for, and a removal by name leaves the user's files alone.
-    Some(format!(
-        "You have reached the tool-round limit. These new files of yours are in the project: {}. \
-         In at most {TIDY_ROUNDS} more rounds, remove by name those of them, and any other file, \
-         that you made only to test or probe (scripts, logs, binaries, and tests you added only \
-         to probe or check, unless the task asks for tests); keep what the task or your change \
-         needs, and change nothing else: only run_command runs now. Then you are asked for your \
-         summary.",
-        named.join(", ")
-    ))
+    if !left.new.is_empty() {
+        let also = match left.own.is_empty() {
+            true => "New",
+            false => "Also new",
+        };
+        let named = named_first(&left.new, LEFT_NAMED.saturating_sub(left.own.len()));
+        text.push_str(&format!(
+            " {also} in the project since this run began, left by a program you ran or a copy \
+             you made or, rarely, by someone else: {named}."
+        ));
+    }
+    text.push_str(&format!(
+        " What is named here may not be all of it. In at most {TIDY_ROUNDS} more rounds, remove \
+         by name those you made only to test or probe (scripts, logs, binaries, throwaway \
+         tests); keep every file of your change, its tests included, and remove none you did \
+         not make; change nothing else: only run_command runs now. Then you are asked for your \
+         summary."
+    ));
+    Some(text)
 }
 
-/// The files in `workspace` that the run of `spec`, begun at `began`, made
-/// and left there, by their paths from it: those git neither tracks nor
-/// ignores that a file tool or a command's own redirection made in its
-/// session (`taint::own`) and that were written since it began, and made
-/// since it began where the disk says when. So a file the user had there,
-/// one an earlier turn of the session left, one the run only wrote over and
-/// what a program it ran wrote are none of them, and nothing is named that
-/// the run cannot be known to have made. A tester's files, by their names,
-/// are left to the sweep as the run ends. None where git cannot say, as
+/// The first `room` of `files` as a notice names them, each in backticks,
+/// then how many more there are.
+fn named_first(files: &[String], room: usize) -> String {
+    let mut named: Vec<String> = (files.iter().take(room))
+        .map(|file| format!("`{file}`"))
+        .collect();
+    match files.len().saturating_sub(room) {
+        0 => {}
+        more if named.is_empty() => named.push(format!("{more} not named here")),
+        more => named.push(format!("and {more} more")),
+    }
+    named.join(", ")
+}
+
+/// What a run left in its project that is new to it, by paths from the
+/// project with `/` between folders.
+#[derive(Debug, Default, PartialEq)]
+struct Left {
+    /// The files its file tools or its commands' own redirections made.
+    own: Vec<String>,
+    /// What else is new there since it began, which a program it ran or a
+    /// copy it made left or, rarely, someone else did: a file, or a folder
+    /// that is wholly new, with `/` after it, in place of all that is in it.
+    new: Vec<String>,
+}
+
+impl Left {
+    /// Whether `path`, a file's, is one of them, or in a folder that is.
+    fn holds(&self, path: &str) -> bool {
+        self.own.iter().any(|own| own == path) || self.new.iter().any(|new| covers(new, path))
+    }
+}
+
+/// Whether `entry`, of a listing of what is new to a project, is the file at
+/// `path` or, with `/` after it, a folder above it.
+fn covers(entry: &str, path: &str) -> bool {
+    entry == path || (entry.ends_with('/') && path.starts_with(entry))
+}
+
+/// Folders git names whole that are looked into for what is new in them: a
+/// project rarely has more that are not wholly new, and each is a listing of
+/// its own.
+const LOOKED_INTO: usize = 8;
+
+/// What the run of `spec`, begun at `began`, left in `workspace` that git
+/// neither tracks nor ignores there (`git::untracked_folded`). Its own: the
+/// files a file tool or a command's own redirection of its session made
+/// since it began, by when the tool made each, so not one an earlier turn
+/// made that was written in since. What else is new: a file or a wholly new
+/// folder the disk says was made since the run began, as a copy, a compiler
+/// or a script of the run's leaves one, which no tool's note sees: a run
+/// that copied its probe tests into the project was told of none of them.
+/// Not among those is what a file tool of the session made earlier, wrote
+/// over or moved, which the disk calls new because a file tool writes by
+/// rename, nor anything on a disk that keeps no such time. A folder that
+/// was there before, untracked, is not new, but what was put in it since
+/// is, and a folder a file tool of the session made holds the run's own
+/// files beside what its programs left there: the first `LOOKED_INTO` of
+/// such folders are listed file by file. A tester's files, by their names,
+/// are left to the sweep as the run ends. Nothing where git cannot say, as
 /// outside a repository.
-fn made_and_left(spec: &Spec, workspace: &Path, began: SystemTime) -> Vec<String> {
-    let Some(untracked) = crate::git::untracked(workspace, ".") else {
-        return Vec::new();
+fn left_behind(spec: &Spec, workspace: &Path, began: SystemTime) -> Left {
+    let listed = crate::git::untracked_folded(workspace);
+    let (Some(listed), Ok(root)) = (listed, std::fs::canonicalize(workspace)) else {
+        return Left::default();
     };
     let ctx = context(spec);
-    let since = began.checked_sub(WRITTEN_SLACK).unwrap_or(began);
     let testers = |path: &str| {
-        let name = path.rsplit('/').next().unwrap_or(path);
-        name.contains(crate::spec_tests::MARKER)
+        let name = path.trim_end_matches('/').rsplit('/').next();
+        name.is_some_and(|name| name.contains(crate::spec_tests::MARKER))
     };
-    (untracked.into_iter())
-        // A repository inside the project, which git lists as a folder.
-        .filter(|path| !path.ends_with('/') && !testers(path))
-        .filter(|path| {
-            let file = workspace.join(path);
-            let written = std::fs::metadata(&file).and_then(|meta| meta.modified());
-            // One an earlier turn made is not this run's for being written
-            // in since, by the user or a program.
-            let made = crate::taint::born(&file).is_none_or(|at| at >= since);
-            made && written.is_ok_and(|at| at >= since) && crate::taint::own(&ctx, &file)
+    let folder = |entry: &&String| entry.ends_with('/');
+    let folders: Vec<&String> = listed.iter().filter(folder).collect();
+    let files: HashSet<&String> = listed.iter().filter(|entry| !folder(entry)).collect();
+    let under = |path: &String| folders.iter().any(|folder| covers(folder, path));
+    let listed_at = |path: &String| files.contains(path) || under(path);
+    let own: Vec<String> = (crate::taint::made_from(&ctx, began).iter())
+        .filter(|path| path.symlink_metadata().is_ok_and(|meta| meta.is_file()))
+        .filter_map(|path| {
+            let inside = path.strip_prefix(&root).ok()?;
+            let parts: Vec<_> = inside.iter().map(|part| part.to_string_lossy()).collect();
+            Some(parts.join("/"))
         })
-        .collect()
+        .filter(|path| !testers(path) && listed_at(path))
+        .collect();
+    let since = |path: &Path| crate::taint::born(path).is_some_and(|at| at >= began);
+    // In place of a folder that was there before, or that a file tool of
+    // the session made, the files in it; not of a repository inside the
+    // project, whose files are its own.
+    let mut entries: Vec<String> = Vec::new();
+    let mut looked = 0;
+    for entry in &listed {
+        let mixed = (entry.strip_suffix('/'))
+            .map(|folder| workspace.join(folder))
+            .filter(|folder| !since(folder) || crate::taint::wrote(&ctx, folder))
+            .filter(|folder| !folder.join(".git").exists());
+        match mixed {
+            Some(folder) if looked < LOOKED_INTO => {
+                looked += 1;
+                let inside = crate::git::untracked(&folder, ".").unwrap_or_default();
+                let files = inside.iter().filter(|path| !path.ends_with('/'));
+                entries.extend(files.map(|path| format!("{entry}{path}")));
+            }
+            _ => entries.push(entry.clone()),
+        }
+    }
+    let new = (entries.into_iter())
+        .filter(|entry| !testers(entry) && !own.contains(entry))
+        .filter(|entry| {
+            let at = workspace.join(entry.trim_end_matches('/'));
+            since(&at) && !crate::taint::wrote(&ctx, &at)
+        })
+        .collect();
+    Left { own, new }
 }
 
 /// How long before its deadline a run still at work is told to end its first
@@ -4311,9 +4402,10 @@ fn unbuilt_files(messages: &[Message], workspace: &Path) -> Vec<String> {
 /// run, whatever came of it: a test that fails there too, as one needing
 /// set-up the copy lacks does, or that ran nothing, tells nothing of the
 /// change and is not run again. But where the line does not pass there and
-/// names tests the run made since it began at `began` (`added_tests`), the
-/// run would end with a failing test of its own in the project, and is sent
-/// back for that instead: to fix its work or the test, or remove the test.
+/// names tests the run added since it began at `began`, by a file tool or
+/// by a copy (`added_tests`), the run would end with a failing test of its
+/// own in the project, and is sent back for that instead: to fix its work
+/// or the test, or remove the test.
 fn broken_tests(
     spec: &Spec,
     turn: &Turn,
@@ -4382,7 +4474,7 @@ fn broken_tests(
     // not, so there it tells of them, not of the change.
     let added = match before {
         Some(true) => Vec::new(),
-        _ => added_tests(&line, workspace, &made_and_left(spec, workspace, began)),
+        _ => added_tests(&line, workspace, &left_behind(spec, workspace, began)),
     };
     if before != Some(true) && added.is_empty() {
         return None;
@@ -4408,17 +4500,19 @@ fn broken_tests(
     })
 }
 
-/// The test files `line` names among `new`, the files the run made that are
-/// new to the project in `workspace` (`made_and_left`), by their paths from
-/// it: each word of one of its commands that is one of them, from the folder
-/// the command runs in when every `cd` before it worked, read past a test's
-/// name or a line after the file's (`file_named`), and that is named as
-/// runners find their tests. The project as it was has none of them, so the
-/// line cannot pass there whatever the work does. A script or a runner's
-/// settings the run made and the line names are no test, and a new test the
-/// run did not make, as the user's own is, is not its to fix or remove.
-fn added_tests(line: &str, workspace: &Path, new: &[String]) -> Vec<String> {
-    if new.is_empty() {
+/// The test files `line` names among `left`, what the run left in the
+/// project in `workspace` that is new to it (`left_behind`), by their paths
+/// from it: each word of one of its commands that is one of them, from the
+/// folder the command runs in when every `cd` before it worked, read past a
+/// test's name or a line after the file's (`file_named`), and that is named
+/// as runners find their tests. The project as it was has none of them, so
+/// the line cannot pass there whatever the work does. A test the run copied
+/// into the project is one it added, as one its file tools wrote is. A
+/// script or a runner's settings the line names are no test, and a test
+/// that was there before the run, as the user's own is, is not its to fix
+/// or remove.
+fn added_tests(line: &str, workspace: &Path, left: &Left) -> Vec<String> {
+    if left.own.is_empty() && left.new.is_empty() {
         return Vec::new();
     }
     let dialect = crate::command::Dialect::here();
@@ -4440,7 +4534,7 @@ fn added_tests(line: &str, workspace: &Path, new: &[String]) -> Vec<String> {
             let parts: Vec<_> = inside.iter().map(|part| part.to_string_lossy()).collect();
             let named = parts.last().is_some_and(|name| tests(name));
             let inside = parts.join("/");
-            if named && new.contains(&inside) && !found.contains(&inside) {
+            if named && left.holds(&inside) && !found.contains(&inside) {
                 found.push(inside);
             }
         }
@@ -11671,9 +11765,14 @@ pub(crate) mod tests {
         let mut spec = own_run("http://127.0.0.1:1/v1".into(), &dir, AGENTS + 2_400);
         spec.connection.workspace = Some(project.clone());
         spec.decide = Some(Arc::new(|_, _| gate::Outcome::Run));
+        let failing = "echo 'probe: expected 2, got 3'; exit 1\n";
+        // A new test of the user's own was there before the run began.
+        std::fs::write(project.join("zz_users_test.sh"), failing).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let began = SystemTime::now();
+        std::thread::sleep(Duration::from_millis(50));
         // A test the run added, as a file tool notes one it made, which
         // fails on its work as it stands.
-        let failing = "echo 'probe: expected 2, got 3'; exit 1\n";
         let ctx = context(&spec);
         let added = |name: &str| {
             std::fs::write(project.join(name), failing).unwrap();
@@ -11691,7 +11790,7 @@ pub(crate) mod tests {
         let probed = ran(json!({"command": "sh zz_probe_test.sh"}), failed);
         spec.transcript.conversation.messages.push(probed);
         let turn = Turn::new(spec.connection.clone());
-        let (began, mut looked) = (SystemTime::UNIX_EPOCH, false);
+        let mut looked = false;
 
         // The project as it was has no such test, so the line fails there
         // too: that tells nothing of the change, but the test is the run's.
@@ -11724,6 +11823,25 @@ pub(crate) mod tests {
             notice.content
         );
         spec.transcript.conversation.messages.pop();
+        // One it copied into the project, which no file tool made, is one it
+        // added too, where the disk says when a file was made.
+        std::fs::copy(
+            project.join("zz_probe_test.sh"),
+            project.join("zz_copied_test.sh"),
+        )
+        .unwrap();
+        let copied = ran(json!({"command": "sh zz_copied_test.sh"}), failed);
+        spec.transcript.conversation.messages.push(copied);
+        let notice = broken_tests(&spec, &turn, 0, began, &mut looked);
+        match crate::taint::born(&project.join("zz_copied_test.sh")) {
+            Some(_) => {
+                let notice = notice.unwrap().content;
+                let named = "it runs tests you added (`zz_copied_test.sh`)";
+                assert!(notice.contains(named), "{notice}");
+            }
+            None => assert!(notice.is_none()),
+        }
+        spec.transcript.conversation.messages.pop();
         // One made before this run began was an earlier turn's, and is left
         // as any line that fails on the project as it was.
         let later = SystemTime::now() + Duration::from_secs(60);
@@ -11738,10 +11856,9 @@ pub(crate) mod tests {
         assert!(!looked);
         std::fs::write(project.join("zz_probe_test.sh"), failing).unwrap();
         // A new script of the run's that is no test is no test left behind,
-        // and a new test the run did not make, as the user's own is, is not
-        // the run's to fix or remove.
+        // and the new test that was there before the run, as the user's own
+        // is, is not the run's to fix or remove.
         added("zz_probe.sh");
-        std::fs::write(project.join("zz_users_test.sh"), failing).unwrap();
         for line in ["sh zz_probe.sh", "sh zz_users_test.sh"] {
             looked = false;
             let other = ran(json!({ "command": line }), failed);
@@ -11772,17 +11889,21 @@ pub(crate) mod tests {
     #[test]
     fn the_tests_a_line_names_that_the_run_added_are_found_by_their_paths() {
         let dir = scratch("added-tests-named");
-        // What the run made that is new to the project: a test the project
-        // had and a new one of the user's are not among them.
-        let made = [
+        // What the run left that is new to the project: files its tools
+        // made, and a folder of copies. A test the project had and a new one
+        // of the user's are not among them.
+        let own = [
             "pkg/tests/zz.test.ts",
             "pkg/tests/test_new.py",
             "tests/zz.test.ts",
             "gen_fixtures.py",
             "jest.config.js",
-        ]
-        .map(str::to_owned);
-        let found = |line: &str| added_tests(line, &dir, &made);
+        ];
+        let left = Left {
+            own: own.map(str::to_owned).to_vec(),
+            new: vec!["probes/".into(), "zz_copied.test.ts".into()],
+        };
+        let found = |line: &str| added_tests(line, &dir, &left);
         // From the folder the line changes to, not one of the same name in
         // the folder before, past a line or a test's name after the file's.
         assert_eq!(
@@ -11801,6 +11922,12 @@ pub(crate) mod tests {
             found("python pkg/tests/test_new.py"),
             ["pkg/tests/test_new.py"]
         );
+        // A test copied into the project, alone or in a folder that is new.
+        assert_eq!(
+            found("npx vitest run zz_copied.test.ts probes/deep/zz_more.test.ts"),
+            ["probes/deep/zz_more.test.ts", "zz_copied.test.ts"]
+        );
+        assert!(found("npx vitest run probes_old/zz.test.ts").is_empty());
         // A script or a runner's settings the run made are no test, whatever
         // else the line runs.
         assert!(found("python gen_fixtures.py && pytest -q").is_empty());
@@ -13789,13 +13916,24 @@ pub(crate) mod tests {
         assert_eq!(times_told(&sent[47], ROUNDS_LEFT), 1);
     }
 
-    /// What asks for the rounds to tidy in, after the files it names.
-    const TIDY_FIRST: &str = "In at most 5 more rounds, remove by name those of them, and any \
-                              other file, that you made only to test or probe (scripts, logs, \
-                              binaries, and tests you added only to probe or check, unless the \
-                              task asks for tests); keep what the task or your change needs, and \
-                              change nothing else: only run_command runs now. Then you are asked \
-                              for your summary.";
+    /// What asks for the rounds to tidy in, after what it names.
+    const TIDY_FIRST: &str = "What is named here may not be all of it. In at most 5 more rounds, \
+                              remove by name those you made only to test or probe (scripts, \
+                              logs, binaries, throwaway tests); keep every file of your change, \
+                              its tests included, and remove none you did not make; change \
+                              nothing else: only run_command runs now. Then you are asked for \
+                              your summary.";
+
+    /// A git project with notes of sixty lines, where the run's transcript
+    /// and its lock, which only these tests keep in the project, are no
+    /// files of it.
+    #[cfg(unix)]
+    fn tidy_project(name: &str) -> Scratch {
+        let dir = long_notes(name);
+        std::fs::write(dir.join(".gitignore"), "helper.*\n").unwrap();
+        git_project(&dir, true);
+        dir
+    }
 
     /// What the wrap-up at the round cap asks for.
     const SUMMARY: &str = "Summarize what is done and what remains, then stop.";
@@ -13809,22 +13947,32 @@ pub(crate) mod tests {
     #[test]
     fn a_run_at_its_round_cap_is_given_rounds_to_take_out_the_files_it_made_only_to_test() {
         let _data = data("tidy-rounds");
-        let dir = long_notes("tidy-rounds");
-        git_project(&dir, true);
-        // A new file of the user's, which the run did not make.
+        let dir = tidy_project("tidy-rounds");
+        // A new file of the user's, which was there before the run.
         std::fs::write(dir.join("draft.txt"), "the user's").unwrap();
+        let draft = |old: &str, new: &str| json!({"path": "draft.txt", "old": old, "new": new});
         let mut replies = vec![
+            // Its own, by a file tool and by a redirection.
             reply("", &[probe("probe_test.txt")]),
             reply("", &[command("echo probing > probe.log")]),
+            // A copy, which no tool's note sees.
+            reply("", &[command("cp notes.txt copied_test.txt")]),
+            // And an edit of the user's file, which a file tool writes by
+            // rename, so the disk says it was made just now.
+            reply("", &[("read_file", json!({"path": "draft.txt"}))]),
+            reply("", &[("edit_file", draft("the user's", "edited"))]),
         ];
-        replies.extend(reads(1..=48));
+        replies.extend(reads(1..=45));
         replies.extend([
             // Turned away at the cap, where the rounds to tidy in are asked for.
             reply("", &[read_notes()]),
             // In them an edit is refused and a removal runs.
             reply(
                 "",
-                &[probe("more.txt"), command("rm probe_test.txt probe.log")],
+                &[
+                    probe("more.txt"),
+                    command("rm probe_test.txt probe.log copied_test.txt"),
+                ],
             ),
             // A reply with no call ends them, and the wrap-up follows.
             reply("Both are gone.", &[]),
@@ -13840,8 +13988,9 @@ pub(crate) mod tests {
         assert_eq!(sent.len(), 4);
 
         // At the cap the calls are answered as not run, as ever, and what
-        // follows them names the run's own new files, by a file tool or a
-        // redirection, and neither the user's nor the run's own transcript.
+        // follows them names the run's own new files first, then the copy,
+        // as new since it began and not as its own, where the disk says when
+        // a file was made; never the user's file, edited or not.
         assert_eq!(
             results(&sent[1]).last(),
             Some(&"Not run: the tool-round limit (50) was reached.")
@@ -13849,11 +13998,18 @@ pub(crate) mod tests {
         let asked = messages(&sent[1]).last().unwrap()["content"]
             .as_str()
             .unwrap();
+        let copied = match crate::taint::born(&dir.join("notes.txt")) {
+            Some(_) => {
+                " Also new in the project since this run began, left by a program you ran or a \
+                 copy you made or, rarely, by someone else: `copied_test.txt`."
+            }
+            None => "",
+        };
         assert_eq!(
             asked,
             format!(
                 "You have reached the tool-round limit. These new files of yours are in the \
-                 project: `probe.log`, `probe_test.txt`. {TIDY_FIRST}"
+                 project: `probe.log`, `probe_test.txt`.{copied} {TIDY_FIRST}"
             )
         );
         // The tools are offered as before, so the cached prefix holds, and
@@ -13864,10 +14020,13 @@ pub(crate) mod tests {
         let ran = results(&sent[2]);
         assert_eq!(ran[ran.len() - 2], TIDY_ONLY);
         assert!(!ran[ran.len() - 1].starts_with("Not run"), "{ran:?}");
-        for gone in ["probe_test.txt", "probe.log", "more.txt"] {
+        for gone in ["probe_test.txt", "probe.log", "copied_test.txt", "more.txt"] {
             assert!(!dir.join(gone).exists(), "{gone}");
         }
-        assert!(dir.join("draft.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("draft.txt")).unwrap(),
+            "edited"
+        );
         // Then the wrap-up, with the tools still offered and none allowed.
         let asked = messages(&sent[3]).last().unwrap()["content"].to_string();
         assert!(asked.contains(SUMMARY), "{asked}");
@@ -13884,8 +14043,7 @@ pub(crate) mod tests {
     #[test]
     fn the_rounds_to_tidy_in_are_five_and_the_wrap_up_follows_the_last_of_them() {
         let _data = data("tidy-rounds-used");
-        let dir = long_notes("tidy-rounds-used");
-        git_project(&dir, true);
+        let dir = tidy_project("tidy-rounds-used");
         let mut replies = vec![reply("", &[probe("probe_test.txt")])];
         replies.extend(reads(1..=49));
         replies.push(reply("", &[read_notes()]));
@@ -13915,8 +14073,7 @@ pub(crate) mod tests {
     #[test]
     fn a_call_repeated_in_the_rounds_to_tidy_in_ends_them_and_the_run_still_ends_at_its_limit() {
         let _data = data("tidy-rounds-loop");
-        let dir = long_notes("tidy-rounds-loop");
-        git_project(&dir, true);
+        let dir = tidy_project("tidy-rounds-loop");
         let same = || reply("", &[command("echo same")]);
         let mut replies = vec![reply("", &[probe("probe_test.txt")])];
         replies.extend(reads(1..=47));
@@ -13963,8 +14120,7 @@ pub(crate) mod tests {
             ),
         ];
         for (at, (first, change, wrap_up)) in cases.into_iter().enumerate() {
-            let dir = long_notes("tidy-rounds-none");
-            git_project(&dir, true);
+            let dir = tidy_project("tidy-rounds-none");
             std::fs::write(dir.join("draft.txt"), "the user's").unwrap();
             let mut replies = vec![reply("", &[first])];
             replies.extend(reads(1..=49));
@@ -13996,8 +14152,7 @@ pub(crate) mod tests {
         // schedule or a server runs: each ends at its cap, with what it made
         // still there.
         for (at, cap) in [1, 25].into_iter().enumerate() {
-            let dir = long_notes("tidy-rounds-small");
-            git_project(&dir, true);
+            let dir = tidy_project("tidy-rounds-small");
             let mut replies = vec![reply("", &[probe("probe_test.txt")])];
             replies.extend(reads(1..=cap - 1));
             replies.extend([reply("", &[read_notes()]), reply("That is all.", &[])]);
@@ -14076,53 +14231,107 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn only_new_files_the_run_made_since_it_began_are_named_for_it_to_tidy() {
-        let dir = scratch("made-and-left");
+    fn what_a_run_left_is_what_its_tools_made_and_then_what_else_is_new_since_it_began() {
+        let dir = scratch("left-behind");
         std::fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
         git_project(&dir, true);
         let spec = own("http://127.0.0.1:9/v1".into(), &dir, AGENTS + 2_306);
         let ctx = context(&spec);
-        let began = SystemTime::now();
+        let write = |name: &str| std::fs::write(dir.join(name), "written").unwrap();
         // As a file tool or a command's redirection notes what it made.
         let made = |name: &str| {
-            std::fs::write(dir.join(name), "made").unwrap();
+            write(name);
             crate::taint::made(&ctx, &dir.join(name));
         };
-        // Its own: one git ignores, a tester's by its name, one git tracks
-        // that it made again, and two that are new to the project.
+        // As a file tool edits a file: by rename, and noted as written.
+        let edited = |name: &str| {
+            write("edit.tmp");
+            std::fs::rename(dir.join("edit.tmp"), dir.join(name)).unwrap();
+            crate::taint::rewrote(&ctx, &dir.join(name));
+        };
+        // Before the run: the user's new file and their new folder, and a
+        // file an earlier turn of the session made.
+        std::fs::create_dir_all(dir.join("old")).unwrap();
+        write("draft.txt");
+        write("old/kept.txt");
+        made("earlier.py");
+        std::thread::sleep(Duration::from_millis(50));
+        let began = SystemTime::now();
+        std::thread::sleep(Duration::from_millis(50));
+        // What the run's tools made: one git ignores, a tester's by its
+        // name, one git tracks that it made again, two that are new to the
+        // project and one in the user's folder.
         for name in [
             "probe.log",
             "letronna_spec_test.py",
             "notes.txt",
             "zz_probe.test.ts",
             "probe.py",
+            "old/probe.py",
         ] {
             made(name);
         }
-        // New, and not made by the run: the user's, or a program's.
-        std::fs::write(dir.join("draft.txt"), "the user's").unwrap();
-        assert_eq!(
-            made_and_left(&spec, &dir, began),
-            ["probe.py", "zz_probe.test.ts"]
-        );
-        // What it made before this run began was an earlier turn's, also
-        // where someone has written in it since, if the disk says when a
-        // file was made.
-        let later = SystemTime::now() + Duration::from_secs(60);
-        assert!(made_and_left(&spec, &dir, later).is_empty());
-        let probe = dir.join("probe.py");
-        let touched = std::fs::File::options().write(true).open(&probe);
-        let after = later + Duration::from_secs(1);
-        touched.unwrap().set_modified(after).unwrap();
-        let named = made_and_left(&spec, &dir, later);
-        match crate::taint::born(&probe) {
-            Some(_) => assert!(named.is_empty(), "{named:?}"),
-            None => assert_eq!(named, ["probe.py"]),
+        // What its tools wrote and did not make: the user's file and the
+        // earlier turn's, each new to the disk for it.
+        edited("draft.txt");
+        edited("earlier.py");
+        // A folder a file tool of its made for a file, as it notes one.
+        crate::taint::create_folders(&ctx, &dir.join("mine")).unwrap();
+        made("mine/probe.c");
+        // What its programs and copies left: a file, a folder that is wholly
+        // new, a file in the user's folder beside the one that was there,
+        // and one in the folder its tool made.
+        std::fs::create_dir_all(dir.join("scratch/deep")).unwrap();
+        for name in [
+            "copied.test.ts",
+            "scratch/a.bin",
+            "scratch/deep/b.bin",
+            "old/new.txt",
+            "mine/probe.bin",
+        ] {
+            write(name);
         }
+        let left = left_behind(&spec, &dir, began);
+        let own = [
+            "mine/probe.c",
+            "old/probe.py",
+            "probe.py",
+            "zz_probe.test.ts",
+        ];
+        assert_eq!(left.own, own);
+        // On a disk that keeps no time of making, only its own are named.
+        let timed = crate::taint::born(&dir.join("draft.txt")).is_some();
+        match timed {
+            true => {
+                let new = [
+                    "copied.test.ts",
+                    "mine/probe.bin",
+                    "old/new.txt",
+                    "scratch/",
+                ];
+                assert_eq!(left.new, new);
+            }
+            false => assert!(left.new.is_empty(), "{left:?}"),
+        }
+        assert!(left.holds("probe.py") && !left.holds("draft.txt"));
+        assert_eq!(left.holds("scratch/deep/b.bin"), timed);
+        assert_eq!(left.holds("old/new.txt"), timed);
+        assert!(!left.holds("old/kept.txt") && !left.holds("scratchy/a.bin"));
+        // What it made before this run began was an earlier turn's.
+        let later = SystemTime::now() + Duration::from_secs(60);
+        assert_eq!(left_behind(&spec, &dir, later), Left::default());
         // Outside a repository git cannot say what is new to the project.
-        let plain = scratch("made-and-left-plain");
+        let plain = scratch("left-behind-plain");
         std::fs::write(plain.join("probe.py"), "made").unwrap();
         crate::taint::made(&ctx, &plain.join("probe.py"));
-        assert!(made_and_left(&spec, &plain, began).is_empty());
+        assert_eq!(left_behind(&spec, &plain, began), Left::default());
+    }
+
+    #[test]
+    fn the_names_past_the_room_for_them_are_counted() {
+        let files = ["a", "b", "c"].map(str::to_owned);
+        assert_eq!(named_first(&files, 20), "`a`, `b`, `c`");
+        assert_eq!(named_first(&files, 2), "`a`, `b`, and 1 more");
+        assert_eq!(named_first(&files, 0), "3 not named here");
     }
 }
