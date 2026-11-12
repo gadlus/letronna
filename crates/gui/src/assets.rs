@@ -162,7 +162,6 @@ pub(crate) enum AppIcon {
     Preview,
     Branch,
     Alert,
-    Loader,
     Keyboard,
     Point,
     Terminal,
@@ -175,6 +174,7 @@ pub(crate) enum AppIcon {
     Download,
     Cpu,
     Drives,
+    Filter,
 }
 impl IconNamed for AppIcon {
     fn path(self) -> SharedString {
@@ -214,7 +214,6 @@ impl IconNamed for AppIcon {
             AppIcon::Preview => "icons/picture-in-picture.svg",
             AppIcon::Branch => "icons/git-branch.svg",
             AppIcon::Alert => "icons/triangle-alert.svg",
-            AppIcon::Loader => "icons/loader-circle.svg",
             AppIcon::Keyboard => "icons/keyboard.svg",
             AppIcon::Point => "icons/cursor-click.svg",
             AppIcon::Terminal => "icons/terminal.svg",
@@ -227,6 +226,7 @@ impl IconNamed for AppIcon {
             AppIcon::Download => "icons/download.svg",
             AppIcon::Cpu => "icons/cpu.svg",
             AppIcon::Drives => "icons/hard-drives.svg",
+            AppIcon::Filter => "icons/list-filter.svg",
         }
         .into()
     }

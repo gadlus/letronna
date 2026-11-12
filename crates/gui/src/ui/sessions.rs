@@ -66,15 +66,6 @@ impl SessionFilter {
             SessionFilter::Pinned => "Pinned",
         }
     }
-
-    fn icon(self) -> AppIcon {
-        match self {
-            SessionFilter::NeedsYou => AppIcon::Alert,
-            SessionFilter::Working => AppIcon::Loader,
-            SessionFilter::Unseen => AppIcon::Circle,
-            SessionFilter::Pinned => AppIcon::Pin,
-        }
-    }
 }
 
 /// A session's state as the sidebar's filters see it.
@@ -1228,52 +1219,157 @@ impl Chat {
         cx.notify();
     }
 
-    /// One button per filter, and a toggle to group by project, in the row
-    /// under the sidebar's search box.
+    /// How many of the sessions the sidebar could list are in each filter's
+    /// state, in the order of `SessionFilter::ALL`.
+    fn session_counts(&self) -> [usize; 4] {
+        let mut counts = [0; 4];
+        for (index, conversation) in self.store.conversations.iter().enumerate() {
+            // A new session is listed once something is said in it.
+            if untouched(conversation) {
+                continue;
+            }
+            let state = self.session_state(index);
+            for filter in SessionFilter::ALL {
+                if passes(state, filter) {
+                    counts[filter as usize] += 1;
+                }
+            }
+        }
+        counts
+    }
+
+    /// Which sessions the sidebar lists, in words, in the row under its
+    /// search box: one menu whose button names what is shown, in the colour
+    /// of a link while some sessions are hidden, and lists every filter with
+    /// how many sessions it holds, and grouping by project. Four glyphs
+    /// stood here before, and nothing said which was which.
+    ///
+    /// Beside the menu, only while there are any, the sessions that wait for
+    /// you and those with something unseen: a mark and a count each, which
+    /// shows just those when pressed and all of them when pressed again.
     pub(crate) fn session_filter_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let picked = self.session_filter();
+        let counts = self.session_counts();
+        let grouped = self.store.settings.group_by_project;
+        let chat = cx.entity();
+        let theme = cx.theme();
+        let (muted, link, amber) = (theme.muted_foreground, theme.link, theme.warning);
+        let menu = Button::new("session-filter")
+            .plain(cx)
+            .xsmall()
+            .tooltip("Which sessions are listed")
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .text_xs()
+                    .text_color(if picked.is_some() { link } else { muted })
+                    .child(Icon::new(AppIcon::Filter).size_3())
+                    .child(picked.map_or("All sessions", SessionFilter::label))
+                    .child(Icon::new(IconName::ChevronDown).size_3()),
+            )
+            .dropdown_menu(move |menu, _, _| {
+                let all = chat.clone();
+                let mut menu = menu.min_w(px(190.)).item(
+                    PopupMenuItem::new("All sessions")
+                        .checked(picked.is_none())
+                        .on_click(move |_, _, cx| {
+                            all.update(cx, |this, cx| {
+                                this.clear_session_filter(cx);
+                            })
+                        }),
+                );
+                for filter in SessionFilter::ALL {
+                    let chat = chat.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(menu_label(filter, counts[filter as usize]))
+                            .checked(picked == Some(filter))
+                            .on_click(move |_, _, cx| {
+                                chat.update(cx, |this, cx| this.toggle_session_filter(filter, cx))
+                            }),
+                    );
+                }
+                let chat = chat.clone();
+                menu.separator().item(
+                    PopupMenuItem::new("Group by project")
+                        .checked(grouped)
+                        .on_click(move |_, _, cx| {
+                            chat.update(cx, |this, cx| this.toggle_grouping(cx))
+                        }),
+                )
+            });
+        // The same marks the session rows and the page rows use: the
+        // triangle for what waits, the dot for what has not been seen.
+        let waiting = [
+            (
+                SessionFilter::NeedsYou,
+                Icon::new(AppIcon::Alert)
+                    .size_3()
+                    .text_color(amber)
+                    .into_any_element(),
+            ),
+            (
+                SessionFilter::Unseen,
+                div()
+                    .size(px(6.))
+                    .rounded_full()
+                    .bg(link)
+                    .into_any_element(),
+            ),
+        ]
+        .into_iter()
+        .filter(|(filter, _)| counts[*filter as usize] > 0)
+        .map(|(filter, mark)| {
+            let count = counts[filter as usize];
+            Button::new(("session-waiting", filter as usize))
+                .plain(cx)
+                .xsmall()
+                .selected(picked == Some(filter))
+                .tooltip(waiting_tip(filter, count))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .text_xs()
+                        .child(mark)
+                        .child(count.to_string()),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle_session_filter(filter, cx)))
+        })
+        .collect::<Vec<_>>();
         h_flex()
-            .px_2()
+            .px_1()
             .gap_1()
             .items_center()
-            .child(self.filter_chip(SessionFilter::NeedsYou, cx))
-            .child(self.filter_chip(SessionFilter::Working, cx))
-            .child(self.filter_chip(SessionFilter::Unseen, cx))
-            .child(self.filter_chip(SessionFilter::Pinned, cx))
+            .child(menu)
             .child(div().flex_1())
-            .child(self.group_toggle(cx))
+            .children(waiting)
     }
+}
 
-    fn filter_chip(&self, filter: SessionFilter, cx: &mut Context<Self>) -> impl IntoElement {
-        let on = self.session_filter() == Some(filter);
-        Button::new(("session-filter", filter as usize))
-            .plain(cx)
-            .xsmall()
-            .selected(on)
-            .icon(Icon::new(filter.icon()).size_3().text_color(if on {
-                cx.theme().link
-            } else {
-                cx.theme().muted_foreground
-            }))
-            // Named while it is the one picked: four small glyphs do not
-            // say which of them is hiding the other sessions.
-            .when(on, |this| this.label(filter.label()))
-            .tooltip(filter.label())
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_session_filter(filter, cx)))
+/// A filter's line in the menu: its name, and how many sessions it holds
+/// when it holds any.
+fn menu_label(filter: SessionFilter, count: usize) -> String {
+    match count {
+        0 => filter.label().to_owned(),
+        count => format!("{} · {count}", filter.label()),
     }
+}
 
-    fn group_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let on = self.store.settings.group_by_project;
-        Button::new("group-by-project")
-            .plain(cx)
-            .xsmall()
-            .selected(on)
-            .icon(Icon::new(AppIcon::Folder).size_3().text_color(if on {
-                cx.theme().link
-            } else {
-                cx.theme().muted_foreground
-            }))
-            .tooltip("Group by project")
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_grouping(cx)))
+/// What a count beside the menu says under the pointer.
+fn waiting_tip(filter: SessionFilter, count: usize) -> String {
+    let (one, many) = match filter {
+        SessionFilter::NeedsYou => ("session needs you", "sessions need you"),
+        SessionFilter::Working => ("session is working", "sessions are working"),
+        SessionFilter::Unseen => (
+            "session has something you have not seen",
+            "sessions have something you have not seen",
+        ),
+        SessionFilter::Pinned => ("session is pinned", "sessions are pinned"),
+    };
+    match count {
+        1 => format!("1 {one}"),
+        count => format!("{count} {many}"),
     }
 }
 
@@ -1281,8 +1377,8 @@ impl Chat {
 mod tests {
     use super::{
         Conversation, SessionFilter, SessionState, Store, active_after, beside, delete_refusal,
-        deleting_several, export_name, group_by_project, next_filter, passes, pins, project_label,
-        span, still, toggled, write_exports,
+        deleting_several, export_name, group_by_project, menu_label, next_filter, passes, pins,
+        project_label, span, still, toggled, waiting_tip, write_exports,
     };
     use gpui::{point, px};
     use std::path::PathBuf;
@@ -1294,6 +1390,21 @@ mod tests {
             unseen,
             pinned,
         }
+    }
+
+    #[test]
+    fn the_filter_menu_says_what_each_filter_holds_in_words() {
+        // A filter that holds nothing is named and no more.
+        assert_eq!(menu_label(SessionFilter::Working, 0), "Working");
+        assert_eq!(menu_label(SessionFilter::NeedsYou, 2), "Needs you · 2");
+        assert_eq!(
+            waiting_tip(SessionFilter::NeedsYou, 1),
+            "1 session needs you"
+        );
+        assert_eq!(
+            waiting_tip(SessionFilter::Unseen, 3),
+            "3 sessions have something you have not seen"
+        );
     }
 
     #[test]

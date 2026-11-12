@@ -165,8 +165,13 @@ New session, drawn as a page like the rest. Built:
   out.
 - **Rows answer the pointer.** A tint on a page or session row under the
   pointer, at once and without movement.
-- **A picked session filter is named.** The four glyphs kept their tooltips;
-  the one that is hiding the other sessions now says which it is.
+- **The session filters are in words.** Four glyphs stood under the search
+  box, a triangle, a broken ring, a ring and a pin, and nothing said which was
+  which. One menu is there now: its button names what is listed, in the colour
+  of a link while some sessions are hidden, and it lists each filter with how
+  many sessions it holds, and grouping by project. Beside it, only while there
+  are any, a mark and a count for the sessions that wait for you and for those
+  with something unseen.
 
 ## Order of work
 
