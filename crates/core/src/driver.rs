@@ -10786,14 +10786,20 @@ pub(crate) mod tests {
         // Nothing to lend yet.
         assert_eq!(with_test_environment(&spec, bare), bare);
         // Not from a command whose set-up failed, though its pipe hides the
-        // exit code it ended with; nor from one that ended with an exit
-        // code, nor from a job left running.
+        // exit code it ended with, be it a module it could not fetch or a
+        // toolchain refused for its version; nor from one that ended with
+        // an exit code, nor from a job left running.
         let fetch = "go: downloading github.com/x/y v1.2.3\ngo: github.com/x/y@v1.2.3: Get \
                      \"https://proxy.golang.org/github.com/x/y/@v/v1.2.3.mod\": dial tcp: \
                      lookup proxy.golang.org on 127.0.0.11:53: server misbehaving\nFAIL\tapp \
                      [setup failed]";
         spec.transcript.conversation.messages.extend([
             tool(given, fetch, false),
+            tool(
+                "GOTOOLCHAIN=local go test . 2>&1 | tail -5",
+                "go: go.work requires go >= 1.26.0 (running go 1.25.5; GOTOOLCHAIN=local)",
+                false,
+            ),
             tool(
                 "export GOMODCACHE=/elsewhere; go test .",
                 "FAIL\n[exit code 1]",

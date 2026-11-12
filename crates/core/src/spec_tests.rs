@@ -358,6 +358,57 @@ const NOT_RECOGNIZED: &str = "is not recognized as";
 /// not installed, as `python -m pytest` does without pytest.
 const NO_MODULE: &str = "No module named ";
 
+/// What Go prints, after the file or module that asks, when the Go here is
+/// older than the project requires and it may not fetch a newer one, as
+/// under `GOTOOLCHAIN=local` or with no network: `go.work requires go >=
+/// 1.26.0 (running go 1.25.5; GOTOOLCHAIN=local)`, both parts on one line.
+/// It builds and runs nothing then.
+const GO_TOO_OLD: [&str; 2] = [" requires go >= ", "(running go "];
+
+/// npm's code where a package's `engines` rule out the Node or npm here and
+/// `engine-strict` makes that an error; its warning of the same has no
+/// `code` before the word, and stops nothing.
+const NPM_ENGINE: [&str; 1] = ["code EBADENGINE"];
+
+/// pnpm's code for an `engines` rule the Node or pnpm here does not meet.
+const PNPM_ENGINE: [&str; 1] = ["ERR_PNPM_UNSUPPORTED_ENGINE"];
+
+/// Yarn's words for an `engines` rule the Node here does not meet.
+const YARN_ENGINE: [&str; 1] = ["The engine \"node\" is incompatible with this module"];
+
+/// pip's words for a package whose `Requires-Python` leaves out the Python
+/// here, with both versions after them.
+const PIP_PYTHON: [&str; 1] = ["requires a different Python:"];
+
+/// cargo's words for a package whose `rust-version` is newer than the rustc
+/// here, between the package and the two versions.
+const CARGO_RUSTC: [&str; 1] = ["cannot be built because it requires rustc"];
+
+/// Bundler's words where the Ruby here is not the one the Gemfile names,
+/// around the two versions on one line.
+const BUNDLER_RUBY: [&str; 2] = ["Your Ruby version is ", ", but your Gemfile specified "];
+
+/// Composer's check, as each of a project's PHP commands starts, where the
+/// PHP here is older than its installed packages require.
+const COMPOSER_PHP: [&str; 1] = ["Your Composer dependencies require a PHP version"];
+
+/// What a toolchain, a runtime or a package manager prints when it will not
+/// start because its version here is not one the project accepts, each the
+/// parts one line holds. A command that ends so ran nothing of the project,
+/// as one whose program is missing did not: on a benchmark run Go's line
+/// was told as failing tests, with its exit code, where the run and the
+/// tester had both found another way to run them.
+const REFUSED: [&[&str]; 8] = [
+    &GO_TOO_OLD,
+    &NPM_ENGINE,
+    &PNPM_ENGINE,
+    &YARN_ENGINE,
+    &PIP_PYTHON,
+    &CARGO_RUSTC,
+    &BUNDLER_RUBY,
+    &COMPOSER_PHP,
+];
+
 /// Programs that run another the command need not name, such as the script
 /// a package gives for its tests, and the test runners such a script runs:
 /// one of these missing under one of those is the command's own runner.
@@ -404,9 +455,23 @@ const TESTS_COUNTED: [&str; 3] = ["running", "Ran", "collected"];
 const LOOPBACK: [&str; 3] = ["127.0.0.1", "localhost", "0.0.0.0"];
 
 /// Whether `output`, a command's, says its program's set-up failed before
-/// anything of its own ran, by `SET_UP_FAILED`.
+/// anything of its own ran: by `SET_UP_FAILED`, or by a line saying its
+/// version here was refused (`refuses`).
 pub(crate) fn set_up_failed(output: &str) -> bool {
-    SET_UP_FAILED.iter().any(|sign| output.contains(sign))
+    could_not_fetch(output) || output.lines().any(refuses)
+}
+
+/// Whether `text` says a module, a package or a host could not be fetched
+/// or reached, by `SET_UP_FAILED`.
+fn could_not_fetch(text: &str) -> bool {
+    SET_UP_FAILED.iter().any(|sign| text.contains(sign))
+}
+
+/// Whether `line`, of a command's output, is a toolchain's, a runtime's or
+/// a package manager's word that it will not start with the version here:
+/// it holds every part of one of `REFUSED`.
+fn refuses(line: &str) -> bool {
+    (REFUSED.iter()).any(|parts| parts.iter().all(|part| line.contains(part)))
 }
 
 /// A tester's files kept for a run: its id, the project it puts them back
@@ -1495,11 +1560,13 @@ pub(crate) fn ran(
     // it added or a lockfile it broke, and stays a failure: but only once
     // it has failed there twice, since the first may have met a registry
     // that was out of reach for a moment, and what the second makes of the
-    // tests is then what came of them.
+    // tests is then what came of them. A toolchain refused for its version
+    // on the work alone is the work's doing the same way, as where it
+    // raised the version the project asks for.
     let mut outcome = outcome;
     let mut broken = missing(command, &outcome);
     if broken.is_none()
-        && let Some(why) = unfetched(&outcome)
+        && let Some(why) = unfetched(&outcome).or_else(|| refused(&outcome))
     {
         match reaches_tests_before(kept, command, workspace, ctx, limit) {
             true => outcome = self::outcome(kept, command, ctx, limit).unwrap_or(outcome),
@@ -1591,11 +1658,14 @@ pub(crate) fn unfinished_build(command: &str, outcome: &Result<String, String>) 
 
 /// Why `outcome`, what the test command `command` made of some work, shows
 /// that the command did not get as far as a test, so that it says nothing
-/// of the work: its program is not installed (`missing`), or a package or a
-/// host it needed could not be fetched (`unfetched`). None when it passed,
-/// did not finish, or failed any other way.
+/// of the work: its program is not installed (`missing`), a package or a
+/// host it needed could not be fetched (`unfetched`), or a toolchain it
+/// runs would not start at the version here (`refused`). None when it
+/// passed, did not finish, or failed any other way.
 pub(crate) fn unrunnable(command: &str, outcome: &Result<String, String>) -> Option<String> {
-    missing(command, outcome).or_else(|| unfetched(outcome))
+    missing(command, outcome)
+        .or_else(|| unfetched(outcome))
+        .or_else(|| refused(outcome))
 }
 
 /// The lines of `outcome`, a test command's that ran to a failing end, and
@@ -1646,9 +1716,22 @@ fn missing(command: &str, outcome: &Result<String, String>) -> Option<String> {
 /// over: that is the work's own server not answering.
 fn unfetched(outcome: &Result<String, String>) -> Option<String> {
     let (_, lines) = before_any_test(outcome)?;
-    let line = (lines.iter()).find(|line| set_up_failed(line) && !loopback(line))?;
+    let line = (lines.iter()).find(|line| could_not_fetch(line) && !loopback(line))?;
     Some(format!(
         "a package or a host it needs could not be reached from here (`{}`)",
+        clipped(line.trim())
+    ))
+}
+
+/// Why `outcome`, a test command's, shows that a toolchain, a runtime or a
+/// package manager it runs would not start at the version here (`refuses`),
+/// with the line that says so; None where it shows no such thing, or any
+/// test ran (`before_any_test`).
+fn refused(outcome: &Result<String, String>) -> Option<String> {
+    let (_, lines) = before_any_test(outcome)?;
+    let line = lines.iter().find(|line| refuses(line))?;
+    Some(format!(
+        "a toolchain it runs will not start at the version installed here (`{}`)",
         clipped(line.trim())
     ))
 }
@@ -5115,6 +5198,165 @@ mod tests {
         // A refused connection is no sign of a set-up that failed, so a
         // passing command that mentions one still lends its set-up.
         assert!(!set_up_failed("ok: ECONNREFUSED is retried"));
+    }
+
+    #[test]
+    fn a_toolchain_that_refuses_its_version_before_any_test_ran_is_no_failing_test() {
+        // As a run's tests ended: Go would not start, and nothing ran.
+        let go = exited(
+            "\n[stderr]\ngo: go.work requires go >= 1.26.0 (running go 1.25.5; GOTOOLCHAIN=local)",
+            1,
+        );
+        assert_eq!(
+            unrunnable("go test ./...", &go).as_deref(),
+            Some(
+                "a toolchain it runs will not start at the version installed here (`go: go.work \
+                 requires go >= 1.26.0 (running go 1.25.5; GOTOOLCHAIN=local)`)"
+            )
+        );
+        // Each marker, in the line its tool prints it in.
+        let lines: [(&[&str], &str); 8] = [
+            (
+                &GO_TOO_OLD,
+                "go: example.com/tool@v0.20.0 requires go >= 1.22 (running go 1.21.0)",
+            ),
+            (&NPM_ENGINE, "npm error code EBADENGINE"),
+            (
+                &PNPM_ENGINE,
+                " ERR_PNPM_UNSUPPORTED_ENGINE  Unsupported environment (bad pnpm and/or Node.js \
+                 version)",
+            ),
+            (
+                &YARN_ENGINE,
+                "error app@1.0.0: The engine \"node\" is incompatible with this module. Expected \
+                 version \">=20\". Got \"18.17.0\"",
+            ),
+            (
+                &PIP_PYTHON,
+                "ERROR: Package 'app' requires a different Python: 3.8.10 not in '>=3.9'",
+            ),
+            (
+                &CARGO_RUSTC,
+                "error: package `app v0.1.0 (/app)` cannot be built because it requires rustc \
+                 1.80 or newer, while the currently active rustc version is 1.75.0",
+            ),
+            (
+                &BUNDLER_RUBY,
+                "Your Ruby version is 3.0.2, but your Gemfile specified 3.2.2",
+            ),
+            (
+                &COMPOSER_PHP,
+                "Composer detected issues in your platform: Your Composer dependencies require \
+                 a PHP version \">= 8.1.0\". You are running 7.4.33.",
+            ),
+        ];
+        assert_eq!(lines.len(), REFUSED.len());
+        for (marker, line) in lines {
+            assert!(REFUSED.contains(&marker), "{line}");
+            assert!(marker.iter().all(|part| line.contains(part)), "{line}");
+            let why = unrunnable("make test", &exited(line, 1));
+            assert!(
+                why.as_deref()
+                    .is_some_and(|why| why.starts_with("a toolchain it runs will not start")),
+                "{line}: {why:?}"
+            );
+            // A command that printed it lent no set-up that let it run.
+            assert!(set_up_failed(line), "{line}");
+        }
+        // A test that logged such a line and failed is a failing test, and
+        // so is a suite that ran before a later step was refused.
+        for output in [
+            "--- FAIL: TestVersion (0.00s)\n    v_test.go:9: got \"go.mod requires go >= 1.26 \
+             (running go 1.25.5)\"\nFAIL",
+            "FAILED tests/test_pip.py::test_old - AssertionError: Package 'app' requires a \
+             different Python: 3.8.10 not in '>=3.9'\n1 failed in 0.20s",
+            "running 3 tests\ntest result: ok. 3 passed; 0 failed\nnpm error code EBADENGINE",
+        ] {
+            assert_eq!(
+                unrunnable("make test", &exited(output, 1)),
+                None,
+                "{output}"
+            );
+        }
+        // Part of a marker is not it: a warning stops nothing, and a file
+        // can ask for a version in other words.
+        for output in [
+            "npm warn EBADENGINE Unsupported engine {",
+            "go: updates to go.mod needed; this module requires go >= 1.22",
+            "Your Ruby version is 3.0.2",
+        ] {
+            assert_eq!(
+                unrunnable("make test", &exited(output, 1)),
+                None,
+                "{output}"
+            );
+            assert!(!set_up_failed(output), "{output}");
+        }
+        // Nor is a command that passed, or was cut at its limit.
+        let line = "go: go.mod requires go >= 1.26 (running go 1.25.5; GOTOOLCHAIN=local)";
+        assert_eq!(unrunnable("go test ./...", &Ok(line.into())), None);
+        assert_eq!(unrunnable("go test ./...", &Err(line.into())), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_toolchain_refused_on_the_project_as_it_was_too_says_nothing_of_the_work() {
+        let root = Scratch::new("spec-tests-run-refused");
+        let repo = |args: &[&str]| assert!(git(&root, args).is_some(), "git {args:?}");
+        let commit = |message: &str| {
+            let identity = ["-c", "user.name=t", "-c", "user.email=t@example.com"];
+            repo(&[&identity[..], &["commit", "-qm", message]].concat());
+        };
+        repo(&["init", "-q"]);
+        std::fs::write(root.join("README"), "a project").unwrap();
+        repo(&["add", "."]);
+        commit("c");
+        // Go is refused wherever `newer` is, as a go.mod the work changed
+        // to ask for a newer Go would leave it.
+        let refusal = "go: go.mod requires go >= 1.26.0 (running go 1.25.5; GOTOOLCHAIN=local)";
+        std::fs::write(
+            root.join("letronna_spec_test.sh"),
+            format!("test -f newer && {{ echo '{refusal}'; exit 1; }}\necho ok\n"),
+        )
+        .unwrap();
+        let command = "sh letronna_spec_test.sh".to_owned();
+        let kept = keep(160, &root, &root, Some(command.clone())).unwrap();
+        let ctx = ToolContext::of(&crate::chat::Connection {
+            workspace: Some(root.to_path_buf()),
+            ..Default::default()
+        });
+        // Refused on the work alone, where the project as it was reaches
+        // its tests: the work's failure, told with what Go printed.
+        std::fs::write(root.join("newer"), "").unwrap();
+        let on_work = ran(&kept, &command, &ctx, TIMEOUT, || None);
+        let Ran::Failed(told) = &on_work else {
+            panic!("{on_work:?}");
+        };
+        assert!(told.contains(refusal), "{told}");
+        // Refused on the project as it was too: the command could not run
+        // here, which says nothing of the work.
+        repo(&["add", "newer"]);
+        commit("d");
+        let before = ran(&kept, &command, &ctx, TIMEOUT, || None);
+        assert_eq!(
+            before,
+            Ran::Broken(format!(
+                "`{command}` did not get as far as a test, since a toolchain it runs will not \
+                 start at the version installed here (`{refusal}`)"
+            ))
+        );
+        // And so the run is told, in place of failing tests.
+        let told = first_run(&before);
+        assert!(
+            told.starts_with(
+                "The tests a tester wrote from the request alone could not be run against \
+                 your work as it stands, which says nothing of the work: `sh \
+                 letronna_spec_test.sh` did not get as far as a test, since a toolchain"
+            ),
+            "{told}"
+        );
+        assert!(!told.contains("exited with code"), "{told}");
+        tidy(160);
     }
 
     #[cfg(unix)]
