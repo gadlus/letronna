@@ -327,17 +327,26 @@ pub(crate) fn reading_rows(readings: &[Reading]) -> String {
     )
 }
 
-/// What a tester's brief says of `readings`; empty with none.
+/// What a tester's brief says of `readings`; empty with none. A test is
+/// asked for each reading only where one implementation could pass them
+/// all: asked for a test per reading whatever the readings, testers wrote
+/// two that exclude each other, and the one that had to fail came back to
+/// the run as a failing test of its work, again with each run of the
+/// tests. Such readings get a row each that says no test ran, which holds
+/// the run to nothing (`requirements::unchecked`), with the words that
+/// favour the reading for the run to weigh.
 pub(crate) fn reading_tests(readings: &[Reading]) -> String {
-    if readings.is_empty() {
+    let Some(first) = readings.first().map(|reading| reading.number) else {
         return String::new();
-    }
+    };
     format!(
         "\n\nThe author read these words of the request more than one way; its choice is not \
          shown:{}\nFor each, name the plausible readings and write a test per reading, named \
-         for the reading, with a row of its own. Where one reading does, emits or records \
-         more than another, or the readings exclude each other, say so in each such row and \
-         quote the words that favour each.",
+         for the reading, with a row of its own, only where one implementation could pass \
+         them all. Where one reading does, emits or records more than another, or the \
+         readings exclude each other, write no test for either: one of them would fail \
+         whatever the work does. Give each such reading a row instead, written \
+         `R{first} | reading: what the words would mean | NOT RUN | the words that favour it`.",
         list(readings)
     )
 }
@@ -1949,6 +1958,32 @@ mod tests {
         assert!(
             tests.contains("a test per reading, named for the reading"),
             "{tests}"
+        );
+        // Only where one implementation could pass every test: of two
+        // readings that exclude each other one test fails whatever the
+        // work does, so neither gets a test.
+        assert!(
+            tests.contains(
+                "with a row of its own, only where one implementation could pass them all. \
+                 Where one reading does, emits or records more than another, or the readings \
+                 exclude each other, write no test for either"
+            ),
+            "{tests}"
+        );
+        // Each gets a row that says no test ran, with the words for it,
+        // and such a row holds the run to nothing.
+        let form = "`R12 | reading: what the words would mean | NOT RUN | the words that \
+                    favour it`";
+        assert!(tests.contains(form), "{tests}");
+        let row = "R12 | reading: once for each run | NOT RUN | \"signaling \
+                   all-test-results once\"";
+        assert!(!crate::requirements::tabled(row));
+        let table: String = (1..=12)
+            .map(|at| format!("R{at} | plain | PASS\n"))
+            .collect();
+        assert_eq!(
+            crate::requirements::unchecked(&format!("{table}{row}"), 12),
+            None
         );
         let told = reading_notice(&found);
         assert!(

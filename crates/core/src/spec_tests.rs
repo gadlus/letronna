@@ -1085,7 +1085,8 @@ pub(crate) fn discard(copy: &Path) {
 /// spells out is used as it spells it, and code is read in `before`, the
 /// project as it was, where there is one, each case the run weighed and
 /// set aside, `doubts`, to test where the request's words decide it, and
-/// the words it read more than one way, `readings`, to test in each reading.
+/// the words it read more than one way, `readings`, to test in each reading
+/// where one implementation could pass them all.
 pub(crate) fn brief(
     request: &str,
     sentences: &[String],
@@ -4298,6 +4299,19 @@ mod tests {
         );
         assert!(
             tests.contains("write a test per reading, named for the reading"),
+            "{tests}"
+        );
+        // Readings that exclude each other get a row each and no test.
+        assert!(
+            tests.contains("only where one implementation could pass them all"),
+            "{tests}"
+        );
+        assert!(
+            tests.ends_with(
+                "write no test for either: one of them would fail whatever the work does. \
+                 Give each such reading a row instead, written `R1 | reading: what the words \
+                 would mean | NOT RUN | the words that favour it`."
+            ),
             "{tests}"
         );
         // A tester started with the run writes its tests before the run has
