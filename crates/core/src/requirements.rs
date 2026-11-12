@@ -656,10 +656,11 @@ fn verdict(cell: &str) -> Option<bool> {
 
 /// The verdict's word a table's `cell` opens with and what the cell goes on
 /// to say, when it holds more than the word, as `PASS — what shows it`,
-/// `FAIL: why` and `PASS (3 cases)` do. Only a word in capitals with such a
-/// mark after it is one: a case that opens "fails when", "Fail fast" or
-/// "FAIL-fast" is prose, and so is one that goes on past a bracket, as
-/// "`PASS (3)` is the summary line" does.
+/// `FAIL: why`, `PASS (3 cases)` and "PASS `the command`" do. Only a word in
+/// capitals with such a mark after it is one: a case that opens "fails
+/// when", "Fail fast" or "FAIL-fast" is prose, and so is one that runs on
+/// from a bracket with nothing to set it off (`set_off`), as "`PASS (3)` is
+/// the summary line" does.
 fn opens(cell: &str) -> Option<(&str, &str)> {
     let letters = cell.bytes().take_while(u8::is_ascii_uppercase).count();
     let (word, rest) = cell.split_at(letters);
@@ -670,8 +671,11 @@ fn opens(cell: &str) -> Option<(&str, &str)> {
     let mut after = said.chars();
     let goes_on = match after.next()? {
         '—' | '–' => true,
-        // A bracket holds what shows it, so it stays, and ends the cell.
-        '(' => return said.ends_with(')').then_some((word, said)),
+        // A bracket holds what shows it, so it stays: it ends the cell, or
+        // what follows it is set off from it.
+        '(' => return (said.ends_with(')') || set_off(said)).then_some((word, said)),
+        // A code span after a space is what shows it, and stays too.
+        '`' => return (said.len() < rest.len()).then_some((word, said)),
         // Bold may close after the mark, as in `**FAIL:** why`.
         ':' | '.' => {
             let next = after.as_str().trim_start_matches('*').chars().next();
@@ -686,6 +690,34 @@ fn opens(cell: &str) -> Option<(&str, &str)> {
     };
     let said = said.trim_start_matches(['—', '–', ':', '.', '-', '\\']);
     goes_on.then_some((word, said.trim_start_matches('*').trim_start()))
+}
+
+/// Whether what a cell `said`, which opens with a bracket, goes on to say
+/// once the bracket closes is set off from it by a dash or a semicolon, as
+/// in `(by reading) — not run`: the note and what follows both show the
+/// verdict then, where words that run on from the bracket make a sentence
+/// about it.
+fn set_off(said: &str) -> bool {
+    let mut depth = 0usize;
+    let closed = said.char_indices().find(|(_, c)| {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        depth == 0
+    });
+    let Some((at, _)) = closed else {
+        return false;
+    };
+    let rest = &said[at + 1..];
+    let after = rest.trim_start();
+    match after.chars().next() {
+        Some('—' | '–' | ';') => true,
+        // Set off by spaces, as no hyphen inside a word is.
+        Some('-') => after.len() < rest.len() && after[1..].starts_with(' '),
+        _ => false,
+    }
 }
 
 /// The verdict's word a table's `cell` ends with, the case before it and
@@ -2096,6 +2128,90 @@ mod tests {
     }
 
     #[test]
+    fn a_verdict_with_a_code_span_or_more_after_a_note_in_brackets_is_read() {
+        // As a review wrote its whole table, the word and then the command
+        // that showed it with no mark between, and as others wrote a row
+        // or two, a note in brackets and more after a dash or a semicolon.
+        let report = "| Requirement | case | verdict |\n|---|---|---|\n\
+                      | R1 | the name is written first | PASS `python parse.py` (`core: 0`) |\n\
+                      | R2 | a frame with no instance | UNCLEAR `capture` skips it, so the \
+                      count drops |\n\
+                      | R3 | the ref suggested | FAIL (beyond my rows) — `go test`: the ref \
+                      that failed |\n\
+                      | R4 | given as a string | PASS (by reading the branch) — not stated \
+                      for an unknown type |\n\
+                      | R5 | an entry that is no pair | PASS (throws `Error`); the request \
+                      does not say |\n\
+                      | R6 | zero locals | **PASS** `node count.js` |\n\
+                      | R7 | later step first | PASS (both orders) - `sh order.sh` |";
+        let read = |text: &str| -> Vec<(usize, bool, bool)> {
+            (rows(text).into_iter())
+                .map(|(number, passed, row)| (number, passed, left_unclear(&row)))
+                .collect()
+        };
+        let found = [
+            (1, true, false),
+            (2, false, true),
+            (3, false, false),
+            (4, true, false),
+            (5, true, false),
+            (6, true, false),
+            (7, true, false),
+        ];
+        assert_eq!(read(report), found);
+        // Written again after a cut, the span and the note are what shows
+        // the row, and the rows read as they were.
+        let again = cut_rows(report, "cut").unwrap();
+        assert!(
+            again.starts_with(
+                "\nRows of its table the quote above cut, written again:\n\
+                 R3 | the ref suggested | FAIL | (beyond my rows) — `go test`: the ref that \
+                 failed\n\
+                 R2 | a frame with no instance | UNCLEAR | `capture` skips it, so the count \
+                 drops\n\
+                 R1 | the name is written first | PASS\n"
+            ),
+            "{again}"
+        );
+        let mut back = read(&again);
+        back.sort_unstable();
+        assert_eq!(back, found);
+        // Words that run on from the bracket or the word are a sentence,
+        // a span with no space before it is part of a name, and a word not
+        // in capitals is prose.
+        for prose in [
+            "R1 | `PASS (3)` is the summary line",
+            "R1 | the summary line | PASS (3) is printed last",
+            "R1 | the summary line | PASS (3), then the names",
+            "R1 | the summary line | PASS`ed` is printed",
+            "R1 | the mode | Pass `--strict` through to the linter",
+        ] {
+            assert!(!tabled(prose), "{prose}");
+        }
+        // The guards on a verdict that shares its cell hold for these too:
+        // the case gives none ahead of other cells, nor does a line whose
+        // first cell says more than requirements' numbers, nor a cell that
+        // passes a case and then doubts or fails it.
+        for row in [
+            "R1 | PASS `ok 1` is printed for a passing test | see the log",
+            "R1 | PASS (3) — the summary line | see the log",
+            "R1 (set aside) | the indent | PASS `task --list` prints two spaces",
+            "R1 holds for `a | b` too | PASS (3) — `node tap.js`",
+            "R1 | set once | PASS `python hop.py` for one key; another is UNCLEAR",
+            "R1 | set once | PASS (one key) — the other FAILS",
+            "R1 | adds | NOT RUN | FAILED `pytest -q` at the import",
+        ] {
+            assert!(!tabled(row), "{row}");
+        }
+        // And a row that fails or is left unclear stays so whatever its
+        // span or note says of passing.
+        let failed = "R1 | the exit code | FAIL `sh t.sh` prints PASS where it should not";
+        assert_eq!(read(failed), [(1, false, false)]);
+        let doubted = "R1 | which end | UNCLEAR (PASS on one reading) — FAIL on the other";
+        assert_eq!(read(doubted), [(1, false, true)]);
+    }
+
+    #[test]
     fn a_cell_that_passes_a_case_and_then_doubts_or_fails_it_gives_no_verdict() {
         // As a review wrote one: the pass, then a doubt it had beside it.
         for both in [
@@ -2767,6 +2883,7 @@ mod tests {
             "R4 | the line is kept | `PASS` | \"PASS: all tests passed\"",
             "R4 | the line is kept | **PASS:** `PASS: all tests passed` is printed | node tap.js",
             "R4 | the line is kept | PASS: `all tests passed` is the last line | node tap.js",
+            "R4 | the line is kept | PASS `all tests passed` is the last line | node tap.js",
             "R4 | the line is kept | `PASS` — see `all tests passed` | node tap.js",
             "R4 | the line is kept | `UNCLEAR` | \"PASS: all tests passed\"",
         ] {
