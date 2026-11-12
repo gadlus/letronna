@@ -408,6 +408,13 @@ pub struct Turn {
     /// A helper's turn, whose last word is its report to the agent that
     /// started it.
     helper: bool,
+    /// Rounds a caller gave the turn past its cap, with the notice that asks
+    /// for them in place of the wrap-up, until `begin` reaches the cap.
+    offered: Option<(usize, String)>,
+    /// Those rounds once `begin` has asked for them, which the turn may run
+    /// past its limit to take out what it made only to test: 0 when it was
+    /// given none.
+    tidy: usize,
 }
 
 impl Turn {
@@ -446,6 +453,8 @@ impl Turn {
             timed_out: false,
             spent: false,
             helper: false,
+            offered: None,
+            tidy: 0,
         }
     }
 
@@ -473,6 +482,47 @@ impl Turn {
     /// Whether the turn was asked for its report because its budget is spent.
     pub fn spent(&self) -> bool {
         self.spent
+    }
+
+    /// Whether the turn has run every round of its cap and was given none
+    /// past it, so `begin` would answer the calls of its next reply as not
+    /// run and ask for the wrap-up.
+    pub fn at_cap(&self) -> bool {
+        let ending = self.connection.wrap_up || self.timed_out;
+        !ending && self.limit > 0 && self.tidy == 0 && self.rounds >= self.limit
+    }
+
+    /// Gives the turn `rounds` more once `begin` turns its calls away at the
+    /// round cap, asked for there with `notice` in place of the wrap-up:
+    /// rounds to take out what it made only to test, run as any other until
+    /// `tidied` ends them.
+    pub fn tidy_at_cap(&mut self, rounds: usize, notice: String) {
+        self.offered = Some((rounds, notice));
+    }
+
+    /// Whether the turn is in the rounds it was given past its cap.
+    pub fn tidying(&self) -> bool {
+        self.tidy > 0 && !self.connection.wrap_up
+    }
+
+    /// Ends the rounds given to tidy in once they are used, or at once when
+    /// `now`, as when a reply in them made no call: the notice handed back,
+    /// to go after the conversation so far, asks for the wrap-up with no
+    /// tools, as `begin` asks for it at the cap. None while they go on, and
+    /// for a turn given none.
+    pub fn tidied(&mut self, now: bool) -> Option<Message> {
+        if !self.tidying() || !(now || self.rounds >= self.limit + self.tidy) {
+            return None;
+        }
+        self.connection.wrap_up = true;
+        Some(Message {
+            role: "user".into(),
+            content: WRAP_UP.into(),
+            notice: true,
+            // It ends the turn it is in, as the notice at the round cap does.
+            folded: true,
+            ..Default::default()
+        })
     }
 
     /// The same turn as a helper's when `on`, asked at its round cap for its
@@ -704,6 +754,10 @@ impl Turn {
         if !reply.tool_calls.is_empty() {
             return Ok(None);
         }
+        // A reply with no call in the rounds given to tidy in ends them,
+        // whatever it says, and the wrap-up follows it: like the wrap-up,
+        // it is not sent back.
+        let wrap_up = wrap_up || self.tidying();
         if reply.content.trim().is_empty() {
             // Some routes turn down an assistant message with no content, so
             // an empty reply is dropped rather than kept.
@@ -778,7 +832,8 @@ impl Turn {
     /// Queue the calls the model asked for. False when the turn should stop
     /// instead: nothing to run, no round allowed at all, or the wrap-up asked
     /// for at the round cap has come. At the cap the calls are answered as not
-    /// run instead, and a notice after them asks for that wrap-up with no tools.
+    /// run instead, and a notice after them asks for that wrap-up with no
+    /// tools, or first for the rounds it was given to tidy in (`tidy_at_cap`).
     pub fn begin(&mut self, calls: Vec<ToolCall>) -> bool {
         // With no round allowed nothing was done to sum up, so a call ends
         // the turn there: /btw makes one request.
@@ -788,7 +843,7 @@ impl Turn {
         self.order = calls.iter().map(|call| call.id.clone()).collect();
         self.queue = calls.into();
         self.results.clear();
-        if self.rounds >= self.limit || self.timed_out {
+        if self.rounds >= self.limit + self.tidy || self.timed_out {
             let why = match self.timed_out {
                 true => "Not run: the time for this task is up.".to_owned(),
                 false => format!(
@@ -798,6 +853,22 @@ impl Turn {
             };
             while !self.queue.is_empty() {
                 self.finish_call(Err(why.clone()));
+            }
+            // Rounds given to tidy in are asked for in place of the wrap-up,
+            // which follows them (`tidied`); not once the time is up.
+            if !self.timed_out
+                && let Some((rounds, notice)) = self.offered.take()
+            {
+                self.tidy = rounds;
+                self.results.push(Message {
+                    role: "user".into(),
+                    content: notice,
+                    notice: true,
+                    // It goes on with the turn it is in, as a nudge does.
+                    folded: true,
+                    ..Default::default()
+                });
+                return true;
             }
             self.results.push(Message {
                 role: "user".into(),
@@ -984,6 +1055,10 @@ impl Turn {
         let since = self.rounds_since_edit;
         let due = self.progress_every > 0 && since > 0 && since.is_multiple_of(self.progress_every);
         if !due || self.progress_notes >= PROGRESS_NOTES || self.noted_round == self.rounds {
+            return None;
+        }
+        // In the rounds given to tidy in no next step of the work is wanted.
+        if self.tidying() {
             return None;
         }
         self.progress_notes += 1;
@@ -1946,6 +2021,97 @@ mod tests {
         assert!(turn.connection.wrap_up && !turn.spent());
     }
 
+    /// A turn of one round that has run it and was given `rounds` more to
+    /// tidy in, asked for at the cap in place of the wrap-up.
+    fn tidying(rounds: usize) -> Turn {
+        let mut turn = Turn::with_limit(turn().connection, 1);
+        assert!(!turn.at_cap());
+        assert!(turn.begin(vec![call("read_file")]));
+        turn.finish_call(Ok("found".into()));
+        turn.take_results();
+        assert!(turn.at_cap() && !turn.tidying());
+        turn.tidy_at_cap(rounds, "Take out what you made to test.".into());
+        // The calls are answered as not run, as ever at the cap, and the
+        // notice after them asks for the rounds, not for the wrap-up.
+        assert!(turn.begin(vec![call("read_file")]));
+        assert_eq!(turn.front(), None);
+        let sent = turn.take_results();
+        assert_eq!(
+            sent[0].content,
+            "Not run: the tool-round limit (1) was reached."
+        );
+        assert_eq!(sent[1].content, "Take out what you made to test.");
+        assert!(sent[1].notice && sent[1].folded && sent[1].role == "user");
+        assert!(turn.tidying() && !turn.at_cap());
+        assert!(!turn.connection.wrap_up && turn.capped().is_none());
+        turn
+    }
+
+    #[test]
+    fn a_turn_given_rounds_to_tidy_in_runs_them_past_its_cap_and_then_wraps_up() {
+        let mut turn = tidying(2);
+        for _ in 0..2 {
+            // Not ended while one of them is left.
+            assert!(turn.tidied(false).is_none());
+            assert!(turn.begin(vec![call("run_command")]));
+            assert_eq!(turn.next(|_| Outcome::Run), Next::Run(call("run_command")));
+            turn.finish_call(Ok("removed".into()));
+            turn.take_results();
+        }
+        // After the last, the wrap-up is asked for with no tools, as at the
+        // cap, and the turn says where it stopped by the cap it was given.
+        let ask = turn.tidied(false).expect("the wrap-up");
+        assert_eq!(ask.content, WRAP_UP);
+        assert!(ask.notice && ask.folded && ask.role == "user");
+        assert!(turn.connection.wrap_up && !turn.tidying());
+        assert_eq!(
+            turn.capped().as_deref(),
+            Some("Stopped after 1 rounds; send \"continue\" to keep going.")
+        );
+        assert!(turn.tidied(true).is_none());
+        assert!(!turn.begin(vec![call("run_command")]));
+    }
+
+    #[test]
+    fn a_reply_with_no_call_in_the_rounds_to_tidy_in_is_not_sent_back() {
+        let stops = "Removing the probe files now.";
+        // In any other round of a run nobody watches, it is.
+        let mut usual = turn();
+        assert!(usual.begin(vec![call("read_file")]));
+        usual.finish_call(Ok("found".into()));
+        usual.take_results();
+        let mut reply = answer(&mut usual, stops);
+        assert!(matches!(usual.continuation(&mut reply), Ok(Some(_))));
+        let mut blank = answer(&mut usual, "");
+        assert!(matches!(usual.continuation(&mut blank), Ok(Some(_))));
+
+        let mut turn = tidying(5);
+        let mut reply = answer(&mut turn, stops);
+        assert!(matches!(turn.continuation(&mut reply), Ok(None)));
+        let mut blank = answer(&mut turn, "");
+        assert!(matches!(turn.continuation(&mut blank), Ok(None)));
+        // A call in them is kept, where the wrap-up drops it.
+        let mut removal = answer(&mut turn, "");
+        removal.tool_calls = vec![call("run_command")];
+        assert!(matches!(turn.continuation(&mut removal), Ok(None)));
+        assert_eq!(removal.tool_calls.len(), 1);
+        // Ended at once by the caller, with rounds still left.
+        assert_eq!(turn.tidied(true).expect("the wrap-up").content, WRAP_UP);
+    }
+
+    #[test]
+    fn a_turn_whose_time_is_up_is_asked_for_its_answer_whatever_rounds_it_was_given() {
+        let mut turn = Turn::with_limit(turn().connection, 1);
+        assert!(turn.begin(vec![call("read_file")]));
+        turn.finish_call(Ok("found".into()));
+        turn.take_results();
+        turn.tidy_at_cap(5, "Take out what you made to test.".into());
+        turn.time_up();
+        assert!(turn.begin(vec![call("read_file")]));
+        assert_eq!(turn.take_results()[1].content, TIME_UP);
+        assert!(turn.connection.wrap_up && !turn.tidying());
+    }
+
     #[test]
     fn a_model_that_keeps_calling_tools_is_eventually_stopped() {
         let mut turn = turn();
@@ -2356,6 +2522,21 @@ mod tests {
         (1..=rounds)
             .filter(|_| read_round(turn).contains(TAKING_STOCK))
             .collect()
+    }
+
+    #[test]
+    fn a_turn_in_the_rounds_it_was_given_to_tidy_in_is_not_asked_where_it_stands() {
+        let mut turn = Turn {
+            progress_every: 2,
+            ..Turn::with_limit(turn().connection, 2).unattended()
+        };
+        assert_eq!(noted_rounds(&mut turn, 2), [2]);
+        turn.tidy_at_cap(4, "Take out what you made to test.".into());
+        assert!(turn.begin(vec![call("read_file")]));
+        turn.take_results();
+        assert!(turn.tidying());
+        // Its fourth and sixth rounds without a change would each be asked.
+        assert_eq!(noted_rounds(&mut turn, 4), Vec::<usize>::new());
     }
 
     #[test]

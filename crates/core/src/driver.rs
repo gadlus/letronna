@@ -68,6 +68,14 @@
 //! is told once that it broke an existing test, to fix the code or, where
 //! the request changes what the test expects, the test (`spec_tests::base`).
 //!
+//! A run is told once when a tenth of its tool rounds are left, as it is of
+//! its time: a session's own run to write what it owes and take out what it
+//! made only to test, a helper to finish its checks and write its report.
+//! At its round cap, a run nobody watches that made files new to its project
+//! and still there is given five more rounds, in which only commands run, to
+//! take out those it made only to test; the wrap-up that ends it follows
+//! them.
+//!
 //! Nothing here polls. Each wait -- for the model, for a tool, for an
 //! approval -- is a blocking receive that a stop closes, so a stop is heard at
 //! once, and the stop and the budget are checked again before every model
@@ -883,6 +891,13 @@ fn steps(
             if turn.capped().is_some() && !spec.connection.wrap_up {
                 return Ok(Outcome::RoundLimit);
             }
+            // A reply with no call in the rounds given to tidy in ends them:
+            // the wrap-up is asked for as at the cap, and ends the run.
+            if let Some(ask) = turn.tidied(true) {
+                spec.transcript.conversation.messages.push(ask);
+                save(&mut spec.transcript)?;
+                continue;
+            }
             // Mail that came while it worked may change the answer, so it
             // carries the run on rather than going unread, as the warning
             // does for one that ends past it without having heard it.
@@ -1330,12 +1345,18 @@ fn steps(
         if turn.spent() {
             return Ok(Outcome::OverBudget);
         }
+        // At its cap a run nobody watches that would leave files it made in
+        // the project is given rounds to take out those it made only to
+        // test, asked for in place of the wrap-up, which follows them.
+        if let Some(notice) = tidy_rounds(spec, turn, began, read) {
+            turn.tidy_at_cap(TIDY_ROUNDS, notice);
+        }
         if capped || !turn.begin(calls) {
             return at_limit(spec, report);
         }
         // The round at the cap runs nothing: it only answers its calls as not
-        // run and asks for the wrap-up.
-        if turn.capped().is_none() {
+        // run and asks for the wrap-up, or for the tidying before it.
+        if turn.front().is_some() {
             report.rounds += 1;
             spec.status.rounds.store(report.rounds, Ordering::Relaxed);
         }
@@ -1346,6 +1367,17 @@ fn steps(
         }
         if let Some(outcome) = settled(spec, report) {
             return Ok(outcome);
+        }
+        // The rounds given to tidy in end with the last of them, or with a
+        // call repeated without end, and the wrap-up follows as at the cap,
+        // so the run still ends at its limit; not after a stop, whose calls
+        // are yet to be answered.
+        if !spec.cancel.is_set()
+            && let Some(ask) = turn.tidied(turn.looping().is_some())
+        {
+            spec.transcript.conversation.messages.push(ask);
+            save(&mut spec.transcript)?;
+            continue;
         }
         // After the answer, which a repeat in the same reply must not throw away.
         if let Some(why) = turn.looping() {
@@ -1449,9 +1481,17 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
             }
             Some(decide(call, &context(spec)))
         };
+        // In the rounds given past the cap only a command runs, which is
+        // what takes a file out: an edit or a helper would go on with the
+        // work, and nothing else is needed to remove a file.
+        let tidying = turn.tidying();
+        let kept_back = |call: &ToolCall| tidying && call.name != "run_command";
         // Only what the gate runs as the call stands joins a batch; one it
         // would put to the judge or the user, or refuse, is taken alone.
         let held = |call: &ToolCall| {
+            if kept_back(call) {
+                return true;
+            }
             let outcome = decide(call).unwrap_or_else(|| gated(spec, call, &rules, false).0);
             outcome != gate::Outcome::Run
         };
@@ -1472,6 +1512,7 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
             continue;
         }
         let (outcome, layer) = match turn.front() {
+            Some(call) if kept_back(call) => (gate::Outcome::Refuse(TIDY_ONLY.into()), None),
             Some(call) => match decide(call) {
                 Some(outcome) if call_refusal(spec, call).is_none() => (outcome, None),
                 _ => gated(spec, call, &rules, true),
@@ -2438,6 +2479,118 @@ fn round_warning(spec: &Spec, turn: &Turn, used: usize, warned: &mut bool) -> Op
             )
         }
     })
+}
+
+/// Tool rounds a session's own run nobody watches is given past its round
+/// cap to take out what it made only to test: a look, a removal or two and
+/// a check of what is left fit in five, and no more of the work does. A run
+/// the cap stopped while it was still probing left its probe files in the
+/// project, failing tests among them, where a run of the project's own
+/// tests picked them up.
+const TIDY_ROUNDS: usize = 5;
+
+/// Files of its own that notice names at most: a run's probes are a handful,
+/// and a longer list says no more about where the rest are.
+const LEFT_NAMED: usize = 20;
+
+/// The least of a run's time that must be left for those rounds, about what
+/// five short replies and the summary after them take: a run the deadline
+/// stops in them would end with no summary at all.
+const TIDY_TIME: Duration = Duration::from_secs(2 * 60);
+
+/// How long before a run began a file may say it was last written and still
+/// count as written in it: a disk that keeps times to the second, or to two,
+/// puts a file written at once a little before.
+const WRITTEN_SLACK: Duration = Duration::from_secs(2);
+
+/// What a call that is no command is answered in the rounds a run is given
+/// past its cap, so they are not used to go on with the work.
+const TIDY_ONLY: &str = "Not run: only removing what you made to test is left.";
+
+/// The notice giving a session's own run nobody watches `TIDY_ROUNDS` more
+/// rounds as its turn reaches the round cap, in place of the wrap-up there,
+/// which follows them: it names the files the run made that are still in the
+/// project (`made_and_left`), for it to take out those it made only to test,
+/// by the rule of the round warning. None, and the wrap-up comes at once as
+/// it did, where the run made no such file; for a helper, whose files are its
+/// parent's to tidy; for a run a person watches, who says what stays; for
+/// one with a schema, which ends at its cap with the answer it has; where no
+/// command may run; and with too little time or budget left for them, the
+/// rounds and the summary each counted as `read`, what the last request
+/// read, read again in full, as where no cache serves it.
+fn tidy_rounds(spec: &Spec, turn: &Turn, began: SystemTime, read: u64) -> Option<String> {
+    if !turn.at_cap() || !unwatched(spec) || spec.watch.is_some() || spec.schema.is_some() {
+        return None;
+    }
+    if !turn.runs_commands() || refused(spec, "run_command").is_some() {
+        return None;
+    }
+    // A run whose budget ran out in them would end with no summary at all.
+    let cost = read.saturating_mul(TIDY_ROUNDS as u64 + 1);
+    let short = |budget: &Arc<Budget>| budget.check().is_err() || budget.left() < cost;
+    if spec.budget.as_ref().is_some_and(short) {
+        return None;
+    }
+    let left = (spec.connection.deadline)
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+    if left.is_some_and(|left| left < TIDY_TIME) {
+        return None;
+    }
+    let files = made_and_left(spec, spec.connection.workspace.as_deref()?, began);
+    if files.is_empty() {
+        return None;
+    }
+    let mut named: Vec<String> = (files.iter().take(LEFT_NAMED))
+        .map(|file| format!("`{file}`"))
+        .collect();
+    if files.len() > LEFT_NAMED {
+        named.push(format!("and {} more", files.len() - LEFT_NAMED));
+    }
+    // What stays is said too: the list cannot tell a probe from a file the
+    // task asked for, and a removal by name leaves the user's files alone.
+    Some(format!(
+        "You have reached the tool-round limit. These new files of yours are in the project: {}. \
+         In at most {TIDY_ROUNDS} more rounds, remove by name those of them, and any other file, \
+         that you made only to test or probe (scripts, logs, binaries, and tests you added only \
+         to probe or check, unless the task asks for tests); keep what the task or your change \
+         needs, and change nothing else: only run_command runs now. Then you are asked for your \
+         summary.",
+        named.join(", ")
+    ))
+}
+
+/// The files in `workspace` that the run of `spec`, begun at `began`, made
+/// and left there, by their paths from it: those git neither tracks nor
+/// ignores that a file tool or a command's own redirection made in its
+/// session (`taint::own`) and that were written since it began, and made
+/// since it began where the disk says when. So a file the user had there,
+/// one an earlier turn of the session left, one the run only wrote over and
+/// what a program it ran wrote are none of them, and nothing is named that
+/// the run cannot be known to have made. A tester's files, by their names,
+/// are left to the sweep as the run ends. None where git cannot say, as
+/// outside a repository.
+fn made_and_left(spec: &Spec, workspace: &Path, began: SystemTime) -> Vec<String> {
+    let Some(untracked) = crate::git::untracked(workspace, ".") else {
+        return Vec::new();
+    };
+    let ctx = context(spec);
+    let since = began.checked_sub(WRITTEN_SLACK).unwrap_or(began);
+    let testers = |path: &str| {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        name.contains(crate::spec_tests::MARKER)
+    };
+    (untracked.into_iter())
+        // A repository inside the project, which git lists as a folder.
+        .filter(|path| !path.ends_with('/') && !testers(path))
+        .filter(|path| {
+            let file = workspace.join(path);
+            let written = std::fs::metadata(&file).and_then(|meta| meta.modified());
+            // One an earlier turn made is not this run's for being written
+            // in since, by the user or a program.
+            let made = crate::taint::born(&file).is_none_or(|at| at >= since);
+            made && written.is_ok_and(|at| at >= since) && crate::taint::own(&ctx, &file)
+        })
+        .collect()
 }
 
 /// How long before its deadline a run still at work is told to end its first
@@ -13397,5 +13550,311 @@ pub(crate) mod tests {
             .unwrap();
         assert!(notice.ends_with(told), "{notice}");
         assert_eq!(times_told(&sent[47], ROUNDS_LEFT), 1);
+    }
+
+    /// What asks for the rounds to tidy in, after the files it names.
+    const TIDY_FIRST: &str = "In at most 5 more rounds, remove by name those of them, and any \
+                              other file, that you made only to test or probe (scripts, logs, \
+                              binaries, and tests you added only to probe or check, unless the \
+                              task asks for tests); keep what the task or your change needs, and \
+                              change nothing else: only run_command runs now. Then you are asked \
+                              for your summary.";
+
+    /// What the wrap-up at the round cap asks for.
+    const SUMMARY: &str = "Summarize what is done and what remains, then stop.";
+
+    /// A call that makes `path`, a file of the run's own.
+    fn probe(path: &str) -> (&'static str, Value) {
+        ("write_file", json!({"path": path, "content": "probing\n"}))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_at_its_round_cap_is_given_rounds_to_take_out_the_files_it_made_only_to_test() {
+        let _data = data("tidy-rounds");
+        let dir = scratch("tidy-rounds");
+        git_project(&dir, true);
+        // A new file of the user's, which the run did not make.
+        std::fs::write(dir.join("draft.txt"), "the user's").unwrap();
+        let (endpoint, provider) = provider(vec![
+            reply("", &[probe("probe_test.txt")]),
+            reply("", &[command("echo probing > probe.log")]),
+            // Turned away at the cap, where the rounds to tidy in are asked for.
+            reply("", &[read_notes()]),
+            // In them an edit is refused and a removal runs.
+            reply(
+                "",
+                &[probe("more.txt"), command("rm probe_test.txt probe.log")],
+            ),
+            // A reply with no call ends them, and the wrap-up follows.
+            reply("Both are gone.", &[]),
+            reply("The notes were read; the probes are removed.", &[]),
+        ]);
+        let mut spec = own(endpoint, &dir, AGENTS + 2_300);
+        spec.rounds = 2;
+        let status = spec.status.clone();
+        let report = finished(spec);
+        let sent = provider.sent();
+        assert_eq!(sent.len(), 6);
+
+        // At the cap the calls are answered as not run, as ever, and what
+        // follows them names the run's own new files, by a file tool or a
+        // redirection, and neither the user's nor the run's own transcript.
+        assert_eq!(
+            results(&sent[3]).last(),
+            Some(&"Not run: the tool-round limit (2) was reached.")
+        );
+        let asked = messages(&sent[3]).last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            asked,
+            format!(
+                "You have reached the tool-round limit. These new files of yours are in the \
+                 project: `probe.log`, `probe_test.txt`. {TIDY_FIRST}"
+            )
+        );
+        // The tools are offered as before, so the cached prefix holds, and
+        // may be called.
+        assert_eq!(sent[3].get("tool_choice"), None);
+        assert_eq!(sent[3]["tools"], sent[2]["tools"]);
+        // The edit did not run, the removal did.
+        let ran = results(&sent[4]);
+        assert_eq!(ran[ran.len() - 2], TIDY_ONLY);
+        assert!(!ran[ran.len() - 1].starts_with("Not run"), "{ran:?}");
+        for gone in ["probe_test.txt", "probe.log", "more.txt"] {
+            assert!(!dir.join(gone).exists(), "{gone}");
+        }
+        assert!(dir.join("draft.txt").exists());
+        // Then the wrap-up, with the tools still offered and none allowed.
+        let asked = messages(&sent[5]).last().unwrap()["content"].to_string();
+        assert!(asked.contains(SUMMARY), "{asked}");
+        assert_eq!(sent[5]["tool_choice"], "none");
+        assert_eq!(sent[5]["tools"], sent[2]["tools"]);
+        // It ended at its limit, and the round it tidied in is counted.
+        assert_eq!(report.status, Outcome::RoundLimit);
+        assert_eq!(report.text, "The notes were read; the probes are removed.");
+        assert_eq!(report.rounds, 3);
+        assert_eq!(status.rounds.load(Ordering::Relaxed), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_rounds_to_tidy_in_are_five_and_the_wrap_up_follows_the_last_of_them() {
+        let _data = data("tidy-rounds-used");
+        let dir = scratch("tidy-rounds-used");
+        git_project(&dir, true);
+        let mut replies = vec![
+            reply("", &[probe("probe_test.txt")]),
+            reply("", &[read_notes()]),
+        ];
+        replies.extend((1..=5).map(|look| reply("", &[command(&format!("echo look {look}"))])));
+        replies.push(reply("The probe is still there.", &[]));
+        let (endpoint, provider) = provider(replies);
+        let mut spec = own(endpoint, &dir, AGENTS + 2_301);
+        spec.rounds = 1;
+        let report = finished(spec);
+        let sent = provider.sent();
+
+        // Its one round, the reply turned away, five rounds and the wrap-up:
+        // no reply is asked for between the last of the five and the wrap-up.
+        assert_eq!(sent.len(), 8);
+        assert_eq!(sent[6].get("tool_choice"), None);
+        assert_eq!(sent[7]["tool_choice"], "none");
+        let asked = messages(&sent[7]).last().unwrap()["content"].to_string();
+        assert!(asked.contains(SUMMARY), "{asked}");
+        let turned_away = (results(&sent[7]).iter())
+            .filter(|result| result.starts_with("Not run"))
+            .count();
+        assert_eq!(turned_away, 1);
+        assert_eq!((report.status, report.rounds), (Outcome::RoundLimit, 6));
+        assert_eq!(report.text, "The probe is still there.");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_call_repeated_in_the_rounds_to_tidy_in_ends_them_and_the_run_still_ends_at_its_limit() {
+        let _data = data("tidy-rounds-loop");
+        let dir = scratch("tidy-rounds-loop");
+        git_project(&dir, true);
+        let same = || reply("", &[command("echo same")]);
+        let (endpoint, provider) = provider(vec![
+            reply("", &[probe("probe_test.txt")]),
+            same(),
+            same(),
+            reply("", &[read_notes()]),
+            // The fifth time the call comes back the same is the third of
+            // the rounds to tidy in: a run going round in circles ends, but
+            // this one had reached its limit already.
+            same(),
+            same(),
+            same(),
+            reply("Nothing was removed.", &[]),
+        ]);
+        let mut spec = own(endpoint, &dir, AGENTS + 2_307);
+        spec.rounds = 3;
+        let report = finished(spec);
+        let sent = provider.sent();
+        assert_eq!(sent.len(), 8);
+        assert_eq!(sent[7]["tool_choice"], "none");
+        let asked = messages(&sent[7]).last().unwrap()["content"].to_string();
+        assert!(asked.contains(SUMMARY), "{asked}");
+        assert_eq!((report.status, report.rounds), (Outcome::RoundLimit, 6));
+        assert_eq!(report.text, "Nothing was removed.");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_that_made_no_file_one_someone_watches_and_a_helper_get_no_rounds_to_tidy_in() {
+        let _data = data("tidy-rounds-none");
+        type Change = fn(&mut Spec);
+        let cases: [((&str, Value), Change, &str); 3] = [
+            // The user's new file is there, and none of the run's own.
+            (read_notes(), |_| (), SUMMARY),
+            (
+                probe("probe_test.txt"),
+                |spec| spec.connection.human = true,
+                SUMMARY,
+            ),
+            (
+                probe("probe_test.txt"),
+                |spec| spec.depth = 1,
+                "Write your report now",
+            ),
+        ];
+        for (at, (first, change, wrap_up)) in cases.into_iter().enumerate() {
+            let dir = scratch("tidy-rounds-none");
+            git_project(&dir, true);
+            std::fs::write(dir.join("draft.txt"), "the user's").unwrap();
+            let (endpoint, provider) = provider(vec![
+                reply("", &[first]),
+                reply("", &[read_notes()]),
+                reply("That is all.", &[]),
+            ]);
+            let mut spec = own(endpoint, &dir, AGENTS + 2_302 + at as u64);
+            spec.rounds = 1;
+            change(&mut spec);
+            let report = finished(spec);
+            let sent = provider.sent();
+            // The wrap-up comes at once, as it did.
+            assert_eq!(sent.len(), 3, "{at}");
+            assert_eq!(sent[2]["tool_choice"], "none", "{at}");
+            let asked = messages(&sent[2]).last().unwrap()["content"].to_string();
+            assert!(asked.contains(wrap_up), "{at}: {asked}");
+            assert!(!carries(&sent[2], "more rounds"), "{at}");
+            assert_eq!(
+                (report.status, report.rounds),
+                (Outcome::RoundLimit, 1),
+                "{at}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rounds_to_tidy_in_are_given_only_where_a_run_nobody_watches_can_use_them() {
+        let dir = scratch("tidy-rounds-guards");
+        git_project(&dir, true);
+        let own_run = || {
+            let mut spec = own("http://127.0.0.1:9/v1".into(), &dir, AGENTS + 2_308);
+            spec.rounds = 1;
+            spec
+        };
+        std::fs::write(dir.join("probe.py"), "made").unwrap();
+        crate::taint::made(&context(&own_run()), &dir.join("probe.py"));
+        let began = SystemTime::UNIX_EPOCH;
+        // Its turn, with its one round run.
+        let at_cap = |spec: &Spec| {
+            let mut turn = Turn::with_limit(spec.connection.clone(), spec.rounds);
+            let read = ToolCall {
+                id: "call-0".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            };
+            assert!(turn.begin(vec![read]));
+            turn.finish_call(Ok("read".into()));
+            turn.take_results();
+            turn
+        };
+        // Its last request read 1,000 tokens.
+        let given = |spec: &Spec| tidy_rounds(spec, &at_cap(spec), began, 1_000).is_some();
+        assert!(given(&own_run()));
+        // Not before the cap.
+        let spec = own_run();
+        let fresh = Turn::with_limit(spec.connection.clone(), spec.rounds);
+        assert!(tidy_rounds(&spec, &fresh, began, 1_000).is_none());
+        // Not where a frontend shows the run, with a schema, where no command
+        // may run, with under six requests' tokens left, or under two minutes.
+        type Change = fn(&mut Spec);
+        let changes: [Change; 6] = [
+            |spec| spec.watch = Some(Arc::new(|_| ())),
+            |spec| spec.schema = Some(json!({"type": "object"})),
+            |spec| spec.connection.plan = true,
+            |spec| spec.allow = Allow::Only(vec!["read_file".into()]),
+            |spec| spec.budget = Some(nearly_spent(1_000_000)),
+            |spec| spec.connection.deadline = Some(Instant::now() + Duration::from_secs(60)),
+        ];
+        for (at, change) in changes.into_iter().enumerate() {
+            let mut spec = own_run();
+            change(&mut spec);
+            assert!(!given(&spec), "{at}");
+        }
+        // With the tokens and the time for them, they are.
+        let mut roomy = own_run();
+        roomy.budget = Some(Arc::new(Budget::new(1_000_000, None)));
+        roomy.connection.deadline = Some(Instant::now() + Duration::from_secs(10 * 60));
+        assert!(given(&roomy));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_new_files_the_run_made_since_it_began_are_named_for_it_to_tidy() {
+        let dir = scratch("made-and-left");
+        std::fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
+        git_project(&dir, true);
+        let spec = own("http://127.0.0.1:9/v1".into(), &dir, AGENTS + 2_306);
+        let ctx = context(&spec);
+        let began = SystemTime::now();
+        // As a file tool or a command's redirection notes what it made.
+        let made = |name: &str| {
+            std::fs::write(dir.join(name), "made").unwrap();
+            crate::taint::made(&ctx, &dir.join(name));
+        };
+        // Its own: one git ignores, a tester's by its name, one git tracks
+        // that it made again, and two that are new to the project.
+        for name in [
+            "probe.log",
+            "letronna_spec_test.py",
+            "notes.txt",
+            "zz_probe.test.ts",
+            "probe.py",
+        ] {
+            made(name);
+        }
+        // New, and not made by the run: the user's, or a program's.
+        std::fs::write(dir.join("draft.txt"), "the user's").unwrap();
+        assert_eq!(
+            made_and_left(&spec, &dir, began),
+            ["probe.py", "zz_probe.test.ts"]
+        );
+        // What it made before this run began was an earlier turn's, also
+        // where someone has written in it since, if the disk says when a
+        // file was made.
+        let later = SystemTime::now() + Duration::from_secs(60);
+        assert!(made_and_left(&spec, &dir, later).is_empty());
+        let probe = dir.join("probe.py");
+        let touched = std::fs::File::options().write(true).open(&probe);
+        let after = later + Duration::from_secs(1);
+        touched.unwrap().set_modified(after).unwrap();
+        let named = made_and_left(&spec, &dir, later);
+        match crate::taint::born(&probe) {
+            Some(_) => assert!(named.is_empty(), "{named:?}"),
+            None => assert_eq!(named, ["probe.py"]),
+        }
+        // Outside a repository git cannot say what is new to the project.
+        let plain = scratch("made-and-left-plain");
+        std::fs::write(plain.join("probe.py"), "made").unwrap();
+        crate::taint::made(&ctx, &plain.join("probe.py"));
+        assert!(made_and_left(&spec, &plain, began).is_empty());
     }
 }
