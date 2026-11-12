@@ -2645,7 +2645,7 @@ struct Left {
     /// What else is there that was not as it began, which a program it ran
     /// or a copy it made left or, rarely, someone else did: a file, or a
     /// folder that is wholly new, with `/` after it, in place of all that
-    /// is in it.
+    /// is in it. The files named as tests come first.
     new: Vec<String>,
 }
 
@@ -2766,9 +2766,12 @@ const LOOKED_INTO: usize = 8;
 /// there holds what git ignores of the user's beside what a program left in
 /// it, and the folder of a run's change, with nothing in it but the change,
 /// was named whole as left by a program it ran. A repository inside the
-/// project is never looked into, since its files are its own. A tester's
-/// files, by their names, are left to the sweep as the run ends. Nothing
-/// where git cannot say, as outside a repository.
+/// project is never looked into, since its files are its own. Files named
+/// as tests come first in what else is new (`tests`): by their paths alone,
+/// a compiler's objects took every place the notice has for names and left
+/// out the copied test that a run of the project's tests picks up. A
+/// tester's files, by their names, are left to the sweep as the run ends.
+/// Nothing where git cannot say, as outside a repository.
 fn left_behind(
     spec: &Spec,
     workspace: &Path,
@@ -2829,14 +2832,17 @@ fn left_behind(
             entries.extend(files.filter(|path| !already.holds(path)));
         }
     }
-    let new = (entries.into_iter())
+    let (first, rest): (Vec<String>, Vec<String>) = (entries.into_iter())
         .filter(|entry| !testers(entry) && !made.contains(entry))
         .filter(|entry| {
             let at = workspace.join(entry.trim_end_matches('/'));
             !crate::taint::unchanged_since(&at, began) && !crate::taint::wrote(&ctx, &at)
         })
-        .collect();
-    Left { own, new }
+        .partition(|entry| entry.rsplit('/').next().is_some_and(tests));
+    Left {
+        own,
+        new: [first, rest].concat(),
+    }
 }
 
 /// How long before its deadline a run still at work is told to end its first
@@ -14670,21 +14676,21 @@ pub(crate) mod tests {
             "zz_probe.test.ts",
         ];
         assert_eq!(left.own, own);
-        // What else is new: no file of the user's that was made anew,
-        // nothing in the folder they had that the listing named whole, and
-        // neither folder of the run's change, only what a program left in
-        // one of them. The folder that held what git ignores is not named
-        // whole either, which would name the user's log with it. The file
-        // taken out of the index is as it was before the run. A folder is
-        // named whole only where the disk says it is new: elsewhere its
-        // files are, one by one.
+        // What else is new, the file named as a test first: no file of the
+        // user's that was made anew, nothing in the folder they had that
+        // the listing named whole, and neither folder of the run's change,
+        // only what a program left in one of them. The folder that held
+        // what git ignores is not named whole either, which would name the
+        // user's log with it. The file taken out of the index is as it was
+        // before the run. A folder is named whole only where the disk says
+        // it is new: elsewhere its files are, one by one.
         let wholly: &[&str] = match crate::taint::born(&dir.join("scratch")) {
             Some(_) => &["scratch/"],
             None => &["scratch/a.bin", "scratch/deep/b.bin"],
         };
         let mut new = vec![
-            "change/deep/out.bin",
             "copied.test.ts",
+            "change/deep/out.bin",
             "logs/new.txt",
             "mine/probe.bin",
         ];
@@ -14780,6 +14786,83 @@ pub(crate) mod tests {
                  `zz_probe_test.py`. {TIDY_FIRST}"
             )
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_notice_at_the_cap_names_the_runs_files_then_the_tests_among_what_else_is_new() {
+        let dir = scratch("tidy-notice");
+        for folder in ["src", "tests", "packages/core/src"] {
+            std::fs::create_dir_all(dir.join(folder)).unwrap();
+        }
+        for file in [
+            "src/lib.py",
+            "tests/test_lib.py",
+            "packages/core/src/index.ts",
+        ] {
+            std::fs::write(dir.join(file), "x = 1\n").unwrap();
+        }
+        git_project(&dir, true);
+        // The user's own untracked files, there before the run.
+        std::fs::create_dir_all(dir.join("wip")).unwrap();
+        for file in ["scratch_test.py", "todo_local.md", "wip/plan.md"] {
+            std::fs::write(dir.join(file), "the user's\n").unwrap();
+        }
+        let spec = own("http://127.0.0.1:9/v1".into(), &dir, AGENTS + 2_317);
+        let ctx = context(&spec);
+        let turn = Turn::with_limit(spec.connection.clone(), spec.rounds);
+        let already = there_already(&spec, &turn).unwrap();
+        let began = SystemTime::now();
+        // Its change, by its file tools: a file, a test of it, and a file in
+        // a new folder a command of its made; and a probe of its own.
+        std::fs::create_dir_all(dir.join("packages/core/src/feature")).unwrap();
+        for file in [
+            "src/feature.py",
+            "tests/test_feature.py",
+            "packages/core/src/feature/index.ts",
+            "probe.py",
+        ] {
+            std::fs::write(dir.join(file), "x = 2\n").unwrap();
+            crate::taint::made(&ctx, &dir.join(file));
+        }
+        // Five copies it made, two of them named as tests, and thirty
+        // objects a compiler of its left beside the source.
+        for copy in [
+            "repro.py",
+            "src/lib_copy.py",
+            "tests/zz_probe_test.py",
+            "tests/zz_edge_test.py",
+            "zz_lib.py",
+        ] {
+            std::fs::copy(dir.join("src/lib.py"), dir.join(copy)).unwrap();
+        }
+        for object in 0..30 {
+            std::fs::write(dir.join(format!("src/gen_{object:02}.o")), "o").unwrap();
+        }
+        // And it put a stash back, which made the user's files anew.
+        git_in(&dir, &["stash", "-u", "-q"]);
+        git_in(&dir, &["stash", "pop", "-q"]);
+
+        let asked = tidy_rounds(&spec, &at_cap(&spec), began, Some(&already), 1_000).unwrap();
+        // Its own first, the file in the folder of its change and not that
+        // folder; then what else is new, the tests before the rest, with
+        // what there is no room to name counted; nothing of the user's.
+        let objects: Vec<String> = (0..13).map(|at| format!("`src/gen_{at:02}.o`")).collect();
+        assert_eq!(
+            asked,
+            format!(
+                "You have reached the tool-round limit. These new files of yours are in the \
+                 project: `packages/core/src/feature/index.ts`, `probe.py`, `src/feature.py`, \
+                 `tests/test_feature.py`. Also new in the project since this run began, left by \
+                 a program you ran or a copy you made or, rarely, by someone else: \
+                 `tests/zz_edge_test.py`, `tests/zz_probe_test.py`, `repro.py`, {}, and 19 more. \
+                 {TIDY_FIRST}",
+                objects.join(", ")
+            )
+        );
+        for theirs in ["scratch_test.py", "todo_local.md", "wip/"] {
+            assert!(!asked.contains(theirs), "{theirs}");
+        }
     }
 
     #[test]
