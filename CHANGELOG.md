@@ -13,6 +13,9 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ## [Unreleased]
 
+### Added
+- **All** — Add from Hugging Face takes a link to a model's own page that has no GGUF file, such as `huggingface.co/LiquidAI/LFM3-1.7B`, and offers the files of a GGUF copy of it: its maker's own (`LiquidAI/LFM3-1.7B-GGUF`) first, or else the most downloaded copy that carries the model's name, never a fine-tune named otherwise. It says which repository the files are from, and when that is not the maker's.
+
 ## [0.1.0-alpha.5.1] - 2026-11-11
 
 ### Added

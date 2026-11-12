@@ -103,6 +103,8 @@ In the model menu they are under **On this computer**; in the terminal, `/model`
 
 **Add from Hugging Face**, under the list, takes a link to any public GGUF model: its page (`https://huggingface.co/unsloth/Qwen3.5-9B-GGUF`), a file's `blob` or `resolve` link, `hf.co/owner/model`, or `owner/model:Q4_K_M` as llama.cpp and Ollama take it. Letronna asks the hub what the repository holds and lists its GGUF files, each with its size and whether it runs well here; a 4-bit one is suggested, or the one the link named. The one you pick is downloaded like the models above: pinned to the commit it was read at, and kept only once its size and SHA-256 match what Hugging Face said of it. A vision file (`mmproj`) in the same repository becomes its photo reading.
 
+A link to a model's own page that holds no GGUF file, such as `https://huggingface.co/LiquidAI/LFM3-1.7B`, is answered with the files of a GGUF copy of it. Letronna asks the hub which GGUF repositories say they are quantized from that model and takes one that carries the model's own name: its maker's (`LiquidAI/LFM3-1.7B-GGUF`) first, or else the most downloaded. A fine-tune, whose name says more, is never taken for the model. The page names the repository the files are from, and says when it is not the maker's.
+
 - Models that are split into several files, or that need a Hugging Face sign-in, can't be added; the page says which.
 - What it needs is estimated from its parameters, as nobody has measured it here; once it answers, its speed is timed as the others' is.
 - It chats only, without web search, until a model is known to call tools well.
