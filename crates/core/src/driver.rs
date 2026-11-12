@@ -67,6 +67,9 @@
 //! run in a copy of the last commit with the project's packages linked in,
 //! is told once that it broke an existing test, to fix the code or, where
 //! the request changes what the test expects, the test (`spec_tests::base`).
+//! Where that command does not pass there because it names tests the run
+//! added, the run is told instead that a test of its own still fails on its
+//! work, to fix the work or the test, or remove the test.
 //!
 //! A run is told once when a tenth of its tool rounds are left, as it is of
 //! its time: a session's own run to write what it owes and take out what it
@@ -1253,7 +1256,9 @@ fn steps(
                 && !compared
                 && report.rounds < spec.rounds
                 && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
-                && let Some(notice) = timed(spec, || broken_tests(spec, turn, begun, &mut compared))
+                && let Some(notice) = timed(spec, || {
+                    broken_tests(spec, turn, begun, began, &mut compared)
+                })
             {
                 spec.transcript.conversation.messages.push(notice);
                 save(&mut spec.transcript)?;
@@ -4302,8 +4307,17 @@ fn unbuilt_files(messages: &[Message], workspace: &Path) -> Vec<String> {
 /// run the work's code. `looked` is set once the project as it was has been
 /// run, whatever came of it: a test that fails there too, as one needing
 /// set-up the copy lacks does, or that ran nothing, tells nothing of the
-/// change and is not run again.
-fn broken_tests(spec: &Spec, turn: &Turn, begun: usize, looked: &mut bool) -> Option<Message> {
+/// change and is not run again. But where the line does not pass there and
+/// names tests the run made since it began at `began` (`added_tests`), the
+/// run would end with a failing test of its own in the project, and is sent
+/// back for that instead: to fix its work or the test, or remove the test.
+fn broken_tests(
+    spec: &Spec,
+    turn: &Turn,
+    begun: usize,
+    began: SystemTime,
+    looked: &mut bool,
+) -> Option<Message> {
     // A helper's tests are its parent's to judge, a person watching reads
     // what failed, and past the round cap or in plan mode nothing runs.
     if !unwatched(spec) || turn.capped().is_some() || !turn.runs_commands() {
@@ -4361,7 +4375,13 @@ fn broken_tests(spec: &Spec, turn: &Turn, begun: usize, looked: &mut bool) -> Op
     let limit = test_limit(spec);
     let before = crate::spec_tests::verdict(&line, &base, &ctx, limit);
     crate::spec_tests::discard(&base);
-    if before != Some(true) {
+    // A line that names tests the run added cannot pass where they are
+    // not, so there it tells of them, not of the change.
+    let added = match before {
+        Some(true) => Vec::new(),
+        _ => added_tests(&line, workspace, &made_and_left(spec, workspace, began)),
+    };
+    if before != Some(true) && added.is_empty() {
         return None;
     }
     // The runs may have taken the time the fix needed: then the run is left
@@ -4371,14 +4391,72 @@ fn broken_tests(spec: &Spec, turn: &Turn, begun: usize, looked: &mut bool) -> Op
     if left.is_some_and(|left| left < crate::requirements::REVIEW_TIME / 2) {
         return None;
     }
+    let content = match added.is_empty() {
+        true => crate::spec_tests::broken(&command, &output),
+        false => crate::spec_tests::added_failing(&command, &added, &output),
+    };
     Some(Message {
         role: "user".into(),
-        content: crate::spec_tests::broken(&command, &output),
+        content,
         notice: true,
         // Folded into the run, so the window keeps the task it is for.
         folded: true,
         ..Default::default()
     })
+}
+
+/// The test files `line` names among `new`, the files the run made that are
+/// new to the project in `workspace` (`made_and_left`), by their paths from
+/// it: each word of one of its commands that is one of them, from the folder
+/// the command runs in when every `cd` before it worked, read past a test's
+/// name or a line after the file's (`file_named`), and that is named as
+/// runners find their tests. The project as it was has none of them, so the
+/// line cannot pass there whatever the work does. A script or a runner's
+/// settings the run made and the line names are no test, and a new test the
+/// run did not make, as the user's own is, is not its to fix or remove.
+fn added_tests(line: &str, workspace: &Path, new: &[String]) -> Vec<String> {
+    if new.is_empty() {
+        return Vec::new();
+    }
+    let dialect = crate::command::Dialect::here();
+    let assessed = crate::command::assess(line, dialect, Some(workspace));
+    let mut commands: Vec<&crate::command::Command> = assessed.commands.iter().collect();
+    let mut found: Vec<String> = Vec::new();
+    while let Some(command) = commands.pop() {
+        commands.extend(&command.nested);
+        // The last of the folders it may run in: a file of the same name in
+        // one before a `cd` is not the one the line ran.
+        let Some(folder) = command.dirs.as_ref().and_then(|dirs| dirs.last()) else {
+            continue;
+        };
+        for word in command.argv.iter().skip(command.at) {
+            let path = folder.join(file_named(word));
+            let Ok(inside) = path.strip_prefix(workspace) else {
+                continue;
+            };
+            let parts: Vec<_> = inside.iter().map(|part| part.to_string_lossy()).collect();
+            let named = parts.last().is_some_and(|name| tests(name));
+            let inside = parts.join("/");
+            if named && new.contains(&inside) && !found.contains(&inside) {
+                found.push(inside);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// `word` as far as the file it names, past a test's name or a line after
+/// it: `a_test.py` of `a_test.py::test_x`, and `a.test.ts` of `a.test.ts:12`.
+fn file_named(word: &str) -> &str {
+    let mut file = word.split("::").next().unwrap_or(word);
+    while let Some((before, line)) = file.rsplit_once(':')
+        && !line.is_empty()
+        && line.bytes().all(|b| b.is_ascii_digit())
+    {
+        file = before;
+    }
+    file
 }
 
 /// The last `run_command` result in `messages` whose command did more than
@@ -11364,9 +11442,9 @@ pub(crate) mod tests {
         let messages = &mut spec.transcript.conversation.messages;
         messages.push(ran("notes.txt lacks hello\n[exit code 1]"));
         let turn = Turn::new(spec.connection.clone());
-        let mut looked = false;
+        let (began, mut looked) = (SystemTime::UNIX_EPOCH, false);
 
-        let notice = broken_tests(&spec, &turn, 0, &mut looked).unwrap();
+        let notice = broken_tests(&spec, &turn, 0, began, &mut looked).unwrap();
         assert!(looked);
         assert!(notice.notice && notice.folded && notice.role == "user");
         assert!(
@@ -11404,15 +11482,15 @@ pub(crate) mod tests {
         // neither runs the project as it was.
         looked = false;
         spec.connection.human = true;
-        assert!(broken_tests(&spec, &turn, 0, &mut looked).is_none());
+        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
         spec.connection.human = false;
         spec.decide = Some(Arc::new(|_, _| gate::Outcome::Ask));
-        assert!(broken_tests(&spec, &turn, 0, &mut looked).is_none());
+        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
         assert!(!looked);
         spec.decide = Some(Arc::new(|_, _| gate::Outcome::Run));
         // Once the same line has passed, there is nothing to compare.
         spec.transcript.conversation.messages.push(ran(""));
-        assert!(broken_tests(&spec, &turn, 0, &mut looked).is_none());
+        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
         assert!(!looked);
         spec.transcript.conversation.messages.pop();
         // A failure the run has fixed since under another line is stale:
@@ -11427,7 +11505,7 @@ pub(crate) mod tests {
         };
         std::fs::write(project.join("notes.txt"), "hello\n").unwrap();
         spec.transcript.conversation.messages.push(narrow);
-        assert!(broken_tests(&spec, &turn, 0, &mut looked).is_none());
+        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
         assert!(!looked);
         spec.transcript.conversation.messages.pop();
         std::fs::write(project.join("notes.txt"), "bye\n").unwrap();
@@ -11439,13 +11517,13 @@ pub(crate) mod tests {
         std::fs::write(project.join("check.sh"), vacuous).unwrap();
         git(&["commit", "-q", "-a", "-m", "second"]);
         std::fs::write(project.join("check.sh"), &failing).unwrap();
-        assert!(broken_tests(&spec, &turn, 0, &mut looked).is_none());
+        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
         assert!(looked);
         // One that fails on the project as it was too tells nothing of the
         // change.
         looked = false;
         git(&["commit", "-q", "-a", "-m", "third"]);
-        assert!(broken_tests(&spec, &turn, 0, &mut looked).is_none());
+        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
         assert!(looked);
     }
 
@@ -11467,13 +11545,13 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let turn = Turn::new(spec.connection.clone());
-        let mut looked = false;
+        let (began, mut looked) = (SystemTime::UNIX_EPOCH, false);
 
         // A folder outside the project is never run elsewhere.
         for outside in ["/elsewhere", "../other"] {
             let args = json!({"command": "sh check.sh", "workdir": outside});
             spec.transcript.conversation.messages.push(ran(args));
-            assert!(broken_tests(&spec, &turn, 0, &mut looked).is_none());
+            assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
             assert!(!looked);
             spec.transcript.conversation.messages.pop();
         }
@@ -11484,7 +11562,7 @@ pub(crate) mod tests {
             .messages
             .push(ran(json!({"command": "cargo test -p meta"})));
         spec.connection.deadline = Some(Instant::now() + crate::spec_tests::TIMEOUT * 3);
-        assert!(broken_tests(&spec, &turn, 0, &mut looked).is_none());
+        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
         assert!(!looked);
         spec.connection.deadline = None;
         spec.transcript.conversation.messages.pop();
@@ -11499,11 +11577,11 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&site).unwrap();
         let editable = format!("{}/src\n", project.display());
         std::fs::write(site.join("__editable__.own-0.1.pth"), editable).unwrap();
-        assert!(broken_tests(&spec, &turn, 0, &mut looked).is_none());
+        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
         assert!(!looked);
         // Without it, the comparison is made.
         std::fs::remove_dir_all(project.join(".venv")).unwrap();
-        assert!(broken_tests(&spec, &turn, 0, &mut looked).is_some());
+        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_some());
         assert!(looked);
     }
 
@@ -11579,6 +11657,157 @@ pub(crate) mod tests {
             std::fs::read_to_string(project.join("notes.txt")).unwrap(),
             "bye\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_test_the_run_added_sends_it_back_to_fix_or_remove_it() {
+        let dir = scratch("added-tests");
+        let project = dir.join("project");
+        let git = checked_project(&project);
+        let mut spec = own_run("http://127.0.0.1:1/v1".into(), &dir, AGENTS + 2_400);
+        spec.connection.workspace = Some(project.clone());
+        spec.decide = Some(Arc::new(|_, _| gate::Outcome::Run));
+        // A test the run added, as a file tool notes one it made, which
+        // fails on its work as it stands.
+        let failing = "echo 'probe: expected 2, got 3'; exit 1\n";
+        let ctx = context(&spec);
+        let added = |name: &str| {
+            std::fs::write(project.join(name), failing).unwrap();
+            crate::taint::made(&ctx, &project.join(name));
+        };
+        added("zz_probe_test.sh");
+        let ran = |args: Value, content: &str| Message {
+            role: "tool".into(),
+            name: "run_command".into(),
+            args: args.to_string(),
+            content: content.into(),
+            ..Default::default()
+        };
+        let failed = "probe: expected 2, got 3\n[exit code 1]";
+        let probed = ran(json!({"command": "sh zz_probe_test.sh"}), failed);
+        spec.transcript.conversation.messages.push(probed);
+        let turn = Turn::new(spec.connection.clone());
+        let (began, mut looked) = (SystemTime::UNIX_EPOCH, false);
+
+        // The project as it was has no such test, so the line fails there
+        // too: that tells nothing of the change, but the test is the run's.
+        let notice = broken_tests(&spec, &turn, 0, began, &mut looked).unwrap();
+        assert!(looked);
+        assert!(notice.notice && notice.folded && notice.role == "user");
+        assert_eq!(
+            notice.content,
+            "`sh zz_probe_test.sh` still fails on your work as it stands, and it runs tests you \
+             added (`zz_probe_test.sh`). Its output:\n\nprobe: expected 2, got 3\n[exit code \
+             1]\n\nFix your work where the request's words ask for what the test checks; \
+             otherwise fix the test, or remove it unless the task asks for it: a failing test \
+             you added is not left behind. Then end with your whole answer again."
+        );
+        // Run in a folder of the project, it is named by its path from the
+        // project.
+        std::fs::create_dir_all(project.join("sub")).unwrap();
+        added("sub/zz_inner_test.sh");
+        let inner = json!({"command": "sh zz_inner_test.sh", "workdir": "sub"});
+        spec.transcript
+            .conversation
+            .messages
+            .push(ran(inner, failed));
+        let notice = broken_tests(&spec, &turn, 0, began, &mut looked).unwrap();
+        assert!(
+            notice
+                .content
+                .contains("it runs tests you added (`sub/zz_inner_test.sh`)"),
+            "{}",
+            notice.content
+        );
+        spec.transcript.conversation.messages.pop();
+        // One made before this run began was an earlier turn's, and is left
+        // as any line that fails on the project as it was.
+        let later = SystemTime::now() + Duration::from_secs(60);
+        assert!(broken_tests(&spec, &turn, 0, later, &mut looked).is_none());
+        // One that passes now, as a test the task asked for does once the
+        // work is right, sends no run back, and the project as it was is not
+        // run for it.
+        looked = false;
+        let passing = "echo 'test result: ok. 1 passed; 0 failed'\n";
+        std::fs::write(project.join("zz_probe_test.sh"), passing).unwrap();
+        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
+        assert!(!looked);
+        std::fs::write(project.join("zz_probe_test.sh"), failing).unwrap();
+        // A new script of the run's that is no test is no test left behind,
+        // and a new test the run did not make, as the user's own is, is not
+        // the run's to fix or remove.
+        added("zz_probe.sh");
+        std::fs::write(project.join("zz_users_test.sh"), failing).unwrap();
+        for line in ["sh zz_probe.sh", "sh zz_users_test.sh"] {
+            looked = false;
+            let other = ran(json!({ "command": line }), failed);
+            spec.transcript.conversation.messages.push(other);
+            assert!(
+                broken_tests(&spec, &turn, 0, began, &mut looked).is_none(),
+                "{line}"
+            );
+            assert!(looked, "{line}");
+            spec.transcript.conversation.messages.pop();
+        }
+        // A failing line of the project's own tests that fails on the
+        // project as it was too is left alone as before, whatever the run
+        // added beside it.
+        looked = false;
+        std::fs::write(project.join("notes.txt"), "bye\n").unwrap();
+        git(&["commit", "-q", "-a", "-m", "second"]);
+        let checked = ran(
+            json!({"command": "sh check.sh"}),
+            "notes.txt lacks hello\n[exit code 1]",
+        );
+        spec.transcript.conversation.messages.push(checked);
+        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
+        assert!(looked);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_tests_a_line_names_that_the_run_added_are_found_by_their_paths() {
+        let dir = scratch("added-tests-named");
+        // What the run made that is new to the project: a test the project
+        // had and a new one of the user's are not among them.
+        let made = [
+            "pkg/tests/zz.test.ts",
+            "pkg/tests/test_new.py",
+            "tests/zz.test.ts",
+            "gen_fixtures.py",
+            "jest.config.js",
+        ]
+        .map(str::to_owned);
+        let found = |line: &str| added_tests(line, &dir, &made);
+        // From the folder the line changes to, not one of the same name in
+        // the folder before, past a line or a test's name after the file's.
+        assert_eq!(
+            found("cd pkg && npx vitest run tests/zz.test.ts:12 tests/old.test.ts"),
+            ["pkg/tests/zz.test.ts"]
+        );
+        assert_eq!(
+            found("npx vitest run tests/zz.test.ts"),
+            ["tests/zz.test.ts"]
+        );
+        assert_eq!(
+            found("python -m pytest pkg/tests/test_new.py::test_a -q"),
+            ["pkg/tests/test_new.py"]
+        );
+        assert_eq!(
+            found("python pkg/tests/test_new.py"),
+            ["pkg/tests/test_new.py"]
+        );
+        // A script or a runner's settings the run made are no test, whatever
+        // else the line runs.
+        assert!(found("python gen_fixtures.py && pytest -q").is_empty());
+        assert!(found("npx jest --config jest.config.js").is_empty());
+        // A test the run did not make and a line that names no file are none.
+        assert!(found("pytest pkg/tests/users_test.py").is_empty());
+        assert!(found("npm test").is_empty());
+        assert_eq!(file_named("a_test.py::Suite::test_x"), "a_test.py");
+        assert_eq!(file_named("a.test.ts:12:3"), "a.test.ts");
+        assert_eq!(file_named("tests/v2"), "tests/v2");
     }
 
     #[test]

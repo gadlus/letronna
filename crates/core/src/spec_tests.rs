@@ -78,7 +78,10 @@
 //! of the run's own that failed, still fails in a fresh copy of the work, and
 //! passes there found a regression, and the run is told so (`broken`); one
 //! that ran no test (`ran_nothing`), or whose stores lead back into the
-//! project (`imports_elsewhere`), proves nothing.
+//! project (`imports_elsewhere`), proves nothing. One that does not pass
+//! there because it names tests the work added is still failing on the
+//! work, and the run is told to fix the work or the test, or remove the
+//! test (`added_failing`).
 
 use crate::cancel::Cancel;
 use crate::tools::ToolContext;
@@ -2524,6 +2527,30 @@ pub(crate) fn broken(command: &str, output: &str) -> String {
          then where the request's words change what that test expects, update the test's \
          expectation and quote the words in your answer; otherwise fix the code so it passes \
          again. Do not delete, skip or weaken the test. Then end with your whole answer again."
+    )
+}
+
+/// The notice sending a run back when `command`, a test line of its own that
+/// failed for it with `output`, still fails on its work and names `added`,
+/// test files the work added: the project as it was has none of them, so it
+/// cannot say whether the change broke anything, but a test the run added
+/// that fails on its own work is the run's to settle, by the work where the
+/// request asks for what it checks and by the test otherwise. Left as it
+/// was, it fails the project's own suite for whoever runs that next.
+pub(crate) fn added_failing(command: &str, added: &[String], output: &str) -> String {
+    let (shown, left_out) = quoted(output);
+    let mut named: Vec<String> = (added.iter().take(NAMED))
+        .map(|file| format!("`{file}`"))
+        .collect();
+    if added.len() > NAMED {
+        named.push(format!("and {} more", added.len() - NAMED));
+    }
+    format!(
+        "`{command}` still fails on your work as it stands, and it runs tests you added ({}). \
+         Its output{left_out}:\n\n{shown}\n\nFix your work where the request's words ask for \
+         what the test checks; otherwise fix the test, or remove it unless the task asks for it: \
+         a failing test you added is not left behind. Then end with your whole answer again.",
+        named.join(", ")
     )
 }
 
