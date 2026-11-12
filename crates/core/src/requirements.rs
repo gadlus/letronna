@@ -1191,7 +1191,9 @@ fn counted(count: usize, what: &str) -> String {
 /// decides rather than fixes, which `unresolved` then looks for. A row left
 /// unclear that names two results is decided by running its own command:
 /// a run answered one as not stated after a probe of something else, and
-/// the difference the row had shown was the one that counted.
+/// the difference the row had shown was the one that counted. That is
+/// asked in words alone: whether a row names two results is not read off
+/// it, so `unresolved` takes a line that says not stated for any row.
 pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
     let rows = rows(report);
     let missing: Vec<String> = (1..=count)
@@ -1290,13 +1292,16 @@ pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
              and change nothing for that row on a guess. "
         ));
     }
-    // A probe of the run's own, of something else, let it answer so a row
-    // whose command had shown the work differ.
+    // A probe of the run's own, of something else, let it answer as not
+    // stated a row whose command had shown the work differ. The form above
+    // still stands for it where neither result is called for, with the
+    // command it ran in the cell that says nothing ran.
     if !unclear.is_empty() {
         text.push_str(&format!(
-            "A row that names two results that differ is not answered by `{NOT_STATED}`: run \
-             that row's own command and say in your line which result the request's words, or \
-             the project's own feature of the same kind, call for, or that neither does. "
+            "A row that names two results that differ is answered only after you run that \
+             row's own command: say in your line which result the request's words, or the \
+             project's own feature of the same kind, call for; where neither does, write \
+             `{NOT_STATED}` with that command in place of `left as is`, and change nothing. "
         ));
     }
     text.push_str(
@@ -3244,11 +3249,15 @@ mod tests {
         assert!(text.ends_with("not only what changed."), "{text}");
         // A row that names two results is not waved off so: its own
         // command is run, and the line says which result is called for.
-        let shown = "on a guess. A row that names two results that differ is not answered by \
-                     `not stated`: run that row's own command and say in your line which result \
-                     the request's words, or the project's own feature of the same kind, call \
-                     for, or that neither does. Only your last message";
+        let shown = "on a guess. A row that names two results that differ is answered only \
+                     after you run that row's own command: say in your line which result the \
+                     request's words, or the project's own feature of the same kind, call for; \
+                     where neither does, write `not stated` with that command in place of `left \
+                     as is`, and change nothing. Only your last message";
         assert!(text.contains(shown), "{text}");
+        // It adds to the form for a case the request is silent on, and
+        // takes none of it back.
+        assert!(!text.contains("is not answered by"), "{text}");
         // A failed row that says unclear of why is a failed row, and a row
         // too long to show its verdict is still told by its list.
         let why = unchecked("R1 | iso | FAIL | t.sh | unclear | why", 1).unwrap();
