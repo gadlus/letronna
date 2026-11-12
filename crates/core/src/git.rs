@@ -681,11 +681,12 @@ pub(crate) fn untracked(folder: &Path, pattern: &str) -> Option<Vec<String>> {
 /// once, `/` after it, in place of all that is in it, and one that holds
 /// nothing at all left out; `None` where there is no repository or git could
 /// not say. A folder of thousands of files costs one name so, and a listing
-/// still too long to keep ends early rather than not being given. Where
-/// `folder` itself holds nothing the repository tracks, git names it alone,
-/// which says nothing of what is in it: its files are then listed one by
-/// one, as `untracked` lists them.
-pub(crate) fn untracked_folded(folder: &Path) -> Option<Vec<String>> {
+/// still too long to keep ends early rather than not being given; whether
+/// it did rides along, since what a listing cut short leaves out is not
+/// thereby missing from the project. Where `folder` itself holds nothing
+/// the repository tracks, git names it alone, which says nothing of what is
+/// in it: its files are then listed one by one, as `untracked` lists them.
+pub(crate) fn untracked_folded(folder: &Path) -> Option<(Vec<String>, bool)> {
     let args = [
         "ls-files",
         "-z",
@@ -694,13 +695,13 @@ pub(crate) fn untracked_folded(folder: &Path) -> Option<Vec<String>> {
         "--directory",
         "--no-empty-directory",
     ];
-    let (out, _) = git(folder, &args, 1 << 20).ok()?;
+    let (out, cut) = git(folder, &args, 1 << 20).ok()?;
     let mut listed = out.split('\0').filter(|path| !path.is_empty());
     if listed.any(|path| path == "./") {
-        return untracked(folder, ".");
+        return untracked(folder, ".").map(|files| (files, false));
     }
     let listed = out.split('\0').filter(|path| !path.is_empty());
-    Some(listed.map(str::to_owned).collect())
+    Some((listed.map(str::to_owned).collect(), cut))
 }
 
 /// Whether `folder` is the top of a repository's working tree, not a folder
@@ -1077,15 +1078,15 @@ mod tests {
         // A file beside tracked ones by its path, a wholly new folder once,
         // and neither a folder git ignores, one that holds only what it
         // ignores, nor an empty one.
-        assert_eq!(
-            untracked_folded(&folder).unwrap(),
-            ["new/", "src/probe.txt", "top.txt"]
-        );
+        let listed = |folder: &Path| {
+            let (listed, cut) = untracked_folded(folder).unwrap();
+            // So few names are all of them.
+            assert!(!cut);
+            listed
+        };
+        assert_eq!(listed(&folder), ["new/", "src/probe.txt", "top.txt"]);
         // Asked of a folder that itself holds nothing tracked, its files.
-        assert_eq!(
-            untracked_folded(&folder.join("new")).unwrap(),
-            ["a.txt", "deep/b.txt"]
-        );
+        assert_eq!(listed(&folder.join("new")), ["a.txt", "deep/b.txt"]);
         assert_eq!(untracked_folded(&scratch("untracked-folded-none")), None);
     }
 

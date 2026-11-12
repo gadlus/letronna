@@ -653,6 +653,9 @@ fn steps(
     // Before the first call too, so a file any call makes counts as made.
     let noted = to_make(spec, contract);
     let began = SystemTime::now();
+    // Before the first call too, so what the project already held that git
+    // does not track is never taken for something the run left there.
+    let already = there_already(spec, turn);
     let mut put_back = false;
     let mut missed = false;
     let mut reworded = false;
@@ -1267,7 +1270,7 @@ fn steps(
                 && report.rounds < spec.rounds
                 && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
                 && let Some(notice) = timed(spec, || {
-                    broken_tests(spec, turn, begun, began, &mut compared)
+                    broken_tests(spec, turn, begun, began, already.as_deref(), &mut compared)
                 })
             {
                 spec.transcript.conversation.messages.push(notice);
@@ -1363,7 +1366,7 @@ fn steps(
         // At its cap a run nobody watches that would leave files it made in
         // the project is given rounds to take out those it made only to
         // test, asked for in place of the wrap-up, which follows them.
-        if let Some(notice) = tidy_rounds(spec, turn, began, read) {
+        if let Some(notice) = tidy_rounds(spec, turn, began, already.as_deref(), read) {
             turn.tidy_at_cap(TIDY_ROUNDS, notice);
             tidying = true;
         }
@@ -2535,6 +2538,20 @@ fn short_of_time(spec: &Spec, least: Duration) -> bool {
 /// past its cap, so they are not used to go on with the work.
 const TIDY_ONLY: &str = "Not run: only removing what you made to test is left.";
 
+/// Whether the run of `spec` is one given rounds to tidy in at its round
+/// cap, should it have left anything by then, for the reasons `tidy_rounds`
+/// gives: a session's own run that nobody watches and no frontend shows,
+/// with no schema, that may run commands and whose cap is large enough to
+/// be warned of.
+fn tidies(spec: &Spec, turn: &Turn) -> bool {
+    unwatched(spec)
+        && spec.watch.is_none()
+        && spec.schema.is_none()
+        && warned_rounds(spec.rounds).is_some()
+        && turn.runs_commands()
+        && refused(spec, "run_command").is_none()
+}
+
 /// The notice giving a session's own run nobody watches `TIDY_ROUNDS` more
 /// rounds as its turn reaches the round cap, in place of the wrap-up there,
 /// which follows them: it names what the run left in the project that is
@@ -2551,13 +2568,16 @@ const TIDY_ONLY: &str = "Not run: only removing what you made to test is left.";
 /// summary each counted as `read`, what the last request read, read again
 /// in full, as where no cache serves it. Nor at a cap too small to be warned
 /// of (`warned_rounds`): five rounds more are most of another such run,
-/// where the cap was set to keep it short.
-fn tidy_rounds(spec: &Spec, turn: &Turn, began: SystemTime, read: u64) -> Option<String> {
-    if !turn.at_cap() || !unwatched(spec) || spec.watch.is_some() || spec.schema.is_some() {
-        return None;
-    }
-    warned_rounds(spec.rounds)?;
-    if !turn.runs_commands() || refused(spec, "run_command").is_some() {
+/// where the cap was set to keep it short. `already` is what the project
+/// held as the run began (`there_already`).
+fn tidy_rounds(
+    spec: &Spec,
+    turn: &Turn,
+    began: SystemTime,
+    already: Option<&[String]>,
+    read: u64,
+) -> Option<String> {
+    if !turn.at_cap() || !tidies(spec, turn) {
         return None;
     }
     // A run whose budget ran out in them would end with no summary at all.
@@ -2569,7 +2589,8 @@ fn tidy_rounds(spec: &Spec, turn: &Turn, began: SystemTime, read: u64) -> Option
     if short_of_time(spec, TIDY_TIME) {
         return None;
     }
-    let left = left_behind(spec, spec.connection.workspace.as_deref()?, began);
+    let workspace = spec.connection.workspace.as_deref()?;
+    let left = left_behind(spec, workspace, began, already);
     if left.own.is_empty() && left.new.is_empty() {
         return None;
     }
@@ -2621,9 +2642,10 @@ fn named_first(files: &[String], room: usize) -> String {
 struct Left {
     /// The files its file tools or its commands' own redirections made.
     own: Vec<String>,
-    /// What else is new there since it began, which a program it ran or a
-    /// copy it made left or, rarely, someone else did: a file, or a folder
-    /// that is wholly new, with `/` after it, in place of all that is in it.
+    /// What else is there that was not as it began, which a program it ran
+    /// or a copy it made left or, rarely, someone else did: a file, or a
+    /// folder that is wholly new, with `/` after it, in place of all that
+    /// is in it.
     new: Vec<String>,
 }
 
@@ -2640,30 +2662,119 @@ fn covers(entry: &str, path: &str) -> bool {
     entry == path || (entry.ends_with('/') && path.starts_with(entry))
 }
 
+/// A listing of what git neither tracks nor ignores in a project
+/// (`git::untracked_folded`), to look paths up in.
+struct Untracked<'a> {
+    /// The files it names.
+    files: HashSet<&'a str>,
+    /// The folders it names whole, each with `/` after it.
+    folders: Vec<&'a str>,
+}
+
+impl<'a> Untracked<'a> {
+    fn of(listed: &'a [String]) -> Self {
+        let entries = listed.iter().map(String::as_str);
+        let (folders, files): (Vec<&str>, Vec<&str>) =
+            entries.partition(|entry| entry.ends_with('/'));
+        let files = files.into_iter().collect();
+        Untracked { files, folders }
+    }
+
+    /// Whether it names the file at `path`.
+    fn names(&self, path: &str) -> bool {
+        self.files.contains(path)
+    }
+
+    /// Whether it lists `path`, a file's or, with `/` after it, a folder's:
+    /// by name, or in a folder it names whole.
+    fn holds(&self, path: &str) -> bool {
+        self.names(path) || self.folders.iter().any(|folder| path.starts_with(folder))
+    }
+
+    /// Whether it lists anything in `folder`, named with `/` after it.
+    fn reaches_into(&self, folder: &str) -> bool {
+        let inside = |entry: &&str| entry.starts_with(folder);
+        self.files.iter().any(inside) || self.folders.iter().any(inside)
+    }
+}
+
+/// What git neither tracks nor ignores in the project as the run of `spec`
+/// begins (`git::untracked_folded`), to tell what the run leaves there from
+/// what was there (`left_behind`). When the disk says a file was made
+/// cannot tell the two apart: a stash put back, or a program's edit in
+/// place, makes each file anew, and a run that did either was told the
+/// user's own untracked files were left by a program it ran, and that their
+/// failing test was one it added. Listed only for a run that can come to
+/// use it, since it is a walk of the project: one given rounds to tidy in
+/// at its cap (`tidies`), or sent back with its requirements, after which a
+/// failing test it added is looked for (`broken_tests`). None for any
+/// other; where git cannot say, as outside a repository; and where the
+/// listing was too long to keep whole, since what it left out would pass
+/// for new.
+fn there_already(spec: &Spec, turn: &Turn) -> Option<Vec<String>> {
+    let compared = unwatched(spec)
+        && turn.runs_commands()
+        && refused(spec, "run_command").is_none()
+        && states_requirements(spec);
+    if !tidies(spec, turn) && !compared {
+        return None;
+    }
+    let (listed, cut) = crate::git::untracked_folded(spec.connection.workspace.as_deref()?)?;
+    (!cut).then_some(listed)
+}
+
+/// Whether the request of `spec` states enough requirements for its run to
+/// be sent back with them (`requirements`): `FEWEST` or more, in a request
+/// that is no mail.
+fn states_requirements(spec: &Spec) -> bool {
+    let own = (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
+    let request = own.iter().rfind(|message| chat::opens_turn(message));
+    request.is_some_and(|request| {
+        let typed = crate::references::typed(&request.content);
+        let stated = crate::requirements::sentences(typed).len();
+        !request.notice && stated >= crate::requirements::FEWEST
+    })
+}
+
 /// Folders git names whole that are looked into for what is new in them: a
 /// project rarely has more that are not wholly new, and each is a listing of
 /// its own.
 const LOOKED_INTO: usize = 8;
 
 /// What the run of `spec`, begun at `began`, left in `workspace` that git
-/// neither tracks nor ignores there (`git::untracked_folded`). Its own: the
-/// files a file tool or a command's own redirection of its session made
-/// since it began, by when the tool made each, so not one an earlier turn
-/// made that was written in since. What else is new: a file or a wholly new
-/// folder the disk says was made since the run began, as a copy, a compiler
-/// or a script of the run's leaves one, which no tool's note sees: a run
-/// that copied its probe tests into the project was told of none of them.
-/// Not among those is what a file tool of the session made earlier, wrote
-/// over or moved, which the disk calls new because a file tool writes by
-/// rename, nor anything on a disk that keeps no such time. A folder that
-/// was there before, untracked, is not new, but what was put in it since
-/// is, and a folder a file tool of the session made holds the run's own
-/// files beside what its programs left there: the first `LOOKED_INTO` of
-/// such folders are listed file by file. A tester's files, by their names,
-/// are left to the sweep as the run ends. Nothing where git cannot say, as
+/// neither tracks nor ignores there (`git::untracked_folded`), told from
+/// what was there by `already`, the same listing as it began
+/// (`there_already`). Its own: the files a file tool or a command's own
+/// redirection of its session made since it began, by when the tool made
+/// each, so not one an earlier turn made that was written in since. What
+/// else is new: what git lists now that `already` did not hold, by name or
+/// in a folder it named whole, as a copy, a compiler or a script of the
+/// run's leaves a file, which no tool's note sees: a run that copied its
+/// probe tests into the project was told of none of them. No path `already`
+/// named is in either, and without `already` nothing else is new. When the
+/// disk says a file was made does not make it new, as it did: a stash put
+/// back and a program's edit in place make each file anew. The disk only
+/// rules out: a file it says is as it was before the run
+/// (`taint::unchanged_since`) was there then, as one the run took out of
+/// git's index or stopped ignoring was, which git lists now and did not
+/// then. Nor is new what a file tool of the session made earlier, wrote
+/// over or moved. A folder git names whole is named so only where all in it
+/// is new: the disk says the folder was made since the run began, `already`
+/// listed nothing in it and no file tool made it. Any other is looked into,
+/// the first `LOOKED_INTO` of them, and the files in it that are new are
+/// named one by one: a folder that was there holds what git ignores of the
+/// user's beside what a program left in it, and one a file tool made holds
+/// the run's own files. A repository inside the project is never looked
+/// into, since its files are its own. A tester's files, by their names, are
+/// left to the sweep as the run ends. Nothing where git cannot say, as
 /// outside a repository.
-fn left_behind(spec: &Spec, workspace: &Path, began: SystemTime) -> Left {
-    let listed = crate::git::untracked_folded(workspace);
+fn left_behind(
+    spec: &Spec,
+    workspace: &Path,
+    began: SystemTime,
+    already: Option<&[String]>,
+) -> Left {
+    let listed = crate::git::untracked_folded(workspace).map(|(listed, _)| listed);
     let (Some(listed), Ok(root)) = (listed, std::fs::canonicalize(workspace)) else {
         return Left::default();
     };
@@ -2672,46 +2783,55 @@ fn left_behind(spec: &Spec, workspace: &Path, began: SystemTime) -> Left {
         let name = path.trim_end_matches('/').rsplit('/').next();
         name.is_some_and(|name| name.contains(crate::spec_tests::MARKER))
     };
-    let folder = |entry: &&String| entry.ends_with('/');
-    let folders: Vec<&String> = listed.iter().filter(folder).collect();
-    let files: HashSet<&String> = listed.iter().filter(|entry| !folder(entry)).collect();
-    let under = |path: &String| folders.iter().any(|folder| covers(folder, path));
-    let listed_at = |path: &String| files.contains(path) || under(path);
-    let own: Vec<String> = (crate::taint::made_from(&ctx, began).iter())
+    let now = Untracked::of(&listed);
+    let already = already.map(Untracked::of);
+    let made: Vec<String> = (crate::taint::made_from(&ctx, began).iter())
         .filter(|path| path.symlink_metadata().is_ok_and(|meta| meta.is_file()))
         .filter_map(|path| {
             let inside = path.strip_prefix(&root).ok()?;
             let parts: Vec<_> = inside.iter().map(|part| part.to_string_lossy()).collect();
             Some(parts.join("/"))
         })
-        .filter(|path| !testers(path) && listed_at(path))
         .collect();
-    let since = |path: &Path| crate::taint::born(path).is_some_and(|at| at >= began);
-    // In place of a folder that was there before, or that a file tool of
-    // the session made, the files in it; not of a repository inside the
-    // project, whose files are its own.
+    // Not a path that was there by name as the run began, whatever has made
+    // the file at it since.
+    let there = |path: &str| already.as_ref().is_some_and(|already| already.names(path));
+    let own: Vec<String> = (made.iter())
+        .filter(|path| !testers(path) && now.holds(path) && !there(path))
+        .cloned()
+        .collect();
+    let Some(already) = already else {
+        return Left {
+            own,
+            new: Vec::new(),
+        };
+    };
     let mut entries: Vec<String> = Vec::new();
     let mut looked = 0;
-    for entry in &listed {
-        let mixed = (entry.strip_suffix('/'))
-            .map(|folder| workspace.join(folder))
-            .filter(|folder| !since(folder) || crate::taint::wrote(&ctx, folder))
-            .filter(|folder| !folder.join(".git").exists());
-        match mixed {
-            Some(folder) if looked < LOOKED_INTO => {
-                looked += 1;
-                let inside = crate::git::untracked(&folder, ".").unwrap_or_default();
-                let files = inside.iter().filter(|path| !path.ends_with('/'));
-                entries.extend(files.map(|path| format!("{entry}{path}")));
-            }
-            _ => entries.push(entry.clone()),
+    for entry in listed.iter().filter(|entry| !already.holds(entry)) {
+        let Some(folder) = entry.strip_suffix('/') else {
+            entries.push(entry.clone());
+            continue;
+        };
+        let folder = workspace.join(folder);
+        let whole = crate::taint::born_since(&folder, began)
+            && !already.reaches_into(entry)
+            && !crate::taint::wrote(&ctx, &folder);
+        if whole {
+            entries.push(entry.clone());
+        } else if looked < LOOKED_INTO && !folder.join(".git").exists() {
+            looked += 1;
+            let inside = crate::git::untracked(&folder, ".").unwrap_or_default();
+            let files = inside.iter().filter(|path| !path.ends_with('/'));
+            let files = files.map(|path| format!("{entry}{path}"));
+            entries.extend(files.filter(|path| !already.holds(path)));
         }
     }
     let new = (entries.into_iter())
-        .filter(|entry| !testers(entry) && !own.contains(entry))
+        .filter(|entry| !testers(entry) && !made.contains(entry))
         .filter(|entry| {
             let at = workspace.join(entry.trim_end_matches('/'));
-            since(&at) && !crate::taint::wrote(&ctx, &at)
+            !crate::taint::unchanged_since(&at, began) && !crate::taint::wrote(&ctx, &at)
         })
         .collect();
     Left { own, new }
@@ -4430,12 +4550,14 @@ fn unbuilt_files(messages: &[Message], workspace: &Path) -> Vec<String> {
 /// names tests the run added since it began at `began`, by a file tool or
 /// by a copy (`added_tests`), the run would end with a failing test of its
 /// own in the project, and is sent back for that instead: to fix its work
-/// or the test, or remove the test.
+/// or the test, or remove the test. `already` is what the project held as
+/// the run began (`there_already`), none of which the run added.
 fn broken_tests(
     spec: &Spec,
     turn: &Turn,
     begun: usize,
     began: SystemTime,
+    already: Option<&[String]>,
     looked: &mut bool,
 ) -> Option<Message> {
     // A helper's tests are its parent's to judge, a person watching reads
@@ -4499,7 +4621,10 @@ fn broken_tests(
     // not, so there it tells of them, not of the change.
     let added = match before {
         Some(true) => Vec::new(),
-        _ => added_tests(&line, workspace, &left_behind(spec, workspace, began)),
+        _ => {
+            let left = left_behind(spec, workspace, began, already);
+            added_tests(&line, workspace, &left)
+        }
     };
     if before != Some(true) && added.is_empty() {
         return None;
@@ -11566,7 +11691,7 @@ pub(crate) mod tests {
         let turn = Turn::new(spec.connection.clone());
         let (began, mut looked) = (SystemTime::UNIX_EPOCH, false);
 
-        let notice = broken_tests(&spec, &turn, 0, began, &mut looked).unwrap();
+        let notice = broken_tests(&spec, &turn, 0, began, None, &mut looked).unwrap();
         assert!(looked);
         assert!(notice.notice && notice.folded && notice.role == "user");
         assert!(
@@ -11604,15 +11729,15 @@ pub(crate) mod tests {
         // neither runs the project as it was.
         looked = false;
         spec.connection.human = true;
-        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
+        assert!(broken_tests(&spec, &turn, 0, began, None, &mut looked).is_none());
         spec.connection.human = false;
         spec.decide = Some(Arc::new(|_, _| gate::Outcome::Ask));
-        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
+        assert!(broken_tests(&spec, &turn, 0, began, None, &mut looked).is_none());
         assert!(!looked);
         spec.decide = Some(Arc::new(|_, _| gate::Outcome::Run));
         // Once the same line has passed, there is nothing to compare.
         spec.transcript.conversation.messages.push(ran(""));
-        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
+        assert!(broken_tests(&spec, &turn, 0, began, None, &mut looked).is_none());
         assert!(!looked);
         spec.transcript.conversation.messages.pop();
         // A failure the run has fixed since under another line is stale:
@@ -11627,7 +11752,7 @@ pub(crate) mod tests {
         };
         std::fs::write(project.join("notes.txt"), "hello\n").unwrap();
         spec.transcript.conversation.messages.push(narrow);
-        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
+        assert!(broken_tests(&spec, &turn, 0, began, None, &mut looked).is_none());
         assert!(!looked);
         spec.transcript.conversation.messages.pop();
         std::fs::write(project.join("notes.txt"), "bye\n").unwrap();
@@ -11639,13 +11764,13 @@ pub(crate) mod tests {
         std::fs::write(project.join("check.sh"), vacuous).unwrap();
         git(&["commit", "-q", "-a", "-m", "second"]);
         std::fs::write(project.join("check.sh"), &failing).unwrap();
-        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
+        assert!(broken_tests(&spec, &turn, 0, began, None, &mut looked).is_none());
         assert!(looked);
         // One that fails on the project as it was too tells nothing of the
         // change.
         looked = false;
         git(&["commit", "-q", "-a", "-m", "third"]);
-        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
+        assert!(broken_tests(&spec, &turn, 0, began, None, &mut looked).is_none());
         assert!(looked);
     }
 
@@ -11673,7 +11798,7 @@ pub(crate) mod tests {
         for outside in ["/elsewhere", "../other"] {
             let args = json!({"command": "sh check.sh", "workdir": outside});
             spec.transcript.conversation.messages.push(ran(args));
-            assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
+            assert!(broken_tests(&spec, &turn, 0, began, None, &mut looked).is_none());
             assert!(!looked);
             spec.transcript.conversation.messages.pop();
         }
@@ -11684,7 +11809,7 @@ pub(crate) mod tests {
             .messages
             .push(ran(json!({"command": "cargo test -p meta"})));
         spec.connection.deadline = Some(Instant::now() + crate::spec_tests::TIMEOUT * 3);
-        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
+        assert!(broken_tests(&spec, &turn, 0, began, None, &mut looked).is_none());
         assert!(!looked);
         spec.connection.deadline = None;
         spec.transcript.conversation.messages.pop();
@@ -11699,11 +11824,11 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&site).unwrap();
         let editable = format!("{}/src\n", project.display());
         std::fs::write(site.join("__editable__.own-0.1.pth"), editable).unwrap();
-        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
+        assert!(broken_tests(&spec, &turn, 0, began, None, &mut looked).is_none());
         assert!(!looked);
         // Without it, the comparison is made.
         std::fs::remove_dir_all(project.join(".venv")).unwrap();
-        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_some());
+        assert!(broken_tests(&spec, &turn, 0, began, None, &mut looked).is_some());
         assert!(looked);
     }
 
@@ -11791,11 +11916,20 @@ pub(crate) mod tests {
         spec.connection.workspace = Some(project.clone());
         spec.decide = Some(Arc::new(|_, _| gate::Outcome::Run));
         let failing = "echo 'probe: expected 2, got 3'; exit 1\n";
-        // A new test of the user's own was there before the run began.
-        std::fs::write(project.join("zz_users_test.sh"), failing).unwrap();
-        std::thread::sleep(Duration::from_millis(50));
+        // A new test of the user's own was there before the run began, and
+        // is what the project held then that git does not track.
+        let users = project.join("zz_users_test.sh");
+        std::fs::write(&users, failing).unwrap();
+        let (already, _) = crate::git::untracked_folded(&project).unwrap();
+        assert_eq!(already, ["zz_users_test.sh"]);
+        let already = Some(&already[..]);
         let began = SystemTime::now();
-        std::thread::sleep(Duration::from_millis(50));
+        // Since then it was made anew, as a stash put back or a program's
+        // edit in place makes a file: the disk does not say it is as it was
+        // before the run.
+        std::fs::remove_file(&users).unwrap();
+        std::fs::write(&users, failing).unwrap();
+        assert!(!crate::taint::unchanged_since(&users, began));
         // A test the run added, as a file tool notes one it made, which
         // fails on its work as it stands.
         let ctx = context(&spec);
@@ -11819,7 +11953,7 @@ pub(crate) mod tests {
 
         // The project as it was has no such test, so the line fails there
         // too: that tells nothing of the change, but the test is the run's.
-        let notice = broken_tests(&spec, &turn, 0, began, &mut looked).unwrap();
+        let notice = broken_tests(&spec, &turn, 0, began, already, &mut looked).unwrap();
         assert!(looked);
         assert!(notice.notice && notice.folded && notice.role == "user");
         assert_eq!(
@@ -11842,7 +11976,7 @@ pub(crate) mod tests {
             .conversation
             .messages
             .push(ran(inner, failed));
-        let notice = broken_tests(&spec, &turn, 0, began, &mut looked).unwrap();
+        let notice = broken_tests(&spec, &turn, 0, began, already, &mut looked).unwrap();
         assert!(
             notice
                 .content
@@ -11852,7 +11986,7 @@ pub(crate) mod tests {
         );
         spec.transcript.conversation.messages.pop();
         // One it copied into the project, which no file tool made, is one it
-        // added too, where the disk says when a file was made.
+        // added too: the project did not hold it as the run began.
         std::fs::copy(
             project.join("zz_probe_test.sh"),
             project.join("zz_copied_test.sh"),
@@ -11860,39 +11994,36 @@ pub(crate) mod tests {
         .unwrap();
         let copied = ran(json!({"command": "sh zz_copied_test.sh"}), failed);
         spec.transcript.conversation.messages.push(copied);
-        let notice = broken_tests(&spec, &turn, 0, began, &mut looked);
-        match crate::taint::born(&project.join("zz_copied_test.sh")) {
-            Some(_) => {
-                let notice = notice.unwrap().content;
-                let named = "it runs tests you added (`zz_copied_test.sh`)";
-                assert!(notice.contains(named), "{notice}");
-            }
-            None => assert!(notice.is_none()),
-        }
+        let notice = broken_tests(&spec, &turn, 0, began, already, &mut looked).unwrap();
+        let named = "it runs tests you added (`zz_copied_test.sh`)";
+        assert!(notice.content.contains(named), "{}", notice.content);
+        // Not where the project could not be listed then: only what its
+        // tools made is known to be the run's.
+        assert!(broken_tests(&spec, &turn, 0, began, None, &mut looked).is_none());
         spec.transcript.conversation.messages.pop();
         // One made before this run began was an earlier turn's, and is left
         // as any line that fails on the project as it was.
         let later = SystemTime::now() + Duration::from_secs(60);
-        assert!(broken_tests(&spec, &turn, 0, later, &mut looked).is_none());
+        assert!(broken_tests(&spec, &turn, 0, later, already, &mut looked).is_none());
         // One that passes now, as a test the task asked for does once the
         // work is right, sends no run back, and the project as it was is not
         // run for it.
         looked = false;
         let passing = "echo 'test result: ok. 1 passed; 0 failed'\n";
         std::fs::write(project.join("zz_probe_test.sh"), passing).unwrap();
-        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
+        assert!(broken_tests(&spec, &turn, 0, began, already, &mut looked).is_none());
         assert!(!looked);
         std::fs::write(project.join("zz_probe_test.sh"), failing).unwrap();
         // A new script of the run's that is no test is no test left behind,
         // and the new test that was there before the run, as the user's own
-        // is, is not the run's to fix or remove.
+        // is, is not the run's to fix or remove, made anew since or not.
         added("zz_probe.sh");
         for line in ["sh zz_probe.sh", "sh zz_users_test.sh"] {
             looked = false;
             let other = ran(json!({ "command": line }), failed);
             spec.transcript.conversation.messages.push(other);
             assert!(
-                broken_tests(&spec, &turn, 0, began, &mut looked).is_none(),
+                broken_tests(&spec, &turn, 0, began, already, &mut looked).is_none(),
                 "{line}"
             );
             assert!(looked, "{line}");
@@ -11910,7 +12041,7 @@ pub(crate) mod tests {
             "notes.txt lacks hello\n[exit code 1]",
         );
         spec.transcript.conversation.messages.push(both);
-        let notice = broken_tests(&spec, &turn, 0, began, &mut looked).unwrap();
+        let notice = broken_tests(&spec, &turn, 0, began, already, &mut looked).unwrap();
         let notice = notice.content;
         assert!(
             notice.starts_with(
@@ -11933,7 +12064,7 @@ pub(crate) mod tests {
             "notes.txt lacks hello\n[exit code 1]",
         );
         spec.transcript.conversation.messages.push(checked);
-        assert!(broken_tests(&spec, &turn, 0, began, &mut looked).is_none());
+        assert!(broken_tests(&spec, &turn, 0, began, already, &mut looked).is_none());
         assert!(looked);
     }
 
@@ -14000,21 +14131,35 @@ pub(crate) mod tests {
     fn a_run_at_its_round_cap_is_given_rounds_to_take_out_the_files_it_made_only_to_test() {
         let _data = data("tidy-rounds");
         let dir = tidy_project("tidy-rounds");
-        // A new file of the user's, which was there before the run.
-        std::fs::write(dir.join("draft.txt"), "the user's").unwrap();
+        // New files of the user's, which were there before the run, one of
+        // them in a new folder of theirs.
+        std::fs::create_dir_all(dir.join("wip")).unwrap();
+        for file in ["draft.txt", "todo.txt", "wip/plan.txt"] {
+            std::fs::write(dir.join(file), "the user's").unwrap();
+        }
         let draft = |old: &str, new: &str| json!({"path": "draft.txt", "old": old, "new": new});
+        let stash = "git -c user.name=user_a -c user.email=user_a@example.com stash -u -q";
         let mut replies = vec![
             // Its own, by a file tool and by a redirection.
             reply("", &[probe("probe_test.txt")]),
             reply("", &[command("echo probing > probe.log")]),
             // A copy, which no tool's note sees.
             reply("", &[command("cp notes.txt copied_test.txt")]),
-            // And an edit of the user's file, which a file tool writes by
+            // An edit of the user's file, which a file tool writes by
             // rename, so the disk says it was made just now.
             reply("", &[("read_file", json!({"path": "draft.txt"}))]),
             reply("", &[("edit_file", draft("the user's", "edited"))]),
+            // And what makes the user's other files anew with no tool's
+            // note of it: a program's edit in place, and a stash put back.
+            reply(
+                "",
+                &[command(
+                    "sed -i.bak s/user/owner/ todo.txt && rm todo.txt.bak",
+                )],
+            ),
+            reply("", &[command(&format!("{stash} && git stash pop -q"))]),
         ];
-        replies.extend(reads(1..=45));
+        replies.extend(reads(1..=43));
         replies.extend([
             // Turned away at the cap, where the rounds to tidy in are asked for.
             reply("", &[read_notes()]),
@@ -14033,16 +14178,24 @@ pub(crate) mod tests {
         let (endpoint, provider) = provider(replies);
         let spec = own(endpoint, &dir, AGENTS + 2_300);
         let status = spec.status.clone();
+        let began = SystemTime::now();
         let report = finished(spec);
         // Its fifty rounds, then the reply turned away, the round it tidied
         // in, the reply with no call and the wrap-up.
         let sent = &provider.sent()[50..];
         assert_eq!(sent.len(), 4);
 
+        // The user's files were made anew, and are theirs still.
+        let as_before = |file: &str| crate::taint::unchanged_since(&dir.join(file), began);
+        for (file, text) in [("todo.txt", "the owner's"), ("wip/plan.txt", "the user's")] {
+            assert_eq!(std::fs::read_to_string(dir.join(file)).unwrap(), text);
+            assert!(!as_before(file), "{file}");
+        }
         // At the cap the calls are answered as not run, as ever, and what
         // follows them names the run's own new files first, then the copy,
-        // as new since it began and not as its own, where the disk says when
-        // a file was made; never the user's file, edited or not.
+        // as new since it began and not as its own; never a file of the
+        // user's, which the project held as the run began, whatever was
+        // done to it since.
         assert_eq!(
             results(&sent[1]).last(),
             Some(&"Not run: the tool-round limit (50) was reached.")
@@ -14050,18 +14203,13 @@ pub(crate) mod tests {
         let asked = messages(&sent[1]).last().unwrap()["content"]
             .as_str()
             .unwrap();
-        let copied = match crate::taint::born(&dir.join("notes.txt")) {
-            Some(_) => {
-                " Also new in the project since this run began, left by a program you ran or a \
-                 copy you made or, rarely, by someone else: `copied_test.txt`."
-            }
-            None => "",
-        };
         assert_eq!(
             asked,
             format!(
                 "You have reached the tool-round limit. These new files of yours are in the \
-                 project: `probe.log`, `probe_test.txt`.{copied} {TIDY_FIRST}"
+                 project: `probe.log`, `probe_test.txt`. Also new in the project since this run \
+                 began, left by a program you ran or a copy you made or, rarely, by someone \
+                 else: `copied_test.txt`. {TIDY_FIRST}"
             )
         );
         // The tools are offered as before, so the cached prefix holds, and
@@ -14293,6 +14441,22 @@ pub(crate) mod tests {
         assert!(!short_of_time(&spec, TIDY_TIME));
     }
 
+    /// The turn of `spec`'s run with every round of its cap run.
+    fn at_cap(spec: &Spec) -> Turn {
+        let mut turn = Turn::with_limit(spec.connection.clone(), spec.rounds);
+        for round in 0..spec.rounds {
+            let read = ToolCall {
+                id: "call-0".into(),
+                name: "read_file".into(),
+                arguments: json!({ "offset": round }).to_string(),
+            };
+            assert!(turn.begin(vec![read]));
+            turn.finish_call(Ok(format!("read {round}")));
+            turn.take_results();
+        }
+        turn
+    }
+
     #[cfg(unix)]
     #[test]
     fn rounds_to_tidy_in_are_given_only_where_a_run_nobody_watches_can_use_them() {
@@ -14302,28 +14466,13 @@ pub(crate) mod tests {
         std::fs::write(dir.join("probe.py"), "made").unwrap();
         crate::taint::made(&context(&own_run()), &dir.join("probe.py"));
         let began = SystemTime::UNIX_EPOCH;
-        // Its turn, with every round of its cap run.
-        let at_cap = |spec: &Spec| {
-            let mut turn = Turn::with_limit(spec.connection.clone(), spec.rounds);
-            for round in 0..spec.rounds {
-                let read = ToolCall {
-                    id: "call-0".into(),
-                    name: "read_file".into(),
-                    arguments: json!({ "offset": round }).to_string(),
-                };
-                assert!(turn.begin(vec![read]));
-                turn.finish_call(Ok(format!("read {round}")));
-                turn.take_results();
-            }
-            turn
-        };
         // Its last request read 1,000 tokens.
-        let given = |spec: &Spec| tidy_rounds(spec, &at_cap(spec), began, 1_000).is_some();
+        let given = |spec: &Spec| tidy_rounds(spec, &at_cap(spec), began, None, 1_000).is_some();
         assert!(given(&own_run()));
         // Not before the cap.
         let spec = own_run();
         let fresh = Turn::with_limit(spec.connection.clone(), spec.rounds);
-        assert!(tidy_rounds(&spec, &fresh, began, 1_000).is_none());
+        assert!(tidy_rounds(&spec, &fresh, began, None, 1_000).is_none());
         // Not where a frontend shows the run, with a schema, where no command
         // may run, with under six requests' tokens left, or under two
         // minutes, nor at a cap too small to be warned of.
@@ -14351,13 +14500,85 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn what_a_run_left_is_what_its_tools_made_and_then_what_else_is_new_since_it_began() {
+    fn a_project_is_listed_as_a_run_begins_only_where_the_run_can_come_to_use_the_listing() {
+        let dir = scratch("there-already");
+        git_project(&dir, true);
+        std::fs::create_dir_all(dir.join("wip")).unwrap();
+        for file in ["draft.txt", "wip/plan.txt", "wip/more.txt"] {
+            std::fs::write(dir.join(file), "the user's").unwrap();
+        }
+        let own_run = || own("http://127.0.0.1:9/v1".into(), &dir, AGENTS + 2_314);
+        let listed = |spec: &Spec| {
+            let turn = Turn::with_limit(spec.connection.clone(), spec.rounds);
+            there_already(spec, &turn)
+        };
+        // For a run that is given rounds to tidy in at its cap: what git
+        // does not track, a folder of it once.
+        assert_eq!(listed(&own_run()).unwrap(), ["draft.txt", "wip/"]);
+        // Not for one that is given none and asked little: at a cap too
+        // small to be warned of, where a frontend shows it, with a schema,
+        // a helper, one someone watches, and where no command may run.
+        type Change = fn(&mut Spec);
+        let changes: [Change; 7] = [
+            |spec| spec.rounds = 49,
+            |spec| spec.watch = Some(Arc::new(|_| ())),
+            |spec| spec.schema = Some(json!({"type": "object"})),
+            |spec| spec.depth = 1,
+            |spec| spec.connection.human = true,
+            |spec| spec.connection.plan = true,
+            |spec| spec.allow = Allow::Only(vec!["read_file".into()]),
+        ];
+        for (at, change) in changes.into_iter().enumerate() {
+            let mut spec = own_run();
+            change(&mut spec);
+            assert!(listed(&spec).is_none(), "{at}");
+        }
+        // But for one whose request states the requirements it is sent back
+        // with, whatever its cap: a failing test it added is looked for
+        // after them, and must be told from one that was there.
+        let mut stated = own_run();
+        stated.rounds = 25;
+        stated.transcript.conversation.messages[0].content = SPECIFIED.into();
+        assert_eq!(listed(&stated).unwrap(), ["draft.txt", "wip/"]);
+        stated.connection.human = true;
+        assert!(listed(&stated).is_none());
+        // Nor outside a repository, where git cannot say.
+        let plain = scratch("there-already-plain");
+        std::fs::write(plain.join("draft.txt"), "the user's").unwrap();
+        let outside = own("http://127.0.0.1:9/v1".into(), &plain, AGENTS + 2_315);
+        assert!(listed(&outside).is_none());
+    }
+
+    /// Runs git in `dir` as a user who can commit, as a stash does, with
+    /// what it prints kept out of the tests' own output.
+    #[cfg(unix)]
+    fn git_in(dir: &Path, args: &[&str]) {
+        let mut git = std::process::Command::new("git");
+        git.args([
+            "-c",
+            "user.name=user_a",
+            "-c",
+            "user.email=user_a@example.com",
+        ]);
+        git.args(args).current_dir(dir);
+        git.stdout(std::process::Stdio::null());
+        assert!(git.status().unwrap().success(), "git {args:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn what_a_run_left_is_what_its_tools_made_and_then_what_the_project_did_not_hold_before() {
         let dir = scratch("left-behind");
         std::fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
+        let write = |name: &str| std::fs::write(dir.join(name), "written").unwrap();
+        // A file of the user's that git has in its index, and a folder of
+        // theirs that holds only what git ignores.
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        write("indexed.txt");
+        write("logs/theirs.log");
         git_project(&dir, true);
         let spec = own("http://127.0.0.1:9/v1".into(), &dir, AGENTS + 2_306);
         let ctx = context(&spec);
-        let write = |name: &str| std::fs::write(dir.join(name), "written").unwrap();
         // As a file tool or a command's redirection notes what it made.
         let made = |name: &str| {
             write(name);
@@ -14369,18 +14590,28 @@ pub(crate) mod tests {
             std::fs::rename(dir.join("edit.tmp"), dir.join(name)).unwrap();
             crate::taint::rewrote(&ctx, &dir.join(name));
         };
-        // Before the run: the user's new file and their new folder, and a
+        // As a stash put back or a program's edit in place leaves a file:
+        // made anew, with no tool's note of it.
+        let anew = |name: &str| {
+            std::fs::remove_file(dir.join(name)).unwrap();
+            write(name);
+        };
+        // Before the run: the user's new files and their new folder, and a
         // file an earlier turn of the session made.
         std::fs::create_dir_all(dir.join("old")).unwrap();
-        write("draft.txt");
-        write("old/kept.txt");
+        for name in ["draft.txt", "todo.txt", "redone.py", "old/kept.txt"] {
+            write(name);
+        }
         made("earlier.py");
-        std::thread::sleep(Duration::from_millis(50));
+        // Long enough before it for the disk to say so.
+        std::thread::sleep(Duration::from_millis(300));
+        let (already, cut) = crate::git::untracked_folded(&dir).unwrap();
+        assert!(!cut);
         let began = SystemTime::now();
-        std::thread::sleep(Duration::from_millis(50));
         // What the run's tools made: one git ignores, a tester's by its
         // name, one git tracks that it made again, two that are new to the
-        // project and one in the user's folder.
+        // project, one in the user's folder, and one where a file of the
+        // user's was as it began.
         for name in [
             "probe.log",
             "letronna_spec_test.py",
@@ -14391,6 +14622,8 @@ pub(crate) mod tests {
         ] {
             made(name);
         }
+        std::fs::remove_file(dir.join("redone.py")).unwrap();
+        made("redone.py");
         // What its tools wrote and did not make: the user's file and the
         // earlier turn's, each new to the disk for it.
         edited("draft.txt");
@@ -14399,7 +14632,7 @@ pub(crate) mod tests {
         crate::taint::create_folders(&ctx, &dir.join("mine")).unwrap();
         made("mine/probe.c");
         // What its programs and copies left: a file, a folder that is wholly
-        // new, a file in the user's folder beside the one that was there,
+        // new, a file in each of the user's folders beside what was there,
         // and one in the folder its tool made.
         std::fs::create_dir_all(dir.join("scratch/deep")).unwrap();
         for name in [
@@ -14407,11 +14640,19 @@ pub(crate) mod tests {
             "scratch/a.bin",
             "scratch/deep/b.bin",
             "old/new.txt",
+            "logs/new.txt",
             "mine/probe.bin",
         ] {
             write(name);
         }
-        let left = left_behind(&spec, &dir, began);
+        // What made the user's files anew, and took one out of git's index.
+        anew("todo.txt");
+        anew("old/kept.txt");
+        git_in(&dir, &["rm", "-q", "--cached", "indexed.txt"]);
+
+        let left = left_behind(&spec, &dir, began, Some(&already));
+        // Its own, by what its tools noted: also the one in the user's
+        // folder, but not the one at a path the project held as it began.
         let own = [
             "mine/probe.c",
             "old/probe.py",
@@ -14419,32 +14660,109 @@ pub(crate) mod tests {
             "zz_probe.test.ts",
         ];
         assert_eq!(left.own, own);
-        // On a disk that keeps no time of making, only its own are named.
-        let timed = crate::taint::born(&dir.join("draft.txt")).is_some();
-        match timed {
-            true => {
-                let new = [
-                    "copied.test.ts",
-                    "mine/probe.bin",
-                    "old/new.txt",
-                    "scratch/",
-                ];
-                assert_eq!(left.new, new);
-            }
-            false => assert!(left.new.is_empty(), "{left:?}"),
+        // What else is new: no file of the user's that was made anew, and
+        // nothing in the folder they had that the listing named whole. The
+        // folder that held what git ignores is not named whole, which would
+        // name the user's log with it, nor the one its file tool made. The
+        // file taken out of the index is as it was before the run. A folder
+        // is named whole only where the disk says it is new: elsewhere its
+        // files are, one by one.
+        let wholly: &[&str] = match crate::taint::born(&dir.join("scratch")) {
+            Some(_) => &["scratch/"],
+            None => &["scratch/a.bin", "scratch/deep/b.bin"],
+        };
+        let mut new = vec!["copied.test.ts", "logs/new.txt", "mine/probe.bin"];
+        new.extend(wholly);
+        assert_eq!(left.new, new);
+        let as_before = |file: &str| crate::taint::unchanged_since(&dir.join(file), began);
+        assert!(as_before("indexed.txt") && !as_before("todo.txt"));
+        assert!(left.holds("probe.py") && left.holds("scratch/deep/b.bin"));
+        for theirs in [
+            "draft.txt",
+            "todo.txt",
+            "redone.py",
+            "old/kept.txt",
+            "indexed.txt",
+            "logs/theirs.log",
+        ] {
+            assert!(!left.holds(theirs), "{theirs}");
         }
-        assert!(left.holds("probe.py") && !left.holds("draft.txt"));
-        assert_eq!(left.holds("scratch/deep/b.bin"), timed);
-        assert_eq!(left.holds("old/new.txt"), timed);
-        assert!(!left.holds("old/kept.txt") && !left.holds("scratchy/a.bin"));
+        assert!(!left.holds("old/new.txt") && !left.holds("scratchy/a.bin"));
+        // Where the project could not be listed as the run began, only what
+        // its tools made is known to be new.
+        let unlisted = left_behind(&spec, &dir, began, None);
+        let mut made = own.to_vec();
+        made.insert(3, "redone.py");
+        assert_eq!(unlisted.own, made);
+        assert!(unlisted.new.is_empty(), "{unlisted:?}");
         // What it made before this run began was an earlier turn's.
         let later = SystemTime::now() + Duration::from_secs(60);
-        assert_eq!(left_behind(&spec, &dir, later), Left::default());
+        assert_eq!(left_behind(&spec, &dir, later, None), Left::default());
         // Outside a repository git cannot say what is new to the project.
         let plain = scratch("left-behind-plain");
         std::fs::write(plain.join("probe.py"), "made").unwrap();
         crate::taint::made(&ctx, &plain.join("probe.py"));
-        assert_eq!(left_behind(&spec, &plain, began), Left::default());
+        let outside = left_behind(&spec, &plain, began, Some(&[]));
+        assert_eq!(outside, Left::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stash_put_back_and_an_edit_in_place_make_none_of_the_users_files_the_runs_leftovers() {
+        let dir = scratch("left-behind-anew");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.py"), "x = 1\n").unwrap();
+        git_project(&dir, true);
+        // The user's own untracked files, one of them a failing test.
+        std::fs::create_dir_all(dir.join("wip")).unwrap();
+        for file in ["scratch_test.py", "todo_local.md", "wip/plan.md"] {
+            std::fs::write(dir.join(file), "the user's\n").unwrap();
+        }
+        let spec = own("http://127.0.0.1:9/v1".into(), &dir, AGENTS + 2_316);
+        let turn = Turn::with_limit(spec.connection.clone(), spec.rounds);
+        let already = there_already(&spec, &turn).unwrap();
+        assert_eq!(already, ["scratch_test.py", "todo_local.md", "wip/"]);
+        let began = SystemTime::now();
+        // The run puts a stash back, and edits two of them in place with a
+        // program: each is a new file on disk afterwards.
+        git_in(&dir, &["stash", "-u", "-q"]);
+        assert!(!dir.join("scratch_test.py").exists());
+        git_in(&dir, &["stash", "pop", "-q"]);
+        for file in ["todo_local.md", "scratch_test.py"] {
+            let mut edit = std::process::Command::new("sed");
+            edit.args(["-i.bak", "-e", "s/user/owner/", file]);
+            assert!(edit.current_dir(&dir).status().unwrap().success(), "{file}");
+            std::fs::remove_file(dir.join(format!("{file}.bak"))).unwrap();
+        }
+        let as_before = |file: &str| crate::taint::unchanged_since(&dir.join(file), began);
+        for file in ["scratch_test.py", "todo_local.md", "wip/plan.md"] {
+            assert!(!as_before(file), "{file}");
+        }
+        // Nothing of theirs is the run's, so with nothing of its own left
+        // it gets no rounds to tidy in.
+        let already = Some(&already[..]);
+        assert_eq!(left_behind(&spec, &dir, began, already), Left::default());
+        assert!(tidy_rounds(&spec, &at_cap(&spec), began, already, 1_000).is_none());
+        // What it copies into the project is new, but not in the folder
+        // they had, where what was there cannot be told from what was not.
+        std::fs::copy(dir.join("scratch_test.py"), dir.join("zz_probe_test.py")).unwrap();
+        std::fs::copy(
+            dir.join("scratch_test.py"),
+            dir.join("wip/zz_probe_test.py"),
+        )
+        .unwrap();
+        let left = left_behind(&spec, &dir, began, already);
+        assert!(left.own.is_empty(), "{left:?}");
+        assert_eq!(left.new, ["zz_probe_test.py"]);
+        let asked = tidy_rounds(&spec, &at_cap(&spec), began, already, 1_000).unwrap();
+        assert_eq!(
+            asked,
+            format!(
+                "You have reached the tool-round limit. New in the project since this run began, \
+                 left by a program you ran or a copy you made or, rarely, by someone else: \
+                 `zz_probe_test.py`. {TIDY_FIRST}"
+            )
+        );
     }
 
     #[test]

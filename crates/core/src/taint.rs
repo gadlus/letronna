@@ -375,6 +375,31 @@ pub(crate) fn born(path: &Path) -> Option<SystemTime> {
     return path.symlink_metadata().and_then(|meta| meta.created()).ok();
 }
 
+/// Whether the disk says `path` itself was made at `then` or later, as far
+/// as its clock may run behind; false where it keeps no such time.
+pub(crate) fn born_since(path: &Path, then: SystemTime) -> bool {
+    born(path).is_some_and(|at| at + CLOCK_SLACK >= then)
+}
+
+/// Whether the disk says `path` itself is as it was before `then`, by more
+/// than its clock may run behind: on Unix by when anything of it last
+/// changed, what it holds or its name, which a file made since cannot put
+/// back as a copy that keeps its original's times puts back when it was
+/// made; elsewhere by when it was made. False where the disk cannot say,
+/// which rules nothing out.
+pub(crate) fn unchanged_since(path: &Path, then: SystemTime) -> bool {
+    #[cfg(unix)]
+    let last = path.symlink_metadata().ok().and_then(|meta| {
+        use std::os::unix::fs::MetadataExt;
+        let seconds = u64::try_from(meta.ctime()).ok()?;
+        let since = std::time::Duration::new(seconds, u32::try_from(meta.ctime_nsec()).ok()?);
+        SystemTime::UNIX_EPOCH.checked_add(since)
+    });
+    #[cfg(not(unix))]
+    let last = born(path);
+    last.is_some_and(|at| at + CLOCK_SLACK < then)
+}
+
 /// `born` through Linux's statx call, read where the kernel lays out its
 /// answer: the mask of what it filled at byte 0, and the birth time's
 /// seconds at 80 and nanoseconds at 88.
@@ -687,6 +712,43 @@ mod tests {
         // Another session made none of them.
         assert!(made_from(&in_session(731_092), before).is_empty());
         assert!(!wrote(&in_session(731_092), &dir.join("first.txt")));
+    }
+
+    #[test]
+    fn a_file_is_as_it_was_before_a_time_only_where_the_disk_says_so_past_its_clocks_slack() {
+        let dir = crate::store::tests::Scratch::new("taint-unchanged");
+        let file = dir.join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        let now = SystemTime::now();
+        // Made a moment ago, it is not as it was before now: the disk's
+        // clock may run that far behind.
+        assert!(!unchanged_since(&file, now));
+        // Before a time well after it, it is; and nothing is that is not
+        // there.
+        let later = now + std::time::Duration::from_secs(60);
+        let untimed = cfg!(not(unix)) && born(&file).is_none();
+        assert!(unchanged_since(&file, later) || untimed);
+        assert!(!unchanged_since(&dir.join("missing.txt"), later));
+        // Made since a time only where the disk keeps when it was made.
+        assert_eq!(born_since(&file, now), born(&file).is_some());
+        assert!(!born_since(&file, later) && !born_since(&dir.join("missing.txt"), now));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_that_keeps_its_originals_times_is_not_as_it_was_before_it_was_made() {
+        let dir = crate::store::tests::Scratch::new("taint-kept-times");
+        std::fs::write(dir.join("old.txt"), "x").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let then = SystemTime::now();
+        // Such a copy says it was made when its original was, on a disk
+        // that sets that time back with the others, but not that nothing
+        // of it has changed since.
+        let mut copy = std::process::Command::new("cp");
+        copy.args(["-p", "old.txt", "copy.txt"]).current_dir(&dir);
+        assert!(copy.status().unwrap().success());
+        assert!(unchanged_since(&dir.join("old.txt"), then));
+        assert!(!unchanged_since(&dir.join("copy.txt"), then));
     }
 
     #[test]
