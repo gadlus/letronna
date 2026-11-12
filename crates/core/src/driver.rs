@@ -2760,14 +2760,15 @@ const LOOKED_INTO: usize = 8;
 /// then. Nor is new what a file tool of the session made earlier, wrote
 /// over or moved. A folder git names whole is named so only where all in it
 /// is new: the disk says the folder was made since the run began, `already`
-/// listed nothing in it and no file tool made it. Any other is looked into,
-/// the first `LOOKED_INTO` of them, and the files in it that are new are
-/// named one by one: a folder that was there holds what git ignores of the
-/// user's beside what a program left in it, and one a file tool made holds
-/// the run's own files. A repository inside the project is never looked
-/// into, since its files are its own. A tester's files, by their names, are
-/// left to the sweep as the run ends. Nothing where git cannot say, as
-/// outside a repository.
+/// listed nothing in it, no file tool made it and no file in it is the
+/// run's own. Any other is looked into, the first `LOOKED_INTO` of them,
+/// and the files in it that are new are named one by one: a folder that was
+/// there holds what git ignores of the user's beside what a program left in
+/// it, and the folder of a run's change, with nothing in it but the change,
+/// was named whole as left by a program it ran. A repository inside the
+/// project is never looked into, since its files are its own. A tester's
+/// files, by their names, are left to the sweep as the run ends. Nothing
+/// where git cannot say, as outside a repository.
 fn left_behind(
     spec: &Spec,
     workspace: &Path,
@@ -2816,7 +2817,8 @@ fn left_behind(
         let folder = workspace.join(folder);
         let whole = crate::taint::born_since(&folder, began)
             && !already.reaches_into(entry)
-            && !crate::taint::wrote(&ctx, &folder);
+            && !crate::taint::wrote(&ctx, &folder)
+            && !made.iter().any(|path| path.starts_with(entry.as_str()));
         if whole {
             entries.push(entry.clone());
         } else if looked < LOOKED_INTO && !folder.join(".git").exists() {
@@ -14628,12 +14630,17 @@ pub(crate) mod tests {
         // earlier turn's, each new to the disk for it.
         edited("draft.txt");
         edited("earlier.py");
-        // A folder a file tool of its made for a file, as it notes one.
+        // A folder a file tool of its made for a file, as it notes one, and
+        // the folder of its change, which a command of its made.
         crate::taint::create_folders(&ctx, &dir.join("mine")).unwrap();
         made("mine/probe.c");
+        std::fs::create_dir_all(dir.join("change/deep")).unwrap();
+        made("change/mod.py");
+        std::fs::create_dir_all(dir.join("whole")).unwrap();
+        made("whole/mod.py");
         // What its programs and copies left: a file, a folder that is wholly
         // new, a file in each of the user's folders beside what was there,
-        // and one in the folder its tool made.
+        // and files in the folder its tool made and in that of its change.
         std::fs::create_dir_all(dir.join("scratch/deep")).unwrap();
         for name in [
             "copied.test.ts",
@@ -14642,6 +14649,7 @@ pub(crate) mod tests {
             "old/new.txt",
             "logs/new.txt",
             "mine/probe.bin",
+            "change/deep/out.bin",
         ] {
             write(name);
         }
@@ -14654,24 +14662,32 @@ pub(crate) mod tests {
         // Its own, by what its tools noted: also the one in the user's
         // folder, but not the one at a path the project held as it began.
         let own = [
+            "change/mod.py",
             "mine/probe.c",
             "old/probe.py",
             "probe.py",
+            "whole/mod.py",
             "zz_probe.test.ts",
         ];
         assert_eq!(left.own, own);
-        // What else is new: no file of the user's that was made anew, and
-        // nothing in the folder they had that the listing named whole. The
-        // folder that held what git ignores is not named whole, which would
-        // name the user's log with it, nor the one its file tool made. The
-        // file taken out of the index is as it was before the run. A folder
-        // is named whole only where the disk says it is new: elsewhere its
+        // What else is new: no file of the user's that was made anew,
+        // nothing in the folder they had that the listing named whole, and
+        // neither folder of the run's change, only what a program left in
+        // one of them. The folder that held what git ignores is not named
+        // whole either, which would name the user's log with it. The file
+        // taken out of the index is as it was before the run. A folder is
+        // named whole only where the disk says it is new: elsewhere its
         // files are, one by one.
         let wholly: &[&str] = match crate::taint::born(&dir.join("scratch")) {
             Some(_) => &["scratch/"],
             None => &["scratch/a.bin", "scratch/deep/b.bin"],
         };
-        let mut new = vec!["copied.test.ts", "logs/new.txt", "mine/probe.bin"];
+        let mut new = vec![
+            "change/deep/out.bin",
+            "copied.test.ts",
+            "logs/new.txt",
+            "mine/probe.bin",
+        ];
         new.extend(wholly);
         assert_eq!(left.new, new);
         let as_before = |file: &str| crate::taint::unchanged_since(&dir.join(file), began);
@@ -14688,11 +14704,12 @@ pub(crate) mod tests {
             assert!(!left.holds(theirs), "{theirs}");
         }
         assert!(!left.holds("old/new.txt") && !left.holds("scratchy/a.bin"));
+        assert!(!left.holds("change/mod.pyc") && !left.holds("whole/out.bin"));
         // Where the project could not be listed as the run began, only what
         // its tools made is known to be new.
         let unlisted = left_behind(&spec, &dir, began, None);
         let mut made = own.to_vec();
-        made.insert(3, "redone.py");
+        made.insert(4, "redone.py");
         assert_eq!(unlisted.own, made);
         assert!(unlisted.new.is_empty(), "{unlisted:?}");
         // What it made before this run began was an earlier turn's.
