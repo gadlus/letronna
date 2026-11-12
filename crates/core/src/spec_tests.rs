@@ -4310,10 +4310,10 @@ mod tests {
         assert!(
             tests.ends_with(
                 "write no test that only one of those readings would pass, unless the \
-                 request's words favour that reading, and still test what they share. Give \
-                 each reading left without a test of its own a row instead, written `R1 | \
-                 reading: what the words would mean | NOT RUN | \"the words that favour it\", \
-                 or none`."
+                 request's words favour that one reading over the others, and still test \
+                 what they share. Give each reading left without a test of its own a row \
+                 instead, written `R1 | reading: what the words would mean | NOT RUN | \"the \
+                 words that favour it\", or none`."
             ),
             "{tests}"
         );

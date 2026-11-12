@@ -332,12 +332,14 @@ pub(crate) fn reading_rows(readings: &[Reading]) -> String {
 /// all: asked for a test per reading whatever the readings, testers wrote
 /// two that exclude each other, and the one that had to fail came back to
 /// the run as a failing test of its work, again with each run of the
-/// tests. Of such readings only one the request's words favour has a test
-/// that the others would fail, and what the readings share is tested
-/// still: told to write no test of them, a tester may leave the
-/// requirement untested. A reading left without a test has a row that says
-/// none ran, which holds the run to nothing (`requirements::unchecked`),
-/// with the words that favour it, or none, for the run to weigh.
+/// tests. Of such readings only the one the request's words favour over
+/// the others has a test that they would fail, said so since words favour
+/// each reading somewhat, as its row's own last cell allows; and what the
+/// readings share is tested still: told to write no test of them, a tester
+/// may leave the requirement untested. A reading left without a test has a
+/// row that says none ran, which holds the run to nothing
+/// (`requirements::unchecked`), with the words that favour it, or none,
+/// for the run to weigh.
 pub(crate) fn reading_tests(readings: &[Reading]) -> String {
     let Some(first) = readings.first().map(|reading| reading.number) else {
         return String::new();
@@ -348,7 +350,7 @@ pub(crate) fn reading_tests(readings: &[Reading]) -> String {
          for the reading, with a row of its own, only where one implementation could pass \
          them all. Where one reading does, emits or records more than another, or the \
          readings exclude each other, write no test that only one of those readings would \
-         pass, unless the request's words favour that reading, and still test what they \
+         pass, unless the request's words favour that one reading over the others, and still test what they \
          share. Give each reading left without a test of its own a row instead, written \
          `R{first} | reading: what the words would mean | NOT RUN | \"the words that favour \
          it\", or none`.",
@@ -1973,12 +1975,15 @@ mod tests {
                 "with a row of its own, only where one implementation could pass them all. \
                  Where one reading does, emits or records more than another, or the readings \
                  exclude each other, write no test that only one of those readings would \
-                 pass, unless the request's words favour that reading, and still test what \
+                 pass, unless the request's words favour that one reading over the others, and still test what \
                  they share."
             ),
             "{tests}"
         );
         assert!(!tests.contains("no test for either"), "{tests}");
+        // Favoured over the others: words favour each reading somewhat, as
+        // the row's last cell says, and that would bring both tests back.
+        assert!(!tests.contains("favour that reading"), "{tests}");
         // A reading left without a test gets a row that says none ran,
         // with the words for it or none, and such a row holds the run to
         // nothing, whatever its last cell says.
