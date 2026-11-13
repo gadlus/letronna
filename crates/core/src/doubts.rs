@@ -53,6 +53,13 @@
 //! work does: such a case is given only where fewer than `KEPT` others
 //! were set aside. The ones given stay in the order the run named them.
 //!
+//! Reviews started side by side are each given `KEPT` of their own
+//! (`dealt`): that many for each of them are chosen the same way and dealt
+//! out in turn, so between them they check several times `KEPT` cases.
+//! Given the same ones each, the reviews of a run that had set aside more
+//! checked no more of them than one would have. A tester is given those of
+//! one helper.
+//!
 //! A case is given once. Named again, it takes the later sentence's words
 //! and place, as nearer to the work as it stands, and keeps the hardest it
 //! was weighed; a later sentence weighed only by `PASSING` is most often
@@ -84,7 +91,7 @@
 use crate::chat::Message;
 use std::ops::Range;
 
-/// Cases given at most.
+/// Cases a helper is given at most.
 const KEPT: usize = 10;
 
 /// Of `KEPT`, the cases taken for how hard each was weighed. The rest are
@@ -495,6 +502,56 @@ pub(crate) fn shared(said: &[&str], sentence: &[String]) -> Range<usize> {
 /// it has none: as it was last named, by a sentence the run does not tick
 /// off, and as hard as it was ever weighed.
 pub(crate) fn doubts(messages: &[Message], request: &str, sentences: &[String]) -> Vec<String> {
+    let found = set_aside(messages, request, sentences);
+    given(&found, chosen(&found, 1))
+}
+
+/// The cases of `doubts` as each of `helpers` reviews started side by side
+/// is given them, a list for each, at most `KEPT` in the order they were
+/// named. `KEPT` for each helper are chosen as `doubts` chooses its own
+/// (`chosen`) and dealt out one at a time in the order chosen, so each
+/// helper has its share of those weighed hardest and of the latest, and no
+/// two are given the same case. Where fewer were set aside, a helper with
+/// places left takes the first chosen of the cases dealt to the others, so
+/// `KEPT` cases or fewer all reach every helper, and one helper is given
+/// what `doubts` gives. Given the same `KEPT` each, the reviews of a run
+/// checked no more of what it had set aside than one would have: on a
+/// benchmark run that had set aside 81 cases, its two reviews are given 20
+/// of them this way. The case that run's result turned on, a check it had
+/// predicted and weighed off, is still not one of them: by weight it comes
+/// 29th, after four weighed harder and 24 weighed alike and named later.
+pub(crate) fn dealt(
+    messages: &[Message],
+    request: &str,
+    sentences: &[String],
+    helpers: usize,
+) -> Vec<Vec<String>> {
+    let found = set_aside(messages, request, sentences);
+    let chosen = chosen(&found, helpers);
+    (0..helpers)
+        .map(|helper| {
+            // Its own first, then the others' while it has places left.
+            let own = |at: &usize| at % helpers == helper;
+            let places = 0..chosen.len();
+            let kept = (places.clone().filter(own))
+                .chain(places.filter(|at| !own(at)))
+                .take(KEPT)
+                .map(|at| chosen[at])
+                .collect();
+            given(&found, kept)
+        })
+        .collect()
+}
+
+/// A case set aside: what it is known by (`key`), its words, and where it
+/// ranks, by how hard it was weighed and then by whether the request names
+/// something it names.
+type Case = (String, String, (u8, bool));
+
+/// Each case the assistant's replies in `messages` weighed and set aside,
+/// in the order they were last named, as `doubts` chooses among them for
+/// `request` and `sentences`, the requirements it states.
+fn set_aside(messages: &[Message], request: &str, sentences: &[String]) -> Vec<Case> {
     // The words of each requirement the notice numbers, and the names of
     // the whole request, those in its code among them.
     let listed: Vec<Vec<String>> = (sentences.iter())
@@ -505,9 +562,7 @@ pub(crate) fn doubts(messages: &[Message], request: &str, sentences: &[String]) 
     let own = messages
         .iter()
         .filter(|message| message.role == "assistant");
-    // Each case with what it is known by and where it ranks: how hard it
-    // was weighed, then whether the request names something it names.
-    let mut found: Vec<(String, String, (u8, bool))> = Vec::new();
+    let mut found: Vec<Case> = Vec::new();
     for text in own.flat_map(|message| [&message.reasoning, &message.content]) {
         for (case, markers, ticked) in cases(text) {
             // Ticked off, a sentence says what the run checked: it names
@@ -531,17 +586,33 @@ pub(crate) fn doubts(messages: &[Message], request: &str, sentences: &[String]) 
             found.push((key, case, rank));
         }
     }
+    found
+}
+
+/// The cases of `found` that `helpers` helpers are given between them, as
+/// their places in it, in the order they are chosen: `RANKED` for each
+/// helper by how hard each was weighed, the later first of those weighed
+/// alike; then the latest not yet taken that a word not of `PASSING`
+/// weighed, up to `KEPT` for each helper in all; then the latest of the
+/// rest.
+fn chosen(found: &[Case], helpers: usize) -> Vec<usize> {
     let mut kept: Vec<usize> = (0..found.len()).collect();
     kept.sort_by_key(|&at| std::cmp::Reverse((found[at].2, at)));
-    kept.truncate(RANKED);
+    kept.truncate(RANKED * helpers);
     // Then the latest, those weighed only in passing after all the others.
     for passing in [false, true] {
         let latest: Vec<usize> = ((0..found.len()).rev())
             .filter(|at| !kept.contains(at) && (passing || found[*at].2.0 > PASSED))
-            .take(KEPT.saturating_sub(kept.len()))
+            .take((KEPT * helpers).saturating_sub(kept.len()))
             .collect();
         kept.extend(latest);
     }
+    kept
+}
+
+/// The cases at `kept` in `found` as a helper is given them: in the order
+/// the run named them, each in at most `CHARS` characters.
+fn given(found: &[Case], mut kept: Vec<usize>) -> Vec<String> {
     kept.sort_unstable();
     (kept.into_iter().map(|at| cut(&found[at].1))).collect()
 }
@@ -1066,6 +1137,115 @@ mod tests {
         let mut notes = inputs(1..=10, "I'll keep it.");
         notes.extend(inputs(11..=17, "Not needed."));
         assert_eq!(weighed(&notes.join("\n")), alone(1..=10));
+    }
+
+    /// What each of `helpers` reviews is given of `notes`, written in one
+    /// reply, for no request.
+    fn shared_out(notes: &[String], helpers: usize) -> Vec<Vec<String>> {
+        dealt(&[said(&notes.join("\n"), "")], "", &[], helpers)
+    }
+
+    /// The inputs `numbers`, each as `inputs` names it.
+    fn each(numbers: &[usize]) -> Vec<String> {
+        numbers.iter().flat_map(|&n| alone(n..=n)).collect()
+    }
+
+    #[test]
+    fn one_review_is_dealt_the_cases_a_tester_is_given() {
+        // Whatever weighed them and however many there are: none, fewer
+        // than the ten, the ten, and more than the ten of each kind.
+        let mut notes = inputs(1..=8, "Rare.");
+        notes.insert(
+            3,
+            "Hidden tests might call `open()` twice. Unlikely.".to_owned(),
+        );
+        notes.extend(inputs(9..=20, "I'll keep it."));
+        notes.extend(inputs(21..=32, "Not needed."));
+        for count in [0, 1, 4, 10, 11, 21, 33] {
+            let notes = &notes[..count];
+            let given = weighed(&notes.join("\n"));
+            assert_eq!(given.len(), count.min(KEPT), "{count}");
+            assert_eq!(shared_out(notes, 1), [given], "{count}");
+        }
+        // No review, no list.
+        assert!(shared_out(&notes, 0).is_empty());
+    }
+
+    #[test]
+    fn two_reviews_are_dealt_ten_cases_each_with_the_hardest_weighed_split_between_them() {
+        // Twenty-five set aside: two a check was predicted of and waved
+        // off, eight a strong word weighed, and fifteen another word did.
+        let mut notes = vec!["Hidden tests might call `open()` twice. Unlikely.".to_owned()];
+        notes.extend(inputs(1..=8, "Rare."));
+        notes.push("Hidden tests might pass `null` for it. Unlikely.".to_owned());
+        notes.extend(inputs(9..=23, "I'll keep it."));
+        let dealt = shared_out(&notes, 2);
+        let [first, second] = dealt.as_slice() else {
+            panic!("{dealt:?}");
+        };
+        // Twenty of them, ten each and none twice.
+        assert_eq!((first.len(), second.len()), (KEPT, KEPT));
+        assert!(!first.iter().any(|case| second.contains(case)), "{dealt:?}");
+        // The ten weighed hardest go to each in turn, the hardest first and
+        // of those weighed alike the later, so each review has one of the
+        // two checks predicted and four of the eight; the latest ten of the
+        // rest go the same way. Each list is in the order the run named
+        // its cases.
+        let mut one = each(&[2, 4, 6, 8]);
+        one.push("Hidden tests might pass `null` for it.".to_owned());
+        one.extend(each(&[15, 17, 19, 21, 23]));
+        assert_eq!(*first, one);
+        let mut other = vec!["Hidden tests might call `open()` twice.".to_owned()];
+        other.extend(each(&[1, 3, 5, 7, 14, 16, 18, 20, 22]));
+        assert_eq!(*second, other);
+        // The five set aside earliest by the weaker word reach neither, and
+        // a tester is given the ten it was: the five weighed hardest and
+        // the latest five.
+        let both = [one, other].concat();
+        assert!(!alone(9..=13).iter().any(|case| both.contains(case)));
+        let mut tested = vec!["Hidden tests might call `open()` twice.".to_owned()];
+        tested.extend(alone(6..=8));
+        tested.push("Hidden tests might pass `null` for it.".to_owned());
+        tested.extend(alone(19..=23));
+        assert_eq!(weighed(&notes.join("\n")), tested);
+    }
+
+    #[test]
+    fn ten_cases_or_fewer_reach_every_review() {
+        for count in [1, 7, 10] {
+            let notes = inputs(1..=count, "Rare.");
+            for helpers in 1..=4 {
+                let all = vec![alone(1..=count); helpers];
+                assert_eq!(shared_out(&notes, helpers), all, "{count} for {helpers}");
+            }
+        }
+        assert_eq!(shared_out(&[], 3), vec![Vec::<String>::new(); 3]);
+        // With more than ten and fewer than ten for each, a review's places
+        // left go to the hardest weighed of the cases dealt to the others:
+        // of fourteen, each of two has its own seven and three of the
+        // other's, so the four a strong word weighed reach both.
+        let mut notes = inputs(1..=4, "Rare.");
+        notes.extend(inputs(5..=14, "I'll keep it."));
+        let dealt = shared_out(&notes, 2);
+        assert_eq!(dealt[0], each(&[1, 2, 3, 4, 6, 8, 10, 12, 13, 14]));
+        assert_eq!(dealt[1], each(&[1, 2, 3, 4, 5, 7, 9, 11, 13, 14]));
+    }
+
+    #[test]
+    fn a_case_weighed_only_in_passing_is_dealt_only_where_reviews_have_places_left() {
+        // Ten others for each of two reviews leave it no place, however
+        // late it was named.
+        let mut notes = inputs(1..=20, "I'll keep it.");
+        notes.extend(inputs(21..=26, "Not needed."));
+        let dealt = shared_out(&notes, 2);
+        assert_eq!(dealt[0], each(&[2, 4, 6, 8, 10, 12, 14, 16, 18, 20]));
+        assert_eq!(dealt[1], each(&[1, 3, 5, 7, 9, 11, 13, 15, 17, 19]));
+        // Sixteen others leave four places, which the latest four take.
+        let mut notes = inputs(1..=16, "I'll keep it.");
+        notes.extend(inputs(17..=22, "Not needed."));
+        let dealt = shared_out(&notes, 2);
+        assert_eq!(dealt[0], each(&[2, 4, 6, 8, 10, 12, 14, 16, 20, 22]));
+        assert_eq!(dealt[1], each(&[1, 3, 5, 7, 9, 11, 13, 15, 19, 21]));
     }
 
     #[test]

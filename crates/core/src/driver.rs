@@ -4146,9 +4146,13 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
         .filter(|_| copied.is_some())
         .and_then(crate::spec_tests::before);
     // The cases the run weighed and set aside, without its reasons, so each
-    // helper checks them by the request's words.
+    // helper checks them by the request's words. The tester is given those
+    // of one helper, and each review that starts its own, dealt from as
+    // many times that as reviews start: side by side they then check more
+    // of them than the same few each.
     let own = (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
     let doubts = crate::doubts::doubts(own, request, found);
+    let dealt = crate::doubts::dealt(own, request, found, shares.len().min(afford));
     // And the words of a requirement it read more than one way in this
     // turn, without the reading it took, so each helper judges every
     // reading. A tester started with the run wrote its tests before any of
@@ -4174,14 +4178,15 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
     let (reports, unread, tested, taken, lost) = std::thread::scope(|scope| {
         let started: Vec<_> = (shares.into_iter())
             .take(afford)
-            .map(|share| {
+            .zip(&dealt)
+            .map(|(share, cases)| {
                 let ctx = ctx.clone();
                 let args = json!({
                     "description": format!("Review R{} to R{}", share.0, share.1),
                     "name": format!("review-r{}", share.0),
                     "type": "review",
                     "background": false,
-                    "prompt": crate::requirements::brief(request, found, share, &doubts, &readings),
+                    "prompt": crate::requirements::brief(request, found, share, cases, &readings),
                 });
                 scope.spawn(move || tools::Tool::run(&crate::agents::Agent, &args, &ctx))
             })
@@ -9494,6 +9499,83 @@ pub(crate) mod tests {
             assert!(task.contains("- Open `a..` on empty input?"), "{task}");
             assert!(!task.contains("Rare, leave it"), "{task}");
         }
+    }
+
+    /// The tasks of the `helpers` helpers started for a run in a folder
+    /// `name`, as `setup` leaves it, that is asked twelve requirements,
+    /// which two reviews share, and sets twenty-five inputs aside, each
+    /// weighed as the others are.
+    fn tasks_with_cases_aside(
+        name: &str,
+        id: AgentId,
+        helpers: usize,
+        setup: impl FnOnce(&mut Spec),
+    ) -> Vec<String> {
+        let _data = data(name);
+        let dir = scratch(name);
+        let request: String = (1..=12)
+            .map(|n| format!("Field {n} must be read as a number. "))
+            .collect();
+        let stated = crate::requirements::sentences(&request);
+        assert_eq!(crate::requirements::shares(stated.len()), [(1, 6), (7, 12)]);
+        let aside: String = (1..=25)
+            .map(|n| format!("\nInput `{n}` alone? Rare."))
+            .collect();
+        let passed: String = (1..=12).map(|n| format!("R{n} | plain | PASS\n")).collect();
+        let mut answers = vec![
+            reply("", &[write_made()]),
+            reply(&format!("Added the reader.{aside}"), &[]),
+        ];
+        answers.extend(std::iter::repeat_n(reply(&passed, &[]), helpers));
+        answers.push(reply("Each requirement holds.", &[]));
+        let (mut spec, provider) = specified(&dir, id, &request, answers);
+        setup(&mut spec);
+        assert_eq!(finished(spec).status, Outcome::Done);
+        let tasks: Vec<String> = (provider.sent().iter().flat_map(messages))
+            .filter_map(|message| message["content"].as_str())
+            .filter(|content| content.contains("You are a helper ("))
+            .map(String::from)
+            .collect();
+        assert_eq!(tasks.len(), helpers, "{tasks:?}");
+        tasks
+    }
+
+    /// The inputs the one of `tasks` that holds `told` lists as cases set
+    /// aside; None when no helper was given that task.
+    fn aside(tasks: &[String], told: &str) -> Option<Vec<usize>> {
+        let task = tasks.iter().find(|task| task.contains(told))?;
+        let listed = (task.lines())
+            .filter_map(|line| line.trim().strip_prefix("- Input `"))
+            .filter_map(|rest| rest.split('`').next()?.parse().ok());
+        Some(listed.collect())
+    }
+
+    #[test]
+    fn reviews_side_by_side_are_each_dealt_their_own_cases_and_the_tester_the_ten_it_was() {
+        let tasks = tasks_with_cases_aside("requirements-dealt", AGENTS + 1_744, 3, |_| {});
+        // The latest twenty go to the two reviews in turn, ten each and
+        // none to both, where each was given the same ten.
+        let odd: Vec<usize> = (7..=25).step_by(2).collect();
+        let even: Vec<usize> = (6..=24).step_by(2).collect();
+        assert_eq!(aside(&tasks, "Check R1 to R6;"), Some(odd));
+        assert_eq!(aside(&tasks, "Check R7 to R12;"), Some(even));
+        // The tester is given the ten it was: those of one helper.
+        let latest: Vec<usize> = (16..=25).collect();
+        assert_eq!(aside(&tasks, "You are a helper (tester)."), Some(latest));
+    }
+
+    #[test]
+    fn the_one_review_a_budget_has_room_for_is_dealt_the_cases_of_one() {
+        // Two reviews would share the requirements and the budget has room
+        // for one: it is given the ten a lone review is, not its half of
+        // the twenty that two are dealt.
+        let tokens = crate::requirements::REVIEW_TOKENS;
+        let short = |spec: &mut Spec| spec.budget = Some(Arc::new(Budget::new(2 * tokens, None)));
+        let tasks = tasks_with_cases_aside("requirements-dealt-one", AGENTS + 1_743, 2, short);
+        let latest: Vec<usize> = (16..=25).collect();
+        assert_eq!(aside(&tasks, "Check R1 to R6;"), Some(latest.clone()));
+        assert_eq!(aside(&tasks, "Check R7 to R12;"), None);
+        assert_eq!(aside(&tasks, "You are a helper (tester)."), Some(latest));
     }
 
     #[test]

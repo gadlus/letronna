@@ -528,8 +528,9 @@ pub(crate) fn shares(count: usize) -> Vec<(usize, usize)> {
 /// would leave out: the request word for word, how to find the change, and
 /// each case its table has a row for; and not the run's reasons for what it
 /// left out, which a reviewer tends to agree with, though each case it
-/// weighed and set aside, `doubts`, is listed for a row of its own, and the
-/// words it read more than one way, `readings`, for a row per reading.
+/// weighed and set aside that this helper is dealt, `doubts`, is listed for
+/// a row of its own, and the words it read more than one way, `readings`,
+/// for a row per reading.
 pub(crate) fn brief(
     request: &str,
     sentences: &[String],
