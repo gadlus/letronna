@@ -39,6 +39,23 @@ Say "keep it running" and the result stays up as a worker. That fits a scheduler
 - **Secrets**: put them in `/work/.env`, not in the code.
 - **Commands**: `letronna cloud apps`, `logs`, `down` and `up` manage workers. You can also ask in the chat.
 
+## A Discord bot, day and night
+
+Your own Discord bot can be answered from the cloud, in one server, whether your computer is on or not. Tag the bot, or reply to it, and it does the task and answers in the channel.
+
+```sh
+letronna cloud relay discord on --server <server-id> [--role <role-id>]... [--admins]
+letronna cloud relay discord          # how it is
+letronna cloud relay discord off
+```
+
+- **The token**: the one you gave Letronna under Messaging. It is never typed into a chat.
+- **Who it hears**: members with a role you name (`--role`, once for each), the server's owner and its Administrators (`--admins`), or both. Everyone else is passed over, and so are DMs.
+- **Apart from your account**: whoever tags the bot is not you, so its tasks run in a thread of their own with none of your account's variables, connectors or skills, and nothing can be left running from it. Set what the bot needs for that thread alone. Anyone the bot hears can have it use what you set there.
+- **What it costs**: its tasks are paid from your credit, on the light tier unless you say `--tier normal`. It takes three at a time (one a member) and 200 a day.
+- **This computer**: while the cloud answers the bot, Letronna here leaves it alone, or both would answer. `off` gives it back.
+- **In Discord**: add the bot to the server with View Channels, Send Messages and Read Message History; the command prints the link when it is not there yet. Message Content can stay off: the bot then reads less of the message a reply answers.
+
 ## Web apps
 
 A web app gets its own address, `https://lc-<id>.letronna.si`.

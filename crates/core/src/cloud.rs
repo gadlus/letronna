@@ -305,6 +305,101 @@ pub fn relay(on: bool) -> Result<(), String> {
     crate::messaging::save(&config)
 }
 
+/// A thing of Discord's, by its ID and the name it goes by.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Named {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// The account's Discord bot, as Letronna Cloud answers it.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct DiscordBot {
+    /// Whether the cloud answers one.
+    #[serde(default)]
+    pub discord: bool,
+    #[serde(default)]
+    pub bot: Named,
+    #[serde(default)]
+    pub server: Named,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub admins: bool,
+    /// The cloud thread its tasks run in, kept apart from the account.
+    #[serde(default)]
+    pub thread: String,
+    /// connecting, connected, away, waiting, failed or off.
+    #[serde(default)]
+    pub state: String,
+    /// Why it is not connected, when the cloud knows.
+    #[serde(default)]
+    pub failure: String,
+    #[serde(default)]
+    pub asks_today: u32,
+    /// The link that adds the bot to a server with what answering takes.
+    #[serde(default)]
+    pub invite: String,
+}
+
+/// Where a Discord bot listens and who it hears there.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Hears {
+    pub server: String,
+    /// Members holding one of these roles are heard.
+    pub roles: Vec<String>,
+    /// So are the server's owner and whoever holds Administrator.
+    pub admins: bool,
+    /// light or normal; the cloud's choice when empty.
+    pub tier: String,
+}
+
+/// Have Letronna Cloud answer the Discord bot set up in Messaging, in one
+/// server, for the members `hears` names, whether this computer is on or
+/// not. This Letronna stops listening to the bot itself: both would answer.
+/// The token is the saved one, so it is never typed into a chat or a shell.
+pub fn discord_relay(hears: &Hears) -> Result<DiscordBot, String> {
+    let mut config = crate::messaging::load();
+    let token = config.discord.bot_token.trim().to_owned();
+    if token.is_empty() {
+        return Err("Give Letronna your Discord bot's token first, in Messaging.".into());
+    }
+    let bot = send(
+        client()?
+            .post(url("/v1/relay/discord"))
+            .json(&serde_json::json!({
+                "token": token,
+                "server": hears.server,
+                "roles": hears.roles,
+                "admins": hears.admins,
+                "tier": hears.tier,
+            })),
+    )?
+    .json()
+    .map_err(|e| e.to_string())?;
+    config.discord.cloud = true;
+    crate::messaging::save(&config)?;
+    Ok(bot)
+}
+
+/// Have Letronna Cloud stop answering the Discord bot and forget its token;
+/// this Letronna hears the bot again.
+pub fn discord_relay_off() -> Result<(), String> {
+    send(client()?.post(url("/v1/relay/discord/off")))?;
+    let mut config = crate::messaging::load();
+    config.discord.cloud = false;
+    crate::messaging::save(&config)
+}
+
+/// The Discord bot Letronna Cloud answers for this account, and how it is.
+pub fn discord_relay_state() -> Result<DiscordBot, String> {
+    send(client()?.get(url("/v1/relay/discord")))?
+        .json()
+        .map_err(|e| e.to_string())
+}
+
 /// Tell Letronna Cloud this computer is up and listening to its chat apps.
 pub fn heartbeat() -> Result<(), String> {
     send(client()?.post(url("/v1/relay/heartbeat"))).map(drop)
