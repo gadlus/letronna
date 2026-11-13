@@ -28,6 +28,23 @@
 //! the literal inside that clause, the case ends with that clause. So what
 //! the case is stays, and the verdict and the reasons after it go.
 //!
+//! Two kinds of sentence are a case with no span or quote in them. One
+//! predicts a check, with a marker that opens with `CHECK`, and introduces
+//! the fenced code that follows it, as "A hidden test might do:" does: the
+//! case is that sentence with the first lines of the code under it, in
+//! `PREDICTED` characters at most, and a sentence after the code that names
+//! nothing weighs it off as it would a sentence that holds a span. With the
+//! code skipped, the reviewers of a run that had written out the very test
+//! its work then failed were given the sentence before it, which said
+//! nothing of the test, and each guessed another meaning. The other names a
+//! defect in the work in so many words (`DEFECTS`), as "That would break
+//! it, but that's rare." does. It is the case of a weigh-off in its own
+//! sentence, and of one in the sentence after it that names nothing, as
+//! "Out of scope. Leave it." is; and it ranks with the cases weighed
+//! hardest, since the run has said its work is wrong there and left it.
+//! Such a sentence held no span, so a run's reviewers were given another
+//! sentence in its place, or none.
+//!
 //! A run that works for long weighs off several times `KEPT` cases. The one
 //! its request's tests then check is sometimes an early one it weighed hard,
 //! and more often one of the last it named, so the ones given are chosen
@@ -104,6 +121,11 @@ const RANKED: usize = 5;
 /// Characters a case is given in at most.
 const CHARS: usize = 200;
 
+/// Characters a check the run predicted is given in at most with the code
+/// it introduces: in the runs read, four in five of such checks fit, the
+/// sentence and its code together.
+const PREDICTED: usize = 300;
+
 /// Sentences before a weigh-off its case may be named in, as "Could also
 /// set `x`? That would pollute it. I'll keep only y." names it two back;
 /// one fewer for a verdict of `ALONE`.
@@ -154,12 +176,22 @@ const MARKERS: &[&str] = &[
     "good enough",
     "assume",
     "safest",
+    "not an issue",
+    "not a problem",
 ];
 
 /// Words that weigh a case off only as a sentence of their own, in lower
 /// case: each a verdict on the sentence before it, where inside a sentence
 /// it is what the work does, as in "skip the header".
-const ALONE: &[&str] = &["skip", "ignore", "acceptable", "edge", "keep"];
+const ALONE: &[&str] = &[
+    "skip",
+    "ignore",
+    "acceptable",
+    "edge",
+    "keep",
+    "accept",
+    "accepted",
+];
 
 /// The words every marker that predicts a check of a case opens with.
 const CHECK: &str = "hidden test";
@@ -187,6 +219,52 @@ const WAVED: &[&str] = &[
 /// cases one of them weighed off were a document, a command, a file to
 /// tidy or the order of the run's own code, not something the work does.
 const PASSING: &[&str] = &["not needed", "doesn't matter", "leave it", "skip"];
+
+/// Words that name a defect in the work, in lower case, each matched as
+/// whole words. A sentence that holds one says the work is wrong there, so
+/// it is a case with no span or quote and ranks with those weighed hardest.
+/// Not among them are words the runs read said as often of a test of the
+/// project, a link or a cache as of the work: "fails", "broken", "crash"
+/// and "misses".
+const DEFECTS: &[&str] = &[
+    "bug",
+    "bugs",
+    "buggy",
+    "wrong",
+    "breaks",
+    "would break",
+    "could break",
+    "may break",
+    "might break",
+    "would fail",
+    "will fail",
+    "limitation",
+    "should i fix",
+    "should we fix",
+];
+
+/// Words that turn one of `DEFECTS` round where one is among the `DENIED`
+/// words before it, as in "won't break" and "not a real bug".
+const UNDONE: &[&str] = &[
+    "not", "no", "never", "isn't", "aren't", "wasn't", "nothing", "won't", "wouldn't", "doesn't",
+    "don't", "didn't", "can't", "cannot", "without",
+];
+
+/// Words before one of `DEFECTS` that are read for one of `UNDONE`.
+const DENIED: usize = 3;
+
+/// What a sentence says of a test, a script or a probe of the run's own:
+/// a defect there is none of the work's.
+const PROBES: &[&str] = &["my test", "my tests", "my script", "my probe", "my scratch"];
+
+/// Words a sentence opens with when it speaks of the one before it, as
+/// "That's wrong but rare." does.
+const OPENERS: &[&str] = &["that", "that's", "this", "it", "it's", "which"];
+
+/// Words in a sentence that names a defect with no span or quote and is
+/// too short to say alone what is wrong, as "Should I fix the second
+/// case?" is.
+const SHORT: usize = 8;
 
 /// The weight of a case the run predicted a check of, waved off with one
 /// of `WAVED` or weighed while quoting a requirement, and no more.
@@ -564,7 +642,7 @@ fn set_aside(messages: &[Message], request: &str, sentences: &[String]) -> Vec<C
         .filter(|message| message.role == "assistant");
     let mut found: Vec<Case> = Vec::new();
     for text in own.flat_map(|message| [&message.reasoning, &message.content]) {
-        for (case, markers, ticked) in cases(text) {
+        for (case, markers, ticked, defect) in cases(text) {
             // Ticked off, a sentence says what the run checked: it names
             // no case, and what the same span named before it stands.
             if ticked {
@@ -573,7 +651,8 @@ fn set_aside(messages: &[Message], request: &str, sentences: &[String]) -> Vec<C
             let key = key(&case);
             let before = found.iter().position(|(kept, ..)| *kept == key);
             let quoted = quotes(&case, &listed);
-            let mut rank = (weight(&markers, quoted), quoted || named(&case, &names));
+            let weight = weight(&markers, quoted, defect);
+            let mut rank = (weight, quoted || named(&case, &names));
             // Named again, a case takes the later words and place and
             // keeps the hardest it was weighed; a naming weighed only in
             // passing leaves one weighed otherwise as it stood.
@@ -618,17 +697,19 @@ fn given(found: &[Case], mut kept: Vec<usize>) -> Vec<String> {
 }
 
 /// How hard `markers`, the words that weighed a case off, weigh it, when
-/// `quoted` with a requirement's words quoted: most where one predicts a
-/// check of it and it was weighed again, by another marker or with the
-/// quote; then where one predicts a check, one of `WAVED` waves it off or
-/// a requirement is quoted; then the rest, and least where each is one of
-/// `PASSING`.
-fn weight(markers: &[&str], quoted: bool) -> u8 {
+/// `quoted` with a requirement's words quoted and when it names a `defect`
+/// in the work: most where one predicts a check of it and it was weighed
+/// again, by another marker or with the quote, or where it names a defect
+/// and more than words said in passing weighed it; then where one predicts
+/// a check, one of `WAVED` waves it off or a requirement is quoted; then
+/// the rest, and least where each is one of `PASSING`.
+fn weight(markers: &[&str], quoted: bool, defect: bool) -> u8 {
     let checked = markers.iter().any(|marker| marker.starts_with(CHECK));
     let again = markers.iter().any(|marker| !marker.starts_with(CHECK));
     let waved = markers.iter().any(|marker| WAVED.contains(marker));
     let passing = markers.iter().all(|marker| PASSING.contains(marker));
     match (checked, waved || quoted) {
+        _ if defect && !passing => STRONG + 1,
         (true, _) if again || quoted => STRONG + 1,
         (false, false) if passing => PASSED,
         (false, false) => STRONG - 1,
@@ -704,21 +785,31 @@ pub(crate) fn section(doubts: &[String], tester: bool) -> String {
 }
 
 /// The cases `text` weighs off, in the order each was last weighed, each
-/// with the markers of every sentence that weighed it and whether its own
-/// sentence ticks it off.
-fn cases(text: &str) -> Vec<(String, Vec<&'static str>, bool)> {
-    let units = units(text);
+/// with the markers of every sentence that weighed it, whether its own
+/// sentence ticks it off, and whether that sentence names a defect in the
+/// work (`defect`). A sentence that holds a span or a quote, predicts a
+/// check and introduces code (`introduces`), or names a defect, is its own
+/// case; one that names nothing weighs off the nearest of the `BACK` before
+/// it that holds a span or a quote or introduces such code, or the one
+/// before it where that one names a defect.
+fn cases(text: &str) -> Vec<(String, Vec<&'static str>, bool, bool)> {
+    let units = spoken(text);
+    let names = |unit: &Spoken| !literals(&unit.words).is_empty() || introduces(unit).is_some();
+    let wrong = |unit: &Spoken| defect(&unit.words).is_some();
     // Each sentence named as a case, with the markers that weighed it.
     let mut named: Vec<(usize, Vec<&'static str>)> = Vec::new();
     for (at, unit) in units.iter().enumerate() {
-        let marks = marks(&masked(unit));
+        let marks = marks(&masked(&unit.words));
         if marks.is_empty() {
             continue;
         }
-        let Some(naming) = (at.saturating_sub(BACK)..=at)
-            .rev()
-            .find(|&before| !literals(&units[before]).is_empty())
-        else {
+        let naming = match names(unit) || wrong(unit) {
+            true => Some(at),
+            false => (at.saturating_sub(BACK)..at).rev().find(|&before| {
+                names(&units[before]) || (before + 1 == at && wrong(&units[before]))
+            }),
+        };
+        let Some(naming) = naming else {
             continue;
         };
         // A verdict of one word is on the sentence it follows, or on the
@@ -740,9 +831,137 @@ fn cases(text: &str) -> Vec<(String, Vec<&'static str>, bool)> {
     (named.into_iter())
         .map(|(naming, markers)| {
             let unit = &units[naming];
-            (case(unit), markers, ticked(unit))
+            let before = naming.checked_sub(1).map(|at| units[at].words.as_str());
+            let defect = defect(&unit.words).is_some();
+            (told(unit, before), markers, ticked(&unit.words), defect)
         })
         .collect()
+}
+
+/// The case the sentence `unit` names as a helper is given it, without the
+/// verdict and reasons after it: a check it predicts with the code it
+/// introduces under it (`predicted`); otherwise its words through its last
+/// span or quote, or the defect it names where that comes later
+/// (`through`). One that names a defect with no span or quote, and opens
+/// with one of `OPENERS` or has `SHORT` words or fewer, says too little
+/// alone of what is wrong, so the sentence `before` it goes ahead of it,
+/// as much of its end as leaves the case whole in `CHARS` characters.
+fn told(unit: &Spoken, before: Option<&str>) -> String {
+    if let Some(said) = introduces(unit) {
+        return predicted(&said, &unit.code);
+    }
+    let words = &unit.words;
+    let quoted = literals(words).last().map(|range| range.end);
+    let Some(named) = quoted.max(defect(words)) else {
+        return words.clone();
+    };
+    let case = through(words, named);
+    let prose = masked(words);
+    let mut said = prose
+        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+        .filter(|word| !word.is_empty());
+    let opens = said.next().is_some_and(|word| OPENERS.contains(&word));
+    let refers = opens || prose.split_whitespace().count() <= SHORT;
+    let room = CHARS.saturating_sub(case.chars().count() + 1);
+    match before {
+        Some(before) if quoted.is_none() && refers && room > 0 => {
+            format!("{} {case}", ending(before, room))
+        }
+        _ => case,
+    }
+}
+
+/// The end of `sentence` in at most `most` characters, cut at a word with
+/// a `…` ahead of it.
+fn ending(sentence: &str, most: usize) -> String {
+    let size = sentence.chars().count();
+    if size <= most {
+        return sentence.to_owned();
+    }
+    let tail: String = sentence.chars().skip(size - most + 1).collect();
+    let at = tail.find(char::is_whitespace).unwrap_or(0);
+    format!("\u{2026}{}", tail[at..].trim_start())
+}
+
+/// What `unit` says to predict a check, where it introduces code: its
+/// words before the fenced code that follows it, through the clause that
+/// holds a marker of `CHECK`. None where no code follows it, or nothing it
+/// says before the code predicts a check.
+fn introduces(unit: &Spoken) -> Option<String> {
+    if unit.code.is_empty() {
+        return None;
+    }
+    let said = unit.words[..unit.before].trim_end();
+    let check = (marks(&masked(said)).into_iter())
+        .find(|(_, marker)| marker.starts_with(CHECK))
+        .map(|(at, marker)| at + marker.len())?;
+    Some(through(said, check))
+}
+
+/// `said`, which predicts a check, with the lines of `code` it introduces
+/// under it as fenced code, each two spaces in so the case stays one item
+/// of a list, in `PREDICTED` characters at most: `said` as any case is cut,
+/// then whole lines of the code while they fit, of the first as much as
+/// fits, and a `…` for what is left out, of that line or after the lines.
+fn predicted(said: &str, code: &[String]) -> String {
+    let said = cut(said);
+    let indent = (code.iter())
+        .map(|line| line.chars().take_while(|c| c.is_whitespace()).count())
+        .min()
+        .unwrap_or(0);
+    let mut left = PREDICTED.saturating_sub(said.chars().count());
+    let mut kept: Vec<String> = Vec::new();
+    for line in code {
+        let line: String = line.chars().skip(indent).collect();
+        let size = line.chars().count();
+        if size <= left {
+            kept.push(line);
+            left -= size;
+            continue;
+        }
+        // Too long alone, the first line is cut as a case is, at a word.
+        if kept.is_empty() {
+            let head: String = line.chars().take(left.saturating_sub(1)).collect();
+            let at = head.rfind(char::is_whitespace).unwrap_or(head.len());
+            kept.push(format!("{}\u{2026}", head[..at].trim_end()));
+        }
+        break;
+    }
+    if kept.len() < code.len() {
+        kept.push("\u{2026}".to_owned());
+    }
+    let opens = match said.ends_with(['.', '?', '!', '\u{2026}']) {
+        true => "",
+        false => ":",
+    };
+    format!("{said}{opens}\n  ```\n  {}\n  ```", kept.join("\n  "))
+}
+
+/// Where the last defect `unit` names ends in it, if it names one: one of
+/// `DEFECTS` outside its spans and quotes, with none of `UNDONE` among the
+/// `DENIED` words before it. A sentence that says "either way" names none,
+/// since what it says holds of both choices and not of the one the work
+/// made, nor does one that speaks of the run's own test or script
+/// (`PROBES`).
+fn defect(unit: &str) -> Option<usize> {
+    let prose = masked(unit);
+    let holds = |said: &&str| !whole(&prose, said).is_empty();
+    if holds(&"either way") || PROBES.iter().any(holds) {
+        return None;
+    }
+    let bare = |word: &str| -> String {
+        let marks = |c: char| !(c.is_alphanumeric() || c == '\'');
+        word.trim_matches(marks).to_owned()
+    };
+    let denied = |at: usize| {
+        let mut before = prose[..at].split_whitespace().rev().take(DENIED);
+        before.any(|word| UNDONE.contains(&bare(word).as_str()))
+    };
+    (DEFECTS.iter())
+        .flat_map(|word| whole(&prose, word).into_iter().map(|at| (at, word.len())))
+        .filter(|(at, _)| !denied(*at))
+        .map(|(at, len)| at + len)
+        .max()
 }
 
 /// Whether `unit` ticks its case off: a check mark after its last literal,
@@ -755,19 +974,48 @@ fn ticked(unit: &str) -> bool {
 /// The sentences of `text` outside fenced code, a verdict of a few words
 /// joined to the one before it.
 fn units(text: &str) -> Vec<String> {
+    (spoken(text).into_iter().map(|unit| unit.words)).collect()
+}
+
+/// A sentence of a reply's text, as `spoken` gives it.
+struct Spoken {
+    /// Its words, with a verdict of a few words after it joined to them.
+    words: String,
+    /// The lines of the fenced code that follows it before any other
+    /// sentence, which it introduces as "A hidden test might do:" does,
+    /// without the blank ones; none where no code follows it.
+    code: Vec<String>,
+    /// How many bytes of `words` it had said when that code began.
+    before: usize,
+}
+
+/// The sentences of `text` as `units` gives them, each with the fenced code
+/// it introduces.
+fn spoken(text: &str) -> Vec<Spoken> {
     let text = text.replace(['\u{2018}', '\u{2019}'], "'");
-    let mut units: Vec<String> = Vec::new();
+    let mut units: Vec<Spoken> = Vec::new();
     let mut fence: Option<&str> = None;
-    for line in text.lines() {
-        let line = line.trim();
+    // Whether the block being read is the first after the last sentence.
+    let mut introduced = false;
+    for raw in text.lines() {
+        let line = raw.trim();
         if let Some(mark) = fence {
             if line.starts_with(mark) {
                 fence = None;
+            } else if introduced
+                && !line.is_empty()
+                && let Some(last) = units.last_mut()
+            {
+                last.code.push(raw.trim_end().to_owned());
             }
             continue;
         }
         if let Some(mark) = ["```", "~~~"].into_iter().find(|m| line.starts_with(m)) {
             fence = Some(mark);
+            introduced = units.last().is_some_and(|last| last.code.is_empty());
+            if let (true, Some(last)) = (introduced, units.last_mut()) {
+                last.before = last.words.len();
+            }
             continue;
         }
         let line = ["- ", "* ", "+ "]
@@ -779,10 +1027,14 @@ fn units(text: &str) -> Vec<String> {
                 sentence.split_whitespace().count() <= GLUED && literals(sentence).is_empty();
             match units.last_mut() {
                 Some(last) if short => {
-                    last.push(' ');
-                    last.push_str(sentence);
+                    last.words.push(' ');
+                    last.words.push_str(sentence);
                 }
-                _ => units.push(sentence.to_owned()),
+                _ => units.push(Spoken {
+                    words: sentence.to_owned(),
+                    code: Vec::new(),
+                    before: 0,
+                }),
             }
         }
     }
@@ -914,11 +1166,10 @@ fn clauses(prose: &str) -> Vec<Range<usize>> {
     found
 }
 
-/// The case `unit` names, without the verdict and reasons after it.
-fn case(unit: &str) -> String {
-    let Some(quoted) = literals(unit).last().map(|range| range.end) else {
-        return unit.to_owned();
-    };
+/// `unit` through the clause that holds what names its case, which ends at
+/// `quoted`, and on through the clauses after it until one where a marker
+/// starts: without the verdict and the reasons after it.
+fn through(unit: &str, quoted: usize) -> String {
     let prose = masked(unit);
     let marks = marks(&prose);
     let clauses = clauses(&prose);
@@ -952,9 +1203,10 @@ fn key(case: &str) -> String {
     }
 }
 
-/// `case` in at most `CHARS` characters, cut at a word with a `…`.
+/// `case` in at most `CHARS` characters, cut at a word with a `…`; one
+/// with code under it is left as `predicted` made it.
 fn cut(case: &str) -> String {
-    if case.chars().count() <= CHARS {
+    if case.contains('\n') || case.chars().count() <= CHARS {
         return case.to_owned();
     }
     let head: String = case.chars().take(CHARS - 1).collect();
@@ -1778,6 +2030,255 @@ mod tests {
         // The words of a choice the run made are not said in passing.
         for word in ["i'll keep", "i'll leave", "assume", "no need to"] {
             assert!(MARKERS.contains(&word) && !PASSING.contains(&word));
+        }
+    }
+
+    /// `said` with `lines` of code under it, as a check predicted with its
+    /// code is given.
+    fn under(said: &str, lines: &[&str]) -> String {
+        format!("{said}\n  ```\n  {}\n  ```", lines.join("\n  "))
+    }
+
+    #[test]
+    fn a_check_predicted_in_code_is_given_with_the_code_it_introduces() {
+        // As a run wrote out the test its work then failed. The sentence
+        // before it holds a quote and says nothing of the test: it is no
+        // longer the case, and the blank line of the code is left out.
+        let notes = "That is a narrower miss than the \"spurious match\" one.\n\n\
+                     Hmm, but hidden tests might do:\n\n```ts\nconst added = createAdded();\n\n\
+                     entity.add(Velocity);      // before any query exists\n\
+                     expect(world.query(added(Motion))).toEqual([entity]);\n```\n\
+                     So the query has to be made first.";
+        let code = [
+            "const added = createAdded();",
+            "entity.add(Velocity);      // before any query exists",
+            "expect(world.query(added(Motion))).toEqual([entity]);",
+        ];
+        assert_eq!(
+            weighed(notes),
+            [under("Hmm, but hidden tests might do:", &code)]
+        );
+        // Lines keep their indentation under the least indented, whatever
+        // fences the code, and a sentence that holds a span keeps it.
+        let nested = "A hidden test may check `f`:\n~~~\n    def f():\n        pass\n~~~";
+        assert_eq!(
+            weighed(nested),
+            [under(
+                "A hidden test may check `f`:",
+                &["def f():", "    pass"]
+            )]
+        );
+        // What the run said of it after the code is its verdict, not the
+        // case, and a tick there says the run checked it.
+        let works = "Hidden test might do:\n```\nopen(path)\n```\nWorks.";
+        assert_eq!(
+            weighed(works),
+            [under("Hidden test might do:", &["open(path)"])]
+        );
+        let ticked = "Hidden test might do:\n```\nopen(path)\n```\n\u{2713}";
+        assert!(weighed(ticked).is_empty(), "{:?}", weighed(ticked));
+        // Two predictions are two cases, each by its own code.
+        let two = format!("{works}\nA hidden test could also do:\n```\nclose(path)\n```");
+        assert_eq!(weighed(&two).len(), 2, "{:?}", weighed(&two));
+        // Code a sentence introduces without predicting a check names
+        // nothing, and code after another sentence is not the prediction's.
+        let plain = "Simplest is this:\n```\nlet x = 1;\n```\nRare.";
+        assert!(weighed(plain).is_empty(), "{:?}", weighed(plain));
+        let apart = "Hidden tests might do this.\nSo write the helper first:\n```\nhelp()\n```";
+        assert!(weighed(apart).is_empty(), "{:?}", weighed(apart));
+    }
+
+    #[test]
+    fn a_predicted_check_keeps_the_first_lines_of_long_code() {
+        let long: Vec<String> = (1..=20)
+            .map(|n| format!("expect(parse(input_{n})).toEqual(output_{n});"))
+            .collect();
+        let notes = format!("A hidden test could be:\n```\n{}\n```", long.join("\n"));
+        let found = weighed(&notes);
+        let [case] = found.as_slice() else {
+            panic!("{found:?}");
+        };
+        let lines: Vec<&str> = case.lines().collect();
+        let [said, opens, kept @ .., more, closes] = lines.as_slice() else {
+            panic!("{case}");
+        };
+        assert_eq!(
+            [*said, *opens, *more, *closes],
+            ["A hidden test could be:", "  ```", "  \u{2026}", "  ```"]
+        );
+        // Whole lines, as many as fit with the sentence and not one more.
+        assert!(!kept.is_empty() && kept.len() < long.len(), "{case}");
+        let whole = |(kept, line): (&&str, &String)| kept.strip_prefix("  ") == Some(line.as_str());
+        assert!(kept.iter().zip(&long).all(whole), "{case}");
+        let size = |lines: &[String]| -> usize {
+            let code: usize = lines.iter().map(|line| line.chars().count()).sum();
+            said.chars().count() + code
+        };
+        assert!(size(&long[..kept.len()]) <= PREDICTED, "{case}");
+        assert!(size(&long[..=kept.len()]) > PREDICTED, "{case}");
+        // A first line too long alone is cut at a word, as a case is.
+        let line = "expect(parse(input)).toEqual(output); ".repeat(12);
+        let found = weighed(&format!("A hidden test could be:\n```\n{line}\n```"));
+        let [case] = found.as_slice() else {
+            panic!("{found:?}");
+        };
+        let lines: Vec<&str> = case.lines().collect();
+        let [said, _, kept, _] = lines.as_slice() else {
+            panic!("{case}");
+        };
+        assert!(kept.ends_with("toEqual(output);\u{2026}"), "{case}");
+        assert!(
+            said.chars().count() + kept.trim_start().chars().count() <= PREDICTED,
+            "{case}"
+        );
+    }
+
+    #[test]
+    fn a_check_predicted_in_code_is_weighed_as_one_predicted_in_words_is() {
+        let case = under("Hidden tests might do:", &["open(path)", "open(path)"]);
+        let code = "Hidden tests might do:\n```\nopen(path)\nopen(path)\n```";
+        // Weighed again after its code, in any words, it is kept first.
+        for again in [
+            "Unlikely.",
+            "Not needed.",
+            "That would be rare in a caller.",
+        ] {
+            let mut notes = vec![format!("{code}\n{again}")];
+            notes.extend(inputs(1..=12, "Rare."));
+            let found = weighed(&notes.join("\n"));
+            assert_eq!(found[0], case, "{again}");
+            assert_eq!(found[1..], alone(4..=12), "{again}");
+        }
+        // Only predicted, it is weighed as a case a strong word waved off.
+        let mut notes = vec![code.to_owned()];
+        notes.extend(inputs(1..=12, "Rare."));
+        assert_eq!(weighed(&notes.join("\n")), alone(3..=12));
+        let mut notes = vec![code.to_owned()];
+        notes.extend(inputs(1..=12, "I'll keep it."));
+        let found = weighed(&notes.join("\n"));
+        assert_eq!(found[0], case);
+        assert_eq!(found[1..], alone(4..=12));
+        // What the request names in its code puts it first among those.
+        let request = "Add `open(path)`, which may be called twice.";
+        let mut notes = vec![code.to_owned()];
+        notes.extend(inputs(1..=12, "Rare."));
+        let found = doubts(&[said(&notes.join("\n"), "")], request, &[]);
+        assert_eq!(found[0], case);
+        assert_eq!(found[1..], alone(4..=12));
+    }
+
+    #[test]
+    fn a_case_with_code_under_it_stays_one_item_of_a_helpers_list() {
+        let cases = [
+            under("Hidden tests might do:", &["open(path)", "    close(path)"]),
+            "An empty `name`?".to_owned(),
+        ];
+        for tester in [false, true] {
+            let text = section(&cases, tester);
+            let listed = ":\n- Hidden tests might do:\n  ```\n  open(path)\n      close(path)\n  \
+                          ```\n- An empty `name`?";
+            assert!(text.ends_with(listed), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_defect_named_in_plain_words_is_a_case_with_no_span_or_quote() {
+        // In the sentence a marker weighs off, without its verdict.
+        let own = "Sending more than the limit in one call would break the mux, but that's rare.";
+        let case = "Sending more than the limit in one call would break the mux";
+        assert_eq!(weighed(own), [case]);
+        // Or in the sentence before one that names nothing.
+        let before = "A reader given two files at once gets the wrong order. Out of scope here.";
+        assert_eq!(
+            weighed(before),
+            ["A reader given two files at once gets the wrong order."]
+        );
+        // One that speaks of the sentence before it, or is too short to
+        // say what is wrong, is given after that sentence.
+        let spoken = "For wide globals the dump writes zeros. That's wrong but rare.";
+        assert_eq!(weighed(spoken), [spoken]);
+        let short = "Two traits may land in different groups. Hmm, but should I fix the second \
+                     case? That's out of scope. Leave it.";
+        assert_eq!(
+            weighed(short),
+            ["Two traits may land in different groups. Hmm, but should I fix the second case?"]
+        );
+        // Of a long sentence before it only the end, so the defect stays.
+        let long = format!(
+            "Each {}reads the header twice. That's a bug, but rare.",
+            "of the many readers ".repeat(12)
+        );
+        let found = weighed(&long);
+        let [given] = found.as_slice() else {
+            panic!("{found:?}");
+        };
+        assert!(given.chars().count() <= CHARS, "{given}");
+        assert!(given.starts_with('\u{2026}'), "{given}");
+        assert!(
+            given.ends_with("reads the header twice. That's a bug"),
+            "{given}"
+        );
+        // A defect denied, one said of both choices and one of the run's
+        // own test are no defect of the work, and name nothing.
+        for notes in [
+            "That is not a real bug, and it is rare.",
+            "Reading twice never breaks the order. Rare.",
+            "Exact tests would fail either way.",
+            "So my test expectation is arguably wrong.",
+        ] {
+            assert!(weighed(notes).is_empty(), "{notes}: {:?}", weighed(notes));
+        }
+    }
+
+    #[test]
+    fn a_defect_the_run_named_and_left_ranks_with_the_cases_weighed_hardest() {
+        let case = "Sending more than the limit in one call would break the mux";
+        let mut notes = vec![format!("{case}, but that's rare.")];
+        notes.extend(inputs(1..=12, "Rare."));
+        let found = weighed(&notes.join("\n"));
+        assert_eq!(found[0], case);
+        assert_eq!(found[1..], alone(4..=12));
+        // So does one that holds a span, which was a case before.
+        let mut notes = vec!["A `frame` past the limit breaks the mux. Edge case.".to_owned()];
+        notes.extend(inputs(1..=12, "Rare."));
+        let found = weighed(&notes.join("\n"));
+        assert_eq!(found[0], "A `frame` past the limit breaks the mux.");
+        assert_eq!(found[1..], alone(4..=12));
+        // Weighed only by words said in passing, it is kept last as any
+        // such case is.
+        let mut notes = vec![format!("{case}. Not needed.")];
+        notes.extend(inputs(1..=12, "I'll keep it."));
+        assert_eq!(weighed(&notes.join("\n")), alone(3..=12));
+    }
+
+    #[test]
+    fn words_that_call_a_case_no_issue_or_accept_it_weigh_it_off() {
+        for (notes, case) in [
+            (
+                "A `stack` read lazily on a subclass? Not an issue.",
+                "A `stack` read lazily on a subclass?",
+            ),
+            (
+                "Two consumers on one `queue` are polled twice a round. Not a problem.",
+                "Two consumers on one `queue` are polled twice a round.",
+            ),
+            (
+                "A `handle` made after the transition misses it. Accept.",
+                "A `handle` made after the transition misses it.",
+            ),
+            (
+                "A `handle` made after the transition misses it. Accepted.",
+                "A `handle` made after the transition misses it.",
+            ),
+        ] {
+            assert_eq!(weighed(notes), [case], "{notes}");
+        }
+        // Inside a sentence, to accept is what the work does.
+        let does = "We accept `None` there and return early.";
+        assert!(weighed(does).is_empty(), "{:?}", weighed(does));
+        // Neither waves a case off, nor is said in passing.
+        for word in ["not an issue", "not a problem", "accept", "accepted"] {
+            assert!(!WAVED.contains(&word) && !PASSING.contains(&word));
         }
     }
 
