@@ -4147,9 +4147,10 @@ fn reviews(spec: &Spec, request: &str, found: &[String]) -> Reviewed {
         .and_then(crate::spec_tests::before);
     // The cases the run weighed and set aside, without its reasons, so each
     // helper checks them by the request's words. The tester is given those
-    // of one helper, and each review that starts its own, dealt from as
-    // many times that as reviews start: side by side they then check more
-    // of them than the same few each.
+    // of one helper. Every review that starts is given the three weighed
+    // hardest and seven of its own, dealt from those chosen for as many
+    // reviews as start: side by side they then check more of them than the
+    // same ten each, and the likeliest to decide the result more than once.
     let own = (spec.transcript.conversation.messages.get(spec.from..)).unwrap_or_default();
     let doubts = crate::doubts::doubts(own, request, found);
     let dealt = crate::doubts::dealt(own, request, found, shares.len().min(afford));
@@ -9551,14 +9552,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn reviews_side_by_side_are_each_dealt_their_own_cases_and_the_tester_the_ten_it_was() {
+    fn reviews_side_by_side_are_each_given_the_same_three_cases_and_seven_of_their_own() {
         let tasks = tasks_with_cases_aside("requirements-dealt", AGENTS + 1_744, 3, |_| {});
-        // The latest twenty go to the two reviews in turn, ten each and
-        // none to both, where each was given the same ten.
-        let odd: Vec<usize> = (7..=25).step_by(2).collect();
-        let even: Vec<usize> = (6..=24).step_by(2).collect();
-        assert_eq!(aside(&tasks, "Check R1 to R6;"), Some(odd));
-        assert_eq!(aside(&tasks, "Check R7 to R12;"), Some(even));
+        // The latest three go to both reviews and the fourteen before them
+        // to the two in turn, seven each and none to both, where each was
+        // given the same ten.
+        let mut first: Vec<usize> = (10..=22).step_by(2).collect();
+        let mut second: Vec<usize> = (9..=21).step_by(2).collect();
+        first.extend(23..=25);
+        second.extend(23..=25);
+        assert_eq!(aside(&tasks, "Check R1 to R6;"), Some(first));
+        assert_eq!(aside(&tasks, "Check R7 to R12;"), Some(second));
         // The tester is given the ten it was: those of one helper.
         let latest: Vec<usize> = (16..=25).collect();
         assert_eq!(aside(&tasks, "You are a helper (tester)."), Some(latest));
@@ -9567,8 +9571,8 @@ pub(crate) mod tests {
     #[test]
     fn the_one_review_a_budget_has_room_for_is_dealt_the_cases_of_one() {
         // Two reviews would share the requirements and the budget has room
-        // for one: it is given the ten a lone review is, not its half of
-        // the twenty that two are dealt.
+        // for one: it is given the ten a lone review is, not its ten of
+        // the seventeen that two are given.
         let tokens = crate::requirements::REVIEW_TOKENS;
         let short = |spec: &mut Spec| spec.budget = Some(Arc::new(Budget::new(2 * tokens, None)));
         let tasks = tasks_with_cases_aside("requirements-dealt-one", AGENTS + 1_743, 2, short);
