@@ -266,7 +266,7 @@ pub fn listen(
 ) -> Result<Option<Arc<AtomicBool>>, NotHeard> {
     let (telegram, discord) = (&config.telegram, &config.discord);
     let mut held = HEARING.lock().unwrap_or_else(PoisonError::into_inner);
-    if !telegram.ready() && !discord.bot_ready() {
+    if !telegram.ready() && !discord.hears() {
         // So another Letronna can hear them.
         *held = None;
         return Ok(None);
@@ -281,7 +281,8 @@ pub fn listen(
     if telegram.ready() {
         messaging::poll(telegram.token.clone(), stop.clone(), sender.clone());
     }
-    if discord.bot_ready() {
+    // A bot Letronna Cloud answers is left to it.
+    if discord.hears() {
         messaging::discord_listen(discord.clone(), stop.clone(), sender);
     }
     Ok(Some(stop))

@@ -2,7 +2,7 @@
 //! computer, and see, follow or stop the runs there.
 
 use crate::render;
-use letronna_core::cloud::{self, Run, TIERS, Task};
+use letronna_core::cloud::{self, DiscordBot, Hears, Run, TIERS, Task};
 use std::io::Write;
 
 const HELP: &str = "\
@@ -16,6 +16,11 @@ Run a task in Letronna Cloud, on Letronna's servers (Pro)
                                        answer, or take that back
   letronna cloud relay on|off          have the cloud answer your Telegram bot
                                        while this computer is off
+  letronna cloud relay discord on --server <id> [--role <id>]... [--admins]
+                                       have the cloud answer your Discord bot in
+                                       one server, day and night, for members
+                                       with a role, its admins, or both
+  letronna cloud relay discord [off]   how that bot is, or stop
   letronna cloud apps                  the apps and workers your runs left running
   letronna cloud logs <thread>         what one printed last
   letronna cloud down <thread>         take one down
@@ -69,6 +74,7 @@ pub fn run(words: &[String]) -> i32 {
                 println!("Letronna Cloud now answers your Telegram chat whenever this computer has been off for three minutes.");
             }),
             Some("off") => cloud::relay(false).map(|()| println!("The cloud no longer answers your Telegram chat.")),
+            Some("discord") => discord(&words[2..]),
             _ => Err("Say on or off: letronna cloud relay on".into()),
         },
         Some("support") => match &words[1..] {
@@ -134,6 +140,97 @@ fn parse(words: &[String]) -> Result<(Task, bool), String> {
         return Err("Say what to do, like: letronna cloud \"add a test for parse\" --repo https://github.com/me/app".into());
     }
     Ok((task, wait))
+}
+
+/// Whether `id` reads as one of Discord's IDs.
+fn discord_id(id: &str) -> bool {
+    (15..=21).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Who `letronna cloud relay discord on <words>` has the bot hear, refused
+/// here when it could not be right, before the bot's token is sent anywhere.
+fn discord_hears(words: &[String]) -> Result<Hears, String> {
+    let mut hears = Hears::default();
+    let mut rest = words.iter();
+    while let Some(word) = rest.next() {
+        let mut value = |flag: &str| {
+            rest.next()
+                .cloned()
+                .ok_or_else(|| format!("{flag} needs a value."))
+        };
+        match word.as_str() {
+            "--server" => hears.server = value("--server")?,
+            "--role" => hears.roles.push(value("--role")?),
+            "--admins" => hears.admins = true,
+            "--tier" => hears.tier = value("--tier")?,
+            other => return Err(format!("Unknown option {other}. See letronna cloud --help.")),
+        }
+    }
+    if !discord_id(&hears.server) {
+        return Err("Say which server: --server <its ID>, a number. In Discord, turn on Developer Mode, then right-click the server and Copy Server ID.".into());
+    }
+    if let Some(role) = hears.roles.iter().find(|role| !discord_id(role)) {
+        return Err(format!("{role} is not a role's ID, which is a number."));
+    }
+    if hears.roles.is_empty() && !hears.admins {
+        return Err("Say who the bot hears: --role <ID> for members with that role (once for each role), --admins for the server's owner and its Administrators, or both.".into());
+    }
+    if !matches!(hears.tier.as_str(), "" | "light" | "normal") {
+        return Err("--tier is light or normal.".into());
+    }
+    Ok(hears)
+}
+
+/// The bot the cloud answers, in a line or two.
+fn discord_line(bot: &DiscordBot) -> String {
+    if bot.bot.id.is_empty() {
+        return "The cloud answers no Discord bot of yours. Start with: letronna cloud relay discord on --server <id> --admins".into();
+    }
+    let mut who = Vec::new();
+    if !bot.roles.is_empty() {
+        who.push(match bot.roles.len() {
+            1 => "members with the role you named".to_owned(),
+            n => format!("members with one of {n} roles"),
+        });
+    }
+    if bot.admins {
+        who.push("the server's owner and Administrators".to_owned());
+    }
+    let name = |named: &cloud::Named| match named.name.is_empty() {
+        true => named.id.clone(),
+        false => named.name.clone(),
+    };
+    let mut line = format!(
+        "{} in {}: {}. It hears {}. {} asked today. Thread {}.",
+        name(&bot.bot),
+        name(&bot.server),
+        bot.state,
+        who.join(" and "),
+        bot.asks_today,
+        bot.thread
+    );
+    if !bot.failure.is_empty() {
+        line.push_str(&format!("\n{}", bot.failure));
+    }
+    line
+}
+
+/// `letronna cloud relay discord …`.
+fn discord(words: &[String]) -> Result<(), String> {
+    match words.first().map(String::as_str) {
+        None => cloud::discord_relay_state().map(|bot| println!("{}", discord_line(&bot))),
+        Some("off") => cloud::discord_relay_off().map(|()| {
+            println!("The cloud no longer answers your Discord bot, and has forgotten its token. Letronna on this computer hears it again.");
+        }),
+        Some("on") => {
+            let bot = cloud::discord_relay(&discord_hears(&words[1..])?)?;
+            println!("Letronna Cloud now answers your Discord bot whether this computer is on or not; Letronna here leaves the bot to it.");
+            println!("{}", discord_line(&bot));
+            println!("Its tasks run apart from your account: set what it needs for thread {} alone.", bot.thread);
+            Ok(())
+        }
+        Some(other) => Err(format!("Say on or off after discord, not {other}: letronna cloud relay discord on --server <id> --admins")),
+    }
 }
 
 fn start(task: &Task, wait: bool) -> Result<(), String> {
@@ -281,6 +378,47 @@ mod tests {
             (task.thread.as_str(), task.repo.as_str(), wait),
             ("th_1", "https://x/y", true)
         );
+    }
+
+    #[test]
+    fn a_discord_bot_is_told_who_it_hears_or_refused_before_its_token_is_sent() {
+        let (server, role) = ("1065950016553881751", "1567927065670586488");
+        assert_eq!(
+            discord_hears(&words(&["--server", server, "--role", role, "--admins"])),
+            Ok(Hears {
+                server: server.into(),
+                roles: vec![role.into()],
+                admins: true,
+                tier: String::new(),
+            })
+        );
+        let two = discord_hears(&words(&["--role", role, "--tier", "normal", "--role", "123456789012345678", "--server", server])).unwrap();
+        assert_eq!((two.roles.len(), two.admins, two.tier.as_str()), (2, false, "normal"));
+        let refused = |all: &[&str]| discord_hears(&words(all)).unwrap_err();
+        assert!(refused(&["--admins"]).contains("Say which server"));
+        assert!(refused(&["--server", "my-server", "--admins"]).contains("Say which server"));
+        assert!(refused(&["--server", server]).contains("Say who the bot hears"));
+        assert!(refused(&["--server", server, "--role", "mods"]).contains("mods is not a role's ID"));
+        assert!(refused(&["--server", server, "--admins", "--tier", "heavy"]).contains("light or normal"));
+        assert!(refused(&["--server"]).contains("--server needs a value"));
+        assert!(refused(&["--server", server, "--everyone"]).contains("Unknown option --everyone"));
+    }
+
+    #[test]
+    fn the_bot_the_cloud_answers_is_said_in_a_line() {
+        assert!(discord_line(&DiscordBot::default()).contains("answers no Discord bot"));
+        let bot: DiscordBot = serde_json::from_str(
+            r#"{"discord": true, "bot": {"id": "9", "name": "helper"}, "server": {"id": "5", "name": "The Server"},
+                "roles": ["1567927065670586488"], "admins": true, "thread": "th_1", "state": "connected",
+                "failure": "", "asks_today": 3, "invite": "https://discord.com/x"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            discord_line(&bot),
+            "helper in The Server: connected. It hears members with the role you named and the server's owner and Administrators. 3 asked today. Thread th_1."
+        );
+        let failed = DiscordBot { state: "failed".into(), failure: "Discord refused the bot's token.".into(), admins: false, ..bot };
+        assert!(discord_line(&failed).ends_with("Thread th_1.\nDiscord refused the bot's token."));
     }
 
     #[test]

@@ -138,6 +138,11 @@ pub struct Discord {
     /// As for Telegram: off unless the user says otherwise.
     #[serde(default)]
     pub allow_tools: bool,
+    /// Letronna Cloud answers this bot in a server, day and night; set by
+    /// `letronna cloud relay discord on`. This Letronna then leaves the
+    /// bot's messages to it: both would answer the same one.
+    #[serde(default)]
+    pub cloud: bool,
 }
 
 impl Discord {
@@ -149,6 +154,12 @@ impl Discord {
     /// The bot can listen and answer.
     pub fn bot_ready(&self) -> bool {
         self.enabled && !self.bot_token.trim().is_empty() && !self.owner.trim().is_empty()
+    }
+
+    /// The bot's messages are this Letronna's to hear: it can listen, and
+    /// Letronna Cloud does not answer it in its place.
+    pub fn hears(&self) -> bool {
+        self.bot_ready() && !self.cloud
     }
 }
 
@@ -696,7 +707,8 @@ pub fn owner_dm(config: &Config, heard: bool) -> Option<Dm> {
     if let (true, true, Some(chat)) = (heard, telegram.ready(), private) {
         return Some(Dm::Telegram(chat));
     }
-    if heard && config.discord.bot_ready() {
+    // Not a bot Letronna Cloud answers: a tap on a card there is not heard here.
+    if heard && config.discord.hears() {
         return Some(Dm::Discord);
     }
     if config.slack.ready() && !config.slack.owner.trim().is_empty() {
@@ -1732,6 +1744,28 @@ pub(crate) mod tests {
         assert!(Dm::Telegram(1001).hears(&tap(1001, 1001, "allow:c1")));
         assert!(!Dm::Telegram(1001).hears(&tap(-100, 1001, "allow:c1")));
         assert!(!Dm::Slack.hears(&tap(1001, 1001, "allow:c1")));
+    }
+
+    #[test]
+    fn a_bot_letronna_cloud_answers_is_left_to_it_here() {
+        let mut config = Config::default();
+        config.discord.enabled = true;
+        config.discord.bot_token = "bot-token".into();
+        config.discord.owner = "99".into();
+        // Heard here, and a card for its owner's DM can go there.
+        assert!(config.discord.hears());
+        assert!(matches!(super::owner_dm(&config, true), Some(Dm::Discord)));
+        // The cloud answers it: not heard here, so no card goes where a tap
+        // would not be heard either, but it still reports as before.
+        config.discord.cloud = true;
+        assert!(config.discord.bot_ready() && !config.discord.hears());
+        assert!(super::owner_dm(&config, true).is_none());
+        assert!(reporting(&config).contains(&"Discord (bot DM)"));
+        // Kept with the rest of the settings, and off in settings from before it.
+        let kept: Config = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert!(kept.discord.cloud);
+        let before: super::Discord = serde_json::from_str(r#"{"enabled": true, "bot_token": "t", "owner": "1"}"#).unwrap();
+        assert!(before.hears());
     }
 
     #[test]

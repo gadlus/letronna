@@ -61,7 +61,7 @@ pub fn run() -> i32 {
 fn opening(config: &messaging::Config) -> String {
     let apps: Vec<&str> = [
         (config.telegram.ready(), "Telegram"),
-        (config.discord.bot_ready(), "Discord"),
+        (config.discord.hears(), "Discord"),
     ]
     .into_iter()
     .filter_map(|(ready, app)| ready.then_some(app))
