@@ -204,9 +204,9 @@ impl Chat {
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(
-                                "Paste a link to a GGUF model. Letronna lists its files, says \
-                                 how each would run here, and checks the one you pick as it \
-                                 arrives.",
+                                "Paste a link to a model. Letronna lists its GGUF files, or \
+                                 those of a GGUF copy when it has none, says how each would \
+                                 run here, and checks the one you pick as it arrives.",
                             ),
                     ),
             )
@@ -300,7 +300,13 @@ impl Chat {
                             .child(Icon::new(AppIcon::PopOut).size_3p5().text_color(link))
                             .on_click(move |_, _, cx| cx.open_url(&page)),
                     )
-                    .child(div().text_xs().text_color(muted).child(facts.join(" · "))),
+                    .child(div().text_xs().text_color(muted).child(facts.join(" · ")))
+                    // Whose files these are, when not the linked model's own.
+                    .children(
+                        found
+                            .from_a_copy()
+                            .map(|said| div().text_xs().text_color(muted).child(said)),
+                    ),
             )
             .child(
                 Button::new("hf-close")
