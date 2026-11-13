@@ -26,11 +26,10 @@
 //! or quoted literal, and on through the clauses after it until one where a
 //! marker starts, which is dropped with all after it; where a marker follows
 //! the literal inside that clause, the case ends with that clause. So what
-//! the case is stays, and the verdict and the reasons after it go. A case
-//! that a defect names, with no span after the defect's words, ends sooner
-//! where the run turns to weighing it, at a "but", a "though", a dash or a
-//! bracket (`TURNS`): given "That's wrong but rare.", a reviewer was handed
-//! the run's verdict with the case.
+//! the case is stays, and the verdict and the reasons after it go. A
+//! question of mending (below), with no span after its words, ends sooner
+//! where the run turns to answering it, at a "but", a "though", a dash or a
+//! bracket (`TURNS`), so its verdict is not handed over with the case.
 //!
 //! Two kinds of sentence are a case with no span or quote in them. One
 //! predicts a check, with a marker that opens with `CHECK`, and introduces
@@ -43,24 +42,21 @@
 //! out, unless that sentence only says "E.g." or the like (`EXAMPLE`). With
 //! the code skipped, the reviewers of a run that had written out the very
 //! test its work then failed were given the sentence before it, which said
-//! nothing of the test, and each guessed another meaning. The other names a
-//! defect in the work in so many words (`DEFECTS`), as "That would break
-//! it, but that's rare." does. It names none where the word is denied
-//! anywhere before it in its clause, or where the sentence puts the fault
-//! somewhere else: in the run's own test or the run itself (`PROBES`), in
-//! what is mended, in the project as it was before the change or in what
-//! the request asks for (`ELSEWHERE`, `FORMER`). It is the case of a
-//! weigh-off in its own sentence, and of one in the sentence after it that
-//! names nothing, as "Out of scope. Leave it." is; and it ranks with the
-//! cases weighed hardest, since the run has said its work is wrong there
-//! and left it, for `FAULTS` in `RANKED` of the places given by weight and
-//! no more. A run says such words often, so each case past those places is
-//! chosen as it would be without the word, one with no span or quote only
-//! where places are left; a defect stays with the words that named it; and
-//! a request that itself asks for a fault to be mended (`mends`) turns the
-//! rule off, since its run says the words of what it was asked for. Such a
-//! sentence held no span, so a run's reviewers were given another sentence
-//! in its place, or none.
+//! nothing of the test, and each guessed another meaning. The other is a
+//! question the run puts to itself about mending its own work, "should I
+//! fix …" or "should we fix …" (`MENDING`), and then leaves. It is the case
+//! of a weigh-off in its own sentence, and of one in the sentence after it
+//! that names nothing, as "Out of scope. Leave it." is. What is to be
+//! mended is said before it, so the sentence before goes ahead of it,
+//! without that sentence's own verdict; and it ranks with the cases weighed
+//! hardest, since the run saw a defect in its work there and left it. Such
+//! a question held no span, so a run's reviewers were given another
+//! sentence in its place, or none: one run asked it of the defect that then
+//! decided its result. Words that only call something wrong, as "bug",
+//! "wrong" and "would break" do, make no case. A rule that read them, with
+//! denials and with faults that were mended, the project's own or asked
+//! for left out, brought in forty cases on the recorded runs and put out
+//! forty, about as many of them real.
 //!
 //! A run that works for long weighs off several times `KEPT` cases. The one
 //! its request's tests then check is sometimes an early one it weighed hard,
@@ -261,166 +257,17 @@ const WAVED: &[&str] = &[
 /// tidy or the order of the run's own code, not something the work does.
 const PASSING: &[&str] = &["not needed", "doesn't matter", "leave it", "skip"];
 
-/// Words that name a defect in the work, in lower case, each matched as
-/// whole words. A sentence that holds one says the work is wrong there, so
-/// it is a case with no span or quote and ranks with those weighed hardest,
-/// for `FAULTS` in `RANKED` of their places. Not among them are words the
-/// runs read said as often of a test of the project, a link or a cache as
-/// of the work: "fails", "broken", "crash" and "misses"; and "breaks" is
-/// one only with what it breaks, where "line breaks" and "the loop breaks
-/// out" name none.
-const DEFECTS: &[&str] = &[
-    "bug",
-    "bugs",
-    "buggy",
-    "wrong",
-    "breaks the",
-    "breaks it",
-    "breaks that",
-    "breaks this",
-    "would break",
-    "could break",
-    "may break",
-    "might break",
-    "would fail",
-    "will fail",
-    "limitation",
-    "should i fix",
-    "should we fix",
-];
+/// The words a run asks itself with whether to mend its own work, in lower
+/// case, each matched as whole words. Weighed off, the question names a
+/// defect the run saw and left, so it is a case with no span or quote and
+/// ranks with those weighed hardest. No other form is among them: "should
+/// I handle", "support" and "guard", asked of what to add and most often
+/// with a span or taken up, were tried on the recorded runs and changed no
+/// case given.
+const MENDING: &[&str] = &["should i fix", "should we fix"];
 
-/// Words that turn one of `DEFECTS` round where one comes before it in its
-/// clause, however far, as in "won't break", "hardly a bug" and "I don't
-/// think that this is a bug".
-const UNDONE: &[&str] = &[
-    "not",
-    "no",
-    "never",
-    "isn't",
-    "aren't",
-    "wasn't",
-    "nothing",
-    "none",
-    "won't",
-    "wouldn't",
-    "couldn't",
-    "shouldn't",
-    "doesn't",
-    "don't",
-    "didn't",
-    "can't",
-    "cannot",
-    "without",
-    "hardly",
-    "barely",
-    "neither",
-    "nor",
-];
-
-/// Words that open a new statement inside a clause: one of `UNDONE` before
-/// one of them denies nothing after it, as in "it does not flush and that
-/// is a bug".
-const TURNED: &[&str] = &[" and ", " which ", " so "];
-
-/// Words right after one of `DEFECTS` that say it holds only of what the
-/// work does not do, as in "would fail without trimming".
-const AVERTED: &[&str] = &["without", "unless", "otherwise"];
-
-/// What a sentence says of a test, a script or a probe of the run's own,
-/// of a test that is wrong, or of the run itself: a defect there is none
-/// of the work's.
-const PROBES: &[&str] = &[
-    "my test",
-    "my tests",
-    "my script",
-    "my probe",
-    "my scratch",
-    "test is wrong",
-    "tests are wrong",
-    "i might be wrong",
-    "i may be wrong",
-    "i could be wrong",
-    "i may have wrong",
-    "i was wrong",
-];
-
-/// Words that put a fault somewhere other than in the work as it stands,
-/// each matched as whole words: it is mended or was one of an earlier
-/// draft, it was the project's before the change, or it is what the request
-/// asks for. They are phrases, since a bare "fixed", "old" or "existing"
-/// is said as often of a width or of the things the work handles.
-const ELSEWHERE: &[&str] = &[
-    "fixed the",
-    "fixed it",
-    "fixed that",
-    "fixed now",
-    "now fixed",
-    "is fixed",
-    "was fixed",
-    "been fixed",
-    "already fixed",
-    "bug fix",
-    "bug fixes",
-    "was a bug",
-    "had a bug",
-    "was wrong",
-    "was buggy",
-    "pre-existing",
-    "before my change",
-    "before the change",
-    "before this change",
-    "in this repo",
-    "in this codebase",
-    "as asked",
-    "as required",
-    "as specified",
-    "as the request says",
-    "as the request asks",
-    "as the task says",
-    "asked behaviour",
-    "asked behavior",
-    "asks us to fix",
-    "asks to fix",
-];
-
-/// Words that say of the next word, where it is one of `CODE`, that it is
-/// the project's as it was before the change, as "the existing
-/// implementation" and "the old behaviour" are.
-const FORMER: &[&str] = &["old", "existing", "previous", "original"];
-
-/// What one of `FORMER` is said of to mean the project before the change;
-/// "old events" and "existing entries" are things the work handles, and
-/// "existing tests" what it may break.
-const CODE: &[&str] = &[
-    "code",
-    "behavior",
-    "behaviour",
-    "implementation",
-    "version",
-    "logic",
-];
-
-/// Words a request opens a sentence with when it asks for a fault to be
-/// mended.
-const MEND: &[&str] = &["fix", "fixes", "fixed"];
-
-/// Of `RANKED` places, those that cases only a defect ranks so high may
-/// take, so that a run which says such a word in every other sentence
-/// leaves the checks it predicted the rest: none of the runs replayed
-/// named more of them than this for each of its reviews.
-const FAULTS: usize = 2;
-
-/// Words a sentence opens with when it speaks of the one before it, as
-/// "That's wrong but rare." does.
-const OPENERS: &[&str] = &["that", "that's", "this", "it", "it's", "which"];
-
-/// Words in a case that names a defect with no span or quote and is too
-/// short to say alone what is wrong, as "Should I fix the second case?"
-/// is.
-const SHORT: usize = 8;
-
-/// Where a sentence that names a defect turns to what the run made of it,
-/// in lower case: a "but" or "though", a dash, or an aside in brackets.
+/// Where a question of mending turns to what the run made of it, in lower
+/// case: a "but" or "though", a dash, or an aside in brackets.
 const TURNS: &[&str] = &[
     " but ",
     " though ",
@@ -790,17 +637,14 @@ pub(crate) fn dealt(
         .collect()
 }
 
-/// A case set aside: what it is known by (`key`), its words, where it
+/// A case set aside: what it is known by (`key`), its words, and where it
 /// ranks, by how hard it was weighed and then by whether the request names
-/// something it names, and how hard it was weighed apart from any defect
-/// it names, which is less where only the defect ranks it so high.
-type Case = (String, String, (u8, bool), u8);
+/// something it names.
+type Case = (String, String, (u8, bool));
 
 /// Each case the assistant's replies in `messages` weighed and set aside,
 /// in the order they were last named, as `doubts` chooses among them for
-/// `request` and `sentences`, the requirements it states. Where `request`
-/// asks for a fault to be mended (`mends`), no sentence is a case or ranks
-/// higher for a word of `DEFECTS`.
+/// `request` and `sentences`, the requirements it states.
 fn set_aside(messages: &[Message], request: &str, sentences: &[String]) -> Vec<Case> {
     // The words of each requirement the notice numbers, and the names of
     // the whole request, those in its code among them.
@@ -809,13 +653,12 @@ fn set_aside(messages: &[Message], request: &str, sentences: &[String]) -> Vec<C
         .map(|sentence| words(sentence).into_iter().map(|(_, word)| word).collect())
         .collect();
     let names = identifiers(request);
-    let faults = !mends(request);
     let own = messages
         .iter()
         .filter(|message| message.role == "assistant");
     let mut found: Vec<Case> = Vec::new();
     for text in own.flat_map(|message| [&message.reasoning, &message.content]) {
-        for weighed in cases(text, faults) {
+        for weighed in cases(text) {
             // Ticked off, a sentence says what the run checked: it names
             // no case, and what the same span named before it stands.
             if weighed.ticked {
@@ -825,78 +668,39 @@ fn set_aside(messages: &[Message], request: &str, sentences: &[String]) -> Vec<C
             let before = found.iter().position(|(kept, ..)| *kept == key);
             let quoted = quotes(&case, &listed);
             let weight = weight(&markers, quoted, weighed.defect);
-            // Without its defect a sentence that names nothing else was
-            // no case at all, and weighs as one said in passing.
-            let mut plain = match weighed.bare {
-                true => PASSED,
-                false => self::weight(&markers, quoted, false),
-            };
             let mut rank = (weight, quoted || named(&case, &names));
             // Named again, a case takes the later words and place and
             // keeps the hardest it was weighed; a naming weighed only in
-            // passing leaves one weighed otherwise as it stood. A defect
-            // stays with the words that named it: later words that name
-            // none keep what the case weighed apart from it.
+            // passing leaves one weighed otherwise as it stood.
             if let Some(at) = before {
                 if rank.0 == PASSED && found[at].2.0 > PASSED {
                     continue;
                 }
-                let (_, _, mut was, had) = found.remove(at);
-                if !weighed.defect {
-                    was.0 = had;
-                }
-                (rank, plain) = (rank.max(was), plain.max(had));
+                rank = rank.max(found.remove(at).2);
             }
-            found.push((key, case, rank, plain));
+            found.push((key, case, rank));
         }
     }
     found
 }
 
-/// Whether `request` asks for a fault to be mended: outside its code, a
-/// sentence of it holds one of `DEFECTS` or opens with one of `MEND`. A
-/// run given such a request says those words all through its notes of
-/// what it was asked to mend, not of a defect it left.
-fn mends(request: &str) -> bool {
-    units(request).iter().any(|unit| {
-        let prose = masked(unit);
-        let mut said = prose
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|word| !word.is_empty());
-        let opens = said.next().is_some_and(|word| MEND.contains(&word));
-        opens || (DEFECTS.iter()).any(|word| !whole(&prose, word).is_empty())
-    })
-}
-
 /// The cases of `found` that `helpers` helpers are given between them, as
 /// their places in it, in the order they are chosen: `RANKED` for each
-/// helper by how hard each was weighed, the first `SHARED` of them for all
-/// (`dealt`); then the latest not yet taken that a word not of `PASSING`
-/// weighed, up to `SHARED` and `KEPT` less `SHARED` for each helper in all;
-/// then the latest of the rest. Of cases weighed alike, one weighed so
-/// apart from any defect comes first, then one the request names, then the
-/// later. Of the cases only a defect ranks so high, the first `FAULTS` in
-/// `RANKED` keep that weight, and each of the others is chosen by the
-/// weight it had without the defect.
+/// helper by how hard each was weighed, the later first of those weighed
+/// alike and the first `SHARED` of them for all (`dealt`); then the latest
+/// not yet taken that a word not of `PASSING` weighed, up to `SHARED` and
+/// `KEPT` less `SHARED` for each helper in all; then the latest of the
+/// rest.
 fn chosen(found: &[Case], helpers: usize) -> Vec<usize> {
     let ranked = RANKED * helpers;
     let places = SHARED.min(ranked) + (KEPT - SHARED) * helpers;
-    let raised = |at: &usize| found[*at].2.0 > found[*at].3;
     let mut kept: Vec<usize> = (0..found.len()).collect();
     kept.sort_by_key(|&at| std::cmp::Reverse((found[at].2, at)));
-    let over: Vec<usize> = (kept.iter().copied().filter(raised))
-        .skip(ranked * FAULTS / RANKED)
-        .collect();
-    let rank = |at: usize| match over.contains(&at) {
-        true => (found[at].3, true, found[at].2.1),
-        false => (found[at].2.0, !raised(&at), found[at].2.1),
-    };
-    kept.sort_by_key(|&at| std::cmp::Reverse((rank(at), at)));
     kept.truncate(ranked);
     // Then the latest, those weighed only in passing after all the others.
     for passing in [false, true] {
         let latest: Vec<usize> = ((0..found.len()).rev())
-            .filter(|at| !kept.contains(at) && (passing || rank(*at).0 > PASSED))
+            .filter(|at| !kept.contains(at) && (passing || found[*at].2.0 > PASSED))
             .take(places.saturating_sub(kept.len()))
             .collect();
         kept.extend(latest);
@@ -912,13 +716,12 @@ fn given(found: &[Case], mut kept: Vec<usize>) -> Vec<String> {
 }
 
 /// How hard `markers`, the words that weighed a case off, weigh it, when
-/// `quoted` with a requirement's words quoted and when it names a `defect`
-/// in the work: most where one predicts a check of it and it was weighed
-/// again, by another marker or with the quote, or where it names a defect
-/// and more than words said in passing weighed it, which `chosen` counts
-/// for `FAULTS` in `RANKED` places and no more; then where one predicts a
-/// check, one of `WAVED` waves it off or a requirement is quoted; then the
-/// rest, and least where each is one of `PASSING`.
+/// `quoted` with a requirement's words quoted and when it asks whether to
+/// mend a `defect` in the work: most where one predicts a check of it and
+/// it was weighed again, by another marker or with the quote, or where it
+/// asks of a defect and more than words said in passing weighed it; then
+/// where one predicts a check, one of `WAVED` waves it off or a requirement
+/// is quoted; then the rest, and least where each is one of `PASSING`.
 fn weight(markers: &[&str], quoted: bool, defect: bool) -> u8 {
     let checked = markers.iter().any(|marker| marker.starts_with(CHECK));
     let again = markers.iter().any(|marker| !marker.starts_with(CHECK));
@@ -1010,23 +813,20 @@ struct Weighed {
     markers: Vec<&'static str>,
     /// Whether its own sentence ticks it off.
     ticked: bool,
-    /// Whether its sentence names a defect in the work (`defect`).
+    /// Whether its sentence asks whether to mend a defect (`mending`).
     defect: bool,
-    /// Whether the defect is all it names: no span, quote or code.
-    bare: bool,
 }
 
 /// The cases `text` weighs off, in the order each was last weighed. A
 /// sentence that holds a span or a quote, predicts a check and introduces
-/// code (`introduces`), or names a defect, where `faults` are read, is its
-/// own case; one that names nothing weighs off the nearest of the `BACK`
-/// before it that holds a span or a quote or introduces such code, or the
-/// one before it where that one names a defect.
-fn cases(text: &str, faults: bool) -> Vec<Weighed> {
+/// code (`introduces`), or asks whether to mend the work (`mending`), is
+/// its own case; one that names nothing weighs off the nearest of the
+/// `BACK` before it that holds a span or a quote or introduces such code,
+/// or the one before it where that one asks whether to mend.
+fn cases(text: &str) -> Vec<Weighed> {
     let units = spoken(text);
     let names = |unit: &Spoken| !literals(&unit.words).is_empty() || introduces(unit).is_some();
-    let fault = |unit: &Spoken| faults.then(|| defect(&unit.words)).flatten();
-    let wrong = |unit: &Spoken| fault(unit).is_some();
+    let asks = |unit: &Spoken| mending(&unit.words).is_some();
     // Each sentence named as a case, with the markers that weighed it.
     let mut named: Vec<(usize, Vec<&'static str>)> = Vec::new();
     for (at, unit) in units.iter().enumerate() {
@@ -1034,10 +834,10 @@ fn cases(text: &str, faults: bool) -> Vec<Weighed> {
         if marks.is_empty() {
             continue;
         }
-        let naming = match names(unit) || wrong(unit) {
+        let naming = match names(unit) || asks(unit) {
             true => Some(at),
             false => (at.saturating_sub(BACK)..at).rev().find(|&before| {
-                names(&units[before]) || (before + 1 == at && wrong(&units[before]))
+                names(&units[before]) || (before + 1 == at && asks(&units[before]))
             }),
         };
         let Some(naming) = naming else {
@@ -1063,19 +863,17 @@ fn cases(text: &str, faults: bool) -> Vec<Weighed> {
         .map(|(naming, markers)| {
             let unit = &units[naming];
             let before = naming.checked_sub(1).map(|at| units[at].words.as_str());
-            let fault = fault(unit);
-            let own = told(unit, fault);
-            let bare = fault.is_some() && !names(unit);
+            let asked = mending(&unit.words);
+            let own = told(unit, asked);
             Weighed {
                 key: key(&own),
-                case: match (bare, before) {
-                    (true, Some(before)) => after(&own, before),
+                case: match before {
+                    Some(before) if asked.is_some() && !names(unit) => after(&own, before),
                     _ => own,
                 },
                 markers,
                 ticked: ticked(&unit.words),
-                defect: fault.is_some(),
-                bare,
+                defect: asked.is_some(),
             }
         })
         .collect()
@@ -1084,16 +882,16 @@ fn cases(text: &str, faults: bool) -> Vec<Weighed> {
 /// The case the sentence `unit` names, without the verdict and reasons
 /// after it: a check it predicts with the code it introduces under it
 /// (`predicted`); otherwise its words through its last span or quote, or
-/// the defect it names, which ends at `fault`, where that comes later
-/// (`through`), and then no further than where the run turns to weighing
-/// the defect (`unweighed`).
-fn told(unit: &Spoken, fault: Option<usize>) -> String {
+/// the question of mending it asks, which ends at `asked`, where that
+/// comes later (`through`), and then no further than where the run turns
+/// to answering the question (`unweighed`).
+fn told(unit: &Spoken, asked: Option<usize>) -> String {
     if let Some(said) = introduces(unit) {
         return predicted(&said, &unit.code);
     }
     let words = &unit.words;
     let quoted = literals(words).last().map(|range| range.end);
-    let named = fault.filter(|end| quoted.is_none_or(|span| *end > span));
+    let named = asked.filter(|end| quoted.is_none_or(|span| *end > span));
     match (named, quoted) {
         (Some(end), _) => unweighed(&through(words, end), end),
         (None, Some(span)) => through(words, span),
@@ -1101,27 +899,21 @@ fn told(unit: &Spoken, fault: Option<usize>) -> String {
     }
 }
 
-/// `case`, which names a defect with no span or quote, as a helper is
-/// given it: where it opens with one of `OPENERS` or has `SHORT` words or
-/// fewer it says too little alone of what is wrong, so the sentence
+/// `case`, a question of mending with no span or quote, as a helper is
+/// given it: what is to be mended is said before it, so the sentence
 /// `before` it goes ahead of it without its own verdict (`context`), as
 /// much of its end as leaves the case whole in `CHARS` characters.
 fn after(case: &str, before: &str) -> String {
-    let own = masked(case);
-    let mut said = own
-        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
-        .filter(|word| !word.is_empty());
-    let opens = said.next().is_some_and(|word| OPENERS.contains(&word));
-    let room = CHARS.saturating_sub(case.chars().count() + 1);
-    match (opens || own.split_whitespace().count() <= SHORT) && room > 0 {
-        true => format!("{} {case}", ending(&context(before), room)),
-        false => case.to_owned(),
+    match CHARS.saturating_sub(case.chars().count() + 1) {
+        0 => case.to_owned(),
+        room => format!("{} {case}", ending(&context(before), room)),
     }
 }
 
-/// `case`, which a defect names, no further than the first of `TURNS`
-/// after `named`, where the defect's words end: what follows is what the
-/// run made of it, as "but rare" and "(callers never do that)" are.
+/// `case`, which a question of mending names, no further than the first of
+/// `TURNS` after `named`, where the question's words end: what follows is
+/// what the run made of it, as "but rare" and "(callers never do that)"
+/// are.
 fn unweighed(case: &str, named: usize) -> String {
     let from = named.min(case.len());
     let after = case[from..].to_ascii_lowercase();
@@ -1130,8 +922,8 @@ fn unweighed(case: &str, named: usize) -> String {
     case[..end].trim_end_matches(TRAILING).to_owned()
 }
 
-/// `before`, the sentence that goes ahead of a defect too short to stand
-/// alone, without what the run made of it: through the clause of its last
+/// `before`, the sentence that goes ahead of a question of mending,
+/// without what the run made of it: through the clause of its last
 /// span or quote, or its first where it has none, and on as `through`
 /// goes, less the clauses of `GLUED` words or fewer that end it after a
 /// stop or a dash, as "Fine." and "— fine." do, with a stop where words
@@ -1236,59 +1028,12 @@ fn predicted(said: &str, code: &[String]) -> String {
     format!("{said}{opens}\n  ```\n  {}\n  ```", kept.join("\n  "))
 }
 
-/// Where the last defect `unit` names ends in it, if it names one: one of
-/// `DEFECTS` outside its spans and quotes, with none of `UNDONE` before it
-/// in its clause, since the last of `TURNED` there, and none of `AVERTED`
-/// right after it. A sentence names none where it says "either way", since
-/// what it says holds of both choices and not of the one the work made;
-/// where it speaks of the run's own test or script, or of the run as wrong
-/// (`PROBES`); or where it puts the fault somewhere other than in the work
-/// as it stands (`ELSEWHERE`, `former`).
-fn defect(unit: &str) -> Option<usize> {
+/// Where `unit` stops asking whether to mend the work, if it asks: the
+/// end of the last of `MENDING` outside its spans and quotes.
+fn mending(unit: &str) -> Option<usize> {
     let prose = masked(unit);
-    let holds = |said: &&str| !whole(&prose, said).is_empty();
-    let elsewhere = PROBES.iter().chain(ELSEWHERE).any(holds) || former(&prose);
-    if holds(&"either way") || elsewhere {
-        return None;
-    }
-    let clauses = clauses(&prose);
-    let any = |said: &str, of: &[&str]| {
-        let marks = |c: char| !(c.is_alphanumeric() || c == '\'');
-        (said.split_whitespace()).any(|word| of.contains(&word.trim_matches(marks)))
-    };
-    let denied = |at: usize, end: usize| {
-        let clause = clauses.iter().find(|clause| clause.end > at);
-        let from = clause.map_or(0, |clause| clause.start);
-        let turn = (TURNED.iter())
-            .filter_map(|turn| prose[from..at].rfind(turn))
-            .max();
-        let after = prose[end..].split_whitespace().next().unwrap_or_default();
-        any(&prose[from + turn.unwrap_or(0)..at], UNDONE) || any(after, AVERTED)
-    };
-    let named = |word: &&str| -> Vec<(usize, usize)> {
-        let ends = |at: usize| (at, at + word.len());
-        whole(&prose, word).into_iter().map(ends).collect()
-    };
-    (DEFECTS.iter().flat_map(named))
-        .filter(|&(at, end)| !denied(at, end))
-        .map(|(_, end)| end)
-        .max()
-}
-
-/// Whether `prose`, as `masked` writes it, speaks of the project as it was
-/// before the change: one of `FORMER` right before one of `CODE`, or with
-/// only a word of `DEFECTS` between them, as in "the old (buggy)
-/// behaviour".
-fn former(prose: &str) -> bool {
-    let words: Vec<&str> = prose
-        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
-        .filter(|word| !word.is_empty())
-        .collect();
-    let code = |at: usize| words.get(at).is_some_and(|word| CODE.contains(word));
-    (words.iter().enumerate()).any(|(at, word)| {
-        let between = words.get(at + 1).is_some_and(|word| DEFECTS.contains(word));
-        FORMER.contains(word) && (code(at + 1) || (between && code(at + 2)))
-    })
+    let last = |asked: &&str| whole(&prose, asked).pop().map(|at| at + asked.len());
+    MENDING.iter().filter_map(last).max()
 }
 
 /// Whether `unit` ticks its case off: a check mark after its last literal,
@@ -1792,31 +1537,6 @@ mod tests {
         tested.push(null);
         tested.extend(alone(19..=23));
         assert_eq!(weighed(&notes.join("\n")), tested);
-    }
-
-    #[test]
-    fn of_the_three_every_review_is_given_a_check_weighed_again_comes_before_a_defect() {
-        // Three checks predicted and waved off, thirteen cases a strong word
-        // weighed, and last a defect named and left: the latest, yet the
-        // three every review is given are the checks, and the defect goes
-        // to one review.
-        let checks: Vec<String> = (1..=3)
-            .map(|n| format!("Hidden tests might call `open_{n}()` twice."))
-            .collect();
-        let mut notes: Vec<String> = (checks.iter())
-            .map(|check| format!("{check} Unlikely."))
-            .collect();
-        notes.extend(inputs(1..=13, "Rare."));
-        let defect = "The writer of module 1 has a bug in how it logs";
-        notes.push(format!("{defect}, not an issue for us."));
-        let dealt = shared_out(&notes, 2);
-        let [first, second] = dealt.as_slice() else {
-            panic!("{dealt:?}");
-        };
-        let both: Vec<&String> = first.iter().filter(|case| second.contains(case)).collect();
-        assert_eq!(both, checks.iter().collect::<Vec<_>>());
-        let has = |list: &[String]| list.iter().any(|case| case == defect);
-        assert!(has(first) != has(second), "{dealt:?}");
     }
 
     #[test]
@@ -2560,43 +2280,60 @@ mod tests {
     }
 
     #[test]
-    fn a_defect_named_in_plain_words_is_a_case_with_no_span_or_quote() {
-        // In the sentence a marker weighs off, without its verdict.
-        let own = "Sending more than the limit in one call would break the mux, but that's rare.";
-        let case = "Sending more than the limit in one call would break the mux";
-        assert_eq!(weighed(own), [case]);
-        // Or in the sentence before one that names nothing.
-        let before = "A reader given two files at once gets the wrong order. Out of scope here.";
+    fn a_question_of_mending_the_run_leaves_is_a_case_with_no_span_or_quote() {
+        // Weighed off in the sentence after it, which names nothing; what
+        // is to be mended is said before it, and that sentence goes ahead.
+        let left = "Two traits may land in different groups. Hmm, but should I fix the second \
+                    case? That's out of scope. Leave it.";
         assert_eq!(
-            weighed(before),
-            ["A reader given two files at once gets the wrong order."]
-        );
-        // One that speaks of the sentence before it, or is too short to
-        // say what is wrong, is given after that sentence.
-        let spoken = "For wide globals the dump writes zeros. That's wrong but rare.";
-        assert_eq!(
-            weighed(spoken),
-            ["For wide globals the dump writes zeros. That's wrong"]
-        );
-        let short = "Two traits may land in different groups. Hmm, but should I fix the second \
-                     case? That's out of scope. Leave it.";
-        assert_eq!(
-            weighed(short),
+            weighed(left),
             ["Two traits may land in different groups. Hmm, but should I fix the second case?"]
         );
-        // The sentence ahead of it is there to be read with it: the case
-        // that sentence is by its own span stands beside it.
-        let beside = "A `handle` shared by two readers? Rare. That's a bug with three, but rare.";
+        let row = "The reader drops the last row.";
+        for (asked, case) in [
+            // In any case of letters and of we as of I, with a verdict
+            // glued to it or in a clause of its own sentence.
+            ("SHOULD WE FIX that? Out of scope.", "SHOULD WE FIX that?"),
+            ("Should I fix it, or is that rare?", "Should I fix it"),
+            // Without what the run made of it, after a dash or in brackets.
+            (
+                "Should I fix that \u{2014} probably not.",
+                "Should I fix that",
+            ),
+            (
+                "Should I fix that (it is one row in a thousand)? Rare.",
+                "Should I fix that",
+            ),
+        ] {
+            let found = weighed(&format!("{row} {asked}"));
+            assert_eq!(found, [format!("{row} {case}")], "{asked}");
+        }
+        // The sentence ahead of it loses its own verdict, after a dash or
+        // as a sentence of a word, and is there to be read with it: the
+        // case that sentence is by its own span stands beside it.
+        let ahead = "If two readers share a `handle` the order holds";
+        let asked = "But should I fix the three-reader case?";
         assert_eq!(
-            weighed(beside),
+            weighed(&format!("{ahead} \u{2014} fine. {asked} Out of scope.")),
+            [format!("{ahead}. {asked}")]
+        );
+        assert_eq!(
+            weighed("Two readers get their rows in order. Fine. Should I fix three? Rare."),
+            ["Two readers get their rows in order. Should I fix three?"]
+        );
+        assert_eq!(
+            weighed(
+                "A `handle` shared by two readers? Rare. Should I fix the three-reader case? \
+                 Out of scope."
+            ),
             [
                 "A `handle` shared by two readers?",
-                "A `handle` shared by two readers? That's a bug with three"
+                "A `handle` shared by two readers? Should I fix the three-reader case?"
             ]
         );
-        // Of a long sentence before it only the end, so the defect stays.
+        // Of a long sentence before it only the end, so the question stays.
         let long = format!(
-            "Each {}reads the header twice. That's a bug, but rare.",
+            "Each {}reads the header twice. Should I fix that? Out of scope.",
             "of the many readers ".repeat(12)
         );
         let found = weighed(&long);
@@ -2606,253 +2343,59 @@ mod tests {
         assert!(given.chars().count() <= CHARS, "{given}");
         assert!(given.starts_with('\u{2026}'), "{given}");
         assert!(
-            given.ends_with("reads the header twice. That's a bug"),
+            given.ends_with("reads the header twice. Should I fix that?"),
             "{given}"
         );
-        // A defect denied, one said of both choices and one of the run's
-        // own test are no defect of the work, and name nothing.
-        for notes in [
-            "That is not a real bug, and it is rare.",
-            "Reading twice never breaks the order. Rare.",
-            "Exact tests would fail either way.",
-            "So my test expectation is arguably wrong.",
-            "Here I might be wrong, though that is unlikely.",
-        ] {
-            assert!(weighed(notes).is_empty(), "{notes}: {:?}", weighed(notes));
-        }
-    }
-
-    #[test]
-    fn a_defect_is_given_without_what_the_run_made_of_it() {
-        for (notes, case) in [
-            // A verdict in the defect's own clause, after a "but", a dash
-            // or a "though", and a reason in brackets.
-            (
-                "A second read would break the stream but that's rare.",
-                "A second read would break the stream",
-            ),
-            (
-                "A second read would break\u{2014}unlikely.",
-                "A second read would break",
-            ),
-            (
-                "A child marked to omit is still written, which is arguably a bug but minor.",
-                "A child marked to omit is still written, which is arguably a bug",
-            ),
-            (
-                "Sending more than the limit would break the mux, though callers never do \
-                 that. Rare.",
-                "Sending more than the limit would break the mux",
-            ),
-            (
-                "Removing the wrappers would break the page (the selects stay hidden). Edge \
-                 case.",
-                "Removing the wrappers would break the page",
-            ),
-            // The sentence that goes before a short one loses its own
-            // verdict, after a dash or as a sentence of a word.
-            (
-                "If two readers share a `handle` the order holds \u{2014} fine. But should I \
-                 fix the three-reader case? Out of scope.",
-                "If two readers share a `handle` the order holds. But should I fix the \
-                 three-reader case?",
-            ),
-            (
-                "A reader given two files gets them in order. Fine. That would break with \
-                 three, but rare.",
-                "A reader given two files gets them in order. That would break with three",
-            ),
-            // The last of a list is no verdict.
-            (
-                "The dump writes the name, the size, the flags. That's wrong but rare.",
-                "The dump writes the name, the size, the flags. That's wrong",
-            ),
-        ] {
-            assert_eq!(weighed(notes), [case], "{notes}");
-        }
-        // A case its span names keeps the clause the span is in, as before.
+        // With a span the question is the case its span makes it, with no
+        // sentence ahead; and one the run does not leave is no case.
         assert_eq!(
-            weighed("That is arguably wrong for `Or(a, b)` but fine for one trait."),
-            ["That is arguably wrong for `Or(a, b)` but fine for one trait."]
+            weighed(&format!("{row} Should I fix `read_all()`? Out of scope.")),
+            ["Should I fix `read_all()`?"]
         );
+        let taken = format!("{row} Should I fix it? Yes, in the loop.");
+        assert!(weighed(&taken).is_empty(), "{:?}", weighed(&taken));
     }
 
     #[test]
-    fn a_defect_the_run_named_and_left_ranks_with_the_cases_weighed_hardest() {
-        let case = "Sending more than the limit in one call would break the mux";
-        let mut notes = vec![format!("{case}, but that's rare.")];
+    fn a_question_of_mending_left_ranks_with_the_cases_weighed_hardest() {
+        let case = "The reader drops the last row. Should I fix it?";
+        let mut notes = vec![format!("{case} Out of scope.")];
         notes.extend(inputs(1..=12, "Rare."));
         let found = weighed(&notes.join("\n"));
         assert_eq!(found[0], case);
         assert_eq!(found[1..], alone(4..=12));
-        // So does one that holds a span, which was a case before.
-        let mut notes = vec!["A `frame` past the limit breaks the mux. Edge case.".to_owned()];
+        // So does one that holds a span.
+        let spanned = "Should I fix `read_all()` for the last row?";
+        let mut notes = vec![format!("{spanned} Out of scope.")];
         notes.extend(inputs(1..=12, "Rare."));
         let found = weighed(&notes.join("\n"));
-        assert_eq!(found[0], "A `frame` past the limit breaks the mux.");
+        assert_eq!(found[0], spanned);
         assert_eq!(found[1..], alone(4..=12));
         // Weighed only by words said in passing, it is kept last as any
         // such case is.
-        let mut notes = vec![format!("{case}. Not needed.")];
+        let mut notes = vec![format!("{case} Not needed.")];
         notes.extend(inputs(1..=12, "I'll keep it."));
         assert_eq!(weighed(&notes.join("\n")), alone(3..=12));
     }
 
     #[test]
-    fn cases_only_a_defect_ranks_so_high_take_two_in_five_of_the_places_given_by_weight() {
-        // Six checks predicted, then ten defects named and left. Of the
-        // five places given by weight the latest two defects take two and
-        // the checks three; the other checks are the latest that more than
-        // a word said in passing weighed; and the places left go to the
-        // latest of the other defects, no case at all without the word.
-        let mut notes: Vec<String> = (1..=6)
-            .map(|n| format!("Hidden tests might call `check_{n}()` with an empty list."))
-            .collect();
-        let checks = notes.clone();
-        let named = |n: usize| format!("The writer of module {n} has a bug in how it logs");
-        notes.extend((1..=10).map(|n| format!("{}, not an issue for us.", named(n))));
-        let mut kept = checks.clone();
-        kept.extend((7..=10).map(named));
-        assert_eq!(weighed(&notes.join("\n")), kept);
-        // Two reviews are given every check between them too.
-        let dealt = shared_out(&notes, 2).concat();
-        assert!(
-            checks.iter().all(|check| dealt.contains(check)),
-            "{dealt:?}"
-        );
-        // A defect in a sentence that holds a span was a case before the
-        // word: past its two places it is chosen as its other words weigh
-        // it, here with the cases a strong word waved off after it.
-        let spanned = |n: usize| format!("A `frame_{n}` past the limit breaks the mux.");
-        let mut notes: Vec<String> = (1..=4)
-            .map(|n| format!("{} Edge case.", spanned(n)))
-            .collect();
+    fn a_sentence_that_only_calls_something_wrong_is_no_case_by_it() {
+        // A bug, something wrong and what would break are said as often of
+        // a fault mended, the project's own or asked for as of one left.
+        for notes in [
+            "Sending more than the limit in one call would break the mux, but that's rare.",
+            "For wide globals the dump writes zeros. That's a bug, but rare.",
+            "A reader given two files at once gets the wrong order. Out of scope here.",
+            "This breaks when the list is empty, which is an edge case.",
+            "I could fix the second case too. Not needed.",
+        ] {
+            assert!(weighed(notes).is_empty(), "{notes}: {:?}", weighed(notes));
+        }
+        // With a span such a sentence is the case its span makes it,
+        // weighed as its words weigh it and no harder.
+        let mut notes = vec!["A `frame` past the limit breaks the mux. Edge case.".to_owned()];
         notes.extend(inputs(1..=12, "Rare."));
-        let mut kept = vec![spanned(3), spanned(4)];
-        kept.extend(alone(5..=12));
-        assert_eq!(weighed(&notes.join("\n")), kept);
-    }
-
-    #[test]
-    fn a_defect_denied_anywhere_before_it_in_its_clause_is_none() {
-        for notes in [
-            "I don't think that this is a bug, and it's rare.",
-            "It is hardly a bug. Edge case.",
-            "That isn't really a serious bug. Edge case.",
-            "There is nothing in this code that is wrong, I assume.",
-            // Nor is one that holds only of what the work does not do.
-            "The reader would fail without trimming, but mine trims. Rare.",
-        ] {
-            assert!(weighed(notes).is_empty(), "{notes}: {:?}", weighed(notes));
-        }
-        // A denial in another clause, or before the words turn to a new
-        // statement, denies nothing after it.
-        for notes in [
-            "The dump does not flush, which is a bug. Rare.",
-            "The dump does not flush and that is a bug. Rare.",
-        ] {
-            let case = notes.trim_end_matches(" Rare.");
-            assert_eq!(weighed(notes), [case], "{notes}");
-        }
-    }
-
-    #[test]
-    fn a_fault_mended_the_projects_own_or_asked_for_is_no_defect_of_the_work() {
-        for notes in [
-            // Mended, or one of an earlier draft.
-            "I fixed the bug in the cache key. Good enough.",
-            "That was a bug in my first draft, fixed now. Not an issue.",
-            // The project's before the change.
-            "The old module had a bug in its logging, not an issue for us.",
-            "The existing code has a bug there, I assume.",
-            "Risk: an existing test relies on the old (buggy) behavior? Unlikely.",
-            "Before my change this would fail; now it passes. Edge case.",
-            "The constant in this repo is arguably a bug.",
-            // What the request asks for, and a test that is wrong.
-            "If the user passes the wrong type we raise an error, as asked. Edge case.",
-            "An empty name will fail validation, as the request says. I'll keep that.",
-            "The project's test is wrong about the order, I assume.",
-            // And a break that is none.
-            "Line breaks are kept as they were. Rare.",
-            "The loop breaks out once the limit is hit. Unlikely to matter.",
-        ] {
-            assert!(weighed(notes).is_empty(), "{notes}: {:?}", weighed(notes));
-        }
-        // Old things the work handles, and tests it may break, are the
-        // work's still.
-        let events = "A query made later sees all old pair events. That could be wrong, but rare.";
-        assert_eq!(
-            weighed(events),
-            ["A query made later sees all old pair events. That could be wrong"]
-        );
-        assert_eq!(
-            weighed("Renaming it could break existing tests, though that is unlikely."),
-            ["Renaming it could break existing tests"]
-        );
-        // With a span such a sentence is the case it was, weighed as its
-        // other words weigh it and no harder; so is one that only quotes
-        // the word, from the request or anything else.
-        for early in [
-            "The old code had a bug in `flush()`, but that's rare.",
-            "The request says \"fix the bug in the parser\". Out of scope for the tests.",
-        ] {
-            let mut notes = vec![early.to_owned()];
-            notes.extend(inputs(1..=12, "Rare."));
-            assert_eq!(weighed(&notes.join("\n")), alone(3..=12), "{early}");
-        }
-    }
-
-    #[test]
-    fn a_defect_stays_with_the_words_that_named_it() {
-        // Named again by its span in words that name no defect, the case
-        // is given in those words and weighed as they and its markers
-        // weigh it; named again as a defect, it keeps its place.
-        let wrong = "A `frame` past the limit breaks the mux. Edge case.";
-        let plain = "Is a `frame` counted before the header? I'll keep it so.";
-        let later = inputs(1..=12, "Rare.").join("\n");
-        let found = stands(&[wrong, &later]);
-        assert_eq!(found[0], "A `frame` past the limit breaks the mux.");
-        assert_eq!(stands(&[wrong, plain, &later]), alone(3..=12));
-        let again = "An empty `frame` is wrong too, but rare.";
-        let found = stands(&[plain, wrong, again, &later]);
-        assert_eq!(found[0], "An empty `frame` is wrong too");
-        assert_eq!(found[1..], alone(4..=12));
-    }
-
-    #[test]
-    fn a_request_to_mend_a_fault_makes_no_word_for_one_a_defect_the_run_left() {
-        let given = |request: &str, notes: &str| doubts(&[said(notes, "")], request, &[]);
-        let bare = "The parser still has a bug with a list in a list, but that's rare.";
-        let case = "The parser still has a bug with a list in a list";
-        let spanned = "A `frame` past the limit breaks the mux.";
-        let mut later = vec![format!("{spanned} Edge case.")];
-        later.extend(inputs(1..=12, "Rare."));
-        let later = later.join("\n");
-        // Asked for something new, a run that says so names a defect it
-        // left; a fix named in passing or in the request's code asks for
-        // none to be mended.
-        for request in [
-            "Add a parser for nested items.",
-            "Add a report with an actionable fix recommendation.",
-            "Add `fix()`.\n```\n// bug\n```",
-        ] {
-            assert!(!mends(request), "{request}");
-            assert_eq!(given(request, bare), [case], "{request}");
-            assert_eq!(given(request, &later)[0], spanned, "{request}");
-        }
-        // Asked to mend a fault, it says the word all through its notes of
-        // what it was asked for: no sentence is a case for it, and one that
-        // holds a span is weighed as its other words weigh it.
-        for request in [
-            "Nested items close early, which is a bug.",
-            "The parser gives the wrong order for nested items.",
-            "Fix nested items so that they close late.",
-            "Nested items:\n- Fix the early close.",
-        ] {
-            assert!(mends(request), "{request}");
-            assert!(given(request, bare).is_empty(), "{request}");
-            assert_eq!(given(request, &later), alone(3..=12), "{request}");
-        }
+        assert_eq!(weighed(&notes.join("\n")), alone(3..=12));
     }
 
     #[test]
