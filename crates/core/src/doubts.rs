@@ -26,7 +26,11 @@
 //! or quoted literal, and on through the clauses after it until one where a
 //! marker starts, which is dropped with all after it; where a marker follows
 //! the literal inside that clause, the case ends with that clause. So what
-//! the case is stays, and the verdict and the reasons after it go.
+//! the case is stays, and the verdict and the reasons after it go. A case
+//! that a defect names, with no span after the defect's words, ends sooner
+//! where the run turns to weighing it, at a "but", a "though", a dash or a
+//! bracket (`TURNS`): given "That's wrong but rare.", a reviewer was handed
+//! the run's verdict with the case.
 //!
 //! Two kinds of sentence are a case with no span or quote in them. One
 //! predicts a check, with a marker that opens with `CHECK`, and introduces
@@ -399,10 +403,25 @@ const FAULTS: usize = 2;
 /// "That's wrong but rare." does.
 const OPENERS: &[&str] = &["that", "that's", "this", "it", "it's", "which"];
 
-/// Words in a sentence that names a defect with no span or quote and is
-/// too short to say alone what is wrong, as "Should I fix the second
-/// case?" is.
+/// Words in a case that names a defect with no span or quote and is too
+/// short to say alone what is wrong, as "Should I fix the second case?"
+/// is.
 const SHORT: usize = 8;
+
+/// Where a sentence that names a defect turns to what the run made of it,
+/// in lower case: a "but" or "though", a dash, or an aside in brackets.
+const TURNS: &[&str] = &[
+    " but ",
+    " though ",
+    " although ",
+    " (",
+    "\u{2014}",
+    "\u{2013}",
+    " - ",
+];
+
+/// The marks a case does not end with once words after it are dropped.
+const TRAILING: [char; 7] = [',', ';', ':', '-', '\u{2013}', '\u{2014}', ' '];
 
 /// The weight of a case the run predicted a check of, waved off with one
 /// of `WAVED` or weighed while quoting a requirement, and no more.
@@ -791,8 +810,7 @@ fn set_aside(messages: &[Message], request: &str, sentences: &[String]) -> Vec<C
             if weighed.ticked {
                 continue;
             }
-            let (case, markers) = (weighed.case, weighed.markers);
-            let key = key(&case);
+            let (key, case, markers) = (weighed.key, weighed.case, weighed.markers);
             let before = found.iter().position(|(kept, ..)| *kept == key);
             let quoted = quotes(&case, &listed);
             let weight = weight(&markers, quoted, weighed.defect);
@@ -970,6 +988,8 @@ pub(crate) fn section(doubts: &[String], tester: bool) -> String {
 
 /// A case a text weighs off, as `cases` gives it.
 struct Weighed {
+    /// What the case is known by (`key`), by its own sentence alone.
+    key: String,
     /// The case as a helper is given it.
     case: String,
     /// The markers of every sentence that weighed it.
@@ -1030,48 +1050,101 @@ fn cases(text: &str, faults: bool) -> Vec<Weighed> {
             let unit = &units[naming];
             let before = naming.checked_sub(1).map(|at| units[at].words.as_str());
             let fault = fault(unit);
+            let own = told(unit, fault);
+            let bare = fault.is_some() && !names(unit);
             Weighed {
-                case: told(unit, before, fault),
+                key: key(&own),
+                case: match (bare, before) {
+                    (true, Some(before)) => after(&own, before),
+                    _ => own,
+                },
                 markers,
                 ticked: ticked(&unit.words),
                 defect: fault.is_some(),
-                bare: fault.is_some() && !names(unit),
+                bare,
             }
         })
         .collect()
 }
 
-/// The case the sentence `unit` names as a helper is given it, without the
-/// verdict and reasons after it: a check it predicts with the code it
-/// introduces under it (`predicted`); otherwise its words through its last
-/// span or quote, or the defect it names, which ends at `fault`, where
-/// that comes later (`through`). One that names a defect with no span or
-/// quote, and opens with one of `OPENERS` or has `SHORT` words or fewer,
-/// says too little alone of what is wrong, so the sentence `before` it
-/// goes ahead of it, as much of its end as leaves the case whole in
-/// `CHARS` characters.
-fn told(unit: &Spoken, before: Option<&str>, fault: Option<usize>) -> String {
+/// The case the sentence `unit` names, without the verdict and reasons
+/// after it: a check it predicts with the code it introduces under it
+/// (`predicted`); otherwise its words through its last span or quote, or
+/// the defect it names, which ends at `fault`, where that comes later
+/// (`through`), and then no further than where the run turns to weighing
+/// the defect (`unweighed`).
+fn told(unit: &Spoken, fault: Option<usize>) -> String {
     if let Some(said) = introduces(unit) {
         return predicted(&said, &unit.code);
     }
     let words = &unit.words;
     let quoted = literals(words).last().map(|range| range.end);
-    let Some(named) = quoted.max(fault) else {
-        return words.clone();
-    };
-    let case = through(words, named);
-    let prose = masked(words);
-    let mut said = prose
+    let named = fault.filter(|end| quoted.is_none_or(|span| *end > span));
+    match (named, quoted) {
+        (Some(end), _) => unweighed(&through(words, end), end),
+        (None, Some(span)) => through(words, span),
+        (None, None) => words.clone(),
+    }
+}
+
+/// `case`, which names a defect with no span or quote, as a helper is
+/// given it: where it opens with one of `OPENERS` or has `SHORT` words or
+/// fewer it says too little alone of what is wrong, so the sentence
+/// `before` it goes ahead of it without its own verdict (`context`), as
+/// much of its end as leaves the case whole in `CHARS` characters.
+fn after(case: &str, before: &str) -> String {
+    let own = masked(case);
+    let mut said = own
         .split(|c: char| !(c.is_alphanumeric() || c == '\''))
         .filter(|word| !word.is_empty());
     let opens = said.next().is_some_and(|word| OPENERS.contains(&word));
-    let refers = opens || prose.split_whitespace().count() <= SHORT;
     let room = CHARS.saturating_sub(case.chars().count() + 1);
-    match before {
-        Some(before) if quoted.is_none() && refers && room > 0 => {
-            format!("{} {case}", ending(before, room))
+    match (opens || own.split_whitespace().count() <= SHORT) && room > 0 {
+        true => format!("{} {case}", ending(&context(before), room)),
+        false => case.to_owned(),
+    }
+}
+
+/// `case`, which a defect names, no further than the first of `TURNS`
+/// after `named`, where the defect's words end: what follows is what the
+/// run made of it, as "but rare" and "(callers never do that)" are.
+fn unweighed(case: &str, named: usize) -> String {
+    let from = named.min(case.len());
+    let after = case[from..].to_ascii_lowercase();
+    let turn = TURNS.iter().filter_map(|turn| after.find(turn)).min();
+    let end = turn.map_or(case.len(), |at| from + at);
+    case[..end].trim_end_matches(TRAILING).to_owned()
+}
+
+/// `before`, the sentence that goes ahead of a defect too short to stand
+/// alone, without what the run made of it: through the clause of its last
+/// span or quote, or its first where it has none, and on as `through`
+/// goes, less the clauses of `GLUED` words or fewer that end it after a
+/// stop or a dash, as "Fine." and "— fine." do, with a stop where words
+/// were dropped. A short clause after a comma is the last of a list, and
+/// stays.
+fn context(before: &str) -> String {
+    let quoted = literals(before).last().map_or(0, |range| range.end);
+    let kept = through(before, quoted);
+    let prose = masked(&kept);
+    let clauses = clauses(&prose);
+    let mut end = kept.len();
+    for pair in clauses.windows(2).rev() {
+        let (ahead, last) = (&prose[pair[0].clone()], &prose[pair[1].clone()]);
+        let words = last
+            .split_whitespace()
+            .filter(|word| word.chars().any(char::is_alphanumeric));
+        let verdict = words.count() <= GLUED && !last.contains('#');
+        if !verdict || ahead.trim_end().ends_with(',') || pair[1].start < quoted {
+            break;
         }
-        _ => case,
+        end = pair[1].start;
+    }
+    let kept = kept[..end].trim_end().trim_end_matches(TRAILING);
+    let whole = kept.len() == before.len() || kept.ends_with(['.', '?', '!']);
+    match whole {
+        true => kept.to_owned(),
+        false => format!("{kept}."),
     }
 }
 
@@ -1425,8 +1498,7 @@ fn through(unit: &str, quoted: usize) -> String {
             .find(|clause| marked(clause, 0))
             .map_or(unit.len(), |clause| clause.start),
     };
-    let trailing = [',', ';', ':', '-', '\u{2013}', '\u{2014}', ' '];
-    unit[..end].trim().trim_end_matches(trailing).to_owned()
+    unit[..end].trim().trim_end_matches(TRAILING).to_owned()
 }
 
 /// What `case` is known by: its first code span, or its words where it has
@@ -2456,12 +2528,25 @@ mod tests {
         // One that speaks of the sentence before it, or is too short to
         // say what is wrong, is given after that sentence.
         let spoken = "For wide globals the dump writes zeros. That's wrong but rare.";
-        assert_eq!(weighed(spoken), [spoken]);
+        assert_eq!(
+            weighed(spoken),
+            ["For wide globals the dump writes zeros. That's wrong"]
+        );
         let short = "Two traits may land in different groups. Hmm, but should I fix the second \
                      case? That's out of scope. Leave it.";
         assert_eq!(
             weighed(short),
             ["Two traits may land in different groups. Hmm, but should I fix the second case?"]
+        );
+        // The sentence ahead of it is there to be read with it: the case
+        // that sentence is by its own span stands beside it.
+        let beside = "A `handle` shared by two readers? Rare. That's a bug with three, but rare.";
+        assert_eq!(
+            weighed(beside),
+            [
+                "A `handle` shared by two readers?",
+                "A `handle` shared by two readers? That's a bug with three"
+            ]
         );
         // Of a long sentence before it only the end, so the defect stays.
         let long = format!(
@@ -2489,6 +2574,61 @@ mod tests {
         ] {
             assert!(weighed(notes).is_empty(), "{notes}: {:?}", weighed(notes));
         }
+    }
+
+    #[test]
+    fn a_defect_is_given_without_what_the_run_made_of_it() {
+        for (notes, case) in [
+            // A verdict in the defect's own clause, after a "but", a dash
+            // or a "though", and a reason in brackets.
+            (
+                "A second read would break the stream but that's rare.",
+                "A second read would break the stream",
+            ),
+            (
+                "A second read would break\u{2014}unlikely.",
+                "A second read would break",
+            ),
+            (
+                "A child marked to omit is still written, which is arguably a bug but minor.",
+                "A child marked to omit is still written, which is arguably a bug",
+            ),
+            (
+                "Sending more than the limit would break the mux, though callers never do \
+                 that. Rare.",
+                "Sending more than the limit would break the mux",
+            ),
+            (
+                "Removing the wrappers would break the page (the selects stay hidden). Edge \
+                 case.",
+                "Removing the wrappers would break the page",
+            ),
+            // The sentence that goes before a short one loses its own
+            // verdict, after a dash or as a sentence of a word.
+            (
+                "If two readers share a `handle` the order holds \u{2014} fine. But should I \
+                 fix the three-reader case? Out of scope.",
+                "If two readers share a `handle` the order holds. But should I fix the \
+                 three-reader case?",
+            ),
+            (
+                "A reader given two files gets them in order. Fine. That would break with \
+                 three, but rare.",
+                "A reader given two files gets them in order. That would break with three",
+            ),
+            // The last of a list is no verdict.
+            (
+                "The dump writes the name, the size, the flags. That's wrong but rare.",
+                "The dump writes the name, the size, the flags. That's wrong",
+            ),
+        ] {
+            assert_eq!(weighed(notes), [case], "{notes}");
+        }
+        // A case its span names keeps the clause the span is in, as before.
+        assert_eq!(
+            weighed("That is arguably wrong for `Or(a, b)` but fine for one trait."),
+            ["That is arguably wrong for `Or(a, b)` but fine for one trait."]
+        );
     }
 
     #[test]
@@ -2523,7 +2663,7 @@ mod tests {
             .map(|n| format!("Hidden tests might call `check_{n}()` with an empty list."))
             .collect();
         let checks = notes.clone();
-        let named = |n: usize| format!("Module {n} has a bug in its logging");
+        let named = |n: usize| format!("The writer of module {n} has a bug in how it logs");
         notes.extend((1..=10).map(|n| format!("{}, not an issue for us.", named(n))));
         let mut kept = checks.clone();
         kept.extend((7..=10).map(named));
