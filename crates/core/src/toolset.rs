@@ -113,6 +113,14 @@ impl Family {
                 "no Chrome or Edge found",
                 None,
             ),
+            // A ChatGPT plan makes the pictures and nothing else of it, so
+            // the note says what works and still leads to the account.
+            Family::Media
+                if !crate::auth::signed_in()
+                    && crate::providers::chatgpt::images::plan(None).is_some() =>
+            {
+                (false, "pictures only", Some(Fix::Account))
+            }
             Family::Media => (
                 crate::auth::signed_in(),
                 "needs sign-in",
@@ -203,6 +211,16 @@ mod tests {
         assert_eq!(switched_off(&media), ["speak"]);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_media_family_says_a_chatgpt_plan_makes_pictures_only() {
+        let (_vault, _held) = crate::providers::auth::tests::vault("toolset-media-plan");
+        let note = || Family::Media.readiness().map(|ready| ready.note);
+        assert_eq!(note(), Some("needs sign-in"));
+        crate::providers::tests::plugged_in("chatgpt");
+        crate::providers::auth::tests::keep(crate::providers::chatgpt::NAME, "access-1");
+        assert_eq!(note(), Some("pictures only"));
     }
 
     #[test]

@@ -52,6 +52,8 @@ For a light headless browser on macOS and Linux, add [Lightpanda](https://github
 
 These tools run on Letronna's hosted models whatever gateway the chat uses. They are paid from your credit, so they ask first.
 
+A ChatGPT plan makes pictures too. In a chat signed in with ChatGPT, `make_image` and `edit_image` use the plan, which covers them and counts them toward its image limit; they still ask first. The plan's model picks the size itself, and its edits take up to 5 pictures and no mask. With a Letronna account as well, picking a hosted image model with `/model image` has `make_image` use that one instead, paid from your credit; `edit_image` stays on the chat's gateway. Without an account, a ChatGPT sign-in is enough for `make_image` in any chat. Speech, transcription and video need the account.
+
 | Tool | Makes | Billed per |
 |---|---|---|
 | `make_image` | An image from a description | Image |
