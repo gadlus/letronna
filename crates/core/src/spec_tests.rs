@@ -167,6 +167,7 @@ const FIRST_PATCH: &str = "first.patch";
 /// the project as it was: what tests import from or build with, and nothing
 /// the work writes, as a `dist/` or `build/` it built, a `*.egg-info` it
 /// packaged or a `__pycache__` of its new modules would be.
+#[cfg(unix)]
 const STORES: [&str; 9] = [
     "node_modules",
     ".venv",
@@ -181,9 +182,11 @@ const STORES: [&str; 9] = [
 
 /// Files under `site-packages` and the folder of its files read at most
 /// for a path into the project, which an editable install leaves there.
+#[cfg(unix)]
 const EDITABLE_READ: u64 = 64 * 1024;
 
 /// How deep under a linked store a `site-packages` folder is looked for.
+#[cfg(unix)]
 const STORE_DEPTH: usize = 5;
 
 /// Characters of the tests' output the run is shown at most: the lines that
@@ -266,6 +269,7 @@ const DIFFERING: usize = 20;
 
 /// Folders a test run or a build leaves behind, which hold no work of the
 /// run's, so no file in them is one that differs.
+#[cfg(unix)]
 const CACHES: [&str; 10] = [
     "__pycache__",
     "htmlcov",
@@ -724,7 +728,7 @@ pub(crate) fn first(run: u64) -> Option<FirstVersion> {
 }
 
 /// Where run `run`'s first complete version is kept, handed out or not.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn snapshot_of(run: u64) -> Option<PathBuf> {
     let firsts = firsts().lock().ok()?;
     (firsts.iter().find(|first| first.run == run)).map(|first| first.dir.clone())
@@ -840,6 +844,7 @@ fn place(from: &Path, at: &Path, kind: &std::fs::FileType) -> std::io::Result<()
 /// a path from the project, for `error`: a run that lost the driver's run
 /// of the tester's tests to a copy that could not be made otherwise left
 /// nothing to say why.
+#[cfg(unix)]
 fn unplaced(step: &'static str, path: &str, error: &std::io::Error) {
     crate::diag::event(
         "spec_copy_failed",
@@ -856,7 +861,7 @@ fn unplaced(step: &'static str, path: &str, error: &std::io::Error) {
 }
 
 /// What `unplaced` has noted so far, each step and path, for the tests.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn noted() -> &'static Mutex<Vec<(&'static str, String)>> {
     static NOTED: OnceLock<Mutex<Vec<(&'static str, String)>>> = OnceLock::new();
     NOTED.get_or_init(Default::default)
@@ -2416,6 +2421,7 @@ fn differing(_first: &Path, _workspace: &Path) -> Vec<String> {
 /// Whether `part`, a component of a path, names what a test run or a build
 /// leaves behind and no work of the run's: a cache, compiled Python,
 /// coverage, a package's egg-info.
+#[cfg(unix)]
 fn artefact(part: &str) -> bool {
     CACHES.contains(&part)
         || part.starts_with("coverage")
@@ -2425,6 +2431,7 @@ fn artefact(part: &str) -> bool {
 }
 
 /// Whether a component of `path` is hidden.
+#[cfg(unix)]
 fn hidden(path: &str) -> bool {
     path.split('/').any(|part| part.starts_with('.'))
 }
@@ -8378,6 +8385,7 @@ mod tests {
     }
 
     /// `environment`, with the words it found joined by a space.
+    #[cfg(unix)]
     fn lent_words(line: &str, program: &str) -> Option<String> {
         environment(line, program).map(|found| found.join(" "))
     }

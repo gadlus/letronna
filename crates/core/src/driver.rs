@@ -5338,6 +5338,7 @@ pub(crate) mod tests {
 
     /// `finished`, with the `second_attempt` experiment as `attempts` says
     /// for this run, set here rather than saved.
+    #[cfg(unix)]
     fn finished_attempting(spec: Spec, attempts: bool) -> Report {
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
@@ -11219,6 +11220,7 @@ pub(crate) mod tests {
 
     /// A provider that turns every request down and counts them, until a
     /// connection that sends nothing ends it.
+    #[cfg(unix)]
     fn refusing() -> (String, SocketAddr, Arc<AtomicUsize>) {
         let (server, endpoint) = listen();
         let address = server.local_addr().unwrap();
