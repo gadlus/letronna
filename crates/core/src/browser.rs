@@ -60,6 +60,265 @@ const SETTLE_MOST: Duration = Duration::from_secs(3);
 const QUIET_LOOK: Duration = Duration::from_millis(50);
 /// How long a page gets to load.
 const LOAD_TIME: Duration = Duration::from_secs(20);
+
+/// Ask `tab` to go to `url`, and give the site the time a slow one takes
+/// to begin answering (`cdp::NAVIGATE_TIME`): the browser answers only once
+/// the site has. One that has not by then is told as what it is, a site
+/// that did not answer, so the model does not take its browser for broken.
+fn navigate(tab: &mut Tab, url: &str) -> Result<Value, String> {
+    navigate_within(tab, url, cdp::NAVIGATE_TIME)
+}
+
+/// `navigate`, with the time the site gets.
+fn navigate_within(tab: &mut Tab, url: &str, limit: Duration) -> Result<Value, String> {
+    let asked = tab.call_within("Page.navigate", json!({"url": url}), limit);
+    asked.map_err(|why| match why == cdp::unanswered("Page.navigate") {
+        true => unanswering(url, limit),
+        false => why,
+    })
+}
+
+/// What the model is told of a site that did not begin to answer within
+/// `limit`: whose fault it is, and what is worth doing about it.
+fn unanswering(url: &str, limit: Duration) -> String {
+    let site = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| url.to_owned());
+    format!(
+        "{site} did not begin to answer within {} seconds. The browser is working: the site is \
+         slow, down, or does not answer this computer's address. `look` shows what has loaded \
+         since. Open it once more before giving up on it, and then say that it did not answer; \
+         another browser would fare no better.",
+        limit.as_secs()
+    )
+}
+
+/// browse's action that gives the page to the user and waits for them.
+const HAND_OVER: &str = "hand_over";
+
+/// Whether a call hands the page to the user: for what only they can do
+/// there, a password, a code sent to them, a check that they are human. It
+/// is a wait for a person and not an action to allow, so the gate puts it
+/// to them in every mode and no grant answers it.
+pub fn hands_over(tool: &str, args: &Value) -> bool {
+    tool == BROWSE && args["action"] == HAND_OVER
+}
+
+/// `hands_over`, of a call as the model made it.
+pub fn handed_over(call: &ToolCall) -> bool {
+    call.name == BROWSE
+        && serde_json::from_str::<Value>(&call.arguments)
+            .is_ok_and(|args| hands_over(BROWSE, &args))
+}
+
+/// Whether whoever started this run passes its owner's hands on to the
+/// page: Letronna Cloud, for a run its owner watches from an app that can
+/// take a page (`LETRONNA_HAND_OVER=1`).
+#[cfg(not(test))]
+fn hands_passed_on() -> bool {
+    std::env::var_os("LETRONNA_HAND_OVER").is_some_and(|value| value == "1")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own word for `hands_passed_on`, as nothing else sets the
+    /// environment for one test alone.
+    pub(crate) static HANDS_PASSED_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// In a test, what its thread says; see `HANDS_PASSED_ON`.
+#[cfg(test)]
+fn hands_passed_on() -> bool {
+    HANDS_PASSED_ON.get()
+}
+
+/// Whether there is a way for a person to act on the page now: whoever
+/// started the run passes their hands on, the browser has a window of its
+/// own, or Letronna's window is showing it. With none, a hand-over would be
+/// a card about a page nobody can reach.
+pub fn can_hand_over() -> bool {
+    hands_passed_on() || !headless() || watch::watched()
+}
+
+/// What a hand-over's card shows: what the user is to do, and on which page.
+fn handing_said(args: &Value, page: Option<&str>) -> String {
+    let why = args["why"].as_str().unwrap_or_default().trim();
+    let what = match why.is_empty() {
+        true => "Hand the page over to you".to_owned(),
+        false => format!("Hand the page over to you: {why}"),
+    };
+    match page {
+        Some(page) => format!("{what}\non {page}"),
+        None => what,
+    }
+}
+
+/// What the model is told when it hands a page over and nobody can take
+/// it: a run nobody watches, or a browser no person can reach.
+const NOBODY_TO_HAND_TO: &str = "Nobody is here to take the page. Say what it needs that only the user can do \
+     (a sign-in, a code sent to them, a check that they are human) and that it was left \
+     undone; do not try to get past it yourself.";
+
+/// What heads the page listed after the user gave it back.
+const HANDED_BACK: &str = "The user says they are done on the page. This is the page now: check that it shows \
+     what was needed before going on.";
+
+/// The page as the user left it, once they said they were done with it.
+/// Only a yes on the call's own card is that: run without one, with nobody
+/// there to ask, it says so instead.
+fn handed_back(ctx: &ToolContext) -> Result<String, String> {
+    if !ctx.approved {
+        return Err(NOBODY_TO_HAND_TO.into());
+    }
+    // What they signed in to is worth keeping now, not only if the run
+    // lives to its end.
+    keep_now();
+    with_session(ctx, |session| {
+        let page = session.read(false)?;
+        session.show(&page, &View::default(), vec![HANDED_BACK.into()])
+    })
+}
+
+/// How many hand-overs wait on their user now.
+fn handed() -> &'static std::sync::atomic::AtomicUsize {
+    static HANDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    &HANDED
+}
+
+/// A page in its user's hands, until this is let go of: its browser is not
+/// closed for being idle meanwhile, however long they take.
+pub struct InTheirHands(());
+
+/// Keep the browser open while `call` waits on the user, if it hands the
+/// page to them: a person signing in takes longer than a model between two
+/// steps, and a browser closed under them would take the page with it.
+pub fn hold_for(call: &ToolCall) -> Option<InTheirHands> {
+    handed_over(call).then(|| {
+        handed().fetch_add(1, Ordering::SeqCst);
+        InTheirHands(())
+    })
+}
+
+impl Drop for InTheirHands {
+    fn drop(&mut self) {
+        handed().fetch_sub(1, Ordering::SeqCst);
+        // The agent has it again from now: the wait for idleness starts here.
+        mark_agent_use();
+    }
+}
+
+/// Whether a page is in its user's hands now.
+fn in_their_hands() -> bool {
+    handed().load(Ordering::SeqCst) > 0
+}
+
+/// Where the browser's cookies are kept between runs, when whoever starts
+/// the runs keeps them (`LETRONNA_BROWSER_KEPT`, a file's path): Letronna
+/// Cloud, for a thread whose owner chose to stay signed in. A run's browser
+/// starts clean there, so what a run was signed in to would be gone at the
+/// next message.
+fn kept_file() -> Option<PathBuf> {
+    std::env::var_os("LETRONNA_BROWSER_KEPT")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The most the cookies kept between runs may come to, written out.
+const KEPT_MOST: usize = 500 * 1024;
+
+/// The cookies in `file`, as an earlier run left them; none when there is
+/// no such file, or it holds something else.
+fn kept_cookies(file: &Path) -> Vec<Value> {
+    let Ok(read) = std::fs::read(file) else {
+        return Vec::new();
+    };
+    if read.len() > 2 * KEPT_MOST {
+        return Vec::new();
+    }
+    let cookies: Vec<Value> = serde_json::from_slice(&read).unwrap_or_default();
+    match cookies.iter().all(Value::is_object) {
+        true => cookies,
+        false => Vec::new(),
+    }
+}
+
+/// Each cookie of `all` once, by its name, site and path, the one met last
+/// standing, and no more of them than are kept: the first met go first.
+fn cookies_once(all: Vec<Value>) -> Vec<Value> {
+    let mut once: Vec<Value> = Vec::new();
+    let mut at: HashMap<(String, String, String), usize> = HashMap::new();
+    for cookie in all {
+        let part = |name: &str| cookie[name].as_str().unwrap_or_default().to_owned();
+        let key = (part("name"), part("domain"), part("path"));
+        match at.get(&key) {
+            Some(place) => once[*place] = cookie,
+            None => {
+                at.insert(key, once.len());
+                once.push(cookie);
+            }
+        }
+    }
+    while !once.is_empty() && Value::Array(once.clone()).to_string().len() > KEPT_MOST {
+        once.remove(0);
+    }
+    once
+}
+
+/// Write `cookies` to `file`, whole or not at all, for this user alone.
+fn keep_cookies(file: &Path, cookies: &[Value]) {
+    if let Some(folder) = file.parent() {
+        let _ = std::fs::create_dir_all(folder);
+    }
+    let part = file.with_extension("part");
+    let Ok(written) = serde_json::to_vec(cookies) else {
+        return;
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let wrote = options.open(&part).and_then(|mut to| {
+        use std::io::Write;
+        to.write_all(&written)
+    });
+    match wrote {
+        Ok(()) => {
+            let _ = std::fs::rename(&part, file);
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(&part);
+        }
+    }
+}
+
+/// Keep the browser's cookies for the next run now, where they are kept.
+fn keep_now() {
+    if let Ok(mut all) = lock() {
+        all.keep();
+    }
+}
+
+/// Whether the browser tools are offered at all. On a machine thrown away
+/// after its run (`cdp::thrown_away`) with no browser on it and none to
+/// reach elsewhere, they are not: nothing there could ever install one, and
+/// a tool that can only fail sent the model looking for a browser to
+/// install. Anywhere else they are, and say what to install when called.
+fn offered_here() -> bool {
+    reachable(
+        cdp::thrown_away(),
+        cdp::installed().is_some(),
+        remote_address().is_some(),
+    )
+}
+
+/// `offered_here`, from what it goes by.
+fn reachable(thrown_away: bool, installed: bool, elsewhere: bool) -> bool {
+    !thrown_away || installed || elsewhere
+}
 /// After loading, how long to wait for the page's own requests to quieten,
 /// which is when a page drawn by script has usually drawn itself.
 const IDLE_TIME: Duration = Duration::from_secs(3);
@@ -464,12 +723,13 @@ impl Tool for Browse {
         BROWSE
     }
     fn description(&self) -> &'static str {
-        "Look at web pages in a real browser (Chrome, Edge or Brave) on a profile of its own, which the user can watch and step into from Letronna's window. For pages that need script, a sign-in or clicking through. Actions:\n- open: loads `url` and lists the page, one element a line with a ref such as e12 for use_page, and each frame's contents under a header naming its origin. A download is saved in the project's media/downloads folder and named in this result or the next; a name that could run gets .download added.\n- look: lists the page again. On a long page use `find` (each match with the lines after it) before `full`.\n- scroll: about a screen, or the panel holding `ref`.\n- back\n- tabs: lists them.\n- console: recent errors and log lines.\n- screenshot: the view, or the whole page with `full` (a very long page is cut and says so). The user sees it, and you see it when your model takes images.\n- pdf: saves the page as a PDF in the same folder and gives its path.\n- hover: rests the mouse on `ref`, which the page takes as a real one's and may act on, and shows what changed, as use_page does.\n- wait: until `text` shows in the page's own text, not its frames', or with `gone` has left it, then lists the page."
+        "Look at web pages in a real browser (Chrome, Edge or Brave) on a profile of its own, which the user can watch and step into from Letronna's window. For pages that need script, a sign-in or clicking through. Actions:\n- open: loads `url` and lists the page, one element a line with a ref such as e12 for use_page, and each frame's contents under a header naming its origin. A download is saved in the project's media/downloads folder and named in this result or the next; a name that could run gets .download added.\n- look: lists the page again. On a long page use `find` (each match with the lines after it) before `full`.\n- scroll: about a screen, or the panel holding `ref`.\n- back\n- tabs: lists them.\n- console: recent errors and log lines.\n- screenshot: the view, or the whole page with `full` (a very long page is cut and says so). The user sees it, and you see it when your model takes images.\n- pdf: saves the page as a PDF in the same folder and gives its path.\n- hover: rests the mouse on `ref`, which the page takes as a real one's and may act on, and shows what changed, as use_page does.\n- wait: until `text` shows in the page's own text, not its frames', or with `gone` has left it, then lists the page.\n- hand_over: gives the page to the user and waits until they say they are done, for what only they can do there: a password, a code sent to them, a check that they are human. Say what they are to do in `why`, in a few words. Never ask for a password in the chat and never type one. Lists the page after."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["open", "look", "scroll", "back", "tabs", "console", "screenshot", "pdf", "hover", "wait"]},
+            "action": {"type": "string", "enum": ["open", "look", "scroll", "back", "tabs", "console", "screenshot", "pdf", "hover", "wait", "hand_over"]},
             "url": {"type": "string"},
+            "why": {"type": "string", "description": "For hand_over: what the user is to do on the page."},
             "full": {"type": "boolean", "description": "For look and scroll: all the page's text, not only what can be used. For screenshot: the whole page."},
             "find": {"type": "string", "description": "For look: search the page's text for these words."},
             "from": {"type": "integer", "description": "For look: the line to carry on from."},
@@ -486,6 +746,9 @@ impl Tool for Browse {
     fn needs_approval(&self) -> bool {
         true
     }
+    fn offered(&self, _: &crate::chat::Connection) -> bool {
+        offered_here()
+    }
     fn untrusted(&self) -> bool {
         true
     }
@@ -493,6 +756,9 @@ impl Tool for Browse {
         if args["action"] == "open" {
             let get = format!("GET {}", args["url"].as_str().unwrap_or_default());
             return with_downloads_said(get, args, ctx);
+        }
+        if args["action"] == HAND_OVER {
+            return handing_said(args, current_page(ctx.conversation).as_deref());
         }
         let mut what = crate::tools::summary(BROWSE, &args.to_string());
         if let Some(frame) = frame_said(args) {
@@ -556,9 +822,10 @@ impl Tool for Browse {
                 let gone = args["gone"].as_bool().unwrap_or(false);
                 wait_for(ctx, text, gone, wait_time(args))
             }
+            HAND_OVER => handed_back(ctx),
             other => Err(format!(
                 "browse cannot `{other}`; it can open, look, scroll, back, tabs, console, \
-                 screenshot, pdf, hover or wait."
+                 screenshot, pdf, hover, wait or hand_over."
             )),
         };
         told_downloads(ctx.conversation, past_check(ctx, done))
@@ -598,6 +865,9 @@ impl Tool for UsePage {
     }
     fn needs_approval(&self) -> bool {
         true
+    }
+    fn offered(&self, _: &crate::chat::Connection) -> bool {
+        offered_here()
     }
     fn mutates(&self) -> bool {
         true
@@ -1056,6 +1326,7 @@ pub fn summary(args: &Value) -> String {
         }
         "screenshot" => "take a screenshot".into(),
         "pdf" => "save the page as a PDF".into(),
+        HAND_OVER => "hand the page over".into(),
         "hover" => format!("hover over {}", text("ref")),
         "wait" if args["gone"].as_bool() == Some(true) => {
             format!("wait for \"{}\" to go", text("text"))
@@ -2076,9 +2347,18 @@ fn check_signs(tab: &mut Tab, stop: &Cancel) -> Option<Value> {
     Some(said["result"]["value"].clone()).filter(Value::is_object)
 }
 
+/// What the model is told of a site's check where its starter passes the
+/// user's hands on to the page (`hands_passed_on`): to give them the page.
+const HAND_THE_CHECK_OVER: &str = "This looks like the site's bot check. Give the page to the user with browse's \
+     hand_over, saying in `why` that the site asks them to show they are human, then go on \
+     from the page it lists.";
+
 /// What the model is told of a site's check the call did not wait on: to
 /// ask the user to get past it, and where.
 fn ask_past_check(headless: bool) -> String {
+    if hands_passed_on() {
+        return HAND_THE_CHECK_OVER.into();
+    }
     match headless {
         true => "This looks like the site's bot check. Ask the user to get past it in the \
                  browser panel beside the chat in Letronna's window, then look again. In the \
@@ -2803,7 +3083,8 @@ fn close_when_idle(started: u64) {
     let mut watched = Instant::now();
     loop {
         std::thread::sleep(IDLE_CHECK);
-        if watch::watched() {
+        // Watched in the window, or in its user's hands (`hold_for`): in use.
+        if watch::watched() || in_their_hands() {
             watched = Instant::now();
             continue;
         }
@@ -2864,6 +3145,8 @@ impl Browsers {
     /// Close the browser while nothing uses it, remembering what each
     /// conversation had open to give back when it is next used.
     fn rest(&mut self) {
+        // For the next run too, should this one not live to close it again.
+        self.keep();
         for session in &mut self.sessions {
             let context = session.context.as_deref();
             let rested = Rested {
@@ -2877,6 +3160,32 @@ impl Browsers {
             browser.close();
         }
         watch::unfollow();
+    }
+
+    /// Write the cookies of every conversation's browser where they are
+    /// kept between runs (`kept_file`), those of a browser closed for being
+    /// idle among them. Nothing where none are kept, or where no browser
+    /// was used: what an earlier run left then stays as it is.
+    fn keep(&mut self) {
+        let Some(file) = kept_file() else {
+            return;
+        };
+        let mut used = false;
+        let mut all: Vec<Value> = Vec::new();
+        for rested in self.remembered.values() {
+            used = true;
+            all.extend(rested.cookies.iter().cloned());
+        }
+        for session in &self.sessions {
+            // One that cannot be read now is left out, not taken for empty.
+            if let Ok(cookies) = session.reach.cookies(session.context.as_deref()) {
+                used = true;
+                all.extend(cookies);
+            }
+        }
+        if used {
+            keep_cookies(&file, &cookies_once(all));
+        }
     }
 
     /// An owner's session, opened if it has none, and the most recently used
@@ -2903,6 +3212,13 @@ impl Browsers {
                         .set_cookies(session.context.as_deref(), cookies);
                     if !url.is_empty() && url != "about:blank" {
                         let _ = session.load_at(&url);
+                    }
+                } else if let Some(file) = kept_file() {
+                    // What an earlier run was signed in to, before a page
+                    // is opened that would ask for it again.
+                    let kept = kept_cookies(&file);
+                    if !kept.is_empty() {
+                        let _ = session.reach.set_cookies(session.context.as_deref(), kept);
                     }
                 }
                 self.sessions.push(session);
@@ -3346,6 +3662,9 @@ pub fn close_hidden() {
     let Ok(mut all) = state().try_lock() else {
         return;
     };
+    // What it was signed in to, for the next run, where that is kept: also
+    // of a browser closed already for being idle.
+    all.keep();
     if all
         .browser
         .as_ref()
@@ -3504,7 +3823,7 @@ impl Session {
 
     /// Start loading an address, without waiting for it to load.
     fn go_to(&mut self, url: &str) -> Result<(), String> {
-        let reply: Value = self.tab.call("Page.navigate", json!({"url": url}))?;
+        let reply = navigate(&mut self.tab, url)?;
         self.refs.forget();
         match reply["errorText"].as_str().filter(|e| !e.is_empty()) {
             Some(error) => Err(format!("Could not open {url}: {error}.")),
@@ -3524,7 +3843,7 @@ impl Session {
     fn open(&mut self, url: &str, saving: &Saving) -> Result<String, String> {
         self.tab.events.clear();
         let notes = self.downloading(saving, |session| {
-            let reply: Value = session.tab.call("Page.navigate", json!({"url": url}))?;
+            let reply = navigate(&mut session.tab, url)?;
             // A download ends the page's own loading as aborted, which is no
             // failure; it is said a moment after the answer, which comes
             // once the browser knows it is one.
@@ -5653,6 +5972,180 @@ fn console_line(event: &Event) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_site_that_does_not_answer_is_told_as_the_site_not_the_browser() {
+        // The browser answers a navigation only once the site has; this one never does.
+        let (address, _server) = cdp::tests::fake_browser(|method, _| match method {
+            "Page.navigate" => (Vec::new(), json!({"unanswered": true})),
+            _ => (Vec::new(), json!({})),
+        });
+        let mut tab = Tab::connect(&address, "T1").unwrap();
+        let limit = Duration::from_millis(200);
+        let why = navigate_within(&mut tab, "https://kulino.dinus.ac.id/login", limit).unwrap_err();
+        assert!(
+            why.starts_with("kulino.dinus.ac.id did not begin to answer within 0 seconds."),
+            "{why}"
+        );
+        assert!(why.contains("The browser is working"), "{why}");
+        // Nothing in it sends the model after another browser.
+        assert!(!why.contains("install"), "{why}");
+        // The tab is still good: the page may yet load, and `look` reads it.
+        assert!(!tab.broken);
+        assert!(cdp::NAVIGATE_TIME > cdp::CALL_TIME);
+        // Any other failure is told as it came.
+        let (address, _server) = cdp::tests::fake_browser(|_, _| {
+            (
+                Vec::new(),
+                json!({"error": {"message": "Cannot navigate to invalid URL"}}),
+            )
+        });
+        let mut tab = Tab::connect(&address, "T1").unwrap();
+        let why = navigate_within(&mut tab, "https://example.com", limit).unwrap_err();
+        assert!(why.contains("invalid URL"), "{why}");
+    }
+
+    #[test]
+    fn a_page_is_handed_over_by_browse_alone_and_says_what_for() {
+        let call = |name: &str, args: Value| ToolCall {
+            id: "c1".into(),
+            name: name.into(),
+            arguments: args.to_string(),
+        };
+        let hand = json!({"action": "hand_over", "why": "sign in to your account"});
+        assert!(hands_over(BROWSE, &hand));
+        assert!(handed_over(&call(BROWSE, hand.clone())));
+        // Not another action of browse, nor the same word to another tool.
+        assert!(!hands_over(
+            BROWSE,
+            &json!({"action": "open", "url": "https://a.test"})
+        ));
+        assert!(!hands_over("use_page", &hand));
+        assert!(!handed_over(&call("run_command", hand.clone())));
+        assert!(!handed_over(&ToolCall {
+            id: "c2".into(),
+            name: BROWSE.into(),
+            arguments: "not json".into(),
+        }));
+        // Its step and its card say what it is, and the card what the user is to do.
+        assert_eq!(summary(&hand), "hand the page over");
+        assert_eq!(
+            handing_said(&hand, Some("Sign in — https://accounts.example/login")),
+            "Hand the page over to you: sign in to your account\non Sign in — https://accounts.example/login"
+        );
+        assert_eq!(
+            handing_said(&json!({"action": "hand_over"}), None),
+            "Hand the page over to you"
+        );
+        // The model is told of it, and never to ask for a password.
+        let told = Browse.description();
+        assert!(told.contains("- hand_over:") && told.contains("Never ask for a password"));
+        let actions = &Browse.parameters()["properties"]["action"]["enum"];
+        assert!(actions.as_array().unwrap().contains(&json!("hand_over")));
+    }
+
+    #[test]
+    fn a_page_handed_over_with_nobody_to_take_it_says_so() {
+        // Run without a yes on its own card: nobody was there to ask.
+        let ctx = ToolContext::default();
+        let said = Browse
+            .run(&json!({"action": "hand_over", "why": "sign in"}), &ctx)
+            .unwrap_err();
+        assert!(
+            said.starts_with("Nobody is here to take the page."),
+            "{said}"
+        );
+        assert!(
+            said.contains("do not try to get past it yourself"),
+            "{said}"
+        );
+        // A browser with no window and nobody passing hands on: no way to it.
+        HANDS_PASSED_ON.set(false);
+        assert!(!hands_passed_on());
+        HANDS_PASSED_ON.set(true);
+        assert!(can_hand_over());
+        // Where hands are passed on, a site's check is handed over too.
+        assert!(ask_past_check(true).contains("hand_over"));
+        HANDS_PASSED_ON.set(false);
+        assert!(!ask_past_check(true).contains("hand_over"));
+    }
+
+    #[test]
+    fn a_browser_in_its_users_hands_is_not_closed_under_them() {
+        let call = |action: &str| ToolCall {
+            id: "c1".into(),
+            name: BROWSE.into(),
+            arguments: json!({ "action": action }).to_string(),
+        };
+        // Any other call holds nothing.
+        assert!(hold_for(&call("look")).is_none());
+        let held = hold_for(&call("hand_over")).unwrap();
+        assert!(in_their_hands());
+        // A second, from another conversation, is held as well.
+        let other = hold_for(&call("hand_over")).unwrap();
+        drop(held);
+        assert!(in_their_hands());
+        drop(other);
+        // Given back, it is the agent's from that moment.
+        let used = agent_used().lock().unwrap().unwrap();
+        assert!(used.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn cookies_kept_between_runs_are_read_back_as_they_were_written() {
+        let dir = std::env::temp_dir().join(format!("letronna-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("kept").join("cookies.json");
+        // None yet: nothing to give a new browser.
+        assert!(kept_cookies(&file).is_empty());
+        let cookie = |name: &str, domain: &str, value: &str| json!({"name": name, "domain": domain, "path": "/", "value": value, "secure": true});
+        // Each once, the one met last standing, in the order first met.
+        let once = cookies_once(vec![
+            cookie("SID", ".example.com", "old"),
+            cookie("LANG", ".example.com", "en"),
+            cookie("SID", ".other.example", "theirs"),
+            cookie("SID", ".example.com", "new"),
+        ]);
+        assert_eq!(once.len(), 3);
+        assert_eq!(once[0]["value"], "new");
+        assert_eq!(once[2]["domain"], ".other.example");
+        // Its folder is made, and the file is this user's alone.
+        keep_cookies(&file, &once);
+        assert_eq!(kept_cookies(&file), once);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert!(!file.with_extension("part").exists());
+        // Something else where they should be is no cookies at all.
+        std::fs::write(&file, "#!/bin/sh\necho not cookies").unwrap();
+        assert!(kept_cookies(&file).is_empty());
+        std::fs::write(&file, r#"["SID", 7]"#).unwrap();
+        assert!(kept_cookies(&file).is_empty());
+        // No more are kept than fit: the first met go first.
+        let many: Vec<Value> = (0..400)
+            .map(|n| cookie(&format!("c{n}"), ".example.com", &"x".repeat(2000)))
+            .collect();
+        let kept = cookies_once(many);
+        assert!(Value::Array(kept.clone()).to_string().len() <= KEPT_MOST);
+        assert!(!kept.is_empty() && kept.len() < 400);
+        assert_eq!(kept.last().unwrap()["name"], "c399");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_browser_tools_are_not_offered_where_there_can_never_be_a_browser() {
+        // A machine thrown away after its run, with no browser on it or elsewhere.
+        assert!(!reachable(true, false, false));
+        // One with a browser, or one to reach elsewhere, offers them.
+        assert!(reachable(true, true, false));
+        assert!(reachable(true, false, true));
+        // Someone's own computer always does: there they can install one.
+        assert!(reachable(false, false, false));
+        assert!(reachable(false, true, false));
+    }
 
     #[test]
     fn only_web_addresses_are_opened() {

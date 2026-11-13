@@ -1019,7 +1019,7 @@
   },
   {
     "function": {
-      "description": "Look at web pages in a real browser (Chrome, Edge or Brave) on a profile of its own, which the user can watch and step into from Letronna's window. For pages that need script, a sign-in or clicking through. Actions:\n- open: loads `url` and lists the page, one element a line with a ref such as e12 for use_page, and each frame's contents under a header naming its origin. A download is saved in the project's media/downloads folder and named in this result or the next; a name that could run gets .download added.\n- look: lists the page again. On a long page use `find` (each match with the lines after it) before `full`.\n- scroll: about a screen, or the panel holding `ref`.\n- back\n- tabs: lists them.\n- console: recent errors and log lines.\n- screenshot: the view, or the whole page with `full` (a very long page is cut and says so). The user sees it, and you see it when your model takes images.\n- pdf: saves the page as a PDF in the same folder and gives its path.\n- hover: rests the mouse on `ref`, which the page takes as a real one's and may act on, and shows what changed, as use_page does.\n- wait: until `text` shows in the page's own text, not its frames', or with `gone` has left it, then lists the page.",
+      "description": "Look at web pages in a real browser (Chrome, Edge or Brave) on a profile of its own, which the user can watch and step into from Letronna's window. For pages that need script, a sign-in or clicking through. Actions:\n- open: loads `url` and lists the page, one element a line with a ref such as e12 for use_page, and each frame's contents under a header naming its origin. A download is saved in the project's media/downloads folder and named in this result or the next; a name that could run gets .download added.\n- look: lists the page again. On a long page use `find` (each match with the lines after it) before `full`.\n- scroll: about a screen, or the panel holding `ref`.\n- back\n- tabs: lists them.\n- console: recent errors and log lines.\n- screenshot: the view, or the whole page with `full` (a very long page is cut and says so). The user sees it, and you see it when your model takes images.\n- pdf: saves the page as a PDF in the same folder and gives its path.\n- hover: rests the mouse on `ref`, which the page takes as a real one's and may act on, and shows what changed, as use_page does.\n- wait: until `text` shows in the page's own text, not its frames', or with `gone` has left it, then lists the page.\n- hand_over: gives the page to the user and waits until they say they are done, for what only they can do there: a password, a code sent to them, a check that they are human. Say what they are to do in `why`, in a few words. Never ask for a password in the chat and never type one. Lists the page after.",
       "name": "browse",
       "parameters": {
         "properties": {
@@ -1034,7 +1034,8 @@
               "screenshot",
               "pdf",
               "hover",
-              "wait"
+              "wait",
+              "hand_over"
             ],
             "type": "string"
           },
@@ -1090,6 +1091,10 @@
             "type": "string"
           },
           "url": {
+            "type": "string"
+          },
+          "why": {
+            "description": "For hand_over: what the user is to do on the page.",
             "type": "string"
           }
         },

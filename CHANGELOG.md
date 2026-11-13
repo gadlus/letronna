@@ -13,6 +13,16 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ## [Unreleased]
 
+### Added
+- **All** — A page can be handed to you. For what only you can do on a page, a password, a code sent to you or a check that you are human, the model does not ask for your password in the chat and types none: it hands the page over with `browse`'s `hand_over`, says what to do, and waits. You do it on the page, in the browser beside the chat or the browser's own window, and answer the card when you are done; it then reads the page again and goes on. It is asked in every mode, no "yes for all" covers it, and the browser is not closed for being idle while it is in your hands.
+- **Terminal** — A run started by Letronna Cloud and watched from the Letronna app can hand its page over too: the app shows the page and passes what you tap and type to it (`LETRONNA_HAND_OVER=1`), and the card on the stream says it is a page (`kind: "page"`). What you type never reaches the model.
+- **Terminal** — With `LETRONNA_BROWSER_KEPT` naming a file, the browser's cookies are read from it when a session begins and written to it when the browser closes, and at once after a page is handed back. Letronna Cloud uses it to keep a chat signed in from one run to the next, where you chose that.
+
+### Fixed
+- **All** — A page whose site is slow to answer gets 45 seconds to begin, not 20. When it still has not, Letronna says that the site did not answer, that its browser is working and that `look` shows what has loaded since, where it said only "The browser did not answer in time (Page.navigate)". A model that read that took its browser for broken and went looking for another one to install.
+- **All** — When the browser will not start, the error ends with the last lines it printed, such as a library the machine lacks or a profile it cannot write. They were thrown away before, so a start that failed said only that it had.
+- **Terminal** — On a machine made for one run and thrown away after (`LETRONNA_DISPOSABLE=1`, as a Letronna Cloud run's container is) with no browser on it, `browse` and `use_page` are not offered, and nothing there tells the model to install Chrome, which it could not.
+
 ## [0.1.0-alpha.5.1] - 2026-11-11
 
 ### Added
