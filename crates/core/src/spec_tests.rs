@@ -2061,12 +2061,20 @@ fn words_first(silent: &str) -> String {
 /// benchmark run a tester's tests expected a record where the project had
 /// no place for one, and the run took the record out of the place two of a
 /// review's rows had passed: the request named the place without saying
-/// whose, which is not silence, so the rule does not hang on it. The notice
-/// of a first version that passed (`regressed`) says another thing of
-/// silence: there the run puts back what broke the test, which a later
-/// review's row may have passed.
+/// whose, which is not silence, so the rule does not hang on it. Nor do
+/// words that can be read both ways ask for the change: on another run a
+/// sentence could be read as asking for a signal when a test run is
+/// aborted or for none, the work sent it, every row of a review that had
+/// watched it do so passed, a tester's tests expected none, and the run,
+/// having read the sentence both ways, took the signal out for the tests:
+/// the hidden test then failed on that. So the rule says which of the two
+/// saw the work run. The notice of a first version that passed
+/// (`regressed`) says another thing of silence: there the run puts back
+/// what broke the test, which a later review's row may have passed.
 const SILENT: &str = "say so in your answer; and unless the request's words ask for it, do \
-                      not take away or move something a review's row passed to pass a test";
+                      not take away or move something a review's row passed to pass a test: \
+                      words that can be read both ways do not ask for it, and the reviewer ran \
+                      your work, which the tester never saw";
 
 /// `words_first` as each notice of a tester's tests says it but the one of
 /// a first version that passed: `ONE_READING` ahead of it, so the first
@@ -2078,13 +2086,17 @@ fn words_and_rows() -> String {
 
 /// What a notice of a tester's tests tells the run of the tester itself. On
 /// a benchmark run the run took the tester's tests for what its work was
-/// graded by, and undid what a review had passed to suit one. It says what
-/// decides where the two disagree, not that the tests judge nothing: tests
-/// a run still fails after `RUNS` send-backs choose between its work and a
-/// second attempt, where that experiment is on.
+/// graded by, and undid what a review had passed to suit one; told only
+/// that they are one more reading, the run on three later benchmark runs
+/// still wrote that the tester's tests were what decided its grade, or that
+/// passing them was worth having, and changed work that was right. So it
+/// says what the tests are not for as well as what decides where the two
+/// disagree. It does not say that the tests judge nothing: tests a run
+/// still fails after `RUNS` send-backs choose between its work and a second
+/// attempt, where that experiment is on.
 const ONE_READING: &str = "The tester can misread the request as you can: its tests are one \
-                           more reading of it, and where they and the request's words disagree \
-                           the words decide.";
+                           more reading of it, passing them is not the aim of your work, and \
+                           where they and the request's words disagree the words decide.";
 
 /// What the report of a tester started ahead of the work tells the run in
 /// place of `WORDS_FIRST`: its table says nothing of the work, so its tests
@@ -2155,7 +2167,7 @@ fn failed(
         "Your work as it stands was run against the tests a tester wrote from the request \
          alone, in a copy of the project with them put back at the paths they are kept from, \
          so nothing in the project was touched: `{command}` {ended}. Its \
-         output{left_out}:\n\n{shown}\n\n{others}{fix} {words} One that calls the \
+         output{left_out}:\n\n{shown}\n\n{others}{fix} {words} A test that calls the \
          code wrongly, such as with a name or import the request does not spell, or that fails \
          for want of a fixture, helper or set-up the tester left out, is the tester's to fix \
          where it is kept, in `{}`, since that is where it is run from; never something to add \
@@ -6532,7 +6544,9 @@ mod tests {
         let failing = Ok("FAIL tests/letronna_spec.test.ts\n[exit code 1]".to_owned());
         let silent = "Where the words are silent on the case, say so in your answer; and unless \
                       the request's words ask for it, do not take away or move something a \
-                      review's row passed to pass a test.";
+                      review's row passed to pass a test: words that can be read both ways do \
+                      not ask for it, and the reviewer ran your work, which the tester never \
+                      saw.";
         let notices = [
             failed(&kept, "npx vitest run x", &failing, None).unwrap(),
             told(report, Some(&kept), true),
@@ -6569,21 +6583,26 @@ mod tests {
             dir: PathBuf::from("/tmp/kept"),
             files: vec!["tests/letronna_spec.test.ts".to_owned()],
         };
-        // The words decide where the two disagree; it does not say the tests
-        // judge nothing, since a second attempt is chosen by them.
+        // The words decide where the two disagree, and passing the tests is
+        // not what the work is for; it does not say the tests judge nothing,
+        // since a second attempt is chosen by them.
         assert_eq!(
             ONE_READING,
             "The tester can misread the request as you can: its tests are one more reading of \
-             it, and where they and the request's words disagree the words decide."
+             it, passing them is not the aim of your work, and where they and the request's \
+             words disagree the words decide."
         );
         assert!(!ONE_READING.contains("judged"), "{ONE_READING}");
         // What a review passed stays whether the words are silent or not,
         // unless they ask for the change: words that name a place without
-        // saying whose are not silent, and ask for no move.
+        // saying whose are not silent, and ask for no move, nor do words
+        // that can be read both ways; of the two, the reviewer saw the work.
         assert_eq!(
             SILENT,
             "say so in your answer; and unless the request's words ask for it, do not take \
-             away or move something a review's row passed to pass a test"
+             away or move something a review's row passed to pass a test: words that can be \
+             read both ways do not ask for it, and the reviewer ran your work, which the tester \
+             never saw"
         );
         let report = "R1 | adds | FAIL | npx vitest run x | got []\nRun: npx vitest run x";
         let failing = Ok("FAIL tests/letronna_spec.test.ts\n[exit code 1]".to_owned());
@@ -6773,7 +6792,7 @@ mod tests {
                  say.\n\n- `--- FAIL: TestLetronnaSpecRound`\n\nThe rest failed then too. A \
                  test you answered by quoting the request's words needs nothing more. One you \
                  neither fixed nor answered is still yours: fix your work for it, or quote the \
-                 words it ignores. Run the tests again the same way. {} One that calls",
+                 words it ignores. Run the tests again the same way. {} A test that calls",
                 words_and_rows()
             )),
             "{text}"

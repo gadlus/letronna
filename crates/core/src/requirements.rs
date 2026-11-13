@@ -100,9 +100,13 @@ macro_rules! cases {
 /// fixed: told to fix any case its helper "calls unclear or sets aside" as
 /// well, a run would build what a row written `NOT_ASKED` had just passed,
 /// so a doubt is decided by the request's words, as the notices of a
-/// review's rows say, and such a row asks for nothing.
+/// review's rows say, and such a row asks for nothing. A row that passed
+/// says what was run and what it showed, as one that failed does: on a
+/// benchmark run a review had watched the work do what each of its rows
+/// passed, the rows said `PASS` and no more, and the run, sent a tester's
+/// test that expected otherwise, took the test for the only evidence.
 const REVIEW: &str = concat!(
-    "First ask a helper that hasn't seen your work: with the agent tool, start a helper of type `review`, not general, and wait for its report. Give it the request word for word, the numbered requirements above, the files you changed or made and each case you chose not to handle, with why. Ask it to change no file, to work out each value it checks with code of its own, not your scripts or helpers, and to end its report with a table of one row per requirement and case, the verdict alone in its cell and what shows it in the cell after, written `R1 | case | PASS` or `R1 | case | FAIL | command that shows it`, with a row for each of these cases that applies: ",
+    "First ask a helper that hasn't seen your work: with the agent tool, start a helper of type `review`, not general, and wait for its report. Give it the request word for word, the numbered requirements above, the files you changed or made and each case you chose not to handle, with why. Ask it to change no file, to work out each value it checks with code of its own, not your scripts or helpers, and to end its report with a table of one row per requirement and case, the verdict alone in its cell and what shows it in the cell after, written `R1 | case | PASS | command and what it showed` or `R1 | case | FAIL | command that shows it`, with a row for each of these cases that applies: ",
     cases!(),
     " and each case you chose not to handle, which fails when the request's words say what should happen in it, quoted in the row, whatever the reason it was set aside, and passes, written `R1 | case | PASS | not asked`, when they do not, or is UNCLEAR where your change made the project do another thing in it than before: a gap the request does not ask to close is no failure. Ask it to write any doubt, caveat or problem it notices beyond those rows as a row of its own, FAIL with its command where a run of its own shows the work wrong, otherwise `R1 | case | UNCLEAR | what it doubts`, never only prose, and to leave UNCLEAR a row that can only pass by bending another requirement's words. Judge each row by what the request says should happen, not by what the code now does. Fix every row that fails by changing the work, not the case, unless the request rules that case out. A case it calls unclear is a doubt, not a failure: decide it by the request's words, and change the work for it only where those words ask for that. Change nothing for a row written `not asked`."
 );
@@ -554,16 +558,16 @@ pub(crate) fn brief(
     text.push_str(&format!(
         "\n\nCheck {rows}. End your report with a table of one row per requirement and \
          case, the verdict alone in its cell and what shows it in the cell after, written \
-         `R{first} | case | PASS` or `R{first} | case | FAIL | command that \
-         shows it`, with a row for each of these cases that applies: {} and each case the \
-         change leaves out or handles more narrowly than the request's words, which fails \
-         when those words say what should happen in it, quoted in the row. Any doubt about a \
-         case, any caveat to a row, and anything wrong you notice beyond the rows asked for \
-         gets a row of its own, FAIL with its command where a run of yours shows the work \
-         wrong, otherwise `R{first} | case | UNCLEAR | what you doubt`, never \
-         only prose, since prose may be cut before the change's author reads it. A row that \
-         can only pass by bending another requirement's words is UNCLEAR too: quote both, and \
-         prescribe no fix.",
+         `R{first} | case | PASS | command and what it showed` or `R{first} | case | FAIL | \
+         command that shows it`, with a row for each of these cases that applies: {} and each \
+         case the change leaves out or handles more narrowly than the request's words, which \
+         fails when those words say what should happen in it, quoted in the row. Any doubt \
+         about a case, any caveat to a row, and anything wrong you notice beyond the rows \
+         asked for gets a row of its own, FAIL with its command where a run of yours shows the \
+         work wrong, otherwise `R{first} | case | UNCLEAR | what you doubt`, never only prose, \
+         since prose may be cut before the change's author reads it. A row that can only pass \
+         by bending another requirement's words is UNCLEAR too: quote both, and prescribe no \
+         fix.",
         cases!()
     ));
     text.push_str(&crate::doubts::section(doubts, false));
@@ -1306,7 +1310,7 @@ pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
         text.push_str(
             "A failed row that is a tester's test is one more reading of the request: to pass \
              it, do not take away or move something another row passed, unless the request's \
-             words ask for that. ",
+             words ask for that, and words that can be read both ways do not. ",
         );
     }
     if !unclear.is_empty() {
@@ -3217,7 +3221,10 @@ mod tests {
             part.contains("Check R2 to R2; other helpers check the rest."),
             "{part}"
         );
-        assert!(part.contains("written `R2 | case | PASS`"), "{part}");
+        assert!(
+            part.contains("written `R2 | case | PASS | command and what it showed`"),
+            "{part}"
+        );
     }
 
     #[test]
@@ -3225,8 +3232,9 @@ mod tests {
         // What shows a row goes in the cell after, where a helper left to
         // itself writes it on after the verdict, as `PASS — what shows it`.
         let alone = "a table of one row per requirement and case, the verdict alone in its \
-                     cell and what shows it in the cell after, written `R1 | case | PASS` or \
-                     `R1 | case | FAIL | command that shows it`, with a row for each";
+                     cell and what shows it in the cell after, written `R1 | case | PASS | \
+                     command and what it showed` or `R1 | case | FAIL | command that shows it`, \
+                     with a row for each";
         let rules: Vec<String> = ["Dates must parse.".to_owned()].into();
         let asked = brief("Dates must parse.", &rules, (1, 1), &[], &[]);
         assert!(asked.contains(alone), "{asked}");
@@ -3449,7 +3457,8 @@ mod tests {
         let testers = "Fix what fails unless the request rules that case out. A failed row that \
                        is a tester's test is one more reading of the request: to pass it, do \
                        not take away or move something another row passed, unless the request's \
-                       words ask for that. For each failed row you do not fix,";
+                       words ask for that, and words that can be read both ways do not. For \
+                       each failed row you do not fix,";
         assert!(failed.contains(testers), "{failed}");
         assert!(!text.contains("a tester's test"), "{text}");
         let missing = unchecked("R1 | iso | PASS", 2).unwrap();
