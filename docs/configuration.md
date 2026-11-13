@@ -28,6 +28,8 @@ Most settings are in the window's Settings and in `/` commands. Both are stored 
 |---|---|
 | `LETRONNA_BROWSER` | Path of the browser to drive |
 | `LETRONNA_BROWSER_HEADLESS=0` | Give the browser a visible window |
+| `LETRONNA_HAND_OVER=1` | Whoever started the run passes its owner's taps and typing on to the page while a `hand_over` card is up, as Letronna Cloud does for a run watched from the app. A browser with no window can then be handed over. |
+| `LETRONNA_BROWSER_KEPT` | A file the browser's cookies are read from when a session begins and written to when the browser closes, so whoever starts each run on a clean machine can carry its sign-ins to the next. Cookies only, 500 KB at most. |
 | `LETRONNA_BROWSER_URL` | Use a remote browser: `ws(s)://…` for a cloud service, or `http://host:9222` for a Chrome started with `--remote-debugging-port`. Prefer an SSH tunnel, because anyone who can reach that port can drive the browser. |
 
 ### Misc

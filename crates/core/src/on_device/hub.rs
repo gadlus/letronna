@@ -11,6 +11,13 @@
 //! Only single-file GGUF models are offered: split files would need the
 //! shelf to carry one model in several downloads, and a model behind a
 //! sign-in would need a Hugging Face token Letronna does not keep.
+//!
+//! A maker's own page mostly holds the model as it was trained, with its
+//! GGUF files in a copy beside it. A link to such a page is answered with
+//! a copy's files: the hub is asked which GGUF repositories say they are
+//! quantized from the model, and only one that carries the model's own
+//! name is taken, the maker's before anyone else's. A fine-tune that says
+//! more in its name is a different model, and is never offered for it.
 
 use super::added::Added;
 use std::time::Duration;
@@ -228,6 +235,31 @@ pub struct Found {
     pub picked: usize,
     /// Model files split into parts, left out.
     pub split: usize,
+    /// The model the link named, when it holds no GGUF file itself and
+    /// these are the files of a GGUF copy of it.
+    pub copy_of: Option<String>,
+}
+
+impl Found {
+    /// Said when the files are a copy's, so whose they are is plain before
+    /// one is downloaded.
+    pub fn from_a_copy(&self) -> Option<String> {
+        let model = self.copy_of.as_ref()?;
+        let by = owner(&self.repo);
+        Some(if by.eq_ignore_ascii_case(owner(model)) {
+            format!("{model} has no GGUF file itself. These are from its maker's GGUF copy.")
+        } else {
+            format!(
+                "{model} has no GGUF file itself. These are from a GGUF copy by {by}, not its \
+                 maker."
+            )
+        })
+    }
+}
+
+/// Whose a repository is.
+fn owner(repo: &str) -> &str {
+    repo.split('/').next().unwrap_or_default()
 }
 
 /// The hub's answer about a repository at a revision, as far as it is read.
@@ -285,18 +317,29 @@ pub fn look(link: &Link) -> Result<Found, String> {
 }
 
 fn look_at(hub: &str, link: &Link) -> Result<Found, String> {
-    let revision = link.revision.as_deref().unwrap_or("main");
-    let url = format!(
-        "{hub}/api/models/{}/revision/{}?blobs=true",
-        link.repo,
-        revision.replace('/', "%2F")
-    );
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(30))
         .user_agent(concat!("Letronna/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| e.to_string())?;
+    let info = ask(&client, hub, link)?;
+    if bare(link, &info)
+        && let Some(found) = copy(&client, hub, link, &info)
+    {
+        return Ok(found);
+    }
+    read(link, info)
+}
+
+/// Ask the hub what a repository holds at the link's revision.
+fn ask(client: &reqwest::blocking::Client, hub: &str, link: &Link) -> Result<Info, String> {
+    let revision = link.revision.as_deref().unwrap_or("main");
+    let url = format!(
+        "{hub}/api/models/{}/revision/{}?blobs=true",
+        link.repo,
+        revision.replace('/', "%2F")
+    );
     let response = client
         .get(&url)
         .send()
@@ -320,19 +363,115 @@ fn look_at(hub: &str, link: &Link) -> Result<Found, String> {
         429 => return Err("Hugging Face is busy. Try again in a minute.".into()),
         status => return Err(format!("Hugging Face answered {status}. Try again later.")),
     }
-    let info: Info = response
+    response
         .json()
-        .map_err(|_| "Hugging Face's answer could not be read. Try again later.")?;
-    read(link, info)
+        .map_err(|_| "Hugging Face's answer could not be read. Try again later.".into())
+}
+
+/// The repository's name as the hub spells it, when that is a name a link
+/// could hold.
+fn spelled(link: &Link, info: &Info) -> String {
+    info.id
+        .as_ref()
+        .filter(|id| parse(id).is_ok_and(|named| named.repo == **id && named.tag.is_none()))
+        .cloned()
+        .unwrap_or_else(|| link.repo.clone())
+}
+
+/// Whether a repository open to everyone holds no GGUF file at all, and
+/// the link asked for none by its path: a model as its maker trained it.
+fn bare(link: &Link, info: &Info) -> bool {
+    link.file.is_none()
+        && !info.disabled
+        && matches!(
+            info.gated,
+            serde_json::Value::Null | serde_json::Value::Bool(false)
+        )
+        && !info
+            .siblings
+            .iter()
+            .any(|s| s.rfilename.to_ascii_lowercase().ends_with(".gguf"))
+}
+
+/// The copies asked about before giving up: each one is a request, and
+/// past the first few a copy is too little used to offer unasked.
+const COPIES: usize = 3;
+
+/// A repository in the hub's list of a model's copies.
+#[derive(serde::Deserialize)]
+struct Listing {
+    id: String,
+    #[serde(default)]
+    downloads: u64,
+}
+
+/// The files of a GGUF copy of the model `info` describes: the maker's
+/// own before anyone else's, then the most downloaded. None when no copy
+/// carries the model's name, or none of the first few can be downloaded.
+fn copy(client: &reqwest::blocking::Client, hub: &str, link: &Link, info: &Info) -> Option<Found> {
+    let model = spelled(link, info);
+    let (maker, name) = model.split_once('/')?;
+    // The hub's own list of what says it is quantized from this model. A
+    // list that can't be had leaves the maker's own copy to try.
+    let mut copies: Vec<Listing> = client
+        .get(format!("{hub}/api/models"))
+        .query(&[
+            ("filter", format!("base_model:quantized:{model}").as_str()),
+            ("filter", "gguf"),
+            ("search", name),
+            ("sort", "downloads"),
+            ("direction", "-1"),
+            ("limit", "50"),
+        ])
+        .send()
+        .ok()
+        .filter(|response| response.status().is_success())
+        .and_then(|response| response.json().ok())
+        .unwrap_or_default();
+    copies.retain(|copy| copy_named(&copy.id, &model));
+    // Where a maker keeps a copy, it is under the model's name: asked for
+    // by that name too, as a card need not say what it was made from.
+    let own = format!("{model}-GGUF");
+    if !copies.iter().any(|copy| copy.id.eq_ignore_ascii_case(&own)) {
+        copies.push(Listing {
+            id: own,
+            downloads: 0,
+        });
+    }
+    copies.sort_by_key(|copy| {
+        (
+            !owner(&copy.id).eq_ignore_ascii_case(maker),
+            std::cmp::Reverse(copy.downloads),
+        )
+    });
+    copies.into_iter().take(COPIES).find_map(|copy| {
+        let there = Link {
+            tag: link.tag.clone(),
+            ..parse(&copy.id).ok().filter(|named| named.tag.is_none())?
+        };
+        let mut found = read(&there, ask(client, hub, &there).ok()?).ok()?;
+        found.copy_of = Some(model.clone());
+        Some(found)
+    })
+}
+
+/// Whether `repo` is named as a plain GGUF copy of `model`: the model's
+/// name with GGUF after it ("Qwen3.5-9B-GGUF", "owner_Qwen3.5-9B-GGUF"),
+/// and nothing a fine-tune would add.
+fn copy_named(repo: &str, model: &str) -> bool {
+    let (Some((maker, name)), Some((_, copy))) = (model.split_once('/'), repo.split_once('/'))
+    else {
+        return false;
+    };
+    ["-", "_", "."].iter().any(|join| {
+        copy.eq_ignore_ascii_case(&format!("{name}{join}gguf"))
+            || copy.eq_ignore_ascii_case(&format!("{maker}_{name}{join}gguf"))
+    })
 }
 
 /// What a repository offers, from the hub's answer.
 fn read(link: &Link, info: Info) -> Result<Found, String> {
-    // As the hub spells it, when that is a name a link could hold.
-    let repo = info
-        .id
-        .filter(|id| parse(id).is_ok_and(|named| named.repo == *id && named.tag.is_none()))
-        .unwrap_or_else(|| link.repo.clone());
+    let repo = spelled(link, &info);
     if info.disabled {
         return Err(format!("{repo} has been disabled on Hugging Face."));
     }
@@ -485,6 +624,7 @@ fn read(link: &Link, info: Info) -> Result<Found, String> {
         choices,
         picked,
         split,
+        copy_of: None,
     })
 }
 
@@ -693,8 +833,14 @@ mod tests {
     fn hub(answer: serde_json::Value) -> String {
         let body = answer.to_string();
         serve(move |request| {
-            assert!(request.target.contains("?blobs=true"), "{}", request.target);
             match request.target.as_str() {
+                // No repository says it is a copy of this one.
+                t if t.starts_with("/api/models?") => (
+                    200,
+                    vec![("Content-Type", "application/json".into())],
+                    "[]".into(),
+                ),
+                t if !t.contains("?blobs=true") => panic!("{t}"),
                 t if t.starts_with("/api/models/gone/") => (
                     401,
                     Vec::new(),
@@ -798,6 +944,222 @@ mod tests {
         );
         let no_internet = look_at("http://127.0.0.1:9", &link("o/r")).unwrap_err();
         assert!(no_internet.contains("Couldn't reach"), "{no_internet}");
+    }
+
+    /// A hub of several repositories, each answering as `repos` says, with
+    /// `copies` as its list of what is quantized from a model, and every
+    /// address asked for kept in the order it was asked.
+    fn hub_of(
+        repos: Vec<serde_json::Value>,
+        copies: serde_json::Value,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heard = asked.clone();
+        let base = serve(move |request| {
+            heard.lock().unwrap().push(request.target.clone());
+            let json = vec![("Content-Type", "application/json".into())];
+            if request.target.starts_with("/api/models?") {
+                return (200, json, copies.to_string());
+            }
+            let held = repos.iter().find(|repo| {
+                let at = format!("/api/models/{}/revision/", repo["id"].as_str().unwrap());
+                request
+                    .target
+                    .to_lowercase()
+                    .starts_with(&at.to_lowercase())
+            });
+            match held {
+                Some(repo) => (200, json, repo.to_string()),
+                None => (
+                    401,
+                    json,
+                    r#"{"error":"Invalid username or password."}"#.into(),
+                ),
+            }
+        });
+        (base, asked)
+    }
+
+    /// A model as its maker trained it: weights, and no GGUF file.
+    fn trained() -> serde_json::Value {
+        serde_json::json!({
+            "id": "LiquidAI/LFM3-1.7B",
+            "sha": COMMIT,
+            "gated": false,
+            "siblings": [
+                {"rfilename": "README.md", "size": 64059},
+                {"rfilename": "model.safetensors", "size": 3_400_000_000u64},
+            ],
+        })
+    }
+
+    fn copy_at(repo: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": repo,
+            "sha": "cd0c74c575b5c416f3011b5b4c298077f26ca8c2",
+            "gated": false,
+            "cardData": {"license": "other", "base_model": ["LiquidAI/LFM3-1.7B"]},
+            "siblings": [
+                sibling("LFM3-1.7B-Q8_0.gguf", 1_846_238_496),
+                sibling("LFM3-1.7B-Q4_K_M.gguf", 1_099_627_808),
+            ],
+        })
+    }
+
+    fn listing(repo: &str, downloads: u64) -> serde_json::Value {
+        serde_json::json!({"id": repo, "downloads": downloads, "tags": ["gguf"]})
+    }
+
+    #[test]
+    fn a_model_with_no_gguf_file_offers_its_makers_copy() {
+        // A fine-tune and another's copy are both downloaded more.
+        let (base, asked) = hub_of(
+            vec![
+                trained(),
+                copy_at("LiquidAI/LFM3-1.7B-GGUF"),
+                copy_at("someone/LFM3-1.7B-Tuned-GGUF"),
+                copy_at("bartowski/LFM3-1.7B-GGUF"),
+            ],
+            serde_json::json!([
+                listing("someone/LFM3-1.7B-Tuned-GGUF", 900_000),
+                listing("bartowski/LFM3-1.7B-GGUF", 500_000),
+                listing("LiquidAI/LFM3-1.7B-GGUF", 300_000),
+            ]),
+        );
+        // Typed in small letters: the hub's spelling is what its list goes by.
+        let found = look_at(&base, &link("https://huggingface.co/liquidai/lfm3-1.7b")).unwrap();
+        assert_eq!(found.repo, "LiquidAI/LFM3-1.7B-GGUF");
+        assert_eq!(found.copy_of.as_deref(), Some("LiquidAI/LFM3-1.7B"));
+        assert_eq!(found.commit, "cd0c74c575b5c416f3011b5b4c298077f26ca8c2");
+        let picked = &found.choices[found.picked];
+        assert_eq!(picked.file, "LFM3-1.7B-Q4_K_M.gguf");
+        assert_eq!(picked.repo, "LiquidAI/LFM3-1.7B-GGUF");
+        assert_eq!(picked.name, "LFM3-1.7B · Q4_K_M");
+        let said = found.from_a_copy().unwrap();
+        assert!(said.contains("its maker's GGUF copy"), "{said}");
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 3, "{asked:?}");
+        assert!(
+            asked[1].contains("filter=base_model%3Aquantized%3ALiquidAI%2FLFM3-1.7B")
+                && asked[1].contains("filter=gguf")
+                && asked[1].contains("search=LFM3-1.7B"),
+            "{}",
+            asked[1]
+        );
+        assert!(
+            asked[2].starts_with("/api/models/LiquidAI/LFM3-1.7B-GGUF/revision/main"),
+            "{}",
+            asked[2]
+        );
+        // The quantization the link named is the one taken from the copy.
+        let tagged = look_at(&base, &link("LiquidAI/LFM3-1.7B:q8_0")).unwrap();
+        assert_eq!(tagged.choices[tagged.picked].file, "LFM3-1.7B-Q8_0.gguf");
+        assert_eq!(tagged.copy_of.as_deref(), Some("LiquidAI/LFM3-1.7B"));
+    }
+
+    #[test]
+    fn a_makers_copy_is_found_by_its_name_when_its_card_names_no_model() {
+        let (base, _) = hub_of(
+            vec![trained(), copy_at("LiquidAI/LFM3-1.7B-GGUF")],
+            serde_json::json!([]),
+        );
+        let found = look_at(&base, &link("LiquidAI/LFM3-1.7B")).unwrap();
+        assert_eq!(found.repo, "LiquidAI/LFM3-1.7B-GGUF");
+    }
+
+    #[test]
+    fn with_no_copy_of_its_makers_the_most_downloaded_of_its_name_is_offered() {
+        let mut gated = copy_at("unsloth/LFM3-1.7B-GGUF");
+        gated["gated"] = "auto".into();
+        let (base, asked) = hub_of(
+            vec![
+                trained(),
+                copy_at("someone/LFM3-1.7B-Tuned-GGUF"),
+                gated,
+                copy_at("bartowski/LiquidAI_LFM3-1.7B-GGUF"),
+                copy_at("someone/lfm3-1.7b-gguf"),
+            ],
+            serde_json::json!([
+                listing("someone/LFM3-1.7B-Tuned-GGUF", 900_000),
+                listing("someone/lfm3-1.7b-gguf", 2_000),
+                listing("unsloth/LFM3-1.7B-GGUF", 500_000),
+                listing("bartowski/LiquidAI_LFM3-1.7B-GGUF", 7_000),
+            ]),
+        );
+        // The maker has none, and the one downloaded most asks for a sign-in.
+        let found = look_at(&base, &link("LiquidAI/LFM3-1.7B")).unwrap();
+        assert_eq!(found.repo, "bartowski/LiquidAI_LFM3-1.7B-GGUF");
+        assert_eq!(found.choices[found.picked].maker, "bartowski");
+        let said = found.from_a_copy().unwrap();
+        assert!(
+            said.contains("a GGUF copy by bartowski, not its maker"),
+            "{said}"
+        );
+        let asked = asked.lock().unwrap().clone();
+        assert!(!asked.iter().any(|t| t.contains("Tuned")), "{asked:?}");
+        // No more than the first few are asked about.
+        assert_eq!(asked.len(), 2 + COPIES, "{asked:?}");
+    }
+
+    #[test]
+    fn a_fine_tune_is_never_offered_as_the_model() {
+        let (base, _) = hub_of(
+            vec![trained(), copy_at("someone/LFM3-1.7B-Tuned-GGUF")],
+            serde_json::json!([listing("someone/LFM3-1.7B-Tuned-GGUF", 900_000)]),
+        );
+        let why = look_at(&base, &link("LiquidAI/LFM3-1.7B")).unwrap_err();
+        assert!(why.contains("LiquidAI/LFM3-1.7B has no GGUF file"), "{why}");
+        for (repo, named) in [
+            ("unsloth/Qwen3.5-9B-GGUF", true),
+            ("unsloth/qwen3.5-9b-gguf", true),
+            ("unsloth/Qwen3.5-9B_GGUF", true),
+            ("bartowski/Qwen_Qwen3.5-9B-GGUF", true),
+            ("someone/Qwen3.5-9B-Tuned-GGUF", false),
+            ("someone/Qwen3.5-9B-GGUF-v2", false),
+            ("someone/Qwen3.5-9B", false),
+            ("someone/other_Qwen3.5-9B-GGUF", false),
+        ] {
+            assert_eq!(copy_named(repo, "Qwen/Qwen3.5-9B"), named, "{repo}");
+        }
+    }
+
+    #[test]
+    fn only_a_model_open_to_all_with_no_gguf_file_goes_looking() {
+        let copies = serde_json::json!([listing("LiquidAI/LFM3-1.7B-GGUF", 300_000)]);
+        let mut gated = trained();
+        gated["gated"] = "manual".into();
+        let (base, asked) = hub_of(
+            vec![gated, copy_at("LiquidAI/LFM3-1.7B-GGUF")],
+            copies.clone(),
+        );
+        let why = look_at(&base, &link("LiquidAI/LFM3-1.7B")).unwrap_err();
+        assert!(why.contains("sign in"), "{why}");
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        // A file the link names is that repository's or nobody's.
+        let (base, asked) = hub_of(
+            vec![trained(), copy_at("LiquidAI/LFM3-1.7B-GGUF")],
+            copies.clone(),
+        );
+        let named =
+            link("https://huggingface.co/LiquidAI/LFM3-1.7B/blob/main/LFM3-1.7B-Q4_K_M.gguf");
+        let why = look_at(&base, &named).unwrap_err();
+        assert!(why.contains("has no file LFM3-1.7B-Q4_K_M.gguf"), "{why}");
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        // A repository with GGUF files of its own is read as it always was.
+        let (base, asked) = hub_of(vec![qwen()], copies);
+        let found = look_at(&base, &link("unsloth/Qwen3.5-2B-GGUF")).unwrap();
+        assert_eq!(found.copy_of, None);
+        assert_eq!(found.from_a_copy(), None);
+        assert_eq!(asked.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    #[ignore = "Asks huggingface.co: cargo test -p letronna-core -- --ignored a_real_model_with_no_gguf"]
+    fn a_real_model_with_no_gguf_file_offers_its_makers_copy() {
+        let found = look(&link("https://huggingface.co/LiquidAI/LFM3-1.7B")).unwrap();
+        assert_eq!(found.repo, "LiquidAI/LFM3-1.7B-GGUF");
+        assert_eq!(found.copy_of.as_deref(), Some("LiquidAI/LFM3-1.7B"));
+        assert_eq!(found.choices[found.picked].file, "LFM3-1.7B-Q4_K_M.gguf");
     }
 
     #[test]

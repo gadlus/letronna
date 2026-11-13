@@ -30,6 +30,7 @@ Letronna's search comes in three settings, under Settings › Search or with `/s
 - **What the model sees**: the page's accessibility tree, with refs such as `e12` to act on.
 - **Profiles**: each session gets its own private browser. Settings › Privacy can switch this to one shared, persistent profile.
 - **In the window**: the browser shows live beside the chat, and you can use it too. Sign in, get past a check, or point at an element to comment on it.
+- **A page handed to you**: for what only you can do on a page, a password, a code sent to you or a check that you are human, the model does not ask for your password and types none. It hands the page over (`browse`'s `hand_over`) and waits, with a card that says what to do. You do it on the page, in the window beside the chat, the browser's own window, or from the Letronna app when the run is in Letronna Cloud, and answer the card when you are done. It is asked in every mode, and no "yes for all" covers it. With nobody there, or no way for you to reach the page, the model is told so and says what was left undone.
 - **Remote browsers**: a remote Chrome or a cloud browser also works; see `LETRONNA_BROWSER_URL` in [Configuration](configuration.md).
 - **Safety**: an address carrying one of your keys is never opened, and neither is a cloud metadata service.
 
@@ -50,6 +51,8 @@ For a light headless browser on macOS and Linux, add [Lightpanda](https://github
 ## Images, speech and video
 
 These tools run on Letronna's hosted models whatever gateway the chat uses. They are paid from your credit, so they ask first.
+
+A ChatGPT plan makes pictures too. In a chat signed in with ChatGPT, `make_image` and `edit_image` use the plan, which covers them and counts them toward its image limit; they still ask first. The plan's model picks the size itself, and its edits take up to 5 pictures and no mask. With a Letronna account as well, picking a hosted image model with `/model image` has `make_image` use that one instead, paid from your credit; `edit_image` stays on the chat's gateway. Without an account, a ChatGPT sign-in is enough for `make_image` in any chat. Speech, transcription and video need the account.
 
 | Tool | Makes | Billed per |
 |---|---|---|

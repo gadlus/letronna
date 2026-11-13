@@ -445,6 +445,7 @@ fn add(desk: &mut impl Desk, text: &str, said: &str) -> Result<Done, String> {
             .map_or(String::new(), |license| format!(" · licence {license}")),
         &found.commit[..7]
     )];
+    detail.extend(found.from_a_copy());
     if let Some(eyes) = entries.first().and_then(|entry| entry.eyes.as_ref()) {
         detail.push(format!(
             "Reads photos: {} more is fetched the first time you send one.",

@@ -412,13 +412,13 @@ impl Tool for CallMcpTool {
 /// as plan mode would offer. Ranked by Jev for a search on `connection`
 /// where it is asked, else by the words.
 fn search(
-    tools: &[Arc<dyn Tool>],
+    all: &[Arc<dyn Tool>],
     query: &str,
     plan: bool,
     rare: &[String],
     connection: Option<&Connection>,
 ) -> String {
-    let every: Vec<&Arc<dyn Tool>> = tools
+    let every: Vec<&Arc<dyn Tool>> = all
         .iter()
         .filter(|tool| is_mcp(tool.name()) || rare.iter().any(|name| name == tool.name()))
         .collect();
@@ -435,6 +435,17 @@ fn search(
                 tools left out qualifies."
             .into();
     }
+    // What it finds reads as the run that searches would be sent it.
+    let offered: Vec<&str> = connection
+        .map(|connection| crate::tools::callable(all, connection))
+        .unwrap_or_default()
+        .iter()
+        .map(|tool| tool.name())
+        .collect();
+    let seen = Seen {
+        connection,
+        offered: &offered,
+    };
     // A search that names a tool exactly finds it without asking anyone.
     let exact = tools.iter().any(|tool| tool.name() == query.trim());
     let judged = connection
@@ -466,7 +477,7 @@ fn search(
             "No tool matches \"{}\" by its words. Pick one by what it does, or search again in other words:",
             query.trim()
         ));
-        gists(&mut out, &tools, FOUND_BYTES);
+        gists(&mut out, &tools, FOUND_BYTES, seen);
         return out;
     }
     out.push_str(
@@ -474,14 +485,14 @@ fn search(
     );
     let mut shown = 0;
     for tool in ranked.iter().take(MAX_FOUND) {
-        let whole = entry(tool.as_ref(), &tool.parameters(), "");
+        let whole = entry(tool.as_ref(), &seen.parameters(tool.as_ref()), "", seen);
         if out.len() + whole.len() <= FOUND_BYTES {
             out.push_str(&whole);
         } else if shown == 0 {
             // The best match alone is too large to show whole, and a result
             // is cut in the middle past its limit, which would lose what
             // its arguments require.
-            out.push_str(&oversized(tool.as_ref(), FOUND_BYTES - out.len()));
+            out.push_str(&oversized(tool.as_ref(), FOUND_BYTES - out.len(), seen));
         } else {
             break;
         }
@@ -512,17 +523,45 @@ fn options(tools: &[&Arc<dyn Tool>], query: &str) -> Vec<(&'static str, &'static
         .collect()
 }
 
+/// A tool as the run that searches reads it: what a request over its
+/// connection would send, which for some turns on the session -- who makes
+/// a picture, whether another tool it names is there. A tool found here is
+/// in no request's array, so this is the only place its description is
+/// read. With no connection, as it describes itself.
+#[derive(Clone, Copy)]
+struct Seen<'a> {
+    connection: Option<&'a Connection>,
+    /// Every tool the run can call, as `Tool::description_for` takes them.
+    offered: &'a [&'a str],
+}
+
+impl Seen<'_> {
+    fn description(&self, tool: &dyn Tool) -> Cow<'static, str> {
+        match self.connection {
+            Some(connection) => tool.description_for(connection, self.offered),
+            None => tool.description().into(),
+        }
+    }
+
+    fn parameters(&self, tool: &dyn Tool) -> Value {
+        match self.connection {
+            Some(connection) => tool.parameters_for(connection),
+            None => tool.parameters(),
+        }
+    }
+}
+
 /// How `tool` shows in a search's result, with `schema` for its arguments
 /// and `note` after it.
-fn entry(tool: &dyn Tool, schema: &Value, note: &str) -> String {
-    let (name, description) = (tool.name(), described(tool));
+fn entry(tool: &dyn Tool, schema: &Value, note: &str, seen: Seen) -> String {
+    let (name, description) = (tool.name(), described(tool, seen));
     format!("\n{name}: {description}\narguments: {schema}{note}\n")
 }
 
 /// `tool`'s description on one line, cut at `DESCRIPTION_CHARS`.
-fn described(tool: &dyn Tool) -> String {
-    let description = tool
-        .description()
+fn described(tool: &dyn Tool, seen: Seen) -> String {
+    let description = seen
+        .description(tool)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
@@ -535,12 +574,13 @@ fn described(tool: &dyn Tool) -> String {
 /// The entry of a tool too large to show whole in `room` bytes: its schema
 /// without the words that only explain it, or, when that is still too
 /// large, only the names of its arguments.
-fn oversized(tool: &dyn Tool, room: usize) -> String {
-    let schema = tool.parameters();
+fn oversized(tool: &dyn Tool, room: usize, seen: Seen) -> String {
+    let schema = seen.parameters(tool);
     let plain = entry(
         tool,
         &plain(&schema),
         " (their descriptions left out, to fit)",
+        seen,
     );
     if plain.len() <= room {
         return plain;
@@ -565,7 +605,7 @@ fn oversized(tool: &dyn Tool, room: usize) -> String {
     let mut out = format!(
         "\n{}: {}\narguments: too large to show; they are",
         tool.name(),
-        described(tool)
+        described(tool, seen)
     );
     list(
         &mut out,
@@ -620,9 +660,9 @@ const GIST_CHARS: usize = 80;
 
 /// Adds a line for each of `tools`, its name and what it does, while `out`
 /// stays within two thirds of `limit` bytes, then the rest by name.
-fn gists(out: &mut String, tools: &[&Arc<dyn Tool>], limit: usize) {
+fn gists(out: &mut String, tools: &[&Arc<dyn Tool>], limit: usize, seen: Seen) {
     for (at, tool) in tools.iter().enumerate() {
-        let about = described(tool.as_ref());
+        let about = described(tool.as_ref(), seen);
         let about = match about.char_indices().nth(GIST_CHARS) {
             Some((cut, _)) => format!("{}…", &about[..cut]),
             None => about,
@@ -824,6 +864,37 @@ pub(crate) mod tests {
         }
     }
 
+    /// A tool that reads another way where the gateway searches the web,
+    /// as one whose description and arguments turn on the session does.
+    struct Turning;
+    impl Tool for Turning {
+        fn name(&self) -> &'static str {
+            "turning"
+        }
+        fn description(&self) -> &'static str {
+            "Make a thing the usual way."
+        }
+        fn description_for(&self, connection: &Connection, offered: &[&str]) -> Cow<'static, str> {
+            match connection.search {
+                true => format!("Make a thing the other way, one of {}.", offered.len()).into(),
+                false => self.description().into(),
+            }
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {
+                "what": {"type": "string"}, "size": {"type": "string"}}})
+        }
+        fn parameters_for(&self, connection: &Connection) -> Value {
+            match connection.search {
+                true => json!({"type": "object", "properties": {"what": {"type": "string"}}}),
+                false => self.parameters(),
+            }
+        }
+        fn run(&self, _: &Value, _: &ToolContext) -> Result<String, String> {
+            Ok("made".into())
+        }
+    }
+
     /// A tool taking a `path`, which changes nothing unless `mutates`.
     pub(crate) fn fake(
         name: &'static str,
@@ -886,6 +957,52 @@ pub(crate) mod tests {
             name: CALL_MCP_TOOL.into(),
             arguments: arguments.into(),
         }
+    }
+
+    #[test]
+    fn a_tool_found_reads_as_the_run_that_searches_is_offered_it() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::store::tests::Scratch::new("mcp-find-seen");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(Turning)];
+        let rare = ["turning".to_owned()];
+        let usual = connection();
+        let other = Connection {
+            search: true,
+            ..connection()
+        };
+        // Found in no request's array, so this is all the run reads of it:
+        // what a request over its own connection would have sent.
+        let as_usual = search(&tools, "turning", false, &rare, Some(&usual));
+        let as_other = search(&tools, "turning", false, &rare, Some(&other));
+        // And with no connection, as it describes itself.
+        let bare = search(&tools, "turning", false, &rare, None);
+        // Where no word matches, its gist is the session's too.
+        let gist = search(&tools, "zzz", false, &rare, Some(&other));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+
+        for found in [&as_usual, &bare] {
+            assert!(
+                found.contains("\nturning: Make a thing the usual way.\n"),
+                "{found}"
+            );
+            assert!(found.contains(r#""size":{"type":"string"}"#), "{found}");
+        }
+        assert!(
+            as_other.contains("\nturning: Make a thing the other way, one of 1.\n"),
+            "{as_other}"
+        );
+        assert!(
+            as_other.contains(r#""what":{"type":"string"}"#),
+            "{as_other}"
+        );
+        assert!(!as_other.contains("size"), "{as_other}");
+        assert!(
+            gist.contains("\nturning: Make a thing the other way, one of 1."),
+            "{gist}"
+        );
     }
 
     /// The names of Letronna's own less used tools a request over

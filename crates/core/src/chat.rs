@@ -2518,8 +2518,9 @@ enum Quirk {
     /// The Responses API, which the route turned down: the model is sent
     /// chat/completions instead.
     Responses,
-    /// The Responses API's summaries of the reasoning, which OpenAI gives
-    /// only an organization it has verified.
+    /// The summaries of the reasoning: the Responses API's, which OpenAI
+    /// gives only an organization it has verified, and the Messages API's
+    /// `display`, which a route older than Opus 4.7 may not know.
     Summary,
 }
 
@@ -2790,13 +2791,14 @@ fn sends_older_reasoning_empty(sent: &Value) -> bool {
 // A bad signature is a replayed block the route cannot check, as one made
 // for another account; "thinking block" is a model that thinks only on a
 // budget wanting the last call's thinking back, which it then never gets.
-const MESSAGES_QUIRKS: [(Quirk, &str); 6] = [
+const MESSAGES_QUIRKS: [(Quirk, &str); 7] = [
     (Quirk::Effort, "effort"),
     (Quirk::Replay, "anthropic-beta"),
     (Quirk::Replay, "block_binding"),
     (Quirk::Replay, "signature"),
     (Quirk::Thinking, "adaptive"),
     (Quirk::Thinking, "thinking block"),
+    (Quirk::Summary, "display"),
 ];
 
 /// `learn`, from a refusal of `posted`, the Messages request a chat body
@@ -2804,11 +2806,16 @@ const MESSAGES_QUIRKS: [(Quirk, &str); 6] = [
 fn learn_messages(connection: &Connection, posted: &Value, error: &str) -> bool {
     let error = error.to_lowercase().replace('_', "");
     let (endpoint, model) = route(connection);
+    // A refused summary is named by its place, `thinking.adaptive.display`,
+    // which names adaptive thinking too: only the summary is left out.
+    let summed = posted.pointer("/thinking/display").is_some();
+    let summary_refused = summed && error.contains("display");
     let mut learned_any = false;
     for (quirk, field) in MESSAGES_QUIRKS {
         let carried = match quirk {
             Quirk::Effort => posted.pointer("/output_config/effort").is_some(),
-            Quirk::Thinking => posted.get("thinking").is_some(),
+            Quirk::Thinking => posted.get("thinking").is_some() && !summary_refused,
+            Quirk::Summary => summed,
             _ => {
                 posted.pointer("/thinking/block_binding").is_some()
                     || crate::providers::wire::anthropic::replays(posted)
@@ -2862,6 +2869,7 @@ fn as_messages(connection: &Connection, body: &Value) -> Value {
     let thinking = crate::providers::wire::anthropic::Thinking {
         allowed: !helper && !has_quirk(connection, Quirk::Thinking),
         bound: !has_quirk(connection, Quirk::Replay),
+        summarized: !has_quirk(connection, Quirk::Summary),
     };
     crate::providers::wire::anthropic::request(&body, thinking)
 }
@@ -15971,6 +15979,25 @@ mod tests {
         let again = as_messages(&c, &body(&c, &hello(), None, None));
         assert!(again.get("thinking").is_none());
         // The effort was not at fault, and still goes.
+        assert_eq!(again["output_config"], json!({"effort": "high"}));
+    }
+
+    #[test]
+    fn a_route_that_turns_the_summary_down_still_thinks() {
+        let c = Connection {
+            endpoint: "https://api.anthropic.com/v1".into(),
+            model: "claude-refuses-the-summary".into(),
+            effort: "high".into(),
+            ..connection()
+        };
+        let posted = as_messages(&c, &body(&c, &hello(), None, None));
+        assert_eq!(posted["thinking"]["display"], "summarized");
+        // Its place names adaptive thinking too, which was not at fault.
+        let refusal = r#"{"type":"error","error":{"type":"invalid_request_error","message":"thinking.adaptive.display: Extra inputs are not permitted"}}"#;
+        assert!(learn_messages(&c, &posted, refusal));
+        let again = as_messages(&c, &body(&c, &hello(), None, None));
+        assert_eq!(again["thinking"]["type"], "adaptive");
+        assert!(again["thinking"].get("display").is_none());
         assert_eq!(again["output_config"], json!({"effort": "high"}));
     }
 

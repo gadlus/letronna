@@ -1563,6 +1563,9 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
             Next::Sandboxed(call) => dispatch(spec, &call, false, report, true, None),
             Next::Refuse(_, why) => Some(Err(why)),
             Next::AskUser(call) => {
+                // A page handed to the user stays open for as long as they
+                // take over it, and is the agent's again once they answer.
+                let _in_their_hands = crate::browser::hold_for(&call);
                 // Only the judge's word says why, when it was unsure.
                 let why = layer.as_ref().map(Layer::tag).unwrap_or_default();
                 let (ctx, lasting) = (context(spec), lasting(spec, &call, &rules));
