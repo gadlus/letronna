@@ -86,16 +86,22 @@ const RULES: usize = 8;
 /// still open, so the first item of a list inside an item acted on the
 /// outer one; the tester's tests and the review tried no list inside a
 /// list, so a rule about a thing that can hold its own kind has a row for
-/// the same input one level down. On another a change kept each thing it
-/// made in a module-level map it never emptied: with about forty made
-/// across a test file two of them fell into different internal groups and
-/// a query over both matched nothing, while the tester's 26 tests and both
-/// reviews, which made a few each, passed, and a reviewer wrote of the map
-/// "Perf caveat, not correctness."; so state that outlives a call has a
-/// row for a plain case run again after many more have been made.
+/// the same input one level down. The row says what the rule gives for
+/// the inner one and what for the outer one, and the request's words judge
+/// each: asked that the rule "apply to the inner one alone and leave the
+/// outer one as it was", a review would fail a rule that is right to reach
+/// upward, as one by which a group is valid only if its members are. On
+/// another a change kept each thing it made in a module-level map it never
+/// emptied: with about forty made across a test file two of them fell into
+/// different internal groups and a query over both matched nothing, while
+/// the tester's 26 tests and both reviews, which made a few each, passed,
+/// and a reviewer wrote of the map "Perf caveat, not correctness."; so
+/// state that outlives a call has a row for a plain case run again after
+/// many more have been made, one row for each such state, where every
+/// other item is asked of each requirement it applies to.
 macro_rules! cases {
     () => {
-        "a field, argument or part the requirement names left out, undefined or empty; a plain value as well as the same value wrapped, such as in an object or a parser's state, each also built by hand and passed straight to the method that reads it; each other way the same input can be written, such as its parts in another order or a spelling the project's docs or tests use, including any the parser might reject before the new check runs; an error the requirement names, matched by its exact words, not a generic error; two of something the requirement allows only once; the new form beside the existing form of the same thing in one call, where one applies and the other must not; a thing the requirement's rule is about that can hold another of its own kind, such as a list in a list, a group in a group or a call in a call, with the same input one level down, where the rule must apply to the inner one alone and leave the outer one as it was; each place in the code that records the event the requirement is about or changes that state, such as a demotion, a close or a removal, found by searching the code, not only the call the request names; where the change keeps state that outlives a call, such as a module-level map, cache, counter or registry, one of the requirement's plain cases run again after many more of the things that state holds have been made, dozens where a test makes a few, and again after the project's own reset where it has one; the other side of a condition, such as what \"and is not ended\" or \"unless\" keeps out, with both sides in one input chosen so that the result would differ if the condition's words were removed from the requirement, the row naming both results; steps the requirement sets in no order, in each order, such as the later one first; each category the requirement maps to an output, with an input from outside the project's own code, such as a caller's function or a returned error, that uses the requirement's own words for it; each input the change itself treats apart from its general path, such as an early return on a zero, empty or boundary value or a form it exempts, found by reading the change, the row saying what the general path gives when run on that input (the guard passes where that path crashes or does not end, and where the input is absent, the file, section, collection or value the rule reads not being there at all, unless the request says what happens then; for input that is there, such as a zero or an empty value, the guard passes where both results are the same; where they differ the row is FAIL only where it quotes a sentence of the request that says what happens for that input, by name or by a rule that covers it, and the change gives another result, even where the project's own code of the same kind makes the same exception; where no sentence does, the guard passes where the project's own code of the same kind, named in the row, makes the same exception, and is otherwise UNCLEAR, naming both results and the command that shows them, never FAIL); and each case the project's own tests check of the existing feature nearest to it, done again for the new one in the same order of calls, with the same fixtures and through the same entry point, such as a query made for the first time only after the change it should see;"
+        "a field, argument or part the requirement names left out, undefined or empty; a plain value as well as the same value wrapped, such as in an object or a parser's state, each also built by hand and passed straight to the method that reads it; each other way the same input can be written, such as its parts in another order or a spelling the project's docs or tests use, including any the parser might reject before the new check runs; an error the requirement names, matched by its exact words, not a generic error; two of something the requirement allows only once; the new form beside the existing form of the same thing in one call, where one applies and the other must not; a thing the requirement's rule is about that can hold another of its own kind, such as a list in a list, a group in a group or a call in a call, with the same input one level down, the row saying what the rule gives for the inner one and what for the outer one, each judged by the request's words; each place in the code that records the event the requirement is about or changes that state, such as a demotion, a close or a removal, found by searching the code, not only the call the request names; where the change keeps state that outlives a call, such as a module-level map, cache, counter or registry, once for each such state, one of the requirement's plain cases run again after many more of the things that state holds have been made, dozens where a test makes a few, and again after the project's own reset where it has one; the other side of a condition, such as what \"and is not ended\" or \"unless\" keeps out, with both sides in one input chosen so that the result would differ if the condition's words were removed from the requirement, the row naming both results; steps the requirement sets in no order, in each order, such as the later one first; each category the requirement maps to an output, with an input from outside the project's own code, such as a caller's function or a returned error, that uses the requirement's own words for it; each input the change itself treats apart from its general path, such as an early return on a zero, empty or boundary value or a form it exempts, found by reading the change, the row saying what the general path gives when run on that input (the guard passes where that path crashes or does not end, and where the input is absent, the file, section, collection or value the rule reads not being there at all, unless the request says what happens then; for input that is there, such as a zero or an empty value, the guard passes where both results are the same; where they differ the row is FAIL only where it quotes a sentence of the request that says what happens for that input, by name or by a rule that covers it, and the change gives another result, even where the project's own code of the same kind makes the same exception; where no sentence does, the guard passes where the project's own code of the same kind, named in the row, makes the same exception, and is otherwise UNCLEAR, naming both results and the command that shows them, never FAIL); and each case the project's own tests check of the existing feature nearest to it, done again for the new one in the same order of calls, with the same fixtures and through the same entry point, such as a query made for the first time only after the change it should see;"
     };
 }
 
@@ -3937,8 +3943,12 @@ mod tests {
         // list, where it reached the outer one.
         let case = "a thing the requirement's rule is about that can hold another of its own \
                     kind, such as a list in a list, a group in a group or a call in a call, with \
-                    the same input one level down, where the rule must apply to the inner one \
-                    alone and leave the outer one as it was;";
+                    the same input one level down, the row saying what the rule gives for the \
+                    inner one and what for the outer one, each judged by the request's words;";
+        // It asks what the rule gives at each level and lets the words
+        // judge: a rule that is right to reach upward, as one by which a
+        // group is valid only if its members are, is not failed for it.
+        assert!(!cases!().contains("leave the outer one as it was"));
         // The run that asks for a review reads it, and a review started for it.
         assert!(REVIEW.contains(case), "{REVIEW}");
         let rules: Vec<String> = ["Dates must parse.".to_owned()].into();
@@ -3956,10 +3966,10 @@ mod tests {
         // A map never emptied gave the right answer for the few things a
         // test made, and another once dozens had been made before them.
         let case = "where the change keeps state that outlives a call, such as a module-level \
-                    map, cache, counter or registry, one of the requirement's plain cases run \
-                    again after many more of the things that state holds have been made, dozens \
-                    where a test makes a few, and again after the project's own reset where it \
-                    has one;";
+                    map, cache, counter or registry, once for each such state, one of the \
+                    requirement's plain cases run again after many more of the things that state \
+                    holds have been made, dozens where a test makes a few, and again after the \
+                    project's own reset where it has one;";
         // The run that asks for a review reads it, and a review started for it.
         assert!(REVIEW.contains(case), "{REVIEW}");
         let rules: Vec<String> = ["Dates must parse.".to_owned()].into();
