@@ -33,12 +33,16 @@
 //! the fenced code that follows it, as "A hidden test might do:" does: the
 //! case is that sentence with the first lines of the code under it, in
 //! `PREDICTED` characters at most, and a sentence after the code that names
-//! nothing weighs it off as it would a sentence that holds a span. With the
-//! code skipped, the reviewers of a run that had written out the very test
-//! its work then failed were given the sentence before it, which said
+//! nothing weighs it off as it would a sentence that holds a span. Where
+//! another sentence comes between the prediction and the code, as "Cheap to
+//! add:" does, the code is most often the run's own change and is left
+//! out, unless that sentence only says "E.g." or the like (`EXAMPLE`). With
+//! the code skipped, the reviewers of a run that had written out the very
+//! test its work then failed were given the sentence before it, which said
 //! nothing of the test, and each guessed another meaning. The other names a
 //! defect in the work in so many words (`DEFECTS`), as "That would break
-//! it, but that's rare." does. It is the case of a weigh-off in its own
+//! it, but that's rare." does, unless it says so of the run's own test or
+//! of the run itself (`PROBES`). It is the case of a weigh-off in its own
 //! sentence, and of one in the sentence after it that names nothing, as
 //! "Out of scope. Leave it." is; and it ranks with the cases weighed
 //! hardest, since the run has said its work is wrong there and left it.
@@ -125,6 +129,19 @@ const CHARS: usize = 200;
 /// it introduces: in the runs read, four in five of such checks fit, the
 /// sentence and its code together.
 const PREDICTED: usize = 300;
+
+/// What a sentence may say, and no more, between a check the run predicts
+/// and the code that shows it, as "Hidden tests may pass a list. E.g." does.
+const EXAMPLE: &[&str] = &[
+    "e.g",
+    "eg",
+    "i.e",
+    "ie",
+    "for example",
+    "for instance",
+    "like",
+    "such as",
+];
 
 /// Sentences before a weigh-off its case may be named in, as "Could also
 /// set `x`? That would pollute it. I'll keep only y." names it two back;
@@ -253,9 +270,20 @@ const UNDONE: &[&str] = &[
 /// Words before one of `DEFECTS` that are read for one of `UNDONE`.
 const DENIED: usize = 3;
 
-/// What a sentence says of a test, a script or a probe of the run's own:
-/// a defect there is none of the work's.
-const PROBES: &[&str] = &["my test", "my tests", "my script", "my probe", "my scratch"];
+/// What a sentence says of a test, a script or a probe of the run's own,
+/// or of the run itself: a defect there is none of the work's.
+const PROBES: &[&str] = &[
+    "my test",
+    "my tests",
+    "my script",
+    "my probe",
+    "my scratch",
+    "i might be wrong",
+    "i may be wrong",
+    "i could be wrong",
+    "i may have wrong",
+    "i was wrong",
+];
 
 /// Words a sentence opens with when it speaks of the one before it, as
 /// "That's wrong but rare." does.
@@ -594,10 +622,11 @@ pub(crate) fn doubts(messages: &[Message], request: &str, sentences: &[String]) 
 /// `KEPT` cases or fewer all reach every helper, and one helper is given
 /// what `doubts` gives. Given the same `KEPT` each, the reviews of a run
 /// checked no more of what it had set aside than one would have: on a
-/// benchmark run that had set aside 81 cases, its two reviews are given 20
+/// benchmark run that had set aside 82 cases, its two reviews are given 20
 /// of them this way. The case that run's result turned on, a check it had
-/// predicted and weighed off, is still not one of them: by weight it comes
-/// 29th, after four weighed harder and 24 weighed alike and named later.
+/// predicted in a code span and left as a question, is still not one of
+/// them: by weight it comes 30th, after five weighed harder and 24 weighed
+/// alike and named later, of some forty checks that run predicted.
 pub(crate) fn dealt(
     messages: &[Message],
     request: &str,
@@ -885,17 +914,25 @@ fn ending(sentence: &str, most: usize) -> String {
 
 /// What `unit` says to predict a check, where it introduces code: its
 /// words before the fenced code that follows it, through the clause that
-/// holds a marker of `CHECK`. None where no code follows it, or nothing it
-/// says before the code predicts a check.
+/// holds its last marker of `CHECK`. None where no code follows it, where
+/// nothing it says before the code predicts a check, or where another
+/// sentence comes between the two and says more than one of `EXAMPLE`, as
+/// "Cheap to add:" does: the code is then most often the run's own change.
 fn introduces(unit: &Spoken) -> Option<String> {
     if unit.code.is_empty() {
         return None;
     }
     let said = unit.words[..unit.before].trim_end();
     let check = (marks(&masked(said)).into_iter())
-        .find(|(_, marker)| marker.starts_with(CHECK))
-        .map(|(at, marker)| at + marker.len())?;
-    Some(through(said, check))
+        .filter(|(_, marker)| marker.starts_with(CHECK))
+        .map(|(at, marker)| at + marker.len())
+        .next_back()?;
+    let example = |sentence: &&str| {
+        let bare = sentence.trim_matches(|c: char| !c.is_alphanumeric());
+        EXAMPLE.contains(&bare.to_lowercase().as_str())
+    };
+    let between = crate::requirements::split(&said[check..]);
+    (between.iter().skip(1).all(example)).then(|| through(said, check))
 }
 
 /// `said`, which predicts a check, with the lines of `code` it introduces
@@ -941,8 +978,8 @@ fn predicted(said: &str, code: &[String]) -> String {
 /// `DEFECTS` outside its spans and quotes, with none of `UNDONE` among the
 /// `DENIED` words before it. A sentence that says "either way" names none,
 /// since what it says holds of both choices and not of the one the work
-/// made, nor does one that speaks of the run's own test or script
-/// (`PROBES`).
+/// made, nor does one that speaks of the run's own test or script, or of
+/// the run as wrong (`PROBES`).
 fn defect(unit: &str) -> Option<usize> {
     let prose = masked(unit);
     let holds = |said: &&str| !whole(&prose, said).is_empty();
@@ -2086,6 +2123,26 @@ mod tests {
         assert!(weighed(plain).is_empty(), "{:?}", weighed(plain));
         let apart = "Hidden tests might do this.\nSo write the helper first:\n```\nhelp()\n```";
         assert!(weighed(apart).is_empty(), "{:?}", weighed(apart));
+        // Nor is code that a few words of the run's own introduce after
+        // the prediction, which is most often its change: the case is the
+        // sentence, as it was. Words that only say an example follows
+        // leave the code the prediction's.
+        let own = "Hidden tests may call `flush()` twice. Cheap to add:\n```\nfn flush() {}\n```";
+        assert_eq!(
+            weighed(own),
+            ["Hidden tests may call `flush()` twice. Cheap to add"]
+        );
+        let unnamed = "Hidden tests may call it twice. Let's implement:\n```\nfn flush() {}\n```";
+        assert!(weighed(unnamed).is_empty(), "{:?}", weighed(unnamed));
+        for opener in ["E.g.", "For example:", "I.e."] {
+            let said = format!("Hidden tests may call it twice. {opener}");
+            let notes = format!("{said}\n```\nflush();\nflush();\n```");
+            assert_eq!(
+                weighed(&notes),
+                [under(&said, &["flush();", "flush();"])],
+                "{opener}"
+            );
+        }
     }
 
     #[test]
@@ -2225,6 +2282,7 @@ mod tests {
             "Reading twice never breaks the order. Rare.",
             "Exact tests would fail either way.",
             "So my test expectation is arguably wrong.",
+            "Here I might be wrong, though that is unlikely.",
         ] {
             assert!(weighed(notes).is_empty(), "{notes}: {:?}", weighed(notes));
         }
