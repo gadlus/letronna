@@ -7575,17 +7575,25 @@ mod tests {
         let out = run("run_command", &slow, &ctx).unwrap();
         let (printed, note) = out.split_once("\n\n[").expect(&out);
         assert_eq!(printed.trim_end(), "done");
-        assert!(
-            note.starts_with("It ran for 0 s. About 29 minutes of"),
-            "{note}"
-        );
+        // What a command took counts its shell's own start, which on Windows
+        // can be most of a second: the seconds are pinned only where the
+        // shell starts at once.
+        let (ran, left) = (note.strip_prefix("It ran for "))
+            .and_then(|rest| rest.split_once(" s. "))
+            .expect(note);
+        assert!(cfg!(windows) || ran == "0", "{note}");
+        assert!(left.starts_with("About 29 minutes of"), "{note}");
         // Seconds once there are few, and nothing after a quick command or
         // in a run with no deadline.
         ctx.caller.connection = timed(90);
         let out = run("run_command", &slow, &ctx).unwrap();
         assert!(out.contains(" s of this run's time are left.]"), "{out}");
-        let quick = json!({ "command": "echo done" }).to_string();
-        assert_eq!(run("run_command", &quick, &ctx).unwrap().trim_end(), "done");
+        // Not on Windows, where starting the shell alone can take longer
+        // than the fraction of a second a test counts as long.
+        if !cfg!(windows) {
+            let quick = json!({ "command": "echo done" }).to_string();
+            assert_eq!(run("run_command", &quick, &ctx).unwrap().trim_end(), "done");
+        }
         ctx.caller.connection = None;
         assert_eq!(run("run_command", &slow, &ctx).unwrap().trim_end(), "done");
         // A failing command's code is still read as its last line.
