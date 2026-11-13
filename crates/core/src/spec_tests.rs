@@ -2068,13 +2068,17 @@ fn words_first(silent: &str) -> String {
 /// watched it do so passed, a tester's tests expected none, and the run,
 /// having read the sentence both ways, took the signal out for the tests:
 /// the hidden test then failed on that. So the rule says which of the two
-/// saw the work run. The notice of a first version that passed
-/// (`regressed`) says another thing of silence: there the run puts back
-/// what broke the test, which a later review's row may have passed.
+/// saw the work run, and says it only of a row that tells what was run and
+/// what it showed: a row passed as not asked, or by reading the change,
+/// shows no run of the work, and nothing is claimed for it. The notice of
+/// a first version that passed (`regressed`) says another thing of
+/// silence: there the run puts back what broke the test, which a later
+/// review's row may have passed.
 const SILENT: &str = "say so in your answer; and unless the request's words ask for it, do \
                       not take away or move something a review's row passed to pass a test: \
-                      words that can be read both ways do not ask for it, and the reviewer ran \
-                      your work, which the tester never saw";
+                      words that can be read both ways do not ask for it, and where the row \
+                      says what was run and what it showed, the reviewer ran your work, which \
+                      the tester never saw";
 
 /// `words_first` as each notice of a tester's tests says it but the one of
 /// a first version that passed: `ONE_READING` ahead of it, so the first
@@ -6545,8 +6549,8 @@ mod tests {
         let silent = "Where the words are silent on the case, say so in your answer; and unless \
                       the request's words ask for it, do not take away or move something a \
                       review's row passed to pass a test: words that can be read both ways do \
-                      not ask for it, and the reviewer ran your work, which the tester never \
-                      saw.";
+                      not ask for it, and where the row says what was run and what it showed, \
+                      the reviewer ran your work, which the tester never saw.";
         let notices = [
             failed(&kept, "npx vitest run x", &failing, None).unwrap(),
             told(report, Some(&kept), true),
@@ -6596,13 +6600,19 @@ mod tests {
         // What a review passed stays whether the words are silent or not,
         // unless they ask for the change: words that name a place without
         // saying whose are not silent, and ask for no move, nor do words
-        // that can be read both ways; of the two, the reviewer saw the work.
+        // that can be read both ways; of the two, the reviewer saw the
+        // work, where its row says what it ran: a row passed as not asked
+        // or by reading shows no run, and none is claimed for it.
         assert_eq!(
             SILENT,
             "say so in your answer; and unless the request's words ask for it, do not take \
              away or move something a review's row passed to pass a test: words that can be \
-             read both ways do not ask for it, and the reviewer ran your work, which the tester \
-             never saw"
+             read both ways do not ask for it, and where the row says what was run and what \
+             it showed, the reviewer ran your work, which the tester never saw"
+        );
+        assert!(
+            !SILENT.contains("and the reviewer ran your work"),
+            "{SILENT}"
         );
         let report = "R1 | adds | FAIL | npx vitest run x | got []\nRun: npx vitest run x";
         let failing = Ok("FAIL tests/letronna_spec.test.ts\n[exit code 1]".to_owned());
