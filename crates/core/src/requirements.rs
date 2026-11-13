@@ -1073,6 +1073,11 @@ const ROW_CHARS: usize = 300;
 /// The longest case a row the quote cut is written again with, in characters.
 const CASE_CHARS: usize = 120;
 
+/// The most a passed row the quote cut is written again with of what shows
+/// it, in characters: room for a command and what it printed, and half a
+/// failed row's, since a long table passes most of its rows.
+const PASSED_CHARS: usize = 150;
+
 /// Rows the quote cut that are written again after it; a bigger table is
 /// read in the helper's whole report.
 const CUT_SHOWN: usize = 60;
@@ -1090,15 +1095,20 @@ const CUT_ORDER: [(&str, &str); 3] = [
 
 /// The rows of a review's table in `report` that `quote`, the report as cut
 /// to fit, lost, to go after it so the run is held to the whole table: each
-/// failed row with what shows it, and each passed one by its requirement and
-/// case, the failed ones first, then those left unclear, then those that
-/// passed (`CUT_ORDER`), with a count of each kind left out past
-/// `CUT_SHOWN`. Of the passed ones, a row of a requirement that is left no
-/// other is written before a second row of one that has its own, so
-/// `unchecked` finds no requirement without a row that its review gave one.
-/// The rows it lost that give no verdict that can be read (`written`) are
-/// counted too, since they hold the run to nothing and it is not told of
-/// them otherwise. None when the quote kept every row.
+/// by its requirement and case with what shows it, the failed ones first,
+/// then those left unclear, then those that passed (`CUT_ORDER`), with a
+/// count of each kind left out past `CUT_SHOWN`. Of the passed ones, a row
+/// of a requirement that is left no other is written before a second row
+/// of one that has its own, so `unchecked` finds no requirement without a
+/// row that its review gave one. The rows it lost that give no verdict that
+/// can be read (`written`) are counted too, since they hold the run to
+/// nothing and it is not told of them otherwise. A passed row keeps what
+/// shows it as a failed one does, in `PASSED_CHARS` at most: a review is
+/// asked what it ran for a row that passed, so the run can tell what the
+/// reviewer watched its work do, and the report of a helper started beside
+/// others is cut to its share of a page, so most of a long table reaches
+/// the run only as it is written again here. None when the quote kept
+/// every row.
 pub(crate) fn cut_rows(report: &str, quote: &str) -> Option<String> {
     let cut = |text: &str, most: usize| -> String { text.chars().take(most).collect() };
     let (read, unread): (Vec<_>, Vec<_>) = (written(report).into_iter())
@@ -1162,15 +1172,19 @@ pub(crate) fn cut_rows(report: &str, quote: &str) -> Option<String> {
             let case = cut(&joined(case), CASE_CHARS);
             let mut shows = vec![after.as_str()];
             shows.extend(((at + 1).min(cells.len())..cells.len()).map(whole));
-            let shows = cut(&joined(shows), ROW_CHARS);
+            let most = match passed {
+                true => PASSED_CHARS,
+                false => ROW_CHARS,
+            };
+            let shows = cut(&joined(shows), most);
             let word = match (passed, left_unclear(&line)) {
                 (true, _) => "PASS",
                 (false, true) => UNCLEAR,
                 (false, false) => "FAIL",
             };
-            let row = match (passed, shows.is_empty()) {
-                (true, _) | (false, true) => format!("R{number} | {case} | {word}"),
-                (false, false) => format!("R{number} | {case} | {word} | {shows}"),
+            let row = match shows.is_empty() {
+                true => format!("R{number} | {case} | {word}"),
+                false => format!("R{number} | {case} | {word} | {shows}"),
             };
             (number, word, row)
         })
@@ -2753,7 +2767,7 @@ mod tests {
              R4 | the count includes the last test | FAIL | (`node count.js`: 2)\n\
              R2 | an empty name gives an empty reason | UNCLEAR | (\"the test's name\")\n\
              R1 | skipped results before the threshold do not count | PASS\n\
-             R1 | failures are listed by name (threshold 2) | PASS"
+             R1 | failures are listed by name (threshold 2) | PASS | (no limit is set)"
         );
         let mut found: Vec<(usize, bool, bool)> = (rows(&again).into_iter())
             .map(|(number, passed, row)| (number, passed, left_unclear(&row)))
@@ -2822,7 +2836,7 @@ mod tests {
                  failed\n\
                  R2 | a frame with no instance | UNCLEAR | `capture` skips it, so the count \
                  drops\n\
-                 R1 | the name is written first | PASS\n"
+                 R1 | the name is written first | PASS | `python parse.py` (`core: 0`)\n"
             ),
             "{again}"
         );
@@ -3041,7 +3055,7 @@ mod tests {
                 "\nR1 | exact count | FAIL | got 2\n\
                  R4 | exact message | FAIL | **not** the one asked for\n\
                  R3 | later step first | UNCLEAR | The request sets no order\n\
-                 R2 | empty input | PASS"
+                 R2 | empty input | PASS | `[]`"
             ),
             "{again}"
         );
@@ -4053,7 +4067,7 @@ mod tests {
             "R21 | which end | UNCLEAR | the request names neither"
         );
         assert_eq!(written[2], "R22 | empty input | UNCLEAR");
-        assert_eq!(written[3], "R1 | case 1 | PASS");
+        assert_eq!(written[3], "R1 | case 1 | PASS | t1.sh");
         // Only rows that passed are left out, and the count says so.
         assert_eq!(written[CUT_SHOWN], "and 23 more rows that passed");
         // Every requirement the table has a row for still has one, where
@@ -4097,7 +4111,7 @@ mod tests {
              R5 | the count | FAIL | node count.js\n\
              R6 | handles `x | y` | FAIL | prints `x`\n\
              R4 | `total` is kept | UNCLEAR | (for `0`)\n\
-             R1 | `core` holds the name | PASS"
+             R1 | `core` holds the name | PASS | `python parse.py`"
         );
         // And reads as the rows it was.
         let found: Vec<(usize, bool)> = (rows(&again).into_iter())
@@ -4174,6 +4188,38 @@ mod tests {
     }
 
     #[test]
+    fn a_passed_row_written_again_keeps_what_the_review_ran_and_what_it_showed() {
+        // As a review is asked to write a row that passed, and one for a
+        // case set aside that the request does not decide.
+        let report = format!(
+            "R1 | an open range | PASS | `node range.js 3..` prints `[3, 9]`\n\
+             R2 | a name with nothing in it | PASS | {NOT_ASKED}\n\
+             R3 | two ranges | PASS"
+        );
+        let again = cut_rows(&report, "cut").unwrap();
+        assert_eq!(
+            again,
+            format!(
+                "\nRows of its table the quote above cut, written again:\n\
+                 R1 | an open range | PASS | `node range.js 3..` prints `[3, 9]`\n\
+                 R2 | a name with nothing in it | PASS | {NOT_ASKED}\n\
+                 R3 | two ranges | PASS"
+            )
+        );
+        // They read as the rows they were, and hold the run to nothing.
+        assert_eq!(unchecked(&again, 3), None);
+        // In half the room a failed row has, since most rows of a long
+        // table pass.
+        let (ran, printed) = ("x".repeat(500), "y".repeat(500));
+        let long = format!("R1 | a | PASS | {ran}\nR2 | b | FAIL | {printed}");
+        let again = cut_rows(&long, "cut").unwrap();
+        let failed = format!("\nR2 | b | FAIL | {}\n", "y".repeat(ROW_CHARS));
+        assert!(again.contains(&failed), "{again}");
+        let passed = format!("\nR1 | a | PASS | {}", "x".repeat(PASSED_CHARS));
+        assert!(again.ends_with(&passed), "{again}");
+    }
+
+    #[test]
     fn a_row_written_again_keeps_what_its_verdicts_cell_went_on_to_say() {
         let report = "| R1 | missing field | PASS — `KeyError` |\n\
                       | R2 | plain value | FAIL — `node check.js` prints 2 | expected 3 |\n\
@@ -4183,7 +4229,7 @@ mod tests {
             again,
             "\nRows of its table the quote above cut, written again:\nR2 | plain value | FAIL \
              | `node check.js` prints 2 | expected 3\nR3 | later step first | UNCLEAR | (the \
-             request sets no order)\nR1 | missing field | PASS"
+             request sets no order)\nR1 | missing field | PASS | `KeyError`"
         );
         // Written again, they read as the rows they were.
         let found: Vec<(usize, bool, bool)> = (rows(&again).into_iter())
