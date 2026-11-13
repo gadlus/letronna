@@ -142,14 +142,21 @@ impl Server {
     }
 
     fn listing(&self) -> Vec<Value> {
+        // As a call made here would run, over no chat's connection: a tool
+        // whose description turns on the session, as make_image's does on
+        // who makes the picture, is listed as it will go.
+        let connection = crate::chat::Connection {
+            workspace: self.ctx.workspace.clone(),
+            ..Default::default()
+        };
         let mut listed: Vec<Value> = self
             .tools
             .iter()
             .map(|tool| {
                 json!({
                     "name": tool.name(),
-                    "description": tool.description(),
-                    "inputSchema": tool.parameters(),
+                    "description": tool.description_for(&connection, &[]),
+                    "inputSchema": tool.parameters_for(&connection),
                 })
             })
             .collect();
@@ -546,6 +553,27 @@ mod tests {
         let text = answered["result"]["content"][0]["text"].as_str().unwrap();
         assert!(!text.contains("a-saved-key"), "{text}");
         assert!(text.contains(crate::redact::MARKER), "{text}");
+    }
+
+    #[test]
+    fn a_picture_a_chatgpt_plan_will_make_is_listed_as_the_plans() {
+        let (_vault, _held) = crate::providers::auth::tests::vault("mcp-serve-plan");
+        crate::providers::tests::plugged_in("chatgpt");
+        crate::providers::auth::tests::keep(crate::providers::chatgpt::NAME, "access-1");
+        let offered = exposed();
+        assert!(offered.iter().any(|tool| tool.name() == "make_image"));
+        let listed = Server::new(offered, false, None).listing();
+        let image = listed
+            .iter()
+            .find(|tool| tool["name"] == "make_image")
+            .unwrap();
+        let said = image["description"].as_str().unwrap();
+        assert!(said.contains("on the user's ChatGPT plan"), "{said}");
+        assert!(!said.contains("Letronna credit"), "{said}");
+        assert_eq!(
+            image["inputSchema"]["properties"],
+            json!({"prompt": {"type": "string", "description": "What the image should show, in detail."}})
+        );
     }
 
     #[test]
