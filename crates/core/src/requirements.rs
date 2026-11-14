@@ -711,60 +711,93 @@ pub(crate) const AHEAD_OPENS: &str =
     "[The tester's report, written before your change; its rows judge nothing of your work]";
 pub(crate) const AHEAD_CLOSES: &str = "[End of the tester's report]";
 
-/// The rows of a review's table in `report`: each requirement's number,
-/// whether the case passed, and the row as written. A line is a row when a
-/// cell of it opens with `R` and a number and a later cell says PASS or
-/// FAIL, alone or ahead of what shows it (`judged`), however the helper
-/// laid the table out; one whose last cell says the case waits on the work
-/// (`placeholder`) is no row, since it says nothing of the work once the
-/// work is there, nor is any line of a report written ahead of the work,
-/// between `AHEAD_OPENS` and `AHEAD_CLOSES`.
+/// The rows of a review's table in `report` that are a requirement's: each
+/// with its requirement's number, whether the case passed, and the row as
+/// written. A line is such a row when its first cell opens with `R` and a
+/// number and a later cell says PASS or FAIL, alone or ahead of what shows
+/// it (`judged`), however the helper laid the table out; one whose last
+/// cell says the case waits on the work (`placeholder`) is no row, since it
+/// says nothing of the work once the work is there, nor is any line of a
+/// report written ahead of the work, between `AHEAD_OPENS` and
+/// `AHEAD_CLOSES`.
 fn rows(report: &str) -> Vec<(usize, bool, String)> {
     (written(report).into_iter())
-        .filter_map(|(number, passed, line)| Some((number, passed?, line)))
+        .filter_map(|(number, passed, line)| Some((number?, passed?, line)))
         .collect()
 }
 
+/// The line `cut_rows` writes ahead of the rows a quote cut, which marks
+/// them as rows of a review's table whichever of them the cut left
+/// (`written`).
+const WRITTEN_AGAIN: &str = "Rows of its table the quote above cut, written again:";
+
 /// The lines of `report` written as rows of a review's table, as `rows`
-/// reads them, each with whether its case passed; and with None, those
+/// reads them, each with whether its case passed; with None for that, those
 /// that open as a row does, requirements' numbers alone in the first of
 /// three cells or more (`numbered`), and give no verdict that can be read:
 /// a row the reading could not make out, or one whose test was not run.
-fn written(report: &str) -> Vec<(usize, Option<bool>, String)> {
+/// And, with None for the number, the rows that belong to no requirement:
+/// a review writes the cases it was given that a run set aside, and what it
+/// doubts beyond the rows asked for, as `set-aside | case | FAIL | …`,
+/// `— | case | UNCLEAR | …` or `extra | …`, and read as no rows these held
+/// the run to nothing and were lost wherever its report was cut. In the
+/// benchmark runs read, 155 of 378 reviews wrote 759 such rows, 252 of them
+/// failed or left unclear, and five in six of those never reached their
+/// run: one was `extra | module-level … | UNCLEAR | never pruned`, of the
+/// state that then hung the hidden tests. Such a line is a row by its shape
+/// and its place, not by its label: a case between the first cell and the
+/// one that gives the verdict, and a requirement's row above it in the same
+/// table, a table being lines with a bar that follow one another, or the
+/// rows `cut_rows` wrote again under `WRITTEN_AGAIN`. So a legend, a line a
+/// program printed, a sentence of the request, another helper's table of
+/// its own, or the piece of a line a quote takes up again with after its
+/// cut is none.
+fn written(report: &str) -> Vec<(Option<usize>, Option<bool>, String)> {
     let mut found = Vec::new();
     let mut ahead = false;
+    // Whether the table being read has given a requirement's row yet.
+    let mut tabled = false;
     for line in report.lines() {
-        match line.trim() {
-            AHEAD_OPENS => {
-                ahead = true;
-                continue;
-            }
-            AHEAD_CLOSES => {
-                ahead = false;
-                continue;
-            }
-            _ if ahead => continue,
-            _ => {}
+        let marked = match line.trim() {
+            AHEAD_OPENS => Some(true),
+            AHEAD_CLOSES => Some(false),
+            _ => None,
+        };
+        ahead = marked.unwrap_or(ahead);
+        if ahead || marked.is_some() || !line.contains('|') {
+            tabled = !ahead && line.trim() == WRITTEN_AGAIN;
+            continue;
         }
         let cells = cells(line);
         let Some(first) = cells.first() else {
             continue;
         };
-        let digits: String = (first.strip_prefix('R').unwrap_or_default().chars())
-            .take_while(char::is_ascii_digit)
-            .collect();
-        let Ok(number) = digits.parse::<usize>() else {
-            continue;
-        };
         if cells.last().is_some_and(|cell| placeholder(cell)) {
             continue;
         }
-        let passed = judged(&cells).and_then(|(_, word)| verdict(word));
-        if passed.is_some() || (cells.len() > 2 && numbered(first)) {
-            found.push((number, passed, line.trim().to_owned()));
+        let judged = judged(&cells);
+        let passed = judged.and_then(|(_, word)| verdict(word));
+        let row = match number(first) {
+            Some(_) => passed.is_some() || (cells.len() > 2 && numbered(first)),
+            // A label, a case, and then the verdict.
+            None => tabled && passed.is_some() && judged.is_some_and(|(at, _)| at > 1),
+        };
+        if row {
+            tabled |= passed.is_some();
+            found.push((number(first), passed, line.trim().to_owned()));
         }
     }
     found
+}
+
+/// The requirement a row's first `cell` opens with, as `R4` and `R4/R5`
+/// do; None for any other, such as the label of a row that belongs to no
+/// requirement.
+fn number(cell: &str) -> Option<usize> {
+    let digits: String = (cell.strip_prefix('R').unwrap_or_default().chars())
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
 }
 
 /// Whether a table's `cell` only says that the case waits on the work, as
@@ -981,8 +1014,11 @@ fn given(cell: &str) -> &str {
 /// cell after the number is the case wherever more cells follow it, so
 /// whatever it quotes it gives a verdict only as the row's last, and a row
 /// a cell of which says the test was not run (`unrun`) has none to give,
-/// nor has a line whose first cell holds more than requirements' numbers
-/// (`numbered`), which is a sentence a bar in its code happened to cut.
+/// nor has a line whose first cell opens with a requirement's number and
+/// holds more (`numbered`), which is a sentence a bar in its code happened
+/// to cut. A first cell that opens with no number is the label of a row
+/// that belongs to no requirement, read as a requirement's row is;
+/// `written` says which such lines are rows.
 /// A word alone in a cell after one that says only that the test was not
 /// run is why it was not, and no verdict: a tester's row for a reading it
 /// wrote no test of may end `NOT RUN | unclear`, and read as a row left
@@ -997,7 +1033,7 @@ fn judged<'a>(cells: &[&'a str]) -> Option<(usize, &'a str)> {
     if let Some(alone) = later().find(|(at, cell)| judges(*at) && verdict(cell).is_some()) {
         return Some(alone);
     }
-    let row = cells.first().is_some_and(|cell| numbered(cell));
+    let row = (cells.first()).is_some_and(|cell| numbered(cell) || number(cell).is_none());
     if !row || later().any(|(_, cell)| unrun(cell)) {
         return None;
     }
@@ -1119,12 +1155,20 @@ const CUT_ORDER: [(&str, &str); 3] = [
 /// asked what it ran for a row that passed, so the run can tell what the
 /// reviewer watched its work do, and the report of a helper started beside
 /// others is cut to its share of a page, so most of a long table reaches
-/// the run only as it is written again here. None when the quote kept
-/// every row.
+/// the run only as it is written again here. A row that belongs to no
+/// requirement is written again and counted as any other, under its own
+/// first cell; one that passed gives way to a requirement's only row where
+/// the room runs out. A row is lost where the quote does not read as a row
+/// what the report does (`written`): the end of a table the cut kept may
+/// hold only rows of no requirement, which are rows of nothing without the
+/// requirement's row they stood under. None when the quote kept every row.
 pub(crate) fn cut_rows(report: &str, quote: &str) -> Option<String> {
     let cut = |text: &str, most: usize| -> String { text.chars().take(most).collect() };
+    let kept: Vec<String> = (written(quote).into_iter())
+        .map(|(_, _, line)| line)
+        .collect();
     let (read, unread): (Vec<_>, Vec<_>) = (written(report).into_iter())
-        .filter(|(_, _, line)| !quote.contains(line.as_str()))
+        .filter(|(_, _, line)| !kept.contains(line))
         .partition(|(_, passed, _)| passed.is_some());
     let unread = match unread.len() {
         0 => None,
@@ -1133,7 +1177,7 @@ pub(crate) fn cut_rows(report: &str, quote: &str) -> Option<String> {
             counted(count, "more")
         )),
     };
-    let lost: Vec<(usize, &str, String)> = (read.into_iter())
+    let lost: Vec<(Option<usize>, &str, String)> = (read.into_iter())
         .filter_map(|(number, passed, line)| Some((number, passed?, line)))
         .map(|(number, passed, line)| {
             let cells = cells(&line);
@@ -1194,9 +1238,14 @@ pub(crate) fn cut_rows(report: &str, quote: &str) -> Option<String> {
                 (false, true) => UNCLEAR,
                 (false, false) => "FAIL",
             };
+            // A row of no requirement opens with its own first cell.
+            let head = match number {
+                Some(number) => format!("R{number}"),
+                None => cells[0].to_owned(),
+            };
             let row = match shows.is_empty() {
-                true => format!("R{number} | {case} | {word}"),
-                false => format!("R{number} | {case} | {word} | {shows}"),
+                true => format!("{head} | {case} | {word}"),
+                false => format!("{head} | {case} | {word} | {shows}"),
             };
             (number, word, row)
         })
@@ -1215,19 +1264,19 @@ pub(crate) fn cut_rows(report: &str, quote: &str) -> Option<String> {
     // The requirements that have a row already, in what the quote kept or
     // among the rows taken so far: a passed row of any other goes first.
     let mut rowed: Vec<usize> = (rows(quote).iter().map(|(number, _, _)| *number))
-        .chain(shown.iter().map(|at| lost[*at].0))
+        .chain(shown.iter().filter_map(|at| lost[*at].0))
         .collect();
     let (only, others): (Vec<usize>, Vec<usize>) = of(passed).partition(|at| {
-        let new = !rowed.contains(&lost[*at].0);
-        rowed.extend(new.then_some(lost[*at].0));
-        new
+        let new = lost[*at].0.filter(|number| !rowed.contains(number));
+        rowed.extend(new);
+        new.is_some()
     });
     let room = CUT_SHOWN - shown.len();
     let mut kept: Vec<usize> = only.into_iter().chain(others).take(room).collect();
     // In the table's order again, whichever were taken first.
     kept.sort_unstable();
     shown.extend(kept);
-    let mut text = String::from("\nRows of its table the quote above cut, written again:");
+    let mut text = format!("\n{WRITTEN_AGAIN}");
     for at in &shown {
         text.push_str(&format!("\n{}", lost[*at].2));
     }
@@ -3108,6 +3157,182 @@ mod tests {
             read("R2 `test_iter` | it is an iterator | FAIL"),
             Some((2, false))
         );
+    }
+
+    /// The rows `written` reads in `report`: each one's number, if it has
+    /// one, and whether it passed, with None for one that gave no verdict.
+    fn verdicts(report: &str) -> Vec<(Option<usize>, Option<bool>)> {
+        (written(report).into_iter())
+            .map(|(number, passed, _)| (number, passed))
+            .collect()
+    }
+
+    #[test]
+    fn a_row_that_names_no_requirement_is_read_in_a_table_with_a_requirements_row() {
+        // As reviews wrote the cases they were given that a run set aside,
+        // and what they doubted beyond the rows asked for.
+        let report = "## Table\n\n\
+                      | Req | Case | Verdict | What shows it |\n\
+                      |---|---|---|---|\n\
+                      | R18 | after 60 more aspects exist | PASS | `part-c.mts` |\n\
+                      | set-aside | `world.traits.size` after creating aspects | PASS | not asked |\n\
+                      | extra | module-level `aspectsByTrait` outlives calls and worlds | UNCLEAR | never pruned |\n\
+                      | — | `Not(aspect)` misses a complete entity | FAIL | `npx tsx check10.mts`: 0 |\n\
+                      | author case | `go test ./...` | UNCLEAR — could not run: no module cache |\n\
+                      | aside | `Equal` \"fine either way\" | PASS for the stated contract |\n\
+                      | n/a (R15, outside my set) | `--force-rescan` counters | FAIL | prints `Files scanned: 0` |\n\
+                      other | no terminating semicolon | FAIL | `python check.py`: a blank line appended\n\n\
+                      ## Verdict";
+        let held = [
+            (Some(18), Some(true)),
+            (None, Some(true)),
+            (None, Some(false)),
+            (None, Some(false)),
+            (None, Some(false)),
+            (None, Some(true)),
+            (None, Some(false)),
+            (None, Some(false)),
+        ];
+        assert_eq!(verdicts(report), held);
+        // A doubt among them is a doubt, and a failure a failure.
+        let unclear: Vec<bool> = (written(report).iter())
+            .map(|(_, _, row)| left_unclear(row))
+            .collect();
+        assert_eq!(
+            unclear,
+            [false, false, true, false, true, false, false, false]
+        );
+        // None of them is a requirement's row.
+        assert_eq!(rows(report).len(), 1);
+    }
+
+    #[test]
+    fn a_line_with_a_verdict_and_no_requirement_is_no_row_outside_a_reviews_table() {
+        // A table of another helper's, with no requirement's row in it.
+        let suites = "| Suite | Command | Result | Note |\n|---|---|---|---|\n\
+                      | core | `vitest run` | PASS | 137 tests |\n\
+                      | react | `vitest run` | FAIL | `document is not defined` |";
+        assert_eq!(verdicts(suites), []);
+        assert!(!tabled(suites));
+        assert_eq!(cut_rows(suites, "cut"), None);
+        // Nor does a requirement's row elsewhere in the report make rows of
+        // it: a table is lines with a bar that follow one another.
+        let apart = format!("R1 | iso | PASS | `date -u`\n\nWhat I ran:\n\n{suites}");
+        assert_eq!(verdicts(&apart), [(Some(1), Some(true))]);
+        // Nor one below it: the line a quote takes up again with after its
+        // cut is a piece of a line, whatever it looks like, as these were
+        // of `| R25 | … |` and of a row whose case holds a bar.
+        for piece in [
+            "25 | `test_aiter_json_in_memory_is_repeatable` | FAIL | `pytest -q`",
+            "`ll`, `lr`, `c\\|l`, `p`, empty) | FAIL | `node align.js` |",
+            "| — | docs untouched | UNCLEAR | which docs |",
+        ] {
+            let tail =
+                format!("    … [middle trimmed] …\n    {piece}\n    | R26 | repeatable | PASS |");
+            assert_eq!(verdicts(&tail), [(Some(26), Some(true))], "{piece}");
+        }
+        // Beside a requirement's rows, a line is a row only with a case
+        // between its first cell and its verdict: not a legend, a piece of
+        // a sentence, a cell that says two things, or a header.
+        for line in [
+            "**Table** (`PASS`; `FAIL | command`; `UNCLEAR | doubt`). Operators are named in words.",
+            "Legend | PASS | FAIL | UNCLEAR",
+            "the manager | PASS | every run above goes through that path (`h.py`)",
+            "| Set-aside: `log.WithError(err)` | PASS | not asked |",
+            "(fetch is `limit+1`) | PASS (by reading) |",
+            "| set-aside | \"with zero records nothing to persist\" | PASS/UNCLEAR — a header-only file |",
+            "| — | `consuming_from_sac` must check the queue | FAIL, by request words | returns `True` |",
+            "| # | Case | PASS / FAIL | Evidence |",
+            "| Req | Case | Verdict | What shows it |",
+            "| — | set-aside: rollback | FAIL | `npx jest letronna_spec` | not yet implemented |",
+            "| — | set-aside: `build()` bypasses caching | NOT RUN | no runner |",
+        ] {
+            let table = format!("| R1 | iso | PASS | `date -u` |\n{line}\n| R2 | utc | PASS |");
+            assert_eq!(
+                verdicts(&table),
+                [(Some(1), Some(true)), (Some(2), Some(true))],
+                "{line}"
+            );
+        }
+        // A table that counts its rows ahead of the requirement is read as
+        // it was, as no table.
+        let counted = "| 4 | R9 | relative dir | FAIL | `scc --bounded-memory-dir out src` |\n\
+                       | 5 | R10 | all formats | PASS |";
+        assert_eq!(verdicts(counted), []);
+        // And nothing between the lines that mark a report as written ahead
+        // of the work, nor a sentence of the request quoted in a notice.
+        let ahead = format!(
+            "{AHEAD_OPENS}\nR1 | adds | PASS\n— | set-aside: empty input | FAIL | pytest -q\n\
+             {AHEAD_CLOSES}\n— | another | FAIL | pytest -q"
+        );
+        assert_eq!(verdicts(&ahead), []);
+        let notice = "- R6: A failed test is printed as `name | status | FAIL | why`.\n\
+                      - R7: The summary is printed last.\n\nR6 | exact line | PASS | `node tap.js`";
+        assert_eq!(verdicts(notice), [(Some(6), Some(true))]);
+    }
+
+    #[test]
+    fn rows_of_no_requirement_a_cut_lost_are_written_again_under_their_own_first_cell() {
+        let report = "| R1 | `limit` kept | PASS | `npx jest -t limit` |\n\
+                      | R2 | cursor past the end | FAIL | `npx jest -t end`: 500 |\n\
+                      | set-aside | `total` with a cursor | PASS | not asked |\n\
+                      | **extra** | module-level `aspectsByTrait` | UNCLEAR — never pruned |\n\
+                      | — | `Not(aspect)` misses a complete entity | **FAIL** | `npx tsx check10.mts`: 0 |";
+        let again = cut_rows(report, "cut").unwrap();
+        assert_eq!(
+            again,
+            "\nRows of its table the quote above cut, written again:\n\
+             R2 | cursor past the end | FAIL | `npx jest -t end`: 500\n\
+             — | `Not(aspect)` misses a complete entity | FAIL | `npx tsx check10.mts`: 0\n\
+             extra | module-level `aspectsByTrait` | UNCLEAR | never pruned\n\
+             R1 | `limit` kept | PASS | `npx jest -t limit`\n\
+             set-aside | `total` with a cursor | PASS | not asked"
+        );
+        // Written again, they read as the rows they were.
+        let held = [
+            (Some(2), Some(false)),
+            (None, Some(false)),
+            (None, Some(false)),
+            (Some(1), Some(true)),
+            (None, Some(true)),
+        ];
+        assert_eq!(verdicts(&again), held);
+        // Also where the quote kept every requirement's row, so that only
+        // rows of no requirement are written under the line that marks them.
+        let quote = "    | R1 | `limit` kept | PASS | `npx jest -t limit` |\n\
+                     \x20   | R2 | cursor past the end | FAIL | `npx jest -t end`: 500 |\n\
+                     \x20   … [middle trimmed] …\n    Files I changed: none.";
+        let again = cut_rows(report, quote).unwrap();
+        assert!(
+            again.starts_with(&format!("\n{WRITTEN_AGAIN}\n— | `Not(aspect)`")),
+            "{again}"
+        );
+        assert_eq!(
+            verdicts(&again),
+            [(None, Some(false)), (None, Some(false)), (None, Some(true))]
+        );
+        // The end of a table the cut kept, with none of its requirement's
+        // rows, holds no row as the quote stands, so those are written
+        // again; with one of them, they are rows where they stand.
+        let tail = "    … [middle trimmed] …\n\
+                    \x20   module-level `aspectsByTrait` | UNCLEAR — never pruned |\n\
+                    \x20   | — | `Not(aspect)` misses a complete entity | **FAIL** | `npx tsx check10.mts`: 0 |";
+        let again = cut_rows(report, tail).unwrap();
+        assert!(again.contains("\n— | `Not(aspect)` misses"), "{again}");
+        let kept = format!(
+            "    | R2 | cursor past the end | FAIL | `npx jest -t end`: 500 |\n{}",
+            tail.split_once('\n').unwrap().1
+        );
+        let again = cut_rows(report, &kept).unwrap();
+        assert!(!again.contains("`Not(aspect)` misses"), "{again}");
+        assert!(again.contains("\nextra | module-level"), "{again}");
+        // Past the rows written again they are counted as any other.
+        let many: String = (1..=CUT_SHOWN)
+            .map(|n| format!("R{n} | c | PASS\n"))
+            .chain(["set-aside | docs untouched | PASS | not asked\n".to_owned()])
+            .collect();
+        let again = cut_rows(&many, "cut").unwrap();
+        assert!(again.ends_with("\nand 1 more row that passed"), "{again}");
     }
 
     #[test]
