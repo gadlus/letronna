@@ -1157,8 +1157,8 @@ const CUT_ORDER: [(&str, &str); 3] = [
 /// others is cut to its share of a page, so most of a long table reaches
 /// the run only as it is written again here. A row that belongs to no
 /// requirement is written again and counted as any other, under its own
-/// first cell; one that passed gives way to a requirement's only row where
-/// the room runs out. A row is lost where the quote does not read as a row
+/// first cell as written, its spans whole; one that passed gives way to a
+/// requirement's only row where the room runs out. A row is lost where the quote does not read as a row
 /// what the report does (`written`): the end of a table the cut kept may
 /// hold only rows of no requirement, which are rows of nothing without the
 /// requirement's row they stood under. None when the quote kept every row.
@@ -1238,10 +1238,14 @@ pub(crate) fn cut_rows(report: &str, quote: &str) -> Option<String> {
                 (false, true) => UNCLEAR,
                 (false, false) => "FAIL",
             };
-            // A row of no requirement opens with its own first cell.
+            // A row of no requirement opens with its own first cell, as
+            // written: a span in it stays whole as in any other cell. One
+            // left half open is the mark a row written whole in one span
+            // opens with, which is not the cell's.
             let head = match number {
                 Some(number) => format!("R{number}"),
-                None => cells[0].to_owned(),
+                None if halved(whole(0)) => cells[0].to_owned(),
+                None => whole(0).to_owned(),
             };
             let row = match shows.is_empty() {
                 true => format!("{head} | {case} | {word}"),
@@ -3421,6 +3425,30 @@ mod tests {
             .collect();
         let again = cut_rows(&many, "cut").unwrap();
         assert!(again.ends_with("\nand 1 more row that passed"), "{again}");
+        // A first cell with code in it is written again whole, as every
+        // other cell is: stripped of the marks at its edges, it left a span
+        // half open in five rows of one recorded review. Only the mark
+        // that opens a row written whole in one span is not the cell's.
+        let coded = "| R1 | `using` in a module | PASS | `run1.ts` |\n\
+                     | Set-aside: `using of;` | expression-statement reading | UNCLEAR | before: `Unexpected token: 'of'` |\n\
+                     | `a` and `b` | both orders | **FAIL** | `node both.js` prints `b` |\n\
+                     `extra | the count | FAIL | node count.js`";
+        let again = cut_rows(coded, "cut").unwrap();
+        assert_eq!(
+            again,
+            "\nRows of its table the quote above cut, written again:\n\
+             `a` and `b` | both orders | FAIL | `node both.js` prints `b`\n\
+             extra | the count | FAIL | node count.js\n\
+             Set-aside: `using of;` | expression-statement reading | UNCLEAR | before: `Unexpected token: 'of'`\n\
+             R1 | `using` in a module | PASS | `run1.ts`"
+        );
+        // They read back as the rows they were, and the one left unclear is
+        // known by the same first cell as before the cut.
+        let rows = [(None, Some(false)); 3];
+        assert_eq!(verdicts(&again)[..3], rows);
+        let told = unchecked(&format!("    R1 | `using` in a module | PASS{again}"), 1).unwrap();
+        assert_eq!(left_open(&told), left_open(&unchecked(coded, 1).unwrap()));
+        assert_eq!(left_open(&told), ["Set-aside: using of;"]);
     }
 
     #[test]
