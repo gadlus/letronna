@@ -745,13 +745,23 @@ const WRITTEN_AGAIN: &str = "Rows of its table the quote above cut, written agai
 /// failed or left unclear, and five in six of those never reached their
 /// run: one was `extra | module-level … | UNCLEAR | never pruned`, of the
 /// state that then hung the hidden tests. Such a line is a row by its shape
-/// and its place, not by its label: a case between the first cell and the
-/// one that gives the verdict, and a requirement's row above it in the same
-/// table, a table being lines with a bar that follow one another, or the
-/// rows `cut_rows` wrote again under `WRITTEN_AGAIN`. So a legend, a line a
-/// program printed, a sentence of the request, another helper's table of
-/// its own, or the piece of a line a quote takes up again with after its
-/// cut is none.
+/// and its place, not by its label: its verdict is in its third cell or a
+/// later one, so that a case stands between its first cell and the
+/// verdict, and it is directly under a requirement's row, one that gives a
+/// verdict, with nothing but lines that hold a bar between the two; or it
+/// is one of the rows `cut_rows` wrote again under `WRITTEN_AGAIN`. That
+/// keeps out what the reports and notices read do hold: a line apart from
+/// a requirement's rows, as another helper's table of its own, a sentence
+/// of the request and what a program printed are; one whose verdict is its
+/// second cell, as a legend `Key | PASS | FAIL` and the tail of a cut row
+/// are; and the piece of a line a quote takes up again with after its cut,
+/// which has no row above it. It asks nothing else of a line, so one of
+/// that shape set directly under a requirement's row is read whatever it
+/// is: a row of another table with no line between the two, a line that
+/// sums the table up as `Overall | all rows | FAIL | …` does, a line a
+/// program printed in three cells. None stands so in the 543 reports read,
+/// and a list of words such as "Overall" would be a guess at what none of
+/// them wrote.
 fn written(report: &str) -> Vec<(Option<usize>, Option<bool>, String)> {
     let mut found = Vec::new();
     let mut ahead = false;
@@ -3371,6 +3381,53 @@ mod tests {
         let notice = "- R6: A failed test is printed as `name | status | FAIL | why`.\n\
                       - R7: The summary is printed last.\n\nR6 | exact line | PASS | `node tap.js`";
         assert_eq!(verdicts(notice), [(Some(6), Some(true))]);
+    }
+
+    #[test]
+    fn a_line_of_a_rows_shape_directly_under_a_requirements_row_is_read_whatever_it_is() {
+        // What the rule does with what no recorded review wrote, pinned:
+        // it asks a line's shape and its place, and nothing of what it is.
+        let under = |lines: &str| {
+            verdicts(&format!("| R1 | iso | PASS | `date -u` |\n{lines}"))[1..].to_vec()
+        };
+        // A table of results set under the review's with no line between.
+        let results = "| input | output | expected | result |\n|---|---|---|---|\n\
+                       | `..3` | `[0,3]` | error | FAIL |";
+        assert_eq!(under(results), [(None, Some(false))]);
+        // A line that sums the table up, one a program printed, a note,
+        // and the key to the table, read as the first of its verdicts that
+        // does not pass.
+        for (line, passed) in [
+            ("| **Overall** | — | **FAIL** | 1 of 2 rows fails |", false),
+            ("| Summary | 2 rows | FAIL |", false),
+            ("| Total | 2 rows, 1 passed | PASS |", true),
+            ("not ok | t2 | FAIL | boom", false),
+            ("| note | the suite prints | `PASS` | when green |", true),
+            (
+                "| Key | meaning | PASS — ran and matched | FAIL — ran and differed | UNCLEAR — could not tell |",
+                false,
+            ),
+        ] {
+            assert_eq!(under(line), [(None, Some(passed))], "{line}");
+            // Apart from the requirement's row, none is a row.
+            assert_eq!(under(&format!("\n{line}")), [], "{line}");
+            assert_eq!(under(&format!("```\n{line}\n```")), [], "{line}");
+        }
+        // With no case between its first cell and its verdict, none is one
+        // under the requirement's row either.
+        for line in [
+            "| Overall | FAIL |",
+            "| Overall | | FAIL | 1 of 2 |",
+            "Overall: 1 PASS | 1 FAIL | 0 UNCLEAR",
+            "| Key | PASS | FAIL | UNCLEAR |",
+        ] {
+            assert_eq!(under(line), [], "{line}");
+        }
+        // Read, such a line holds the run as any row of no requirement
+        // does: to a line that opens with its first cell.
+        let summed = "R1 | iso | PASS | `date -u`\n\
+                      | **Overall** | all rows | **UNCLEAR** | could not run the suite |";
+        assert_eq!(left_open(&unchecked(summed, 1).unwrap()), ["Overall"]);
     }
 
     #[test]
