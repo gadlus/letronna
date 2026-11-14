@@ -1478,7 +1478,8 @@ pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
 /// `—`, which is what the line that answers it opens with (`settles`). They
 /// are told by the list they are in, since a long row is cut before the
 /// cell that says so. A first cell that is a list's or a table's marks
-/// alone is left out: no line could open with it.
+/// alone, or a list's number alone, is left out: no line could open with
+/// it (`label`).
 pub(crate) fn left_open(text: &str) -> Vec<String> {
     let opening = format!("[{} check] The review's table ", crate::BRAND);
     if !text.starts_with(&opening) {
@@ -1511,11 +1512,26 @@ pub(crate) fn left_open(text: &str) -> Vec<String> {
 const MARKS: [char; 8] = ['-', '*', '|', '`', '>', '#', ' ', '\t'];
 
 /// The first `cell` of a row that belongs to no requirement as a notice
-/// names it and an answer's line opens with it: without the marks a line
-/// may open with, and without those of code, which the span a notice
-/// shows it in would end at.
+/// names it and an answer's line opens with it: without the marks or the
+/// list's number a line may open with (`unlisted`), since an answer's line
+/// is read without them and one held to `1. extra` could be settled by no
+/// line; and without the marks of code, which the span a notice shows it
+/// in would end at. Empty for a cell that is marks or a list's number and
+/// no more.
 fn label(cell: &str) -> String {
-    cell.trim_start_matches(MARKS).replace('`', "")
+    unlisted(cell).replace('`', "")
+}
+
+/// `line` without what it opens with ahead of what it says: the marks of a
+/// list, a heading or a table, and a numbered list's number, as "1. R4"
+/// and "2) extra" have.
+fn unlisted(line: &str) -> &str {
+    let line = line.trim_start_matches(MARKS);
+    let item = line.trim_start_matches(|c: char| c.is_ascii_digit());
+    match item.strip_prefix(['.', ')']) {
+        Some(rest) if item.len() < line.len() => rest.trim_start_matches(MARKS),
+        _ => line,
+    }
 }
 
 /// The requirements `head` opens with, as `R4`, `R4/R5` or `R4 and R5`
@@ -1618,13 +1634,7 @@ fn loosely(label: &str) -> String {
 /// doubt copied back in it; and a cell that is one code span and more than
 /// a verdict's word quotes, as one in quote marks does, so it gives none.
 fn settles(line: &str, row: &str, request: &[String]) -> bool {
-    let line = line.trim_start_matches(MARKS);
-    // A numbered list's item, as "1. R4".
-    let item = line.trim_start_matches(|c: char| c.is_ascii_digit());
-    let line = match item.strip_prefix(['.', ')']) {
-        Some(rest) if item.len() < line.len() => rest.trim_start_matches(MARKS),
-        _ => line,
-    };
+    let line = unlisted(line);
     let cells = cells(line);
     let [head, reading, ..] = cells.as_slice() else {
         return false;
@@ -4320,6 +4330,65 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    #[test]
+    fn a_first_cell_that_opens_with_a_lists_number_is_known_without_it() {
+        // An answer's line that opens "1. " is read as a list's item, its
+        // number no part of what it says, so a row whose first cell opens
+        // so is known by what follows the number: held to `1. extra`, no
+        // line the run could write would have settled it.
+        let report = "R1 | iso | PASS | `date -u`\n\
+                      | 1. extra | module-level `aspectsByTrait` | UNCLEAR | never pruned |\n\
+                      | 2) other | dead helper | UNCLEAR | unused |";
+        let sent = unchecked(report, 1).unwrap();
+        assert_eq!(left_open(&sent), ["extra", "other"]);
+        let form = "write one line in your answer, `extra | reading taken | ";
+        assert!(sent.contains(form), "{sent}");
+        let quote = "\"default to the end of the input\"";
+        for answer in [
+            format!(
+                "1. extra | not stated | {quote} | left as is\n2) other | not stated | {quote} | left as is"
+            ),
+            format!(
+                "extra | not stated | {quote} | left as is\n- other | not stated | {quote} | left as is"
+            ),
+            format!(
+                "| 1. extra | not stated | {quote} | left as is |\n| 2) other | not stated | {quote} | left as is |"
+            ),
+        ] {
+            assert_eq!(
+                unresolved(&[answered(&answer)], OPEN, &left_open(&sent)),
+                None,
+                "{answer}"
+            );
+        }
+        // A first cell that is the number alone is held to no line, as
+        // one that is a list's mark alone: whatever line opened with it
+        // would be read as an item that opens with its reading.
+        let bare = "R1 | iso | PASS | `date -u`\n\
+                    | 1. | docs untouched | UNCLEAR | which docs |\n\
+                    | 2) | `total` with a cursor | UNCLEAR | counts all matches |";
+        let sent = unchecked(bare, 1).unwrap();
+        assert!(
+            sent.contains("left unclear:\n- | 1. | docs untouched | UNCLEAR"),
+            "{sent}"
+        );
+        assert!(left_open(&sent).is_empty(), "{sent}");
+        assert!(!sent.contains("write one line"), "{sent}");
+        // A number that is no list's keeps its place: `2`, `#3` and `S1`
+        // open a line as they open their rows.
+        let counted = "R1 | iso | PASS\n2 | docs untouched | UNCLEAR | which docs\n\
+                       S1 | dead helper | UNCLEAR | unused";
+        let sent = unchecked(counted, 1).unwrap();
+        assert_eq!(left_open(&sent), ["2", "S1"]);
+        let answer = format!(
+            "2 | not stated | {quote} | left as is\nS1 | not stated | {quote} | left as is"
+        );
+        assert_eq!(
+            unresolved(&[answered(&answer)], OPEN, &left_open(&sent)),
+            None
+        );
     }
 
     #[test]
