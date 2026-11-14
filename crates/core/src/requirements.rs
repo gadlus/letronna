@@ -1322,7 +1322,13 @@ fn counted(count: usize, what: &str) -> String {
 /// other does where it failed or was left unclear, listed as it was
 /// written, and is answered by a line that opens with its own first cell;
 /// it is never a requirement's row, so a requirement with only such rows
-/// near it still has none.
+/// near it still has none. Of each kind the requirements' rows are listed
+/// first and those of no requirement after them, each in the table's
+/// order: only `FAILED_SHOWN` and `UNCLEAR_SHOWN` are listed, a run's
+/// notice holds its reviews one after another, and listed where the tables
+/// had them the first review's rows of no requirement took the places of
+/// the next review's requirements, 59 rows left unclear and 5 failed in
+/// the benchmark runs read.
 pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
     let rows = rows(report);
     let missing: Vec<String> = (1..=count)
@@ -1330,10 +1336,16 @@ pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
         .map(|number| format!("R{number}"))
         .collect();
     let written = written(report);
-    let (unclear, failed): (Vec<_>, Vec<_>) = (written.iter())
-        .filter(|(_, passed, _)| *passed == Some(false))
-        .filter(|(number, _, _)| number.is_none_or(|number| number <= count))
-        .partition(|(_, _, row)| left_unclear(row));
+    // The rows that hold the run that are a requirement's, or else those
+    // of no requirement.
+    let held = |numbered: bool| {
+        (written.iter())
+            .filter(move |(number, _, _)| number.is_some() == numbered)
+            .filter(|(_, passed, _)| *passed == Some(false))
+            .filter(|(number, _, _)| number.is_none_or(|number| number <= count))
+    };
+    let (unclear, failed): (Vec<_>, Vec<_>) =
+        (held(true).chain(held(false))).partition(|(_, _, row)| left_unclear(row));
     if missing.is_empty() && failed.is_empty() && unclear.is_empty() {
         return None;
     }
@@ -4108,6 +4120,74 @@ mod tests {
         ] {
             assert!(listed(row).is_some(), "{row}");
         }
+    }
+
+    #[test]
+    fn rows_of_requirements_are_listed_before_rows_that_name_none() {
+        // The rows three reviews of one run left unclear, in the order its
+        // notice held them: the first review's doubt beyond its
+        // requirements stands second, and ten rows of requirements follow.
+        let doubts = [
+            "R6 | re-evaluation only when a dependency trait is present | UNCLEAR | every path goes through `instance.predicates`",
+            "— | `registerPredicate` scans every live entity each time | UNCLEAR | cost is O(entities × queries)",
+            "R3 | predicate returns truthy non-boolean | UNCLEAR | implementation requires `=== true`",
+            "R7 | `Not(predicate)` where the predicate returns a truthy object | UNCLEAR | got `[1]`",
+            "R9 | reading: run-time diff | UNCLEAR | both readings quote \"not present in the previous result\"",
+            "R9 | entity already satisfying P, modifier created after | UNCLEAR | `r9.ts` \"A first run\" → 0",
+            "R9 | same input, but world created after the modifier | UNCLEAR | `r9.ts` \"E world2\" → 1",
+            "R10 | true→false→true before the run | UNCLEAR | \"matches transition to false\"",
+            "R11 | predicate created after a previous transition | UNCLEAR | baseline missing",
+            "R13 | nested `updateEach` (deferral depth) | UNCLEAR | I did not exercise nesting",
+            "R10 | `entity.remove(Position)` threw once | UNCLEAR | not reproducible in five reruns",
+        ];
+        let passed: String = (1..=13)
+            .map(|n| format!("R{n} | plain case | PASS | `r{n}.ts`\n"))
+            .collect();
+        let text = unchecked(&format!("{passed}{}", doubts.join("\n")), 13).unwrap();
+        // Each requirement's row is among the ten listed, in the table's
+        // order, and the one of no requirement is counted after them:
+        // listed where it stood, it took the last one's place.
+        let listed: Vec<&str> = text.lines().skip(1).take(11).collect();
+        let mut held: Vec<String> = (doubts.iter())
+            .filter(|row| row.starts_with('R'))
+            .map(|row| format!("- {row}"))
+            .collect();
+        held.push("- and 1 more left unclear".to_owned());
+        assert_eq!(listed, held, "{text}");
+        assert_eq!(
+            left_open(&text),
+            ["R6", "R3", "R7", "R9", "R10", "R11", "R13"]
+        );
+        // With a place left among the ten, it is listed, last.
+        let text = unchecked(&format!("{passed}{}", doubts[..10].join("\n")), 13).unwrap();
+        let listed: Vec<&str> = text.lines().skip(1).take(11).collect();
+        assert_eq!(listed[8], format!("- {}", doubts[9]), "{text}");
+        assert_eq!(listed[9], format!("- {}", doubts[1]), "{text}");
+        assert!(
+            listed[10].starts_with("A row left unclear is a doubt"),
+            "{text}"
+        );
+        assert_eq!(left_open(&text).last().map(String::as_str), Some("—"));
+        // The same of the rows that failed, each kind apart.
+        let failed = "R1 | iso | PASS | `date -u`\n\
+                      R2 | aspect created after the entity is complete | FAIL | `npx tsx final.mts`: false\n\
+                      — | `Not(aspect)` misses a complete entity | FAIL | `npx tsx check10.mts`: 0\n\
+                      extra | module-level `aspectsByTrait` | UNCLEAR | never pruned\n\
+                      R2 | sibling write from a callback survives | FAIL | `part-e.mts`: `{b:2}`\n\
+                      R1 | same trait twice | UNCLEAR | the request is silent on repeats";
+        let text = unchecked(failed, 2).unwrap();
+        assert!(
+            text.starts_with(
+                "[Letronna check] The review's table has these rows that failed:\n\
+                 - R2 | aspect created after the entity is complete | FAIL | `npx tsx final.mts`: false\n\
+                 - R2 | sibling write from a callback survives | FAIL | `part-e.mts`: `{b:2}`\n\
+                 - — | `Not(aspect)` misses a complete entity | FAIL | `npx tsx check10.mts`: 0\n\
+                 and these left unclear:\n\
+                 - R1 | same trait twice | UNCLEAR | the request is silent on repeats\n\
+                 - extra | module-level `aspectsByTrait` | UNCLEAR | never pruned\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
