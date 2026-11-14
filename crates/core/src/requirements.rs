@@ -1415,8 +1415,9 @@ pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
         unclear.take(UNCLEAR_SHOWN).chain(failed.take(FAILED_SHOWN))
     };
     let numbered = listed().find_map(|(number, _, _)| Some(format!("R{}", (*number)?)));
-    let loose = (listed().find(|(number, _, _)| number.is_none()))
-        .and_then(|(_, _, row)| cells(row).first().map(|label| (*label).to_owned()));
+    let loose = (listed().filter(|(number, _, _)| number.is_none()))
+        .filter_map(|(_, _, row)| cells(row).first().map(|cell| label(cell)))
+        .find(|label| !label.is_empty());
     if let Some(head) = numbered.as_ref().or(loose.as_ref()) {
         let which = match (unclear.is_empty(), failed.is_empty()) {
             (false, true) => "each row left unclear above",
@@ -1433,10 +1434,7 @@ pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
         ));
     }
     if let Some(label) = loose {
-        text.push_str(&format!(
-            "A row that names no requirement gets its line as well, opened with the row's own \
-             first cell where a number would be, as `{label} | reading taken | …`. "
-        ));
+        text.push_str(&loosely(&label));
     }
     // A probe of the run's own, of something else, let it answer as not
     // stated a row whose command had shown the work differ. The form above
@@ -1457,11 +1455,15 @@ pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
     Some(text)
 }
 
-/// The requirements whose rows `text` shows as left unclear, each once,
-/// when it is the notice `unchecked` writes; none for any other text. They
+/// What the rows `text` shows as left unclear open with, each once, when it
+/// is the notice `unchecked` writes; none for any other text: `R4` for a
+/// requirement's rows, the first requirement the row names, and its own
+/// first cell for a row that belongs to no requirement, as `set-aside` or
+/// `—`, which is what the line that answers it opens with (`settles`). They
 /// are told by the list they are in, since a long row is cut before the
-/// cell that says so.
-pub(crate) fn left_open(text: &str) -> Vec<usize> {
+/// cell that says so. A first cell that is a list's or a table's marks
+/// alone is left out: no line could open with it.
+pub(crate) fn left_open(text: &str) -> Vec<String> {
     let opening = format!("[{} check] The review's table ", crate::BRAND);
     if !text.starts_with(&opening) {
         return Vec::new();
@@ -1473,12 +1475,31 @@ pub(crate) fn left_open(text: &str) -> Vec<usize> {
             listing = line.ends_with("left unclear:");
             continue;
         };
-        let number = (cells(row).first())
-            .and_then(|cell| numbers(cell).first().copied())
-            .filter(|number| !open.contains(number));
-        open.extend(number);
+        let cells = cells(row);
+        let head = (cells.first())
+            .and_then(|cell| match numbers(cell).first() {
+                Some(number) => Some(format!("R{number}")),
+                // With its case after it, as the count of the rows the list
+                // leaves out has none.
+                None if cells.len() > 1 => Some(label(cell)),
+                None => None,
+            })
+            .filter(|head| !head.is_empty() && !open.contains(head));
+        open.extend(head);
     }
     open
+}
+
+/// The marks of a list, a heading or a table that a line may open with
+/// ahead of what it says.
+const MARKS: [char; 8] = ['-', '*', '|', '`', '>', '#', ' ', '\t'];
+
+/// The first `cell` of a row that belongs to no requirement as a notice
+/// names it and an answer's line opens with it: without the marks a line
+/// may open with, and without those of code, which the span a notice
+/// shows it in would end at.
+fn label(cell: &str) -> String {
+    cell.trim_start_matches(MARKS).replace('`', "")
 }
 
 /// The requirements `head` opens with, as `R4`, `R4/R5` or `R4 and R5`
@@ -1500,11 +1521,18 @@ fn numbers(head: &str) -> Vec<usize> {
 }
 
 /// What sends a run back once more when its replies in `messages`, those
-/// after the notice that showed it `rows` left unclear, hold no line for
-/// one of them in the form that notice asked for (`settles`). None when
-/// each has one. A check of words, with no model: it tells an answer that
-/// weighed the request from "unclear; leave", and asks for no change.
-pub(crate) fn unresolved(messages: &[Message], request: &str, rows: &[usize]) -> Option<String> {
+/// after the notice that showed it `rows` left unclear, each by what it
+/// opens with (`left_open`), hold no line for one of them in the form that
+/// notice asked for (`settles`). None when each has one. A check of words,
+/// with no model: it tells an answer that weighed the request from
+/// "unclear; leave", and asks for no change. The form is shown for a
+/// requirement's row where one is open, and what the line for a row of no
+/// requirement opens with is said after it (`loosely`).
+pub(crate) fn unresolved(
+    messages: &[Message],
+    request: &str,
+    rows: &[impl AsRef<str>],
+) -> Option<String> {
     let request: Vec<String> = (crate::doubts::words(request).into_iter())
         .map(|(_, word)| word)
         .collect();
@@ -1512,19 +1540,26 @@ pub(crate) fn unresolved(messages: &[Message], request: &str, rows: &[usize]) ->
         .filter(|message| message.role == "assistant")
         .flat_map(|message| message.content.lines())
         .collect();
-    let mut open: Vec<String> = Vec::new();
-    for &number in rows {
-        let name = format!("R{number}");
-        let settled = lines.iter().any(|line| settles(line, number, &request));
-        if !settled && !open.contains(&name) {
-            open.push(name);
+    let mut open: Vec<&str> = Vec::new();
+    for row in rows.iter().map(AsRef::as_ref) {
+        let settled = lines.iter().any(|line| settles(line, row, &request));
+        if !settled && !open.contains(&row) {
+            open.push(row);
         }
     }
-    let first = open.first()?.clone();
+    let loose = open.iter().find(|row| numbers(row).is_empty());
+    let first = (open.iter().find(|row| !numbers(row).is_empty())).or(open.first())?;
     let (rows, each) = match open.len() {
         1 => ("a row", "it"),
         _ => ("rows", "each"),
     };
+    // A row of no requirement is named by its first cell, in a code span.
+    let names: Vec<String> = (open.iter())
+        .map(|row| match numbers(row).is_empty() {
+            true => format!("`{row}`"),
+            false => (*row).to_owned(),
+        })
+        .collect();
     Some(format!(
         "[{} check] The review left {rows} of {} unclear, and your answer has no line for \
          {each} that names the reading you took and quotes the request. Write one line for \
@@ -1532,15 +1567,30 @@ pub(crate) fn unresolved(messages: &[Message], request: &str, rows: &[usize]) ->
          with {SETTLING} or more words in a row quoted as the request writes them and a \
          command you ran that tests that reading. Where the request states nothing on the \
          case, write `{first} | {NOT_STATED} | \"the nearest words it does have\" | left as \
-         is`, and change nothing for that row on a guess. Only your last message is passed \
+         is`, and change nothing for that row on a guess. {}Only your last message is passed \
          on as your answer, so end with your whole answer again, not only what changed.",
         crate::BRAND,
-        and_list(&open)
+        and_list(&names),
+        loose.map(|label| loosely(label)).unwrap_or_default()
     ))
 }
 
-/// Whether `line` of an answer settles requirement `number`'s row. It opens
-/// with that number, after any marks of a list, a heading or a table; it
+/// What a notice that asks for a line for each row says of a row that
+/// belongs to no requirement, `label` being the first cell of one: the form
+/// it shows opens with a requirement's number, which such a row has none of.
+fn loosely(label: &str) -> String {
+    format!(
+        "A row that names no requirement gets its line as well, opened with the row's own \
+         first cell where a number would be, as `{label} | reading taken | …`. "
+    )
+}
+
+/// Whether `line` of an answer settles the row that opens with `row`, a
+/// requirement's number as `R4` or the first cell of a row that belongs to
+/// no requirement (`left_open`). It opens with that number, after any marks
+/// of a list, a heading or a table, or its first cell opens with that
+/// cell's words, whatever their case and marks of code, so that
+/// `set-aside (the record's name)` answers a row under `Set-aside`; it
 /// has a cell after that for the reading taken, which is no shrug such as
 /// "unclear, leave" though it may be `NOT_STATED`; it quotes, in quote marks or a
 /// code span, `SETTLING` or more words found in a row in `request`, its
@@ -1551,20 +1601,24 @@ pub(crate) fn unresolved(messages: &[Message], request: &str, rows: &[usize]) ->
 /// which takes the cell after the number for the case and so would pass a
 /// doubt copied back in it; and a cell that is one code span and more than
 /// a verdict's word quotes, as one in quote marks does, so it gives none.
-fn settles(line: &str, number: usize, request: &[String]) -> bool {
-    let marks = |c: char| matches!(c, '-' | '*' | '|' | '`' | '>' | '#' | ' ' | '\t');
-    let line = line.trim_start_matches(marks);
+fn settles(line: &str, row: &str, request: &[String]) -> bool {
+    let line = line.trim_start_matches(MARKS);
     // A numbered list's item, as "1. R4".
     let item = line.trim_start_matches(|c: char| c.is_ascii_digit());
     let line = match item.strip_prefix(['.', ')']) {
-        Some(rest) if item.len() < line.len() => rest.trim_start_matches(marks),
+        Some(rest) if item.len() < line.len() => rest.trim_start_matches(MARKS),
         _ => line,
     };
     let cells = cells(line);
     let [head, reading, ..] = cells.as_slice() else {
         return false;
     };
-    if cells.len() < 3 || !numbers(head).contains(&number) {
+    let plain = |cell: &str| cell.replace(['`', '*'], "").to_lowercase();
+    let named = match numbers(row).first() {
+        Some(number) => numbers(head).contains(number),
+        None => plain(head).starts_with(&plain(row)),
+    };
+    if cells.len() < 3 || !named {
         return false;
     }
     // A shrug is a few words that are all of them shrugs, so a reading that
@@ -2810,7 +2864,7 @@ mod tests {
             ),
             "{text}"
         );
-        assert_eq!(left_open(&text), [1]);
+        assert_eq!(left_open(&text), ["R1"]);
         assert!(left_unclear(
             "R1 | closed but never read | UNCLEAR — raises `Closed`"
         ));
@@ -3077,7 +3131,7 @@ mod tests {
             text.contains("that failed:\n- | R4 (set aside) | which end"),
             "{text}"
         );
-        assert_eq!(left_open(&text), [13]);
+        assert_eq!(left_open(&text), ["R13"]);
         // A sentence that opens with a number and a bracket is still none,
         // nor is a note with no number before it.
         for prose in [
@@ -3715,7 +3769,7 @@ mod tests {
         let long = format!("R1 | {} | UNCLEAR | which zone", "a long case ".repeat(40));
         let cut = unchecked(&long, 1).unwrap();
         assert!(!cut.contains("UNCLEAR"), "{cut}");
-        assert_eq!(left_open(&cut), [1]);
+        assert_eq!(left_open(&cut), ["R1"]);
         // A table with only failed rows is told nothing of doubts, and is
         // asked for the line only for a row it does not fix.
         let failed = unchecked("R1 | iso | PASS\nR2 | utc | FAIL | t.sh", 2).unwrap();
@@ -3785,7 +3839,8 @@ mod tests {
             "{text}"
         );
         // The rows shown as unclear are the ones an answer is held to.
-        assert_eq!(left_open(&text), (1..=10).collect::<Vec<_>>());
+        let shown: Vec<String> = (1..=10).map(|n| format!("R{n}")).collect();
+        assert_eq!(left_open(&text), shown);
         // With rows missing too, the lists go on from them.
         let both = unchecked("R1 | a | FAIL | t.sh\nR1 | b | UNCLEAR | which end", 2).unwrap();
         assert!(
@@ -3796,7 +3851,7 @@ mod tests {
             ),
             "{both}"
         );
-        assert_eq!(left_open(&both), [1]);
+        assert_eq!(left_open(&both), ["R1"]);
         // No other text holds a run to a line.
         assert!(left_open("- R1 | b | UNCLEAR | which end").is_empty());
         assert!(left_open(&notice(&["It must hold.".to_owned()], true, &[])).is_empty());
@@ -3892,7 +3947,7 @@ mod tests {
         let line = "R3 | the end of the whole input, not of the line | \"default to the end \
                     of the input\" | `cargo test open_range`";
         let answer = format!("Fixed R2.\n\n{line}\n\nAll rows pass now.");
-        assert_eq!(unresolved(&[answered(&answer)], OPEN, &[3]), None);
+        assert_eq!(unresolved(&[answered(&answer)], OPEN, &["R3"]), None);
         // However the line is laid out, in any reply after the notice: as
         // a list's item, a table's row or a heading, for two rows at once,
         // the quote in a code span, without the request's marks, or with
@@ -3918,20 +3973,20 @@ mod tests {
         ];
         for line in laid {
             let replies = [answered(line), answered("Done.")];
-            assert_eq!(unresolved(&replies, OPEN, &[3]), None, "{line}");
+            assert_eq!(unresolved(&replies, OPEN, &["R3"]), None, "{line}");
         }
         // Where the request states nothing on the case, saying so with the
         // nearest words is an answer, and no change is asked for.
         let silent = "R3 | not stated | \"default to the end of the input\" | left as is";
-        assert_eq!(unresolved(&[answered(silent)], OPEN, &[3]), None);
+        assert_eq!(unresolved(&[answered(silent)], OPEN, &["R3"]), None);
         // Nothing is asked with no row left unclear.
-        assert_eq!(unresolved(&[answered("Done.")], OPEN, &[]), None);
+        assert_eq!(unresolved(&[answered("Done.")], OPEN, &[""; 0]), None);
     }
 
     #[test]
     fn a_row_shrugged_off_or_settled_by_words_the_request_lacks_is_listed() {
-        let listed = |answer: &str, rows: &[usize]| unresolved(&[answered(answer)], OPEN, rows);
-        let text = listed("R3: unclear; the request does not say. Leave.", &[3]).unwrap();
+        let listed = |answer: &str, rows: &[&str]| unresolved(&[answered(answer)], OPEN, rows);
+        let text = listed("R3: unclear; the request does not say. Leave.", &["R3"]).unwrap();
         assert!(
             text.starts_with(
                 "[Letronna check] The review left a row of R3 unclear, and your answer has no \
@@ -3972,12 +4027,12 @@ mod tests {
             "Leave.",
         ];
         for answer in unsettled {
-            assert!(listed(answer, &[3]).is_some(), "{answer}");
+            assert!(listed(answer, &["R3"]).is_some(), "{answer}");
         }
         // Each row without a line is named, once, and the settled ones are not.
         let answer = "R2 | both ends given | \"must be written as `a..b`\" | cargo test\n\
                       R1: unclear. Leave.";
-        let text = listed(answer, &[1, 2, 3, 3]).unwrap();
+        let text = listed(answer, &["R1", "R2", "R3", "R3"]).unwrap();
         assert!(
             text.contains("left rows of R1 and R3 unclear, and your answer has no line for each"),
             "{text}"
@@ -3989,12 +4044,12 @@ mod tests {
             content: "R3 | whole input | \"default to the end of the input\" | cargo test".into(),
             ..Default::default()
         };
-        assert!(unresolved(&[user], OPEN, &[3]).is_some());
+        assert!(unresolved(&[user], OPEN, &["R3"]).is_some());
     }
 
     #[test]
     fn a_reviews_row_copied_back_settles_nothing_however_its_verdict_is_written() {
-        let listed = |answer: &str| unresolved(&[answered(answer)], OPEN, &[3]);
+        let listed = |answer: &str| unresolved(&[answered(answer)], OPEN, &["R3"]);
         // With what shows the verdict in its cell, or the verdict at the
         // end of another, the row is the review's all the same.
         for row in [
@@ -4031,7 +4086,7 @@ mod tests {
         // The request's own words may open or close with a verdict's.
         let request = "Print one line per test. When every test passes, the last line must be \
                        `PASS: all tests passed`. A failing test is printed as `FAIL: <name>`.";
-        let listed = |answer: &str| unresolved(&[answered(answer)], request, &[4]);
+        let listed = |answer: &str| unresolved(&[answered(answer)], request, &["R4"]);
         // Quoted in a code span they settle the row, as in quote marks.
         for line in [
             "R4 | the line is kept | \"PASS: all tests passed\" | node tap.js",
@@ -4052,6 +4107,110 @@ mod tests {
             "R4 | the line is kept | `UNCLEAR` | \"PASS: all tests passed\"",
         ] {
             assert!(listed(row).is_some(), "{row}");
+        }
+    }
+
+    #[test]
+    fn a_row_of_no_requirement_is_answered_by_a_line_that_opens_with_its_first_cell() {
+        // Doubts as reviews wrote them below their requirements' rows.
+        let report = "R1 | iso | PASS | `date -u`\n\
+                      R2 | which zone | UNCLEAR | the words name none\n\
+                      | extra | module-level `aspectsByTrait` | UNCLEAR | never pruned |\n\
+                      | — | docs untouched | UNCLEAR | which docs |\n\
+                      | — | `total` with a cursor | UNCLEAR | counts all matches |\n\
+                      | **Set-aside** | hidden tests import `Record` | UNCLEAR — both names fit |\n\
+                      - | compile check | UNCLEAR | no toolchain";
+        let sent = unchecked(report, 2).unwrap();
+        // Each is held by what it opens with, once, but for one that
+        // opens with a list's mark alone.
+        let open = left_open(&sent);
+        assert_eq!(open, ["R2", "extra", "—", "Set-aside"]);
+        // A line for each settles them, however it is laid out.
+        let quote = "\"default to the end of the input\"";
+        let answer = format!(
+            "R2 | the whole input | {quote} | `cargo test open_range`\n\
+             - extra | not stated | {quote} | left as is\n\
+             | **—** | docs are not asked for | {quote} | `git status --short` |\n\
+             set-aside (the record's name) | not stated | {quote} | left as is"
+        );
+        assert_eq!(unresolved(&[answered(&answer)], OPEN, &open), None);
+        for line in [
+            format!("extra | not stated | {quote} | left as is"),
+            format!("`extra` | not stated | {quote} | left as is"),
+            format!("1. Extra: the module-level map | not stated | {quote} | left as is"),
+            format!("### extra | the map is per module | {quote} | `node many.js`"),
+        ] {
+            assert_eq!(
+                unresolved(&[answered(&line)], OPEN, &["extra"]),
+                None,
+                "{line}"
+            );
+        }
+        // Without one, the run is sent back for it, by its first cell.
+        let partial = answer.lines().take(2).collect::<Vec<_>>().join("\n");
+        let text = unresolved(&[answered(&partial)], OPEN, &open).unwrap();
+        assert!(
+            text.starts_with(
+                "[Letronna check] The review left rows of `—` and `Set-aside` unclear, and your \
+                 answer has no line for each that names the reading you took and quotes the \
+                 request. Write one line for each, `— | reading taken | \"the request's words \
+                 for it\" | command run`"
+            ),
+            "{text}"
+        );
+        let opened = "on a guess. A row that names no requirement gets its line as well, opened \
+                      with the row's own first cell where a number would be, as `— | reading \
+                      taken | …`. Only your last message";
+        assert!(text.contains(opened), "{text}");
+        // With a requirement's row open too, the form is shown for that.
+        let text = unresolved(&[answered("Done.")], OPEN, &open).unwrap();
+        assert!(
+            text.contains("rows of R2, `extra`, `—` and `Set-aside` unclear"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Write one line for each, `R2 | reading taken | "),
+            "{text}"
+        );
+        assert!(
+            text.contains("as `extra | reading taken | …`. Only"),
+            "{text}"
+        );
+        // A line for another row, the review's own row copied back, a
+        // shrug, or words the request lacks settle nothing, as for a
+        // requirement's row.
+        for line in [
+            format!("set-aside | not stated | {quote} | left as is"),
+            format!("R2 | not stated | {quote} | left as is"),
+            "extra | module-level `aspectsByTrait` | UNCLEAR | never pruned".to_owned(),
+            format!("extra | unclear, leave | {quote} | none"),
+            "extra | not stated | \"never pruned\" | left as is".to_owned(),
+            format!("As for the extra row, {quote} says nothing of it."),
+        ] {
+            assert!(
+                unresolved(&[answered(&line)], OPEN, &["extra"]).is_some(),
+                "{line}"
+            );
+        }
+        // With no requirement's row left unclear, the rest still are. A
+        // first cell with code in it is named without the marks of code,
+        // which the span it is shown in would end at, and a line that
+        // opens with it settles its row with them or without.
+        let coded = "R1 | iso | PASS\n\
+                     | Set-aside: `using of;` | as an expression statement | UNCLEAR | either parse |";
+        let sent = unchecked(coded, 1).unwrap();
+        assert_eq!(left_open(&sent), ["Set-aside: using of;"]);
+        assert!(
+            sent.contains("as `Set-aside: using of; | reading taken | …`. "),
+            "{sent}"
+        );
+        for head in ["Set-aside: `using of;`", "set-aside: using of;"] {
+            let line = format!("{head} | not stated | {quote} | left as is");
+            assert_eq!(
+                unresolved(&[answered(&line)], OPEN, &left_open(&sent)),
+                None,
+                "{line}"
+            );
         }
     }
 
@@ -4434,7 +4593,7 @@ mod tests {
         let text = unchecked(&again, 23).unwrap();
         assert!(!text.contains("has no row"), "{text}");
         assert!(text.contains("- R23 | exact message | FAIL"), "{text}");
-        assert_eq!(left_open(&text), [21, 22]);
+        assert_eq!(left_open(&text), ["R21", "R22"]);
         // The passed rows kept are in the table's order, each requirement's
         // first among them.
         let kept: Vec<usize> = (rows(&again).iter())
