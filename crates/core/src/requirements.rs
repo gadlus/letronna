@@ -1318,14 +1318,21 @@ fn counted(count: usize, what: &str) -> String {
 /// the difference the row had shown was the one that counted. That is
 /// asked in words alone: whether a row names two results is not read off
 /// it, so `unresolved` takes a line that says not stated for any row.
+/// A row that belongs to no requirement (`written`) holds the run as any
+/// other does where it failed or was left unclear, listed as it was
+/// written, and is answered by a line that opens with its own first cell;
+/// it is never a requirement's row, so a requirement with only such rows
+/// near it still has none.
 pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
     let rows = rows(report);
     let missing: Vec<String> = (1..=count)
         .filter(|number| !rows.iter().any(|(row, _, _)| row == number))
         .map(|number| format!("R{number}"))
         .collect();
-    let (unclear, failed): (Vec<_>, Vec<_>) = (rows.iter())
-        .filter(|(number, passed, _)| !passed && *number <= count)
+    let written = written(report);
+    let (unclear, failed): (Vec<_>, Vec<_>) = (written.iter())
+        .filter(|(_, passed, _)| *passed == Some(false))
+        .filter(|(number, _, _)| number.is_none_or(|number| number <= count))
         .partition(|(_, _, row)| left_unclear(row));
     if missing.is_empty() && failed.is_empty() && unclear.is_empty() {
         return None;
@@ -1401,19 +1408,34 @@ pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
              only where the words you quote ask for that. ",
         );
     }
-    if let Some((number, _, _)) = unclear.first().or(failed.first()) {
+    // The form is shown for a requirement's row where one is listed above,
+    // and what a row of no requirement opens its line with is said apart.
+    let listed = || {
+        let (unclear, failed) = (unclear.iter(), failed.iter());
+        unclear.take(UNCLEAR_SHOWN).chain(failed.take(FAILED_SHOWN))
+    };
+    let numbered = listed().find_map(|(number, _, _)| Some(format!("R{}", (*number)?)));
+    let loose = (listed().find(|(number, _, _)| number.is_none()))
+        .and_then(|(_, _, row)| cells(row).first().map(|label| (*label).to_owned()));
+    if let Some(head) = numbered.as_ref().or(loose.as_ref()) {
         let which = match (unclear.is_empty(), failed.is_empty()) {
             (false, true) => "each row left unclear above",
             (false, false) => "each row left unclear above, and each failed row you do not fix",
             (true, _) => "each failed row you do not fix",
         };
         text.push_str(&format!(
-            "For {which}, write one line in your answer, `R{number} | reading taken | \"the \
+            "For {which}, write one line in your answer, `{head} | reading taken | \"the \
              request's words for it\" | command run`, with the words quoted as the request \
              writes them and a command you ran that tests that reading. A bare \"the request \
              does not say\" settles nothing: where it states nothing on the case, write \
-             `R{number} | {NOT_STATED} | \"the nearest words it does have\" | left as is`, \
+             `{head} | {NOT_STATED} | \"the nearest words it does have\" | left as is`, \
              and change nothing for that row on a guess. "
+        ));
+    }
+    if let Some(label) = loose {
+        text.push_str(&format!(
+            "A row that names no requirement gets its line as well, opened with the row's own \
+             first cell where a number would be, as `{label} | reading taken | …`. "
         ));
     }
     // A probe of the run's own, of something else, let it answer as not
@@ -3778,6 +3800,78 @@ mod tests {
         // No other text holds a run to a line.
         assert!(left_open("- R1 | b | UNCLEAR | which end").is_empty());
         assert!(left_open(&notice(&["It must hold.".to_owned()], true, &[])).is_empty());
+    }
+
+    #[test]
+    fn a_failed_or_unclear_row_of_no_requirement_holds_the_run_as_any_other_does() {
+        // As two reviews of one run wrote them, below their requirements'
+        // rows, which all passed.
+        let report = "R1 | iso | PASS | `date -u`\n\
+                      R2 | utc | PASS | `date`\n\
+                      set-aside | `world.traits.size` after creating aspects | PASS | not asked\n\
+                      extra | module-level `aspectsByTrait` outlives calls | UNCLEAR | never pruned\n\
+                      — | `Not(aspect)` misses a complete entity | FAIL | `npx tsx check10.mts`: 0";
+        let text = unchecked(report, 2).unwrap();
+        assert!(
+            text.starts_with(
+                "[Letronna check] The review's table has these rows that failed:\n\
+                 - — | `Not(aspect)` misses a complete entity | FAIL | `npx tsx check10.mts`: 0\n\
+                 and these left unclear:\n\
+                 - extra | module-level `aspectsByTrait` outlives calls | UNCLEAR | never pruned\n\
+                 A failed row stands for its whole case"
+            ),
+            "{text}"
+        );
+        // Each is answered by a line that opens as its row does.
+        let form = "For each row left unclear above, and each failed row you do not fix, write \
+                    one line in your answer, `extra | reading taken | \"the request's words for \
+                    it\" | command run`";
+        assert!(text.contains(form), "{text}");
+        let opened = "on a guess. A row that names no requirement gets its line as well, opened \
+                      with the row's own first cell where a number would be, as `extra | reading \
+                      taken | …`. A row that names two results";
+        assert!(text.contains(opened), "{text}");
+        // It is no requirement's row: one that has none of its own is
+        // still told so.
+        let short = unchecked(report, 3).unwrap();
+        assert!(
+            short.starts_with(
+                "[Letronna check] The review's table has no row for R3, and has these rows \
+                 that failed:\n- — | `Not(aspect)`"
+            ),
+            "{short}"
+        );
+        // Beside a requirement's row that holds the run, the form is shown
+        // for that one, and theirs is said after it.
+        let both = format!("{report}\nR2 | which zone | UNCLEAR | the words name none");
+        let text = unchecked(&both, 2).unwrap();
+        assert!(
+            text.contains("write one line in your answer, `R2 | reading taken | "),
+            "{text}"
+        );
+        assert!(
+            text.contains("where a number would be, as `extra | reading taken | …`. "),
+            "{text}"
+        );
+        // One that passed holds the run to nothing, and with none of them
+        // nothing is said of them.
+        let passed = "R1 | iso | PASS\nset-aside | docs untouched | PASS | not asked";
+        assert_eq!(unchecked(passed, 1), None);
+        let plain = unchecked("R1 | iso | UNCLEAR | which zone", 1).unwrap();
+        assert!(!plain.contains("names no requirement"), "{plain}");
+        // Cut from the quote and written again, they hold the run all the
+        // same, also where the quote kept every requirement's row.
+        let quote = "    R1 | iso | PASS | `date -u`\n    R2 | utc | PASS | `date`\n    … [cut] …";
+        let told = format!("{quote}{}", cut_rows(report, quote).unwrap());
+        let text = unchecked(&told, 2).unwrap();
+        assert!(
+            text.contains("that failed:\n- — | `Not(aspect)` misses a complete entity | FAIL"),
+            "{text}"
+        );
+        assert!(
+            text.contains("left unclear:\n- extra | module-level `aspectsByTrait`"),
+            "{text}"
+        );
     }
 
     /// An assistant's reply saying `content`.
