@@ -89,6 +89,10 @@ pub(crate) struct Caller {
     /// as the script passes it on: a read there is not one the model saw,
     /// and the script's output is fenced and noted as a whole, not each result.
     pub script: bool,
+    /// Bytes of a result the call keeps at most, for a caller that reads the
+    /// output itself and shows the model only what it picks of it, as the
+    /// driver does of a test run's; None for `MAX_OUTPUT`.
+    pub keeps: Option<usize>,
 }
 
 impl ToolContext {
@@ -372,6 +376,10 @@ const SPILL_BYTES: usize = 4 * 1024 * 1024;
 /// command printing gigabytes keeps no more than 8 MiB for its two pipes.
 const KEEP_HEAD: usize = 1024 * 1024;
 const KEEP_TAIL: usize = 3 * 1024 * 1024;
+/// The most a command's result holds before any cut: what is kept of both
+/// its pipes, with room for the lines Letronna adds around them. A caller
+/// keeping this much (`Caller::keeps`) has all that the run kept.
+pub(crate) const COMMAND_KEPT: usize = 2 * (KEEP_HEAD + KEEP_TAIL) + 64 * 1024;
 /// A command's output that outgrows what is kept is saved to disk as it is
 /// read, up to this many bytes for its two pipes together: far past what a
 /// model pages through, while a command printing without end still costs
@@ -621,7 +629,11 @@ pub(crate) const ALIASES: &[(&str, &str, &[&str])] = &[
     ("bash_id", "id", &["read_job"]),
     ("shell_id", "id", &["stop_job"]),
     ("job_id", "job", &["wait", "send_job"]),
-    ("id", "job", &["send_job"]),
+    ("id", "job", &["wait", "send_job"]),
+    // The job tools name the job two ways, `job` to wait for and type into
+    // and `id` to read and stop, and a run that leaves them to find_tools
+    // has only a job's start to go by: either name reaches each of them.
+    ("job", "id", &["read_job", "stop_job"]),
 ];
 
 /// Renames another agent's name for a parameter of tool `name` to Letronna's,
@@ -944,6 +956,33 @@ pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> 
     result
 }
 
+/// What a call to `tool` is told when its arguments arrived with nothing in
+/// them and the tool cannot do without some. Each tool then named the one
+/// field it looked for first, as it does for a call that left one out,
+/// which reads as a slip in that field: a model whose calls reach Letronna
+/// emptied, as one did in a quarter of the replies where it made several at
+/// once, sent the same call again. Said once for the whole call, it knows
+/// that nothing of what it wrote arrived.
+fn arrived_empty(tool: &dyn Tool, args: &Value) -> Option<String> {
+    if !args.as_object().is_some_and(|fields| fields.is_empty()) {
+        return None;
+    }
+    let schema = tool.parameters();
+    let required: Vec<String> = (schema["required"].as_array()?.iter())
+        .filter_map(Value::as_str)
+        .map(|name| format!("`{name}`"))
+        .collect();
+    let needs = match required.as_slice() {
+        [] => return None,
+        [one] => format!("{one} is required"),
+        [rest @ .., last] => format!("{} and {last} are required", rest.join(", ")),
+    };
+    Some(format!(
+        "The call's arguments arrived empty, so nothing ran: {needs}. Send the call again \
+         with its arguments."
+    ))
+}
+
 /// `run` for a tool already found: what every call goes through.
 pub(crate) fn run_found(
     tool: &dyn Tool,
@@ -971,6 +1010,10 @@ pub(crate) fn run_found(
     // The gate refuses these before any card, but a call can get here
     // without it; refuse again rather than trust the caller.
     if let Some(why) = crate::gate::refusal(tool, &args, ctx) {
+        return Err(why);
+    }
+    // After the gate, so a call it turns down is not asked for again.
+    if let Some(why) = arrived_empty(tool, &args) {
         return Err(why);
     }
     // After the gate, so a hook sees only a call that would run, and can
@@ -1075,9 +1118,13 @@ pub(crate) fn run_found(
     }
     out.push_str(&note);
     out.push_str(&heard);
-    let said = crate::hooks::after(hooks, tool.name(), &args, &out, ctx);
+    // A caller keeping more reads the output itself; the user's hooks and
+    // the plugins hear it as any call's is cut.
+    let command = tool.name() == "run_command";
+    let said = crate::hooks::after(hooks, tool.name(), &args, &as_cut(&out, ctx, command), ctx);
     out.push_str(&said);
-    let plugged = crate::plugins::code::after(tool.name(), &args, &out, took, ctx);
+    let seen = as_cut(&out, ctx, command);
+    let plugged = crate::plugins::code::after(tool.name(), &args, &seen, took, ctx);
     out.push_str(&plugged);
     Ok(out)
 }
@@ -1206,13 +1253,15 @@ fn openings(paragraphs: &[String]) -> String {
     }
 }
 
-/// `out` as it is when it fits; otherwise cut, with the whole of it saved
+/// `out` as it is when it fits in what `ctx`'s caller keeps, `MAX_OUTPUT`
+/// unless it says otherwise; otherwise cut, with the whole of it saved
 /// where the model can page through it and the cut saying where. A
 /// `command`'s output also keeps the lines of the part cut that look like
 /// errors (`keep_errors`); no other tool's, a file read least of all, whose
 /// lines are worth only as much as the place they were in.
 fn fit(out: String, ctx: &ToolContext, command: bool) -> String {
-    if out.len() <= MAX_OUTPUT {
+    let max = ctx.caller.keeps.unwrap_or(MAX_OUTPUT);
+    if out.len() <= max {
         return out;
     }
     let note = match spill(&out, ctx) {
@@ -1227,9 +1276,23 @@ fn fit(out: String, ctx: &ToolContext, command: bool) -> String {
         None => String::new(),
     };
     if command {
-        return keep_errors(out, MAX_OUTPUT, &note);
+        return keep_errors(out, max, &note);
     }
-    keep_ends(out, MAX_OUTPUT, &note)
+    keep_ends(out, max, &note)
+}
+
+/// `out` as a call made for a model holds it: cut to `MAX_OUTPUT` as `fit`
+/// cuts, `command`'s keeping the lines that look like errors, where `ctx`'s
+/// caller keeps more and it is longer. What the user's hooks and the
+/// plugins are given, whoever made the call.
+fn as_cut<'a>(out: &'a str, ctx: &ToolContext, command: bool) -> Cow<'a, str> {
+    if ctx.caller.keeps.is_none() || out.len() <= MAX_OUTPUT {
+        return Cow::Borrowed(out);
+    }
+    Cow::Owned(match command {
+        true => keep_errors(out.to_owned(), MAX_OUTPUT, ""),
+        false => keep_ends(out.to_owned(), MAX_OUTPUT, ""),
+    })
 }
 
 /// The most of a cut command output's room that lines from the part cut may
@@ -1401,17 +1464,24 @@ fn keep_ends_around(text: String, gaps: &[Gap], max: usize, note: &str) -> Strin
     let left = &text[head..tail];
     let lines = left.lines().count() + gaps.iter().map(|g| g.lines).sum::<usize>();
     let bytes = left.len() + gaps.iter().map(|g| g.bytes).sum::<usize>();
-    let unit = if lines == 1 { "line" } else { "lines" };
     let gap = if head == 0 || text[..head].ends_with('\n') {
         ""
     } else {
         "\n"
     };
     format!(
-        "{}{gap}… [{lines} {unit} ({bytes} bytes) left out{note}]\n{}",
+        "{}{gap}{}{}",
         &text[..head],
+        left_out(lines, bytes, note),
         &text[tail..]
     )
+}
+
+/// The line standing for `lines` lines and `bytes` bytes of output left out,
+/// ending in `note`.
+fn left_out(lines: usize, bytes: usize, note: &str) -> String {
+    let unit = if lines == 1 { "line" } else { "lines" };
+    format!("… [{lines} {unit} ({bytes} bytes) left out{note}]\n")
 }
 
 /// Where the last line that ends by `at` ends, or `at` itself on a line
@@ -2113,7 +2183,7 @@ fn run_shell(command: &str, cwd: Option<&Path>, cancel: &Cancel) -> Result<Strin
         shell(command, cwd),
         command,
         cancel,
-        None,
+        Keeping::default(),
         COMMAND_TIMEOUT,
         None,
         None,
@@ -2131,7 +2201,15 @@ pub(crate) fn run_shell_in(
 ) -> Result<String, String> {
     let cmd = shell(command, Some(cwd));
     let (owner, sooner) = (owner_at_limit(ctx), sooner(limit, ctx));
-    run_shell_saving(cmd, command, &ctx.cancel, None, limit, owner, sooner)
+    run_shell_saving(
+        cmd,
+        command,
+        &ctx.cancel,
+        Keeping::default(),
+        limit,
+        owner,
+        sooner,
+    )
 }
 
 /// The conversation a foreground command run in `ctx` becomes a job of when
@@ -2232,6 +2310,23 @@ struct SaveTo {
     cap: usize,
 }
 
+/// What a command's run keeps of its output: `max` bytes in its result,
+/// `MAX_OUTPUT` unless its caller keeps more (`Caller::keeps`), and a cut
+/// one saved whole to `save`, where there is one.
+struct Keeping {
+    max: usize,
+    save: Option<SaveTo>,
+}
+
+impl Default for Keeping {
+    fn default() -> Self {
+        Self {
+            max: MAX_OUTPUT,
+            save: None,
+        }
+    }
+}
+
 /// Runs `command` in `dir`, in the sandbox for `cwd`, the project, and the
 /// folders `added` beside it, as `run_shell_saving` runs any other, and says
 /// in the result that it did.
@@ -2243,12 +2338,12 @@ fn run_sandboxed(
     added: &[PathBuf],
     dir: &Path,
     cancel: &Cancel,
-    save: Option<SaveTo>,
+    keeping: Keeping,
     limit: Duration,
 ) -> Result<String, String> {
     let (policy, _scratch) = crate::sandbox::Policy::for_project(cwd, added)?;
     let wrapped = crate::sandbox::here().wrap(&shell(command, Some(dir)), &policy)?;
-    match run_shell_saving(wrapped, command, cancel, save, limit, None, None) {
+    match run_shell_saving(wrapped, command, cancel, keeping, limit, None, None) {
         Ok(text) => Ok(crate::sandbox::noted(&text)),
         Err(e) => Err(crate::sandbox::noted(&e)),
     }
@@ -2264,14 +2359,14 @@ fn run_shell_saving(
     cmd: std::process::Command,
     command: &str,
     cancel: &Cancel,
-    save: Option<SaveTo>,
+    keeping: Keeping,
     limit: Duration,
     owner: Option<u64>,
     sooner: Option<(Duration, Option<Cut>)>,
 ) -> Result<String, String> {
-    let result = run_shell_into(cmd, command, cancel, save.as_ref(), limit, owner, sooner);
+    let result = run_shell_into(cmd, command, cancel, &keeping, limit, owner, sooner);
     // What the pipes were streamed to only goes into the saved file.
-    if let Some(save) = &save {
+    if let Some(save) = &keeping.save {
         for pipe in PIPE_NAMES {
             let _ = std::fs::remove_file(save.path.with_extension(pipe));
         }
@@ -2284,21 +2379,22 @@ const PIPE_NAMES: [&str; 2] = ["stdout", "stderr"];
 
 /// What the first line of a command's result says, as `run_shell_into`
 /// words it, when the command carried on in the background at its limit.
-const MOVED: &str = "so it carries on in the background as job #";
+pub(crate) const MOVED: &str = "so it carries on in the background as job #";
 /// Where the result of a command moved to the background turns from what to
 /// do about the job to what the command printed.
-const SO_FAR: &str = " Output so far:\n";
+pub(crate) const SO_FAR: &str = " Output so far:\n";
 
 fn run_shell_into(
     mut cmd: std::process::Command,
     command: &str,
     cancel: &Cancel,
-    save: Option<&SaveTo>,
+    keeping: &Keeping,
     limit: Duration,
     owner: Option<u64>,
     sooner: Option<(Duration, Option<Cut>)>,
 ) -> Result<String, String> {
     use std::process::Stdio;
+    let save = keeping.save.as_ref();
     let _running = Running::start();
     // Grouped the way a job's shell is, so one moved to the background can
     // be stopped with everything it started.
@@ -2492,7 +2588,8 @@ fn run_shell_into(
         }
     }
     if let (Some(log), Some(owner), Some(tree)) = (log, owner, tree) {
-        let so_far = cut_around(text.clone(), &gaps, &note);
+        // For the job's log, which a model reads.
+        let so_far = cut_around(text.clone(), &gaps, &note, MAX_OUTPUT);
         // In the log before the job exists, so its exit notice cannot miss
         // it; what the readers added since the hand-over came after it.
         if let Ok(mut log) = log.lock() {
@@ -2515,16 +2612,17 @@ fn run_shell_into(
             None => format!(
                 "Still running after {}s, so it carries on in the background as job \
                  #{id} instead of being stopped. A notice comes when it exits; call \
-                 wait with job {id} to wait for it, read_job to read what it \
-                 prints, or stop_job if you no longer need it.{SO_FAR}",
+                 wait with job {id} to wait for it, read_job with id {id} to read \
+                 what it prints, or stop_job with id {id} if you no longer need \
+                 it.{SO_FAR}",
                 limit.as_secs()
             ),
             // The user wants the turn to go on, so it is not waited for.
             Some(Cut::Asked) => format!(
                 "Still running after {:.0}s, {}, so it carries on in the background as \
                  job #{id}. Go on with the next step rather than wait for it: a notice \
-                 comes when it exits, read_job reads what it prints, and stop_job ends \
-                 it.{SO_FAR}",
+                 comes when it exits, read_job with id {id} reads what it prints, and \
+                 stop_job with id {id} ends it.{SO_FAR}",
                 started.elapsed().as_secs_f64(),
                 Cut::Asked.when()
             ),
@@ -2536,7 +2634,7 @@ fn run_shell_into(
             Some(cut) => format!(
                 "Still running after {:.0}s, {}, so it carries on in the background as \
                  job #{id} instead of being stopped. Call wait with job {id} if you need \
-                 what it makes, or stop_job {id} if not.{SO_FAR}",
+                 what it makes, or stop_job with id {id} if not.{SO_FAR}",
                 started.elapsed().as_secs_f64(),
                 cut.when()
             ),
@@ -2546,7 +2644,7 @@ fn run_shell_into(
             gap.at += moved.len();
         }
     }
-    Ok(cut_around(text, &gaps, &note))
+    Ok(cut_around(text, &gaps, &note, keeping.max))
 }
 
 /// Whether `child`, not yet reaped, is stopped for reading from or setting up
@@ -2573,15 +2671,31 @@ fn stopped_at_terminal(child: &std::process::Child) -> bool {
         && matches!(unsafe { info.si_status() }, libc::SIGTTIN | libc::SIGTTOU)
 }
 
-/// `text` cut to `MAX_OUTPUT` around the output left out at `gaps`, with
-/// `note` on the marker, or as it is when nothing was.
-fn cut_around(text: String, gaps: &[Gap], note: &str) -> String {
+/// `text` cut to `max` around the output left out at `gaps`, with `note` on
+/// the marker, or as it is when nothing was. Where `text` and a marker at
+/// each gap fit in `max`, as for a caller keeping all a run kept, each gap
+/// is marked where it is and nothing more is cut, so the end of one pipe
+/// stays beside the start of the other.
+fn cut_around(text: String, gaps: &[Gap], note: &str, max: usize) -> String {
     if gaps.is_empty() {
+        return text;
+    }
+    if text.len() + gaps.len() * (MARKER_ROOM + note.len()) <= max {
+        let mut text = text;
+        for gap in gaps.iter().rev() {
+            let apart = if gap.at == 0 || text[..gap.at].ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            let line = left_out(gap.lines, gap.bytes, note);
+            text.insert_str(gap.at, &format!("{apart}{line}"));
+        }
         return text;
     }
     // Only the command's run knows where the gaps are, so it makes the cut,
     // and the one `run` makes then finds the result short enough.
-    keep_ends_around(text, gaps, MAX_OUTPUT, note)
+    keep_ends_around(text, gaps, max, note)
 }
 
 /// Puts a command's output together in `save` as the model would read it
@@ -2988,7 +3102,7 @@ impl Tool for WriteFile {
         format!("Write {}:\n{content}", path_arg(args))
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
-        let path = resolve_write_or_scratch(path_arg(args), ctx)?;
+        let path = resolve_write_or_scratch(named_path(args, "write")?, ctx)?;
         let content = args["content"].as_str().ok_or("`content` is required.")?;
         check_document(&path, content)?;
         let change = crate::filestate::overwrite(ctx.conversation, &path, path_arg(args))?;
@@ -3010,8 +3124,9 @@ impl Tool for WriteFile {
         let lsp = crate::lsp::before_write(ctx, &path, change.before());
         let new = change.before().is_none();
         change.write(text.as_bytes(), &ctx.files)?;
-        if new {
-            crate::taint::made(ctx, &path);
+        match new {
+            true => crate::taint::made(ctx, &path),
+            false => crate::taint::rewrote(ctx, &path),
         }
         let text = match crate::formatter::after_write(ctx, &path, path_arg(args), &text) {
             Some((now, said)) => {
@@ -3128,7 +3243,7 @@ impl Tool for EditFile {
         format!("Edit {}:\n{}", path_arg(args), self.preview(args, ctx))
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
-        let path = resolve_write_or_scratch(path_arg(args), ctx)?;
+        let path = resolve_write_or_scratch(named_path(args, "edit")?, ctx)?;
         let edits = edits(args)?;
         // A mistyped path is told apart from a new file before the error
         // sends the model to write_file for one.
@@ -3159,6 +3274,7 @@ impl Tool for EditFile {
         ));
         let lsp = crate::lsp::before_write(ctx, &path, Some(text));
         change.write(done.text.as_bytes(), &ctx.files)?;
+        crate::taint::rewrote(ctx, &path);
         let raw = path_arg(args);
         let after = match crate::formatter::after_write(ctx, &path, raw, &done.text) {
             Some((now, said)) => {
@@ -3341,19 +3457,31 @@ impl Tool for RunCommand {
                 path,
                 cap: PIPE_SPILL_BYTES,
             });
+            let keeping = Keeping {
+                max: ctx.caller.keeps.unwrap_or(MAX_OUTPUT),
+                save,
+            };
+            // What the line's own redirections are about to make, which is
+            // the session's to write over or delete afterwards (taint.rs).
+            let fresh = crate::taint::fresh(crate::gate::write_targets(args, ctx));
             // Last before it runs, so as little as can be falls between.
             let watch = crate::snapshot::watch(command, &dir, cwd, ctx);
+            let ran = Instant::now();
             let out = if ctx.sandboxed {
-                run_sandboxed(command, cwd, &ctx.added, &dir, &ctx.cancel, save, limit)
+                run_sandboxed(command, cwd, &ctx.added, &dir, &ctx.cancel, keeping, limit)
             } else {
                 let (owner, sooner) = (owner_at_limit(ctx), sooner(limit, ctx));
                 let cmd = shell(command, Some(&dir));
-                run_shell_saving(cmd, command, &ctx.cancel, save, limit, owner, sooner)
+                run_shell_saving(cmd, command, &ctx.cancel, keeping, limit, owner, sooner)
             };
             let first = out.as_ref().ok().and_then(|text| text.lines().next());
             let moved = first.is_some_and(|line| line.contains(MOVED));
             if let Some(watch) = watch {
                 watch.after(moved);
+            }
+            // One moved to the background is still writing: not told yet.
+            if !moved {
+                fresh.made(ctx);
             }
             let note = crate::filestate::note(ctx.conversation, before, cwd);
             // A note means a file moved while it ran, so nothing is sure.
@@ -3367,7 +3495,7 @@ impl Tool for RunCommand {
                     let ends = stopped_with_run(ctx) + SO_FAR;
                     Ok(note + &text.replacen(SO_FAR, &ends, 1))
                 }
-                Ok(text) => Ok(note + &text),
+                Ok(text) => Ok(note + &text + &time_left(ctx, ran.elapsed())),
                 Err(e) => Err(note + &e),
             };
         }
@@ -3420,7 +3548,7 @@ impl Tool for RunCommand {
 /// How a program is started so that it outlives the run, in the shell
 /// `run_command` runs. The run ends its jobs' process groups, or on Windows
 /// their Job Objects, as it ends, and no other command's.
-const DETACHED: &str = if cfg!(windows) {
+pub(crate) const DETACHED: &str = if cfg!(windows) {
     "Start-Process"
 } else if cfg!(target_os = "linux") {
     "setsid nohup CMD > LOG 2>&1 &"
@@ -3428,6 +3556,37 @@ const DETACHED: &str = if cfg!(windows) {
     // macOS has no setsid; run as a command rather than a job, this is enough.
     "nohup CMD > LOG 2>&1 &"
 };
+
+/// How long a command of a run with a deadline takes before its result
+/// says how much of the run's time is left.
+#[cfg(not(test))]
+const LONG_COMMAND: Duration = Duration::from_secs(60);
+/// A fraction of a second in tests, so one says it without a minute's wait.
+#[cfg(test)]
+const LONG_COMMAND: Duration = Duration::from_millis(300);
+
+/// What ends the result of a command that `took` a long while in a run with
+/// a deadline: how long it took and how much of the run is left. A run is
+/// told its time once, as it starts, and the warning comes at four fifths
+/// of it; in between it has only its own count, and runs gave up saying
+/// they were out of time with half an hour to go, or started a second long
+/// build with minutes left. In brackets after a blank line, where the exit
+/// code's line still reads as the command's last.
+fn time_left(ctx: &ToolContext, took: Duration) -> String {
+    let deadline = (ctx.caller.connection.as_deref()).and_then(|connection| connection.deadline);
+    let Some(deadline) = deadline.filter(|_| took >= LONG_COMMAND) else {
+        return String::new();
+    };
+    let left = deadline.saturating_duration_since(Instant::now()).as_secs();
+    let left = match left {
+        0..120 => format!("{left} s"),
+        _ => format!("{} minutes", left / 60),
+    };
+    format!(
+        "\n\n[It ran for {} s. About {left} of this run's time are left.]",
+        took.as_secs()
+    )
+}
 
 /// What a job started in `ctx` is told after it is said to run, when the run
 /// stops its jobs as it ends, as `-p` does: a server the task wants left up
@@ -4654,6 +4813,18 @@ pub(crate) fn path_arg(args: &Value) -> &str {
     args["path"].as_str().unwrap_or(".")
 }
 
+/// The file a tool is `to` read, write or edit, which it cannot do without.
+/// Left out, `path_arg` names the project folder, and read_file answered
+/// only that `.` is a folder: nothing in that says an argument was missing,
+/// and a model that sent the call with none sent it again, until the run
+/// was stopped for going round in circles.
+fn named_path<'a>(args: &'a Value, to: &str) -> Result<&'a str, String> {
+    args["path"]
+        .as_str()
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| format!("`path` is required: the file to {to}."))
+}
+
 struct ReadFile;
 impl Tool for ReadFile {
     fn name(&self) -> &'static str {
@@ -4676,7 +4847,7 @@ impl Tool for ReadFile {
         }, "required": ["path"]})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
-        let raw = path_arg(args);
+        let raw = named_path(args, "read")?;
         let path = resolve(raw, ctx).map_err(|e| e + &similar(raw, ctx))?;
         let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
         let limit = args["limit"].as_u64().unwrap_or(u64::MAX).max(1) as usize;
@@ -5755,6 +5926,38 @@ mod tests {
     }
 
     #[test]
+    fn a_file_tool_called_without_a_path_says_which_argument_is_missing() {
+        let dir = std::env::temp_dir().join(format!("letronna-no-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        // Not "`.` is a folder", which a model that left the path out read
+        // as a wrong path and answered with the same empty call.
+        for args in [json!({}), json!({"path": ""}), json!({"path": "  "})] {
+            assert_eq!(
+                ReadFile.run(&args, &ctx).unwrap_err(),
+                "`path` is required: the file to read.",
+                "{args}"
+            );
+        }
+        assert_eq!(
+            WriteFile.run(&json!({"content": "a"}), &ctx).unwrap_err(),
+            "`path` is required: the file to write."
+        );
+        assert_eq!(
+            EditFile
+                .run(&json!({"old": "a", "new": "b"}), &ctx)
+                .unwrap_err(),
+            "`path` is required: the file to edit."
+        );
+        // list_dir still lists the project when it names no folder.
+        assert!(ListDir.run(&json!({}), &ctx).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn listing_a_file_points_to_read_file() {
         let dir = std::env::temp_dir().join(format!("letronna-list-file-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -6808,6 +7011,45 @@ mod tests {
     }
 
     #[test]
+    fn a_job_tool_takes_the_job_by_either_of_its_names() {
+        // read_job and stop_job call it `id`, wait and send_job `job`, and a
+        // run that left them to find_tools has no schema to say which.
+        for (tool, sent, taken) in [
+            ("read_job", "job", "id"),
+            ("stop_job", "job", "id"),
+            ("wait", "id", "job"),
+            ("send_job", "id", "job"),
+        ] {
+            let mut args = json!({ sent: 3 });
+            rename_aliases(tool, &mut args);
+            assert_eq!(args, json!({ taken: 3 }), "{tool}");
+        }
+    }
+
+    #[test]
+    fn a_call_whose_arguments_arrived_empty_is_told_so_once_for_all_of_them() {
+        let ctx = ToolContext::default();
+        for sent in ["", "{}", "  "] {
+            assert_eq!(
+                run("write_file", sent, &ctx).unwrap_err(),
+                "The call's arguments arrived empty, so nothing ran: `path` and `content` \
+                 are required. Send the call again with its arguments.",
+                "{sent:?}"
+            );
+        }
+        assert_eq!(
+            run("read_file", "{}", &ctx).unwrap_err(),
+            "The call's arguments arrived empty, so nothing ran: `path` is required. Send the \
+             call again with its arguments."
+        );
+        // One that only left a field out is told which, as before, and a
+        // tool that needs none runs.
+        let partly = run("write_file", r#"{"path": "a.txt"}"#, &ctx).unwrap_err();
+        assert!(!partly.contains("arrived empty"), "{partly}");
+        assert!(arrived_empty(&ListDir, &json!({})).is_none());
+    }
+
+    #[test]
     fn every_alias_leads_from_a_name_its_tool_lacks_to_one_it_has() {
         for (theirs, ours, names) in ALIASES {
             for name in *names {
@@ -7084,7 +7326,15 @@ mod tests {
     fn run_for(command: &str, limit: Duration, owner: Option<u64>) -> Result<String, String> {
         let dir = std::env::temp_dir();
         let cmd = shell(command, Some(&dir));
-        run_shell_saving(cmd, command, &Cancel::default(), None, limit, owner, None)
+        run_shell_saving(
+            cmd,
+            command,
+            &Cancel::default(),
+            Keeping::default(),
+            limit,
+            owner,
+            None,
+        )
     }
 
     /// The job a command moved to the background became, from what the
@@ -7120,7 +7370,10 @@ mod tests {
         assert_eq!(so_far.trim_end(), "before");
         // Named, as the jobs' tools are offered only on demand.
         assert!(
-            said.contains("or stop_job if you no longer need it."),
+            said.contains(&format!(
+                "read_job with id {id} to read what it prints, or stop_job with id {id} if \
+                 you no longer need it."
+            )),
             "{said}"
         );
 
@@ -7304,6 +7557,68 @@ mod tests {
     }
 
     #[test]
+    fn a_long_command_of_a_run_with_a_deadline_says_how_much_time_is_left() {
+        let (dir, mut ctx) = workspace_with("time-left", "x");
+        let timed = |seconds: u64| {
+            Some(Arc::new(Connection {
+                deadline: Some(Instant::now() + Duration::from_secs(seconds)),
+                ..Default::default()
+            }))
+        };
+        let slow = if cfg!(windows) {
+            "Start-Sleep -Milliseconds 500; echo done"
+        } else {
+            "sleep 0.5; echo done"
+        };
+        let slow = json!({ "command": slow }).to_string();
+        ctx.caller.connection = timed(1_800);
+        let out = run("run_command", &slow, &ctx).unwrap();
+        let (printed, note) = out.split_once("\n\n[").expect(&out);
+        assert_eq!(printed.trim_end(), "done");
+        // What a command took counts its shell's own start, which on Windows
+        // can be most of a second: the seconds are pinned only where the
+        // shell starts at once.
+        let (ran, left) = (note.strip_prefix("It ran for "))
+            .and_then(|rest| rest.split_once(" s. "))
+            .expect(note);
+        assert!(cfg!(windows) || ran == "0", "{note}");
+        assert!(left.starts_with("About 29 minutes of"), "{note}");
+        // Seconds once there are few, and nothing after a quick command or
+        // in a run with no deadline.
+        ctx.caller.connection = timed(90);
+        let out = run("run_command", &slow, &ctx).unwrap();
+        assert!(out.contains(" s of this run's time are left.]"), "{out}");
+        // Not on Windows, where starting the shell alone can take longer
+        // than the fraction of a second a test counts as long.
+        if !cfg!(windows) {
+            let quick = json!({ "command": "echo done" }).to_string();
+            assert_eq!(run("run_command", &quick, &ctx).unwrap().trim_end(), "done");
+        }
+        ctx.caller.connection = None;
+        assert_eq!(run("run_command", &slow, &ctx).unwrap().trim_end(), "done");
+        // A failing command's code is still read as its last line.
+        ctx.caller.connection = timed(1_800);
+        let failing = if cfg!(windows) {
+            "Start-Sleep -Milliseconds 500; exit 3"
+        } else {
+            "sleep 0.5; exit 3"
+        };
+        let out = run(
+            "run_command",
+            &json!({ "command": failing }).to_string(),
+            &ctx,
+        )
+        .unwrap();
+        let result = crate::chat::Message {
+            name: "run_command".into(),
+            content: out,
+            ..Default::default()
+        };
+        assert_eq!(crate::tool_runs::exit_code(&result), Some(3));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_command_moved_to_the_background_in_a_print_run_says_the_run_stops_it() {
         let command = if cfg!(windows) {
             "Start-Sleep 30"
@@ -7312,14 +7627,15 @@ mod tests {
         };
         let args = json!({"command": command, "timeout": 1}).to_string();
         let said = run("run_command", &args, &in_run(7_705, true)).unwrap();
-        crate::jobs::stop(moved_job(&said, "1s").0).unwrap();
+        let id = moved_job(&said, "1s").0;
+        crate::jobs::stop(id).unwrap();
         let (told, _) = said.split_once(SO_FAR).unwrap();
         assert!(
             told.ends_with(&format!(
-                "or stop_job if you no longer need it. Background jobs are stopped when this \
-                 run ends; if it must keep running after that, start it detached instead, in a \
-                 plain run_command and not as a job, as with `{DETACHED}`, and check that it \
-                 answers."
+                "or stop_job with id {id} if you no longer need it. Background jobs are stopped \
+                 when this run ends; if it must keep running after that, start it detached \
+                 instead, in a plain run_command and not as a job, as with `{DETACHED}`, and \
+                 check that it answers."
             )),
             "{said}"
         );
@@ -7452,7 +7768,8 @@ mod tests {
         assert!(note.starts_with("Still running after "), "{note}");
         assert!(
             note.contains(&format!(
-                "Call wait with job {id} if you need what it makes, or stop_job {id} if not"
+                "Call wait with job {id} if you need what it makes, or stop_job with id {id} \
+                 if not"
             )),
             "{note}"
         );
@@ -7486,7 +7803,10 @@ mod tests {
             .unwrap_or_else(|| panic!("{said}"));
         crate::jobs::stop(id).unwrap();
         assert!(Instant::now() < now + Duration::from_secs(6), "{note}");
-        assert!(note.contains(&format!("or stop_job {id} if not")), "{note}");
+        assert!(
+            note.contains(&format!("or stop_job with id {id} if not")),
+            "{note}"
+        );
     }
 
     /// Where the exit notice of a job of `owner`'s comes from, once the job
@@ -7536,7 +7856,10 @@ mod tests {
             .and_then(|(id, _)| id.parse().ok())
             .unwrap_or_else(|| panic!("{said}"));
         crate::jobs::stop(id).unwrap();
-        assert!(note.contains(&format!("or stop_job {id} if not")), "{note}");
+        assert!(
+            note.contains(&format!("or stop_job with id {id} if not")),
+            "{note}"
+        );
         assert_eq!(so_far.trim_end(), "before");
         // Left for the turn to take once the call is over.
         let taken = crate::inbox::take(7_711, true);
@@ -7595,8 +7918,9 @@ mod tests {
             .and_then(|(id, _)| id.parse().ok())
             .unwrap_or_else(|| panic!("{said}"));
         crate::jobs::stop(id).unwrap();
-        let what_to_do =
-            format!("Call wait with job {id} if you need what it makes, or stop_job {id} if not.");
+        let what_to_do = format!(
+            "Call wait with job {id} if you need what it makes, or stop_job with id {id} if not."
+        );
         assert_eq!(told.matches(&what_to_do).count(), 1, "{said}");
         assert_eq!(
             told.matches("stopped when this run ends").count(),
@@ -7767,7 +8091,7 @@ mod tests {
             shell(command, Some(&dir)),
             command,
             &cancel,
-            None,
+            Keeping::default(),
             COMMAND_TIMEOUT,
             Some(7_703),
             None,
@@ -7801,7 +8125,7 @@ mod tests {
             shell(command, Some(&dir)),
             command,
             &Cancel::default(),
-            None,
+            Keeping::default(),
             Duration::from_secs(20),
             Some(7_704),
             None,
@@ -8561,6 +8885,66 @@ mod tests {
     }
 
     #[test]
+    fn a_caller_that_reads_the_output_itself_keeps_what_it_asks_for() {
+        let mut ctx = ToolContext::default();
+        ctx.caller.keeps = Some(64 * 1024);
+        assert_eq!(fit(long_text(), &ctx, true), long_text());
+        ctx.caller.keeps = Some(2 * MAX_OUTPUT);
+        let out = fit(long_text(), &ctx, true);
+        assert!(
+            out.len() > MAX_OUTPUT && out.len() <= 2 * MAX_OUTPUT,
+            "{}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn a_caller_keeping_all_a_run_kept_has_each_gap_marked_where_it_is() {
+        let text = "out start\nout end\n[stderr]\nerr start\nerr end\n".to_owned();
+        let gaps = [
+            Gap {
+                at: 10,
+                bytes: 100,
+                lines: 5,
+            },
+            Gap {
+                at: 37,
+                bytes: 50,
+                lines: 2,
+            },
+        ];
+        assert_eq!(
+            cut_around(text, &gaps, "", COMMAND_KEPT),
+            "out start\n… [5 lines (100 bytes) left out]\nout end\n[stderr]\nerr start\n\
+             … [2 lines (50 bytes) left out]\nerr end\n"
+        );
+        // Past what a model's call keeps, the two ends are kept around them.
+        let long = format!("{}{}", long_text(), long_text());
+        let gaps = [Gap {
+            at: long_text().len(),
+            bytes: 100,
+            lines: 5,
+        }];
+        let cut = cut_around(long, &gaps, "", MAX_OUTPUT);
+        assert!(cut.len() <= MAX_OUTPUT, "{}", cut.len());
+    }
+
+    #[test]
+    fn hooks_hear_a_long_output_as_a_models_call_would() {
+        let mut ctx = ToolContext::default();
+        let long = long_text();
+        assert!(matches!(as_cut(&long, &ctx, true), Cow::Borrowed(_)));
+        ctx.caller.keeps = Some(COMMAND_KEPT);
+        let heard = as_cut(&long, &ctx, true);
+        assert!(heard.len() <= MAX_OUTPUT, "{}", heard.len());
+        assert!(heard.contains(" left out]\n"), "{heard}");
+        assert!(matches!(
+            as_cut("short", &ctx, true),
+            Cow::Borrowed("short")
+        ));
+    }
+
+    #[test]
     fn only_a_commands_output_keeps_its_errors() {
         let (_turn, dir) = data_folder("errors");
         let ctx = in_conversation(8, &dir);
@@ -8751,7 +9135,10 @@ mod tests {
             cap,
         };
         let seq = "seq 1 999999";
-        let save = Some(save);
+        let save = Keeping {
+            save: Some(save),
+            ..Keeping::default()
+        };
         let out = run_shell_saving(
             shell(seq, None),
             seq,

@@ -125,6 +125,13 @@ pub fn backoff(endpoint: &str, retry_after: Option<Duration>) {
     gate(endpoint).backoff(retry_after);
 }
 
+/// How long the provider at `endpoint` still rests after a 429, for a caller
+/// that takes no permit and would only be turned away meanwhile.
+pub fn resting(endpoint: &str) -> Option<Duration> {
+    let until = gate(endpoint).lock().until?;
+    Some(until.saturating_duration_since(Instant::now())).filter(|left| !left.is_zero())
+}
+
 /// The rest a response's `Retry-After` asks for; a date, which providers
 /// rarely send, gets the doubling rest instead.
 pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
@@ -445,6 +452,20 @@ mod tests {
         drop(turn);
         assert!(gate.acquire(&stop).is_none());
         assert_eq!(gate.lock().in_use, 0);
+    }
+
+    #[test]
+    fn a_rest_is_told_while_it_lasts_and_not_after() {
+        let endpoint = "http://resting.test:8080/v1";
+        assert_eq!(resting(endpoint), None);
+        backoff(endpoint, Some(Duration::from_millis(300)));
+        let left = resting(endpoint).unwrap();
+        assert!(left <= Duration::from_millis(300), "{left:?}");
+        // The same provider by another path, and no other.
+        assert!(resting("http://resting.test:8080/other").is_some());
+        assert_eq!(resting("http://resting.test:8081/v1"), None);
+        std::thread::sleep(Duration::from_millis(350));
+        assert_eq!(resting(endpoint), None);
     }
 
     #[test]

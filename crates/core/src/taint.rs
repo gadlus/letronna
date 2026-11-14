@@ -1,7 +1,8 @@
 //! Which sessions have read words someone other than the user wrote, and
-//! which files each one's tools made, for the gate's check on what such a
-//! session does next; and the words of any instruction planted in what each
-//! read, for `echo` to find in what it writes.
+//! which files each one's tools made, and when, or wrote over, for the
+//! gate's check on what such a session does next and for a run to be told
+//! what it left in its project; and the words of any instruction planted in
+//! what each read, for `echo` to find in what it writes.
 //!
 //! A page or a server's reply reaches the model fenced, as data, but a model
 //! can still be talked into acting on it, and with approvals skipped --
@@ -58,8 +59,14 @@ struct Session {
     /// The one MCP server every such word came from, while there is one;
     /// `None` once it read any from anywhere else.
     only_from: Option<String>,
-    /// The files its file tools created, by real path.
-    made: HashSet<PathBuf>,
+    /// The files its file tools created, by real path, with when each was
+    /// made: a file tool writes by rename, so an edit since gives the file a
+    /// new time of making on disk and leaves this one as it was.
+    made: HashMap<PathBuf, SystemTime>,
+    /// The files its file tools wrote where one was already, or moved one
+    /// to, by real path: none of them new, though the disk says each was
+    /// made as it was written.
+    rewrote: HashSet<PathBuf>,
     /// The folders its file tools created for them, by real path, with when
     /// the system says each was made, to tell what arrived in it later.
     folders: HashMap<PathBuf, SystemTime>,
@@ -134,16 +141,128 @@ pub(crate) fn read_only_from(ctx: &ToolContext, server: &str) -> bool {
     })
 }
 
-/// Notes that a file tool created `path` in `ctx`'s session.
+/// Notes that a file tool created `path` in `ctx`'s session, now.
 pub(crate) fn made(ctx: &ToolContext, path: &Path) {
     let (Some(id), Ok(path)) = (session(ctx), std::fs::canonicalize(path)) else {
         return;
     };
     let mut sessions = sessions();
     let made = &mut sessions.entry(id).or_default().made;
-    if made.len() < MADE {
-        made.insert(path);
+    // One made again, where the first was deleted, is as new as it is.
+    if made.len() < MADE || made.contains_key(&path) {
+        made.insert(path, SystemTime::now());
     }
+}
+
+/// Notes that a file tool of `ctx`'s session wrote `path` without making it:
+/// over a file that was there, as an edit does, or with a file it moved
+/// there. The disk says such a file was made as it was written, so without
+/// this note a user's file the session edited would look new since.
+pub(crate) fn rewrote(ctx: &ToolContext, path: &Path) {
+    let (Some(id), Ok(path)) = (session(ctx), std::fs::canonicalize(path)) else {
+        return;
+    };
+    let mut sessions = sessions();
+    let rewrote = &mut sessions.entry(id).or_default().rewrote;
+    if rewrote.len() < MADE {
+        rewrote.insert(path);
+    }
+}
+
+/// The files a file tool or a command's own redirection created in `ctx`'s
+/// session at `since` or later, by real path, in order: what a run that
+/// began then made, and nothing an earlier turn of its session did, whatever
+/// has been written in that since.
+pub(crate) fn made_from(ctx: &ToolContext, since: SystemTime) -> Vec<PathBuf> {
+    let Some(id) = session(ctx) else {
+        return Vec::new();
+    };
+    let sessions = sessions();
+    let made = sessions.get(&id).map(|session| &session.made);
+    let mut paths: Vec<PathBuf> = (made.into_iter().flatten())
+        .filter(|(_, at)| **at >= since)
+        .map(|(path, _)| path.clone())
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Whether a file tool of `ctx`'s session wrote what is at `path`, at any
+/// time: made it, as a file or as a folder for one, wrote over it or moved a
+/// file there. However new the disk says it is, it is then no file a program
+/// or anyone else newly left there.
+pub(crate) fn wrote(ctx: &ToolContext, path: &Path) -> bool {
+    let (Some(id), Ok(path)) = (session(ctx), std::fs::canonicalize(path)) else {
+        return false;
+    };
+    sessions().get(&id).is_some_and(|session| {
+        session.made.contains_key(&path)
+            || session.rewrote.contains(&path)
+            || session.folders.contains_key(&path)
+    })
+}
+
+/// Redirections of one command looked at for files it made. A line names a
+/// handful; past this the rest stay the user's, which only asks more.
+const FRESH: usize = 64;
+
+/// How far before a command started a file it made may say it was made. The
+/// system stamps a file from a coarser clock than the one read here, which
+/// can run a tick behind it: some milliseconds, sixteen on Windows.
+const CLOCK_SLACK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The places a command about to run sends its output to where nothing is
+/// yet, and when it started: what it leaves there is its own making.
+pub(crate) struct Fresh {
+    paths: Vec<PathBuf>,
+    since: SystemTime,
+}
+
+/// Of `targets`, the files a command about to run redirects its output to,
+/// those not there yet. A session's file tools were the only ones whose
+/// files counted as its own, so one it made with `echo > notes.txt` was the
+/// user's to the gate, and a session that had read a page could not write
+/// over, or delete, its own scratch file with nobody there to say yes.
+pub(crate) fn fresh(targets: Vec<PathBuf>) -> Fresh {
+    let paths = targets
+        .into_iter()
+        // Not `exists`, which follows links: a link to nowhere is there.
+        .filter(|path| path.symlink_metadata().is_err())
+        .take(FRESH)
+        .collect();
+    Fresh {
+        paths,
+        since: SystemTime::now(),
+    }
+}
+
+impl Fresh {
+    /// Notes as `ctx`'s session's own each of them the command left as a
+    /// plain file it made itself: not a link, nor a second name of a file
+    /// somewhere else, nor one older than the command, as a file moved
+    /// there is, which keeps the time it was made. Without that time, on a
+    /// disk that keeps none, it stays the user's.
+    pub(crate) fn made(self, ctx: &ToolContext) {
+        for path in &self.paths {
+            let young = born(path).is_some_and(|at| at + CLOCK_SLACK >= self.since);
+            if young && plain(path) {
+                made(ctx, path);
+            }
+        }
+    }
+}
+
+/// Whether `path` itself is a file with no other name: no link to follow,
+/// and no hard link that would make a file elsewhere the session's too.
+fn plain(path: &Path) -> bool {
+    let Ok(meta) = path.symlink_metadata() else {
+        return false;
+    };
+    #[cfg(unix)]
+    let alone = std::os::unix::fs::MetadataExt::nlink(&meta) == 1;
+    #[cfg(not(unix))]
+    let alone = true;
+    meta.file_type().is_file() && alone
 }
 
 /// Creates `folder` and any folder it is in that is missing, as a file tool
@@ -194,7 +313,7 @@ pub(crate) fn own(ctx: &ToolContext, path: &Path) -> bool {
         let Some(session) = sessions.get(&id) else {
             return false;
         };
-        if session.made.contains(&path) {
+        if session.made.contains_key(&path) {
             return true;
         }
         match session.folders.get(&path) {
@@ -254,6 +373,31 @@ pub(crate) fn born(path: &Path) -> Option<SystemTime> {
     return statx_born(path);
     #[cfg(not(all(target_os = "linux", not(target_env = "gnu"))))]
     return path.symlink_metadata().and_then(|meta| meta.created()).ok();
+}
+
+/// Whether the disk says `path` itself was made at `then` or later, as far
+/// as its clock may run behind; false where it keeps no such time.
+pub(crate) fn born_since(path: &Path, then: SystemTime) -> bool {
+    born(path).is_some_and(|at| at + CLOCK_SLACK >= then)
+}
+
+/// Whether the disk says `path` itself is as it was before `then`, by more
+/// than its clock may run behind: on Unix by when anything of it last
+/// changed, what it holds or its name, which a file made since cannot put
+/// back as a copy that keeps its original's times puts back when it was
+/// made; elsewhere by when it was made. False where the disk cannot say,
+/// which rules nothing out.
+pub(crate) fn unchanged_since(path: &Path, then: SystemTime) -> bool {
+    #[cfg(unix)]
+    let last = path.symlink_metadata().ok().and_then(|meta| {
+        use std::os::unix::fs::MetadataExt;
+        let seconds = u64::try_from(meta.ctime()).ok()?;
+        let since = std::time::Duration::new(seconds, u32::try_from(meta.ctime_nsec()).ok()?);
+        SystemTime::UNIX_EPOCH.checked_add(since)
+    });
+    #[cfg(not(unix))]
+    let last = born(path);
+    last.is_some_and(|at| at + CLOCK_SLACK < then)
 }
 
 /// `born` through Linux's statx call, read where the kernel lays out its
@@ -498,6 +642,10 @@ mod tests {
         crate::filestate::asked(731_021, 1, 0, 0);
         tools::run("write_file", &write("theirs.txt"), &ctx).unwrap();
         assert!(!own(&ctx, &dir.join("theirs.txt")));
+        // Noted as written all the same, so the disk's new time for it does
+        // not read as a file newly left there.
+        assert!(wrote(&ctx, &dir.join("theirs.txt")));
+        assert!(!wrote(&ctx, &dir.join("unwritten.txt")));
         // A file the patch moves is still the user's under its new name.
         let patch = "*** Begin Patch\n*** Add File: added.txt\n+x\n\
                      *** Update File: theirs.txt\n*** Move to: moved.txt\n*** End Patch";
@@ -508,6 +656,99 @@ mod tests {
         assert!(!own(&ctx, &dir.join("moved.txt")));
         assert!(!own(&in_session(731_022), &dir.join("new.txt")));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_is_made_when_its_tool_created_it_whatever_is_written_in_it_since() {
+        let dir = crate::store::tests::Scratch::new("taint-made-since");
+        std::fs::write(dir.join("theirs.txt"), "the user's").unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.to_path_buf()),
+            ..in_session(731_091)
+        };
+        let real = |name: &str| std::fs::canonicalize(dir.join(name)).unwrap();
+        let before = SystemTime::now();
+        let write = |path: &str| json!({ "path": path, "content": "x" }).to_string();
+        tools::run("write_file", &write("first.txt"), &ctx).unwrap();
+        assert_eq!(made_from(&ctx, before), [real("first.txt")]);
+        assert!(wrote(&ctx, &dir.join("first.txt")));
+        assert!(!wrote(&ctx, &dir.join("theirs.txt")));
+        // A later turn begins, and edits what the first made and what the
+        // user had: the rename gives each a new time of making on disk.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let later = SystemTime::now();
+        for path in ["first.txt", "theirs.txt"] {
+            let read = json!({ "path": path }).to_string();
+            tools::run("read_file", &read, &ctx).unwrap();
+        }
+        // The edits come in the next reply, after the reads were seen.
+        crate::filestate::asked(731_091, 1, 0, 0);
+        for (path, old) in [("first.txt", "x"), ("theirs.txt", "the user's")] {
+            let edit = json!({ "path": path, "old": old, "new": "edited" }).to_string();
+            tools::run("edit_file", &edit, &ctx).unwrap();
+        }
+        tools::run("write_file", &write("second.txt"), &ctx).unwrap();
+        // Only what the later turn created is made since it began.
+        assert_eq!(made_from(&ctx, later), [real("second.txt")]);
+        assert_eq!(
+            made_from(&ctx, before),
+            [real("first.txt"), real("second.txt")]
+        );
+        // And the user's file it edited is noted as written, not as made.
+        assert!(wrote(&ctx, &dir.join("theirs.txt")));
+        assert!(!own(&ctx, &dir.join("theirs.txt")));
+        // A patch makes what it adds, and only writes what it updates or
+        // moves.
+        let patch = "*** Begin Patch\n*** Add File: added.txt\n+x\n\
+                     *** Update File: theirs.txt\n*** Move to: moved.txt\n*** End Patch";
+        let patch = json!({ "patch": patch }).to_string();
+        tools::run(crate::patch::APPLY_PATCH, &patch, &ctx).unwrap();
+        assert_eq!(
+            made_from(&ctx, later),
+            [real("added.txt"), real("second.txt")]
+        );
+        assert!(wrote(&ctx, &dir.join("moved.txt")));
+        assert!(!own(&ctx, &dir.join("moved.txt")));
+        // Another session made none of them.
+        assert!(made_from(&in_session(731_092), before).is_empty());
+        assert!(!wrote(&in_session(731_092), &dir.join("first.txt")));
+    }
+
+    #[test]
+    fn a_file_is_as_it_was_before_a_time_only_where_the_disk_says_so_past_its_clocks_slack() {
+        let dir = crate::store::tests::Scratch::new("taint-unchanged");
+        let file = dir.join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        let now = SystemTime::now();
+        // Made a moment ago, it is not as it was before now: the disk's
+        // clock may run that far behind.
+        assert!(!unchanged_since(&file, now));
+        // Before a time well after it, it is; and nothing is that is not
+        // there.
+        let later = now + std::time::Duration::from_secs(60);
+        let untimed = cfg!(not(unix)) && born(&file).is_none();
+        assert!(unchanged_since(&file, later) || untimed);
+        assert!(!unchanged_since(&dir.join("missing.txt"), later));
+        // Made since a time only where the disk keeps when it was made.
+        assert_eq!(born_since(&file, now), born(&file).is_some());
+        assert!(!born_since(&file, later) && !born_since(&dir.join("missing.txt"), now));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_that_keeps_its_originals_times_is_not_as_it_was_before_it_was_made() {
+        let dir = crate::store::tests::Scratch::new("taint-kept-times");
+        std::fs::write(dir.join("old.txt"), "x").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let then = SystemTime::now();
+        // Such a copy says it was made when its original was, on a disk
+        // that sets that time back with the others, but not that nothing
+        // of it has changed since.
+        let mut copy = std::process::Command::new("cp");
+        copy.args(["-p", "old.txt", "copy.txt"]).current_dir(&dir);
+        assert!(copy.status().unwrap().success());
+        assert!(unchanged_since(&dir.join("old.txt"), then));
+        assert!(!unchanged_since(&dir.join("copy.txt"), then));
     }
 
     #[test]

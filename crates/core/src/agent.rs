@@ -33,7 +33,7 @@ pub(crate) const CONTINUE: &str =
     "Your last reply was cut off at the output limit; continue exactly where it stopped.";
 
 /// The notice for a reply cut off inside a tool call, which was not run.
-const CALL_AGAIN: &str = "Your last reply was cut off at the output limit in the middle \
+pub(crate) const CALL_AGAIN: &str = "Your last reply was cut off at the output limit in the middle \
     of a tool call, so the call was not run. Make it again with less in it, splitting the \
     work over several calls if it needs more room.";
 
@@ -79,7 +79,85 @@ const LOOP_SHARE: f64 = 0.15;
 const LOOP_NEW_SENTENCES: f64 = 0.05;
 
 /// The notice after a short answer that stops at what it is about to do.
-const CONTINUE_NOW: &str = "Continue now.";
+pub(crate) const CONTINUE_NOW: &str = "Continue now.";
+
+/// The notice when a run nobody watches stops there again: "Continue now."
+/// was answered once more with what it would do.
+pub(crate) const NOTHING_RAN: &str = "Your reply called no tool, so nothing ran, and nobody is \
+    here to answer you. Call the tool for your next step now. If the work is finished, give \
+    your final answer in full.";
+
+/// The notice after a reply that wrote a tool call out as text.
+pub(crate) const CALL_IT: &str = "Your reply wrote a tool call as text, which runs nothing. \
+    Make the call itself, as a tool call, with the same arguments.";
+
+/// How often one run nobody watches is sent back for stopping at its next
+/// step. On Terminal-Bench 2.0 one model ended 19 of its 41 failed runs
+/// there, most on a line such as "Found a bit-order bug — fixing it and
+/// re-checking", and a run sent back only once ended on the next such line.
+const PUSHES_UNATTENDED: u8 = 3;
+
+/// How often one run is told it wrote a call as text: a model that goes on
+/// doing so after two tellings is not going to stop for a third.
+const WRITTEN_CALLS: u8 = 2;
+
+/// The longest answer of a run nobody watches read as stopping at work
+/// still to do: a paragraph of what was found, then the step not taken.
+const STOPS_SHORT_CHARS: usize = 600;
+
+/// What work under way is called by the model about to do it, as the first
+/// word of the last thing it says: "fixing it and re-checking".
+const UNDER_WAY: [&str; 30] = [
+    "adding",
+    "applying",
+    "building",
+    "checking",
+    "compiling",
+    "continuing",
+    "creating",
+    "debugging",
+    "downloading",
+    "editing",
+    "fixing",
+    "generating",
+    "implementing",
+    "installing",
+    "investigating",
+    "looking",
+    "patching",
+    "proceeding",
+    "reading",
+    "removing",
+    "running",
+    "searching",
+    "starting",
+    "switching",
+    "testing",
+    "trying",
+    "updating",
+    "verifying",
+    "working",
+    "writing",
+];
+
+/// Words after "I'll" or "I'm going to" that say what is being left as it
+/// is, not what is about to be done.
+const LEFT_AS_IS: [&str; 14] = [
+    "assume",
+    "be",
+    "defer",
+    "hold",
+    "keep",
+    "leave",
+    "mention",
+    "not",
+    "note",
+    "point",
+    "recommend",
+    "skip",
+    "suggest",
+    "summarize",
+];
 
 /// The notice when a turn that changed files is about to end with no
 /// command since that ran clean and did more than read.
@@ -107,6 +185,22 @@ const WRAP_UP: &str = "You have reached the tool-round limit. Summarize what is 
 /// The notice in its place once the turn's time is up.
 const TIME_UP: &str = "Your time for this task is up. Give your answer now, in the form the \
     task asks for, from what you have found.";
+
+/// The notice at a helper's round cap in place of `WRAP_UP`: what it writes
+/// next is all the agent that started it reads, so it is asked for its
+/// report rather than a summary of what is done.
+const REPORT_NOW: &str = "You have reached the tool-round limit. Write your report now, in the \
+    form the task asks for, from what you have found: keep every row or finding you have, and \
+    where the task asks for a row per requirement or case, give each one you did not get to a \
+    row marked UNCLEAR that says it was not checked, rather than guess or leave it out.";
+
+/// The notice once a helper's token budget is spent, sent as at the round
+/// cap: the tools still offered and none allowed.
+const BUDGET_SPENT: &str = "Your token budget for this task is spent, so no more tools can be \
+    called. Write your report now, in the form the task asks for, from what you have found: \
+    keep every row or finding you have, and where the task asks for a row per requirement or \
+    case, give each one you did not get to a row marked UNCLEAR that says it was not checked, \
+    rather than guess or leave it out.";
 
 /// The answer a call gets when the turn is stopped while it runs; the front
 /// end that stopped it records it before `Turn::stop`. The call may have
@@ -255,8 +349,11 @@ pub struct Turn {
     asked_again: bool,
     /// Replies dropped and asked for again unchanged since the last tool round.
     asked_unchanged: usize,
-    /// An answer that stopped at its next step was sent back this turn.
-    pushed_on: bool,
+    /// How often an answer that stopped at its next step was sent back this
+    /// turn.
+    pushed: u8,
+    /// How often a reply that wrote a tool call as text was sent back.
+    called_in_words: u8,
     /// Whether an answer after unchecked edits is sent back to check them.
     verify: bool,
     /// A file was changed since the last command that checked it.
@@ -298,9 +395,26 @@ pub struct Turn {
     /// The settings turn parallel tool calls off, so no batch holds more
     /// than one.
     one_at_a_time: bool,
+    /// Whether the commands of one reply that only read run at once, as its
+    /// file reads do, in a run nobody watches: the `parallel_read_commands`
+    /// experiment. A model that looks around with `ls`, `git log` and `cat`
+    /// in one reply otherwise waits for each in turn.
+    reads_together: bool,
     /// Its time is up, so the next round asks for the wrap-up as the round
     /// cap does.
     timed_out: bool,
+    /// Its budget is spent, and its report was asked for as at the round cap.
+    spent: bool,
+    /// A helper's turn, whose last word is its report to the agent that
+    /// started it.
+    helper: bool,
+    /// Rounds a caller gave the turn past its cap, with the notice that asks
+    /// for them in place of the wrap-up, until `begin` reaches the cap.
+    offered: Option<(usize, String)>,
+    /// Those rounds once `begin` has asked for them, which the turn may run
+    /// past its limit to take out what it made only to test: 0 when it was
+    /// given none.
+    tidy: usize,
 }
 
 impl Turn {
@@ -319,7 +433,8 @@ impl Turn {
             order: Vec::new(),
             asked_again: false,
             asked_unchanged: 0,
-            pushed_on: false,
+            pushed: 0,
+            called_in_words: 0,
             verify: false,
             edited: false,
             asked_to_verify: false,
@@ -334,13 +449,86 @@ impl Turn {
             progress_notes: 0,
             noted_round: 0,
             one_at_a_time: !crate::store::parallel_tool_calls(),
+            reads_together: crate::store::experiments().parallel_read_commands,
             timed_out: false,
+            spent: false,
+            helper: false,
+            offered: None,
+            tidy: 0,
         }
     }
 
     /// Ends the turn as the round cap does, at its next round: its time is up.
     pub fn time_up(&mut self) {
         self.timed_out = true;
+    }
+
+    /// Ends the turn as the round cap does, with its next request: its budget
+    /// is spent, and the notice handed back, to go after the conversation so
+    /// far, asks for its report with no tools.
+    pub fn budget_spent(&mut self) -> Message {
+        self.spent = true;
+        self.connection.wrap_up = true;
+        Message {
+            role: "user".into(),
+            content: BUDGET_SPENT.into(),
+            notice: true,
+            // It ends the turn it is in, as the notice at the round cap does.
+            folded: true,
+            ..Default::default()
+        }
+    }
+
+    /// Whether the turn was asked for its report because its budget is spent.
+    pub fn spent(&self) -> bool {
+        self.spent
+    }
+
+    /// Whether the turn has run every round of its cap and was given none
+    /// past it, so `begin` would answer the calls of its next reply as not
+    /// run and ask for the wrap-up.
+    pub fn at_cap(&self) -> bool {
+        let ending = self.connection.wrap_up || self.timed_out;
+        !ending && self.limit > 0 && self.tidy == 0 && self.rounds >= self.limit
+    }
+
+    /// Gives the turn `rounds` more once `begin` turns its calls away at the
+    /// round cap, asked for there with `notice` in place of the wrap-up:
+    /// rounds to take out what it made only to test, run as any other until
+    /// `tidied` ends them.
+    pub fn tidy_at_cap(&mut self, rounds: usize, notice: String) {
+        self.offered = Some((rounds, notice));
+    }
+
+    /// Whether the turn is in the rounds it was given past its cap.
+    pub fn tidying(&self) -> bool {
+        self.tidy > 0 && !self.connection.wrap_up
+    }
+
+    /// Ends the rounds given to tidy in once they are used, or at once when
+    /// `now`, as when a reply in them made no call: the notice handed back,
+    /// to go after the conversation so far, asks for the wrap-up with no
+    /// tools, as `begin` asks for it at the cap. None while they go on, and
+    /// for a turn given none.
+    pub fn tidied(&mut self, now: bool) -> Option<Message> {
+        if !self.tidying() || !(now || self.rounds >= self.limit + self.tidy) {
+            return None;
+        }
+        self.connection.wrap_up = true;
+        Some(Message {
+            role: "user".into(),
+            content: WRAP_UP.into(),
+            notice: true,
+            // It ends the turn it is in, as the notice at the round cap does.
+            folded: true,
+            ..Default::default()
+        })
+    }
+
+    /// The same turn as a helper's when `on`, asked at its round cap for its
+    /// report rather than a summary.
+    pub fn for_helper(self, on: bool) -> Self {
+        Self { helper: on, ..self }
     }
 
     /// The same turn, ended by a call it keeps repeating whatever its
@@ -566,6 +754,10 @@ impl Turn {
         if !reply.tool_calls.is_empty() {
             return Ok(None);
         }
+        // A reply with no call in the rounds given to tidy in ends them,
+        // whatever it says, and the wrap-up follows it: like the wrap-up,
+        // it is not sent back.
+        let wrap_up = wrap_up || self.tidying();
         if reply.content.trim().is_empty() {
             // Some routes turn down an assistant message with no content, so
             // an empty reply is dropped rather than kept.
@@ -581,10 +773,38 @@ impl Turn {
             }
             return Ok(None);
         }
-        if self.rounds > 0 && !self.pushed_on && !wrap_up && announces(&reply.content) {
-            self.pushed_on = true;
+        // With nobody there, a reply that calls no tool ends the run, so one
+        // that only says what comes next, or writes its call out as text,
+        // is the run stopping with the work undone.
+        let unattended = !self.connection.human;
+        if unattended
+            && !wrap_up
+            && self.called_in_words < WRITTEN_CALLS
+            && writes_a_call(&reply.content)
+        {
+            self.called_in_words += 1;
             return Ok(Some(nudge(
-                CONTINUE_NOW,
+                CALL_IT,
+                "It wrote a tool call as text; asking it to make the call.",
+            )));
+        }
+        let stops = match unattended {
+            // Before any tool has run a plain question is as likely as a
+            // task, and its answer may end on a plan: only the surest sign.
+            true if self.rounds == 0 => self.pushed == 0 && announces(&reply.content),
+            true => self.pushed < PUSHES_UNATTENDED && stops_short(&reply.content),
+            // Someone watching can say "go on" themselves: once, and never
+            // before a tool has run, when there is nothing to go on with.
+            false => self.rounds > 0 && self.pushed == 0 && announces(&reply.content),
+        };
+        if stops && !wrap_up {
+            self.pushed += 1;
+            let notice = match self.pushed {
+                1 => CONTINUE_NOW,
+                _ => NOTHING_RAN,
+            };
+            return Ok(Some(nudge(
+                notice,
                 "It stopped at its next step; asking it to go on.",
             )));
         }
@@ -612,7 +832,8 @@ impl Turn {
     /// Queue the calls the model asked for. False when the turn should stop
     /// instead: nothing to run, no round allowed at all, or the wrap-up asked
     /// for at the round cap has come. At the cap the calls are answered as not
-    /// run instead, and a notice after them asks for that wrap-up with no tools.
+    /// run instead, and a notice after them asks for that wrap-up with no
+    /// tools, or first for the rounds it was given to tidy in (`tidy_at_cap`).
     pub fn begin(&mut self, calls: Vec<ToolCall>) -> bool {
         // With no round allowed nothing was done to sum up, so a call ends
         // the turn there: /btw makes one request.
@@ -622,7 +843,7 @@ impl Turn {
         self.order = calls.iter().map(|call| call.id.clone()).collect();
         self.queue = calls.into();
         self.results.clear();
-        if self.rounds >= self.limit || self.timed_out {
+        if self.rounds >= self.limit + self.tidy || self.timed_out {
             let why = match self.timed_out {
                 true => "Not run: the time for this task is up.".to_owned(),
                 false => format!(
@@ -633,9 +854,30 @@ impl Turn {
             while !self.queue.is_empty() {
                 self.finish_call(Err(why.clone()));
             }
+            // Rounds given to tidy in are asked for in place of the wrap-up,
+            // which follows them (`tidied`); not once the time is up.
+            if !self.timed_out
+                && let Some((rounds, notice)) = self.offered.take()
+            {
+                self.tidy = rounds;
+                self.results.push(Message {
+                    role: "user".into(),
+                    content: notice,
+                    notice: true,
+                    // It goes on with the turn it is in, as a nudge does.
+                    folded: true,
+                    ..Default::default()
+                });
+                return true;
+            }
             self.results.push(Message {
                 role: "user".into(),
-                content: (if self.timed_out { TIME_UP } else { WRAP_UP }).into(),
+                content: match (self.timed_out, self.helper) {
+                    (true, _) => TIME_UP,
+                    (false, true) => REPORT_NOW,
+                    (false, false) => WRAP_UP,
+                }
+                .into(),
                 notice: true,
                 // It ends the turn it is in, as a nudge goes on with one.
                 folded: true,
@@ -657,6 +899,7 @@ impl Turn {
     pub fn capped(&self) -> Option<String> {
         self.connection.wrap_up.then(|| match self.timed_out {
             true => "Stopped when its time was up.".to_owned(),
+            false if self.spent => "Stopped when its budget was spent.".to_owned(),
             false => format!(
                 "Stopped after {} rounds; send \"continue\" to keep going.",
                 self.limit
@@ -697,10 +940,20 @@ impl Turn {
         let max = if self.one_at_a_time { 1 } else { max };
         self.queue
             .iter()
-            .take_while(|call| tools::concurrent(&call.name) && !held(call))
+            .take_while(|call| self.beside(&call.name, &call.arguments) && !held(call))
             .take(max)
             .cloned()
             .collect()
+    }
+
+    /// Whether a call to `name` with `arguments` may run beside the others
+    /// of its reply: a call to a tool that says so, or, where commands that
+    /// only read run together and nobody watches the run, such a command.
+    fn beside(&self, name: &str, arguments: &str) -> bool {
+        tools::concurrent(name)
+            || (self.reads_together
+                && !self.connection.human
+                && only_reads(name, arguments, self.connection.workspace.as_deref()))
     }
 
     /// Record the outcome of the call at the front of the queue.
@@ -761,7 +1014,8 @@ impl Turn {
             ..Default::default()
         };
         self.track_edits(&result);
-        let fails_the_rest = fails_the_rest(&result);
+        let beside = self.beside(&result.name, &result.args);
+        let fails_the_rest = fails_the_rest(&result, beside);
         self.results.push(result);
         // A call that runs alone runs after everything before it, so nothing
         // of the reply is under way: what is left was never started.
@@ -801,6 +1055,10 @@ impl Turn {
         let since = self.rounds_since_edit;
         let due = self.progress_every > 0 && since > 0 && since.is_multiple_of(self.progress_every);
         if !due || self.progress_notes >= PROGRESS_NOTES || self.noted_round == self.rounds {
+            return None;
+        }
+        // In the rounds given to tidy in no next step of the work is wanted.
+        if self.tidying() {
             return None;
         }
         self.progress_notes += 1;
@@ -1130,9 +1388,14 @@ fn result_shape(content: &str) -> String {
 /// a time. Nor does a call the user, the gate or a stop kept from running:
 /// each call of the reply is answered on its own there, as a read beside a
 /// write plan mode refuses still runs.
-fn fails_the_rest(result: &Message) -> bool {
+///
+/// `beside` says the call was one that runs beside its neighbours, a
+/// command that only reads among them where those run together: the calls
+/// queued with it ran when it did, so a failure of it must not answer for
+/// them that they never ran.
+fn fails_the_rest(result: &Message, beside: bool) -> bool {
     let on_its_own = [tools::ASK_USER, crate::memory::MEMORY];
-    if tools::concurrent(&result.name) || on_its_own.contains(&result.name.as_str()) {
+    if beside || on_its_own.contains(&result.name.as_str()) {
         return false;
     }
     result.is_error && !refused_or_stopped(&result.content)
@@ -1169,12 +1432,39 @@ fn nudge(notice: &str, why: &'static str) -> Nudge {
     }
 }
 
+/// Whether a call to `name` with `arguments` is a command that only reads,
+/// such as `ls`, `git diff` or `cat`, by the reading of its line that says
+/// a command checked nothing (`checks`) and takes no snapshot of the
+/// project: one that waits for its end here, not one left in the
+/// background, on a terminal or asked to run outside the sandbox.
+fn only_reads(name: &str, arguments: &str, workspace: Option<&std::path::Path>) -> bool {
+    if name != "run_command" {
+        return false;
+    }
+    let Ok(args) = tools::parse_args_for(name, arguments) else {
+        return false;
+    };
+    let set = |flag: &str| args[flag].as_bool() == Some(true);
+    if set("background") || set("tty") || set("unsandboxed") {
+        return false;
+    }
+    let Some(line) = args["command"].as_str() else {
+        return false;
+    };
+    let dialect = crate::command::Dialect::here();
+    crate::command::assess(line, dialect, workspace).risk == crate::command::Risk::ReadOnly
+}
+
 /// Whether a command's result checks the edits before it: it ran to the end
 /// without failing, and did more than read, as `ls` or `git diff` only do.
 // A failing command is still an `Ok` result, told apart only by the
 // `[exit code N]` line it ends with.
 fn checks(result: &Message, workspace: Option<&std::path::Path>) -> bool {
     if result.is_error || crate::tool_runs::exit_code(result).is_some() {
+        return false;
+    }
+    // Still running as a job: it has not ended, so it has checked nothing.
+    if crate::tool_runs::moved(result) {
         return false;
     }
     let args = tools::parse_args_for(&result.name, &result.args).unwrap_or_default();
@@ -1348,6 +1638,117 @@ fn announces(answer: &str) -> bool {
     let opens = |with: &[&str]| with.iter().any(|opening| rest.starts_with(opening));
     opens(&["let me ", "i'll now ", "i will now "])
         || (after_then.is_some() && opens(&["i'll ", "i will ", "i'm going to ", "i am going to "]))
+}
+
+/// Whether `answer`, the reply of a run nobody watches that called no tool,
+/// stops at work still to do: `announces`, or its last clause says what it
+/// is about to do or is doing, as in "Found the bug — fixing it and
+/// re-checking" or "Next step: rebuild". A clause that speaks to the user,
+/// asks, or says what is left as it is, is an answer's own ending.
+fn stops_short(answer: &str) -> bool {
+    if announces(answer) {
+        return true;
+    }
+    let answer = answer.trim();
+    if answer.chars().count() > STOPS_SHORT_CHARS || answer.ends_with(['?', '!']) {
+        return false;
+    }
+    let body = answer.trim_end_matches(['.', ':', '\u{2026}']);
+    let from = |stops: &[&str], text: &str| {
+        (stops.iter())
+            .filter_map(|stop| text.rfind(stop).map(|at| at + stop.len()))
+            .max()
+            .unwrap_or(0)
+    };
+    // The last sentence, and what follows its last dash, colon or
+    // semicolon: "Rebooted — checking what the boot screen shows".
+    let sentence = &body[from(&[". ", "! ", "? ", "\n"], body)..];
+    let sentence = sentence.trim().to_lowercase().replace('\u{2019}', "'");
+    let clause = &sentence[from(&[" \u{2014} ", " \u{2013} ", " - ", "; ", ": "], &sentence)..];
+    let clause = clause.trim();
+    let words = |text: &str| -> Vec<String> {
+        text.split(|c: char| !(c.is_alphanumeric() || c == '\'' || c == '-'))
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let to_the_user = ["know", "wait", "stop", "pause", "you", "your", "shall"];
+    if (words(&sentence).iter()).any(|word| to_the_user.contains(&word.as_str())) {
+        return false;
+    }
+    if ["next step", "next:", "now:", "todo"]
+        .iter()
+        .any(|opening| sentence.starts_with(opening))
+    {
+        return true;
+    }
+    // What it says it will do, unless that is to leave something be.
+    let intents = [
+        "let me ",
+        "i'll ",
+        "i will ",
+        "i'm going to ",
+        "i am going to ",
+        "going to ",
+        "about to ",
+        "i need to ",
+        "i still need to ",
+        "still need to ",
+    ];
+    let intended = |text: &str| {
+        let rest = intents
+            .iter()
+            .find_map(|intent| text.strip_prefix(intent))?;
+        let next = (rest.split(' ')).find(|word| !["now", "next", "then", "first"].contains(word));
+        Some(next.is_some_and(|word| !LEFT_AS_IS.contains(&word)))
+    };
+    if let Some(intends) = intended(&sentence).or_else(|| intended(clause)) {
+        return intends;
+    }
+    // What it says it is doing, with nothing called to do it.
+    let under_way = |text: &str| {
+        let words = words(text);
+        let first = match words.first().map(String::as_str) {
+            Some("now" | "next" | "then") => words.get(1),
+            _ => words.first(),
+        };
+        first.is_some_and(|word| {
+            let word = word.strip_prefix("re-").unwrap_or(word);
+            UNDER_WAY.contains(&word)
+                || (word.strip_prefix("re")).is_some_and(|rest| UNDER_WAY.contains(&rest))
+        })
+    };
+    under_way(&sentence) || under_way(clause)
+}
+
+/// Whether `answer` holds a tool call written out as text, in the markup a
+/// model's own format gives one or as the JSON of a call to one of
+/// Letronna's tools: said so, where nobody is there to notice that nothing
+/// ran.
+fn writes_a_call(answer: &str) -> bool {
+    let lower = answer.to_lowercase();
+    let markup = [
+        "<tool_call",
+        "<function_call",
+        "<function=",
+        "<invoke ",
+        "<|tool_call",
+        "<|tool\u{2581}call",
+        "[tool_call",
+        "```tool_code",
+        "```tool_call",
+    ];
+    if markup.iter().any(|mark| lower.contains(mark)) {
+        return true;
+    }
+    if !(lower.contains("\"arguments\"") || lower.contains("\"parameters\"")) {
+        return false;
+    }
+    tools::all().iter().any(|tool| {
+        let name = tool.name();
+        lower.contains(&format!("\"name\": \"{name}\""))
+            || lower.contains(&format!("\"name\":\"{name}\""))
+    })
 }
 
 #[cfg(test)]
@@ -1577,6 +1978,138 @@ mod tests {
         // Unbroken, the repeats still end it.
         assert!(read(&mut turn).contains("Change your approach"));
         assert!(turn.looping().is_some());
+    }
+
+    #[test]
+    fn a_turn_whose_budget_is_spent_asks_for_the_report_as_at_the_cap() {
+        let mut turn = turn();
+        assert!(turn.begin(vec![call("read_file")]));
+        turn.finish_call(Ok("found".into()));
+        turn.take_results();
+        assert!(!turn.spent());
+        let ask = turn.budget_spent();
+        assert_eq!(
+            (ask.role.as_str(), ask.notice, ask.folded),
+            ("user", true, true)
+        );
+        assert_eq!(ask.content, BUDGET_SPENT);
+        assert!(turn.spent() && turn.connection.wrap_up);
+        assert_eq!(
+            turn.capped().as_deref(),
+            Some("Stopped when its budget was spent.")
+        );
+        // Calls in place of the report are dropped unrun, as in any wrap-up.
+        let mut report = answer(&mut turn, "R1 | a | PASS");
+        report.tool_calls = vec![call("read_file")];
+        assert_eq!(
+            turn.continuation(&mut report).map(|n| n.is_some()),
+            Ok(false)
+        );
+        assert!(report.tool_calls.is_empty());
+        assert!(!turn.begin(vec![call("read_file")]));
+    }
+
+    #[test]
+    fn a_helper_at_its_round_cap_is_asked_for_its_report() {
+        let mut turn = Turn::with_limit(turn().connection, 1).for_helper(true);
+        assert!(turn.begin(vec![call("read_file")]));
+        turn.finish_call(Ok("found".into()));
+        turn.take_results();
+        assert!(turn.begin(vec![call("read_file")]));
+        let sent = turn.take_results();
+        assert_eq!(sent[1].content, REPORT_NOW);
+        assert!(turn.connection.wrap_up && !turn.spent());
+    }
+
+    /// A turn of one round that has run it and was given `rounds` more to
+    /// tidy in, asked for at the cap in place of the wrap-up.
+    fn tidying(rounds: usize) -> Turn {
+        let mut turn = Turn::with_limit(turn().connection, 1);
+        assert!(!turn.at_cap());
+        assert!(turn.begin(vec![call("read_file")]));
+        turn.finish_call(Ok("found".into()));
+        turn.take_results();
+        assert!(turn.at_cap() && !turn.tidying());
+        turn.tidy_at_cap(rounds, "Take out what you made to test.".into());
+        // The calls are answered as not run, as ever at the cap, and the
+        // notice after them asks for the rounds, not for the wrap-up.
+        assert!(turn.begin(vec![call("read_file")]));
+        assert_eq!(turn.front(), None);
+        let sent = turn.take_results();
+        assert_eq!(
+            sent[0].content,
+            "Not run: the tool-round limit (1) was reached."
+        );
+        assert_eq!(sent[1].content, "Take out what you made to test.");
+        assert!(sent[1].notice && sent[1].folded && sent[1].role == "user");
+        assert!(turn.tidying() && !turn.at_cap());
+        assert!(!turn.connection.wrap_up && turn.capped().is_none());
+        turn
+    }
+
+    #[test]
+    fn a_turn_given_rounds_to_tidy_in_runs_them_past_its_cap_and_then_wraps_up() {
+        let mut turn = tidying(2);
+        for _ in 0..2 {
+            // Not ended while one of them is left.
+            assert!(turn.tidied(false).is_none());
+            assert!(turn.begin(vec![call("run_command")]));
+            assert_eq!(turn.next(|_| Outcome::Run), Next::Run(call("run_command")));
+            turn.finish_call(Ok("removed".into()));
+            turn.take_results();
+        }
+        // After the last, the wrap-up is asked for with no tools, as at the
+        // cap, and the turn says where it stopped by the cap it was given.
+        let ask = turn.tidied(false).expect("the wrap-up");
+        assert_eq!(ask.content, WRAP_UP);
+        assert!(ask.notice && ask.folded && ask.role == "user");
+        assert!(turn.connection.wrap_up && !turn.tidying());
+        assert_eq!(
+            turn.capped().as_deref(),
+            Some("Stopped after 1 rounds; send \"continue\" to keep going.")
+        );
+        assert!(turn.tidied(true).is_none());
+        assert!(!turn.begin(vec![call("run_command")]));
+    }
+
+    #[test]
+    fn a_reply_with_no_call_in_the_rounds_to_tidy_in_is_not_sent_back() {
+        let stops = "Removing the probe files now.";
+        // In any other round of a run nobody watches, it is.
+        let mut usual = turn();
+        assert!(usual.begin(vec![call("read_file")]));
+        usual.finish_call(Ok("found".into()));
+        usual.take_results();
+        let mut reply = answer(&mut usual, stops);
+        assert!(matches!(usual.continuation(&mut reply), Ok(Some(_))));
+        let mut blank = answer(&mut usual, "");
+        assert!(matches!(usual.continuation(&mut blank), Ok(Some(_))));
+
+        let mut turn = tidying(5);
+        let mut reply = answer(&mut turn, stops);
+        assert!(matches!(turn.continuation(&mut reply), Ok(None)));
+        let mut blank = answer(&mut turn, "");
+        assert!(matches!(turn.continuation(&mut blank), Ok(None)));
+        // A call in them is kept, where the wrap-up drops it.
+        let mut removal = answer(&mut turn, "");
+        removal.tool_calls = vec![call("run_command")];
+        assert!(matches!(turn.continuation(&mut removal), Ok(None)));
+        assert_eq!(removal.tool_calls.len(), 1);
+        // Ended at once by the caller, with rounds still left.
+        assert_eq!(turn.tidied(true).expect("the wrap-up").content, WRAP_UP);
+    }
+
+    #[test]
+    fn a_turn_whose_time_is_up_is_asked_for_its_answer_whatever_rounds_it_was_given() {
+        let mut turn = Turn::with_limit(turn().connection, 1);
+        assert!(turn.begin(vec![call("read_file")]));
+        turn.finish_call(Ok("found".into()));
+        turn.take_results();
+        turn.tidy_at_cap(5, "Take out what you made to test.".into());
+        turn.time_up();
+        assert!(turn.begin(vec![call("read_file")]));
+        assert_eq!(turn.take_results()[1].content, TIME_UP);
+        assert!(turn.connection.wrap_up && !turn.tidying());
     }
 
     #[test]
@@ -1992,6 +2525,21 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_in_the_rounds_it_was_given_to_tidy_in_is_not_asked_where_it_stands() {
+        let mut turn = Turn {
+            progress_every: 2,
+            ..Turn::with_limit(turn().connection, 2).unattended()
+        };
+        assert_eq!(noted_rounds(&mut turn, 2), [2]);
+        turn.tidy_at_cap(4, "Take out what you made to test.".into());
+        assert!(turn.begin(vec![call("read_file")]));
+        turn.take_results();
+        assert!(turn.tidying());
+        // Its fourth and sixth rounds without a change would each be asked.
+        assert_eq!(noted_rounds(&mut turn, 4), Vec::<usize>::new());
+    }
+
+    #[test]
     fn a_run_that_reads_for_twelve_rounds_is_asked_where_it_stands_three_times() {
         let mut turn = unattended_every(12);
         let mut sent = Vec::new();
@@ -2305,6 +2853,97 @@ mod tests {
         // A reply of a dozen reads runs eight at a time.
         turn.begin(vec![call("read_file"); 12]);
         assert_eq!(turn.next_batch(never, MAX_BATCH).len(), 8);
+    }
+
+    #[test]
+    fn commands_that_only_read_join_a_batch_where_that_is_turned_on_and_nobody_watches() {
+        let command = |id: &str, line: &str| ToolCall {
+            id: id.into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({ "command": line }).to_string(),
+        };
+        let never = |_: &ToolCall| false;
+        // A command only reads when what it reads is in the project, so
+        // the turns below have one.
+        let project =
+            std::env::temp_dir().join(format!("letronna-reads-together-{}", std::process::id()));
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(project.join("Cargo.toml"), "").unwrap();
+        let fresh = || {
+            let mut turn = self::turn();
+            turn.connection.workspace = Some(project.clone());
+            turn
+        };
+        let looks = [
+            command("a", "ls src"),
+            command("b", "git log --oneline -5"),
+            call("read_file"),
+            command("c", "cat Cargo.toml"),
+        ];
+        let reply = [
+            looks.to_vec(),
+            vec![command("d", "cargo build"), command("e", "ls")],
+        ]
+        .concat();
+
+        // As it has always been: a command runs alone, whatever it does.
+        let mut alone = fresh();
+        alone.begin(reply.clone());
+        assert!(alone.next_batch(never, MAX_BATCH).is_empty());
+
+        // Set here rather than saved, as the test below sets its own.
+        let mut turn = Turn {
+            reads_together: true,
+            ..fresh()
+        };
+        turn.begin(reply.clone());
+        // Up to the first that does more than read, which waits its turn,
+        // and so does the read queued behind it.
+        assert_eq!(turn.next_batch(never, MAX_BATCH), looks);
+        // One of them failing answers for itself alone: the others ran
+        // beside it, and the build behind them was never counting on it.
+        turn.finish_id("b", Err("The command timed out.".into()));
+        for id in ["a", "c"] {
+            turn.finish_id(id, Ok(id.into()));
+        }
+        turn.finish_id(&call("read_file").id, Ok("read".into()));
+        assert!(turn.next_batch(never, MAX_BATCH).is_empty());
+        assert_eq!(
+            turn.next(|_| Outcome::Run),
+            Next::Run(command("d", "cargo build"))
+        );
+        // The build failing still leaves what was queued behind it unrun.
+        turn.finish_call(Err("The command timed out.".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Ask);
+        let said: Vec<String> = turn.take_results().into_iter().map(|r| r.content).collect();
+        assert_eq!(said.last().map(String::as_str), Some(AFTER_A_FAILURE));
+
+        // With someone watching, the window and the terminal run them as
+        // they always have.
+        let mut watched = Turn {
+            reads_together: true,
+            ..fresh()
+        };
+        watched.connection.human = true;
+        watched.begin(reply);
+        assert!(watched.next_batch(never, MAX_BATCH).is_empty());
+
+        // Not one left running, on a terminal or outside the sandbox.
+        let here = Some(project.as_path());
+        for flag in ["background", "tty", "unsandboxed"] {
+            let args = serde_json::json!({ "command": "ls", flag: true }).to_string();
+            assert!(!only_reads("run_command", &args, here), "{flag}");
+        }
+        assert!(only_reads("run_command", r#"{"command": "ls"}"#, here));
+        assert!(!only_reads(
+            "run_command",
+            r#"{"command": "rm notes.txt"}"#,
+            here
+        ));
+        assert!(!only_reads("write_file", r#"{"command": "ls"}"#, here));
+        // Nor one that reads with no project to say what is in its reach.
+        assert!(!only_reads("run_command", r#"{"command": "ls"}"#, None));
+        std::fs::remove_dir_all(project).unwrap();
     }
 
     #[test]
@@ -2628,6 +3267,7 @@ One thing I did not change: a bare carriage return inside a quoted field is stil
     #[test]
     fn an_answer_that_stops_at_its_next_step_is_pushed_on_once() {
         let mut turn = turn();
+        turn.connection.human = true;
         // Before any tool has run there is nothing to go on with.
         let mut plan = answer(&mut turn, "Let me read the file.");
         assert!(matches!(turn.continuation(&mut plan), Ok(None)));
@@ -2641,6 +3281,91 @@ One thing I did not change: a bare carriage return inside a quoted field is stil
         assert_eq!(plan.content, "Found it. Now let me run the tests:");
         let mut plan = answer(&mut turn, "Now let me run the tests:");
         assert!(matches!(turn.continuation(&mut plan), Ok(None)), "twice");
+    }
+
+    #[test]
+    fn a_run_nobody_watches_is_sent_back_each_time_it_stops_at_work_to_do() {
+        let mut turn = turn();
+        // The surest sign alone before any tool has run.
+        let mut first = answer(&mut turn, "Checking the config.");
+        assert!(matches!(turn.continuation(&mut first), Ok(None)));
+        turn.begin(vec![call("read_file")]);
+        turn.finish_call(Ok("contents".into()));
+        turn.take_results();
+        // As one model ended 19 runs of Terminal-Bench 2.0.
+        let lines = [
+            "Found a bit-order bug \u{2014} fixing it and re-checking",
+            "Rebooted \u{2014} checking what the boot screen shows",
+            "Next step: rebuild with the patch applied.",
+        ];
+        let notices = [CONTINUE_NOW, NOTHING_RAN, NOTHING_RAN];
+        for (line, notice) in lines.iter().zip(notices) {
+            let mut said = answer(&mut turn, line);
+            let nudge = turn.continuation(&mut said).unwrap().expect(line);
+            assert_eq!(nudge.notice.content, notice, "{line}");
+            assert_eq!(said.content, *line);
+        }
+        // Three times a run: the fourth is its answer.
+        let mut fourth = answer(&mut turn, "Now running the tests");
+        assert!(matches!(turn.continuation(&mut fourth), Ok(None)));
+    }
+
+    #[test]
+    fn work_still_to_do_is_told_from_an_answers_own_ending() {
+        for said in [
+            "Found a bit-order bug \u{2014} fixing it and re-checking",
+            "Rebooted \u{2014} checking what the boot screen shows",
+            "The first pass is in. I'll fix the parser and rerun the tests.",
+            "Two tests still fail; re-running with the verbose flag",
+            "Next step: rebuild",
+            "The build is broken. Now rebuilding with the right flags.",
+            "I'm going to now patch the loader.",
+            "Still need to write the output file.",
+        ] {
+            assert!(stops_short(said), "{said}");
+        }
+        for said in [
+            "The tests pass.",
+            "Fixed the rolling window and ran the suite: 14 passed.",
+            "Done. The server is running on port 8080.",
+            "Let me know if you want the other file changed too.",
+            "I'll wait for your go-ahead before deleting it.",
+            "I'm going to leave the config as it is.",
+            "I'll keep the old name, as the tests use it.",
+            "Next steps for you: deploy it and watch the logs.",
+            "The cause is unknown: the log stops before the crash.",
+            "Shall I go on and run the tests?",
+            "Now I see: the bug was the off-by-one in the loop.",
+            &format!("{} Fixing the parser.", "Done. ".repeat(120)),
+        ] {
+            assert!(!stops_short(said), "{said}");
+        }
+    }
+
+    #[test]
+    fn a_tool_call_written_as_text_is_sent_back_to_be_made() {
+        let mut turn = turn();
+        let written = [
+            "I'll read it.\n<tool_call>{\"name\": \"read_file\"}</tool_call>",
+            "{\"name\": \"run_command\", \"arguments\": {\"command\": \"ls\"}}",
+        ];
+        for text in written {
+            let mut said = answer(&mut turn, text);
+            let nudge = turn.continuation(&mut said).unwrap().expect(text);
+            assert_eq!(nudge.notice.content, CALL_IT);
+        }
+        // Twice a run, and never with someone watching, who can see it.
+        let mut third = answer(&mut turn, written[0]);
+        assert!(matches!(turn.continuation(&mut third), Ok(None)));
+        let mut watched = self::turn();
+        watched.connection.human = true;
+        let mut said = answer(&mut watched, written[0]);
+        assert!(matches!(watched.continuation(&mut said), Ok(None)));
+        // An answer about a tool's JSON names no tool of Letronna's.
+        assert!(!writes_a_call(
+            "The API takes {\"name\": \"widget\", \"arguments\": {}} as its body."
+        ));
+        assert!(!writes_a_call("Fixed the loader and ran the tests."));
     }
 
     #[test]

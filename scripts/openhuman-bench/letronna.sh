@@ -53,6 +53,10 @@ export LETRONNA_READ_TIMEOUT="${LETRONNA_READ_TIMEOUT:-1200}"
 # run may do what is hard to take back, such as `rm -r` or `git reset
 # --hard`, as the other harnesses' permission bypasses do.
 export LETRONNA_DISPOSABLE=1
+# Its files are thrown away with it, so a run that has read a web page or
+# one of the task's documents may still move, write over and delete the
+# task's files; nothing that sends data off the machine is let through.
+export LETRONNA_DISPOSABLE_FILES=1
 # The agent's PATH and python are the task image's, not a login shell's.
 export LETRONNA_NO_LOGIN_ENV=1
 # Nothing may open a sign-in page or any other in a browser.

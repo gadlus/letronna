@@ -564,6 +564,14 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
     for path in &added {
         crate::taint::made(ctx, path);
     }
+    // What it wrote where a file was, or moved a file to, it did not make.
+    for step in &steps {
+        if let Step::Write { path, .. } = step
+            && !added.contains(path)
+        {
+            crate::taint::rewrote(ctx, path);
+        }
+    }
     // After the batch lets go, as the formatter takes a moment and records
     // what it changed under the same lock.
     drop(batch);

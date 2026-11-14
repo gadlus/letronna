@@ -654,6 +654,66 @@ pub(crate) fn at_head(folder: &Path, path: &str) -> Option<String> {
     Some(out)
 }
 
+/// The files below `folder` its repository neither tracks nor ignores whose
+/// paths match `pattern`, a pathspec as git reads one, by their paths from
+/// there; `None` where there is no repository or git could not say. Git
+/// looks into no repository inside it, a submodule's or another's, and
+/// lists only what it finds, so a name it reads otherwise than the disk
+/// spells it, by case or by its Unicode form, is left out rather than in.
+pub(crate) fn untracked(folder: &Path, pattern: &str) -> Option<Vec<String>> {
+    let args = [
+        "ls-files",
+        "-z",
+        "--others",
+        "--exclude-standard",
+        "--",
+        pattern,
+    ];
+    // A pattern this once, where every other call reads paths as names.
+    let globbed = [("GIT_LITERAL_PATHSPECS".to_owned(), "0".to_owned())];
+    let (out, cut) = run(folder, &args, 1 << 20, &[0], &globbed).ok()?;
+    let listed = out.split('\0').filter(|path| !path.is_empty());
+    (!cut).then(|| listed.map(str::to_owned).collect())
+}
+
+/// The files below `folder` its repository neither tracks nor ignores, by
+/// their paths from there, with a folder that holds nothing it tracks named
+/// once, `/` after it, in place of all that is in it, and one that holds
+/// nothing at all left out; `None` where there is no repository or git could
+/// not say. A folder of thousands of files costs one name so, and a listing
+/// still too long to keep ends early rather than not being given; whether
+/// it did rides along, since what a listing cut short leaves out is not
+/// thereby missing from the project. Where `folder` itself holds nothing
+/// the repository tracks, git names it alone, which says nothing of what is
+/// in it: its files are then listed one by one, as `untracked` lists them.
+pub(crate) fn untracked_folded(folder: &Path) -> Option<(Vec<String>, bool)> {
+    let args = [
+        "ls-files",
+        "-z",
+        "--others",
+        "--exclude-standard",
+        "--directory",
+        "--no-empty-directory",
+    ];
+    let (out, cut) = git(folder, &args, 1 << 20).ok()?;
+    let mut listed = out.split('\0').filter(|path| !path.is_empty());
+    if listed.any(|path| path == "./") {
+        return untracked(folder, ".").map(|files| (files, false));
+    }
+    let listed = out.split('\0').filter(|path| !path.is_empty());
+    Some((listed.map(str::to_owned).collect(), cut))
+}
+
+/// Whether `folder` is the top of a repository's working tree, not a folder
+/// inside one.
+pub(crate) fn is_top(folder: &Path) -> bool {
+    let Ok((out, _)) = git(folder, &["rev-parse", "--show-toplevel"], 4096) else {
+        return false;
+    };
+    let canonical = |path: &Path| std::fs::canonicalize(path).ok();
+    canonical(Path::new(out.trim())).is_some_and(|top| canonical(folder) == Some(top))
+}
+
 /// The paths of the files in the commit checked out in `folder`'s
 /// repository with a line that matches the extended regular expression
 /// `pattern`; none where nothing matches or there is no repository.
@@ -802,6 +862,18 @@ fn run_raw(
     ])
     .args(args)
     .current_dir(folder)
+    // Set by a hook or a shell this started from, these would choose the
+    // repository, its index or how a path is read in place of `folder`.
+    .env_remove("GIT_DIR")
+    .env_remove("GIT_WORK_TREE")
+    .env_remove("GIT_INDEX_FILE")
+    .env_remove("GIT_COMMON_DIR")
+    .env_remove("GIT_OBJECT_DIRECTORY")
+    .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+    .env_remove("GIT_NAMESPACE")
+    .env_remove("GIT_GLOB_PATHSPECS")
+    .env_remove("GIT_NOGLOB_PATHSPECS")
+    .env_remove("GIT_ICASE_PATHSPECS")
     .envs(crate::command::GUARDS.iter().copied())
     // Paths are names, never patterns: `--literal-pathspecs`, said where
     // `off` can still take it back for a command that refuses it.
@@ -942,6 +1014,80 @@ mod tests {
         setup(&folder, &["add", "a.txt"]);
         setup(&folder, &["commit", "-q", "-m", "first"]);
         folder
+    }
+
+    #[test]
+    fn only_files_the_repository_neither_tracks_nor_ignores_are_untracked() {
+        let folder = repo("untracked-list");
+        std::fs::create_dir_all(folder.join("sub/deep")).unwrap();
+        std::fs::create_dir_all(folder.join("built")).unwrap();
+        std::fs::write(folder.join(".gitignore"), "built/\n").unwrap();
+        for file in [
+            "sub/a_spec.txt",
+            "sub/deep/b[1]_spec.txt",
+            "built/c_spec.txt",
+            "d.txt",
+        ] {
+            std::fs::write(folder.join(file), "x").unwrap();
+        }
+        std::fs::write(folder.join("staged_spec.txt"), "x").unwrap();
+        setup(&folder, &["add", "staged_spec.txt"]);
+        // A repository inside, whose files are its own.
+        let inner = folder.join("vendor/lib");
+        std::fs::create_dir_all(&inner).unwrap();
+        setup(&inner, &["init", "-q"]);
+        std::fs::write(inner.join("e_spec.txt"), "x").unwrap();
+        setup(&inner, &["add", "e_spec.txt"]);
+        assert_eq!(
+            untracked(&folder, "*_spec*").unwrap(),
+            ["sub/a_spec.txt", "sub/deep/b[1]_spec.txt"]
+        );
+        // Asked from a folder inside, the paths are from there.
+        assert_eq!(
+            untracked(&folder.join("sub"), "*_spec*").unwrap(),
+            ["a_spec.txt", "deep/b[1]_spec.txt"]
+        );
+        assert!(is_top(&folder));
+        assert!(!is_top(&folder.join("sub")));
+        // Outside a repository git cannot say.
+        let none = scratch("untracked-none");
+        assert_eq!(untracked(&none, "*_spec*"), None);
+        assert!(!is_top(&none));
+    }
+
+    #[test]
+    fn a_folder_that_holds_nothing_tracked_is_listed_once_in_place_of_what_is_in_it() {
+        let folder = repo("untracked-folded");
+        for dir in ["src", "new/deep", "built", "empty", "logs"] {
+            std::fs::create_dir_all(folder.join(dir)).unwrap();
+        }
+        std::fs::write(folder.join(".gitignore"), "built/\n*.log\n").unwrap();
+        std::fs::write(folder.join("src/lib.txt"), "x").unwrap();
+        setup(&folder, &["add", ".gitignore", "src/lib.txt"]);
+        setup(&folder, &["commit", "-q", "-m", "second"]);
+        for file in [
+            "src/probe.txt",
+            "new/a.txt",
+            "new/deep/b.txt",
+            "built/c.txt",
+            "logs/run.log",
+            "top.txt",
+        ] {
+            std::fs::write(folder.join(file), "x").unwrap();
+        }
+        // A file beside tracked ones by its path, a wholly new folder once,
+        // and neither a folder git ignores, one that holds only what it
+        // ignores, nor an empty one.
+        let listed = |folder: &Path| {
+            let (listed, cut) = untracked_folded(folder).unwrap();
+            // So few names are all of them.
+            assert!(!cut);
+            listed
+        };
+        assert_eq!(listed(&folder), ["new/", "src/probe.txt", "top.txt"]);
+        // Asked of a folder that itself holds nothing tracked, its files.
+        assert_eq!(listed(&folder.join("new")), ["a.txt", "deep/b.txt"]);
+        assert_eq!(untracked_folded(&scratch("untracked-folded-none")), None);
     }
 
     #[test]

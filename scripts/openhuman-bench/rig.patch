@@ -24,7 +24,7 @@ new file mode 100755
 index 0000000..967d162
 --- /dev/null
 +++ b/bundles/adapters/letronna.sh
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,70 @@
 +#!/usr/bin/env bash
 +# Letronna's adapter for OpenHuman's benchmark rig, in the contract of its
 +# bundles/adapters/*.sh: _common.sh gives PROMPT, a fresh HOME and the task's
@@ -80,6 +80,10 @@ index 0000000..967d162
 +# run may do what is hard to take back, such as `rm -r` or `git reset
 +# --hard`, as the other harnesses' permission bypasses do.
 +export LETRONNA_DISPOSABLE=1
++# Its files are thrown away with it, so a run that has read a web page or
++# one of the task's documents may still move, write over and delete the
++# task's files; nothing that sends data off the machine is let through.
++export LETRONNA_DISPOSABLE_FILES=1
 +# The agent's PATH and python are the task image's, not a login shell's.
 +export LETRONNA_NO_LOGIN_ENV=1
 +# Nothing may open a sign-in page or any other in a browser.

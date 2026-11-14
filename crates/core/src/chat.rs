@@ -714,7 +714,7 @@ pub(crate) const REPLY_TOKENS: usize = 8_192;
 /// for the reply is room the window cannot use, and some gateways hold
 /// credit against all of it before the reply starts. 32,000 is a long file
 /// written in one call.
-const MAX_REPLY_TOKENS: usize = 32_000;
+pub(crate) const MAX_REPLY_TOKENS: usize = 32_000;
 
 /// How much of a conversation one request carries, in estimated tokens
 /// unless said otherwise.
@@ -3917,13 +3917,84 @@ impl Assembler {
             if !name.is_empty() {
                 call.name.clone_from(name);
             }
-            call.arguments.push_str(arguments);
+            let slot = self.place(slot, *index, arguments);
+            if let Some(slot) = slot {
+                self.calls[slot].arguments.push_str(arguments);
+            }
         }
         for (id, arguments) in &chunk.tool_calls_done {
             if let Some(call) = self.calls.iter_mut().find(|call| call.id == *id) {
-                call.arguments.clone_from(arguments);
+                // A call's whole arguments in place of what its pieces came
+                // to; one that says nothing where pieces did come leaves
+                // them, where it used to wipe them.
+                if !arguments.trim().is_empty() || call.arguments.is_empty() {
+                    call.arguments.clone_from(arguments);
+                }
             }
         }
+    }
+
+    /// The call `arguments`, a fragment that reached the call at `slot` by
+    /// the gateway's `index`, is added to, or `None` when it adds nothing.
+    ///
+    /// It is `slot`, but for a fragment that opens a JSON object where that
+    /// call's arguments are already a whole one. No call's arguments are
+    /// two objects, so the fragment is not this call's:
+    /// - the same object again is the last chunk of a gateway that sends
+    ///   the arguments whole after their pieces, and adds nothing;
+    /// - after an empty `{}` put down as a placeholder, it replaces it;
+    /// - while a later call of the reply has none yet, it is that call's,
+    ///   from a gateway that names each call with its own index and then
+    ///   sends every call's arguments under one: left where they landed,
+    ///   the first call's arguments were no JSON at all and the others
+    ///   arrived empty;
+    /// - otherwise it is a new call to the same tool, as one that sends
+    ///   each call whole with no id, all at one index, makes them.
+    fn place(&mut self, slot: usize, index: Option<usize>, arguments: &str) -> Option<usize> {
+        if arguments.is_empty() {
+            return None;
+        }
+        let gathered = self.calls[slot].arguments.as_str();
+        // Looked at only where a fragment opens an object, so a long call's
+        // pieces are not each parsed with all that came before them.
+        let opens = arguments.trim_start().starts_with('{');
+        let whole = opens
+            && !gathered.is_empty()
+            && serde_json::from_str::<Value>(gathered).is_ok_and(|read| read.is_object());
+        if !whole {
+            return Some(slot);
+        }
+        if gathered == arguments {
+            return None;
+        }
+        if gathered.trim() == "{}" {
+            self.calls[slot].arguments.clear();
+            return Some(slot);
+        }
+        let waiting = (slot + 1..self.calls.len()).find(|&later| {
+            self.calls[later].arguments.is_empty() && !self.calls[later].name.is_empty()
+        });
+        let to = waiting.unwrap_or_else(|| {
+            self.calls.push(ToolCall {
+                name: self.calls[slot].name.clone(),
+                ..Default::default()
+            });
+            self.extras.push(Value::Null);
+            self.calls.len() - 1
+        });
+        if let Some(index) = index {
+            self.slots.insert(index, to);
+        }
+        self.active = Some(to);
+        crate::diag::event(
+            "tool_call_placed",
+            &[
+                ("from", slot.into()),
+                ("to", to.into()),
+                ("new", waiting.is_none().into()),
+            ],
+        );
+        Some(to)
     }
 }
 
@@ -4849,6 +4920,10 @@ fn stream(
         if extra.cancel.is_set() {
             return Err(Failure::new(FailureKind::Stopped, "Stopped."));
         }
+        // As it goes out, for whoever looks into what came back (off
+        // unless asked for; see stream_dump).
+        let wire = posted.as_ref().or(reshaped.map(|(_, body)| body));
+        crate::stream_dump::begin(connection.conversation, url, wire.unwrap_or(&sent));
         let sent_at = std::time::Instant::now();
         let send = request
             .try_clone()
@@ -4886,8 +4961,14 @@ fn stream(
                 match read(
                     response, connection, extra, ticket, sender, &mut begun, &mut slow,
                 ) {
-                    Ok(()) => return Ok(()),
-                    Err(failure) => failure,
+                    Ok(()) => {
+                        crate::stream_dump::end("");
+                        return Ok(());
+                    }
+                    Err(failure) => {
+                        crate::stream_dump::end(&failure.to_string());
+                        failure
+                    }
                 }
             }
             Ok(response) => {
@@ -5161,6 +5242,7 @@ fn read(
                 ));
             }
         };
+        crate::stream_dump::line(&line);
         // A read waiting on the provider cannot be woken, so a stop is heard
         // when the next line arrives.
         if extra.cancel.is_set() {
@@ -5463,6 +5545,14 @@ impl Reply {
                 FailureKind::Network,
                 "The provider closed the stream early or does not support SSE chat completions.",
             ));
+        }
+        // A call that never got a name cannot be run or answered: left out,
+        // and noted, where it used to vanish with nothing to say it had been.
+        let unnamed = (self.assembler.calls.iter())
+            .filter(|call| call.name.is_empty())
+            .count();
+        if unnamed > 0 {
+            crate::diag::event("tool_calls_unnamed", &[("count", unnamed.into())]);
         }
         let (mut calls, extras): (Vec<_>, Vec<_>) = self
             .assembler
@@ -6671,6 +6761,120 @@ mod tests {
                 call("tool_1_read_file_YmFy", "read_file", r#"{"path":"b.rs"}"#),
             ]
         );
+    }
+
+    /// A chat completion chunk with one tool-call fragment at `index`.
+    fn piece(index: usize, id: &str, name: &str, arguments: &str) -> String {
+        let mut call = json!({"index": index, "function": {"arguments": arguments}});
+        if !id.is_empty() {
+            call["id"] = id.into();
+        }
+        if !name.is_empty() {
+            call["function"]["name"] = name.into();
+        }
+        json!({"choices": [{"index": 0, "delta": {"tool_calls": [call]}}]}).to_string()
+    }
+
+    #[test]
+    fn arguments_sent_under_one_index_reach_the_calls_they_are_for() {
+        // Each call named under its own index, then every call's arguments
+        // under index zero: the first call got all three objects end to
+        // end, which is no JSON, and the other two arrived empty.
+        let named = [
+            piece(0, "call_a", "read_file", ""),
+            piece(1, "call_b", "read_file", ""),
+            piece(2, "call_c", "run_command", ""),
+        ];
+        let whole = [
+            piece(0, "", "", r#"{"path":"a.rs"}"#),
+            piece(0, "", "", r#"{"path":"b.rs"}"#),
+            piece(0, "", "", r#"{"command":"ls"}"#),
+        ];
+        let wanted = [
+            call("call_a", "read_file", r#"{"path":"a.rs"}"#),
+            call("call_b", "read_file", r#"{"path":"b.rs"}"#),
+            call("call_c", "run_command", r#"{"command":"ls"}"#),
+        ];
+        let events: Vec<&str> = named.iter().chain(&whole).map(String::as_str).collect();
+        assert_eq!(assemble(&events), wanted);
+        // The same a token at a time.
+        let pieces = [
+            piece(0, "", "", r#"{"pa"#),
+            piece(0, "", "", r#"th":"a.rs"}"#),
+            piece(0, "", "", r#"{"path""#),
+            piece(0, "", "", r#":"b.rs"}"#),
+            piece(0, "", "", r#"{"command":"#),
+            piece(0, "", "", r#""ls"}"#),
+        ];
+        let events: Vec<&str> = named.iter().chain(&pieces).map(String::as_str).collect();
+        assert_eq!(assemble(&events), wanted);
+        // Sent as it should be, each under its own index and a piece of one
+        // between the pieces of another, nothing is moved.
+        let interleaved = [
+            piece(0, "", "", r#"{"pa"#),
+            piece(1, "", "", r#"{"path":"#),
+            piece(0, "", "", r#"th":"a.rs"}"#),
+            piece(1, "", "", r#""b.rs"}"#),
+            piece(2, "", "", r#"{"command":"ls"}"#),
+        ];
+        let events: Vec<&str> = (named.iter().chain(&interleaved))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(assemble(&events), wanted);
+    }
+
+    #[test]
+    fn whole_arguments_sent_again_or_after_a_placeholder_are_one_calls() {
+        // A last chunk that repeats the arguments whole after their pieces.
+        let again = [
+            piece(0, "call_a", "read_file", r#"{"path":"#),
+            piece(0, "", "", r#""a.rs"}"#),
+            piece(0, "", "", r#"{"path":"a.rs"}"#),
+        ];
+        let events: Vec<&str> = again.iter().map(String::as_str).collect();
+        assert_eq!(
+            assemble(&events),
+            [call("call_a", "read_file", r#"{"path":"a.rs"}"#)]
+        );
+        // An empty object first, then the arguments.
+        let placeholder = [
+            piece(0, "call_a", "read_file", "{}"),
+            piece(0, "", "", r#"{"path":"a.rs"}"#),
+        ];
+        let events: Vec<&str> = placeholder.iter().map(String::as_str).collect();
+        assert_eq!(
+            assemble(&events),
+            [call("call_a", "read_file", r#"{"path":"a.rs"}"#)]
+        );
+        // Two calls whole at one index with no id to tell them apart, which
+        // used to make one call of `{..}{..}`.
+        let unnumbered = [
+            piece(0, "", "read_file", r#"{"path":"a.rs"}"#),
+            piece(0, "", "read_file", r#"{"path":"b.rs"}"#),
+        ];
+        let events: Vec<&str> = unnumbered.iter().map(String::as_str).collect();
+        assert_eq!(
+            assemble(&events),
+            [
+                call("", "read_file", r#"{"path":"a.rs"}"#),
+                call("", "read_file", r#"{"path":"b.rs"}"#),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_whole_call_that_says_nothing_leaves_what_its_pieces_gathered() {
+        let mut assembler = Assembler::default();
+        let event = piece(0, "call_a", "read_file", r#"{"path":"a.rs"}"#);
+        assembler.add(&parse_event(&event).unwrap());
+        let done = |arguments: &str| Chunk {
+            tool_calls_done: vec![("call_a".into(), arguments.into())],
+            ..Default::default()
+        };
+        assembler.add(&done(""));
+        assert_eq!(assembler.calls[0].arguments, r#"{"path":"a.rs"}"#);
+        assembler.add(&done(r#"{"path":"b.rs"}"#));
+        assert_eq!(assembler.calls[0].arguments, r#"{"path":"b.rs"}"#);
     }
 
     #[test]

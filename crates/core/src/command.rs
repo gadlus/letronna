@@ -1455,7 +1455,7 @@ fn peel(argv: &[String], dialect: Dialect) -> (usize, Risk) {
 
 /// Whether `word` sets a variable for the command after it, as
 /// `RUST_LOG=debug` does.
-fn assignment(word: &str) -> bool {
+pub(crate) fn assignment(word: &str) -> bool {
     word.split_once('=').is_some_and(|(name, _)| {
         name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
             && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')

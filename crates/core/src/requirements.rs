@@ -19,7 +19,11 @@
 //! is mostly code. Code blocks, indented code, console sessions, headings
 //! and tables are skipped whole; a list item is a sentence of its own, and a
 //! line broken inside a paragraph is joined to the next. A sentence ends at
-//! a stop outside a code span and not after an abbreviation such as "e.g.".
+//! a stop outside a code span and not after an abbreviation such as "e.g.",
+//! and a name from code opens one as a capital does, backticks or none. One
+//! that joins clauses with a dash set off by spaces or a semicolon is cut
+//! there where each side states a requirement of its own and stands alone,
+//! so a request written as one long sentence is read as the several it is.
 //! The bar is a few such sentences, so a short request or a bug report,
 //! which the notice to run a build or test covers, costs nothing.
 //!
@@ -31,6 +35,7 @@
 //! are looked up, never the folder walked, and only a file changed since the
 //! run began counts.
 
+use crate::chat::Message;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -50,10 +55,53 @@ const RULES: usize = 8;
 
 /// The cases a review's table has a row for where they apply, as a
 /// literal that both the notice asking a run for a review and the brief
-/// of a review started for the run are built from.
+/// of a review started for the run are built from. On a benchmark run an
+/// early return for one value, which the request never asked for, decided
+/// a hidden test, and the tester and a reviewer each weighed the case in
+/// their notes and wrote no row for it; so a row is asked for each input
+/// the change excepts from its own rule. A guard is no failure where the
+/// general path, run on the input, crashes or does not end: "no defined
+/// result" is what a reviewer says of any boundary value. Told to fail
+/// every other guard whose path gives another result, reviews failed ones
+/// that were right more often than one that was wrong: a check skipped
+/// because what it reads was not there, which a run then took out and
+/// should have kept, a guard the project's own code of the same kind has,
+/// and one for a value no sentence of the request spoke of. So a guard
+/// for input that is absent passes unless the request says what happens
+/// then, as does one that gives what the general path gives, which is no
+/// exception at all; and one for input that is there fails only by a
+/// sentence of the request that says what happens for that input, quoted
+/// in the row. Such a sentence outranks an exception the project shares.
+/// With none, a guard the project's own code of the same kind makes too
+/// passes, that code named in the row: left a doubt, every guard the
+/// project plainly shares sent its run back. Any other is a doubt, never
+/// a failure, also where it differs from the project's code, which a
+/// review's own prompt would fail: it names both results and the command
+/// that shows them, for the run to run and decide by. On
+/// another a review tested the other side of a condition the code never
+/// evaluated with an input that gives the same result with the condition
+/// and without, so the input is to be one the condition's words change the
+/// result for, and the row names both results to show it is. On another a
+/// rule for the items of a list was built to act on the nearest item
+/// still open, so the first item of a list inside an item acted on the
+/// outer one; the tester's tests and the review tried no list inside a
+/// list, so a rule about a thing that can hold its own kind has a row for
+/// the same input one level down. The row says what the rule gives for
+/// the inner one and what for the outer one, and the request's words judge
+/// each: asked that the rule "apply to the inner one alone and leave the
+/// outer one as it was", a review would fail a rule that is right to reach
+/// upward, as one by which a group is valid only if its members are. On
+/// another a change kept each thing it made in a module-level map it never
+/// emptied: with about forty made across a test file two of them fell into
+/// different internal groups and a query over both matched nothing, while
+/// the tester's 26 tests and both reviews, which made a few each, passed,
+/// and a reviewer wrote of the map "Perf caveat, not correctness."; so
+/// state that outlives a call has a row for a plain case run again after
+/// many more have been made, one row for each such state, where every
+/// other item is asked of each requirement it applies to.
 macro_rules! cases {
     () => {
-        "a field, argument or part the requirement names left out, undefined or empty; a plain value as well as the same value wrapped, such as in an object or a parser's state, each also built by hand and passed straight to the method that reads it; each other way the same input can be written, such as its parts in another order or a spelling the project's docs or tests use, including any the parser might reject before the new check runs; an error the requirement names, matched by its exact words, not a generic error; two of something the requirement allows only once; the new form beside the existing form of the same thing in one call, where one applies and the other must not; each place in the code that records the event the requirement is about or changes that state, such as a demotion, a close or a removal, found by searching the code, not only the call the request names; the other side of a condition, such as what \"and is not ended\" or \"unless\" keeps out, with both sides in one input; steps the requirement sets in no order, in each order, such as the later one first; each category the requirement maps to an output, with an input from outside the project's own code, such as a caller's function or a returned error, that uses the requirement's own words for it; and each case the project's own tests check of the existing feature nearest to it, done again for the new one in the same order of calls, with the same fixtures and through the same entry point, such as a query made for the first time only after the change it should see;"
+        "a field, argument or part the requirement names left out, undefined or empty; a plain value as well as the same value wrapped, such as in an object or a parser's state, each also built by hand and passed straight to the method that reads it; each other way the same input can be written, such as its parts in another order or a spelling the project's docs or tests use, including any the parser might reject before the new check runs; an error the requirement names, matched by its exact words, not a generic error; two of something the requirement allows only once; the new form beside the existing form of the same thing in one call, where one applies and the other must not; a thing the requirement's rule is about that can hold another of its own kind, such as a list in a list, a group in a group or a call in a call, with the same input one level down, the row saying what the rule gives for the inner one and what for the outer one, each judged by the request's words; each place in the code that records the event the requirement is about or changes that state, such as a demotion, a close or a removal, found by searching the code, not only the call the request names; where the change keeps state that outlives a call, such as a module-level map, cache, counter or registry, once for each such state, one of the requirement's plain cases run again after many more of the things that state holds have been made, dozens where a test makes a few, and again after the project's own reset where it has one; the other side of a condition, such as what \"and is not ended\" or \"unless\" keeps out, with both sides in one input chosen so that the result would differ if the condition's words were removed from the requirement, the row naming both results; steps the requirement sets in no order, in each order, such as the later one first; each category the requirement maps to an output, with an input from outside the project's own code, such as a caller's function or a returned error, that uses the requirement's own words for it; each input the change itself treats apart from its general path, such as an early return on a zero, empty or boundary value or a form it exempts, found by reading the change, the row saying what the general path gives when run on that input (the guard passes where that path crashes or does not end, and where the input is absent, the file, section, collection or value the rule reads not being there at all, unless the request says what happens then; for input that is there, such as a zero or an empty value, the guard passes where both results are the same; where they differ the row is FAIL only where it quotes a sentence of the request that says what happens for that input, by name or by a rule that covers it, and the change gives another result, even where the project's own code of the same kind makes the same exception; where no sentence does, the guard passes where the project's own code of the same kind, named in the row, makes the same exception, and is otherwise UNCLEAR, naming both results and the command that shows them, never FAIL); and each case the project's own tests check of the existing feature nearest to it, done again for the new one in the same order of calls, with the same fixtures and through the same entry point, such as a query made for the first time only after the change it should see;"
     };
 }
 
@@ -62,11 +110,22 @@ macro_rules! cases {
 /// run itself tends to check only the paths it built, with its own code. Its
 /// table, a row per numbered requirement and case, is what `unchecked`
 /// holds the run to afterwards: a helper asked only for what fails samples
-/// cases, and files the ones it is unsure of as asides.
+/// cases, and files the ones it is unsure of as asides. A case the run set
+/// aside fails only where the request's words decide it, and passes with
+/// `NOT_ASKED` where they do not, or is a doubt where the change made the
+/// project do another thing in it than before. Only a row that fails is
+/// fixed: told to fix any case its helper "calls unclear or sets aside" as
+/// well, a run would build what a row written `NOT_ASKED` had just passed,
+/// so a doubt is decided by the request's words, as the notices of a
+/// review's rows say, and such a row asks for nothing. A row that passed
+/// says what was run and what it showed, as one that failed does: on a
+/// benchmark run a review had watched the work do what each of its rows
+/// passed, the rows said `PASS` and no more, and the run, sent a tester's
+/// test that expected otherwise, took the test for the only evidence.
 const REVIEW: &str = concat!(
-    "First ask a helper that hasn't seen your work: with the agent tool, start a helper of type `review`, not general, and wait for its report. Give it the request word for word, the numbered requirements above, the files you changed or made and each case you chose not to handle, with why. Ask it to change no file, to work out each value it checks with code of its own, not your scripts or helpers, and to end its report with a table of one row per requirement and case, written `R1 | case | PASS` or `R1 | case | FAIL | command that shows it`, with a row for each of these cases that applies: ",
+    "First ask a helper that hasn't seen your work: with the agent tool, start a helper of type `review`, not general, and wait for its report. Give it the request word for word, the numbered requirements above, the files you changed or made and each case you chose not to handle, with why. Ask it to change no file, to work out each value it checks with code of its own, not your scripts or helpers, and to end its report with a table of one row per requirement and case, the verdict alone in its cell and what shows it in the cell after, written `R1 | case | PASS | command and what it showed` or `R1 | case | FAIL | command that shows it`, with a row for each of these cases that applies: ",
     cases!(),
-    " and each case you chose not to handle, which fails when the request's words say what should happen in it, quoted in the row, whatever the reason it was set aside. Ask it to write any doubt, caveat or problem it notices beyond those rows as a row of its own, `R1 | case | UNCLEAR | what it doubts`, never only prose, and the same for a row that can only pass by bending another requirement's words. Judge each row by what the request says should happen, not by what the code now does. Fix every row that fails by changing the work, not the case, and any case it calls unclear or sets aside, unless the request rules that case out."
+    " and each case you chose not to handle, which fails when the request's words say what should happen in it, quoted in the row, whatever the reason it was set aside, and passes, written `R1 | case | PASS | not asked`, when they do not, or is UNCLEAR where your change made the project do another thing in it than before: a gap the request does not ask to close is no failure. Ask it to write any doubt, caveat or problem it notices beyond those rows as a row of its own, FAIL with its command where a run of its own shows the work wrong, otherwise `R1 | case | UNCLEAR | what it doubts`, never only prose, and to leave UNCLEAR a row that can only pass by bending another requirement's words. Judge each row by what the request says should happen, not by what the code now does. Fix every row that fails by changing the work, not the case, unless the request rules that case out. A case it calls unclear is a doubt, not a failure: decide it by the request's words, and change the work for it only where those words ask for that. Change nothing for a row written `not asked`."
 );
 
 /// The least time a run with a deadline needs left to be asked for the
@@ -82,7 +141,7 @@ pub(crate) const REVIEW_TOKENS: u64 =
     crate::agents::budget_for(crate::agents::BUDGET, crate::agent_defs::REVIEW_ROUNDS);
 
 /// What the run is told after the sentences.
-const CHECK: &str = "These are picked by their wording, so read the request once more for any behaviour it states that the list leaves out. For each, run or write a quick test that shows it holds through the entry point a caller uses, end to end, not only by reading internal state, minding exact messages, strings and orderings. A behaviour tied to an event, such as something being demoted, closed or removed, holds on every call that can cause that event, not only the one the sentence names: find each and test it. A sentence that limits a behaviour, with words such as only, unless, otherwise, if they differ, and not, as long as, or while keeping or preserving something, also says where it must not happen: test that side too, with the input closest to the line, such as a value that is there but empty or undefined, values that differ in one place, or new data for something that is to stay as it was. Code of yours that lets a stated behaviour be skipped on some path, such as a flag that turns it off, a default that leaves it out or an early return, needs the request to exempt that path; where it does not, make the behaviour happen there too. A case the request's words decide is not yours to set aside or file as an assumption, even where the code makes it hard, such as a read that cannot tell a missing value from one that is there but empty: find another way to tell them apart, such as checking the length or whether the key is there first, and keep to the request's rule. Where steps are set in no order, try them in each order, such as the later one first. Where the request maps categories to outputs, test each with an input from outside the project's own code, such as a caller's function or a returned error, that uses the request's own words for it. Where a sentence names several cases or inputs, try each one in every form it could be written, including any your parser or code might reject before it reaches your new check. Where the request lists the kinds of thing your change handles, such as several types, formats or sources, each other rule it states holds for every one of them: test each rule on each kind, not only on the first. Where it lets parts nest, test the rules inside a nested part too, including one at a position that is missing or empty. Where a sentence's words could mean more than one shape of input, such as a plain value or the same value wrapped in an object, accept and test every shape they could mean, not only the one your code already handles. Spell each the way the project already writes its parts, as its grammar, tests or docs show them, with the new syntax added where those parts allow it, and try that spelling first: it is the one a user writes, not one you invented. A class, function or file the request names that the project already has is the one to change, unless the request asks for a new one: find it and extend it rather than making a new one of that name beside it. Where your change does something the project already does elsewhere, such as reporting a failure, tracking a change or hiding an option, do it the same way: read how the project's own tests call and check the existing ones, follow that over a looser reading of the request's words, and test yours the same way, with the same calls and set-up, such as one object reused across tests or a reset between them. Where they make a change and then call or query for the first time, do that too rather than calling once beforehand to clear or warm it up, since a first call can take its own path. Fix any that fail; skip one that only gives background or the old behaviour. Remove any script or test you added only for this check, unless the task asks for tests. Only your last message is passed on as your answer, so end with your whole answer again, not only what changed.";
+const CHECK: &str = "These are picked by their wording, so read the request once more for any behaviour it states that the list leaves out. For each, run or write a quick test that shows it holds through the entry point a caller uses, end to end, not only by reading internal state, minding exact messages, strings and orderings. A behaviour tied to an event, such as something being demoted, closed or removed, holds on every call that can cause that event, not only the one the sentence names: find each and test it. A sentence that limits a behaviour, with words such as only, unless, otherwise, if they differ, and not, as long as, or while keeping or preserving something, also says where it must not happen: test that side too, with the input closest to the line, such as a value that is there but empty or undefined, values that differ in one place, or new data for something that is to stay as it was. Code of yours that lets a stated behaviour be skipped on some path, such as a flag that turns it off, a default that leaves it out or an early return, needs the request to exempt that path; where it does not, make the behaviour happen there too. A case the request's words decide is not yours to set aside or file as an assumption, even where the code makes it hard, such as a read that cannot tell a missing value from one that is there but empty: find another way to tell them apart, such as checking the length or whether the key is there first, and keep to the request's rule. Where steps are set in no order, try them in each order, such as the later one first. Where the request maps categories to outputs, test each with an input from outside the project's own code, such as a caller's function or a returned error, that uses the request's own words for it. Where a sentence names several cases or inputs, try each one in every form it could be written, including any your parser or code might reject before it reaches your new check. Where the request lists the kinds of thing your change handles, such as several types, formats or sources, each other rule it states holds for every one of them: test each rule on each kind, not only on the first. Where it lets parts nest, test the rules inside a nested part too, including one at a position that is missing or empty. Where a sentence's words could mean more than one shape of input, such as a plain value or the same value wrapped in an object, accept and test every shape they could mean, not only the one your code already handles. Spell each the way the project already writes its parts, as its grammar, tests or docs show them, with the new syntax added where those parts allow it, and try that spelling first: it is the one a user writes, not one you invented. A class, function or file the request names that the project already has is the one to change, unless the request asks for a new one: find it and extend it rather than making a new one of that name beside it. Where your change does something the project already does elsewhere, such as reporting a failure, tracking a change or hiding an option, do it the same way: read how the project's own tests call and check the existing ones, follow that over a looser reading of the request's words, and test yours the same way, with the same calls and set-up, such as one object reused across tests or a reset between them. Where they make a change and then call or query for the first time, do that too rather than calling once beforehand to clear or warm it up, since a first call can take its own path. Fix any that fail; skip one that only gives background or the old behaviour. Once your tests pass, change no behaviour the request does not state on a guess at what is tidier or at what a test you cannot see might check: a late change of behaviour needs the request's words or a failing row behind it. Remove any script or test you added only for this check, unless the task asks for tests. Only your last message is passed on as your answer, so end with your whole answer again, not only what changed.";
 
 /// What a run whose work is files the request names is told after the
 /// sentences, in place of `CHECK`.
@@ -254,12 +313,97 @@ const PAST: &[&str] = &["was", "were", "previously"];
 /// Words, in lower case and without their stop, after which a stop ends no
 /// sentence.
 const ABBREVIATIONS: &[&str] = &[
-    "e.g", "i.e", "eg", "ie", "etc", "vs", "cf", "approx", "incl", "esp", "resp", "no", "fig", "al",
+    "e.g", "i.e", "eg", "ie", "etc", "vs", "cf", "approx", "incl", "esp", "resp", "no", "fig",
+    "al", "a.k.a", "aka", "w.r.t", "wrt", "viz",
+];
+
+/// Words, in lower case and without their stop, that are as often a whole
+/// word ending a sentence as a short form, as "max" is: a stop after one
+/// ends no sentence before a word in lower case, name or not, as in "The
+/// min. chunk_size must be 4 bytes."
+const SHORTENED: &[&str] = &[
+    "min", "max", "ver", "ex", "excl", "eq", "sec", "ref", "est", "avg", "num", "pos", "neg",
+    "temp", "misc",
 ];
 
 /// What a code span stands as while a sentence's words are weighed: one word
 /// that is neither a marker nor code.
 const SPAN: &str = "\u{2026}";
+
+/// Marks that join two clauses in one sentence: a dash set off by spaces,
+/// and a semicolon before a space.
+const JOINTS: &[&str] = &[" -- ", " \u{2014} ", " \u{2013} ", "; "];
+
+/// Fewest words, a code span counted as one, that make a side of a joint a
+/// clause of its own: with fewer it is a label, an item of a list or an
+/// aside, whose verb or subject is on the other side.
+const CLAUSE: usize = 6;
+
+/// First words of a clause that goes on from the one before its joint.
+const GOES_ON: &[&str] = &[
+    "otherwise",
+    "else",
+    "then",
+    "and",
+    "or",
+    "but",
+    "so",
+    "nor",
+    "not",
+    "which",
+    "whereas",
+    "also",
+    "instead",
+    "except",
+    "to",
+    "as",
+    "of",
+    "by",
+    "from",
+    "into",
+    "than",
+    "that",
+    "e.g",
+    "i.e",
+    "eg",
+    "ie",
+];
+
+/// Last words that leave the words before a joint unfinished: an article,
+/// or a word that takes what follows it, as "everything after -- to the
+/// child" has on both sides of a mark that is no joint.
+const HANGING: &[&str] = &[
+    "a", "an", "the", "to", "of", "by", "from", "into", "with", "without", "for", "in", "on", "at",
+    "as", "than", "that", "and", "or", "but", "after", "before", "between", "via", "per", "until",
+    "through",
+];
+
+/// Words of a clause that says how things were, as a bug report joins one
+/// to its asks in "each of these worked in 1.2": a side that holds one, or
+/// a version's number, is no clause, so it takes no request to `FEWEST`.
+const EARLIER: &[&str] = &[
+    "worked",
+    "used to",
+    "regression",
+    "regressed",
+    "broke",
+    "broken",
+    "anymore",
+];
+
+/// First words that, with a comma after them, say where or when what
+/// follows applies, as those of `CONDITIONS` do.
+const SETTINGS: &[&str] = &[
+    "in", "for", "on", "with", "without", "under", "during", "after", "before", "while", "where",
+    "within", "given",
+];
+
+/// First words of a clause whose subject is on the other side of its
+/// joint, as "must also return true" has it, beside the first word of any
+/// of `MARKERS` that ends in "s", as "returns" does.
+const SUBJECTLESS: &[&str] = &[
+    "must", "should", "shall", "cannot", "can't", "can", "may", "will", "doesn't",
+];
 
 /// A run of lines that may hold sentences, and whether it is a list's item,
 /// whose first sentence may start in lower case.
@@ -273,8 +417,29 @@ struct Block {
 /// wording, or one does and `RULES` or more do with the plain ones counted,
 /// the request is a specification, whose plain sentences state one too,
 /// such as "Keys are matched without case": then each sentence is kept but
-/// a question, a story, how to work or code.
+/// a question, a story, how to work or code. A sentence that joins clauses
+/// which each state one is cut into them (`clauses`), with two limits. The
+/// cuts alone take a request to `FEWEST` only where one sentence joins that
+/// many clauses, as a specification written as one sentence does: a bug
+/// report's sentence joins two asks, and is no more of one for it. And no
+/// cut takes the list past `LISTED`, where it would cost a later sentence
+/// its number.
 pub(crate) fn sentences(request: &str) -> Vec<String> {
+    let (whole, cut) = (read(request, false), read(request, true));
+    let over = whole.len() < FEWEST && cut.len() >= FEWEST;
+    let joined = || {
+        let mut all = blocks(request).into_iter();
+        all.any(|block| (split(&block.text).into_iter()).any(|one| clauses(one).len() >= FEWEST))
+    };
+    match cut.len() > LISTED || (over && !joined()) {
+        true => whole,
+        false => cut,
+    }
+}
+
+/// The requirement sentences of `request` as `sentences` gives them, each
+/// sentence `cut` into its clauses or left whole.
+fn read(request: &str, cut: bool) -> Vec<String> {
     let (mut stated, mut specified): (Vec<String>, Vec<String>) = Default::default();
     let keep = |found: &mut Vec<String>, sentence: &str| {
         if !found.iter().any(|kept| kept == sentence) {
@@ -284,17 +449,24 @@ pub(crate) fn sentences(request: &str) -> Vec<String> {
     for block in blocks(request) {
         for (at, sentence) in split(&block.text).into_iter().enumerate() {
             // One starting in lower case goes on from words cut off by code,
-            // as "returns" after a snippet does, unless it opens an item.
+            // as "returns" after a snippet does, unless it opens an item or
+            // with a name, as "state_data is injected" does.
             let lower = sentence.chars().next().is_some_and(char::is_lowercase);
-            if lower && !(block.item && at == 0) {
+            if lower && !(block.item && at == 0) && !namelike(first_word(sentence)) {
                 continue;
             }
-            let states = states(sentence);
-            if states {
-                keep(&mut stated, sentence);
-            }
-            if states || specifies(sentence) {
-                keep(&mut specified, sentence);
+            let parts = match cut {
+                true => clauses(sentence),
+                false => vec![sentence],
+            };
+            for part in parts {
+                let states = states(part);
+                if states {
+                    keep(&mut stated, part);
+                }
+                if states || specifies(part) {
+                    keep(&mut specified, part);
+                }
             }
         }
     }
@@ -372,8 +544,17 @@ pub(crate) fn shares(count: usize) -> Vec<(usize, usize)> {
 /// `sentences`, the requirements `request` states. It is told what the run
 /// would leave out: the request word for word, how to find the change, and
 /// each case its table has a row for; and not the run's reasons for what it
-/// left out, which a reviewer tends to agree with.
-pub(crate) fn brief(request: &str, sentences: &[String], share: (usize, usize)) -> String {
+/// left out, which a reviewer tends to agree with, though each case it
+/// weighed and set aside that this helper is dealt, `doubts`, is listed for
+/// a row of its own, and the words it read more than one way, `readings`,
+/// for a row per reading.
+pub(crate) fn brief(
+    request: &str,
+    sentences: &[String],
+    share: (usize, usize),
+    doubts: &[String],
+    readings: &[crate::doubts::Reading],
+) -> String {
     let mut text = String::from(
         "Review a change you have not seen, made to the project in your working folder, \
          against the request below. Its author's reasons are not given, so judge it by the \
@@ -394,38 +575,71 @@ pub(crate) fn brief(request: &str, sentences: &[String], share: (usize, usize)) 
     };
     text.push_str(&format!(
         "\n\nCheck {rows}. End your report with a table of one row per requirement and \
-         case, written `R{first} | case | PASS` or `R{first} | case | FAIL | command that \
-         shows it`, with a row for each of these cases that applies: {} and each case the \
-         change leaves out or handles more narrowly than the request's words, which fails \
-         when those words say what should happen in it, quoted in the row. Any doubt about a \
-         case, any caveat to a row, and anything wrong you notice beyond the rows asked for \
-         gets a row of its own, written `R{first} | case | UNCLEAR | what you doubt`, never \
-         only prose, since prose may be cut before the change's author reads it. A row that \
-         can only pass by bending another requirement's words is UNCLEAR too: quote both, and \
-         prescribe no fix.",
+         case, the verdict alone in its cell and what shows it in the cell after, written \
+         `R{first} | case | PASS | command and what it showed` or `R{first} | case | FAIL | \
+         command that shows it`, with a row for each of these cases that applies: {} and each \
+         case the change leaves out or handles more narrowly than the request's words, which \
+         fails when those words say what should happen in it, quoted in the row. Any doubt \
+         about a case, any caveat to a row, and anything wrong you notice beyond the rows \
+         asked for gets a row of its own, FAIL with its command where a run of yours shows the \
+         work wrong, otherwise `R{first} | case | UNCLEAR | what you doubt`, never only prose, \
+         since prose may be cut before the change's author reads it. A row that can only pass \
+         by bending another requirement's words is UNCLEAR too: quote both, and prescribe no \
+         fix.",
         cases!()
     ));
+    text.push_str(&crate::doubts::section(doubts, false));
+    // Only the readings of its own rows, as the requirements are shared.
+    let own: Vec<_> = (readings.iter())
+        .filter(|reading| whole || (first..=last).contains(&reading.number))
+        .cloned()
+        .collect();
+    text.push_str(&crate::doubts::reading_rows(&own));
     text
 }
 
 /// What the run is told when helpers that have not seen its work reviewed or
 /// tested it for the run: the numbered requirements, as `notice` lists them,
 /// the reviewers' `reports` with their tables, or with none the ask for a
-/// review as `notice` makes it, what it is told of the tester's report when
-/// there is one, `tested`, and the check to make after.
-pub(crate) fn reviewed(sentences: &[String], reports: &[String], tested: Option<&str>) -> String {
-    // With no review's table the run still asks for a review itself.
-    let mut text = notice(sentences, reports.is_empty(), &[]);
+/// review as `notice` makes it where the run can still `review`, after what
+/// became of the reviews `lost`,
+/// the reports that came back with no table that could be read, `unread`,
+/// what it is told of the tester's report when there is one, `tested`, and
+/// the check to make after.
+pub(crate) fn reviewed(
+    sentences: &[String],
+    reports: &[String],
+    unread: &[String],
+    tested: Option<&str>,
+    lost: Option<(usize, usize)>,
+    review: bool,
+) -> String {
+    // With no review's table the run still asks for a review itself, where
+    // it can `review`.
+    let mut text = notice(sentences, reports.is_empty() && review, &[]);
     let at = text.find(CHECK).unwrap_or(text.len());
     text.truncate(at);
+    if let Some((started, spent)) = lost {
+        let at = text.find(REVIEW).unwrap_or(text.len());
+        text.insert_str(at, &unreported(started, spent));
+    }
     if !reports.is_empty() {
         text.push_str(
             "Helpers that haven't seen your work reviewed it against the request; their \
              reports follow, each ending with a table of its rows. Fix every row that fails by \
-             changing the work, not the case, and any case a report calls unclear or sets \
-             aside, unless the request rules that case out.",
+             changing the work, not the case, unless the request rules that case out. A case \
+             a report calls unclear or sets aside is a doubt, not a failure: decide it by the \
+             request's words, and change the work for it only where those words ask for \
+             that.",
         );
         for report in reports {
+            text.push_str(&format!("\n\n{}", report.trim()));
+        }
+        text.push_str("\n\n");
+    }
+    if !unread.is_empty() {
+        text.push_str(&untabled(unread.len()));
+        for report in unread {
             text.push_str(&format!("\n\n{}", report.trim()));
         }
         text.push_str("\n\n");
@@ -436,6 +650,43 @@ pub(crate) fn reviewed(sentences: &[String], reports: &[String], tested: Option<
     }
     text.push_str(CHECK);
     text
+}
+
+/// What a run is told before it is asked to start a review itself, when
+/// none of the `started` reviews begun for it came back with a table and
+/// their budget stopped `spent` of them: a review that ran out checked
+/// nothing to the end, which is not a review that found nothing wrong.
+fn unreported(started: usize, spent: usize) -> String {
+    let which = match (started, spent) {
+        (1, _) => "The review started for you ran out of budget before reporting".to_owned(),
+        (n, spent) if spent == n => {
+            format!("The {n} reviews started for you ran out of budget before reporting")
+        }
+        (n, spent) => format!(
+            "{spent} of the {n} reviews started for you ran out of budget before reporting, \
+             and the rest gave no table"
+        ),
+    };
+    format!("{which}, so nothing is reviewed yet: that is not a pass. ")
+}
+
+/// What a run is told ahead of the reports of the `count` reviews started
+/// for it that came back with no table that could be read: none of their
+/// rows holds the run, so what they found is its own to read, where a
+/// report dropped without a word passed for a review that found nothing.
+fn untabled(count: usize) -> String {
+    let which = match count {
+        1 => "One review started for you came back with no table that could be read, so none \
+              of its rows is counted: its report follows. Read it for what it found, and fix \
+              what it says fails"
+            .to_owned(),
+        n => format!(
+            "{n} reviews started for you came back with no table that could be read, so none \
+             of their rows is counted: their reports follow. Read them for what they found, \
+             and fix what they say fails"
+        ),
+    };
+    format!("{which} by changing the work, not the case, unless the request rules that case out.")
 }
 
 /// How many requirements `text` numbers, when it is the notice `notice`
@@ -453,37 +704,139 @@ pub(crate) fn listed(text: &str) -> Option<usize> {
     text.lines().filter_map(numbered).max()
 }
 
-/// The rows of a review's table in `report`: each requirement's number,
-/// whether the case passed, and the row as written. A line is a row when a
-/// cell of it opens with `R` and a number and a later cell says PASS or
-/// FAIL, however the helper laid the table out.
+/// The line a notice opens a tester's report with when the tester wrote it
+/// ahead of the work, in the project as it was, and the line that closes
+/// it: the rows between judge nothing of the work, so `rows` skips them.
+pub(crate) const AHEAD_OPENS: &str =
+    "[The tester's report, written before your change; its rows judge nothing of your work]";
+pub(crate) const AHEAD_CLOSES: &str = "[End of the tester's report]";
+
+/// The rows of a review's table in `report` that are a requirement's: each
+/// with its requirement's number, whether the case passed, and the row as
+/// written. A line is such a row when its first cell opens with `R` and a
+/// number and a later cell says PASS or FAIL, alone or ahead of what shows
+/// it (`judged`), however the helper laid the table out; one whose last
+/// cell says the case waits on the work (`placeholder`) is no row, since it
+/// says nothing of the work once the work is there, nor is any line of a
+/// report written ahead of the work, between `AHEAD_OPENS` and
+/// `AHEAD_CLOSES`.
 fn rows(report: &str) -> Vec<(usize, bool, String)> {
+    (written(report).into_iter())
+        .filter_map(|(number, passed, line)| Some((number?, passed?, line)))
+        .collect()
+}
+
+/// The line `cut_rows` writes ahead of the rows a quote cut, which marks
+/// them as rows of a review's table whichever of them the cut left
+/// (`written`).
+const WRITTEN_AGAIN: &str = "Rows of its table the quote above cut, written again:";
+
+/// The lines of `report` written as rows of a review's table, as `rows`
+/// reads them, each with whether its case passed; with None for that, those
+/// that open as a row does, requirements' numbers alone in the first of
+/// three cells or more (`numbered`), and give no verdict that can be read:
+/// a row the reading could not make out, or one whose test was not run.
+/// And, with None for the number, the rows that belong to no requirement:
+/// a review writes the cases it was given that a run set aside, and what it
+/// doubts beyond the rows asked for, as `set-aside | case | FAIL | …`,
+/// `— | case | UNCLEAR | …` or `extra | …`, and read as no rows these held
+/// the run to nothing and were lost wherever its report was cut. In the
+/// benchmark runs read, 155 of 378 reviews wrote 759 such rows, 252 of them
+/// failed or left unclear, and five in six of those never reached their
+/// run: one was `extra | module-level … | UNCLEAR | never pruned`, of the
+/// state that then hung the hidden tests. Such a line is a row by its shape
+/// and its place, not by its label: its verdict is in its third cell or a
+/// later one, so that a case stands between its first cell and the
+/// verdict, and it is directly under a requirement's row, one that gives a
+/// verdict, with nothing but lines that hold a bar between the two; or it
+/// is one of the rows `cut_rows` wrote again under `WRITTEN_AGAIN`. That
+/// keeps out what the reports and notices read do hold: a line apart from
+/// a requirement's rows, as another helper's table of its own, a sentence
+/// of the request and what a program printed are; one whose verdict is its
+/// second cell, as a legend `Key | PASS | FAIL` and the tail of a cut row
+/// are; and the piece of a line a quote takes up again with after its cut,
+/// which has no row above it. It asks nothing else of a line, so one of
+/// that shape set directly under a requirement's row is read whatever it
+/// is: a row of another table with no line between the two, a line that
+/// sums the table up as `Overall | all rows | FAIL | …` does, a line a
+/// program printed in three cells. None stands so in the 543 reports read,
+/// and a list of words such as "Overall" would be a guess at what none of
+/// them wrote.
+fn written(report: &str) -> Vec<(Option<usize>, Option<bool>, String)> {
     let mut found = Vec::new();
+    let mut ahead = false;
+    // Whether the table being read has given a requirement's row yet.
+    let mut tabled = false;
     for line in report.lines() {
+        let marked = match line.trim() {
+            AHEAD_OPENS => Some(true),
+            AHEAD_CLOSES => Some(false),
+            _ => None,
+        };
+        ahead = marked.unwrap_or(ahead);
+        if ahead || marked.is_some() || !line.contains('|') {
+            tabled = !ahead && line.trim() == WRITTEN_AGAIN;
+            continue;
+        }
         let cells = cells(line);
         let Some(first) = cells.first() else {
             continue;
         };
-        let digits: String = (first.strip_prefix('R').unwrap_or_default().chars())
-            .take_while(char::is_ascii_digit)
-            .collect();
-        let Ok(number) = digits.parse::<usize>() else {
+        if cells.last().is_some_and(|cell| placeholder(cell)) {
             continue;
+        }
+        let judged = judged(&cells);
+        let passed = judged.and_then(|(_, word)| verdict(word));
+        let row = match number(first) {
+            Some(_) => passed.is_some() || (cells.len() > 2 && numbered(first)),
+            // A label, a case, and then the verdict.
+            None => tabled && passed.is_some() && judged.is_some_and(|(at, _)| at > 1),
         };
-        if let Some(passed) = cells[1..].iter().find_map(|cell| verdict(cell)) {
-            found.push((number, passed, line.trim().to_owned()));
+        if row {
+            tabled |= passed.is_some();
+            found.push((number(first), passed, line.trim().to_owned()));
         }
     }
     found
+}
+
+/// The requirement a row's first `cell` opens with, as `R4` and `R4/R5`
+/// do; None for any other, such as the label of a row that belongs to no
+/// requirement.
+fn number(cell: &str) -> Option<usize> {
+    let digits: String = (cell.strip_prefix('R').unwrap_or_default().chars())
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+/// Whether a table's `cell` only says that the case waits on the work, as
+/// a tester writing its tests ahead of the work marks each of its rows.
+fn placeholder(cell: &str) -> bool {
+    cell.to_ascii_lowercase().starts_with("not yet implemented")
+}
+
+/// A table's `cell` stripped of the marks a table is often written with.
+fn bare(cell: &str) -> &str {
+    cell.trim().trim_matches(|c| c == '*' || c == '`').trim()
 }
 
 /// The cells of a table's `line`, cut at each `|` and stripped of the marks
 /// a table is often written with.
 fn cells(line: &str) -> Vec<&str> {
     line.split('|')
-        .map(|cell| cell.trim().trim_matches(|c| c == '*' || c == '`').trim())
+        .map(bare)
         .filter(|cell| !cell.is_empty())
         .collect()
+}
+
+/// Whether a table's `cell`, as its line writes it between two bars, is one
+/// code span and nothing else.
+fn spanned(cell: &str) -> bool {
+    let Some(inner) = cell.strip_prefix('`') else {
+        return false;
+    };
+    (inner.strip_suffix('`')).is_some_and(|inner| !inner.contains('`'))
 }
 
 /// Whether a table's `cell` says a case passed or failed, if it says either;
@@ -496,11 +849,221 @@ fn verdict(cell: &str) -> Option<bool> {
     }
 }
 
-/// Whether a table's row `line` was left `UNCLEAR` rather than failed.
+/// The verdict's word a table's `cell` opens with and what the cell goes on
+/// to say, when it holds more than the word, as `PASS — what shows it`,
+/// `FAIL: why`, `PASS (3 cases)` and "PASS `the command`" do. Only a word in
+/// capitals with such a mark after it is one: a case that opens "fails
+/// when", "Fail fast" or "FAIL-fast" is prose, and so is one that runs on
+/// from a bracket with nothing to set it off (`set_off`), as "`PASS (3)` is
+/// the summary line" does. UNCLEAR needs no mark: whatever follows it after
+/// a space or a comma is the doubt, as in `UNCLEAR not exercised`, where
+/// the words after PASS or FAIL may be a sentence about the word. In the
+/// benchmark runs read, twelve doubts were written so, and ten of them
+/// reached no run.
+fn opens(cell: &str) -> Option<(&str, &str)> {
+    let letters = cell.bytes().take_while(u8::is_ascii_uppercase).count();
+    let (word, rest) = cell.split_at(letters);
+    verdict(word)?;
+    // What is left of the marks a word written in bold closes with.
+    let rest = rest.trim_start_matches(['*', '`']);
+    let said = rest.trim_start();
+    let mut after = said.chars();
+    let goes_on = match after.next()? {
+        '—' | '–' => true,
+        // A bracket holds what shows it, so it stays: it ends the cell, or
+        // what follows it is set off from it.
+        '(' => return (said.ends_with(')') || set_off(said)).then_some((word, said)),
+        // A code span after a space is what shows it, and stays too.
+        '`' => return (said.len() < rest.len()).then_some((word, said)),
+        // Bold may close after the mark, as in `**FAIL:** why`.
+        ':' | '.' => {
+            let next = after.as_str().trim_start_matches('*').chars().next();
+            next.is_none_or(char::is_whitespace)
+        }
+        // Set off by a space, as no hyphen inside a word is.
+        '-' => said.len() < rest.len(),
+        // Before a bar escaped to keep the row in one column of a table,
+        // so what shows it is in the next cell.
+        '\\' => after.next().is_none(),
+        // A doubt goes on in any words.
+        ',' => word == UNCLEAR,
+        _ => word == UNCLEAR && said.len() < rest.len(),
+    };
+    let said = said.trim_start_matches(['—', '–', ':', '.', '-', '\\', ',']);
+    goes_on.then_some((word, said.trim_start_matches('*').trim_start()))
+}
+
+/// Whether what a cell `said`, which opens with a bracket, goes on to say
+/// once the bracket closes is set off from it by a dash or a semicolon, as
+/// in `(by reading) — not run`: the note and what follows both show the
+/// verdict then, where words that run on from the bracket make a sentence
+/// about it.
+fn set_off(said: &str) -> bool {
+    let mut depth = 0usize;
+    let closed = said.char_indices().find(|(_, c)| {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        depth == 0
+    });
+    let Some((at, _)) = closed else {
+        return false;
+    };
+    let rest = &said[at + 1..];
+    let after = rest.trim_start();
+    match after.chars().next() {
+        Some('—' | '–' | ';') => true,
+        // Set off by spaces, as no hyphen inside a word is.
+        Some('-') => after.len() < rest.len() && after[1..].starts_with(' '),
+        _ => false,
+    }
+}
+
+/// The verdict's word a table's `cell` ends with, the case before it and
+/// any note in brackets after it, when the helper wrote the case and the
+/// verdict in one cell, as `case — PASS` and `case — UNCLEAR (what it
+/// doubts)` do. Only a word in capitals after a dash, with no more than
+/// such a note after it, is one: a case that mentions a verdict is prose,
+/// and a cell that opens with one verdict's word and ends with another
+/// says both.
+fn closes(cell: &str) -> Option<(&str, &str, &str)> {
+    let marks = ['*', '`'];
+    cell.rmatch_indices(['—', '–', '-']).find_map(|(at, dash)| {
+        let (case, said) = (&cell[..at], &cell[at + dash.len()..]);
+        // Set off by spaces, as no hyphen inside a word is.
+        let apart = dash != "-" || (case.ends_with(' ') && said.starts_with(' '));
+        let said = said.trim_start().trim_start_matches(marks);
+        let letters = said.bytes().take_while(u8::is_ascii_uppercase).count();
+        let (word, note) = said.split_at(letters);
+        let note = note.trim_start_matches(marks).trim_start();
+        let noted = note.is_empty() || (note.starts_with('(') && note.ends_with(')'));
+        let case = case.trim_end();
+        let leads = case.bytes().take_while(u8::is_ascii_uppercase).count();
+        let cased = !case.is_empty() && verdict(&case[..leads]).is_none();
+        (apart && noted && cased && verdict(word).is_some()).then_some((case, word, note))
+    })
+}
+
+/// What a table's `cell` holds when it gives a verdict and more: the case
+/// before the word, the word, and what shows it after (`opens`, `closes`).
+/// One that says PASS and goes on to say FAIL or UNCLEAR in capitals says
+/// both, so it gives no verdict rather than a wrong one.
+fn carried(cell: &str) -> Option<(&str, &str, &str)> {
+    let opened = opens(cell).map(|(word, shows)| ("", word, shows));
+    let (case, word, shows) = opened.or_else(|| closes(cell))?;
+    let both = verdict(word) == Some(true) && denied(shows);
+    (!both).then_some((case, word, shows))
+}
+
+/// Whether `shows`, what a cell goes on to say after a word that passes,
+/// says FAIL or UNCLEAR in capitals, so that the cell says both.
+fn denied(shows: &str) -> bool {
+    let denies = |said: &str| verdict(said) == Some(false) && !said.contains(char::is_lowercase);
+    (shows.split(|c: char| !c.is_ascii_alphabetic())).any(denies)
+}
+
+/// Words that make a sentence about the word PASS when they follow it, as
+/// "PASS is printed last" is of a line a program prints, in lower case.
+const OF_THE_WORD: [&str; 6] = ["is", "are", "was", "were", "and", "or"];
+
+/// The word a row's verdict column `cell` gives when it opens with one
+/// that passes, in capitals, and goes on in plain words after a space, as
+/// `PASS by reading the branch` and `PASS always 0` do. Read only there,
+/// in the row's third cell (`judged`): in any other the same words may be
+/// what a program printed. No verdict where the words are about the word
+/// (`OF_THE_WORD`), or go on to say FAIL or UNCLEAR (`denied`).
+fn passes(cell: &str) -> Option<&str> {
+    let letters = cell.bytes().take_while(u8::is_ascii_uppercase).count();
+    let (word, rest) = cell.split_at(letters);
+    let rest = rest.trim_start_matches(['*', '`']);
+    let said = rest.strip_prefix(' ')?.trim_start();
+    let first = said.split(|c: char| !c.is_alphanumeric()).next()?;
+    let plain = said.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && !OF_THE_WORD.contains(&first.to_ascii_lowercase().as_str());
+    (verdict(word) == Some(true) && plain && !denied(said)).then_some(word)
+}
+
+/// Whether a table's `cell` says a test was not run, as a tester marks one
+/// it could not run, with or without the reason after it.
+fn unrun(cell: &str) -> bool {
+    let rest = cell.strip_prefix("NOT RUN");
+    rest.is_some_and(|rest| !rest.starts_with(char::is_alphabetic))
+}
+
+/// Whether a row's first `cell` names requirements and nothing else, as
+/// `R4`, `R4/R5` and `R4 and R5` do, where a sentence that opens with a
+/// requirement's number goes on in other words. A note in brackets may
+/// close it, as in `R4 (set aside)`: a review marks so the rows it was
+/// asked for of the cases a run set aside, and none of them was read.
+fn numbered(cell: &str) -> bool {
+    let noted = (cell.trim_end().strip_suffix(')')).and_then(|cell| cell.rfind('('));
+    let cell = noted.map_or(cell, |open| &cell[..open]);
+    let mut words = (cell.split(|c: char| !c.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .peekable();
+    let names = |word: &str| {
+        let digits = word.strip_prefix('R').unwrap_or_default();
+        word == "and" || (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    };
+    words.peek().is_some() && words.all(names)
+}
+
+/// The verdict's word a table's `cell` gives with more (`carried`), or else
+/// the cell itself, which may be the word alone.
+fn given(cell: &str) -> &str {
+    carried(cell).map_or(cell, |(_, word, _)| word)
+}
+
+/// The cell of a row's `cells` that gives its verdict, and the word it
+/// gives. A cell that is the word alone wins, the first of them, as a
+/// review is asked to write it; with none, a cell that holds the word and
+/// more (`carried`), and of several the first that does not say the case
+/// passed, since a failed row read as passed is the worse mistake. The
+/// cell after the number is the case wherever more cells follow it, so
+/// whatever it quotes it gives a verdict only as the row's last, and a row
+/// a cell of which says the test was not run (`unrun`) has none to give,
+/// nor has a line whose first cell opens with a requirement's number and
+/// holds more (`numbered`), which is a sentence a bar in its code happened
+/// to cut. A first cell that opens with no number is the label of a row
+/// that belongs to no requirement, read as a requirement's row is;
+/// `written` says which such lines are rows.
+/// A word alone in a cell after one that says only that the test was not
+/// run is why it was not, and no verdict: a tester's row for a reading it
+/// wrote no test of may end `NOT RUN | unclear`, and read as a row left
+/// unclear it held the run to a doubt nobody had.
+/// The third cell, the verdict's own column, also gives one where it
+/// passes the case in plain words (`passes`).
+fn judged<'a>(cells: &[&'a str]) -> Option<(usize, &'a str)> {
+    let later = || cells.iter().copied().enumerate().skip(1);
+    // What follows a cell that says only that the test was not run says why.
+    let not_run = later().find(|(_, cell)| *cell == "NOT RUN");
+    let judges = |at: usize| not_run.is_none_or(|(not_run, _)| at < not_run);
+    if let Some(alone) = later().find(|(at, cell)| judges(*at) && verdict(cell).is_some()) {
+        return Some(alone);
+    }
+    let row = (cells.first()).is_some_and(|cell| numbered(cell) || number(cell).is_none());
+    if !row || later().any(|(_, cell)| unrun(cell)) {
+        return None;
+    }
+    let said = |(at, cell)| {
+        let case = at == 1 && cells.len() > 2;
+        let carried = (carried(cell).filter(|_| !case)).map(|(_, word, _)| word);
+        // The third cell is the verdict's own column.
+        let column = || (at == 2).then(|| passes(cell)).flatten();
+        carried.or_else(column).map(|word| (at, word))
+    };
+    (later().filter_map(said))
+        .find(|(_, word)| verdict(word) == Some(false))
+        .or_else(|| later().find_map(said))
+}
+
+/// Whether a table's row `line` was left `UNCLEAR` rather than failed, by
+/// the cell that gives its verdict (`judged`): a failed row may say unclear
+/// of why.
 fn left_unclear(line: &str) -> bool {
-    cells(line)
-        .iter()
-        .any(|cell| cell.eq_ignore_ascii_case(UNCLEAR))
+    judged(&cells(line)).is_some_and(|(_, word)| word.eq_ignore_ascii_case(UNCLEAR))
 }
 
 /// Whether `report` holds a review's table, with a row of at least one
@@ -517,66 +1080,287 @@ const UNCLEAR: &str = "UNCLEAR";
 /// them the run reads the report it already has.
 const FAILED_SHOWN: usize = 10;
 
+/// Rows left unclear a follow-up quotes, counted apart from the failed
+/// ones: counted with them, a long table's doubts all fell under "more".
+const UNCLEAR_SHOWN: usize = 10;
+
+/// Fewest words in a row a quote in a line that settles a row shares with
+/// the request: one or two, such as "must not", are found in most requests.
+const SETTLING: usize = 3;
+
+/// Words a reading cell that takes no reading is made of, in lower case.
+const SHRUGS: &[&str] = &[
+    "left",
+    "open",
+    "as",
+    "is",
+    "it",
+    "tbd",
+    "unclear",
+    "ambiguous",
+    "unknown",
+    "unsure",
+    "undecided",
+    "leave",
+    "skip",
+    "none",
+    "n/a",
+    "?",
+    "-",
+];
+
+/// The most words a reading cell made only of `SHRUGS` has.
+const SHRUG_WORDS: usize = 3;
+
+/// The reading cell of the line a run answers a row with when the request
+/// states nothing on it and the run leaves it as it is: silence is no ground
+/// for a late change of behaviour. It is the run's word in its own answer,
+/// where `NOT_ASKED` is a review's in its table.
+const NOT_STATED: &str = "not stated";
+
+/// What a review writes in the cell after PASS for a case the run set aside
+/// that the request's words do not decide. On a benchmark run a row made
+/// from such a case failed for a gap the project had before the change,
+/// which the request never mentions, and closing it broke the project's
+/// own tests.
+pub(crate) const NOT_ASKED: &str = "not asked";
+
 /// The longest row a follow-up quotes, in characters.
 const ROW_CHARS: usize = 300;
 
 /// The longest case a row the quote cut is written again with, in characters.
 const CASE_CHARS: usize = 120;
 
+/// The most a passed row the quote cut is written again with of what shows
+/// it, in characters: room for a command and what it printed, and half a
+/// failed row's, since a long table passes most of its rows.
+const PASSED_CHARS: usize = 150;
+
 /// Rows the quote cut that are written again after it; a bigger table is
 /// read in the helper's whole report.
 const CUT_SHOWN: usize = 60;
 
+/// The verdicts the rows a quote cut are written again under, in the order
+/// they are written, each with what a count of the ones left out calls it.
+/// What holds the run comes first: only `CUT_SHOWN` rows are written, and
+/// taken in the table's order a failed row far down a long table reached
+/// the run as one of "more rows".
+const CUT_ORDER: [(&str, &str); 3] = [
+    ("FAIL", "that failed"),
+    (UNCLEAR, "left unclear"),
+    ("PASS", "that passed"),
+];
+
 /// The rows of a review's table in `report` that `quote`, the report as cut
 /// to fit, lost, to go after it so the run is held to the whole table: each
-/// failed row with what shows it, and each passed one by its requirement and
-/// case. None when the quote kept every row.
+/// by its requirement and case with what shows it, the failed ones first,
+/// then those left unclear, then those that passed (`CUT_ORDER`), with a
+/// count of each kind left out past `CUT_SHOWN`. Of the passed ones, a row
+/// of a requirement that is left no other is written before a second row
+/// of one that has its own, so `unchecked` finds no requirement without a
+/// row that its review gave one. The rows it lost that give no verdict that
+/// can be read (`written`) are counted too, since they hold the run to
+/// nothing and it is not told of them otherwise. A passed row keeps what
+/// shows it as a failed one does, in `PASSED_CHARS` at most: a review is
+/// asked what it ran for a row that passed, so the run can tell what the
+/// reviewer watched its work do, and the report of a helper started beside
+/// others is cut to its share of a page, so most of a long table reaches
+/// the run only as it is written again here. A row that belongs to no
+/// requirement is written again and counted as any other, under its own
+/// first cell as written, its spans whole; one that passed gives way to a
+/// requirement's only row where the room runs out. A row is lost where the quote does not read as a row
+/// what the report does (`written`): the end of a table the cut kept may
+/// hold only rows of no requirement, which are rows of nothing without the
+/// requirement's row they stood under. None when the quote kept every row.
 pub(crate) fn cut_rows(report: &str, quote: &str) -> Option<String> {
     let cut = |text: &str, most: usize| -> String { text.chars().take(most).collect() };
-    let lost: Vec<String> = (rows(report).into_iter())
-        .filter(|(_, _, line)| !quote.contains(line.as_str()))
+    let kept: Vec<String> = (written(quote).into_iter())
+        .map(|(_, _, line)| line)
+        .collect();
+    let (read, unread): (Vec<_>, Vec<_>) = (written(report).into_iter())
+        .filter(|(_, _, line)| !kept.contains(line))
+        .partition(|(_, passed, _)| passed.is_some());
+    let unread = match unread.len() {
+        0 => None,
+        count => Some(format!(
+            "{} with no verdict that could be read",
+            counted(count, "more")
+        )),
+    };
+    let lost: Vec<(Option<usize>, &str, String)> = (read.into_iter())
+        .filter_map(|(number, passed, line)| Some((number, passed?, line)))
         .map(|(number, passed, line)| {
             let cells = cells(&line);
-            let at = (cells.iter().skip(1))
-                .position(|cell| verdict(cell).is_some())
-                .map_or(cells.len(), |at| at + 1);
-            let case = cut(&cells[1..at].join(" | "), CASE_CHARS);
-            let shows = cut(&cells[(at + 1).min(cells.len())..].join(" | "), ROW_CHARS);
-            let word = if left_unclear(&line) { UNCLEAR } else { "FAIL" };
-            match (passed, shows.is_empty()) {
-                (true, _) => format!("R{number} | {case} | PASS"),
-                (false, true) => format!("R{number} | {case} | {word}"),
-                (false, false) => format!("R{number} | {case} | {word} | {shows}"),
-            }
+            // Each cell as written, less the marks of bold: `cells` takes a
+            // code span's mark from a cell's edge, which would leave the
+            // span half open in the row written again. But for the mark
+            // that closes a row written whole in one span, which opened
+            // before the number.
+            let raw: Vec<&str> = (line.split('|'))
+                .map(|cell| cell.trim().trim_matches('*').trim())
+                .filter(|cell| !bare(cell).is_empty())
+                .collect();
+            let halved = |text: &str| text.matches('`').count() % 2 == 1;
+            let last = raw.len().saturating_sub(1);
+            let wrapped = last > 0
+                && (raw[0].starts_with('`') && halved(raw[0]))
+                && (raw[last].ends_with('`') && halved(raw[last]));
+            let whole = |at: usize| match raw.get(at) {
+                Some(cell) if raw.len() != cells.len() => cells.get(at).unwrap_or(cell),
+                Some(cell) if wrapped && at == last => cell.strip_suffix('`').unwrap_or(cell),
+                Some(cell) => cell,
+                None => cells[at],
+            };
+            let at = judged(&cells).map_or(cells.len(), |(at, _)| at);
+            // What the verdict's own cell says besides the word is the
+            // end of the case before it and shows it after, each with the
+            // span's mark its edge of the cell lost.
+            let (before, after) = (cells.get(at).copied().and_then(carried))
+                .map_or(("", ""), |(case, _, shows)| (case, shows));
+            let edge = match at < cells.len() {
+                true => whole(at),
+                false => "",
+            };
+            let before = match halved(before) && edge.starts_with('`') {
+                true => format!("`{before}"),
+                false => before.to_owned(),
+            };
+            let after = match halved(after) && edge.ends_with('`') {
+                true => format!("{after}`"),
+                false => after.to_owned(),
+            };
+            let joined = |said: Vec<&str>| -> String {
+                let said: Vec<&str> = said.into_iter().filter(|said| !said.is_empty()).collect();
+                said.join(" | ")
+            };
+            let mut case: Vec<&str> = (1..at).map(whole).collect();
+            case.push(&before);
+            let case = cut(&joined(case), CASE_CHARS);
+            let mut shows = vec![after.as_str()];
+            shows.extend(((at + 1).min(cells.len())..cells.len()).map(whole));
+            let most = match passed {
+                true => PASSED_CHARS,
+                false => ROW_CHARS,
+            };
+            let shows = cut(&joined(shows), most);
+            let word = match (passed, left_unclear(&line)) {
+                (true, _) => "PASS",
+                (false, true) => UNCLEAR,
+                (false, false) => "FAIL",
+            };
+            // A row of no requirement opens with its own first cell, as
+            // written: a span in it stays whole as in any other cell. One
+            // left half open is the mark a row written whole in one span
+            // opens with, which is not the cell's.
+            let head = match number {
+                Some(number) => format!("R{number}"),
+                None if halved(whole(0)) => cells[0].to_owned(),
+                None => whole(0).to_owned(),
+            };
+            let row = match shows.is_empty() {
+                true => format!("{head} | {case} | {word}"),
+                false => format!("{head} | {case} | {word} | {shows}"),
+            };
+            (number, word, row)
         })
         .collect();
     if lost.is_empty() {
-        return None;
+        // Nothing to write again, and still rows the run is not held to.
+        return unread.map(|unread| {
+            let unread = unread.replacen(" more", "", 1);
+            format!("\nThe quote above cut {unread} from its table.")
+        });
     }
-    let mut text = String::from("\nRows of its table the quote above cut, written again:");
-    for row in lost.iter().take(CUT_SHOWN) {
-        text.push_str(&format!("\n{row}"));
+    let lost = lost.as_slice();
+    let of = |kind: &'static str| (0..lost.len()).filter(move |at| lost[*at].1 == kind);
+    let [(failed, _), (unclear, _), (passed, _)] = CUT_ORDER;
+    let mut shown: Vec<usize> = of(failed).chain(of(unclear)).take(CUT_SHOWN).collect();
+    // The requirements that have a row already, in what the quote kept or
+    // among the rows taken so far: a passed row of any other goes first.
+    let mut rowed: Vec<usize> = (rows(quote).iter().map(|(number, _, _)| *number))
+        .chain(shown.iter().filter_map(|at| lost[*at].0))
+        .collect();
+    let (only, others): (Vec<usize>, Vec<usize>) = of(passed).partition(|at| {
+        let new = lost[*at].0.filter(|number| !rowed.contains(number));
+        rowed.extend(new);
+        new.is_some()
+    });
+    let room = CUT_SHOWN - shown.len();
+    let mut kept: Vec<usize> = only.into_iter().chain(others).take(room).collect();
+    // In the table's order again, whichever were taken first.
+    kept.sort_unstable();
+    shown.extend(kept);
+    let mut text = format!("\n{WRITTEN_AGAIN}");
+    for at in &shown {
+        text.push_str(&format!("\n{}", lost[*at].2));
     }
-    if lost.len() > CUT_SHOWN {
-        text.push_str(&format!("\nand {} more rows", lost.len() - CUT_SHOWN));
+    let more: Vec<String> = (CUT_ORDER.iter())
+        .map(|(kind, said)| (of(kind).filter(|at| !shown.contains(at)).count(), said))
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, said)| format!("{} {said}", counted(count, "more")))
+        .chain(unread)
+        .enumerate()
+        // Only the first says what is counted.
+        .map(|(at, said)| match at {
+            0 => said,
+            _ => said.replacen(" rows", "", 1).replacen(" row", "", 1),
+        })
+        .collect();
+    if !more.is_empty() {
+        text.push_str(&format!("\nand {}", and_list(&more)));
     }
     Some(text)
 }
 
+/// `count` rows as a count of them is written, with `what` before the
+/// word: "1 more row", "3 more rows".
+fn counted(count: usize, what: &str) -> String {
+    match count {
+        1 => format!("1 {what} row"),
+        count => format!("{count} {what} rows"),
+    }
+}
+
 /// What sends a run back once more when the review's table in `report`
 /// leaves some of the first `count` requirements without a row, or has rows
-/// that failed; None when it covers each and every row passed.
+/// that failed; None when it covers each and every row passed. The failed
+/// rows come first, then the ones left unclear, each kind with a count of
+/// its own, and the run is asked for a line of a set form for each row it
+/// decides rather than fixes, which `unresolved` then looks for. A row left
+/// unclear that names two results is decided by running its own command:
+/// a run answered one as not stated after a probe of something else, and
+/// the difference the row had shown was the one that counted. That is
+/// asked in words alone: whether a row names two results is not read off
+/// it, so `unresolved` takes a line that says not stated for any row.
+/// A row that belongs to no requirement (`written`) holds the run as any
+/// other does where it failed or was left unclear, listed as it was
+/// written, and is answered by a line that opens with its own first cell;
+/// it is never a requirement's row, so a requirement with only such rows
+/// near it still has none. Of each kind the requirements' rows are listed
+/// first and those of no requirement after them, each in the table's
+/// order: only `FAILED_SHOWN` and `UNCLEAR_SHOWN` are listed, a run's
+/// notice holds its reviews one after another, and listed where the tables
+/// had them the first review's rows of no requirement took the places of
+/// the next review's requirements, 59 rows left unclear and 5 failed in
+/// the benchmark runs read.
 pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
     let rows = rows(report);
     let missing: Vec<String> = (1..=count)
         .filter(|number| !rows.iter().any(|(row, _, _)| row == number))
         .map(|number| format!("R{number}"))
         .collect();
-    let failed: Vec<&String> = (rows.iter())
-        .filter(|(number, passed, _)| !passed && *number <= count)
-        .map(|(_, _, row)| row)
-        .collect();
-    if missing.is_empty() && failed.is_empty() {
+    let written = written(report);
+    // The rows that hold the run that are a requirement's, or else those
+    // of no requirement.
+    let held = |numbered: bool| {
+        (written.iter())
+            .filter(move |(number, _, _)| number.is_some() == numbered)
+            .filter(|(_, passed, _)| *passed == Some(false))
+            .filter(|(number, _, _)| number.is_none_or(|number| number <= count))
+    };
+    let (unclear, failed): (Vec<_>, Vec<_>) =
+        (held(true).chain(held(false))).partition(|(_, _, row)| left_unclear(row));
+    if missing.is_empty() && failed.is_empty() && unclear.is_empty() {
         return None;
     }
     let brand = crate::BRAND;
@@ -584,24 +1368,34 @@ pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
     if !missing.is_empty() {
         text.push_str(&format!("has no row for {}", and_list(&missing)));
     }
-    if !failed.is_empty() {
-        if !missing.is_empty() {
-            text.push_str(", and ");
+    let mut said = !missing.is_empty();
+    let kinds = [
+        (&failed, FAILED_SHOWN, "that failed"),
+        (&unclear, UNCLEAR_SHOWN, "left unclear"),
+    ];
+    for (held, shown, kind) in kinds {
+        if held.is_empty() {
+            continue;
         }
-        let unclear = failed.iter().any(|row| left_unclear(row));
-        text.push_str(match unclear {
-            true => "has these rows that failed or were left unclear:",
-            false => "has these rows that failed:",
+        // The first list goes on from "has no row for"; a second from the
+        // first, which ends its line.
+        text.push_str(match (said, text.ends_with('\n')) {
+            (false, _) => "has these rows ",
+            (true, false) => ", and has these rows ",
+            (true, true) => "and these ",
         });
-        for row in failed.iter().take(FAILED_SHOWN) {
+        text.push_str(&format!("{kind}:"));
+        for (_, _, row) in held.iter().take(shown) {
             let row: String = row.chars().take(ROW_CHARS).collect();
             text.push_str(&format!("\n- {row}"));
         }
-        if failed.len() > FAILED_SHOWN {
-            text.push_str(&format!("\n- and {} more", failed.len() - FAILED_SHOWN));
+        if held.len() > shown {
+            text.push_str(&format!("\n- and {} more {kind}", held.len() - shown));
         }
         text.push('\n');
-    } else {
+        said = true;
+    }
+    if failed.is_empty() && unclear.is_empty() {
         text.push_str(". ");
     }
     if !missing.is_empty() {
@@ -620,18 +1414,276 @@ pub(crate) fn unchecked(report: &str, count: usize) -> Option<String> {
              and any tests a tester's report says are kept for you, and fix any that now fail. ",
         );
     }
-    if failed.iter().any(|row| left_unclear(row)) {
+    if !failed.is_empty() || unclear.is_empty() {
+        text.push_str("Fix what fails unless the request rules that case out. ");
+    }
+    // A tester's rows are read with a review's where its report came with
+    // the reviews, and "fix the rule behind it" is then said of a test that
+    // may have misread the request, as the notices of its tests say.
+    if !failed.is_empty() {
         text.push_str(
-            "A row left unclear is a doubt its reviewer could not settle: decide it by the \
-             request's words, quote them in your answer, and test the case; where they settle \
-             nothing, keep to the reading closest to them and say which you took. ",
+            "A failed row that is a tester's test is one more reading of the request: to pass \
+             it, do not take away or move something another row passed, unless the request's \
+             words ask for that, and words that can be read both ways do not. ",
         );
     }
+    if !unclear.is_empty() {
+        text.push_str(
+            "A row left unclear is a doubt its reviewer could not settle, not a failure: \
+             decide it by the request's words and test the case, and change the work for it \
+             only where the words you quote ask for that. ",
+        );
+    }
+    // The form is shown for a requirement's row where one is listed above,
+    // and what a row of no requirement opens its line with is said apart.
+    let listed = || {
+        let (unclear, failed) = (unclear.iter(), failed.iter());
+        unclear.take(UNCLEAR_SHOWN).chain(failed.take(FAILED_SHOWN))
+    };
+    let numbered = listed().find_map(|(number, _, _)| Some(format!("R{}", (*number)?)));
+    let loose = (listed().filter(|(number, _, _)| number.is_none()))
+        .filter_map(|(_, _, row)| cells(row).first().map(|cell| label(cell)))
+        .find(|label| !label.is_empty());
+    if let Some(head) = numbered.as_ref().or(loose.as_ref()) {
+        let which = match (unclear.is_empty(), failed.is_empty()) {
+            (false, true) => "each row left unclear above",
+            (false, false) => "each row left unclear above, and each failed row you do not fix",
+            (true, _) => "each failed row you do not fix",
+        };
+        text.push_str(&format!(
+            "For {which}, write one line in your answer, `{head} | reading taken | \"the \
+             request's words for it\" | command run`, with the words quoted as the request \
+             writes them and a command you ran that tests that reading. A bare \"the request \
+             does not say\" settles nothing: where it states nothing on the case, write \
+             `{head} | {NOT_STATED} | \"the nearest words it does have\" | left as is`, \
+             and change nothing for that row on a guess. "
+        ));
+    }
+    if let Some(label) = loose {
+        text.push_str(&loosely(&label));
+    }
+    // A probe of the run's own, of something else, let it answer as not
+    // stated a row whose command had shown the work differ. The form above
+    // still stands for it where neither result is called for, with the
+    // command it ran in the cell that says nothing ran.
+    if !unclear.is_empty() {
+        text.push_str(&format!(
+            "A row that names two results that differ is answered only after you run that \
+             row's own command: say in your line which result the request's words, or the \
+             project's own feature of the same kind, call for; where neither does, write \
+             `{NOT_STATED}` with that command in place of `left as is`, and change nothing. "
+        ));
+    }
     text.push_str(
-        "Fix what fails unless the request rules that case out. Only your last message is \
-         passed on as your answer, so end with your whole answer again, not only what changed.",
+        "Only your last message is passed on as your answer, so end with your whole answer \
+         again, not only what changed.",
     );
     Some(text)
+}
+
+/// What the rows `text` shows as left unclear open with, each once, when it
+/// is the notice `unchecked` writes; none for any other text: `R4` for a
+/// requirement's rows, the first requirement the row names, and its own
+/// first cell for a row that belongs to no requirement, as `set-aside` or
+/// `—`, which is what the line that answers it opens with (`settles`). They
+/// are told by the list they are in, since a long row is cut before the
+/// cell that says so. A first cell that is a list's or a table's marks
+/// alone, or a list's number alone, is left out: no line could open with
+/// it (`label`).
+pub(crate) fn left_open(text: &str) -> Vec<String> {
+    let opening = format!("[{} check] The review's table ", crate::BRAND);
+    if !text.starts_with(&opening) {
+        return Vec::new();
+    }
+    let mut open = Vec::new();
+    let mut listing = false;
+    for line in text.lines() {
+        let Some(row) = line.strip_prefix("- ").filter(|_| listing) else {
+            listing = line.ends_with("left unclear:");
+            continue;
+        };
+        let cells = cells(row);
+        let head = (cells.first())
+            .and_then(|cell| match numbers(cell).first() {
+                Some(number) => Some(format!("R{number}")),
+                // With its case after it, as the count of the rows the list
+                // leaves out has none.
+                None if cells.len() > 1 => Some(label(cell)),
+                None => None,
+            })
+            .filter(|head| !head.is_empty() && !open.contains(head));
+        open.extend(head);
+    }
+    open
+}
+
+/// The marks of a list, a heading or a table that a line may open with
+/// ahead of what it says.
+const MARKS: [char; 8] = ['-', '*', '|', '`', '>', '#', ' ', '\t'];
+
+/// The first `cell` of a row that belongs to no requirement as a notice
+/// names it and an answer's line opens with it: without the marks or the
+/// list's number a line may open with (`unlisted`), since an answer's line
+/// is read without them and one held to `1. extra` could be settled by no
+/// line; and without the marks of code, which the span a notice shows it
+/// in would end at. Empty for a cell that is marks or a list's number and
+/// no more.
+fn label(cell: &str) -> String {
+    unlisted(cell).replace('`', "")
+}
+
+/// `line` without what it opens with ahead of what it says: the marks of a
+/// list, a heading or a table, and a numbered list's number, as "1. R4"
+/// and "2) extra" have.
+fn unlisted(line: &str) -> &str {
+    let line = line.trim_start_matches(MARKS);
+    let item = line.trim_start_matches(|c: char| c.is_ascii_digit());
+    match item.strip_prefix(['.', ')']) {
+        Some(rest) if item.len() < line.len() => rest.trim_start_matches(MARKS),
+        _ => line,
+    }
+}
+
+/// The requirements `head` opens with, as `R4`, `R4/R5` or `R4 and R5`
+/// name them; none where it opens with anything else.
+fn numbers(head: &str) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut rest = head;
+    while let Some(after) = rest.strip_prefix('R') {
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        let Ok(number) = digits.parse() else {
+            break;
+        };
+        found.push(number);
+        let after = after[digits.len()..].trim_start();
+        let after = after.strip_prefix("and ").unwrap_or(after);
+        rest = after.trim_start_matches(['/', ',', '&', '+', ' ']);
+    }
+    found
+}
+
+/// What sends a run back once more when its replies in `messages`, those
+/// after the notice that showed it `rows` left unclear, each by what it
+/// opens with (`left_open`), hold no line for one of them in the form that
+/// notice asked for (`settles`). None when each has one. A check of words,
+/// with no model: it tells an answer that weighed the request from
+/// "unclear; leave", and asks for no change. The form is shown for a
+/// requirement's row where one is open, and what the line for a row of no
+/// requirement opens with is said after it (`loosely`).
+pub(crate) fn unresolved(
+    messages: &[Message],
+    request: &str,
+    rows: &[impl AsRef<str>],
+) -> Option<String> {
+    let request: Vec<String> = (crate::doubts::words(request).into_iter())
+        .map(|(_, word)| word)
+        .collect();
+    let lines: Vec<&str> = (messages.iter())
+        .filter(|message| message.role == "assistant")
+        .flat_map(|message| message.content.lines())
+        .collect();
+    let mut open: Vec<&str> = Vec::new();
+    for row in rows.iter().map(AsRef::as_ref) {
+        let settled = lines.iter().any(|line| settles(line, row, &request));
+        if !settled && !open.contains(&row) {
+            open.push(row);
+        }
+    }
+    let loose = open.iter().find(|row| numbers(row).is_empty());
+    let first = (open.iter().find(|row| !numbers(row).is_empty())).or(open.first())?;
+    let (rows, each) = match open.len() {
+        1 => ("a row", "it"),
+        _ => ("rows", "each"),
+    };
+    // A row of no requirement is named by its first cell, in a code span.
+    let names: Vec<String> = (open.iter())
+        .map(|row| match numbers(row).is_empty() {
+            true => format!("`{row}`"),
+            false => (*row).to_owned(),
+        })
+        .collect();
+    Some(format!(
+        "[{} check] The review left {rows} of {} unclear, and your answer has no line for \
+         {each} that names the reading you took and quotes the request. Write one line for \
+         {each}, `{first} | reading taken | \"the request's words for it\" | command run`, \
+         with {SETTLING} or more words in a row quoted as the request writes them and a \
+         command you ran that tests that reading. Where the request states nothing on the \
+         case, write `{first} | {NOT_STATED} | \"the nearest words it does have\" | left as \
+         is`, and change nothing for that row on a guess. {}Only your last message is passed \
+         on as your answer, so end with your whole answer again, not only what changed.",
+        crate::BRAND,
+        and_list(&names),
+        loose.map(|label| loosely(label)).unwrap_or_default()
+    ))
+}
+
+/// What a notice that asks for a line for each row says of a row that
+/// belongs to no requirement, `label` being the first cell of one: the form
+/// it shows opens with a requirement's number, which such a row has none of.
+fn loosely(label: &str) -> String {
+    format!(
+        "A row that names no requirement gets its line as well, opened with the row's own \
+         first cell where a number would be, as `{label} | reading taken | …`. "
+    )
+}
+
+/// Whether `line` of an answer settles the row that opens with `row`, a
+/// requirement's number as `R4` or the first cell of a row that belongs to
+/// no requirement (`left_open`). It opens with that number, after any marks
+/// of a list, a heading or a table, or its first cell opens with that
+/// cell's words, whatever their case and marks of code, so that
+/// `set-aside (the record's name)` answers a row under `Set-aside`; it
+/// has a cell after that for the reading taken, which is no shrug such as
+/// "unclear, leave" though it may be `NOT_STATED`; it quotes, in quote marks or a
+/// code span, `SETTLING` or more words found in a row in `request`, its
+/// words as `doubts::words` gives them, the quote's middle left out or not;
+/// and it is no row of the review's table copied back: no cell after the
+/// number says UNCLEAR, alone or with more (`carried`), and its third gives
+/// no verdict. The cells are read one by one, not as `judged` reads a row,
+/// which takes the cell after the number for the case and so would pass a
+/// doubt copied back in it; and a cell that is one code span and more than
+/// a verdict's word quotes, as one in quote marks does, so it gives none.
+fn settles(line: &str, row: &str, request: &[String]) -> bool {
+    let line = unlisted(line);
+    let cells = cells(line);
+    let [head, reading, ..] = cells.as_slice() else {
+        return false;
+    };
+    let plain = |cell: &str| cell.replace(['`', '*'], "").to_lowercase();
+    let named = match numbers(row).first() {
+        Some(number) => numbers(head).contains(number),
+        None => plain(head).starts_with(&plain(row)),
+    };
+    if cells.len() < 3 || !named {
+        return false;
+    }
+    // A shrug is a few words that are all of them shrugs, so a reading that
+    // opens with one, such as "unknown keys are rejected", is a reading.
+    let reading = reading.to_lowercase();
+    let said: Vec<&str> = (reading.split_whitespace())
+        .map(|word| word.trim_end_matches([',', ';', ':', '.']))
+        .collect();
+    let shrugged = said.len() <= SHRUG_WORDS && said.iter().all(|word| SHRUGS.contains(word));
+    // What each cell says where a verdict is looked for: nothing where it
+    // quotes in a code span, as the request's own words may open with one.
+    let raw = (line.split('|').map(str::trim)).filter(|cell| !bare(cell).is_empty());
+    let quotes = |cell: &str, raw: &str| spanned(raw) && verdict(cell).is_none();
+    let said: Vec<&str> = (cells.iter().zip(raw))
+        .map(|(cell, raw)| if quotes(cell, raw) { "" } else { *cell })
+        .collect();
+    let doubted = (said[1..].iter()).any(|cell| given(cell).eq_ignore_ascii_case(UNCLEAR));
+    // The review writes its verdict third, alone in its cell or with what
+    // shows it (`carried`); a run may end its line with one.
+    let third = verdict(given(said[2])).is_some();
+    let copied = doubted || third;
+    if shrugged || copied {
+        return false;
+    }
+    crate::doubts::literals(line).into_iter().any(|range| {
+        let quote = crate::doubts::words(&line[range]);
+        let said: Vec<&str> = quote.iter().map(|(_, word)| word.as_str()).collect();
+        crate::doubts::shared(&said, request).len() >= SETTLING
+    })
 }
 
 /// `items` joined as a sentence lists them: "a", "a and b", "a, b and c".
@@ -666,16 +1718,8 @@ fn files(outputs: &[String]) -> String {
 /// path or a name is looked for in `workspace`, an absolute path where it
 /// points.
 pub(crate) fn outputs(request: &str, workspace: &Path, since: SystemTime) -> Vec<String> {
-    let mut looked: Vec<&str> = Vec::new();
     let mut found: Vec<(String, PathBuf)> = Vec::new();
-    for word in crate::inputs::words(request).filter(|word| filelike(word)) {
-        if looked.contains(&word) {
-            continue;
-        }
-        if looked.len() == LOOKED {
-            break;
-        }
-        looked.push(word);
+    for word in named(request) {
         // Before looking, which on Windows signs in to a share it names.
         if crate::paths::unsafe_raw(word, Some(workspace)).is_some() {
             continue;
@@ -694,6 +1738,23 @@ pub(crate) fn outputs(request: &str, workspace: &Path, since: SystemTime) -> Vec
         }
     }
     found.into_iter().map(|(word, _)| word).collect()
+}
+
+/// The words of `request` that read as a file's path or name, each once and
+/// as the request first writes it, `LOOKED` at most: the files a run on it
+/// is to write or change, as far as its words say.
+pub(crate) fn named(request: &str) -> Vec<&str> {
+    let mut named: Vec<&str> = Vec::new();
+    for word in crate::inputs::words(request).filter(|word| filelike(word)) {
+        if named.contains(&word) {
+            continue;
+        }
+        if named.len() == LOOKED {
+            break;
+        }
+        named.push(word);
+    }
+    named
 }
 
 /// Whether `word` reads as a file's path or name, such as `out/a.csv` or
@@ -784,8 +1845,9 @@ fn blocks(request: &str) -> Vec<Block> {
 
 /// The sentences of `text`, split at a stop followed by a space or the end,
 /// outside a code span and not after an abbreviation or before a word in
-/// lower case.
-fn split(text: &str) -> Vec<&str> {
+/// lower case that is no name; a bang ends one only before a word that
+/// opens with a capital and is not all capitals, outside a quoted string.
+pub(crate) fn split(text: &str) -> Vec<&str> {
     let bytes = text.as_bytes();
     let mut sentences = Vec::new();
     let (mut start, mut at) = (0, 0);
@@ -805,14 +1867,23 @@ fn split(text: &str) -> Vec<&str> {
                 .last()
                 .unwrap_or_default();
             let last = last.trim_start_matches(['(', '"', '\'']).to_lowercase();
-            let next = text[at + 1..].trim_start().chars().next();
-            // After a bang, words in lower case or in brackets go on, as "and
-            // ! (complement)" does.
+            let word = first_word(&text[at + 1..]);
+            let next = word.chars().next();
             let goes_on = match c {
+                // A name in lower case opens a sentence as a capital does,
+                // as "isolate scopes. state_data is injected" shows.
                 b'.' => {
-                    ABBREVIATIONS.contains(&last.as_str()) || next.is_some_and(char::is_lowercase)
+                    ABBREVIATIONS.contains(&last.as_str())
+                        || (next.is_some_and(char::is_lowercase)
+                            && (!namelike(word) || SHORTENED.contains(&last.as_str())))
                 }
-                b'!' => next.is_some_and(|next| next.is_lowercase() || next == '('),
+                // A bang is as often part of what is written out, as in "and
+                // ! (complement)" or "emits Bail out! ERROR message".
+                b'!' => {
+                    next.is_some_and(|next| !next.is_uppercase())
+                        || shouted(word)
+                        || quoted(&text[start..at])
+                }
                 _ => false,
             };
             if !goes_on {
@@ -827,6 +1898,183 @@ fn split(text: &str) -> Vec<&str> {
         sentences.push(rest);
     }
     sentences
+}
+
+/// The clauses of `sentence`, cut at each of its `joints` that plainly
+/// sets two requirements apart: a request written as one long sentence,
+/// its requirements joined by dashes, counted as stating one and so got no
+/// review. The words since the cut before are a clause of their own
+/// (`clause`) and so are the words up to the next joint, which also stand
+/// alone after it (`follows`); no colon before the joint opens a list
+/// (`lists`), whose items share the words before it; where the words
+/// before open by saying when they apply (`conditional`), which may hold
+/// for both sides, so do the words after; and the words before end on no
+/// word that leaves them unfinished (`hangs`). Two dashes that set off an
+/// aside cut nothing. A side that is no clause stays with the words before
+/// it, and no cut leaves words that state nothing.
+fn clauses(sentence: &str) -> Vec<&str> {
+    let joints = joints(sentence);
+    let after = |at: usize| {
+        let next = joints.get(at + 1).map_or(sentence.len(), |next| next.start);
+        &sentence[joints[at].end..next]
+    };
+    // Two dashes and no more set off an aside where the words after the
+    // second go on from those before the first.
+    let dashes: Vec<usize> = (0..joints.len())
+        .filter(|at| !sentence[joints[*at].clone()].starts_with(';'))
+        .collect();
+    let aside = matches!(dashes.as_slice(), [_, second] if !follows(after(*second)));
+    let mut cuts: Vec<std::ops::Range<usize>> = Vec::new();
+    for (at, joint) in joints.iter().enumerate() {
+        if aside && dashes.contains(&at) {
+            continue;
+        }
+        let start = cuts.last().map_or(0, |cut| cut.end);
+        let (left, right) = (&sentence[start..joint.start], after(at));
+        let shared = lists(left) || (conditional(left) && !conditional(right));
+        if clause(left) && !hangs(left) && follows(right) && !shared {
+            cuts.push(joint.clone());
+        }
+    }
+    while (cuts.last()).is_some_and(|cut| !states(&sentence[cut.end..])) {
+        cuts.pop();
+    }
+    let mut found = Vec::new();
+    let mut start = 0;
+    for cut in cuts {
+        found.push(sentence[start..cut.start].trim());
+        start = cut.end;
+    }
+    found.push(sentence[start..].trim());
+    found
+}
+
+/// Where `sentence` could be cut between two clauses: each of `JOINTS`
+/// outside a code span, a quoted string and brackets, but for a semicolon
+/// that ends a web address or an entity such as `&amp;`, a dash beside a
+/// number, which is a range or a minus as in "0 – 255", a double hyphen
+/// before an option, which a command line is written with, and either
+/// mark before a number, which goes on with one more value, as "; 0 only
+/// when every check has passed" does after what gives 1.
+fn joints(sentence: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = sentence.as_bytes();
+    let mut found = Vec::new();
+    let (mut at, mut depth) = (0, 0usize);
+    while at < bytes.len() {
+        match bytes[at] {
+            b'`' => {
+                let run = bytes[at..].iter().take_while(|&&b| b == b'`').count();
+                let ticks = &sentence[at..at + run];
+                // A span never closed is plain text from its ticks on.
+                at += run + sentence[at + run..].find(ticks).map_or(0, |end| end + run);
+                continue;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        let mark = (JOINTS.iter()).find(|mark| bytes[at..].starts_with(mark.as_bytes()));
+        if let Some(mark) = mark.filter(|_| depth == 0) {
+            let before = &sentence[..at];
+            let word = before.rsplit(' ').next().unwrap_or_default();
+            let semicolon = mark.starts_with(';');
+            let address = semicolon && (word.contains("://") || word.starts_with('&'));
+            let rest = &sentence[at + mark.len()..];
+            let digit = |c: Option<char>| c.is_some_and(|c| c.is_ascii_digit());
+            let (behind, ahead) = (
+                digit(before.chars().next_back()),
+                digit(rest.chars().next()),
+            );
+            let written = ahead || (!semicolon && (behind || rest.starts_with('-')));
+            if !address && !written && !quoted(before) && !single_quoted(before) {
+                found.push(at..at + mark.len());
+            }
+        }
+        at += 1;
+    }
+    found
+}
+
+/// Whether `text` ends inside a string in single quotes: after a quote
+/// that opens a word and before one that closes a word, an apostrophe
+/// inside a word being neither.
+fn single_quoted(text: &str) -> bool {
+    let mut open = false;
+    let mut before = ' ';
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}') {
+            let after = chars.peek().copied().unwrap_or(' ');
+            let opens = before.is_whitespace() || matches!(before, '(' | '[' | '{');
+            match (opens && !after.is_whitespace(), !after.is_alphanumeric()) {
+                (true, _) => open = true,
+                (false, true) => open = false,
+                (false, false) => {}
+            }
+        }
+        before = c;
+    }
+    open
+}
+
+/// Whether `side` of a joint is a clause of its own: it states a
+/// requirement by its own words (`states`), in `CLAUSE` words or more, and
+/// does not say how things were (`earlier`).
+fn clause(side: &str) -> bool {
+    states(side) && outside_code(side).split_whitespace().count() >= CLAUSE && !earlier(side)
+}
+
+/// Whether `side` says how things were rather than what is asked: it holds
+/// one of `EARLIER`, or a version's number such as "1.2" or "v2.0.1".
+fn earlier(side: &str) -> bool {
+    let prose = outside_code(side).to_lowercase();
+    let version = |word: &str| {
+        let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+        let mut parts = word.strip_prefix('v').unwrap_or(word).split('.');
+        let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+        parts.next().is_some_and(digits) && parts.next().is_some_and(digits)
+    };
+    EARLIER.iter().any(|word| holds(&prose, word)) || prose.split_whitespace().any(version)
+}
+
+/// Whether `side` ends on a word that leaves it unfinished (`HANGING`).
+fn hangs(side: &str) -> bool {
+    let prose = outside_code(side).to_lowercase();
+    let last = prose.split_whitespace().next_back().unwrap_or_default();
+    HANGING.contains(&last.trim_matches(|c: char| !c.is_alphanumeric()))
+}
+
+/// Whether `side` is a clause of its own (`clause`) that stands alone
+/// after a joint: it opens with no word of `GOES_ON` and no verb whose
+/// subject the cut would take from it (`SUBJECTLESS`), and does not end on
+/// "not", its verb left on the other side, as "the second does not." ends.
+fn follows(side: &str) -> bool {
+    let prose = outside_code(side).to_lowercase().replace('\u{2019}', "'");
+    let bare = |word: &str| -> String {
+        let kept = |c: char| c.is_alphanumeric() || c == '\'';
+        word.trim_matches(|c: char| !kept(c)).to_owned()
+    };
+    let first = bare(first_word(&prose));
+    let marker = (MARKERS.iter()).any(|marker| marker.split(' ').next() == Some(first.as_str()));
+    let subjectless = SUBJECTLESS.contains(&first.as_str()) || (first.ends_with('s') && marker);
+    let last = bare(prose.split_whitespace().next_back().unwrap_or_default());
+    let elided = last == "not" || last == "cannot" || last.ends_with("n't");
+    clause(side) && !GOES_ON.contains(&first.as_str()) && !subjectless && !elided
+}
+
+/// Whether `side` holds a colon that opens a list, whose items the joints
+/// after it set apart: cut off, an item would lose what the words before
+/// the colon say of each.
+fn lists(side: &str) -> bool {
+    outside_code(side).contains(": ")
+}
+
+/// Whether `side` opens by saying when it applies: with one of `CONDITIONS`
+/// or `SETTINGS`, and a comma after it.
+fn conditional(side: &str) -> bool {
+    let prose = outside_code(side).to_lowercase();
+    let first = first_word(&prose).trim_matches(|c: char| !c.is_alphanumeric());
+    (CONDITIONS.contains(&first) || SETTINGS.contains(&first)) && prose.contains(',')
 }
 
 /// Whether `sentence` states something the change must do, rather than how
@@ -939,6 +2187,41 @@ fn codelike(word: &str) -> bool {
         || word.contains([
             '=', '/', '\\', '"', '{', '}', '[', ']', '<', '>', '#', '@', '$', '|', '_',
         ])
+}
+
+/// The first word of `text`, as far as the next space.
+fn first_word(text: &str) -> &str {
+    text.split_whitespace().next().unwrap_or_default()
+}
+
+/// Whether `word`, outside a code span, reads as a name from code rather
+/// than a word of prose: one that is `codelike`, has a dot between letters,
+/// or a capital after a small letter, as `resetBailState` has, and is no
+/// abbreviation.
+fn namelike(word: &str) -> bool {
+    let name = word.trim_end_matches(['*', ',', '.', ';', ':', '!', '?']);
+    if ABBREVIATIONS.contains(&name.to_lowercase().as_str()) {
+        return false;
+    }
+    let letters: Vec<char> = name.chars().collect();
+    let dotted =
+        (letters.windows(3)).any(|w| w[1] == '.' && w[0].is_alphabetic() && w[2].is_alphabetic());
+    let humped = (letters.windows(2)).any(|w| w[0].is_lowercase() && w[1].is_uppercase());
+    codelike(name) || dotted || humped
+}
+
+/// Whether `word` is written all in capitals, two letters or more, as the
+/// `ERROR` of a message spelled out is.
+fn shouted(word: &str) -> bool {
+    let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+    word.chars().filter(|c| c.is_uppercase()).count() >= 2 && !word.contains(char::is_lowercase)
+}
+
+/// Whether `text` ends inside a quoted string: after a double quote not
+/// yet closed.
+fn quoted(text: &str) -> bool {
+    let plain = text.matches('"').count() % 2 == 1;
+    plain || text.matches('\u{201c}').count() > text.matches('\u{201d}').count()
 }
 
 /// Whether `line` opens a console session: a shell's or Python's prompt, or
@@ -1202,6 +2485,91 @@ mod tests {
     }
 
     #[test]
+    fn a_sentence_that_opens_with_a_name_is_a_sentence_of_its_own() {
+        let request = "get_state_data(state) returns active data dict or None. \
+                       state_data_values property snapshots all active data by state identifier. \
+                       set_state_data(state, key, value) validates active state, declared key, \
+                       and DataVar type constraints, raising InvalidDefinition on violation. \
+                       get_data_changes() returns DataChangeInfo records accumulated during the \
+                       current macrostep, cleared at each macrostep boundary, with state_id, key, \
+                       old_value, new_value attributes.";
+        let split = split(request);
+        assert_eq!(split.len(), 4, "{split:?}");
+        assert_eq!(
+            split[1],
+            "state_data_values property snapshots all active data by state identifier."
+        );
+        assert!(split[3].starts_with("get_data_changes() returns DataChangeInfo records"));
+        let kept = sentences(request);
+        assert!(kept.contains(&split[0].to_owned()), "{kept:?}");
+        assert!(kept.contains(&split[3].to_owned()), "{kept:?}");
+        assert_eq!(
+            sentences("Parallel regions must isolate scopes. state_data is injected into each."),
+            [
+                "Parallel regions must isolate scopes.",
+                "state_data is injected into each.",
+            ]
+        );
+        assert_eq!(
+            super::split("Both expose bail state. resetBailState clears all bail state."),
+            [
+                "Both expose bail state.",
+                "resetBailState clears all bail state.",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_word_of_prose_in_lower_case_still_goes_on_from_the_stop_before_it() {
+        assert_eq!(
+            split(
+                "Use a marker, e.g. something short. Keep it, i.e. foo, as is. Call the \
+                 handler. then it returns."
+            ),
+            [
+                "Use a marker, e.g. something short.",
+                "Keep it, i.e. foo, as is.",
+                "Call the handler. then it returns.",
+            ]
+        );
+        let request = "The loader must accept tabs.\n\n```\nload()\n```\n\n\
+                       returns `None` when the file must not be read.\n\n\
+                       e.g. the cache must never be read twice.";
+        assert_eq!(sentences(request), ["The loader must accept tabs."]);
+    }
+
+    #[test]
+    fn a_short_form_before_a_name_ends_no_sentence() {
+        for request in [
+            "The min. chunk_size must be 4 bytes.",
+            "Up to the max. retry_count is allowed, a.k.a. maxRetries in the config.",
+            "Compare it w.r.t. base_url only, as in ver. v2_schema and ex. get_user().",
+        ] {
+            assert_eq!(split(request), [request]);
+        }
+        // As a whole word one still ends a sentence before a capital.
+        assert_eq!(
+            split("Each value is capped at the max. Values above it must be rejected."),
+            [
+                "Each value is capped at the max.",
+                "Values above it must be rejected.",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bang_inside_a_message_written_out_ends_no_sentence() {
+        let request = "Teamcity emits Bail out! ERROR message, and a count of the tests.";
+        assert_eq!(split(request), [request]);
+        let request = "The reporter prints \"Bail out! Too many failures\" only once.";
+        assert_eq!(split(request), [request]);
+        assert_eq!(
+            split("Stop! Each rule must apply once."),
+            ["Stop!", "Each rule must apply once."]
+        );
+    }
+
+    #[test]
     fn two_words_that_ask_for_something_are_a_requirement() {
         assert_eq!(
             sentences("Export `Result`. `retry` option. Respect `strict`."),
@@ -1213,6 +2581,215 @@ mod tests {
     fn a_sentence_said_twice_is_listed_once() {
         let request = "The flag must default to off.\n\nThe flag must default to off.";
         assert_eq!(sentences(request), ["The flag must default to off."]);
+    }
+
+    #[test]
+    fn a_request_written_as_one_long_sentence_is_cut_where_its_clauses_join() {
+        let request = "The exporter should write one file per table -- column names are taken \
+                       from the first row -- empty cells must be written as two quotes \u{2014} \
+                       each row ends with a line feed and nothing after it \u{2013} the header \
+                       is left out when `--bare` is given, and a table with no rows returns an \
+                       error.";
+        let found = sentences(request);
+        // A clause no word marks as a requirement stays with the one before.
+        assert_eq!(
+            found,
+            [
+                "The exporter should write one file per table -- column names are taken from \
+                 the first row",
+                "empty cells must be written as two quotes",
+                "each row ends with a line feed and nothing after it",
+                "the header is left out when `--bare` is given, and a table with no rows \
+                 returns an error.",
+            ]
+        );
+        assert!(found.len() >= FEWEST);
+        // A semicolon between two requirements cuts as a dash does.
+        assert_eq!(
+            sentences(
+                "Keys must be unique within one section; a key repeated in another section \
+                 is accepted as its own."
+            ),
+            [
+                "Keys must be unique within one section",
+                "a key repeated in another section is accepted as its own.",
+            ]
+        );
+        // Sentences are split at their stops as before, for the notes of a
+        // run too, which are read by them.
+        let joined = "Keys must be unique within one section -- a second one must be refused.";
+        assert_eq!(split(joined), [joined]);
+    }
+
+    #[test]
+    fn a_joint_inside_code_a_quote_brackets_or_an_address_cuts_nothing() {
+        for request in [
+            "The header line must read `a; every b -- c` and the body must follow it on the \
+             next line.",
+            "The error message must read \"no such key; the name must be one of the listed \
+             keys\" in every case.",
+            "The error message must read 'no such key; the name must be one of the listed \
+             keys' in every case.",
+            "The reader must accept both forms (the short one must come first; the long one \
+             must follow it on its own line) in any file.",
+            "The client must fetch the page at https://example.com/a;b=1; the reply must be \
+             kept for an hour at most.",
+            "Every attribute value must keep a literal &amp; the writer must never decode it \
+             a second time.",
+        ] {
+            assert_eq!(sentences(request), [request], "{request}");
+        }
+        // An apostrophe opens no quote.
+        assert_eq!(
+            sentences(
+                "The reader's cache must hold every page it has read; the writer's cache \
+                 must hold none of them."
+            )
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_side_that_does_not_stand_alone_stays_with_the_words_before_it() {
+        for request in [
+            // A label, an aside and a few words with no verb are no clause.
+            "`strict` -- unknown keys must be rejected with an error that names each of them.",
+            "The error should carry a dump of the stack -- raw bytes a debugger can load.",
+            "The channel must expose four handles of its own -- each a pair of numbers.",
+            // What goes on from the words before it, or leaves its subject
+            // or its verb there.
+            "The merge must fast-forward when the branch has no commits of its own; \
+             otherwise it must create a commit with two parents.",
+            "`is_enabled` reads the setting and returns true by default; must also return \
+             true when no settings are given at all.",
+            "The reader returns the head and the body as two keys; returns an empty map \
+             when the document has neither of them.",
+            "Only the first form marks an endpoint as a stream; applying the second form to \
+             a schema does not.",
+            // The items of a list share the words before its colon.
+            "Add two methods to the reader: `open` must return a handle for the file; \
+             `close` must release it and return nothing at all.",
+            // A condition that opens a sentence may hold for all of it.
+            "If the body is still streaming, reading it twice must raise an error; a second \
+             pass over its parts raises the same error.",
+        ] {
+            assert_eq!(sentences(request), [request], "{request}");
+        }
+        // Each side with a condition of its own stands alone.
+        assert_eq!(
+            sentences(
+                "When the flag is set, the reader must raise an error; when it is not set, \
+                 the reader must return the errors as a list."
+            ),
+            [
+                "When the flag is set, the reader must raise an error",
+                "when it is not set, the reader must return the errors as a list.",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mark_that_joins_no_clauses_cuts_nothing() {
+        for request in [
+            // A range, and a minus.
+            "The value must lie in the range 0 \u{2013} 255 and the reader must reject \
+             anything outside of it.",
+            // Words left unfinished before the mark, or that go on after it.
+            "The parser must stop reading options at -- the words after it must go to the \
+             child unchanged.",
+            "The runner must pass every word it reads -- to the child it starts, which must \
+             read them unchanged.",
+            // A command line as it is written.
+            "The runner must start the child with every flag -- --quiet must be among them \
+             in each case.",
+            // Two dashes that set off an aside.
+            "The reader must keep the file open -- it should never buffer more than one \
+             page -- until the caller has closed it.",
+            // One more value of what the words before a semicolon give.
+            "The command must exit with 1 when any check has failed; 0 only when every \
+             check has passed.",
+        ] {
+            assert_eq!(sentences(request), [request], "{request}");
+        }
+        // A number that ends the words before a semicolon ends a clause.
+        let counted = "The reader must retry a failed read at most 3; the writer must never \
+                       retry a write at all.";
+        assert_eq!(sentences(counted).len(), 2);
+        // Two dashes between three clauses still cut them apart.
+        let joined = "The reader must keep the file open -- it should never buffer more than \
+                      one page -- the caller must close it when it is done.";
+        assert_eq!(sentences(joined).len(), 3);
+    }
+
+    #[test]
+    fn a_clause_that_says_how_things_were_takes_no_request_to_the_bar() {
+        let asks = "The export should keep every row that has no values -- it must not drop \
+                    the header row of the sheet -- empty cells must be written as two quotes";
+        // By the word, by the version, and by both.
+        for told in [
+            "each of these worked before the last release.",
+            "each of these passes on 1.2 as it stands.",
+            "each of these worked in 1.2.",
+        ] {
+            let found = sentences(&format!("{asks} -- {told}"));
+            assert_eq!(found.len(), 3, "{found:?}");
+            assert!(found.len() < FEWEST);
+            assert!(found[2].ends_with(told), "{found:?}");
+        }
+        // A fourth ask joined the same way is a fourth requirement.
+        let asked = format!("{asks} -- each row must end with a line feed.");
+        assert_eq!(sentences(&asked).len(), FEWEST);
+    }
+
+    #[test]
+    fn a_bug_report_with_dashes_and_semicolons_still_states_too_little_for_a_review() {
+        let report = "Export should keep empty rows\n\
+                      Our nightly report has gaps -- the export seems to skip any row with no \
+                      values; I think it should have kept them, and it was fine before the \
+                      last release. The export should keep every row that has no values; it \
+                      must not drop the header row of the sheet either.";
+        let found = sentences(report);
+        assert_eq!(
+            found,
+            [
+                "Export should keep empty rows",
+                "The export should keep every row that has no values",
+                "it must not drop the header row of the sheet either.",
+            ]
+        );
+        assert!(found.len() < FEWEST);
+        // One more ask, and its sentences still count as they did: only a
+        // sentence that joins `FEWEST` clauses takes a request to the bar.
+        let asked = format!("{report} Empty cells must be written as two quotes.");
+        assert_eq!(
+            sentences(&asked),
+            [
+                "Export should keep empty rows",
+                "The export should keep every row that has no values; it must not drop the \
+                 header row of the sheet either.",
+                "Empty cells must be written as two quotes.",
+            ]
+        );
+        // A request that states enough without its cuts has them all.
+        let stated = format!("{asked} Each row must end with a line feed.");
+        assert_eq!(sentences(&stated).len(), 5);
+    }
+
+    #[test]
+    fn a_cut_that_takes_the_list_past_its_length_is_not_made() {
+        let rules: String = (1..=LISTED - 1)
+            .map(|at| format!("Rule {at} must hold. "))
+            .collect();
+        let joined = "Keys must be unique within one section; a key repeated in another \
+                      section is accepted as its own.";
+        // With room for both halves the last sentence is cut in two.
+        let short = rules.replacen("Rule 1 must hold. ", "", 1);
+        assert_eq!(sentences(&format!("{short}{joined}")).len(), LISTED);
+        // Cut here, it would leave its second half without a number.
+        let found = sentences(&format!("{rules}{joined}"));
+        assert_eq!(found.len(), LISTED);
+        assert_eq!(found.last().map(String::as_str), Some(joined));
     }
 
     #[test]
@@ -1276,6 +2853,783 @@ mod tests {
     }
 
     #[test]
+    fn a_verdict_with_its_evidence_in_the_same_cell_is_read() {
+        // As a review wrote its whole table, what shows each row after a
+        // dash, and the other ways a cell goes on past the word.
+        let report = "| Requirement | Case | Status / evidence |\n\
+                      |---|---|---|\n\
+                      | R1 | first character is no separator (`b'{}'`) | PASS — `DecodingError` |\n\
+                      | R1 | closed but never read | UNCLEAR — raises `Closed`; no rule names it |\n\
+                      | R2 | values arrive before the body ends | FAIL — `python lazy.py`: read whole |\n\
+                      | R3 | two forms in one call | PASS (3 cases) | `node both.js` |\n\
+                      | R4 | empty input | FAIL: got `[]` |\n\
+                      | R5 | later step first | PASS - both orders |\n\
+                      | R6 | exact message | **FAIL** — says `bad`, not `invalid` |\n\
+                      | R7 | wrapped value | FAIL. `node wrap.js` throws |\n\
+                      | R8 | plain value | PASSED: as written |";
+        let found: Vec<(usize, bool)> = (rows(report).into_iter())
+            .map(|(number, passed, _)| (number, passed))
+            .collect();
+        let read = [
+            (1, true),
+            (1, false),
+            (2, false),
+            (3, true),
+            (4, false),
+            (5, true),
+            (6, false),
+            (7, false),
+            (8, true),
+        ];
+        assert_eq!(found, read);
+        // The run is held to them as to any row, a doubt as a doubt: it
+        // is listed with the rows left unclear, and answered as one.
+        let text = unchecked(report, 8).unwrap();
+        assert!(
+            text.starts_with(
+                "[Letronna check] The review's table has these rows that failed:\n\
+                 - | R2 | values arrive before the body ends | FAIL — `python lazy.py`: read \
+                 whole |\n- | R4 | empty input"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "throws |\nand these left unclear:\n- | R1 | closed but never read | UNCLEAR — \
+                 raises `Closed`; no rule names it |\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(left_open(&text), ["R1"]);
+        assert!(left_unclear(
+            "R1 | closed but never read | UNCLEAR — raises `Closed`"
+        ));
+        assert!(!left_unclear(
+            "R2 | read whole | FAIL — unclear why it waits"
+        ));
+    }
+
+    #[test]
+    fn a_verdict_at_the_end_of_its_cases_cell_is_read() {
+        // As a review wrote its whole table, the case and its verdict in
+        // one cell with a dash between.
+        let report = "| R1 | skipped results before the threshold do not count — PASS |\n\
+                      | R1 | failures are listed by name (threshold 2) — PASS (no limit is set) |\n\
+                      | R2 | an empty name gives an empty reason — UNCLEAR (\"the test's name\") |\n\
+                      | R3 | the summary line is printed once - FAIL |\n\
+                      | R4 | the count includes the last test – **FAIL** (`node count.js`: 2) |";
+        let found: Vec<(usize, bool, bool)> = (rows(report).into_iter())
+            .map(|(number, passed, row)| (number, passed, left_unclear(&row)))
+            .collect();
+        let read = [
+            (1, true, false),
+            (1, true, false),
+            (2, false, true),
+            (3, false, false),
+            (4, false, false),
+        ];
+        assert_eq!(found, read);
+        // Written again after a cut, the case and what shows it part at
+        // the verdict, and read as the rows they were, the ones that hold
+        // the run first.
+        let again = cut_rows(report, "cut").unwrap();
+        assert_eq!(
+            again,
+            "\nRows of its table the quote above cut, written again:\n\
+             R3 | the summary line is printed once | FAIL\n\
+             R4 | the count includes the last test | FAIL | (`node count.js`: 2)\n\
+             R2 | an empty name gives an empty reason | UNCLEAR | (\"the test's name\")\n\
+             R1 | skipped results before the threshold do not count | PASS\n\
+             R1 | failures are listed by name (threshold 2) | PASS | (no limit is set)"
+        );
+        let mut found: Vec<(usize, bool, bool)> = (rows(&again).into_iter())
+            .map(|(number, passed, row)| (number, passed, left_unclear(&row)))
+            .collect();
+        found.sort_unstable();
+        assert_eq!(found, read);
+        // A case that only mentions a verdict is no row.
+        for case in [
+            "the reporter prints PASS",
+            "a failing test is marked — fail",
+            "the exit code is non-zero-FAIL",
+            "prints `ok` — PASS (in TAP) and FAIL otherwise",
+            "the status reads PASS or FAIL",
+            "the legend — PASS, FAIL or UNCLEAR",
+        ] {
+            assert!(!tabled(&format!("R1 | {case} | NOT RUN")), "{case}");
+        }
+        // A cell that is the word alone wins over one that ends with it.
+        let alone = "R1 | a failing test is marked — FAIL | PASS | node tap.js";
+        assert!(rows(alone)[0].1);
+        // Of two that hold more after the case, no row is passed while one
+        // says otherwise.
+        let failed = "R1 | a passing test | its line is marked — PASS | FAIL — not `ok 1`";
+        assert!(!rows(failed)[0].1);
+    }
+
+    #[test]
+    fn a_verdict_with_a_code_span_or_more_after_a_note_in_brackets_is_read() {
+        // As a review wrote its whole table, the word and then the command
+        // that showed it with no mark between, and as others wrote a row
+        // or two, a note in brackets and more after a dash or a semicolon.
+        let report = "| Requirement | case | verdict |\n|---|---|---|\n\
+                      | R1 | the name is written first | PASS `python parse.py` (`core: 0`) |\n\
+                      | R2 | a frame with no instance | UNCLEAR `capture` skips it, so the \
+                      count drops |\n\
+                      | R3 | the ref suggested | FAIL (beyond my rows) — `go test`: the ref \
+                      that failed |\n\
+                      | R4 | given as a string | PASS (by reading the branch) — not stated \
+                      for an unknown type |\n\
+                      | R5 | an entry that is no pair | PASS (throws `Error`); the request \
+                      does not say |\n\
+                      | R6 | zero locals | **PASS** `node count.js` |\n\
+                      | R7 | later step first | PASS (both orders) - `sh order.sh` |";
+        let read = |text: &str| -> Vec<(usize, bool, bool)> {
+            (rows(text).into_iter())
+                .map(|(number, passed, row)| (number, passed, left_unclear(&row)))
+                .collect()
+        };
+        let found = [
+            (1, true, false),
+            (2, false, true),
+            (3, false, false),
+            (4, true, false),
+            (5, true, false),
+            (6, true, false),
+            (7, true, false),
+        ];
+        assert_eq!(read(report), found);
+        // Written again after a cut, the span and the note are what shows
+        // the row, and the rows read as they were.
+        let again = cut_rows(report, "cut").unwrap();
+        assert!(
+            again.starts_with(
+                "\nRows of its table the quote above cut, written again:\n\
+                 R3 | the ref suggested | FAIL | (beyond my rows) — `go test`: the ref that \
+                 failed\n\
+                 R2 | a frame with no instance | UNCLEAR | `capture` skips it, so the count \
+                 drops\n\
+                 R1 | the name is written first | PASS | `python parse.py` (`core: 0`)\n"
+            ),
+            "{again}"
+        );
+        let mut back = read(&again);
+        back.sort_unstable();
+        assert_eq!(back, found);
+        // Words that run on from the bracket or the word are a sentence,
+        // a span with no space before it is part of a name, and a word not
+        // in capitals is prose.
+        for prose in [
+            "R1 | `PASS (3)` is the summary line",
+            "R1 | the summary line | PASS (3) is printed last",
+            "R1 | the summary line | PASS (3), then the names",
+            "R1 | the summary line | PASS`ed` is printed",
+            "R1 | the mode | Pass `--strict` through to the linter",
+        ] {
+            assert!(!tabled(prose), "{prose}");
+        }
+        // The guards on a verdict that shares its cell hold for these too:
+        // the case gives none ahead of other cells, nor does a line whose
+        // first cell says more than requirements' numbers, nor a cell that
+        // passes a case and then doubts or fails it.
+        for row in [
+            "R1 | PASS `ok 1` is printed for a passing test | see the log",
+            "R1 | PASS (3) — the summary line | see the log",
+            "R1 holds for `a | b` too | PASS (3) — `node tap.js`",
+            "R1 | set once | PASS `python hop.py` for one key; another is UNCLEAR",
+            "R1 | set once | PASS (one key) — the other FAILS",
+            "R1 | adds | NOT RUN | FAILED `pytest -q` at the import",
+        ] {
+            assert!(!tabled(row), "{row}");
+        }
+        // And a row that fails or is left unclear stays so whatever its
+        // span or note says of passing.
+        let failed = "R1 | the exit code | FAIL `sh t.sh` prints PASS where it should not";
+        assert_eq!(read(failed), [(1, false, false)]);
+        let doubted = "R1 | which end | UNCLEAR (PASS on one reading) — FAIL on the other";
+        assert_eq!(read(doubted), [(1, false, true)]);
+    }
+
+    #[test]
+    fn a_doubt_in_plain_words_and_a_pass_in_the_verdicts_column_are_read() {
+        let read = |text: &str| -> Vec<(usize, bool, bool)> {
+            (rows(text).into_iter())
+                .map(|(number, passed, row)| (number, passed, left_unclear(&row)))
+                .collect()
+        };
+        // As a review wrote its doubts, the word and then what it doubts
+        // with no mark between, a comma, or the request's words in quotes.
+        let report = "| Requirement | case | verdict |\n|---|---|---|\n\
+                      | R1 | a read started after close | UNCLEAR not exercised separately; \
+                      it shares the path above |\n\
+                      | R2 | a rule that fails | UNCLEAR, unverified: it depends on the tracer |\n\
+                      | R3 | a buffered read after close | UNCLEAR \"should remain readable\" \
+                      does not say |\n\
+                      | R4 | the default name | PASS not exercised directly; the default is \
+                      an empty string |\n\
+                      | R5 | the offset | PASS always 0; the change says why |\n\
+                      | R6 | one section | **PASS** by reading (`if` and `else if`) |\n\
+                      | R7 | a column named `check` | PASS for layout | `sh t.sh` prints both |";
+        let found = [
+            (1, false, true),
+            (2, false, true),
+            (3, false, true),
+            (4, true, false),
+            (5, true, false),
+            (6, true, false),
+            (7, true, false),
+        ];
+        assert_eq!(read(report), found);
+        // Written again after a cut, a doubt keeps what it doubts.
+        let again = cut_rows(report, "cut").unwrap();
+        assert!(
+            again.starts_with(
+                "\nRows of its table the quote above cut, written again:\n\
+                 R1 | a read started after close | UNCLEAR | not exercised separately; it \
+                 shares the path above\n\
+                 R2 | a rule that fails | UNCLEAR | unverified: it depends on the tracer\n\
+                 R3 | a buffered read after close | UNCLEAR | \"should remain readable\" does \
+                 not say\n\
+                 R4 | the default name | PASS\n"
+            ),
+            "{again}"
+        );
+        assert_eq!(read(&again), found);
+        // A doubt holds the run from any cell but the case, and beside a
+        // failure the row is what its first such cell says, as before.
+        assert_eq!(
+            read("R1 | which end | see the log | UNCLEAR whether the input or the line"),
+            [(1, false, true)]
+        );
+        assert_eq!(
+            read("R1 | which end | FAIL — it prints the line's | UNCLEAR whether that is asked"),
+            [(1, false, false)]
+        );
+        // A pass in plain words is read in the verdict's column alone: in
+        // a later cell, or the row's second of two, the words may be what
+        // a program printed.
+        for row in [
+            "R1 | the summary line | see the log | PASS by the last line",
+            "R1 | PASS by default for an empty suite",
+            "R1 | the summary line | — | PASS for each test, then the total",
+        ] {
+            assert!(!tabled(row), "{row}");
+        }
+        // Nor there where the words are about the word, where they go on
+        // to doubt or fail the case, or where the word is no verdict's.
+        for row in [
+            "R1 | the summary line | PASS is printed last",
+            "R1 | the summary line | PASS and the count are printed",
+            "R1 | the summary line | PASS was missing from the output",
+            "R1 | set once | PASS for one key, UNCLEAR for another",
+            "R1 | set once | PASS on the first hop but FAILS on the second",
+            "R1 | the mode | Pass the flag through",
+            "R1 | the mode | PASSING tests are listed first",
+            "R1 | the mode | PASS/FAIL column is printed",
+            "R1 | the mode | FAIL by one byte",
+            "R1 | adds | PASS by reading | NOT RUN",
+        ] {
+            assert!(!tabled(row), "{row}");
+        }
+        // The case gives no doubt ahead of other cells either, and a
+        // verdict alone in its cell still wins.
+        assert!(!tabled("R1 | UNCLEAR whether it is kept | see the log"));
+        let alone = "R1 | UNCLEAR is printed for an open range | PASS | node range.js";
+        assert_eq!(read(alone), [(1, true, false)]);
+        let failed = "R1 | the count | PASS by reading | FAIL | node count.js prints 2";
+        assert_eq!(read(failed), [(1, false, false)]);
+    }
+
+    #[test]
+    fn a_row_whose_number_carries_a_note_in_brackets_is_read() {
+        // As reviews mark the rows asked of them for a case set aside.
+        let report = "| R17/R2 (set aside) | the indent of the output | PASS (two spaces, as \
+                      the listing has) |\n\
+                      | R13 (set-aside) | the recorded shell | UNCLEAR — not testable here |\n\
+                      | R1–R7 (caveat) | a trailing comma | PASS (not a defect) | the parser \
+                      rejects it the same way |\n\
+                      | R10 (spot check) | the world's own entity is left out | PASS — `len=1` |\n\
+                      | R4 (set aside) | which end | FAIL | `sh range.sh` prints the line's |";
+        let found: Vec<(usize, bool, bool)> = (rows(report).into_iter())
+            .map(|(number, passed, row)| (number, passed, left_unclear(&row)))
+            .collect();
+        let read = [
+            (17, true, false),
+            (13, false, true),
+            (1, true, false),
+            (10, true, false),
+            (4, false, false),
+        ];
+        assert_eq!(found, read);
+        // The run is held to them by their numbers, as to any row.
+        let text = unchecked(report, 17).unwrap();
+        assert!(
+            text.contains("that failed:\n- | R4 (set aside) | which end"),
+            "{text}"
+        );
+        assert_eq!(left_open(&text), ["R13"]);
+        // A sentence that opens with a number and a bracket is still none,
+        // nor is a note with no number before it.
+        for prose in [
+            "R3 (see below) is right but for `a | b` — PASS",
+            "R3 (set aside) and more | which end — PASS",
+            "(set aside) | which end | PASS — `sh t.sh`",
+            "R3 (set aside | which end — PASS",
+        ] {
+            assert!(!tabled(prose), "{prose}");
+        }
+    }
+
+    #[test]
+    fn a_cell_that_passes_a_case_and_then_doubts_or_fails_it_gives_no_verdict() {
+        // As a review wrote one: the pass, then a doubt it had beside it.
+        for both in [
+            "R1 | set once | PASS (stays on the second hop); other keys untested — UNCLEAR",
+            "R1 | the exit code | PASS — though the summary line FAILS to print",
+            "R1 | the count is kept — PASS (UNCLEAR for a count of 0)",
+        ] {
+            assert!(!tabled(both), "{both}");
+        }
+        // A word of prose is no second verdict, and a row that fails or is
+        // left unclear stays so whatever it says of passing.
+        let read = |row: &str| (rows(row)[0].1, left_unclear(row));
+        let passed = "R1 | the exit code | PASS — fails before the change, as it should";
+        assert_eq!(read(passed), (true, false));
+        let failed = "R1 | the exit code | FAIL — the line reads PASS where it should not";
+        assert_eq!(read(failed), (false, false));
+        let doubted = "R1 | which end | UNCLEAR — PASS on one reading, FAIL on the other";
+        assert_eq!(read(doubted), (false, true));
+        // Alone in its cell the word is the verdict, whatever shows it says.
+        let alone = "R1 | a failing test | PASS | prints `FAIL: 1` for it";
+        assert_eq!(read(alone), (true, false));
+    }
+
+    #[test]
+    fn a_verdict_in_bold_that_closes_after_its_mark_is_read() {
+        let report = "| R1 | exact count | **FAIL:** got 2 |\n\
+                      | R2 | empty input | **PASS —** `[]` |\n\
+                      | R3 | later step first | *UNCLEAR.* The request sets no order |\n\
+                      | R4 | exact message | FAIL — **not** the one asked for |";
+        let found: Vec<(usize, bool, bool)> = (rows(report).into_iter())
+            .map(|(number, passed, row)| (number, passed, left_unclear(&row)))
+            .collect();
+        let read = [
+            (1, false, false),
+            (2, true, false),
+            (3, false, true),
+            (4, false, false),
+        ];
+        assert_eq!(found, read);
+        // Written again, what shows it comes without the verdict's marks
+        // and with its own.
+        let again = cut_rows(report, "cut").unwrap();
+        assert!(
+            again.ends_with(
+                "\nR1 | exact count | FAIL | got 2\n\
+                 R4 | exact message | FAIL | **not** the one asked for\n\
+                 R3 | later step first | UNCLEAR | The request sets no order\n\
+                 R2 | empty input | PASS | `[]`"
+            ),
+            "{again}"
+        );
+        // A colon run into bold words is no mark after a verdict.
+        assert!(!tabled(
+            "R1 | exact count | FAIL:**2** rows where 3 were asked for"
+        ));
+    }
+
+    #[test]
+    fn a_sentence_that_opens_with_a_requirements_number_is_no_row() {
+        // A bar inside a code span cuts a cell as any bar does, so a
+        // sentence of the report can end in what looks like a verdict's cell.
+        for prose in [
+            "R1: handles `a | b` — FAIL",
+            "R3 is right but for `a | b`, where the summary line reads — PASS (3)",
+            "R2 holds for a plain value, and for `a | b` too — PASS",
+        ] {
+            assert!(!tabled(prose), "{prose}");
+        }
+        // A row's first cell names requirements alone, however many.
+        let read = |row: &str| {
+            rows(row)
+                .first()
+                .map(|(number, passed, _)| (*number, *passed))
+        };
+        assert_eq!(read("R1 | handles `a | b` — FAIL"), Some((1, false)));
+        assert_eq!(
+            read("| **R4** / R5 | both ends | PASS — `t.sh` |"),
+            Some((4, true))
+        );
+        assert_eq!(read("R4 and R5 | both ends — PASS"), Some((4, true)));
+        // The bar inside a span still cuts: a row written whole in one, as
+        // the brief shows a row, is read, and so is one whose first cell
+        // says more beside a verdict alone in its cell.
+        assert_eq!(read("`R1 | case | FAIL | node check.js`"), Some((1, false)));
+        assert_eq!(
+            read("R2 `test_iter` | it is an iterator | FAIL"),
+            Some((2, false))
+        );
+    }
+
+    /// The rows `written` reads in `report`: each one's number, if it has
+    /// one, and whether it passed, with None for one that gave no verdict.
+    fn verdicts(report: &str) -> Vec<(Option<usize>, Option<bool>)> {
+        (written(report).into_iter())
+            .map(|(number, passed, _)| (number, passed))
+            .collect()
+    }
+
+    #[test]
+    fn a_row_that_names_no_requirement_is_read_in_a_table_with_a_requirements_row() {
+        // As reviews wrote the cases they were given that a run set aside,
+        // and what they doubted beyond the rows asked for.
+        let report = "## Table\n\n\
+                      | Req | Case | Verdict | What shows it |\n\
+                      |---|---|---|---|\n\
+                      | R18 | after 60 more aspects exist | PASS | `part-c.mts` |\n\
+                      | set-aside | `world.traits.size` after creating aspects | PASS | not asked |\n\
+                      | extra | module-level `aspectsByTrait` outlives calls and worlds | UNCLEAR | never pruned |\n\
+                      | — | `Not(aspect)` misses a complete entity | FAIL | `npx tsx check10.mts`: 0 |\n\
+                      | author case | `go test ./...` | UNCLEAR — could not run: no module cache |\n\
+                      | aside | `Equal` \"fine either way\" | PASS for the stated contract |\n\
+                      | n/a (R15, outside my set) | `--force-rescan` counters | FAIL | prints `Files scanned: 0` |\n\
+                      other | no terminating semicolon | FAIL | `python check.py`: a blank line appended\n\n\
+                      ## Verdict";
+        let held = [
+            (Some(18), Some(true)),
+            (None, Some(true)),
+            (None, Some(false)),
+            (None, Some(false)),
+            (None, Some(false)),
+            (None, Some(true)),
+            (None, Some(false)),
+            (None, Some(false)),
+        ];
+        assert_eq!(verdicts(report), held);
+        // A doubt among them is a doubt, and a failure a failure.
+        let unclear: Vec<bool> = (written(report).iter())
+            .map(|(_, _, row)| left_unclear(row))
+            .collect();
+        assert_eq!(
+            unclear,
+            [false, false, true, false, true, false, false, false]
+        );
+        // None of them is a requirement's row.
+        assert_eq!(rows(report).len(), 1);
+    }
+
+    #[test]
+    fn a_line_with_a_verdict_and_no_requirement_is_no_row_outside_a_reviews_table() {
+        // A table of another helper's, with no requirement's row in it.
+        let suites = "| Suite | Command | Result | Note |\n|---|---|---|---|\n\
+                      | core | `vitest run` | PASS | 137 tests |\n\
+                      | react | `vitest run` | FAIL | `document is not defined` |";
+        assert_eq!(verdicts(suites), []);
+        assert!(!tabled(suites));
+        assert_eq!(cut_rows(suites, "cut"), None);
+        // Nor does a requirement's row elsewhere in the report make rows of
+        // it: a table is lines with a bar that follow one another.
+        let apart = format!("R1 | iso | PASS | `date -u`\n\nWhat I ran:\n\n{suites}");
+        assert_eq!(verdicts(&apart), [(Some(1), Some(true))]);
+        // Nor one below it: the line a quote takes up again with after its
+        // cut is a piece of a line, whatever it looks like, as these were
+        // of `| R25 | … |` and of a row whose case holds a bar.
+        for piece in [
+            "25 | `test_aiter_json_in_memory_is_repeatable` | FAIL | `pytest -q`",
+            "`ll`, `lr`, `c\\|l`, `p`, empty) | FAIL | `node align.js` |",
+            "| — | docs untouched | UNCLEAR | which docs |",
+        ] {
+            let tail =
+                format!("    … [middle trimmed] …\n    {piece}\n    | R26 | repeatable | PASS |");
+            assert_eq!(verdicts(&tail), [(Some(26), Some(true))], "{piece}");
+        }
+        // Beside a requirement's rows, a line is a row only with a case
+        // between its first cell and its verdict: not a legend, a piece of
+        // a sentence, a cell that says two things, or a header.
+        for line in [
+            "**Table** (`PASS`; `FAIL | command`; `UNCLEAR | doubt`). Operators are named in words.",
+            "Legend | PASS | FAIL | UNCLEAR",
+            "the manager | PASS | every run above goes through that path (`h.py`)",
+            "| Set-aside: `log.WithError(err)` | PASS | not asked |",
+            "(fetch is `limit+1`) | PASS (by reading) |",
+            "| set-aside | \"with zero records nothing to persist\" | PASS/UNCLEAR — a header-only file |",
+            "| — | `consuming_from_sac` must check the queue | FAIL, by request words | returns `True` |",
+            "| # | Case | PASS / FAIL | Evidence |",
+            "| Req | Case | Verdict | What shows it |",
+            "| — | set-aside: rollback | FAIL | `npx jest letronna_spec` | not yet implemented |",
+            "| — | set-aside: `build()` bypasses caching | NOT RUN | no runner |",
+        ] {
+            let table = format!("| R1 | iso | PASS | `date -u` |\n{line}\n| R2 | utc | PASS |");
+            assert_eq!(
+                verdicts(&table),
+                [(Some(1), Some(true)), (Some(2), Some(true))],
+                "{line}"
+            );
+        }
+        // A table that counts its rows ahead of the requirement is read as
+        // it was, as no table.
+        let counted = "| 4 | R9 | relative dir | FAIL | `scc --bounded-memory-dir out src` |\n\
+                       | 5 | R10 | all formats | PASS |";
+        assert_eq!(verdicts(counted), []);
+        // And nothing between the lines that mark a report as written ahead
+        // of the work, nor a sentence of the request quoted in a notice.
+        let ahead = format!(
+            "{AHEAD_OPENS}\nR1 | adds | PASS\n— | set-aside: empty input | FAIL | pytest -q\n\
+             {AHEAD_CLOSES}\n— | another | FAIL | pytest -q"
+        );
+        assert_eq!(verdicts(&ahead), []);
+        let notice = "- R6: A failed test is printed as `name | status | FAIL | why`.\n\
+                      - R7: The summary is printed last.\n\nR6 | exact line | PASS | `node tap.js`";
+        assert_eq!(verdicts(notice), [(Some(6), Some(true))]);
+    }
+
+    #[test]
+    fn a_line_of_a_rows_shape_directly_under_a_requirements_row_is_read_whatever_it_is() {
+        // What the rule does with what no recorded review wrote, pinned:
+        // it asks a line's shape and its place, and nothing of what it is.
+        let under = |lines: &str| {
+            verdicts(&format!("| R1 | iso | PASS | `date -u` |\n{lines}"))[1..].to_vec()
+        };
+        // A table of results set under the review's with no line between.
+        let results = "| input | output | expected | result |\n|---|---|---|---|\n\
+                       | `..3` | `[0,3]` | error | FAIL |";
+        assert_eq!(under(results), [(None, Some(false))]);
+        // A line that sums the table up, one a program printed, a note,
+        // and the key to the table, read as the first of its verdicts that
+        // does not pass.
+        for (line, passed) in [
+            ("| **Overall** | — | **FAIL** | 1 of 2 rows fails |", false),
+            ("| Summary | 2 rows | FAIL |", false),
+            ("| Total | 2 rows, 1 passed | PASS |", true),
+            ("not ok | t2 | FAIL | boom", false),
+            ("| note | the suite prints | `PASS` | when green |", true),
+            (
+                "| Key | meaning | PASS — ran and matched | FAIL — ran and differed | UNCLEAR — could not tell |",
+                false,
+            ),
+        ] {
+            assert_eq!(under(line), [(None, Some(passed))], "{line}");
+            // Apart from the requirement's row, none is a row.
+            assert_eq!(under(&format!("\n{line}")), [], "{line}");
+            assert_eq!(under(&format!("```\n{line}\n```")), [], "{line}");
+        }
+        // With no case between its first cell and its verdict, none is one
+        // under the requirement's row either.
+        for line in [
+            "| Overall | FAIL |",
+            "| Overall | | FAIL | 1 of 2 |",
+            "Overall: 1 PASS | 1 FAIL | 0 UNCLEAR",
+            "| Key | PASS | FAIL | UNCLEAR |",
+        ] {
+            assert_eq!(under(line), [], "{line}");
+        }
+        // Read, such a line holds the run as any row of no requirement
+        // does: to a line that opens with its first cell.
+        let summed = "R1 | iso | PASS | `date -u`\n\
+                      | **Overall** | all rows | **UNCLEAR** | could not run the suite |";
+        assert_eq!(left_open(&unchecked(summed, 1).unwrap()), ["Overall"]);
+    }
+
+    #[test]
+    fn rows_of_no_requirement_a_cut_lost_are_written_again_under_their_own_first_cell() {
+        let report = "| R1 | `limit` kept | PASS | `npx jest -t limit` |\n\
+                      | R2 | cursor past the end | FAIL | `npx jest -t end`: 500 |\n\
+                      | set-aside | `total` with a cursor | PASS | not asked |\n\
+                      | **extra** | module-level `aspectsByTrait` | UNCLEAR — never pruned |\n\
+                      | — | `Not(aspect)` misses a complete entity | **FAIL** | `npx tsx check10.mts`: 0 |";
+        let again = cut_rows(report, "cut").unwrap();
+        assert_eq!(
+            again,
+            "\nRows of its table the quote above cut, written again:\n\
+             R2 | cursor past the end | FAIL | `npx jest -t end`: 500\n\
+             — | `Not(aspect)` misses a complete entity | FAIL | `npx tsx check10.mts`: 0\n\
+             extra | module-level `aspectsByTrait` | UNCLEAR | never pruned\n\
+             R1 | `limit` kept | PASS | `npx jest -t limit`\n\
+             set-aside | `total` with a cursor | PASS | not asked"
+        );
+        // Written again, they read as the rows they were.
+        let held = [
+            (Some(2), Some(false)),
+            (None, Some(false)),
+            (None, Some(false)),
+            (Some(1), Some(true)),
+            (None, Some(true)),
+        ];
+        assert_eq!(verdicts(&again), held);
+        // Also where the quote kept every requirement's row, so that only
+        // rows of no requirement are written under the line that marks them.
+        let quote = "    | R1 | `limit` kept | PASS | `npx jest -t limit` |\n\
+                     \x20   | R2 | cursor past the end | FAIL | `npx jest -t end`: 500 |\n\
+                     \x20   … [middle trimmed] …\n    Files I changed: none.";
+        let again = cut_rows(report, quote).unwrap();
+        assert!(
+            again.starts_with(&format!("\n{WRITTEN_AGAIN}\n— | `Not(aspect)`")),
+            "{again}"
+        );
+        assert_eq!(
+            verdicts(&again),
+            [(None, Some(false)), (None, Some(false)), (None, Some(true))]
+        );
+        // The end of a table the cut kept, with none of its requirement's
+        // rows, holds no row as the quote stands, so those are written
+        // again; with one of them, they are rows where they stand.
+        let tail = "    … [middle trimmed] …\n\
+                    \x20   module-level `aspectsByTrait` | UNCLEAR — never pruned |\n\
+                    \x20   | — | `Not(aspect)` misses a complete entity | **FAIL** | `npx tsx check10.mts`: 0 |";
+        let again = cut_rows(report, tail).unwrap();
+        assert!(again.contains("\n— | `Not(aspect)` misses"), "{again}");
+        let kept = format!(
+            "    | R2 | cursor past the end | FAIL | `npx jest -t end`: 500 |\n{}",
+            tail.split_once('\n').unwrap().1
+        );
+        let again = cut_rows(report, &kept).unwrap();
+        assert!(!again.contains("`Not(aspect)` misses"), "{again}");
+        assert!(again.contains("\nextra | module-level"), "{again}");
+        // Past the rows written again they are counted as any other.
+        let many: String = (1..=CUT_SHOWN)
+            .map(|n| format!("R{n} | c | PASS\n"))
+            .chain(["set-aside | docs untouched | PASS | not asked\n".to_owned()])
+            .collect();
+        let again = cut_rows(&many, "cut").unwrap();
+        assert!(again.ends_with("\nand 1 more row that passed"), "{again}");
+        // A first cell with code in it is written again whole, as every
+        // other cell is: stripped of the marks at its edges, it left a span
+        // half open in five rows of one recorded review. Only the mark
+        // that opens a row written whole in one span is not the cell's.
+        let coded = "| R1 | `using` in a module | PASS | `run1.ts` |\n\
+                     | Set-aside: `using of;` | expression-statement reading | UNCLEAR | before: `Unexpected token: 'of'` |\n\
+                     | `a` and `b` | both orders | **FAIL** | `node both.js` prints `b` |\n\
+                     `extra | the count | FAIL | node count.js`";
+        let again = cut_rows(coded, "cut").unwrap();
+        assert_eq!(
+            again,
+            "\nRows of its table the quote above cut, written again:\n\
+             `a` and `b` | both orders | FAIL | `node both.js` prints `b`\n\
+             extra | the count | FAIL | node count.js\n\
+             Set-aside: `using of;` | expression-statement reading | UNCLEAR | before: `Unexpected token: 'of'`\n\
+             R1 | `using` in a module | PASS | `run1.ts`"
+        );
+        // They read back as the rows they were, and the one left unclear is
+        // known by the same first cell as before the cut.
+        let rows = [(None, Some(false)); 3];
+        assert_eq!(verdicts(&again)[..3], rows);
+        let told = unchecked(&format!("    R1 | `using` in a module | PASS{again}"), 1).unwrap();
+        assert_eq!(left_open(&told), left_open(&unchecked(coded, 1).unwrap()));
+        assert_eq!(left_open(&told), ["Set-aside: using of;"]);
+    }
+
+    #[test]
+    fn a_row_kept_in_one_column_by_escaping_its_bars_is_read() {
+        let report = "| Req | Row |\n|---|---|\n\
+                      | R1 | pair branch only | FAIL \\| node m.ts gives 0 and 0 |\n\
+                      | R2 | same cache | UNCLEAR \\| identity cannot show it |\n\
+                      | R3 | trait branch | PASS |";
+        let found: Vec<(usize, bool)> = (rows(report).into_iter())
+            .map(|(number, passed, _)| (number, passed))
+            .collect();
+        assert_eq!(found, [(1, false), (2, false), (3, true)]);
+        let again = cut_rows(report, "| R3 | trait branch | PASS |").unwrap();
+        assert!(
+            again.ends_with(
+                "\nR1 | pair branch only | FAIL | node m.ts gives 0 and 0\nR2 | same cache | \
+                 UNCLEAR | identity cannot show it"
+            ),
+            "{again}"
+        );
+        // A bar escaped inside a case is no end of a verdict's cell: the
+        // word alone in its cell still wins.
+        let listed = "| R1 | prints one of `PASS \\| FAIL \\| SKIP` | PASS | node tap.js |";
+        assert!(rows(listed)[0].1);
+    }
+
+    #[test]
+    fn a_case_that_opens_with_a_verdicts_word_in_prose_is_no_verdict() {
+        for case in [
+            "fails when the input is empty",
+            "passes values through unchanged",
+            "Fail fast on the first error",
+            "FAIL-fast mode stops the run",
+            "PASS and FAIL are both counted",
+            "PASS/FAIL column is printed",
+            "FAIL.md is written beside the log",
+            "PASSING tests are listed first",
+            "Passed: 3 of 3 is printed last",
+            "unclear: which of the two wins",
+        ] {
+            assert!(!tabled(&format!("R1 | {case} | NOT RUN")), "{case}");
+            // Nor does it change what the row's own verdict says.
+            let passed = format!("R1 | {case} | PASS | node check.js");
+            assert!(rows(&passed)[0].1, "{case}");
+            assert!(!left_unclear(&passed), "{case}");
+        }
+        // A cell that is the word alone wins over one that goes on.
+        let alone = "R1 | FAIL: the line printed for a failing test | PASS | node tap.js";
+        assert!(rows(alone)[0].1);
+        // Of two that go on after the case, no row is passed while one
+        // says otherwise.
+        let failed = "R1 | a passing test | PASS: printed | FAIL — `ok 1` is missing";
+        assert!(!rows(failed)[0].1);
+        let either = "R1 | a failing test | FAIL: `not ok 1` is missing | PASS — printed";
+        assert!(!rows(either)[0].1);
+    }
+
+    #[test]
+    fn a_case_that_quotes_a_verdict_gives_none_ahead_of_other_cells() {
+        // The cell after the number is the case: what it quotes of a
+        // summary line or a mark is no verdict where more cells follow.
+        for row in [
+            "R6 | `PASS (3)` is the summary line | \u{274c} | node tap.js",
+            "R1 | a good row is marked — PASS | Fail — marked ok",
+            "R1 | what it checks — PASS | NOT RUN",
+            "R1 | PASS: the line printed for a passing test | see the log",
+        ] {
+            assert!(!tabled(row), "{row}");
+        }
+        // The verdict in a later cell is then the row's, whatever the case
+        // quotes.
+        let passed = "R6 | `FAIL: <name>` printed for each failing test | PASS — `node tap.js` \
+                      shows it";
+        assert!(rows(passed)[0].1);
+        let failed = "R6 | `PASS (3)` is the summary line | FAIL — `node tap.js` prints 2";
+        assert!(!rows(failed)[0].1);
+        // As the row's last cell it still gives one, the case before it or
+        // none at all, but not where it goes on past a bracket.
+        assert!(rows("R1 | a good row is marked — PASS")[0].1);
+        assert!(!rows("R1 | FAIL: `not ok 1` is missing")[0].1);
+        assert!(!tabled("R6 | `PASS (3)` is the summary line"));
+        // A row that says its test was not run is no row, whatever a later
+        // cell says of why, unless a cell of it is a verdict alone.
+        for row in [
+            "R1 | adds | NOT RUN | import — FAILED (ImportError)",
+            "R1 | adds | NOT RUN — no seam for it | collection: FAILED (1 error)",
+        ] {
+            assert!(!tabled(row), "{row}");
+        }
+        assert!(!rows("R1 | adds | NOT RUN before the fix | FAIL | pytest -q")[0].1);
+        // A word alone after a cell that says only that a test was not run
+        // is why it was not, as a tester writes of a reading it wrote no
+        // test of; one before that cell is still the row's verdict.
+        for row in [
+            "R12 | reading: … | NOT RUN | unclear",
+            "R12 | reading: once for each run | NOT RUN | UNCLEAR",
+            "| R12 | reading: once for each run | NOT RUN | **unclear** |",
+            "R12 | reading: once for each run | NOT RUN | fail",
+            "R12 | reading: once for each run | NOT RUN | none",
+        ] {
+            assert!(!tabled(row), "{row}");
+            assert!(!left_unclear(row), "{row}");
+            let passed: String = (1..=12)
+                .map(|at| format!("R{at} | plain | PASS\n"))
+                .collect();
+            assert_eq!(unchecked(&format!("{passed}{row}"), 12), None, "{row}");
+        }
+        let failed = rows("R1 | adds | FAIL | NOT RUN | the import raised");
+        assert_eq!(failed.len(), 1);
+        assert!(!failed[0].1);
+        assert!(!rows("R1 | NOT RUNNING the hook leaves the file | FAIL — it is gone")[0].1);
+    }
+
+    #[test]
     fn a_long_list_is_shared_between_review_helpers() {
         assert_eq!(shares(5), [(1, 5)]);
         assert_eq!(shares(10), [(1, 10)]);
@@ -1292,7 +3646,7 @@ mod tests {
         let rules: Vec<String> = ["Ranges must be written as `a..b`.", "Open ranges default."]
             .map(String::from)
             .into();
-        let whole = brief(request, &rules, (1, 2));
+        let whole = brief(request, &rules, (1, 2), &[], &[]);
         assert!(
             whole.contains(&format!("word for word:\n{request}\n")),
             "{whole}"
@@ -1302,12 +3656,30 @@ mod tests {
         assert!(whole.contains(cases!()));
         assert!(whole.contains("git diff"));
         assert!(!whole.contains("with why"));
-        let part = brief(request, &rules, (2, 2));
+        let part = brief(request, &rules, (2, 2), &[], &[]);
         assert!(
             part.contains("Check R2 to R2; other helpers check the rest."),
             "{part}"
         );
-        assert!(part.contains("written `R2 | case | PASS`"), "{part}");
+        assert!(
+            part.contains("written `R2 | case | PASS | command and what it showed`"),
+            "{part}"
+        );
+    }
+
+    #[test]
+    fn a_review_is_asked_for_the_verdict_alone_in_its_cell() {
+        // What shows a row goes in the cell after, where a helper left to
+        // itself writes it on after the verdict, as `PASS — what shows it`.
+        let alone = "a table of one row per requirement and case, the verdict alone in its \
+                     cell and what shows it in the cell after, written `R1 | case | PASS | \
+                     command and what it showed` or `R1 | case | FAIL | command that shows it`, \
+                     with a row for each";
+        let rules: Vec<String> = ["Dates must parse.".to_owned()].into();
+        let asked = brief("Dates must parse.", &rules, (1, 1), &[], &[]);
+        assert!(asked.contains(alone), "{asked}");
+        // The run that starts a review itself asks its helper for the same.
+        assert!(REVIEW.contains(alone), "{REVIEW}");
     }
 
     #[test]
@@ -1316,7 +3688,7 @@ mod tests {
             .map(String::from)
             .into();
         let reports = ["review-r1 finished: 3 rounds.\nR1 | iso | PASS\nR2 | utc | FAIL | t.sh"];
-        let text = reviewed(&rules, &reports.map(String::from), None);
+        let text = reviewed(&rules, &reports.map(String::from), &[], None, None, true);
         assert!(text.starts_with(&notice(&rules, false, &[])[..60]));
         assert_eq!(listed(&text), Some(2));
         assert!(text.contains("Helpers that haven't seen your work reviewed it"));
@@ -1326,15 +3698,131 @@ mod tests {
     }
 
     #[test]
+    fn a_review_with_no_table_that_could_be_read_is_told_with_its_report() {
+        let rules: Vec<String> = ["Dates must parse.", "Times must parse."]
+            .map(String::from)
+            .into();
+        let read = "review-r1 finished: 3 rounds.\nR1 | iso | PASS".to_owned();
+        let prose = "review-r2 finished: 4 rounds.\n    R2 does not hold: `t.sh` prints 1.";
+        // Beside a review whose table was read, after it.
+        let text = reviewed(&rules, &[read], &[prose.into()], None, None, true);
+        let said = "One review started for you came back with no table that could be read, so \
+                    none of its rows is counted: its report follows. Read it for what it found, \
+                    and fix what it says fails by changing the work, not the case, unless the \
+                    request rules that case out.";
+        assert!(
+            text.contains(&format!("R1 | iso | PASS\n\n{said}\n\n{prose}\n\n{CHECK}")),
+            "{text}"
+        );
+        assert!(!text.contains(REVIEW), "{text}");
+        // It adds no row, so the run is still told R2 has none.
+        assert_eq!(rows(&text).len(), 1);
+        assert!(unchecked(&text, 2).unwrap().contains("has no row for R2."));
+        // With no table read at all the run still asks for a review itself,
+        // and reads what came back all the same.
+        let both = [prose.to_owned(), prose.replace("r2", "r1")];
+        let none = reviewed(&rules, &[], &both, None, None, true);
+        let said = "2 reviews started for you came back with no table that could be read, so \
+                    none of their rows is counted: their reports follow. Read them for what \
+                    they found, and fix what they say fails by changing the work, not the case, \
+                    unless the request rules that case out.";
+        assert!(
+            none.contains(&format!(
+                "{REVIEW} {said}\n\n{}\n\n{}\n\n{CHECK}",
+                both[0], both[1]
+            )),
+            "{none}"
+        );
+        assert_eq!(listed(&none), Some(2));
+        assert!(!tabled(&none));
+    }
+
+    #[test]
+    fn a_review_is_asked_for_a_row_for_each_reading_only_where_words_were_read_two_ways() {
+        let rules: Vec<String> = ["Dates must parse in any order.".to_owned()].into();
+        let plain = brief("Dates must parse.", &rules, (1, 1), &[], &[]);
+        assert!(!plain.contains("more than one way"), "{plain}");
+        let read = [crate::doubts::Reading {
+            number: 1,
+            words: "must parse in any order".into(),
+        }];
+        let asked = brief("Dates must parse.", &rules, (1, 1), &[], &read);
+        // After all else, so the brief is otherwise as it was.
+        let rows = asked.strip_prefix(plain.as_str()).unwrap();
+        assert!(
+            rows.starts_with(
+                "\n\nThe author read these words of the request more than one way; its choice \
+                 is not shown:\n- R1: \"must parse in any order\"\nFor each, name the plausible \
+                 readings and write a row per reading, `R1 | reading: "
+            ),
+            "{rows}"
+        );
+        // A helper with a share of the rows is given the readings of its own.
+        let rules: Vec<String> = (1..=24).map(|n| format!("Rule {n} must hold.")).collect();
+        let read = [3, 20].map(|number| crate::doubts::Reading {
+            number,
+            words: format!("Rule {number} must hold"),
+        });
+        let part = brief("Rules.", &rules, (1, 8), &[], &read);
+        assert!(part.contains("- R3: \"Rule 3 must hold\""), "{part}");
+        assert!(!part.contains("- R20: \""), "{part}");
+        let part = brief("Rules.", &rules, (17, 24), &[], &read);
+        assert!(part.contains("- R20: \"Rule 20 must hold\""), "{part}");
+        assert!(part.contains("`R20 | reading: "), "{part}");
+        assert!(!part.contains("- R3: \""), "{part}");
+        assert!(!brief("Rules.", &rules, (9, 16), &[], &read).contains("more than one way"));
+        // A row written as asked is read as any other row is.
+        let table = "R1 | reading: parts in any order | FAIL | t.sh";
+        assert!(unchecked(table, 1).unwrap().contains(table));
+    }
+
+    #[test]
     fn with_only_the_testers_table_the_run_still_asks_for_a_review() {
         let rules: Vec<String> = ["Dates must parse.", "Times must parse."]
             .map(String::from)
             .into();
         let tested = "A tester wrote tests.\nR1 | iso | FAIL | t.sh | got None";
-        let text = reviewed(&rules, &[], Some(tested));
+        let text = reviewed(&rules, &[], &[], Some(tested), None, true);
         assert!(text.contains(REVIEW), "{text}");
         assert!(!text.contains("Helpers that haven't seen your work reviewed it"));
         assert!(text.contains(&format!("{tested}\n\n{CHECK}")), "{text}");
+    }
+
+    #[test]
+    fn reviews_that_ran_out_of_budget_are_not_told_as_reviews_that_found_nothing() {
+        let rules: Vec<String> = ["Dates must parse.", "Times must parse."]
+            .map(String::from)
+            .into();
+        let plain = notice(&rules, true, &[]);
+        let all = reviewed(&rules, &[], &[], None, Some((2, 2)), true);
+        let said = "The 2 reviews started for you ran out of budget before reporting, so \
+                    nothing is reviewed yet: that is not a pass. ";
+        // Said once, just before the ask for a review, with the rest as it was.
+        assert_eq!(all, plain.replacen(REVIEW, &format!("{said}{REVIEW}"), 1));
+        assert_eq!(listed(&all), Some(2));
+        assert!(!tabled(&all));
+
+        let one = reviewed(&rules, &[], &[], None, Some((1, 1)), true);
+        assert!(
+            one.contains("\nThe review started for you ran out of budget before reporting, so"),
+            "{one}"
+        );
+        let some = reviewed(&rules, &[], &[], None, Some((3, 1)), true);
+        assert!(
+            some.contains(
+                "\n1 of the 3 reviews started for you ran out of budget before reporting, \
+                 and the rest gave no table, so nothing is reviewed yet: that is not a pass. \
+                 First ask a helper"
+            ),
+            "{some}"
+        );
+        // With nothing known of how they ended, the ask stands alone.
+        assert_eq!(reviewed(&rules, &[], &[], None, None, true), plain);
+        // A run with no tokens left for a review of its own is told what
+        // became of them, and not to start one that would be refused.
+        let spent = reviewed(&rules, &[], &[], None, Some((2, 2)), false);
+        assert!(!spent.contains(REVIEW), "{spent}");
+        assert!(spent.ends_with(&format!("{said}{CHECK}")), "{spent}");
     }
 
     #[test]
@@ -1343,12 +3831,621 @@ mod tests {
                       R2 | scope first | UNCLEAR | parent singletons start too; the words may rule it out";
         assert!(tabled(report));
         let text = unchecked(report, 2).unwrap();
-        assert!(text.contains("has these rows that failed or were left unclear:\n- R2 | scope"));
+        assert!(text.contains("The review's table has these rows left unclear:\n- R2 | scope"));
         assert!(text.contains("decide it by the request's words"), "{text}");
-        // A table with only failed rows is told nothing of doubts.
+        // It is asked for a line that quotes the request, not for a shrug.
+        assert!(
+            text.contains(
+                "For each row left unclear above, write one line in your answer, `R2 | reading \
+                 taken | \"the request's words for it\" | command run`"
+            ),
+            "{text}"
+        );
+        // Silence is answered by quoting the nearest words and changing
+        // nothing, not by a bare shrug, and a doubt is no failure to fix.
+        assert!(
+            text.contains(
+                "A bare \"the request does not say\" settles nothing: where it states nothing \
+                 on the case, write `R2 | not stated | \"the nearest words it does have\" | \
+                 left as is`, and change nothing for that row on a guess."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("not a failure"), "{text}");
+        assert!(!text.contains("Fix what fails"), "{text}");
+        assert!(text.ends_with("not only what changed."), "{text}");
+        // A row that names two results is not waved off so: its own
+        // command is run, and the line says which result is called for.
+        let shown = "on a guess. A row that names two results that differ is answered only \
+                     after you run that row's own command: say in your line which result the \
+                     request's words, or the project's own feature of the same kind, call for; \
+                     where neither does, write `not stated` with that command in place of `left \
+                     as is`, and change nothing. Only your last message";
+        assert!(text.contains(shown), "{text}");
+        // It adds to the form for a case the request is silent on, and
+        // takes none of it back.
+        assert!(!text.contains("is not answered by"), "{text}");
+        // A failed row that says unclear of why is a failed row, and a row
+        // too long to show its verdict is still told by its list.
+        let why = unchecked("R1 | iso | FAIL | t.sh | unclear | why", 1).unwrap();
+        assert!(
+            why.contains("has these rows that failed:\n- R1 | iso"),
+            "{why}"
+        );
+        assert!(left_open(&why).is_empty());
+        let long = format!("R1 | {} | UNCLEAR | which zone", "a long case ".repeat(40));
+        let cut = unchecked(&long, 1).unwrap();
+        assert!(!cut.contains("UNCLEAR"), "{cut}");
+        assert_eq!(left_open(&cut), ["R1"]);
+        // A table with only failed rows is told nothing of doubts, and is
+        // asked for the line only for a row it does not fix.
         let failed = unchecked("R1 | iso | PASS\nR2 | utc | FAIL | t.sh", 2).unwrap();
         assert!(failed.contains("has these rows that failed:\n- R2 | utc"));
         assert!(!failed.contains("left unclear"), "{failed}");
+        assert!(
+            failed.contains("For each failed row you do not fix, write one line in your answer"),
+            "{failed}"
+        );
+        assert!(!failed.contains("two results that differ"), "{failed}");
+        assert!(
+            failed.contains("Fix what fails unless the request rules"),
+            "{failed}"
+        );
+        // A tester's failed test may be among them, and what another row
+        // passed is not undone for it; rows only left unclear or missing
+        // are told nothing of it.
+        let testers = "Fix what fails unless the request rules that case out. A failed row that \
+                       is a tester's test is one more reading of the request: to pass it, do \
+                       not take away or move something another row passed, unless the request's \
+                       words ask for that, and words that can be read both ways do not. For \
+                       each failed row you do not fix,";
+        assert!(failed.contains(testers), "{failed}");
+        assert!(!text.contains("a tester's test"), "{text}");
+        let missing = unchecked("R1 | iso | PASS", 2).unwrap();
+        assert!(!missing.contains("a tester's test"), "{missing}");
+        assert!(left_open(&failed).is_empty());
+        // And one with only rows missing for no line at all.
+        let short = unchecked("R1 | a | PASS", 3).unwrap();
+        assert!(!short.contains("write one line"), "{short}");
+    }
+
+    #[test]
+    fn failed_rows_come_before_unclear_ones_and_each_kind_is_counted_apart() {
+        // Twelve doubts written before eleven failures, as a review that
+        // doubts early and fails late writes them.
+        let mut report = String::new();
+        for n in 1..=12 {
+            report.push_str(&format!(
+                "R{n} | doubt {n} | UNCLEAR | the words may mean either\n"
+            ));
+        }
+        for n in 13..=23 {
+            report.push_str(&format!("R{n} | case {n} | FAIL | t.sh {n}\n"));
+        }
+        report.push_str("R24 | fine | PASS\n");
+        let text = unchecked(&report, 24).unwrap();
+        let at = |words: &str| {
+            text.find(words)
+                .unwrap_or_else(|| panic!("{words}: {text}"))
+        };
+        assert!(
+            text.starts_with(
+                "[Letronna check] The review's table has these rows that failed:\n\
+                 - R13 | case 13 | FAIL | t.sh 13\n"
+            ),
+            "{text}"
+        );
+        // Ten of each are shown, and each kind says how many more it has.
+        assert!(at("- R22 | case 22") < at("- and 1 more that failed\nand these left unclear:\n"));
+        assert!(!text.contains("- R23 | case 23"), "{text}");
+        assert!(at("left unclear:\n- R1 | doubt 1 |") < at("- R10 | doubt 10"));
+        assert!(at("- R10 | doubt 10") < at("- and 2 more left unclear\n"));
+        assert!(!text.contains("- R11 | doubt 11"), "{text}");
+        assert!(
+            text.contains("For each row left unclear above, and each failed row you do not fix,"),
+            "{text}"
+        );
+        // The rows shown as unclear are the ones an answer is held to.
+        let shown: Vec<String> = (1..=10).map(|n| format!("R{n}")).collect();
+        assert_eq!(left_open(&text), shown);
+        // With rows missing too, the lists go on from them.
+        let both = unchecked("R1 | a | FAIL | t.sh\nR1 | b | UNCLEAR | which end", 2).unwrap();
+        assert!(
+            both.starts_with(
+                "[Letronna check] The review's table has no row for R2, and has these rows \
+                 that failed:\n- R1 | a | FAIL | t.sh\nand these left unclear:\n\
+                 - R1 | b | UNCLEAR | which end\nTest each requirement without a row"
+            ),
+            "{both}"
+        );
+        assert_eq!(left_open(&both), ["R1"]);
+        // No other text holds a run to a line.
+        assert!(left_open("- R1 | b | UNCLEAR | which end").is_empty());
+        assert!(left_open(&notice(&["It must hold.".to_owned()], true, &[])).is_empty());
+    }
+
+    #[test]
+    fn a_failed_or_unclear_row_of_no_requirement_holds_the_run_as_any_other_does() {
+        // As two reviews of one run wrote them, below their requirements'
+        // rows, which all passed.
+        let report = "R1 | iso | PASS | `date -u`\n\
+                      R2 | utc | PASS | `date`\n\
+                      set-aside | `world.traits.size` after creating aspects | PASS | not asked\n\
+                      extra | module-level `aspectsByTrait` outlives calls | UNCLEAR | never pruned\n\
+                      — | `Not(aspect)` misses a complete entity | FAIL | `npx tsx check10.mts`: 0";
+        let text = unchecked(report, 2).unwrap();
+        assert!(
+            text.starts_with(
+                "[Letronna check] The review's table has these rows that failed:\n\
+                 - — | `Not(aspect)` misses a complete entity | FAIL | `npx tsx check10.mts`: 0\n\
+                 and these left unclear:\n\
+                 - extra | module-level `aspectsByTrait` outlives calls | UNCLEAR | never pruned\n\
+                 A failed row stands for its whole case"
+            ),
+            "{text}"
+        );
+        // Each is answered by a line that opens as its row does.
+        let form = "For each row left unclear above, and each failed row you do not fix, write \
+                    one line in your answer, `extra | reading taken | \"the request's words for \
+                    it\" | command run`";
+        assert!(text.contains(form), "{text}");
+        let opened = "on a guess. A row that names no requirement gets its line as well, opened \
+                      with the row's own first cell where a number would be, as `extra | reading \
+                      taken | …`. A row that names two results";
+        assert!(text.contains(opened), "{text}");
+        // It is no requirement's row: one that has none of its own is
+        // still told so.
+        let short = unchecked(report, 3).unwrap();
+        assert!(
+            short.starts_with(
+                "[Letronna check] The review's table has no row for R3, and has these rows \
+                 that failed:\n- — | `Not(aspect)`"
+            ),
+            "{short}"
+        );
+        // Beside a requirement's row that holds the run, the form is shown
+        // for that one, and theirs is said after it.
+        let both = format!("{report}\nR2 | which zone | UNCLEAR | the words name none");
+        let text = unchecked(&both, 2).unwrap();
+        assert!(
+            text.contains("write one line in your answer, `R2 | reading taken | "),
+            "{text}"
+        );
+        assert!(
+            text.contains("where a number would be, as `extra | reading taken | …`. "),
+            "{text}"
+        );
+        // One that passed holds the run to nothing, and with none of them
+        // nothing is said of them.
+        let passed = "R1 | iso | PASS\nset-aside | docs untouched | PASS | not asked";
+        assert_eq!(unchecked(passed, 1), None);
+        let plain = unchecked("R1 | iso | UNCLEAR | which zone", 1).unwrap();
+        assert!(!plain.contains("names no requirement"), "{plain}");
+        // Cut from the quote and written again, they hold the run all the
+        // same, also where the quote kept every requirement's row.
+        let quote = "    R1 | iso | PASS | `date -u`\n    R2 | utc | PASS | `date`\n    … [cut] …";
+        let told = format!("{quote}{}", cut_rows(report, quote).unwrap());
+        let text = unchecked(&told, 2).unwrap();
+        assert!(
+            text.contains("that failed:\n- — | `Not(aspect)` misses a complete entity | FAIL"),
+            "{text}"
+        );
+        assert!(
+            text.contains("left unclear:\n- extra | module-level `aspectsByTrait`"),
+            "{text}"
+        );
+    }
+
+    /// An assistant's reply saying `content`.
+    fn answered(content: &str) -> Message {
+        Message {
+            role: "assistant".into(),
+            content: content.into(),
+            ..Default::default()
+        }
+    }
+
+    /// A request whose fourth sentence leaves open which end is meant.
+    const OPEN: &str = "Add a `parse_range` function. Ranges must be written as `a..b`. \
+                        Open ranges such as `a..` default to the end of the input.";
+
+    #[test]
+    fn a_line_that_quotes_the_request_for_the_reading_taken_settles_a_row() {
+        let line = "R3 | the end of the whole input, not of the line | \"default to the end \
+                    of the input\" | `cargo test open_range`";
+        let answer = format!("Fixed R2.\n\n{line}\n\nAll rows pass now.");
+        assert_eq!(unresolved(&[answered(&answer)], OPEN, &["R3"]), None);
+        // However the line is laid out, in any reply after the notice: as
+        // a list's item, a table's row or a heading, for two rows at once,
+        // the quote in a code span, without the request's marks, or with
+        // its middle left out.
+        let laid = [
+            "- R3 | whole input | \"end of the input\" | cargo test",
+            "| R3 | whole input | \u{201c}Open ranges such as a.. default\u{201d} | cargo test |",
+            "**R3** | whole input | 'the end of the input' | cargo test",
+            "### R3 | whole input | \"to the end of the input\" | cargo test",
+            "1. R3 | whole input | \"to the end of the input\" | cargo test",
+            "R2/R3 | whole input | \"to the end of the input\" | cargo test",
+            "R2 and R3 | whole input | \"to the end of the input\" | cargo test",
+            "R3 | whole input | `default to the end of the input` | cargo test",
+            "R3 | whole input | \"Open ranges \u{2026} default to the end\" | cargo test",
+            "R3 | whole input | \"Open ranges such as [...] the end of the input.\" | ran it",
+            "R3 | left end is inclusive | \"to the end of the input\" | cargo test",
+            "R3 | whole input | \"to the end of the input\" | cargo test | PASS",
+            "R3 | unknown ends are rejected | \"to the end of the input\" | cargo test",
+            "R3 | none are read past the end | \"to the end of the input\" | cargo test",
+            "R3 | leave existing values | \"to the end of the input\" | cargo test",
+            "R3 | skip hidden options | \"to the end of the input\" | cargo test",
+            "R3 | ambiguous matches raise | \"to the end of the input\" | cargo test",
+        ];
+        for line in laid {
+            let replies = [answered(line), answered("Done.")];
+            assert_eq!(unresolved(&replies, OPEN, &["R3"]), None, "{line}");
+        }
+        // Where the request states nothing on the case, saying so with the
+        // nearest words is an answer, and no change is asked for.
+        let silent = "R3 | not stated | \"default to the end of the input\" | left as is";
+        assert_eq!(unresolved(&[answered(silent)], OPEN, &["R3"]), None);
+        // Nothing is asked with no row left unclear.
+        assert_eq!(unresolved(&[answered("Done.")], OPEN, &[""; 0]), None);
+    }
+
+    #[test]
+    fn a_row_shrugged_off_or_settled_by_words_the_request_lacks_is_listed() {
+        let listed = |answer: &str, rows: &[&str]| unresolved(&[answered(answer)], OPEN, rows);
+        let text = listed("R3: unclear; the request does not say. Leave.", &["R3"]).unwrap();
+        assert!(
+            text.starts_with(
+                "[Letronna check] The review left a row of R3 unclear, and your answer has no \
+                 line for it that names the reading you took and quotes the request. Write \
+                 one line for it, `R3 | reading taken | \"the request's words for it\" | \
+                 command run`, with 3 or more words in a row quoted as the request writes them"
+            ),
+            "{text}"
+        );
+        // It is sent back for the line, not for a change made on a guess.
+        assert!(
+            text.contains(
+                "write `R3 | not stated | \"the nearest words it does have\" | left as is`, and \
+                 change nothing for that row on a guess."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("change the work"), "{text}");
+        assert!(text.ends_with("not only what changed."), "{text}");
+        // A quote the request does not hold or too little of it, a shrug
+        // beside a quote, the review's own row copied back, a line with no
+        // reading, another row's line, and prose settle nothing.
+        let unsettled = [
+            "R3 | whole input | \"defaults to the last byte\" | cargo test",
+            "R3 | whole input | \"input\" | cargo test",
+            "R3 | whole input | \"the input\" | cargo test",
+            "R3 | unclear | \"end of the input\" is ambiguous; left",
+            "R3 | Unclear, leave | \"default to the end of the input\" | none",
+            "R3 | ? | \"default to the end of the input\" | -",
+            "R3 | left as is | \"default to the end of the input\" | none",
+            "R3 | whole input | PASS | \"default to the end of the input\"",
+            "R3 | which end \"default to the end of the input\" means | UNCLEAR | input or line",
+            "R3 | \"default to the end of the input\"",
+            "R2 | whole input | \"default to the end of the input\" | cargo test",
+            "R30 | whole input | \"default to the end of the input\" | cargo test",
+            "As for R3, \"default to the end of the input\" is clear enough.",
+            "R3: whole input, since it says \"to the end of the input\"; ran cargo test",
+            "Leave.",
+        ];
+        for answer in unsettled {
+            assert!(listed(answer, &["R3"]).is_some(), "{answer}");
+        }
+        // Each row without a line is named, once, and the settled ones are not.
+        let answer = "R2 | both ends given | \"must be written as `a..b`\" | cargo test\n\
+                      R1: unclear. Leave.";
+        let text = listed(answer, &["R1", "R2", "R3", "R3"]).unwrap();
+        assert!(
+            text.contains("left rows of R1 and R3 unclear, and your answer has no line for each"),
+            "{text}"
+        );
+        assert!(text.contains("`R1 | reading taken | "), "{text}");
+        // Only the run's own replies are read.
+        let user = Message {
+            role: "user".into(),
+            content: "R3 | whole input | \"default to the end of the input\" | cargo test".into(),
+            ..Default::default()
+        };
+        assert!(unresolved(&[user], OPEN, &["R3"]).is_some());
+    }
+
+    #[test]
+    fn a_reviews_row_copied_back_settles_nothing_however_its_verdict_is_written() {
+        let listed = |answer: &str| unresolved(&[answered(answer)], OPEN, &["R3"]);
+        // With what shows the verdict in its cell, or the verdict at the
+        // end of another, the row is the review's all the same.
+        for row in [
+            "R3 | which end \"default to the end of the input\" means | UNCLEAR — input or line",
+            "R3 | whole input | PASS — \"default to the end of the input\"",
+            "R3 | whole input | FAIL: \"default to the end of the input\" is not kept | t.sh",
+            "R3 | which end | \"default to the end of the input\" — UNCLEAR (input or line)",
+        ] {
+            assert!(listed(row).is_some(), "{row}");
+        }
+        // A line of the form asked for settles its row, a dash in it or not.
+        let line = "R3 | the end of the whole input — not of the line | \"default to the end \
+                    of the input\" | cargo test";
+        assert_eq!(listed(line), None);
+        // A doubt copied back in the cell after the number, where a table's
+        // row has its case and gives no verdict, is no reading taken either.
+        for row in [
+            "R3 | which end — UNCLEAR | \"default to the end of the input\" | cargo test",
+            "R3 | UNCLEAR: which end | \"default to the end of the input\" | cargo test",
+            "R3 (open) | which end | \"default to the end of the input\" | UNCLEAR — still",
+        ] {
+            assert!(listed(row).is_some(), "{row}");
+        }
+        // In the review's table that cell is the case, so the row is the
+        // failure its later cell says, not a doubt.
+        let table = "R3 | `UNCLEAR: <range>` is printed for an open range | FAIL — nothing is";
+        let sent = unchecked(table, 3).unwrap();
+        assert!(sent.contains("these rows that failed:\n- R3 |"), "{sent}");
+        assert!(left_open(&sent).is_empty(), "{sent}");
+    }
+
+    #[test]
+    fn a_cell_that_quotes_a_verdicts_word_in_a_code_span_is_no_copied_row() {
+        // The request's own words may open or close with a verdict's.
+        let request = "Print one line per test. When every test passes, the last line must be \
+                       `PASS: all tests passed`. A failing test is printed as `FAIL: <name>`.";
+        let listed = |answer: &str| unresolved(&[answered(answer)], request, &["R4"]);
+        // Quoted in a code span they settle the row, as in quote marks.
+        for line in [
+            "R4 | the line is kept | \"PASS: all tests passed\" | node tap.js",
+            "R4 | the line is kept | `PASS: all tests passed` | node tap.js",
+            "R4 | the line is kept | `the last line must be — PASS` | node tap.js",
+            "| R4 | the line is kept | `PASS: all tests passed` | `node tap.js` |",
+        ] {
+            assert_eq!(listed(line), None, "{line}");
+        }
+        // A verdict alone in a span, one in bold or bare with what shows it,
+        // and one in a span of its own ahead of another are the review's.
+        for row in [
+            "R4 | the line is kept | `PASS` | \"PASS: all tests passed\"",
+            "R4 | the line is kept | **PASS:** `PASS: all tests passed` is printed | node tap.js",
+            "R4 | the line is kept | PASS: `all tests passed` is the last line | node tap.js",
+            "R4 | the line is kept | PASS `all tests passed` is the last line | node tap.js",
+            "R4 | the line is kept | `PASS` — see `all tests passed` | node tap.js",
+            "R4 | the line is kept | `UNCLEAR` | \"PASS: all tests passed\"",
+        ] {
+            assert!(listed(row).is_some(), "{row}");
+        }
+    }
+
+    #[test]
+    fn rows_of_requirements_are_listed_before_rows_that_name_none() {
+        // The rows three reviews of one run left unclear, in the order its
+        // notice held them: the first review's doubt beyond its
+        // requirements stands second, and ten rows of requirements follow.
+        let doubts = [
+            "R6 | re-evaluation only when a dependency trait is present | UNCLEAR | every path goes through `instance.predicates`",
+            "— | `registerPredicate` scans every live entity each time | UNCLEAR | cost is O(entities × queries)",
+            "R3 | predicate returns truthy non-boolean | UNCLEAR | implementation requires `=== true`",
+            "R7 | `Not(predicate)` where the predicate returns a truthy object | UNCLEAR | got `[1]`",
+            "R9 | reading: run-time diff | UNCLEAR | both readings quote \"not present in the previous result\"",
+            "R9 | entity already satisfying P, modifier created after | UNCLEAR | `r9.ts` \"A first run\" → 0",
+            "R9 | same input, but world created after the modifier | UNCLEAR | `r9.ts` \"E world2\" → 1",
+            "R10 | true→false→true before the run | UNCLEAR | \"matches transition to false\"",
+            "R11 | predicate created after a previous transition | UNCLEAR | baseline missing",
+            "R13 | nested `updateEach` (deferral depth) | UNCLEAR | I did not exercise nesting",
+            "R10 | `entity.remove(Position)` threw once | UNCLEAR | not reproducible in five reruns",
+        ];
+        let passed: String = (1..=13)
+            .map(|n| format!("R{n} | plain case | PASS | `r{n}.ts`\n"))
+            .collect();
+        let text = unchecked(&format!("{passed}{}", doubts.join("\n")), 13).unwrap();
+        // Each requirement's row is among the ten listed, in the table's
+        // order, and the one of no requirement is counted after them:
+        // listed where it stood, it took the last one's place.
+        let listed: Vec<&str> = text.lines().skip(1).take(11).collect();
+        let mut held: Vec<String> = (doubts.iter())
+            .filter(|row| row.starts_with('R'))
+            .map(|row| format!("- {row}"))
+            .collect();
+        held.push("- and 1 more left unclear".to_owned());
+        assert_eq!(listed, held, "{text}");
+        assert_eq!(
+            left_open(&text),
+            ["R6", "R3", "R7", "R9", "R10", "R11", "R13"]
+        );
+        // With a place left among the ten, it is listed, last.
+        let text = unchecked(&format!("{passed}{}", doubts[..10].join("\n")), 13).unwrap();
+        let listed: Vec<&str> = text.lines().skip(1).take(11).collect();
+        assert_eq!(listed[8], format!("- {}", doubts[9]), "{text}");
+        assert_eq!(listed[9], format!("- {}", doubts[1]), "{text}");
+        assert!(
+            listed[10].starts_with("A row left unclear is a doubt"),
+            "{text}"
+        );
+        assert_eq!(left_open(&text).last().map(String::as_str), Some("—"));
+        // The same of the rows that failed, each kind apart.
+        let failed = "R1 | iso | PASS | `date -u`\n\
+                      R2 | aspect created after the entity is complete | FAIL | `npx tsx final.mts`: false\n\
+                      — | `Not(aspect)` misses a complete entity | FAIL | `npx tsx check10.mts`: 0\n\
+                      extra | module-level `aspectsByTrait` | UNCLEAR | never pruned\n\
+                      R2 | sibling write from a callback survives | FAIL | `part-e.mts`: `{b:2}`\n\
+                      R1 | same trait twice | UNCLEAR | the request is silent on repeats";
+        let text = unchecked(failed, 2).unwrap();
+        assert!(
+            text.starts_with(
+                "[Letronna check] The review's table has these rows that failed:\n\
+                 - R2 | aspect created after the entity is complete | FAIL | `npx tsx final.mts`: false\n\
+                 - R2 | sibling write from a callback survives | FAIL | `part-e.mts`: `{b:2}`\n\
+                 - — | `Not(aspect)` misses a complete entity | FAIL | `npx tsx check10.mts`: 0\n\
+                 and these left unclear:\n\
+                 - R1 | same trait twice | UNCLEAR | the request is silent on repeats\n\
+                 - extra | module-level `aspectsByTrait` | UNCLEAR | never pruned\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_row_of_no_requirement_is_answered_by_a_line_that_opens_with_its_first_cell() {
+        // Doubts as reviews wrote them below their requirements' rows.
+        let report = "R1 | iso | PASS | `date -u`\n\
+                      R2 | which zone | UNCLEAR | the words name none\n\
+                      | extra | module-level `aspectsByTrait` | UNCLEAR | never pruned |\n\
+                      | — | docs untouched | UNCLEAR | which docs |\n\
+                      | — | `total` with a cursor | UNCLEAR | counts all matches |\n\
+                      | **Set-aside** | hidden tests import `Record` | UNCLEAR — both names fit |\n\
+                      - | compile check | UNCLEAR | no toolchain";
+        let sent = unchecked(report, 2).unwrap();
+        // Each is held by what it opens with, once, but for one that
+        // opens with a list's mark alone.
+        let open = left_open(&sent);
+        assert_eq!(open, ["R2", "extra", "—", "Set-aside"]);
+        // A line for each settles them, however it is laid out.
+        let quote = "\"default to the end of the input\"";
+        let answer = format!(
+            "R2 | the whole input | {quote} | `cargo test open_range`\n\
+             - extra | not stated | {quote} | left as is\n\
+             | **—** | docs are not asked for | {quote} | `git status --short` |\n\
+             set-aside (the record's name) | not stated | {quote} | left as is"
+        );
+        assert_eq!(unresolved(&[answered(&answer)], OPEN, &open), None);
+        for line in [
+            format!("extra | not stated | {quote} | left as is"),
+            format!("`extra` | not stated | {quote} | left as is"),
+            format!("1. Extra: the module-level map | not stated | {quote} | left as is"),
+            format!("### extra | the map is per module | {quote} | `node many.js`"),
+        ] {
+            assert_eq!(
+                unresolved(&[answered(&line)], OPEN, &["extra"]),
+                None,
+                "{line}"
+            );
+        }
+        // Without one, the run is sent back for it, by its first cell.
+        let partial = answer.lines().take(2).collect::<Vec<_>>().join("\n");
+        let text = unresolved(&[answered(&partial)], OPEN, &open).unwrap();
+        assert!(
+            text.starts_with(
+                "[Letronna check] The review left rows of `—` and `Set-aside` unclear, and your \
+                 answer has no line for each that names the reading you took and quotes the \
+                 request. Write one line for each, `— | reading taken | \"the request's words \
+                 for it\" | command run`"
+            ),
+            "{text}"
+        );
+        let opened = "on a guess. A row that names no requirement gets its line as well, opened \
+                      with the row's own first cell where a number would be, as `— | reading \
+                      taken | …`. Only your last message";
+        assert!(text.contains(opened), "{text}");
+        // With a requirement's row open too, the form is shown for that.
+        let text = unresolved(&[answered("Done.")], OPEN, &open).unwrap();
+        assert!(
+            text.contains("rows of R2, `extra`, `—` and `Set-aside` unclear"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Write one line for each, `R2 | reading taken | "),
+            "{text}"
+        );
+        assert!(
+            text.contains("as `extra | reading taken | …`. Only"),
+            "{text}"
+        );
+        // A line for another row, the review's own row copied back, a
+        // shrug, or words the request lacks settle nothing, as for a
+        // requirement's row.
+        for line in [
+            format!("set-aside | not stated | {quote} | left as is"),
+            format!("R2 | not stated | {quote} | left as is"),
+            "extra | module-level `aspectsByTrait` | UNCLEAR | never pruned".to_owned(),
+            format!("extra | unclear, leave | {quote} | none"),
+            "extra | not stated | \"never pruned\" | left as is".to_owned(),
+            format!("As for the extra row, {quote} says nothing of it."),
+        ] {
+            assert!(
+                unresolved(&[answered(&line)], OPEN, &["extra"]).is_some(),
+                "{line}"
+            );
+        }
+        // With no requirement's row left unclear, the rest still are. A
+        // first cell with code in it is named without the marks of code,
+        // which the span it is shown in would end at, and a line that
+        // opens with it settles its row with them or without.
+        let coded = "R1 | iso | PASS\n\
+                     | Set-aside: `using of;` | as an expression statement | UNCLEAR | either parse |";
+        let sent = unchecked(coded, 1).unwrap();
+        assert_eq!(left_open(&sent), ["Set-aside: using of;"]);
+        assert!(
+            sent.contains("as `Set-aside: using of; | reading taken | …`. "),
+            "{sent}"
+        );
+        for head in ["Set-aside: `using of;`", "set-aside: using of;"] {
+            let line = format!("{head} | not stated | {quote} | left as is");
+            assert_eq!(
+                unresolved(&[answered(&line)], OPEN, &left_open(&sent)),
+                None,
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_first_cell_that_opens_with_a_lists_number_is_known_without_it() {
+        // An answer's line that opens "1. " is read as a list's item, its
+        // number no part of what it says, so a row whose first cell opens
+        // so is known by what follows the number: held to `1. extra`, no
+        // line the run could write would have settled it.
+        let report = "R1 | iso | PASS | `date -u`\n\
+                      | 1. extra | module-level `aspectsByTrait` | UNCLEAR | never pruned |\n\
+                      | 2) other | dead helper | UNCLEAR | unused |";
+        let sent = unchecked(report, 1).unwrap();
+        assert_eq!(left_open(&sent), ["extra", "other"]);
+        let form = "write one line in your answer, `extra | reading taken | ";
+        assert!(sent.contains(form), "{sent}");
+        let quote = "\"default to the end of the input\"";
+        for answer in [
+            format!(
+                "1. extra | not stated | {quote} | left as is\n2) other | not stated | {quote} | left as is"
+            ),
+            format!(
+                "extra | not stated | {quote} | left as is\n- other | not stated | {quote} | left as is"
+            ),
+            format!(
+                "| 1. extra | not stated | {quote} | left as is |\n| 2) other | not stated | {quote} | left as is |"
+            ),
+        ] {
+            assert_eq!(
+                unresolved(&[answered(&answer)], OPEN, &left_open(&sent)),
+                None,
+                "{answer}"
+            );
+        }
+        // A first cell that is the number alone is held to no line, as
+        // one that is a list's mark alone: whatever line opened with it
+        // would be read as an item that opens with its reading.
+        let bare = "R1 | iso | PASS | `date -u`\n\
+                    | 1. | docs untouched | UNCLEAR | which docs |\n\
+                    | 2) | `total` with a cursor | UNCLEAR | counts all matches |";
+        let sent = unchecked(bare, 1).unwrap();
+        assert!(
+            sent.contains("left unclear:\n- | 1. | docs untouched | UNCLEAR"),
+            "{sent}"
+        );
+        assert!(left_open(&sent).is_empty(), "{sent}");
+        assert!(!sent.contains("write one line"), "{sent}");
+        // A number that is no list's keeps its place: `2`, `#3` and `S1`
+        // open a line as they open their rows.
+        let counted = "R1 | iso | PASS\n2 | docs untouched | UNCLEAR | which docs\n\
+                       S1 | dead helper | UNCLEAR | unused";
+        let sent = unchecked(counted, 1).unwrap();
+        assert_eq!(left_open(&sent), ["2", "S1"]);
+        let answer = format!(
+            "2 | not stated | {quote} | left as is\nS1 | not stated | {quote} | left as is"
+        );
+        assert_eq!(
+            unresolved(&[answered(&answer)], OPEN, &left_open(&sent)),
+            None
+        );
     }
 
     #[test]
@@ -1364,7 +4461,7 @@ mod tests {
     #[test]
     fn a_review_is_asked_to_write_each_doubt_as_a_row() {
         let rules: Vec<String> = ["Dates must parse.".to_owned()].into();
-        let asked = brief("Dates must parse.", &rules, (1, 1));
+        let asked = brief("Dates must parse.", &rules, (1, 1), &[], &[]);
         assert!(
             asked.contains("`R1 | case | UNCLEAR | what you doubt`"),
             "{asked}"
@@ -1375,6 +4472,30 @@ mod tests {
             "{asked}"
         );
         assert!(REVIEW.contains("`R1 | case | UNCLEAR | what it doubts`"));
+        // What a run of the review's own shows wrong is a failed row, in
+        // each text: filed as a doubt, the run may answer it by leaving
+        // its work as it is. It is the work the run shows wrong, not "it":
+        // a run can show a doubt too, which a guard's row or a reading's
+        // is never failed for.
+        assert!(
+            asked.contains(
+                "anything wrong you notice beyond the rows asked for gets a row of its own, \
+                 FAIL with its command where a run of yours shows the work wrong, otherwise \
+                 `R1 | case | UNCLEAR | what you doubt`, never only prose"
+            ),
+            "{asked}"
+        );
+        assert!(
+            REVIEW.contains(
+                "as a row of its own, FAIL with its command where a run of its own shows the \
+                 work wrong, otherwise `R1 | case | UNCLEAR | what it doubts`, never only \
+                 prose, and to leave UNCLEAR a row that can only pass by bending another \
+                 requirement's words."
+            ),
+            "{REVIEW}"
+        );
+        assert!(!asked.contains("shows it,"), "{asked}");
+        assert!(!REVIEW.contains("shows it,"), "{REVIEW}");
     }
 
     #[test]
@@ -1409,6 +4530,27 @@ mod tests {
     }
 
     #[test]
+    fn the_check_allows_no_late_change_of_behaviour_on_a_guess() {
+        assert!(CHECK.contains("change no behaviour the request does not state on a guess"));
+        assert!(CHECK.contains("needs the request's words or a failing row behind it"));
+        // Whichever way the run is sent back, it reads it.
+        let stated = ["It must hold.".to_owned()];
+        assert!(notice(&stated, false, &[]).contains("on a guess"));
+        assert!(
+            reviewed(
+                &stated,
+                &["R1 | plain | PASS".to_owned()],
+                &[],
+                None,
+                None,
+                true
+            )
+            .contains("on a guess")
+        );
+        assert!(!CHECK_OUTPUT.contains("on a guess"));
+    }
+
+    #[test]
     fn the_review_names_the_helper_type_that_judges_by_the_request() {
         // A general helper has neither the review type's prompt nor its rounds.
         assert!(REVIEW.contains("start a helper of type `review`, not general,"));
@@ -1422,6 +4564,7 @@ mod tests {
             "matched by its exact words, not a generic error",
             "the new form beside the existing form of the same thing in one call",
             "found by searching the code, not only the call the request names",
+            "run again after many more of the things that state holds have been made",
             "the other side of a condition",
             "steps the requirement sets in no order, in each order",
             "uses the requirement's own words for it",
@@ -1435,10 +4578,189 @@ mod tests {
         // and each row is judged by the request rather than by the code.
         assert!(REVIEW.contains("fails when the request's words say what should happen in it"));
         assert!(REVIEW.contains("not by what the code now does"));
+        // One the request's words do not decide passes, in a review's own
+        // word for it: a gap the request leaves open is no failure.
+        let passes = format!(
+            "whatever the reason it was set aside, and passes, written `R1 | case | PASS | \
+             {NOT_ASKED}`, when they do not, or is UNCLEAR where your change made the project \
+             do another thing in it than before: a gap the request does not ask to close is no \
+             failure. Ask it to write any doubt"
+        );
+        assert!(REVIEW.contains(&passes), "{REVIEW}");
+        // It says when such a case is a doubt, so "passes when" leaves no
+        // case to be read as one that fails.
+        assert!(!REVIEW.contains("left the case as it was"), "{REVIEW}");
+        // Only a row that fails is fixed: a doubt is decided by the words,
+        // as the notice that brings a review's reports says it, and a row
+        // the review passed as not asked for changes nothing.
+        let ending = format!(
+            "Fix every row that fails by changing the work, not the case, unless the request \
+             rules that case out. A case it calls unclear is a doubt, not a failure: decide it \
+             by the request's words, and change the work for it only where those words ask for \
+             that. Change nothing for a row written `{NOT_ASKED}`."
+        );
+        assert!(REVIEW.ends_with(&ending), "{REVIEW}");
+        assert!(!REVIEW.contains("sets aside"), "{REVIEW}");
+        let rules = ["It must hold.".to_owned()];
+        let reports = ["R1 | plain | PASS".to_owned()];
+        let brought = reviewed(&rules, &reports, &[], None, None, true);
+        let doubt = "is a doubt, not a failure: decide it by the request's words, and change the \
+                     work for it only where those words ask for that.";
+        assert!(brought.contains(doubt), "{brought}");
+        assert!(REVIEW.contains(doubt), "{REVIEW}");
         // What the run set aside goes to the helper, and a failed row is fixed
         // in the work.
         assert!(REVIEW.contains("each case you chose not to handle, with why"));
         assert!(REVIEW.contains("by changing the work, not the case"));
+    }
+
+    #[test]
+    fn a_case_set_aside_that_the_request_does_not_ask_for_is_a_row_that_passed() {
+        let row = format!("R3 | a name with nothing in it | PASS | {NOT_ASKED}");
+        assert_eq!(rows(&row), [(3, true, row.clone())]);
+        // It holds the run to nothing, laid out with bars or without.
+        let table = format!("R1 | plain | PASS\n| R2 | wrapped | PASS |\n| {row} |");
+        assert_eq!(unchecked(&table, 3), None);
+        // A review started for the run is asked for it in the same word.
+        let rules: Vec<String> = ["Names must parse.".to_owned()].into();
+        let cases = ["Empty `name`?".to_owned()];
+        let asked = brief("Names must parse.", &rules, (1, 1), &cases, &[]);
+        let word = format!("write PASS, with `{NOT_ASKED}` in the cell after: a gap");
+        assert!(asked.contains(&word), "{asked}");
+        // It is a review's word in its table, and `NOT_STATED` the run's in
+        // a line of its answer: neither is asked for where the other is.
+        assert!(!REVIEW.contains(NOT_STATED), "{REVIEW}");
+        assert!(!asked.contains(NOT_STATED), "{asked}");
+        let sent = unchecked("R1 | plain | UNCLEAR | which end", 1).unwrap();
+        assert!(sent.contains(NOT_STATED), "{sent}");
+        assert!(!sent.contains(NOT_ASKED), "{sent}");
+    }
+
+    #[test]
+    fn the_other_side_of_a_condition_is_tested_with_an_input_the_condition_decides() {
+        // One both readings give the same result for shows nothing of it.
+        let case = "the other side of a condition, such as what \"and is not ended\" or \
+                    \"unless\" keeps out, with both sides in one input chosen so that the \
+                    result would differ if the condition's words were removed from the \
+                    requirement, the row naming both results;";
+        assert!(REVIEW.contains(case), "{REVIEW}");
+        let rules: Vec<String> = ["Dates must parse.".to_owned()].into();
+        let asked = brief("Dates must parse.", &rules, (1, 1), &[], &[]);
+        assert!(asked.contains(case), "{asked}");
+    }
+
+    #[test]
+    fn a_rule_about_a_thing_that_can_hold_its_own_kind_gets_a_row_one_level_down() {
+        // A rule that held for a list was never tried on a list inside a
+        // list, where it reached the outer one.
+        let case = "a thing the requirement's rule is about that can hold another of its own \
+                    kind, such as a list in a list, a group in a group or a call in a call, with \
+                    the same input one level down, the row saying what the rule gives for the \
+                    inner one and what for the outer one, each judged by the request's words;";
+        // It asks what the rule gives at each level and lets the words
+        // judge: a rule that is right to reach upward, as one by which a
+        // group is valid only if its members are, is not failed for it.
+        assert!(!cases!().contains("leave the outer one as it was"));
+        // The run that asks for a review reads it, and a review started for it.
+        assert!(REVIEW.contains(case), "{REVIEW}");
+        let rules: Vec<String> = ["Dates must parse.".to_owned()].into();
+        let asked = brief("Dates must parse.", &rules, (1, 1), &[], &[]);
+        assert!(asked.contains(case), "{asked}");
+        // Once, after the other case of two of a thing in one input.
+        let after = "where one applies and the other must not; ";
+        let placed = format!("{after}{case} each place in the code that records the event");
+        assert!(cases!().contains(&placed), "{}", cases!());
+        assert_eq!(cases!().matches("of its own kind").count(), 1);
+    }
+
+    #[test]
+    fn state_a_change_keeps_between_calls_gets_a_row_after_many_more_are_made() {
+        // A map never emptied gave the right answer for the few things a
+        // test made, and another once dozens had been made before them.
+        let case = "where the change keeps state that outlives a call, such as a module-level \
+                    map, cache, counter or registry, once for each such state, one of the \
+                    requirement's plain cases run again after many more of the things that state \
+                    holds have been made, dozens where a test makes a few, and again after the \
+                    project's own reset where it has one;";
+        // The run that asks for a review reads it, and a review started for it.
+        assert!(REVIEW.contains(case), "{REVIEW}");
+        let rules: Vec<String> = ["Dates must parse.".to_owned()].into();
+        let asked = brief("Dates must parse.", &rules, (1, 1), &[], &[]);
+        assert!(asked.contains(case), "{asked}");
+        // Once, after the places in the code that change the state the
+        // requirement is about.
+        let after = "not only the call the request names; ";
+        let placed = format!("{after}{case} the other side of a condition,");
+        assert!(cases!().contains(&placed), "{}", cases!());
+        assert_eq!(cases!().matches("outlives a call").count(), 1);
+    }
+
+    #[test]
+    fn an_input_the_change_excepts_from_its_own_rule_gets_a_row_and_a_guard_passes() {
+        let case = "each input the change itself treats apart from its general path, such as an \
+                    early return on a zero, empty or boundary value or a form it exempts, found \
+                    by reading the change, the row saying what the general path gives when run \
+                    on that input (the guard passes where that path crashes or does not end, \
+                    and where the input is absent, the file, section, collection or value the \
+                    rule reads not being there at all, unless the request says what happens \
+                    then; for input that is there, such as a zero or an empty value, the guard \
+                    passes where both results are the same; where they differ the row is FAIL \
+                    only where it quotes a sentence of the request that says what happens for \
+                    that input, by name or by a rule that covers it, and the change gives \
+                    another result, even where the project's own code of the same kind makes \
+                    the same exception; where no sentence does, the guard passes where the \
+                    project's own code of the same kind, named in the row, makes the same \
+                    exception, and is otherwise UNCLEAR, naming both results and the command \
+                    that shows them, never FAIL);";
+        // A guard for what is not there at all passes, unless the request
+        // says what happens then.
+        assert!(
+            case.contains(
+                "where the input is absent, the file, section, collection or value the rule \
+                 reads not being there at all, unless the request says what happens then"
+            ),
+            "{case}"
+        );
+        // An empty value is there, not absent, and a guard that gives what
+        // the general path gives excepts nothing.
+        assert!(case.contains("for input that is there, such as a zero or an empty value"));
+        assert!(
+            case.contains("the guard passes where both results are the same; where they differ")
+        );
+        // It fails only by a sentence of the request that says what happens
+        // for the input, quoted, which outranks an exception the project
+        // shares.
+        assert!(case.contains(
+            "FAIL only where it quotes a sentence of the request that says what happens for \
+             that input, by name or by a rule that covers it, and the change gives another \
+             result, even where the project's own code of the same kind makes the same exception"
+        ));
+        // With no such sentence a guard the project's own code of the same
+        // kind makes too is the project's way, which the check asks a
+        // change to follow, so it passes, the code named in the row.
+        assert!(CHECK.contains("do it the same way"), "{CHECK}");
+        assert!(case.contains(
+            "where no sentence does, the guard passes where the project's own code of the same \
+             kind, named in the row, makes the same exception"
+        ));
+        // Any other is a doubt, never a failure, and gives the run a
+        // command to run.
+        assert!(case.ends_with(
+            "and is otherwise UNCLEAR, naming both results and the command that shows them, \
+             never FAIL);"
+        ));
+        assert!(!case.contains("whatever the project's own code"), "{case}");
+        // What the path does when run decides, not whether a reviewer
+        // thinks the input has a result at all.
+        assert!(!case.contains("defined result"), "{case}");
+        // The run that asks for a review reads it, and a review started for it.
+        assert!(REVIEW.contains(case), "{REVIEW}");
+        let rules: Vec<String> = ["Dates must parse.".to_owned()].into();
+        let asked = brief("Dates must parse.", &rules, (1, 1), &[], &[]);
+        assert!(asked.contains(case), "{asked}");
+        // Ahead of the project's own tests, which close the list.
+        let closing = format!("{case} and each case the project's own tests check");
+        assert!(cases!().contains(&closing), "{}", cases!());
     }
 
     #[test]
@@ -1451,7 +4773,7 @@ mod tests {
             cut_rows(report, quote).as_deref(),
             Some(
                 "\nRows of its table the quote above cut, written again:\nR2 | plain value | \
-                 FAIL | node check.js\nR3 | two rests | FAIL"
+                 FAIL | `node check.js`\nR3 | two rests | FAIL"
             )
         );
         // Written again, they read as the rows they were.
@@ -1469,7 +4791,225 @@ mod tests {
         let many: String = (1..=CUT_SHOWN + 2)
             .map(|n| format!("R{n} | c | PASS\n"))
             .collect();
-        assert!(cut_rows(&many, "").unwrap().ends_with("\nand 2 more rows"));
+        let again = cut_rows(&many, "").unwrap();
+        assert!(again.ends_with("\nand 2 more rows that passed"), "{again}");
+    }
+
+    #[test]
+    fn of_more_rows_than_are_written_again_the_ones_that_hold_the_run_are_kept() {
+        // A long table whose doubts and whose one failure come last, past
+        // where the rows written again stop.
+        let mut table: String = (1..=CUT_SHOWN + 20)
+            .map(|n| format!("| R{} | case {n} | PASS | t{n}.sh |\n", n.div_ceil(4)))
+            .collect();
+        table.push_str("| R21 | which end | UNCLEAR | the request names neither |\n");
+        table.push_str("| R22 | empty input | UNCLEAR |\n");
+        table.push_str("| R23 | exact message | FAIL | node check.js prints 2 |\n");
+        let again = cut_rows(&table, "cut").unwrap();
+        let written: Vec<&str> = again.lines().skip(2).collect();
+        assert_eq!(written.len(), CUT_SHOWN + 1, "{again}");
+        // The failed row first, then the doubts, then the ones that passed.
+        assert_eq!(
+            written[0],
+            "R23 | exact message | FAIL | node check.js prints 2"
+        );
+        assert_eq!(
+            written[1],
+            "R21 | which end | UNCLEAR | the request names neither"
+        );
+        assert_eq!(written[2], "R22 | empty input | UNCLEAR");
+        assert_eq!(written[3], "R1 | case 1 | PASS | t1.sh");
+        // Only rows that passed are left out, and the count says so.
+        assert_eq!(written[CUT_SHOWN], "and 23 more rows that passed");
+        // Every requirement the table has a row for still has one, where
+        // the first rows in the table's order stop at R15, so the run is
+        // sent back for what failed and is in doubt and for nothing else.
+        let text = unchecked(&again, 23).unwrap();
+        assert!(!text.contains("has no row"), "{text}");
+        assert!(text.contains("- R23 | exact message | FAIL"), "{text}");
+        assert_eq!(left_open(&text), ["R21", "R22"]);
+        // The passed rows kept are in the table's order, each requirement's
+        // first among them.
+        let kept: Vec<usize> = (rows(&again).iter())
+            .filter(|(_, passed, _)| *passed)
+            .map(|(number, _, _)| *number)
+            .collect();
+        assert!(kept.is_sorted(), "{kept:?}");
+        assert!((1..=20).all(|number| kept.contains(&number)), "{kept:?}");
+        // A requirement with a row the quote kept needs none of them.
+        let quote = "    | R20 | case 80 | PASS | t80.sh |";
+        let again = cut_rows(&table, quote).unwrap();
+        assert!(!again.contains("\nR20 |"), "{again}");
+        assert!(again.ends_with("\nand 22 more rows that passed"), "{again}");
+    }
+
+    #[test]
+    fn a_row_written_again_keeps_its_code_spans_whole() {
+        // A span that opens or closes a cell, in the case, in what shows
+        // the row, and in the verdict's own cell on either side of it.
+        let report = "| R1 | `core` holds the name | PASS | `python parse.py` |\n\
+                      | R2 | `a` then `b` | **FAIL** | `sh order.sh` prints `b` |\n\
+                      | R3 | the ref suggested | FAIL — `go test`: `v4` for `v4` |\n\
+                      | R4 | `total` is kept — UNCLEAR (for `0`) |\n\
+                      `R5 | the count | FAIL | node count.js`\n\
+                      | R6 | handles `x | y` | FAIL | prints `x` |";
+        let again = cut_rows(report, "cut").unwrap();
+        assert_eq!(
+            again,
+            "\nRows of its table the quote above cut, written again:\n\
+             R2 | `a` then `b` | FAIL | `sh order.sh` prints `b`\n\
+             R3 | the ref suggested | FAIL | `go test`: `v4` for `v4`\n\
+             R5 | the count | FAIL | node count.js\n\
+             R6 | handles `x | y` | FAIL | prints `x`\n\
+             R4 | `total` is kept | UNCLEAR | (for `0`)\n\
+             R1 | `core` holds the name | PASS | `python parse.py`"
+        );
+        // And reads as the rows it was.
+        let found: Vec<(usize, bool)> = (rows(&again).into_iter())
+            .map(|(number, passed, _)| (number, passed))
+            .collect();
+        let read = [
+            (2, false),
+            (3, false),
+            (5, false),
+            (6, false),
+            (4, false),
+            (1, true),
+        ];
+        assert_eq!(found, read);
+    }
+
+    #[test]
+    fn rows_a_cut_lost_that_gave_no_verdict_are_counted_and_one_row_is_a_row() {
+        // One row past the rows written again.
+        let many: String = (1..=CUT_SHOWN + 1)
+            .map(|n| format!("R{n} | c | PASS\n"))
+            .collect();
+        let again = cut_rows(&many, "").unwrap();
+        assert!(again.ends_with("\nand 1 more row that passed"), "{again}");
+        // Rows that open as a row does and give no verdict that is read
+        // are neither written again nor counted with those that are: the
+        // run is told how many there were.
+        let unread = "R1 | a | PASS\nR2 | b | passes, by the look of it\nR3 | c | NOT RUN\n\
+                      R4 | d | not yet implemented\nR5 said more | e | f\nR6 | g";
+        assert_eq!(
+            cut_rows(unread, "cut").as_deref(),
+            Some(
+                "\nRows of its table the quote above cut, written again:\nR1 | a | PASS\nand 2 \
+                 more rows with no verdict that could be read"
+            )
+        );
+        let both = format!("{many}R70 | x | maybe\n");
+        let again = cut_rows(&both, "").unwrap();
+        assert!(
+            again.ends_with(
+                "\nand 1 more row that passed and 1 more with no verdict that could be read"
+            ),
+            "{again}"
+        );
+        // With none to write again, the count alone; with none cut, nothing.
+        assert_eq!(
+            cut_rows("R2 | b | maybe\nR3 | c | NOT RUN", "cut").as_deref(),
+            Some("\nThe quote above cut 2 rows with no verdict that could be read from its table.")
+        );
+        assert_eq!(
+            cut_rows("R2 | b | maybe", "cut").as_deref(),
+            Some("\nThe quote above cut 1 row with no verdict that could be read from its table.")
+        );
+        assert_eq!(cut_rows("R2 | b | maybe", "    R2 | b | maybe"), None);
+        // No row for the run to be held to is made of them.
+        assert!(!tabled(unread.split_once('\n').unwrap().1));
+    }
+
+    #[test]
+    fn rows_that_hold_the_run_left_out_past_the_cap_are_counted_by_kind() {
+        let table: String = (1..=CUT_SHOWN + 3)
+            .map(|n| format!("R{n} | case {n} | FAIL | t{n}.sh\n"))
+            .chain(["R70 | which end | UNCLEAR\n".to_owned()])
+            .chain((71..=75).map(|n| format!("R{n} | case {n} | PASS\n")))
+            .collect();
+        let again = cut_rows(&table, "cut").unwrap();
+        assert_eq!(again.lines().count(), CUT_SHOWN + 3, "{again}");
+        assert!(
+            again.ends_with(
+                "\nand 3 more rows that failed, 1 more left unclear and 5 more that passed"
+            ),
+            "{again}"
+        );
+    }
+
+    #[test]
+    fn a_passed_row_written_again_keeps_what_the_review_ran_and_what_it_showed() {
+        // As a review is asked to write a row that passed, and one for a
+        // case set aside that the request does not decide.
+        let report = format!(
+            "R1 | an open range | PASS | `node range.js 3..` prints `[3, 9]`\n\
+             R2 | a name with nothing in it | PASS | {NOT_ASKED}\n\
+             R3 | two ranges | PASS"
+        );
+        let again = cut_rows(&report, "cut").unwrap();
+        assert_eq!(
+            again,
+            format!(
+                "\nRows of its table the quote above cut, written again:\n\
+                 R1 | an open range | PASS | `node range.js 3..` prints `[3, 9]`\n\
+                 R2 | a name with nothing in it | PASS | {NOT_ASKED}\n\
+                 R3 | two ranges | PASS"
+            )
+        );
+        // They read as the rows they were, and hold the run to nothing.
+        assert_eq!(unchecked(&again, 3), None);
+        // In half the room a failed row has, since most rows of a long
+        // table pass.
+        let (ran, printed) = ("x".repeat(500), "y".repeat(500));
+        let long = format!("R1 | a | PASS | {ran}\nR2 | b | FAIL | {printed}");
+        let again = cut_rows(&long, "cut").unwrap();
+        let failed = format!("\nR2 | b | FAIL | {}\n", "y".repeat(ROW_CHARS));
+        assert!(again.contains(&failed), "{again}");
+        let passed = format!("\nR1 | a | PASS | {}", "x".repeat(PASSED_CHARS));
+        assert!(again.ends_with(&passed), "{again}");
+    }
+
+    #[test]
+    fn a_row_written_again_keeps_what_its_verdicts_cell_went_on_to_say() {
+        let report = "| R1 | missing field | PASS — `KeyError` |\n\
+                      | R2 | plain value | FAIL — `node check.js` prints 2 | expected 3 |\n\
+                      | R3 | later step first | UNCLEAR (the request sets no order) |";
+        let again = cut_rows(report, "cut").unwrap();
+        assert_eq!(
+            again,
+            "\nRows of its table the quote above cut, written again:\nR2 | plain value | FAIL \
+             | `node check.js` prints 2 | expected 3\nR3 | later step first | UNCLEAR | (the \
+             request sets no order)\nR1 | missing field | PASS | `KeyError`"
+        );
+        // Written again, they read as the rows they were.
+        let found: Vec<(usize, bool, bool)> = (rows(&again).into_iter())
+            .map(|(number, passed, row)| (number, passed, left_unclear(&row)))
+            .collect();
+        assert_eq!(
+            found,
+            [(2, false, false), (3, false, true), (1, true, false)]
+        );
+    }
+
+    #[test]
+    fn rows_of_a_report_written_ahead_of_the_work_hold_the_run_to_nothing() {
+        let ahead = format!(
+            "{AHEAD_OPENS}\nR1 | a | FAIL | pytest | ImportError: no module a\nR2 | b | NOT RUN\n\
+             {AHEAD_CLOSES}"
+        );
+        assert!(!tabled(&ahead));
+        // Beside a review's rows, only the review's count.
+        let both = format!("{ahead}\nR1 | a | PASS\nR2 | b | FAIL | cargo test");
+        let text = unchecked(&both, 2).unwrap();
+        assert!(text.contains("- R2 | b | FAIL | cargo test"), "{text}");
+        assert!(!text.contains("ImportError"), "{text}");
+        assert!(!text.contains("has no row"), "{text}");
+        // Indented, as a notice quotes a report, the marks still hold.
+        let quoted = format!(
+            "    {AHEAD_OPENS}\n    R1 | a | FAIL | pytest | ImportError\n    {AHEAD_CLOSES}"
+        );
+        assert!(!tabled(&quoted));
     }
 
     #[test]
@@ -1499,6 +5039,39 @@ mod tests {
             short.starts_with("[Letronna check] The review's table has no row for R2 and R3. ")
         );
         assert!(!short.contains("failed"), "{short}");
+    }
+
+    #[test]
+    fn a_row_that_waits_on_the_work_is_no_row() {
+        // A tester writing tests ahead of the work marks each row so, and
+        // the row says nothing of the work once the work is there.
+        let ahead = "Run: pytest -q tests/test_letronna_spec.py\n\
+                     R1 | adds | FAIL | pytest -q tests/test_letronna_spec.py | not yet implemented\n\
+                     R2 | rejects | FAIL | pytest -q | Not yet implemented (parse_range is missing).";
+        assert!(!tabled(ahead));
+        let passed = format!("R1 | a | PASS\nR2 | b | PASS\n{ahead}");
+        assert_eq!(unchecked(&passed, 2), None);
+        // A row that failed on the work holds the run, whatever it says of why.
+        let failed = format!(
+            "{ahead}\nR2 | b | FAIL | pytest -q | got NotImplementedError: not yet implemented"
+        );
+        let text = unchecked(&failed, 2).unwrap();
+        assert!(
+            text.contains("- R2 | b | FAIL | pytest -q | got NotImplementedError"),
+            "{text}"
+        );
+        assert!(!text.contains("R1 | adds"), "{text}");
+        assert!(text.contains("has no row for R1"), "{text}");
+    }
+
+    #[test]
+    fn the_files_a_request_names_are_listed_once_each_as_written() {
+        let files = named(
+            "Write the orders to `report.csv`, then check report.csv against `in/orders.json`. \
+             See https://example.com/a.csv for the format, version 1.2 of it.",
+        );
+        assert_eq!(files, ["report.csv", "in/orders.json"]);
+        assert!(named("Fix the parser so that ranges work.").is_empty());
     }
 
     #[test]
